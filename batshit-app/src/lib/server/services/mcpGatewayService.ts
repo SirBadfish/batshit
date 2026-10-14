@@ -13,23 +13,149 @@
  *
  * Risk Profile: DATA-001 (Critical) - Double stringification will corrupt data
  * Test Coverage: P0 tests verify no double stringification
+ *
+ * BL-1371: every registry write is a compare-and-set on the raw RedisJSON text
+ * (`redis.json.getRaw` / `setIfUnchanged` / `delIfUnchanged`), so a write that lands between
+ * another writer's read and its write is never overwritten. The value goes to Redis once, as the
+ * JSON text `json.set` sends (raw `JSON.SET` inside the script), never stringified twice.
  */
 
 import { redis } from '$lib/server/redis'
 import { cloneIconRef, isIconRef } from '$lib/icons/iconTypes'
-import type { MCPGateway, MCPGatewayRegistry, MCPToolGrouping } from '$lib/types/database'
-import type { RedisJSON } from '@redis/json'
+import type {
+  MCPGateway,
+  MCPGatewayRegistry,
+  MCPGatewayStdioConfig,
+  MCPToolGrouping
+} from '$lib/types/database'
 import { logger } from '$lib/utils/logger'
+import { isCliSubagentBridgeServerSegment } from '$lib/utils/cliSubagentToolNames'
 import { getBlockedBatshitServerGatewayReason, isBlockedBatshitServerGatewayUrl } from './mcpGatewayPolicy'
 import {
-  resolveOrphanToolNames,
+  collectGatewayToolNames,
   sweepGatewayReferencesForUser
 } from './mcpGatewayReferenceCleanup'
 import {
   sanitizeStdioGatewayConfig,
   validateStdioGatewayConfig
 } from './mcpGatewayStdio'
-import { gatewayToolSettingsChanged, mcpToolListCache } from './mcpToolListCache'
+import {
+  STDIO_RECORD_KEEPING_FIELDS,
+  gatewayToolSettingsChanged,
+  mcpToolListCache
+} from './mcpToolListCache'
+
+/** What a Refresh or a Test learned about a STDIO gateway (its record keeping). */
+export type StdioCheckResult = Pick<
+  MCPGatewayStdioConfig,
+  'lastTestStatus' | 'lastTestAt' | 'lastError' | 'toolCount'
+>
+
+/**
+ * BL-550: a Refresh or a Test writes back what it learned, and nothing else, into the gateway as
+ * it is when the check ENDS. The check takes seconds (a process start), and the user can save a
+ * new argument meanwhile; writing the launch read before the check put the old one back.
+ *
+ * One step inside Redis: find the gateway by id, refuse when it is gone (`MISSING`) or is no
+ * longer a STDIO gateway with a launch (`NOT_STDIO`), then set each named field at its own path
+ * under `stdioConfig`. Nothing else in the registry is read into the write.
+ *
+ * KEYS[1] the user's registry; ARGV[1] the gateway id; then pairs of field name and its value as
+ * JSON text.
+ */
+export const RECORD_STDIO_CHECK_SCRIPT = `
+if redis.call('EXISTS', KEYS[1]) == 0 then return 'MISSING' end
+local count = redis.call('JSON.ARRLEN', KEYS[1], '$.gateways')[1]
+if type(count) ~= 'number' then return 'MISSING' end
+local index = nil
+for position = 0, count - 1 do
+  local ids = cjson.decode(redis.call('JSON.GET', KEYS[1], '$.gateways[' .. position .. '].id'))
+  if ids[1] == ARGV[1] then
+    index = position
+    break
+  end
+end
+if index == nil then return 'MISSING' end
+local at = '$.gateways[' .. index .. ']'
+local kind = cjson.decode(redis.call('JSON.GET', KEYS[1], at .. '.type'))[1]
+if kind ~= 'stdio' or redis.call('JSON.TYPE', KEYS[1], at .. '.stdioConfig')[1] ~= 'object' then
+  return 'NOT_STDIO'
+end
+for position = 2, #ARGV, 2 do
+  redis.call('JSON.SET', KEYS[1], at .. '.stdioConfig.' .. ARGV[position], ARGV[position + 1])
+end
+return 'OK'
+`
+
+/** The text with each lone UTF-16 surrogate replaced by U+FFFD. */
+function wellFormedText(text: string): string {
+  return text.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '�')
+}
+
+/**
+ * BL-550: the record keeping belongs to the check. A settings save that sends the STDIO launch
+ * keeps what is stored at the moment of the write, whatever the sender's copy says, so a save
+ * built before a Refresh answered cannot put the old result back.
+ */
+function keepStoredStdioRecordKeeping(
+  incoming: MCPGatewayStdioConfig,
+  stored: MCPGatewayStdioConfig | undefined
+): MCPGatewayStdioConfig {
+  const next: Record<string, unknown> = { ...incoming }
+  const current: Record<string, unknown> = stored && typeof stored === 'object' ? { ...stored } : {}
+  for (const field of STDIO_RECORD_KEEPING_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(current, field)) {
+      next[field] = current[field]
+    } else {
+      delete next[field]
+    }
+  }
+  return next as unknown as MCPGatewayStdioConfig
+}
+
+/**
+ * BL-1371: a registry write reads again and rebuilds from fresh objects at most this many times
+ * (the first try and two more), with no wait between, then gives up. Each refused try proves that
+ * another write was stored, so the tries always make progress.
+ */
+const REGISTRY_WRITE_TRIES = 3
+
+/**
+ * BL-1371: a registry write found the stored gateways changed by another write at every one of
+ * its tries. Nothing of it was stored. The gateway routes answer 409.
+ */
+export class GatewayRegistryConflictError extends Error {
+  constructor() {
+    super(
+      `The MCP gateways kept changing while this was being saved (${REGISTRY_WRITE_TRIES} tries), so nothing was saved. Try again.`
+    )
+    this.name = 'GatewayRegistryConflictError'
+  }
+}
+
+/**
+ * What `update` writes: the fields to change, or a SYNCHRONOUS function of the gateway as it is
+ * stored at the try's compare-and-set that answers them (BL-1371). The function runs again on
+ * every try, so it must only compute: no I/O, no `await`.
+ */
+export type GatewayUpdate =
+  | Partial<MCPGateway>
+  | ((stored: Readonly<MCPGateway>) => Partial<MCPGateway>)
+
+/** The JSONPath of one gateway in the registry. */
+function gatewayPath(index: number): string {
+  return `$.gateways[${index}]`
+}
+
+/** The registry from `JSON.GET key $` (a one-entry array), or null for a missing key. */
+function parseRegistryText(raw: string | null): MCPGatewayRegistry | null {
+  if (raw === null) return null
+  const matches = JSON.parse(raw)
+  if (!Array.isArray(matches) || matches.length !== 1) {
+    throw new Error('The MCP gateway registry read answered an unexpected shape.')
+  }
+  return matches[0] as MCPGatewayRegistry
+}
 
 export class MCPGatewayService {
   private readonly VALID_GROUP_MODES = new Set([
@@ -193,7 +319,11 @@ export class MCPGatewayService {
     const baseSlug = this.slugify(baseName) || 'gateway'
     let attempt = baseSlug
     let counter = 1
-    while (existingSlugs.has(attempt)) {
+    // BL-271: the slug is Batshit's hidden id for the gateway (the name the user typed is
+    // kept as typed). It also names the gateway's MCP server in managed CLI profiles
+    // (`batshit_gateway_<slug>`), so it skips every name a Subagent bridge can take, as it
+    // skips another gateway's slug; otherwise "Cody Subagents" became agent cody's bridge.
+    while (existingSlugs.has(attempt) || isCliSubagentBridgeServerSegment(attempt)) {
       attempt = `${baseSlug}_${counter++}`
     }
     gateway.slug = attempt
@@ -201,8 +331,13 @@ export class MCPGatewayService {
     return gateway
   }
 
-  private async ensureSlugs(userId: string, registry: MCPGatewayRegistry | null, client: any) {
-    if (!registry) return
+  /**
+   * Brings a registry read up to the stored shape (groupings, display defaults, slugs), in place.
+   * Answers null when nothing changed, else the warnings to log once the write is stored. Only
+   * computes: `list` writes the result with a compare-and-set (BL-1371).
+   */
+  private normalizeRegistry(registry: MCPGatewayRegistry): string[] | null {
+    const warnings: string[] = []
     let needsSave = false
     for (const gateway of registry.gateways) {
       const normalizedGroupings = this.sanitizeToolGroupings(gateway.toolGroupings)
@@ -219,14 +354,75 @@ export class MCPGatewayService {
         gateway.dcmDisplayDefaults = normalizedDcmDefaults
         needsSave = true
       }
+      if (gateway.slug && isCliSubagentBridgeServerSegment(gateway.slug.trim())) {
+        // BL-271: a slug saved (or restored) before the save-time rule may still be a
+        // Subagent bridge's server name; it gets a new one here, once. Only Batshit's hidden id
+        // changes; the gateway's name stays as the user typed it.
+        const previous = gateway.slug
+        gateway.slug = undefined
+        this.assignSlug(gateway, registry.gateways)
+        warnings.push(
+          `[MCPGatewayService] Gateway "${gateway.name}" had the internal id "${previous}", which is a Subagent bridge's MCP server name; it is now "${gateway.slug}" (BL-271).`
+        )
+        needsSave = true
+      }
       if (!gateway.slug) {
         this.assignSlug(gateway, registry.gateways)
         needsSave = true
       }
     }
-    if (needsSave) {
-      await client.json.set(this.getKey(userId), '$', registry as unknown as RedisJSON)
+    return needsSave ? warnings : null
+  }
+
+  /** The registry as stored now, with its raw text for a compare-and-set (BL-1371). */
+  private async readRegistry(key: string): Promise<{ raw: string | null; registry: MCPGatewayRegistry | null }> {
+    const raw = await redis.json.getRaw(key, '$')
+    return { raw, registry: parseRegistryText(raw) }
+  }
+
+  /**
+   * BL-1371: the gateway at `index` as stored now, with its raw text, or null when that element is
+   * no longer this gateway (another write deleted it or shifted the list between the two reads):
+   * the try is refused before anything is computed from a sibling.
+   */
+  private async readGatewayAt(
+    key: string,
+    index: number,
+    gatewayId: string
+  ): Promise<{ raw: string; gateway: MCPGateway } | null> {
+    const raw = await redis.json.getRaw(key, gatewayPath(index))
+    if (raw === null) return null
+    const matches = JSON.parse(raw)
+    if (!Array.isArray(matches) || matches.length > 1) {
+      throw new Error('The MCP gateway read answered an unexpected shape.')
     }
+    const gateway = matches[0]
+    if (!gateway || typeof gateway !== 'object' || gateway.id !== gatewayId) return null
+    return { raw, gateway: gateway as MCPGateway }
+  }
+
+  private assertValid(gateway: Partial<MCPGateway>) {
+    const validation = this.validateGateway(gateway)
+    if (!validation.valid) {
+      throw new Error(validation.error)
+    }
+  }
+
+  /** A merge function's answer, refused when it is not a plain synchronous result (BL-1371). */
+  private runMerge(
+    merge: (stored: Readonly<MCPGateway>) => Partial<MCPGateway>,
+    stored: MCPGateway
+  ): Partial<MCPGateway> {
+    const answer = merge(stored) as unknown
+    if (
+      !answer ||
+      typeof answer !== 'object' ||
+      Array.isArray(answer) ||
+      typeof (answer as { then?: unknown }).then === 'function'
+    ) {
+      throw new Error('A gateway update function must answer the fields to write, synchronously.')
+    }
+    return answer as Partial<MCPGateway>
   }
 
   /**
@@ -292,71 +488,63 @@ export class MCPGatewayService {
   }
 
   /**
-   * Create a new gateway
+   * Create a new gateway.
    *
-   * ✅ CORRECT Redis 8 Pattern:
-   * - Pass data object DIRECTLY to json.set
-   * - NO JSON.stringify anywhere in this function
+   * BL-1371: a compare-and-set on the whole registry (`$`, '' when there is none yet), because the
+   * slug depends on every other gateway. Each try builds the gateway again from the caller's input,
+   * so a slug picked by a refused try is never kept or answered.
    */
   async create(userId: string, gateway: Omit<MCPGateway, 'id'> | MCPGateway): Promise<MCPGateway> {
-    // Validate gateway data
-    const validation = this.validateGateway(gateway)
-    if (!validation.valid) {
-      throw new Error(validation.error)
-    }
+    this.assertValid(gateway)
 
     const key = this.getKey(userId)
+    const id = 'id' in gateway && gateway.id ? gateway.id : crypto.randomUUID()
 
-    // Generate ID if not provided
-    const newGateway = this.normalizeGatewayForStorage({
-      ...gateway,
-      id: 'id' in gateway && gateway.id ? gateway.id : crypto.randomUUID()
-    } as MCPGateway)
+    for (let attempt = 0; attempt < REGISTRY_WRITE_TRIES; attempt += 1) {
+      const { raw, registry: stored } = await this.readRegistry(key)
+      const registry = stored ?? { gateways: [] }
+      const newGateway = this.normalizeGatewayForStorage({ ...gateway, id } as MCPGateway)
 
-    await redis.execute(async (client) => {
-      // Get existing registry (already parsed!)
-      let registry = await client.json.get(key) as MCPGatewayRegistry | null
-
-      if (!registry) {
-        registry = { gateways: [] }
+      if (registry.gateways.some((g: MCPGateway) => g.id === id)) {
+        throw new Error(`Gateway with ID ${id} already exists`)
       }
 
-      // Check for duplicate ID
-      if (registry.gateways.some((g: MCPGateway) => g.id === newGateway.id)) {
-        throw new Error(`Gateway with ID ${newGateway.id} already exists`)
-      }
-
-      // Add new gateway
       this.assignSlug(newGateway, registry.gateways)
       registry.gateways.push(newGateway)
 
-      // Store back (NO JSON.stringify!)
-      // ⚠️ CRITICAL: Pass object directly - RedisJSON handles serialization
-      await client.json.set(key, '$', registry as unknown as RedisJSON)
-    })
+      if (!(await redis.json.setIfUnchanged(key, '$', raw ?? '', registry))) continue
 
-    // Saved tool lists are kept until the user changes the tool settings (mcpToolListCache.ts).
-    mcpToolListCache.clearGateway(userId, newGateway.id)
-    return newGateway
+      // Saved tool lists are kept until the user changes the tool settings (mcpToolListCache.ts).
+      mcpToolListCache.clearGateway(userId, id)
+      return newGateway
+    }
+    throw new GatewayRegistryConflictError()
   }
 
   /**
-   * Get all gateways for a user
+   * Get all gateways for a user.
    *
-   * ✅ CORRECT Redis 8 Pattern:
-   * - json.get returns already-parsed object
-   * - NO JSON.parse anywhere in this function
+   * A read that needs normalizing (a missing slug, an older grouping or display shape) writes the
+   * normalized registry with a compare-and-set on `$` (BL-1371). When another write landed first it
+   * reads and normalizes again; it answers only a registry it stored, or a read that needed no
+   * write, never a copy whose write was refused (its slugs might never be stored).
    */
   async list(userId: string): Promise<MCPGateway[]> {
     const key = this.getKey(userId)
 
-    return await redis.execute(async (client) => {
-      // Get registry (already parsed!)
-      const registry = await client.json.get(key) as MCPGatewayRegistry | null
+    for (let attempt = 0; attempt < REGISTRY_WRITE_TRIES; attempt += 1) {
+      const { raw, registry } = await this.readRegistry(key)
+      if (!registry) return []
 
-      await this.ensureSlugs(userId, registry, client)
-      return registry?.gateways || []
-    })
+      const warnings = this.normalizeRegistry(registry)
+      if (warnings === null) return registry.gateways || []
+
+      if (!(await redis.json.setIfUnchanged(key, '$', raw!, registry))) continue
+
+      for (const warning of warnings) logger.warn(warning)
+      return registry.gateways
+    }
+    throw new GatewayRegistryConflictError()
   }
 
   /**
@@ -368,70 +556,82 @@ export class MCPGatewayService {
   }
 
   /**
-   * Update an existing gateway
+   * Update an existing gateway.
    *
-   * ✅ CORRECT Redis 8 Pattern:
-   * - Retrieve with json.get (already parsed)
-   * - Modify object
-   * - Store with json.set (NO stringify)
+   * BL-1371: a compare-and-set on THIS gateway's raw text (`$.gateways[i]`), so a write to another
+   * gateway never conflicts. Each try finds the gateway, reads its element again and checks the id
+   * (a delete can shift the list between the two reads), builds the next copy from that stored
+   * element (`updates` may be a synchronous function of it), and writes only while the element is
+   * still that text. A gateway deleted meanwhile is "not found" and is never written again. Only the
+   * stored try clears saved tool lists, and it is the copy answered (a function that answers no
+   * fields writes nothing and answers the gateway as read).
    */
-  async update(userId: string, gatewayId: string, updates: Partial<MCPGateway>): Promise<MCPGateway> {
-    // Validate updates
-    const validation = this.validateGateway(updates)
-    if (!validation.valid) {
-      throw new Error(validation.error)
-    }
+  async update(userId: string, gatewayId: string, updates: GatewayUpdate): Promise<MCPGateway> {
+    if (typeof updates !== 'function') this.assertValid(updates)
 
     const key = this.getKey(userId)
 
-    let updatedGateway: MCPGateway
-    let previousGateway: MCPGateway | null = null
-
-    await redis.execute(async (client) => {
-      // Get existing registry (already parsed!)
-      const registry = await client.json.get(key) as MCPGatewayRegistry | null
-
+    for (let attempt = 0; attempt < REGISTRY_WRITE_TRIES; attempt += 1) {
+      const { registry } = await this.readRegistry(key)
       if (!registry) {
         throw new Error('No gateways found for user')
       }
 
-      // Find gateway index
       const index = registry.gateways.findIndex((g: MCPGateway) => g.id === gatewayId)
       if (index === -1) {
         throw new Error(`Gateway with ID ${gatewayId} not found`)
       }
 
-      // Update gateway object
-      const sanitizedUpdates = this.normalizeGatewayForStorage({ ...updates })
+      const snapshot = await this.readGatewayAt(key, index, gatewayId)
+      if (!snapshot) continue
+      const stored = snapshot.gateway
+
+      let requested: Partial<MCPGateway>
+      if (typeof updates === 'function') {
+        // The function gets its own copy; `stored` stays the element as read.
+        requested = this.runMerge(updates, JSON.parse(JSON.stringify(stored)))
+        // Nothing to change for the gateway as stored (the token migration found another token):
+        // no write, so nothing for a concurrent save to retry over. It answers the stored copy.
+        if (Object.keys(requested).length === 0) return stored
+        this.assertValid(requested)
+      } else {
+        requested = updates
+      }
+
+      const sanitizedUpdates = this.normalizeGatewayForStorage({ ...requested })
       if ('slug' in sanitizedUpdates) {
         delete (sanitizedUpdates as Partial<MCPGateway>).slug
       }
-
-      previousGateway = registry.gateways[index]
-      updatedGateway = {
-        ...registry.gateways[index],
+      if (sanitizedUpdates.stdioConfig) {
+        sanitizedUpdates.stdioConfig = keepStoredStdioRecordKeeping(
+          sanitizedUpdates.stdioConfig,
+          stored.stdioConfig
+        )
+      }
+      const updatedGateway: MCPGateway = {
+        ...stored,
         ...sanitizedUpdates,
         updated_at: new Date().toISOString()
       }
-      registry.gateways[index] = updatedGateway
 
-      // Store updated registry (NO JSON.stringify!)
-      await client.json.set(key, '$', registry as unknown as RedisJSON)
-    })
+      if (!(await redis.json.setIfUnchanged(key, gatewayPath(index), snapshot.raw, updatedGateway))) continue
 
-    // Any edit but the record keeping a lookup or a Test writes back is the user changing the
-    // tool settings, so the next send asks the tool server again (mcpToolListCache.ts).
-    if (gatewayToolSettingsChanged(previousGateway, updatedGateway!)) {
-      mcpToolListCache.clearGateway(userId, gatewayId)
+      // Any edit but the record keeping a lookup or a Test writes back is the user changing the
+      // tool settings, so the next send asks the tool server again (mcpToolListCache.ts).
+      if (gatewayToolSettingsChanged(stored, updatedGateway)) {
+        mcpToolListCache.clearGateway(userId, gatewayId)
+      }
+      return updatedGateway
     }
-    return updatedGateway!
+    throw new GatewayRegistryConflictError()
   }
 
   /**
-   * Delete a gateway
+   * Delete a gateway.
    *
-   * ✅ CORRECT Redis 8 Pattern:
-   * - Retrieve, filter, store - all with json operations
+   * BL-1371: a compare-and-set delete of THIS gateway's element, found and id-checked as in
+   * `update`. The saved tool lists and the reference sweep follow only the stored delete, with the
+   * tool names of the gateway as it was removed.
    *
    * SA-096 DL-8: a delete also sweeps every agent and subagent reference to the
    * gateway, so no record is left pointing at an ID that resolves to nothing.
@@ -439,50 +639,45 @@ export class MCPGatewayService {
   async delete(userId: string, gatewayId: string): Promise<void> {
     const key = this.getKey(userId)
 
-    const removal = await redis.execute(async (client) => {
-      // Get existing registry (already parsed!)
-      const registry = await client.json.get(key) as MCPGatewayRegistry | null
-
+    for (let attempt = 0; attempt < REGISTRY_WRITE_TRIES; attempt += 1) {
+      const { registry } = await this.readRegistry(key)
       if (!registry) {
-        return null // Nothing to delete
+        return // Nothing to delete
       }
 
-      // Filter out the gateway
-      const originalLength = registry.gateways.length
-      const removedGateway = registry.gateways.find((g: MCPGateway) => g.id === gatewayId) ?? null
-      registry.gateways = registry.gateways.filter((g: MCPGateway) => g.id !== gatewayId)
-
-      if (registry.gateways.length === originalLength) {
+      const index = registry.gateways.findIndex((g: MCPGateway) => g.id === gatewayId)
+      if (index === -1) {
         throw new Error(`Gateway with ID ${gatewayId} not found`)
       }
 
-      // Store updated registry (NO JSON.stringify!)
-      await client.json.set(key, '$', registry as unknown as RedisJSON)
+      const snapshot = await this.readGatewayAt(key, index, gatewayId)
+      if (!snapshot) continue
+      if (!(await redis.json.delIfUnchanged(key, gatewayPath(index), snapshot.raw))) continue
 
-      return { removedGateway, survivingGateways: registry.gateways }
-    })
+      mcpToolListCache.clearGateway(userId, gatewayId)
 
-    if (!removal) return
-
-    mcpToolListCache.clearGateway(userId, gatewayId)
-
-    // Reference sweep runs after the registry write so it compares against the
-    // post-delete live set. A sweep failure must not leave the caller believing
-    // the gateway is still present.
-    try {
-      await sweepGatewayReferencesForUser({
-        userId,
-        orphanToolNames: resolveOrphanToolNames(
-          removal.removedGateway,
-          removal.survivingGateways
+      // Reference sweep runs after the registry write so it compares against the
+      // post-delete live set. A sweep failure must not leave the caller believing
+      // the gateway is still present.
+      // BL-1396: every tool name of the gateway as it was removed is a candidate. The sweep keeps
+      // a name that a gateway in the registry as it reads it still serves, and its compare-and-set
+      // refuses a write when the registry changed. This try's earlier read must not decide: a
+      // sibling deleted meanwhile is still in it, so two overlapping deletes of gateways that serve
+      // the same tool would each keep that tool's selection.
+      try {
+        await sweepGatewayReferencesForUser({
+          userId,
+          orphanToolNames: collectGatewayToolNames(snapshot.gateway)
+        })
+      } catch (error) {
+        logger.error(
+          `[MCP Gateway] Deleted gateway ${gatewayId} but failed to sweep references:`,
+          error
         )
-      })
-    } catch (error) {
-      logger.error(
-        `[MCP Gateway] Deleted gateway ${gatewayId} but failed to sweep references:`,
-        error
-      )
+      }
+      return
     }
+    throw new GatewayRegistryConflictError()
   }
 
   /**
@@ -490,6 +685,48 @@ export class MCPGatewayService {
    */
   async setEnabled(userId: string, gatewayId: string, enabled: boolean): Promise<void> {
     await this.update(userId, gatewayId, { enabled })
+  }
+
+  /**
+   * BL-550: write what a Refresh or a Test learned about a STDIO gateway (`RECORD_STDIO_CHECK_SCRIPT`).
+   * Only the fields given are written, each at its own path, into the record as it is now; a
+   * field left out keeps its stored value. Answers `NOT_STDIO` (nothing written) when the gateway
+   * is no longer a STDIO gateway, and throws "not found" (like `update`) when it was deleted.
+   * The saved tool lists stay: this is record keeping, not the user changing the tool settings.
+   */
+  async recordStdioCheckResult(
+    userId: string,
+    gatewayId: string,
+    result: StdioCheckResult
+  ): Promise<'OK' | 'NOT_STDIO'> {
+    for (const field of Object.keys(result)) {
+      if (!STDIO_RECORD_KEEPING_FIELDS.has(field)) {
+        throw new Error(`${field} is not a STDIO check field`)
+      }
+    }
+    // The error is stored as `sanitizeStdioGatewayConfig` stored it (trimmed; empty is none), with
+    // any lone UTF-16 half replaced, because RedisJSON refuses the escape `JSON.stringify` writes
+    // for one. It goes first: a refused value then stops the script before anything is written.
+    const fields: Array<[string, unknown]> = []
+    if (result.lastError !== undefined) {
+      const lastError =
+        typeof result.lastError === 'string' ? wellFormedText(result.lastError).trim() || null : null
+      fields.push(['lastError', lastError])
+    }
+    for (const field of ['lastTestStatus', 'lastTestAt', 'toolCount'] as const) {
+      if (result[field] !== undefined) fields.push([field, result[field]])
+    }
+    const fieldArguments = fields.flatMap(([field, value]) => [field, JSON.stringify(value)])
+
+    const answer = await redis.execute((client) =>
+      client.eval(RECORD_STDIO_CHECK_SCRIPT, {
+        keys: [this.getKey(userId)],
+        arguments: [gatewayId, ...fieldArguments]
+      })
+    )
+    if (answer === 'OK' || answer === 'NOT_STDIO') return answer
+    if (answer === 'MISSING') throw new Error(`Gateway with ID ${gatewayId} not found`)
+    throw new Error(`The STDIO check result of gateway ${gatewayId} answered ${String(answer)}.`)
   }
 
   /**

@@ -22,6 +22,66 @@ async function seedUpload(uploadType: string, filename: string, size = 10) {
 }
 
 describe('goonAssetCleanupService', () => {
+  it('recognizes Clip-only retained Hair media in the initial audit, including encoded system URLs', async () => {
+    await seedUpload('goon_hair_assets', 'shared.png')
+    await redis.json.set('clip:system:borrower', '$', { localUrl: '/uploads/%67oon_hair_assets/shared.png',
+      content: '/uploads/goon_hair_assets/not-an-owner.png' })
+    const audit = await auditGoonUploadAssets('josh')
+    expect(audit.entries).toMatchObject([{ uploadType: 'goon_hair_assets', filename: 'shared.png', referenced: true,
+      references: ['clip:system:borrower'], cleanupEligible: false }])
+    expect(audit.cleanupCandidateCount).toBe(0)
+  })
+  it('preserves Scene files after their saved references are lost, without inventing a recovery', async () => {
+    const scene = { id: 'room', name: 'Room', skybox: { filename: 'room.jpg', url: '/uploads/goon_scenes/room.jpg' } }
+    await redis.json.set('user:josh:settings', '$', { goons_settings: { kitchen: { scenes: { room: scene } } } })
+    await seedUpload('goon_scenes', 'room.jpg', 1234)
+    expect((await auditGoonUploadAssets('josh')).entries[0].referenced).toBe(true)
+
+    // BL-975's erased Scene state: the old reference is no longer in Redis.
+    const erased = { goons_settings: { kitchen: { scenes: {} } } }
+    await redis.json.set('user:josh:settings', '$', erased)
+    const uploadBefore = await redis.json.get('upload:goon_scenes:room.jpg')
+    const audit = await auditGoonUploadAssets('josh')
+    expect(audit.orphans[0]).toMatchObject({ referenced: false, cleanupEligible: false })
+    expect(audit.orphans[0].reason).toMatch(/failed or partial settings write/i)
+    expect(audit).toMatchObject({ cleanupCandidateCount: 0, preservedOrphanRecordCount: 1 })
+    const deleteAsset = vi.fn(async () => undefined)
+    const cleanup = await cleanupOrphanGoonUploadAssets('josh', { deleteAsset })
+    expect(deleteAsset).not.toHaveBeenCalled()
+    expect(cleanup.deletedCount).toBe(0)
+    expect(await redis.json.get('upload:goon_scenes:room.jpg')).toEqual(uploadBefore)
+    expect(await redis.json.get('user:josh:settings')).toEqual(erased)
+  })
+
+  it.each(['goon_scenes', 'goon_scene_thumbs', 'goon_room_shells', 'goon_room_textures', 'goon_scene_props'])(
+    'preserves unknown %s orphans even with no settings record or a very old upload date', async (uploadType) => {
+      await seedUpload(uploadType, 'unknown.bin')
+      const deleteAsset = vi.fn(async () => undefined)
+      const result = await cleanupOrphanGoonUploadAssets('josh', { deleteAsset })
+      expect(deleteAsset).not.toHaveBeenCalled()
+      expect(result.audit.orphans[0]).toMatchObject({ uploadType, cleanupEligible: false })
+      expect(result.audit.orphans[0].reason).toMatch(/cannot determine/i)
+      expect(await redis.exists(`upload:${uploadType}:unknown.bin`)).toBe(true)
+    }
+  )
+
+  it('explains eligible orphans and deletes only the explicitly selected files on a fresh audit', async () => {
+    await seedUpload('goons', 'selected.vrm', 30)
+    await seedUpload('goons', 'new-orphan.vrm', 40)
+    await seedUpload('goon_scenes', 'lost.jpg', 50)
+    const audit = await auditGoonUploadAssets('josh')
+    expect(audit).toMatchObject({ orphanRecordCount: 3, cleanupCandidateCount: 2, cleanupCandidateBytes: 70, preservedOrphanRecordCount: 1 })
+    expect(audit.entries.find((entry) => entry.filename === 'selected.vrm')).toMatchObject({ cleanupEligible: true })
+    expect(audit.entries.find((entry) => entry.filename === 'selected.vrm')?.reason).toMatch(/no current/i)
+    const deleteAsset = vi.fn(async () => undefined)
+    const result = await cleanupOrphanGoonUploadAssets('josh', {
+      deleteAsset,
+      selectedAssets: ['goons/selected.vrm', 'goon_scenes/lost.jpg']
+    })
+    expect(deleteAsset.mock.calls).toEqual([['goons', 'selected.vrm']])
+    expect(result.deletedCount).toBe(1)
+  })
+
   it('fails closed before deletion when reference enumeration cannot be trusted', async () => {
     const deleteAsset = vi.fn(async () => undefined)
     const client = {

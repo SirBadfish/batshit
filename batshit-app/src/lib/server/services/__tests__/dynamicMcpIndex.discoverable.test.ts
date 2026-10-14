@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 /**
- * SA-120 P1 — `buildDynamicMcpIndex().discoverable`: the typed refs the Jev Juice hint
+ * SA-120 P1 — `buildDynamicMcpIndex().discoverable`: the typed refs the Judge Juice hint
  * lane judges over. It must follow discoverability (not the collapsed DCM text), keep
  * enabled MCP tools flagged, and carry the same hints the text would show.
  */

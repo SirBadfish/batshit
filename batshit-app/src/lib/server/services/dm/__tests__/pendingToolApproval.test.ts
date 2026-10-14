@@ -2,6 +2,11 @@ import { beforeEach, describe, expect, it } from 'vitest'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { redis } from '$lib/server/redis'
 import { hasPendingToolApproval } from '../pendingToolApproval'
+import {
+  __resetClaudeApprovalRegistryForTests,
+  recordClaudeApprovalCard,
+  settleClaudeApproval
+} from '$lib/server/services/claudeApprovalRegistry'
 
 /**
  * SA-113 — "is this chat's last turn sitting on a tool approval?"
@@ -41,6 +46,7 @@ async function save(role: 'user' | 'assistant', metadata: Record<string, any> = 
 }
 
 beforeEach(async () => {
+  __resetClaudeApprovalRegistryForTests()
   sequence = 0
   await redis.del(`messages:${SESSION}`)
   await redis.createSession({
@@ -105,6 +111,31 @@ describe('hasPendingToolApproval', () => {
     })
     await save('assistant')
 
+    expect(await hasPendingToolApproval(SESSION)).toBe(false)
+  })
+
+  /**
+   * BL-496 (A3): a Claude card waits INSIDE its running turn, whose reply is not stored until
+   * the turn ends, so the stored messages still show the reply before it. The server's record
+   * of the card is what says the chat waits for the user, watched or not.
+   */
+  it('is true while a Claude card of the running turn waits, though nothing stored says so', async () => {
+    await save('user')
+    await save('assistant')
+    const now = Date.now()
+    recordClaudeApprovalCard({
+      sessionId: SESSION,
+      messageId: 'reply-running',
+      approvalId: 'claude-card-1',
+      toolName: 'Bash',
+      input: { command: 'echo hi' },
+      requestedAt: new Date(now).toISOString(),
+      expiresAt: new Date(now + 600_000).toISOString()
+    })
+
+    expect(await hasPendingToolApproval(SESSION)).toBe(true)
+
+    settleClaudeApproval(SESSION, 'claude-card-1', { status: 'approved' })
     expect(await hasPendingToolApproval(SESSION)).toBe(false)
   })
 })

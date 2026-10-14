@@ -283,6 +283,66 @@ test('one engine whose record cannot be changed never stops the rest of the quit
   }
 });
 
+test('a launch record the quit cannot read is kept for the next quit, never removed, and the log says which (BL-1264)', async () => {
+  await mkdir(join(stateRoot, 'garbled'), { recursive: true });
+  await mkdir(join(stateRoot, 'blank'), { recursive: true });
+  await writeFile(join(stateRoot, 'garbled', PRIMARY), '{ "pid": ');
+  await writeFile(join(stateRoot, 'blank', PRIMARY), '');
+  try {
+    const results = await stopManagedLocalRuntimes(env);
+
+    for (const engineId of ['garbled', 'blank']) {
+      const result = results.find((entry) => entry.engineId === engineId);
+      assert.equal(result.skipped, true, engineId);
+      assert.notEqual(result.ok, false, `${engineId}: a kept record is not a failed quit`);
+      assert.match(result.reason, /kept it for the next quit/);
+      assert.deepEqual(await recordNames(engineId), [PRIMARY], `${engineId}: the record stays`);
+    }
+    const log = await readFile(join(sandbox, 'logs', 'supervisor.log'), 'utf8');
+    assert.match(log, /Local runtime "garbled": the launch record .* is not valid JSON; kept it for the next quit\./);
+    assert.match(log, /Local runtime "blank": the launch record .* is empty; kept it for the next quit\./);
+  } finally {
+    await rm(join(stateRoot, 'garbled'), { recursive: true, force: true });
+    await rm(join(stateRoot, 'blank'), { recursive: true, force: true });
+  }
+});
+
+test('while one launch record cannot be read, the quit stops no engine and removes no record (BL-1269)', async () => {
+  // The unreadable record could be kokoro's "keep running" attach record for the same process.
+  const engine = await startEngineProcess('held-engine');
+  await writeRecord('chatterbox-held', PRIMARY, engine);
+  await writeRecord('no-process', PRIMARY, { command: '/bin/nothing' });
+  await mkdir(join(stateRoot, 'kokoro-held'), { recursive: true });
+  await writeFile(join(stateRoot, 'kokoro-held', PRIMARY), '{ "pid": ');
+  try {
+    const results = await stopManagedLocalRuntimes(env);
+
+    await new Promise((done) => setTimeout(done, 300));
+    assert.equal(alive(engine.pid), true, 'a readable record beside an unreadable one is held, not stopped');
+    const held = results.find((entry) => entry.engineId === 'chatterbox-held');
+    assert.deepEqual([held.skipped, held.held, held.pid, held.ok], [true, true, engine.pid, undefined], 'held is not a failed quit');
+    assert.deepEqual(await recordNames('chatterbox-held'), [PRIMARY]);
+    assert.deepEqual(await recordNames('no-process'), [PRIMARY], 'no record is removed while one is held');
+    assert.deepEqual(await recordNames('kokoro-held'), [PRIMARY]);
+    const log = await readFile(join(sandbox, 'logs', 'supervisor.log'), 'utf8');
+    assert.match(
+      log,
+      /Local runtimes: stopped no voice engine and removed no launch record: .*kokoro-held.* could not be read and may hold an engine's "keep running" choice\. Once the voice engines have stopped \(restarting the computer stops them\), repair or remove that file or folder\. Left as they are: .*Local runtime "chatterbox-held" \(pgid \d+\)/
+    );
+
+    // Repaired (here: removed once nothing it names runs), the next quit decides with every record.
+    await rm(join(stateRoot, 'kokoro-held'), { recursive: true, force: true });
+    await stopManagedLocalRuntimes(env);
+    assert.equal(await waitGone(engine.pid), true);
+    assert.deepEqual(await recordNames('chatterbox-held'), []);
+    assert.deepEqual(await recordNames('no-process'), []);
+  } finally {
+    for (const engineId of ['chatterbox-held', 'no-process', 'kokoro-held']) {
+      await rm(join(stateRoot, engineId), { recursive: true, force: true });
+    }
+  }
+});
+
 test('quitting stops Docker\'s sbx daemon when this app\'s own call started it, and says so (BL-61)', async () => {
   const fake = await installFakeSbxDaemon(join(sandbox, 'sbx'));
   Object.assign(process.env, fake.env);
@@ -309,7 +369,7 @@ test('quitting stops Docker\'s sbx daemon when this app\'s own call started it, 
 
   const result = await stopSbxDaemonStartedByThisApp(sbxEnv);
 
-  assert.deepEqual(result, { action: 'stopped', ok: true, pid });
+  assert.deepEqual(result, { action: 'stopped', ok: true, verdict: 'stopped', pid });
   assert.equal(await waitGone(pid), true);
   assert.deepEqual(await readdir(sbxStateDir), []);
   const log = await readFile(join(sandbox, 'logs', 'supervisor.log'), 'utf8');
@@ -319,6 +379,6 @@ test('quitting stops Docker\'s sbx daemon when this app\'s own call started it, 
   await run(['ls', '--json']);
   const users = await fake.daemonPid();
   started.push(users);
-  assert.deepEqual(await stopSbxDaemonStartedByThisApp(sbxEnv), { action: 'none' });
+  assert.deepEqual(await stopSbxDaemonStartedByThisApp(sbxEnv), { action: 'none', verdict: 'absent' });
   assert.equal(alive(users), true);
 });

@@ -7,6 +7,7 @@ import {
   normalizeSkillId,
   upsertSkill
 } from '$lib/server/services/skillRegistry'
+import { isSkillFilesMissingError } from '$lib/server/services/skillFilesMissing'
 import {
   DEFAULT_PROMPT_ICON_REF,
   DEFAULT_SKILL_ICON_REF
@@ -15,6 +16,7 @@ import { parseIconRef, type IconRef } from '$lib/icons/iconTypes'
 import { normalizeOptionalIconRef } from '$lib/icons/iconLegacy'
 import type { SlashCommandRow } from '$lib/types/database'
 import { sanitizeId } from '$lib/utils/idSanitizer'
+import { writeSlashCommandRecord } from '$lib/server/services/agentAccessLists'
 
 function normalizeInvocation(value: string) {
   const trimmed = value.trim()
@@ -171,8 +173,11 @@ export const GET: RequestHandler = async ({ locals }) => {
             JSON.stringify(comparableSkillCommandMetadata(synchronized))
           ) {
             synchronized.updated_at = new Date().toISOString()
-            await redis.json.set(key, '$', synchronized)
-            command = synchronized
+            // BL-544: a metadata refresh never changes who may use the skill (see the command
+            // route's GET): the per-agent list is kept as stored at the write.
+            const storedCommand = await writeSlashCommandRecord(key, synchronized, { keepAgentAccess: true })
+            if (!storedCommand) continue
+            command = storedCommand
           }
         }
       }
@@ -425,6 +430,10 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
     return json({ slashCommand })
   } catch (error) {
+    // BL-369: a user skill whose files are missing is named, never a generic 500.
+    if (isSkillFilesMissingError(error)) {
+      return json({ error: error.message, code: error.code }, { status: 409 })
+    }
     console.error('Error creating slash command:', error)
     if (error && typeof error === 'object' && 'status' in error && (error as any).status === 400) {
       return json({ error: error instanceof Error ? error.message : 'Invalid slash command' }, { status: 400 })

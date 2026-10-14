@@ -1,3 +1,5 @@
+import type { ObservedUsage } from './executionViewer'
+
 export type DelegatedRunKind = 'subagent' | 'worker'
 export type DelegatedRunStatus = 'completed' | 'failed' | 'timed_out'
 export type DelegatedRunThread = 'fresh' | 'resumed' | 'resumed-empty' | null
@@ -20,6 +22,8 @@ export interface DelegatedRunRecord {
   model: string | null
   provider: string | null
   usage: DelegatedUsage | null
+  observedUsage?: ObservedUsage
+  observedUsageUnavailable?: 'invalid'
   durationMs: number
   status: DelegatedRunStatus
   thread: DelegatedRunThread

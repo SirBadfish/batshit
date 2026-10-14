@@ -614,7 +614,7 @@ describe.runIf(memorySearchLaneActive())('memory recall engine (dedicated Redis 
     })
   })
 
-  describe('SA-120 P4b: inferred recalls from the route-owned Jev Juice provider', () => {
+  describe('SA-120 P4b: inferred recalls from the route-owned Judge Juice provider', () => {
     it('compiles byte-identically without a provider, and with one that brings nothing in', async () => {
       await seedMemory({ lane: 'stm', content: 'Maggie is an Irish Setter', trigger_terms: ['maggie'] })
       await seedMemory({ content: 'A long-term fact nobody asked for' })

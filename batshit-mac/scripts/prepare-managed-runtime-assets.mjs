@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { cpus } from 'node:os';
 import {
   access,
@@ -13,7 +13,7 @@ import {
   stat,
   writeFile
 } from 'node:fs/promises';
-import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -24,12 +24,22 @@ import {
   parseOtoolLibraries
 } from './managed-runtime-portability.mjs';
 import { inspectFfmpegRuntimeCapabilities } from './ffmpeg-runtime-capabilities.mjs';
+import {
+  assertRedisRuntimeUsable,
+  curateRedisMacosArchive,
+  REDIS_BUNDLED_BINARIES,
+  REDIS_BUNDLED_MODULES,
+  REDIS_MACOS_PINNED_ARCHIVE_SHA256,
+  REDIS_PINNED_VERSION,
+  redisMacosArchive,
+  relinkAndSignRedisMacosRuntime
+} from './redis-runtime.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const macRoot = resolve(__dirname, '..');
 const repoRoot = resolve(macRoot, '..');
 
-const nodeVersion = process.env.BATSHIT_MAC_NODE_VERSION || '24.17.0';
+const nodeVersion = process.env.BATSHIT_MAC_NODE_VERSION || '24.21.0';
 const redisVersion = process.env.BATSHIT_MAC_REDIS_VERSION || '8.10.1';
 const ffmpegVersion = process.env.BATSHIT_MAC_FFMPEG_VERSION || '8.1.2';
 const dav1dVersion = '1.5.4';
@@ -50,14 +60,10 @@ const nodeFilename = `node-v${nodeVersion}-darwin-arm64.tar.xz`;
 const nodeBaseUrl = `https://nodejs.org/dist/v${nodeVersion}`;
 const nodeArchiveUrl = `${nodeBaseUrl}/${nodeFilename}`;
 const nodeShasumsUrl = `${nodeBaseUrl}/SHASUMS256.txt`;
-const redisFilename = `redis-oss-${redisVersion}-arm64.zip`;
-const redisArchiveUrl = `https://packages.redis.io/homebrew/${redisFilename}`;
-// SA-101 / DL-101-03: the Redis archive is pinned by exact SHA-256, not merely recorded.
-// This value is the arm64 hash published by the official `redis/homebrew-redis` cask for
-// this exact version. Bumping BATSHIT_MAC_REDIS_VERSION without also supplying the matching
-// BATSHIT_MAC_REDIS_ARCHIVE_SHA256 is refused rather than silently unpinned.
-const REDIS_PINNED_VERSION = '8.10.1';
-const REDIS_PINNED_ARCHIVE_SHA256 = '3e7966a847255580f93fac2398d99c20d80583decf10f194b60fe20a7724e433';
+// SA-101 / DL-101-03: the Redis archive is pinned by exact SHA-256 (redis-runtime.mjs, shared
+// with the Pinokio launcher). Bumping BATSHIT_MAC_REDIS_VERSION without also supplying the
+// matching BATSHIT_MAC_REDIS_ARCHIVE_SHA256 is refused rather than silently unpinned.
+const { filename: redisFilename, url: redisArchiveUrl } = redisMacosArchive(redisVersion);
 // Redis 8's macOS archive ships no licence files, so the tri-licence text and the retained
 // BSD-3-Clause contributions notice are fetched from the matching immutable release tag.
 const redisLicenseBaseUrl = `https://raw.githubusercontent.com/redis/redis/${redisVersion}`;
@@ -65,19 +71,6 @@ const REDIS_LICENSE_FILES = [
   { filename: 'LICENSE.txt', sha256: '4a0e416b9537688f30dfe69ddaceb2ca64d96b7df02a0a6760d376890ddc4e40' },
   { filename: 'REDISCONTRIBUTIONS.txt', sha256: 'aa6a56234e5ca27f09010693d1c31ca83988d7a0dc80fb253603e052d1d7f0d1' }
 ];
-// Only the modules Batshit actually needs are bundled. Batshit stores JSON records, and a
-// data file written by any Redis Stack server carries a RediSearch AUX marker that Redis 8
-// refuses to load without RediSearch present. Bloom and TimeSeries stamp no such marker and
-// are not used, so they stay out of the signing and audit surface.
-const REDIS_BUNDLED_MODULES = ['rejson.so', 'redisearch.so'];
-// redis-check-aof / redis-check-rdb are the documented repair path for the AOF-first Mac
-// lane. redis-benchmark and redis-sentinel have no Batshit use and are not bundled.
-const REDIS_BUNDLED_BINARIES = ['redis-server', 'redis-cli', 'redis-check-aof', 'redis-check-rdb'];
-// redisearch.so links libunwind from a Homebrew llvm@18 path that does not exist on a user's
-// Mac. It needs exactly the 13 standard Itanium C++ ABI _Unwind_* symbols, all of which macOS
-// exports from libSystem. Substituting leaves one unwinder in the process (Apple's, which the
-// redis-server core already uses via libc++abi) rather than loading a second one.
-const REDIS_UNWINDER_SUBSTITUTIONS = new Map([['libunwind.1.dylib', '/usr/lib/libSystem.B.dylib']]);
 const ffmpegFilename = `ffmpeg-${ffmpegVersion}.tar.xz`;
 const ffmpegArchiveUrl = `https://ffmpeg.org/releases/${ffmpegFilename}`;
 const dav1dFilename = `dav1d-${dav1dVersion}.tar.xz`;
@@ -318,6 +311,15 @@ async function prepareNode() {
   const dest = join(assetsRoot, 'node');
   if (!options.force && (await exists(join(dest, 'bin', 'node'))) && (await exists(join(dest, 'SOURCE.txt')))) {
     let npmReady = false;
+    let versionReady = false;
+    const source = await readFile(join(dest, 'SOURCE.txt'), 'utf8');
+    const sourceReady = source.includes(`Node.js ${nodeVersion} macOS arm64 runtime for Batshit.app.\n`) &&
+      source.includes(`Official archive: ${nodeArchiveUrl}\n`);
+    try {
+      versionReady = runCaptured(join(dest, 'bin', 'node'), ['--version']).trim() === `v${nodeVersion}`;
+    } catch {
+      versionReady = false;
+    }
     if ((await hasPortableSymlink(dest, 'npm')) && (await hasPortableSymlink(dest, 'npx'))) {
       try {
         npmReady = Boolean(
@@ -327,11 +329,11 @@ async function prepareNode() {
         npmReady = false;
       }
     }
-    if (npmReady) {
+    if (sourceReady && versionReady && npmReady) {
       log(`Node runtime already prepared: ${dest}`);
       return dest;
     }
-    log('Rebuilding cached Node runtime because its npm/npx launcher links are invalid.');
+    log('Rebuilding cached Node runtime because its source, version, or npm/npx launcher links are invalid.');
   }
 
   const archive = join(downloadsRoot, nodeFilename);
@@ -344,7 +346,15 @@ async function prepareNode() {
   await resetDir(extractRoot);
   run('tar', ['-xJf', archive, '-C', extractRoot], { stdio: 'inherit' });
   const sourceDir = await findDirContaining(extractRoot, 'bin/node');
+  const sourceVersion = runCaptured(join(sourceDir, 'bin', 'node'), ['--version']).trim();
+  if (sourceVersion !== `v${nodeVersion}`) {
+    throw new Error(`Downloaded Node runtime version mismatch: expected v${nodeVersion}, got ${sourceVersion || '(empty)'}.`);
+  }
   await copyDir(sourceDir, dest, { dereference: false });
+  const preparedVersion = runCaptured(join(dest, 'bin', 'node'), ['--version']).trim();
+  if (preparedVersion !== `v${nodeVersion}`) {
+    throw new Error(`Prepared Node runtime version mismatch: expected v${nodeVersion}, got ${preparedVersion || '(empty)'}.`);
+  }
   if (!(await hasPortableSymlink(dest, 'npm')) || !(await hasPortableSymlink(dest, 'npx'))) {
     throw new Error('Prepared Node runtime must preserve the official relative npm and npx symlinks.');
   }
@@ -486,7 +496,7 @@ function resolveRedisArchiveSha256() {
         'cask for that version, or update REDIS_PINNED_VERSION/REDIS_PINNED_ARCHIVE_SHA256 together.'
     );
   }
-  return REDIS_PINNED_ARCHIVE_SHA256;
+  return REDIS_MACOS_PINNED_ARCHIVE_SHA256;
 }
 
 async function assertExpectedSha256(filePath, expected, label) {
@@ -549,28 +559,9 @@ async function prepareRedis() {
   run('unzip', ['-q', archive, '-d', extractRoot], { stdio: 'inherit' });
   const sourceDir = await findDirContaining(extractRoot, 'bin/redis-server');
 
-  // Curate the bundle explicitly instead of copying the whole archive: only the binaries and
-  // modules Batshit runs are shipped, and the modules are flattened into lib/ so every bundled
-  // Mach-O sits at a known depth relative to the bundled OpenSSL dylibs.
+  // Curate only the binaries and modules Batshit runs, with the modules flattened into lib/.
   await resetDir(dest);
-  await mkdir(join(dest, 'bin'), { recursive: true });
-  await mkdir(join(dest, 'lib'), { recursive: true });
-  for (const name of REDIS_BUNDLED_BINARIES) {
-    const source = join(sourceDir, 'bin', name);
-    if (!(await exists(source))) {
-      throw new Error(`Redis archive is missing bin/${name}: ${source}`);
-    }
-    await cp(source, join(dest, 'bin', name));
-    await chmod(join(dest, 'bin', name), 0o755);
-  }
-  for (const name of REDIS_BUNDLED_MODULES) {
-    const source = join(sourceDir, 'lib', 'redis', 'modules', name);
-    if (!(await exists(source))) {
-      throw new Error(`Redis archive is missing lib/redis/modules/${name}: ${source}`);
-    }
-    await cp(source, join(dest, 'lib', name));
-    await chmod(join(dest, 'lib', name), 0o755);
-  }
+  await curateRedisMacosArchive(sourceDir, dest);
 
   await cp(join(openssl, 'lib', 'libssl.3.dylib'), join(dest, 'lib', 'libssl.3.dylib'));
   await cp(join(openssl, 'lib', 'libcrypto.3.dylib'), join(dest, 'lib', 'libcrypto.3.dylib'));
@@ -597,30 +588,9 @@ async function prepareRedis() {
     licenseChecksums.push(`${sha}  share/redis/${entry.filename}`);
   }
 
-  for (const file of await collectMachOFiles(dest)) {
-    const relativePath = file.slice(dest.length + 1);
-    const bundledPrefix = relativePath.startsWith('bin/') ? '@loader_path/../lib' : '@loader_path';
-    const installName = parseOtoolInstallName(runCaptured('otool', ['-D', file]));
-    // A module whose own install name is a build-machine path would otherwise survive the
-    // portability audit through the "dependency === installName" allowance. Rewrite it.
-    if (installName && (installName.startsWith('/Users/') || installName.startsWith('/opt/homebrew/'))) {
-      run('install_name_tool', ['-id', basename(file), file]);
-    }
-    for (const dependency of parseOtoolLibraries(runCaptured('otool', ['-L', file]))) {
-      if (dependency === installName) continue;
-      for (const library of ['libssl.3.dylib', 'libcrypto.3.dylib']) {
-        if (!dependency.endsWith(`/${library}`)) continue;
-        run('install_name_tool', ['-change', dependency, `${bundledPrefix}/${library}`, file]);
-      }
-      for (const [library, replacement] of REDIS_UNWINDER_SUBSTITUTIONS) {
-        if (!dependency.endsWith(`/${library}`)) continue;
-        run('install_name_tool', ['-change', dependency, replacement, file]);
-      }
-    }
-  }
-  await adHocSignMachOFiles(dest);
+  await relinkAndSignRedisMacosRuntime(dest);
   await assertPortableRuntime(dest, 'Redis runtime');
-  await assertRedisRuntimeUsable(dest);
+  await assertRedisRuntimeUsable(dest, join(buildRoot, 'redis-probe'), log);
 
   const binaryChecksums = [];
   for (const relative of [
@@ -658,65 +628,6 @@ ${binaryChecksums.join('\n')}
   );
   log(`Prepared Redis runtime: ${dest}`);
   return dest;
-}
-
-// A prepared runtime that cannot actually start is worse than a missing one, because every
-// later gate (packaging, audit, signing) would pass on bytes that fail on a user's Mac. Boot
-// the prepared server with the bundled modules and prove RedisJSON and Search answer.
-async function assertRedisRuntimeUsable(dest) {
-  const probeDir = join(buildRoot, 'redis-probe');
-  await resetDir(probeDir);
-  // Listen on a unix socket only: no TCP port, so this can never collide with, or be mistaken
-  // for, a Redis the developer is already running.
-  const socketPath = join(probeDir, 'probe.sock');
-  const serverBin = join(dest, 'bin', 'redis-server');
-  const cliBin = join(dest, 'bin', 'redis-cli');
-  const args = [
-    '--port', '0',
-    '--unixsocket', socketPath,
-    '--dir', probeDir,
-    '--save', '',
-    '--daemonize', 'no',
-    '--logfile', join(probeDir, 'redis.log')
-  ];
-  for (const module of REDIS_BUNDLED_MODULES) {
-    args.push('--loadmodule', join(dest, 'lib', module));
-  }
-  const server = spawn(serverBin, args, { stdio: 'ignore', detached: true });
-  server.unref();
-  try {
-    let ready = false;
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      const ping = spawnSync(cliBin, ['-s', socketPath, 'PING'], { encoding: 'utf8' });
-      if (ping.stdout?.trim() === 'PONG') { ready = true; break; }
-      await new Promise((resolve) => setTimeout(resolve, 250));
-    }
-    if (!ready) {
-      const logText = await readFile(join(probeDir, 'redis.log'), 'utf8').catch(() => '');
-      throw new Error(`Prepared Redis runtime did not start.\n${logText}`);
-    }
-    const check = (cmdArgs, label, predicate) => {
-      const result = spawnSync(cliBin, ['-s', socketPath, ...cmdArgs], { encoding: 'utf8' });
-      const output = (result.stdout || '').trim();
-      if (!predicate(output)) {
-        throw new Error(`Prepared Redis runtime failed the ${label} probe: ${output || result.stderr}`);
-      }
-      return output;
-    };
-    check(['JSON.SET', 'batshit:probe', '$', '{"ok":true}'], 'RedisJSON write', (out) => out === 'OK');
-    check(['JSON.GET', 'batshit:probe', '$'], 'RedisJSON read', (out) => out.includes('"ok":true'));
-    check(['FT._LIST'], 'RediSearch', (out) => !/^ERR/i.test(out));
-    const modules = check(['MODULE', 'LIST'], 'module list', () => true);
-    for (const expected of ['ReJSON', 'search']) {
-      if (!modules.includes(expected)) {
-        throw new Error(`Prepared Redis runtime is missing the ${expected} module: ${modules}`);
-      }
-    }
-    log('Verified the prepared Redis runtime starts with RedisJSON and Search.');
-  } finally {
-    spawnSync(cliBin, ['-s', socketPath, 'SHUTDOWN', 'NOSAVE'], { encoding: 'utf8' });
-    await rm(probeDir, { recursive: true, force: true });
-  }
 }
 
 async function copyFfmpegLicenseFiles(sourceDir, dest) {

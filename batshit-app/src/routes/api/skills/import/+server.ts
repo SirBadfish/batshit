@@ -15,7 +15,7 @@ export const POST: RequestHandler = async ({ locals, request }) => {
     const body = (await request.json().catch(() => ({}))) as SkillImportInput
     const result = await importSkillDefinition(body)
 
-    // SA-120 P7: with **Screen Incoming Text** (on the Jev Juice card) on, SKILL.md is shown to Jev once and
+    // SA-120 P7: with **Screen Incoming Text** (on the Judge Juice card) on, SKILL.md is shown to Jev once and
     // the answer rides the response as `jevJuiceScreen`, which the import dialog draws as its
     // own block. Advisory only: the import result is exactly what it was, and nothing is saved
     // until the user saves the form. Off: `null`, and the response is today's bytes.

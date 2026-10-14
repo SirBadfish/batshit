@@ -26,20 +26,6 @@ function formatToolSchema(tool) {
 }
 
 const rawBuiltInTools = [
-  // RETAINED NON-ARTIFACT TOOLS (temporary until Sandbox story closeout)
-  {
-    name: 'batshit_server_fetch_zip',
-    description: 'batshit-server: Fetch a zip payload from Redis by zipId so the agent can peek at zipped content without unzipping it in chat. Params: zipId (required), maxChars (optional; default 4000, set 0 for full content). Returns content (possibly truncated) plus metadata.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        zipId: { type: 'string', description: 'Zip ID to fetch (required)' },
-        maxChars: { type: 'number', description: 'Max characters to return (0 = full)', default: 4000 }
-      },
-      required: ['zipId']
-    }
-  },
-
   // DYNAMIC MCP TOOLS (SA-009)
   // These tools allow agents to discover and execute any MCP tool on-demand,
   // without needing all tools enabled upfront (massive token savings)

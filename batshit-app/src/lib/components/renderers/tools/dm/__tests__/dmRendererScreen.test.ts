@@ -1,15 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { fireEvent, render, screen, waitFor } from '@testing-library/svelte'
 import {
-  UNTRUSTED_TEXT_ADVISORY_TEXT,
-  UNTRUSTED_TEXT_BADGE_TEXT,
   UNTRUSTED_TEXT_DM_CARD_TOLD_TEXT,
+  untrustedTextAdvisoryText,
+  untrustedTextBadgeText,
   untrustedTextCategoryLines,
   untrustedTextHarmText
 } from '$lib/utils/jevJuice'
 
 /**
- * SA-120 P7 — the Jev Juice flag on an Agent DM tool card.
+ * SA-120 P7 — the Judge Juice flag on an Agent DM tool card.
  *
  * The card looks the flag up BY DM ID rather than reading it off the tool result: the result
  * is what the agent sees, and only the agent that READS a flagged DM is told. So the store is
@@ -40,7 +40,8 @@ const FLAG = {
   ],
   harm: 2,
   clipped: false,
-  source: 'agent_dm' as const
+  source: 'agent_dm' as const,
+  judge: 'Jev'
 }
 
 /** The live `sys.dm.send` shape: the agent's input and the control's answer sit under `toolResult`. */
@@ -97,7 +98,7 @@ beforeEach(() => {
   requestJevJuiceDmScreen.mockClear()
 })
 
-describe('DmRenderer: the Jev Juice flag', () => {
+describe('DmRenderer: the Judge Juice flag', () => {
   it('asks for the screen of the DM the card names', async () => {
     render(DmRenderer, { props: { tool: liveWaitSend } })
     await waitFor(() => expect(requestJevJuiceDmScreen).toHaveBeenCalledWith('dm_1788837376535_ib1be0'))
@@ -109,18 +110,30 @@ describe('DmRenderer: the Jev Juice flag', () => {
     await expandCard()
 
     const block = await screen.findByTestId('jev-juice-dm-card-flag')
-    expect(block.textContent).toContain(UNTRUSTED_TEXT_BADGE_TEXT)
+    expect(block.textContent).toContain(untrustedTextBadgeText('Jev'))
     for (const line of untrustedTextCategoryLines(FLAG)) expect(block.textContent).toContain(line)
     expect(block.textContent).toContain('Potential takeover attempt (98% confidence)')
     expect(block.textContent).toContain('Potentially unwanted request (71% confidence)')
     expect(block.textContent).toContain(untrustedTextHarmText(FLAG))
-    expect(block.textContent).toContain(UNTRUSTED_TEXT_ADVISORY_TEXT)
+    expect(block.textContent).toContain(untrustedTextAdvisoryText('Jev'))
     expect(block.textContent).toContain(UNTRUSTED_TEXT_DM_CARD_TOLD_TEXT)
-    expect(block.textContent).not.toContain('Jev Juice')
+    expect(block.textContent).not.toContain('Judge Juice')
     expect(block.className).toContain('is-serious')
 
     // The card opens collapsed, so the subtitle carries the flag on its own.
     expect(screen.getByText(/to demo_openai_api_primary · info · waiting in inbox · flagged by Jev$/)).toBeTruthy()
+  })
+
+  it('SA-120 P10b: names the judge that flagged it, in the subtitle and in the block', async () => {
+    screens.set('dm_1788837376535_ib1be0', { ...FLAG, judge: 'Clef Flash' })
+    render(DmRenderer, { props: { tool: liveWaitSend } })
+    await expandCard()
+
+    const block = await screen.findByTestId('jev-juice-dm-card-flag')
+    expect(block.textContent).toContain('Flagged by Clef Flash')
+    expect(block.textContent).toContain("This is Clef Flash's best guess, and Clef Flash can be wrong.")
+    expect(block.textContent).not.toContain('Jev')
+    expect(screen.getByText(/to demo_openai_api_primary · info · waiting in inbox · flagged by Clef Flash$/)).toBeTruthy()
   })
 
   it('draws nothing at all when there is no flag to draw', async () => {
@@ -129,7 +142,7 @@ describe('DmRenderer: the Jev Juice flag', () => {
     await expandCard()
     expect(screen.queryByTestId('jev-juice-dm-card-flag')).toBeNull()
     expect(screen.queryByTestId('jev-juice-dm-card-skipped')).toBeNull()
-    expect(screen.queryByText(/Jev Juice/)).toBeNull()
+    expect(screen.queryByText(/Judge Juice/)).toBeNull()
   })
 
   it('says plainly when the screen could not run, instead of implying it was clean', async () => {
@@ -138,7 +151,7 @@ describe('DmRenderer: the Jev Juice flag', () => {
     await expandCard()
 
     const note = await screen.findByTestId('jev-juice-dm-card-skipped')
-    expect(note.textContent).toContain('Jev Juice: Incoming text screen skipped')
+    expect(note.textContent).toContain('Judge Juice: Incoming text screen skipped')
     expect(note.getAttribute('title')).toContain('This text was not screened.')
     expect(screen.queryByTestId('jev-juice-dm-card-flag')).toBeNull()
   })

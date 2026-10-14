@@ -8,13 +8,13 @@ This package stays separate from `batshit-app` and `batshit-server`: Electron ow
 
 - Shell: Electron 43 with bundled Chromium.
 - Default Batshit URL: `http://127.0.0.1:5620/`.
-- Bundle ID: `ai.batshit.mac`.
+- Bundle ID: `ai.batshit.mac`. A test package built with an artifact suffix is its own app: `-FirstRunTest` gives `ai.batshit.mac.firstruntest`, named "Batshit FirstRunTest".
 - Standard Electron sandboxed renderers and hidden helper app bundles.
 - Context isolation on, Node integration off, web security on, and navigation limited to the packaged startup shell plus explicit Batshit loopback origins.
 - One visible app instance; a second launch focuses the existing window.
 - One optional Desktop Goon companion window: exact authenticated route, isolated role-scoped preload/state port, transparent frameless policy, no microphone permission, and deterministic return-to-main lifecycle.
 - Runtime Doctor starts the packaged SvelteKit app, batshit-server, streamable MCP helper, and Mac-owned Redis before opening the real UI.
-- The runtime/data contract remains under `~/Library/Application Support/Batshit`, `~/Library/Logs/Batshit`, and `~/Library/Caches/Batshit` unless an isolated test lane supplies overrides.
+- The runtime/data contract remains under `~/Library/Application Support/Batshit`, `~/Library/Logs/Batshit`, and `~/Library/Caches/Batshit` unless an isolated test lane supplies overrides. A test package keeps `Batshit-<Label>` folders of its own, even when Finder or the Dock opens it without its lane launcher.
 - Release runtime target: Apple Silicon on macOS 14 or newer. Node, Redis 8, OpenSSL, and FFmpeg are package-owned; the build and final package audits reject Homebrew paths, missing loader-relative libraries, unresolved runtime search paths, and native files with a newer deployment target.
 
 The packaged startup UI is served from the privileged `batshit-shell://app` scheme instead of `file://`. The main preload bridge exposes only exact runtime actions, the native save dialog, and the narrow Desktop Goon controller. The Desktop preload exposes only its role-scoped Desktop API; raw Electron and raw `MessagePort` objects never enter app code. Renderer crashes, readiness timeouts, port/schema failures, and unresponsive states remain visible; the shell does not silently reload and discard editor state.
@@ -161,17 +161,17 @@ npm run package:zip
 
 The preparation command prints the exact generated environment-file path when a custom asset root is configured; source that reported file before packaging.
 
-The normal app bundle is `electron-out/package/Batshit.app`, matching the product name shown in Finder and the Dock. Version and release-safety labeling remain on distributable artifacts such as `Batshit-0.1.0-macos-ReleaseSafe.zip` and `.dmg`, while isolated review builds use an explicit app suffix such as `Batshit-SA090-R7.app`. Direct `npm run package:mac` builds remain ad-hoc unless `MACOS_CODESIGN_IDENTITY` or `BATSHIT_MAC_SIGN_IDENTITY` is set. Team development rebuild tooling can automatically reuse an installed Developer ID so repeated local rebuilds retain one macOS code identity; `BATSHIT_MAC_SIGNING_MODE=stable` requires that identity and `BATSHIT_MAC_SIGNING_MODE=ad-hoc` explicitly opts out.
+The normal app bundle is `electron-out/package/Batshit.app`, matching the product name shown in Finder and the Dock. Distributable files carry the app version and chip, for example `Batshit-0.1.0-alpha.2-arm64.dmg` and its `.sha256` (named by `scripts/release-artifact-name.mjs` from `batshit-app/src/lib/version.ts`), while isolated review builds use an explicit app suffix such as `Batshit-SA090-R7.app`. A suffixed build is its own app: bundle id `ai.batshit.mac.sa090-r7`, named "Batshit SA090-R7" in the Dock and menu bar, with its own Keychain entry, so a quit or `open -a Batshit` never reaches the real app. Its folders (its data, and with them its one-instance lock) are the ones its launcher names: the first-run test lane defaults to the `Batshit-FirstRunTest` folders, and a review lane can name its own (for example `Batshit-FirstRunTest-SA090-R7`). Opened from Finder or the Dock with no launcher, it uses `Batshit-SA090-R7` folders of its own, never the real app's. Its ports are the real app's defaults (5620, 5600, 5601, 5639) unless its launcher moves them, so opened from Finder while the real app runs it stops at Runtime Doctor on a Redis port it does not own. Its executable and helper names stay `Batshit`, which signing and the package audit look for. Direct `npm run package:mac` builds remain ad-hoc unless `MACOS_CODESIGN_IDENTITY` or `BATSHIT_MAC_SIGN_IDENTITY` is set. Team development rebuild tooling can automatically reuse an installed Developer ID so repeated local rebuilds retain one macOS code identity; `BATSHIT_MAC_SIGNING_MODE=stable` requires that identity and `BATSHIT_MAC_SIGNING_MODE=ad-hoc` explicitly opts out.
 
 Maintainers can launch the disposable first-run test lane from the private checkout. It rebuilds the same Electron package, wipes only the disposable first-run data/log/cache roots, and runs on isolated local ports without touching the normal Mac app data.
 
 ## Public DMG
 
-Josh accepted the long-session Electron package behavior. Managed-runtime preparation builds a checksum-verified OpenSSL 3.5 LTS pair for Redis and FFmpeg with dependency autodetection and X11/XCB disabled. FFmpeg includes a statically linked, checksum-pinned dav1d 1.5.4 AV1 decoder built for Apple Silicon. FFprobe and FFmpeg are package-owned; dav1d shares the macOS 14 minimum and its BSD-2-Clause notice/source/checksum records ship with the runtime. The prepared assets and their final copies inside the app are audited independently.
+Josh accepted the long-session Electron package behavior. Managed-runtime preparation builds a checksum-verified OpenSSL 3.5 LTS pair for Redis and FFmpeg with dependency autodetection and X11/XCB disabled. FFmpeg includes a statically linked, checksum-pinned dav1d 1.5.4 decoder for AV1 upload inspection and thumbnails on Apple Silicon, including Macs without AV1 hardware decoding. FFprobe and FFmpeg are package-owned; dav1d shares the macOS 14 minimum and its BSD-2-Clause notice/source/checksum records ship with the runtime. The prepared assets and their final copies inside the app are audited independently.
 
-Meson, Ninja and pkg-config must be available on PATH when rebuilding dav1d; they are build-only prerequisites and stay outside the packaged runtime. This software decoder serves `batshit-server`, not Electron's video element.
+Meson, Ninja and pkg-config must be available on PATH when rebuilding dav1d; they are build-only prerequisites and stay outside the packaged runtime. This software decoder serves `batshit-server`, not Electron's video element. A successful AV1 upload/thumbnail does not establish smooth 8K Scene playback. Test the exact codec, dimensions and frame rate in the packaged app; use a separately named HEVC delivery when the target device needs it, preserving the original panorama.
 
-After the ReleaseSafe package audit passes:
+After the package audit passes:
 
 ```sh
 npm run package:dmg:check
@@ -184,6 +184,6 @@ Release signing requires Apple Developer Program membership, a valid Developer I
 
 ## Packaging boundaries
 
-The package build uses an immutable `app.asar`, Electron fuse hardening, a custom packaged-shell protocol, microphone/speech privacy descriptions, Batshit's managed Node/Redis/OpenSSL/FFmpeg runtimes, trusted Goon assets, and the runtime package audit. It fails if Electron's framework/helpers, the runtime payload, portability contract, privacy metadata, or trusted asset inventories are incomplete.
+The package build uses an immutable `app.asar`, Electron fuse hardening, a custom packaged-shell protocol, microphone/speech privacy descriptions, Batshit's managed Node/Redis/OpenSSL/FFmpeg runtimes, trusted Goon assets, and the runtime package audit. It requires a C11-capable `cc` on the Mac and compiles the anchored project reader from the copied C source into `Contents/Resources/runtime/batshit-app/scripts/` before signing. The package audit checks its source hash, executable mode, arm64/macOS 14 portability, and signature; the runtime fingerprint includes the binary so a changed reader restarts the app service. It fails if Electron's framework/helpers, the runtime payload, portability contract, privacy metadata, or trusted asset inventories are incomplete.
 
 Electron replaces only the desktop shell. Docker, source-checkout Native BS, the SvelteKit application, batshit-server, backup/restore, and Mac runtime data formats do not change.

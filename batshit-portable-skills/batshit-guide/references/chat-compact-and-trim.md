@@ -11,7 +11,11 @@ The Token Panel under the chat has two tools for long conversations:
 - **Manual Trim** temporarily excludes older eligible messages from future sends. It's reversible with Reset Trim, and the visible transcript stays intact.
 - **Compact** permanently replaces eligible older context with one expandable summary row. Future agents receive the summary instead of the original messages.
 
-Manually unzipped content and active Clips stay live through both — including content you opened and content an agent opened through zip-control permission. The Compact confirmation uses Batshit's server-side prompt budget, including model context limits and Codex CLI packaged input limits where relevant. If the next prompt can't be sent safely, Batshit says so before launching the agent.
+Held content and active Clips stay live through both: what you hold, and files an agent holds. A result Judge Juice opened for a few messages is not protected. The Compact confirmation uses Batshit's server-side prompt budget, including model context limits and Codex CLI packaged input limits where relevant. If the next prompt can't be sent safely, Batshit says so before launching the agent.
+
+Your messages always go first. You can send while a Compact runs. The Compact then stops and changes nothing, and you see "Compact stopped: you sent a message. Press Compact again after the reply." A Compact also stops and changes nothing when another Compact finished first, or when you held a message it was summarizing. Auto Compact stops quietly in those cases and runs again by itself after the reply. The **Stop** button stops a running Compact too, including the summary run when Compact uses your Codex agent's current model. A stopped Compact writes no summary.
+
+In a one-agent chat, Compact waits while a visible approval card needs an answer. Its button explains why it is unavailable, and Auto Compact waits quietly. The card and anything you typed while it waited stay visible. Once the approval is answered or its expiry is recorded, Compact can run again when the chat is idle.
 
 ## When an agent runs out of context mid-task
 
@@ -22,6 +26,7 @@ Long, tool-heavy runs (API and CLI agents) can fill the model's context window b
 - Auto-continue is capped at 3 continuations per request, so a task that can never fit stops with a visible error instead of looping.
 
 For managed CLI agents (Codex and Claude Code), Batshit also watches token usage live and stops gracefully at around 80% of the context window — the note reads "Batshit context guard" — so most long tasks relay to a continuation before hitting the wall.
+The guard uses the selected model's known limit and switches to the CLI-reported limit when the CLI supplies it. If the actual limit is unknown, Batshit cannot calculate an 80% point; an explicit context-limit error can still trigger the continuation.
 
 Group chats don't auto-continue: the failed turn stays preserved, and you can ask the group to continue normally.
 

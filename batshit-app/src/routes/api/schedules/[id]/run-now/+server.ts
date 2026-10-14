@@ -1,5 +1,5 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
-import { deliverScheduledDm } from '$lib/server/services/dm/dmTools'
+import { deliverScheduledDm, DmToolError } from '$lib/server/services/dm/dmTools'
 import {
   clearMissedRun,
   getOwnedSchedule,
@@ -18,7 +18,7 @@ import { toScheduleSummary } from '$lib/types/schedule'
  * without a person pressing this button nothing that was due while Batshit was off ever
  * runs.
  *
- * Three deliberate properties:
+ * Four deliberate properties:
  *
  *  - It **spends the hourly wake budget** like any other wake, because it is one. A user
  *    clearing a long backlog runs into the same caps an agent would.
@@ -70,16 +70,22 @@ export const POST: RequestHandler = async ({ params, locals }) => {
   let outcome: string
   let dmId: string | null = null
   let ok = true
+  let failureHint: string | undefined
 
   try {
-    const delivered = await deliverScheduledDm(schedule, { trigger: 'run-now', now })
+    const delivered = await deliverScheduledDm(schedule, {
+      trigger: 'run-now',
+      now,
+      ...(schedule.missedRun ? { dueAt: new Date(schedule.missedRun.dueAt) } : {})
+    })
     outcome = delivered.outcome
     dmId = delivered.dmId
   } catch (error) {
     // A failed Run now is recorded and shown, never retried and never hidden. The user
     // pressed a button and is owed a straight answer about what happened.
     ok = false
-    outcome = `failed: ${errorMessage(error, 'the schedule could not fire')}`
+    failureHint = error instanceof DmToolError ? error.hint : undefined
+    outcome = `failed: ${errorMessage(error, 'the schedule could not fire')}${failureHint ? ` ${failureHint}` : ''}`
     console.error(`[Schedules] Run now failed for schedule ${schedule.id}:`, error)
   }
 
@@ -119,6 +125,7 @@ export const POST: RequestHandler = async ({ params, locals }) => {
     ...(recordWarning ? { warning: recordWarning } : {}),
     ...(dmId ? { dmId } : {}),
     ...(ok ? {} : { error: outcome }),
+    ...(failureHint ? { hint: failureHint } : {}),
     ...(updated ? { schedule: toScheduleSummary(updated) } : {})
   })
 }

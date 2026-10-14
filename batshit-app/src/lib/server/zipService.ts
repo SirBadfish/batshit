@@ -37,7 +37,31 @@ export interface ZipReference {
 
 export interface ZipCreationOptions {
   zipId?: string
+  /** Retained model output must publish its record and deletion index together. */
+  indexedRetention?: boolean
 }
+
+const INDEXED_RETENTION_PUBLICATION_SCRIPT = `
+-- BATSHIT_RETAINED_OUTPUT_PUBLICATION_V2
+local indexKey, zipKey = KEYS[1], KEYS[2]
+local zipId, zipJson = ARGV[1], ARGV[2]
+local indexType = redis.call('TYPE', indexKey).ok
+if indexType ~= 'none' and indexType ~= 'set' then
+  return redis.error_reply('Retained output index has the wrong Redis type.')
+end
+if redis.call('EXISTS', zipKey) ~= 0 then
+  return redis.error_reply('Retained output zip id already exists.')
+end
+-- Publish the index first. A JSON.SET failure may leave a dangling index member, but cannot
+-- create an unindexed raw record that chat deletion would never sweep.
+redis.call('SADD', indexKey, zipId)
+local written = redis.pcall('JSON.SET', zipKey, '$', zipJson)
+if type(written) == 'table' and written.err then
+  redis.call('SREM', indexKey, zipId)
+  return redis.error_reply(written.err)
+end
+return 1
+`
 
 /**
  * Calculate approximate token count for content
@@ -202,12 +226,11 @@ function resolveZipId(type: string | undefined, options?: ZipCreationOptions): s
  * Generate meaningful description for zip reference
  */
 export function generateZipDescription(content: string, type: string, metadata?: any): string {
-  const lines = content.split('\n')
   const lineCount =
     normalizeLineCount(metadata?.contentLineCount) ??
     normalizeLineCount(metadata?.resultLineCount) ??
     normalizeLineCount(metadata?.lineCount) ??
-    lines.length
+    countContentLines(content)
   const formattedLineCount = formatLineCount(lineCount)
   
   switch(type) {
@@ -253,6 +276,13 @@ export function generateZipDescription(content: string, type: string, metadata?:
     default:
       return normalizeDescriptionPart(`${type} content - ${formattedLineCount}`, 120)
   }
+}
+
+/** Count without allocating one array entry per line of a potentially 8M-character result. */
+function countContentLines(content: string): number {
+  let count = 1
+  for (let at = content.indexOf('\n'); at !== -1; at = content.indexOf('\n', at + 1)) count += 1
+  return count
 }
 
 /**
@@ -401,6 +431,17 @@ export async function createZipFromContent(
   }
   
   await redis.execute(async (client) => {
+    if (options?.indexedRetention) {
+      if (!sessionId || !messageId || options.zipId) {
+        throw new Error('Retained output needs a chat, reply, and newly generated zip id.')
+      }
+      const published = await client.eval(INDEXED_RETENTION_PUBLICATION_SCRIPT, {
+        keys: [`session:${sessionId}:zips`, `zip:${zipId}`],
+        arguments: [zipId, JSON.stringify(zipData)]
+      })
+      if (published !== 1) throw new Error('Retained output publication returned an invalid result.')
+      return
+    }
     await client.json.set(`zip:${zipId}`, '$', zipData)
     if (sessionId) {
       // Keep per-session zip index so deleteSession can clean up

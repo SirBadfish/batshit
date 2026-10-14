@@ -1,4 +1,5 @@
 // Type definitions for saved AI models
+import type { PublishedModelMetadata } from './modelCatalog'
 
 export interface PricingTier {
   from: number;
@@ -153,6 +154,7 @@ export interface SavedModel {
   };
 
   capabilities?: ModelCapabilities;
+  publishedMetadata?: PublishedModelMetadata;
   voiceSession?: ModelVoiceSessionConfig;
   compatibility?: ModelCompatibility;
   enrichment?: ModelEnrichmentSnapshot;
@@ -162,6 +164,12 @@ export interface SavedModel {
   vercelDisplayName?: string;
   connection?: ModelConnectionInfo;
   imageTransport?: ImageTransport;
+  /**
+   * BL-517: set only in the saved-models list answer, never stored. Present when the preset's
+   * connection no longer lists its model (an AI Gateway preset whose model the gateway dropped);
+   * the pickers show the preset as unavailable with this reason, and a send with it is refused.
+   */
+  unavailableReason?: string;
   
   createdAt: string;
   updatedAt: string;

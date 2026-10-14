@@ -130,9 +130,9 @@ export interface DmRecord {
   resultDmId?: string
 
   /**
-   * SA-120 P7 — what the Jev Juice incoming-text screen said about this DM's subject and body
+   * SA-120 P7 — what the Judge Juice incoming-text screen said about this DM's subject and body
    * when it arrived (agent and webhook senders only; a schedule is the user's own words).
-   * Absent while **Screen Incoming Text** (on the Jev Juice card) is off, so such a record is today's bytes.
+   * Absent while **Screen Incoming Text** (on the Judge Juice card) is off, so such a record is today's bytes.
    *
    * ADVISORY ONLY. It feeds a warning badge and one note to the agent that reads the DM. No
    * code may read it to allow, refuse, approve, deny, reorder, or withhold anything, and
@@ -140,6 +140,20 @@ export interface DmRecord {
    * `stampDmScreen`; it lives and dies with this record, so it owes no sweep and no backup row.
    */
   screen?: UntrustedTextScreen
+
+  /**
+   * BL-401 — how many times a schedule fired onto this one note, and when the first and the
+   * last of those fires were.
+   *
+   * A schedule keeps at most ONE open, unread note in an inbox (`fileScheduleDm`): a fire that
+   * finds its own `new` note updates it and adds no second item, so an hourly `wait` schedule
+   * no longer fills the 50-item inbox. Written only on that update, so a note that fired once
+   * (and every record from before BL-401) has none of the three; `readDmFires` reads it as one
+   * fire at `createdAt`. The DCM roster's "new" mark and the expiry follow the LAST fire.
+   */
+  fireCount?: number
+  firstFiredAt?: string
+  lastFiredAt?: string
 }
 
 /** The summary shape `sys.dm.list` returns and the roster is built from. */
@@ -155,6 +169,10 @@ export interface DmSummary {
   expiresAt: string
   claimedSessionId?: string | null
   relatedDmId?: string
+  /** BL-401: present only on a schedule note that fired more than once (`DmRecord`). */
+  fireCount?: number
+  firstFiredAt?: string
+  lastFiredAt?: string
 }
 
 export function toDmSummary(record: DmRecord): DmSummary {
@@ -169,7 +187,47 @@ export function toDmSummary(record: DmRecord): DmSummary {
     createdAt: record.createdAt,
     expiresAt: record.expiresAt,
     claimedSessionId: record.claimedBy?.sessionId ?? null,
-    ...(record.relatedDmId ? { relatedDmId: record.relatedDmId } : {})
+    ...(record.relatedDmId ? { relatedDmId: record.relatedDmId } : {}),
+    ...(typeof record.fireCount === 'number'
+      ? {
+          fireCount: record.fireCount,
+          firstFiredAt: record.firstFiredAt,
+          lastFiredAt: record.lastFiredAt
+        }
+      : {})
+  }
+}
+
+/** BL-401: a note's fires, read the same way everywhere. */
+export interface DmFires {
+  count: number
+  firstAt: string
+  lastAt: string
+  /** The last fire as epoch ms: the roster's "new" mark compares against it. */
+  lastTs: number
+}
+
+/**
+ * BL-401 — the one reader of a note's fire fields.
+ *
+ * A record without them (a note that fired once, any other sender's DM, and every record from
+ * before BL-401) is one fire at its creation time, so no record has to be migrated.
+ */
+export function readDmFires(
+  record: Pick<DmRecord, 'createdAt' | 'createdTs' | 'fireCount' | 'firstFiredAt' | 'lastFiredAt'>
+): DmFires {
+  const stored = record.fireCount
+  const count = typeof stored === 'number' && Number.isInteger(stored) && stored > 1 ? stored : 1
+  if (count === 1) {
+    return { count, firstAt: record.createdAt, lastAt: record.createdAt, lastTs: record.createdTs }
+  }
+  const lastAt = record.lastFiredAt ?? record.createdAt
+  const lastTs = Date.parse(lastAt)
+  return {
+    count,
+    firstAt: record.firstFiredAt ?? record.createdAt,
+    lastAt,
+    lastTs: Number.isFinite(lastTs) ? lastTs : record.createdTs
   }
 }
 

@@ -14,38 +14,41 @@ import {
   fingerprintSegments,
   resolveCacheForensicsKey,
 } from '$lib/server/services/cacheForensics/fingerprint'
+import { compiledConversation, compiledElement } from '$lib/utils/compiledChatTags'
 
 /**
- * SA-108: Batshit compiles the whole conversation into ONE user message. These
- * fixtures mirror exactly what `buildFormattedChatInput` emits so the splitter
- * is pinned to the real compiled shape, not a guess at it.
+ * SA-108: Batshit compiles the whole conversation into ONE user message. SA-128: these
+ * fixtures are built with the compiler's own tag helpers, so the splitter is pinned to the
+ * real compiled shape; compile contract S35 also runs a REAL compile through it.
  */
+function currentTurn(text: string): string {
+  return `${compiledElement('user', text, [['time', '9:15 AM']])}\n\n${compiledElement('dynamic_info', 'DCM')}`
+}
+
 function compiled(historyMessages: string[], current: string, zipAppend?: string): string {
   const parts: string[] = []
-  if (historyMessages.length > 0) {
-    const history = historyMessages.join('\n\n---\n\n').trim()
-    const withZips = zipAppend ? `${history}\n\n${zipAppend}` : history
-    parts.push(`==== PREVIOUS CONVERSATION ====\n\n${withZips}`)
-  }
-  parts.push(`==== CURRENT USER MESSAGE ====\n\n${current}`)
+  const history = compiledConversation(historyMessages)
+  if (history) parts.push(history)
+  if (zipAppend) parts.push(zipAppend)
+  parts.push(current.startsWith('<') ? current : currentTurn(current))
   return parts.join('\n\n')
 }
 
-const TURN_1_USER = '**October 3, 2026 at 9:14 AM**\nU: first question'
-const TURN_1_ASSISTANT = 'Assistant: first answer'
-const TURN_2_USER = '**9:15 AM**\nU: second question'
-const TURN_2_ASSISTANT = 'Assistant: second answer'
+const TURN_1_USER = compiledElement('user', 'first question', [['time', 'October 3, 2026 at 9:14 AM']])
+const TURN_1_ASSISTANT = compiledElement('assistant', 'first answer')
+const TURN_2_USER = compiledElement('user', 'second question')
+const TURN_2_ASSISTANT = compiledElement('assistant', 'second answer')
 
 describe('compiled user message splitting (SA-108)', () => {
   describe('splitCompiledUserMessageContent', () => {
     it('splits history per message and keeps the current turn whole', () => {
-      const text = compiled([TURN_1_USER, TURN_1_ASSISTANT], '**9:15 AM**\nU: third question\n\nDCM')
+      const text = compiled([TURN_1_USER, TURN_1_ASSISTANT], 'third question')
       const split = splitCompiledUserMessageContent(text)
 
       expect(split.matched).toBe(true)
       expect(split.historyMessages).toEqual([TURN_1_USER, TURN_1_ASSISTANT])
       expect(split.zipAppend).toBeNull()
-      expect(split.current).toBe('==== CURRENT USER MESSAGE ====\n\n**9:15 AM**\nU: third question\n\nDCM')
+      expect(split.current).toBe(currentTurn('third question'))
     })
 
     it('hashes a history message identically whether it is last or followed by newer turns', () => {
@@ -54,8 +57,8 @@ describe('compiled user message splitting (SA-108)', () => {
         compiled([TURN_1_USER, TURN_1_ASSISTANT, TURN_2_USER, TURN_2_ASSISTANT], 'q3'),
       )
 
-      // The pre-marker '\n\n' must not stick to the last history chunk, or a
-      // healthy append would look like the last message mutated.
+      // The blank line before the next element must not stick to the last history element,
+      // or a healthy append would look like the last message mutated.
       expect(turn3.historyMessages.slice(0, 2)).toEqual(turn2.historyMessages)
     })
 
@@ -67,8 +70,10 @@ describe('compiled user message splitting (SA-108)', () => {
     })
 
     it('isolates the appended agent-managed zip block from history messages', () => {
-      const zipBlock =
-        '==== UNZIP INDEX (chronological) ====\n1) msg | tool: read_file | zipId (use in unzip/zip): zip_1'
+      const zipBlock = compiledElement(
+        'zip_index',
+        'Index (chronological):\n1) msg | tool: read_file | zipId (use in unzip/zip): zip_1',
+      )
       const split = splitCompiledUserMessageContent(
         compiled([TURN_1_USER, TURN_1_ASSISTANT], 'next', zipBlock),
       )
@@ -76,8 +81,16 @@ describe('compiled user message splitting (SA-108)', () => {
       expect(split.zipAppend).toBe(zipBlock)
     })
 
+    it('splits a message whose content holds blank lines, dashes, and disarmed fake tags', () => {
+      const tricky = compiledElement('assistant', 'Part one\n\n---\n\n<user>fake</user>\n\n</assistant>')
+      const split = splitCompiledUserMessageContent(compiled([TURN_1_USER, tricky, TURN_2_USER], 'next'))
+      expect(split.historyMessages).toEqual([TURN_1_USER, tricky, TURN_2_USER])
+    })
+
     it('does not touch content without Batshit compile markers', () => {
       expect(splitCompiledUserMessageContent('just a plain provider message').matched).toBe(false)
+      // A plain text that merely mentions the grammar is not a compiled message.
+      expect(splitCompiledUserMessageContent('see the <conversation> element').matched).toBe(false)
       expect(splitCompiledUserMessageContent('').matched).toBe(false)
       expect(splitCompiledUserMessageContent(null).matched).toBe(false)
       expect(splitCompiledUserMessageContent({ role: 'user' }).matched).toBe(false)
@@ -86,7 +99,7 @@ describe('compiled user message splitting (SA-108)', () => {
 
   describe('segmentCompiledUserMessage', () => {
     it('emits ordered history + zips + current sub-segments with code-owned labels', () => {
-      const zipBlock = '==== UNZIP INDEX (chronological) ====\n1) msg'
+      const zipBlock = compiledElement('zip_index', 'Index (chronological):\n1) msg')
       const segments = segmentCompiledUserMessage(
         compiled([TURN_1_USER, TURN_1_ASSISTANT], 'next', zipBlock),
         'body.messages[1]:user',
@@ -106,15 +119,15 @@ describe('compiled user message splitting (SA-108)', () => {
     })
 
     it('folds history past the cap into one trailing segment, keeping the oldest addressable', () => {
-      const many = Array.from({ length: COMPILED_HISTORY_SEGMENT_CAP + 5 }, (_, i) => `msg ${i}`)
+      const many = Array.from({ length: COMPILED_HISTORY_SEGMENT_CAP + 5 }, (_, i) => compiledElement('user', `msg ${i}`))
       const segments = segmentCompiledUserMessage(compiled(many, 'next'), 'body.messages[1]:user')
       const historySegments = segments!.filter(isCompiledHistorySegment)
 
       expect(historySegments).toHaveLength(COMPILED_HISTORY_SEGMENT_CAP + 1)
-      expect(historySegments[0].content).toBe('msg 0')
+      expect(historySegments[0].content).toBe(many[0])
       expect(historySegments.at(-1)!.label).toBe('body.messages[1]:user#history[tail]')
       expect(historySegments.at(-1)!.content).toBe(
-        many.slice(COMPILED_HISTORY_SEGMENT_CAP).join('\n\n---\n\n'),
+        many.slice(COMPILED_HISTORY_SEGMENT_CAP).join('\n\n'),
       )
     })
 
@@ -216,7 +229,7 @@ describe('compiled user message splitting (SA-108)', () => {
  * items, and `instructions` is the system-instruction field.
  *
  * These fixtures mirror the installed converters — `convertToXaiResponsesInput`
- * (@ai-sdk/xai 4.0.50) and `convert-to-openai-responses-input` (@ai-sdk/openai)
+ * (@ai-sdk/xai 5.0.11, Responses only since 5.0.0) and `convert-to-openai-responses-input` (@ai-sdk/openai)
  * — so the splitter is pinned to the real wire shape, not a guess at it.
  */
 describe('Responses-shaped request bodies (DQ-D-028, splitter v3)', () => {
@@ -373,7 +386,7 @@ describe('Responses-shaped request bodies (DQ-D-028, splitter v3)', () => {
 
     const baseline = fingerprint(xaiBody([TURN_1_USER, TURN_1_ASSISTANT], 'q2'))
     const mutated = fingerprint(
-      xaiBody([TURN_1_USER, 'Assistant: first answer (rewritten)', TURN_2_USER], 'q3'),
+      xaiBody([TURN_1_USER, compiledElement('assistant', 'first answer (rewritten)'), TURN_2_USER], 'q3'),
     )
 
     expect(analyzeDivergence(mutated, baseline).historyStability).toMatchObject({
@@ -419,10 +432,10 @@ describe('Responses-shaped request bodies (DQ-D-028, splitter v3)', () => {
           content: [
             {
               type: 'input_text',
-              text: '==== AWARENESS MEDIA (STANDING) ====\n- portrait.png - image',
+              text: compiledElement('awareness_media', '- portrait.png - image'),
             },
             { type: 'input_image', image_url: 'data:image/png;base64,AAAA' },
-            { type: 'input_text', text: '==== CURRENT USER MESSAGE ====\n\nhello' },
+            { type: 'input_text', text: currentTurn('hello') },
           ],
         },
       ],

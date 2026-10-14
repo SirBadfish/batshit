@@ -2,6 +2,8 @@
 
 Voice lets agents listen and speak through speech-to-text (STT) and text-to-speech (TTS). It works on its own, and it pairs naturally with [3D Goons](../goons/overview.md), which animate and lip sync while an agent speaks. This page is the mental model; for hands-on setup, see [Voice settings](voice-settings.md).
 
+Voice Settings and the Goon Dock's Lip Sync Lab share the saved global lip-sync choice. The Lab saves its mode/analyzer pair independently of other Voice preferences and waits with **Retry** when saved settings cannot be read.
+
 ## Voice basics
 
 Voice has three related ideas:

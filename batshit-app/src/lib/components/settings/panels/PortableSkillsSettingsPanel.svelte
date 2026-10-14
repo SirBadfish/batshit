@@ -10,6 +10,7 @@
   import { toast } from '$lib/components/ui/sonner/settings-toast'
   import { confirmDialog } from '$lib/stores/confirmDialog'
   import { copyTextToClipboard } from '$lib/utils/clipboard'
+  import { buildPortableSkillEnvLines } from '$lib/utils/portableSkillEnv'
   import { Check, Copy, Download, KeyRound, Loader2, Plus, RefreshCw, RotateCw, Trash2 } from '@lucide/svelte'
   import type {
     PortableSkillEnvTemplateInfo,
@@ -152,7 +153,11 @@
     if (skill.family === null) {
       return `Install the Batshit Portable ${skill.title} skill from ${skill.zipUrl}. No token or env file is needed; it is informational only.`
     }
-    return `Install the Batshit Portable ${skill.title} skill from ${skill.zipUrl}. Use credentials from ~/.batshit/portable-skills/portable-skills.env.`
+    const sharedTemplate = envTemplates.find((template) => template.kind === 'shared')
+    const credentialGuidance = sharedTemplate
+      ? `Use credentials from ${sharedTemplate.path}.`
+      : 'Use the shared env file shown in Portable Skills settings.'
+    return `Install the Batshit Portable ${skill.title} skill from ${skill.zipUrl}. ${credentialGuidance}`
   }
 
   function setResponseState(payload: TokensResponse) {
@@ -286,8 +291,10 @@
     }
   }
 
+  // BL-341: the address is the Batshit this page is on (the native lane is 5621, Pinokio 5650),
+  // never a fixed port.
   function envSnippet() {
-    return `BATSHIT_BASE_URL=http://127.0.0.1:5620\nBATSHIT_PORTABLE_TOKEN=${revealedToken}\n`
+    return buildPortableSkillEnvLines(window.location.origin, revealedToken)
   }
 
   function revealedEnvTemplates() {

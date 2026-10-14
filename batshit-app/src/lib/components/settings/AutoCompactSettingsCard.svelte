@@ -12,7 +12,7 @@
   import * as Select from '$lib/components/ui/select'
   import { Archive, Edit3, Loader2, RefreshCw } from '@lucide/svelte'
   import { toast } from '$lib/components/ui/sonner/settings-toast'
-  import { setUserSettings } from '$lib/stores/userSettings.svelte'
+  import { confirmUserSettings as setUserSettings } from '$lib/stores/userSettings.svelte'
   import type { UserSettingsRow } from '$lib/types/database'
   import type { SavedModel } from '$lib/types/savedModels'
   import {
@@ -50,6 +50,12 @@
   let isLoading = $state(true)
   let saveState = $state<'idle' | 'saving' | 'saved'>('idle')
   let saveError = $state<string | null>(null)
+  // BL-487: until a real load of `/api/user/settings` succeeds, `settings` is showing empty
+  // defaults, not the saved compact prompt/preset. The autosave effect refuses to write while
+  // this is false, so an edit made against a failed load can never overwrite a saved value
+  // with those empty defaults.
+  let settingsLoaded = $state(false)
+  let loadError = $state<string | null>(null)
   let persistedSignature = $state(makeSignature(normalizeGlobalAutoCompactSettings(null)))
   let promptEditorOpen = $state(false)
 
@@ -96,7 +102,7 @@
         saveState = 'saved'
         saveError = null
       })
-      if (updated) setUserSettings(updated)
+      if (updated || result?.settings === null) setUserSettings(updated)
     } catch (error) {
       console.error('Auto Compact settings save failed:', error)
       untrack(() => {
@@ -117,12 +123,21 @@
     const signature = makeSignature(settings)
     if (signature === persistedSignature) return
 
+    if (!settingsLoaded) {
+      // BL-487: never a silent no-op — refuse the write and say why, instead of sending this
+      // draft (built from empty defaults) over whatever is actually saved.
+      saveState = 'idle'
+      saveError = 'Auto Compact settings failed to load, so this change cannot be saved yet.'
+      return
+    }
+
     saveState = 'saving'
     saveError = null
     debouncedSave(settings)
   })
 
   async function loadSettings() {
+    loadError = null
     try {
       const response = await fetch('/api/user/settings')
       if (!response.ok) {
@@ -137,11 +152,27 @@
       untrack(() => {
         settings = next
         persistedSignature = makeSignature(next)
+        settingsLoaded = true
+        // BL-487 follow-up: a successful (re)load clears an earlier "cannot be saved yet"
+        // refusal. Without this, the refusal set by the autosave effect survives forever: once
+        // `settings` and `persistedSignature` both reset to the same reloaded value, the effect
+        // returns at the `signature === persistedSignature` guard above and never reaches the
+        // code that would otherwise clear it.
+        if (saveError) {
+          saveError = null
+          saveState = 'idle'
+        }
       })
-      if (remoteSettings) setUserSettings(remoteSettings)
+      if (remoteSettings || result?.settings === null) setUserSettings(remoteSettings)
     } catch (error) {
       console.error('Auto Compact settings load failed:', error)
-      toast.error(error instanceof Error ? error.message : 'Failed to load Auto Compact settings')
+      const message =
+        error instanceof Error ? error.message : 'Failed to load Auto Compact settings'
+      untrack(() => {
+        settingsLoaded = false
+        loadError = message
+      })
+      toast.error(message)
     } finally {
       untrack(() => {
         isLoading = false
@@ -245,6 +276,18 @@
       />
     {/snippet}
 
+    {#if loadError}
+      <div class="batshit-settings-inline-alert is-danger">
+        <div class="flex items-center justify-between gap-2">
+          <span>{loadError}</span>
+          <Button variant="outline" size="sm" onclick={loadSettings}>
+            <RefreshCw class="h-3.5 w-3.5" />
+            Retry
+          </Button>
+        </div>
+      </div>
+    {/if}
+
     <div class="batshit-settings-form-stack">
       <div class="batshit-settings-form-row">
         <div class="batshit-settings-form-copy">
@@ -287,7 +330,8 @@
             <Label.Root class="batshit-settings-form-label">Trigger</Label.Root>
             <SettingsInfoMenu ariaLabel="About Auto Compact Trigger" contentClass="w-80">
               <p>
-                Smart uses 15% remaining, clamped between 30k and 80k tokens. Custom remaining
+                Smart uses 15% remaining, clamped between 30k and 80k tokens, and never more than a
+                quarter of a smaller model's window. Custom remaining
                 tokens lets you set the exact remaining-context threshold.
               </p>
             </SettingsInfoMenu>

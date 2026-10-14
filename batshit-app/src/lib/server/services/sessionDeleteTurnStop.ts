@@ -11,7 +11,7 @@
  *
  * The rejected alternative was to make every late writer refuse a chat that no longer exists:
  * one check in each writer (the finalize, the Execution Viewer snapshot, every zip writer, the
- * approval, steer, and Jev Juice writers, and every writer yet to come), each racing the delete
+ * approval, steer, and Judge Juice writers, and every writer yet to come), each racing the delete
  * unless it is atomic with its write, while the reply runs on. The session-turn registry already
  * knows which requests are running, so this one place owns the rule instead:
  *
@@ -41,11 +41,13 @@ import {
   abortGroupChat,
   abortStream,
   beginSessionDelete,
+  cancelQueuedSessionTurnsOfDeletedChat,
   endSessionDelete,
   hasRunningRequest,
   stopRunningRequests
 } from '$lib/server/services/streamAbortRegistry'
 import { abortWakeRun } from '$lib/server/services/wakeRunRegistry'
+import { forgetChatReplyRecords } from '$lib/server/services/replyStreamRecord'
 
 export const SESSION_DELETE_TURN_STOP_MS = 30_000
 export const SESSION_DELETE_TURN_POLL_MS = 100
@@ -113,6 +115,8 @@ export async function deleteSessionAfterItsTurn(
   try {
     if (!hasRunningRequest(sessionId)) {
       await sweep()
+      forgetChatReplyRecords(sessionId)
+      cancelQueuedSessionTurnsOfDeletedChat(sessionId)
       return { kind: 'no_turn' }
     }
 
@@ -129,6 +133,11 @@ export async function deleteSessionAfterItsTurn(
     }
 
     await sweep()
+    // BL-775: the chat's recorded reply events and zip detector state go with it.
+    forgetChatReplyRecords(sessionId)
+    // Only now are the sends waiting in the chat's line told it is gone: a delete refused at the
+    // bound, or whose sweep failed, leaves the chat, and their words, in place (BL-194).
+    cancelQueuedSessionTurnsOfDeletedChat(sessionId)
     return { kind: 'stopped', waitedMs: Date.now() - startedAt }
   } finally {
     endSessionDelete(sessionId)

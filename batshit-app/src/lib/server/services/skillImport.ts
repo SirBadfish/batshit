@@ -2,6 +2,7 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { execFile } from 'node:child_process'
+import { stripHostOperatorAuthorityFromChildEnv } from './cliChildEnv'
 import { createHash } from 'node:crypto'
 import { promisify } from 'node:util'
 
@@ -799,13 +800,13 @@ async function loadFromGitSource(source: string, skillPath?: string): Promise<So
   try {
     await execFileAsync('git', ['clone', '--depth', '1', trimmedSource, repoDir], {
       timeout: 90_000,
-      env: {
+      env: stripHostOperatorAuthorityFromChildEnv({
         ...process.env,
         // Hard protocol pin: a remote clone can never be redirected onto
         // file/ssh/ext transports; local clones only use the file transport.
         GIT_ALLOW_PROTOCOL: isLocalGitSource ? 'file' : 'https',
         GIT_TERMINAL_PROMPT: '0'
-      }
+      })
     })
 
     const { markdownPath, skillRootDir } = await resolveSkillMarkdownPath(repoDir, skillPath)

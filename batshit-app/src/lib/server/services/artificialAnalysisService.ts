@@ -3,6 +3,7 @@ import { env } from '$env/dynamic/private'
 import { redis } from '$lib/server/redis'
 import type { ModelCapabilities, ModelEnrichmentSnapshot } from '$lib/types/savedModels'
 import { sanitizeCatalogMaxOutputTokens } from '$lib/utils/modelOutputTokens'
+import { readArtificialAnalysisPrice } from '$lib/utils/catalogPricing'
 
 const DEFAULT_API_URL = 'https://artificialanalysis.ai/api/v2/data/llms/models'
 const CATALOG_CACHE_KEY = 'aa_cache:catalog'
@@ -36,6 +37,9 @@ export interface ArtificialAnalysisRawModel {
   output_price?: number | string
   cached_input_price?: number | string
   pricing?: {
+    /** Artificial Analysis v2 (the default endpoint): US dollars per million tokens. */
+    price_1m_input_tokens?: number | string
+    price_1m_output_tokens?: number | string
     input?: number | string
     output?: number | string
     cached_input?: number | string
@@ -153,7 +157,8 @@ function toNumber(value: unknown): number | undefined {
   if (typeof value === 'number') {
     return Number.isFinite(value) ? value : undefined
   }
-  if (typeof value === 'string') {
+  // BL-130: a blank string is unknown; Number('') would read it as 0.
+  if (typeof value === 'string' && value.trim() !== '') {
     const parsed = Number(value)
     return Number.isFinite(parsed) ? parsed : undefined
   }
@@ -204,18 +209,24 @@ function identifierFromRecord(record: ArtificialAnalysisRawModel) {
 }
 
 function mapRecord(record: ArtificialAnalysisRawModel): EnrichmentResult {
+  // BL-130: Artificial Analysis lists 0 for a price it has no data for, so only a
+  // positive price is one; the enrich route then keeps the catalog's own price.
+  // BL-294: v2 lists its prices under pricing.price_1m_* (live read 2026-09-27);
+  // it lists no cached-input price.
   const pricingInput =
-    toNumber(record.input_cost_per_million) ??
-    toNumber(record.pricing?.input) ??
-    toNumber(record.input_price)
+    readArtificialAnalysisPrice(toNumber(record.pricing?.price_1m_input_tokens)) ??
+    readArtificialAnalysisPrice(toNumber(record.input_cost_per_million)) ??
+    readArtificialAnalysisPrice(toNumber(record.pricing?.input)) ??
+    readArtificialAnalysisPrice(toNumber(record.input_price))
   const pricingOutput =
-    toNumber(record.output_cost_per_million) ??
-    toNumber(record.pricing?.output) ??
-    toNumber(record.output_price)
+    readArtificialAnalysisPrice(toNumber(record.pricing?.price_1m_output_tokens)) ??
+    readArtificialAnalysisPrice(toNumber(record.output_cost_per_million)) ??
+    readArtificialAnalysisPrice(toNumber(record.pricing?.output)) ??
+    readArtificialAnalysisPrice(toNumber(record.output_price))
   const pricingCached =
-    toNumber(record.cached_input_cost_per_million) ??
-    toNumber(record.pricing?.cached_input) ??
-    toNumber(record.cached_input_price)
+    readArtificialAnalysisPrice(toNumber(record.cached_input_cost_per_million)) ??
+    readArtificialAnalysisPrice(toNumber(record.pricing?.cached_input)) ??
+    readArtificialAnalysisPrice(toNumber(record.cached_input_price))
 
   const contextWindow =
     toNumber(record.context_window) ??

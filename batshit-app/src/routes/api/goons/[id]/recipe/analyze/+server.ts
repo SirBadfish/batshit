@@ -12,7 +12,9 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
       goonId: owner.goonId,
       receipt: body.receipt,
       siblingInputs: body.siblingInputs,
-      ...(body.componentMapBundle ? { componentMapBundle: body.componentMapBundle } : {})
+      ...(Object.prototype.hasOwnProperty.call(body, 'componentMapBundle')
+        ? { componentMapBundle: body.componentMapBundle }
+        : {})
     })
     return json(analysis)
   } catch (error) {

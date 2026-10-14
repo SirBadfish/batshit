@@ -39,6 +39,10 @@ vi.mock('../typesafe/typesafeConfig', () => ({
 }))
 vi.mock('$lib/services/apiKey.server', () => ({ apiKeyService: { retrieve } }))
 vi.mock('$env/dynamic/private', () => dynamicPrivateEnv)
+// SA-120 P10a: an Ollama judge's fit check asks Ollama for its num_ctx; this suite never reaches a real Ollama.
+vi.mock('../typesafe/ollamaDecisionModels', () => ({
+  readOllamaContextTokens: vi.fn(async () => ({ status: 'read', contextTokens: null }))
+}))
 
 import { buildJevJuiceGuidancePromptBlock } from '$lib/utils/toolPromptInjection'
 import {
@@ -169,7 +173,7 @@ describe('validateJudgeAskInput', () => {
     expect(validateJudgeAskInput({ ...GOOD_INPUT, model: ' jev-1.13.0 ' }).model).toBe('jev-1.13.0')
     expect(validateJudgeAskInput(GOOD_INPUT).model).toBeNull()
     expect(() => validateJudgeAskInput({ ...GOOD_INPUT, model: 'jev-latest' })).toThrow(/jev-latest is not allowed/)
-    expect(() => validateJudgeAskInput({ ...GOOD_INPUT, model: 42 })).toThrow(/must be a pinned Jev id/)
+    expect(() => validateJudgeAskInput({ ...GOOD_INPUT, model: 42 })).toThrow(/a pinned Jev id such as jev-1.13.0 for TypeSafe/)
   })
 })
 
@@ -190,8 +194,8 @@ describe('requireJudgeEnabledAgent', () => {
       error = caught
     }
     expect(error).toBeInstanceOf(JudgeAskError)
-    expect((error as JudgeAskError).message).toBe('Jev Juice: Judgment Tool is off for this agent.')
-    expect((error as JudgeAskError).hint).toMatch(/Settings → Agents → this agent → Jev Juice: Judgment Tool/)
+    expect((error as JudgeAskError).message).toBe('Judge Juice: Judgment Tool is off for this agent.')
+    expect((error as JudgeAskError).hint).toMatch(/Settings → Agents → this agent → Judge Juice: Judgment Tool/)
   })
 })
 
@@ -252,8 +256,8 @@ describe('judgeAskOp', () => {
     }
     expect(client.calls).toHaveLength(0)
     expect(error).toBeInstanceOf(JudgeAskError)
-    expect((error as JudgeAskError).message).toBe('Jev Juice is off in Settings → Admin.')
-    expect((error as JudgeAskError).hint).toMatch(/Settings → Admin → Jev Juice/)
+    expect((error as JudgeAskError).message).toBe('Judge Juice is off in Settings → Admin.')
+    expect((error as JudgeAskError).hint).toMatch(/Settings → Admin → Judge Juice/)
     const [, , records] = appendTypesafeCallRecords.mock.calls[0] as unknown as [string, string, Array<Record<string, unknown>>]
     expect(records[0]).toMatchObject({ feature: 'judge_ask', status: 'unavailable', reason: 'master_off', usage: null })
   })
@@ -302,6 +306,51 @@ describe('judgeAskOp', () => {
     const ok = await judgeAskOp({ ...CONTEXT, client }, { ...GOOD_INPUT, model: 'jev-1.13.0' })
     expect(ok.model).toBe('jev-1.13.0')
     expect(client.calls).toHaveLength(1)
+  })
+
+  it('SA-120 P10a: with an Ollama judge chosen for the Judgment Tool, the model rule and the misses name that judge', async () => {
+    configState.config = {
+      ...configState.config,
+      providers: [{ id: 'ollama-mac', kind: 'ollama', label: 'Ollama on this Mac', baseUrl: 'http://127.0.0.1:11434', modelId: 'clef-flash' }],
+      defaultProviderId: 'typesafe',
+      laneProviders: { judge_ask: 'ollama-mac' }
+    }
+    const client = fakeClient()
+    // The judge's own model is accepted (it is no longer a Jev id); the TypeSafe model is now the wrong one.
+    expect((await judgeAskOp({ ...CONTEXT, client }, { ...GOOD_INPUT, model: 'clef-flash' })).model).toBe('clef-flash')
+    expect(client.calls.at(-1)).toMatchObject({ model: 'clef-flash', apiKey: null })
+    await expect(judgeAskOp({ ...CONTEXT, client }, { ...GOOD_INPUT, model: 'jev-1.13.0' })).rejects.toThrow(
+      'model jev-1.13.0 is not the configured Clef Flash model (clef-flash).'
+    )
+
+    // A request over the judge's limits: never sent, and the agent learns how to fix it.
+    const wide = {
+      ...GOOD_INPUT,
+      questions: { pick: { type: 'choice', instructions: 'Pick one', criteria: Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`o${i}`, null])) } }
+    }
+    const before = client.calls.length
+    let limit: unknown
+    try {
+      await judgeAskOp({ ...CONTEXT, client }, wide)
+    } catch (caught) {
+      limit = caught
+    }
+    expect(client.calls).toHaveLength(before)
+    expect((limit as JudgeAskError).message).toBe(
+      'The request was too large for this judge (Ollama), so Batshit did not send it. (a Choice with 40 options; this judge takes at most 26)'
+    )
+    expect((limit as JudgeAskError).hint).toMatch(/fewer options, or less state/)
+
+    // The chosen judge is gone: denied, never sent to TypeSafe instead.
+    configState.config = { ...configState.config, providers: [] }
+    let gone: unknown
+    try {
+      await judgeAskOp({ ...CONTEXT, client }, GOOD_INPUT)
+    } catch (caught) {
+      gone = caught
+    }
+    expect(client.calls).toHaveLength(before)
+    expect((gone as JudgeAskError).hint).toBe('The user can choose a judge for the Judgment Tool in Settings → Admin → Judge Juice.')
   })
 
   it('a vendor deadline miss becomes a readable error with the do-not-loop hint, and still leaves an EV row', async () => {

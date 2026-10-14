@@ -1,4 +1,4 @@
-import { failedCommandExitCode } from './toolActivityContract'
+import { describeCommandPreview, describeOutputCut, failedCommandExitCode, toolOutputCut, type ToolOutputCut } from './toolActivityContract'
 
 export const FULL_FIDELITY_AI_EXPANSION_LANES = new Set([
   'read_file',
@@ -107,11 +107,33 @@ function compactJson(value: unknown): string {
   }
 }
 
-function fenceForAi(content: string, language = 'text'): string {
+export type CoolToolAiContentPart = { source: 'agent_words' | 'tool_result'; text: string }
+export type CoolToolAiContent = { text: string; parts: CoolToolAiContentPart[] }
+
+function sourcePart(source: CoolToolAiContentPart['source'], text: string): CoolToolAiContentPart[] {
+  return text ? [{ source, text }] : []
+}
+
+function sourceText(parts: CoolToolAiContentPart[]): string {
+  return parts.map((part) => part.text).join('')
+}
+
+function joinSourceSections(sections: CoolToolAiContentPart[][], separator = '\n'): CoolToolAiContentPart[] {
+  return sections.flatMap((section, index) => index === 0 ? section : [
+    ...sourcePart('agent_words', separator),
+    ...section
+  ])
+}
+
+function fenceForAiParts(content: string, language = 'text', contentSource: CoolToolAiContentPart['source'] = 'tool_result'): CoolToolAiContentPart[] {
   const ticks = content.match(/`+/g) ?? []
   const longest = ticks.reduce((max, entry) => Math.max(max, entry.length), 0)
   const fence = '`'.repeat(Math.max(3, longest + 1))
-  return `${fence}${language || 'text'}\n${content.trimEnd()}\n${fence}`
+  return [
+    ...sourcePart('agent_words', `${fence}${language || 'text'}\n`),
+    ...sourcePart(contentSource, content.trimEnd()),
+    ...sourcePart('agent_words', `\n${fence}`)
+  ]
 }
 
 function formatAiToolHeader(toolName: string, lines: string[]): string {
@@ -123,8 +145,9 @@ function buildFullFidelityToolAiContent(
   payload: Record<string, any>,
   contentLabel: string,
   content: string,
-  language: string
-): string {
+  language: string,
+  contentSource: CoolToolAiContentPart['source']
+): CoolToolAiContentPart[] {
   const result = asObject(getCoolToolResult(payload))
   const args = getCoolToolArgs(payload)
   const path = firstScalarString(
@@ -147,7 +170,10 @@ function buildFullFidelityToolAiContent(
     size ? `Chars/bytes: ${size}` : ''
   ])
 
-  return `${header}\n${contentLabel}:\n${fenceForAi(content, language)}`
+  return [
+    ...sourcePart('agent_words', `${header}\n${contentLabel}:\n`),
+    ...fenceForAiParts(content, language, contentSource)
+  ]
 }
 
 /**
@@ -156,15 +182,21 @@ function buildFullFidelityToolAiContent(
  * error is added only when there is no exit code (a command that never ran, or a lane that
  * reports failures as text).
  */
-function buildShellFailureBlocks(payload: Record<string, any>): string[] {
+function buildShellFailureBlocks(payload: Record<string, any>): CoolToolAiContentPart[][] {
   const result = asObject(getCoolToolResult(payload))
   const exitCode = failedCommandExitCode(result)
   const output = firstString(result?.commandOutput)
   const error = firstScalarString(payload.error)
-  const blocks: string[] = []
-  if (output !== null && output.trim()) blocks.push(`Output:\n${fenceForAi(output, 'text')}`)
+  const blocks: CoolToolAiContentPart[][] = []
+  if (output !== null && output.trim()) blocks.push([
+    ...sourcePart('agent_words', 'Output:\n'),
+    ...fenceForAiParts(output, 'text')
+  ])
   if (error && exitCode === undefined && !(output !== null && sameTextIgnoringWhitespace(error, output))) {
-    blocks.push(`Error:\n${fenceForAi(error, 'text')}`)
+    blocks.push([
+      ...sourcePart('agent_words', 'Error:\n'),
+      ...fenceForAiParts(error, 'text')
+    ])
   }
   return blocks
 }
@@ -179,7 +211,7 @@ function isFailedFileChange(payload: Record<string, any>): boolean {
   )
 }
 
-function buildFailedFileChangeAiContent(toolName: string, payload: Record<string, any>): string {
+function buildFailedFileChangeAiContent(toolName: string, payload: Record<string, any>): CoolToolAiContentPart[] {
   const result = asObject(getCoolToolResult(payload))
   const args = getCoolToolArgs(payload)
   const path = firstScalarString(result?.filePath, result?.path, result?.absolutePath, args.filePath, args.path)
@@ -188,16 +220,21 @@ function buildFailedFileChangeAiContent(toolName: string, payload: Record<string
     path ? `Path: ${path}` : '',
     exitCode !== undefined ? `Exit code: ${exitCode}` : ''
   ])
-  return [header, ...buildShellFailureBlocks(payload)].join('\n')
+  return joinSourceSections([
+    sourcePart('agent_words', header),
+    ...buildShellFailureBlocks(payload)
+  ])
 }
 
-function buildListToolAiContent(toolName: string, payload: Record<string, any>): string {
+function buildListToolAiContent(toolName: string, payload: Record<string, any>): CoolToolAiContentPart[] {
   const result = asObject(getCoolToolResult(payload))
   const args = getCoolToolArgs(payload)
   const path = firstScalarString(result?.path, result?.dirPath, args.path, args.dirPath)
   const files = Array.isArray(result?.files) ? result.files : []
   const total = firstScalarString(result?.totalItems, result?.totalFiles) ?? String(files.length)
   const exitCode = failedCommandExitCode(result)
+  // BL-8: a listing its lane cut holds only its first entries.
+  const cut = toolOutputCut(result)
   const renderedFiles = files
     .map((entry) => {
       if (typeof entry === 'string') return entry
@@ -205,18 +242,30 @@ function buildListToolAiContent(toolName: string, payload: Record<string, any>):
       return firstScalarString((entry as any).path, (entry as any).name, (entry as any).filePath) ?? ''
     })
     .filter(Boolean)
+  // A listing keeps at most 200 entries; the count is the whole listing's (BL-166 review).
+  const listed = Number(total) > renderedFiles.length && renderedFiles.length > 0
+    ? ` (the first ${renderedFiles.length} are listed)`
+    : ''
   const header = formatAiToolHeader(toolName, [
     path ? `Path: ${path}` : '',
     exitCode !== undefined ? `Exit code: ${exitCode}` : '',
-    `Items: ${total}`
+    cut ? `Items: first ${total}${listed}` : `Items: ${total}${listed}`,
+    cut ? describeOutputCut(cut) : ''
   ])
-  return [
-    `${header}\nFiles:\n${renderedFiles.map((file) => `- ${file}`).join('\n') || '(none)'}`,
+  const fileLines = renderedFiles.length
+    ? renderedFiles.flatMap((file, index) => [
+        ...(index ? sourcePart('agent_words', '\n') : []),
+        ...sourcePart('agent_words', '- '),
+        ...sourcePart('tool_result', file)
+      ])
+    : sourcePart('agent_words', '(none)')
+  return joinSourceSections([
+    [...sourcePart('agent_words', `${header}\nFiles:\n`), ...fileLines],
     ...buildShellFailureBlocks(payload)
-  ].join('\n')
+  ])
 }
 
-function buildBashToolAiContent(toolName: string, payload: Record<string, any>): string {
+function buildBashToolAiContent(toolName: string, payload: Record<string, any>): CoolToolAiContentPart[] {
   const result = asObject(getCoolToolResult(payload))
   const args = getCoolToolArgs(payload)
   const command = firstScalarString(result?.command, args.command, args.innerCommand)
@@ -230,26 +279,42 @@ function buildBashToolAiContent(toolName: string, payload: Record<string, any>):
   // explained by its exit code and stderr, not by the generic step error.
   const error = firstScalarString(payload.error)
   const commandNeverRan = exitCode === null || exitCode === '0'
-  const blocks = [
-    formatAiToolHeader(toolName, [
+  const cut = toolOutputCut(result)
+  // The stored preview keeps at most 220 lines of stdout; shown as the whole output, those read as
+  // all the command printed (found in BL-166's proof).
+  const preview = describeCommandPreview(result)
+  const blocks: CoolToolAiContentPart[][] = [
+    sourcePart('agent_words', formatAiToolHeader(toolName, [
       command ? `Command: ${command}` : '',
+      typeof result?.shell === 'string' ? `Shell: ${result.shell}` : '',
       exitCode ? `Exit code: ${exitCode}` : '',
-      errorCode ? `Error code: ${errorCode}` : ''
-    ])
+      errorCode ? `Error code: ${errorCode}` : '',
+      cut ? describeOutputCut(cut) : '',
+      preview ? `Output shown: the ${preview}.` : ''
+    ]))
   ]
-  if (stdout !== null) blocks.push(`Stdout:\n${fenceForAi(stdout, 'text')}`)
-  if (stderr !== null && stderr.trim()) blocks.push(`Stderr:\n${fenceForAi(stderr, 'text')}`)
+  if (stdout !== null) blocks.push([
+    ...sourcePart('agent_words', 'Stdout:\n'),
+    ...fenceForAiParts(stdout, 'text')
+  ])
+  if (stderr !== null && stderr.trim()) blocks.push([
+    ...sourcePart('agent_words', 'Stderr:\n'),
+    ...fenceForAiParts(stderr, 'text')
+  ])
   if (error && commandNeverRan && !(stderr !== null && sameTextIgnoringWhitespace(error, stderr))) {
-    blocks.push(`Error:\n${fenceForAi(error, 'text')}`)
+    blocks.push([
+      ...sourcePart('agent_words', 'Error:\n'),
+      ...fenceForAiParts(error, 'text')
+    ])
   }
-  return blocks.join('\n')
+  return joinSourceSections(blocks)
 }
 
 function sameTextIgnoringWhitespace(left: string, right: string): boolean {
   return left.replace(/\s+/g, ' ').trim() === right.replace(/\s+/g, ' ').trim()
 }
 
-function buildFetchZipToolAiContent(toolName: string, payload: Record<string, any>): string {
+function buildFetchZipToolAiContent(toolName: string, payload: Record<string, any>): CoolToolAiContentPart[] {
   const result = asObject(getCoolToolResult(payload))
   const args = getCoolToolArgs(payload)
   const zipId = firstScalarString(result?.zipId, args.zipId)
@@ -267,39 +332,92 @@ function buildFetchZipToolAiContent(toolName: string, payload: Record<string, an
   ])
 
   if (content !== null) {
-    return `${header}\nContent:\n${fenceForAi(content, 'text')}`
+    return [
+      ...sourcePart('agent_words', `${header}\nContent:\n`),
+      ...fenceForAiParts(content, 'text')
+    ]
   }
 
-  return `${header}\nResult:\n${fenceForAi(compactJson(result), 'json')}`
+  return [
+    ...sourcePart('agent_words', `${header}\nResult:\n`),
+    ...fenceForAiParts(compactJson(result), 'json')
+  ]
 }
 
-function buildGenericToolAiContent(toolName: string, payload: Record<string, any>): string {
+function buildGenericToolAiContent(toolName: string, payload: Record<string, any>): CoolToolAiContentPart[] {
   const args = getCoolToolArgs(payload)
   const result = getCoolToolResult(payload)
-  const blocks = [formatAiToolHeader(toolName, [])]
+  const blocks: CoolToolAiContentPart[][] = [sourcePart('agent_words', formatAiToolHeader(toolName, []))]
   if (Object.keys(args).length) {
-    blocks.push(`Arguments:\n${fenceForAi(compactJson(args), 'json')}`)
+    blocks.push([
+      ...sourcePart('agent_words', 'Arguments:\n'),
+      ...fenceForAiParts(compactJson(args), 'json', 'agent_words')
+    ])
   }
   if (typeof result === 'string') {
-    blocks.push(`Result:\n${fenceForAi(result, 'text')}`)
+    blocks.push([
+      ...sourcePart('agent_words', 'Result:\n'),
+      ...fenceForAiParts(result, 'text')
+    ])
   } else {
-    blocks.push(`Result:\n${fenceForAi(compactJson(result), 'json')}`)
+    blocks.push([
+      ...sourcePart('agent_words', 'Result:\n'),
+      ...fenceForAiParts(compactJson(result), 'json')
+    ])
   }
-  return blocks.join('\n')
+  return joinSourceSections(blocks)
 }
 
-export function buildCoolToolAiContent(
+/**
+ * A search its lane cut (BL-8): the generic transcript, with the cut said in words, as a listing
+ * says it (`Matches: first N` and the cut sentence), in place of the raw `outputCut` field. A search
+ * nothing cut keeps the generic transcript byte for byte.
+ */
+function buildCutSearchToolAiContent(toolName: string, payload: Record<string, any>, cut: ToolOutputCut): CoolToolAiContentPart[] {
+  const args = getCoolToolArgs(payload)
+  const result: Record<string, any> = { ...asObject(getCoolToolResult(payload)) }
+  delete result.outputCut
+  const matches = firstScalarString(result.totalMatches)
+  const blocks: CoolToolAiContentPart[][] = [sourcePart('agent_words', formatAiToolHeader(toolName, [matches ? `Matches: first ${matches}` : '', describeOutputCut(cut)]))]
+  if (Object.keys(args).length) {
+    blocks.push([
+      ...sourcePart('agent_words', 'Arguments:\n'),
+      ...fenceForAiParts(compactJson(args), 'json', 'agent_words')
+    ])
+  }
+  blocks.push([
+    ...sourcePart('agent_words', 'Result:\n'),
+    ...fenceForAiParts(compactJson(result), 'json')
+  ])
+  return joinSourceSections(blocks)
+}
+
+export function buildCoolToolAiContentWithSources(
   _zipId: string,
   zipData: CoolToolZipDataLike,
   payload: Record<string, any> | null
-): string {
-  if (!payload) return String(zipData.content ?? '')
+): CoolToolAiContent {
+  let parts: CoolToolAiContentPart[]
+  if (!payload) {
+    parts = sourcePart('agent_words', String(zipData.content ?? ''))
+    return { text: sourceText(parts), parts }
+  }
 
   const operationKind = getCoolToolOperationKind(payload)
   const toolName =
     firstScalarString(payload.toolName, payload.displayToolName, payload.originalToolName, operationKind) || 'tool'
   const result = asObject(getCoolToolResult(payload))
   const language = firstScalarString(result?.language, payload.metadata?.language) || 'text'
+
+  // A managed helper cut is unstructured model-visible text. Typed lane formatters must
+  // not reinterpret it as missing stdout, a failed fetch, or an empty list on reload.
+  if (result?.modelTextOnly === true && typeof result.content === 'string') {
+    parts = [
+      ...sourcePart('agent_words', `${formatAiToolHeader(toolName, [])}\nResult:\n`),
+      ...fenceForAiParts(result.content, 'text')
+    ]
+    return { text: sourceText(parts), parts }
+  }
 
   switch (operationKind) {
     case 'read_file':
@@ -313,44 +431,86 @@ export function buildCoolToolAiContent(
         result?.data
       )
       if (content !== null) {
-        const transcript = buildFullFidelityToolAiContent(toolName, payload, 'Content', content, language)
+        const transcript = buildFullFidelityToolAiContent(toolName, payload, 'Content', content, language, 'tool_result')
         const error = firstScalarString(payload.error)
         // A read's content is what it printed; one that printed nothing and has no exit code
         // (a command Codex declined) explains its failure only through the error.
         if (error && !content.trim() && failedCommandExitCode(result) === undefined) {
-          return `${transcript}\nError:\n${fenceForAi(error, 'text')}`
+          parts = [
+            ...transcript,
+            ...sourcePart('agent_words', '\nError:\n'),
+            ...fenceForAiParts(error, 'text')
+          ]
+          return { text: sourceText(parts), parts }
         }
-        return transcript
+        // Find 1: a partial skill read keeps its sizes and next call on later turns too.
+        const readMore = typeof result?.readMore === 'string' ? result.readMore.trim() : ''
+        parts = readMore
+          ? [...transcript, ...sourcePart('agent_words', `\n${readMore}`)]
+          : transcript
+        return { text: sourceText(parts), parts }
       }
       break
     }
     case 'write_file': {
-      if (isFailedFileChange(payload)) return buildFailedFileChangeAiContent(toolName, payload)
+      if (isFailedFileChange(payload)) {
+        parts = buildFailedFileChangeAiContent(toolName, payload)
+        return { text: sourceText(parts), parts }
+      }
       const content = firstString(result?.content, result?.fileContent, result?.newContent, result?.output)
       if (content !== null) {
-        return buildFullFidelityToolAiContent(toolName, payload, 'Written content', content, language)
+        parts = buildFullFidelityToolAiContent(toolName, payload, 'Written content', content, language, 'agent_words')
+        return { text: sourceText(parts), parts }
       }
       break
     }
     case 'edit_file': {
-      if (isFailedFileChange(payload)) return buildFailedFileChangeAiContent(toolName, payload)
+      if (isFailedFileChange(payload)) {
+        parts = buildFailedFileChangeAiContent(toolName, payload)
+        return { text: sourceText(parts), parts }
+      }
       const diff = firstString(result?.diff, result?.patch, result?.changes, result?.output)
       if (diff !== null) {
-        return buildFullFidelityToolAiContent(toolName, payload, 'Diff', diff, 'diff')
+        parts = buildFullFidelityToolAiContent(toolName, payload, 'Diff', diff, 'diff', 'agent_words')
+        return { text: sourceText(parts), parts }
       }
       break
     }
-    case 'list_files':
-      return buildListToolAiContent(toolName, payload)
-    case 'bash':
-      return buildBashToolAiContent(toolName, payload)
-    case 'fetch_zip':
-      return buildFetchZipToolAiContent(toolName, payload)
+    case 'list_files': {
+      parts = buildListToolAiContent(toolName, payload)
+      return { text: sourceText(parts), parts }
+    }
+    case 'search_files': {
+      const cut = toolOutputCut(result)
+      if (cut) {
+        parts = buildCutSearchToolAiContent(toolName, payload, cut)
+        return { text: sourceText(parts), parts }
+      }
+      break
+    }
+    case 'bash': {
+      parts = buildBashToolAiContent(toolName, payload)
+      return { text: sourceText(parts), parts }
+    }
+    case 'fetch_zip': {
+      parts = buildFetchZipToolAiContent(toolName, payload)
+      return { text: sourceText(parts), parts }
+    }
     default:
       break
   }
 
-  return buildGenericToolAiContent(toolName, payload)
+  parts = buildGenericToolAiContent(toolName, payload)
+  return { text: sourceText(parts), parts }
+}
+
+/** Text-only compatibility surface; the structured builder is the canonical formatter. */
+export function buildCoolToolAiContent(
+  zipId: string,
+  zipData: CoolToolZipDataLike,
+  payload: Record<string, any> | null
+): string {
+  return buildCoolToolAiContentWithSources(zipId, zipData, payload).text
 }
 
 export function estimateCoolToolAiTokens(
@@ -362,8 +522,23 @@ export function estimateCoolToolAiTokens(
   return Math.ceil(content.length / 4)
 }
 
+// Legacy malformed payloads bypass the structured Cool Tool formatter during AI
+// compilation. Size the exact fallback text that the model receives.
+export function buildMalformedCoolToolAiContent(zipId: string, content: string): string {
+  if (content.includes('<cool_tool')) return content
+  const scriptContent = content.replace(/<\/script/gi, '<\\/script')
+  return `<cool_tool data-zip-id='${zipId}' data-zip-type='cool_tool'><script type="application/json" class="cool-tool-payload">${scriptContent}</script></cool_tool>`
+}
+
+export function estimateMalformedCoolToolAiTokens(zipId: string, content: string): number {
+  return Math.ceil(buildMalformedCoolToolAiContent(zipId, content).length / 4)
+}
+
 export function shouldPreferRawSidecarForAiExpansion(payload: Record<string, any> | null): boolean {
   if (!payload) return false
+  // The saved view already contains the managed text. A typed expansion of its MCP wrapper
+  // would discard it; retained sidecars still follow ordinary storage/retrieval policy.
+  if (payload.toolResult?.modelTextOnly === true) return false
   const operationKind = payload.operationKind ?? payload.metadata?.operationKind
   const rendererFamily = payload.rendererFamily ?? payload.metadata?.rendererFamily
   const isFullFidelityLane =

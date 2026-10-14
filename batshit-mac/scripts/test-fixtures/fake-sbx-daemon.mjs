@@ -3,8 +3,9 @@
 // `Starting sandboxd daemon...` on stderr first; `daemon status --json` never starts one and names
 // the daemon's socket, beside which the daemon keeps `sandboxd.pid`; the daemon runs as
 // `<bin>/sbx daemon start` (here behind node, the way a script shows in `ps`); `daemon stop` stops
-// it. `sandboxes.json` in the fake's state folder is what `ls --json` lists.
-import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
+// it. `sandboxes.json` in the fake's state folder is what `ls --json` lists; `ls-delay-ms` there makes
+// an `ls` to a running daemon take that long, as the first `ls` after hours idle did (BL-193).
+import { chmod, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 const FAKE_SBX = `#!${process.execPath}
@@ -57,6 +58,8 @@ if (command === 'daemon' && sub === 'start') {
     child.unref()
     for (let tries = 0; tries < 60 && !running(); tries += 1) pause(50)
   }
+  const delayFile = path.join(state, 'ls-delay-ms')
+  if (fs.existsSync(delayFile)) pause(Number(fs.readFileSync(delayFile, 'utf8')))
   const sandboxes = fs.existsSync(sandboxesFile) ? JSON.parse(fs.readFileSync(sandboxesFile, 'utf8')) : []
   console.log(JSON.stringify({ sandboxes }, null, 2))
 } else {
@@ -84,6 +87,10 @@ export async function installFakeSbxDaemon(root) {
     },
     async setSandboxes(list) {
       await writeFile(join(state, 'sandboxes.json'), JSON.stringify(list));
+    },
+    /** An `ls` that takes `ms` before it answers (0 or null: at once). */
+    async setLsDelay(ms) {
+      await (ms ? writeFile(join(state, 'ls-delay-ms'), String(ms)) : rm(join(state, 'ls-delay-ms'), { force: true }));
     }
   };
 }

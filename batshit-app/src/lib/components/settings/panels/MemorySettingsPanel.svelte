@@ -19,6 +19,7 @@
   import { normalizeIconRef } from '$lib/icons/iconLegacy'
   import * as agentStore from '$lib/stores/agents.svelte'
   import { resolveAgentMemoryEnabled } from '$lib/utils/memoryControl'
+  import { onUserChannelEvent } from '$lib/services/userChannel'
   import { BookOpen, Brain, History, Loader2, RefreshCw, Search, Zap } from '@lucide/svelte'
   import { toast } from 'svelte-sonner'
 
@@ -51,6 +52,14 @@
   let configSaving = $state(false)
   let reindexing = $state(false)
   let configError = $state<string | null>(null)
+  // BL-962: `embeddingDraft` holds the saved embedding source only after a real read of
+  // `/api/memory/config` succeeded and carried it. Until then it holds the default (the built-in
+  // model), which must never be sent: `PUT /api/memory/config` replaces the whole embedding
+  // record, so the Memory System card is not offered and Save and Re-Index refuse. The first
+  // successful read latches this true; a later reload that fails (after a Save or a Re-Index)
+  // keeps the draft that was read or saved, so it does not clear it.
+  let configLoaded = $state(false)
+  let configLoadBusy = $state(false)
 
   // Browse state (one fetch, grouped into the lane cards)
   let awarenessEntries = $state<Array<Record<string, any>>>([])
@@ -94,6 +103,33 @@
       isLoading = false
     }
   })
+
+  /**
+   * SA-122 A-1y (LS-067/LS-068): an agent saved its own Settings (App Actions), heard on the user
+   * channel. This panel holds no draft of an agent's fields, only its list (the picker's name), so
+   * the listed agent is read again and its entry replaced. A newer read of the same agent drops an
+   * older answer.
+   */
+  const listedAgentReads = new Map<string, number>()
+  async function refreshListedAgent(agentId: string) {
+    const generation = (listedAgentReads.get(agentId) ?? 0) + 1
+    listedAgentReads.set(agentId, generation)
+    try {
+      const response = await fetch(`/api/agents/${encodeURIComponent(agentId)}`, { cache: 'no-store' })
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      const agent = await response.json()
+      if (listedAgentReads.get(agentId) !== generation || agent?.id !== agentId) return
+      agents = agents.map((existing) => (existing.id === agentId ? agent : existing))
+    } catch (error) {
+      console.warn(`[MemoryPanel] Could not read agent ${agentId} again after it changed its own settings:`, error)
+    }
+  }
+  onMount(() =>
+    onUserChannelEvent((event) => {
+      if (event.type !== 'agent_settings_changed' || typeof event.agentId !== 'string') return
+      if (untrack(() => agents.some((agent) => agent.id === event.agentId))) void refreshListedAgent(event.agentId)
+    })
+  )
 
   async function loadPresetOptions() {
     try {
@@ -139,19 +175,28 @@
   }
 
   async function loadConfig() {
+    configLoadBusy = true
     try {
       const response = await fetch('/api/memory/config')
       if (!response.ok) throw new Error(`Failed to load memory config (HTTP ${response.status}).`)
       const payload = await response.json()
-      hydrateEmbeddingDraft(payload?.embedding ?? null)
+      // The route answers the default config for an instance with no record, so a read that
+      // succeeded always carries `embedding`; an answer without it did not read the saved source.
+      if (!payload?.embedding) {
+        throw new Error('The memory config answer carried no embedding settings.')
+      }
+      hydrateEmbeddingDraft(payload.embedding)
       builtinModels = Array.isArray(payload?.builtinModels) ? payload.builtinModels : []
       apiProviders = Array.isArray(payload?.apiProviders) ? payload.apiProviders : ['openai']
       indexMeta = payload?.indexMeta ?? null
       indexMismatch = Boolean(payload?.indexMismatch)
       configError = null
+      configLoaded = true
     } catch (error) {
       console.error('[MemoryPanel] Failed to load memory config:', error)
       configError = error instanceof Error ? error.message : 'Failed to load memory config.'
+    } finally {
+      configLoadBusy = false
     }
   }
 
@@ -233,6 +278,8 @@
   }
 
   async function handleConfigSave() {
+    // BL-962: never a save built from a draft no read of the saved config filled in.
+    if (!configLoaded) return
     configSaving = true
     configError = null
     try {
@@ -256,6 +303,7 @@
   }
 
   async function handleReindex() {
+    if (!configLoaded) return
     reindexing = true
     configError = null
     try {
@@ -515,20 +563,37 @@
         </SettingsInfoMenu>
       </div>
 
-      <MemorySystemCard
-        draft={embeddingDraft}
-        {indexMeta}
-        {builtinModels}
-        {apiProviders}
-        presets={presetOptions}
-        saving={configSaving}
-        {reindexing}
-        errorText={configError}
-        {indexMismatch}
-        onDraftChange={(next) => (embeddingDraft = next)}
-        onSave={handleConfigSave}
-        onReindex={handleReindex}
-      />
+      {#if configLoaded}
+        <MemorySystemCard
+          draft={embeddingDraft}
+          {indexMeta}
+          {builtinModels}
+          {apiProviders}
+          presets={presetOptions}
+          saving={configSaving}
+          {reindexing}
+          errorText={configError}
+          {indexMismatch}
+          onDraftChange={(next) => (embeddingDraft = next)}
+          onSave={handleConfigSave}
+          onReindex={handleReindex}
+        />
+      {:else}
+        <!-- BL-962: the Memory System card waits for a real read of the saved embedding source. -->
+        <div class="batshit-settings-inline-alert is-danger" data-testid="memory-config-load-error">
+          <div class="flex items-center justify-between gap-2">
+            <span>
+              Memory System settings could not load, so the Memory System card is hidden. Press
+              Retry to load it.
+              {#if configError}Details: {configError}{/if}
+            </span>
+            <Button variant="outline" size="sm" onclick={loadConfig} disabled={configLoadBusy}>
+              <RefreshCw class={configLoadBusy ? 'h-3.5 w-3.5 animate-spin' : 'h-3.5 w-3.5'} />
+              Retry
+            </Button>
+          </div>
+        </div>
+      {/if}
 
       <div class="memory-browse-header">
         <Select.Root

@@ -30,7 +30,9 @@ describe('ChatInput quick-action commit seam', () => {
     expect(send).toContain('): Promise<boolean>')
     expect(send).toContain('if (overrides?.mayResetComposer && !overrides.mayResetComposer()) return')
     expect(send).toContain("...(overrides?.mayResetComposer ? { clipIds: sentClipIds } : {})")
-    expect(send).toContain('onQueuedForLater: () => resetAcceptedComposer()')
+    // The guarded reset is the acceptance's (BL-713 removed the page queue's own reset).
+    expect(send).toContain('\n      resetAcceptedComposer()\n    }\n')
+    expect(send).not.toContain('onQueuedForLater')
     expect(send).toContain('if (sendAccepted === false)')
     expect(send).toContain('return true')
   })
@@ -44,6 +46,14 @@ describe('ChatInput quick-action commit seam', () => {
       source.indexOf('function releaseLiveKitMicrophone(')
     )
     expect(end).toContain('invalidatePendingVoiceQuickActionCommit()')
+    expect(end).toContain('if (!options.preservePendingCommit) invalidatePendingVoiceQuickActionCommit()')
+
+    const invalidator = source.slice(
+      source.indexOf('function invalidatePendingVoiceQuickActionCommit('),
+      source.indexOf('\n  $effect(() => {', source.indexOf('function invalidatePendingVoiceQuickActionCommit('))
+    )
+    expect(invalidator).toContain('voiceQuickActionCommits.invalidate()')
+    expect(invalidator).toContain('if (invalidated) waitingForAI = false')
 
     const mountCleanup = source.slice(
       source.indexOf('onMount(() => {'),
@@ -52,12 +62,36 @@ describe('ChatInput quick-action commit seam', () => {
     expect(mountCleanup).toContain('invalidatePendingVoiceQuickActionCommit()')
   })
 
-  it('lets the end-voice quick action persist its own captured marked turn', () => {
+  it('dispatches through the fixed voice projection with the current owners', () => {
     const actionStart = source.indexOf('function runQuickAction(')
     const actionEnd = source.indexOf('// Handle mic button', actionStart)
     const action = source.slice(actionStart, actionEnd)
 
-    expect(action).toContain("case 'end_voice_mode':")
-    expect(action).toContain('endDirectVoiceMode({ notify: true, preservePendingCommit: true })')
+    expect(source).toContain("from '$lib/appActions/voice/quickActionExecutor'")
+    expect(action).toContain('executeVoiceQuickAction(verdict, {')
+    expect(action).toContain('stopPlayback: () => voiceService.stopAll()')
+    expect(action).toContain('requestWorkStop: () => { void handleStopWorkClick() }')
+    expect(action).toContain('endVoiceMode: options => endDirectVoiceMode(options)')
+    expect(action).toContain('openExecutionViewer: () => onOpenExecutionViewer(sessionId)')
+    expect(action).toContain('quickActionSettingsTabTarget(selectedTab)')
+    expect(action).toContain('new CustomEvent(QUICK_ACTION_EVENT, { detail: { id } })')
+  })
+
+  it('guards an older stream reset until the captured queued spoken send settles', () => {
+    const commit = source.slice(source.indexOf('async function commitVoiceModeTurn('), source.indexOf('function quickActionVoiceModeSettings()'))
+    expect(commit).not.toContain('preparingBehindReply')
+    expect(commit).toContain('voiceQueuedReplyWait = replyWait')
+    expect(commit).toContain('onReplyAdmitted: replyWait.onReplyAdmitted')
+    expect(commit).toContain('onSteerPrepared: replyWait.onSteerPrepared')
+    expect(source).toContain('voiceQueuedReplyWait?.observeReply(observation)')
+    const send = commit.indexOf('const accepted = await sendMessageWithText(')
+    expect(commit.indexOf('replyWait.finishSend()', send)).toBeGreaterThan(send)
+    expect(commit).toContain('replyWait.abandonSend()')
+    const reset = source.slice(source.indexOf('export function aiResponseReceived()'), source.indexOf('</script>'))
+    expect(reset).toContain('if (voiceQueuedReplyWait?.holdGenericReplyCompletion()) return\n    waitingForAI = false')
+    const metadata = source.slice(source.indexOf('const metadata: Record<string, any> = {'), source.indexOf('if (isCodexMode3)', source.indexOf('const metadata: Record<string, any> = {')))
+    expect(metadata).not.toContain('onReplyAdmitted')
+    expect(metadata).not.toContain('onSteerPrepared')
+    expect(source).toContain('onReplyAdmitted: overrides?.onReplyAdmitted')
   })
 })

@@ -1,11 +1,11 @@
 /**
- * SA-120 P1 — per-agent Jev Juice switches (DL-120-01, LS-049), plus the one global
+ * SA-120 P1 — per-agent Judge Juice switches (DL-120-01, LS-049), plus the one global
  * switch P5 adds for smart zip (LS-054) and the one instance switch P7 adds for the
  * incoming-text screen (LS-057).
  *
- * Every Jev Juice feature switch defaults OFF and is resolved ONLY through the
+ * Every Judge Juice feature switch defaults OFF and is resolved ONLY through the
  * function here, from the freshly read owning record (the agent, the user's global zip
- * settings, or the instance Jev Juice config), so the send path, Settings, and the Execution Viewer all read the same
+ * settings, or the instance Judge Juice config), so the send path, Settings, and the Execution Viewer all read the same
  * rule. Absent means OFF.
  *
  * Browser-safe: no server imports (Agent Settings reads it too).
@@ -23,14 +23,14 @@ export const AGENT_JEV_REPLY_CHECK_FIELD = 'jev_juice_reply_check' as const
 /** SA-120 P6: the per-agent switch for the after-reply style coach (LS-056). */
 export const AGENT_JEV_STYLE_COACH_FIELD = 'jev_juice_style_coach' as const
 
-/** Every per-agent Jev Juice switch, with the wording the write-side error uses. */
+/** Every per-agent Judge Juice switch, with the wording the write-side error uses. */
 export const AGENT_JEV_JUICE_FIELDS = Object.freeze({
-  [AGENT_JEV_SKILL_TOOL_HINTS_FIELD]: 'Jev Juice: Suggest Skills and Tools',
-  [AGENT_JEV_JUDGE_TOOL_FIELD]: 'Jev Juice: Judgment Tool',
-  [AGENT_JEV_MEMORY_RERANK_FIELD]: 'Jev Juice: Rerank Memory Search',
-  [AGENT_JEV_MEMORY_RECALL_FIELD]: 'Jev Juice: Recall by Meaning',
-  [AGENT_JEV_REPLY_CHECK_FIELD]: 'Jev Juice: Check Replies',
-  [AGENT_JEV_STYLE_COACH_FIELD]: 'Jev Juice: Style Coach'
+  [AGENT_JEV_SKILL_TOOL_HINTS_FIELD]: 'Judge Juice: Suggest Skills and Tools',
+  [AGENT_JEV_JUDGE_TOOL_FIELD]: 'Judge Juice: Judgment Tool',
+  [AGENT_JEV_MEMORY_RERANK_FIELD]: 'Judge Juice: Rerank Memory Search',
+  [AGENT_JEV_MEMORY_RECALL_FIELD]: 'Judge Juice: Recall by Meaning',
+  [AGENT_JEV_REPLY_CHECK_FIELD]: 'Judge Juice: Check Replies',
+  [AGENT_JEV_STYLE_COACH_FIELD]: 'Judge Juice: Style Coach'
 })
 
 function readSwitch(agent: unknown, field: string): boolean {
@@ -84,7 +84,7 @@ export function resolveAgentJevStyleCoachEnabled(agent: unknown): boolean {
  * posture with per-agent overrides and Josh wants exactly one switch for this.
  */
 export const GLOBAL_JEV_SMART_ZIP_FIELD = 'jev_juice_smart_zip' as const
-export const GLOBAL_JEV_SMART_ZIP_LABEL = 'Jev Juice: Smart Zip'
+export const GLOBAL_JEV_SMART_ZIP_LABEL = 'Judge Juice: Smart Zip'
 
 /** THE rule for "may Batshit ask Jev which zipped results a message needs?" Absent means OFF. */
 export function resolveJevSmartZipEnabled(globalZipSettings: unknown): boolean {
@@ -109,7 +109,7 @@ export function validateJevJuiceGlobalZipFields(globalZipSettings: unknown): str
  * owns all three. Absent (every record written before P7) means OFF.
  */
 export const JEV_INCOMING_TEXT_SCREEN_FIELD = 'screenIncomingText' as const
-/** On the Jev Juice card itself, so no "Jev Juice:" prefix (Josh, 2026-09-17): the card is the feature's name. */
+/** On the Judge Juice card itself, so no "Judge Juice:" prefix (Josh, 2026-09-17): the card is the feature's name. */
 export const JEV_INCOMING_TEXT_SCREEN_LABEL = 'Screen Incoming Text'
 
 /** THE rule for "may Batshit show Jev the text of a DM, a webhook message, or an imported skill?" */
@@ -118,7 +118,7 @@ export function resolveJevIncomingTextScreenEnabled(typesafeConfig: unknown): bo
 }
 
 /**
- * SA-120 P8: the In-Chat Wait Limit (LS-059, DL-120-16), the one Jev Juice setting that is a
+ * SA-120 P8: the In-Chat Wait Limit (LS-059, DL-120-16), the one Judge Juice setting that is a
  * number the user tunes rather than a switch. A field of `batshit:typesafe_config` beside
  * Per-Attempt Timeout. Default and bounds live with the transport constants
  * (`typesafe.constants.ts`); the server reads it per call (`runTypesafeJudgment`, `lane: 'in_chat'`).

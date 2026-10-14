@@ -3,7 +3,7 @@
  *
  * send-routed holds the chat's session-turn lock from the top of a request to the end of its
  * `finally`, and a reply that pauses for an approval keeps it through its after-reply work —
- * the Execution Viewer snapshot, the Jev Juice after-reply steps, the sandbox cleanup — while
+ * the Execution Viewer snapshot, the Judge Juice after-reply steps, the sandbox cleanup — while
  * the card is already on screen, because the card arrives with `end`. A click in that window
  * was refused as a second turn ("Another response is already in progress for this session").
  * Measured live (`_local/approval-early-click-proof/before-fix.json`): Approve clicked the
@@ -18,12 +18,15 @@
  * synchronous block, so two clicks that both waited cannot both get through: the first
  * registers, the second finds a lock that answers an approval and is refused.
  *
- * The bound covers after-reply work that is running normally, including two Jev Juice
+ * The bound covers after-reply work that is running normally, including two Judge Juice
  * after-reply judgments (2 s each) and a slow Docker listing. Past it the click is refused as
  * before, and the card goes back to its buttons (`toolApprovalSubmit.ts` in the browser).
  */
 
-import { getActiveSessionTurn } from '$lib/server/services/streamAbortRegistry'
+import {
+  getActiveSessionTurn,
+  holdQueueForApprovalClick
+} from '$lib/server/services/streamAbortRegistry'
 import { hasUserTurnContent } from '$lib/server/services/approvalResumeMessage'
 
 export const APPROVAL_CLICK_WAIT_MS = 15_000
@@ -62,16 +65,27 @@ export function approvalClickWaitsForTurn(
  * `no_wait`: nothing of the card's own reply was holding it. `released`: it let go (or the
  * lock is no longer one worth waiting for). `timed_out`: the bound passed with it still held.
  * The wait never takes or clears a lock.
+ *
+ * BL-4: while it waits, it holds back the chat's line of queued sends
+ * (`holdQueueForApprovalClick`), so the reply letting go does not hand the chat to a send that
+ * arrived after the card did: the click answers that reply and goes first. The hold ends as the
+ * wait does, and hands nothing over by itself: the caller's registration follows in the same
+ * step, and the line's backstop takes the chat on if it does not.
  */
 export async function waitForCardReplyToFinish(
   sessionId: string,
   cardMessageId: string | null | undefined
 ): Promise<'no_wait' | 'released' | 'timed_out'> {
   if (!approvalClickWaitsForTurn(getActiveSessionTurn(sessionId), cardMessageId)) return 'no_wait'
-  const deadline = Date.now() + APPROVAL_CLICK_WAIT_MS
-  while (Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, APPROVAL_CLICK_POLL_MS))
-    if (!approvalClickWaitsForTurn(getActiveSessionTurn(sessionId), cardMessageId)) return 'released'
+  const releaseLine = holdQueueForApprovalClick(sessionId)
+  try {
+    const deadline = Date.now() + APPROVAL_CLICK_WAIT_MS
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, APPROVAL_CLICK_POLL_MS))
+      if (!approvalClickWaitsForTurn(getActiveSessionTurn(sessionId), cardMessageId)) return 'released'
+    }
+    return 'timed_out'
+  } finally {
+    releaseLine()
   }
-  return 'timed_out'
 }

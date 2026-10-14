@@ -41,6 +41,8 @@ An MCP gateway is a source of MCP tools. Batshit works with several gateway type
 
 Each gateway can expose many tools, and you rarely want every tool dumped into every prompt. So Batshit exposes MCP tools through Dynamic Tool Search: the agent gets a compact discovery path for capabilities beyond the tools already in its tool list.
 
+The agent uses its saved gateway selection unless you choose a different set in the chat bar for that send. You can add gateways there; the agent cannot add gateways to its own access through a tool call. Approval resumes keep the original selection, and built-in Workers inherit the starting reply's selection.
+
 ## Dynamic Tool Search and Use
 
 Dynamic Tool Search is an on-demand pattern:
@@ -85,13 +87,13 @@ Common controls:
 - **Display detail** — how much tool information appears in the dynamic context shown to the agent.
 - **Zip buffer** — how many previous agent/assistant responses stay expanded for model context. It doesn't count user messages or each tool call separately.
 - **Zip threshold** — minimum token size before `Normal` behavior may zip content. Most defaults use `0`.
-- **Zip behavior** — `Inherited` follows the parent/default when there's a real one to inherit from, `Normal` uses buffer and threshold, `Auto` zips immediately by default, and `Off` never zips.
+- **Zip behavior** — `Inherited` follows the parent/default when there's a real one to inherit from, `Normal` uses buffer and threshold, `Auto` zips immediately by default, and `Off` keeps output open unless a Cool Tool result reaches the 25,000-token size guard.
 - Default and inherited values appear as quiet placeholder text; a typed-looking value means that row is overriding its parent/default.
 - **Batshit Tools** holds the built-in first-party lanes: file tools, Bash, Web Search, Fetch Zip, Subagent Call, Dynamic Tool Search, Artifact Tools, Fabric Controls, and Agent Browser Actions.
 - CLI Tools and each MCP Source appear as their own top-level rows below Batshit Tools.
 - Other tool handling sits at the bottom, usually as the single All Other Tools row.
 - Group header rows (Batshit Tools, CLI Tools, MCP) can apply Zip Buffer and Zip Threshold to every child row underneath; individual rows can override their own details where the UI shows a per-tool control.
-- Tool Notes and Zip permissions, where available.
+- **Tool Notes**, on by default and marked **Recommended**, because notes keep the facts the agent needs in view after the full result is compressed, so it reads files again less. (The old **Zip Control Permissions** setting is parked: Hold and release replaced it, so it no longer appears and stays off.)
 
 The Global Tool Grid has `Reset to defaults`. The Agent Tool Grid has `Reset to global settings`, which clears the agent's own Tool Grid and Zip overrides so it inherits global behavior again.
 
@@ -99,11 +101,17 @@ Keep tool access as narrow as the job allows. Broad access is powerful, but it a
 
 ### Bash access modes
 
-- **Plan** allows inspection and search commands plus deliberate Markdown (`.md`) writes or edits. Batshit blocks command chaining, hidden mutation or command-execution flags, shell/process substitution, and pipelines that contain an executor or writer instead of another approved read-only stage. Git commands are blocked here because repository configuration can make even an inspection run helper programs.
-- **Agent** allows workspace work. Simple inspections normally skip a popup. Shell file writes, Git commands, interpreters, and ambiguous compound commands follow your approval policy unless explicitly allowlisted. Every operation must qualify independently. Batshit's managed patch and native file tools keep their normal workspace checks.
+- **Plan** allows inspection and search commands plus deliberate Markdown (`.md`) writes or edits. Batshit blocks command chaining, hidden mutation or command-execution flags, shell/process substitution, and pipelines that contain an executor or writer instead of another approved read-only stage. Git commands are blocked here because repository configuration can make even an inspection run helper programs. Use direct commands or managed `apply_patch` for Markdown edits; shell/interpreter wrappers are blocked, and every redirected output file must be Markdown.
+- **Agent** allows workspace work. Simple inspections normally skip a popup. In an API agent chat, shell file writes, Git commands, interpreters, and ambiguous compound commands follow your approval policy unless explicitly allowlisted. Every operation must qualify independently. Batshit's managed patch and native file tools keep their normal workspace checks.
 - **Dangerous** skips approval popups, while Batshit's hard safety blocks and your Never Allow rules still apply.
 
+**Codex and Claude agents use their own Bash.** A CLI agent already has a shell, file editing, and search of its own, so Batshit does not give it a second Bash tool, and it refuses one that a CLI agent tries anyway ("Use your own shell tool."). That is why the Bash Tool switch is off and greyed out for a CLI agent and for a CLI Subagent. Its commands run where the Codex or Claude program runs them (on your Mac as you; in Docker, inside the app container), under the mode you picked for that agent in the chat bar (Codex: Chat (read-only), Agent (workspace write), or Agent (full access); Claude: Plan, Ask before edits, Edit automatically, or Bypass permissions), and never with more than its Agent Settings allow (a Codex Sandbox Level you set tighter by hand holds; see [What a chat message lets the agent do](../primary-agents/overview.md#what-a-chat-message-lets-the-agent-do)). The Bash modes above, the Sandbox choice, the allow list, the Never Allow list, and Batshit's guard on its own source code do not reach those commands, and **Stop** for one is the program's own. A Codex agent in Chat (read-only) mode cannot change files; pick Agent (workspace write) for that. If you want Batshit's Sandbox and lists around an agent's commands, use an API agent.
+
 **An approved command runs once.** If the reply fails or you press **Stop** after you approved, the card still says **Approved** and does not offer the buttons again. To run the command again, ask the agent again; it asks you again with a new card.
+
+**What you typed while it waited, waits too.** A steer or a queued message the agent did not get to before the card waits for your click, and the agent answers it when the reply you approved (or denied) finishes; a card that expired does not release it. See [When the reply stops at an approval card](../chat/overview.md#when-the-reply-stops-at-an-approval-card).
+
+Local Bash commands use an installed system zsh, or bash when zsh is unavailable. The tool card records the shell that ran the command. If neither shell is installed, Batshit explains what is missing. A failed command is never repeated in another shell. Managed `apply_patch` edits run inside Batshit and do not need either shell.
 
 ### The Fabric Controls and Artifact Tools rows
 
@@ -111,7 +119,7 @@ Most people never need to touch these two. They're already set the way they shou
 
 You'll find both inside the **Batshit Tools** group, on the rows already named `Fabric Controls` and `Artifact Tools`.
 
-**Fabric Controls** are Batshit's own app actions, the things that let an agent manage Artifacts, install a CLI Tool, look at your model catalog, and so on. There are around forty of them, and they all live in one row.
+**Fabric Controls** are Batshit's own app actions, the things that let an agent manage Artifacts, install a CLI Tool, look at your model catalog, start a Pinokio app, and so on. There are more than sixty of them, and they all live in one row.
 
 **Artifact Tools** are the Artifacts you've published and marked as agent-usable. Each one shows up as something the agent can run directly.
 
@@ -123,7 +131,7 @@ Each row carries the same controls as everything else in the grid:
 
 The two rows ship with different display detail on purpose, because they're different sizes:
 
-- **Fabric Controls** shows **the group name only**. Around forty entries is too many to list on every single message, and listing them would cost you real tokens for something the agent can find in one search anyway. The agent still reaches all of them, it just searches instead of being handed the full list.
+- **Fabric Controls** shows **the group name, the count, and the kinds of control it holds**, for example `Fabric Controls (45 tools: artifacts, CLI tools, ComfyUI, Pinokio, …)`. More than sixty entries is too many to list on every single message, and listing them would cost you real tokens for something the agent can find in one search anyway. The kinds are there so the agent knows to search: when you ask about Pinokio in plain words, it sees that it has Pinokio controls. It only sees the kinds it can actually use.
 - **Artifact Tools** shows **names and hints**. This family is small and it's yours, so spelling out each Artifact's input fields is worth it: the agent can call your Artifact directly instead of spending an extra round trip searching for it first.
 
 Discoverable and Display detail only appear when the family is actually reachable for that agent. If Fabric is switched off for an agent entirely, the row keeps its Zip settings and drops the other two controls.
@@ -162,6 +170,8 @@ A Batshit CLI Tool is not just shell text in a prompt. It's a saved tool record 
 
 Use CLI Tools for a repeatable local action that agents should call safely and consistently. Stop cancels a saved CLI tool running in that reply; on Mac and Linux, Stop and timeout also end the processes it started.
 
+An agent can find and run only the CLI Tools saved for it. An agent with no saved CLI Tool selection uses the CLI Tools your Tool Grid makes discoverable, and a Subagent uses its own selection. A tool call can ask for fewer CLI Tools, never for one outside that list.
+
 Most CLI Tool setup is best handled through an agent or the CLI Tool Creator flow, because the record includes command shape, validation, permissions, and runtime boundaries. Settings still shows the saved details and user-facing controls — icon, status, tests, permissions — but normal users shouldn't need to hand-author raw manifests.
 
 Good examples:
@@ -197,7 +207,11 @@ See [Artifacts](../artifacts/overview.md) for details.
 
 ## Runtime add-ons
 
-Runtime add-ons are optional services Batshit can connect to, start through an approved operator, or guide you to start manually. Current Docker add-on shapes:
+Runtime add-ons are optional services Batshit can connect to, start through an approved operator, or guide you to start manually.
+
+For Codex and Claude agents, starting or stopping an add-on must go through a Primary Agent’s matching Batshit Tools control and its user approval. A direct automation request is refused and names the control. A Subagent or Worker must ask its Primary Agent; the refusal does not grant it access to that control. Existing n8n workflow actions and signed-in or service automation keep their separate settings-governed behavior.
+
+Current Docker add-on shapes:
 
 - Startable sidecar/worker/profile entries such as Cloudflared, FBX-to-VRMA, Agent Browser, LiveKit, and `comfyui-validation`.
 - Connect-existing entries such as real ComfyUI/Gradio-style services, Local AI runtimes, and voice engines.
@@ -210,7 +224,7 @@ The Docker core app container does not get arbitrary host Docker control. Start/
 | Primary Agent type | Tool path |
 | --- | --- |
 | `API` | Uses Batshit native tools through the direct provider path. |
-| `CLI` | Uses CLI-native command/search/edit behavior plus Batshit-managed helper tools through a managed bridge. |
+| `CLI` | Uses CLI-native command/search/edit behavior (its own shell, so Batshit's Bash modes, Sandbox, and lists do not apply) plus Batshit-managed helper tools through a managed bridge. |
 
 The user-facing result should feel similar, but the transport differs. If a tool works for one type and not another, check that it's enabled for that agent type and that the runtime path is configured.
 
@@ -261,6 +275,10 @@ Tools are powerful — treat them like giving a capable assistant access to real
 | CLI Tool is visible but fails | Manifest input, working directory, missing executable, or missing saved key. | Run the CLI Tool test path. |
 | n8n tool callback fails | The Batshit Tools node isn't forwarding the per-message native-tool token, or the callback URL isn't reachable from n8n. | The `x-batshit-native-tool-token` header, n8n execution history, and runtime URLs. |
 | Agent starts inventing setup commands | The add-on is connect-existing or deferred, not startable. | Runtime add-on status/prepare result. |
+
+## App Actions in Fabric Controls
+
+App Actions use the existing Fabric Controls row. They let a Primary Agent operate a small set of views in a live tab showing its chat, inspect masked Settings and change only its own display name, Awareness/Triggers/Recalled Lane Budgets and the linger defaults for trigger and recalled memories. The agent discovers the exact action it needs; enabling discovery does not remove approvals or grant new native/file permissions. [Fabric](../fabric/overview.md#asking-an-agent-to-use-the-current-view) explains multiple tabs, unsaved edits and unconfirmed results.
 
 ## Related docs
 

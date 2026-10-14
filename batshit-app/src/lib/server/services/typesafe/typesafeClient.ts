@@ -1,5 +1,5 @@
 /**
- * SA-120 Jev Juice — the one server-side TypeSafe System One client (DL-120-08).
+ * SA-120 Judge Juice — the one server-side TypeSafe System One client (DL-120-08).
  *
  * Plain `fetch` plus a long-lived keep-alive dispatcher, chosen over the vendor SDK
  * (AMD-120-01): the SDK's debug logger prints request bodies unredacted, it has no
@@ -19,6 +19,14 @@
  *
  * Callers do not use this directly; `runTypesafeJudgment` in
  * `typesafeAvailability.ts` applies the master/feature/key rule first.
+ *
+ * SA-120 P10a (DL-120-18): the same client serves every judge that speaks Jev's
+ * `/v1/systemone` dialect. A client is built per endpoint (base URL plus path:
+ * TypeSafe, an Ollama or System One URL, or Cloudflare's per-account, per-model
+ * Workers AI path); the key is per request and `null` sends no Authorization header
+ * (Ollama, a keyless URL). The answer parser accepts extra fields other runtimes add
+ * (`confidence` on a Noul, `legend`, `latency_ms`, Ollama's criteria echoes) and
+ * stays strict on the typed answer itself.
  */
 
 import type { TypesafeErrorReason, TypesafeUnavailableReason, TypesafeUsage } from '$lib/types/typesafe'
@@ -105,7 +113,8 @@ export interface JevResponse<Q extends JevQuestions = JevQuestions> {
 // ---------------------------------------------------------------------------
 
 export interface TypesafeSystemOneRequest<Q extends JevQuestions = JevQuestions> {
-  apiKey: string
+  /** The bearer key, or `null` for a judge that takes none (Ollama, a keyless System One URL). */
+  apiKey: string | null
   model: string
   state: unknown
   questions: Q
@@ -154,6 +163,8 @@ export interface TypesafeClientOptions {
   /** Test seam. Production uses the global fetch with the keep-alive dispatcher. */
   fetch?: TypesafeFetch
   baseUrl?: string
+  /** SA-120 P10a: the path under `baseUrl`; `/v1/systemone` unless the judge says otherwise (Cloudflare). */
+  path?: string
   /** Test seam: `null` skips the dispatcher entirely; omit for the shared keep-alive agent. */
   dispatcher?: unknown | null
   /** Test seam for the retry wait. */
@@ -217,14 +228,25 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
 }
 
-function parseAnswer(value: unknown): JevAnswer | null {
+function isProbability(value: unknown): value is number {
+  return isFiniteNumber(value) && value >= 0 && value <= 1
+}
+
+/**
+ * One answer, typed against the question it answers. Extra fields a runtime adds are ignored; the typed answer is
+ * strict (SA-120 P10a): a Noul is a probability, and a Choice names one of the question's own options.
+ */
+function parseAnswer(value: unknown, question: JevQuestion): JevAnswer | null {
   if (!isRecord(value)) return null
-  if (value.type === 'noul' && isFiniteNumber(value.noul)) {
+  if (value.type === 'noul' && isProbability(value.noul)) {
     return { type: 'noul', noul: value.noul }
   }
   if (
     value.type === 'choice' &&
     typeof value.choice === 'string' &&
+    question.type === 'choice' &&
+    isRecord(question.criteria) &&
+    Object.prototype.hasOwnProperty.call(question.criteria, value.choice) &&
     isRecord(value.probabilities) &&
     isFiniteNumber(value.confidence)
   ) {
@@ -254,13 +276,19 @@ function parseAnswer(value: unknown): JevAnswer | null {
 
 /** Exported for the eval harness and tests: turns a raw vendor body into a typed response or null. */
 export function parseSystemOneResponse<Q extends JevQuestions>(
-  raw: unknown,
+  body: unknown,
   questions: Q
 ): JevResponse<Q> | null {
+  // Cloudflare's REST API wraps every Workers AI answer as `{ result, success, errors, messages }`; the answer
+  // inside is the same Jev shape. Not verified against a live Cloudflare call yet (no account in SA-120 P10a).
+  const raw =
+    isRecord(body) && !isRecord(body.answers) && isRecord(body.result) && isRecord(body.result.answers)
+      ? body.result
+      : body
   if (!isRecord(raw) || !isRecord(raw.answers)) return null
   const answers: Record<string, JevAnswer> = {}
   for (const id of Object.keys(questions)) {
-    const parsed = parseAnswer(raw.answers[id])
+    const parsed = parseAnswer(raw.answers[id], questions[id])
     if (!parsed || parsed.type !== questions[id].type) return null
     answers[id] = parsed
   }
@@ -285,7 +313,7 @@ export function createTypesafeClient(options: TypesafeClientOptions = {}): Types
   const baseUrl = (options.baseUrl ?? TYPESAFE_BASE_URL).replace(/\/+$/, '')
   const sleep = options.sleep ?? defaultSleep
   const now = options.now ?? (() => performance.now())
-  const url = `${baseUrl}${TYPESAFE_SYSTEM_ONE_PATH}`
+  const url = `${baseUrl}${options.path ?? TYPESAFE_SYSTEM_ONE_PATH}`
 
   async function resolveDispatcher(): Promise<unknown> {
     if (options.dispatcher === null) return undefined
@@ -303,11 +331,12 @@ export function createTypesafeClient(options: TypesafeClientOptions = {}): Types
       model: request.model,
       questions: request.questions
     })
-    const headers = {
-      Authorization: `Bearer ${request.apiKey}`,
+    const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       Accept: 'application/json'
     }
+    // A judge that takes no key gets no Authorization header at all (never `Bearer null`).
+    if (request.apiKey) headers.Authorization = `Bearer ${request.apiKey}`
     const latency = () => Math.round(now() - started)
 
     const unavailable = (
@@ -386,6 +415,9 @@ export function createTypesafeClient(options: TypesafeClientOptions = {}): Types
           method: 'POST',
           headers,
           body,
+          // Never follow a redirect: a 307/308 would re-send the body (user text) to another host while the card says
+          // where the text goes (review round 1, S1). A redirect rejects and reads as `network`.
+          redirect: 'error',
           signal,
           ...(dispatcher ? { dispatcher } : {})
         })
@@ -443,6 +475,11 @@ export function createTypesafeClient(options: TypesafeClientOptions = {}): Types
       }
 
       if (status === 401 || status === 403) return failure('unauthorized', attempts, { httpStatus: status })
+      // SA-120 P10a: a runtime that refuses an oversized input instead of cutting it (Ollaya's 422 STATE_TRUNCATED)
+      // is the same outcome as Batshit's own fit check refusing it.
+      if (status === 422 && /STATE_TRUNCATED/.test(text)) {
+        return unavailable('provider_limit', attempts, false, { httpStatus: status, detail: boundDetail(text) })
+      }
       if (status === 400 || status === 422) {
         return failure('bad_request', attempts, { httpStatus: status, detail: boundDetail(text) })
       }
@@ -453,10 +490,19 @@ export function createTypesafeClient(options: TypesafeClientOptions = {}): Types
   return { systemOne }
 }
 
-let sharedClient: TypesafeClient | null = null
+const sharedClients = new Map<string, TypesafeClient>()
 
-/** The one long-lived client for product code (DL-120-08). Tests build their own with `createTypesafeClient`. */
-export function getTypesafeClient(): TypesafeClient {
-  if (!sharedClient) sharedClient = createTypesafeClient()
-  return sharedClient
+/**
+ * The long-lived client for one judge endpoint (DL-120-08; SA-120 P10a: one per endpoint, all sharing the one
+ * keep-alive dispatcher, whose pools are per origin). Called with no endpoint it is the TypeSafe client.
+ * Tests build their own with `createTypesafeClient`.
+ */
+export function getTypesafeClient(endpoint: { baseUrl: string; path: string } = { baseUrl: TYPESAFE_BASE_URL, path: TYPESAFE_SYSTEM_ONE_PATH }): TypesafeClient {
+  const key = `${endpoint.baseUrl.replace(/\/+$/, '')}${endpoint.path}`
+  let client = sharedClients.get(key)
+  if (!client) {
+    client = createTypesafeClient({ baseUrl: endpoint.baseUrl, path: endpoint.path })
+    sharedClients.set(key, client)
+  }
+  return client
 }

@@ -5,9 +5,23 @@ import { createHash } from 'node:crypto'
 
 import { unzipSync, zipSync } from 'fflate/node'
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+// Only the default-lane snapshot reply is adapted. Production parser/classifier/export run;
+// this does not qualify Lua atomicity, and the real lane uses its real EVAL unchanged.
+vi.mock('../backupHairSnapshot', async (importOriginal) => {
+  const original = await importOriginal<typeof import('../backupHairSnapshot')>()
+  return { ...original, readHairBackupSnapshot: async (client: any) => {
+    if (process.env.VITEST_USE_REAL_REDIS === 'true') return original.readHairBackupSnapshot(client)
+    const { fakeHairSnapshotAnswer } = await import('./fixtures/hairSnapshotFake')
+    return original.readHairBackupSnapshot({ eval: () => fakeHairSnapshotAnswer(client) })
+  } }
+})
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { redis } from '$lib/server/redis'
+import { guardToolModelText } from '../toolModelResultGuard'
 import { mcpToolListCache } from '$lib/server/services/mcpToolListCache'
+import { executionViewerService } from '$lib/server/services/executionViewerService'
+import { captureRecipeVerificationEpoch, isRecipeVerificationEpochCurrent } from '../recipeVerificationEpoch.server'
+import { createRecipeStageAdmissionCache } from '../recipeStageAdmission.server'
 import {
   createDefaultFacialArtworkState,
   createFacialArtworkArtworkLayer,
@@ -44,7 +58,9 @@ import {
   recipeRevisionBundleSha256,
   recipeRevisionIdentity,
   recipeSiblingStateSha256,
-  recipeStateSnapshotSha256
+  recipeStateSnapshotSha256,
+  verifyGoonRecipeDocument,
+  verifyRecipeReviewedState
 } from '$lib/goons/recipe'
 import {
   agentRunCredentialKey,
@@ -67,6 +83,26 @@ import {
   __resetScheduleDueCacheForTests,
   listDueSchedules
 } from '$lib/server/services/schedules/scheduleStore'
+import {
+  __resetStreamAbortRegistryForTests,
+  queueSessionTurn,
+  registerSessionTurn,
+  releaseSessionTurn
+} from '$lib/server/services/streamAbortRegistry'
+import {
+  collectGoonUploadReferencesForClient,
+  hasGoonUploadReference
+} from '../goonAssetCleanupService'
+import {
+  listCoreSystemPromptDefinitions,
+  listCoreSystemPrompts,
+  reconcileCoreSystemPromptsAfterRestore,
+  resetCoreSystemPrompt,
+  saveCoreSystemPrompt
+} from '../systemPromptRegistry'
+
+const managedHelper = vi.hoisted(() => vi.fn())
+vi.mock('../localAiManagedProfiles', async original => ({ ...await original<typeof import('../localAiManagedProfiles')>(), managedProfileHelper: managedHelper }))
 
 useRedisTestServer()
 
@@ -558,11 +594,19 @@ async function seedRepresentativeData(userId: string) {
     },
     schema_version: 1
   })
-  // SA-120: the instance-level Jev Juice config rides the `settings` group.
+  // SA-120: the instance-level Judge Juice config rides the `settings` group.
   await redis.json.set('batshit:typesafe_config', '$', {
     enabled: true,
     modelId: 'jev-1.13.0',
     attemptTimeoutMs: 2500,
+    // SA-120 P10a: the judges ride the same record; none of their fields is a secret (keys live in api_keys).
+    providers: [
+      { id: 'ollama-pc', kind: 'ollama', label: 'Ollama on the PC', baseUrl: 'http://192.168.1.20:11434', modelId: 'clef-flash' },
+      { id: 'cf', kind: 'cloudflare', label: 'Cloudflare', accountId: '0123456789abcdef0123456789abcdef', modelId: 'clef' },
+      { id: 'liquid', kind: 'systemone_url', label: 'Liquid AI', baseUrl: 'https://api.liquid.ai/decisions', modelId: 'lfm2-d1', sendsKey: true }
+    ],
+    defaultProviderId: 'ollama-pc',
+    laneProviders: { untrusted_text: 'liquid' },
     updatedAt: '2026-09-16T12:00:00.000Z'
   })
   await redis.json.set('batshit:memory_index_meta', '$', {
@@ -656,6 +700,13 @@ async function seedRepresentativeData(userId: string) {
 
 describe('backupRestoreService', () => {
   beforeEach(async () => {
+    managedHelper.mockReset()
+    vi.stubEnv('BATSHIT_TOKEN', 'backup-restore-test-service-token')
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {
+      expect(url).toMatch(/\/api\/upload\/asset-maintenance\/(begin|end)$/)
+      const { token } = JSON.parse(String(init.body))
+      return Response.json({ success: true, token, state: url.endsWith('/begin') ? 'created' : 'released', activeOperations: 0 })
+    }))
     previousUploadsDir = process.env.UPLOADS_DIR
     previousPublicServerUrl = process.env.PUBLIC_BATSHIT_SERVER_URL
     previousContainerized = process.env.BATSHIT_CONTAINERIZED
@@ -673,6 +724,8 @@ describe('backupRestoreService', () => {
   })
 
   afterEach(async () => {
+    vi.unstubAllGlobals()
+    vi.unstubAllEnvs()
     if (previousUploadsDir === undefined) {
       delete process.env.UPLOADS_DIR
     } else {
@@ -747,7 +800,7 @@ describe('backupRestoreService', () => {
     }
   })
 
-  it('files the Jev Juice config under the `settings` group, not the `chats` fall-through (SA-120)', async () => {
+  it('files the Judge Juice config under the `settings` group, not the `chats` fall-through (SA-120)', async () => {
     await seedRepresentativeData('source')
 
     const bundle = await createBackupBundle('source')
@@ -759,9 +812,100 @@ describe('backupRestoreService', () => {
 
     expect(grouped).toHaveLength(1)
     expect(grouped[0].groupId).toBe('settings')
+    // SA-120 P10a: a normal (secret-free) export keeps every judge field; the secret-field rule nulls none of them.
+    const exported = JSON.stringify(grouped[0])
+    expect(exported).toContain('"sendsKey":true')
+    expect(exported).toContain('"accountId":"0123456789abcdef0123456789abcdef"')
+    expect(exported).toContain('"baseUrl":"http://192.168.1.20:11434"')
+    expect(exported).toContain('"laneProviders":{"untrusted_text":"liquid"}')
+    expect(bundle.manifest.secrets.redactedPaths.filter((entry: string) => entry.includes('batshit:typesafe_config'))).toEqual([])
   })
 
-  it('carries the Jev Juice after-reply records with their chat, in the `chats` group, and restores them (SA-120 P6)', async () => {
+  it.each(['missing-field', 'missing-provider'])('keeps old host authority inactive across restore/delete/recreate: %s', async shape => {
+    vi.stubEnv('BATSHIT_RUNTIME_OWNER', 'mac-app')
+    const servers = await import('../localAiServers')
+    const management = await import('../localAiModelManagement')
+    const id = '11111111-1111-4111-8111-111111111111'
+    const modelId = '22222222-2222-4222-8222-222222222222'
+    let generation = '33333333-3333-4333-8333-333333333333'
+    let grantGeneration = generation
+    let revoked = false
+    const setup = () => ({ registrationId: id, generationId: grantGeneration, createdAt: '2026-10-04T14:00:00Z',
+      models: [{ id: modelId, nativeRef: 'Qwen.gguf', servedName: 'custom', baseConfig: `batshit-managed/base-${modelId}.kcpps` }] })
+    await seedRepresentativeData('source')
+    if (shape === 'missing-field') await redis.json.set('local_provider:source:koboldcpp', '$', { id: 'koboldcpp', baseUrl: 'http://localhost:5001', openaiPath: '/v1', enabled: true })
+    const bundle = await createBackupBundle('source')
+    await servers.saveLocalAiServers('target', [{ id: 'koboldcpp', baseUrl: 'http://localhost:5001', enabled: true }])
+    await servers.saveKoboldManagedProfileReference('target', { version: 1, registrationId: id, state: 'active' })
+    managedHelper.mockImplementation(async (action, input) => {
+      if (action === 'fence-restore') {
+        expect(await redis.json.get('local_provider:target:koboldcpp')).toMatchObject({ managedProfile: { registrationId: id } })
+        expect(input).toMatchObject({ userId: 'target', operationId: expect.stringMatching(/^[a-f0-9-]{36}$/) })
+        generation = input.operationId
+        return { generationId: generation, retainedFiles: true }
+      }
+      if (action === 'revoke-owner') { revoked = true; return { revoked: [id], retainedFiles: true } }
+      if (action === 'list') return { registrations: revoked || grantGeneration !== generation ? [] : [setup()], reenrollmentRequired: grantGeneration !== generation }
+      if (action === 'validate') {
+        if (revoked || grantGeneration !== generation) throw new Error('Host grant inactive; explicit re-enrollment required')
+        return setup()
+      }
+      throw new Error(`Unexpected managed action ${action}`)
+    })
+    await restoreBackupBundle('target', bundle.bytes, { confirmReplace: true })
+    if (shape === 'missing-field') expect(await redis.json.get('local_provider:target:koboldcpp')).toMatchObject({ managedProfile: { registrationId: null, state: 'reenrollment-required' } })
+    const { deleteLocalAiServer } = await import('../localAiServerDeletion')
+    await deleteLocalAiServer('target', 'koboldcpp')
+    expect(managedHelper).toHaveBeenCalledWith('revoke-owner', { userId: 'target', requireState: shape === 'missing-field' })
+    await servers.saveLocalAiServers('target', [{ id: 'koboldcpp', baseUrl: 'http://localhost:5001', enabled: true }])
+    const previousFetch = globalThis.fetch
+    vi.stubGlobal('fetch', vi.fn(async (url, init) => {
+      const route = new URL(String(url)).pathname
+      if (route === '/api/extra/version') return Response.json({ admin: 2, router: false, llm: true })
+      if (route === '/api/admin/list_options') return Response.json(['Qwen.gguf', `batshit-managed/base-${modelId}.kcpps`, 'initial_model', 'unload_model'])
+      if (route === '/v1/models') return Response.json({ data: [{ id: 'koboldcpp/custom' }] })
+      if (route === '/api/extra/true_max_context_length') return Response.json({ value: 65536 })
+      if (route === '/api/extra/perf') return Response.json({ idle: 1, queue: 0, uptime: 100 })
+      return previousFetch(url as string, init as RequestInit)
+    }))
+    const state = await management.readLocalAiManagement('target', 'koboldcpp')
+    expect(state.registeredSetup).toBeUndefined()
+    await expect(management.enableKoboldManagedSetup('target', id, state.connectionKey!)).rejects.toThrow('re-enrollment')
+    expect(await redis.json.get('local_provider:target:koboldcpp')).not.toHaveProperty('managedProfile')
+    // Explicit new host enrollment binds this generation even at an equal clock.
+    grantGeneration = generation; revoked = false
+    expect((await management.enableKoboldManagedSetup('target', id, state.connectionKey!)).success).toBe(true)
+    expect(await redis.json.get('local_provider:target:koboldcpp')).toMatchObject({ managedProfile: { state: 'active' } })
+  })
+
+  it('refuses destructive restore when durable host fencing fails', async () => {
+    vi.stubEnv('BATSHIT_RUNTIME_OWNER', 'mac-app')
+    await seedRepresentativeData('source')
+    const bundle = await createBackupBundle('source')
+    await redis.json.set('local_provider:target:koboldcpp', '$', { id: 'koboldcpp', baseUrl: 'http://localhost:5001', managedProfile: { version: 1, registrationId: 'old-grant', state: 'active' } })
+    managedHelper.mockRejectedValue(new Error('Host generation custody unknown'))
+    await expect(restoreBackupBundle('target', bundle.bytes, { confirmReplace: true })).rejects.toThrow('custody unknown')
+    expect(await redis.json.get('local_provider:target:koboldcpp')).toMatchObject({ managedProfile: { registrationId: 'old-grant' } })
+    expect(await redis.json.get('user:target:agents')).toBeNull()
+    expect(managedHelper).toHaveBeenCalledOnce()
+  })
+
+  it('restores managed context preferences inactive without restoring a host grant', async () => {
+    await seedRepresentativeData('source')
+    await redis.json.set('local_provider:source:koboldcpp', '$', {
+      id: 'koboldcpp', baseUrl: 'http://localhost:5001', openaiPath: '/v1', enabled: true,
+      managedProfile: { version: 1, registrationId: '11111111-1111-4111-8111-111111111111', state: 'active', desired: { modelId: 'model', contextTokens: 60000 } }
+    })
+    const bundle = await createBackupBundle('source')
+    const names = Object.keys(unzipSync(bundle.bytes))
+    expect(names.some(name => name.includes('koboldcpp-managed-profiles') || name.includes('batshit-managed'))).toBe(false)
+    expect((await restoreBackupBundle('target', bundle.bytes, { confirmReplace: true })).restored).toBe(true)
+    expect(await redis.json.get('local_provider:target:koboldcpp')).toMatchObject({
+      baseUrl: 'http://localhost:5001', managedProfile: { version: 1, registrationId: null, state: 'reenrollment-required', desired: { contextTokens: 60000 }, restoredAt: expect.any(String) }
+    })
+  })
+
+  it('carries the Judge Juice after-reply records with their chat, in the `chats` group, and restores them (SA-120 P6)', async () => {
     // A new session-scoped key family owes backup a decision. These annotate a chat's replies
     // (the chip under them), so they travel with the chat: collected per session on the way
     // out, restorable on the way in.
@@ -794,6 +938,246 @@ describe('backupRestoreService', () => {
     expect(result.restored).toBe(true)
     expect(await redis.sMembers('jev_post_turn:sess_1')).toEqual(['msg_1'])
     expect(await redis.json.get('jev_post_turn_item:sess_1:msg_1')).toEqual(item)
+  })
+
+  it('carries one Codex cleanup warning with its reply in the chats group', async () => {
+    await seedRepresentativeData('source')
+    const warning = {
+      messageId: 'msg_1',
+      kind: 'unconfirmed_command_cleanup'
+    }
+    await redis.sAdd('codex_cleanup_warnings:sess_1', 'msg_1')
+    await redis.json.set('codex_cleanup_warning:sess_1:msg_1', '$', warning)
+    const bundle = await createBackupBundle('source')
+    const records = Object.entries(unzipSync(bundle.bytes))
+      .filter(([name]) => name.startsWith('redis/records/') && name.endsWith('.json'))
+      .map(([, bytes]) => JSON.parse(Buffer.from(bytes).toString('utf8')))
+      .filter((record) => String(record.key).startsWith('codex_cleanup_warning'))
+    expect(records.map((record) => [record.key, record.groupId]).sort()).toEqual([
+      ['codex_cleanup_warning:sess_1:msg_1', 'chats'],
+      ['codex_cleanup_warnings:sess_1', 'chats']
+    ])
+    await redis.del('codex_cleanup_warnings:sess_1')
+    await redis.del('codex_cleanup_warning:sess_1:msg_1')
+    expect((await restoreBackupBundle('target', bundle.bytes, { confirmReplace: true })).restored).toBe(true)
+    expect(await redis.sMembers('codex_cleanup_warnings:sess_1')).toEqual(['msg_1'])
+    expect(await redis.json.get('codex_cleanup_warning:sess_1:msg_1')).toEqual(warning)
+  })
+
+  it('carries where a reply\'s pictures came from with its chat, in the chats group (BL-474 step 2)', async () => {
+    await seedRepresentativeData('source')
+    const decided = {
+      messageId: 'msg_1',
+      version: 1,
+      state: 'decided',
+      textHashes: ['e'.repeat(64)],
+      lane: 'api',
+      complete: true,
+      addresses: { 'https://pictures.example.org/a.png': {
+        state: 'blocked', rule: 4,
+        evidence: { inRecord: false, startInRecord: false, sharesChatRun: false, complete: true }
+      } }
+    }
+    const pending = { messageId: 'msg_2', version: 1790000000000, state: 'pending' }
+    const replaySource = { textHash: 'a'.repeat(64), spans: [{ start: 0, end: 12, source: 'agent_note' }] }
+    const reply = await redis.json.get('message:sess_1:msg_1') as Record<string, any>
+    await redis.json.set('message:sess_1:msg_1', '$', { ...reply, metadata: {
+      ...(reply.metadata ?? {}), imageOriginExpected: true, imageOriginExpectedVersion: 1,
+      providerUserSources: [replaySource]
+    } })
+    await redis.sAdd('image_origins:sess_1', 'msg_1')
+    await redis.sAdd('image_origins:sess_1', 'msg_2')
+    await redis.json.set('image_origin:sess_1:msg_1', '$', decided)
+    await redis.json.set('image_origin:sess_1:msg_2', '$', pending)
+    const bundle = await createBackupBundle('source')
+    const records = Object.entries(unzipSync(bundle.bytes))
+      .filter(([name]) => name.startsWith('redis/records/') && name.endsWith('.json'))
+      .map(([, bytes]) => JSON.parse(Buffer.from(bytes).toString('utf8')))
+      .filter((record) => String(record.key).startsWith('image_origin'))
+    expect(records.map((record) => [record.key, record.groupId]).sort()).toEqual([
+      ['image_origin:sess_1:msg_1', 'chats'],
+      ['image_origin:sess_1:msg_2', 'chats'],
+      ['image_origins:sess_1', 'chats']
+    ])
+    await redis.del('image_origins:sess_1')
+    await redis.del('image_origin:sess_1:msg_1')
+    await redis.del('image_origin:sess_1:msg_2')
+    expect((await restoreBackupBundle('target', bundle.bytes, { confirmReplace: true })).restored).toBe(true)
+    expect((await redis.sMembers('image_origins:sess_1')).sort()).toEqual(['msg_1', 'msg_2'])
+    expect(await redis.json.get('image_origin:sess_1:msg_1')).toEqual(decided)
+    expect(await redis.json.get('image_origin:sess_1:msg_2')).toEqual(pending)
+    expect((await redis.json.get('message:sess_1:msg_1') as any).metadata).toMatchObject({
+      imageOriginExpected: true, imageOriginExpectedVersion: 1, providerUserSources: [replaySource]
+    })
+  })
+
+  it('backs up and restores a size-guard raw copy and its chat index before the reply is saved', async () => {
+    if (process.env.VITEST_USE_REAL_REDIS !== 'true') vi.stubEnv('VITEST_FAKE_RETAINED_OUTPUT_EVAL', 'true')
+    await seedRepresentativeData('source')
+    const content = 'retained output line\n'.repeat(6_000)
+    await guardToolModelText(content, {
+      userId: 'source', sessionId: 'sess_1', messageId: 'unfinished-reply', agentId: 'agent_1'
+    })
+    const [zipId] = await redis.sMembers('session:sess_1:zips')
+    const bundle = await createBackupBundle('source')
+    const records = Object.entries(unzipSync(bundle.bytes))
+      .filter(([name]) => name.startsWith('redis/records/') && name.endsWith('.json'))
+      .map(([, bytes]) => JSON.parse(Buffer.from(bytes).toString('utf8')))
+    expect(records.find((record) => record.key === `zip:${zipId}`)?.groupId).toBe('chats')
+    expect(records.some((record) => record.key === 'session:sess_1:zips')).toBe(true)
+
+    await redis.del(`zip:${zipId}`)
+    await redis.del('session:sess_1:zips')
+    expect((await restoreBackupBundle('target', bundle.bytes, { confirmReplace: true })).restored).toBe(true)
+    expect(await redis.getZip(zipId)).toMatchObject({ content, type: 'tool_raw', metadata: {
+      userId: 'target', sessionId: 'sess_1', messageId: 'unfinished-reply', agentId: 'agent_1', retainedForSizeGuard: true
+    } })
+    expect(await redis.sMembers('session:sess_1:zips')).toContain(zipId)
+  })
+
+  it("carries an agent's hold with its path and agent id, in the `chats` group, and restores it exactly (SA-129 P2b, BL-359)", async () => {
+    // P2 added `path` and `agentId` to `unzipped_item`. There is no shape check to add them to:
+    // backup copies the whole record and restore rewrites only user id fields, so both come back
+    // exactly. This pins that, since the hold follows the file and releases by these two fields.
+    await seedRepresentativeData('source')
+    const agentHold = {
+      zipId: 'cool_tool_1790700000000_hold1',
+      sessionId: 'sess_1',
+      permanent: true,
+      unzippedAt: 1790700000000,
+      source: 'agent',
+      path: 'src/app.ts',
+      agentId: 'agent_1',
+      name: 'read_file',
+      tokens: 42
+    }
+    const userCountdown = {
+      zipId: 'cool_tool_1790700000000_hold2',
+      sessionId: 'sess_1',
+      permanent: false,
+      duration: 10,
+      messageCount: 3,
+      unzippedAt: 1790700000001,
+      source: 'user'
+    }
+    await redis.sAdd('unzipped:sess_1', agentHold.zipId)
+    await redis.sAdd('unzipped:sess_1', userCountdown.zipId)
+    await redis.set(`unzipped_item:sess_1:${agentHold.zipId}`, agentHold)
+    await redis.set(`unzipped_item:sess_1:${userCountdown.zipId}`, userCountdown)
+
+    const bundle = await createBackupBundle('source')
+    const records = Object.entries(unzipSync(bundle.bytes))
+      .filter(([name]) => name.startsWith('redis/records/') && name.endsWith('.json'))
+      .map(([, bytes]) => JSON.parse(Buffer.from(bytes).toString('utf8')))
+      .filter((record) => String(record.key).startsWith('unzipped'))
+    expect(records.map((record) => [record.key, record.groupId]).sort()).toEqual([
+      ['unzipped:sess_1', 'chats'],
+      [`unzipped_item:sess_1:${agentHold.zipId}`, 'chats'],
+      [`unzipped_item:sess_1:${userCountdown.zipId}`, 'chats']
+    ])
+
+    await redis.del('unzipped:sess_1')
+    await redis.del(`unzipped_item:sess_1:${agentHold.zipId}`)
+    await redis.del(`unzipped_item:sess_1:${userCountdown.zipId}`)
+    const result = await restoreBackupBundle('target', bundle.bytes, { confirmReplace: true })
+    expect(result.restored).toBe(true)
+    expect((await redis.sMembers('unzipped:sess_1')).sort()).toEqual([agentHold.zipId, userCountdown.zipId].sort())
+    expect(await redis.get(`unzipped_item:sess_1:${agentHold.zipId}`)).toEqual(agentHold)
+    expect(await redis.get(`unzipped_item:sess_1:${userCountdown.zipId}`)).toEqual(userCountdown)
+  })
+
+  describe('a list with one entry stays a list (BL-128)', () => {
+    // The three key families that store a list at the root. With one entry each: a chat
+    // after its first run, one artifact in the panel, and a Subagent thread of one message.
+    const RUN = {
+      id: 'msg_run_1',
+      sessionId: 'sess_1',
+      userId: 'source',
+      agentId: 'agent_1',
+      createdAt: '2026-09-22T12:00:00.000Z'
+    }
+    const THREAD_MESSAGE = { role: 'user', content: 'Find the invoice from March.' }
+
+    async function seedOneEntryLists() {
+      await seedRepresentativeData('source')
+      await redis.json.set('session:sess_1:execution_log', '$', [RUN])
+      await redis.json.set('user:source:artifact_order:panel', '$', ['artifact_1'])
+      await redis.json.set('subagent_sessions:sess_1:subagent:researcher', '$', [THREAD_MESSAGE])
+    }
+
+    function exportedRecords(bytes: Uint8Array) {
+      const entries = unzipSync(bytes)
+      return new Map(
+        Object.entries(entries)
+          .filter(([name]) => name.startsWith('redis/records/') && name.endsWith('.json'))
+          .map(([name, entryBytes]) => {
+            const record = JSON.parse(Buffer.from(entryBytes).toString('utf8'))
+            return [record.key as string, { name, record }]
+          })
+      )
+    }
+
+    async function expectListsReadable() {
+      // The Execution Viewer is the reader that lost the run: it reads nothing but a list.
+      const snapshots = await executionViewerService.getSnapshots('sess_1')
+      expect(snapshots.map((snapshot) => snapshot.id)).toEqual(['msg_run_1'])
+      expect(await redis.json.get('user:target:artifact_order:panel')).toEqual(['artifact_1'])
+      expect(await redis.json.get('subagent_sessions:sess_1:subagent:researcher')).toEqual([
+        THREAD_MESSAGE
+      ])
+    }
+
+    it('saves each one as a list and restores it readable', async () => {
+      await seedOneEntryLists()
+
+      const bundle = await createBackupBundle('source')
+      const records = exportedRecords(bundle.bytes)
+      expect(records.get('session:sess_1:execution_log')?.record.value).toEqual([RUN])
+      expect(records.get('user:source:artifact_order:panel')?.record.value).toEqual(['artifact_1'])
+      expect(records.get('subagent_sessions:sess_1:subagent:researcher')?.record.value).toEqual([
+        THREAD_MESSAGE
+      ])
+
+      const preflight = await preflightBackupRestore('target', bundle.bytes)
+      expect(preflight.warnings.join('\n')).not.toContain('one-item')
+
+      const result = await restoreBackupBundle('target', bundle.bytes, { confirmReplace: true })
+      expect(result.restored).toBe(true)
+      await expectListsReadable()
+    })
+
+    it('puts one an older backup saved as a single item back in its list, and says so', async () => {
+      await seedOneEntryLists()
+      const bundle = await createBackupBundle('source')
+
+      // Rebuild the archive the way export wrote it before BL-128: each one-entry list as
+      // the entry itself. Nothing else in the archive changes.
+      const entries = { ...unzipSync(bundle.bytes) }
+      const records = exportedRecords(bundle.bytes)
+      for (const key of [
+        'session:sess_1:execution_log',
+        'user:source:artifact_order:panel',
+        'subagent_sessions:sess_1:subagent:researcher'
+      ]) {
+        const found = records.get(key)
+        expect(found, key).toBeDefined()
+        const flattened = { ...found!.record, value: found!.record.value[0] }
+        entries[found!.name] = new Uint8Array(Buffer.from(JSON.stringify(flattened), 'utf8'))
+      }
+      const olderBytes = zipSync(entries)
+
+      const preflight = await preflightBackupRestore('target', olderBytes)
+      expect(preflight.ok).toBe(true)
+      expect(preflight.warnings).toContain(
+        "An older Batshit saved 3 one-item lists in this backup as a single item (a chat's Execution Viewer log after one run, an artifact order, or a Subagent thread). Restore puts them back as lists."
+      )
+
+      const result = await restoreBackupBundle('target', olderBytes, { confirmReplace: true })
+      expect(result.restored).toBe(true)
+      await expectListsReadable()
+      // A record whose value is an object is restored as saved, never put in a list.
+      expect(await redis.json.get('session:sess_1')).toMatchObject({ id: 'sess_1', title: 'Backup Chat' })
+    })
   })
 
   it("throws the restored user's saved tool lists away, because gateways and keys were replaced around the gateway service", async () => {
@@ -867,6 +1251,72 @@ describe('backupRestoreService', () => {
     await expect(
       restoreBackupBundle('target', zipSync(entries), { confirmReplace: true })
     ).rejects.toThrow(/will not restore/i)
+  })
+
+  it('never carries the Dev switch "Use paused plans on this copy" into another copy (plan pause)', async () => {
+    // A setting of ONE copy: Josh's own Dev copy may switch the plan pause off,
+    // and a backup restored on any other copy must not bring that switch along.
+    await seedRepresentativeData('source')
+    const switchKey = 'batshit:dev:paused_plans'
+    await redis.json.set(switchKey, '$', { usePausedPlans: true, updatedAt: 'zcpause' } as never)
+
+    const bundle = await createBackupBundle('source')
+    const entries = unzipSync(bundle.bytes)
+    const records = Object.entries(entries)
+      .filter(([name]) => name.startsWith('redis/records/') && name.endsWith('.json'))
+      .map(([name, value]) => {
+        delete entries[name]
+        return JSON.parse(Buffer.from(value).toString('utf8')) as Record<string, any>
+      })
+    expect(records.map((record) => record.key)).not.toContain(switchKey)
+
+    records.push({ key: switchKey, type: 'json', groupId: 'settings', value: { usePausedPlans: true } })
+    records.forEach((record, index) => {
+      entries[`redis/records/${String(index + 1).padStart(8, '0')}.json`] = Buffer.from(
+        JSON.stringify(record)
+      )
+    })
+    const manifest = JSON.parse(Buffer.from(entries['manifest.json']).toString('utf8'))
+    manifest.contents.redisRecordCount = records.length
+    entries['manifest.json'] = Buffer.from(JSON.stringify(manifest))
+    await redis.del(switchKey)
+
+    await expect(
+      restoreBackupBundle('target', zipSync(entries), { confirmReplace: true })
+    ).rejects.toThrow(/will not restore/i)
+    expect(await redis.exists(switchKey)).toBeFalsy()
+  })
+
+  it('excludes Goon file-operation authority from export and refuses it in a hand-built import', async () => {
+    await seedRepresentativeData('source')
+    const authorityKeys = [
+      `goon_asset_delete:goon_custom_models:${'a'.repeat(64)}.glb`,
+      'goon_asset_restore',
+      'goon_asset_restore_done:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    ]
+    for (const key of authorityKeys) await redis.set(key, 'local-operation-authority')
+    const bundle = await createBackupBundle('source')
+    const originalEntries = unzipSync(bundle.bytes)
+    const exportedKeys = Object.entries(originalEntries)
+      .filter(([name]) => name.startsWith('redis/records/') && name.endsWith('.json'))
+      .map(([, bytes]) => JSON.parse(Buffer.from(bytes).toString('utf8')).key as string)
+    for (const key of authorityKeys) {
+      expect(exportedKeys).not.toContain(key)
+      await redis.del(key)
+    }
+    for (const key of authorityKeys) {
+      const entries = { ...originalEntries }
+      const manifest = JSON.parse(Buffer.from(entries['manifest.json']).toString('utf8'))
+      const count = manifest.contents.redisRecordCount + 1
+      entries[`redis/records/${String(count).padStart(8, '0')}.json`] = Buffer.from(JSON.stringify({
+        key, type: 'string', value: 'forged-operation-authority', ttlSeconds: null, groupId: 'goons'
+      }))
+      manifest.contents.redisRecordCount = count
+      entries['manifest.json'] = Buffer.from(JSON.stringify(manifest))
+      await expect(restoreBackupBundle('target', zipSync(entries), { confirmReplace: true }))
+        .rejects.toThrow(/will not restore/i)
+      expect(await redis.exists(key)).toBe(false)
+    }
   })
 
   it('can include encrypted secret records only when requested', async () => {
@@ -1045,6 +1495,17 @@ describe('backupRestoreService', () => {
     expect(restoredMemoryConfig.embedding.lane).toBe('local-ai')
     const restoredTypesafeConfig = (await redis.json.get('batshit:typesafe_config')) as Record<string, any>
     expect(restoredTypesafeConfig).toMatchObject({ enabled: true, modelId: 'jev-1.13.0', attemptTimeoutMs: 2500 })
+    // SA-120 P10a: the judges, the default, and the per-feature choices come back exactly.
+    expect(restoredTypesafeConfig.providers).toHaveLength(3)
+    expect(restoredTypesafeConfig.providers[2]).toEqual({
+      id: 'liquid',
+      kind: 'systemone_url',
+      label: 'Liquid AI',
+      baseUrl: 'https://api.liquid.ai/decisions',
+      modelId: 'lfm2-d1',
+      sendsKey: true
+    })
+    expect(restoredTypesafeConfig).toMatchObject({ defaultProviderId: 'ollama-pc', laneProviders: { untrusted_text: 'liquid' } })
     const restoredMemoryMeta = (await redis.json.get('batshit:memory_index_meta')) as Record<string, any>
     expect(restoredMemoryMeta.dims).toBe(4)
     const restoredEpisode = (await redis.json.get('episode:sess_1:ep_1')) as Record<string, any>
@@ -1155,7 +1616,10 @@ describe('backupRestoreService', () => {
     const savedToolList = { userId: 'target', gatewayId: 'gw-docker', inputs: { probe: 'staged' } }
     await mcpToolListCache.read(savedToolList, async () => ({ ok: true, tools: [] }))
 
+    const recipeEpoch = captureRecipeVerificationEpoch()
     const result = await restoreStagedBackup('target', stageId, { confirmReplace: true })
+    expect(isRecipeVerificationEpochCurrent(recipeEpoch)).toBe(false)
+    expect(captureRecipeVerificationEpoch()).not.toBeNull()
     expect(result).toMatchObject({ restored: true, fileAssetCount: 4, targetUserId: 'target' })
     // The restore replaced the gateways and API keys around the gateway service, so the
     // next send asks every tool server again.
@@ -1201,20 +1665,30 @@ describe('backupRestoreService', () => {
       path.join(backupStagingRoot, `${storageKey}.rollback.ndjson`),
       `${JSON.stringify(originalRecord)}\n`
     )
+    const originalStat = await fs.lstat(path.join(oldRoot, 'before.txt'), { bigint: true })
+    const identifyRecord = (record: unknown) => {
+      const bytes = Buffer.from(`${JSON.stringify(record)}\n`)
+      return { bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') }
+    }
     await fs.writeFile(
       path.join(backupStagingRoot, `${storageKey}.restore-journal.json`),
       `${JSON.stringify({
-        contract: 'batshit-backup-restore-journal/v1',
+        contract: 'batshit-backup-restore-journal/v2',
         stageId,
         userId: 'target',
         phase: 'redis-replacing',
         hadOriginalUploads: true,
+        originalUploadEntries: [{ name: 'before.txt', device: String(originalStat.dev), inode: String(originalStat.ino) }],
+        redisRecoveryFiles: { plan: identifyRecord(targetRecord), rollback: identifyRecord(originalRecord) },
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       })}\n`
     )
 
+    const recipeEpoch = captureRecipeVerificationEpoch()
     await ensureBackupRestoreRecovery()
+    expect(isRecipeVerificationEpochCurrent(recipeEpoch)).toBe(false)
+    expect(captureRecipeVerificationEpoch()).not.toBeNull()
 
     await expect(redis.json.get(originalRecord.key)).resolves.toMatchObject({
       displayName: 'Before Restore'
@@ -1226,6 +1700,37 @@ describe('backupRestoreService', () => {
     await expect(
       fs.stat(path.join(backupStagingRoot, `${storageKey}.restore-journal.json`))
     ).rejects.toThrow()
+  })
+
+  it.each(['redis-complete', 'rollback-complete'] as const)('retains journal and barrier when %s cleanup fails', async (phase) => {
+    const stageId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+    const storageKey = createHash('sha256').update(stageId).digest('hex')
+    const journalPath = path.join(backupStagingRoot, `${storageKey}.restore-journal.json`)
+    const rollbackPath = path.join(backupStagingRoot, `${storageKey}.rollback.ndjson`)
+    await fs.writeFile(journalPath, JSON.stringify({
+      contract: 'batshit-backup-restore-journal/v1', stageId, userId: 'target',
+      phase, hadOriginalUploads: true,
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
+    }))
+    await fs.writeFile(path.join(uploadRoot, 'settled.txt'), 'settled files must survive cleanup retry')
+    const originalRm = fs.rm.bind(fs)
+    const remove = vi.spyOn(fs, 'rm').mockImplementation(async (target, options) => {
+      if (target === rollbackPath) throw new Error('injected cleanup failure')
+      return originalRm(target, options)
+    })
+    try {
+      await expect(ensureBackupRestoreRecovery()).rejects.toThrow('injected cleanup failure')
+      expect(await fs.readFile(journalPath, 'utf8')).toContain(phase)
+      expect(await fs.readFile(path.join(backupStagingRoot, 'goon-asset-restore.json'), 'utf8')).toContain('goon-asset-restore/v1')
+      expect(vi.mocked(fetch).mock.calls.map(([url]) => String(url).split('/').at(-1))).toEqual(['begin'])
+    } finally {
+      remove.mockRestore()
+    }
+    await ensureBackupRestoreRecovery()
+    await expect(fs.stat(journalPath)).rejects.toThrow()
+    expect(await fs.readFile(path.join(uploadRoot, 'settled.txt'), 'utf8')).toBe('settled files must survive cleanup retry')
+    await expect(fs.stat(path.join(backupStagingRoot, 'goon-asset-restore.json'))).rejects.toThrow()
+    expect(vi.mocked(fetch).mock.calls.map(([url]) => String(url).split('/').at(-1))).toEqual(['begin', 'begin', 'end'])
   })
 
   it('drains active HTTP work and blocks new requests during restore maintenance', async () => {
@@ -1254,6 +1759,58 @@ describe('backupRestoreService', () => {
     releaseAfterMaintenance?.()
     releaseRestoreRequest?.()
   })
+
+  it('never waits for a chat’s line that holds for an approval card: its sends are kept like a shutdown’s (BL-713)', async () => {
+    __resetStreamAbortRegistryForTests()
+    const chat = 'bl713-restore-chat'
+    const reply = registerSessionTurn(chat, 'single', 'msg-card')
+    if (!reply.ok) throw new Error('expected the reply to register')
+    // A send waiting in the line holds the restore gate for its request (respond-async).
+    const releaseWaitingSend = enterBackupRestoreHttpRequest()
+    const waiting = queueSessionTurn(chat, { kind: 'single', messageId: 'msg-b-reply', userMessageId: 'msg-b' })
+    // Its request: a kept send moves its words and lets go at once; a send that runs holds the gate.
+    void waiting.outcome.then((handover) => {
+      if (handover.kind !== 'keep') return
+      releaseSessionTurn(chat, handover.entry.turnId)
+      releaseWaitingSend?.()
+    })
+    // The reply stops at a card: the line holds for the user's answer.
+    releaseSessionTurn(chat, reply.entry.turnId, { approvalCardMessageId: 'msg-card' })
+
+    const endMaintenance = await beginBackupRestoreMaintenance()
+    expect(await waiting.outcome).toMatchObject({ kind: 'keep', reason: 'shutdown' })
+    endMaintenance()
+    __resetStreamAbortRegistryForTests()
+  }, 10_000)
+
+  it('keeps a line whose hold forms while the restore drains (BL-713 review)', async () => {
+    __resetStreamAbortRegistryForTests()
+    const chat = 'bl713-restore-drain-chat'
+    // The restore's own request, the reply's request, and the waiting send's request all hold the gate.
+    const releaseRestoreRequest = enterBackupRestoreHttpRequest()
+    const reply = registerSessionTurn(chat, 'single', 'msg-card')
+    if (!reply.ok) throw new Error('expected the reply to register')
+    const releaseReplyRequest = enterBackupRestoreHttpRequest()
+    const releaseWaitingSend = enterBackupRestoreHttpRequest()
+    const waiting = queueSessionTurn(chat, { kind: 'single', messageId: 'msg-b-reply', userMessageId: 'msg-b' })
+    void waiting.outcome.then((handover) => {
+      if (handover.kind !== 'keep') return
+      releaseSessionTurn(chat, handover.entry.turnId)
+      releaseWaitingSend?.()
+    })
+
+    const maintenance = beginBackupRestoreMaintenance()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    // Only now does the reply stop at a card and let go: the hold forms during the drain.
+    releaseSessionTurn(chat, reply.entry.turnId, { approvalCardMessageId: 'msg-card' })
+    releaseReplyRequest?.()
+
+    const endMaintenance = await maintenance
+    expect(await waiting.outcome).toMatchObject({ kind: 'keep', reason: 'shutdown' })
+    endMaintenance()
+    releaseRestoreRequest?.()
+    __resetStreamAbortRegistryForTests()
+  }, 10_000)
 
   it('keeps user-owned seeded agents and models restorable', async () => {
     const sourceUserId = 'seed-user'
@@ -1392,7 +1949,7 @@ describe('backupRestoreService', () => {
     await expect(fs.readFile(refitSourcePath, 'utf8')).resolves.toBe('reusable-refit-bytes')
   })
 
-  it('backs up and remaps durable Recipe revisions, documents, and jobs', async () => {
+  it('backs up and remaps the supported durable Recipe graph', async () => {
     const sha = (value: string) => value.repeat(64)
     const source = {
       package: { ref: '/uploads/goon_custom_packages/source.bgoon', sha256: sha('1') },
@@ -1417,6 +1974,7 @@ describe('backupRestoreService', () => {
     }
     const previewState = {
       schemaVersion: 'backup-preview-state/v1',
+      definitionSha256: sha('5'),
       displayUrl: 'http://localhost:5606/uploads/goons/recipe-preview.png'
     }
     const state = {
@@ -1529,7 +2087,18 @@ describe('backupRestoreService', () => {
     const reviewedStateDocument = await createGoonRecipeDocument({
       userId: 'source',
       goonId: 'goon_recipe',
-      content: { contract: 'recipe-reviewed-state/v1' }
+      content: await verifyRecipeReviewedState({
+        contract: 'recipe-reviewed-state/v1',
+        reviewId: 'review-backup-fixture',
+        operation: 'package-update',
+        analysisId: 'analysis-backup-fixture',
+        planSha256: plan.planSha256,
+        containmentReceiptSha256: receiptDocument.sha256,
+        state,
+        adjustedControlIds: [],
+        confirmedControlIds: [],
+        cleanResetConfirmed: false
+      })
     })
     const receiptKey = `goon_recipe_document:source:goon_recipe:${receiptDocument.sha256}`
     const liveKey = `goon_recipe_document:source:goon_recipe:${liveDocument.sha256}`
@@ -1690,6 +2259,117 @@ describe('backupRestoreService', () => {
       expect.arrayContaining([revisionKey, receiptKey, jobKey])
     )
 
+    const editBundleRecords = (
+      bytes: Uint8Array,
+      edit: (records: Record<string, any>[]) => void
+    ) => {
+      const editedEntries = unzipSync(bytes)
+      const records = Object.entries(editedEntries)
+        .filter(([name]) => name.startsWith('redis/records/') && name.endsWith('.json'))
+        .map(([name, value]) => {
+          delete editedEntries[name]
+          return JSON.parse(Buffer.from(value).toString('utf8')) as Record<string, any>
+        })
+      edit(records)
+      records.forEach((record, index) => {
+        editedEntries[`redis/records/${String(index + 1).padStart(8, '0')}.json`] =
+          Buffer.from(JSON.stringify(record))
+      })
+      const manifest = JSON.parse(Buffer.from(editedEntries['manifest.json']).toString('utf8'))
+      manifest.contents.redisRecordCount = records.length
+      editedEntries['manifest.json'] = Buffer.from(JSON.stringify(manifest))
+      return zipSync(editedEntries)
+    }
+    const unsupportedProjection = editBundleRecords(bundle.bytes, records => {
+      records.find(record => record.key === revisionKey)!.value.localReviewEyeStateProjection = {
+        contract: 'recipe-local-review-eye-state-projection/v1'
+      }
+    })
+    const protectedTarget = { id: 'target', marker: 'preserve-before-refusal' }
+    await redis.json.set('user:target', '$', protectedTarget)
+    await expect(preflightBackupRestore('target', unsupportedProjection)).rejects.toThrow(/revision envelope/i)
+    await expect(restoreBackupBundle('target', unsupportedProjection, { confirmReplace: true })).rejects.toThrow(/revision envelope/i)
+    expect(await redis.json.get('user:target')).toEqual(protectedTarget)
+
+    for (const [field, documentKey] of [
+      ['reviewedState', reviewedStateKey],
+      ['migrationReport', reportKey]
+    ] as const) {
+      const missingDocument = editBundleRecords(bundle.bytes, records => {
+        records.splice(records.findIndex(record => record.key === documentKey), 1)
+      })
+      await expect(preflightBackupRestore('target', missingDocument)).rejects.toThrow(
+        /references missing JSON record/
+      )
+      const wrongHash = editBundleRecords(bundle.bytes, records => {
+        records.find(record => record.key === jobKey)!.value[field].sha256 = sha('0')
+      })
+      await expect(preflightBackupRestore('target', wrongHash)).rejects.toThrow(
+        /document contract, and hash/
+      )
+    }
+    // A valid outer content hash must not authorize repairing corrupt source
+    // state during target URL normalization.
+    for (const staleHash of ['sibling', 'snapshot'] as const) {
+      const content = structuredClone(reviewedStateDocument.content) as Record<string, any>
+      if (staleHash === 'sibling') content.state.siblings[0].stateSha256 = sha('0')
+      else content.state.stateSha256 = sha('0')
+      const corruptDocument = await createGoonRecipeDocument({
+        userId: 'source', goonId: 'goon_recipe', content
+      })
+      const corruptKey = `goon_recipe_document:source:goon_recipe:${corruptDocument.sha256}`
+      const corruptBundle = editBundleRecords(bundle.bytes, records => {
+        const document = records.find(record => record.key === reviewedStateKey)!
+        document.key = corruptKey
+        document.value = corruptDocument
+        records.find(record => record.key === jobKey)!.value.reviewedState = {
+          contract: corruptDocument.documentContract, ref: corruptKey, sha256: corruptDocument.sha256
+        }
+      })
+      await expect(preflightBackupRestore('target', corruptBundle)).rejects.toThrow(
+        /state hash mismatch|sibling .* hash mismatch/
+      )
+    }
+
+    const analysisDocument = await createGoonRecipeDocument({
+      userId: 'source', goonId: 'goon_recipe',
+      content: {
+        contract: 'recipe-update-analysis-context/v3',
+        analysisId: 'analysis-backup-fixture',
+        sourceRevision: revisionRef,
+        containmentReceipt: receiptRef,
+        basePlan: planRef,
+        siblingInputs: Object.fromEntries(['eyeAppearance', 'facialArtwork', 'oralAppearance'].map(id => [
+          id, { sourceStateId: null, targetStateId: null, targetDefinition: null, message: null }
+        ])),
+        externalSiblingInputs: [],
+        componentMapBundle: null
+      }
+    })
+    const analysisKey = `goon_recipe_document:source:goon_recipe:${analysisDocument.sha256}`
+    // This source-validation check does not claim that a restored migration
+    // analysis can resume: its source-state/proof bindings need separate coverage.
+    const missingPendingReview = editBundleRecords(bundle.bytes, records => {
+      records.splice(records.findIndex(record => record.key === jobKey), 1)
+      records.splice(records.findIndex(record => record.key === reviewedStateKey), 1)
+      records.push({
+        ...records.find(record => record.key === planKey)!,
+        key: analysisKey, value: analysisDocument
+      })
+      const owner = records.find(record => record.key === 'goon:goon_recipe')!.value.recipe
+      owner.liveStatus = 'up_to_date'
+      owner.pendingJob = null
+      owner.pendingAnalysis = {
+        analysisId: 'analysis-backup-fixture',
+        analysisRef: { contract: analysisDocument.documentContract, ref: analysisKey, sha256: analysisDocument.sha256 },
+        basePlan: planRef, selectedPlan: planRef, migrationReport: reportRef,
+        containmentReceipt: receiptRef, reviewedState: reviewedStateRef, targetWriteVersion: owner.writeVersion
+      }
+    })
+    await expect(preflightBackupRestore('target', missingPendingReview)).rejects.toThrow(
+      /pending analysis reviewedState references missing JSON record/
+    )
+
     const tamperedEntries = { ...entries }
     const revisionEntry = Object.entries(tamperedEntries).find(([, bytes]) => {
       try {
@@ -1789,6 +2469,25 @@ describe('backupRestoreService', () => {
       created_at: '2026-07-17T00:00:00.000Z',
       updated_at: '2026-07-17T00:00:00.000Z'
     })
+    for (const [field, document] of [
+      ['reviewedState', reviewedStateDocument],
+      ['migrationReport', reportDocument]
+    ] as const) {
+      const otherDocument = await createGoonRecipeDocument({
+        userId: 'source', goonId: 'other_recipe', content: document.content
+      })
+      const otherKey = `goon_recipe_document:source:other_recipe:${otherDocument.sha256}`
+      await redis.json.set(otherKey, '$', otherDocument)
+      const otherBundle = await createBackupBundle('source')
+      const crossLinkedDocument = editBundleRecords(otherBundle.bytes, records => {
+        records.find(record => record.key === jobKey)!.value[field] = {
+          contract: otherDocument.documentContract, ref: otherKey, sha256: otherDocument.sha256
+        }
+      })
+      await expect(preflightBackupRestore('target', crossLinkedDocument)).rejects.toThrow(
+        /Goon namespace/
+      )
+    }
     const crossLinkedGoon = (await redis.json.get('goon:goon_recipe')) as Record<string, any>
     crossLinkedGoon.recipe.activeRevision = otherRevisionRef
     await redis.json.set('goon:goon_recipe', '$', crossLinkedGoon)
@@ -1838,6 +2537,40 @@ describe('backupRestoreService', () => {
     expect(restoredJob.userId).toBe('target')
     expect(restoredJob.sourceRevision.ref).toBe(targetRevisionKey)
     expect(restoredJob.stagedSource.containmentReceipt.ref).toBe(targetReceiptKey)
+    const restoredReviewedDocument = await verifyGoonRecipeDocument(
+      await redis.json.get(restoredJob.reviewedState.ref)
+    )
+    const restoredReview = await verifyRecipeReviewedState(restoredReviewedDocument.content)
+    expect(restoredJob.reviewedState).toEqual({
+      contract: restoredReviewedDocument.documentContract,
+      ref: `goon_recipe_document:target:goon_recipe:${restoredReviewedDocument.sha256}`,
+      sha256: restoredReviewedDocument.sha256
+    })
+    expect(restoredReviewedDocument.sha256).not.toBe(reviewedStateDocument.sha256)
+    expect(restoredReview.state.stateSha256).not.toBe(state.stateSha256)
+    expect(restoredReview.state.siblings[0].stateSha256).not.toBe(state.siblings[0].stateSha256)
+    expect(restoredReview.state.siblings[0].state).toMatchObject({
+      displayUrl: '/uploads/goons/recipe-preview.png'
+    })
+    expect(restoredReview.state).toEqual(restoredGoon.recipe.authoringRevision.state)
+    expect(await redis.json.get(reviewedStateKey.replace(':source:', ':target:'))).toBeNull()
+    expect(restoredJob.migrationReport).toEqual({ ...reportRef, ref: reportKey.replace(':source:', ':target:') })
+
+    // A same-user restore can reproduce every owner/job field exactly. Record
+    // equality must still not preserve process-local numerical verification.
+    const sameUserBundle = await createBackupBundle('target')
+    const admissionKey = JSON.stringify({ owner: restoredGoon.recipe, job: restoredJob })
+    const admissionCache = createRecipeStageAdmissionCache()
+    const recipeEpoch = captureRecipeVerificationEpoch()
+    admissionCache.remember(admissionKey, 'a'.repeat(64), recipeEpoch)
+    await restoreBackupBundle('target', sameUserBundle.bytes, { confirmReplace: true })
+    const sameOwner = (await redis.json.get('goon:goon_recipe') as Record<string, any>).recipe
+    const sameJob = await redis.json.get(targetJobKey)
+    expect(sameOwner).toEqual(restoredGoon.recipe)
+    expect(sameJob).toEqual(restoredJob)
+    expect(admissionCache.take(JSON.stringify({ owner: sameOwner, job: sameJob }))).toBeNull()
+    expect(isRecipeVerificationEpochCurrent(recipeEpoch)).toBe(false)
+    expect(captureRecipeVerificationEpoch()).not.toBeNull()
   })
 
   it('rewrites imported project paths to the Docker workspace during containerized restore', async () => {
@@ -2048,6 +2781,352 @@ describe('backupRestoreService', () => {
 
     expect(preflight.ok).toBe(true)
     expect(preflight.redisRecordCount).toBe(records.length)
+  })
+
+  describe('bug batch 2026-09-27 (BL-370, BL-371, BL-372)', () => {
+    function exportedRecords(bytes: Uint8Array) {
+      const entries = unzipSync(bytes)
+      return Object.entries(entries)
+        .filter(([name]) => name.startsWith('redis/records/') && name.endsWith('.json'))
+        .map(([, entryBytes]) => JSON.parse(Buffer.from(entryBytes).toString('utf8'))) as Array<{
+        key: string
+        type: string
+        value: any
+        groupId: string
+      }>
+    }
+
+    /** Rebuild an archive without some records, as a backup from an older Batshit would be. */
+    function withoutRecords(bytes: Uint8Array, drop: (key: string) => boolean) {
+      const entries = { ...unzipSync(bytes) }
+      let removed = 0
+      for (const name of Object.keys(entries)) {
+        if (!name.startsWith('redis/records/') || !name.endsWith('.json')) continue
+        const record = JSON.parse(Buffer.from(entries[name]).toString('utf8'))
+        if (!drop(record.key)) continue
+        delete entries[name]
+        removed += 1
+      }
+      const manifest = JSON.parse(Buffer.from(entries['manifest.json']).toString('utf8'))
+      manifest.contents.redisRecordCount -= removed
+      entries['manifest.json'] = new Uint8Array(Buffer.from(JSON.stringify(manifest), 'utf8'))
+      return { bytes: zipSync(entries), removed }
+    }
+
+    it('carries the Motion Vault list in the `goons` group, restores it for the new user, and keeps its files referenced (BL-370)', async () => {
+      await fs.mkdir(path.join(uploadRoot, 'goon_animations'), { recursive: true })
+      await fs.writeFile(path.join(uploadRoot, 'goon_animations', 'wave.vrma'), 'vrma-bytes')
+      await redis.json.set('upload:goon_animations:wave.vrma', '$', {
+        filename: 'wave.vrma',
+        mimetype: 'application/octet-stream',
+        size: 10,
+        uploadType: 'goon_animations',
+        storage: 'filesystem',
+        relativePath: 'goon_animations/wave.vrma',
+        filePath: path.join(uploadRoot, 'goon_animations', 'wave.vrma')
+      })
+      await redis.json.set('user:source:goons_animation_library', '$', {
+        vrma: [
+          {
+            url: 'http://localhost:5606/uploads/goon_animations/wave.vrma',
+            filename: 'wave.vrma',
+            displayName: 'Wave'
+          }
+        ]
+      })
+
+      const bundle = await createBackupBundle('source')
+      const library = exportedRecords(bundle.bytes).find(
+        (record) => record.key === 'user:source:goons_animation_library'
+      )
+      expect(library, 'the Motion Vault list is in the backup').toBeDefined()
+      expect(library!.groupId).toBe('goons')
+
+      await redis.del('user:source:goons_animation_library')
+      await restoreBackupBundle('target', bundle.bytes, { confirmReplace: true })
+
+      const restored = (await redis.json.get('user:target:goons_animation_library')) as Record<string, any>
+      expect(restored?.vrma?.[0]).toMatchObject({
+        url: '/uploads/goon_animations/wave.vrma',
+        filename: 'wave.vrma',
+        displayName: 'Wave'
+      })
+      // Admin Goon Asset Cleanup finds Motion Vault files only through this key: without it
+      // the restored animation would be offered for deletion as an orphan.
+      const references = await redis.execute((client) =>
+        collectGoonUploadReferencesForClient(client as any, 'target')
+      )
+      expect(hasGoonUploadReference(references, 'goon_animations', 'wave.vrma')).toBe(true)
+    })
+
+    describe("a custom provider's Extra Headers (BL-371)", () => {
+      const SECRET_HEADER_VALUES = {
+        Authorization: 'Bearer zcbackup-gateway-bearer',
+        'cf-aig-authorization': 'Bearer zcbackup-cf-gateway',
+        'Ocp-Apim-Subscription-Key': 'zcbackup-apim-key',
+        'X-Custom-Tenant': 'zcbackup-tenant-value'
+      }
+
+      async function seedProviderWithHeaders(userId: string) {
+        await redis.sAdd(`user:${userId}:custom_providers`, 'custom_gateway')
+        await redis.json.set(`custom_provider:${userId}:custom_gateway`, '$', {
+          id: 'custom_gateway',
+          label: 'Gateway',
+          baseUrl: 'https://gateway.example.com/v1',
+          headers: {
+            ...SECRET_HEADER_VALUES,
+            'HTTP-Referer': 'https://batshit.ai',
+            'X-Title': 'Batshit'
+          },
+          apiKeyEncrypted: 'encrypted-custom',
+          apiKeyIv: 'iv-custom',
+          apiKeyAuthTag: 'tag-custom',
+          createdAt: '2026-09-27T00:00:00.000Z',
+          updatedAt: '2026-09-27T00:00:00.000Z'
+        })
+      }
+
+      it('leaves every header value out of a normal backup unless the header is on the reviewed allow-list', async () => {
+        await seedProviderWithHeaders('source')
+
+        const bundle = await createBackupBundle('source')
+        const provider = exportedRecords(bundle.bytes).find(
+          (record) => record.key === 'custom_provider:source:custom_gateway'
+        )
+        expect(provider!.value.headers).toEqual({
+          Authorization: null,
+          'cf-aig-authorization': null,
+          'Ocp-Apim-Subscription-Key': null,
+          'X-Custom-Tenant': null,
+          'HTTP-Referer': 'https://batshit.ai',
+          'X-Title': 'Batshit'
+        })
+        for (const name of Object.keys(SECRET_HEADER_VALUES)) {
+          expect(bundle.manifest.secrets.redactedPaths).toContain(
+            `custom_provider:source:custom_gateway.headers.${name}`
+          )
+        }
+        // No entry anywhere in the archive carries a header value.
+        const archiveText = Object.values(unzipSync(bundle.bytes))
+          .map((entryBytes) => Buffer.from(entryBytes).toString('utf8'))
+          .join('\n')
+        for (const secret of Object.values(SECRET_HEADER_VALUES)) {
+          expect(archiveText).not.toContain(secret)
+        }
+      })
+
+      it('keeps the header values in a With Secrets backup', async () => {
+        await seedProviderWithHeaders('source')
+
+        const bundle = await createBackupBundle('source', { includeSecrets: true })
+        const provider = exportedRecords(bundle.bytes).find(
+          (record) => record.key === 'custom_provider:source:custom_gateway'
+        )
+        expect(provider!.value.headers).toMatchObject(SECRET_HEADER_VALUES)
+      })
+
+      it('names the headers to enter again in the restore summary, and restores their names with no value', async () => {
+        await seedProviderWithHeaders('source')
+        const bundle = await createBackupBundle('source')
+
+        const preflight = await preflightBackupRestore('target', bundle.bytes)
+        const warning = preflight.warnings.find((entry) => entry.includes('"Gateway"'))
+        expect(warning).toBeDefined()
+        for (const name of Object.keys(SECRET_HEADER_VALUES)) {
+          expect(warning).toContain(name)
+        }
+        expect(warning).not.toContain('HTTP-Referer')
+
+        await restoreBackupBundle('target', bundle.bytes, { confirmReplace: true })
+        const restored = (await redis.json.get('custom_provider:target:custom_gateway')) as Record<string, any>
+        expect(restored.headers).toMatchObject({ Authorization: null, 'X-Title': 'Batshit' })
+      })
+    })
+
+    describe('core prompt metadata (BL-372)', () => {
+      let promptDefaultsDir: string
+
+      async function writeDefaults(version: string, keep: string[] = []) {
+        for (const definition of listCoreSystemPromptDefinitions()) {
+          const text = keep.includes(definition.id)
+            ? `${definition.id} default, unchanged across versions\n`
+            : `${definition.id} default ${version}\n`
+          await fs.writeFile(path.join(promptDefaultsDir, definition.defaultFile), text)
+        }
+      }
+
+      beforeEach(async () => {
+        promptDefaultsDir = await fs.mkdtemp(path.join(os.tmpdir(), 'batshit-prompt-defaults-'))
+        vi.stubEnv('BATSHIT_SYSTEM_PROMPTS_DIR', promptDefaultsDir)
+      })
+
+      afterEach(async () => {
+        await fs.rm(promptDefaultsDir, { recursive: true, force: true })
+      })
+
+      function summaryOf(summaries: Awaited<ReturnType<typeof listCoreSystemPrompts>>, id: string) {
+        return summaries.find((summary) => summary.id === id)!
+      }
+
+      it('carries the metadata beside each prompt, so an older default is refreshed after the restore', async () => {
+        await writeDefaults('v1')
+        await listCoreSystemPrompts()
+        const bundle = await createBackupBundle('source')
+        const meta = exportedRecords(bundle.bytes).find(
+          (record) => record.key === 'batshit:system_prompt_meta:api_primary'
+        )
+        expect(meta, 'the prompt metadata is in the backup').toBeDefined()
+        expect(meta!.groupId).toBe('prompts')
+
+        // The app is updated: new defaults, and this instance refreshes to them.
+        await writeDefaults('v2')
+        await listCoreSystemPrompts()
+
+        await restoreBackupBundle('target', bundle.bytes, { confirmReplace: true })
+
+        // Right away, not at the next start: agents compile from the stored text.
+        expect(await redis.get('batshit:batshit_mode3_system_prompt')).toBe('api_primary default v2\n')
+        const summary = summaryOf(await listCoreSystemPrompts(), 'api_primary')
+        expect(summary).toMatchObject({ matchesDefault: true, customized: false, newDefaultAvailable: false })
+      })
+
+      it("keeps the user's own edit and says a new default is available", async () => {
+        await writeDefaults('v1')
+        await listCoreSystemPrompts()
+        await saveCoreSystemPrompt('api_primary', 'my own API prompt\n')
+        const bundle = await createBackupBundle('source')
+
+        await writeDefaults('v2')
+        await listCoreSystemPrompts()
+        await resetCoreSystemPrompt('api_primary')
+
+        await restoreBackupBundle('target', bundle.bytes, { confirmReplace: true })
+
+        expect(await redis.get('batshit:batshit_mode3_system_prompt')).toBe('my own API prompt\n')
+        const summary = summaryOf(await listCoreSystemPrompts(), 'api_primary')
+        expect(summary).toMatchObject({ customized: true, newDefaultAvailable: true })
+      })
+
+      it('drops the instance\'s own metadata when an older backup has none, and says which prompts it cannot place', async () => {
+        await writeDefaults('v1', ['dynamic_mcp'])
+        await listCoreSystemPrompts()
+        const original = await createBackupBundle('source')
+        const older = withoutRecords(original.bytes, (key) => key.startsWith('batshit:system_prompt_meta:'))
+        expect(older.removed).toBe(listCoreSystemPromptDefinitions().length)
+
+        await writeDefaults('v2', ['dynamic_mcp'])
+        await listCoreSystemPrompts()
+
+        const preflight = await preflightBackupRestore('target', older.bytes)
+        const warning = preflight.warnings.find((entry) => entry.includes('API Primary Agent System Prompt'))
+        expect(warning).toBeDefined()
+        expect(warning).not.toContain('Dynamic Tool Search Prompt')
+
+        await restoreBackupBundle('target', older.bytes, { confirmReplace: true })
+
+        // The instance's own v2 metadata is gone right after the restore: it described the old text.
+        expect(await redis.get('batshit:system_prompt_meta:api_primary')).toBeNull()
+        // Never overwritten on a guess: the restored text may be an edit.
+        expect(await redis.get('batshit:batshit_mode3_system_prompt')).toBe('api_primary default v1\n')
+        const summaries = await listCoreSystemPrompts()
+        // The instance's own v2 metadata did not survive to claim the old text is the new default.
+        expect(summaryOf(summaries, 'api_primary')).toMatchObject({ matchesDefault: false, customized: true })
+        // A prompt whose text is today's default is recorded as the default, so the next update refreshes it.
+        expect(summaryOf(summaries, 'dynamic_mcp')).toMatchObject({ matchesDefault: true, customized: false })
+        const dynamicMeta = (await redis.get('batshit:system_prompt_meta:dynamic_mcp')) as Record<string, any>
+        expect(dynamicMeta).toMatchObject({ promptId: 'dynamic_mcp', customized: false })
+        expect(typeof dynamicMeta.defaultHash).toBe('string')
+      })
+
+      it('restores a backup carrying metadata for a prompt this Batshit no longer lists, and leaves that metadata out', async () => {
+        await writeDefaults('v1')
+        await listCoreSystemPrompts()
+        const original = await createBackupBundle('source')
+        // A core prompt retired after the backup was made: its metadata is in the backup.
+        const entries = { ...unzipSync(original.bytes) }
+        entries['redis/records/99999999.json'] = new Uint8Array(
+          Buffer.from(
+            JSON.stringify({
+              key: 'batshit:system_prompt_meta:zcbackup_retired',
+              type: 'json',
+              value: { promptId: 'zcbackup_retired', defaultHash: 'f'.repeat(64), customized: false, updatedAt: '2026-09-27T00:00:00.000Z' },
+              ttlSeconds: null,
+              groupId: 'prompts'
+            }),
+            'utf8'
+          )
+        )
+        const manifest = JSON.parse(Buffer.from(entries['manifest.json']).toString('utf8'))
+        manifest.contents.redisRecordCount += 1
+        entries['manifest.json'] = new Uint8Array(Buffer.from(JSON.stringify(manifest), 'utf8'))
+        const withRetired = zipSync(entries)
+
+        const preflight = await preflightBackupRestore('target', withRetired)
+        expect(preflight.warnings.find((entry) => entry.includes('zcbackup_retired'))).toBeDefined()
+        await restoreBackupBundle('target', withRetired, { confirmReplace: true })
+        expect(await redis.exists('batshit:system_prompt_meta:zcbackup_retired')).toBe(false)
+        expect(await redis.get('batshit:system_prompt_meta:api_primary')).toMatchObject({ promptId: 'api_primary' })
+      })
+
+      it('a prompt text read that fails leaves the stored text alone and still checks the other prompts', async () => {
+        await writeDefaults('v1')
+        await listCoreSystemPrompts()
+        await saveCoreSystemPrompt('api_primary', 'my own API prompt\n')
+        await writeDefaults('v2')
+
+        // The facade answers null for a failed read (BL-230); the raw client throws. The default
+        // test lane's facade methods are already mocks, so call their own implementations.
+        const failingKey = 'batshit:batshit_mode3_system_prompt'
+        const originalOf = (method: (...args: any[]) => any) =>
+          vi.isMockFunction(method) ? method.getMockImplementation()! : method.bind(redis)
+        const facadeGet = originalOf(redis.get)
+        const execute = originalOf(redis.execute)
+        const getSpy = vi.spyOn(redis, 'get').mockImplementation(async (key: string) =>
+          key === failingKey ? null : facadeGet(key)
+        )
+        const executeSpy = vi.spyOn(redis, 'execute').mockImplementation(async (operation: any) =>
+          execute((client: any) =>
+            operation(
+              new Proxy(client, {
+                get(target, property) {
+                  if (property === 'get') {
+                    return async (key: string) => {
+                      if (key === failingKey) throw new Error('injected read failure')
+                      return target.get(key)
+                    }
+                  }
+                  const value = Reflect.get(target, property)
+                  return typeof value === 'function' ? value.bind(target) : value
+                }
+              })
+            )
+          )
+        )
+        try {
+          await reconcileCoreSystemPromptsAfterRestore()
+        } finally {
+          getSpy.mockRestore()
+          executeSpy.mockRestore()
+        }
+
+        expect(await redis.get(failingKey)).toBe('my own API prompt\n')
+        // The next prompt in the list was still checked: its older uncustomized default is refreshed.
+        expect(await redis.get('batshit:batshit_mode4_system_prompt')).toBe('cli_primary default v2\n')
+      })
+
+      it('one unreadable default file skips that prompt and checks the rest', async () => {
+        await writeDefaults('v1')
+        await listCoreSystemPrompts()
+        await writeDefaults('v2')
+        const apiDefinition = listCoreSystemPromptDefinitions().find((definition) => definition.id === 'api_primary')!
+        await fs.rm(path.join(promptDefaultsDir, apiDefinition.defaultFile))
+
+        await expect(reconcileCoreSystemPromptsAfterRestore()).resolves.toBeUndefined()
+
+        expect(await redis.get('batshit:batshit_mode3_system_prompt')).toBe('api_primary default v1\n')
+        expect(await redis.get('batshit:batshit_mode4_system_prompt')).toBe('cli_primary default v2\n')
+      })
+    })
   })
 
   describe('the schedule due cache survives nothing (F-8, DL-118-01)', () => {

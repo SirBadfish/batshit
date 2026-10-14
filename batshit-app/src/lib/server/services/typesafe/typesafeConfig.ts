@@ -1,5 +1,5 @@
 /**
- * SA-120 Jev Juice — the instance-level config record (`batshit:typesafe_config`).
+ * SA-120 Judge Juice — the instance-level config record (`batshit:typesafe_config`).
  *
  * Read side is tolerant: a corrupt stored value falls back per field so a send can
  * never throw on config (LS-044's rule). Write side refuses invalid input loudly, so
@@ -8,6 +8,16 @@
 
 import { redis } from '$lib/server/redis'
 import type { TypesafeConfig } from '$lib/types/typesafe'
+import {
+  BUILTIN_TYPESAFE_PROVIDER_ID,
+  isJudgeChoiceValue,
+  newDanglingJudgeChoices,
+  normalizeStoredJudgeDefault,
+  normalizeStoredJudgeLaneProviders,
+  normalizeStoredJudgeProviders,
+  validateJudgeLaneProvidersInput,
+  validateJudgeProvidersInput
+} from '$lib/utils/judgeProviders'
 import {
   JEV_IN_CHAT_WAIT_FIELD,
   JEV_IN_CHAT_WAIT_LABEL,
@@ -34,6 +44,9 @@ export const DEFAULT_TYPESAFE_CONFIG: TypesafeConfig = Object.freeze({
   attemptTimeoutMs: TYPESAFE_DEFAULT_ATTEMPT_TIMEOUT_MS,
   inChatWaitMs: TYPESAFE_DEFAULT_IN_CHAT_WAIT_MS,
   screenIncomingText: false,
+  providers: [],
+  defaultProviderId: BUILTIN_TYPESAFE_PROVIDER_ID,
+  laneProviders: {},
   updatedAt: null
 })
 
@@ -62,7 +75,8 @@ export function isValidInChatWaitMs(value: unknown): value is number {
 
 /** Tolerant read: unknown or invalid stored fields read as the defaults (and say so once at debug). */
 export function normalizeStoredTypesafeConfig(raw: unknown): TypesafeConfig {
-  if (!raw || typeof raw !== 'object') return { ...DEFAULT_TYPESAFE_CONFIG }
+  // Fresh lists every read: the frozen default's own list and map are never handed out to be changed.
+  if (!raw || typeof raw !== 'object') return { ...DEFAULT_TYPESAFE_CONFIG, providers: [], laneProviders: {} }
   const stored = raw as Record<string, unknown>
   const modelId = isPinnedTypesafeModelId(stored.modelId)
     ? (stored.modelId as string).trim()
@@ -85,6 +99,13 @@ export function normalizeStoredTypesafeConfig(raw: unknown): TypesafeConfig {
       inChatWaitMs: stored.inChatWaitMs
     })
   }
+  const providers = normalizeStoredJudgeProviders(stored.providers)
+  if (Array.isArray(stored.providers) && providers.length !== stored.providers.length) {
+    logger.debug('[typesafe] stored judge list had invalid entries; they read as absent', {
+      stored: stored.providers.length,
+      kept: providers.length
+    })
+  }
   return {
     enabled: stored.enabled === true,
     modelId,
@@ -92,12 +113,29 @@ export function normalizeStoredTypesafeConfig(raw: unknown): TypesafeConfig {
     inChatWaitMs,
     // SA-120 P7 (LS-057): only a stored `true` is ON, so a record written before P7 reads OFF.
     screenIncomingText: resolveJevIncomingTextScreenEnabled(stored),
+    // SA-120 P10a (DL-120-18): a record written before P10a has none of these and reads as TypeSafe only. An invalid
+    // judge is dropped; a choice that names a judge the list does not hold is KEPT, so the access rule denies with
+    // `no_provider` instead of quietly sending the text to another judge. A choice that is PRESENT but damaged (not
+    // a judge id) reads as UNREADABLE_JUDGE_CHOICE and denies too; only an ABSENT default means TypeSafe (round 1, M2).
+    providers,
+    defaultProviderId: normalizeStoredJudgeDefault(stored),
+    laneProviders: normalizeStoredJudgeLaneProviders(stored.laneProviders),
     updatedAt: typeof stored.updatedAt === 'string' ? stored.updatedAt : null
   }
 }
 
 export type TypesafeConfigPatch = Partial<
-  Pick<TypesafeConfig, 'enabled' | 'modelId' | 'attemptTimeoutMs' | 'inChatWaitMs' | 'screenIncomingText'>
+  Pick<
+    TypesafeConfig,
+    | 'enabled'
+    | 'modelId'
+    | 'attemptTimeoutMs'
+    | 'inChatWaitMs'
+    | 'screenIncomingText'
+    | 'providers'
+    | 'defaultProviderId'
+    | 'laneProviders'
+  >
 >
 
 export type TypesafeConfigValidation = { ok: true; value: TypesafeConfigPatch } | { ok: false; error: string }
@@ -146,6 +184,23 @@ export function validateTypesafeConfigInput(body: unknown): TypesafeConfigValida
     }
     value.screenIncomingText = input[JEV_INCOMING_TEXT_SCREEN_FIELD] as boolean
   }
+  // SA-120 P10a (DL-120-18): each field, when present, replaces the stored one whole (the card sends its whole list).
+  if ('providers' in input) {
+    const providers = validateJudgeProvidersInput(input.providers)
+    if (!providers.ok) return providers
+    value.providers = providers.value
+  }
+  if ('defaultProviderId' in input) {
+    if (!isJudgeChoiceValue(input.defaultProviderId)) {
+      return { ok: false, error: '`defaultProviderId` must name a judge (typesafe or an added judge id).' }
+    }
+    value.defaultProviderId = input.defaultProviderId
+  }
+  if ('laneProviders' in input) {
+    const lanes = validateJudgeLaneProvidersInput(input.laneProviders)
+    if (!lanes.ok) return lanes
+    value.laneProviders = lanes.value
+  }
   return { ok: true, value }
 }
 
@@ -154,15 +209,31 @@ export async function getTypesafeConfig(): Promise<TypesafeConfig> {
   return normalizeStoredTypesafeConfig(stored)
 }
 
-/** Merges a validated patch over the stored record and stamps `updatedAt`. */
+/** A refused save: the route answers 400 with this message and nothing was written. */
+export class TypesafeConfigValidationError extends Error {}
+
+/**
+ * Merges a validated patch over the stored record and stamps `updatedAt`. The whole record is written, so a patch
+ * that names only `enabled` keeps every judge, the default, and the per-feature choices (they come from the read).
+ * A save that would CREATE a choice naming a judge the record does not hold is refused, never stored: removing a judge
+ * in use must move those choices in the same save. A broken choice that was already stored (a restore, a hand edit)
+ * does not block a save, so Judge Juice can always be switched off; it still denies until a save names a judge again
+ * (review round 1, S3).
+ */
 export async function setTypesafeConfig(patch: TypesafeConfigPatch): Promise<TypesafeConfig> {
   const validation = validateTypesafeConfigInput(patch)
-  if (!validation.ok) throw new Error(validation.error)
+  if (!validation.ok) throw new TypesafeConfigValidationError(validation.error)
   const current = await getTypesafeConfig()
   const next: TypesafeConfig = {
     ...current,
     ...validation.value,
     updatedAt: new Date().toISOString()
+  }
+  const dangling = newDanglingJudgeChoices(current, next)
+  if (dangling.length > 0) {
+    throw new TypesafeConfigValidationError(
+      `These choices name a judge that is not in the list: ${dangling.join(', ')}. Pick another judge for them first.`
+    )
   }
   await redis.json.set(TYPESAFE_CONFIG_KEY, '$', next as never)
   return next

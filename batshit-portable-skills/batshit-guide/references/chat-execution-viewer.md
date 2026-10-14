@@ -1,6 +1,6 @@
 # Execution Viewer
 
-Most AI apps hide the prompt. You send a message, an answer comes back, and what the model *actually* received is a black box. Batshit doesn't work that way. The Execution Viewer is a side sheet that shows you exactly what an agent was sent, what it sent back, which model and runtime ran it, and what the tokens looked like.
+The Execution Viewer is a side sheet that shows what Batshit sent an agent, what came back, which model and runtime ran it, and what the tokens looked like.
 
 When an agent does something surprising, you don't have to guess — you look.
 
@@ -8,7 +8,7 @@ When an agent does something surprising, you don't have to guess — you look.
 
 Open the Execution Viewer on a message to inspect that run:
 
-- The compiled prompt and system prompt the agent actually received.
+- The compiled prompt and system prompt Batshit sent the agent.
 - The per-turn runtime context (the Dynamic Current Message — see below).
 - Token counts and badges, so you can see what the request cost in context. When a provider reports prompt-cache reads or cache creation/write tokens, Batshit normalizes those into the same token evidence instead of hiding them in raw logs.
 - Tool calls and their results.
@@ -16,6 +16,12 @@ Open the Execution Viewer on a message to inspect that run:
 - The model and runtime path that handled the turn.
 
 It's read-only — a window into the run, not a place you edit anything. Think of it as the receipt for every agent turn.
+
+A few limits:
+
+- It keeps the last ten runs of each chat.
+- Text longer than 120,000 characters is stored as its beginning and its end, with a note in between. Images show as a short placeholder, not their data.
+- For a `CLI` agent, the prompt shown is what Batshit handed Codex or Claude Code. The CLI adds its own tools and project files (such as `AGENTS.md` or `CLAUDE.md`) before it calls the model, and Codex adds its own instructions too. Batshit cannot see those, so the input count the CLI reports is larger than the prompt shown.
 
 ## When to reach for it
 
@@ -29,7 +35,7 @@ The rule of thumb: when behavior surprises you, check the Execution Viewer befor
 
 ## The Dynamic Current Message (DCM)
 
-Here's a concept that's new to most people. Every time you send a message, Batshit assembles an extra block of context just for that turn — the **Dynamic Current Message**, or DCM. It's built fresh on every send and is never saved as part of your chat history.
+Here's a concept that's new to most people. Every time you send a message, Batshit assembles an extra block of context just for that turn — the **Dynamic Current Message**, or DCM. It's built fresh on every send and is never saved as part of your chat history. In **Compiled Messages**, it's the part inside the `<dynamic_info>` tags, right after your newest message.
 
 The DCM is how the agent knows about the *current state of your workspace* right now, including things like:
 
@@ -50,9 +56,15 @@ Delegated usage contributes to the Token Panel's running conversation totals and
 
 Unknown usage or unavailable pricing stays unknown. In particular, the official n8n Workflow Subagent templates do not return usage; a custom workflow can report it. Claude Code's native helpers are labeled **Claude Code Helper** and do not receive Batshit's separate Worker accounting.
 
+When a CLI reply fails or is stopped, the Viewer keeps the request and tool evidence it captured. For a failed Claude Code reply, token counts from its final model usage report remain visible when supplied; a count it did not supply stays unknown. A reported `0` stays `0`.
+
 ## Schema Hints
 
 A related new idea: when an agent uses Dynamic Tool Search, Batshit doesn't dump every tool's full definition into the prompt. Instead it returns **Schema Hints** — compact, on-demand descriptions of just the tool the agent picked. The agent gets enough to call the tool correctly, without paying the token cost of every tool's schema up front. You'll see these hints in tool-search results when you inspect a run. More on the search-then-use pattern in [Tools, MCPs, CLI Tools, and Skills](../tools/overview.md).
+
+## Opening the viewer through an agent
+
+A Primary Agent with the relevant Fabric control can open the Viewer in a live tab already showing its chat. Batshit verifies the current chat and that the Viewer has loaded. It does not switch you to a different chat. Multiple matching tabs need an exact choice. An unconfirmed result means visibility was not proved. Opening it does not create usage or execution records.
 
 ## Related docs
 

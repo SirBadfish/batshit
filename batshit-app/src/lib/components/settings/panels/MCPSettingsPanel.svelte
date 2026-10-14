@@ -1,4 +1,8 @@
 <script lang="ts">
+  import { refuse, type SettingsTarget } from '$lib/appActions/catalog'
+  import { appActionsHaveDrafts, type ActionContext } from '$lib/appActions/owners'
+  import { onMount } from 'svelte'
+
   /**
    * MCP Gateways Management Panel (Svelte 5)
    * Reused by both the standalone /mcps route and the settings sheet tab.
@@ -36,6 +40,12 @@
   import { cn } from '$lib/utils'
   import GatewayCard from '$lib/components/mcps/GatewayCard.svelte'
   import GatewayInlineSettingsCards from '$lib/components/mcps/GatewayInlineSettingsCards.svelte'
+  import {
+    markOutcomeUnknown,
+    nextGatewaySeq,
+    requestGatewayRead,
+    subscribeGatewaySaveEvents
+  } from '$lib/components/mcps/gatewaySaveState'
   import GlobalToolGrid from '$lib/components/mcps/GlobalToolGrid.svelte'
   import ZipVisualIndicatorsCard from '$lib/components/settings/ZipVisualIndicatorsCard.svelte'
   import N8nGatewayForm from '$lib/components/mcps/N8nGatewayForm.svelte'
@@ -159,25 +169,115 @@
     () => sortedGateways.find((gateway) => gateway.id === selectedGatewayId) ?? null
   )
 
+  // BL-1394: when each held copy of a gateway was installed (`nextGatewaySeq`: a save landing
+  // when it landed, a list or owned read when it started; never lowered), the newest list read,
+  // and landed or read copies of gateways the panel does not list yet (a panel opened while a save was
+  // out). A copy that cannot be shown to be newer never replaces the held one, so it cannot come
+  // back on the next pick. Plain: read only after a fetch answers, never by an effect.
+  const installedSeq = new Map<string, number>()
+  const unlistedReads = new Map<string, { gateway: MCPGateway; startedAt: number }>()
+  const handledLandings = new WeakSet<MCPGateway>()
+  let panelMounted = true
+  let listReadToken = 0
+
+  function parsedStamp(value: string | undefined) {
+    const at = value ? Date.parse(value) : Number.NaN
+    return Number.isFinite(at) ? at : null
+  }
+
+  /** 1 newer, -1 older, 0 when the stamps prove no order (equal, absent or invalid). */
+  function compareStamps(incoming: MCPGateway, held: MCPGateway) {
+    const incomingAt = parsedStamp(incoming.updated_at)
+    const heldAt = parsedStamp(held.updated_at)
+    if (incomingAt === null || heldAt === null || incomingAt === heldAt) return 0
+    return incomingAt > heldAt ? 1 : -1
+  }
+
+  /** JSON with object keys sorted, so two copies of one record compare equal whatever their key order. */
+  function sortedJson(value: unknown) {
+    return JSON.stringify(value, (_key, entry) =>
+      entry && typeof entry === 'object' && !Array.isArray(entry)
+        ? Object.fromEntries(Object.entries(entry).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
+        : entry
+    )
+  }
+
+  /** A landed or read copy of a gateway the panel does not list yet, ordered against one already filed. */
+  function fileUnlisted(gateway: MCPGateway, seq: number) {
+    const unlisted = unlistedReads.get(gateway.id)
+    if (!unlisted || copyOrder(gateway, seq, unlisted.gateway, unlisted.startedAt) !== 'keep') {
+      unlistedReads.set(gateway.id, { gateway, startedAt: seq })
+    }
+  }
+
+  function installGateway(gateway: MCPGateway, seq: number) {
+    installedSeq.set(gateway.id, Math.max(installedSeq.get(gateway.id) ?? 0, seq))
+    gateways = gateways.map((entry) => (entry.id === gateway.id ? gateway : entry))
+  }
+
+  /**
+   * Whether a listed or read copy whose read started at `startedAt` replaces the held one. A
+   * strictly newer stamp does, and a strictly older one never does by itself. When the stamps
+   * prove no order (equal, absent or invalid), the read's start decides: it replaces the held
+   * copy when it started after that copy was installed. A read that started later but shows an
+   * older stamp contradicts the held copy (the server answered the reads in another order, or a
+   * restore put back an older record): 'conflict'.
+   */
+  function copyOrder(incoming: MCPGateway, startedAt: number, held: MCPGateway, heldSeq: number) {
+    const order = compareStamps(incoming, held)
+    if (order === 1) return 'install'
+    if (startedAt <= heldSeq) return 'keep'
+    return order === 0 ? 'install' : 'conflict'
+  }
+
   // Load gateways from API
   async function loadGateways() {
     if (!data?.user?.id) return
+    const userId = data.user.id
 
+    // BL-1394: a list read installs a gateway only by the rule above; a held copy (or a read
+    // copy that arrived before the gateway was listed) otherwise stays, and a conflict asks for
+    // a read of the saved gateway. Only the newest list read applies.
+    const startedAt = nextGatewaySeq()
+    const token = ++listReadToken
     loading = true
     try {
-      const response = await fetch(`/api/mcp/gateways?userId=${data.user.id}`)
+      const response = await fetch(`/api/mcp/gateways?userId=${userId}`)
 
       if (!response.ok) {
         throw new Error(`Failed to load gateways: ${response.statusText}`)
       }
 
       const responseData = await response.json()
-      gateways = responseData.gateways || []
+      if (token !== listReadToken) return
+      const listed: MCPGateway[] = responseData.gateways || []
+      const held = new Map(gateways.map((gateway) => [gateway.id, gateway]))
+      const conflicts: string[] = []
+      gateways = listed.map((incoming) => {
+        const unlisted = unlistedReads.get(incoming.id)
+        unlistedReads.delete(incoming.id)
+        const current = held.get(incoming.id) ?? unlisted?.gateway
+        const currentSeq = held.has(incoming.id) ? (installedSeq.get(incoming.id) ?? 0) : (unlisted?.startedAt ?? 0)
+        const order = current ? copyOrder(incoming, startedAt, current, currentSeq) : 'install'
+        if (order === 'install') {
+          installedSeq.set(incoming.id, Math.max(currentSeq, startedAt))
+          return incoming
+        }
+        if (order === 'conflict') conflicts.push(incoming.id)
+        installedSeq.set(incoming.id, currentSeq)
+        return current!
+      })
+      // A read copy from before this list read, of a gateway the list does not hold, was deleted.
+      for (const [id, unlisted] of unlistedReads) {
+        if (unlisted.startedAt < startedAt) unlistedReads.delete(id)
+      }
+      for (const id of conflicts) void requestGatewayRead(userId, id)
     } catch (error) {
+      if (token !== listReadToken) return
       console.error('[MCP Settings] Error loading gateways:', error)
       toast.error('Failed to load gateways')
     } finally {
-      loading = false
+      if (token === listReadToken) loading = false
     }
   }
 
@@ -283,15 +383,77 @@
     showAddGatewayForm = 'stdio'
   }
 
+  // BL-1394: a landed save installs its copy only when its stamp is strictly newer than the held
+  // one; an older answer arriving late is dropped. When the stamps prove no order (equal, absent or
+  // invalid) and the content differs, the panel reads the saved gateway instead of guessing, and a
+  // form filled for that gateway waits for that read (the outcome is unknown until then). The held
+  // copy is a Svelte proxy, never the landed object itself, so content is compared, not identity.
   function handleGatewayUpdated(updatedGateway: MCPGateway) {
-    gateways = gateways.map((gateway) => (gateway.id === updatedGateway.id ? updatedGateway : gateway))
+    // One landed copy can arrive twice (its card, then a read-only card mounted since); it carries
+    // nothing new the second time.
+    if (!panelMounted || handledLandings.has(updatedGateway)) return
+    handledLandings.add(updatedGateway)
+    const current = gateways.find((gateway) => gateway.id === updatedGateway.id)
+    if (!current) {
+      // Not listed yet (Settings reopened while the save was out): it waits for the list read.
+      fileUnlisted(updatedGateway, nextGatewaySeq())
+      return
+    }
+    const order = compareStamps(updatedGateway, current)
+    if (order === 1) installGateway(updatedGateway, nextGatewaySeq())
+    else if (order === 0 && sortedJson(updatedGateway) !== sortedJson(current)) {
+      markOutcomeUnknown('settings', updatedGateway.id)
+      markOutcomeUnknown('grouping', updatedGateway.id)
+      void requestGatewayRead(data?.user?.id ?? null, updatedGateway.id)
+    }
   }
+
+  // An owned read (requested here, or by a card whose save may have been stored) installs its copy
+  // by the same rule as a list read, except that a conflict installs it: a read that started after
+  // the held copy was installed is the server's answer (a restore can put back an older stamp). A
+  // read of a gateway the panel does not list yet waits for the list read.
+  onMount(() => {
+    const unsubscribe = subscribeGatewaySaveEvents((event) => {
+      if (event.kind === 'save-settled') {
+        // Every landing reaches the open panel, whichever card sent it or is shown now (the card
+        // that sent it may have outlived an earlier panel). A copy already handled is skipped.
+        if (event.landed) handleGatewayUpdated(event.landed)
+        return
+      }
+      if (event.kind !== 'read') return
+      const current = gateways.find((gateway) => gateway.id === event.gatewayId)
+      if (!current) {
+        fileUnlisted(event.gateway, event.startedAt)
+        return
+      }
+      if (copyOrder(event.gateway, event.startedAt, current, installedSeq.get(event.gatewayId) ?? 0) !== 'keep') {
+        installGateway(event.gateway, event.startedAt)
+      }
+    })
+    return () => {
+      // A save whose card outlived this panel still calls it; a closed panel shows nothing, so it
+      // neither installs nor reads (the panel open now hears that copy from its own card).
+      panelMounted = false
+      unsubscribe()
+    }
+  })
 
   function handleBack() {
     if (mode === 'page') {
       goto('/')
     }
   }
+
+  export function readAppActionState() {
+    return { toolsTab: activeTab, busy: false, dirty: Boolean(showAddGatewayForm), error: null }
+  }
+  export function selectAppActionTarget(target: SettingsTarget, context: ActionContext) {
+    context.check()
+    if (appActionsHaveDrafts()) refuse('unsaved_changes')
+    if (!target.toolsTab) refuse('unsupported_target')
+    activeTab = target.toolsTab
+  }
+
 </script>
 
 <div class="bs-settings-panel-native flex h-full flex-col">

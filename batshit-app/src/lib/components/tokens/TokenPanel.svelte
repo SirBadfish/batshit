@@ -1,6 +1,7 @@
 <script lang="ts">
   import { Button } from '$lib/components/ui/button'
   import * as Tooltip from '$lib/components/ui/tooltip'
+  import { CHATGPT_PLAN_USAGE_URL } from '$lib/utils/chatgptPlanConnection'
   import {
     Archive,
     Bug,
@@ -8,6 +9,7 @@
     Database,
     FileText,
     Gauge,
+    Info,
     Moon,
     RotateCcw,
     Scissors
@@ -20,10 +22,12 @@
     contextState = 'unknown',
     contextLabel = 'Unknown',
     contextDetail = 'Context usage is unavailable.',
+    contextUnknownHint = null,
     trimmedTokens = 0,
     costLabel = 'Unknown',
     costDetail = 'Cost is unavailable.',
     costState = 'unknown',
+    chatgptPlan = false,
     delegatedDetail = null,
     trimAvailable = false,
     trimUnavailableReason = 'Manual trim is unavailable.',
@@ -67,10 +71,12 @@
     contextState?: 'exact' | 'near' | 'estimated' | 'unknown'
     contextLabel?: string
     contextDetail?: string
+    contextUnknownHint?: string | null
     trimmedTokens?: number
     costLabel?: string
     costDetail?: string
     costState?: 'exact' | 'estimated' | 'unknown'
+    chatgptPlan?: boolean
     delegatedDetail?: string | null
     trimAvailable?: boolean
     trimUnavailableReason?: string
@@ -125,6 +131,27 @@
     onOpenExecutionViewer?: () => void
   }>()
 
+  let koboldPerformanceInfoOpen = $state(false)
+  let koboldPerformanceInfoPointerOpen: boolean | null = null
+
+  function toggleKoboldPerformanceInfo(event: MouseEvent) {
+    // Touch focus can open Bits UI after pointerup but before click. Toggle from
+    // the state at pointerdown; keyboard activation uses the current open state.
+    const wasOpen = event.detail > 0 && koboldPerformanceInfoPointerOpen !== null
+      ? koboldPerformanceInfoPointerOpen
+      : koboldPerformanceInfoOpen
+    koboldPerformanceInfoOpen = !wasOpen
+    koboldPerformanceInfoPointerOpen = null
+  }
+
+  // This explains the selected program's capability, not the latest reply's origin.
+  $effect(() => {
+    if (localProgramLabel !== 'KoboldCpp') {
+      koboldPerformanceInfoOpen = false
+      koboldPerformanceInfoPointerOpen = null
+    }
+  })
+
   const resolvedContextPercent = $derived.by(() => {
     if (typeof contextPercent === 'number' && Number.isFinite(contextPercent)) {
       return Math.max(0, Math.min(contextPercent, 100))
@@ -137,7 +164,10 @@
   })
 
   const contextPercentLabel = $derived.by(() => {
-    if (resolvedContextPercent === null) return 'Unknown'
+    if (resolvedContextPercent === null) {
+      return typeof currentTokens === 'number' && Number.isFinite(currentTokens)
+        ? formatRoundedThousands(currentTokens) : 'Unknown'
+    }
     const prefix = contextState === 'estimated' || contextState === 'near' ? '~' : ''
     return `${prefix}${Math.round(resolvedContextPercent)}%`
   })
@@ -252,6 +282,11 @@
 <Tooltip.Provider delayDuration={0}>
   <div class="token-panel">
     <div class="token-panel-bar">
+      {#if chatgptPlan}
+        <a class="token-panel-trigger" href={CHATGPT_PLAN_USAGE_URL} target="_blank" rel="noopener noreferrer" aria-label="ChatGPT plan — manage usage" data-ab-control="token-chatgpt-plan">
+          <Coins class="token-panel-trigger-icon" /><span>ChatGPT Plan</span>
+        </a>
+      {:else}
       <Tooltip.Root>
         <Tooltip.Trigger
           class="token-panel-trigger"
@@ -279,6 +314,7 @@
           </div>
         </Tooltip.Content>
       </Tooltip.Root>
+      {/if}
 
       <Tooltip.Root>
         <Tooltip.Trigger
@@ -324,6 +360,9 @@
             <div>
               {formatRoundedThousands(currentTokens)} / {formatRoundedThousands(contextLimit)} tokens used
             </div>
+            {#if resolvedContextPercent === null && contextUnknownHint}
+              <div>{contextUnknownHint}</div>
+            {/if}
           </div>
         </Tooltip.Content>
       </Tooltip.Root>
@@ -379,6 +418,7 @@
         </Tooltip.Content>
       </Tooltip.Root>
 
+      <div class="inline-flex items-center">
       <Tooltip.Root>
         <Tooltip.Trigger
           class="token-panel-trigger"
@@ -415,6 +455,28 @@
           </div>
         </Tooltip.Content>
       </Tooltip.Root>
+        {#if localProgramLabel === 'KoboldCpp'}
+          <Tooltip.Root bind:open={koboldPerformanceInfoOpen} disableCloseOnTriggerClick>
+            <Tooltip.Trigger
+              class="batshit-settings-info-trigger is-amber inline-flex shrink-0 items-center justify-center"
+              aria-label="KoboldCpp performance information"
+              aria-expanded={koboldPerformanceInfoOpen}
+              data-ab-control="token-kobold-performance-info"
+              onpointerdown={() => koboldPerformanceInfoPointerOpen = koboldPerformanceInfoOpen}
+              onpointercancel={() => koboldPerformanceInfoPointerOpen = null}
+              onclick={toggleKoboldPerformanceInfo}
+            >
+              <Info class="h-3.5 w-3.5" aria-hidden="true" />
+            </Tooltip.Trigger>
+            <Tooltip.Content side="top" class="token-panel-tooltip is-context">
+              <div class="token-panel-tooltip-stack">
+                <div class="token-panel-tooltip-title">KoboldCpp performance</div>
+                <div>KoboldCpp doesn’t identify which reply its performance statistics belong to. Batshit shows measured reply speed when available.</div>
+              </div>
+            </Tooltip.Content>
+          </Tooltip.Root>
+        {/if}
+      </div>
 
       <Button
         size="sm"
@@ -668,7 +730,7 @@
   }
 
   .token-panel-ring-meter {
-    color: var(--bs-app-primary-line);
+    color: var(--bs-app-primary-text);
   }
 
   .token-panel-ring-meter.is-danger {

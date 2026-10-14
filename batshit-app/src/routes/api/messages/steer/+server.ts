@@ -1,6 +1,10 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
 import { redis } from '$lib/server/redis'
-import { getActiveSessionTurn, getActiveStream } from '$lib/server/services/streamAbortRegistry'
+import {
+  countQueuedSessionTurns,
+  getActiveSessionTurn,
+  getActiveStream
+} from '$lib/server/services/streamAbortRegistry'
 import {
   enqueueSteer,
   flushPendingSteersToTransport,
@@ -171,6 +175,14 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     return json(notSteerable(groupVerdict.reason).body, { status: 409 })
   }
   if (activeStream.messageId !== messageId) {
+    return json(replyFinished().body, { status: 409 })
+  }
+  // BL-4: sends that met this reply are waiting in the chat's line, and they run after it. A
+  // queued message held HERE would be promoted inside the running request, before the first of
+  // them: answered ahead of messages sent before it. So it goes the ordinary way instead (the
+  // tag the client already reads as "send it as a normal message"), and waits behind them in
+  // order. A steer still lands: it is part of this reply, not a later message.
+  if (deliver === 'end' && countQueuedSessionTurns(sessionId) > 0) {
     return json(replyFinished().body, { status: 409 })
   }
 

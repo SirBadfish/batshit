@@ -297,8 +297,8 @@
     background: color-mix(in oklab, var(--bs-app-primary) 18%, var(--bs-app-inset-surface));
     color: var(--bs-app-title);
     box-shadow:
-      inset 0 0 0 1px color-mix(in oklab, var(--bs-app-primary) 56%, transparent),
-      0 0 12px color-mix(in oklab, var(--bs-app-primary) 18%, transparent);
+      inset 0 0 0 1px color-mix(in oklab, var(--bs-app-primary-text) 56%, transparent),
+      0 0 12px color-mix(in oklab, var(--bs-app-primary-text) 18%, transparent);
   }
 
   :global(.artifact-icon-button.is-active:hover),
@@ -308,7 +308,7 @@
   }
 
   :global(.artifact-icon-button.is-active .artifact-icon-renderer) {
-    filter: drop-shadow(0 0 5px color-mix(in oklab, var(--bs-app-primary) 50%, transparent));
+    filter: drop-shadow(0 0 5px color-mix(in oklab, var(--bs-app-primary-text) 50%, transparent));
   }
 
   :global(.artifact-icon-button.is-dnd-shadow) {

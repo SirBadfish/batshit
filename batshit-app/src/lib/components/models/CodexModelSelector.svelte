@@ -3,6 +3,7 @@
   import * as DropdownMenu from '$lib/components/ui/dropdown-menu'
   import { toast } from 'svelte-sonner'
   import * as agentStore from '$lib/stores/agents.svelte'
+  import { chatBarBlockSave } from '$lib/utils/chatBarBlockSave'
   import { CODEX_SUBMODEL_CHOICES, supportsCodexFastMode, supportsCodexXhighReasoning } from '$lib/data/codex-models'
   import ModelProviderIcon from '$lib/components/models/ModelProviderIcon.svelte'
   import type { CodexAgentSettings, CodexPermissionMode, CodexApproval, CodexSandbox } from '$lib/types/codex'
@@ -66,10 +67,26 @@
   async function handleSelect(nextModel: string) {
     if (!currentAgent) return
     try {
+      // BL-848: only the model, always sent (a pick the copy already shows must still write it: the
+      // record may hold another), and what the new model implies: a model that does not support
+      // Extra High or the fast service tier always sends the reasoning effort or service tier it
+      // needs, though the value equals the copy (the record may hold the one it cannot run). A
+      // model that supports them leaves a reasoning effort or speed chosen in another window alone.
+      // The server writes the Codex settings key by key, so every other key stays.
+      const viewedSettings = withDefaults(currentAgent.codex_settings, selectedModel)
       const nextSettings = withDefaults(currentAgent.codex_settings, nextModel)
-      await agentStore.updateAgentSettings(currentAgent.id, {
-        codex_settings: nextSettings
-      })
+      // Trade-off: for a model without Extra High the effort sent is the COPY's, clamped
+      // (`withDefaults`). It clears an Extra High another window saved (a model that cannot run it),
+      // but it also writes over a supported effort saved there since (the copy shows medium, the
+      // record holds low). Today every model the list holds supports both, so only a model outside
+      // the list reaches this.
+      const group = ['model']
+      if (!supportsCodexXhighReasoning(nextModel)) group.push('reasoningEffort')
+      if (!supportsCodexFastMode(nextModel)) group.push('serviceTier')
+      await agentStore.updateAgentSettings(
+        currentAgent.id,
+        chatBarBlockSave('codex_settings', currentAgent.codex_settings, viewedSettings, nextSettings, { group })
+      )
     } catch (error) {
       console.error('[CodexModelSelector] Failed to update Codex model', error)
       toast.error('Unable to save Codex model selection')
@@ -106,7 +123,7 @@
     {#each CODEX_SUBMODEL_CHOICES as option (option.value)}
       <DropdownMenu.Item
         onSelect={() => handleSelect(option.value)}
-        class={`flex items-center gap-2 ${option.value === selectedModel ? 'border-l-2 border-primary pl-2' : ''}`}
+        class={`flex items-center gap-2 ${option.value === selectedModel ? 'border-l-2 border-primary-text pl-2' : ''}`}
       >
         <ModelProviderIcon
           modelId={option.value}

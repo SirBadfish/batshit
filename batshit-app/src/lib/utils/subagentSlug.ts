@@ -34,6 +34,18 @@ export function buildCliSubagentRuntimeId(subagentSlug: string): string {
   return `subagent_cli_${normalizeSubagentSlugValue(subagentSlug)}`
 }
 
+/**
+ * BL-285 (2026-09-27): a Worker's CLI runtime id, and so its managed profile folder
+ * (`batshit_agent_subagent_cli-<slot>`). Workers used `buildCliSubagentRuntimeId` too, so a
+ * Subagent slugged `worker_<agent>_<n>` shared that Worker slot's folder. The "-" is a
+ * character no Subagent slug holds (the sanitizer folds it into "_"), and no Primary Agent id
+ * may start with `subagent_cli` (`agentIdRules.ts`), so the folder is only ever this Worker
+ * slot's. Worker slots are throwaway: each run prepares its profile again.
+ */
+export function buildCliWorkerRuntimeId(workerSlot: string): string {
+  return `subagent_cli-${normalizeSubagentSlugValue(workerSlot, 'worker')}`
+}
+
 export function buildSubagentSlugCollisionError(
   slug: string,
   firstLabel: string,

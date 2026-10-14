@@ -1,4 +1,5 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
+import { resolveRuntimeContext } from '$lib/server/services/runtimeContext'
 
 import {
   getLiveKitSidecarRuntimeSummary,
@@ -13,7 +14,7 @@ export const GET: RequestHandler = async ({ locals }) => {
 
   try {
     const runtime = await getLiveKitSidecarRuntimeSummary(locals.user.id)
-    return json({ runtime })
+    return json({ runtime, runtimeContext: resolveRuntimeContext() })
   } catch (error) {
     console.error('[voice/runtime/livekit] Failed to inspect runtime:', error)
     return json(
@@ -41,15 +42,18 @@ export const POST: RequestHandler = async ({ locals, request }) => {
 
     if (operation === 'install') {
       const result = await installLiveKitSidecarRuntime(locals.user.id)
-      return json(result)
+      return json({ ...result, runtimeContext: resolveRuntimeContext() })
     }
 
     if (operation && operation !== 'start') {
       return json({ error: `Unsupported LiveKit runtime operation "${operation}".` }, { status: 400 })
     }
 
-    const runtime = await startLiveKitSidecarRuntime(locals.user.id, { forceRestart })
-    return json({ runtime })
+    // A Start through this route (the panel's button, or anything calling it) may restart this
+    // Batshit's own, proven sidecar from before its launch record carried its address (BL-1311);
+    // auto-start never does.
+    const runtime = await startLiveKitSidecarRuntime(locals.user.id, { forceRestart, repairOwnLaunch: true })
+    return json({ runtime, runtimeContext: resolveRuntimeContext() })
   } catch (error) {
     console.error('[voice/runtime/livekit] Failed to start runtime:', error)
     return json(

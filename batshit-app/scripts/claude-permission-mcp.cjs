@@ -9,7 +9,9 @@
  */
 
 const path = require('node:path')
+const os = require('node:os')
 const process = require('node:process')
+const { randomUUID } = require('node:crypto')
 const sdkRoot = path.join(__dirname, '..', 'node_modules', '@modelcontextprotocol', 'sdk', 'dist', 'cjs')
 const { Server } = require(path.join(sdkRoot, 'server', 'index.js'))
 const { StdioServerTransport } = require(path.join(sdkRoot, 'server', 'stdio.js'))
@@ -24,6 +26,32 @@ const APPROVAL_TOOL_FULL_NAME =
   process.env.BATSHIT_PERMISSION_TOOL_NAME ||
   'mcp__batshit_gateway_claude-approvals__batshit_permission_prompt'
 const DEFAULT_TIMEOUT_SECONDS = 60 * 10
+/**
+ * BL-496 (A5): how long a card waits for its answer, and so the card's own `expiresAt`. Ten
+ * minutes: measured on Claude Code 2.1.280, the CLI keeps this MCP call open the full 600 s
+ * (`claude-code-integration.md`, the approval section). The only other value is a test knob;
+ * it can only shorten the wait, and only in a test run (`VITEST` or `NODE_ENV=test`), so an
+ * app's own environment can never shorten a real approval.
+ */
+const IS_TEST_RUN = process.env.VITEST === 'true' || process.env.NODE_ENV === 'test'
+const TEST_WAIT_SECONDS = IS_TEST_RUN
+  ? Number.parseInt(process.env.BATSHIT_TEST_CLAUDE_APPROVAL_WAIT_SECONDS || '', 10)
+  : Number.NaN
+const APPROVAL_WAIT_SECONDS =
+  Number.isInteger(TEST_WAIT_SECONDS) && TEST_WAIT_SECONDS > 0 && TEST_WAIT_SECONDS < DEFAULT_TIMEOUT_SECONDS
+    ? TEST_WAIT_SECONDS
+    : DEFAULT_TIMEOUT_SECONDS
+/**
+ * BL-496 (A6): the words the model gets when nobody answered. Claude Code refuses a deny with
+ * no `message` ("The permission prompt tool returned an invalid permission result", measured
+ * on 2.1.280), so a deny always carries words.
+ */
+const UNANSWERED_DENY_MESSAGE =
+  'Nobody answered this approval in 10 minutes, so it was denied. Do not try it again now. Tell the user what you need.'
+const DENY_WITHOUT_REASON_MESSAGE = 'The user denied this tool call.'
+/** A Redis failure inside the wait: not a person's deny and not an unanswered card. */
+const WAIT_FAILED_DENY_MESSAGE =
+  'Batshit could not read the answer to this approval, so it was denied. Do not try it again now. Tell the user the approval could not be read.'
 const SSE_CHANNEL_PREFIX = 'batshit:sse:'
 const PERMISSION_MODE = process.env.BATSHIT_CLAUDE_PERMISSION_MODE || 'default'
 const WORKDIR = process.env.BATSHIT_CLAUDE_WORKDIR || process.cwd()
@@ -67,10 +95,6 @@ function parseJsonList(value) {
     .filter((entry) => entry.length)
 }
 
-function normalizeToolName(value) {
-  return typeof value === 'string' ? value.trim() : ''
-}
-
 function parseRule(rule) {
   if (!rule || typeof rule !== 'string') return null
   const trimmed = rule.trim()
@@ -84,11 +108,12 @@ function escapeRegex(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
-function wildcardToRegex(pattern) {
+function wildcardToRegex(pattern, { filePattern = false, literalPrefix = '' } = {}) {
   const escaped = escapeRegex(pattern)
   const withDouble = escaped.replace(/\\\*\\\*/g, '.*')
   const withSingle = withDouble.replace(/\\\*/g, '[^/]*')
-  return new RegExp(`^${withSingle}$`, 'i')
+  const glob = filePattern ? withSingle.replace(/\\\?/g, '[^/]') : withSingle
+  return new RegExp(`^${escapeRegex(literalPrefix)}${glob}$`, 'i')
 }
 
 function matchRule(rule, toolName, toolInput) {
@@ -96,7 +121,8 @@ function matchRule(rule, toolName, toolInput) {
   if (!parsed) return false
   const base = parsed.tool.toLowerCase()
   const name = toolName.toLowerCase()
-  if (base !== name) return false
+  // Claude's Edit rules govern all file-editing tools, including notebook cells.
+  if (base !== name && !(base === 'edit' && (name === 'write' || name === 'notebookedit'))) return false
   if (!parsed.pattern) return true
 
   if (base === 'bash') {
@@ -109,37 +135,37 @@ function matchRule(rule, toolName, toolInput) {
     }
   }
 
-  const filePath = extractFilePath(toolInput)
+  const filePath = extractFilePath(toolInput, toolName)
   if (!filePath) return false
-  const normalized = filePath.replace(/\\/g, '/')
+  const fileTarget = filePath.replace(/\\/g, '/')
+  const anchoredRule = parsed.pattern.startsWith('//') || parsed.pattern.startsWith('~/')
+  const normalized = anchoredRule
+    ? path.resolve(WORKDIR, fileTarget).replace(/\\/g, '/')
+    : fileTarget
+  // Claude uses // for an absolute path. A home prefix is literal even when the
+  // actual home directory contains glob characters; only the rule suffix is a glob.
+  const pattern = parsed.pattern.startsWith('//') ? parsed.pattern.slice(1)
+    : parsed.pattern.startsWith('~/') ? parsed.pattern.slice(2) : parsed.pattern
+  const literalPrefix = parsed.pattern.startsWith('~/')
+    ? `${os.homedir().replace(/\\/g, '/').replace(/\/$/, '')}/` : ''
   try {
-    return wildcardToRegex(parsed.pattern).test(normalized)
+    return wildcardToRegex(pattern, { filePattern: true, literalPrefix }).test(normalized)
   } catch {
-    return normalized.startsWith(parsed.pattern)
+    return false
   }
 }
 
-function resolveToolInput(args) {
-  if (!args || typeof args !== 'object') return undefined
-  return (
-    args.toolInput ??
-    args.tool_input ??
-    args.input ??
-    args.arguments ??
-    args.params ??
-    undefined
-  )
-}
-
-function extractFilePath(toolInput) {
+function extractFilePath(toolInput, toolName) {
   if (!toolInput || typeof toolInput !== 'object') return ''
-  return (
-    toolInput.filePath ||
-    toolInput.file_path ||
-    toolInput.path ||
-    toolInput.file ||
-    ''
-  )
+  // Match the actual tool target before compatibility aliases. An unrelated
+  // field must not hide a NotebookEdit's notebook_path or a Write's file_path.
+  const fields = toolName.toLowerCase() === 'notebookedit'
+    ? ['notebook_path', 'file_path', 'filePath', 'path', 'file']
+    : ['file_path', 'filePath', 'path', 'file']
+  for (const field of fields) {
+    if (typeof toolInput[field] === 'string' && toolInput[field]) return toolInput[field]
+  }
+  return ''
 }
 
 function isWithinAllowedDirs(filePath) {
@@ -155,35 +181,15 @@ function isWithinAllowedDirs(filePath) {
   })
 }
 
-function resolveApprovalId(request, args) {
-  if (args && typeof args.approvalId === 'string' && args.approvalId.trim().length > 0) {
-    return args.approvalId.trim()
-  }
-  if (args && typeof args.requestId === 'string' && args.requestId.trim().length > 0) {
-    return args.requestId.trim()
-  }
-  if (args && typeof args.id === 'string' && args.id.trim().length > 0) {
-    return args.id.trim()
-  }
-  if (request && typeof request.id === 'string' && request.id.trim().length > 0) {
-    return request.id.trim()
-  }
-  return `approval_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
-}
-
-function buildResponsePayload(approved, reason, args) {
+function buildResponsePayload(approved, reason, toolInput) {
   if (approved) {
     const payload = { behavior: 'allow' }
-    const updatedInput = resolveToolInput(args)
-    if (updatedInput && typeof updatedInput === 'object') {
-      payload.updatedInput = updatedInput
-    }
+    payload.updatedInput = toolInput
     return payload
   }
   const payload = { behavior: 'deny' }
-  if (typeof reason === 'string' && reason.trim().length > 0) {
-    payload.message = reason.trim()
-  }
+  payload.message =
+    typeof reason === 'string' && reason.trim().length > 0 ? reason.trim() : DENY_WITHOUT_REASON_MESSAGE
   return payload
 }
 
@@ -195,15 +201,10 @@ function matchRules(rules, toolName, toolInput) {
   return false
 }
 
-function getToolName(args) {
-  return normalizeToolName(
-    args?.toolName ||
-      args?.tool ||
-      args?.name ||
-      args?.tool_name ||
-      args?.toolNameRaw ||
-      ''
-  )
+function isPlainObject(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const prototype = Object.getPrototypeOf(value)
+  return prototype === Object.prototype || prototype === null
 }
 
 function evaluateDecision(toolName, toolInput) {
@@ -219,17 +220,17 @@ function evaluateDecision(toolName, toolInput) {
   const allowed = matchRules(ALLOWED_TOOLS, toolName, toolInput)
   const autoAllow =
     AUTO_ALLOW_TOOLS.some((entry) => entry.toLowerCase() === lower) || isRead
-  const filePath = extractFilePath(toolInput)
+  const filePath = extractFilePath(toolInput, toolName)
   const inAllowedDir = isEdit && filePath && isWithinAllowedDirs(filePath)
-
-  if (isMcpTool && ALLOWED_MCP_TOOLS.has(toolName)) {
-    return { decision: 'allow' }
-  }
 
   if (PERMISSION_MODE === 'plan') {
     if (isRead || isWeb) return { decision: 'allow' }
     if (PLAN_ALLOW_TOOLS.has(toolName.toLowerCase())) return { decision: 'allow' }
     return { decision: 'deny', reason: 'Plan mode blocks edits/commands' }
+  }
+
+  if (isMcpTool && ALLOWED_MCP_TOOLS.has(toolName)) {
+    return { decision: 'allow' }
   }
 
   if (PERMISSION_MODE === 'dontAsk') {
@@ -240,8 +241,9 @@ function evaluateDecision(toolName, toolInput) {
   }
 
   if (PERMISSION_MODE === 'acceptEdits') {
-    if (allowed) return { decision: 'allow' }
-    if (inAllowedDir) return { decision: 'allow' }
+    // Claude Code already evaluated allowed rules and ordinary in-directory edits.
+    // A request escalated here must reach the user: our wildcard/path checks cannot
+    // override Claude's compound-command or protected-file decision (BL-497).
     if (autoAllow) return { decision: 'allow' }
     return { decision: 'prompt' }
   }
@@ -267,7 +269,10 @@ async function waitForApproval(key, timeoutSeconds) {
   const timeout = Number.isFinite(timeoutSeconds) ? timeoutSeconds : DEFAULT_TIMEOUT_SECONDS
   try {
     const result = await redis.brPop(key, timeout)
-    if (!result || !result.element) return { approved: false }
+    // BL-496 (A6): the wait ran out. A typed expiry, not a human's deny.
+    if (!result || !result.element) {
+      return { approved: false, expired: true, expiryReason: 'unanswered', reason: UNANSWERED_DENY_MESSAGE }
+    }
     const raw = result.element
     try {
       const parsed = JSON.parse(raw)
@@ -291,7 +296,7 @@ async function waitForApproval(key, timeoutSeconds) {
     return { approved: false, reason: String(raw) }
   } catch (error) {
     console.error('[claude-approval-mcp] Approval wait failed', error)
-    return { approved: false, reason: 'Approval wait failed' }
+    return { approved: false, expired: true, expiryReason: 'wait_failed', reason: WAIT_FAILED_DENY_MESSAGE }
   }
 }
 
@@ -312,12 +317,11 @@ async function main() {
           inputSchema: {
             type: 'object',
             properties: {
-              approvalId: { type: 'string', description: 'Optional approval request id' },
-              toolName: { type: 'string', description: 'Tool requesting permission' },
-              toolInput: { type: 'object', description: 'Input for the tool requesting permission' },
-              prompt: { type: 'string', description: 'Prompt shown to the user' },
-              sessionId: { type: 'string', description: 'Optional session id override' }
+              tool_name: { type: 'string', minLength: 1, description: 'Claude Code tool requesting permission' },
+              input: { type: 'object', description: 'Exact input Claude Code is asking to run' },
+              tool_use_id: { type: 'string', minLength: 1, description: 'Claude Code tool use identifier' }
             },
+            required: ['tool_name', 'input', 'tool_use_id'],
             additionalProperties: true
           }
         }
@@ -327,24 +331,24 @@ async function main() {
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const args = request?.params?.arguments || {}
-    const approvalId = resolveApprovalId(request, args)
-    const resolvedSessionId =
-      (args && typeof args.sessionId === 'string' && args.sessionId.trim().length > 0
-        ? args.sessionId.trim()
-        : null) ||
-      sessionId
+    const dispatchedToolName = request?.params?.name
+    const callback = args && typeof args === 'object' ? args : {}
+    const toolName = typeof callback.tool_name === 'string' ? callback.tool_name.trim() : ''
+    const toolUseId = typeof callback.tool_use_id === 'string' ? callback.tool_use_id.trim() : ''
+    const toolInput = callback.input
+    const resolvedSessionId = sessionId
 
-    if (!resolvedSessionId) {
+    if (dispatchedToolName !== APPROVAL_TOOL_NAME || !resolvedSessionId || !toolName || !toolUseId || !isPlainObject(toolInput)) {
       // Fail CLOSED: a permission gate without its session context cannot ask
       // the user, so it must deny — never silently allow (G-0078).
-      console.error('[claude-approval-mcp] Missing session id; denying tool approval', {
-        approvalId,
+      console.error('[claude-approval-mcp] Invalid callback or missing session id; denying tool approval', {
+        toolName,
         messageId
       })
       const payload = buildResponsePayload(
         false,
-        'Tool approval denied: the approval bridge received no session id, so the user cannot be asked. Re-run the message; if this persists, the Claude lane is not propagating BATSHIT_SESSION_ID.',
-        args
+        'Tool approval denied: the callback was malformed, unknown, or missing launch session context.',
+        toolInput
       )
       return {
         content: [{ type: 'text', text: JSON.stringify(payload) }],
@@ -352,19 +356,22 @@ async function main() {
       }
     }
 
-    const toolArgs = args && typeof args === 'object' ? args : {}
-    const toolName = getToolName(toolArgs)
-    const toolInput = resolveToolInput(toolArgs) ?? toolArgs
     const decision = evaluateDecision(toolName, toolInput)
 
     if (decision.decision !== 'prompt') {
-      const payload = buildResponsePayload(decision.decision === 'allow', decision.reason, toolArgs)
+      const payload = buildResponsePayload(decision.decision === 'allow', decision.reason, toolInput)
       return {
         content: [{ type: 'text', text: JSON.stringify(payload) }],
         structured_content: payload
       }
     }
 
+    const approvalId = randomUUID()
+    const presentationArgs = { approvalId, toolName, toolInput, toolUseId }
+    // BL-496 (A5): one clock. The card ends when this wait ends, and says when.
+    const requestedAtMs = Date.now()
+    const requestedAt = new Date(requestedAtMs).toISOString()
+    const expiresAt = new Date(requestedAtMs + APPROVAL_WAIT_SECONDS * 1000).toISOString()
     const toolEventBase = {
       sessionId: resolvedSessionId,
       messageId,
@@ -378,16 +385,21 @@ async function main() {
     await publishSseEvent(resolvedSessionId, {
       type: 'tool-call',
       ...toolEventBase,
-      args: toolArgs
+      args: presentationArgs,
+      requestedAt,
+      expiresAt
     })
 
     const key = `toolApprovalResponse:${resolvedSessionId}:${approvalId}`
-    const approvalResult = await waitForApproval(key, DEFAULT_TIMEOUT_SECONDS)
-    const payload = buildResponsePayload(approvalResult.approved, approvalResult.reason, toolArgs)
+    const approvalResult = await waitForApproval(key, APPROVAL_WAIT_SECONDS)
+    const payload = buildResponsePayload(approvalResult.approved, approvalResult.reason, toolInput)
     await publishSseEvent(resolvedSessionId, {
       type: 'tool-result',
       ...toolEventBase,
-      result: payload
+      result: payload,
+      // BL-496 (A6): the card's end, typed: a human's answer, or a wait nobody answered.
+      approvalStatus: approvalResult.approved ? 'approved' : approvalResult.expired ? 'expired' : 'denied',
+      ...(approvalResult.expired ? { expiryReason: approvalResult.expiryReason } : {})
     })
     return {
       content: [{ type: 'text', text: JSON.stringify(payload) }],

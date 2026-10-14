@@ -39,6 +39,8 @@ export const POST: RequestHandler = async ({ locals, request }) => {
     const result = await findCliTools({
       userId,
       agentId: agentBinding.agentId ?? null,
+      // BL-686: the credential's list bounds a managed run; the body's list only narrows.
+      ...(auth.auth === 'agent' ? { cliToolScope: auth.cliToolScope ?? [] } : {}),
       selectedToolIds: body.selectedToolIds,
       query: body.query,
       limit: body.limit,

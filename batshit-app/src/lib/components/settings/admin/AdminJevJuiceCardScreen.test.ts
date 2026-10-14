@@ -5,7 +5,7 @@ import { JEV_INCOMING_TEXT_SCREEN_LABEL } from '$lib/utils/jevJuiceControl'
 
 /**
  * SA-120 P7 — the one instance switch **Screen Incoming Text** (LS-057) on the Admin card
- * (no "Jev Juice:" prefix there, Josh 2026-09-17: the card is the feature's name), under the same Settings Auto-Save Contract as the rest of it: hydration must
+ * (no "Judge Juice:" prefix there, Josh 2026-09-17: the card is the feature's name), under the same Settings Auto-Save Contract as the rest of it: hydration must
  * never save, and one flip saves once, carrying the whole config rather than one field.
  */
 
@@ -78,7 +78,7 @@ describe('AdminJevJuiceCard: Screen Incoming Text', () => {
     expect(toggle.getAttribute('data-state')).toBe('checked')
     expect(toggle.id).toBe('jev-juice-screen-incoming-text')
     expect(JEV_INCOMING_TEXT_SCREEN_LABEL).toBe('Screen Incoming Text')
-    expect(screen.queryByText('Jev Juice: Screen Incoming Text')).toBeNull()
+    expect(screen.queryByText('Judge Juice: Screen Incoming Text')).toBeNull()
     // Give any hydration-triggered autosave a chance to (wrongly) fire.
     await new Promise((resolve) => setTimeout(resolve, 700))
     expect(putBodies(calls)).toHaveLength(0)
@@ -99,7 +99,11 @@ describe('AdminJevJuiceCard: Screen Incoming Text', () => {
       modelId: 'jev-1.13.0',
       attemptTimeoutMs: 5000,
       inChatWaitMs: 750,
-      screenIncomingText: true
+      screenIncomingText: true,
+      // SA-120 P10a: the judges ride the same whole draft; a record from before P10a hydrates as TypeSafe only.
+      providers: [],
+      defaultProviderId: 'typesafe',
+      laneProviders: {}
     })
     await screen.findByText('Saved')
     await new Promise((resolve) => setTimeout(resolve, 700))

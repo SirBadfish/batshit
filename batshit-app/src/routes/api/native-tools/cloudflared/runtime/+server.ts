@@ -8,7 +8,7 @@ import {
 } from '$lib/server/services/cloudflaredRuntime'
 
 function isValidPlatform(value: unknown): value is CloudflaredInstallPlatform {
-  return typeof value === 'string' && value in CLOUDFLARED_ASSETS
+  return typeof value === 'string' && Object.hasOwn(CLOUDFLARED_ASSETS, value)
 }
 
 export const GET: RequestHandler = async ({ locals }) => {

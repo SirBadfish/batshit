@@ -4,6 +4,7 @@ import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import {
   GoonMutationError,
   assertGenericGoonPatchAllowed,
+  createOwnedGoonForClient,
   patchOwnedGoonForClient
 } from '../goonMutationRepository.server'
 
@@ -23,7 +24,6 @@ describe('atomic Goon mutation repository', () => {
       'nailSurface',
       'skinAppearance',
       'hairState',
-      'clothingState',
       'recipeFitReceipts'
     ]) {
       expect(() => assertGenericGoonPatchAllowed(existing, { [field]: null })).toThrowError(
@@ -67,5 +67,80 @@ describe('atomic Goon mutation repository', () => {
       recipe: { contract: 'goon-recipe/v2', writeVersion: 7, sentinel: 'must-survive' }
     })
     expect(stored).not.toBeInstanceOf(GoonMutationError)
+  })
+
+  it.runIf(REAL_REDIS_LANE)('rejects custom asset acquisition atomically during deletion and after metadata removal', async () => {
+    const uploadKey = 'upload:goon_custom_models:shared.glb'
+    const markerKey = 'goon_asset_delete:goon_custom_models:shared.glb'
+    const base = {
+      id: 'guarded-goon',
+      user_id: 'atomic-user',
+      name: 'Before',
+      kind: 'custom',
+      sourceProfile: 'expert-custom-glb',
+      files: {},
+      created_at: '2026-07-17T00:00:00.000Z',
+      updated_at: '2026-07-17T00:00:00.000Z'
+    } as any
+    const customAvatar = { model: { url: '/uploads/goon_custom_models/shared.glb', filename: 'shared.glb' } }
+    await redis.execute((client) => client.json.set(uploadKey, '$', { filename: 'shared.glb' }))
+    await redis.execute((client) => client.set(markerKey, JSON.stringify({
+      contract: 'goon-asset-deletion/v1', phase: 'reserved'
+    })))
+
+    await expect(redis.execute((client) => createOwnedGoonForClient({
+      client, userId: 'atomic-user', goon: { ...base, customAvatar }
+    }))).rejects.toMatchObject({ code: 'ASSET_UNAVAILABLE', status: 409 })
+    expect(await redis.json.get('goon:guarded-goon')).toBeNull()
+    expect(await redis.execute((client) => client.sIsMember('user:atomic-user:goons', 'guarded-goon'))).toBe(0)
+
+    await redis.execute((client) => client.del(markerKey))
+    await redis.execute((client) => createOwnedGoonForClient({
+      client, userId: 'atomic-user', goon: base
+    }))
+    await redis.execute((client) => client.set(markerKey, JSON.stringify({
+      contract: 'goon-asset-deletion/v1', phase: 'deleting'
+    })))
+    await expect(redis.execute((client) => patchOwnedGoonForClient({
+      client,
+      userId: 'atomic-user',
+      goonId: 'guarded-goon',
+      updates: { name: 'Changed', customAvatar },
+      updatedAt: '2026-07-17T00:00:01.000Z'
+    }))).rejects.toMatchObject({ code: 'ASSET_UNAVAILABLE', status: 409 })
+    expect(await redis.json.get('goon:guarded-goon')).toMatchObject({ name: 'Before' })
+
+    await redis.execute((client) => client.del(markerKey))
+    await redis.execute((client) => client.del(uploadKey))
+    await expect(redis.execute((client) => patchOwnedGoonForClient({
+      client,
+      userId: 'atomic-user',
+      goonId: 'guarded-goon',
+      updates: { customAvatar },
+      updatedAt: '2026-07-17T00:00:01.000Z'
+    }))).rejects.toMatchObject({ code: 'ASSET_UNAVAILABLE', status: 409 })
+    expect(await redis.json.get('goon:guarded-goon')).toMatchObject({ name: 'Before' })
+  })
+
+  it.runIf(REAL_REDIS_LANE)('blocks custom refs during restore while allowing records without them', async () => {
+    await redis.json.set('upload:goon_custom_models:restored.glb', '$', { filename: 'restored.glb' })
+    await redis.execute((client) => client.set('goon_asset_restore', 'restore-token'))
+    const base = {
+      id: 'restore-guarded-goon', user_id: 'atomic-user', name: 'Restoring',
+      kind: 'custom', sourceProfile: 'expert-custom-glb', files: {},
+      created_at: '2026-07-17T00:00:00.000Z', updated_at: '2026-07-17T00:00:00.000Z'
+    } as any
+    await expect(redis.execute((client) => createOwnedGoonForClient({
+      client,
+      userId: 'atomic-user',
+      goon: {
+        ...base,
+        customAvatar: { model: { filename: 'restored.glb' } }
+      }
+    }))).rejects.toMatchObject({ code: 'ASSET_UNAVAILABLE', status: 409 })
+    expect(await redis.json.get('goon:restore-guarded-goon')).toBeNull()
+
+    await redis.execute((client) => createOwnedGoonForClient({ client, userId: 'atomic-user', goon: base }))
+    expect(await redis.json.get('goon:restore-guarded-goon')).toMatchObject({ name: 'Restoring' })
   })
 })

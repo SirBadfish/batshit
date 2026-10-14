@@ -9,10 +9,8 @@ vi.mock('$lib/services/zipping', () => ({
 
 import { compileForAI } from '$lib/services/messageCompiler'
 import { buildSteerPlaceholder, type DeliveredSteer } from '$lib/utils/steerControl'
-import {
-  COMPILED_HISTORY_SEPARATOR,
-  segmentCompiledUserMessage
-} from '$lib/server/services/cacheForensics/compiledMessageSegments'
+import { segmentCompiledUserMessage } from '$lib/server/services/cacheForensics/compiledMessageSegments'
+import { compiledConversation, compiledElement } from '$lib/utils/compiledChatTags'
 import { analyzeHistoryStability } from '$lib/server/services/cacheForensics/divergence'
 import {
   fingerprintSegments,
@@ -39,11 +37,11 @@ const steer: DeliveredSteer = {
   lane: 'api'
 }
 
-const U1 = '**9:14 AM**\nU: first question'
-const A1 = 'Assistant: first answer'
-const U2 = '**9:15 AM**\nU: do the thing'
-const U3 = '**9:20 AM**\nU: third question'
-const A3 = 'Assistant: third answer'
+const U1 = compiledElement('user', 'first question', [['time', 'September 10, 2026 at 9:14 AM']])
+const A1 = compiledElement('assistant', 'first answer')
+const U2 = compiledElement('user', 'do the thing')
+const U3 = 'third question'
+const A3 = compiledElement('assistant', 'third answer')
 
 /** The assistant reply that carried the steer, exactly as it is stored. */
 const A2_STORED = `Assistant: starting.\n\n${buildSteerPlaceholder('steer_abc')}\n\nDone, and the tests pass.`
@@ -52,12 +50,14 @@ async function compileA2() {
   return compileForAI(A2_STORED, 0, 1, {}, { id: 'msg_a2', metadata: { steers: [steer] } }, {})
 }
 
-/** The shape the real compiler emits: one user message, history joined in array order. */
+/**
+ * The shape the real compiler emits (SA-128): one user message, the history elements in
+ * `<conversation>` in array order, then the new message. A compiled reply goes into its
+ * `<assistant>` element exactly as the compiler wraps it.
+ */
 function compiledUserMessage(history: string[], current: string): string {
-  return [
-    `==== PREVIOUS CONVERSATION ====\n\n${history.join(COMPILED_HISTORY_SEPARATOR).trim()}`,
-    `==== CURRENT USER MESSAGE ====\n\n${current}`
-  ].join('\n\n')
+  const elements = history.map((entry) => (entry.startsWith('<') ? entry : compiledElement('assistant', entry)))
+  return [compiledConversation(elements), compiledElement('user', current, [['time', '9:30 AM']])].join('\n\n')
 }
 
 function fingerprint(history: string[], current: string) {
@@ -73,7 +73,7 @@ describe('a steered turn keeps history append-only (DL-114-04)', () => {
     expect(a2).toContain('[The user said, mid-reply: also run the tests]')
 
     const turnThree = fingerprint([U1, A1, U2, a2], U3)
-    const turnFour = fingerprint([U1, A1, U2, a2, U3, A3], '**9:25 AM**\nU: fourth question')
+    const turnFour = fingerprint([U1, A1, U2, a2, compiledElement('user', U3), A3], 'fourth question')
 
     expect(analyzeHistoryStability(turnFour, turnThree)).toMatchObject({
       state: 'append-only',
@@ -93,7 +93,7 @@ describe('a steered turn keeps history append-only (DL-114-04)', () => {
     // A mid-turn user record compiles BEFORE the reply it interrupted (Part 2.3), so it
     // lands between two history messages that already exist.
     const withInsertedRecord = fingerprint(
-      [U1, A1, U2, '**9:16 AM**\nU: also run the tests', a2],
+      [U1, A1, U2, compiledElement('user', 'also run the tests'), a2],
       U3
     )
 

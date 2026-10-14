@@ -14,11 +14,14 @@ import { describe, expect, it } from 'vitest'
 import {
   BROKER_FABRIC_BATSHIT_TOOLS_CONTROL_IDS,
   BROKER_FABRIC_FETCH_ZIP_CONTROL_ID,
+  DELEGATED_RUN_BROKER_SCOPE,
   isBrokerAvailable,
   isControlIdAllowedByList,
   resolveBrokerFabricAllowedControlIds,
   resolveBrokerFamilies,
   resolveBrokerToolToggles,
+  resolveDelegatedRunAllowedControlIds,
+  resolveDelegatedRunBrokerInputs,
   type BrokerToolToggles
 } from '$lib/utils/brokerAvailability'
 
@@ -623,5 +626,99 @@ describe('Judge controls (SA-120 P2, DL-120-06)', () => {
         judgeControlsEnabled: true
       })
     ).toEqual([])
+  })
+})
+
+/* -------------------------------------------------------------------------- *
+ * BL-81 — a Subagent or Worker run may use exactly what its DCM index offers it.
+ *
+ * The Subagent DCM builder (`buildManagedSubagentDynamicInfo`) and the control scope minted
+ * onto a delegated CLI run's credential both read their inputs through
+ * `resolveDelegatedRunBrokerInputs` and their flags from `DELEGATED_RUN_BROKER_SCOPE`, and the
+ * scope is the two broker groups that index lists: Fabric and Artifact Tools.
+ * -------------------------------------------------------------------------- */
+
+describe('the control scope of a delegated run (BL-81)', () => {
+  const ALL_ON: BrokerToolToggles = resolveBrokerToolToggles({})
+
+  it('keeps the Fabric control plane and every agent-owned family closed, as every Subagent site does', () => {
+    expect(DELEGATED_RUN_BROKER_SCOPE).toEqual({
+      allowArtifactRuntimeTools: true,
+      allowFabricControlTools: false,
+      memoryControlsEnabled: false,
+      dmControlsEnabled: false,
+      scheduleControlsEnabled: false,
+      judgeControlsEnabled: false
+    })
+  })
+
+  it('reads the runtime from the Subagent type and the six toggles off its resolved settings', () => {
+    const scope = {
+      subagentType: 'cli',
+      nativeToolSettings: { ...ALL_ON, fetchZipEnabled: false, bashEnabled: true } as any
+    }
+    expect(resolveDelegatedRunBrokerInputs(scope)).toEqual({
+      runtime: 'cli',
+      toggles: { ...ALL_ON, fetchZipEnabled: false }
+    })
+    expect(resolveDelegatedRunBrokerInputs({ ...scope, subagentType: 'api' }).runtime).toBe('api')
+  })
+
+  it('offers Fetch Zip and the published artifact tools when their toggles are on', () => {
+    for (const runtime of ['api', 'cli'] as const) {
+      expect(resolveDelegatedRunAllowedControlIds({ runtime, toggles: ALL_ON }), runtime).toEqual([
+        BROKER_FABRIC_FETCH_ZIP_CONTROL_ID,
+        'use.artifact.*'
+      ])
+    }
+  })
+
+  it('drops Fetch Zip when its toggle is off, and the artifact tools when theirs is', () => {
+    expect(
+      resolveDelegatedRunAllowedControlIds({
+        runtime: 'cli',
+        toggles: { ...ALL_ON, fetchZipEnabled: false }
+      })
+    ).toEqual(['use.artifact.*'])
+    expect(
+      resolveDelegatedRunAllowedControlIds({
+        runtime: 'cli',
+        toggles: { ...ALL_ON, artifactRuntimeEnabled: false }
+      })
+    ).toEqual([BROKER_FABRIC_FETCH_ZIP_CONTROL_ID])
+    expect(resolveDelegatedRunAllowedControlIds({ runtime: 'cli', toggles: ALL_OFF })).toEqual([])
+  })
+
+  it('follows each runtime\'s own Fabric rule, exactly as the index does', () => {
+    // On `cli` the Fabric family follows the Batshit Tools toggle, so Fetch Zip is only offered
+    // beside it; on `api` Fetch Zip opens the family by itself.
+    const fetchZipOnly: BrokerToolToggles = { ...ALL_OFF, fetchZipEnabled: true }
+    expect(resolveDelegatedRunAllowedControlIds({ runtime: 'cli', toggles: fetchZipOnly })).toEqual([])
+    expect(resolveDelegatedRunAllowedControlIds({ runtime: 'api', toggles: fetchZipOnly })).toEqual([
+      BROKER_FABRIC_FETCH_ZIP_CONTROL_ID
+    ])
+  })
+
+  it('never offers a control a primary alone may use, whatever the toggles', () => {
+    for (const runtime of ['api', 'cli'] as const) {
+      const allowed = resolveDelegatedRunAllowedControlIds({ runtime, toggles: ALL_ON })
+      for (const controlId of [
+        'sys.skill.save',
+        'sys.skill.import',
+        'sys.dm.list',
+        'sys.memory.search',
+        'sys.schedule.list',
+        'sys.judge.ask',
+        'sys.artifact.update',
+        'artifact.artifact_1.action.run.run',
+        'sys.cli_tool.create',
+        'sys.mcp.dynamic.find',
+        'sys.runtime_addon.start',
+        'sys.voice.engine.register'
+      ]) {
+        expect(isControlIdAllowedByList(controlId, allowed), `${runtime} ${controlId}`).toBe(false)
+      }
+      expect(isControlIdAllowedByList('use.artifact.anything', allowed), runtime).toBe(true)
+    }
   })
 })

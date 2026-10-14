@@ -30,7 +30,10 @@ import {
   internalServiceHeaders
 } from '$lib/server/services/internalRequestAuth'
 import { hasPendingToolApproval } from '$lib/server/services/dm/pendingToolApproval'
-import { getActiveSessionTurn } from '$lib/server/services/streamAbortRegistry'
+import {
+  countQueuedSessionTurns,
+  getActiveSessionTurn
+} from '$lib/server/services/streamAbortRegistry'
 import {
   abortWakeRun,
   clearWakeRun,
@@ -58,6 +61,47 @@ import {
   type SessionOriginKind
 } from '$lib/utils/sessionOrigin'
 import type { AgentRow, ChatMessage, ChatSessionRow } from '$lib/types/database'
+
+/* ------------------------------------------------------------------ *
+ * BL-398: the woken-turn POST's own dispatcher
+ * ------------------------------------------------------------------ *
+ * send-routed only answers a wake once the whole turn ends (finishWokenTurn's
+ * response), which for ordinary CLI work is routinely well past five minutes.
+ * Node's global fetch (undici's default dispatcher) gives up at a 300s headers
+ * timeout with no response headers received, so `.catch` below saw every long
+ * wake as a failure and `clearWakeRun` dropped the run before the wake's own
+ * timer (`wake_timeout_minutes`, `resolveWakeTimeoutMs`) ever got to. That timer
+ * is what actually bounds this call (it aborts `controller.signal`, which this
+ * fetch is given below), so the dispatcher's own timeouts can be off.
+ *
+ * One `Agent` for the process, like `typesafeClient.ts`'s keep-alive dispatcher.
+ */
+let wakeFetchDispatcher: Promise<unknown> | null = null
+
+async function getWakeFetchDispatcher(): Promise<unknown> {
+  if (!wakeFetchDispatcher) {
+    wakeFetchDispatcher = import('undici')
+      .then(
+        ({ Agent }) =>
+          new Agent({
+            headersTimeout: 0,
+            bodyTimeout: 0
+          })
+      )
+      .catch((error) => {
+        // Never cache a rejection: one failed `import('undici')` (a transient module-load
+        // failure) would otherwise fail every later wake for the rest of the process.
+        wakeFetchDispatcher = null
+        throw error
+      })
+  }
+  return wakeFetchDispatcher
+}
+
+/** Test seam only: forces the next wake to rebuild the dispatcher (like a fresh process). */
+export function __resetWakeFetchDispatcherForTests(): void {
+  wakeFetchDispatcher = null
+}
 
 /* ------------------------------------------------------------------ *
  * Contract
@@ -299,6 +343,22 @@ async function runAgentWakeup(
   const reservation = reserveWakeSlot(input.agentId)
   if (!reservation.ok) return refuse(reservation.code, reservation.reason)
   slot.id = reservation.reservationId
+  const reservedAt = reservation.reservedAt
+
+  // BL-398: resolved here, before the session is created, the wake user message is saved,
+  // or anything is broadcast — a failed build must leave no orphan user message and no
+  // session announced with nothing able to post to it. The slot's `finally` release still
+  // applies on this refusal (`registerWakeRun` has not consumed it yet).
+  let wakeDispatcher: unknown
+  try {
+    wakeDispatcher = await getWakeFetchDispatcher()
+  } catch (error) {
+    console.error('[Wake-up] Failed to build the wake fetch dispatcher:', error)
+    return refuse(
+      'wake_setup_failed',
+      'Batshit could not prepare the wake-up request, so it is waiting in the inbox instead.'
+    )
+  }
 
   // 7) Resolve the target session, honouring the recipient's working style.
   let targetSession: ChatSessionRow | null = null
@@ -364,7 +424,14 @@ async function runAgentWakeup(
     }
   }
 
-  if (targetSession && getActiveSessionTurn(targetSession.id)) {
+  // BL-713: sends waiting in the chat's line count as busy too (the line may hold for an approval
+  // card with no turn running). Refused here, before anything is saved: send-routed would refuse
+  // the woken turn (`queued_turns_waiting`), and its saved message would sit unanswered in the
+  // chat, where the waiting send would read it as history.
+  if (
+    targetSession &&
+    (getActiveSessionTurn(targetSession.id) || countQueuedSessionTurns(targetSession.id) > 0)
+  ) {
     return refuse(
       'agent_busy',
       `${agent.displayName ?? 'That agent'} is mid-task, so this is waiting in its inbox instead.`
@@ -526,6 +593,9 @@ async function runAgentWakeup(
       userId: input.userId,
       origin,
       startedAt: Date.now(),
+      reservedAt,
+      // BL-505: the woken turn is the run under this id; it spends no Clip countdown.
+      assistantMessageId,
       controller,
       timer
     },
@@ -552,10 +622,15 @@ async function runAgentWakeup(
   // (a `result`, or "One at a time") longer than 300 messages would have posted ancient
   // history and left out the DM message this turn is about.
   const history = await redis.getRecentMessages(sessionId, 300)
-  const runPromise = fetch(`${originBase}/api/messages/send-routed`, {
+  // Assigned to an explicitly-typed variable first (not an inline object literal at the
+  // `fetch` call site) so `dispatcher` — real at runtime, on every lane that resolves
+  // `fetch` to undici — does not trip the object-literal excess-property check against
+  // `RequestInit`, the same seam `typesafeClient.ts`'s `TypesafeFetchInit` uses.
+  const wakeFetchInit: RequestInit & { dispatcher?: unknown } = {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...internalServiceHeaders() },
     signal: controller.signal,
+    dispatcher: wakeDispatcher,
     body: JSON.stringify({
       content: input.content,
       sessionId,
@@ -571,7 +646,8 @@ async function runAgentWakeup(
         }
       }
     })
-  })
+  }
+  const runPromise = fetch(`${originBase}/api/messages/send-routed`, wakeFetchInit)
 
   void runPromise
     .then(async (response) => {
@@ -590,6 +666,10 @@ async function runAgentWakeup(
           status: response.status,
           detail: detail.slice(0, 400)
         })
+      } else {
+        // The OK (and 499) branches never read the body; leaving it unread ties up the
+        // connection until GC. Nothing in it is needed — the turn's own record is Redis's.
+        response.body?.cancel().catch(() => {})
       }
       await finishWokenTurn(sessionId, reason, input.userId)
     })
@@ -666,6 +746,12 @@ async function finishWokenTurn(
         stampDmNeedsUser,
         WAKE_DELIVERED_INFO_RESULT
       } = await import('$lib/server/services/dm/dmStore')
+      // BL-702 / BL-703: all three writes below skip a note that a schedule fired again
+      // after this wake was RESERVED, not only after it registered — `entry.reservedAt` is
+      // stamped 3-9s earlier than `entry.startedAt`, closing the gap a fire could land in
+      // during the session/message setup awaits, before the registry entry (and its dmId)
+      // existed at all.
+      const guard = { turnStartedAt: entry.reservedAt ?? entry.startedAt }
       await stampDmDelivery(entry.origin.dmId, {
         ...(reason === 'agent_busy'
           ? {
@@ -676,7 +762,7 @@ async function finishWokenTurn(
           : {}),
         outcome: reason,
         sessionId
-      })
+      }, guard)
 
       // F-SEC-1b — the second of the two holdups only the user can clear. A woken turn that
       // stops at a Bash or MCP approval card ENDS normally, so without this the chat looks
@@ -691,7 +777,8 @@ async function finishWokenTurn(
       if (parkedOnApproval) {
         await stampDmNeedsUser(
           entry.origin.dmId,
-          'This chat is waiting for you to approve a tool before it can go on.'
+          'This chat is waiting for you to approve a tool before it can go on.',
+          guard
         )
       } else if (reason === 'completed') {
         // SA-115 F-P1-2 — a wake DELIVERS an info note, so the note is no longer open.
@@ -725,7 +812,12 @@ async function finishWokenTurn(
         // Every sender kind, because what closes it is the delivery, not who sent it.
         const originDm = await getDm(entry.origin.dmId)
         if (originDm?.kind === 'info' && !originDm.delivery?.needsUser) {
-          await acknowledgeInfoDm(entry.origin.dmId, entry.agentId, WAKE_DELIVERED_INFO_RESULT)
+          await acknowledgeInfoDm(
+            entry.origin.dmId,
+            entry.agentId,
+            WAKE_DELIVERED_INFO_RESULT,
+            guard
+          )
         }
       }
     } catch (error) {

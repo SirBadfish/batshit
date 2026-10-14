@@ -75,6 +75,17 @@ const inspectionPreview = {
   mimeType: "model/gltf-binary",
 };
 
+function cleanupFetch() {
+  return vi.fn(async (url: string, init: RequestInit) => {
+    if (url.endsWith('/asset-deletion/discover-hair-import')) return Response.json({ files: [] });
+    if (url.endsWith('/asset-deletion/reserve')) return Response.json({ reservation: {
+      contract: 'goon-asset-deletion/v1', token: '00000000-0000-4000-8000-000000000001', phase: 'reserved',
+    } });
+    if (url.endsWith('/upload/asset') && init.method === 'DELETE') return Response.json({ existed: true, deletedFile: true });
+    throw new Error('Unexpected cleanup fixture request');
+  });
+}
+
 describe("Hair import lifecycle cleanup", () => {
   useRedisTestServer();
 
@@ -379,9 +390,7 @@ l 9 10
       now: new Date("2026-08-08T12:00:00.000Z"),
       jobId: "expired-job",
     });
-    const fetcher = vi
-      .fn()
-      .mockResolvedValue(new Response(null, { status: 204 }));
+    const fetcher = cleanupFetch();
     vi.stubGlobal("fetch", fetcher);
 
     await expect(
@@ -389,13 +398,14 @@ l 9 10
         "cleanup-user",
         new Date("2026-08-10T12:00:00.000Z"),
       ),
-    ).resolves.toEqual({ deletedJobs: 1, deletedFiles: 2 });
-    expect(fetcher).toHaveBeenCalledTimes(2);
-    expect(JSON.parse(String(fetcher.mock.calls[0]![1]!.body))).toEqual({
+    ).resolves.toEqual({ deletedJobs: 1, deletedFiles: 2, retainedFiles: 0, missingFiles: 0 });
+    expect(fetcher).toHaveBeenCalledTimes(5);
+    const deletions = fetcher.mock.calls.filter(([, init]) => init.method === 'DELETE');
+    expect(JSON.parse(String(deletions[0]![1]!.body))).toMatchObject({
       uploadType: "goon_hair_imports",
       filename: "inspection-preview.glb",
     });
-    expect(JSON.parse(String(fetcher.mock.calls[1]![1]!.body))).toEqual({
+    expect(JSON.parse(String(deletions[1]![1]!.body))).toMatchObject({
       uploadType: "goon_hair_imports",
       filename: "expired-source.obj",
     });
@@ -428,7 +438,7 @@ l 9 10
     ).rejects.toMatchObject({ code: "CLEANUP_FAILED", status: 502 });
     await expect(
       getHairImportJobForCleanup("cleanup-retry-user", "expired-retry-job"),
-    ).resolves.toEqual(job);
+    ).resolves.toEqual({ ...job, status: "cancelled", stateVersion: job.stateVersion + 1 });
   });
 
   it("discards an obsolete job contract and every owned draft file before a new import", async () => {
@@ -447,9 +457,7 @@ l 9 10
       );
       await client.sAdd(hairImportJobIndexKey("obsolete-user"), jobId);
     });
-    const fetcher = vi
-      .fn()
-      .mockResolvedValue(new Response(null, { status: 204 }));
+    const fetcher = cleanupFetch();
     vi.stubGlobal("fetch", fetcher);
 
     await expect(
@@ -457,8 +465,8 @@ l 9 10
         "obsolete-user",
         new Date("2026-08-10T12:00:00.000Z"),
       ),
-    ).resolves.toEqual({ deletedJobs: 1, deletedFiles: 2 });
-    expect(fetcher).toHaveBeenCalledTimes(2);
+    ).resolves.toEqual({ deletedJobs: 1, deletedFiles: 2, retainedFiles: 0, missingFiles: 0 });
+    expect(fetcher).toHaveBeenCalledTimes(4);
     await expect(
       getHairImportJobForCleanup("obsolete-user", jobId),
     ).rejects.toMatchObject({ code: "NOT_FOUND" });

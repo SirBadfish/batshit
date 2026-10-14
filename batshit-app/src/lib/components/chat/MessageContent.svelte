@@ -5,6 +5,8 @@
   import { normalizeId } from '$lib/utils/idNormalizer'
   import { getTypeZipSettings } from '$lib/utils/toolRenderMap'
   import { calculateZipActivation } from '$lib/utils/zipActivation'
+  import { toast } from 'svelte-sonner'
+  import type { ToolResultSizeGuard } from '$lib/utils/toolResultSizeGuard'
   import { resolveZipStateActors } from '$lib/utils/zipStatusPresentation'
   import { extractVisibleBatshitCueState } from '$lib/utils/batshitCue'
   import { hideStreamingHiddenControlBlocks } from '$lib/utils/zipControl'
@@ -32,7 +34,7 @@
   import { buildHydratedCoolToolStep } from './coolToolHydration'
   import { zippingService, type UnzippedItem } from '$lib/services/zipping'
   import { api } from '$lib/services/api'
-  import { onMount, onDestroy, untrack } from 'svelte'
+  import { onMount, onDestroy, untrack, setContext } from 'svelte'
   import { estimateTokens } from '$lib/utils/tokens'
   import {
     estimateCoolToolAiTokens,
@@ -40,9 +42,18 @@
   } from '$lib/utils/coolToolAiContent'
   import { buildToolActivityGroups } from './toolActivityGrouping'
   import * as agentStore from '$lib/stores/agents.svelte'
+  import { getDeadCopyReason } from '$lib/stores/zipDeadCopies.svelte'
+  import { describeHoldForUser, isUserHold } from '$lib/utils/zipHoldWords'
+  import type { DeadCopyReason } from '$lib/utils/zipDeadCopies'
   import * as sessionStore from '$lib/stores/session.svelte'
   import * as groupStore from '$lib/stores/groups.svelte'
   import { page } from '$app/state'
+  import { classifyImageSource } from '$lib/utils/imageSource'
+  import { IMAGE_MESSAGE_ID_CONTEXT } from '$lib/stores/imageLoadConsent.svelte'
+  import { getImageOriginDisplay, markImageOriginExpected } from '$lib/stores/imageAddressOrigins.svelte'
+  import { projectRemovedTextRanges, type TextRange } from '$lib/utils/hydratedTextRanges'
+  import { sha256Hex } from '$lib/utils/sha256'
+  import { BATSHIT_SERVER_URL } from '$lib/services/apiClient'
   import { getUserSettings } from '$lib/stores/userSettings.svelte'
   import * as projectStore from '$lib/stores/projects.svelte'
   import { 
@@ -101,6 +112,18 @@
     metadata?: any
     agentSettings?: any
   }>()
+
+  // Pictures drawn inside this message's tool cards key their Load click to this message (BL-474).
+  setContext(IMAGE_MESSAGE_ID_CONTEXT, () => messageId)
+  // One hash per exact reply text, shared by all of its image segments.
+  const replyTextHash = $derived(sha256Hex(content))
+  $effect(() => {
+    const streamSessionId = sessionId
+    const streamMessageId = messageId
+    if (role === 'assistant' && isStreaming) {
+      untrack(() => markImageOriginExpected(streamSessionId, streamMessageId))
+    }
+  })
   
   
   const stripClips = (text: string, removeAll: boolean = false) => {
@@ -117,6 +140,7 @@
   
   let strippedContent = $state('')
   let compiledContent = $state('')
+  let hydratedContent = $state<{ content: string; ranges: TextRange[] } | null>(null)
   let isCompiling = $state(false)
   let lastCompiledSource = $state<string | null>(null)
   let pendingCompileSource = $state<string | null>(null)
@@ -543,6 +567,10 @@
             return null
           }
 
+          // Only an address from the server's own record makes this Clip's picture Batshit's
+          // (BL-474); an address read from the message text below is classified like any other.
+          const recordGaveAddress = fetchedClip && Boolean(displayUrl || externalUrl || localUrl)
+
           if (!displayUrl && !externalUrl && !localUrl && sourceContent.includes('{{batshit-clip|')) {
             const clipDataRegex = new RegExp(`\\{\\{batshit-clip\\|id:${clipId}\\|[^}]+\\}\\}([^{]+)\\{\\{/batshit-clip\\}\\}`)
             const clipMatch = sourceContent.match(clipDataRegex)
@@ -570,7 +598,9 @@
             contentType,
             content: contentText,
             tokens,
-            fileSize
+            fileSize,
+            // The picture's address came from the server's Clip record (BL-474).
+            fromServer: recordGaveAddress
           }
         }))
         if (pendingClipLoadKey !== loadKey) return
@@ -610,6 +640,7 @@
   
   // SA-911: Single unified effect for content compilation (removed duplicate effect that was causing race conditions)
   $effect(() => {
+    const compilationKey = JSON.stringify([role, content, validZipIds ? [...validZipIds].sort() : null, messageSteers])
     if (role === 'assistant') {
       strippedContent = content
       
@@ -619,6 +650,8 @@
         // SA-114 P3: expand steer markers from the LIVE store, because the stored
         // `metadata.steers[]` does not exist until finalise. Without this the raw
         // `{{batshit-steer:…}}` braces would sit in the chat for the rest of the reply.
+        compileToken++
+        hydratedContent = null
         compiledContent = hasSteerPlaceholder(streamingContent)
           ? expandSteerPlaceholders(streamingContent, liveSteers, formatSteerForUser)
           : streamingContent
@@ -631,32 +664,44 @@
         // short-circuit would then show the raw `{{batshit-steer:…}}` braces in the chat.
         !hasSteerPlaceholder(content)
       ) {
+        compileToken++
+        hydratedContent = null
         compiledContent = content
         isCompiling = false
         pendingCompileSource = null
-        lastCompiledSource = content
+        lastCompiledSource = compilationKey
       } else if (hasOnlyCoolToolZips(content) && !hasSteerPlaceholder(content)) {
         // Tool-only messages already hydrate from Redis; no compile needed.
+        compileToken++
+        hydratedContent = null
         compiledContent = content
         isCompiling = false
         pendingCompileSource = null
-        lastCompiledSource = content
+        lastCompiledSource = compilationKey
       } else {
-        if (content === lastCompiledSource || content === pendingCompileSource) {
+        if (compilationKey === lastCompiledSource || compilationKey === pendingCompileSource) {
           return
         }
-        pendingCompileSource = content
+        pendingCompileSource = compilationKey
         isCompiling = true
         const token = ++compileToken
-        compileForUserBatch(content, { steers: messageSteers }).then(compiled => {
+        let nextHydrated: { content: string; ranges: TextRange[] } | null = null
+        compileForUserBatch(content, {
+          steers: messageSteers,
+          trustedZipIds: validZipIds ?? new Set(),
+          onHydratedRanges: (value, ranges) => { nextHydrated = { content: value, ranges } }
+        }).then(compiled => {
           if (token !== compileToken) return
           compiledContent = compiled
+          hydratedContent = nextHydrated
           isCompiling = false
           pendingCompileSource = null
-          lastCompiledSource = content
+          lastCompiledSource = compilationKey
         }).catch(error => {
           if (token !== compileToken) return
           console.error('[MessageContent] Failed to compile content', error)
+          compileToken++
+          hydratedContent = null
           compiledContent = content
           isCompiling = false
           pendingCompileSource = null
@@ -669,31 +714,42 @@
       
       if (isStreaming) {
         // CRITICAL FIX: Always update compiledContent during streaming for reactivity
+        compileToken++
+        hydratedContent = null
         compiledContent = strippedContent
         isCompiling = false
         pendingCompileSource = null
         lastCompiledSource = null
       } else if (extractZipIds(strippedContent, validZipIds).length === 0) {
+        compileToken++
+        hydratedContent = null
         compiledContent = strippedContent
         isCompiling = false
         pendingCompileSource = null
-        lastCompiledSource = strippedContent
+        lastCompiledSource = compilationKey
       } else {
-        if (strippedContent === lastCompiledSource || strippedContent === pendingCompileSource) {
+        if (compilationKey === lastCompiledSource || compilationKey === pendingCompileSource) {
           return
         }
-        pendingCompileSource = strippedContent
+        pendingCompileSource = compilationKey
         isCompiling = true
         const token = ++compileToken
-        compileForUserBatch(strippedContent).then(compiled => {
+        let nextHydrated: { content: string; ranges: TextRange[] } | null = null
+        compileForUserBatch(strippedContent, {
+          trustedZipIds: validZipIds ?? new Set(),
+          onHydratedRanges: (value, ranges) => { nextHydrated = { content: value, ranges } }
+        }).then(compiled => {
           if (token !== compileToken) return
           compiledContent = compiled
+          hydratedContent = nextHydrated
           isCompiling = false
           pendingCompileSource = null
-          lastCompiledSource = strippedContent
+          lastCompiledSource = compilationKey
         }).catch(error => {
           if (token !== compileToken) return
           console.error('[MessageContent] Failed to compile content', error)
+          compileToken++
+          hydratedContent = null
           compiledContent = strippedContent
           isCompiling = false
           pendingCompileSource = null
@@ -900,6 +956,7 @@
           toolName: zipData?.metadata?.toolName || zipData?.name,
           fallbackTokens: zipData?.tokens ?? zipData?.metadata?.tokens ?? 0,
           isUnzipped: zippingService.isUnzipped(normalizeId(zipId)),
+          isInferredUnzipped: zippingService.getUnzippedInfo(normalizeId(zipId))?.source === 'inferred',
           isRezipped: zippingService.isRezipped(normalizeId(zipId))
         })
 
@@ -922,6 +979,7 @@
             tokens: fallbackSettings.zipThreshold
           },
           isUnzipped: zippingService.isUnzipped(normalizeId(zipId)),
+          isInferredUnzipped: zippingService.getUnzippedInfo(normalizeId(zipId))?.source === 'inferred',
           isRezipped: zippingService.isRezipped(normalizeId(zipId))
         })
 
@@ -955,7 +1013,10 @@
       role,
       content,
       clipsLoaded ? messageClips : [],
-      validZipIds ?? undefined
+      validZipIds ?? undefined,
+      !isCompiling && hydratedContent && hydratedContent.content === segmentContent
+        ? projectRemovedTextRanges(segmentContent, visibleSegmentContent, hydratedContent.ranges)
+        : []
     )
 
     if (hiddenImageZipIds.size > 0) {
@@ -1246,7 +1307,9 @@
         toolName: segment.toolName || metadata?.metadata?.toolName,
         fallbackTokens,
         isUnzipped: zippingService.isUnzipped(normalizedSegmentId),
-        isRezipped: zippingService.isRezipped(normalizedSegmentId)
+        isInferredUnzipped: zippingService.getUnzippedInfo(normalizedSegmentId)?.source === 'inferred',
+        isRezipped: zippingService.isRezipped(normalizedSegmentId),
+        ...deadCopyActivationInput(normalizedSegmentId)
       })
 
       if (activation.shouldCompress) {
@@ -1289,6 +1352,7 @@
         toolName: segment.toolName || metadata?.metadata?.toolName,
         fallbackTokens,
         isUnzipped: zippingService.isUnzipped(normalizedExpectedId),
+        isInferredUnzipped: zippingService.getUnzippedInfo(normalizedExpectedId)?.source === 'inferred',
         isRezipped: zippingService.isRezipped(normalizedExpectedId)
       })
 
@@ -1382,6 +1446,10 @@
     autoZip?: boolean
     agentControlled?: boolean
     inferredControlled?: boolean
+    holdLabel?: string | null
+    deadCopyReason?: DeadCopyReason | null
+    heldDeadCopy?: boolean
+    sizeGuard?: ToolResultSizeGuard
   } {
     const normalized = normalizeId(options.zipId)
     if (!normalized) {
@@ -1414,11 +1482,16 @@
       toolName: options.toolName,
       fallbackTokens,
       isUnzipped,
-      isRezipped
+      isInferredUnzipped: unzippedItem?.source === 'inferred',
+      isRezipped,
+      ...deadCopyActivationInput(normalized)
     })
 
     const autoZip = activation.autoZip
-    const effectiveUnzipped = isUnzipped
+    // SA-129 P2 (BL-333): a dead copy is compressed in the prompt even while an agent holds it
+    // (the hold waits for the next whole read); only a user hold keeps one open.
+    const deadCopyCompressed = Boolean(activation.deadCopy) && activation.shouldCompress
+    const effectiveUnzipped = isUnzipped && !activation.shouldCompress
 
     // SA-120 P5: one reading of stored sources for the chat and the Zip Manager, so an
     // `inferred` unzip is never drawn as a user lock.
@@ -1432,6 +1505,7 @@
 
     const aboutToZip =
       !autoZip &&
+      !activation.shouldCompress &&
       !effectiveUnzipped &&
       !isRezipped &&
       !activation.exceedsBuffer &&
@@ -1462,12 +1536,36 @@
       remainingMessages: manualRemainingMessages ?? autoRemainingMessages,
       autoZip,
       agentControlled: actors.agentControlled,
-      inferredControlled: actors.inferredControlled
+      inferredControlled: actors.inferredControlled,
+      holdLabel: describeHoldForUser(
+        unzippedItem,
+        unzippedItem?.agentId ? agentStore.getAgentById(unzippedItem.agentId)?.displayName ?? null : null
+      ),
+      deadCopyReason: deadCopyCompressed ? activation.deadCopy : null,
+      // BL-358: an agent's (or Judge Juice's) hold on a dead copy the prompt compresses anyway;
+      // the badge still offers Release, as the Zip Manager does.
+      heldDeadCopy: isUnzipped && activation.shouldCompress,
+      sizeGuard: activation.sizeGuard
+    }
+  }
+
+  /**
+   * SA-129 P2 (BL-333): the dead-copy facts the compile uses, for this chat's badges. The server
+   * runs the compile's own ledger over the chat (`zipDeadCopies.svelte`); a user hold keeps a dead
+   * copy open, an agent's hold does not.
+   */
+  function deadCopyActivationInput(zipId: string) {
+    const reason = getDeadCopyReason(sessionId || sessionStore.getCurrentSessionId(), zipId)
+    const item = zippingService.getUnzippedInfo(zipId)
+    return {
+      deadCopy: reason ? { reason, repliesUntilDead: 0 } : null,
+      isUserUnzipped: isUserHold(item)
     }
   }
   
-  function handleUnzip(zipId: string, permanent: boolean, name?: string, description?: string, tokens?: number, _autoZip?: boolean) {
-    zippingService.unzip(zipId, permanent, 10, name, description, tokens, 'user')
+  async function handleUnzip(zipId: string, permanent: boolean, name?: string, description?: string, tokens?: number, _autoZip?: boolean) {
+    const ok = await zippingService.unzip(zipId, permanent, 10, name, description, tokens, 'user')
+    if (!ok) toast.error(zippingService.getLastUnzipError() ?? 'Could not hold this result.')
   }
 
   function handleZipNow(zipId: string) {
@@ -1661,11 +1759,21 @@
       {#each firstAppearanceClips as clip}
         <div class="clip-first-appearance" data-clip-id={clip.clipId}>
           {#if clip.url && clip.filename?.match(/\.(jpg|jpeg|png|gif|webp|svg)$/i)}
-            <img 
-              src={clip.url} 
-              alt={clip.filename}
-              class="clip-first-appearance-image"
-            />
+            {@const clipSource = classifyImageSource(clip.url, {
+              baseUrl: page.url.href,
+              serverUrls: [BATSHIT_SERVER_URL],
+              fromTrustedClip: Boolean(clip.fromServer)
+            })}
+            {#if clipSource.kind === 'owned'}
+              <img 
+                src={clipSource.url} 
+                alt={clip.filename}
+                class="clip-first-appearance-image"
+              />
+            {:else}
+              <!-- Not the server's own address: the same click rule as any picture (BL-474). -->
+              <ImageRenderer src={clip.url} alt={clip.filename} {messageId} {sessionId} />
+            {/if}
           {/if}
           <div class="clip-first-appearance-info">
             📎 {clip.filename}
@@ -1768,6 +1876,10 @@
         autoZip={autoZip}
         agentControlled={Boolean(zipState.agentControlled)}
         inferredControlled={Boolean(zipState.inferredControlled)}
+        holdLabel={zipState.holdLabel ?? null}
+        deadCopyReason={zipState.deadCopyReason ?? null}
+        heldDeadCopy={Boolean(zipState.heldDeadCopy)}
+        sizeGuard={zipState.sizeGuard}
         {manualZip}
         onToggleUnzip={(permanent: boolean) =>
           normalizedZipId &&
@@ -1836,6 +1948,10 @@
         autoZip={autoZip}
         agentControlled={Boolean(zipState.agentControlled)}
         inferredControlled={Boolean(zipState.inferredControlled)}
+        holdLabel={zipState.holdLabel ?? null}
+        deadCopyReason={zipState.deadCopyReason ?? null}
+        heldDeadCopy={Boolean(zipState.heldDeadCopy)}
+        sizeGuard={zipState.sizeGuard}
         {manualZip}
         onToggleUnzip={(permanent: boolean) =>
           normalizedZipId &&
@@ -1914,6 +2030,10 @@
           autoZip={autoZip}
           agentControlled={Boolean(zipState.agentControlled)}
           inferredControlled={Boolean(zipState.inferredControlled)}
+          holdLabel={zipState.holdLabel ?? null}
+          deadCopyReason={zipState.deadCopyReason ?? null}
+          heldDeadCopy={Boolean(zipState.heldDeadCopy)}
+          sizeGuard={zipState.sizeGuard}
           {manualZip}
           onToggleUnzip={(permanent: boolean) =>
             normalizedZipId &&
@@ -1981,6 +2101,10 @@
           autoZip={autoZip}
           agentControlled={Boolean(zipState.agentControlled)}
           inferredControlled={Boolean(zipState.inferredControlled)}
+          holdLabel={zipState.holdLabel ?? null}
+          deadCopyReason={zipState.deadCopyReason ?? null}
+          heldDeadCopy={Boolean(zipState.heldDeadCopy)}
+          sizeGuard={zipState.sizeGuard}
           {manualZip}
           onToggleUnzip={(permanent: boolean) =>
             zipId &&
@@ -2051,6 +2175,10 @@
           autoZip={autoZip}
           agentControlled={Boolean(zipState.agentControlled)}
           inferredControlled={Boolean(zipState.inferredControlled)}
+          holdLabel={zipState.holdLabel ?? null}
+          deadCopyReason={zipState.deadCopyReason ?? null}
+          heldDeadCopy={Boolean(zipState.heldDeadCopy)}
+          sizeGuard={zipState.sizeGuard}
           {manualZip}
           onToggleUnzip={(permanent: boolean) =>
             zipId &&
@@ -2121,6 +2249,10 @@
           autoZip={autoZip}
           agentControlled={Boolean(zipState.agentControlled)}
           inferredControlled={Boolean(zipState.inferredControlled)}
+          holdLabel={zipState.holdLabel ?? null}
+          deadCopyReason={zipState.deadCopyReason ?? null}
+          heldDeadCopy={Boolean(zipState.heldDeadCopy)}
+          sizeGuard={zipState.sizeGuard}
           {manualZip}
           onToggleUnzip={(permanent: boolean) =>
             zipId &&
@@ -2215,6 +2347,10 @@
             autoZip={autoZip}
             agentControlled={Boolean(zipState.agentControlled)}
             inferredControlled={Boolean(zipState.inferredControlled)}
+            holdLabel={zipState.holdLabel ?? null}
+            deadCopyReason={zipState.deadCopyReason ?? null}
+            heldDeadCopy={Boolean(zipState.heldDeadCopy)}
+            sizeGuard={zipState.sizeGuard}
             {manualZip}
             onToggleUnzip={(permanent: boolean) =>
               handleUnzip(
@@ -2249,6 +2385,11 @@
               sessionId={sessionId}
               fullResolutionSrc={fullResolutionUrl}
               filename={clipData?.filename}
+              {messageId}
+              trustedClip={Boolean(clipData?.fromServer)}
+              origin={role === 'assistant' && !clipData?.fromServer && !segment.hydratedContext
+                ? getImageOriginDisplay({ sessionId, messageId, content, textHash: replyTextHash, address: imageSrc, isStreaming, metadata })
+                : undefined}
             />
           </ZipbatshitWrapper>
         {:else}
@@ -2262,6 +2403,11 @@
             sessionId={sessionId}
             fullResolutionSrc={fullResolutionUrl}
             filename={clipData?.filename}
+            {messageId}
+            trustedClip={Boolean(clipData?.fromServer)}
+              origin={role === 'assistant' && !clipData?.fromServer && !segment.hydratedContext
+                ? getImageOriginDisplay({ sessionId, messageId, content, textHash: replyTextHash, address: imageSrc, isStreaming, metadata })
+                : undefined}
           />
         {/if}
       {/if}
@@ -2312,6 +2458,10 @@
         autoZip={autoZip}
         agentControlled={Boolean(zipState.agentControlled)}
         inferredControlled={Boolean(zipState.inferredControlled)}
+        holdLabel={zipState.holdLabel ?? null}
+        deadCopyReason={zipState.deadCopyReason ?? null}
+        heldDeadCopy={Boolean(zipState.heldDeadCopy)}
+        sizeGuard={zipState.sizeGuard}
         {manualZip}
         onToggleUnzip={(permanent: boolean) =>
           handleUnzip(
@@ -2400,6 +2550,10 @@
         autoZip={autoZip}
         agentControlled={Boolean(zipState.agentControlled)}
         inferredControlled={Boolean(zipState.inferredControlled)}
+        holdLabel={zipState.holdLabel ?? null}
+        deadCopyReason={zipState.deadCopyReason ?? null}
+        heldDeadCopy={Boolean(zipState.heldDeadCopy)}
+        sizeGuard={zipState.sizeGuard}
         {manualZip}
         onToggleUnzip={(permanent: boolean) =>
           handleUnzip(

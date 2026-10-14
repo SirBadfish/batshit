@@ -63,11 +63,13 @@ import {
   isExactDesktopControlsUrl,
   isExactDesktopGoonUrl,
   isSafeExternalUrl,
+  macShellFolderEnv,
   resolveBackupExportUrl,
   resolveDesktopControlsUrl,
   resolveDesktopGoonUrl,
   resolveCustomCssPath,
   resolveDevToolsEnabled,
+  resolveMacShellIdentity,
   resolveShellAssetPath,
   validateElectronIpcSender,
   validateBackupExportOptions,
@@ -79,6 +81,11 @@ import {
 
 const execFileAsync = promisify(execFile);
 const moduleDir = dirname(fileURLToPath(import.meta.url));
+// BL-72: which app this shell is, and so which folders it uses, settled before anything reads them.
+// A test package keeps its own folders even when Finder or the Dock opens it without its launcher,
+// and the runtime supervisor inherits them from this environment.
+const shellIdentity = resolveMacShellIdentity({ packaged: app.isPackaged, packagedName: app.getName() });
+Object.assign(process.env, macShellFolderEnv(shellIdentity, process.env, homedir()));
 const allowedOrigins = collectAllowedOrigins();
 const devToolsEnabled = resolveDevToolsEnabled({ homePath: homedir(), fileExists: existsSync });
 const customCssPath = resolveCustomCssPath(process.env, homedir());
@@ -126,7 +133,7 @@ protocol.registerSchemesAsPrivileged([
 ]);
 
 app.enableSandbox();
-app.setName('Batshit');
+app.setName(shellIdentity.appName);
 app.setPath(
   'userData',
   process.env.BATSHIT_MAC_SHELL_DATA_DIR ||
@@ -309,7 +316,7 @@ function installIpcHandlers() {
     );
     const result = await dialog.showSaveDialog(mainWindow, {
       title: 'Export Batshit Backup',
-      defaultPath: join(app.getPath('downloads'), createBackupExportFilename()),
+      defaultPath: join(app.getPath('downloads'), createBackupExportFilename(new Date(), { partial: Boolean(options.partial) })),
       filters: [{ name: 'Batshit backup', extensions: ['zip'] }]
     });
     const targetPath = result.canceled ? null : result.filePath || null;
@@ -317,13 +324,22 @@ function installIpcHandlers() {
       return { completed: false, native: true, canceled: true };
     }
 
-    await streamBackupExportToFile({
+    const exported = await streamBackupExportToFile({
       electronSession: record.webContents.session,
       exportUrl,
       includeSecrets: options.includeSecrets,
+      ...(options.partial ? { partial: options.partial } : {}),
       targetPath
     });
-    return { completed: true, native: true, canceled: false, path: targetPath };
+    return {
+      completed: true,
+      native: true,
+      canceled: false,
+      path: targetPath,
+      ...(exported.notCarried ? { notCarried: exported.notCarried } : {}),
+      // BL-378 Phase 1b: the summary header string, beside notCarried; the app parses it strictly.
+      ...(exported.missingUploads ? { missingUploads: exported.missingUploads } : {})
+    };
   });
 
   ipcMain.handle('batshit:open-goon-package', async (event) => {
@@ -543,7 +559,7 @@ function createWindow(savedState = null) {
     ...(restoredBounds ?? {}),
     show: false,
     backgroundColor: '#080810',
-    title: 'Batshit',
+    title: shellIdentity.appName,
     webPreferences: {
       preload: join(moduleDir, 'preload.cjs'),
       nodeIntegration: false,

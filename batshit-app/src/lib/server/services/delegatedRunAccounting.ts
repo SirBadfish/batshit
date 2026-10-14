@@ -10,6 +10,17 @@ import {
   normalizeUsageLike,
   type ApiUsageLike,
 } from '$lib/server/services/apiProviderUsage'
+import { readObservedUsage } from './observedUsage'
+
+function observationOf(record: Record<string, any>): Pick<DelegatedRunRecord, 'observedUsage' | 'observedUsageUnavailable'> {
+  if (record.observedUsageUnavailable !== undefined && record.observedUsageUnavailable !== null) return { observedUsageUnavailable: 'invalid' }
+  try {
+    const observedUsage = readObservedUsage(record.observedUsage)
+    return observedUsage ? { observedUsage } : {}
+  } catch {
+    return { observedUsageUnavailable: 'invalid' }
+  }
+}
 
 function plainObject(value: unknown): Record<string, any> | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
@@ -152,7 +163,8 @@ export function buildDelegatedExecutionSummary(steps: unknown): DelegatedExecuti
       for (const entry of batch) {
         const status = entry.status as DelegatedRunStatus
         if (!['completed', 'failed', 'timed_out'].includes(status)) continue
-        const usage = normalizeUsageLike(entry.usage) ?? null
+        const observation = observationOf(entry)
+        const usage = observation.observedUsage || observation.observedUsageUnavailable ? null : normalizeUsageLike(entry.usage) ?? null
         addUsageForRun(usage)
         const duration = Number(entry.durationMs)
         const base = typeof entry.base === 'string' && entry.base.trim() ? entry.base.trim() : null
@@ -163,6 +175,7 @@ export function buildDelegatedExecutionSummary(steps: unknown): DelegatedExecuti
           model: typeof entry.modelId === 'string' ? entry.modelId : null,
           provider: typeof entry.provider === 'string' ? entry.provider : null,
           usage,
+          ...observation,
           durationMs: Number.isFinite(duration) ? Math.max(0, Math.round(duration)) : 0,
           status,
           // A worker has no stored thread at all — honest absence, not a made-up 'fresh'.
@@ -175,7 +188,8 @@ export function buildDelegatedExecutionSummary(steps: unknown): DelegatedExecuti
     if (!payload) continue
     const kind = payload.kind as DelegatedRunKind
     const status = payload.status as DelegatedRunStatus
-    const usage = normalizeUsageLike(payload.usage) ?? null
+    const observation = observationOf(payload)
+    const usage = observation.observedUsage || observation.observedUsageUnavailable ? null : normalizeUsageLike(payload.usage) ?? null
     addUsageForRun(usage)
 
     const duration = Number(payload.durationMs)
@@ -199,6 +213,7 @@ export function buildDelegatedExecutionSummary(steps: unknown): DelegatedExecuti
           : null,
       provider: typeof payload.provider === 'string' ? payload.provider : null,
       usage,
+      ...observation,
       durationMs: Number.isFinite(duration) ? Math.max(0, Math.round(duration)) : 0,
       status,
       thread: normalizeThread(payload.thread),
@@ -217,6 +232,46 @@ export function buildDelegatedExecutionSummary(steps: unknown): DelegatedExecuti
       usageKnownRuns,
       usageUnknownRuns: runs.length - usageKnownRuns,
       usage: buildUsageLike(totalUsage) ?? null,
+    },
+  }
+}
+
+function isDelegatedSummary(value: unknown): value is DelegatedExecutionSummary {
+  const record = plainObject(value)
+  return Boolean(record && Array.isArray(record.runs))
+}
+
+/**
+ * BL-525: one message's delegated spend when it was written in two halves, the part before an
+ * approval card and the resume after it. Both halves' runs count, the earlier first; the totals
+ * are the two halves' totals added (a run's usage stays unknown when it was unknown, and the
+ * totals' `usage` is the sum over the runs that reported one, as `buildDelegatedExecutionSummary`
+ * builds it). Null only when neither half ran a Subagent or a Worker.
+ */
+export function mergeDelegatedSummaries(prior: unknown, resumed: unknown): DelegatedExecutionSummary | null {
+  const before = isDelegatedSummary(prior) ? prior : null
+  const after = isDelegatedSummary(resumed) ? resumed : null
+  if (!before) return after
+  if (!after) return before
+  const runs = [...before.runs, ...after.runs]
+  const beforeUsage = normalizeUsageLike(before.totals?.usage)
+  const afterUsage = normalizeUsageLike(after.totals?.usage)
+  const usage =
+    beforeUsage && afterUsage
+      ? buildUsageLike(addUsage(beforeUsage, afterUsage))
+      : (beforeUsage ?? afterUsage ?? null)
+  const count = (key: 'usageKnownRuns' | 'usageUnknownRuns') =>
+    (Number(before.totals?.[key]) || 0) + (Number(after.totals?.[key]) || 0)
+  return {
+    runs,
+    totals: {
+      runs: runs.length,
+      completed: runs.filter((run) => run.status === 'completed').length,
+      failed: runs.filter((run) => run.status === 'failed').length,
+      timedOut: runs.filter((run) => run.status === 'timed_out').length,
+      usageKnownRuns: count('usageKnownRuns'),
+      usageUnknownRuns: count('usageUnknownRuns'),
+      usage: usage ?? null,
     },
   }
 }

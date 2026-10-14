@@ -149,6 +149,21 @@ describe('POST /api/slash-commands/[id]/invoke (skill)', () => {
     ])
   })
 
+  it("says a skill's files are missing instead of a generic failure (BL-369)", async () => {
+    vi.mocked(getSkill).mockRejectedValue(
+      Object.assign(new Error('The files for skill "Artifact Skill" are missing from /tmp/zc/skills/artifacts_general.'), {
+        code: 'SKILL_FILES_MISSING'
+      })
+    )
+
+    const response = await POST(buildEvent({ agentId: 'agent-1', rawArgs: '' }))
+
+    expect(response.status).toBe(409)
+    const payload = await response.json()
+    expect(payload).toMatchObject({ code: 'SKILL_FILES_MISSING' })
+    expect(payload.error).toContain('are missing from /tmp/zc/skills/artifacts_general')
+  })
+
   it('repairs built-in commands when their backing skill record is missing', async () => {
     const staleCommand = {
       ...baseCommand,

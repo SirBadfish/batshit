@@ -109,7 +109,8 @@ describe('the Batshit Tool broker: plumbing is the server', () => {
 
     expect(scopeCalls.length).toBeGreaterThan(0)
     for (const call of scopeCalls) {
-      expect(call).toMatchObject({ userId: 'josh', agentMetadata: null })
+      expect(call.userId).toBe('josh')
+      expect(call.agentMetadata == null).toBe(true)
       expect(call.agentId).not.toBe('someone-else')
     }
   })

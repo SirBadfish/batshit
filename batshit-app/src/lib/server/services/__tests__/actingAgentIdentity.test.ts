@@ -14,7 +14,10 @@ import {
   bindActingSessionId,
   bindDispatchContextIdentity,
   boundAgentId,
+  boundDelegatedAllowedControlIds,
+  boundScopeAgentId,
   laneCanVouchForAgentIdentity,
+  refuseDelegatedRunOutsideList,
   requireActingAgentIdentity
 } from '../actingAgentIdentity'
 
@@ -87,6 +90,41 @@ describe('DL-117-04: binding the session', () => {
   it('falls back to the claim on a lane with no bound session', () => {
     expect(bindActingSessionId({ auth: 'service' }, 'session-9')).toBe('session-9')
     expect(bindActingSessionId({ auth: 'service' }, '   ')).toBeUndefined()
+  })
+})
+
+describe('BL-81: whose access lists govern a delegated run', () => {
+  const delegatedLane = {
+    auth: 'agent' as const,
+    agentId: 'subagent_cli_research_bot',
+    sessionId: 'session-1',
+    delegated: true,
+    scopeAgentId: ' research_bot '
+  }
+
+  it('is the scope id on a delegated credential, trimmed', () => {
+    expect(boundScopeAgentId(delegatedLane)).toBe('research_bot')
+  })
+
+  it('is not a rebinding: the bound agent is still the per-run id', () => {
+    expect(boundAgentId(delegatedLane)).toBe('subagent_cli_research_bot')
+    // So a body naming the scope id is still a mismatch, not a second identity to claim.
+    expect(bindActingAgentId(delegatedLane, 'research_bot')).toMatchObject({
+      ok: false,
+      code: AGENT_MISMATCH_ERROR_CODE
+    })
+  })
+
+  it('is nothing unless the credential is delegated and on the agent lane', () => {
+    // A primary run's own agent governs; a scope that somehow rode along must not re-scope it.
+    expect(boundScopeAgentId({ ...delegatedLane, delegated: false })).toBe('')
+    expect(boundScopeAgentId({ ...delegatedLane, delegated: undefined })).toBe('')
+    expect(boundScopeAgentId({ ...delegatedLane, auth: 'service' })).toBe('')
+    expect(boundScopeAgentId({ ...delegatedLane, auth: 'session' })).toBe('')
+    // A delegated credential minted before BL-75 has no scope, and keeps failing closed.
+    expect(boundScopeAgentId({ ...delegatedLane, scopeAgentId: null })).toBe('')
+    expect(boundScopeAgentId({ ...delegatedLane, scopeAgentId: '  ' })).toBe('')
+    expect(boundScopeAgentId(null)).toBe('')
   })
 })
 
@@ -197,6 +235,77 @@ describe('DL-117-04: the dispatch context', () => {
       ok: true,
       context
     })
+  })
+})
+
+describe('BL-81: what a delegated run may use', () => {
+  const delegatedLane = {
+    auth: 'agent' as const,
+    agentId: 'subagent_cli_research_bot',
+    delegated: true,
+    scopeAgentId: 'research_bot',
+    delegatedAllowedControlIds: ['use.artifact.*']
+  }
+
+  it('is the list its credential carries', () => {
+    expect(boundDelegatedAllowedControlIds(delegatedLane)).toEqual(['use.artifact.*'])
+  })
+
+  it('is empty, never absent, for a delegated credential that carries none', () => {
+    // A delegated call with no list must fail closed at the registry, so it must not look like
+    // a primary's call here.
+    expect(boundDelegatedAllowedControlIds({ ...delegatedLane, delegatedAllowedControlIds: undefined })).toEqual([])
+    expect(boundDelegatedAllowedControlIds({ ...delegatedLane, delegatedAllowedControlIds: null })).toEqual([])
+  })
+
+  it('is absent for a primary run and on every other lane, whose own settings govern', () => {
+    expect(boundDelegatedAllowedControlIds({ ...delegatedLane, delegated: false })).toBeUndefined()
+    expect(boundDelegatedAllowedControlIds({ ...delegatedLane, auth: 'service' })).toBeUndefined()
+    expect(boundDelegatedAllowedControlIds({ ...delegatedLane, auth: 'session' })).toBeUndefined()
+    expect(boundDelegatedAllowedControlIds({ ...delegatedLane, auth: 'portable-skill' })).toBeUndefined()
+    expect(boundDelegatedAllowedControlIds(null)).toBeUndefined()
+  })
+})
+
+describe('BL-81 follow-up: a delegated credential on a route outside the control routes', () => {
+  const delegatedLane = {
+    auth: 'agent' as const,
+    agentId: 'subagent_cli_research_bot',
+    delegated: true,
+    scopeAgentId: 'research_bot',
+    delegatedAllowedControlIds: ['use.artifact.*']
+  }
+
+  it('refuses the route when the run\'s list does not hold the control that does its work', () => {
+    expect(refuseDelegatedRunOutsideList(delegatedLane, 'sys.zip.fetch')).toMatchObject({
+      code: 'CONTROL_NOT_ALLOWED'
+    })
+  })
+
+  it('lets the route go on exactly when the list holds that control, wildcards included', () => {
+    const listed = { ...delegatedLane, delegatedAllowedControlIds: ['sys.zip.fetch', 'use.artifact.*'] }
+    expect(refuseDelegatedRunOutsideList(listed, 'sys.zip.fetch')).toBeNull()
+    expect(refuseDelegatedRunOutsideList(listed, 'use.artifact.demo_tool')).toBeNull()
+  })
+
+  it('refuses a route whose work no list holds, whatever the list says', () => {
+    const everything = { ...delegatedLane, delegatedAllowedControlIds: ['*'] }
+    expect(refuseDelegatedRunOutsideList(everything, null)).toMatchObject({ code: 'CONTROL_NOT_ALLOWED' })
+  })
+
+  it('fails closed for a delegated credential that carries no list (minted before BL-81)', () => {
+    expect(
+      refuseDelegatedRunOutsideList({ ...delegatedLane, delegatedAllowedControlIds: undefined }, 'sys.zip.fetch')
+    ).toMatchObject({ code: 'CONTROL_NOT_ALLOWED' })
+  })
+
+  it('never refuses a primary run, a browser, the instance token, or an artifact runtime token', () => {
+    expect(refuseDelegatedRunOutsideList({ ...delegatedLane, delegated: false }, null)).toBeNull()
+    expect(refuseDelegatedRunOutsideList({ ...delegatedLane, auth: 'session' }, null)).toBeNull()
+    expect(refuseDelegatedRunOutsideList({ ...delegatedLane, auth: 'service' }, null)).toBeNull()
+    expect(refuseDelegatedRunOutsideList({ ...delegatedLane, auth: 'portable-skill' }, null)).toBeNull()
+    expect(refuseDelegatedRunOutsideList({ auth: 'runtime' }, null)).toBeNull()
+    expect(refuseDelegatedRunOutsideList(null, null)).toBeNull()
   })
 })
 

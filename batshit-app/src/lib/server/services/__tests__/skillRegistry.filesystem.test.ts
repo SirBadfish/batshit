@@ -213,6 +213,40 @@ describe('skillRegistry filesystem-first canonical behavior', () => {
     expect(redisRecord.bundle_files).toEqual([])
   })
 
+  it('rescans continued descriptions and nested blocks from canonical files (BL-1239)', async () => {
+    const { upsertSkill, getSkill } = await import('../skillRegistry')
+    await upsertSkill({
+      userId: 'user-1', commandId: 'continued_cmd',
+      skill: {
+        id: 'continued_skill', name: 'continued-skill',
+        markdown: '---\nname: continued-skill\ndescription: Original\n---\n# Continued Skill\n'
+      }
+    })
+    const skillFile = path.join(tempHome, '.batshit', 'skills', 'continued_skill', 'SKILL.md')
+    await fs.writeFile(skillFile, `---
+name: continued-skill
+description: Complete description
+  with its continuation: preserved
+metadata:
+  notes: >-
+    First: line
+    Second line
+  author: Batshit
+license: MIT
+---
+# Continued Skill
+`, 'utf8')
+
+    const refreshed = await getSkill('user-1', 'continued_skill')
+    expect(refreshed?.description).toBe('Complete description with its continuation: preserved')
+    expect(refreshed?.metadata).toEqual({ notes: 'First: line Second line', author: 'Batshit' })
+    expect(mockState.store.get('skill:user-1:continued_skill')).toMatchObject({
+      description: 'Complete description with its continuation: preserved',
+      metadata: { notes: 'First: line Second line', author: 'Batshit' },
+      license: 'MIT'
+    })
+  })
+
   it('migrates legacy Redis skill content to filesystem and strips content blobs from Redis records', async () => {
     const { getSkill, runSkillFilesystemMigrationPass } = await import('../skillRegistry')
 

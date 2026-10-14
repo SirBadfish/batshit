@@ -144,7 +144,7 @@
   }
 
   .facial-artwork-changed {
-    color: var(--primary);
+    color: var(--primary-text);
     font-weight: 650;
   }
 

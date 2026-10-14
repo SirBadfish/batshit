@@ -1,17 +1,34 @@
 import { Script } from 'node:vm'
+import {
+  buildUnknownThemeVariableAdvisory,
+  buildUnknownThemeVariableMessage,
+  checkArtifactThemeVariables
+} from './artifactThemeVariables'
 
 export type ArtifactHtmlPreflightIssue = {
-  code: 'INLINE_SCRIPT_SYNTAX_ERROR' | 'UNSUPPORTED_RUNTIME_API'
+  code: 'INLINE_SCRIPT_SYNTAX_ERROR' | 'UNSUPPORTED_RUNTIME_API' | 'UNKNOWN_THEME_VARIABLE'
   message: string
-  scriptIndex: number
+  /** The inline script the problem is in; absent for a page-wide one (UNKNOWN_THEME_VARIABLE). */
+  scriptIndex?: number
   line?: number
 }
 
 export type ArtifactHtmlPreflightAdvisory = {
-  code: 'ESCAPED_TEMPLATE_LITERAL_INTERPOLATION'
+  code: 'ESCAPED_TEMPLATE_LITERAL_INTERPOLATION' | 'UNKNOWN_THEME_VARIABLE'
   message: string
-  scriptIndex: number
+  /** The inline script the advice is about; absent for a page-wide one (UNKNOWN_THEME_VARIABLE). */
+  scriptIndex?: number
   line?: number
+}
+
+export type ArtifactHtmlPreflightOptions = {
+  /** Every saved body of the artifact, so a variable a saved version already read is not refused. */
+  previousContents?: Array<string | null | undefined>
+  /**
+   * BL-326: refuse a CSS variable the save adds that an artifact never receives. On while structure
+   * enforcement is on; otherwise (and for variables already saved) it is an advisory.
+   */
+  refuseAddedThemeVariables?: boolean
 }
 
 export type ArtifactHtmlPreflightResult = {
@@ -155,7 +172,10 @@ function findUnsupportedRuntimeApiIssue(
   return null
 }
 
-export function validateArtifactHtmlPreflight(content: string | null | undefined): ArtifactHtmlPreflightResult {
+export function validateArtifactHtmlPreflight(
+  content: string | null | undefined,
+  options: ArtifactHtmlPreflightOptions = {}
+): ArtifactHtmlPreflightResult {
   const normalizedContent = typeof content === 'string' ? content : ''
   const scripts = extractInlineScripts(normalizedContent)
   const issues: ArtifactHtmlPreflightIssue[] = []
@@ -205,6 +225,17 @@ export function validateArtifactHtmlPreflight(content: string | null | undefined
     }
   }
 
+  // BL-326: CSS variables the page reads that an artifact never receives.
+  const themeVariables = checkArtifactThemeVariables(normalizedContent, options.previousContents ?? [])
+  const refused = options.refuseAddedThemeVariables === true ? themeVariables.added : []
+  const advised = options.refuseAddedThemeVariables === true ? themeVariables.kept : themeVariables.unknown
+  if (refused.length > 0) {
+    issues.push({ code: 'UNKNOWN_THEME_VARIABLE', message: buildUnknownThemeVariableMessage(refused), line: refused[0].line })
+  }
+  if (advised.length > 0) {
+    advisories.push({ code: 'UNKNOWN_THEME_VARIABLE', message: buildUnknownThemeVariableAdvisory(advised), line: advised[0].line })
+  }
+
   return {
     ok: issues.length === 0,
     checkedScripts,
@@ -218,7 +249,8 @@ export function buildArtifactHtmlPreflightMessage(result: ArtifactHtmlPreflightR
   const lines = [
     'Artifact save blocked: artifact HTML preflight failed.',
     ...result.issues.map((issue) => `- ${issue.message}`),
-    'Fix the artifact HTML, then run `sys.artifact.validate_structure` again before saving.'
+    // BL-77: saves run this same check, so the fix is to save again, not to add a validate step.
+    'Fix the artifact HTML and save it again.'
   ]
   return lines.join('\n')
 }

@@ -1,12 +1,13 @@
 # Providers
 
-Providers are how Batshit gets access to AI models — the API keys you save, the Model Presets you build on top of them, the Model Catalog that helps you create those presets, and the CLI providers (Codex and Claude Code) that run as their own managed agents. This page explains how those pieces fit together so the detail pages make sense.
+Providers are how Batshit gets access to AI models — the API keys or supported plan connections you save, the Model Presets you build on top of them, the Model Catalog that helps you create those presets, and the CLI providers (Codex and Claude Code) that run as their own managed agents. This page explains how those pieces fit together so the detail pages make sense.
 
 In Batshit, "provider" mostly means a source of model intelligence. Most of the time that's a hosted AI provider you reach with an API key. But CLI tools and Local AI programs are also ways to bring models in, and it helps to know where each one lives.
 
 ## The pieces
 
 - **API keys** — the secrets that let Batshit talk to a hosted provider like OpenAI, Anthropic, Google, Groq, OpenRouter, or Vercel AI Gateway. Saved in Settings → API Keys and encrypted at rest.
+- **ChatGPT Plan** — sign in from Settings → API Keys in the local Mac app, then select an account-specific model preset for an ordinary API agent. See [the connection steps](api-keys-and-models.md#connect-a-chatgpt-plan-in-the-mac-app). Available models and usage limits belong to your ChatGPT account; [published model properties](model-catalog.md#chatgpt-plan-models) have their own source and verification date.
 - **Model Presets** — saved, named model configurations (provider connection plus model ID plus options like tools, image transport, reasoning, and pricing). Built in Settings → Models. Agents pick a preset instead of repeating provider settings everywhere.
 - **Model Catalog** — a helper that knows about a lot of models across providers and can turn a catalog entry into a saved preset for you, so you don't have to hand-enter every model ID and capability.
 - **CLI providers** — Codex CLI and Claude Code CLI. These aren't hosted-key providers; they're command-line agents Batshit installs and manages, then you log into. They power `CLI` Primary Agents.
@@ -30,7 +31,7 @@ These are two different ways to reach a model, and Batshit keeps them in separat
 - **Provider keys (API)** are for hosted models you reach over the internet. They live in Settings → API Keys. You're sending requests to someone else's servers, billed by that provider.
 - **Local AI programs** are models running on your own computer or network — through Ollama, LM Studio, Docker Model Runner, llama.cpp, vLLM, SGLang, or oMLX. They live in Settings → Local AI, not API Keys, because they're mostly a URL to a local engine rather than a hosted-provider secret. (They can carry a key too, if your program asks for one.) After connecting one, you still create a Model Preset that uses it.
 
-If you want models that run on your own hardware, start with [Local AI](../local-ai/overview.md). If you want hosted models, start with the API key flow.
+If you want models that run on your own hardware, start with [Local AI](../local-ai/overview.md). For hosted models, start in Settings → API Keys with a provider key or, in the local Mac app, a supported ChatGPT Plan connection.
 
 ## CLI providers (Codex and Claude Code)
 

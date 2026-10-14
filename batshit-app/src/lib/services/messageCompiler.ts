@@ -1,5 +1,10 @@
 import { api } from './api'
-import { calculateZipActivation } from '$lib/utils/zipActivation'
+import { projectRemovedTextRanges, replaceTextRanges, type TextRange } from '$lib/utils/hydratedTextRanges'
+import { replaceAddressSourceRanges, type PositionedAddressSource } from '$lib/utils/addressSourceRanges'
+import { calculateZipActivation, describeReadCompressHint } from '$lib/utils/zipActivation'
+import { classifyToolResultSize, resolveToolResultPromptTokens, TOOL_RESULT_SIZE_REASON_TEXT, type ToolResultSizeGuard } from '$lib/utils/toolResultSizeGuard'
+import { describeHeldReadHint } from '$lib/utils/zipHoldWords'
+import { DEAD_COPY_REASON_TEXT, type DeadCopyReason, type DeadCopyToolResult } from '$lib/utils/zipDeadCopies'
 import { canonicalToolName } from '$lib/utils/toolRenderMap'
 import {
   extractAllReferences,
@@ -17,8 +22,10 @@ import {
 import { getActiveInterruptedReasoningRecoveryBlock } from '$lib/utils/reasoningRecovery'
 import { isConcreteZipId } from '$lib/utils/zipReferenceSafety'
 import {
-  buildCoolToolAiContent,
+  buildMalformedCoolToolAiContent,
+  buildCoolToolAiContentWithSources,
   estimateCoolToolAiTokens,
+  estimateMalformedCoolToolAiTokens,
   parseCoolToolPayload,
   shouldPreferRawSidecarForAiExpansion
 } from '$lib/utils/coolToolAiContent'
@@ -28,6 +35,7 @@ import {
 } from '$lib/utils/htmlEntities'
 import { logger } from '$lib/utils/logger'
 import type { ZipStateView } from './zipping'
+import type { AddressSourcePiece } from '$lib/utils/imageAddressOrigin'
 
 const ZIP_COMPILATION_BATCH_SIZE = 100
 
@@ -58,13 +66,15 @@ export interface ZipExposure {
   zip: ExtractedZip
   zipData: ZipData
   expandedContent: string
+  /** BL-1014: the exact expanded Cool Tool body with its structural provenance. */
+  expandedContentParts?: AddressSourcePiece[]
   message?: any
 }
 
 /**
  * SA-120 P5: one zip this compile left COMPRESSED for the model, reported through
  * `onZipCompressed`. Observation only — the decision was already made and applied by
- * the time the callback runs. The canonical compiler hands these to the Jev Juice
+ * the time the callback runs. The canonical compiler hands these to the Judge Juice
  * smart-zip hint lane as its candidates, so the lane judges exactly what the agent
  * cannot see rather than re-deriving zip activation on its own.
  */
@@ -84,8 +94,8 @@ export interface ZipCompression {
   tokens: number
   operationKind?: string
   toolName?: string
-  /** Safety row (`metadata.forceCompress`): stays compressed even when unzipped. */
-  forceCompress: boolean
+  /** The size rule reported by activation, never the stored forceCompress stamp. */
+  sizeGuard: ToolResultSizeGuard
   /** Someone zipped it by hand (`rezipped_item`). */
   rezipped: boolean
   /**
@@ -96,13 +106,18 @@ export interface ZipCompression {
   rezippedBy: 'user' | 'agent' | 'inferred' | null
   /** Compressed only because the tool is not shared with this group agent. */
   groupUnshared: boolean
+  /**
+   * SA-129 P1 (DL-01): a dead copy of a file read (superseded or stale). Such a zip cannot be
+   * reopened by an `inferred` (Judge Juice) unzip, so the smart-zip lane never offers it.
+   */
+  deadCopy: DeadCopyReason | null
   messagesFromEnd: number
 }
 
 /**
  * SA-120 P5: one zip this compile left EXPANDED for the model, reported through
  * `onZipExposed` in every view mode (unlike `onZipExposure`, which carries the expanded body
- * for the appended block). Facts only, after the fact. The Jev Juice smart-zip lane asks,
+ * for the appended block). Facts only, after the fact. The Judge Juice smart-zip lane asks,
  * once the reply is finished, whether the agent is done with the ones that would otherwise
  * stay open.
  */
@@ -170,8 +185,6 @@ export function buildPreservedReasoningHistory(agent: any, message?: any): strin
   return blocks.join('\n\n')
 }
 
-const escapeScriptContent = (value: string) => value.replace(/<\/script/gi, '<\\/script')
-
 function getCoolToolRawSidecarZipId(zipData: ZipData, payload: Record<string, any> | null): string | null {
   const candidates = [
     zipData.metadata?.rawSidecarZipId,
@@ -188,37 +201,18 @@ function getCoolToolRawSidecarZipId(zipData: ZipData, payload: Record<string, an
   return null
 }
 
-function getCoolToolPromptTokens(zipData: ZipData): number | null {
-  const candidates = [
-    (zipData as any).promptTokens,
-    (zipData as any).aiTokens,
-    zipData.metadata?.promptTokens,
-    zipData.metadata?.aiTokens,
-    zipData.metadata?.tokenBasis === 'ai_expanded' ? zipData.tokens : undefined,
-    zipData.metadata?.tokenBasis === 'ai_expanded' ? zipData.metadata?.tokens : undefined
-  ]
-
-  for (const candidate of candidates) {
-    if (typeof candidate === 'number' && Number.isFinite(candidate) && candidate > 0) {
-      return Math.ceil(candidate)
-    }
-  }
-
-  return null
-}
-
 async function ensureCoolToolPromptTokens(
   zip: ExtractedZip,
   zipData: ZipData,
   fetchImpl?: typeof fetch,
   zipResolver?: (zipId: string) => Promise<ZipData | null>
 ): Promise<ZipData> {
-  if (zipData.type !== 'cool_tool' || getCoolToolPromptTokens(zipData) !== null) {
+  if (zipData.type !== 'cool_tool' || resolveToolResultPromptTokens(zipData) !== null) {
     return zipData
   }
 
   const mainPayload = parseCoolToolPayload(zipData.content)
-  if (!mainPayload) return zipData
+  if (!mainPayload && typeof zipData.content !== 'string') return zipData
 
   const rawSidecarZipId = getCoolToolRawSidecarZipId(zipData, mainPayload)
   const rawSidecarZip =
@@ -229,8 +223,10 @@ async function ensureCoolToolPromptTokens(
     rawSidecarZip?.type === 'tool_raw' && typeof rawSidecarZip.content === 'string'
       ? rawSidecarZip.content
       : zipData.content
-  const promptPayload = parseCoolToolPayload(payloadContent) || mainPayload
-  const promptTokens = estimateCoolToolAiTokens(zip.id, zipData, promptPayload)
+  const promptPayload = parseCoolToolPayload(payloadContent)
+  const promptTokens = promptPayload
+    ? estimateCoolToolAiTokens(zip.id, zipData, promptPayload)
+    : estimateMalformedCoolToolAiTokens(zip.id, payloadContent)
 
   return {
     ...zipData,
@@ -258,30 +254,36 @@ function isLikelyZipId(id: string): boolean {
   return isConcreteZipId(id)
 }
 
+function extractedZipAt(ref: ReturnType<typeof extractAllReferences>[number], index: number): ExtractedZip {
+  return {
+    raw: ref.fullMatch,
+    id: ref.id,
+    type: 'zip',
+    tokens: '0',
+    name: '',
+    description: ref.optionalContent || '',
+    optionalContent: ref.optionalContent,
+    index,
+    length: ref.fullMatch.length
+  }
+}
+
 export function extractZips(content: string): ExtractedZip[] {
   const references = extractAllReferences(content)
   const zips: ExtractedZip[] = []
   
-  // Find each reference in the content to get its position
+  // The resolver returns source order. Advance across clips too, so a matching marker in an
+  // earlier reference's label cannot steal the later occurrence (including interleaved A/B/A).
+  let cursor = 0
   references.forEach(ref => {
+    const index = content.indexOf(ref.fullMatch, cursor)
+    if (index < 0) throw new Error('The compiled reference has no source position.')
+    cursor = index + ref.fullMatch.length
     if (ref.type === 'zip') {
       if (!isLikelyZipId(ref.id)) {
         return
       }
-      const index = content.indexOf(ref.fullMatch)
-      if (index !== -1) {
-        zips.push({
-          raw: ref.fullMatch,
-          id: ref.id,
-          type: 'zip',
-          tokens: '0',
-          name: '',
-          description: ref.optionalContent || '',
-          optionalContent: ref.optionalContent,
-          index,
-          length: ref.fullMatch.length
-        })
-      }
+      zips.push(extractedZipAt(ref, index))
     }
   })
   
@@ -329,7 +331,7 @@ function getGroupShareKeysForZip(options: {
   }
 }
 
-function isToolSharedForGroup(
+export function isToolSharedForGroup(
   options: {
     zipType?: string
     toolCandidates?: Array<string | undefined>
@@ -344,6 +346,78 @@ function isToolSharedForGroup(
   if (shareKeys.keys.some((key) => normalized.has(key))) return true
   if (shareKeys.usesAllOtherFallback && normalized.has('all_other_tools')) return true
   return false
+}
+
+/**
+ * The zip references `compileForAI` resolves in one message, in order: control blocks stripped
+ * first, then the message's `metadata.zipIds` allow-list. SA-129 P1's dead-copy ledger reads the
+ * same list, so it sees exactly the results the compile does.
+ */
+export function listCompilableZips(content: string, message?: any): ExtractedZip[] {
+  const validZipIdsRaw = Array.isArray(message?.metadata?.zipIds) ? message.metadata.zipIds : null
+  const validZipIds = validZipIdsRaw
+    ? new Set(validZipIdsRaw.map((id: string) => normalizeId(id)))
+    : null
+  return extractZips(content ? stripZipControlBlocks(content) : content).filter((zip) => {
+    if (!validZipIds) return true
+    return validZipIds.has(normalizeId(zip.id))
+  })
+}
+
+/**
+ * SA-129: every tool result among `messages`, in chat order, as the dead-copy ledger reads it:
+ * the references `compileForAI` resolves (`listCompilableZips`), read through `resolveZip`, with
+ * the author of each message. A zip that cannot be read is left out, so it can neither die nor
+ * kill another copy. The compile (P1) and the chat's badges (P2, BL-333) read this one list.
+ */
+export async function collectDeadCopyToolResults(
+  messages: any[],
+  resolveZip: (zipId: string) => Promise<any | null>
+): Promise<{ results: DeadCopyToolResult[]; messageIndexByZip: Map<string, number> }> {
+  const results: DeadCopyToolResult[] = []
+  const messageIndexByZip = new Map<string, number>()
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index] as any
+    if (message?.role !== 'assistant' || typeof message.content !== 'string' || !message.content) continue
+    const authorId =
+      typeof message.agent_id === 'string' && message.agent_id.trim()
+        ? message.agent_id.trim()
+        : typeof message.agentId === 'string' && message.agentId.trim()
+          ? message.agentId.trim()
+          : null
+    for (const zip of listCompilableZips(message.content, message)) {
+      const zipId = normalizeId(zip.id)
+      if (messageIndexByZip.has(zipId)) continue
+      let zipData: any = null
+      try {
+        zipData = await resolveZip(zip.id)
+      } catch {
+        zipData = null
+      }
+      if (!zipData || zipData.type !== 'cool_tool') continue
+      messageIndexByZip.set(zipId, index)
+      results.push({
+        zipId,
+        authorId,
+        messageIndex: index,
+        operationKind: typeof zipData.metadata?.operationKind === 'string' ? zipData.metadata.operationKind : null,
+        payload: parseCoolToolPayload(zipData.content)
+      })
+    }
+  }
+  return { results, messageIndexByZip }
+}
+
+/** SA-129 P1: one dead copy as a compile sees it (`findDeadCopies` plus its author's reply count). */
+export interface CompileDeadCopy {
+  reason: DeadCopyReason
+  /** How many of the author's replies had finished when the copy died. */
+  repliesUntilDead: number
+}
+
+function isReadTranscriptLane(zipData: ZipData): boolean {
+  const kind = zipData.metadata?.operationKind
+  return kind === 'read_file' || kind === 'skill_read'
 }
 
 // Compile content for AI (respect buffer/threshold)
@@ -379,6 +453,18 @@ export async function compileForAI(
      * singleton, which holds only the current chat.
      */
     zipState?: ZipStateView
+    /**
+     * SA-129 P1 (DL-01): this compile's dead copies by normalized zip id, built once per
+     * compile from its own messages (never shared between compiles, like `zipState`).
+     */
+    deadCopies?: ReadonlyMap<string, CompileDeadCopy>
+    /**
+     * BL-474 step 2: told about each piece of this message that is not the agent's own words
+     * (a tool result it expanded in place, a steer it expanded), with its source, AFTER the text
+     * is written. Read only: it can never change or interrupt the compile; a throw is logged and
+     * ignored. A tool result in the appended view is told by the zip index that holds it.
+     */
+    onDeliveredSource?: (piece: PositionedAddressSource) => void
   }
 ): Promise<string> {
   const zipState: ZipStateView =
@@ -401,22 +487,26 @@ export async function compileForAI(
     currentAgentId !== messageAgentId
 
   const zipViewMode = options?.zipViewMode === 'appended' ? 'appended' : 'inline'
-  const validZipIdsRaw = Array.isArray((_message as any)?.metadata?.zipIds)
-    ? (_message as any)?.metadata?.zipIds
-    : null
-  const validZipIds = validZipIdsRaw
-    ? new Set(validZipIdsRaw.map((id: string) => normalizeId(id)))
-    : null
+  // SA-129 P1 (DL-03): the compression hint speaks to the agent this compile is for, so a group
+  // compile gives none to another agent's results (they age by that agent's replies).
+  const compressHintsForThisAgent = !shouldLimitSharedTools
+  // SA-129 P2: the agent this compile is for, which "Held by you" means.
+  const compilingAgentId = currentAgentId ?? (typeof agent?.id === 'string' ? agent.id : null)
+  const reportDelivered = (piece: PositionedAddressSource) => {
+    if (!options?.onDeliveredSource) return
+    try {
+      options.onDeliveredSource(piece)
+    } catch (error) {
+      console.error('[compileForAI] onDeliveredSource observer threw; ignored:', error)
+    }
+  }
 
+  const zips = listCompilableZips(content, _message)
   if (content) {
     content = stripZipControlBlocks(content)
   }
-
-  const zips = extractZips(content).filter((zip) => {
-    if (!validZipIds) return true
-    return validZipIds.has(normalizeId(zip.id))
-  })
   let compiled = content
+  let delivered: PositionedAddressSource[] = []
   let offset = 0
 
   zips.sort((a, b) => a.index - b.index)
@@ -443,6 +533,9 @@ export async function compileForAI(
       
       const toolNameForZip =
         zipData.metadata?.operationKind || zipData.metadata?.toolName || zipData.name
+      // An unzip whose source cannot be read is the user's, the strongest.
+      const unzippedSource = isUnzipped ? zipState.getUnzippedInfo(checkZipId)?.source : undefined
+      const isUserUnzipped = isUnzipped && unzippedSource !== 'agent' && unzippedSource !== 'inferred'
 
       const activation = calculateZipActivation({
         zipType: zipData.type,
@@ -453,8 +546,11 @@ export async function compileForAI(
         toolName: toolNameForZip,
         fallbackTokens: zipData.tokens,
         isUnzipped,
+        isInferredUnzipped: unzippedSource === 'inferred',
         isRezipped,
-        recoveryHold: options?.recoveryHold === true
+        recoveryHold: options?.recoveryHold === true,
+        deadCopy: options?.deadCopies?.get(checkZipId) ?? null,
+        isUserUnzipped
       })
 
       const start = zip.index + offset
@@ -480,8 +576,9 @@ export async function compileForAI(
       const shouldExpose = !shouldCompress
       const shouldAppend = zipViewMode === 'appended'
 
-      const buildExpandedContent = async () => {
+      const buildExpandedContent = async (): Promise<{ text: string; parts?: AddressSourcePiece[] }> => {
         let expandedContent = zipData.content
+        let expandedContentParts: AddressSourcePiece[] | undefined
 
         // For Cool Tools, we need to handle them specially
         if (zipData.type === 'cool_tool') {
@@ -496,22 +593,35 @@ export async function compileForAI(
               ? rawSidecarZip.content
               : zipData.content
           const payloadForAi = parseCoolToolPayload(payloadContent)
-          const alreadyWrapped = payloadContent.includes('<cool_tool')
           if (payloadForAi) {
-            expandedContent = buildCoolToolAiContent(zip.id, zipData, payloadForAi)
-          } else if (alreadyWrapped) {
-            expandedContent = payloadContent
+            const formatted = buildCoolToolAiContentWithSources(zip.id, zipData, payloadForAi)
+            expandedContent = formatted.text
+            expandedContentParts = formatted.parts
+            // SA-129 P2 (DL-03): an open read says when it compresses, or who holds it open. A
+            // held copy the dead-copy rule compressed anyway (an agent's hold on a copy it edited
+            // since) is never expanded, so it never reaches here.
+            const compressHint =
+              compressHintsForThisAgent && isReadTranscriptLane(zipData)
+                ? isUnzipped
+                  ? describeHeldReadHint(zipState.getUnzippedInfo(checkZipId), compilingAgentId)
+                  : describeReadCompressHint(activation, { isUnzipped })
+                : null
+            if (compressHint) {
+              expandedContent += `\n${compressHint}`
+              expandedContentParts = [
+                ...(expandedContentParts ?? []),
+                { source: 'agent_words', text: `\n${compressHint}` }
+              ]
+            }
           } else {
-            // Wrap JSON payload once as a cool_tool tag so messageFormatter can parse it
-            const payloadStr = typeof payloadContent === 'string'
-              ? payloadContent
-              : JSON.stringify(payloadContent)
-            const scriptContent = escapeScriptContent(payloadStr)
-            expandedContent = `<cool_tool data-zip-id='${zip.id}' data-zip-type='cool_tool'><script type="application/json" class="cool-tool-payload">${scriptContent}<\/script></cool_tool>`
+            // Keep malformed legacy fallback and its size estimate byte-identical.
+            expandedContent = buildMalformedCoolToolAiContent(zip.id, payloadContent)
+            // A malformed transcript has no trustworthy structural source boundaries.
+            expandedContentParts = [{ source: 'agent_words', text: expandedContent }]
           }
         }
 
-        return expandedContent
+        return { text: expandedContent, parts: expandedContentParts }
       }
 
       const descriptionPart = (value: unknown) => (typeof value === 'string' ? value.trim() : '')
@@ -520,7 +630,6 @@ export async function compileForAI(
         try {
           const label = descriptionPart(zipData.metadata?.zipDescriptionLabel)
           const target = descriptionPart(zipData.metadata?.zipDescriptionTarget)
-          const unzippedSource = isUnzipped ? zipState.getUnzippedInfo(checkZipId)?.source : undefined
           options.onZipExposed({
             zipId: zip.id,
             zipType: zipData.type,
@@ -550,19 +659,39 @@ export async function compileForAI(
       }
 
       if (shouldAppend && shouldExpose) {
-        const expandedContent = await buildExpandedContent()
+        const expanded = await buildExpandedContent()
         options?.onZipExposure?.({
           zipId: zip.id,
           zip,
           zipData,
-          expandedContent,
+          expandedContent: expanded.text,
+          ...(expanded.parts ? { expandedContentParts: expanded.parts } : {}),
           message: _message
         })
       }
 
       if (shouldCompress || (shouldAppend && shouldExpose)) {
         const optionalContent = zip.optionalContent || zip.description
-        const compressedZip = createReference('zip', zip.id, optionalContent)
+        // SA-129 P1: a copy the dead-copy rule compressed says why after its description.
+        const deadCopyText =
+          shouldCompress && !shouldForceCompress && activation.deadCopy && activation.deadCopyNamed
+            ? DEAD_COPY_REASON_TEXT[activation.deadCopy]
+            : ''
+        // A large result already carried this reference before a later read made it
+        // a dead copy. Keep its size reason stable; activation still reports the
+        // winning rule separately for Holds, UI and Judge Juice.
+        const referenceSize = zipData.type === 'cool_tool' ? classifyToolResultSize(activation.tokens) : null
+        const sizeGuardText = shouldCompress && !shouldForceCompress && referenceSize
+          ? TOOL_RESULT_SIZE_REASON_TEXT[referenceSize]
+          : ''
+        const reasonText = sizeGuardText || deadCopyText
+        const referenceText = reasonText
+          ? optionalContent
+            ? `${optionalContent} - ${reasonText}`
+            : reasonText
+          : optionalContent
+        const compressedZip = createReference('zip', zip.id, referenceText)
+        delivered = replaceAddressSourceRanges(delivered,start,start+zip.length,compressedZip)
         compiled = compiled.substring(0, start) +
           compressedZip +
           compiled.substring(start + zip.length)
@@ -589,10 +718,11 @@ export async function compileForAI(
                   ? zipData.metadata.operationKind
                   : undefined,
               toolName: activation.toolName,
-              forceCompress: zipData.metadata?.forceCompress === true,
+              sizeGuard: activation.sizeGuard,
               rezipped: isRezipped,
               rezippedBy: isRezipped ? (zipState.getRezippedSource(checkZipId) ?? 'user') : null,
               groupUnshared: shouldForceCompress,
+              deadCopy: activation.deadCopy,
               messagesFromEnd: activation.messagesFromEnd
             })
           } catch (error) {
@@ -601,13 +731,23 @@ export async function compileForAI(
         }
       } else {
         // When expanding zips that are within the buffer zone OR manually unzipped
-        const expandedContent = await buildExpandedContent()
+        const expanded = await buildExpandedContent()
         
+        delivered = replaceAddressSourceRanges(delivered,start,start+zip.length,expanded.text)
         compiled = compiled.substring(0, start) +
-          expandedContent +
+          expanded.text +
           compiled.substring(start + zip.length)
-        offset += expandedContent.length - zip.length
+        offset += expanded.text.length - zip.length
         reportExposed()
+        // Only a tool's own result is a tool result; any other zip family holds the agent's
+        // own words (an `<error>` block the reply wrote), which stay in its message.
+        if (zipData.type === 'cool_tool') {
+          let at = start
+          for (const piece of expanded.parts ?? [{ source: 'agent_words' as const, text: expanded.text }]) {
+            delivered.push({...piece,start:at,end:at+piece.text.length})
+            at += piece.text.length
+          }
+        }
       }
     } catch (error) {
       console.warn('[compileForAI] Failed to resolve zip during AI history compilation:', {
@@ -626,11 +766,26 @@ export async function compileForAI(
   // The text lives in `metadata.steers[]` rather than in the marker — the same split the
   // zip family uses, and what lets one assistant record carry it without the compiled
   // history ever changing after it is written.
-  compiled = expandSteerPlaceholders(
-    compiled,
-    readMessageSteers(_message),
-    formatSteerForModel
-  )
+  const beforeSteers = compiled
+  const steerEdits: Array<{start:number;end:number;replacement:string;piece:AddressSourcePiece}> = []
+  compiled = expandSteerPlaceholders(compiled,readMessageSteers(_message),formatSteerForModel,
+    (start,end,replacement,steer,line)=>{
+      steerEdits.push({start,end,replacement,piece:{source:steer ? (steer.source==='dm'?'agent_note':'user') : 'batshit',text:line}})
+    })
+  let untrimmedSteers = beforeSteers
+  for(const edit of steerEdits.reverse()) {
+    delivered=replaceAddressSourceRanges(delivered,edit.start,edit.end,edit.replacement)
+    const within=edit.replacement.indexOf(edit.piece.text)
+    delivered.push({...edit.piece,start:edit.start+within,end:edit.start+within+edit.piece.text.length})
+    untrimmedSteers=untrimmedSteers.slice(0,edit.start)+edit.replacement+untrimmedSteers.slice(edit.end)
+  }
+  const leadingTrim=untrimmedSteers.length-untrimmedSteers.trimStart().length
+  // expandSteerPlaceholders removes only the new edge newlines; preserve caller whitespace.
+  const removedLeading=untrimmedSteers.length>compiled.length && !/^\s/.test(beforeSteers)?leadingTrim:0
+  if(removedLeading) delivered=replaceAddressSourceRanges(delivered,0,removedLeading,'')
+  if(untrimmedSteers.length-removedLeading>compiled.length) {
+    delivered=replaceAddressSourceRanges(delivered,compiled.length,untrimmedSteers.length-removedLeading,'')
+  }
 
   // Tell the model when this response never completed, so it does not treat
   // the partial work as a finished turn (mirrors the user-facing failure
@@ -641,9 +796,13 @@ export async function compileForAI(
         ? (_message as any).metadata.error_message.trim()
         : ''
     const reason = reasonRaw.length > 200 ? `${reasonRaw.slice(0, 200)}…` : reasonRaw
-    const note = reason
-      ? `[This response was cut short by an error before completing: ${reason}]`
-      : '[This response was cut short by an error before completing.]'
+    // BL-239: an output-limit stop is not an error, and its stored message is advice for the
+    // user (continue, or raise Max Tokens), so the model gets the plain fact instead.
+    const note = (_message as any)?.metadata?.failure_kind === 'output_limit'
+      ? "[This response stopped at the model's output limit before it was finished.]"
+      : reason
+        ? `[This response was cut short by an error before completing: ${reason}]`
+        : '[This response was cut short by an error before completing.]'
     compiled = compiled.trim().length > 0 ? `${compiled}\n\n${note}` : note
   }
 
@@ -656,6 +815,8 @@ export async function compileForAI(
     ? ''
     : buildPreservedReasoningHistory(agent, _message)
   if (preservedReasoningHistory) {
+    const prefix=compiled.trim().length>0?`${preservedReasoningHistory}\n\n`:preservedReasoningHistory
+    delivered=replaceAddressSourceRanges(delivered,0,0,prefix)
     compiled = compiled.trim().length > 0
       ? `${preservedReasoningHistory}\n\n${compiled}`
       : preservedReasoningHistory
@@ -666,6 +827,7 @@ export async function compileForAI(
       : interruptedReasoningRecovery
   }
 
+  for(const piece of delivered) reportDelivered({...piece,text:compiled.slice(piece.start,piece.end)})
   return compiled
 }
 
@@ -713,12 +875,14 @@ export async function batchGetZips(zipIds: string[]): Promise<Map<string, ZipDat
  */
 export async function compileForUserBatch(
   content: string,
-  options?: { steers?: DeliveredSteer[] }
+  options?: { steers?: DeliveredSteer[]; trustedZipIds?: ReadonlySet<string>; onHydratedRanges?: (content: string, ranges: TextRange[]) => void }
 ): Promise<string> {
   const steers = options?.steers ?? []
   const zips = extractZips(content)
   if (zips.length === 0) {
-    return expandSteerPlaceholders(content, steers, formatSteerForUser)
+    const expanded = expandSteerPlaceholders(content, steers, formatSteerForUser)
+    options?.onHydratedRanges?.(expanded, [])
+    return expanded
   }
   
   const zipIds = zips.map(t => t.id)
@@ -726,6 +890,7 @@ export async function compileForUserBatch(
   const zipDataMap = await batchGetZips(zipIds)
   
   let compiled = content
+  let hydrated: TextRange[] = []
   
   zips.sort((a, b) => b.index - a.index)
   
@@ -763,10 +928,24 @@ export async function compileForUserBatch(
         expandedContent = zipData.content
     }
     
+    hydrated = replaceTextRanges(hydrated, zip.index, zip.index + zip.length, expandedContent.length)
+    if (zipData.type !== 'cool_tool' && options?.trustedZipIds?.has(normalizeId(zip.id))) {
+      hydrated.push({ start: zip.index, end: zip.index + expandedContent.length })
+    }
     compiled = compiled.substring(0, zip.index) +
       expandedContent +
       compiled.substring(zip.index + zip.length)
   }
   
-  return expandSteerPlaceholders(compiled, steers, formatSteerForUser)
+  const replacements: Array<{ start: number; end: number; text: string }> = []
+  const expanded = expandSteerPlaceholders(compiled, steers, formatSteerForUser, (start, end, text) => {
+    replacements.push({ start, end, text })
+  })
+  let beforeTrim = compiled
+  for (const replacement of replacements.reverse()) {
+    hydrated = replaceTextRanges(hydrated, replacement.start, replacement.end, replacement.text.length)
+    beforeTrim = beforeTrim.slice(0, replacement.start) + replacement.text + beforeTrim.slice(replacement.end)
+  }
+  options?.onHydratedRanges?.(expanded, projectRemovedTextRanges(beforeTrim, expanded, hydrated))
+  return expanded
 }

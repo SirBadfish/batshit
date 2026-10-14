@@ -1,3 +1,4 @@
+import type { LocalContextBudgetEvidence } from '$lib/types/localContextBudget'
 import { buildCodexPromptPackageFromMessages } from '$lib/server/services/codexBridge'
 import { getSmartAutoCompactTriggerTokens } from '$lib/utils/contextCompaction'
 import { countTotalTokens } from '$lib/utils/tokenCounter'
@@ -15,6 +16,13 @@ export interface PromptBudgetReport {
   estimatedRuntimeTokens: number
   nativeOverheadTokens: number
   contextLimit: number | null
+  localContext?: LocalContextBudgetEvidence | null
+  /** Optional saved CLI telemetry failed; never substitute a guessed denominator. */
+  contextWindowWarning?: string | null
+  /** Server lookup completion time; browser receipt time cannot order evidence. */
+  contextWindowCheckedAt?: number
+  /** Same privacy-safe model/settings identity used by saved CLI window reports. */
+  contextWindowSettingsKey?: string | null
   contextRemainingTokens: number | null
   contextPercent: number | null
   outputReserveTokens: number

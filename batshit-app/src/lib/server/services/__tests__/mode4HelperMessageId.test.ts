@@ -45,7 +45,19 @@ beforeAll(async () => {
         body = { raw }
       }
       received.push({ url: req.url ?? '', body, headers: req.headers as Record<string, any> })
-      res.writeHead(200, { 'Content-Type': 'application/json' })
+      if (req.url === '/api/native-tools/guard-result') {
+        // The Codex helper guards every final MCP text, even when this fixture's
+        // control result is small enough to pass through unchanged.
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ success: true, text: body.text }))
+        return
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json',
+        ...(req.url === '/api/controls/use' ? {
+          'x-batshit-tool-text-max-bytes': '8000',
+          'x-batshit-tool-text-budget-source': 'codex-fallback',
+          ...(body?.controlId === 'sys.zip.fetch' ? { 'x-batshit-tool-page-kind': 'fetch-zip' } : {})
+        } : {}) })
       res.end(JSON.stringify(responseBodies.get(req.url ?? '') ?? { success: true }))
     })
   })

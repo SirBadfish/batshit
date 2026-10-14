@@ -19,6 +19,7 @@ import {
   getEnabledAgentSlashCapabilities,
   resolveSkillAccessForActor
 } from '../slashCommandCapabilities'
+import { splitFrontmatter } from '../skillFrontmatter'
 
 function skillCommand(overrides: Record<string, unknown>) {
   return {
@@ -162,6 +163,76 @@ describe('slashCommandCapabilities', () => {
         isSystem: false
       })
     ])
+  })
+
+  // BL-469: a SKILL.md with a folded or literal description listed `— >` or `— |`.
+  it('lists the text of a folded or literal SKILL.md description on one line', async () => {
+    const folded = splitFrontmatter(`---
+name: typesafe-system-one
+description: >
+  TypeSafe AI's System One models (flagship: Jev): typed questions
+  about any text.
+---
+# TypeSafe
+`).frontmatter.description as string
+    const literal = splitFrontmatter(`---
+name: release-notes
+description: |
+  Drafts release notes.
+    Use it when: a release is tagged.
+
+  Never publishes.
+---
+# Release Notes
+`).frontmatter.description as string
+
+    seedCommands([
+      skillCommand({
+        id: 'typesafe-system-one',
+        name: 'typesafe-system-one',
+        displayName: 'TypeSafe',
+        invocation_pattern: '/typesafe-system-one',
+        skill_id: 'typesafe_system_one',
+        is_system: false,
+        enabled_for_all_agents: true,
+        skill_summary: folded
+      }),
+      skillCommand({
+        id: 'release-notes',
+        name: 'release-notes',
+        displayName: 'Release Notes',
+        invocation_pattern: '/release-notes',
+        skill_id: 'release_notes',
+        is_system: false,
+        enabled_for_all_agents: true,
+        description: literal
+      })
+    ])
+
+    const lines = buildSkillsCommandsDcmLines(await getEnabledAgentSlashCapabilities('user-1', 'agent-1'))
+
+    expect(lines.slice(0, 3)).toEqual([
+      'skills_commands:',
+      '- /release-notes | skill | skillId=release_notes — Drafts release notes. Use it when: a release is tagged. Never publishes.',
+      "- /typesafe-system-one | skill | skillId=typesafe_system_one — TypeSafe AI's System One models (flagship: Jev): typed questions about any text."
+    ])
+  })
+
+  it('leaves out the dash when a description is only whitespace', () => {
+    const lines = buildSkillsCommandsDcmLines([
+      {
+        id: 'blank',
+        name: 'blank',
+        displayName: 'Blank',
+        type: 'skill',
+        invocation: '/blank',
+        description: ' \n\t ',
+        isSystem: false,
+        skillId: 'blank'
+      }
+    ])
+
+    expect(lines[1]).toBe('- /blank | skill | skillId=blank')
   })
 })
 

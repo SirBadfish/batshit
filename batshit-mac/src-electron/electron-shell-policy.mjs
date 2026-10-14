@@ -62,6 +62,47 @@ export function collectAllowedOrigins(env = process.env) {
   return origins;
 }
 
+export const MAC_APP_NAME = 'Batshit';
+const TEST_PACKAGE_LABEL = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/**
+ * Which app this shell is (BL-72). A test package built with `rebuild-mac-app.sh --artifact-suffix
+ * -<Label>` is named "Batshit <Label>" (its package.json `productName`, from `macPackageIdentity` in
+ * package-mac-app.mjs) and keeps its data in "Batshit-<Label>" folders, so its name, its Keychain
+ * entry ("<name> Safe Storage"), its folders, and its one-instance lock never touch the real app's.
+ * The real app and an unpackaged shell are "Batshit", as before. Any other packaged name is refused:
+ * acting as the real app would put a test build on the real app's data.
+ */
+export function resolveMacShellIdentity({ packaged, packagedName }) {
+  if (!packaged || packagedName === MAC_APP_NAME) {
+    return { appName: MAC_APP_NAME, dataFolderName: MAC_APP_NAME, testPackage: false };
+  }
+  const prefix = `${MAC_APP_NAME} `;
+  const label = typeof packagedName === 'string' && packagedName.startsWith(prefix) ? packagedName.slice(prefix.length) : '';
+  if (!TEST_PACKAGE_LABEL.test(label)) {
+    throw new Error(
+      `This Mac package calls itself "${packagedName}", which is neither Batshit nor a Batshit test package ("Batshit <Label>").`
+    );
+  }
+  return { appName: packagedName, dataFolderName: `${MAC_APP_NAME}-${label}`, testPackage: true };
+}
+
+/**
+ * The folders a test package uses when its launcher named none (opened from Finder or the Dock):
+ * its own, never the real app's. main.mjs adds them to its environment, which the runtime supervisor
+ * inherits. Folders a launcher set win; the real app adds none.
+ */
+export function macShellFolderEnv(identity, env = process.env, homePath = '') {
+  if (!identity?.testPackage) return {};
+  const folder = identity.dataFolderName;
+  const defaults = {
+    BATSHIT_MAC_DATA_DIR: join(homePath, 'Library', 'Application Support', folder),
+    BATSHIT_MAC_LOG_DIR: join(homePath, 'Library', 'Logs', folder),
+    BATSHIT_MAC_CACHE_DIR: join(homePath, 'Library', 'Caches', folder)
+  };
+  return Object.fromEntries(Object.entries(defaults).filter(([key]) => !env[key]));
+}
+
 export const DEV_TOOLS_OPT_IN_FILENAME = 'enable-devtools';
 
 export function resolveMacDataRoot(env = process.env, homePath = '') {
@@ -276,19 +317,68 @@ export function validateSaveFileOptions(value) {
   return result;
 }
 
+const BACKUP_PARTIAL_ENTRY_LIMIT = 10_000;
+const BACKUP_PARTIAL_STRING_MAX = 4096;
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+
+/**
+ * BL-378 Phase 1b: the partial backup's `partial` option, bounded the way the app route bounds it
+ * (1 to 10,000 entries of exactly key, relativePath and fingerprint; keys and paths at most 4,096
+ * UTF-16 code units, as `targetPath` is measured here; a 64-lowercase-hex fingerprint;
+ * confirmAllMissing only true). The route checks it again in full. A fresh copy goes on, never the
+ * renderer's object.
+ */
+function validateBackupPartialOption(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Backup export partial must be an object.');
+  }
+  for (const key of Object.keys(value)) {
+    if (key !== 'acknowledged' && key !== 'confirmAllMissing') throw new Error(`Unsupported backup export partial option: ${key}`);
+  }
+  if (value.confirmAllMissing !== undefined && value.confirmAllMissing !== true) {
+    throw new Error('Backup export confirmAllMissing may only be true.');
+  }
+  const list = value.acknowledged;
+  if (!Array.isArray(list) || list.length < 1 || list.length > BACKUP_PARTIAL_ENTRY_LIMIT) {
+    throw new Error(`Backup export partial must list 1 to ${BACKUP_PARTIAL_ENTRY_LIMIT} upload records.`);
+  }
+  const acknowledged = list.map((entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new Error('Backup export partial entries must be objects.');
+    }
+    const fields = Object.keys(entry);
+    if (fields.length !== 3 || !['key', 'relativePath', 'fingerprint'].every((field) => Object.hasOwn(entry, field))) {
+      throw new Error('Backup export partial entries must have exactly key, relativePath and fingerprint.');
+    }
+    for (const field of ['key', 'relativePath']) {
+      const text = entry[field];
+      if (typeof text !== 'string' || !text || text.length > BACKUP_PARTIAL_STRING_MAX || text.includes('\0')) {
+        throw new Error(`Backup export partial ${field} is invalid.`);
+      }
+    }
+    if (typeof entry.fingerprint !== 'string' || !SHA256_HEX.test(entry.fingerprint)) {
+      throw new Error('Backup export partial fingerprint is invalid.');
+    }
+    return { key: entry.key, relativePath: entry.relativePath, fingerprint: entry.fingerprint };
+  });
+  return value.confirmAllMissing === true ? { acknowledged, confirmAllMissing: true } : { acknowledged };
+}
+
 export function validateBackupExportOptions(value) {
   if (value === undefined || value === null) return { includeSecrets: false };
   if (typeof value !== 'object' || Array.isArray(value)) {
     throw new Error('Backup export options must be an object.');
   }
-  const allowed = new Set(['includeSecrets']);
+  const allowed = new Set(['includeSecrets', 'partial']);
   for (const key of Object.keys(value)) {
     if (!allowed.has(key)) throw new Error(`Unsupported backup export option: ${key}`);
   }
   if (value.includeSecrets !== undefined && typeof value.includeSecrets !== 'boolean') {
     throw new Error('Backup export includeSecrets must be a boolean.');
   }
-  return { includeSecrets: value.includeSecrets === true };
+  const options = { includeSecrets: value.includeSecrets === true };
+  if (value.partial !== undefined) options.partial = validateBackupPartialOption(value.partial);
+  return options;
 }
 
 export function resolveBackupExportUrl(value, allowedOrigins, desktopUrl, controlsUrl) {

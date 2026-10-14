@@ -223,7 +223,14 @@ export const mcpToolListCache = createMcpToolListCache()
 // What a lookup or a Test writes back about itself; changing only these is not the user
 // changing the tool settings. Everything else is, including fields added later.
 const RECORD_KEEPING_FIELDS = new Set(['discoveredTools', 'lastDiscovery', 'updated_at'])
-const STDIO_RECORD_KEEPING_FIELDS = new Set(['lastTestStatus', 'lastTestAt', 'lastError', 'toolCount'])
+// BL-550: the same four are the only STDIO fields a Refresh or a Test writes, and the only ones a
+// settings save never writes (`mcpGatewayService.recordStdioCheckResult`, `.update`).
+export const STDIO_RECORD_KEEPING_FIELDS: ReadonlySet<string> = new Set([
+  'lastTestStatus',
+  'lastTestAt',
+  'lastError',
+  'toolCount'
+])
 
 function withoutRecordKeeping(gateway: MCPGateway): Record<string, unknown> {
   const settings: Record<string, unknown> = {}

@@ -15,14 +15,14 @@ function errorMessage(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback
 }
 
-export const GET: RequestHandler = async ({ locals }) => {
+export const GET: RequestHandler = async ({ locals, url }) => {
   if (!locals.user) {
     return json({ success: false, error: 'Not authenticated' }, { status: 401 })
   }
 
   try {
     const tokens = await listPortableSkillTokens(locals.user.id)
-    const envTemplates = await ensurePortableSkillEnvTemplates()
+    const envTemplates = await ensurePortableSkillEnvTemplates(url.origin)
     return json({
       success: true,
       tokens,
@@ -38,7 +38,7 @@ export const GET: RequestHandler = async ({ locals }) => {
   }
 }
 
-export const POST: RequestHandler = async ({ request, locals }) => {
+export const POST: RequestHandler = async ({ request, locals, url }) => {
   if (!locals.user) {
     return json({ success: false, error: 'Not authenticated' }, { status: 401 })
   }
@@ -56,7 +56,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       label: body.label,
       families: body.families
     })
-    const envTemplates = await ensurePortableSkillEnvTemplates()
+    const envTemplates = await ensurePortableSkillEnvTemplates(url.origin)
 
     return json({
       success: true,

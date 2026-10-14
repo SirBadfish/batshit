@@ -19,7 +19,7 @@ Use this skill when the user wants to:
 - generate a 360 skybox or panorama for Batshit;
 - design Room Builder textures and scene props;
 - make a cozy, cinematic, lofi, fantasy, sci-fi, or showcase environment;
-- choose between 4K compatibility textures and 8K hero textures;
+- choose between 4K compatibility backgrounds and 8K hero backgrounds;
 - turn visual references into a Batshit scene plan without copying the source.
 
 If the user only wants to set up a Goon avatar, use the Goon guide instead. If they want to create a general mini-app Artifact, use `/artifact-creator`.
@@ -31,11 +31,11 @@ Load `references/batshit-scene-spec.md` before making a scene plan. Keep these c
 - Current Goon scenes use **skybox**, **Room Shell / Room Builder**, **props**, **markers**, and one saved **Scene Atmosphere** particle layer.
 - Only **Sit** and **Lay** markers are explicit. Standing uses floor placement, not stand markers.
 - Props are static scene objects today. Do not promise animated props.
-- The Scene Editor's first accordion is **World**. It owns Skybox upload, **Scene Placement**, **Ground Projection Line**, and **Scene Atmosphere**. Room Builder owns Uploaded GLB versus Procedural Builder room geometry.
+- The Scene Editor's first accordion is **World**. It owns Skybox image/video upload, **Scene Placement**, **Ground Projection Line**, and **Scene Atmosphere**. Room Builder owns Uploaded GLB versus Procedural Builder room geometry.
 - Scene Placement is independent from the room source: use **Ground Level** for scenes placed on outdoor terrain, or **Elevated / Overlook** for rooftops, balconies, cliffs, space, and distant views.
 - Ground Level also exposes a saved **Ground Projection Line**. `50%` is the correct default equirectangular equator; move it only to correct an existing panorama whose intended ground boundary is globally higher or lower.
 - Uploaded GLB Room Shells support saved uniform scale, X/Y/Z offset, Y rotation, Reset Placement, and best-effort Align Floor. Keep those controls independent from Props and Markers.
-- Scene Atmosphere supports one built-in particle preset per scene: rain, snow, embers, fireflies, dust/pollen, petals, magic sparks, or mist. Do not promise custom sprite uploads, multiple atmosphere layers, weather occlusion, animated props, GIFs, or video textures.
+- Scene Atmosphere supports one built-in particle preset per scene: rain, snow, embers, fireflies, dust/pollen, petals, magic sparks, or mist. Do not promise custom sprite uploads, multiple atmosphere layers, weather occlusion, animated props, GIFs, or video room/prop textures. Skyboxes separately accept muted looping MP4/WebM video backgrounds.
 - `Outside` atmosphere is visible only through open or transparent room surfaces. Prefer `Inside` or `Whole Stage` when an opaque room should visibly contain the effect.
 - If no Goons/Scenes Fabric controls are discoverable, produce the scene assets/spec and give clear Scene Editor steps instead of pretending you saved the scene.
 
@@ -51,7 +51,7 @@ Choose texture resolution deliberately. Do not silently assume the biggest file 
 
 Recommend **Hero 8K** for final skyboxes. Use **Standard 4K** when the target is a smaller or lower-memory Mac/PC, the scene is already texture-heavy, many skyboxes may be mounted, or performance testing shows 8K is too costly. Draft remains an iteration mode, not the preferred final export.
 
-Runtime note: the embedded Mac app gives skyboxes their own texture budget. Ultra can use Hero 8K when the graphics device supports it, Auto/High use up to Standard 4K, and Low uses up to 2K. Avatar and room textures keep separate budgets.
+Still-image runtime note: the embedded Mac app gives skyboxes their own texture budget. Ultra can use Hero 8K when the graphics device supports it, Auto/High use up to Standard 4K, and Low uses up to 2K. Avatar and room textures keep separate budgets. Video plays at its uploaded resolution; choose an export supported by the target decoder. See the animation reference only when video is in scope.
 
 Even when the final output is 4K, include high-detail language in the prompt:
 
@@ -67,6 +67,8 @@ This wording helps the model produce denser surface detail instead of painterly 
 2. **Load references.**
    - Always load `references/batshit-scene-spec.md`.
    - Load `references/skybox-generation.md` when creating or prompting a skybox/panorama.
+   - Load `references/image-first-panorama.md` only when starting from a perspective hero/reference image.
+   - Load `references/animated-panorama.md` only when making, importing, or troubleshooting an animated/video background. Still-only plans do not need this guide.
    - Load `references/qwen360-skybox-workflow.md` when installing, using, or troubleshooting Batshit's bundled Qwen 360 ComfyUI skybox workflow.
    - Load `references/lofi-showcase-aesthetics.md` for cozy, lofi, cinematic, ambience-heavy, or showcase scenes.
 3. **Choose a texture mode.** Use the Resolution Policy. Name the tradeoff plainly.

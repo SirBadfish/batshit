@@ -31,6 +31,7 @@
     type DesktopControlsStateEvent
   } from '$lib/goons/desktopControlsNativeBridge'
   import { dispatchSessionClipStateChanged } from '$lib/utils/liveSettingsEvents'
+  import { clipCompressionSettingsFromResponse } from '$lib/utils/clipCompressionSettings'
   import {
     GOON_QUICK_CONTROLS_SCHEMA_VERSION,
     normalizeGoonQuickControlAction,
@@ -244,21 +245,14 @@
   }
 
   async function getClipCompressionSettings() {
+    // BL-484: the response handling itself lives in the shared util
+    // (`clipCompressionSettingsFromResponse`), so this page and any future caller read the
+    // exact same rule its own tests prove — only a FAILED request throws; a missing/partial
+    // `ui_settings` (every user until they save Settings > Clips once, including a fresh
+    // install) normalizes to the defaults instead.
     const response = await fetch('/api/user/settings')
-    if (!response.ok) {
-      throw new Error(`Clip upload settings are unavailable (${response.status}).`)
-    }
     const payload = await response.json().catch(() => null)
-    const settings = payload?.settings?.ui_settings
-    if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
-      throw new Error('Clip compression settings are unavailable.')
-    }
-    return {
-      compress_images: settings.compress_images !== false,
-      compression_quality: settings.compression_quality || 40,
-      max_image_size: settings.max_image_size || '1024',
-      force_jpeg: settings.force_jpeg !== false
-    }
+    return clipCompressionSettingsFromResponse(response.ok, response.status, payload)
   }
 
   async function uploadFiles(files: File[]) {
@@ -627,7 +621,7 @@
     align-items: center;
     justify-content: center;
     padding: 6px;
-    color: hsl(var(--foreground));
+    color: var(--foreground);
     user-select: none;
   }
 
@@ -640,9 +634,9 @@
     align-items: center;
     gap: 4px;
     padding: 8px 8px 8px 11px;
-    border: 1px solid color-mix(in srgb, hsl(var(--border)) 78%, transparent);
+    border: 1px solid color-mix(in oklab, var(--border) 78%, transparent);
     border-radius: 20px;
-    background: color-mix(in srgb, hsl(var(--background)) 93%, transparent);
+    background: color-mix(in oklab, var(--background) 93%, transparent);
     box-shadow: 0 16px 36px rgb(0 0 0 / 0.35), inset 0 1px rgb(255 255 255 / 0.04);
     backdrop-filter: blur(24px) saturate(135%);
     -webkit-app-region: drag;
@@ -658,7 +652,7 @@
     width: 4px;
     height: 22px;
     border-radius: 999px;
-    background: hsl(var(--muted-foreground) / 0.28);
+    background: color-mix(in oklab, var(--muted-foreground) 28%, transparent);
     flex: 0 0 auto;
   }
 
@@ -702,12 +696,12 @@
     place-items: center;
     flex: 0 0 auto;
     border-radius: 0.375rem;
-    color: hsl(var(--foreground));
+    color: var(--foreground);
   }
 
   .desktop-goon-quick-select:hover:not(.disabled) {
-    background: hsl(var(--accent));
-    color: hsl(var(--accent-foreground));
+    background: var(--accent);
+    color: var(--accent-foreground);
   }
 
   .desktop-goon-quick-select.disabled {
@@ -736,7 +730,7 @@
 
   .desktop-goon-quick-select > select:focus-visible {
     outline: none;
-    box-shadow: 0 0 0 2px hsl(var(--ring));
+    box-shadow: 0 0 0 2px var(--ring);
   }
 
   .desktop-goon-quick-select > select:disabled {
@@ -752,7 +746,7 @@
   .desktop-controls-divider {
     width: 1px;
     height: 24px;
-    background: hsl(var(--border) / 0.8);
+    background: color-mix(in oklab, var(--border) 80%, transparent);
     flex: 0 0 auto;
     margin: 0 2px;
   }
@@ -764,8 +758,8 @@
     flex: 0 0 auto;
     overflow: visible;
     border-radius: 10px;
-    border: 1px solid hsl(var(--border));
-    background: hsl(var(--muted));
+    border: 1px solid var(--border);
+    background: var(--muted);
   }
 
   .desktop-clip-token > img,
@@ -790,8 +784,8 @@
     display: grid;
     place-items: center;
     border-radius: 999px;
-    background: hsl(var(--destructive));
-    color: hsl(var(--destructive-foreground));
+    background: var(--destructive);
+    color: var(--destructive-foreground);
     box-shadow: 0 2px 6px rgb(0 0 0 / 0.35);
   }
 
@@ -807,10 +801,10 @@
     align-items: center;
     justify-content: center;
     gap: 8px;
-    border: 1px dashed hsl(var(--primary));
+    border: 1px dashed var(--primary-text);
     border-radius: 20px;
-    background: hsl(var(--background) / 0.94);
-    color: hsl(var(--primary));
+    background: color-mix(in oklab, var(--background) 94%, transparent);
+    color: var(--primary-text);
     font-size: 13px;
     font-weight: 650;
     pointer-events: none;
@@ -825,7 +819,7 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     font-size: 10px;
-    color: hsl(var(--destructive));
+    color: var(--destructive);
     pointer-events: none;
   }
 
@@ -885,7 +879,7 @@
   .desktop-controls-segment > button.is-selected {
     background: color-mix(in oklab, var(--primary) 52%, var(--secondary));
     color: var(--primary-foreground);
-    box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--primary) 72%, transparent);
+    box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--primary-text) 72%, transparent);
   }
 
   .desktop-controls-segment > button:focus-visible {

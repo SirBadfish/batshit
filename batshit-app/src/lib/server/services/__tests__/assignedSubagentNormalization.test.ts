@@ -38,4 +38,22 @@ describe('normalizeAssignedSubagent', () => {
       model: 'gpt-5.4',
     })
   })
+
+  it('keeps the preset and connection an API Subagent runs through (BL-266)', () => {
+    const connection = { id: 'direct:google', type: 'direct', service: 'google', useDeveloperPrefix: false }
+    const normalized = normalizeAssignedSubagent({
+      id: 'gemini_helper',
+      displayName: 'Gemini Helper',
+      subagentType: 'api',
+      primary_model_provider: 'google',
+      primary_model_name: 'gemini-3.5-flash',
+      primary_model_preset_id: 'gemini_3_flash_google_gemini_3_flash_direct_google',
+      primary_model_connection: connection,
+    })
+
+    // Live, the send path handed the runner this normalized copy, and without these two fields
+    // every Subagent with its own model was refused as if its model had no preset.
+    expect(normalized.primary_model_preset_id).toBe('gemini_3_flash_google_gemini_3_flash_direct_google')
+    expect(normalized.primary_model_connection).toEqual(connection)
+  })
 })

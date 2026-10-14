@@ -1,9 +1,11 @@
 import { inflateSync } from 'node:zlib'
-import { describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   createHairImportTexturePng,
-  strictJsonBytes
+  strictJsonBytes,
+  storeHairAssetArtifact,
+  discoverHairImportCleanupFiles
 } from '../hairImportOwnedFiles.server'
 
 function chunks(bytes: Uint8Array) {
@@ -20,6 +22,50 @@ function chunks(bytes: Uint8Array) {
 }
 
 describe('Hair import owned-file helpers', () => {
+  beforeEach(() => { vi.stubEnv('BATSHIT_TOKEN', 'synthetic-hair-file-test-token') })
+  afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs() })
+
+  it('publishes the importer owner with canonical bytes before any job CAS', async () => {
+    const bytes = new TextEncoder().encode('{}\n')
+    const { createHash } = await import('node:crypto')
+    const sha256 = createHash('sha256').update(bytes).digest('hex')
+    const request = vi.fn(async (_url: unknown, options: any) => {
+      const form = options.body as FormData
+      expect(JSON.parse(String(form.get('hairImportOwner')))).toEqual({ contract: 'hair-import-upload/v1', userId: 'user', jobId: 'job' })
+      expect(form.get('hairImportStateVersion')).toBe('7')
+      expect(form.get('assetId')).toBe('imported-hair-job')
+      expect(form.get('revisionId')).toBe('imported-hair-job-r1')
+      expect(form.get('role')).toBe('import-receipt')
+      expect([...new Uint8Array(await (form.get('file') as Blob).arrayBuffer())]).toEqual([...bytes])
+      return Response.json({ file: { filename: 'receipt.json', size: bytes.length, sha256 } })
+    })
+    vi.stubGlobal('fetch', request)
+    const stored = await storeHairAssetArtifact({ assetId: 'imported-hair-job', revisionId: 'imported-hair-job-r1',
+      role: 'import-receipt', importOwner: { userId: 'user', jobId: 'job', stateVersion: 7 }, filename: 'receipt.json', mimeType: 'application/json', bytes })
+    expect(stored).toMatchObject({ uploadType: 'goon_hair_assets', sha256, bytes: bytes.length })
+    expect(request).toHaveBeenCalledTimes(1)
+  })
+  it('refuses malformed discovery tuples before they can corrupt retry ownership', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json({ files: [{ uploadType: 'goon_hair_assets', filename: 'foreign.png',
+      ref: '/uploads/goon_hair_assets/foreign.png', sha256: 'a'.repeat(64), bytes: 1, mimeType: 'image/png' }] })))
+    await expect(discoverHairImportCleanupFiles({ jobKey: 'hair_import_job:owner:job', stateVersion: 2, mode: 'retired', files: [] }))
+      .rejects.toThrow('invalid file list')
+  })
+
+  it('keeps most of each lock Base with a full-strength soft Highlight streak across its width', () => {
+    const png = createHairImportTexturePng('highlight-mask');
+    const raw = inflateSync(Buffer.concat(chunks(png).filter((chunk) => chunk.type === 'IDAT').map((chunk) => chunk.data)));
+    const row = (y: number) => Array.from({ length: 64 }, (_, x) => raw[y * 257 + 1 + x * 4]);
+    const values = row(0);
+    expect(values.filter((value) => value === 0).length).toBeGreaterThan(40);
+    expect(values[31]).toBe(255);
+    expect(values[32]).toBe(255);
+    expect(values.some((value) => value > 0 && value < 255)).toBe(true);
+    expect(values).toEqual([...values].reverse());
+    expect(row(32)).toEqual(values);
+    expect(row(63)).toEqual(values);
+  });
+
   it('creates deterministic RGBA PNGs for neutral value and highlight masks', () => {
     const neutral = createHairImportTexturePng('neutral-value', 4, 3)
     const repeated = createHairImportTexturePng('neutral-value', 4, 3)

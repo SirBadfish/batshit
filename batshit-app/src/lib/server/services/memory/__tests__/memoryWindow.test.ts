@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   memorySearchLaneActive,
   useMemorySearchTestServer
@@ -14,6 +14,15 @@ import {
  * Deterministic seams: summary generation and token estimation are injected; the
  * embedder is the P2 fake. No live model calls (live proof is P8).
  */
+
+// BL-436: every door into the embedder factory is recorded, and a test can make a call with no
+// signed-in user fail the way a Model Manager preset on a local runtime does in production.
+const embedderFactory = vi.hoisted(() => ({
+  calls: [] as Array<{ userId: string | null }>,
+  requireUser: false,
+  setupError: null as Error | null,
+  beforeResolve: null as (() => Promise<void>) | null
+}))
 
 vi.mock('../memoryEmbedder', async (importOriginal) => {
   const original = await importOriginal<typeof import('../memoryEmbedder')>()
@@ -51,7 +60,17 @@ vi.mock('../memoryEmbedder', async (importOriginal) => {
     // the REAL `createMemoryEmbedderAsync`, whose internal call resolves the
     // module-local `createMemoryEmbedder` binding rather than this mock, so
     // overriding only the sync name silently runs the real embedder.
-    createMemoryEmbedderAsync: async () => testEmbedder()
+    createMemoryEmbedderAsync: async (_config: unknown, options?: { userId?: string | null }) => {
+      embedderFactory.calls.push({ userId: options?.userId ?? null })
+      if (embedderFactory.beforeResolve) await embedderFactory.beforeResolve()
+      if (embedderFactory.setupError) throw embedderFactory.setupError
+      if (embedderFactory.requireUser && !options?.userId) {
+        throw new Error(
+          "The memory embedding preset 'preset_window_test' points at a local runtime, which needs a signed-in user context to resolve its base URL."
+        )
+      }
+      return testEmbedder()
+    }
   }
 })
 
@@ -60,8 +79,15 @@ import { createMemorySegment, listMemorySegments, getMemorySegment } from '../me
 import {
   graduateRegularSessionTail,
   parseNapCompactionSections,
-  runFixedSessionNap
+  runFixedSessionNap,
+  swapGraduationEvents
 } from '../memoryGraduation'
+import {
+  beginSessionDelete,
+  endSessionDelete,
+  registerSessionTurn,
+  releaseSessionTurn
+} from '$lib/server/services/streamAbortRegistry'
 import {
   ensureFixedSessionOpenEpisode,
   episodeKey,
@@ -70,6 +96,7 @@ import {
   type EpisodeRecord
 } from '../memoryEpisodes'
 import {
+  closeEpisodeOp,
   deleteMemoryOp,
   updateWhiteboardOp,
   searchMemoriesOp,
@@ -83,6 +110,8 @@ import {
   getMemoryFold
 } from '../memoryRecall'
 import { getMemoryLingerState } from '../memoryLinger'
+import { reportForCliSnapshot } from '$lib/utils/cliContextWindow'
+import { countMessageTokens } from '$lib/utils/tokenCounter'
 import {
   applyFixedSessionGraduationToMessages,
   getFixedSessionGraduationState,
@@ -99,6 +128,13 @@ const REGULAR_SESSION = 'sess_window_regular'
 const PRESET_ID = 'preset_window_test'
 
 const NOW = new Date('2026-06-10T12:00:00.000Z')
+const CLAUDE_CAP_ENV_KEYS = [
+  'CLAUDE_CODE_DISABLE_1M_CONTEXT',
+  'ANTHROPIC_BASE_URL',
+  'CLAUDE_CODE_USE_BEDROCK',
+  'CLAUDE_CODE_USE_VERTEX',
+  'CLAUDE_CODE_USE_FOUNDRY'
+] as const
 
 function agentRecord(overrides: Record<string, any> = {}) {
   return {
@@ -116,6 +152,44 @@ function agentRecord(overrides: Record<string, any> = {}) {
     },
     ...overrides
   }
+}
+
+function namedClaudeCliAgent(memoryWindow: Record<string, unknown> = {
+  floor_mode: 'auto',
+  ceiling_headroom_mode: 'auto',
+  nap_threshold_percent: 80
+}, overrides: Record<string, unknown> = {}) {
+  return agentRecord({
+    primary_model_preset_id: null,
+    primary_model_provider: 'claude-cli',
+    primary_model_name: 'claude/claude-cli',
+    primary_model_connection: { id: 'claude-cli', type: 'direct', service: 'claude-cli' },
+    claude_settings: { permissionMode: 'default', model: 'sonnet' },
+    memory_window: memoryWindow,
+    ...overrides
+  })
+}
+
+async function seedCliContextReport(sessionId: string, agent: Record<string, any>, contextWindow: number) {
+  const report = reportForCliSnapshot({
+    runtime: 'claude',
+    model: 'sonnet',
+    actualModel: 'claude-sonnet-5',
+    contextWindow,
+    evidence: 'runtime',
+    disableClaude1M: false,
+    reportedAt: NOW.getTime()
+  }, agent, null, null, agent.primary_model_name)
+  await redis.json.set(`session:${sessionId}:execution_log`, '$', [{
+    id: `reply-${sessionId}`,
+    sessionId,
+    userId: USER,
+    agentId: agent.id,
+    agentName: 'Claude context report fixture',
+    agentType: 'cli',
+    createdAt: NOW.toISOString(),
+    runtime: { runtimeId: 'claude', metadata: { cliContextWindow: report } }
+  }] as never)
 }
 
 async function seedAgent(overrides: Record<string, any> = {}) {
@@ -189,6 +263,11 @@ const bigText = (label: string) => `${label} ${'x'.repeat(6_000)}`
 
 describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
   beforeEach(async () => {
+    for (const key of CLAUDE_CAP_ENV_KEYS) vi.stubEnv(key, '')
+    embedderFactory.calls = []
+    embedderFactory.requireUser = false
+    embedderFactory.setupError = null
+    embedderFactory.beforeResolve = null
     await setMemoryConfig({
       lane: 'local-ai',
       modelId: 'local-ai:test-embedder',
@@ -209,6 +288,10 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
       provider: 'openai',
       contextWindow: 200_000
     } as never)
+  })
+
+  afterEach(() => {
+    vi.unstubAllEnvs()
   })
 
   // -------------------------------------------------------------------------
@@ -327,6 +410,133 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
     })
     return { ep1, ep2 }
   }
+
+  it.each(['open', 'empty closed'] as const)(
+    'BL-790: stale zips relieve a nap with an unavailable embedder and %s episode',
+    async (episodeKind) => {
+      await seedNapConversation()
+      // No eligible closed summary. The empty closed episode exercises selection, too.
+      await redis.json.set(episodeKey(FIXED_SESSION, 'ep1'), '$.state', 'open' as never)
+      if (episodeKind === 'empty closed') {
+        await seedEpisode({ id: 'empty', state: 'closed', opened_at: '2026-05-01T00:00:00.000Z', closed_at: '2026-05-02T00:00:00.000Z' })
+      }
+      await redis.sAdd(`unzipped:${FIXED_SESSION}`, 'zip_pinned')
+      await redis.json.set(`unzipped_item:${FIXED_SESSION}:zip_pinned`, '$', { source: 'user' } as never)
+      await redis.json.set(`message:${FIXED_SESSION}:m6`, '$.metadata.response_failed', true as never)
+      const messagesBefore = await redis.getSessionMessages(FIXED_SESSION)
+      embedderFactory.setupError = new Error('BL-790 embedding setup unavailable')
+      const generateSummary = vi.fn(async () => 'must not be called')
+
+      const outcome = await runFixedSessionNap({
+        userId: USER, agent: agentRecord(), sessionId: FIXED_SESSION,
+        trigger: 'manual', eventFetch: fetch, now: NOW, generateSummary,
+        estimateTokens: estimateQueue([150_000, 150_000, 70_000])
+      })
+
+      expect(outcome.status, outcome.error).toBe('completed')
+      expect(embedderFactory.calls).toEqual([])
+      expect(generateSummary).not.toHaveBeenCalled()
+      expect(outcome.record?.rezippedZipCount).toBe(1)
+      expect(await redis.sMembers(`rezipped:${FIXED_SESSION}`)).toEqual(['zip_stale_1'])
+      expect(await redis.json.get(`rezipped_item:${FIXED_SESSION}:zip_stale_1`)).toMatchObject({ source: 'agent', reason: 'nap', napId: outcome.record?.id })
+      expect(await redis.exists(`rezipped_item:${FIXED_SESSION}:zip_pinned`)).toBe(false)
+      expect(await redis.exists(`rezipped_item:${FIXED_SESSION}:zip_stale_2`)).toBe(false)
+      expect(await redis.getSessionMessages(FIXED_SESSION)).toEqual(messagesBefore)
+      expect(await listMemorySegments(AGENT)).toEqual([])
+      const stored = await redis.getSession(FIXED_SESSION)
+      expect(getFixedSessionGraduationState(stored?.metadata).events).toEqual([])
+      expect(getFixedSessionNapRecords(stored?.metadata).at(-1)?.status).toBe('completed')
+      expect((await getEpisode(FIXED_SESSION, 'ep2'))?.whiteboard?.content).toBe('Garage width: 6m')
+    }
+  )
+
+  it.each(['step 1', 'step 3'] as const)(
+    'BL-790: unavailable embedding setup fails before the needed %s summary',
+    async (step) => {
+      await seedNapConversation()
+      if (step === 'step 3') await redis.json.set(episodeKey(FIXED_SESSION, 'ep1'), '$.state', 'open' as never)
+      embedderFactory.setupError = new Error('BL-790 embedding setup unavailable')
+      const generateSummary = vi.fn(async () => 'must not be called')
+      const outcome = await runFixedSessionNap({
+        userId: USER, agent: agentRecord(), sessionId: FIXED_SESSION,
+        trigger: 'manual', eventFetch: fetch, now: NOW, generateSummary,
+        estimateTokens: estimateQueue([150_000, 150_000, 150_000])
+      })
+      expect(outcome.status).toBe('failed')
+      expect(outcome.error).toBe('BL-790 embedding setup unavailable')
+      expect(embedderFactory.calls).toEqual([{ userId: USER }])
+      expect(generateSummary).not.toHaveBeenCalled()
+      expect(await listMemorySegments(AGENT)).toEqual([])
+      const stored = await redis.getSession(FIXED_SESSION)
+      expect(getFixedSessionGraduationState(stored?.metadata).events).toEqual([])
+      expect(getFixedSessionNapRecords(stored?.metadata).at(-1)?.status).toBe('failed')
+      expect(outcome.record?.rezippedZipCount).toBe(step === 'step 3' ? 3 : 0)
+      expect((await getEpisode(FIXED_SESSION, 'ep1'))?.state).toBe(step === 'step 3' ? 'open' : 'closed')
+      expect((await getEpisode(FIXED_SESSION, 'ep2'))?.whiteboard?.content).toBe('Garage width: 6m')
+    }
+  )
+
+  it.each([
+    ['step 1', 'turn_started', false], ['step 1', 'chat_deleted', false],
+    ['step 3', 'turn_started', false], ['step 3', 'chat_deleted', false],
+    ['step 1', 'turn_started', true], ['step 1', 'chat_deleted', true],
+    ['step 3', 'turn_started', true], ['step 3', 'chat_deleted', true]
+  ] as const)(
+    'BL-790: %s setup interrupted by %s (rejected=%s) spends no summary and writes no segment',
+    async (step, stop, rejected) => {
+      await seedNapConversation()
+      if (step === 'step 3') await redis.json.set(episodeKey(FIXED_SESSION, 'ep1'), '$.state', 'open' as never)
+      let resolveEntered!: () => void
+      let releaseSetup!: () => void
+      const entered = new Promise<void>((resolve) => { resolveEntered = resolve })
+      const held = new Promise<void>((resolve) => { releaseSetup = resolve })
+      embedderFactory.beforeResolve = async () => { resolveEntered(); await held }
+      if (rejected) embedderFactory.setupError = new Error('BL-790 interrupted setup failed')
+      const generateSummary = vi.fn(async () => 'must not be called')
+      let turnId: number | null = null
+      const nap = runFixedSessionNap({
+        userId: USER, agent: agentRecord(), sessionId: FIXED_SESSION,
+        trigger: 'manual', eventFetch: fetch, now: NOW, generateSummary,
+        estimateTokens: estimateQueue([150_000, 150_000, 150_000])
+      })
+      try {
+        await Promise.race([
+          entered,
+          nap.then(() => { throw new Error('Nap settled before embedding setup was reached') })
+        ])
+        if (stop === 'chat_deleted') await redis.deleteSession(FIXED_SESSION)
+        else {
+          const registered = registerSessionTurn(FIXED_SESSION, 'single', 'msg_bl790_setup')
+          expect(registered.ok).toBe(true)
+          turnId = registered.ok ? registered.entry.turnId : null
+        }
+        releaseSetup()
+        const outcome = await nap
+        expect(outcome.status, outcome.error).toBe('ended_early')
+        expect(outcome.endedEarly).toBe(stop)
+        expect(embedderFactory.calls).toEqual([{ userId: USER }])
+        expect(generateSummary).not.toHaveBeenCalled()
+        expect(await listMemorySegments(AGENT)).toEqual([])
+        if (stop === 'chat_deleted') {
+          expect(outcome.record).toBeNull()
+          expect(await keysOfFixedSession()).toEqual([])
+        } else {
+          expect(outcome.record?.awarenessFold).toBe('skipped')
+          expect(outcome.record?.rezippedZipCount).toBe(step === 'step 3' ? 3 : 0)
+          const stored = await redis.getSession(FIXED_SESSION)
+          expect(getFixedSessionGraduationState(stored?.metadata).events).toEqual([])
+          expect((await getEpisode(FIXED_SESSION, 'ep2'))?.whiteboard?.content).toBe('Garage width: 6m')
+        }
+      } finally {
+        releaseSetup()
+        try {
+          await nap
+        } finally {
+          if (turnId !== null) releaseSessionTurn(FIXED_SESSION, turnId)
+        }
+      }
+    }
+  )
 
   it('nap step 1 graduates closed episodes: memseg + window event + episode mark, floor-protected tail untouched', async () => {
     await seedNapConversation()
@@ -455,6 +665,95 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
     expect(ids).toContain('m12')
   })
 
+  // BL-436: a Model Manager preset on a local runtime (or the api lane with a key saved in
+  // Settings) only embeds for a signed-in user. The nap used to write its segments through the
+  // store's no-user default, so every nap with such a preset failed and the window got no relief.
+  it('a nap embeds steps 1 and 3 with the signed-in user\'s embedder (BL-436)', async () => {
+    await seedNapConversation()
+    embedderFactory.requireUser = true
+
+    const outcome = await runFixedSessionNap({
+      userId: USER,
+      agent: agentRecord(),
+      sessionId: FIXED_SESSION,
+      trigger: 'manual',
+      eventFetch: fetch,
+      now: NOW,
+      generateSummary: async (prompt) =>
+        prompt.includes('OLDER OPEN-EPISODE SEGMENT TO COMPACT')
+          ? ['SUMMARY:', 'Garage project started.', 'WHITEBOARD:', 'Garage width: 6m.'].join('\n')
+          : 'Lake trip planned for July; cabin booked.',
+      estimateTokens: estimateQueue([150_000, 130_000, 128_000, 70_000])
+    })
+
+    expect(outcome.error).toBeUndefined()
+    expect(outcome.status).toBe('completed')
+    expect(outcome.record?.graduatedEpisodeIds).toEqual(['ep1'])
+    expect(outcome.record?.compaction?.segmentId).toBeTruthy()
+    expect((await listMemorySegments(AGENT)).map((segment) => segment.episode_id).sort()).toEqual([
+      'ep1',
+      'ep2'
+    ])
+    // One embedder for the whole nap, built for the signed-in user.
+    expect(embedderFactory.calls).toEqual([{ userId: USER }])
+  })
+
+  // BL-749: step 2's rezip loop takes no lock of its own against a delete (the zip state lock
+  // guards writers of zip state, not the delete route), and the loop can span several Redis round
+  // trips fetching `unzipped`/`rezipped` membership before it ever writes. A delete that starts in
+  // that gap must stop the loop before its first write, the same way `look()` stops step 1 and
+  // step 3.
+  it('BL-749: a delete that starts during the step-2 loop leaves no rezipped key', async () => {
+    await seedNapConversation()
+    await redis.json.set(
+      `message:${FIXED_SESSION}:m6`,
+      '$.metadata.response_failed',
+      true as never
+    )
+
+    const realSMembers = redis.sMembers.bind(redis)
+    let unzippedReadCount = 0
+    let sawUnzippedRead = false
+    const spy = vi
+      .spyOn(redis, 'sMembers')
+      .mockImplementation(async (key: string) => {
+        const result = await realSMembers(key)
+        // `loadContextProtections` (at the nap's start) reads `unzipped:{id}` once already; the
+        // step-2 loop's OWN read of it is the second. A delete starting exactly there — after the
+        // membership reads, before any write — is the race this test drives.
+        if (key === `unzipped:${FIXED_SESSION}`) {
+          unzippedReadCount += 1
+          if (unzippedReadCount === 2) {
+            sawUnzippedRead = true
+            beginSessionDelete(FIXED_SESSION)
+          }
+        }
+        return result
+      })
+
+    try {
+      const outcome = await runFixedSessionNap({
+        userId: USER,
+        agent: agentRecord(),
+        sessionId: FIXED_SESSION,
+        trigger: 'manual',
+        eventFetch: fetch,
+        now: NOW,
+        generateSummary: async () => 'Lake trip planned for July; cabin booked.',
+        estimateTokens: estimateQueue([150_000, 130_000, 128_000, 70_000])
+      })
+
+      expect(sawUnzippedRead).toBe(true)
+      expect(outcome.status).toBe('ended_early')
+      expect(outcome.endedEarly).toBe('chat_deleted')
+      expect(await redis.sMembers(`rezipped:${FIXED_SESSION}`)).toEqual([])
+      expect(await redis.exists(`rezipped_item:${FIXED_SESSION}:zip_stale_1`)).toBe(false)
+    } finally {
+      spy.mockRestore()
+      endSessionDelete(FIXED_SESSION)
+    }
+  })
+
   it('nap step 3 never rewrites a board the agent wrote: summary-only call, board kept (2026-09-19)', async () => {
     await seedNapConversation()
     // The agent writes the board through its control — that makes it the agent's.
@@ -529,6 +828,183 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
     expect(ep2?.whiteboard?.written_by).toBe('nap')
   })
 
+  // BL-549: a turn sent in the middle of a nap can write the board while the nap waits on its
+  // summary model. The nap read an empty board (it would fill it) or a board a nap wrote (it
+  // would refresh it); its write must not land on the board the agent wrote since.
+  it.each([
+    ['an empty board (the fill path)', null],
+    [
+      'a board a nap wrote (the refresh path)',
+      { content: 'Garage width: 6m', updated_at: '2026-06-10T09:30:00.000Z', written_by: 'nap' }
+    ]
+  ])('BL-549: the agent writes its board while the nap waits on the model, from %s: the agent\'s board stays', async (_label, board) => {
+    await seedNapConversation()
+    await redis.json.set(episodeKey(FIXED_SESSION, 'ep2'), '$.whiteboard', board as never)
+
+    const outcome = await runFixedSessionNap({
+      userId: USER,
+      agent: agentRecord(),
+      sessionId: FIXED_SESSION,
+      trigger: 'manual',
+      eventFetch: fetch,
+      now: NOW,
+      generateSummary: async (prompt) => {
+        if (prompt.includes('OLDER OPEN-EPISODE SEGMENT TO COMPACT')) {
+          // The turn that arrived mid-nap: the agent writes its board through its control.
+          await updateWhiteboardOp(
+            { userId: USER, agentId: AGENT, sessionId: FIXED_SESSION },
+            { content: 'Agent board: buy the metal shelving.' }
+          )
+          return ['SUMMARY:', 'Garage project started; measurements done.', 'WHITEBOARD:', 'a nap board that must not land'].join('\n')
+        }
+        return 'Lake trip planned for July; cabin booked.'
+      },
+      estimateTokens: estimateQueue([150_000, 130_000, 128_000, 70_000])
+    })
+
+    expect(outcome.status).toBe('completed')
+    const ep2 = await getEpisode(FIXED_SESSION, 'ep2')
+    expect(ep2?.whiteboard?.content).toBe('Agent board: buy the metal shelving.')
+    expect(ep2?.whiteboard?.written_by).toBe('agent')
+    expect(outcome.record!.compaction!.whiteboard).toBe('kept')
+    // The summary of the older stretch still stands: a finished step is complete by itself.
+    const step3Segment = await getMemorySegment(AGENT, outcome.record!.compaction!.segmentId)
+    expect(step3Segment?.summary).toContain('Garage project started')
+  })
+
+  // BL-549 review: a turn sent during the nap's summary call can close the open episode (the
+  // agent's close control). The nap's summary and event are already written by then; the board
+  // write must not turn the finished nap into a failure. The board stays on the closed episode.
+  it('BL-549: the agent closes the episode while the nap waits on the model: the nap completes and keeps the board', async () => {
+    await seedNapConversation()
+    await redis.json.set(episodeKey(FIXED_SESSION, 'ep2'), '$.whiteboard', null as never)
+
+    const outcome = await runFixedSessionNap({
+      userId: USER,
+      agent: agentRecord(),
+      sessionId: FIXED_SESSION,
+      trigger: 'manual',
+      eventFetch: fetch,
+      now: NOW,
+      generateSummary: async (prompt) => {
+        if (prompt.includes('OLDER OPEN-EPISODE SEGMENT TO COMPACT')) {
+          await closeEpisodeOp({ userId: USER, agentId: AGENT, sessionId: FIXED_SESSION })
+          return ['SUMMARY:', 'Garage project started; measurements done.', 'WHITEBOARD:', 'a nap board that must not land'].join('\n')
+        }
+        return 'Lake trip planned for July; cabin booked.'
+      },
+      estimateTokens: estimateQueue([150_000, 130_000, 128_000, 70_000])
+    })
+
+    expect(outcome.status, outcome.error).toBe('completed')
+    expect(outcome.record!.compaction!.whiteboard).toBe('kept')
+    const ep2 = await getEpisode(FIXED_SESSION, 'ep2')
+    expect(ep2?.state).toBe('closed')
+    expect(ep2?.whiteboard).toBeNull()
+  })
+
+  // BL-623: a nap takes no turn registration, so a chat delete sweeps at once, also in the middle
+  // of a nap's summary call. Whatever the nap writes after the sweep must not bring back a key of
+  // the chat. Its summary is agent memory (`memseg:{agentId}:…`), which outlives a deleted chat
+  // by design, like the summary of any chat graduated before its delete.
+  it.each([
+    // Deleted in step 3, the chat had one summary from step 1 already, written before the delete.
+    ['step 1 (a closed episode)', 'CONVERSATION SEGMENT TO GRADUATE', 0],
+    ['step 3 (the open episode)', 'OLDER OPEN-EPISODE SEGMENT TO COMPACT', 1]
+  ])('BL-623: a chat deleted during the summary call of %s: the nap ends early and writes no key of the chat', async (_label, marker, summaries) => {
+    await seedNapConversation()
+    const keysOfTheChat = () =>
+      redis.execute(async (client) => {
+        const keys: string[] = []
+        for await (const batch of client.scanIterator({ MATCH: `*${FIXED_SESSION}*`, COUNT: 500 })) {
+          keys.push(...(Array.isArray(batch) ? batch : [batch]))
+        }
+        return keys
+      })
+    // The scan sees the chat's keys while the chat exists (the positive control).
+    expect(await keysOfTheChat()).toEqual(
+      expect.arrayContaining([`session:${FIXED_SESSION}`, `messages:${FIXED_SESSION}`, episodeKey(FIXED_SESSION, 'ep2')])
+    )
+    let deleted = false
+    const outcome = await runFixedSessionNap({
+      userId: USER,
+      agent: agentRecord(),
+      sessionId: FIXED_SESSION,
+      trigger: 'manual',
+      eventFetch: fetch,
+      now: NOW,
+      generateSummary: async (prompt) => {
+        if (prompt.includes(marker) && !deleted) {
+          deleted = true
+          await redis.deleteSession(FIXED_SESSION)
+        }
+        return prompt.includes('OLDER OPEN-EPISODE SEGMENT TO COMPACT')
+          ? ['SUMMARY:', 'Garage project started; measurements done.', 'WHITEBOARD:', 'Garage width: 6m.'].join('\n')
+          : 'Lake trip planned for July; cabin booked.'
+      },
+      estimateTokens: estimateQueue([150_000, 130_000, 128_000, 70_000])
+    })
+
+    expect(deleted).toBe(true)
+    // BL-549 N1: the nap looks for a deleted chat before it writes the summary made in that
+    // call, and ends early: no summary, no event, no record (the chat is gone).
+    expect(outcome.status).toBe('ended_early')
+    expect(outcome.endedEarly).toBe('chat_deleted')
+    expect(outcome.record).toBeNull()
+    expect(outcome.metadata).toBeNull()
+    expect(await keysOfTheChat()).toEqual([])
+    // What stays is agent memory written BEFORE the delete (step 1's summary in the step 3
+    // case), like the summary of any chat graduated before its delete.
+    const segments = await listMemorySegments(AGENT)
+    expect(segments.map((segment) => segment.session_id)).toEqual(
+      new Array(summaries).fill(FIXED_SESSION)
+    )
+  })
+
+  // BL-751: `createMemorySegment` embeds BEFORE it writes the segment, so a chat deleted during
+  // that embedding call is still there when the segment lands, but gone by the time the window
+  // event write runs right after (the summary call itself is covered by BL-623 above; this is the
+  // one gap still open after that fix). The event write then answers `missing`; before this fix
+  // that was a thrown error, the nap recorded `failed`, and the route answered 500 instead of
+  // `chat_deleted`. The segment this call just created, never wired into any window, must not
+  // survive it either.
+  it('BL-751: a chat deleted during the embedding call for a graduated segment leaves no memseg, and the nap ends as chat_deleted', async () => {
+    await seedNapConversation()
+    let deleted = false
+    const embedder = {
+      modelId: 'local-ai:test-embedder@8',
+      dims: 8,
+      async embedDocuments(texts: string[]) {
+        if (!deleted) {
+          deleted = true
+          await redis.deleteSession(FIXED_SESSION)
+        }
+        return texts.map(() => new Array(8).fill(0.1))
+      },
+      async embedQuery() {
+        return new Array(8).fill(0.1)
+      }
+    }
+
+    const outcome = await runFixedSessionNap({
+      userId: USER,
+      agent: agentRecord(),
+      sessionId: FIXED_SESSION,
+      trigger: 'manual',
+      eventFetch: fetch,
+      now: NOW,
+      generateSummary: async () => 'Lake trip planned for July; cabin booked.',
+      estimateTokens: estimateQueue([150_000, 130_000, 128_000, 70_000]),
+      embedder
+    })
+
+    expect(deleted).toBe(true)
+    expect(outcome.status).toBe('ended_early')
+    expect(outcome.endedEarly).toBe('chat_deleted')
+    expect(outcome.record).toBeNull()
+    expect(await listMemorySegments(AGENT)).toEqual([])
+  })
+
   it('nap step 3 parse failure is loud and leaves the window untouched by step 3', async () => {
     await seedNapConversation()
     const outcome = await runFixedSessionNap({
@@ -577,6 +1053,92 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
     expect(
       getFixedSessionNapRecords((await redis.getSession(FIXED_SESSION))?.metadata)
     ).toHaveLength(0)
+  })
+
+  it('uses the session runtime window for a named CLI nap; absent report keeps the verified choice', async () => {
+    const cliAgent = namedClaudeCliAgent()
+    const reportSession = 'sess_window_cli_report'
+    const choiceSession = 'sess_window_cli_choice'
+    for (const sessionId of [reportSession, choiceSession]) {
+      await redis.json.set(`session:${sessionId}`, '$', {
+        id: sessionId,
+        user_id: USER,
+        agent_id: AGENT,
+        metadata: { fixedSession: { version: 1, enabled: true, created_at: NOW.toISOString() } }
+      } as never)
+      await seedMessage(sessionId, `source-${sessionId}`, 'user', 'This original source remains available.',
+        '2026-06-09T08:00:00.000Z')
+    }
+    await seedCliContextReport(reportSession, cliAgent, 200_000)
+
+    let summaryCalls = 0
+    const runtimeNap = await runFixedSessionNap({
+      userId: USER,
+      agent: cliAgent,
+      sessionId: reportSession,
+      trigger: 'threshold',
+      eventFetch: fetch,
+      now: NOW,
+      generateSummary: async () => {
+        summaryCalls += 1
+        return 'unused summary'
+      },
+      estimateTokens: estimateQueue([170_000])
+    })
+    const choiceNap = await runFixedSessionNap({
+      userId: USER,
+      agent: cliAgent,
+      sessionId: choiceSession,
+      trigger: 'threshold',
+      eventFetch: fetch,
+      now: NOW,
+      generateSummary: async () => {
+        summaryCalls += 1
+        return 'unused summary'
+      },
+      estimateTokens: estimateQueue([170_000])
+    })
+
+    expect(runtimeNap.window?.contextLimit).toBe(200_000)
+    expect(runtimeNap.window?.napAtTokens).toBeLessThan(170_000)
+    expect(runtimeNap.status).toBe('completed')
+    expect(choiceNap.window?.contextLimit).toBe(1_000_000)
+    expect(choiceNap.window?.napAtTokens).toBeGreaterThan(170_000)
+    expect(choiceNap.status).toBe('not_needed')
+    expect(summaryCalls).toBe(0)
+    for (const sessionId of [reportSession, choiceSession]) {
+      expect((await redis.getSessionMessages(sessionId)).map((message) => message.content)).toContain(
+        'This original source remains available.'
+      )
+    }
+  })
+
+  it('keeps an unknown CLI default honest and refuses a nap before a summary call', async () => {
+    const unknownAgent = namedClaudeCliAgent(undefined, {
+      claude_settings: { permissionMode: 'default' }
+    })
+    const sessionId = 'sess_window_cli_unknown'
+    await redis.json.set(`session:${sessionId}`, '$', {
+      id: sessionId,
+      user_id: USER,
+      agent_id: AGENT,
+      metadata: { fixedSession: { version: 1, enabled: true, created_at: NOW.toISOString() } }
+    } as never)
+    let summaryCalls = 0
+
+    await expect(runFixedSessionNap({
+      userId: USER,
+      agent: unknownAgent,
+      sessionId,
+      trigger: 'manual',
+      eventFetch: fetch,
+      now: NOW,
+      generateSummary: async () => {
+        summaryCalls += 1
+        return 'should not run'
+      }
+    })).rejects.toThrow('could not resolve a model context limit')
+    expect(summaryCalls).toBe(0)
   })
 
   it('naps refuse regular sessions and memory-disabled agents', async () => {
@@ -690,6 +1252,124 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
     expect(again.status).toBe('nothing_new')
   })
 
+  it('uses a matching CLI runtime window for the regular graduation summary budget', async () => {
+    const cliAgent = namedClaudeCliAgent({
+      floor_mode: 'custom',
+      floor_tokens: 1_000,
+      ceiling_headroom_mode: 'custom',
+      ceiling_headroom_tokens: 50_000,
+      nap_threshold_percent: 80
+    })
+    const reportSession = 'sess_window_regular_cli_report'
+    const choiceSession = 'sess_window_regular_cli_choice'
+    for (const sessionId of [reportSession, choiceSession]) {
+      await redis.json.set(`session:${sessionId}`, '$', {
+        id: sessionId,
+        user_id: USER,
+        agent_id: AGENT,
+        metadata: {}
+      } as never)
+      for (let index = 0; index < 6; index += 1) {
+        await seedMessage(sessionId, `long-${sessionId}-${index}`, index % 2 ? 'assistant' : 'user',
+          `Source detail ${'garden detail '.repeat(10_000)}`,
+          `2026-06-09T08:${String(index * 5).padStart(2, '0')}:00.000Z`)
+      }
+    }
+    await seedCliContextReport(reportSession, cliAgent, 200_000)
+    const caps: Record<string, number> = {}
+    for (const sessionId of [reportSession, choiceSession]) {
+      const messages = await redis.getSessionMessages(sessionId)
+      const sourceTokens = messages.reduce((total, message) => total + countMessageTokens(message), 0)
+      expect(sourceTokens).toBeGreaterThan(40_000)
+      await graduateRegularSessionTail({
+        userId: USER,
+        agent: cliAgent,
+        sessionId,
+        reason: 'close',
+        now: NOW,
+        generateSummary: async (_prompt, hardMaxTokens) => {
+          caps[sessionId] = hardMaxTokens
+          return 'The source segment was reviewed and preserved.'
+        }
+      })
+    }
+
+    expect(caps[reportSession]).toBe(5_000)
+    expect(caps[choiceSession]).toBe(16_000)
+  })
+
+  // BL-436: the same fix for regular chats — `/api/memory/graduate-session` passes no embedder.
+  it('regular-session graduation embeds with the signed-in user\'s embedder (BL-436)', async () => {
+    const times = ['08:00', '08:05', '08:10', '08:15', '08:20', '08:25']
+    for (let i = 0; i < 6; i++) {
+      await seedMessage(
+        REGULAR_SESSION,
+        `r${i + 1}`,
+        i % 2 === 0 ? 'user' : 'assistant',
+        `Regular message ${i + 1} about the garden project`,
+        `2026-06-09T${times[i]}:00.000Z`
+      )
+    }
+    embedderFactory.requireUser = true
+
+    const outcome = await graduateRegularSessionTail({
+      userId: USER,
+      agent: agentRecord(),
+      sessionId: REGULAR_SESSION,
+      reason: 'close',
+      now: NOW,
+      generateSummary: async () => 'Garden project discussed.'
+    })
+
+    expect(outcome.status).toBe('graduated')
+    expect((await listMemorySegments(AGENT)).map((segment) => segment.session_id)).toEqual([
+      REGULAR_SESSION
+    ])
+    expect(embedderFactory.calls).toEqual([{ userId: USER }])
+  })
+
+  // BL-224: the summarizer reads a switched chat with the compiler's speaker view, so the
+  // agent's own memory never records another agent's words as its own.
+  it('names another agent in a switched regular chat and keeps the graduating agent as <assistant>', async () => {
+    await redis.json.set('agent:agent_window_other', '$', {
+      id: 'agent_window_other',
+      user_id: USER,
+      displayName: 'Bram'
+    } as never)
+    await seedMessage(REGULAR_SESSION, 'r1', 'user', 'Which color for the kitchen?', '2026-06-10T11:50:00.000Z')
+    await seedMessage(REGULAR_SESSION, 'r2', 'assistant', 'Sage green.', '2026-06-10T11:51:00.000Z')
+    await seedMessage(REGULAR_SESSION, 'r3', 'user', 'Ask Bram too.', '2026-06-10T11:52:00.000Z')
+    await seedMessage(
+      REGULAR_SESSION,
+      'r4',
+      'assistant',
+      'I promised to paint it navy.',
+      '2026-06-10T11:53:00.000Z',
+      {},
+      'agent_window_other'
+    )
+
+    let prompt = ''
+    const outcome = await graduateRegularSessionTail({
+      userId: USER,
+      agent: agentRecord(),
+      sessionId: REGULAR_SESSION,
+      reason: 'close',
+      now: NOW,
+      generateSummary: async (text) => {
+        prompt = text
+        return 'Kitchen colors discussed.'
+      }
+    })
+
+    expect(outcome.status).toBe('graduated')
+    expect(prompt).toContain('<assistant id="r2" time="2026-06-10T11:51:00.000Z">\nSage green.\n</assistant>')
+    expect(prompt).toContain(
+      '<agent name="Bram" id="r4" time="2026-06-10T11:53:00.000Z">\nI promised to paint it navy.\n</agent>'
+    )
+    await redis.del('agent:agent_window_other')
+  })
+
   it('close-reason graduation skips the idle requirement; small tails and fixed/group sessions refuse', async () => {
     await seedMessage(REGULAR_SESSION, 'r1', 'user', 'Quick note', '2026-06-10T11:50:00.000Z')
     await seedMessage(REGULAR_SESSION, 'r2', 'assistant', 'Noted.', '2026-06-10T11:51:00.000Z')
@@ -729,6 +1409,333 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
         generateSummary: async () => 'unused'
       })
     ).rejects.toThrow(/Infinite Sessions/)
+  })
+
+  // BL-723: the graduation mark is written at its own path. The writer used to read the chat
+  // after the summary call and write that copy's whole metadata back: a Compact event or any
+  // other block written after its read was erased.
+  it('the graduation mark keeps the blocks other writers added during the graduation (BL-723)', async () => {
+    for (let i = 0; i < 4; i++) {
+      await seedMessage(
+        REGULAR_SESSION,
+        `r${i + 1}`,
+        i % 2 === 0 ? 'user' : 'assistant',
+        `Regular message ${i + 1} about the shed roof`,
+        `2026-06-10T11:5${i}:00.000Z`
+      )
+    }
+    await redis.json.set(`session:${REGULAR_SESSION}`, '$.metadata.memoryGraduation', {
+      version: 1,
+      lastGraduatedMessageId: 'r0',
+      lastGraduatedAt: '2026-06-01T00:00:00.000Z',
+      segmentIds: ['zcmeta_seg_before']
+    } as never)
+    const compactEvent = {
+      id: 'zcmeta_evt_during_summary',
+      createdAt: '2026-06-10T11:59:00.000Z',
+      sourceMessageIds: ['r1', 'r2'],
+      summary: 'A Compact written while the graduation waited on its summary.'
+    }
+    const origin = { kind: 'zcmeta_written_just_before_the_mark' }
+
+    // BL-738: write the origin block INSIDE the summary call — the exact window between the
+    // graduation's read and its mark write — so this assertion can never be silently switched off.
+    // The old version guarded it behind `if (originWritten)`, set by a hook counting a second
+    // `redis.getSession` call: an unrelated extra read anywhere in the graduation path would
+    // change which call was "the second one" and disable the assertion with no test failure.
+    // The blocks written inside the summary call would also survive the OLD writer (it re-read the
+    // chat after the summary), so the assertions below cannot tell old from new alone; the spy
+    // pins that the graduation never writes the whole record (BL-738 review).
+    const wholeRecordWrites = vi.spyOn(redis, 'updateSession')
+    const outcome = await graduateRegularSessionTail({
+      userId: USER,
+      agent: agentRecord(),
+      sessionId: REGULAR_SESSION,
+      reason: 'close',
+      now: NOW,
+      generateSummary: async () => {
+        const written = await redis.appendContextCompactionEvent(REGULAR_SESSION, compactEvent, null)
+        expect(written.ok).toBe(true)
+        await redis.json.set(`session:${REGULAR_SESSION}`, '$.metadata.origin', origin as never)
+        return 'Shed roof discussed.'
+      }
+    })
+    expect(outcome.status).toBe('graduated')
+    expect(wholeRecordWrites.mock.calls.filter(([id]) => id === REGULAR_SESSION)).toEqual([])
+    wholeRecordWrites.mockRestore()
+
+    const metadata = (await redis.getSession(REGULAR_SESSION))?.metadata as Record<string, any>
+    expect(metadata.contextCompaction).toEqual({ version: 1, events: [compactEvent] })
+    expect(metadata.origin).toEqual(origin)
+    expect(metadata.memoryGraduation).toEqual({
+      version: 1,
+      lastGraduatedMessageId: 'r4',
+      lastGraduatedAt: NOW.toISOString(),
+      segmentIds: ['zcmeta_seg_before', outcome.segmentId]
+    })
+  })
+
+  // BL-737: the mark write is a compare-and-set on the id THIS graduation read at its own start,
+  // never an ordering check on any timestamp. Two graduations racing settle by whichever CAS
+  // lands first; the loser reports `superseded`, not `graduated`, and its segment (already a
+  // duplicate of ground the winner covers) does not survive it.
+  it('two overlapping graduations of the same tail: the one whose CAS loses answers superseded and discards its segment', async () => {
+    for (let i = 0; i < 4; i++) {
+      await seedMessage(
+        REGULAR_SESSION,
+        `r${i + 1}`,
+        i % 2 === 0 ? 'user' : 'assistant',
+        `Regular message ${i + 1} about the fence`,
+        `2026-06-10T11:5${i}:00.000Z`
+      )
+    }
+
+    // Inside the racing graduation's own summary call, a second graduation of the SAME tail
+    // (reading the same "no mark yet" start) writes and wins first.
+    const outcome = await graduateRegularSessionTail({
+      userId: USER,
+      agent: agentRecord(),
+      sessionId: REGULAR_SESSION,
+      reason: 'close',
+      now: NOW,
+      generateSummary: async () => {
+        const winner = await redis.writeRegularGraduationMark(
+          REGULAR_SESSION,
+          {
+            lastGraduatedMessageId: 'r4',
+            lastGraduatedAt: '2026-06-10T12:01:00.000Z',
+            segmentId: 'zcmeta_seg_winner'
+          },
+          null
+        )
+        expect(winner).toBe('ok')
+        return 'Fence discussed.'
+      }
+    })
+
+    expect(outcome.status).toBe('superseded')
+    // The winner's mark stands untouched.
+    const mark = (await redis.getSession(REGULAR_SESSION))?.metadata?.memoryGraduation as any
+    expect(mark.lastGraduatedMessageId).toBe('r4')
+    expect(mark.segmentIds).toEqual(['zcmeta_seg_winner'])
+    // The loser's own segment (never reused, never linked) does not survive it.
+    const segments = await listMemorySegments(AGENT)
+    expect(segments.map((segment) => segment.id)).not.toContain('zcmeta_seg_winner')
+    expect(segments.filter((segment) => segment.session_id === REGULAR_SESSION)).toHaveLength(0)
+  })
+
+  // BL-737's regular-session counterpart to BL-751: `createMemorySegment` embeds before it
+  // writes, so a chat deleted during THIS call's own embed is still there for the segment write
+  // but gone by the time the mark write runs. There is no window event here to catch it first
+  // (regular sessions write no window event, DL-104-12) — the mark write's own MISSING answer is
+  // the only place this gap can surface, and it must not be reported as `graduated`.
+  it('the chat is deleted during the embedding call: chat_deleted, and the just-created segment does not survive it', async () => {
+    for (let i = 0; i < 4; i++) {
+      await seedMessage(
+        REGULAR_SESSION,
+        `r${i + 1}`,
+        i % 2 === 0 ? 'user' : 'assistant',
+        `Regular message ${i + 1} about the deck`,
+        `2026-06-10T11:5${i}:00.000Z`
+      )
+    }
+    let deleted = false
+    const embedder = {
+      modelId: 'local-ai:test-embedder@8',
+      dims: 8,
+      async embedDocuments(texts: string[]) {
+        if (!deleted) {
+          deleted = true
+          await redis.deleteSession(REGULAR_SESSION)
+        }
+        return texts.map(() => new Array(8).fill(0.1))
+      },
+      async embedQuery() {
+        return new Array(8).fill(0.1)
+      }
+    }
+
+    const outcome = await graduateRegularSessionTail({
+      userId: USER,
+      agent: agentRecord(),
+      sessionId: REGULAR_SESSION,
+      reason: 'close',
+      now: NOW,
+      generateSummary: async () => 'Deck discussed.',
+      embedder
+    })
+
+    expect(deleted).toBe(true)
+    expect(outcome.status).toBe('chat_deleted')
+    expect(await listMemorySegments(AGENT)).toEqual([])
+  })
+
+  // The BL-751 discard must never touch a REUSED segment: a same-range attempt from an earlier
+  // partial run is owned by whatever created (or already reused) it, not by this losing call.
+  it('a reused segment is left alone when this graduation loses its CAS', async () => {
+    for (let i = 0; i < 4; i++) {
+      await seedMessage(
+        REGULAR_SESSION,
+        `r${i + 1}`,
+        i % 2 === 0 ? 'user' : 'assistant',
+        `Regular message ${i + 1} about the porch`,
+        `2026-06-10T11:5${i}:00.000Z`
+      )
+    }
+    // An earlier partial attempt already wrote a segment covering this exact tail (episode_id
+    // null, same message ids), which `writeGraduationForMessages` will find and reuse.
+    const existing = await createMemorySegment({
+      agent_id: AGENT,
+      user_id: USER,
+      session_id: REGULAR_SESSION,
+      episode_id: null,
+      message_ids: ['r1', 'r2', 'r3', 'r4'],
+      summary: 'Porch discussed (earlier attempt).',
+      first_message_at: '2026-06-10T11:50:00.000Z',
+      last_message_at: '2026-06-10T11:53:00.000Z',
+      token_count: 10,
+      graduated_by: 'session_close'
+    })
+
+    const outcome = await graduateRegularSessionTail({
+      userId: USER,
+      agent: agentRecord(),
+      sessionId: REGULAR_SESSION,
+      reason: 'close',
+      now: NOW,
+      generateSummary: async () => {
+        // A competing write beats this one to the mark, so this call's CAS loses.
+        const winner = await redis.writeRegularGraduationMark(
+          REGULAR_SESSION,
+          {
+            lastGraduatedMessageId: 'r4',
+            lastGraduatedAt: '2026-06-10T12:01:00.000Z',
+            segmentId: 'zcmeta_seg_other_winner'
+          },
+          null
+        )
+        expect(winner).toBe('ok')
+        return 'Porch discussed (this attempt).'
+      }
+    })
+
+    expect(outcome.status).toBe('superseded')
+    // The reused segment survives: it belongs to whatever attempt created or is using it, not to
+    // this losing call.
+    expect(await getMemorySegment(AGENT, existing.id)).not.toBeNull()
+  })
+
+  // BL-737 review: the mirror case of the test above. THIS call creates a brand-new segment (not
+  // reused), but the WINNER is the one that reuses it and links it into the mark it writes. The
+  // old code deleted any segment it did not itself reuse whenever its CAS lost, so it deleted the
+  // segment the winner's mark now names — leaving that mark pointing at nothing.
+  it('the winner reused THIS losing call\'s own new segment: it survives the discard (BL-737 review)', async () => {
+    for (let i = 0; i < 4; i++) {
+      await seedMessage(
+        REGULAR_SESSION,
+        `r${i + 1}`,
+        i % 2 === 0 ? 'user' : 'assistant',
+        `Regular message ${i + 1} about the attic`,
+        `2026-06-10T11:5${i}:00.000Z`
+      )
+    }
+
+    const original = redis.writeRegularGraduationMark.bind(redis)
+    const spy = vi
+      .spyOn(redis, 'writeRegularGraduationMark')
+      .mockImplementationOnce(async (sessionId, mark, expected) => {
+        // Simulate the winner landing first, reusing THIS call's about-to-be-written segment id
+        // (the same id `written.segmentId` this call created moments ago via `createMemorySegment`
+        // inside `writeGraduationForMessages`) and linking it into the mark it writes.
+        const winner = await original(
+          sessionId,
+          {
+            lastGraduatedMessageId: 'r4',
+            lastGraduatedAt: '2026-06-10T12:01:00.000Z',
+            segmentId: mark.segmentId
+          },
+          null
+        )
+        expect(winner).toBe('ok')
+        // Now run this (the losing) call for real: its CAS no longer matches.
+        return original(sessionId, mark, expected)
+      })
+
+    const outcome = await graduateRegularSessionTail({
+      userId: USER,
+      agent: agentRecord(),
+      sessionId: REGULAR_SESSION,
+      reason: 'close',
+      now: NOW,
+      generateSummary: async () => 'Attic discussed.'
+    })
+    spy.mockRestore()
+
+    expect(outcome.status).toBe('superseded')
+    const mark = (await redis.getSession(REGULAR_SESSION))?.metadata?.memoryGraduation as any
+    expect(mark.lastGraduatedMessageId).toBe('r4')
+    // The segment this losing call created is the one the winner's mark now lists — it must
+    // survive, not be deleted out from under that mark.
+    expect(mark.segmentIds).toHaveLength(1)
+    const segments = await listMemorySegments(AGENT)
+    expect(segments.map((segment) => segment.id)).toEqual(mark.segmentIds)
+  })
+
+  // BL-737 review (FIX 2, test gap): the headline bug end-to-end through
+  // `graduateRegularSessionTail` itself, not just the Lua script it calls. A mark naming a
+  // message that no longer exists in the chat must still let the NEXT graduation move forward,
+  // not answer something that looks like `graduated` forever nor get stuck. The old
+  // `lastGraduatedMessageTs` "forward only" ordering check got stuck exactly here: resuming from
+  // message 0 always re-derives a tail whose last message is at or before the deleted mark's own
+  // timestamp, so `storedTsValue >= tonumber(ARGV[5])` was true and the write answered `STALE`
+  // forever — the caller ignored that `false` and reported `graduated` anyway on every call,
+  // never actually advancing the watermark. The CAS fix reads and matches the CURRENT stored id
+  // instead, so this must both graduate once and then report `nothing_new`.
+  it('a mark naming a deleted message still lets the next graduation advance, then reports nothing_new (BL-737 review)', async () => {
+    for (let i = 0; i < 5; i++) {
+      await seedMessage(
+        REGULAR_SESSION,
+        `r${i + 1}`,
+        i % 2 === 0 ? 'user' : 'assistant',
+        `Regular message ${i + 1} about the greenhouse`,
+        `2026-06-10T11:5${i}:00.000Z`
+      )
+    }
+    // The mark names r5 as already graduated...
+    await redis.json.set(`session:${REGULAR_SESSION}`, '$.metadata.memoryGraduation', {
+      version: 1,
+      lastGraduatedMessageId: 'r5',
+      lastGraduatedAt: '2026-06-01T00:00:00.000Z',
+      segmentIds: ['zcmeta_seg_before_delete']
+    } as never)
+    // ...but r5 was since deleted from the chat (the user deleted the message), leaving a tail
+    // of exactly MIN_GRADUATION_MESSAGES (4: r1-r4) once resumed from message 0.
+    await redis.deleteMessage('r5', REGULAR_SESSION, USER)
+
+    const outcome = await graduateRegularSessionTail({
+      userId: USER,
+      agent: agentRecord(),
+      sessionId: REGULAR_SESSION,
+      reason: 'close',
+      now: NOW,
+      generateSummary: async () => 'Greenhouse discussed.'
+    })
+    expect(outcome.status).toBe('graduated')
+    expect(outcome.messageCount).toBe(4)
+
+    const mark = (await redis.getSession(REGULAR_SESSION))?.metadata?.memoryGraduation as any
+    expect(mark.lastGraduatedMessageId).toBe('r4')
+    expect(mark.segmentIds).toEqual(['zcmeta_seg_before_delete', outcome.segmentId])
+
+    const again = await graduateRegularSessionTail({
+      userId: USER,
+      agent: agentRecord(),
+      sessionId: REGULAR_SESSION,
+      reason: 'close',
+      now: NOW,
+      generateSummary: async () => 'unused'
+    })
+    expect(again.status).toBe('nothing_new')
   })
 
   // -------------------------------------------------------------------------
@@ -1097,5 +2104,342 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
       (await redis.getSession(FIXED_SESSION))?.metadata ?? null
     )
     expect(state.events[0].summary).toContain('Pre-existing summary')
+  })
+  // -------------------------------------------------------------------------
+  // BL-549 N1/N2: a nap yields to a turn and to a chat delete; N4: its writes go by path
+  // -------------------------------------------------------------------------
+
+  const keysOfFixedSession = () =>
+    redis.execute(async (client) => {
+      const keys: string[] = []
+      for await (const batch of client.scanIterator({ MATCH: `*${FIXED_SESSION}*`, COUNT: 500 })) {
+        keys.push(...(Array.isArray(batch) ? batch : [batch]))
+      }
+      return keys.sort()
+    })
+
+  it('BL-549 N1/N2: a turn that starts after step 1 ends the nap early; step 1 stays, steps 2 and 3 never run', async () => {
+    await seedNapConversation()
+    let calls = 0
+    let turnId: number | null = null
+    const prompts: string[] = []
+    try {
+      const outcome = await runFixedSessionNap({
+        userId: USER,
+        agent: agentRecord(),
+        sessionId: FIXED_SESSION,
+        trigger: 'manual',
+        eventFetch: fetch,
+        now: NOW,
+        generateSummary: async (prompt) => {
+          prompts.push(prompt)
+          return prompt.includes('OLDER OPEN-EPISODE SEGMENT TO COMPACT')
+            ? ['SUMMARY:', 'Garage.', 'WHITEBOARD:', 'a nap board that must not land'].join('\n')
+            : 'Lake trip planned for July; cabin booked.'
+        },
+        estimateTokens: async () => {
+          calls += 1
+          // The user sends while the nap measures the window after step 1.
+          if (calls === 2) {
+            const registered = registerSessionTurn(FIXED_SESSION, 'single', 'msg_zcnap_turn')
+            expect(registered.ok).toBe(true)
+            turnId = registered.ok ? registered.entry.turnId : null
+          }
+          return [150_000, 130_000, 128_000, 70_000][Math.min(calls - 1, 3)]
+        }
+      })
+
+      expect(outcome.status, outcome.error).toBe('ended_early')
+      expect(outcome.endedEarly).toBe('turn_started')
+      expect(outcome.record?.status).toBe('ended_early')
+      expect(outcome.record?.endedEarly).toBe('ended early: a message arrived; 1 closed episode written')
+      // BL-549 N2: the next step does not start, the Awareness fold included.
+      expect(outcome.record?.awarenessFold).toBe('skipped')
+      // Step 1 is finished and stays: ep1 graduated, its event in the window.
+      expect(outcome.record?.graduatedEpisodeIds).toEqual(['ep1'])
+      expect((await getEpisode(FIXED_SESSION, 'ep1'))?.state).toBe('graduated')
+      const stored = await redis.getSession(FIXED_SESSION)
+      const events = getFixedSessionGraduationState(stored?.metadata ?? null).events
+      expect(events.map((event) => event.episodeId)).toEqual(['ep1'])
+      // Step 2 never ran: no zip was compressed. Step 3 never ran: no call, board untouched.
+      expect(outcome.record?.rezippedZipCount).toBe(0)
+      expect(await redis.sMembers(`rezipped:${FIXED_SESSION}`)).toEqual([])
+      expect(prompts.some((prompt) => prompt.includes('OLDER OPEN-EPISODE SEGMENT TO COMPACT'))).toBe(false)
+      expect((await getEpisode(FIXED_SESSION, 'ep2'))?.whiteboard?.content).toBe('Garage width: 6m')
+      // The record is stored with the chat.
+      const naps = getFixedSessionNapRecords(stored?.metadata ?? null)
+      expect(naps.at(-1)?.status).toBe('ended_early')
+      expect(naps.at(-1)?.endedEarly).toBe('ended early: a message arrived; 1 closed episode written')
+    } finally {
+      if (turnId !== null) releaseSessionTurn(FIXED_SESSION, turnId)
+    }
+  })
+
+  it('BL-549 N1: a turn that starts during the step 3 summary call: the nap writes no summary, event or board for it', async () => {
+    await seedNapConversation()
+    let turnId: number | null = null
+    try {
+      const outcome = await runFixedSessionNap({
+        userId: USER,
+        agent: agentRecord(),
+        sessionId: FIXED_SESSION,
+        trigger: 'manual',
+        eventFetch: fetch,
+        now: NOW,
+        generateSummary: async (prompt) => {
+          if (prompt.includes('OLDER OPEN-EPISODE SEGMENT TO COMPACT')) {
+            const registered = registerSessionTurn(FIXED_SESSION, 'single', 'msg_zcnap_turn3')
+            turnId = registered.ok ? registered.entry.turnId : null
+            return ['SUMMARY:', 'Garage.', 'WHITEBOARD:', 'a nap board that must not land'].join('\n')
+          }
+          return 'Lake trip planned for July; cabin booked.'
+        },
+        estimateTokens: estimateQueue([150_000, 130_000, 128_000, 70_000])
+      })
+
+      expect(outcome.status, outcome.error).toBe('ended_early')
+      expect(outcome.endedEarly).toBe('turn_started')
+      // Steps 1 and 2 are finished and stay.
+      expect(outcome.record?.graduatedEpisodeIds).toEqual(['ep1'])
+      expect(outcome.record?.rezippedZipCount).toBeGreaterThan(0)
+      expect(outcome.record?.compaction).toBeNull()
+      const events = getFixedSessionGraduationState(
+        (await redis.getSession(FIXED_SESSION))?.metadata ?? null
+      ).events
+      expect(events.map((event) => event.episodeId)).toEqual(['ep1'])
+      expect((await listMemorySegments(AGENT)).filter((segment) => segment.episode_id === 'ep2')).toEqual([])
+      expect((await getEpisode(FIXED_SESSION, 'ep2'))?.whiteboard?.content).toBe('Garage width: 6m')
+    } finally {
+      if (turnId !== null) releaseSessionTurn(FIXED_SESSION, turnId)
+    }
+  })
+
+  // BL-549, Faye's option A (2026-09-27): a closed episode does not change when a message
+  // arrives, so a step-1 summary whose call FINISHED is written; then the nap ends early.
+  async function seedThreeClosedEpisodes() {
+    const stretch = [
+      ['A', '2026-06-10T06:00:00.000Z'],
+      ['B', '2026-06-10T07:00:00.000Z'],
+      ['C', '2026-06-10T08:00:00.000Z']
+    ] as const
+    for (const [label, start] of stretch) {
+      const base = new Date(start).getTime()
+      for (let index = 0; index < 4; index += 1) {
+        await seedMessage(
+          FIXED_SESSION,
+          `m${label}${index}`,
+          index % 2 === 0 ? 'user' : 'assistant',
+          `Stretch ${label} note ${index}`,
+          new Date(base + index * 60_000).toISOString()
+        )
+      }
+      await seedEpisode({
+        id: `ep${label}`,
+        state: 'closed',
+        opened_at: start,
+        closed_at: new Date(base + 10 * 60_000).toISOString(),
+        boundary_signal: 'agent_mark'
+      })
+    }
+    await seedMessage(FIXED_SESSION, 'mTail', 'user', bigText('Recent context'), '2026-06-10T11:00:00.000Z')
+  }
+
+  it('BL-549 option A: a turn that starts during episode 1\'s summary call: episode 1 is written, episodes 2 and 3 are untouched, the nap ends', async () => {
+    await seedThreeClosedEpisodes()
+    let turnId: number | null = null
+    let calls = 0
+    try {
+      const outcome = await runFixedSessionNap({
+        userId: USER,
+        agent: agentRecord(),
+        sessionId: FIXED_SESSION,
+        trigger: 'manual',
+        eventFetch: fetch,
+        now: NOW,
+        generateSummary: async () => {
+          calls += 1
+          if (turnId === null) {
+            const registered = registerSessionTurn(FIXED_SESSION, 'single', 'msg_zcnap_optA')
+            turnId = registered.ok ? registered.entry.turnId : -1
+          }
+          return `Summary number ${calls}.`
+        },
+        estimateTokens: estimateQueue([150_000, 130_000, 128_000, 70_000])
+      })
+
+      expect(turnId).toBeGreaterThan(0)
+      expect(calls).toBe(1)
+      expect(outcome.status, outcome.error).toBe('ended_early')
+      expect(outcome.endedEarly).toBe('turn_started')
+      expect(outcome.record?.graduatedEpisodeIds).toEqual(['epA'])
+      expect(outcome.record?.endedEarly).toBe('ended early: a message arrived; 1 closed episode written')
+      expect(outcome.record?.awarenessFold).toBe('skipped')
+      expect((await getEpisode(FIXED_SESSION, 'epA'))?.state).toBe('graduated')
+      expect((await getEpisode(FIXED_SESSION, 'epB'))?.state).toBe('closed')
+      expect((await getEpisode(FIXED_SESSION, 'epC'))?.state).toBe('closed')
+      const events = getFixedSessionGraduationState(
+        (await redis.getSession(FIXED_SESSION))?.metadata ?? null
+      ).events
+      expect(events.map((event) => event.episodeId)).toEqual(['epA'])
+      expect(events[0].summary).toBe('Summary number 1.')
+      const segments = (await listMemorySegments(AGENT)).map((segment) => segment.episode_id)
+      expect(segments).toEqual(['epA'])
+      expect(await redis.sMembers(`rezipped:${FIXED_SESSION}`)).toEqual([])
+    } finally {
+      if (turnId !== null && turnId > 0) releaseSessionTurn(FIXED_SESSION, turnId)
+    }
+  })
+
+  // BL-623 leak: a delete that lands during the token estimate before step 2 left
+  // `rezipped:{id}` and `rezipped_item:{id}:*` behind (probe, 2026-09-27, yield helper).
+  it('BL-623: a chat deleted during the estimate before step 2 leaves no key of the chat', async () => {
+    await seedNapConversation()
+    let calls = 0
+    const outcome = await runFixedSessionNap({
+      userId: USER,
+      agent: agentRecord(),
+      sessionId: FIXED_SESSION,
+      trigger: 'manual',
+      eventFetch: fetch,
+      now: NOW,
+      generateSummary: async (prompt) =>
+        prompt.includes('OLDER OPEN-EPISODE SEGMENT TO COMPACT')
+          ? ['SUMMARY:', 'Garage.', 'WHITEBOARD:', 'Garage width: 6m.'].join('\n')
+          : 'Lake trip planned for July; cabin booked.',
+      estimateTokens: async () => {
+        calls += 1
+        if (calls === 2) await redis.deleteSession(FIXED_SESSION)
+        return [150_000, 130_000, 128_000, 70_000][Math.min(calls - 1, 3)]
+      }
+    })
+
+    expect(outcome.status, outcome.error).toBe('ended_early')
+    expect(outcome.endedEarly).toBe('chat_deleted')
+    expect(outcome.record).toBeNull()
+    expect(await keysOfFixedSession()).toEqual([])
+  })
+
+  // BL-549 N4: the nap's event and its record go at their own paths. Another writer's block,
+  // written between any read of the nap and its next write, stays.
+  it('BL-549 N4: blocks another writer adds to the chat record during the nap survive the graduation event and the nap record', async () => {
+    await seedNapConversation()
+    const realGetSession = redis.getSession.bind(redis)
+    let written = 0
+    const spy = vi.spyOn(redis, 'getSession').mockImplementation(async (id: string) => {
+      const session = await realGetSession(id)
+      if (id === FIXED_SESSION && session) {
+        // Another writer lands right after this read (a Compact, a group move, anything).
+        written += 1
+        await redis.json.set(`session:${FIXED_SESSION}`, `$.metadata.zcnap_other_${written}`, { n: written } as never)
+      }
+      return session
+    })
+    try {
+      const outcome = await runFixedSessionNap({
+        userId: USER,
+        agent: agentRecord(),
+        sessionId: FIXED_SESSION,
+        trigger: 'manual',
+        eventFetch: fetch,
+        now: NOW,
+        generateSummary: async (prompt) =>
+          prompt.includes('OLDER OPEN-EPISODE SEGMENT TO COMPACT')
+            ? ['SUMMARY:', 'Garage.', 'WHITEBOARD:', 'Garage width: 6m.'].join('\n')
+            : 'Lake trip planned for July; cabin booked.',
+        estimateTokens: estimateQueue([150_000, 130_000, 128_000, 70_000])
+      })
+      expect(outcome.status, outcome.error).toBe('completed')
+    } finally {
+      spy.mockRestore()
+    }
+    expect(written).toBeGreaterThan(0)
+    const stored = (await redis.getSession(FIXED_SESSION)) as any
+    for (let n = 1; n <= written; n += 1) {
+      expect(stored.metadata[`zcnap_other_${n}`], `block ${n} of ${written}`).toEqual({ n })
+    }
+    // The nap's own writes are there too: two events (step 1 and step 3) and one record.
+    expect(getFixedSessionGraduationState(stored.metadata).events).toHaveLength(2)
+    expect(getFixedSessionNapRecords(stored.metadata)).toHaveLength(1)
+    expect(stored.metadata.fixedSession.enabled).toBe(true)
+  })
+
+  it('BL-549 N4: two nap records and two graduation events written at once both stay; the record list keeps its last 20', async () => {
+    await redis.json.set(`session:${FIXED_SESSION}`, '$.metadata.fixedSession.naps', [] as never)
+    for (let n = 0; n < 19; n += 1) {
+      await redis.execute((client) =>
+        client.json.arrAppend(`session:${FIXED_SESSION}`, '$.metadata.fixedSession.naps', {
+          id: `nap_old_${n}`, at: NOW.toISOString(), status: 'completed'
+        })
+      )
+    }
+    const record = (id: string) => ({
+      id, at: NOW.toISOString(), trigger: 'manual' as const, status: 'completed' as const,
+      tokensBefore: 1, tokensAfter: 1, napAtTokens: 1, graduatedEpisodeIds: [], segmentIds: [],
+      skippedEpisodes: [], rezippedZipCount: 0, compaction: null
+    })
+    const event = (id: string) => ({
+      id, createdAt: NOW.toISOString(), source: 'nap' as const, episodeId: null, segmentId: `seg_${id}`,
+      sourceMessageIds: ['m1'], compactedMessageCount: 1, summary: `summary ${id}`, summaryTokenEstimate: 3
+    })
+    await Promise.all([
+      redis.appendFixedSessionNapRecord(FIXED_SESSION, record('nap_a')),
+      redis.appendFixedSessionNapRecord(FIXED_SESSION, record('nap_b')),
+      redis.appendFixedSessionGraduationEvent(FIXED_SESSION, event('grad_a')),
+      redis.appendFixedSessionGraduationEvent(FIXED_SESSION, event('grad_b'))
+    ])
+    const stored = (await redis.getSession(FIXED_SESSION)) as any
+    const naps = getFixedSessionNapRecords(stored.metadata).map((nap) => nap.id)
+    expect(naps).toHaveLength(20)
+    expect(naps).toEqual(expect.arrayContaining(['nap_a', 'nap_b']))
+    expect(naps).not.toContain('nap_old_0')
+    const events = getFixedSessionGraduationState(stored.metadata).events.map((entry) => entry.id)
+    expect(events.sort()).toEqual(['grad_a', 'grad_b'])
+    // A chat that is gone gets no write and is never recreated.
+    await redis.deleteSession(FIXED_SESSION)
+    expect(await redis.appendFixedSessionNapRecord(FIXED_SESSION, record('nap_c'))).toBeNull()
+    expect(await redis.appendFixedSessionGraduationEvent(FIXED_SESSION, event('grad_c'))).toBe('missing')
+    expect(await redis.exists(`session:${FIXED_SESSION}`)).toBe(false)
+  })
+
+  it('BL-549 N4: the era swap keeps a block and an event another writer added, and refuses when a replaced event is gone', async () => {
+    const event = (id: string) => ({
+      id, createdAt: NOW.toISOString(), source: 'nap' as const, episodeId: null, segmentId: `seg_${id}`,
+      sourceMessageIds: [`m_${id}`], compactedMessageCount: 1, summary: `summary ${id}`, summaryTokenEstimate: 3
+    })
+    await redis.json.set(`session:${FIXED_SESSION}`, '$.metadata.fixedSession.graduation', {
+      version: 1, events: [event('g1'), event('g2'), event('g3')]
+    } as never)
+    // Written after dreaming read the events for its era summary: a block and a new event.
+    await redis.json.set(`session:${FIXED_SESSION}`, '$.metadata.zcnap_swap_before', { kept: true } as never)
+    await redis.execute((client) =>
+      client.json.arrAppend(`session:${FIXED_SESSION}`, '$.metadata.fixedSession.graduation.events', event('g4') as never)
+    )
+    // And another writer that lands right after any read the swap itself makes.
+    const realGetSession = redis.getSession.bind(redis)
+    let written = 0
+    const spy = vi.spyOn(redis, 'getSession').mockImplementation(async (id: string) => {
+      const session = await realGetSession(id)
+      if (id === FIXED_SESSION && session) {
+        written += 1
+        await redis.json.set(`session:${FIXED_SESSION}`, `$.metadata.zcnap_swap_other_${written}`, { n: written } as never)
+      }
+      return session
+    })
+    try {
+      await swapGraduationEvents(FIXED_SESSION, ['g1', 'g2'], event('era'))
+    } finally {
+      spy.mockRestore()
+    }
+    const stored = (await redis.getSession(FIXED_SESSION)) as any
+    expect(stored.metadata.zcnap_swap_before).toEqual({ kept: true })
+    for (let n = 1; n <= written; n += 1) {
+      expect(stored.metadata[`zcnap_swap_other_${n}`], `block ${n} of ${written}`).toEqual({ n })
+    }
+    const ids = getFixedSessionGraduationState(stored.metadata).events.map((entry) => entry.id)
+    expect(ids).toEqual(['era', 'g3', 'g4'])
+    // A replaced event that is gone refuses the swap and changes nothing.
+    await expect(swapGraduationEvents(FIXED_SESSION, ['g1', 'g3'], event('era2'))).rejects.toThrow(/changed underneath/)
+    const after = getFixedSessionGraduationState(((await redis.getSession(FIXED_SESSION)) as any).metadata).events
+    expect(after.map((entry) => entry.id)).toEqual(['era', 'g3', 'g4'])
   })
 })

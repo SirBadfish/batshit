@@ -1,4 +1,5 @@
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, readdir, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -50,5 +51,27 @@ describe('the sbx daemon record', () => {
       callEndedAt: '2026-09-21T13:02:20.950Z',
       sbxPath: path.join(bin, 'sbx')
     })
+  })
+  it('writes under the record folder\'s lock, the same lock the shutdown side takes (BL-1257)', async () => {
+    const stateDir = path.join(root, 'state')
+    process.env.BATSHIT_SBX_DAEMON_STATE_DIR = stateDir
+    process.env.BATSHIT_VOICE_RUNTIME_OWNER = 'native:4242:1758459739000'
+    process.env.PATH = path.join(root, 'nothing-here')
+    // The shutdown side's lock (plain JavaScript beside the app, loaded by Node), held while the app writes.
+    const twin = createRequire(import.meta.url)(
+      path.resolve(process.cwd(), '../batshit-mac/scripts/local-voice-runtime-stop.mjs')
+    ) as { withLocalRuntimeRecordLock: (dir: string, work: () => Promise<void>) => Promise<void> }
+    let held!: () => void
+    const acquired = new Promise<void>((done) => (held = done))
+    const released = twin.withLocalRuntimeRecordLock(stateDir, async () => {
+      held()
+      await new Promise((done) => setTimeout(done, 400))
+    })
+    await acquired
+    const startedAt = Date.now()
+    await recordSbxDaemonStart(Date.now(), Date.now())
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(300)
+    await released
+    expect(await readdir(stateDir)).toEqual(['.batshit-sbx-daemon-launch.json'])
   })
 })

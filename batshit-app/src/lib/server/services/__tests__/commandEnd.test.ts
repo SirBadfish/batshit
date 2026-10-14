@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest'
+import { inspectTestProcessState, isTestProcessRunning } from '$lib/test-utils/process-state'
 import { spawn } from 'node:child_process'
 import { createRequire } from 'node:module'
 import path from 'node:path'
@@ -7,12 +8,10 @@ import {
   SANDBOX_COMMAND_END_SCRIPT,
   SANDBOX_COMMAND_END_TIMEOUT_MS,
   SANDBOX_COMMAND_TAG_ENV,
-  endLiveCommandGroups,
-  liveCommandGroups,
   newSandboxCommandTag,
-  sandboxCommandEndArgv,
-  trackCommandGroup
+  sandboxCommandEndArgv
 } from '../commandEnd'
+import { spawnOwnedCommandGroup, endLiveOwnedCommandGroups, liveOwnedCommandCount } from '../ownedCommandGroup'
 
 /**
  * How Batshit ends what a command started, on a Stop and on a timeout (2026-09-18). The local
@@ -20,22 +19,14 @@ import {
  * `tools/docker/command-end.test.mjs` (Linux) and in the live sandbox tests.
  */
 
-function isRunning(pid: number) {
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === 'EPERM'
-  }
-}
 
-async function goneWithin(pid: number, ms: number) {
+async function stoppedWithin(pid: number, ms: number) {
   const deadline = Date.now() + ms
   while (Date.now() < deadline) {
-    if (!isRunning(pid)) return true
+    if (!isTestProcessRunning(pid)) return true
     await new Promise((resolve) => setTimeout(resolve, 25))
   }
-  return !isRunning(pid)
+  return !isTestProcessRunning(pid)
 }
 
 describe('ending a command inside a sandbox', () => {
@@ -82,50 +73,42 @@ describe('ending a command inside a sandbox', () => {
 })
 
 describe('the local shell’s command groups when Batshit quits', () => {
-  const started: number[] = []
+  afterEach(async () => { await endLiveOwnedCommandGroups() })
 
-  afterEach(() => {
-    for (const pid of started.splice(0)) {
-      try {
-        process.kill(-pid, 'SIGKILL')
-      } catch {}
-    }
-  })
-
-  // A command as the local shell runs it: the leader of its own process group, here with a
-  // background program and one that ignores the polite signal.
-  function startGroup(script: string) {
-    const child = spawn('/bin/sh', ['-c', script], { detached: true, stdio: 'ignore' })
-    const pid = child.pid as number
-    started.push(pid)
-    trackCommandGroup(pid)
-    return pid
+  async function startGroup(script: string) {
+    const child = spawnOwnedCommandGroup('/bin/sh', ['-c', script], { env: {} })
+    child.stdout.resume()
+    child.stderr.resume()
+    await new Promise<void>((resolve, reject) => {
+      child.once('spawn', resolve)
+      child.once('error', reject)
+    })
+    return child.pid as number
   }
 
   it('ends every live command group: politely first, then for good', async () => {
-    const plain = startGroup('sleep 30 & sleep 31')
-    const stubborn = startGroup("trap '' TERM; sleep 32 & wait")
+    const plain = await startGroup('sleep 30 & sleep 31')
+    const stubborn = await startGroup("trap '' TERM; sleep 32 & wait")
     await new Promise((resolve) => setTimeout(resolve, 200))
-    expect(isRunning(plain) && isRunning(stubborn)).toBe(true)
+    expect(inspectTestProcessState(plain)).toBe('live')
+    expect(inspectTestProcessState(stubborn)).toBe('live')
 
-    const ended = await endLiveCommandGroups()
+    const ended = await endLiveOwnedCommandGroups()
 
     expect(ended).toBeGreaterThanOrEqual(2)
-    expect(await goneWithin(plain, 1_000)).toBe(true)
-    expect(await goneWithin(stubborn, 1_000)).toBe(true)
+    expect(await stoppedWithin(plain, 1_000)).toBe(true)
+    expect(await stoppedWithin(stubborn, 1_000)).toBe(true)
   })
 
   it('kills any command group still left when the app server exits', async () => {
     // A crash or `process.exit` never runs the SIGTERM shutdown task. A real Node process
     // loads this module, starts a command group, and exits.
-    const moduleFile = path.resolve(process.cwd(), 'src/lib/server/services/commandEnd.ts')
+    const moduleFile = path.resolve(process.cwd(), 'src/lib/server/services/ownedCommandGroup.ts')
     const script = [
-      "import { spawn } from 'node:child_process'",
-      `import { trackCommandGroup } from ${JSON.stringify(moduleFile)}`,
-      "const child = spawn('/bin/sh', ['-c', 'sleep 30 & sleep 31'], { detached: true, stdio: 'ignore' })",
-      'trackCommandGroup(child.pid)',
-      'console.log(child.pid)',
-      'setTimeout(() => process.exit(0), 200)'
+      `import { spawnOwnedCommandGroup } from ${JSON.stringify(moduleFile)}`,
+      "const child = spawnOwnedCommandGroup('/bin/sh', ['-c', 'sleep 30 & sleep 31'], { env: {} })",
+      'child.stdout.resume(); child.stderr.resume()',
+      'child.once("spawn", () => { console.log(child.pid); setTimeout(() => process.exit(0), 200) })'
     ].join('\n')
     const tsx = path.resolve(process.cwd(), 'node_modules/.bin/tsx')
     const output = await new Promise<string>((resolve, reject) => {
@@ -136,20 +119,19 @@ describe('the local shell’s command groups when Batshit quits', () => {
       app.on('exit', () => resolve(text))
     })
     const pid = Number(output.trim())
-    started.push(pid)
 
     expect(pid).toBeGreaterThan(0)
-    expect(await goneWithin(pid, 1_000)).toBe(true)
+    expect(await stoppedWithin(pid, 1_000)).toBe(true)
   }, 20_000)
 
   it('forgets a group once nothing in it runs', async () => {
-    const pid = startGroup('sleep 0.3')
-    expect(liveCommandGroups()).toContain(pid)
-    await goneWithin(pid, 2_000)
+    const pid = await startGroup('sleep 0.3')
+    expect(liveOwnedCommandCount()).toBeGreaterThan(0)
+    await stoppedWithin(pid, 2_000)
     await new Promise((resolve) => setTimeout(resolve, 100))
 
     // A finished group is never signalled again, so a later process that happens to get its
     // number is never touched.
-    expect(liveCommandGroups()).not.toContain(pid)
+    expect(liveOwnedCommandCount()).toBe(0)
   })
 })

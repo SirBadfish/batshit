@@ -98,7 +98,9 @@ describe('GET /api/dms/brief', () => {
           findings: [{ id: 'override', probability: 0.98 }],
           harm: 2,
           clipped: false,
-          source: 'agent_dm'
+          source: 'agent_dm',
+          // The record has no provider (written before P10a), so TypeSafe's model: Jev.
+          judge: 'Jev'
         }
       }
     })
@@ -108,7 +110,8 @@ describe('GET /api/dms/brief', () => {
     expect((await briefsOf('dm_skipped')).dm_skipped.screen).toEqual({
       status: 'skipped',
       reason: 'deadline',
-      source: 'agent_dm'
+      source: 'agent_dm',
+      judge: 'Jev'
     })
   })
 

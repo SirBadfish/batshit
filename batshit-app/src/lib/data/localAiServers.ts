@@ -41,7 +41,9 @@ export const LOCAL_AI_SERVER_DEFINITIONS: LocalAiServerDefinition[] = [
     defaultImageTransport: 'auto',
     defaultImageBaseUrl: 'http://localhost:5600',
     supports: {
-      management: false,
+      // SA-124 P8: Batshit loads and unloads this program's models through its
+      // own API (localAiModelManagement.ts), so the badge says Managed (BL-105).
+      management: true,
       modelList: true,
       richMetadata: true,
       promptCacheReporting: 'never-reports'
@@ -50,14 +52,14 @@ export const LOCAL_AI_SERVER_DEFINITIONS: LocalAiServerDefinition[] = [
   {
     id: 'llama-cpp',
     label: 'llama.cpp',
-    description: 'llama-server OpenAI-compatible API endpoint.',
+    description: 'llama-server API endpoint; model controls require router mode.',
     defaultBaseUrl: 'http://localhost:8080',
     openaiPath: '/v1',
     enabledByDefault: false,
     defaultImageTransport: 'auto',
     defaultImageBaseUrl: 'http://localhost:5600',
     supports: {
-      management: false,
+      management: true,
       modelList: true,
       promptCacheReporting: 'reports'
     }
@@ -109,7 +111,9 @@ export const LOCAL_AI_SERVER_DEFINITIONS: LocalAiServerDefinition[] = [
     defaultImageTransport: 'auto',
     defaultImageBaseUrl: 'http://localhost:5600',
     supports: {
-      management: false,
+      // SA-124 P8: Batshit loads and unloads this program's models through its
+      // own API (localAiModelManagement.ts), so the badge says Managed (BL-105).
+      management: true,
       modelList: true,
       // Measured live 2026-09-02: 8,192 of 9,274 tokens credited on a warm
       // 9k-token prompt, 134.6s -> 18.6s. Caches in 4,096-token blocks, so a
@@ -127,7 +131,9 @@ export const LOCAL_AI_SERVER_DEFINITIONS: LocalAiServerDefinition[] = [
     defaultImageTransport: 'auto',
     defaultImageBaseUrl: 'http://localhost:5600',
     supports: {
-      management: false,
+      // SA-124 P8: Batshit loads and unloads this program's models through its
+      // own API (localAiModelManagement.ts), so the badge says Managed (BL-105).
+      management: true,
       modelList: true,
       // Measured live against KoboldCpp 1.121 (mac-arm64, 2026-09-20): the chat
       // path returns usage.{prompt_tokens, completion_tokens, total_tokens} and

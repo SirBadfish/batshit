@@ -1,6 +1,7 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
 import { redis } from '$lib/server/redis'
 import { stripClientSuppliedOrigin } from '$lib/utils/sessionOrigin'
+import { hasRedisGlobCharacters, REDIS_GLOB_CHARACTERS_TEXT } from '$lib/utils/redisGlob'
 
 // GET /api/sessions - List all sessions for the current user
 export const GET: RequestHandler = async ({ url, locals }) => {
@@ -42,9 +43,18 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     // SA-113 P1 (DL-113-06): the user-wide live channel rides the same Redis pattern as
     // session channels and is told apart by a `user:` prefix. A client-chosen session id
     // containing a colon could impersonate that channel name, so ids stay colon-free.
-    if (typeof sessionId !== 'string' || sessionId.includes(':') || !sessionId.trim()) {
+    // BL-541: the id also becomes part of the KEYS patterns the chat's delete sweeps with
+    // (`episode:{id}:*`, `unzipped_item:{id}:*`, …), where `*`, `?`, `[`, `]`, and `\` are glob
+    // syntax: deleting a chat named `a*` deleted every chat starting with `a`. `redis.deleteSession`
+    // escapes them too, for an id that is already stored or comes back in a restore.
+    if (
+      typeof sessionId !== 'string' ||
+      sessionId.includes(':') ||
+      hasRedisGlobCharacters(sessionId) ||
+      !sessionId.trim()
+    ) {
       return json(
-        { error: 'Session ID must be a non-empty string without ":".' },
+        { error: `Session ID must be a non-empty string without ":", ${REDIS_GLOB_CHARACTERS_TEXT}.` },
         { status: 400 }
       )
     }

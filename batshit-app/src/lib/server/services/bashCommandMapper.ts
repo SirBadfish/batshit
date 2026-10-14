@@ -1,3 +1,5 @@
+import { extractManagedApplyPatchDocument, isManagedApplyPatchCommand } from './managedApplyPatch'
+
 export interface BashToolMapping {
   toolName:
     | 'batshit_server_read_file'
@@ -36,6 +38,8 @@ const SHELL_OPTION_WITH_VALUE = /^(?:[-+][oO]|--rcfile|--init-file)$/
  * separators around that word do not count.
  */
 function flagFollowsShellWord(text: string, flagIndex: number): boolean {
+  const prefix = text.slice(0, flagIndex).trim()
+  if (/^(?:\/[^\s]+\/)?su(?:\s+-)?(?:\s+[A-Za-z_][A-Za-z0-9_-]*)?\s*$/.test(prefix)) return true
   const words = text
     .slice(0, flagIndex)
     .split(/[\s;&|()`]+/)
@@ -61,23 +65,29 @@ function flagFollowsShellWord(text: string, flagIndex: number): boolean {
 function shellQuotedCommandString(text: string): string | null {
   // A flag word and its quoted value: a `-lc`, then any cluster with a `c`. Built on every call,
   // since a shared `/g` pattern carries `lastIndex` from one call to the next.
-  const patterns = [/(?<!\S)-lc\s+(['"])([\s\S]*?)\1/g, /(?<!\S)-[a-zA-Z]*c[a-zA-Z]*\s+(['"])([\s\S]*?)\1/g]
-  for (const pattern of patterns) {
-    for (const match of text.matchAll(pattern)) {
-      if (match[2] && flagFollowsShellWord(text, match.index ?? 0)) return match[2]
-    }
+  const patterns = [/(?<!\S)-lc\s+('([^']*)'|"((?:\\[\s\S]|[^"\\])*)")/g, /(?<!\S)-[a-zA-Z]*c[a-zA-Z]*\s+('([^']*)'|"((?:\\[\s\S]|[^"\\])*)")/g]
+  for (const match of patterns.flatMap((pattern) => [...text.matchAll(pattern)])) {
+    if (!flagFollowsShellWord(text, match.index ?? 0)) continue
+    if (match[2] !== undefined) return match[2]
+    return match[3].replace(/\\([$`"\\\n])/g, (_match, escaped: string) => escaped === '\n' ? '' : escaped)
   }
   return null
 }
 
-function extractShellCommand(command: string): string {
+/**
+ * The command line a shell wrapper runs (`/bin/zsh -lc '…'`, `bash -c "…"`, `su -c '…'`), or the
+ * command itself. The one unwrap: the Codex event adapter reads its terse verbs through it, and the
+ * shell policy reads what it maps (see `flagFollowsShellWord`), so a change here is a gate change.
+ */
+export function extractShellCommand(command: string): string {
   const trimmed = command.trim()
   if (!trimmed) return command
 
-  const shellCommandString = shellQuotedCommandString(trimmed)
+  const envelope = extractTopLevelCommandLines(trimmed).join('\n')
+  const shellCommandString = shellQuotedCommandString(envelope)
   if (shellCommandString !== null) return shellCommandString
 
-  const tokens = tokenizeCommand(trimmed)
+  const tokens = tokenizeCommand(envelope)
   for (let index = 0; index < tokens.length - 2; index += 1) {
     const token = tokens[index]?.toLowerCase()
     const flag = tokens[index + 1]?.toLowerCase()
@@ -106,25 +116,49 @@ function extractPrimaryCommandSegment(shellCommand: string): string {
   const trimmed = shellCommand.trim()
   if (!trimmed) return ''
 
-  // Heredocs can contain semicolons/newlines in the body, so inspect the first heredoc header line
-  // rather than the first line of the whole script. Batshit-managed write/edit scripts often begin
-  // with setup preambles like `set -euo pipefail` or `mkdir -p ...` before the real heredoc command.
-  if (/<<-?\s*['"]?[A-Za-z_][A-Za-z0-9_]*['"]?/.test(trimmed)) {
-    const heredocHeader = trimmed
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .find((line) => /<<-?\s*['"]?[A-Za-z_][A-Za-z0-9_]*['"]?/.test(line))
+  const heredocHeader = extractTopLevelCommandLines(trimmed).find((line) => shellHeredocMarker(line))
+  if (heredocHeader) return heredocHeader
 
-    if (heredocHeader) return heredocHeader
-    return trimmed.split(/\r?\n/, 1)[0]?.trim() ?? trimmed
-  }
-
-  const segments = shellCommand
-    .split(/&&|\|\||;/)
-    .map((segment) => segment.trim())
-    .filter(Boolean)
+  const segments = splitShellCommandSegments(shellCommand).filter(Boolean)
   if (segments.length === 0) return trimmed
   return segments[segments.length - 1]
+}
+
+/** Raw command-list boundaries; quoted punctuation and fd merges are data. */
+export function splitShellCommandSegments(command: string): string[] {
+  const segments: string[] = []
+  let quote: string | null = null
+  let start = 0
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index]
+    if (quote) {
+      if (char === '\\' && quote === '"') index += 1
+      else if (char === quote) quote = null
+      continue
+    }
+    if (char === '\\') { index += 1; continue }
+    if (char === "'" || char === '"') { quote = char; continue }
+    const separator = char === ';' || (char === '|' && command[index + 1] === '|') ||
+      (char === '&' && command[index - 1] !== '>' && command[index - 1] !== '<' && command[index - 1] !== '|' && command[index + 1] !== '>')
+    if (!separator) continue
+    segments.push(command.slice(start, index).trim())
+    if (command[index + 1] === char) index += 1
+    start = index + 1
+  }
+  segments.push(command.slice(start).trim())
+  return segments
+}
+
+/** A real heredoc operator and its quote-removed delimiter; quoted/comment text cannot open one. */
+export function shellHeredocMarker(line: string): string | null {
+  for (const words of splitShellSimpleCommands(line)) {
+    for (let index = 0; index < words.length; index += 1) {
+      if (!words[index].redirectOperator || !/^(?:\d+)?<<-?$/.test(words[index].text)) continue
+      const delimiter = words[index + 1]
+      if (delimiter && !delimiter.redirectOperator && delimiter.text) return delimiter.text
+    }
+  }
+  return null
 }
 
 function extractTopLevelCommandLines(shellCommand: string): string[] {
@@ -145,10 +179,7 @@ function extractTopLevelCommandLines(shellCommand: string): string[] {
 
     commands.push(trimmed)
 
-    const markerMatch = trimmed.match(/<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?/)
-    if (markerMatch?.[1]) {
-      heredocMarker = markerMatch[1]
-    }
+    heredocMarker = shellHeredocMarker(trimmed)
   }
 
   return commands
@@ -185,17 +216,6 @@ function firstPipelineStage(command: string): string {
   return command
 }
 
-// `head -n 2 file` and `tail -n +5 file` give a count before the file; the count is not the path.
-// An option without a separate value (`cat -n`, `head -5`, `--lines=5`) is skipped whole.
-const CAT_LIKE_COUNT_OPTION = /(?:-[nc]|--lines|--bytes)\s+[+-]?\d+[a-z]*\s+/iy
-const CAT_LIKE_OTHER_OPTION = /-\S+\s+/y
-const CAT_LIKE_PATH = /(?![><])['"]?([^'"`\s|><]+)/y
-
-function matchAt(pattern: RegExp, text: string, index: number): RegExpExecArray | null {
-  pattern.lastIndex = index
-  return pattern.exec(text)
-}
-
 /**
  * The file a `cat`, `head`, or `tail` in the read stage reads: the first word after its options.
  * The options are skipped one at a time, never back: the single regex this replaced could match a
@@ -203,20 +223,83 @@ function matchAt(pattern: RegExp, text: string, index: number): RegExpExecArray 
  * back to calling a count the file (`head -n 5 | grep x` read `5`).
  */
 function extractCatLikePath(readStage: string): string | undefined {
-  const commands = /\b(?:cat|head|tail)\b\s+/gi
-  let command: RegExpExecArray | null
-  while ((command = commands.exec(readStage))) {
-    let index = command.index + command[0].length
-    for (;;) {
-      const option =
-        matchAt(CAT_LIKE_COUNT_OPTION, readStage, index) ?? matchAt(CAT_LIKE_OTHER_OPTION, readStage, index)
-      if (!option) break
-      index += option[0].length
-    }
-    const filePath = matchAt(CAT_LIKE_PATH, readStage, index)?.[1]
-    if (filePath) return filePath
+  const words = readOperands(readStage)
+  if (!words || !/^(cat|head|tail)$/.test(words[0]?.text ?? '')) return undefined
+  for (let index = 1; index < words.length; index += 1) {
+    const word = words[index]
+    if (words[0].text !== 'cat' && /^(?:-[nc]|--lines|--bytes)$/.test(word.text)) { index += 1; continue }
+    if (word.text.startsWith('-')) continue
+    if (word.text === '<' || word.dynamic || word.text.startsWith('/dev/')) return undefined
+    return word.text
   }
   return undefined
+}
+
+/**
+ * Whether a command substitution (`$(…)` or a backtick) is still open at the end of `stage`, outside
+ * single quotes. `firstPipelineStage` cuts at the first `|` outside quotes, even one inside
+ * `$(… | head -1)`, so such a stage ends inside the substitution and its last word is the
+ * substitution's, never the file the read names.
+ */
+function hasOpenSubstitution(stage: string): boolean {
+  let depth = 0
+  let backtick = false
+  let quote: string | null = null
+  for (let index = 0; index < stage.length; index += 1) {
+    const char = stage[index]
+    if (quote === "'") {
+      if (char === "'") quote = null
+      continue
+    }
+    if (char === '\\') {
+      index += 1
+    } else if (char === '"') {
+      quote = quote === '"' ? null : '"'
+    } else if (char === "'" && quote === null) {
+      quote = "'"
+    } else if (char === '`') {
+      backtick = !backtick
+    } else if (char === '$' && stage[index + 1] === '(') {
+      depth += 1
+      index += 1
+    } else if (char === ')' && depth > 0) {
+      depth -= 1
+    }
+  }
+  return depth > 0 || backtick
+}
+
+/** An output redirect word: `>out`, `2>/dev/null`, `2>&1`, `>&2`, `&>/dev/null`, or a bare `2>`. */
+function isNullRedirectTarget(target: string | null): boolean {
+  return target !== null && (target === '/dev/null' || /^\/dev\/fd\/\d+$/.test(target) || /^&(?:\d+|-)$/.test(target))
+}
+
+/** Find sed's literal file after its options and script; redirects are separate shell tokens. */
+function extractSedReadPath(readStage: string): string | undefined {
+  if (hasOpenSubstitution(readStage)) return undefined
+  const words = readOperands(readStage)
+  if (!words || words[0]?.text !== 'sed') return undefined
+  let hasScript = false
+  let endOptions = false
+  for (let index = 1; index < words.length; index += 1) {
+    const word = words[index]
+    if (word.text === '<') continue
+    if (word.text === '--') { endOptions = true; continue }
+    if (endOptions) return word.dynamic ? undefined : word.text
+    if (/^(?:-e|-f|--expression|--file)$/.test(word.text)) { hasScript = true; index += 1; continue }
+    if (/^(?:-[ef].+|--(?:expression|file)=)/.test(word.text)) { hasScript = true; continue }
+    if (word.text.startsWith('-')) continue
+    if (!hasScript) { hasScript = true; continue }
+    return word.dynamic || word.text.startsWith('/dev/') ? undefined : word.text
+  }
+  return undefined
+}
+
+/** Remove output redirects and their destinations before finding a read operand. */
+function readOperands(command: string): ShellWord[] | null {
+  if (summarizeShellSimpleCommands(command).some((item) => item.outputRedirectTargets.some((target) => !isNullRedirectTarget(target)))) return null
+  const words = splitShellSimpleCommands(command)[0] ?? []
+  return words.filter((word, index) => !word.outputRedirect && !words[index - 1]?.outputRedirect)
 }
 
 function extractPathFromReadCommand(shellCommand: string): string | undefined {
@@ -228,12 +311,7 @@ function extractPathFromReadCommand(shellCommand: string): string | undefined {
   const catLikePath = extractCatLikePath(readStage)
   if (catLikePath) return catLikePath
 
-  const sedMatch = readStage.match(
-    /\bsed\b[\s\S]*?\s(?:['"]?)([^'"`\s|><]+)(?:['"]?)\s*$/i
-  )
-  if (sedMatch?.[1]) return sedMatch[1].trim()
-
-  return undefined
+  return extractSedReadPath(readStage)
 }
 
 function extractLeadingCommandName(command: string): string {
@@ -353,12 +431,9 @@ function extractApplyPatchTargetPath(shellCommand: string): string | undefined {
 }
 
 function extractRedirectPath(shellCommand: string): string | undefined {
-  const match = shellCommand.match(/(?:^|\s)(?:\d*>>|\d*>|>>|>)\s*(['"]?)([^'"`><\s]+)\1/)
-  const candidate = match?.[2]?.trim()
-  if (!candidate) return undefined
-  if (candidate.startsWith('&')) return undefined
-  if (candidate === '/dev/null' || candidate.startsWith('/dev/fd/')) return undefined
-  return candidate
+  return summarizeShellSimpleCommands(shellCommand)
+    .flatMap((command) => command.outputRedirectTargets)
+    .find((target): target is string => target !== null && !isNullRedirectTarget(target))
 }
 
 /** One word of a command line, after the shell's quote and backslash removal. */
@@ -368,6 +443,8 @@ interface ShellWord {
   dynamic: boolean
   /** This word contains an output-redirection `>` that was outside quotes/backslash escaping. */
   outputRedirect: boolean
+  /** A real shell redirect operator, never quoted argument text. */
+  redirectOperator?: boolean
 }
 
 const SHELL_WORD_BREAK = /\s/
@@ -501,7 +578,19 @@ function splitShellSimpleCommands(line: string): ShellWord[][] {
       inWord = true
       continue
     }
-    if (char === '>') outputRedirect = true
+    if (char === '>' || char === '<') {
+      const descriptor = /^\d+$/.test(text) || text === '&' ? text : ''
+      if (descriptor) { text = ''; inWord = false }
+      else endWord()
+      let operator = descriptor + char
+      if (next === char || next === '&' || (char === '>' && next === '|')) {
+        operator += next
+        index += 1
+      }
+      if (operator.endsWith('<<') && line[index + 1] === '-') { operator += '-'; index += 1 }
+      words.push({ text: operator, dynamic: false, outputRedirect: char === '>', redirectOperator: true })
+      continue
+    }
     if (char === '#' && !inWord) break
     if (SHELL_WORD_BREAK.test(char)) {
       if (char === '\n') endCommand()
@@ -546,6 +635,8 @@ function shellProgramName(word: ShellWord): string {
 export interface ShellSimpleCommandSummary {
   /** The first non-assignment word's basename, lowercased; null for assignment-only commands. */
   program: string | null
+  /** Actual executable word before basename normalization. */
+  commandWord: string | null
   /** Shell-unquoted words, retained so policy can classify each operation independently. */
   words: string[]
   /** Literal redirect destinations; null means a redirect target could not be proven. */
@@ -561,19 +652,23 @@ export interface ShellSimpleCommandSummary {
  */
 export function summarizeShellSimpleCommands(line: string): ShellSimpleCommandSummary[] {
   return splitShellSimpleCommands(line).map((words) => {
-    const commandWord = words.find((word) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(word.text))
+    const commandWord = words.find((word, index) => !word.redirectOperator &&
+      !words[index - 1]?.redirectOperator && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(word.text))
     const outputRedirectTargets: Array<string | null> = []
     for (let index = 0; index < words.length; index += 1) {
       const word = words[index]
       if (!word.outputRedirect) continue
       const lastRedirect = word.text.lastIndexOf('>')
       let target = lastRedirect >= 0 ? word.text.slice(lastRedirect + 1) : ''
+      if (target === '&') target += words[index + 1]?.text ?? ''
       if (target.startsWith('|')) target = target.slice(1)
-      if (!target) target = words[index + 1]?.text ?? ''
+      if (!target) target = words[index + 1]?.dynamic ? '' : words[index + 1]?.text ?? ''
+      if (word.text.endsWith('>&') && target && !target.startsWith('&')) target = `&${target}`
       outputRedirectTargets.push(target || null)
     }
     return {
       program: commandWord ? shellProgramName(commandWord) : null,
+      commandWord: commandWord?.text ?? null,
       words: words.map((word) => word.text),
       outputRedirectTargets,
       dynamic: words.some((word) => word.dynamic)
@@ -1025,8 +1120,7 @@ export function mapBashCommandToRendererTool(command: string): BashToolMapping {
     }
   }
 
-  const applyPatchLine = commandLines.find((line) => line.toLowerCase().includes('apply_patch'))
-  if (applyPatchLine) {
+  if (isManagedApplyPatchCommand(shellCommand) && extractManagedApplyPatchDocument(shellCommand)) {
     const filePath = extractApplyPatchTargetPath(shellCommand)
     return {
       toolName: 'batshit_server_edit_file',

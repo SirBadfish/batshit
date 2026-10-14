@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, untrack } from 'svelte'
+  import { onDestroy, onMount, untrack } from 'svelte'
   import { debounce } from '$lib/utils/debounce'
   import * as Card from '$lib/components/ui/card'
   import * as Collapsible from '$lib/components/ui/collapsible'
@@ -31,9 +31,13 @@
   // SA-124 P8: the programs whose own API can actually load a model. The other
   // three (llama.cpp, vLLM, SGLang) take one model per process from a launch
   // flag, so they keep the read-only Detected Models card.
-  const MANAGEABLE_PROGRAMS = new Set(['koboldcpp', 'lmstudio', 'omlx'])
+  const MANAGEABLE_PROGRAMS = new Set(['koboldcpp', 'lmstudio', 'omlx', 'ollama', 'llama-cpp'])
   import type { UserSettingsRow } from '$lib/types/database'
-  import { dispatchLocalAiSettingsUpdated } from '$lib/utils/liveSettingsEvents'
+  import {
+    dispatchLocalAiSettingsUpdated,
+    LIVE_SETTINGS_EVENTS,
+    type ModelConnectionsUpdatedDetail
+  } from '$lib/utils/liveSettingsEvents'
 
   const SAVE_DEBOUNCE_MS = 600
   const IMAGE_TRANSPORT_OPTIONS: Array<{ value: LocalAiImageTransport; label: string; helper: string }> = [
@@ -68,14 +72,24 @@
 
   let servers = $state<LocalAiServerSummary[]>([...defaultServers])
 
+  const LOAD_FAILED_MESSAGE = 'Failed to load local AI servers'
+
   let isLoading = $state(true)
   let loadError = $state<string | null>(null)
+  // BL-962: `servers` holds saved values only after a real read of `/api/settings/local-ai`
+  // succeeded. Until then it holds the built-in defaults, which may never be written back: the
+  // route writes a whole record for every server it is sent, so a save built from the defaults
+  // erases every saved address and switch. The server cards are not offered then, and the
+  // autosave returns. Once a read succeeded the copy stays, and a later failed Reload keeps it
+  // (it never swaps it for the defaults).
+  let settingsLoaded = $state(false)
   let saveState = $state<'idle' | 'saving' | 'saved'>('idle')
   let saveError = $state<string | null>(null)
   let persistedSignature = $state(makeSignature(defaultServers))
 
   type ServerStatus = {
-    state: 'unknown' | 'checking' | 'online' | 'offline'
+    state: 'unknown' | 'checking' | 'online' | 'unreachable' | 'access-required'
+    identity: string
     message?: string
   }
 
@@ -84,17 +98,54 @@
   type ModelListState = {
     state: 'idle' | 'loading' | 'loaded' | 'error'
     models: string[]
+    identity: string
     error?: string
   }
 
   let modelListState = $state<Record<string, ModelListState>>({})
+  let serverReadVersion = $state(0)
+  let apiKeyReadVersion = $state(0)
+  let endpointDraftVersions = $state<Record<string, number>>({})
+  const statusRequestVersions = new Map<string, number>()
+  const modelListRequestVersions = new Map<string, number>()
 
   function toggleServerOpen(id: string) {
     openServerId = openServerId === id ? null : id
   }
 
-  onMount(async () => {
-    await loadServers()
+  onMount(() => {
+    const refreshOpenServer = () => {
+      const server = servers.find((row) => row.id === openServerId)
+      if (server?.enabled) void checkServer(server)
+    }
+    const handleModelConnectionsUpdated = (event: Event) => {
+      const detail = (event as CustomEvent<ModelConnectionsUpdatedDetail>).detail
+      if (detail?.source === 'api-keys') {
+        // The actual key stays in the encrypted server store. This version marks status reads
+        // from before a key edit as stale without putting secret material in browser state.
+        apiKeyReadVersion += 1
+        refreshOpenServer()
+      } else if (detail?.source === 'local-ai') {
+        refreshOpenServer()
+      }
+    }
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') refreshOpenServer()
+    }
+    window.addEventListener(LIVE_SETTINGS_EVENTS.modelConnectionsUpdated, handleModelConnectionsUpdated)
+    window.addEventListener('focus', refreshOpenServer)
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    void loadServers()
+    return () => {
+      window.removeEventListener(LIVE_SETTINGS_EVENTS.modelConnectionsUpdated, handleModelConnectionsUpdated)
+      window.removeEventListener('focus', refreshOpenServer)
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+    }
+  })
+
+  onDestroy(() => {
+    statusRequestVersions.clear()
+    modelListRequestVersions.clear()
   })
 
   async function loadServers() {
@@ -104,65 +155,165 @@
     try {
       const response = await fetch('/api/settings/local-ai')
       if (!response.ok) {
-        throw new Error('Failed to load local AI servers')
+        // The route's own words when it sent some ({ error } or { message } as JSON); the plain
+        // sentence when the answer is not JSON or names nothing.
+        const body = await response.json().catch(() => null)
+        const detail = [body?.error, body?.message].find(
+          (value): value is string => typeof value === 'string' && value.trim().length > 0
+        )
+        throw new Error(detail?.trim() ?? LOAD_FAILED_MESSAGE)
       }
       const payload = await response.json()
-      servers = payload?.servers ?? defaultServers
+      // An answer with no server list is not a read of the saved servers.
+      if (!Array.isArray(payload?.servers)) {
+        throw new Error(LOAD_FAILED_MESSAGE)
+      }
+      servers = payload.servers
+      serverReadVersion += 1
       persistedSignature = makeSignature(servers)
       modelListState = {}
+      settingsLoaded = true
     } catch (error) {
       console.error('Failed to load local AI servers:', error)
-      loadError = error instanceof Error ? error.message : 'Failed to load local AI servers'
-      servers = [...defaultServers]
-      persistedSignature = makeSignature(servers)
-      modelListState = {}
+      // BL-962: a failed read changes nothing but the failure. `servers` stays what it was (the
+      // defaults before a first good read, the loaded copy after one).
+      loadError = error instanceof Error ? error.message : LOAD_FAILED_MESSAGE
     } finally {
       isLoading = false
     }
   }
 
-  function updateStatus(id: string, next: ServerStatus) {
-    serverStatus = {
-      ...serverStatus,
-      [id]: next
+  function endpointIdentity(server: LocalAiServerSummary) {
+    return JSON.stringify([
+      server.baseUrl,
+      server.openaiPath,
+      server.enabled,
+      serverReadVersion,
+      apiKeyReadVersion,
+      endpointDraftVersions[server.id] ?? 0
+    ])
+  }
+
+  function bumpEndpointDraftVersion(id: string) {
+    endpointDraftVersions = {
+      ...endpointDraftVersions,
+      [id]: (endpointDraftVersions[id] ?? 0) + 1
     }
   }
 
-  async function checkServer(server: LocalAiServerSummary) {
-    const target = `${server.baseUrl}${server.openaiPath}/models`
-    updateStatus(server.id, { state: 'checking' })
+  function currentServer(id: string) {
+    return servers.find((server) => server.id === id)
+  }
+
+  function statusFor(server: LocalAiServerSummary) {
+    const status = serverStatus[server.id]
+    return status?.identity === endpointIdentity(server) ? status : undefined
+  }
+
+  function modelListFor(server: LocalAiServerSummary) {
+    const list = modelListState[server.id]
+    return list?.identity === endpointIdentity(server) ? list : undefined
+  }
+
+  function nextRequestVersion(versions: Map<string, number>, id: string) {
+    const version = (versions.get(id) ?? 0) + 1
+    versions.set(id, version)
+    return version
+  }
+
+  function updateStatus(id: string, identity: string, next: Omit<ServerStatus, 'identity'>) {
+    serverStatus = {
+      ...serverStatus,
+      [id]: { ...next, identity }
+    }
+  }
+
+  function canonicalBaseUrl(value: string) {
+    return value.trim().replace(/\/+$/, '')
+  }
+
+  function canonicalOpenAiPath(value: string) {
+    const trimmed = value.trim().replace(/\/+$/, '')
+    return trimmed || ''
+  }
+
+  async function readAvailability(server: LocalAiServerSummary) {
+    const identity = endpointIdentity(server)
+    const statusRequestVersion = nextRequestVersion(statusRequestVersions, server.id)
+    const listRequestVersion = nextRequestVersion(modelListRequestVersions, server.id)
+    updateStatus(server.id, identity, { state: 'checking' })
+    updateModelList(server.id, identity, { state: 'loading', models: [] })
+
+    const isCurrentRequest = () =>
+      statusRequestVersions.get(server.id) === statusRequestVersion &&
+      modelListRequestVersions.get(server.id) === listRequestVersion &&
+      endpointIdentity(currentServer(server.id) ?? server) === identity
+
+    const setCurrentStatus = (next: Omit<ServerStatus, 'identity'>) => {
+      if (isCurrentRequest()) updateStatus(server.id, identity, next)
+    }
+    const setCurrentList = (next: Omit<ModelListState, 'identity'>) => {
+      if (isCurrentRequest()) updateModelList(server.id, identity, next)
+    }
 
     const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), 4000)
+    const timeout = setTimeout(() => controller.abort(), 10_000)
 
     try {
-      const response = await fetch(target, { signal: controller.signal })
-      if (response.ok) {
-        updateStatus(server.id, { state: 'online' })
-      } else if (response.status === 401 || response.status === 403) {
-        // SA-102 P5 (DL-102-09): a program that is running fine but wants a key
-        // must not read as "offline". Josh's oMLX answered 401 for weeks.
-        updateStatus(server.id, {
-          state: 'offline',
-          message: `${server.label} is running but needs an API key. Add one under Settings -> API Keys -> Local AI, or turn its key check off in ${server.label}.`
-        })
+      const response = await fetch(
+        `/api/settings/local-ai/models?program=${encodeURIComponent(server.id)}&mode=availability`,
+        { signal: controller.signal }
+      )
+      const payload = await response.json().catch(() => null)
+      if (!response.ok || payload?.success !== true) {
+        throw new Error(payload?.error || payload?.message || 'Failed to check the saved Local AI connection.')
+      }
+
+      const savedEndpointMatchesDraft =
+        canonicalBaseUrl(payload.baseUrl ?? '') === canonicalBaseUrl(server.baseUrl) &&
+        canonicalOpenAiPath(payload.openaiPath ?? '') === canonicalOpenAiPath(server.openaiPath)
+      if (!savedEndpointMatchesDraft) {
+        const message = 'Save the connection before checking its availability.'
+        setCurrentStatus({ state: 'unknown', message })
+        setCurrentList({ state: 'error', models: [], error: message })
+        return
+      }
+
+      if (payload.availability === 'reachable') {
+        if (!Array.isArray(payload.models?.data)) {
+          throw new Error('The saved connection did not return a valid model list.')
+        }
+        const models = parseModelList(payload.models)
+        setCurrentStatus({ state: 'online' })
+        setCurrentList({ state: 'loaded', models })
+      } else if (payload.availability === 'access-required') {
+        const message = payload.message || 'The program requires a valid API key. Check Settings -> API Keys -> Local AI.'
+        setCurrentStatus({ state: 'access-required', message })
+        setCurrentList({ state: 'error', models: [], error: message })
+      } else if (payload.availability === 'unreachable') {
+        const message = payload.message || 'Batshit could not reach the saved connection.'
+        setCurrentStatus({ state: 'unreachable', message })
+        setCurrentList({ state: 'error', models: [], error: message })
       } else {
-        updateStatus(server.id, { state: 'offline', message: `HTTP ${response.status}` })
+        throw new Error('The Local AI availability route returned an unknown status.')
       }
     } catch (error) {
-      updateStatus(server.id, {
-        state: 'offline',
-        message: error instanceof Error ? error.message : 'Connection failed'
-      })
+      const message = error instanceof Error ? error.message : 'Failed to check Local AI availability.'
+      setCurrentStatus({ state: 'unreachable', message })
+      setCurrentList({ state: 'error', models: [], error: message })
     } finally {
       clearTimeout(timeout)
     }
   }
 
-  function updateModelList(id: string, next: ModelListState) {
+  async function checkServer(server: LocalAiServerSummary) {
+    await readAvailability(server)
+  }
+
+  function updateModelList(id: string, identity: string, next: Omit<ModelListState, 'identity'>) {
     modelListState = {
       ...modelListState,
-      [id]: next
+      [id]: { ...next, identity }
     }
   }
 
@@ -185,34 +336,7 @@
   }
 
   async function loadModelList(server: LocalAiServerSummary) {
-    const target = `${server.baseUrl}${server.openaiPath}/models`
-    updateModelList(server.id, { state: 'loading', models: [] })
-
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), 4000)
-
-    try {
-      const response = await fetch(target, { signal: controller.signal })
-      if (!response.ok) {
-        updateModelList(server.id, {
-          state: 'error',
-          models: [],
-          error: `HTTP ${response.status}`
-        })
-        return
-      }
-      const payload = await response.json().catch(() => null)
-      const models = parseModelList(payload)
-      updateModelList(server.id, { state: 'loaded', models })
-    } catch (error) {
-      updateModelList(server.id, {
-        state: 'error',
-        models: [],
-        error: error instanceof Error ? error.message : 'Failed to load models'
-      })
-    } finally {
-      clearTimeout(timeout)
-    }
+    await readAvailability(server)
   }
 
   function makeSignature(list: LocalAiServerSummary[]) {
@@ -315,7 +439,9 @@
   }, SAVE_DEBOUNCE_MS)
 
   $effect(() => {
-    if (isLoading) return
+    // BL-962: never a write built while no read of the saved servers succeeded (the cards are
+    // not offered then either; this line keeps the whole list from being sent if one ever is).
+    if (isLoading || !settingsLoaded) return
 
     const signature = makeSignature(servers)
     if (signature === persistedSignature) return
@@ -345,6 +471,8 @@
     const definition = LOCAL_AI_SERVER_DEFINITIONS.find((entry) => entry.id === serverId)
     if (!definition) return
 
+    bumpEndpointDraftVersion(serverId)
+
     servers = servers.map((server) =>
       server.id === serverId
         ? {
@@ -372,7 +500,7 @@
       </SettingsInfoMenu>
     </div>
 
-    {#if duplicateBaseUrlWarning}
+    {#if settingsLoaded && duplicateBaseUrlWarning}
       <Card.Root class="batshit-settings-card-info-callout">
         <Card.Content class="batshit-settings-card-content-spacious flex items-center gap-2">
           <AlertCircle class="h-4 w-4 shrink-0" />
@@ -381,7 +509,22 @@
       </Card.Root>
     {/if}
 
-    {#if loadError}
+    {#if !settingsLoaded && !isLoading}
+      <!-- BL-962: the server cards wait for a real read of the saved servers. -->
+      <div class="batshit-settings-inline-alert is-danger" data-testid="local-ai-load-error">
+        <div class="flex items-center justify-between gap-2">
+          <span>
+            Local AI servers could not load, so the server cards are hidden. Press Retry to load
+            them.
+            {#if loadError && loadError !== LOAD_FAILED_MESSAGE}Details: {loadError}{/if}
+          </span>
+          <Button variant="outline" size="sm" onclick={loadServers}>
+            <RefreshCw class="h-3.5 w-3.5" />
+            Retry
+          </Button>
+        </div>
+      </div>
+    {:else if loadError}
       <Card.Root class="batshit-settings-card-danger">
         <Card.Content class="batshit-settings-card-content-spacious flex items-center gap-2">
           <AlertCircle class="h-4 w-4 shrink-0" />
@@ -397,8 +540,9 @@
           Loading local AI settings...
         </Card.Content>
       </Card.Root>
-    {:else}
+    {:else if settingsLoaded}
       {#each servers as server (server.id)}
+        {@const visibleStatus = statusFor(server)}
         <Card.Root class="batshit-settings-card batshit-settings-card-default batshit-settings-l1-card">
           <Collapsible.Root open={openServerId === server.id}>
             <button
@@ -430,23 +574,29 @@
 
               <div class="flex flex-wrap items-center justify-end gap-2">
                 <Badge variant={server.supports.management ? 'secondary' : 'outline'}>
-                  {server.supports.management ? 'Managed' : 'Connect Only'}
+                  {server.supports.management ? 'Model Tools' : 'Connect Only'}
                 </Badge>
                 <Badge variant={server.source === 'stored' ? 'secondary' : 'outline'}>
                   {server.source === 'stored' ? 'Saved' : 'Default'}
                 </Badge>
-                <Badge variant={server.enabled ? 'secondary' : 'outline'}>
+                <Badge
+                  variant="outline"
+                  class={server.enabled ? 'batshit-settings-status-badge is-enabled' : 'batshit-settings-status-badge'}
+                >
                   {server.enabled ? 'Enabled' : 'Disabled'}
                 </Badge>
-                {#if serverStatus[server.id]?.state}
+                {#if visibleStatus && visibleStatus.state !== 'unknown'}
                   <Badge
-                    variant={serverStatus[server.id].state === 'online' ? 'secondary' : 'outline'}
+                    variant="outline"
+                    class={`batshit-settings-status-badge ${visibleStatus.state === 'online' ? 'is-success' : visibleStatus.state === 'access-required' ? 'is-warning' : visibleStatus.state === 'unreachable' ? 'is-danger' : ''}`}
                   >
-                    {serverStatus[server.id].state === 'checking'
+                    {visibleStatus.state === 'checking'
                       ? 'Checking'
-                      : serverStatus[server.id].state === 'online'
+                      : visibleStatus.state === 'online'
                         ? 'Online'
-                        : 'Offline'}
+                        : visibleStatus.state === 'access-required'
+                          ? 'Access Required'
+                          : 'Unreachable'}
                   </Badge>
                 {/if}
                 <ChevronDown
@@ -502,12 +652,13 @@
                         checked={server.enabled}
                         onCheckedChange={(checked) => {
                           const enabled = checked === true
+                          bumpEndpointDraftVersion(server.id)
                           servers = servers.map((row) =>
                             row.id === server.id ? { ...row, enabled } : row
                           )
                           if (!enabled) {
-                            updateStatus(server.id, { state: 'unknown' })
-                            updateModelList(server.id, { state: 'idle', models: [] })
+                            updateStatus(server.id, endpointIdentity(server), { state: 'unknown' })
+                            updateModelList(server.id, endpointIdentity(server), { state: 'idle', models: [] })
                           }
                         }}
                       />
@@ -528,6 +679,7 @@
                         value={server.baseUrl}
                         oninput={(event) => {
                           const target = event.currentTarget as HTMLInputElement
+                          bumpEndpointDraftVersion(server.id)
                           servers = servers.map((row) =>
                             row.id === server.id ? { ...row, baseUrl: target.value } : row
                           )
@@ -553,6 +705,7 @@
                         value={server.openaiPath}
                         oninput={(event) => {
                           const target = event.currentTarget as HTMLInputElement
+                          bumpEndpointDraftVersion(server.id)
                           servers = servers.map((row) =>
                             row.id === server.id ? { ...row, openaiPath: target.value } : row
                           )
@@ -647,7 +800,7 @@
                     <div class="batshit-settings-form-label">Management</div>
                     <div class="pt-1">
                       {server.supports.management
-                        ? `Batshit can manage models for ${server.label}.`
+                        ? `Available model tools depend on the native API exposed by ${server.label}.`
                         : `Manage models in ${server.label} itself.`}
                     </div>
                   </div>
@@ -669,12 +822,12 @@
                         size="sm"
                         variant="secondary"
                         onclick={() => checkServer(server)}
-                        disabled={!server.enabled || serverStatus[server.id]?.state === 'checking'}
+                        disabled={!server.enabled || statusFor(server)?.state === 'checking'}
                       >
-                        {serverStatus[server.id]?.state === 'checking' ? 'Checking…' : 'Check Status'}
+                        {statusFor(server)?.state === 'checking' ? 'Checking…' : 'Check Status'}
                       </Button>
-                      {#if serverStatus[server.id]?.message}
-                        <span class="batshit-settings-form-label">{serverStatus[server.id].message}</span>
+                      {#if statusFor(server)?.message}
+                        <span class="batshit-settings-form-meta is-warning">{statusFor(server)?.message}</span>
                       {/if}
                     </div>
                     <Button size="sm" variant="ghost" onclick={loadServers}>
@@ -723,6 +876,9 @@
                   </Card.Header>
                   <Card.Content class="batshit-settings-card-content-flush">
                     <DmrModelManager baseUrl={server.baseUrl} openaiPath={server.openaiPath} />
+                    <p class="batshit-settings-caption">
+                      Download/delete controls do not describe model residency. Native unloading can discard Docker Model Runner's per-model runtime configuration; use Docker's own residency controls.
+                    </p>
                   </Card.Content>
                 </Card.Root>
               {/if}
@@ -737,20 +893,27 @@
                       </Card.Title>
                       <SettingsInfoMenu ariaLabel={`About ${server.label} Models`} contentClass="w-80">
                         <p>
-                          Load and unload {server.label}'s models from here, so they appear in the
-                          model picker. Batshit asks {server.label} what it has rather than reading
-                          a folder, because only the program itself can load a model.
+                          Load keeps a model ready in memory. Unload releases it without deleting
+                          its files and can interrupt active work. Controls appear only when
+                          {server.label} exposes the required native API. llama.cpp needs router
+                          mode; KoboldCpp needs its existing admin configuration.
                         </p>
                       </SettingsInfoMenu>
                     </div>
                   </Card.Header>
                   <Card.Content class="batshit-settings-card-content-flush">
-                    <LocalAiModelManager programId={server.id} enabled={server.enabled} />
+                    <LocalAiModelManager
+                      programId={server.id}
+                      enabled={server.enabled}
+                      connectionReady={saveState !== 'saving' && makeSignature(servers) === persistedSignature}
+                      onAvailabilityChange={() => checkServer(currentServer(server.id) ?? server)}
+                    />
                   </Card.Content>
                 </Card.Root>
               {/if}
 
-              {#if server.supports.modelList && server.id !== 'ollama' && server.id !== 'dmr' && !MANAGEABLE_PROGRAMS.has(server.id)}
+              {#if server.supports.modelList && server.id !== 'ollama' && server.id !== 'dmr' && (!MANAGEABLE_PROGRAMS.has(server.id) || server.id === 'llama-cpp')}
+                {@const currentModelList = modelListFor(server)}
                 <Card.Root class="batshit-settings-card-subtle-frame">
                   <Card.Header class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                     <div class="flex items-center gap-1.5">
@@ -769,26 +932,31 @@
                       variant="outline"
                       size="sm"
                       onclick={() => loadModelList(server)}
-                      disabled={!server.enabled || modelListState[server.id]?.state === 'loading'}
+                      disabled={!server.enabled || currentModelList?.state === 'loading'}
                     >
                       <RefreshCw
-                        class={`${modelListState[server.id]?.state === 'loading' ? 'animate-spin' : ''}`}
+                        class={`${currentModelList?.state === 'loading' ? 'animate-spin' : ''}`}
                       />
                       Refresh
                     </Button>
                   </Card.Header>
                   <Card.Content>
-                    {#if modelListState[server.id]?.state === 'error'}
+                    {#if currentModelList?.state === 'error'}
                       <div class="flex items-center gap-2 text-yellow-600">
                         <AlertCircle class="h-4 w-4" />
                         <span class="batshit-settings-form-label">
-                          {modelListState[server.id]?.error ?? 'Failed to load models'}
+                          {currentModelList?.error ?? 'Failed to load models'}
                         </span>
                       </div>
-                    {:else if modelListState[server.id]?.state === 'loaded'}
-                      {#if modelListState[server.id]?.models.length}
+                    {:else if currentModelList?.state === 'loaded'}
+                      {#if server.id === 'vllm' || server.id === 'sglang'}
+                        <p class="batshit-settings-caption">
+                          This server loads its model at startup. Its memory release/resume controls affect the whole engine and can interrupt work; individual model Load/Unload is unavailable here.
+                        </p>
+                      {/if}
+                      {#if currentModelList?.models.length}
                         <div class="space-y-2">
-                          {#each modelListState[server.id]?.models ?? [] as model}
+                          {#each currentModelList?.models ?? [] as model}
                             <div class="batshit-settings-model-row flex items-center justify-between">
                               <span class="truncate">{model}</span>
                             </div>

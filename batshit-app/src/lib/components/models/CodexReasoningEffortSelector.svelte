@@ -3,6 +3,7 @@
   import * as DropdownMenu from '$lib/components/ui/dropdown-menu'
   import { toast } from 'svelte-sonner'
   import * as agentStore from '$lib/stores/agents.svelte'
+  import { chatBarBlockSave } from '$lib/utils/chatBarBlockSave'
   import {
     CODEX_SUBMODEL_CHOICES,
     CODEX_XHIGH_REASONING_HELPER_TEXT,
@@ -98,18 +99,21 @@
     const clamped = nextReasoning === 'xhigh' && !allowsXhigh ? 'high' : nextReasoning
 
     try {
+      const viewedSettings = withDefaults(currentAgent.codex_settings, selectedModel)
       const nextSettings = withDefaults(currentAgent.codex_settings, selectedModel)
       nextSettings.reasoningEffort = clamped
 
-      const nextProviderSettings = { ...(currentAgent.provider_specific_settings ?? {}) }
-      if (clamped === 'default') {
-        delete nextProviderSettings.codex_reasoning_effort
-      } else {
-        nextProviderSettings.codex_reasoning_effort = clamped
-      }
+      // BL-833: only its own key (the server keeps every other key, the model keys included);
+      // Default removes it (BL-514: a key left out of a save is kept, null removes it).
+      const nextProviderSettings = { codex_reasoning_effort: clamped === 'default' ? null : clamped }
 
+      // BL-848: and in the Codex settings only the reasoning effort, always sent (a pick the copy
+      // already shows must still write it: the record may hold another); the server writes that
+      // block key by key, so every other key stays.
       await agentStore.updateAgentSettings(currentAgent.id, {
-        codex_settings: nextSettings,
+        ...chatBarBlockSave('codex_settings', currentAgent.codex_settings, viewedSettings, nextSettings, {
+          group: ['reasoningEffort']
+        }),
         provider_specific_settings: nextProviderSettings
       })
     } catch (error) {
@@ -144,7 +148,7 @@
           value={option.value}
           onSelect={() => handleSelect(option.value)}
           class={`mode-item flex items-center gap-2 border-l-2 border-r-2 pl-2 pr-2 ${
-            option.value === selectedReasoning ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground'
+            option.value === selectedReasoning ? 'border-primary-text text-foreground' : 'border-transparent text-muted-foreground'
           }`}
         >
           <Brain class="h-4 w-4 shrink-0" />

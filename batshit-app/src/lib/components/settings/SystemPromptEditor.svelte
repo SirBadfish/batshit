@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte'
   import * as Sheet from '$lib/components/ui/sheet'
   import {
   Button } from '$lib/components/ui/button'
@@ -33,13 +34,36 @@
   }: Props = $props()
 
   let editedPrompt = $state(prompt)
+  // The saved prompt the draft is lined up with: the one the editor opened with, or the last one it
+  // followed. `null` while the editor is closed. It tells an untouched draft (follow a new saved
+  // prompt) from an edited one (keep it, and say the saved prompt changed).
+  let draftBase = $state<string | null>(null)
   let hasChanges = $derived(editedPrompt !== prompt)
+  const savedPromptChangedWhileEditing = $derived(
+    draftBase !== null && prompt !== draftBase && editedPrompt !== prompt
+  )
 
-  // Reset edited prompt when dialog opens or prompt changes
+  // BL-894 (BL-816's rule for this editor): the draft is taken when the editor OPENS, never on every
+  // `prompt` change. The only values that may re-run this effect are `open` and `prompt`;
+  // everything it writes (and the `draftBase` / `editedPrompt` it compares) is read inside `untrack`.
   $effect(() => {
-    if (open) {
-      editedPrompt = prompt
-    }
+    const isOpen = open
+    const saved = prompt
+    untrack(() => {
+      if (!isOpen) {
+        draftBase = null
+        return
+      }
+      if (draftBase === null) {
+        editedPrompt = saved
+        draftBase = saved
+        return
+      }
+      if (saved !== draftBase && editedPrompt === draftBase) {
+        editedPrompt = saved
+        draftBase = saved
+      }
+    })
   })
 
   function handleSave() {
@@ -57,6 +81,10 @@
 
   // Handle keyboard shortcuts
   function handleKeydown(e: KeyboardEvent) {
+    // BL-891: only this editor's own sheet hears its keys (the handler is on `Sheet.Content`, not on
+    // the window: five files mount this editor, and a closed editor's draft can be older than its
+    // prompt). `open` is asked as well, for the sheet's close animation.
+    if (!open) return
     // Cmd/Batshit + S to save
     if ((e.metaKey || e.ctrlKey) && e.key === 's' && !readOnly) {
       e.preventDefault()
@@ -78,13 +106,12 @@
   }
 </script>
 
-<svelte:window onkeydown={handleKeydown} />
-
 <Sheet.Root bind:open>
   <Sheet.Content
     side="left"
     class="{widthClasses[width]} overflow-hidden flex flex-col h-full"
     onInteractOutside={(e: Event) => e.preventDefault()}
+    onkeydown={handleKeydown}
   >
     <Sheet.Header class="batshit-settings-editor-header">
       <Sheet.Title class="text-xl">{title}</Sheet.Title>
@@ -94,6 +121,22 @@
     </Sheet.Header>
 
     <div class="batshit-settings-editor-body flex-1 overflow-y-auto">
+      {#if savedPromptChangedWhileEditing}
+        <div
+          class="batshit-settings-inline-alert is-warning mb-4 flex gap-3"
+          data-testid="system-prompt-editor-saved-value-changed"
+        >
+          <AlertCircle class="h-4 w-4 flex-shrink-0 mt-0.5" />
+          <div>
+            <h5 class="batshit-settings-form-label is-warning">Saved prompt changed</h5>
+            <p class="text-sm text-muted-foreground mt-1">
+              The saved prompt changed while you were editing. Your text is kept, and saving replaces the
+              saved prompt with it. Cancel discards your text.
+            </p>
+          </div>
+        </div>
+      {/if}
+
       {#if warning}
         <div class="batshit-settings-inline-alert is-danger mb-4 flex gap-3">
           <AlertCircle class="h-4 w-4 text-destructive flex-shrink-0 mt-0.5" />

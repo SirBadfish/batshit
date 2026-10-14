@@ -29,6 +29,8 @@ export interface GatewayToolsResponse {
 
 export function isHiddenInternalTool(toolName: string): boolean {
   const normalized = toolName.toLowerCase()
+  // Keep the retired file-server MCP name hidden in cached and live gateway discovery.
+  // The managed CLI Fetch Zip helper is a separate bridge, not a gateway selection.
   return (
     normalized.startsWith('mcp_fabric_') ||
     normalized.startsWith('batshit_server_dynamic_mcp_') ||

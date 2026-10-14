@@ -1,10 +1,16 @@
 <script lang="ts">
+  import { isAcceptedGroupNoReplyCompletion } from '$lib/utils/groupNoReplyCompletion'
+  import { cliContextSettingsKey, resolveEffectiveAgentCliModel } from '$lib/utils/cliContextWindow'
+  import type { LocalContextBudgetEvidence } from '$lib/types/localContextBudget'
+  import { buildContextPreviewIdentity } from '$lib/utils/contextPreviewIdentity'
+  import { resolveRuntimeModelSelection } from '$lib/utils/modelPresetRuntime'
   import { page } from '$app/state'
   import { readApprovalResumeStart, isNewApprovalResume, approvalResumeStartPatch } from '$lib/utils/approvalResumeStream'
   import { goto } from '$app/navigation'
   import ChatArea from '$lib/components/chat/ChatArea.svelte'
   import ChatInput from '$lib/components/chat/ChatInput.svelte'
   import TokenPanel from '$lib/components/tokens/TokenPanel.svelte'
+  import { isChatgptPlanConnection } from '$lib/utils/chatgptPlanConnection'
   import { LOCAL_AI_SERVER_DEFINITIONS } from '$lib/data/localAiServers'
   import CompactArtifactShelf from '$lib/components/artifacts/CompactArtifactShelf.svelte'
   import ProjectsSidebar from '$lib/components/projects/ProjectsSidebar.svelte'
@@ -12,6 +18,15 @@
   import IconColumn from '$lib/components/artifacts/IconColumn.svelte'
   import GoonDock from '$lib/components/goons/GoonDock.svelte'
   import ExecutionViewerSheet from '$lib/components/chat/ExecutionViewerSheet.svelte'
+  import { createAppActionsDocument, type AppActionsAPI, type AppActionsDocument } from '$lib/appActions/document'
+  import { createAppActionsBrowserTransport } from '$lib/appActions/browserTransport'
+  import { APP_ACTION_FILE_DEADLINE_MS } from '$lib/appActions/fileProtocol'
+  import { dispatchVoiceDockQuickAction } from '$lib/appActions/voice/dockProjection'
+  import {
+    appActionAvailability, appActionHandler, appActionObservation, performDockAction,
+    registerAppAction, registerAppActionObservation, retireAppActionNavigation,
+    type ActionContext
+  } from '$lib/appActions/owners'
   import DmInboxDrawer from '$lib/components/chat/DmInboxDrawer.svelte'
   import MissedSchedulesDialog from '$lib/components/schedules/MissedSchedulesDialog.svelte'
   import DmInboxIndicator from '$lib/components/chat/DmInboxIndicator.svelte'
@@ -47,6 +62,7 @@
   import { artifactService } from '$lib/services/artifactService'
   import { onMount, onDestroy, tick, untrack } from 'svelte'
   import { toast } from 'svelte-sonner'
+  import { scopeToastOptions } from '$lib/components/ui/sonner/toast-scope'
   import { QUICK_ACTION_EVENT, type QuickActionMark } from '$lib/utils/jevJuiceQuickActions'
   import * as savedModelsStore from '$lib/stores/savedModels.svelte'
   import * as projectStore from '$lib/stores/projects.svelte'
@@ -141,6 +157,7 @@
   import {
     LIVE_SETTINGS_EVENTS,
     dispatchSessionClipStateChanged,
+    resolveServerClipStateSource,
     type DesktopGoonPreferencesUpdatedDetail
   } from '$lib/utils/liveSettingsEvents'
   import { logger } from '$lib/utils/logger'
@@ -149,23 +166,31 @@
     normalizePrimaryAgentType,
     shouldShowReasoningByDefaultForPrimaryAgent
   } from '$lib/utils/primaryAgentType'
-  import { setUserSettings, getUserSettings } from '$lib/stores/userSettings.svelte'
-  import { waitForReplyTarget, waitUntilReplyIsOver } from '$lib/utils/replyEndWait'
+  import { confirmUserSettings, failUserSettingsRead, getUserSettings, getUserSettingsReadState, resetUserSettings } from '$lib/stores/userSettings.svelte'
+  import { applyClaudeApprovalCardEvent, settleClaudeApprovalCard } from '$lib/utils/claudeApprovalCard'
+  import {
+    buildStopFallbackContent,
+    shouldAcceptLateEndAfterStopFallback,
+    stripUnfinalizedReplyControl
+  } from '$lib/utils/replyEndSave'
+  import { sanitizeFinishedReplyContent } from '$lib/utils/replyEndContent'
   import { postSendRouted } from '$lib/services/sendRoutedClient'
   import {
     classifySteerRefusal,
+    isQuietQueuedSendAnswer,
     isSteerDeliver,
+    placeUserMessageLast,
+    readHeldForApprovalCard,
+    readQueuedSendNotice,
     replayableSendMetadata,
     resolveBusySendActions,
     resolveBusySendMode,
-    resolveQueuedSendAfterWait,
     resolveStopInterruptionStamp,
-    QUEUE_ONE_AT_A_TIME_SENTENCE,
-    QUEUE_ONE_AT_A_TIME_TEXT_SENTENCE,
+    restampResentMessage,
+    shouldClearKeptReceipt,
     STEER_REFUSED_GROUP_SENTENCE,
     STEER_REFUSED_UNKNOWN_SENTENCE,
     type BusySendMode,
-    type QueuedSendAfterWait,
     type SteerDeliver,
     type StopInterruptionRecord
   } from '$lib/utils/steerControl'
@@ -174,9 +199,13 @@
     forgetJevJuicePostTurnRecords,
     refreshJevJuicePostTurnRecords
   } from '$lib/stores/jevJuicePostTurn.svelte'
+  import {
+    forgetCodexCleanupWarnings,
+    refreshCodexCleanupWarnings
+  } from '$lib/stores/codexCleanupWarnings.svelte'
+  import { forgetImageOrigins, refreshImageOrigins, markImageOriginExpected } from '$lib/stores/imageAddressOrigins.svelte'
   import { stripGatewayPrefix } from '$lib/utils/toolNameFormatter'
   import { THINKING_INDICATOR, isThinkingIndicator } from '$lib/utils/thinkingIndicator'
-  import { normalizeId } from '$lib/utils/idNormalizer'
   import type { ExecutionSnapshot } from '$lib/types/executionViewer'
   import {
     applyManualTrimToMessages,
@@ -194,13 +223,40 @@
     getContextCompactionState,
     resolveAutoCompactTriggerTokens,
     resolveEffectiveAutoCompactSettings,
-    selectMessagesForCompaction
+    selectMessagesForCompaction,
+    hasPendingCompactApproval,
+    COMPACT_PENDING_APPROVAL_MESSAGE
   } from '$lib/utils/contextCompaction'
-  import { applyFixedSessionGraduationToMessages } from '$lib/utils/fixedSessionGraduation'
+  import {
+    STOPPED_COMPACT_MESSAGE,
+    createCompactStopTracker,
+    holdAutoCompactAfterStop,
+    isAutoCompactHeldAfterStop,
+    isStoppedCompactAnswer,
+    releaseAutoCompactHoldOnReplyEnd,
+    resolveStopTarget,
+    type AutoCompactStopHolds
+  } from '$lib/utils/compactStopTarget'
+  import {
+    resolveChatsToCatchUpAfterUserChannelReturn,
+    resolveRepliesEndedWhileAway,
+    shouldCatchUpChatAfterReconnect
+  } from '$lib/utils/reconnectCatchUp'
+  import {
+    COMPACT_TURN_RUNNING_RETRY_MS,
+    resolveCompactTurnRunning,
+    type CompactTurnRunningHandling
+  } from '$lib/utils/compactTurnRunning'
+  import { resolveCompactEndedEarly } from '$lib/utils/compactEndedEarly'
+  import { isSilentAutoCompactNoCandidates } from '$lib/utils/compactNoCandidates'
+  import {
+    applyFixedSessionGraduationToMessages,
+    describeNapEndedEarly
+  } from '$lib/utils/fixedSessionGraduation'
   import { isFixedSession } from '$lib/utils/fixedSession'
   import { describeSessionOrigin, resolveSessionOrigin } from '$lib/utils/sessionOrigin'
   import { sessionOriginIcon } from '$lib/utils/sessionOriginIcons'
-  import { onUserChannelEvent } from '$lib/services/userChannel'
+  import { onUserChannelEvent, isUserChannelConnected } from '$lib/services/userChannel'
   import { buildSessionMessagesForSend } from '$lib/utils/sessionSendMessages'
   import { createChatLoadQueue, watchSelectedSessionLoad } from '$lib/utils/selectedSessionLoad.svelte'
   import {
@@ -212,30 +268,25 @@
   } from '$lib/utils/sendInFlightGuards'
   import { evaluateActiveChatCapacity } from '$lib/utils/activeChatCapacity'
   import { dispatchVoiceEnginesUpdated } from '$lib/utils/voiceEngineEvents'
-  import { extractToolNotes, extractZipControl, resolveZipControlZipIds, stripZipControlBlocks } from '$lib/utils/zipControl'
-  import { buildControlErrorRecord } from '$lib/utils/controlTags'
+  import { refreshDeadCopies } from '$lib/stores/zipDeadCopies.svelte'
   import {
-    extractMemoryControls,
     isMemoryControlToolStep,
-    memorySaveHint,
     resolveAgentMemoryEnabled,
     resolveEffectiveMemoryWindow,
     resolveMemoryWindowSettings
   } from '$lib/utils/memoryControl'
-  import { stripLeadingSubagentZipEcho } from '$lib/utils/subagentEchoSanitizer'
   import { RealtimeSpeechCoordinator } from '$lib/services/realtimeSpeechCoordinator'
   import { resolveSseEventSessionId } from '$lib/utils/sseSessionGuard'
   import { SseEventDeduper } from '$lib/utils/sseEventDedupe'
   import {
     collectTrustedClipIdsFromMetadata,
-    collectTrustedZipIdsFromMetadata,
-    isConcreteZipId,
     neutralizeAllZipReferenceSyntax,
     neutralizeUntrustedClipReferenceSyntax
   } from '$lib/utils/zipReferenceSafety'
   import {
     buildToolStreamStateFromContent,
     composeToolStreamContent as composeToolStreamContentBase,
+    resetToolStreamStateFromContent,
     type ToolStreamState
   } from '$lib/utils/toolStreamState'
   import { subagentStore } from '$lib/stores/subagents.svelte'
@@ -368,23 +419,51 @@
       scheduleLiveContextPreview('zip-state', 250, { ignoreBusy: true })
     }
     window.addEventListener('batshit:zip-state-changed', handleZipStateChanged)
+    const refreshLocalContext = () => {
+      localConnectionRevision += 1
+      localContextClock = Date.now()
+      if (activeLocalProgramDefinition) scheduleLiveContextPreview('local-model', 0)
+    }
+    window.addEventListener(LIVE_SETTINGS_EVENTS.modelConnectionsUpdated, refreshLocalContext)
+    window.addEventListener('focus', refreshLocalContext)
+    const localContextTimer = setInterval(() => {
+      localContextClock = Date.now()
+      if (activeLocalProgramDefinition && document.visibilityState === 'visible') {
+        scheduleLiveContextPreview('local-model', 0)
+      }
+    }, 15_000)
 
     // SA-113 P1 (DL-113-06): a woken turn streams into a session the browser never sent
     // to, so nothing here knows when it finished. The user channel says so; refetch the
     // finished messages when the chat on screen is the one that just ended.
     const stopUserChannelListener = onUserChannelEvent((event) => {
-      // SA-120 P5: the SERVER changed zip state for a session (Jev Juice smart zip, source
-      // `inferred`). Re-read it from Redis when that chat is on screen, in every tab.
+      // BL-382: the user channel came back; what it said meanwhile is gone (a woken turn's end,
+      // for one). Catch up each chat still streaming that has no chat subscription of its own (a
+      // chat with one catches up on that subscription's return, so none is read twice).
+      if (event?.type === 'reconnected') {
+        for (const sessionId of resolveChatsToCatchUpAfterUserChannelReturn({
+          runStates: Object.values(chatRunRegistry.getRunStates()),
+          chatsWithOwnSubscription: new Set(sseServices.keys())
+        })) {
+          void catchUpAfterReconnect(sessionId)
+        }
+        return
+      }
+      // The SERVER changed zip state for a session (Judge Juice smart zip, SA-120 P5; an agent's
+      // hold or release, or the countdown, SA-129 P2). Re-read it from Redis when that chat is on
+      // screen, in every tab.
       if (event?.type === 'zip_state_changed') {
         const changedSessionId =
           typeof (event as any).sessionId === 'string' ? (event as any).sessionId : null
         if (!changedSessionId || changedSessionId !== currentSessionId) return
+        // SA-129 P2: a reply that ended with no page (a woken turn) can make copies dead too.
+        void refreshDeadCopies(changedSessionId)
         void import('$lib/services/zipping')
           .then(({ zippingService }) => zippingService.refreshFromServer(changedSessionId))
           .then(() => {
             window.dispatchEvent(new CustomEvent('checkZipActivity', { detail: { sessionId: changedSessionId } }))
           })
-          .catch((error) => console.warn('[Jev Juice] Failed to re-read zip state:', error))
+          .catch((error) => console.warn('[Judge Juice] Failed to re-read zip state:', error))
         return
       }
       // SA-120 P6: the after-reply check stored something about a finished reply. It happens
@@ -395,6 +474,18 @@
           typeof (event as any).sessionId === 'string' ? (event as any).sessionId : null
         if (!checkedSessionId || checkedSessionId !== currentSessionId) return
         void refreshJevJuicePostTurnRecords(checkedSessionId)
+        return
+      }
+      if (event?.type === 'image_origin_changed') {
+        const originSessionId = event.sessionId
+        if (originSessionId === currentSessionId) void refreshImageOrigins(originSessionId)
+        return
+      }
+      if (event?.type === 'codex_cleanup_warning') {
+        const warningSessionId =
+          typeof (event as any).sessionId === 'string' ? (event as any).sessionId : null
+        if (!warningSessionId || warningSessionId !== currentSessionId) return
+        void refreshCodexCleanupWarnings(warningSessionId)
         return
       }
       // The SERVER changed this chat's stored messages in a way no stream event could show
@@ -434,17 +525,22 @@
     })
 
     // Initialize user settings store
-    if (data?.userSettings) {
-      setUserSettings(data.userSettings)
-    }
     if (data?.user?.id) {
+      if (data.userSettingsReadSucceeded === true) {
+        confirmUserSettings(data.userSettings)
+      } else {
+        failUserSettingsRead(new Error(data.userSettingsReadError || 'User settings could not load'))
+      }
       refreshUserSettingsRequest(fetch)
         .then((freshSettings) => {
-          setUserSettings(freshSettings)
+          confirmUserSettings(freshSettings)
         })
         .catch((error) => {
           console.error('[Settings] Failed to refresh user settings:', error)
+          failUserSettingsRead(error)
         })
+    } else {
+      resetUserSettings()
     }
 
     if (!savedModelsStore.isInitialized()) {
@@ -481,6 +577,9 @@
     return () => {
       stopUserChannelListener()
       window.removeEventListener('batshit:zip-state-changed', handleZipStateChanged)
+      window.removeEventListener(LIVE_SETTINGS_EVENTS.modelConnectionsUpdated, refreshLocalContext)
+      window.removeEventListener('focus', refreshLocalContext)
+      clearInterval(localContextTimer)
       if (contextPreviewTimer) {
         clearTimeout(contextPreviewTimer)
         contextPreviewTimer = null
@@ -497,8 +596,12 @@
   let manualTrimProtectionVersion = $state(0)
   let trimPreviewBusy = $state(false)
   let compactBusy = $state(false)
+  // BL-653: the chat whose Compact runs, and a Stop pressed during it (not rendered, so not $state).
+  const compactStopTracker = createCompactStopTracker()
   let compactStatus = $state<string | null>(null)
   let autoCompactLastPromptKeyBySession = $state<Record<string, string>>({})
+  // BL-653: chats whose Auto Compact the user stopped; Auto Compact waits there for a reply's end.
+  let autoCompactStopHolds = $state<AutoCompactStopHolds>({})
   // SA-104 P6: Infinite-Session nap state (the compact-state pattern).
   let napBusy = $state(false)
   let napStatus = $state<string | null>(null)
@@ -517,10 +620,17 @@
   }
   let liveContextEstimateBySession = $state<Record<string, {
     tokens: number
+    contextLimit: number | null
+    contextWindowWarning?: string | null
+    contextWindowCheckedAt?: number | null
+    localContext?: LocalContextBudgetEvidence | null
+    settingsKey: string
     reason: string
     updatedAt: number
   }>>({})
   let contextPreviewTimer: ReturnType<typeof setTimeout> | null = null
+  let localConnectionRevision = $state(0)
+  let localContextClock = $state(Date.now())
   let contextPreviewSerial = 0
   let contextPreviewSettingsKey: string | null = null
   let contextPreviewSettingsSessionId: string | null = null
@@ -570,6 +680,7 @@
     if (contextPreviewSettingsSessionId !== sessionId) {
       contextPreviewSettingsSessionId = sessionId
       contextPreviewSettingsKey = key
+      if (activeLocalProgramDefinition) scheduleLiveContextPreview('local-model', 0)
       return
     }
 
@@ -696,6 +807,135 @@
   let artifactsSidebarRef: any = $state(null)
   let draftPreviewArtifactId = $state<string | null>(null)
   let executionViewerOpen = $state(false)
+  let appActionsDocument: AppActionsDocument | null = null
+  let appActionsTransport: ReturnType<typeof createAppActionsBrowserTransport> | null = null
+  let appActionsSessionId: string | null = null
+  $effect(() => {
+    const selected = sessionStore.getCurrentSessionId()
+    if (appActionsDocument && selected !== appActionsSessionId) {
+      retireAppActionNavigation()
+      const transport = appActionsTransport
+      // refresh() joins the single maintenance flight; it is a no-op before the first pass starts (BL-1273).
+      if (transport) void transport.refresh().catch(() => {})
+    }
+    appActionsSessionId = selected
+  })
+
+  onMount(() => {
+    if (!data.user) return
+    const doc = createAppActionsDocument({
+      documentId: crypto.randomUUID(), documentEpoch: crypto.randomUUID(),
+      session: () => sessionStore.getCurrentSessionId(),
+      handler: id => currentSessionId === sessionStore.getCurrentSessionId() ? appActionHandler(id) : undefined,
+      availability: appActionAvailability,
+      observation: appActionObservation,
+      feedback: receipt => {
+        let label = 'App Action'
+        if (receipt.actionId) {
+          try { label = doc.describeFamily(receipt.actionId).label } catch { /* Refused unknown action. */ }
+        }
+        const detail = receipt.import ? receipt.detail ?? [
+          `Upload: ${receipt.import.uploaded}`, `Staged: ${receipt.import.staged}`,
+          `Saved: ${receipt.import.saved}`, `Ready: ${receipt.import.ready}`,
+          receipt.reason?.replaceAll('_', ' ')
+        ].filter(Boolean).join('. ')
+          : receipt.saved === 'failed' || receipt.saved === 'unknown'
+          ? `${receipt.visible === 'applied' ? 'Visibility changed. ' : ''}The Dock preference ${receipt.saved === 'failed' ? 'was not saved' : 'could not be confirmed saved'}.`
+          : receipt.viewer === 'empty' ? 'This session has no execution records.'
+          : receipt.viewer === 'no_session' ? 'No session is selected.'
+          : receipt.reason?.replaceAll('_', ' ')
+        const scope = (appActionObservation().settings as { open?: boolean } | undefined)?.open ? 'settings' : 'app'
+        const options = scopeToastOptions({ description: detail, class: '' }, scope)
+        if (receipt.status === 'completed' || receipt.status === 'no_op') {
+          toast.success(`${label}: ${receipt.status === 'no_op' ? 'already matches' : 'completed'}`, options)
+        } else toast.error(`${label}: ${receipt.status.replaceAll('_', ' ')}`, options)
+      }
+    })
+    const setDock = (open: boolean, context: ActionContext) => performDockAction(open, {
+      desktop: () => desktopTransitionBusy ? 'transitioning' : desktopModeActive ? 'active' : 'inactive',
+      confirmed: () => getUserSettingsReadState() === 'confirmed',
+      visible: () => goonsPanelOpen,
+      apply: visible => { goonsPanelOpen = visible; if (visible) artifactsPanelOpen = false },
+      persist: persistAppActionDock,
+      mounted: visible => visible ? Boolean(goonDockRef) && !artifactsPanelOpen : !goonDockRef
+    }, context)
+    const cleanup = [
+      registerAppActionObservation('dock', () => ({ open: goonsPanelOpen, mounted: Boolean(goonDockRef),
+        settingsConfirmed: getUserSettingsReadState() === 'confirmed',
+        desktop: desktopTransitionBusy ? 'transitioning' : desktopModeActive ? 'active' : 'inactive' })),
+      registerAppAction('goon.show', (_, context) => setDock(true, context), () => dockAppActionAvailability(true)),
+      registerAppAction('goon.hide', (_, context) => setDock(false, context), () => dockAppActionAvailability(false))
+    ]
+    appActionsDocument = doc
+    appActionsSessionId = currentSessionId
+    const transport = createAppActionsBrowserTransport(doc, { fetch: window.fetch.bind(window), crypto: window.crypto,
+      onEvent: onUserChannelEvent, connected: isUserChannelConnected,
+      feedback: reason => toast.error('App Actions unavailable', scopeToastOptions({ description: reason.replaceAll('_', ' '), class: '' }, 'app')) })
+    appActionsTransport = transport
+    const localWindow = window as Window & { batshitAppActions?: AppActionsAPI }
+    localWindow.batshitAppActions = Object.freeze({
+      state: () => ({ ...doc.state(), transport: transport.state(), fileDeadlineMaxMs: APP_ACTION_FILE_DEADLINE_MS }),
+      discover: doc.discover, describe: doc.describe, execute: doc.execute, executeFile: doc.executeFile,
+      discoverFamilies: doc.discoverFamilies, describeFamily: doc.describeFamily, receipt: doc.receipt,
+      inspectSettings: async (args: unknown) => {
+        const response = await fetch('/api/app/actions', { method: 'POST', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ actionId: 'settings.inspect', args }) })
+        return response.json()
+      }
+    })
+    const interrupt = (event: Event) => { if (event.isTrusted) retireAppActionNavigation() }
+    window.addEventListener('pointerdown', interrupt, { capture: true })
+    window.addEventListener('keydown', interrupt, { capture: true })
+    // BL-1273: a page that is visible again may have slept past its lease; refresh reconciles it.
+    const resume = () => { if (document.visibilityState === 'visible') void transport.refresh().catch(() => {}) }
+    document.addEventListener('visibilitychange', resume)
+    return () => {
+      transport.retire()
+      appActionsTransport = null
+      doc.retire()
+      appActionsDocument = null
+      for (const remove of cleanup) remove()
+      delete localWindow.batshitAppActions
+      window.removeEventListener('pointerdown', interrupt, { capture: true })
+      window.removeEventListener('keydown', interrupt, { capture: true })
+      document.removeEventListener('visibilitychange', resume)
+    }
+  })
+
+  function dockAppActionAvailability(open: boolean) {
+    if (desktopTransitionBusy) return 'desktop_transitioning'
+    if (desktopModeActive) return 'desktop_mode_active'
+    if (goonsPanelOpen === open) return 'available'
+    return getUserSettingsReadState() === 'confirmed' ? 'available' : 'settings_unconfirmed'
+  }
+
+  async function persistAppActionDock(open: boolean, context: ActionContext): Promise<'saved' | 'failed' | 'unknown'> {
+    context.check()
+    if (getUserSettingsReadState() !== 'confirmed' || desktopModeActive || desktopTransitionBusy) {
+      return 'failed'
+    }
+    let rejected = false
+    try {
+      // The existing owning serializer admits only this one key; never reuse the blind toggle.
+      const saved = await persistGoonsSettingsPatchRequest(async (input, init) => {
+        context.check()
+        const response = await fetch(input, init)
+        rejected = !response.ok
+        return response
+      }, { dockOpen: open })
+      confirmUserSettings(saved)
+      context.report({ status: 'unknown_outcome', visible: 'applied', saved: 'unknown' })
+      context.check()
+      const readBack = await refreshUserSettingsRequest(async (input, init) => {
+        context.check()
+        return fetch(input, { ...init, signal: context.signal })
+      })
+      confirmUserSettings(readBack)
+      return readBack.goons_settings?.dockOpen === open ? 'saved' : 'unknown'
+    } catch {
+      return rejected ? 'failed' : 'unknown'
+    }
+  }
   // SA-113 P4 (DL-113-10a): the Agent DMs drawer. The envelope that opens it renders only
   // for an agent with Agent DMs on, so an instance that never turned them on gains nothing.
   let dmDrawerOpen = $state(false)
@@ -801,6 +1041,16 @@ const groupChatActive = $derived(Boolean(activeGroupId))
 const activeGroup = $derived.by(() =>
   activeGroupId ? groupStore.getGroupById(activeGroupId) : null
 )
+// Match the group runner's threshold, not merely the presence of group metadata.
+// Such chats cannot resume old/converted approval cards and hold no steer words.
+const compactGroupRunnerSession = $derived.by(() => {
+  const agentIds = Array.isArray(activeGroup?.agent_ids)
+    ? activeGroup.agent_ids
+        .map((id) => (typeof id === 'string' ? id.trim() : ''))
+        .filter(Boolean)
+    : []
+  return new Set(agentIds).size >= 2
+})
 function getGroupChatIdForSession(sessionId?: string | null) {
   const normalized = typeof sessionId === 'string' ? sessionId.trim() : ''
   if (!normalized) return null
@@ -851,18 +1101,27 @@ const effectiveAutoCompactSettings = $derived.by(() =>
     agent: agentStore.getCurrentAgent()?.auto_compact_settings
   })
 )
-const contextUsage = $derived.by(() =>
-  summarizeContextUsage({
+const contextUsage = $derived.by(() => {
+  const settingsKey = getContextPreviewSettingsKey()
+  const matchingPreview = settingsKey && currentLiveContextEstimate?.settingsKey === settingsKey
+    ? currentLiveContextEstimate : null
+  return summarizeContextUsage({
     messages: effectiveMessages,
     snapshots: executionSnapshots,
     activeModel: activeModelPreset,
     agent: agentStore.getCurrentAgent(),
     manualTrimActive: currentEffectiveTrimmedMessageIds.length > 0,
     manualTrimEstimateTokens: currentManualTrimEstimate?.afterTokens ?? null,
-    liveContextEstimateTokens: currentLiveContextEstimate?.tokens ?? null,
-    liveContextEstimateReason: currentLiveContextEstimate?.reason ?? null
+    liveContextEstimateTokens: matchingPreview?.tokens ?? null,
+    liveContextEstimateReason: matchingPreview?.reason ?? null,
+    liveContextLimit: matchingPreview?.contextLimit ?? null,
+    liveLocalContext: matchingPreview?.localContext ?? null,
+    now: localContextClock,
+    liveContextWindowWarning: matchingPreview?.contextWindowWarning ?? null,
+    liveContextCheckedAt: matchingPreview?.contextWindowCheckedAt ?? null,
+    claudeContextEnvironment: data.claudeContextEnvironment
   })
-)
+})
 const currentTokens = $derived(contextUsage.displayTokens)
 const contextLimit = $derived(contextUsage.contextLimit)
 const autoCompactTriggerTokens = $derived(
@@ -906,6 +1165,7 @@ const napUnavailableReason = $derived.by(() => {
 const compactAvailable = $derived.by(() => {
   if (!currentSessionId || !agentStore.getCurrentAgent()?.id) return false
   if (currentSessionFixed) return false
+  if (!compactGroupRunnerSession && hasPendingCompactApproval(messages, currentCompactionEvents)) return false
   const selection = selectMessagesForCompaction(messages, currentCompactionEvents, {
     protections: currentManualTrimProtections
   })
@@ -918,6 +1178,7 @@ const compactUnavailableReason = $derived.by(() => {
   if (currentSessionFixed) {
     return 'Infinite Sessions do not use Compact — context relief happens through episode graduation and naps.'
   }
+  if (!compactGroupRunnerSession && hasPendingCompactApproval(messages, currentCompactionEvents)) return COMPACT_PENDING_APPROVAL_MESSAGE
   const selection = selectMessagesForCompaction(messages, currentCompactionEvents, {
     protections: currentManualTrimProtections
   })
@@ -1059,8 +1320,6 @@ const immersiveActive = $derived.by(
   let thinkingSubjects = $state<Record<string, string>>({})
   let planSubjects = $state<Record<string, { content?: string; items?: any[] }>>({})
   let objectSubjects = $state<Record<string, any>>({})
-  const zipControlPendingBySession = new Map<string, Promise<void>>()
-  let zipControlProcessing = $state(false)
 
 	  // SA-911: Option D "Pause and Process" state
 	  // When a tool-call arrives, we pause text streaming and buffer chunks until tool-result
@@ -1120,6 +1379,12 @@ const immersiveActive = $derived.by(
     string,
     { resolve: () => void; timeout: ReturnType<typeof setTimeout> }
   >()
+  /**
+   * BL-361: replies this tab drew itself after a Stop (the 1.5 s wait for `end` ran out). A
+   * late `end` for one of them that the server finalized is taken, not ignored
+   * (`shouldAcceptLateEndAfterStopFallback`). Plain Set: nothing renders from it.
+   */
+  const savedByStopFallbackMessageIds = new Set<string>()
 
   function resolveStreamCompletion(messageId: string) {
     const waiter = interruptWaiters.get(messageId)
@@ -1149,68 +1414,6 @@ const immersiveActive = $derived.by(
     return new Promise<void>((resolve) => setTimeout(resolve, ms))
   }
 
-  /**
-   * SA-119 P2 (DL-119-06, F-P2-1) — wait until the reply is actually over.
-   *
-   * `waitForStreamCompletion` has an EIGHT-SECOND ceiling and resolves when it expires,
-   * which was survivable while a send that got past it fell into the interrupt branch and
-   * stopped the reply first. DL-119-07 deleted that branch, so the same expiry would now
-   * post an ordinary message into a live turn — and Queue's whole promise is "sends after
-   * this reply". So this waits on the message, and then keeps waiting while the chat is
-   * still busy, because a context-exhaustion auto-continue makes the NEXT assistant message
-   * part of the same run the user is waiting out.
-   *
-   * It is a ceiling and not a forever: a run that is still going after it returns `false`,
-   * and the caller keeps the user's words and says so rather than sending them anywhere.
-   *
-   * "Over" is the chat no longer being busy, and that includes THIS tab's own send, whose abort
-   * controller stays in the run registry until the server says the turn is over: after `end`,
-   * after the server's after-reply work, after the lock is let go. Since 2026-09-18 that is the
-   * server's own `turn_over` over the live hub (`postSendRouted`), not an open request. The old
-   * loop here stopped as soon as no message was left to wait on, so in that second it gave up
-   * and parked the message as "the reply ran too long to wait for" after a 20-second reply
-   * (2026-09-18, measured). The rule, which polls through that second, is `replyEndWait.ts`.
-   */
-  const CLIENT_QUEUE_MAX_WAIT_MS = 15 * 60_000
-  /** How long a queued message waits for a reply that has not named its first message yet. */
-  const CLIENT_QUEUE_TARGET_WAIT_MS = 60_000
-
-  /**
-   * The reply's first message id, or `busy: false` once the chat is free. A group reply has no id
-   * until its first `start` event (`waitForReplyTarget` in `replyEndWait.ts`).
-   */
-  function waitForReplyTargetInSession(sessionId: string) {
-    return waitForReplyTarget(
-      {
-        isBusy: () => chatRunRegistry.isSessionBusy(sessionId),
-        nextTarget: () => {
-          const state = chatRunRegistry.getRunState(sessionId)
-          return state.activeMessageId ?? state.activeStreamMessageIds[0] ?? null
-        },
-        sleep: wait,
-        now: () => Date.now()
-      },
-      CLIENT_QUEUE_TARGET_WAIT_MS
-    )
-  }
-
-  async function waitForReplyToEnd(sessionId: string, messageId: string): Promise<boolean> {
-    return waitUntilReplyIsOver(
-      messageId,
-      {
-        isBusy: () => chatRunRegistry.isSessionBusy(sessionId),
-        nextTarget: () => {
-          const state = chatRunRegistry.getRunState(sessionId)
-          return state.activeMessageId ?? state.activeStreamMessageIds[0] ?? null
-        },
-        waitForMessageEnd: (target) => waitForStreamCompletion(target),
-        sleep: wait,
-        now: () => Date.now()
-      },
-      CLIENT_QUEUE_MAX_WAIT_MS
-    )
-  }
-
   async function parseJsonResponse(response: Response): Promise<Record<string, any>> {
     const payload = await response.json().catch(() => ({}))
     return payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {}
@@ -1226,12 +1429,17 @@ const immersiveActive = $derived.by(
     body: Record<string, any>
     signal: AbortSignal
     wasInterrupting: boolean
+    /** Called once the server owns the send (its 202), before the turn's final answer. */
+    onAccepted?: () => void
   }): Promise<{ response: Response; errorPayload?: Record<string, any> }> {
     const bodyText = JSON.stringify(params.body)
     let attemptIndex = 0
 
     while (true) {
-      const response = await postSendRouted(bodyText, { signal: params.signal })
+      const response = await postSendRouted(bodyText, {
+        signal: params.signal,
+        onAccepted: params.onAccepted
+      })
 
       if (response.ok) {
         return { response }
@@ -1272,8 +1480,8 @@ const immersiveActive = $derived.by(
    * - `queue` — this agent, or this transport, cannot carry a mid-reply message. SA-119
    *   (DL-119-07) renamed this outcome from `not_steerable`: the words now wait for the
    *   reply to end rather than stopping it, which is what the user asked for rather than
-   *   the Stop they did not. **P2 wires the branch**; until then this arm still falls
-   *   through to the browser-held queue below (DL-119-07).
+   *   the Stop they did not: the send goes as an ordinary message and waits in the chat's
+   *   line (BL-713).
    *
    * A network failure is `refused`, with a plain sentence.
    */
@@ -1586,55 +1794,6 @@ const immersiveActive = $derived.by(
     return true
   }
 
-  async function finalizeActiveAssistantMessageAsError(
-    messageId: string | null,
-    message: string,
-    metadata: Record<string, any> = {}
-  ) {
-    if (!messageId) return false
-
-    const existing = messageStore.getMessage(messageId)
-    if (!existing) {
-      unregisterActiveMessage(messageId)
-      resetToolStateForMessage(messageId)
-      resolveStreamCompletion(messageId)
-      return false
-    }
-
-    if (existing.status === 'complete' || existing.status === 'error') {
-      unregisterActiveMessage(messageId)
-      resetToolStateForMessage(messageId)
-      resolveStreamCompletion(messageId)
-      return false
-    }
-
-    const existingContent =
-      typeof existing.content === 'string' ? existing.content.trim() : ''
-
-    messageStore.updateMessage(messageId, {
-      content: existingContent || message,
-      status: 'error',
-      metadata: {
-        ...(existing.metadata || {}),
-        ...metadata,
-        error_message: message
-      }
-    })
-
-    clearThinkingIndicator(messageId)
-    unregisterActiveMessage(messageId)
-    resetToolStateForMessage(messageId)
-    resolveStreamCompletion(messageId)
-    isWaitingForResponse = false
-    syncActiveToolProcessingState()
-    if (chatInputRef?.aiResponseReceived) {
-      chatInputRef.aiResponseReceived()
-    }
-
-    await saveMessageToDatabase(messageId)
-    return true
-  }
-
   async function finalizeActiveAssistantMessageAsInterrupted(messageId: string | null) {
     if (!messageId) return false
 
@@ -1653,11 +1812,13 @@ const immersiveActive = $derived.by(
       return false
     }
 
-    const existingContent =
-      typeof existing.content === 'string' ? existing.content.trim() : ''
+    // BL-361: remembered, so a late `end` the server finalized replaces this copy on screen.
+    savedByStopFallbackMessageIds.add(messageId)
 
     messageStore.updateMessage(messageId, {
-      content: existingContent || 'Response stopped.',
+      // BL-361: the streamed copy can still hold raw control blocks the server strips at its
+      // reply end; the fallback save strips them with the server's own reader.
+      content: buildStopFallbackContent(existing.content),
       status: 'complete',
       metadata: {
         ...(existing.metadata || {}),
@@ -1680,7 +1841,8 @@ const immersiveActive = $derived.by(
       chatInputRef.aiResponseReceived()
     }
 
-    await saveMessageToDatabase(messageId)
+    // BL-775: the server saves a stopped reply itself (its finalize, one retry, then a plain
+    // error to the tabs); this copy is only what the tab shows until the server's `end` arrives.
     return true
   }
 
@@ -1842,13 +2004,19 @@ const immersiveActive = $derived.by(
 
     const stillWaiting = steerInbox
       .getSteersForMessage(sessionId, messageId)
-      .filter((entry) => entry.state === 'queued' || entry.state === 'waiting')
+      .filter((entry) => entry.state === 'queued')
     if (stillWaiting.length === 0) return
 
     if (options.interrupted) {
       for (const entry of stillWaiting) steerInbox.markSteerDropped(entry.steerId)
       return
     }
+
+    // BL-455, BL-713: only what the SERVER still has to place inside the reply or promote. A send
+    // waiting in the chat's line is settled by the server itself (it runs, is kept with its own
+    // receipt, or its chat goes), and it can wait out an approval card long past this backstop.
+    const awaitingServer = steerInbox.getSteersAwaitingServerForMessage(sessionId, messageId)
+    if (awaitingServer.length === 0) return
 
     const armDropBackstop = (entry: { steerId: string }) => {
       const existingTimer = steerSettleTimers.get(entry.steerId)
@@ -1869,7 +2037,7 @@ const immersiveActive = $derived.by(
         }, STEER_PROMOTION_GRACE_MS)
       )
     }
-    for (const entry of stillWaiting) armDropBackstop(entry)
+    for (const entry of awaitingServer) armDropBackstop(entry)
   }
 
   /**
@@ -1908,7 +2076,72 @@ const immersiveActive = $derived.by(
     // stripped (review F-P3b-2). If the chat is busy again it queues again, which is the
     // same promise it made the first time. `fromDroppedReceipt` keeps the OTHER receipts in
     // the chat (review F-P3b-1): this click acts on one of them, not on all of them.
-    void handleSendMessage(payload.content, payload.metadata, { fromDroppedReceipt: true })
+    void handleSendMessage(payload.content, payload.metadata, {
+      fromDroppedReceipt: true,
+      // BL-4: a queued send's receipt names the message it saved, which is still in the chat.
+      // Send now sends THAT message (no second save), wherever the chat is by now.
+      existingUserMessageId: payload.userMessageId
+    })
+  }
+
+  /**
+   * BL-4 — the server is holding this send until the chat is free (a reply another tab started
+   * was already running). The words show once, as the Queue bubble after everything else, so
+   * every tab takes the message out of its list until the send runs and the message comes back
+   * at the end of the chat. The tab that sent it also drops its own reply placeholder (the reply
+   * will open where it belongs, after the message) and keeps the exact send beside the bubble,
+   * so a "Not sent" receipt for it can offer Send now.
+   */
+  function takeQueuedSendOutOfTheList(
+    sessionId: string | null | undefined,
+    notice: { userMessageId: string; assistantMessageId: string | null }
+  ) {
+    const targetSessionId = sessionId ?? null
+    if (notice.assistantMessageId) {
+      const placeholder = messageStore.getMessage(notice.assistantMessageId, targetSessionId)
+      if (placeholder?.metadata?.client_waiting_placeholder === true && !placeholder.content) {
+        clearThinkingIndicator(notice.assistantMessageId)
+        unregisterActiveMessage(notice.assistantMessageId, targetSessionId)
+        resetToolStateForMessage(notice.assistantMessageId)
+        resolveStreamCompletion(notice.assistantMessageId)
+        messageStore.deleteMessage(notice.assistantMessageId, targetSessionId)
+      }
+    }
+    messageStore.deleteMessage(notice.userMessageId, targetSessionId)
+    const ownSend = inFlightSendPayloads.get(notice.userMessageId)
+    if (ownSend) {
+      resendableSteerPayloads.set(notice.userMessageId, {
+        ...ownSend,
+        userMessageId: notice.userMessageId
+      })
+    }
+  }
+
+  /**
+   * BL-4: a Send now sends a kept message now, so in this tab it becomes the chat's latest
+   * message, dated this send, before the reply's placeholder is added after it. Nothing is
+   * written: send-routed moves the stored copy when anything was said after it.
+   */
+  function moveResentMessageToEnd(sessionId: string, messageId: string, sentAt: string) {
+    const kept = messageStore.getMessages(sessionId).find((message) => message.id === messageId)
+    if (!kept) return
+    messageStore.deleteMessage(messageId, sessionId)
+    messageStore.addMessage(restampResentMessage(kept, sentAt))
+  }
+
+  /**
+   * BL-4 — a kept message is back in the chat, at its end, unanswered. Its "Not sent" receipt
+   * stays only in the tab that can Send it now; every other tab shows the words in the chat.
+   */
+  function settleKeptReceipt(messageId: string) {
+    if (
+      shouldClearKeptReceipt({
+        bubbleState: steerInbox.getSteer(messageId)?.state,
+        canSendNow: canResendDroppedSteer(messageId)
+      })
+    ) {
+      steerInbox.clearDroppedSteer(messageId)
+    }
   }
 
   function dismissDroppedSteer(steerId: string) {
@@ -1920,6 +2153,70 @@ const immersiveActive = $derived.by(
   /** Whether a bubble can still be sent exactly as it was written. */
   function canResendDroppedSteer(steerId: string) {
     return resendableSteerPayloads.has(steerId)
+  }
+
+  /**
+   * BL-455 — Send now on a message held for an approval card.
+   *
+   * The server wrote the words as a real message when the reply stopped at the card, so this is
+   * the kept send's path (`existingUserMessageId`): the same message is sent by its id, nothing is
+   * saved twice, and the card stays as it is. The user chose not to wait for it.
+   */
+  function sendHeldMessageNow(messageId: string) {
+    const sessionId = sessionStore.getCurrentSessionId()
+    if (!sessionId) return
+    const held = messageStore.getMessages(sessionId).find((message) => message.id === messageId)
+    if (held?.role !== 'user' || typeof held.content !== 'string' || !held.content.trim()) return
+    void handleSendMessage(
+      held.content,
+      { composerSessionId: sessionId },
+      { fromDroppedReceipt: true, existingUserMessageId: messageId }
+    )
+  }
+
+  /**
+   * BL-713 — Send now on a message that waits in the chat's line while the line holds for an
+   * approval card (its bubble says `Waits for your answer to the approval card.`).
+   *
+   * The server sends that same message by its id: it adds no second entry, the hold ends, and the
+   * line runs in order (the user chose not to wait for the card, as for a held message, BL-455).
+   * Every tab offers it, because the server needs only the id; a second press after the message
+   * went is refused (`queued_send_not_waiting`) and changes nothing.
+   */
+  async function sendWaitingSendNow(steerId: string) {
+    const steer = steerInbox.getSteer(steerId)
+    if (!steer || steer.state !== 'queued' || !steer.queuedSend || !steer.heldForApprovalCard) return
+    const agent = agentStore.getCurrentAgent()
+    if (!agent) return
+    try {
+      const response = await postSendRouted(
+        JSON.stringify({
+          content: steer.text,
+          sessionId: steer.sessionId,
+          agentId: agent.id,
+          agentType: normalizePrimaryAgentType(agent),
+          userMessageId: steerId,
+          waitingSendNow: true,
+          messages: []
+        })
+      )
+      if (response.ok) return
+      const payload = await parseJsonResponse(response)
+      if (payload.code === 'queued_send_not_waiting') {
+        // It already went, or it was kept, or Batshit restarted and its line is gone: the bubble
+        // is stale. Say so plainly and take it away (the line never replays a send that is not
+        // waiting, so nothing brings it back).
+        steerInbox.forgetSteer(steerId)
+        toast.info(typeof payload.error === 'string' && payload.error ? payload.error : 'This message is no longer waiting.', {
+          description: typeof payload.details === 'string' && payload.details ? payload.details : undefined
+        })
+        return
+      }
+      toast.error(typeof payload.error === 'string' && payload.error ? payload.error : 'Failed to send message')
+    } catch (error) {
+      console.error('[sendWaitingSendNow] Failed to send the waiting message now:', error)
+      toast.error('Failed to send message')
+    }
   }
 
 	  // Abort controller for cancelling the selected session's managed API/CLI send.
@@ -1955,15 +2252,6 @@ const immersiveActive = $derived.by(
 	    return currentRunState.steerable === false ? (currentRunState.steerReason ?? null) : null
 	  })
 
-	  /**
-	   * SA-119 P2 (DL-119-06) — the chats with a browser-held queued message waiting.
-	   *
-	   * One per chat. A second would race the first for the same "the reply just ended"
-	   * moment, and whichever lost would send into a live turn — which, with
-	   * interrupt-and-send retired, nothing downstream would catch.
-	   */
-	  const clientQueueWaitingBySession = new Set<string>()
-
 	  const sendInFlightBySession = new Map<string, boolean>()
 	  const sendInFlightSerialBySession = new Map<string, number>()
 	  const lastManualInterruptAtBySession = new Map<string, number>()
@@ -1981,16 +2269,6 @@ const immersiveActive = $derived.by(
 	   * consuming the stamp silently close the session-turn retry as well.
 	   */
 	  const pendingStopInterruptionBySession = new Map<string, StopInterruptionRecord>()
-
-	  /**
-	   * SA-119 P3 (AMD-119-04) — how many times the user has pressed Stop in this chat.
-	   *
-	   * A browser-held queued message is awaiting `waitForReplyToEnd`, and a Stop is exactly
-	   * what makes that wait finish, so its own result cannot say which happened. Comparing
-	   * this count across the await can. A COUNT rather than a flag because a flag needs
-	   * clearing, and whoever cleared it would race the next Stop.
-	   */
-	  const manualStopCountBySession = new Map<string, number>()
 
 	  /**
 	   * SA-119 P3b (AMD-119-05) — the exact send behind a bubble, for its **Send now**.
@@ -2013,6 +2291,17 @@ const immersiveActive = $derived.by(
 	   * approximate resend would be worse than none, and the words are still on screen.
 	   */
 	  const resendableSteerPayloads = new Map<
+	    string,
+	    { content: string; metadata: Record<string, any>; userMessageId?: string }
+	  >()
+
+	  /**
+	   * BL-4 — this tab's own sends that are still waiting for their final answer, by the id of the
+	   * message each saved. When the server says one is queued behind another turn, its exact send
+	   * moves beside the Queue bubble (`resendableSteerPayloads`), so a "Not sent" receipt can Send
+	   * it now. Cleared when the send's final answer arrives.
+	   */
+	  const inFlightSendPayloads = new Map<
 	    string,
 	    { content: string; metadata: Record<string, any> }
 	  >()
@@ -2158,6 +2447,8 @@ const immersiveActive = $derived.by(
 	    chatLoadQueue.forget(sessionId)
 	    messageStore.clearMessages(sessionId)
 	    forgetJevJuicePostTurnRecords(sessionId)
+	    forgetCodexCleanupWarnings(sessionId)
+	    forgetImageOrigins(sessionId)
 	    clearCreatingSession(sessionId)
 	    chatRunRegistry.resetRunState(sessionId)
 	    if (sseServices.has(sessionId)) {
@@ -2256,6 +2547,8 @@ const immersiveActive = $derived.by(
       zippingService.setCurrentSession(sessionId).catch((error) => {
         console.error('[Session Switch] Error updating zipping service:', error)
       })
+      // SA-129 P2 (BL-333): which reads the prompt compresses as dead copies.
+      void refreshDeadCopies(sessionId)
       void loadExecutionSnapshots(sessionId)
     }
   })
@@ -2338,9 +2631,17 @@ const immersiveActive = $derived.by(
     const tokens = currentTokens
     const limit = contextLimit
     const triggerTokens = autoCompactTriggerTokens
-    const busy = Boolean(isWaitingForResponse || isWaitingForToolCall || activeStreamCount > 0 || compactBusy)
+    // BL-622 (C3): `chatWorkBusy` holds while this tab's send is still open (until `turn_over`,
+    // after the server let the chat go), so Auto Compact does not ask beside the reply's after-reply work.
+    const busy = Boolean(chatWorkBusy || isWaitingForResponse || isWaitingForToolCall || activeStreamCount > 0 || compactBusy)
 
     if (!sessionId || !currentAgent?.id || busy || settings.mode === 'off') return
+    // BL-711: keep the waiting card mounted, including its expiry-Deny handler. A resolved
+    // card changes `messages`, so this idle check resumes without a separate timer or hold.
+    if (!compactGroupRunnerSession && hasPendingCompactApproval(messages, currentCompactionEvents)) return
+    // BL-653: the user stopped this chat's Auto Compact; it waits for the chat's next reply to end
+    // (the key below holds the token count, so any estimate update would start it again).
+    if (isAutoCompactHeldAfterStop(autoCompactStopHolds, sessionId)) return
     // SA-104 P6: Infinite Sessions never auto-compact — the nap owns context relief.
     if (currentSessionFixed) return
     if (!limit || typeof tokens !== 'number' || !Number.isFinite(tokens)) return
@@ -2564,8 +2865,8 @@ const immersiveActive = $derived.by(
     // the Goon, so "open" is a no-op there and "close" leaves Desktop Mode, as the Dock toggle does.
     const handleQuickActionEvent = (event: Event) => {
       const id = (event as CustomEvent<{ id?: string }>).detail?.id
-      if (id === 'open_goon_dock' && !goonsPanelOpen && !desktopModeActive) toggleGoonsPanel()
-      else if (id === 'close_goon_dock' && (goonsPanelOpen || desktopModeActive)) toggleGoonsPanel()
+      dispatchVoiceDockQuickAction(id, { visible: () => goonsPanelOpen,
+        desktopActive: () => desktopModeActive, toggleDockOrExitDesktop: () => toggleGoonsPanel() })
     }
     window.addEventListener(QUICK_ACTION_EVENT, handleQuickActionEvent as EventListener)
     window.addEventListener('batshit:settings-opened', handleSettingsOpened as EventListener)
@@ -2661,7 +2962,8 @@ const immersiveActive = $derived.by(
 	    try {
 	      await service.connect(
 	        (event) => handleSSEMessage(event, sessionId),
-	        (error) => handleSSEError(error, sessionId)
+	        (error) => handleSSEError(error, sessionId),
+	        () => handleSSEReconnected(sessionId)
 	      )
 	      toast.dismiss(SSE_RECONNECT_TOAST_ID)
 	      connectedSseSessionIds = [...new Set([...connectedSseSessionIds, sessionId])]
@@ -2875,7 +3177,7 @@ const immersiveActive = $derived.by(
 
       const sanitizedMessages = messages.map((msg) => ({
         ...msg,
-        content: sanitizeMessageContent(msg.content || '')
+        content: sanitizeFinishedReplyContent(msg.content || '')
       }))
 
 	      messageStore.setMessagesForSession(sessionId, sanitizedMessages, {
@@ -2883,11 +3185,20 @@ const immersiveActive = $derived.by(
 	      })
 	      if (sessionStore.getCurrentSessionId() === sessionId) {
 	        messageStore.setActiveSession(sessionId)
+        for (const record of sanitizedMessages) {
+          chatInputRef?.observeVoiceReply?.({ sessionId, type: 'record', messageId: record.id,
+            role: record.role, status: record.status, metadata: record.metadata })
+          if (record.role === 'user' && Array.isArray(record.metadata?.steerPromoted?.steerIds)) {
+            steerInbox.applySteerPromoted({ steerIds: record.metadata.steerPromoted.steerIds })
+          }
+        }
 	      }
-	      // SA-120 P6: the Jev Juice after-reply notes live beside the messages, not inside them
+	      // SA-120 P6: the Judge Juice after-reply notes live beside the messages, not inside them
 	      // (the server writes them after a reply's `end`). Never awaited: a chip must not be
 	      // able to delay or fail a chat's load.
 	      void refreshJevJuicePostTurnRecords(sessionId)
+	      void refreshCodexCleanupWarnings(sessionId)
+	      void refreshImageOrigins(sessionId)
 	    } catch (error) {
 	      const message = error instanceof Error ? error.message : String(error)
 	      if (message.includes('Session not found')) {
@@ -2908,168 +3219,6 @@ const immersiveActive = $derived.by(
 	      }
 	    }
 	  }
-
-  // SA-911: Simplified sanitizeMessageContent - no more complex reordering needed
-  // Tools are now inserted inline in the correct order during streaming
-  function sanitizeMessageContent(content: string): string {
-    if (!content) {
-      return content
-    }
-
-    let sanitized = stripZipControlBlocks(content)
-    sanitized = stripLeadingSubagentZipEcho(sanitized)
-
-    // SA-911: Check if we have BOTH zip refs AND cool_tool tags (duplication issue)
-    // If so, remove cool_tool tags - zips are the source of truth
-    const hasZipRefs = /\{\{batshit-zip:[^}]+\}\}/.test(sanitized)
-    const hasCoolToolTags = /<cool_tool[\s>]/.test(sanitized)
-
-    if (hasZipRefs && hasCoolToolTags) {
-      // Remove ALL cool_tool tags to prevent duplication
-      // When reloaded, compileForUser will expand zips back to cool_tool tags
-      sanitized = sanitized.replace(/<cool_tool[^>]*>[\s\S]*?<\/cool_tool>/gi, '')
-      sanitized = sanitized.replace(/<cool_tool[^>]*\/>/gi, '')
-    } else if (!hasZipRefs) {
-      // No zip refs - only remove empty/self-closing cool_tool wrappers
-      sanitized = sanitized.replace(/<cool_tool[^>]*>\s*<\/cool_tool>/gi, '')
-      sanitized = sanitized.replace(/<cool_tool[^>]*\/>/gi, '')
-    }
-
-    // Remove orphaned closing tags
-    sanitized = sanitized.replace(/<\/cool_tool>/gi, '')
-
-    // Clean up excessive whitespace
-    sanitized = sanitized.replace(/\n{3,}/g, '\n\n').trim()
-
-    return sanitized
-  }
-
-  function isLikelyZipId(id: string): boolean {
-    return isConcreteZipId(id)
-  }
-
-  function extractZipIdsFromReferences(references: any[]): string[] {
-    if (!Array.isArray(references)) return []
-    const ids = new Set<string>()
-    const addId = (value: unknown) => {
-      const id = typeof value === 'string' ? value.trim() : ''
-      if (id && isLikelyZipId(id)) {
-        ids.add(id)
-      }
-    }
-
-    for (const ref of references) {
-      if (ref && typeof ref === 'object') {
-        addId(ref.zipId)
-        addId(ref.zip_id)
-        addId(ref.id)
-      }
-      const reference = typeof ref === 'string'
-        ? ref
-        : typeof ref?.reference === 'string'
-          ? ref.reference
-          : ''
-      if (!reference) continue
-      const match = reference.match(/\{\{batshit-zip:([^:}]+)(?::::[^}]*)?\}\}/)
-      addId(match?.[1])
-    }
-    return Array.from(ids)
-  }
-
-  function extractCurrentToolResultZipIds(references: any[], content = ''): string[] {
-    const referenceList = Array.isArray(references) ? references : []
-    const ids: string[] = []
-    const seen = new Set<string>()
-    const addId = (value: unknown) => {
-      const id = typeof value === 'string' ? value.trim() : ''
-      if (!id || !isLikelyZipId(id) || !id.toLowerCase().startsWith('cool_tool_')) return
-      const normalized = normalizeId(id)
-      if (seen.has(normalized)) return
-      seen.add(normalized)
-      ids.push(id)
-    }
-
-    for (const ref of referenceList) {
-      if (ref && typeof ref === 'object') {
-        addId(ref.zipId)
-        addId(ref.zip_id)
-        addId(ref.id)
-      }
-      const reference = typeof ref === 'string'
-        ? ref
-        : typeof ref?.reference === 'string'
-          ? ref.reference
-          : ''
-      if (!reference) continue
-      const match = reference.match(/\{\{batshit-zip:([^:}]+)(?::::[^}]*)?\}\}/)
-      addId(match?.[1])
-    }
-
-    if (content && content.includes('{{batshit-zip:')) {
-      const regex = /\{\{batshit-zip:([^:}]+)(?::::[^}]*)?\}\}/g
-      let match: RegExpExecArray | null = null
-      while ((match = regex.exec(content)) !== null) {
-        addId(match[1])
-      }
-    }
-
-    return ids
-  }
-
-  function extractZipIdsFromContent(content: string): string[] {
-    if (!content) return []
-    const ids: string[] = []
-    const regex = /\{\{batshit-zip:([^:}]+)(?::::[^}]*)?\}\}/g
-    let match: RegExpExecArray | null = null
-    while ((match = regex.exec(content)) !== null) {
-      if (match[1] && isLikelyZipId(match[1])) {
-        ids.push(match[1])
-      }
-    }
-    return ids
-  }
-
-  function resolveZipControlPermission(agent: any, settings: any): boolean {
-    if (typeof agent?.zip_agent_control_enabled === 'boolean') {
-      return agent.zip_agent_control_enabled
-    }
-    if (agent?.zip_control_mode === 'agent') return true
-    if (agent?.zip_control_mode === 'user') return false
-
-    const global = settings?.global_zip_settings
-    if (typeof global?.zip_agent_control_enabled === 'boolean') {
-      return global.zip_agent_control_enabled
-    }
-    if (global?.zip_control_mode === 'agent') return true
-    if (global?.zip_control_mode === 'user') return false
-    return false
-  }
-
-  function resolveZipToolNotesEnabled(agent: any, settings: any): boolean {
-    if (typeof agent?.zip_tool_notes_enabled === 'boolean') {
-      return agent.zip_tool_notes_enabled
-    }
-
-    const global = settings?.global_zip_settings
-    if (typeof global?.zip_tool_notes_enabled === 'boolean') {
-      return global.zip_tool_notes_enabled
-    }
-
-    return true
-  }
-
-  function collectSessionZipIds(messages: Message[], extra: string[] = []): string[] {
-    const ids = new Set<string>(extra.filter(Boolean))
-    for (const message of messages) {
-      const metadata = (message as any)?.metadata || {}
-      collectTrustedZipIdsFromMetadata(metadata).forEach((id) => ids.add(id))
-      if (typeof message?.content === 'string' && message.content.includes('{{batshit-zip:')) {
-        extractZipIdsFromContent(message.content).forEach((id) => ids.add(id))
-      }
-    }
-    return Array.from(ids)
-  }
-
 
   function resolveVoiceConfig(metadata: Record<string, any>, agentId?: string | null): VoiceConfig | undefined {
     if (!metadata || typeof metadata !== 'object') {
@@ -3232,35 +3381,6 @@ const immersiveActive = $derived.by(
     return () => window.removeEventListener('batshit:voice-input-speech-start', handleVoiceInputSpeechStart)
   })
 
-  // Replace inline <cool_tool> markers with their actual Redis zip references.
-  // This preserves SA-911 inline ordering while enforcing SA-014 zip-only rendering
-  // after the server has created cool_tool zips.
-  function replaceCoolToolMarkersWithZipRefs(content: string, zipRefs: any[]): string {
-    if (!content || !Array.isArray(zipRefs) || zipRefs.length === 0) return content
-
-    const coolToolRefs = zipRefs.filter((ref) => {
-      const placeholder = typeof ref?.placeholder === 'string' ? ref.placeholder : ''
-      const reference = typeof ref?.reference === 'string' ? ref.reference : ''
-      return placeholder.includes('ZIP_COOL_TOOL') || reference.includes('batshit-zip:cool_tool_')
-    })
-
-    if (coolToolRefs.length === 0) return content
-
-    let idx = 0
-    let replaced = content.replace(/<cool_tool[^>]*>[\s\S]*?<\/cool_tool>/gi, (match) => {
-      const ref = coolToolRefs[idx++]
-      return ref?.reference || match
-    })
-
-    // Handle self-closing cool_tool tags defensively
-    replaced = replaced.replace(/<cool_tool[^>]*\/>/gi, (match) => {
-      const ref = coolToolRefs[idx++]
-      return ref?.reference || match
-    })
-
-    return replaced
-  }
-
   async function handleSSEMessage(data: any, sourceSessionId?: string | null) {
     const eventSessionId = resolveSseEventSessionId(data) ?? sourceSessionId ?? null
     if (!eventSessionId) {
@@ -3280,6 +3400,15 @@ const immersiveActive = $derived.by(
           sseEventId: data?.sseEventId ?? data?.metadata?.sseEventId ?? null
         })
         return
+      }
+
+      if (eventSessionId === currentSessionId) {
+        const record = data.type === 'user_message' || data.type === 'complete_message' ? data.message : null
+        chatInputRef?.observeVoiceReply?.({
+          sessionId: eventSessionId, type: data.type,
+          messageId: record?.id ?? data.messageId, steerId: data.steerId,
+          role: record?.role, status: record?.status, metadata: record?.metadata ?? data.metadata
+        })
       }
 
       // Handle different SSE message types
@@ -3326,7 +3455,7 @@ const immersiveActive = $derived.by(
       dispatchSessionClipStateChanged({
         sessionId: eventSessionId,
         clipId: typeof data.clipId === 'string' ? data.clipId : undefined,
-        source: data.source === 'artifact-share' ? 'artifact-share' : 'runtime'
+        source: resolveServerClipStateSource(data.source)
       })
     } else if (data.type === 'user_message' && data.message) {
       const incoming = data.message
@@ -3335,6 +3464,9 @@ const immersiveActive = $derived.by(
         return
       }
 
+      if (Array.isArray(incoming.metadata?.steerPromoted?.steerIds)) {
+        steerInbox.applySteerPromoted({ steerIds: incoming.metadata.steerPromoted.steerIds })
+      }
       const normalizedUserMessage = {
         ...incoming,
         role: incoming.role || 'user',
@@ -3346,15 +3478,21 @@ const immersiveActive = $derived.by(
       if (exists) {
         logger.debug('[SSE] user_message already exists locally, updating:', incoming.id)
         messageStore.updateMessage(incoming.id, normalizedUserMessage)
+        settleKeptReceipt(incoming.id)
         return
       }
 
       logger.debug('[SSE] Inserting user_message from SSE broadcast:', incoming.id)
       messageStore.addMessage(normalizedUserMessage)
+      settleKeptReceipt(incoming.id)
     } else if (data.type === 'steer_queued') {
       // SA-114 P3 (DL-114-14). This is also how a tab that did NOT send learns the words:
       // the steer events ride the session replay buffer, so a tab opened mid-reply sees the
       // queue, the delivery, and the inset in order rather than an unexplained bubble.
+      // BL-4: a send that met another turn waits in the chat's line, and the server says so
+      // here with a notice: its saved message leaves the list and shows as this bubble.
+      const queuedSendNotice = readQueuedSendNotice(data)
+      if (queuedSendNotice) takeQueuedSendOutOfTheList(eventSessionContext, queuedSendNotice)
       steerInbox.applySteerQueued({
         sessionId: eventSessionContext ?? '',
         messageId: typeof data.messageId === 'string' ? data.messageId : '',
@@ -3363,7 +3501,26 @@ const immersiveActive = $derived.by(
         // DL-119-05: the route has carried this since P1. Without it a tab that did not
         // send — a spectator, or one reopened mid-reply — would be told a held message is
         // about to land inside this reply.
-        deliver: isSteerDeliver(data.deliver) ? data.deliver : undefined
+        deliver: isSteerDeliver(data.deliver) ? data.deliver : undefined,
+        queuedSend: queuedSendNotice !== null,
+        // BL-713: a joining tab learns that the line holds this send for an approval card.
+        heldForApprovalCard: readHeldForApprovalCard(data)
+      })
+    } else if (data.type === 'queued_send_hold') {
+      // BL-713: the chat's line starts holding its waiting sends for the user's answer to an
+      // approval card, or stops (the click, a new message, Send now). Their bubbles say so.
+      steerInbox.applyQueuedSendHold({
+        sessionId: eventSessionContext,
+        heldForApprovalCard: readHeldForApprovalCard(data)
+      })
+    } else if (data.type === 'queued_send_dropped') {
+      // BL-4: the server will not send these queued messages (Stop, Batshit stopping or a restore,
+      // the line's cap, and since BL-713 an approval card left unanswered for 15 minutes or
+      // answered only by the page's own expiry Deny). Their bubbles become "Not sent" receipts;
+      // the words come back into the chat, at its end.
+      steerInbox.applySteerDropped({
+        steerIds: Array.isArray(data.userMessageIds) ? data.userMessageIds : [],
+        reason: typeof data.reason === 'string' ? data.reason : undefined
       })
     } else if (data.type === 'steer_delivered') {
       const steerSessionId = eventSessionContext ?? ''
@@ -3383,10 +3540,23 @@ const immersiveActive = $derived.by(
       // The server has written the promoted user message and forwarded it as `user_message`
       // just before this; the bubble with the same id has already become that message
       // (AMD-114-04: the promoted id IS the first steer's id), so this only settles state.
-      steerInbox.applySteerPromoted({
-        steerIds: Array.isArray(data.steerIds) ? data.steerIds : [],
-        messageId: typeof data.messageId === 'string' ? data.messageId : undefined
+      const promotedIds = Array.isArray(data.steerIds) ? data.steerIds : []
+      const savedPromotion = promotedIds.some((id: string) => {
+        const record = messageStore.getMessage(id, eventSessionContext)
+        const savedSteerIds = record?.metadata?.steerPromoted?.steerIds
+        return record?.role === 'user' && Array.isArray(savedSteerIds) &&
+          promotedIds.every((steerId: string) => savedSteerIds.includes(steerId))
       })
+      if (data.metadata?.steerPromoted?.disposition === 'unanswered' && data.savedRecord !== true && !savedPromotion) {
+        for (const steerId of data.steerIds ?? []) {
+          steerInbox.markSteerDropped(steerId, data.metadata.steerPromoted.reason === 'stopped' ? 'stopped' : 'unanswered')
+        }
+      } else {
+        steerInbox.applySteerPromoted({
+          steerIds: Array.isArray(data.steerIds) ? data.steerIds : [],
+          messageId: typeof data.messageId === 'string' ? data.messageId : undefined
+        })
+      }
 	    } else if (data.type === 'complete_message' && data.message) {
 	      // Handle complete message from SSE
 	      const message = data.message
@@ -3456,26 +3626,12 @@ const immersiveActive = $derived.by(
         )
       }
 
-      // Save to database
-      const pageData = page.data
-      if (pageData.user) {
-        const dbService = new DatabaseService()
-        const messageAgent = aiMessage.agent_id
-          ? agentStore.getAgentById(aiMessage.agent_id)
-          : currentAgent
-        dbService.saveMessage(aiMessage, messageAgent)
-          .then(() => {
-	            const finalizedSessionId = aiMessage.session_id
-            if (finalizedSessionId) {
-              void refreshLiveContextPreview('message-finalized', finalizedSessionId, {
-                useStoredMessages: true,
-                ignoreBusy: true
-              })
-            }
-          })
-          .catch(err => {
-            console.error('Failed to save AI message:', err)
-          })
+      // BL-775: the LiveKit turn route saved this reply before it sent it; the tab only shows it.
+      if (aiMessage.session_id) {
+        void refreshLiveContextPreview('message-finalized', aiMessage.session_id, {
+          useStoredMessages: true,
+          ignoreBusy: true
+        })
       }
 
       // Reset waiting state in ChatInput
@@ -3507,6 +3663,7 @@ const immersiveActive = $derived.by(
       const approvalResume = readApprovalResumeStart(data.metadata)
       if (approvalResume && existingStreamMessage && !isNewApprovalResume(existingStreamMessage.metadata, approvalResume)) return
       if (!approvalResume && existingStreamMessage && ignoreLateEventForFinalizedMessage(realMessageId, 'start')) return
+      if (sessionId) markImageOriginExpected(sessionId, realMessageId)
 
       registerActiveMessage(realMessageId)
       resetToolStateForMessage(realMessageId)
@@ -3793,6 +3950,54 @@ const immersiveActive = $derived.by(
         }
       }
 
+    } else if (data.type === 'content_reset') {
+      // BL-759: the agent's program lost its connection mid-answer and started the answer again
+      // (Codex's app-server lane); the server took the unfinished first try out of the reply's
+      // record and sends the reply's text as it now reads. The live text becomes that text, its
+      // tool cards stay where they were, the words buffered while a tool ran are already in it,
+      // and words not spoken yet in Voice Mode go. The reply says what happened once it is saved
+      // (`restartedAfterLostConnection`); it says so here too while it streams.
+      const targetMessageId = resolveStreamMessageId(data.messageId)
+      if (!targetMessageId || typeof data.content !== 'string') {
+        return
+      }
+      if (ignoreLateEventForFinalizedMessage(targetMessageId, data.type)) {
+        return
+      }
+      const currentMessage = messageStore.getMessage(targetMessageId)
+      if (!currentMessage || currentMessage.status === 'complete' || currentMessage.status === 'error') {
+        return
+      }
+      const processingState = toolProcessingStates.get(targetMessageId)
+      if (processingState) processingState.pendingChunks = []
+      const previousToolState = toolStreamStates.get(targetMessageId)
+      let resetContent = data.content
+      if (previousToolState) {
+        const resetToolState = resetToolStreamStateFromContent(
+          previousToolState,
+          data.content,
+          () => toolInsertionSequence++
+        )
+        toolStreamStates.set(targetMessageId, resetToolState)
+        resetContent = composeToolStreamContent(resetToolState)
+      }
+      messageStore.updateMessage(targetMessageId, {
+        content: resetContent,
+        metadata: {
+          ...(currentMessage.metadata || {}),
+          restartedAfterLostConnection: {
+            program:
+              typeof data.metadata?.program === 'string' && data.metadata.program
+                ? data.metadata.program
+                : 'The agent'
+          }
+        }
+      })
+      realtimeSpeechCoordinator.discardUnspoken(
+        targetMessageId,
+        data.content,
+        typeof data.metadata?.removedText === 'string' ? data.metadata.removedText : null
+      )
     } else if (data.type === 'finish') {
       const targetMessageId = resolveStreamMessageId(data.messageId)
       if (!targetMessageId) {
@@ -3824,7 +4029,17 @@ const immersiveActive = $derived.by(
       if (!targetMessageId) {
         return
       }
-      if (ignoreLateEventForFinalizedMessage(targetMessageId, 'end')) {
+      // BL-361: every late event for a finalized message is ignored, except the `end` of a reply
+      // this tab's Stop fallback drew, still finalized, when the server finalized that reply: its
+      // content and metadata replace the fallback copy on screen (the server saved them, BL-775).
+      // Every `end` for the message clears its id, so a reply reopened later ends normally.
+      const lateEndAfterStopFallback = shouldAcceptLateEndAfterStopFallback({
+        savedByStopFallback: savedByStopFallbackMessageIds.has(targetMessageId),
+        isFinalized: isFinalizedMessage(targetMessageId),
+        endMetadata: data.metadata
+      })
+      savedByStopFallbackMessageIds.delete(targetMessageId)
+      if (!lateEndAfterStopFallback && ignoreLateEventForFinalizedMessage(targetMessageId, 'end')) {
         return
       }
 
@@ -3834,184 +4049,32 @@ const immersiveActive = $derived.by(
         resetToolStateForMessage(targetMessageId)
         return
       }
+      markImageOriginExpected(currentMessage.session_id, targetMessageId)
+      void refreshImageOrigins(currentMessage.session_id)
+      // BL-653: a reply of this chat ended, so a stopped Auto Compact may run again here.
+      autoCompactStopHolds = releaseAutoCompactHoldOnReplyEnd(autoCompactStopHolds, currentMessage.session_id)
 
       clearThinkingIndicator(targetMessageId)
 
-      // Prefer server end.content as source of truth because it is fully finalized/persisted.
-      // Streamed local content can still contain transient placeholder states during finalization.
-      const serverEndContent = typeof data.content === 'string' ? data.content : ''
-      const streamedLocalContent = typeof currentMessage.content === 'string' ? currentMessage.content : ''
-      let finalContent = serverEndContent.trim().length > 0
-        ? serverEndContent
-        : streamedLocalContent
-
-      logger.debug('[SA-911 End] Message content length:', finalContent.length)
-
-      // Server finalization owns XML/content zip creation. The browser must not
-      // mint zip references here, or it can create references before storage exists.
-
-      // If we have server-created cool_tool zips, replace inline cool_tool markers
-      // with their real zip references to keep inline order without client-side zipping.
-      if (data.zipReferences && Array.isArray(data.zipReferences) && data.zipReferences.length > 0) {
-        finalContent = replaceCoolToolMarkersWithZipRefs(finalContent, data.zipReferences)
-      }
-
-      // Tool Notes ride their own tag (SA-104 P1); extract them first so the
-      // zip-control pass sees a notes-free message.
-      const toolNotesExtraction = extractToolNotes(finalContent)
-      if (toolNotesExtraction.hadBlock) {
-        finalContent = toolNotesExtraction.cleaned
-      }
-      const zipControlExtraction = extractZipControl(finalContent)
-      if (zipControlExtraction.hadBlock) {
-        finalContent = zipControlExtraction.cleaned
-      }
-      // SA-104 P3: inline memory saves ride their own tag; every block is one save.
-      // Processing happens below through /api/memory/inline-saves (the same server path
-      // as the sys.memory.save tool); here we only extract and clean the content.
-      const memoryExtraction = extractMemoryControls(finalContent)
-      if (memoryExtraction.hadBlock) {
-        finalContent = memoryExtraction.cleaned
-      }
-
-      // Sanitize content (removes duplicates, cleans up whitespace)
-      finalContent = sanitizeMessageContent(finalContent)
-
-      // Safety: ensure zip references are present if we know zips exist in the message
-      if (data.zipReferences && Array.isArray(data.zipReferences) && data.zipReferences.length > 0) {
-        const missingRefs = data.zipReferences
-          .map((r: any) => r.reference || '')
-          .filter(Boolean)
-          .filter((ref: string) => !finalContent.includes(ref))
-        if (missingRefs.length > 0) {
-          const refsBlock = missingRefs.join('\n\n')
-          finalContent = finalContent.trim().length > 0
-            ? `${finalContent}\n\n${refsBlock}`
-            : refsBlock
-        }
-      }
+      // BL-775: the server owns the reply's saved record. Its finalize saved this reply and only
+      // then published `end`, with the saved bytes: the text (the rebuild of the stream, with the
+      // edits this page used to make), the allow-list, the model, the cards. So this tab shows it
+      // exactly as it came and saves nothing: what it shows, what is stored, and what the agent
+      // reads next are the same bytes.
+      const finalContent = typeof data.content === 'string' ? data.content : ''
+      const metadata: any =
+        data.metadata && typeof data.metadata === 'object' && !Array.isArray(data.metadata)
+          ? data.metadata
+          : {}
+      logger.debug('[SA-911 End] Final content length:', finalContent.length)
 
       // Reset tool state for this message
       resetToolStateForMessage(targetMessageId)
 
-      logger.debug('[SA-911 End] Final content length:', finalContent.length)
-
-	  // Build proper metadata structure
-	      const usageFromEnd = data?.usage ?? data?.metadata?.usage
-	      const existingUsage = currentMessage.metadata?.usage ?? usageFromEnd
-      const baseMetadata =
-        data.metadata && typeof data.metadata === 'object' && !Array.isArray(data.metadata)
-          ? data.metadata
-          : {}
-      const metadata: any = {
-        ...baseMetadata,
-        stt: baseMetadata.stt ?? false,
-        tts: baseMetadata.tts ?? false,
-        format: baseMetadata.format ?? 'message',
-        voiceMode: baseMetadata.voiceMode ?? 'text',
-        usage: existingUsage,
-        structuredOutput: baseMetadata.structuredOutput || data.structured || {
-          message: currentMessage.content,
-          responseType: data.structured?.responseType || 'message'
-        }
-      }
-
-      if (metadata.structuredOutput && typeof metadata.structuredOutput === 'object') {
-        metadata.structuredOutput = {
-          ...metadata.structuredOutput,
-          message: finalContent
-        }
-      }
-
-      if (metadata.structured && typeof metadata.structured === 'object') {
-        metadata.structured = {
-          ...metadata.structured,
-          message: finalContent
-        }
-      }
-
-      const zipIds = Array.from(new Set([
-        ...extractZipIdsFromReferences(Array.isArray(data.zipReferences) ? data.zipReferences : []),
-        ...extractZipIdsFromContent(finalContent)
-      ]))
-      metadata.zipIds = zipIds
-
-      const zipControlAgent = currentMessage.agent_id
-        ? agentStore.getAgentById(currentMessage.agent_id)
-        : agentStore.getCurrentAgent()
-      const zipPermissionEnabled = resolveZipControlPermission(zipControlAgent, userSettings)
-      const zipToolNotesEnabled = resolveZipToolNotesEnabled(zipControlAgent, userSettings)
-      // Tool Notes come from their own tag now; storage stays at
-      // metadata.zipControl.toolResultsSummary so downstream readers are unchanged.
-      const resolvedToolResultsSummary = zipToolNotesEnabled
-        ? toolNotesExtraction.payload?.notes ?? []
-        : []
-
-      const hadAnyControlBlock =
-        zipControlExtraction.hadBlock || toolNotesExtraction.hadBlock
-      if (
-        zipControlExtraction.payload ||
-        zipControlExtraction.parseError ||
-        toolNotesExtraction.parseError ||
-        hadAnyControlBlock
-      ) {
-        metadata.zipControl = {
-          unzip: zipControlExtraction.payload?.unzip ?? [],
-          zip: zipControlExtraction.payload?.zip ?? [],
-          toolResultsSummary: resolvedToolResultsSummary,
-          ...(zipControlExtraction.parseError ? { parseError: zipControlExtraction.parseError } : {})
-        }
-      }
-
-      // DL-104-05 loud-failure surface: malformed or deprecated control blocks
-      // become machine-readable metadata; the next turn's compile inserts a
-      // correction line from these records.
-      const controlErrors: Array<ReturnType<typeof buildControlErrorRecord>> = []
-      if (zipControlExtraction.parseError) {
-        controlErrors.push(
-          buildControlErrorRecord(
-            'batshit-zip-control',
-            zipControlExtraction.parseError,
-            'Wrap valid JSON like {"unzip":["tool_result_1"],"zip":["zipId"]} inside <batshit-zip-control>...</batshit-zip-control>.'
-          )
-        )
-      }
-      if (zipControlExtraction.payload?.legacyNotesDropped) {
-        controlErrors.push(
-          buildControlErrorRecord(
-            'batshit-zip-control',
-            'Tool Notes fields inside the zip-control block were dropped.',
-            'Tool Notes moved to their own block: <batshit-tool-notes>{"notes":[{"toolName":"...","summary":"..."}]}</batshit-tool-notes>.'
-          )
-        )
-      }
-      if (toolNotesExtraction.parseError) {
-        controlErrors.push(
-          buildControlErrorRecord(
-            'batshit-tool-notes',
-            toolNotesExtraction.parseError,
-            'Use <batshit-tool-notes>{"notes":[{"toolName":"...","summary":"exact fact(s)"}]}</batshit-tool-notes>.'
-          )
-        )
-      }
-      if (controlErrors.length > 0) {
-        metadata.controlErrors = controlErrors
-      }
-      const requestedUnzip = Array.isArray(zipControlExtraction.payload?.unzip)
-        ? zipControlExtraction.payload?.unzip ?? []
-        : []
-      const requestedZip = Array.isArray(zipControlExtraction.payload?.zip)
-        ? zipControlExtraction.payload?.zip ?? []
-        : []
-      const hasZipActions =
-        requestedUnzip.length > 0 ||
-        requestedZip.length > 0
-
-      // SA-120 P5: Jev Juice smart zip opened zipped results for this send. The SERVER wrote
+      // SA-120 P5: Judge Juice smart zip opened zipped results for this send. The SERVER wrote
       // that state (source `inferred`) at the accepted-send boundary, so this tab re-reads zip
-      // state from Redis: the badge then shows the Jev Juice mark and the ordinary countdown
-      // closes it. Before the agent's own zip control below, so an explicit action lands on
-      // fresh state and wins.
+      // state from Redis: the badge then shows the Judge Juice mark and the ordinary countdown
+      // closes it.
       const inferredZipChanges = (metadata as any)?.jevJuice?.zips
       if (
         eventSessionContext &&
@@ -4025,249 +4088,21 @@ const immersiveActive = $derived.by(
             new CustomEvent('checkZipActivity', { detail: { sessionId: eventSessionContext } })
           )
         } catch (error) {
-          console.warn('[Jev Juice] Failed to re-read zip state after a smart zip change:', error)
+          console.warn('[Judge Juice] Failed to re-read zip state after a smart zip change:', error)
         }
       }
 
-      if (hasZipActions && zipPermissionEnabled) {
-	        const sessionId = eventSessionContext
-        if (sessionId) {
-          let pendingZipControl: Promise<void> | null = null
-          zipControlProcessing = true
-          pendingZipControl = (async () => {
-            try {
-              const { zippingService } = await import('$lib/services/zipping')
-              await zippingService.ensureSessionLoaded(sessionId)
-
-	              const sessionZipIds = collectSessionZipIds(messageStore.getMessages(sessionId), zipIds)
-              const currentToolZipIds = extractCurrentToolResultZipIds(
-                Array.isArray(data.zipReferences) ? data.zipReferences : [],
-                finalContent
-              )
-
-              const resolvedUnzipIds = resolveZipControlZipIds(requestedUnzip, sessionZipIds, {
-                currentToolZipIds
-              })
-              const resolvedZipIds = resolveZipControlZipIds(requestedZip, sessionZipIds, {
-                currentToolZipIds
-              })
-
-              let zipDataMap: Map<string, any> | null = null
-              if (resolvedUnzipIds.length > 0) {
-                zipDataMap = await api.getZips(resolvedUnzipIds)
-              }
-
-              const locked = new Set(
-                zippingService
-                  .getAllUnzipped()
-                  .filter((item) => item?.source === 'user')
-                  .map((item) => normalizeId(item.zipId))
-              )
-
-              for (const zipId of resolvedZipIds) {
-                const normalized = normalizeId(zipId)
-                if (locked.has(normalized)) continue
-                await zippingService.rezip(zipId, 'agent')
-              }
-
-              for (const zipId of resolvedUnzipIds) {
-                const normalized = normalizeId(zipId)
-                if (locked.has(normalized)) continue
-                const existing =
-                  zippingService.getUnzippedInfo(zipId) ??
-                  zippingService.getUnzippedInfo(normalized)
-                if (existing?.source === 'user' || existing?.source === 'agent') {
-                  continue
-                }
-
-                const zipData =
-                  (zipDataMap?.get(zipId) as any) ??
-                  (zipDataMap?.get(normalized) as any)
-                const name =
-                  zipData?.name ??
-                  zipData?.metadata?.toolName ??
-                  zipData?.metadata?.tool_name ??
-                  undefined
-                const description =
-                  zipData?.description ?? zipData?.metadata?.description ?? undefined
-                const tokens =
-                  typeof zipData?.tokens === 'number'
-                    ? zipData.tokens
-                    : typeof zipData?.metadata?.tokens === 'number'
-                      ? zipData.metadata.tokens
-                      : undefined
-
-                await zippingService.unzip(
-                  zipId,
-                  true,
-                  20,
-                  name,
-                  description,
-                  tokens,
-                  'agent'
-                )
-              }
-
-              if (resolvedUnzipIds.length > 0 || resolvedZipIds.length > 0) {
-                window.dispatchEvent(
-                  new CustomEvent('checkZipActivity', {
-                    detail: { sessionId }
-                  })
-                )
-              }
-            } catch (error) {
-              console.warn('[ZipControl] Failed to apply zip actions:', error)
-            } finally {
-              if (zipControlPendingBySession.get(sessionId) === pendingZipControl) {
-                zipControlPendingBySession.delete(sessionId)
-              }
-              zipControlProcessing = zipControlPendingBySession.size > 0
-            }
-          })()
-          zipControlPendingBySession.set(sessionId, pendingZipControl)
-          await pendingZipControl
-        }
-      }
-
-      // SA-104 P3: process inline memory saves through the shared server path
-      // (/api/memory/inline-saves → the same ops layer as sys.memory.save). All
-      // failures surface loudly through metadata.controlErrors (DL-104-05);
-      // successes land in metadata.memorySaves for the chat-surface affordance.
-      if (memoryExtraction.hadBlock) {
-        const appendMemoryControlError = (error: string, hint?: string) => {
-          const list = Array.isArray(metadata.controlErrors) ? metadata.controlErrors : []
-          list.push(buildControlErrorRecord('batshit-memory', error, hint ?? memorySaveHint()))
-          metadata.controlErrors = list
-        }
-        const memoryAgent = zipControlAgent
-        const memorySessionId = eventSessionContext
-
-        if (!resolveAgentMemoryEnabled(memoryAgent)) {
-          appendMemoryControlError(
-            'Memory is not enabled for this agent; the memory save block(s) were not stored.',
-            'Do not emit <batshit-memory> blocks unless memory is enabled for you.'
-          )
-        } else {
-          for (const block of memoryExtraction.blocks) {
-            if (block.parseError) {
-              appendMemoryControlError(block.parseError)
-            }
-          }
-          const validMemoryPayloads = memoryExtraction.blocks
-            .filter((block) => block.payload)
-            .map((block) => block.payload)
-          if (validMemoryPayloads.length > 0 && memorySessionId) {
-            try {
-              const response = await fetch('/api/memory/inline-saves', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  sessionId: memorySessionId,
-                  messageId: targetMessageId,
-                  agentId: memoryAgent?.id ?? currentMessage.agent_id ?? null,
-                  payloads: validMemoryPayloads
-                })
-              })
-              const payload = await response.json().catch(() => null)
-              if (!response.ok) {
-                appendMemoryControlError(
-                  `Memory save failed: ${payload?.error ?? `HTTP ${response.status}`}`,
-                  'The save was not stored. Fix the payload or ask the user to check memory setup, then save again.'
-                )
-              } else {
-                const results = Array.isArray(payload?.results) ? payload.results : []
-                const saves: any[] = []
-                for (const result of results) {
-                  if (result?.error) {
-                    appendMemoryControlError(result.error, result.hint)
-                  } else if (result?.saved) {
-                    saves.push({
-                      id: result.saved.id,
-                      lane: result.saved.lane,
-                      gist: result.saved.gist,
-                      ...(Array.isArray(result.saved.trigger_terms) && result.saved.trigger_terms.length > 0
-                        ? { trigger_terms: result.saved.trigger_terms }
-                        : {}),
-                      ...(result.superseded ? { superseded: result.superseded } : {}),
-                      ...(result.nearDuplicates?.length
-                        ? { nearDuplicates: result.nearDuplicates }
-                        : {})
-                    })
-                  }
-                }
-                if (saves.length > 0) {
-                  metadata.memorySaves = saves
-                }
-              }
-            } catch (error) {
-              appendMemoryControlError(
-                `Memory save request failed: ${error instanceof Error ? error.message : 'network error'}`,
-                'The save was not stored; retry the save in your next message.'
-              )
-            }
-          }
-        }
-      }
-
-      if (Array.isArray(data.metadata?.imageZipIds)) {
-        metadata.imageZipIds = data.metadata.imageZipIds
-      }
-
-      const { showReasoning } = resolveReasoningFlags(targetMessageId)
-      const planPayload = planSubjects[targetMessageId]
-      const fallbackPlanSummary =
-        typeof (currentMessage.metadata as any)?.planSummary === 'string'
-          ? (currentMessage.metadata as any).planSummary
-          : typeof data.metadata?.planSummary === 'string'
-            ? data.metadata.planSummary
-            : ''
-      const fallbackPlanItems = Array.isArray((currentMessage.metadata as any)?.planItems)
-        ? (currentMessage.metadata as any).planItems
-        : Array.isArray(data.metadata?.planItems)
-          ? data.metadata.planItems
-          : []
-
-      const resolvedPlanSummary = planPayload?.content || fallbackPlanSummary
-      const resolvedPlanItems =
-        planPayload?.items && planPayload.items.length > 0 ? planPayload.items : fallbackPlanItems
-
-      if (showReasoning) {
-        if (resolvedPlanSummary) {
-          metadata.planSummary = resolvedPlanSummary
-        }
-        if (Array.isArray(resolvedPlanItems) && resolvedPlanItems.length > 0) {
-          metadata.planItems = resolvedPlanItems
-        }
-      }
-
-      // Also include structured in metadata if it exists
-      if (data.metadata?.structuredOutput) {
-        metadata.structured = data.metadata.structuredOutput
-      } else if (data.structured) {
-        metadata.structured = data.structured
-      }
-
-      // No longer need to track zipMetadata separately
-
-      // Mark message as complete
-      // For other modes: Always mark as complete on 'end' event
-      const shouldMarkComplete = true
-
-      // Mark message as complete with all proper data
       messageStore.updateMessage(targetMessageId, {
-    status: shouldMarkComplete ? 'complete' : 'in_progress',
-    content: finalContent,
-    metadata: metadata,
-    structured: data.structured || {},
-        responseType: data.structured?.responseType || 'message',
-        // Include intermediateSteps if provided (for direct tool result rendering)
-        intermediateSteps: data.intermediateSteps || undefined,
+        status: 'complete',
+        content: finalContent,
+        metadata,
+        intermediateSteps: Array.isArray(data.intermediateSteps) ? data.intermediateSteps : undefined,
         toolPreface: undefined
-        // Don't store toolResults separately since they're now embedded in content
-        // toolResults: toolResults.length > 0 ? toolResults : undefined
       })
 
-      const forceSpeak = isSpeechRequested(metadata)
+      // BL-361: a late `end` after a Stop only replaces the copy on screen; the user stopped it, so it
+      // is not spoken, not handed to the Goon, and does not reset the composer.
+      const forceSpeak = !lateEndAfterStopFallback && isSpeechRequested(metadata)
       const goonAgentId = currentMessage.agent_id ?? resolveAgentIdFromEvent(data)
       if (!forceSpeak) {
         cancelRealtimeSpeechSessions(targetMessageId)
@@ -4280,7 +4115,7 @@ const immersiveActive = $derived.by(
           ? await finishRealtimeSpeech(targetMessageId, speechAgentId, metadata)
           : false
 
-      if (!realtimeSpeechHandled) {
+      if (!realtimeSpeechHandled && !lateEndAfterStopFallback) {
         dispatchGoonSpeechMessage(
           targetMessageId,
           goonAgentId,
@@ -4312,13 +4147,6 @@ const immersiveActive = $derived.by(
         interrupted: metadata?.interrupted === true
       })
 
-      // Save to database after updating. Not for a reply stopped because its chat was deleted:
-      // the chat is gone, the save route refuses it, and the refusal was a false "Failed to save
-      // message to database" (bug sweep, 2026-09-18).
-      if (metadata?.chatDeleted !== true) {
-        await saveMessageToDatabase(targetMessageId)
-      }
-
 	      resolveStreamCompletion(targetMessageId)
       unregisterActiveMessage(targetMessageId)
 	        const finalizedSessionId = messageStore.getMessage(targetMessageId)?.session_id ?? eventSessionContext
@@ -4327,6 +4155,8 @@ const immersiveActive = $derived.by(
           useStoredMessages: true,
           ignoreBusy: true
         })
+        // SA-129 P2 (BL-333): a reply may have made earlier reads dead copies.
+        void refreshDeadCopies(finalizedSessionId)
       }
 
       // Clear the creating session flag now that the response is complete
@@ -4343,7 +4173,7 @@ const immersiveActive = $derived.by(
       syncActiveToolProcessingState()
 
       // Reset waiting state in ChatInput
-      if (chatInputRef?.aiResponseReceived) {
+      if (!lateEndAfterStopFallback && chatInputRef?.aiResponseReceived) {
         chatInputRef.aiResponseReceived()
       }
     } else if (data.type === 'complete') {
@@ -4371,15 +4201,12 @@ const immersiveActive = $derived.by(
           const currentMessage = messageStore.getMessage(targetMessageId)
 
           if (currentMessage && currentMessage.status !== 'complete' && data?.metadata?.chatDeleted !== true) {
+            // No `end` reached this tab, so its copy can still hold raw control blocks, closed or
+            // not; they are hidden (BL-361 review). The server saved the reply (BL-775).
             messageStore.updateMessage(targetMessageId, {
-              status: 'complete'
+              status: 'complete',
+              content: stripUnfinalizedReplyControl(currentMessage.content)
             })
-
-            try {
-              await saveMessageToDatabase(targetMessageId)
-            } catch (error) {
-              console.error('[SSE complete] Failed to persist message:', error)
-            }
           }
         }
 
@@ -4393,6 +4220,7 @@ const immersiveActive = $derived.by(
             useStoredMessages: true,
             ignoreBusy: true
           })
+          void refreshDeadCopies(finalizedSessionId)
         }
       }
 
@@ -4403,55 +4231,6 @@ const immersiveActive = $derived.by(
       }
     } else if (data.type === 'stream_complete') {
       logger.debug('[SSE] Stream complete for session:', data.sessionId)
-    } else if (data.type === 'intermediate_message') {
-      // Handle intermediate AI messages (between tool calls)
-      logger.debug('[SSE] Received intermediate message with ID:', data.messageId)
-
-      // FIX: When we have a current streaming message with tool results placeholder,
-      // the intermediate_message is likely the SAME message being sent again
-      // We should IGNORE it to prevent duplicates
-	      const hasActiveStreamForMessage = data.messageId
-	        ? isMessageActive(data.messageId)
-	        : Boolean(eventSessionContext && chatRunRegistry.getRunState(eventSessionContext).activeStreamMessageIds.length > 0)
-      if (hasActiveStreamForMessage) {
-        logger.debug('[SSE] Ignoring intermediate_message - streaming already active')
-        return
-      }
-
-      // Only process intermediate messages when there's NO current streaming message
-      // This typically happens when tools are called without initial streaming
-	      const sessionId = eventSessionContext
-      const agentId = agentStore.getCurrentAgentId()
-      const pageData = page.data
-
-      const intermediateMessage = {
-        id: data.messageId,
-        content: data.content,
-        role: 'assistant' as const,
-        session_id: sessionId!,
-        agent_id: resolveAgentIdFromEvent(data) || agentId || undefined,
-        user_id: pageData.user?.id || '',
-        status: 'complete' as const,
-        metadata: {},
-        timestamp: new Date().toISOString(),
-        created_at: new Date().toISOString()
-      }
-
-      // Check if message with this ID already exists to prevent duplicates
-	      const existingIntermediateMessage = messageStore.getMessages(sessionId).find(m => m.id === intermediateMessage.id)
-      if (existingIntermediateMessage) {
-        logger.warn('[SSE] Duplicate intermediate message ID detected, updating instead:', intermediateMessage.id)
-        messageStore.updateMessage(intermediateMessage.id, intermediateMessage)
-      } else {
-        // Add a small delay to ensure proper ordering when multiple messages arrive rapidly
-        await new Promise(resolve => setTimeout(resolve, 10))
-        messageStore.addMessage(intermediateMessage)
-      }
-
-      // Save to database
-      const dbService = new DatabaseService()
-      await dbService.saveMessage(intermediateMessage)
-
     } else if (data.type === 'tool_approval_request' || data.type === 'tool-approval-request') {
       const messageId = resolveStreamMessageId(data.messageId)
       if (ignoreLateEventForFinalizedMessage(messageId, data.type)) {
@@ -4510,30 +4289,16 @@ const immersiveActive = $derived.by(
       const targetMessage = resolveMessage(messageId)
       const isApprovalPrompt = isClaudeApprovalTool(data.toolName)
       if (isApprovalPrompt && messageId && targetMessage) {
-        const details = extractClaudeApprovalDetails(data)
-        const { requestedAt, expiresAt } = extractApprovalTimestamps(data)
+        // BL-636: only the helper's complete `tool-call` makes or completes the card
+        // (`applyClaudeApprovalCardEvent`); its bare `tool_start` changes nothing.
         const existingSummary = (targetMessage.metadata as any)?.toolApprovals
-        const existingApprovals = Array.isArray(existingSummary?.approvals)
-          ? existingSummary.approvals
-          : []
-        const alreadyTracked = existingApprovals.some(
-          (entry: any) => entry?.approvalId === details.approvalId
+        const nextApprovals = applyClaudeApprovalCardEvent(
+          Array.isArray(existingSummary?.approvals) ? existingSummary.approvals : [],
+          data,
+          extractClaudeApprovalDetails(data),
+          extractApprovalTimestamps(data)
         )
-        if (!alreadyTracked) {
-          const nextApprovals = [
-            ...existingApprovals,
-            {
-              approvalId: details.approvalId,
-              status: 'pending',
-              submitted: false,
-              ...(requestedAt ? { requestedAt } : {}),
-              ...(expiresAt ? { expiresAt } : {}),
-              toolName: details.toolName,
-              toolCall: details.toolCall,
-              input: details.input,
-              source: 'claude'
-            }
-          ]
+        if (nextApprovals) {
           messageStore.updateMessage(messageId, {
             metadata: {
               ...(targetMessage.metadata || {}),
@@ -4621,12 +4386,8 @@ const immersiveActive = $derived.by(
             normalizedResult?.decision === 'allow' ||
             normalizedResult?.approved === true ||
             (typeof normalizedResult === 'string' && normalizedResult.toLowerCase().includes('allow'))
-
-          const nextApprovals = approvals.map((entry: any) =>
-            entry?.approvalId === details.approvalId
-              ? { ...entry, status: approved ? 'approved' : 'denied' }
-              : entry
-          )
+          // BL-496 (A6): a card nobody answered ends expired, with its reason, not denied.
+          const nextApprovals = settleClaudeApprovalCard(approvals, details.approvalId, data, approved)
 
           if (nextApprovals.length > 0) {
             messageStore.updateMessage(messageId, {
@@ -4873,6 +4634,62 @@ const immersiveActive = $derived.by(
 	    }
 	  }
 
+  /**
+   * BL-382: the server added this chat's listener again (the live connection came back, or the hub
+   * took back a silent tab). It replays only a turn still running, so a reply that ended while the
+   * tab was away (its buffer goes 5 s after `end`) is read from the server here, once per return,
+   * for the chat on screen and for a chat still streaming a reply in this tab (an idle chat in the
+   * background is read when it is opened; `shouldCatchUpChatAfterReconnect`). The replay was written
+   * before this `open`, and the order does not matter: a reply still streaming has no stored copy
+   * yet, and the load keeps this tab's in-progress copy while the chat is busy
+   * (`preserveLocalInProgress`), so it is neither cut nor doubled; a reply the server finished
+   * replaces the half-written copy.
+   */
+  function handleSSEReconnected(sessionId: string) {
+    toast.dismiss(SSE_RECONNECT_TOAST_ID)
+    const catchUp = shouldCatchUpChatAfterReconnect({
+      onScreen: sessionId === sessionStore.getCurrentSessionId(),
+      streamingReplyIds: chatRunRegistry.getRunState(sessionId).activeStreamMessageIds
+    })
+    if (!catchUp) return
+    void catchUpAfterReconnect(sessionId)
+  }
+
+  /**
+   * BL-382: read the chat again, then end this tab's busy state for each reply that ended on the
+   * server while the tab was away (it never heard that `end`), taking the steps `end` takes: no
+   * save, the server already stored the reply. A reply still running keeps its busy state, and its
+   * replay goes on (`resolveRepliesEndedWhileAway` says why the reload is the answer). This also
+   * covers a replayed `end` that arrives after the reload: the reload marked its message finished,
+   * so `ignoreLateEventForFinalizedMessage` drops it.
+   */
+  async function catchUpAfterReconnect(sessionId: string) {
+    await loadMessagesForSession(sessionId)
+    const ended = resolveRepliesEndedWhileAway({
+      activeMessageIds: chatRunRegistry.getRunState(sessionId).activeStreamMessageIds,
+      messages: messageStore.getMessages(sessionId)
+    })
+    for (const messageId of ended) {
+      clearThinkingIndicator(messageId)
+      settleSteerBubblesForMessage(sessionId, messageId, {
+        interrupted: messageStore.getMessage(messageId)?.metadata?.interrupted === true
+      })
+      resetToolStateForMessage(messageId)
+      resolveStreamCompletion(messageId)
+      unregisterActiveMessage(messageId, sessionId)
+    }
+    if (ended.length === 0) return
+    autoCompactStopHolds = releaseAutoCompactHoldOnReplyEnd(autoCompactStopHolds, sessionId)
+    void refreshLiveContextPreview('message-finalized', sessionId, {
+      useStoredMessages: true,
+      ignoreBusy: true
+    })
+    void refreshDeadCopies(sessionId)
+    if (isSessionCreating(sessionId)) clearCreatingSession(sessionId)
+    syncActiveToolProcessingState()
+    if (sessionId === sessionStore.getCurrentSessionId()) chatInputRef?.aiResponseReceived?.()
+  }
+
 	  function handleSSEError(error: any, sourceSessionId?: string | null) {
 	    console.error('[SSE] Error:', error)
 	    const now = Date.now()
@@ -4894,32 +4711,6 @@ const immersiveActive = $derived.by(
   }
 }
 
-
-	  async function saveMessageToDatabase(messageId: string) {
-	    const message = messageStore.getMessage(messageId)
-    logger.debug('[saveMessageToDatabase] Attempting to save:', messageId, message ? $state.snapshot(message) : null)
-
-    if (!message) {
-      console.error('[saveMessageToDatabase] Missing message for id:', messageId)
-      return
-    }
-
-    try {
-      const dbService = new DatabaseService()
-
-      // Tags are now created immediately when AI message arrives
-      // No need for analyzeContentForTags anymore
-
-      const messageAgent = message.agent_id
-        ? agentStore.getAgentById(message.agent_id)
-        : agentStore.getCurrentAgent()
-      await dbService.saveMessage(message, messageAgent)
-      logger.debug('[saveMessageToDatabase] Successfully saved message:', messageId)
-    } catch (error) {
-      console.error('[saveMessageToDatabase] Failed to save message:', error)
-      toast.error('Failed to save message to database')
-	    }
-	  }
 
   /**
    * SA-120 P9: a spoken turn that was ONLY a quick action (DL-120-15). The words are stored as a
@@ -4975,7 +4766,7 @@ const immersiveActive = $derived.by(
 		    metadata: any = {},
 		    // Review F-P3b-1: a replay from a receipt's Send now. Not metadata, because
 		    // `requestMetadata` spreads metadata into the request body and a placeholder record.
-		    sendOptions: { fromDroppedReceipt?: boolean } = {}
+		    sendOptions: { fromDroppedReceipt?: boolean; existingUserMessageId?: string; onNoReplyCompleted?: () => void; onReplyAdmitted?: (kind: 'direct' | 'steer' | 'queued') => void; onSteerPrepared?: (identity: { steerId: string; sessionId: string; targetMessageId?: string }) => void } = {}
 		  ) {
 		    const goonPresentationMode: DesktopGoonPresentationMode | null = goonDcmPresentationMode
 		    metadata = {
@@ -4983,6 +4774,7 @@ const immersiveActive = $derived.by(
 		      goonsEnabled: goonPresentationMode !== null,
 		      goonPresentationMode: goonPresentationMode ?? undefined
 		    }
+		    const sendChatInput = chatInputRef
 		    const composerSessionId = normalizeComposerSessionId(metadata?.composerSessionId)
 		    if (composerSessionId && sessionStore.getCurrentSessionId() !== composerSessionId) {
 		      logger.debug('[handleSendMessage] Aligning store to composer session before send', {
@@ -5234,10 +5026,10 @@ const immersiveActive = $derived.by(
 	     *
 	     * Two outcomes, never three. **Steer** hands the words to the server, which places
 	     * them inside this reply at the agent's next tool boundary. **Queue** sends them the
-	     * moment the reply ends, and has two mechanisms under one word: the SERVER holds a
-	     * text-only message on a steerable turn (`deliver: 'end'`, promoted into the next
-	     * turn's user message), and the BROWSER holds anything else (files, a group chat, an
-	     * unmanaged profile, a Codex exec lane) until the reply finishes.
+	     * moment the reply ends, and has two holders under one word, both on the server: the
+	     * steer inbox holds a text-only message on a steerable turn (`deliver: 'end'`, promoted
+	     * into the next turn's user message), and the chat's line holds anything else (files, a
+	     * group chat, an unmanaged profile, a Codex exec lane), sent at once (BL-713, below).
 	     *
 	     * **Interrupt-and-send is gone** (DL-119-07). Stop, then Enter, is that job, and it
 	     * is one gesture the user chose rather than a side effect of a send. Nothing here may
@@ -5277,27 +5069,22 @@ const immersiveActive = $derived.by(
 	    })
 	    const busySendAction: BusySendMode = busySendOverride ?? busySendActions.enter
 
-	    const managedBusy = isManagedPrimaryAgentType(agentType) && hasActiveStream
+	    // BL-4: a Send now of a message already in the chat goes the ordinary way even while the
+	    // agent is busy: the server queues it behind the running turn, reusing that message. The
+	    // steer route would write it again as a new message.
+	    const managedBusy =
+	      isManagedPrimaryAgentType(agentType) && hasActiveStream && !sendOptions.existingUserMessageId
 	    /**
-	     * Can this turn hold the words on the SERVER at all?
+	     * Can this turn hold the words on the SERVER's steer inbox at all?
 	     *
 	     * Both doors go through one answer because they are one route: a steer and a
-	     * server-held queue differ only in `deliver`. A turn that fails this test can still
-	     * queue — in the browser (DL-119-06) — which is why nothing below falls through to a
+	     * server-held queue differ only in `deliver`. A send that fails this test waits in the
+	     * chat's line instead (BL-713, below), which is why nothing below falls through to a
 	     * send into a live reply.
 	     */
 	    const turnCanHoldText = managedBusy && runSteerable !== false && !sendCarriesAttachments
 	    const steerBranchEligible = turnCanHoldText && busySendAction === 'steer'
 	    const serverQueueEligible = turnCanHoldText && busySendAction === 'queue'
-	    // Everything busy that the server cannot hold waits in the browser instead.
-	    let clientQueueEligible = managedBusy && !steerBranchEligible && !serverQueueEligible
-	    // Set when the route says the reply is already over. There is then nothing to wait
-	    // for, and the browser can still believe it is busy for a few seconds — a
-	    // simulated-streaming reply finishes SERVER-side while the tab is still typing it
-	    // out, which is exactly when this happens (measured on BSMS, 2026-09-11). Sending it
-	    // as an ordinary message is what the user would have got a second later; the
-	    // session-turn lock and its retry handle the overlap.
-	    let steerRefusedAsFinished = false
 
 	    if (steerBranchEligible || serverQueueEligible) {
 	      // DL-119-05: one field decides which promise was made. `now` lands inside this
@@ -5332,7 +5119,8 @@ const immersiveActive = $derived.by(
 	        // AMD-119-05: kept before the round trip, like the bubble, so a refusal or a Stop
 	        // arriving mid-flight still finds it.
 	        resendableSteerPayloads.set(steerId, { content, metadata: replayableSendMetadata(metadata) })
-	        const outcome = await postSteer({
+	        sendOptions.onSteerPrepared?.({ steerId, sessionId: currentSessionId, targetMessageId: steerTargetMessageId })
+        const outcome = await postSteer({
 	          sessionId: currentSessionId,
 	          messageId: steerTargetMessageId,
 	          steerId,
@@ -5341,6 +5129,7 @@ const immersiveActive = $derived.by(
 	        })
 
 	        if (outcome.kind === 'accepted') {
+            sendOptions.onReplyAdmitted?.('steer')
 	          // The server owns the text from here: it either lands inside this reply or
 	          // becomes the next message when the reply ends (DL-114-07, DL-119-05). Nothing
 	          // else in this function runs — no user record is written (DL-114-04), no turn
@@ -5354,15 +5143,16 @@ const immersiveActive = $derived.by(
 
 	        steerInbox.forgetSteer(steerId)
 	        if (outcome.kind === 'already_finished') {
-	          steerRefusedAsFinished = true
-	          clientQueueEligible = false
+	          // The reply ended between the button and the route (a simulated-streaming reply
+	          // finishes SERVER-side while the tab is still typing it out; measured on BSMS,
+	          // 2026-09-11). The words go as an ordinary send below: the chat's line holds them
+	          // if the reply's request still has the chat (BL-4), and they run at once if not.
 	          logger.debug('[handleSendMessage] Steer refused: that reply had already finished')
 	        } else if (outcome.kind === 'queue') {
 	          // DL-119-07: the server says this reply cannot take a steer at all. That answer
-	          // is QUEUE, not a stop the user never asked for — the words wait in the browser
-	          // and go the moment the reply ends (DL-119-06).
-	          clientQueueEligible = true
-	          logger.debug('[handleSendMessage] Steer refused as not steerable; queueing in the browser')
+	          // is QUEUE, not a stop the user never asked for — the words are sent below and
+	          // wait in the chat's line until the reply ends (BL-713).
+	          logger.debug('[handleSendMessage] Steer refused as not steerable; the send waits in the line')
 	        } else {
 	          // PR #106 review F-4: the server said no WITHOUT ending the reply — the cap, a
 	          // waiting DM, a bad request, an outage. The reply keeps running and the steers it
@@ -5374,134 +5164,31 @@ const immersiveActive = $derived.by(
 	      }
 	    }
 
-	    if (clientQueueEligible) {
-	      /**
-	       * DL-119-06 — Queue, held in the browser.
-	       *
-	       * One at a time per chat: a second would race the first for the same "the reply
-	       * just ended" moment and the loser would send into a live turn. The refusal is a
-	       * toast and the words stay in the composer, because dropping one silently is the
-	       * thing this story exists to stop.
-	       */
-	      if (clientQueueWaitingBySession.has(currentSessionId)) {
-	        toast.info(
-	          sendCarriesAttachments
-	            ? QUEUE_ONE_AT_A_TIME_SENTENCE
-	            : QUEUE_ONE_AT_A_TIME_TEXT_SENTENCE
-	        )
-	        return false
-	      }
+	    /**
+	     * BL-713 — the page keeps no queue of its own.
+	     *
+	     * A send while a reply runs that the steer route did not take (a Clip, an `@file`
+	     * mention, a group chat, a lane that cannot take a steer, a steer refused as not
+	     * steerable or as too late) is saved and posted at once, like any send. The server holds
+	     * it in the chat's line (BL-4) and runs it as itself when the reply ends, with its own
+	     * Clips, files and send options, tab or no tab; at an approval card the line waits for
+	     * the user's answer. Every tab shows it as the line's Queued bubble (`steer_queued`), so a
+	     * reload, a closed tab or a second window loses nothing. Until BL-713 the page held these
+	     * in the tab (DL-119-06) and saved them only when the reply ended: a reload lost them.
+	     *
+	     * Such a send starts no run here and draws no reply placeholder: the reply that is
+	     * running keeps this tab's run state (its busy state, its Stop, its voice). The send's
+	     * own reply appears when it starts, like a reply another tab started.
+	     */
+	    const sendWaitsInLine = isManagedPrimaryAgentType(agentType) && hasActiveStream
+      // BL-1291/1295: the page's actual local admission ends Voice preparation. Direct
+      // keeps its own stream completion; queued waits for its own terminal response.
+      sendOptions.onReplyAdmitted?.(sendWaitsInLine ? 'queued' : 'direct')
 
-	      const waitRunState = chatRunRegistry.getRunState(currentSessionId)
-	      let waitForMessageId =
-	        waitRunState.activeMessageId ?? waitRunState.activeStreamMessageIds[0] ?? null
-	      if (!waitForMessageId) {
-	        // A group reply has no message id until its first `start` event, so a message queued
-	        // in that moment used to skip the wait below and go straight into the running turn,
-	        // which refused it (`session_turn_in_progress`) and left it saved and unanswered (bug
-	        // sweep, 2026-09-18). Wait for the id, or for the reply to end. The words are still in
-	        // the composer during this short wait, so a Stop or a reply that never starts leaves
-	        // them there.
-	        clientQueueWaitingBySession.add(currentSessionId)
-	        const stopCountBeforeTargetWait = manualStopCountBySession.get(currentSessionId) ?? 0
-	        let found: { target: string | null; busy: boolean } = { target: null, busy: true }
-	        try {
-	          found = await waitForReplyTargetInSession(currentSessionId)
-	        } finally {
-	          clientQueueWaitingBySession.delete(currentSessionId)
-	        }
-	        if ((manualStopCountBySession.get(currentSessionId) ?? 0) !== stopCountBeforeTargetWait) {
-	          // AMD-119-04: Stop stops everything, a message waiting to be queued included.
-	          return false
-	        }
-	        if (found.target) {
-	          waitForMessageId = found.target
-	        } else if (found.busy) {
-	          toast.info('That reply is still starting. Your message is still in the box: send it again in a moment.')
-	          return false
-	        }
-	        // Otherwise the chat is free again: nothing to wait for, so it goes as an ordinary
-	        // message below.
-	      }
-	      if (waitForMessageId) {
-	        // F-P3-3: the bubble DL-114-10 describes — the words stay visible while they
-	        // wait, and go the moment the send leaves as an ordinary message.
-	        const waitingSteerId = `steer_${crypto.randomUUID().replace(/-/g, '')}`
-	        steerInbox.noteLocalSteer({
-	          steerId: waitingSteerId,
-	          sessionId: currentSessionId,
-	          messageId: waitForMessageId,
-	          text: content,
-	          state: 'waiting',
-	          withFiles: sendCarriesAttachments
-	        })
-	        resendableSteerPayloads.set(waitingSteerId, { content, metadata: replayableSendMetadata(metadata) })
-	        /**
-	         * AMD-119-05 (Josh, 2026-09-13) — the words leave the box now.
-	         *
-	         * A steer and a server-held queue already clear it, because both return from
-	         * here the moment the route accepts them. This branch does not return until the
-	         * reply ends, so the words sat in the composer AND in the bubble for the whole
-	         * wait — which reads as "this is going to be sent twice". The clips are left
-	         * alone: they are sticky by design, and a one-time clip has not been spent yet.
-	         */
-	        if (typeof metadata?.onQueuedForLater === 'function') {
-	          metadata.onQueuedForLater()
-	        }
-	        clientQueueWaitingBySession.add(currentSessionId)
-	        const stopCountBeforeWait = manualStopCountBySession.get(currentSessionId) ?? 0
-	        let replyEnded = false
-	        let outcome: QueuedSendAfterWait = 'still-running'
-	        try {
-	          replyEnded = await waitForReplyToEnd(currentSessionId, waitForMessageId)
-	        } finally {
-	          clientQueueWaitingBySession.delete(currentSessionId)
-	          outcome = resolveQueuedSendAfterWait({
-	            stoppedDuringWait:
-	              (manualStopCountBySession.get(currentSessionId) ?? 0) !== stopCountBeforeWait,
-	            replyEnded
-	          })
-	          // AMD-119-04, review F-P3b-4: the bubble IS the receipt for BOTH ways of not
-	          // sending — a Stop, and a wait that gave up on a reply still running. The
-	          // composer was cleared when the message was queued (AMD-119-05), so the bubble
-	          // is the only place the words still are. Only a send retires it.
-	          if (outcome === 'send') steerInbox.forgetSteer(waitingSteerId)
-	        }
-	        if (outcome === 'dropped-by-stop') {
-	          /**
-	           * AMD-119-04 (Josh, 2026-09-13) — Stop stops everything.
-	           *
-	           * DL-119-05 already had Stop drop a SERVER-held queued message with this exact
-	           * receipt. This branch used to send instead, because a Stop is one of the ways
-	           * `waitForReplyToEnd` finishes — and `settleSteerBubblesForMessage` had already
-	           * drawn the receipt, so the user was told "Not sent" about a message that then
-	           * sent. Marked here rather than left to that call because a context-exhaustion
-	           * auto-continue can move the session's active message id, and the settle is
-	           * keyed on the id this bubble was filed under.
-	           */
-	          steerInbox.markSteerDropped(waitingSteerId)
-	          // AMD-119-05: the words stay in the bubble, which carries Send now / Dismiss.
-	          // Nothing is written back into the composer — a user who spent the wait typing
-	          // something else would lose it to a receipt.
-	          return false
-	        }
-	        if (outcome === 'still-running') {
-	          // F-P2-1: the reply is still running after the ceiling. Queue promised "sends
-	          // after this reply", so sending now would break the promise AND race a live
-	          // turn. Review F-P3b-4: the words left the composer when the message was
-	          // queued, so the bubble becomes the receipt — with Send now for when the reply
-	          // ends — instead of vanishing with them.
-	          steerInbox.markSteerDropped(waitingSteerId, 'timed_out')
-	          toast.info('That reply is still going. Your message is kept on its receipt — use Send now when the reply ends.')
-	          return false
-	        }
-	      }
-	    }
-
-	    // A queued message that waited, or a steer the route said was too late, may have
-	    // changed whether anything is still running. Nothing below stops a reply: DL-119-07
-	    // retired interrupt-and-send, and Stop is the only thing that interrupts.
-	    stopRealtimeSpeechPlayback()
+	    // Nothing below stops a reply: DL-119-07 retired interrupt-and-send, and Stop is the only
+	    // thing that interrupts. A send that waits in the line leaves the running reply's voice
+	    // alone, as a steer and a queued text do (DL-114-11).
+	    if (!sendWaitsInLine) stopRealtimeSpeechPlayback()
 
 	    /**
 	     * SA-119 P2b (F-P2-7) — the interruption note, written from Stop's record alone.
@@ -5510,11 +5197,9 @@ const immersiveActive = $derived.by(
 	     * colour the one send that follows it. Whether it then becomes a stamp is
 	     * `resolveStopInterruptionStamp`'s decision, in the rules module beside
 	     * `resolveBusySendActions`, because it has real behaviour and belongs where a test
-	     * can mutate it — this file can only be pinned on order and reachability.
-	     *
-	     * `browserQueued` is the half that is easy to miss: a steer and a server-held queue
-	     * return far above, but a BROWSER-held queue falls through to exactly here, and what
-	     * it waits for — "the reply ends" — is precisely what a Stop makes happen.
+	     * can mutate it — this file can only be pinned on order and reachability. A steer and a
+	     * server-held queued text return far above; every other send, one that waits in the
+	     * chat's line included (BL-713), reads the record here, as it was when Enter was pressed.
 	     */
 	    const stopInterruptionRecord =
 	      pendingStopInterruptionBySession.get(currentSessionId) ?? null
@@ -5529,21 +5214,14 @@ const immersiveActive = $derived.by(
 	    })()
 	    const stopInterruption = resolveStopInterruptionStamp({
 	      record: stopInterruptionRecord,
-	      browserQueued: clientQueueEligible,
 	      latestAssistantMessageId
 	    })
 
-	    const pendingZipControl = currentSessionId ? zipControlPendingBySession.get(currentSessionId) : null
-	    if (pendingZipControl) {
-	      try {
-	        await pendingZipControl
-	      } catch (error) {
-	        console.warn('[handleSendMessage] Zip control still processing for session:', error)
-	      }
-	    }
-
 	    // Generate standardized message ID (Story 6.9b)
-	    let userId = await generateClientMessageId(currentSessionId, 'msg_user_client')
+	    // BL-4: a Send now of a kept message reuses it: same id, nothing written again.
+	    let userId =
+	      sendOptions.existingUserMessageId ??
+	      (await generateClientMessageId(currentSessionId, 'msg_user_client'))
 
 	    // Create user message with agent_id for consistency
     const userMessage = {
@@ -5585,30 +5263,35 @@ const immersiveActive = $derived.by(
     // don't appear immediately anyway due to the compilation architecture.
     // The tags are embedded in content and will be detected after the next message.
 
-    // Add user message to store
-    messageStore.addMessage(userMessage)
+    // BL-4: a Send now of a kept message is already in the chat and in every tab's list.
+    if (!sendOptions.existingUserMessageId) {
+      // Add user message to store
+      messageStore.addMessage(userMessage)
 
-    // Broadcast user message so spectator tabs update immediately
-    try {
-      await fetch('/api/sse', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-internal-sse-forward': '1'
-        },
-        body: JSON.stringify({
-          type: 'user_message',
-          sessionId: currentSessionId,
-          message: userMessage
+      // Broadcast user message so spectator tabs update immediately
+      try {
+        await fetch('/api/sse', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-internal-sse-forward': '1'
+          },
+          body: JSON.stringify({
+            type: 'user_message',
+            sessionId: currentSessionId,
+            message: userMessage
+          })
         })
-      })
-    } catch (error) {
-      console.error('[handleSendMessage] Failed to broadcast user message via SSE:', error)
-    }
+      } catch (error) {
+        console.error('[handleSendMessage] Failed to broadcast user message via SSE:', error)
+      }
 
-    // Save user message to database
-    const dbService = new DatabaseService()
-    await dbService.saveMessage(userMessage, currentAgentForSend)
+      // Save user message to database
+      const dbService = new DatabaseService()
+      await dbService.saveMessage(userMessage, currentAgentForSend)
+    } else {
+      moveResentMessageToEnd(currentSessionId, userId, userMessage.created_at)
+    }
     sessionStore.updateSession(currentSessionId, { agent_id: currentAgentForSend.id })
 
     if (typeof metadata?.onAccepted === 'function') {
@@ -5628,9 +5311,12 @@ const immersiveActive = $derived.by(
     try {
       logger.debug('[handleSendMessage] Sending with session ID:', currentSessionId)
 
-	      // Set waiting state
-	      isWaitingForResponse = true
-	      clearActiveToolProcessingState(currentSessionId)
+	      // Set waiting state. BL-713: not for a send that waits in the chat's line: the reply
+	      // that is running owns this tab's waiting and tool state.
+	      if (!sendWaitsInLine) {
+	        isWaitingForResponse = true
+	        clearActiveToolProcessingState(currentSessionId)
+	      }
       logger.debug('[handleSendMessage] States set:', { isWaitingForResponse, isWaitingForToolCall })
 
       // Force a tick to ensure state update propagates
@@ -5648,7 +5334,10 @@ const immersiveActive = $derived.by(
         managedAssistantMessageId = groupChatSendId
           ? null
           : await generateClientMessageId(currentSessionId, 'msg_assistant_client')
-        if (managedAssistantMessageId) {
+        // BL-713: a send that waits in the chat's line draws no reply placeholder and starts no
+        // run: the running reply keeps this tab's run state, so its Stop and busy state stay its
+        // own (`startRun` replaces the chat's run state whole). Its reply opens when it starts.
+        if (managedAssistantMessageId && !sendWaitsInLine) {
           createAssistantWaitingPlaceholder({
             messageId: managedAssistantMessageId,
             sessionId: currentSessionId,
@@ -5661,12 +5350,14 @@ const immersiveActive = $derived.by(
         }
 
 	        const abortController = new AbortController();
-	        chatRunRegistry.startRun({
-	          sessionId: currentSessionId,
-	          transport: liveAgentType,
-	          activeMessageId: managedAssistantMessageId,
-	          abortController
-	        })
+	        if (!sendWaitsInLine) {
+	          chatRunRegistry.startRun({
+	            sessionId: currentSessionId,
+	            transport: liveAgentType,
+	            activeMessageId: managedAssistantMessageId,
+	            abortController
+	          })
+	        }
 
           const requestMetadata = {
             ...metadata,
@@ -5689,8 +5380,14 @@ const immersiveActive = $derived.by(
             sessionId: currentSessionId,
             agentId: agentWithOverride.id,
             messageId: managedAssistantMessageId ?? undefined,
+            // BL-4: the message this send saved. If the chat is busy, the server holds the send
+            // until it is free and reuses this message (never a second copy).
+            userMessageId: userId,
             messages: (() => {
-              const allMsgs = messagesForSend
+              // A Send now of a kept message: it is the current turn, so it goes last.
+              const allMsgs = sendOptions.existingUserMessageId
+                ? placeUserMessageLast(messagesForSend, userId, managedAssistantMessageId)
+                : messagesForSend
               // Strip large fields to prevent oversized request payloads.
               // intermediateSteps (400KB+ for artifact builds) are never needed by the server from the client.
               // providerMessages (375KB+) are only needed from the last few assistant messages for continuation.
@@ -5706,11 +5403,20 @@ const immersiveActive = $derived.by(
             agentType,
             metadata: requestMetadata
           }
+          inFlightSendPayloads.set(userId, { content, metadata: replayableSendMetadata(metadata) })
           const routedSend = await postSendRoutedWithInterruptRetry({
             body: routedRequestBody,
             signal: abortController.signal,
 	            wasInterrupting:
-	              Date.now() - (lastManualInterruptAtBySession.get(currentSessionId) ?? 0) < 8_000
+	              Date.now() - (lastManualInterruptAtBySession.get(currentSessionId) ?? 0) < 8_000,
+	            // BL-713: the server owns a send that waits in the line from its 202; this tab's
+	            // next send must not be ignored as a duplicate while it waits (the line may wait
+	            // for an approval card with no reply running, and a new message ends that wait).
+	            onAccepted: sendWaitsInLine
+	              ? () => {
+	                  if (isLatestSendSerial(sendSessionId, sendRunId)) setSendInFlight(sendSessionId, false)
+	                }
+	              : undefined
           })
           const response = routedSend.response
 
@@ -5731,7 +5437,26 @@ const immersiveActive = $derived.by(
 		            throw sendError
 		          }
 
-          await response.json().catch(() => null);
+          const completed = await response.json().catch(() => null)
+          // A group may complete without a stream (Smart skip or no eligible speaker).
+          // Reload the server receipt directly too: the user-channel event can be missed.
+          if (groupChatSendId && isAcceptedGroupNoReplyCompletion(completed, userId)) {
+            // The accepted terminal response owns completion; a slow reload must not keep
+            // Voice waiting. The existing per-chat load queue owns this independent refresh.
+            void loadMessagesForSession(currentSessionId)
+            const run = chatRunRegistry.getRunState(currentSessionId)
+            if (!abortController.signal.aborted && !sendWaitsInLine &&
+              isLatestSendSerial(currentSessionId, sendRunId) && run.abortController === abortController &&
+              run.activeStreamMessageIds.length === 0 && run.activeToolMessageIds.length === 0 &&
+              currentSessionId === sessionStore.getCurrentSessionId() &&
+              agentStore.getCurrentAgentId() === agentWithOverride.id && chatInputRef === sendChatInput) {
+              if (completed.replyOutcome === 'unconfirmed') {
+                toast.error('Batshit could not confirm that it saved the judge\'s decision. No agent answered. You can send again or name an agent to ask for a reply. The Execution Viewer shows what is known.')
+              }
+              if (sendOptions.onNoReplyCompleted) sendOptions.onNoReplyCompleted()
+              else sendChatInput?.aiResponseReceived?.()
+            }
+          }
         } catch (error: any) {
           if (error.name === 'AbortError') {
             logger.debug('[handleSendMessage] Stream aborted by user');
@@ -5739,10 +5464,13 @@ const immersiveActive = $derived.by(
             throw error;
           }
         } finally {
+	          inFlightSendPayloads.delete(userId)
 	          if (chatRunRegistry.getRunState(currentSessionId).abortController === abortController) {
 	            chatRunRegistry.releaseAbortController(currentSessionId, abortController)
 	          }
-	          if (isLatestSendSerial(currentSessionId, sendRunId)) {
+	          // BL-713: a send that waited in the line never took this tab's waiting and tool state;
+	          // the reply that owns it may still be running when this send's answer comes.
+	          if (isLatestSendSerial(currentSessionId, sendRunId) && !sendWaitsInLine) {
 	            clearActiveToolProcessingState(currentSessionId)
 	            isWaitingForResponse = false
 	          }
@@ -5761,12 +5489,22 @@ const immersiveActive = $derived.by(
 	        /Image data URLs are not allowed in text context/i.test(message)
 		      const isSessionTurnInProgress = errorCode === 'session_turn_in_progress'
 
+	      if (isQuietQueuedSendAnswer(errorCode)) {
+	        // BL-4: a queued send the server kept (Stop, or Batshit stopping) or whose message was
+	        // deleted while it waited. Its receipt already says so, and its words are in the chat.
+	        if (!sendWaitsInLine) isWaitingForResponse = false
+	        if (isSessionCreating(currentSessionId)) {
+	          clearCreatingSession(currentSessionId)
+	        }
+	        return false
+	      }
+
 	      if (errorCode === 'session_deleted') {
 	        // The chat was deleted, here or in another tab, while this reply ran or waited. Say so
 	        // once: the generic error toast below printed the sentence as its title AND its
 	        // description (bug sweep, 2026-09-18). Nothing to retry and nothing to save.
-	        toast.info(message || 'This chat was deleted.')
-	        isWaitingForResponse = false
+	        toast.info(details || message || 'This chat was deleted.')
+	        if (!sendWaitsInLine) isWaitingForResponse = false
 	        if (isSessionCreating(currentSessionId)) {
 	          clearCreatingSession(currentSessionId)
 	        }
@@ -5782,7 +5520,7 @@ const immersiveActive = $derived.by(
 	          managedAssistantMessageId,
 	          details || 'Response already in progress.'
 	        )
-	        isWaitingForResponse = false
+	        if (!sendWaitsInLine) isWaitingForResponse = false
 	        if (isSessionCreating(currentSessionId)) {
 	          logger.debug(
 	            '[handleSendMessage] Clearing creating-session flag due to in-flight session turn'
@@ -5801,7 +5539,7 @@ const immersiveActive = $derived.by(
 	          managedAssistantMessageId,
 	          'Inline image detected. Re-attach the image as a clip/input and send again.'
 	        )
-	        isWaitingForResponse = false
+	        if (!sendWaitsInLine) isWaitingForResponse = false
 	        if (isSessionCreating(currentSessionId)) {
 	          logger.debug('[handleSendMessage] Clearing creating-session flag due to send error')
 	          clearCreatingSession(currentSessionId)
@@ -5850,7 +5588,7 @@ const immersiveActive = $derived.by(
 	          ? details
 	          : message || 'The response failed before streaming started.'
 	      )
-	      isWaitingForResponse = false
+	      if (!sendWaitsInLine) isWaitingForResponse = false
 
 	      // Clear the creating session flag on send error
 	      if (isSessionCreating(currentSessionId)) {
@@ -5888,13 +5626,6 @@ const immersiveActive = $derived.by(
 	      })
 	    }
 
-	    // AMD-119-04: counted whether or not there was a message id to name, because a
-	    // browser-held queued message is waiting on THIS gesture, not on what it cut.
-	    manualStopCountBySession.set(
-	      sessionId,
-	      (manualStopCountBySession.get(sessionId) ?? 0) + 1
-	    )
-
 	    stopRealtimeSpeechPlayback(previousMessageId)
 	    // SA-114 P3 (F-P3-B): Stop promotes nothing (DL-114-07), so anything still waiting is
 	    // gone. Said here rather than waited for: a stopped turn may deliver no finalise
@@ -5903,14 +5634,21 @@ const immersiveActive = $derived.by(
 	    chatRunRegistry.markStopping(sessionId)
 
     try {
-      await fetch('/api/messages/interrupt', {
+      const interrupted = await fetch('/api/messages/interrupt', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           sessionId,
-          messageId: previousMessageId
+          messageId: previousMessageId,
+          // BL-4: this Stop stops the sends waiting in the chat's line too (AMD-119-04).
+          stopsWaitingSends: true
         })
       })
+      const result = interrupted.ok ? await interrupted.json() : null
+      if (result?.success === true && previousMessageId && result.messageId === previousMessageId &&
+        (result.reason === 'aborted' || result.reason === 'setup_stopped')) {
+        chatInputRef?.voiceSteerTargetStopped?.(sessionId, previousMessageId)
+      }
     } catch (error) {
       console.error('[handleStopStream] Failed to interrupt stream:', error)
     }
@@ -5958,7 +5696,7 @@ const immersiveActive = $derived.by(
   }
 
   function getCurrentManualTrimProtections(extraClipIds: string[] = []) {
-    // SA-120 P5: a result Jev Juice opened (source `inferred`) is Batshit's guess, not a pin.
+    // SA-120 P5: a result Judge Juice opened (source `inferred`) is Batshit's guess, not a pin.
     // It never shields a message from the user's own Manual Trim or Compact.
     const protectedUnzippedZipIds = zippingService
       .getAllUnzipped()
@@ -6040,8 +5778,7 @@ const immersiveActive = $derived.by(
       if (
         key === 'custom_tool_settings' ||
         key === 'zip_ai_view_mode' ||
-        key === 'zip_control_mode' ||
-        key === 'zip_agent_control_enabled' ||
+        key === 'zip_agent_control_experiment' ||
         key === 'zip_tool_notes_enabled' ||
         key.startsWith('zip_threshold_') ||
         key.startsWith('zip_disabled_') ||
@@ -6055,8 +5792,32 @@ const immersiveActive = $derived.by(
 
   function getContextPreviewSettingsKey() {
     const agent = agentStore.getCurrentAgent() as Record<string, any> | null
-    return JSON.stringify({
+    const selection = agent ? resolveRuntimeModelSelection({
+      preset: activeModelPreset, provider: agent.primary_model_provider,
+      connection: agent.primary_model_connection, modelId: agent.primary_model_name,
+      settings: agent.provider_specific_settings ?? null
+    }) : null
+    const codexContext = agent ? cliContextSettingsKey('codex', agent, selection?.contextWindow,
+      selection?.settings, selection?.modelId) : null
+    const service = selection?.connection?.service ?? agent?.primary_model_connection?.service ??
+      agent?.primary_model_provider ?? null
+    const activeCodexSettings = agent?.codex_settings ?? selection?.settings ?? agent?.provider_specific_settings
+    return buildContextPreviewIdentity({
       agentId: agent?.id ?? null,
+      isCodex: service === 'codex' || service === 'openai-codex',
+      codexContext,
+      codexModel: agent ? resolveEffectiveAgentCliModel('codex', agent, selection?.settings, selection?.modelId) : null,
+      presetId: agent?.primary_model_preset_id ?? null,
+      presetContextWindow: selection?.contextWindow ?? null,
+      apiProvider: selection?.provider,
+      apiModelId: selection?.modelId,
+      apiConnection: selection?.connection,
+      apiSettings: selection?.settings,
+      localConnectionRevision,
+      claudeContextEnvironment: data.claudeContextEnvironment,
+      codexOverrides: activeCodexSettings?.configOverrides ?? activeCodexSettings?.codex_config_overrides,
+      claudeContext: agent ? cliContextSettingsKey('claude', agent, selection?.contextWindow,
+        selection?.settings, selection?.modelId) : null,
       agentZip: getZipContextSettingsPayload(agent),
       globalZip: getZipContextSettingsPayload(userSettings?.global_zip_settings as any)
     })
@@ -6085,7 +5846,7 @@ const immersiveActive = $derived.by(
     const currentAgent = agentStore.getCurrentAgent()
     if (!sessionId || !currentAgent?.id) return
     if (!options.ignoreBusy && (chatWorkBusy || compactBusy)) return
-    if (!options.useStoredMessages && messageStore.getMessages().length === 0) {
+    if (!options.useStoredMessages && messageStore.getMessages().length === 0 && !activeLocalProgramDefinition) {
       clearLiveContextEstimate(sessionId)
       return
     }
@@ -6121,7 +5882,7 @@ const immersiveActive = $derived.by(
     if (!options.ignoreBusy && (chatWorkBusy || compactBusy)) return
 
     const currentMessages = messageStore.getMessages()
-    if (!options.useStoredMessages && currentMessages.length === 0) {
+    if (!options.useStoredMessages && currentMessages.length === 0 && !activeLocalProgramDefinition) {
       clearLiveContextEstimate(sessionId)
       return
     }
@@ -6139,6 +5900,7 @@ const immersiveActive = $derived.by(
     }
 
     const requestSerial = ++contextPreviewSerial
+    const settingsKey = getContextPreviewSettingsKey()
     try {
       const response = await fetch('/api/messages/context-preview', {
         method: 'POST',
@@ -6151,18 +5913,31 @@ const immersiveActive = $derived.by(
         throw new Error(payload?.error || 'Failed to refresh context preview')
       }
 
-      if (requestSerial !== contextPreviewSerial || currentSessionId !== sessionId) return
+      if (requestSerial !== contextPreviewSerial || currentSessionId !== sessionId || getContextPreviewSettingsKey() !== settingsKey) return
       if (typeof payload?.tokens !== 'number' || !Number.isFinite(payload.tokens)) return
 
       liveContextEstimateBySession = {
         ...liveContextEstimateBySession,
         [sessionId]: {
           tokens: Math.max(0, Math.round(payload.tokens)),
+          contextLimit: typeof payload?.budget?.contextLimit === 'number'
+            ? payload.budget.contextLimit : null,
+          contextWindowWarning: typeof payload?.budget?.contextWindowWarning === 'string'
+            ? payload.budget.contextWindowWarning : null,
+          contextWindowCheckedAt: typeof payload?.budget?.contextWindowCheckedAt === 'number'
+            ? payload.budget.contextWindowCheckedAt : null,
+          localContext: payload?.budget?.localContext ?? null,
+          settingsKey: settingsKey ?? `unreusable:${crypto.randomUUID()}`,
           reason: describeContextPreviewReason(reason),
           updatedAt: Date.now()
         }
       }
     } catch (error) {
+      if (activeLocalProgramDefinition && requestSerial === contextPreviewSerial && currentSessionId === sessionId) {
+        const prior = liveContextEstimateBySession[sessionId]
+        if (prior) liveContextEstimateBySession = { ...liveContextEstimateBySession,
+          [sessionId]: { ...prior, contextLimit: null, localContext: null } }
+      }
       console.warn('[TokenPanel] Failed to refresh live context preview:', error)
     }
   }
@@ -6294,10 +6069,85 @@ const immersiveActive = $derived.by(
     toast.success('Manual trim cleared')
   }
 
+  /**
+   * BL-622 (C3): the server refused a Compact because a reply is running in the chat. Auto Compact
+   * stays quiet and runs again after the reply: its once-per-state key is cleared after a wait, never
+   * at once (its trigger reads that key, so clearing it now would ask the server again in a loop).
+   * A pressed Compact is told, in the server's words.
+   */
+  function handleCompactTurnRunning(
+    sessionId: string,
+    handling: CompactTurnRunningHandling,
+    payload: Record<string, any> | null
+  ) {
+    if (handling === 'tell_user') {
+      toast.info(payload?.error || 'A reply is running in this chat. Compact runs after it.')
+      return
+    }
+    const refusedKey = autoCompactLastPromptKeyBySession[sessionId]
+    setTimeout(() => {
+      if (autoCompactLastPromptKeyBySession[sessionId] !== refusedKey) return
+      const next = { ...autoCompactLastPromptKeyBySession }
+      delete next[sessionId]
+      autoCompactLastPromptKeyBySession = next
+    }, COMPACT_TURN_RUNNING_RETRY_MS)
+  }
+
+  /**
+   * BL-755: `compaction_changed` means another Compact's event already landed in the chat's
+   * record while this tab still holds the copy it read before the summary call. Auto Compact's
+   * quiet retry must see the winning event, not this tab's stale `contextCompaction`, or it
+   * either summarizes what little is left or meets a `no_compaction_candidates` refusal. Refetches
+   * the chat's current record and applies its metadata before the retry fires.
+   */
+  async function refreshSessionMetadataAfterCompactionChanged(sessionId: string) {
+    try {
+      const response = await fetch(`/api/sessions/${sessionId}`)
+      if (!response.ok) return
+      const session = await response.json().catch(() => null)
+      if (session?.metadata) sessionStore.updateSession(sessionId, { metadata: session.metadata })
+    } catch (error) {
+      console.warn('[TokenPanel] Failed to refresh chat metadata after a Compact conflict:', error)
+    }
+  }
+
+  /**
+   * BL-622 (C7), BL-653: the composer's Stop. While only a Compact runs, it ends the Compact through
+   * the Compact's own Stop route; otherwise it is the reply's Stop, as before.
+   */
+  function handleStopWork() {
+    if (resolveStopTarget({ compactBusy, replyBusy: chatWorkBusy }) === 'compact') {
+      void stopRunningCompact()
+      return
+    }
+    return handleStopStream()
+  }
+
+  async function stopRunningCompact() {
+    // BL-653: the chat whose Compact runs, not the open chat (the user may have opened another).
+    const sessionId = compactStopTracker.requestStop()
+    if (!sessionId) return
+    try {
+      const response = await fetch('/api/messages/compact/stop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId })
+      })
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null)
+        throw new Error(payload?.error || 'Could not stop the Compact')
+      }
+    } catch (error) {
+      console.error('[TokenPanel] Failed to stop the Compact:', error)
+      toast.error(error instanceof Error ? error.message : 'Could not stop the Compact')
+    }
+  }
+
   async function handleCompact(options: { mode?: 'manual' | 'auto'; confirmFirst?: boolean } = {}) {
     const mode = options.mode ?? 'manual'
     const confirmFirst = options.confirmFirst ?? true
     if (compactBusy) return
+    compactStopTracker.begin()
 
     const sessionId = currentSessionId
     const currentAgent = agentStore.getCurrentAgent()
@@ -6316,6 +6166,10 @@ const immersiveActive = $derived.by(
     }
 
     const currentMessages = messageStore.getMessages()
+    if (!compactGroupRunnerSession && hasPendingCompactApproval(currentMessages, currentCompactionEvents)) {
+      if (mode === 'manual') toast.info(COMPACT_PENDING_APPROVAL_MESSAGE)
+      return
+    }
     const localSelection = selectMessagesForCompaction(currentMessages, currentCompactionEvents, {
       protections: currentManualTrimProtections
     })
@@ -6326,6 +6180,7 @@ const immersiveActive = $derived.by(
 
     let preview: Record<string, any> | null = null
     compactBusy = true
+    compactStopTracker.enterPhase(sessionId)
     compactStatus = 'Calculating compact plan...'
     try {
       const response = await fetch('/api/messages/compact', {
@@ -6343,7 +6198,21 @@ const immersiveActive = $derived.by(
       })
 
       preview = await response.json().catch(() => null)
+      // BL-653: the plan never reads its run's stop, so a Stop pressed during it ends the Compact
+      // here, before the summary request (in auto mode without a confirm, it would start at once).
+      if (compactStopTracker.stopRequested) {
+        autoCompactStopHolds = holdAutoCompactAfterStop(autoCompactStopHolds, sessionId, mode)
+        toast.info(STOPPED_COMPACT_MESSAGE)
+        return
+      }
       if (!response.ok) {
+        const turnRunning = resolveCompactTurnRunning(mode, response.status, preview)
+        if (turnRunning) {
+          handleCompactTurnRunning(sessionId, turnRunning, preview)
+          return
+        }
+        // BL-755: nothing left to compact is not an error; only a pressed Compact hears about it.
+        if (isSilentAutoCompactNoCandidates(mode, response.status, preview)) return
         throw new Error(preview?.error || 'Failed to calculate compact plan')
       }
     } catch (error) {
@@ -6352,6 +6221,7 @@ const immersiveActive = $derived.by(
       return
     } finally {
       compactBusy = false
+      compactStopTracker.leavePhase()
       compactStatus = null
     }
 
@@ -6422,6 +6292,7 @@ const immersiveActive = $derived.by(
     }
 
     compactBusy = true
+    compactStopTracker.enterPhase(sessionId)
     compactStatus = 'Generating compact summary...'
     let shouldRefreshContextAfterCompact = false
     try {
@@ -6440,6 +6311,31 @@ const immersiveActive = $derived.by(
 
       const payload = await response.json().catch(() => null)
       if (!response.ok) {
+        if (isStoppedCompactAnswer(response.status, payload)) {
+          autoCompactStopHolds = holdAutoCompactAfterStop(autoCompactStopHolds, sessionId, mode)
+          toast.info(payload?.error || STOPPED_COMPACT_MESSAGE)
+          return
+        }
+        const turnRunning = resolveCompactTurnRunning(mode, response.status, payload)
+        if (turnRunning) {
+          handleCompactTurnRunning(sessionId, turnRunning, payload)
+          return
+        }
+        // BL-622 (C5): the Compact looked again after its summary call and wrote nothing. A pressed
+        // Compact says why; an Auto Compact stays quiet and runs again after the same wait — except
+        // a Stop, which needs no retry (BL-756), and a `compaction_changed` retry, which first
+        // refreshes this tab's stale copy of the chat's metadata (BL-755).
+        const endedEarly = resolveCompactEndedEarly(mode, response.status, payload)
+        if (endedEarly) {
+          if (endedEarly.kind === 'tell_user') toast.info(endedEarly.message)
+          else if (endedEarly.kind === 'retry_quietly') {
+            if (endedEarly.refreshMetadata) void refreshSessionMetadataAfterCompactionChanged(sessionId)
+            handleCompactTurnRunning(sessionId, 'retry_quietly', payload)
+          }
+          return
+        }
+        // BL-755: nothing left to compact is not an error; only a pressed Compact hears about it.
+        if (isSilentAutoCompactNoCandidates(mode, response.status, payload)) return
         throw new Error(payload?.error || 'Failed to compact context')
       }
 
@@ -6471,6 +6367,9 @@ const immersiveActive = $derived.by(
           ...liveContextEstimateBySession,
           [sessionId]: {
             tokens: afterTokens,
+            contextLimit: typeof payload?.afterBudget?.contextLimit === 'number'
+              ? payload.afterBudget.contextLimit : null,
+            settingsKey: getContextPreviewSettingsKey() ?? `unreusable:${crypto.randomUUID()}`,
             reason: describeContextPreviewReason('compact'),
             updatedAt: Date.now()
           }
@@ -6493,6 +6392,7 @@ const immersiveActive = $derived.by(
       toast.error(error instanceof Error ? error.message : 'Failed to compact context')
     } finally {
       compactBusy = false
+      compactStopTracker.leavePhase()
       compactStatus = null
       if (shouldRefreshContextAfterCompact) {
         scheduleLiveContextPreview('compact', 0)
@@ -6553,6 +6453,18 @@ const immersiveActive = $derived.by(
             description: `The window is below the nap threshold (${formatTokenCount(payload?.napAtTokens)} tokens).`
           })
         }
+        return
+      }
+
+      // BL-549 N6: an early end is not a completion. A pressed nap that stopped because a
+      // message arrived is told so; the idle auto-nap, and a nap that ended because the
+      // chat is gone, say nothing.
+      if (payload?.status === 'ended_early') {
+        const message = describeNapEndedEarly(trigger, payload?.endedEarly)
+        if (message) toast.info(message)
+        // What it finished before the message arrived stays (option A), so the window's
+        // preview is refreshed as after a completed nap; a deleted chat has none to refresh.
+        if (payload?.endedEarly !== 'chat_deleted') scheduleLiveContextPreview('nap', 0)
         return
       }
 
@@ -6648,14 +6560,18 @@ const immersiveActive = $derived.by(
   }
 
   async function updateGoonsSettings(patch: Partial<GoonsSettings>) {
+    if (getUserSettingsReadState() !== 'confirmed') {
+      toast.error('Goon settings could not load. Open Settings and press Retry before changing them.')
+      return
+    }
     try {
       const persistedSettings = await persistGoonsSettingsPatchRequest(fetch, patch)
-      const currentUserSettings = getUserSettings()
-      if (currentUserSettings) {
-        setUserSettings({ ...currentUserSettings, goons_settings: persistedSettings })
-      }
+      confirmUserSettings(persistedSettings)
     } catch (error) {
       console.error('[Goons] Failed to persist settings:', error)
+      toast.error('Goon preferences could not be confirmed saved.', {
+        description: error instanceof Error ? error.message : 'The settings request failed.'
+      })
     }
   }
 
@@ -7181,17 +7097,14 @@ const immersiveActive = $derived.by(
   }
 
   async function persistDesktopControlsPreferences(patch: Partial<DesktopGoonPreferences>) {
-    const persistedSettings = await persistGoonsSettingsPatchRequest(fetch, {
-      desktop: normalizeDesktopGoonPreferences({
-        ...desktopGoonPreferences,
-        ...patch
-      })
-    })
-    const currentUserSettings = getUserSettings()
-    if (currentUserSettings) {
-      setUserSettings({ ...currentUserSettings, goons_settings: persistedSettings })
+    if (getUserSettingsReadState() !== 'confirmed') {
+      throw new Error('Goon settings could not load. Open Settings and press Retry before changing Desktop preferences.')
     }
-    applyDesktopGoonPreferencesLive(normalizeDesktopGoonPreferences(persistedSettings.desktop))
+    const persistedSettings = await persistGoonsSettingsPatchRequest(fetch, {
+      desktop: patch
+    })
+    confirmUserSettings(persistedSettings)
+    applyDesktopGoonPreferencesLive(normalizeDesktopGoonPreferences(persistedSettings.goons_settings?.desktop))
   }
 
   function updateDesktopHandoffEyeContact(enabled: boolean) {
@@ -7962,6 +7875,9 @@ const immersiveActive = $derived.by(
           onResendDroppedSteer={resendDroppedSteer}
           onDismissDroppedSteer={dismissDroppedSteer}
           canResendDroppedSteer={canResendDroppedSteer}
+          sessionBusy={chatWorkBusy}
+          onSendHeldMessage={sendHeldMessageNow}
+          onSendWaitingSendNow={sendWaitingSendNow}
         />
       {:else}
         <!-- Centered Welcome Layout -->
@@ -8007,7 +7923,7 @@ const immersiveActive = $derived.by(
             onVoiceModeChange={(enabled) => voiceMode = enabled}
             showExecutionViewer={false}
             workBusy={chatWorkBusy || compactBusy}
-            onStopWork={handleStopStream}
+            onStopWork={handleStopWork}
             onOpenExecutionViewer={() => {
               executionViewerOpen = true
             }}
@@ -8021,12 +7937,16 @@ const immersiveActive = $derived.by(
         </div>
 
         <TokenPanel
+          chatgptPlan={isChatgptPlanConnection(activeModelPreset?.connection?.id ?? agentStore.getCurrentAgent()?.primary_model_connection?.id)}
           {currentTokens}
           {contextLimit}
           contextPercent={contextUsage.contextPercent}
           contextState={contextUsage.state}
           contextLabel={contextUsage.label}
           contextDetail={contextUsage.detail}
+          contextUnknownHint={contextLimit === null && normalizePrimaryAgentType(agentStore.getCurrentAgent()) === 'cli'
+            ? 'The active CLI model\'s context limit is unknown. Batshit will show a percentage when a reliable limit is available.'
+            : null}
           trimAvailable={contextUsage.trimAvailable}
           trimUnavailableReason={contextUsage.trimUnavailableReason}
           trimBusy={trimPreviewBusy}
@@ -8332,9 +8252,9 @@ const immersiveActive = $derived.by(
     gap: 0.375rem;
     margin: 0 auto;
     padding: 0.25rem 0.625rem;
-    border: 1px solid var(--bs-border-subtle, color-mix(in oklab, var(--primary) 24%, transparent));
+    border: 1px solid var(--bs-app-primary-soft);
     border-radius: 999px;
-    background: color-mix(in oklab, var(--primary) 8%, transparent);
+    background: var(--bs-app-primary-faint);
     color: var(--muted-foreground);
     font-size: 0.6875rem;
     line-height: 1.2;
@@ -8473,7 +8393,7 @@ const immersiveActive = $derived.by(
 
   .right-panel-resize-handle:hover,
   .right-panel-resize-handle:focus-visible {
-    background: color-mix(in oklab, var(--bs-app-primary) 20%, transparent);
+    background: var(--bs-app-primary-faint);
     outline: none;
   }
 

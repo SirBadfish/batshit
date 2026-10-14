@@ -1,4 +1,4 @@
-import os from 'node:os'
+import { getBatshitHomeDir } from './batshitHome'
 import path from 'node:path'
 
 import type { SkillBundleFile, SkillRow } from '$lib/types/database'
@@ -9,6 +9,13 @@ import {
   type SkillAccessRefusalCode,
   type SkillRuntimeActor
 } from './slashCommandCapabilities'
+import {
+  normalizeSkillReadOffset,
+  partialSkillReadFields,
+  readSkillTextWindow,
+  skillReadOffsetPastEndError,
+  type SkillReadWindow
+} from './skillReadWindow'
 
 export type { SkillRuntimeActor } from './slashCommandCapabilities'
 
@@ -81,34 +88,23 @@ function resolveSkillCacheDir(skill: SkillRow): string {
     if (parsed.ext.length > 0) return path.dirname(cachePath)
     return cachePath
   }
-  return path.join(os.homedir(), '.batshit', 'skills', skill.id)
+  return path.join(getBatshitHomeDir(), 'skills', skill.id)
 }
 
 function decodeBundleFileText(
   file: SkillBundleFile,
-  maxChars?: number
-): { content: string; truncated: boolean; originalChars: number } {
+  maxChars?: number,
+  offset = 0
+): SkillReadWindow {
   const decoded =
     file.encoding === 'base64'
       ? Buffer.from(file.content, 'base64').toString('utf8')
       : file.content
-  const originalChars = decoded.length
   const safeMax =
     typeof maxChars === 'number' && Number.isFinite(maxChars)
       ? Math.max(64, Math.min(50_000, Math.floor(maxChars)))
       : 12_000
-  if (decoded.length <= safeMax) {
-    return {
-      content: decoded,
-      truncated: false,
-      originalChars
-    }
-  }
-  return {
-    content: decoded.slice(0, safeMax),
-    truncated: true,
-    originalChars
-  }
+  return readSkillTextWindow(decoded, safeMax, offset)
 }
 
 export type SkillRuntimeResolution =
@@ -147,7 +143,14 @@ export async function resolveSkillRuntimeForTool(
     }
   }
 
-  const skill = await getSkill(userId, access.skillId)
+  let skill: Awaited<ReturnType<typeof getSkill>>
+  try {
+    skill = await getSkill(userId, access.skillId)
+  } catch (error) {
+    // BL-369: a user skill whose files are missing is refused with the reason (the folder it
+    // looked in), so the agent can tell the user; nothing is written.
+    return { runtime: null, error: error instanceof Error ? error.message : String(error) }
+  }
   if (!skill) {
     return {
       runtime: null,
@@ -173,11 +176,12 @@ export function findBundleFileByPath(
   return files.find((file) => normalizeBundlePath(file.path) === normalized) ?? null
 }
 
-export function readSkillBundleFileText(
-  file: SkillBundleFile,
-  maxChars?: number
-): { content: string; truncated: boolean; originalChars: number } {
-  return decodeBundleFileText(file, maxChars)
+/**
+ * A window of a bundle file: `maxChars` characters from `offset` (find 1). `offset` must already
+ * be checked (`normalizeSkillReadOffset`); a window past the end is empty.
+ */
+export function readSkillBundleFileText(file: SkillBundleFile, maxChars?: number, offset = 0): SkillReadWindow {
+  return decodeBundleFileText(file, maxChars, offset)
 }
 
 export function resolveBundleFileAbsolutePath(cacheDir: string, file: SkillBundleFile): string | null {
@@ -211,6 +215,8 @@ export async function executeSkillRuntimeAction(input: {
   action?: SkillRuntimeAction
   path?: string
   maxChars?: number
+  /** `read` only: where the window starts, in characters (find 1). */
+  offset?: number
 }) {
   const action = input.action ?? 'list'
   const runtimeResult = await resolveSkillRuntimeForTool(input.userId, input.skillId, input.actor)
@@ -312,6 +318,16 @@ export async function executeSkillRuntimeAction(input: {
     }
   }
 
+  const offset = normalizeSkillReadOffset(input.offset)
+  if (!offset.ok) {
+    return {
+      success: false,
+      action: 'read' as const,
+      error: offset.error,
+      availableReferences: allPaths
+    }
+  }
+
   const isSkillMdRequest = targetPath.toLowerCase().replace(/^\/+/, '') === 'skill.md'
   if (isSkillMdRequest) {
     const skillMarkdown = skill.skill_markdown?.trim()
@@ -324,19 +340,28 @@ export async function executeSkillRuntimeAction(input: {
       }
     }
 
-    const maxChars = clampReferenceChars(input.maxChars)
-    const truncated = skillMarkdown.length > maxChars
-    return {
-      success: true,
-      action: 'read' as const,
-      skillId: skill.id,
-      skillName: skill.displayName || skill.name,
-      path: 'SKILL.md',
-      content: truncated ? skillMarkdown.slice(0, maxChars) : skillMarkdown,
-      contentTruncated: truncated,
-      originalChars: skillMarkdown.length,
-      returnedChars: truncated ? maxChars : skillMarkdown.length
-    }
+    const window = readSkillTextWindow(skillMarkdown, clampReferenceChars(input.maxChars), offset.offset)
+    return (
+      readPastEndRefusal(offset.offset, window.originalChars, 'SKILL.md', allPaths) ?? {
+        success: true,
+        action: 'read' as const,
+        skillId: skill.id,
+        skillName: skill.displayName || skill.name,
+        path: 'SKILL.md',
+        content: window.content,
+        contentTruncated: window.truncated,
+        originalChars: window.originalChars,
+        returnedChars: window.content.length,
+        ...partialSkillReadFields({
+          skillId: skill.id,
+          action: 'read',
+          path: 'SKILL.md',
+          offset: window.offset,
+          returnedChars: window.content.length,
+          originalChars: window.originalChars
+        })
+      }
+    )
   }
 
   const file = findBundleFileByPath(references, targetPath)
@@ -349,16 +374,31 @@ export async function executeSkillRuntimeAction(input: {
     }
   }
 
-  const decoded = readSkillBundleFileText(file, clampReferenceChars(input.maxChars))
-  return {
-    success: true,
-    action: 'read' as const,
-    skillId: skill.id,
-    skillName: skill.displayName || skill.name,
-    path: file.path,
-    content: decoded.content,
-    contentTruncated: decoded.truncated,
-    originalChars: decoded.originalChars,
-    returnedChars: decoded.content.length
-  }
+  const decoded = readSkillBundleFileText(file, clampReferenceChars(input.maxChars), offset.offset)
+  return (
+    readPastEndRefusal(offset.offset, decoded.originalChars, file.path, allPaths) ?? {
+      success: true,
+      action: 'read' as const,
+      skillId: skill.id,
+      skillName: skill.displayName || skill.name,
+      path: file.path,
+      content: decoded.content,
+      contentTruncated: decoded.truncated,
+      originalChars: decoded.originalChars,
+      returnedChars: decoded.content.length,
+      ...partialSkillReadFields({
+        skillId: skill.id,
+        action: 'read',
+        path: file.path,
+        offset: decoded.offset,
+        returnedChars: decoded.content.length,
+        originalChars: decoded.originalChars
+      })
+    }
+  )
+}
+
+function readPastEndRefusal(offset: number, originalChars: number, path: string, availableReferences: string[]) {
+  const error = skillReadOffsetPastEndError(offset, originalChars, path)
+  return error ? { success: false, action: 'read' as const, error, availableReferences } : null
 }

@@ -583,7 +583,7 @@ export async function uploadGoonSceneSkybox(file: File): Promise<GoonFileRef> {
 
   if (!res.ok) {
     const text = await res.text().catch(() => '')
-    throw new Error(text || 'Failed to upload skybox image')
+    throw new Error(text || 'Failed to upload panorama background')
   }
 
   const data = await res.json()
@@ -608,7 +608,7 @@ export async function deleteGoonSceneSkybox(filename: string): Promise<void> {
 
   if (!res.ok) {
     const text = await res.text().catch(() => '')
-    throw new Error(text || 'Failed to delete skybox image')
+    throw new Error(text || 'Failed to delete panorama background')
   }
 }
 

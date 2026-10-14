@@ -22,7 +22,7 @@ Start a new chat with the **New Chat** action at the top of the sidebar. Batshit
 
 Each Session has two names worth knowing about:
 
-- A **Session ID** — a short identifier Batshit generates for you. You can rename the ID, but only *before* the conversation has any messages. Once a chat has started, the ID is locked so existing history can't be quietly re-pointed. (This is a safety rule, not a limitation you'll usually bump into.)
+- A **Session ID** — a short identifier Batshit generates for you. You can rename the ID, but only *before* the conversation has any messages. Once a chat has started, the ID is locked so existing history can't be quietly re-pointed. An ID cannot contain `:`, `*`, `?`, `[`, `]`, or `\`. (This is a safety rule, not a limitation you'll usually bump into.)
 - A **title** — the friendly name shown in the sidebar. You can rename the title any time, even mid-conversation, as often as you like.
 
 The practical takeaway: rename the *title* whenever you want a chat to be easy to find. The ID is mostly plumbing.
@@ -47,7 +47,7 @@ A few things to know:
 
 - There's always a **default folder**, and it can't be deleted. Chats that aren't filed anywhere live there.
 - Folders sort by recent activity, so the chats you're actually using float toward the top.
-- Deleting a folder gives you a choice: **delete the folder only** (its chats move back to the default folder, nothing is lost) or **delete the folder and its chats** (the chats are permanently removed). Batshit asks which one you mean — it never guesses.
+- Deleting a folder gives you a choice: **delete the folder only** (its chats move back to the default folder, nothing is lost) or **delete the folder and its chats** (the chats are permanently removed, archived chats in that folder too). Batshit asks which one you mean — it never guesses. Before you confirm, it tells you how many chats will go and names the archived ones, since the sidebar does not show them in the folder. If a chat lands in the folder while that question is open, nothing is deleted and Batshit asks you to look again.
 - A chat you delete leaves every Batshit tab you have open at once, not only the one you deleted it from. A tab that was showing it goes to a new, empty chat.
 
 ## Deleting a chat that is still replying
@@ -63,7 +63,7 @@ Some chats you really don't want to delete by accident — a reference conversat
 Locking a Session protects it from deletion. While a chat is locked:
 
 - You can't delete it until you unlock it, and the delete control tells you so.
-- It's protected even from bulk cleanup — if you delete a whole folder's chats, a locked chat in that folder stops the operation rather than getting swept up.
+- It's protected even from bulk cleanup — if you delete a whole folder's chats, a locked chat in that folder stops the operation rather than getting swept up. Batshit names the locked chats so you can unlock them first.
 
 Locking is enforced in several places at once, so an accidental delete path can't slip past it. What locking does *not* do is protect against deliberate infrastructure-level wipes (for example, clearing the underlying data store directly). For real recovery insurance, use [Backup and restore](../admin/backup-and-restore.md) and keep your own backups.
 

@@ -12,6 +12,15 @@ export type LocalAiServerId =
 
 export type LocalAiImageTransport = 'auto' | 'url'
 
+/** Preference/reference only. Host write authority never lives in Redis/backup. */
+export type KoboldManagedProfileReference = {
+  version: 1
+  registrationId: string | null
+  state: 'active' | 'reenrollment-required'
+  restoredAt?: string
+  desired?: { modelId: string; contextTokens: number }
+}
+
 export type LocalAiServerDefinition = {
   id: LocalAiServerId
   label: string
@@ -46,6 +55,7 @@ export type LocalAiServerRecord = {
   imageBaseUrl?: string
   createdAt: string
   updatedAt: string
+  managedProfile?: KoboldManagedProfileReference
 }
 
 export type LocalAiServerSummary = LocalAiServerDefinition & {
@@ -57,6 +67,7 @@ export type LocalAiServerSummary = LocalAiServerDefinition & {
   createdAt?: string
   updatedAt?: string
   source: 'default' | 'stored'
+  managedProfile?: KoboldManagedProfileReference
 }
 
 export type LocalAiServerUpdate = {

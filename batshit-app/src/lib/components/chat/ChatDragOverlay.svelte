@@ -46,7 +46,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    border: 2px dashed var(--primary);
+    border: 2px dashed var(--primary-text);
     border-radius: calc(var(--radius) + 4px);
     background: oklch(from var(--background) l c h / 0.9);
   }
@@ -58,7 +58,7 @@
   .chat-drag-icon {
     margin-inline: auto;
     margin-bottom: 0.5rem;
-    color: var(--primary);
+    color: var(--primary-text);
   }
 
   .chat-drag-title {

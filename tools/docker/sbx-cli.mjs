@@ -13,12 +13,20 @@
 // inside the sandbox, and a call that starts sbx's daemon prints daemon-start lines to
 // stdout ahead of any JSON.
 import { createHash } from 'node:crypto'
+import { realpathSync } from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { SANDBOX_COMMAND_TAG_ENV, sandboxCommandEndArgv } from './command-end.mjs'
 
 export const SBX_COMMAND = 'sbx'
 export const SBX_SANDBOX_NAME_PREFIX = 'batshit-'
 const SBX_SANDBOX_KIT = 'shell'
 const SBX_ALL_HOSTS = '**'
+import homePolicy from '../../batshit-app/src/lib/server/services/sandboxHomePolicy.json' with { type: 'json' }
+const SANDBOX_BATSHIT_WRITABLE_DIRS = homePolicy.writableDirs
+const SANDBOX_BATSHIT_PROTECTED_DIRS = homePolicy.protectedDirs
+const SANDBOX_MOUNT_VERSION = homePolicy.mountVersion
+
 export const SBX_ABANDONED_AFTER_MS = 60 * 60_000
 
 export const SBX_SETUP_STEPS =
@@ -33,6 +41,24 @@ export function buildSbxSessionMarker(sessionId) {
   return `-s${hashHex(sessionId, 8)}-`
 }
 
+// Same default-preserving home layout as the app; the host operator retains its own root.
+function sandboxHomes() {
+  const shared = path.join(os.homedir(), '.batshit')
+  const configured = process.env.BATSHIT_HOME_DIR?.trim() || process.env.BATSHIT_HOST_RUNTIME_ROOT?.trim()
+  if (configured && !path.isAbsolute(configured)) throw new Error('Batshit sandbox home must name an absolute folder.')
+  const home = configured ? path.resolve(configured) : shared
+  const runtimeRoot = process.env.BATSHIT_AGENT_RUNTIME_ROOT?.trim()
+  const agents = path.join(runtimeRoot ? path.resolve(runtimeRoot) : home, 'agents')
+  const protectedHome = process.env.BATSHIT_SANDBOX_PROTECTED_HOME_DIR?.trim()
+  if (protectedHome && !path.isAbsolute(protectedHome)) throw new Error('BATSHIT_SANDBOX_PROTECTED_HOME_DIR must name an absolute folder.')
+  return { shared, home, agents, protectedHomes: protectedHome ? [path.resolve(protectedHome)] : [] }
+}
+
+function sandboxHomeMountIdentity() {
+  const { shared, home, agents, protectedHomes } = sandboxHomes()
+  return home === shared && agents === path.join(shared, 'agents') && protectedHomes.length === 0 ? '' : JSON.stringify([home, shared, agents, ...protectedHomes])
+}
+
 export function buildSbxSandboxName({ userId, workspaceRoot, sessionId }) {
   const userPart =
     String(userId || '')
@@ -43,7 +69,8 @@ export function buildSbxSandboxName({ userId, workspaceRoot, sessionId }) {
       .slice(0, 20) || 'user'
   const session = typeof sessionId === 'string' ? sessionId.trim() : ''
   const sessionSegment = session ? `s${hashHex(session, 8)}-` : ''
-  return `${SBX_SANDBOX_NAME_PREFIX}${userPart}-${sessionSegment}${hashHex(workspaceRoot, 10)}`
+  // A new name avoids reusing an existing sbx VM with the old broader mounts.
+  return `${SBX_SANDBOX_NAME_PREFIX}${userPart}-${sessionSegment}m${SANDBOX_MOUNT_VERSION}-${hashHex(`managed-mounts-v${SANDBOX_MOUNT_VERSION}:${workspaceRoot}${sandboxHomeMountIdentity()}`, 10)}`
 }
 
 export function isManagedSbxSandboxName(name) {
@@ -55,7 +82,40 @@ export const sbxListArgs = () => ['ls', '--json']
 export const sbxPolicyListArgs = () => ['policy', 'ls']
 
 export function sbxCreateArgs({ sandboxName, workspaceRoot, extraWorkspaces = [] }) {
-  return ['create', '--name', sandboxName, '--deny-network', SBX_ALL_HOSTS, SBX_SANDBOX_KIT, workspaceRoot, ...extraWorkspaces]
+  const { home, shared, agents, protectedHomes } = sandboxHomes()
+  const isHome = (root) => path.basename(root) === '.batshit' || path.resolve(root) === home
+  const mounts = extraWorkspaces.flatMap((workspace) =>
+    isHome(workspace)
+      ? SANDBOX_BATSHIT_WRITABLE_DIRS.map((name) => path.join(
+        path.resolve(workspace) === home && !homePolicy.laneOwnedDirs.includes(name) ? shared : workspace, name
+      ))
+      : [workspace]
+  )
+  const protectedRoots = [agents, ...[home, shared, ...protectedHomes].flatMap((root) => SANDBOX_BATSHIT_PROTECTED_DIRS.map((name) => path.join(root, name)))]
+  for (const workspace of extraWorkspaces) {
+    if (isHome(workspace)) protectedRoots.push(...SANDBOX_BATSHIT_PROTECTED_DIRS.map((name) => path.join(workspace, name)))
+    if (SANDBOX_BATSHIT_PROTECTED_DIRS.includes(path.basename(workspace)) && path.basename(path.dirname(workspace)) === '.batshit') protectedRoots.push(workspace)
+  }
+  for (const workspace of [workspaceRoot, ...mounts]) {
+    if (protectedRoots.some((agents) => overlapsProtectedHome(workspace, agents))) {
+      throw new Error('Sandbox workspace exposes managed agent homes or protected runtime/Pinokio data.')
+    }
+  }
+  return ['create', '--name', sandboxName, '--deny-network', SBX_ALL_HOSTS, SBX_SANDBOX_KIT, workspaceRoot, ...mounts]
+}
+
+function overlapsProtectedHome(workspace, agents) {
+  const flavor = /^[a-z]:[\\/]/i.test(workspace) ? path.win32 : path.posix
+  const canonical = (value) => {
+    try { return realpathSync.native(value) } catch { return flavor.resolve(value) }
+  }
+  const actualWorkspace = canonical(workspace)
+  const actualAgents = canonical(agents)
+  const inside = (target, root) => {
+    const relative = flavor.relative(root, target)
+    return relative === '' || (relative !== '..' && !relative.startsWith(`..${flavor.sep}`) && !flavor.isAbsolute(relative))
+  }
+  return inside(actualWorkspace, actualAgents) || inside(actualAgents, actualWorkspace)
 }
 
 export function sbxDenyAllNetworkArgs(sandboxName) {

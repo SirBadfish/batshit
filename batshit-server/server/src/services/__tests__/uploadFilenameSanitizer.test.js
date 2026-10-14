@@ -1,5 +1,6 @@
 const uploadRouter = require('../../api/upload-redis');
 const { zipSync, strToU8 } = require('fflate');
+const { GOON_MANIFEST_MAX_BYTES } = require('../goonPackageLimits.json');
 
 describe('upload filename sanitizer', () => {
   it('replaces spaces and unsafe characters while preserving the file extension', () => {
@@ -76,6 +77,28 @@ describe('upload content validation', () => {
         maxUncompressedBytes: 1024 * 1024
       })
     ).toThrow(/unsupported files/i);
+  });
+
+  it.each([7522825, GOON_MANIFEST_MAX_BYTES])('accepts a %i-byte Guided manifest within the shared ceiling', (size) => {
+    const manifest = strToU8(JSON.stringify({ payload: 'x'.repeat(size - 14) }));
+    const archive = zipSync({ 'avatar.json': manifest, 'avatar.vrm': new Uint8Array([1]) }, { level: 0 });
+    const entries = uploadRouter.readConstrainedGoonArchiveEntries(archive, {
+      laneLabel: 'Guided Goon', allowedBasenames: ['avatar.json', 'avatar.vrm'],
+      maxUncompressedBytes: uploadRouter.GOON_CORE_IMPORT_MAX_FILE_SIZE
+    });
+    expect(Buffer.from(entries.find(([name]) => name === 'avatar.json')[1]).equals(Buffer.from(manifest))).toBe(true);
+  });
+
+  it('rejects Guided manifests above the shared ceiling while retaining the total expansion ceiling', () => {
+    const read = (manifestSize, maxUncompressedBytes) => {
+      const manifest = strToU8(JSON.stringify({ payload: 'x'.repeat(manifestSize - 14) }));
+      return uploadRouter.readConstrainedGoonArchiveEntries(
+        zipSync({ 'avatar.json': manifest, 'avatar.vrm': new Uint8Array([1]) }, { level: 0 }),
+        { laneLabel: 'Guided Goon', allowedBasenames: ['avatar.json', 'avatar.vrm'], maxUncompressedBytes }
+      );
+    };
+    expect(() => read(GOON_MANIFEST_MAX_BYTES + 1, uploadRouter.GOON_CORE_IMPORT_MAX_FILE_SIZE)).toThrow(/manifest is too large/);
+    expect(() => read(3 * 1024 * 1024, 2 * 1024 * 1024)).toThrow(/expands beyond the allowed size/);
   });
 });
 

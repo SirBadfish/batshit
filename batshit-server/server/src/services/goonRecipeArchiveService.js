@@ -76,6 +76,10 @@ function createOutputState(outputDir, memberPath) {
     resolveDone = resolve;
     rejectDone = reject;
   });
+  // A stream can fail before the extractor reaches Promise.all(done). Observe
+  // that rejection immediately; the original promise still rejects, and the
+  // extractor rethrows firstError after cleaning every temporary output.
+  done.catch(() => {});
   return {
     memberPath,
     tempPath,

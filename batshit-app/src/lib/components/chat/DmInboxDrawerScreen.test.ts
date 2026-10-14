@@ -1,9 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
 import { render, screen, waitFor } from '@testing-library/svelte'
-import { UNTRUSTED_TEXT_BADGE_TEXT, UNTRUSTED_TEXT_DRAWER_TOLD_TEXT, untrustedTextFlagDetail } from '$lib/utils/jevJuice'
+import { UNTRUSTED_TEXT_DRAWER_TOLD_TEXT, untrustedTextBadgeText, untrustedTextFlagDetail } from '$lib/utils/jevJuice'
 
 /**
- * SA-120 P7 — the advisory Jev Juice badge on a row of the Agent DM drawer.
+ * SA-120 P7 — the advisory Judge Juice badge on a row of the Agent DM drawer.
  *
  * The drawer is the one place the user sees the raw incoming text, so it is where the flag
  * matters most. It reads the screen the `/api/dms` row carries, and only ever draws what may
@@ -23,7 +23,18 @@ const SCREEN = {
   at: '2026-09-17T09:30:00.000Z',
   findings: [{ id: 'override', probability: 0.98 }],
   severity: 'serious',
-  harm: 2
+  harm: 2,
+  // The call's own row: it is what names the judge (a row with no provider was TypeSafe).
+  record: {
+    feature: 'untrusted_text',
+    model: 'jev-1.13.0',
+    latencyMs: 190,
+    usage: null,
+    deadlineHit: false,
+    status: 'ok',
+    questionCount: 4,
+    at: '2026-09-17T09:30:00.000Z'
+  }
 }
 
 function row(id: string, overrides: Record<string, unknown> = {}) {
@@ -66,7 +77,7 @@ function installFetch(dms: unknown[]) {
   }))
 }
 
-describe('DmInboxDrawer: the Jev Juice badge', () => {
+describe('DmInboxDrawer: the Judge Juice badge', () => {
   it('badges a flagged row, and only that row', async () => {
     installFetch([
       row('dm_flagged', { screen: SCREEN }),
@@ -78,7 +89,7 @@ describe('DmInboxDrawer: the Jev Juice badge', () => {
     await waitFor(() => expect(screen.getByText('subject dm_unscreened')).toBeTruthy())
     const badges = screen.getAllByTestId('jev-juice-dm-flag')
     expect(badges).toHaveLength(1)
-    expect(badges[0].textContent).toContain(UNTRUSTED_TEXT_BADGE_TEXT)
+    expect(badges[0].textContent).toContain(untrustedTextBadgeText('Jev'))
     expect(badges[0].className).toContain('is-serious')
     expect(badges[0].getAttribute('title')).toBe(
       untrustedTextFlagDetail(
@@ -88,7 +99,8 @@ describe('DmInboxDrawer: the Jev Juice badge', () => {
           findings: [{ id: 'override', probability: 0.98 }],
           harm: 2,
           clipped: false,
-          source: 'agent_dm'
+          source: 'agent_dm',
+          judge: 'Jev'
         },
         UNTRUSTED_TEXT_DRAWER_TOLD_TEXT
       )
@@ -98,8 +110,25 @@ describe('DmInboxDrawer: the Jev Juice badge', () => {
     expect(badges[0].getAttribute('title')).toContain('Potential harm: serious')
     expect(badges[0].getAttribute('title')).toContain(UNTRUSTED_TEXT_DRAWER_TOLD_TEXT)
     expect(badges[0].textContent).toContain('Flagged by Jev')
-    expect(badges[0].textContent).not.toContain('Jev Juice')
+    expect(badges[0].textContent).not.toContain('Judge Juice')
     expect(screen.queryByTestId('jev-juice-dm-screen-skipped')).toBeNull()
+  })
+
+  it('SA-120 P10b: the badge names the judge that flagged it, from the screen\'s own row', async () => {
+    installFetch([
+      row('dm_cloudflare', {
+        screen: {
+          ...SCREEN,
+          record: { ...SCREEN.record, model: 'clef-flash', provider: { id: 'cf_1', kind: 'cloudflare', label: 'CF' } }
+        }
+      })
+    ])
+    render(DmInboxDrawer, { props: { open: true } })
+
+    const badge = await screen.findByTestId('jev-juice-dm-flag')
+    expect(badge.textContent).toContain('Flagged by Clef Flash')
+    expect(badge.textContent).not.toContain('Jev')
+    expect(badge.getAttribute('title')).toContain("This is Clef Flash's best guess, and Clef Flash can be wrong.")
   })
 
   it('warns rather than alarms for a caution flag', async () => {
@@ -116,8 +145,32 @@ describe('DmInboxDrawer: the Jev Juice badge', () => {
     render(DmInboxDrawer, { props: { open: true } })
 
     const note = await screen.findByTestId('jev-juice-dm-screen-skipped')
-    expect(note.textContent).toContain('Jev Juice: Incoming text screen skipped')
+    expect(note.textContent).toContain('Judge Juice: Incoming text screen skipped')
     expect(note.getAttribute('title')).toContain('This text was not screened.')
     expect(screen.queryByTestId('jev-juice-dm-flag')).toBeNull()
+  })
+})
+
+/**
+ * BL-401 — a schedule keeps one unread note, and a fire that finds it counts itself on it. The
+ * row says so, so the user sees why one row stands for many fires.
+ */
+describe('DmInboxDrawer: a schedule note that fired more than once', () => {
+  it('says how many times it fired, and only on that row', async () => {
+    installFetch([
+      row('dm_fired', {
+        from: { kind: 'schedule', scheduleId: 'sch_q', name: 'Queue check' },
+        fireCount: 5,
+        firstFiredAt: '2026-09-17T09:00:00.000Z',
+        lastFiredAt: '2026-09-17T13:00:00.000Z'
+      }),
+      row('dm_once')
+    ])
+    render(DmInboxDrawer, { props: { open: true } })
+
+    await waitFor(() => expect(screen.getByText('subject dm_once')).toBeTruthy())
+    const counts = screen.getAllByTestId('dm-drawer-fire-count')
+    expect(counts).toHaveLength(1)
+    expect(counts[0].textContent).toMatch(/fired 5 times, last /)
   })
 })

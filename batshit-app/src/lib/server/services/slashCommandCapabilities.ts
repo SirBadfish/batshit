@@ -138,7 +138,7 @@ export async function resolveSkillAccessForActor(
 
 /**
  * SA-120 P1: every active, chat-invocable command on the instance regardless of agent
- * assignment. The Jev Juice capability-gap catalog compares this against the agent's
+ * assignment. The Judge Juice capability-gap catalog compares this against the agent's
  * own enabled list to find a skill the request needs that this agent cannot invoke.
  */
 export async function listAllSlashCapabilities(userId: string): Promise<AgentSlashCapability[]> {
@@ -210,7 +210,9 @@ export function buildSkillsCommandsDcmLines(capabilities: AgentSlashCapability[]
     for (const capability of visible) {
       const typeLabel = capability.type === 'skill' ? 'skill' : 'prompt'
       const suffix = capability.type === 'skill' && capability.skillId ? ` | skillId=${capability.skillId}` : ''
-      const summary = capability.description ? ` — ${capability.description}` : ''
+      // One line per entry: a literal (`|`) SKILL.md description keeps its line breaks (BL-469).
+      const description = capability.description?.replace(/\s+/g, ' ').trim()
+      const summary = description ? ` — ${description}` : ''
       lines.push(`- ${capability.invocation} | ${typeLabel}${suffix}${summary}`)
     }
     if (capabilities.length > maxEntries) {

@@ -2,7 +2,7 @@
 import { createClient } from 'redis';
 import crypto from 'crypto';
 import bcrypt from 'bcrypt';
-import { sanitizeId, suggestAlternatives } from '$lib/utils/idSanitizer';
+import { sanitizeId } from '$lib/utils/idSanitizer';
 import { normalizeGoonsSettings } from '$lib/goons/resolve';
 
 // Session duration (24 hours in seconds)
@@ -28,6 +28,72 @@ export function resolveAuthRedisUrl(env: NodeJS.ProcessEnv = process.env): strin
 
     return `redis://${host}:${port}${db}`;
 }
+
+export function resolveAuthRedisDatabase(url: string): number {
+    const segment = new URL(url).pathname.replace(/^\//, '');
+    if (!segment) return 0;
+    if (!/^\d+$/.test(segment) || !Number.isSafeInteger(Number(segment))) {
+        throw new Error('The authentication Redis URL must name a valid database number.');
+    }
+    return Number(segment);
+}
+
+// BL-1482: admission and all five existing account writes are one Redis operation.
+// A page-load redirect is not authorization for the subsequent setup POST. No
+// lock key is needed: the account namespaces themselves close first-run admission.
+export const CREATE_INITIAL_ADMIN_SCRIPT = `
+if redis.call('EXISTS', KEYS[4], KEYS[5]) > 0 then return 'EXISTS' end
+for _, pattern in ipairs({'user:*', 'email:*', 'user_session:*'}) do
+    local cursor = '0'
+    repeat
+        local batch = redis.call('SCAN', cursor, 'MATCH', pattern, 'COUNT', 100)
+        for _, key in ipairs(batch[2]) do
+            -- This exact legacy System Clip index is instance metadata, not
+            -- an account. No other user:system:* key receives an exemption.
+            if key ~= 'user:system:clips' then return 'EXISTS' end
+        end
+        cursor = batch[1]
+    until cursor == '0'
+end
+for _, key in ipairs(KEYS) do
+    if redis.call('EXISTS', key) > 0 then return 'EXISTS' end
+end
+
+-- Validate every JSON argument before the first write. Use the original JSON
+-- bytes for JSON.SET; cjson re-encoding would change stored numeric precision.
+local data = cjson.decode(ARGV[3])
+local settings = cjson.decode(ARGV[4])
+if type(data) ~= 'table' or type(settings) ~= 'table' or
+    data.id ~= ARGV[1] or data.email ~= ARGV[2] or
+    type(data.password) ~= 'string' or data.is_admin ~= true or
+    settings.user_id ~= ARGV[1] then
+    return 'INVALID'
+end
+local writes = {
+    {'JSON.SET', KEYS[1], '$', ARGV[3], 'NX'},
+    {'JSON.SET', KEYS[2], '$', ARGV[4], 'NX'},
+    {'SET', KEYS[3], ARGV[1], 'NX'},
+    {'SADD', KEYS[4], ARGV[1]},
+    {'SET', KEYS[5], ARGV[1], 'NX'}
+}
+local created = {}
+for index, command in ipairs(writes) do
+    local answer = redis.pcall(unpack(command))
+    local ok = index == 4 and answer == 1 or
+        index ~= 4 and type(answer) == 'table' and answer.ok == 'OK'
+    if not ok then
+        -- Lua does not undo earlier commands on failure. Only these proven-new
+        -- keys belong to this invocation; no pre-existing state can be erased.
+        if #created > 0 then
+            local removed = redis.pcall('DEL', unpack(created))
+            if removed ~= #created then return 'PARTIAL' end
+        end
+        return 'WRITE_FAILED'
+    end
+    created[#created + 1] = KEYS[index]
+end
+return 'CREATED'
+`;
 
 export function resolveSessionCookieName(env: NodeJS.ProcessEnv = process.env): string {
     const explicit = env.BATSHIT_SESSION_COOKIE_NAME?.trim();
@@ -81,14 +147,16 @@ export interface Session {
     expires_at: string;
 }
 
-class AuthService {
+export class AuthService {
     private redis: ReturnType<typeof createClient> | null = null;
 
     // Initialize Redis connection
     private async ensureRedis() {
         if (!this.redis) {
+            const url = resolveAuthRedisUrl();
             this.redis = createClient({
-                url: resolveAuthRedisUrl()
+                url,
+                database: resolveAuthRedisDatabase(url)
             });
             
             this.redis.on('error', (err) => {
@@ -125,22 +193,16 @@ class AuthService {
     }
 
     // Create the first admin user
-    async createAdminUser(email: string, password: string, displayName: string): Promise<{ success: boolean; user?: User; error?: string }> {
-        const redis = await this.ensureRedis();
-
-        // Generate slug-based user ID from display name
-        const userId = sanitizeId(displayName);
-
-        // CRITICAL: Check for collision BEFORE creating user
-        const exists = await redis.exists(`user:${userId}:settings`);
-        if (exists) {
-            const suggestions = suggestAlternatives(userId, 3);
-            return {
-                success: false,
-                error: `Username '${userId}' already exists. Try ${suggestions.map(s => `'${s}'`).join(', ')} or choose a different name.`
-            };
+    async createAdminUser(email: string, password: string, displayName: string): Promise<{ success: boolean; user?: User; error?: string; status?: number }> {
+        if (typeof email !== 'string' || !email.trim() ||
+            typeof password !== 'string' || password.length < 10 ||
+            typeof displayName !== 'string' || !displayName.trim()) {
+            return { success: false, status: 400, error: 'A name, email and password of at least 10 characters are required.' };
         }
-
+        const userId = sanitizeId(displayName);
+        if (!userId) {
+            return { success: false, status: 400, error: 'The name must contain a letter or number.' };
+        }
         const hashedPassword = await this.hashPassword(password);
 
         // Store user data as JSON object (indexed by slug ID)
@@ -153,17 +215,6 @@ class AuthService {
             created_at: new Date().toISOString()
         };
 
-        await redis.json.set(`user:${userId}:data`, '$', userData);
-
-        // Create email→userId mapping for authentication lookup
-        await redis.set(`email:${email}`, userId);
-
-        // Mark as admin (use slug ID)
-        await redis.set('user:admin', userId);
-
-        // Add to users set (use slug ID)
-        await redis.sAdd('users:all', userId);
-
         // Create user settings with display name using RedisJSON
         const userSettings = {
             id: `settings_${userId}`,
@@ -175,7 +226,23 @@ class AuthService {
             updated_at: new Date().toISOString()
         };
 
-        await redis.json.set(`user:${userId}:settings`, '$', userSettings);
+        const redis = await this.ensureRedis();
+        const result = await redis.eval(CREATE_INITIAL_ADMIN_SCRIPT, {
+            keys: [`user:${userId}:data`, `user:${userId}:settings`, `email:${email}`, 'users:all', 'user:admin'],
+            arguments: [userId, email, JSON.stringify(userData), JSON.stringify(userSettings)]
+        });
+        if (result === 'EXISTS') {
+            return {
+                success: false,
+                status: 409,
+                error: 'An admin account or saved account state already exists. Sign in or recover that account instead.'
+            };
+        }
+        if (result !== 'CREATED') {
+            throw new Error(result === 'WRITE_FAILED' || result === 'INVALID'
+                ? 'Admin setup failed without creating an account. Check the app logs before retrying.'
+                : 'Admin setup could not confirm account creation. Account state was kept; check the app logs before retrying.');
+        }
 
         return {
             success: true,

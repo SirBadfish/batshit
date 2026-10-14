@@ -7,6 +7,7 @@
   import { Sidebar_batshit } from '$lib/components/batshit-sidebar';
   import { Toaster } from '$lib/components/ui/sonner';
   import ConfirmDialogHost from '$lib/components/ui/ConfirmDialogHost.svelte';
+  import PinokioStartBridge from '$lib/components/artifacts/PinokioStartBridge.svelte';
   import { installGlobalClientTelemetry } from '$lib/services/clientTelemetry';
   const { data, children } = $props();
 
@@ -150,4 +151,5 @@
 {#if !isDesktopCompanionPage}
   <Toaster position="top-right" />
   <ConfirmDialogHost />
+  <PinokioStartBridge />
 {/if}

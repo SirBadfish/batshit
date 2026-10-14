@@ -409,7 +409,7 @@
   .artifact-header-overlay-spinner {
     width: 32px;
     height: 32px;
-    border: 4px solid var(--primary);
+    border: 4px solid var(--primary-text);
     border-top-color: transparent;
     border-radius: 999px;
     animation: artifact-overlay-spin 1s linear infinite;

@@ -1,7 +1,61 @@
 import { describe, expect, it } from 'vitest'
+import { guardCutNotice } from '$lib/test-utils/guard-cut-notice'
 import { buildHydratedCoolToolStep } from './coolToolHydration'
 
 describe('coolToolHydration', () => {
+  it.each([
+    ['bash', 'bash', { command: 'printf large-output' }],
+    ['read_file', 'read_file', { path: '/tmp/large.txt', command: 'cat /tmp/large.txt' }],
+    ['batshit_server_fetch_zip', 'fetch_zip', { zipId: 'raw_1', offset: 0 }]
+  ] as const)('keeps a saved model-text cut from %s in the generic renderer', (toolName, operationKind, toolArgs) => {
+    const cutText = `Command output\nstdout:\n${'x'.repeat(7900)}\n${guardCutNotice(7_900, 'raw_1')}`
+    const hydrated = buildHydratedCoolToolStep({
+      type: 'tool', toolName, originalToolName: toolName,
+      operationKind, rendererFamily: 'generic_tool', toolArgs,
+      toolResult: { content: cutText, modelTextOnly: true },
+      metadata: { operationKind, rendererFamily: 'generic_tool' }
+    })
+
+    expect(hydrated.operationKind).toBe(operationKind)
+    expect(hydrated.rendererFamily).toBe('generic_tool')
+    expect(hydrated.metadata.rendererFamily).toBe('generic_tool')
+    expect(hydrated.toolResult).toEqual({ content: cutText, modelTextOnly: true })
+    expect(hydrated.observation).toEqual(hydrated.toolResult)
+  })
+
+  // Review of BL-677: the P2 guard (3ac8f5517) saved cut views of up to 100,000 characters. After
+  // the 96,000 ceiling such a card reloaded as a typed card with empty stdout and stderr.
+  const p2Notice = guardCutNotice(99_000, 'tool_raw_1790000000000_p2', 400_000)
+  const p2View = (length: number) => {
+    const header = 'Command output\nstatus: exitCode=0\nstdout:\n'
+    return `${header}${'y'.repeat(length - header.length - 1 - p2Notice.length)}\n${p2Notice}`
+  }
+  const reload = (toolName: string, operationKind: string, toolArgs: Record<string, any>, content: string) =>
+    buildHydratedCoolToolStep({
+      type: 'tool', toolName, originalToolName: toolName,
+      operationKind, rendererFamily: 'generic_tool', toolArgs,
+      // The shape the P2 normalizer saved: savedPlainMcpText plus modelTextOnly.
+      toolResult: { content, contentLength: content.length, contentTruncated: false, modelTextOnly: true },
+      metadata: { operationKind, rendererFamily: 'generic_tool' }
+    })
+
+  it.each([
+    ['bash', 'bash', { command: 'cat /tmp/huge.log' }],
+    ['read_file', 'read_file', { path: '/tmp/huge.log', command: 'cat /tmp/huge.log' }],
+    ['batshit_server_fetch_zip', 'fetch_zip', { zipId: 'tool_raw_1790000000000_p2', offset: 0 }]
+  ] as const)('reloads a P2-era saved %s cut of 99,500 characters as its cut view', (toolName, operationKind, toolArgs) => {
+    const content = p2View(99_500)
+    expect(content).toHaveLength(99_500)
+    const hydrated = reload(toolName, operationKind, toolArgs, content)
+    expect(hydrated.operationKind).toBe(operationKind)
+    expect(hydrated.rendererFamily).toBe('generic_tool')
+  })
+
+  it('does not stretch the saved ceiling past the old 100,000 characters', () => {
+    const hydrated = reload('bash', 'bash', { command: 'cat /tmp/huge.log' }, p2View(100_001))
+    expect(hydrated.rendererFamily).toBe('bash')
+  })
+
   it('preserves normalized renderer identity for hydrated native wrapper tool zips', () => {
     const hydrated = buildHydratedCoolToolStep({
       type: 'tool',

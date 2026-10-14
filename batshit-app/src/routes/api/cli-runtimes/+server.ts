@@ -15,6 +15,7 @@ import {
 } from '$lib/server/services/codexCliStatus'
 import { resolveClaudeCliExecutableDetailed } from '$lib/server/services/claudeCliStatus'
 import { requireAdmin, requireUser } from '$lib/server/services/routeSecurity'
+import { isCliVersionOlder, probeCliVersion } from '$lib/server/services/cliVersion'
 import { redis } from '$lib/server/redis'
 
 const MAX_MUTATION_BODY_BYTES = 1024
@@ -80,7 +81,13 @@ async function enforceMutationRateLimit(userId: string): Promise<Response | null
 
 type CliRuntimeSummary = {
   managed: Awaited<ReturnType<typeof getManagedCliInstallStatus>>
-  resolution: CliExecutableResolution & { found: boolean }
+  resolution: CliExecutableResolution & {
+    found: boolean
+    /** BL-268: what the found CLI reports as its version (null when it could not be read). */
+    version: string | null
+    /** BL-268: the found CLI is older than the version Batshit installs. */
+    olderThanPinned: boolean
+  }
 }
 
 function resolveRuntimeExecutable(runtime: ManagedCliRuntimeId): CliExecutableResolution {
@@ -94,9 +101,23 @@ async function buildRuntimeSummary(runtime: ManagedCliRuntimeId): Promise<CliRun
     getManagedCliInstallStatus(runtime),
     Promise.resolve(resolveRuntimeExecutable(runtime))
   ])
+  const found = resolution.source !== 'not-found'
+  // BL-268: a CLI older than the pinned one may refuse newer models on Batshit's list
+  // ("requires a newer version of Codex"), so Agent Settings says so beside the install button.
+  const version =
+    resolution.source === 'managed' && resolution.managedVersion
+      ? resolution.managedVersion
+      : found
+        ? await probeCliVersion(resolution.executable)
+        : null
   return {
     managed,
-    resolution: { ...resolution, found: resolution.source !== 'not-found' }
+    resolution: {
+      ...resolution,
+      found,
+      version,
+      olderThanPinned: isCliVersionOlder(version, managed.pinnedVersion)
+    }
   }
 }
 

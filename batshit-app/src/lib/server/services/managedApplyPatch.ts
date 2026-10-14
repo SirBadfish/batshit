@@ -1,3 +1,11 @@
+import {
+  lexShellCommands,
+  shellProgramWord,
+  shellTextRunsProgram,
+  substitutionsInExpandedText,
+  type ShellLexCommand
+} from './shellCommandLexer'
+
 export const APPLY_PATCH_BEGIN_MARKER = '*** Begin Patch'
 export const APPLY_PATCH_END_MARKER = '*** End Patch'
 export const APPLY_PATCH_UPDATE_PREFIX = '*** Update File: '
@@ -58,86 +66,263 @@ function normalizeManagedPatchInput(value: string): string {
   return value.replace(/\r\n/g, '\n')
 }
 
-function isShellIdentifierStart(char: string): boolean {
+/**
+ * BL-244 / BL-252 (2026-09-25): the ONE reading of a Bash command that uses the managed
+ * `apply_patch`. Batshit applies the patch itself and no shell ever runs the command, so the
+ * command must be nothing but the patch: optional `set -e`-style lines, an optional
+ * `cd <folder>` (on its own line, or `cd <folder> &&` in front of `apply_patch`), optional
+ * variable assignments, then `apply_patch` with the patch as a heredoc, a quoted argument, or
+ * bare lines, and nothing after it but blank or comment lines.
+ *
+ * - `managed`: apply the patch, in `cdPath` when one is given (the executor resolves it and keeps
+ *   it inside the workspace root). `document` is null when no `*** Begin Patch` / `*** End Patch`
+ *   pair is present, which the executor reports as before.
+ * - `refused`: the command uses `apply_patch` in some other way (a test after it, input piped
+ *   into it, a redirect on its line, a `cd` it cannot follow). Nothing may run: before, every
+ *   other line was silently dropped while the result said the command succeeded (BL-252).
+ * - `none`: the command never runs `apply_patch` (`which apply_patch`, `grep apply_patch x`, a
+ *   heredoc body that mentions it), so it is an ordinary shell command.
+ */
+export type ManagedApplyPatchCommand =
+  | { kind: 'none' }
+  | { kind: 'managed'; cdPath: string | null; document: string | null }
+  | { kind: 'refused'; reason: string }
+
+const SETUP_FLAGS = /^(?:[-+][euxv]*o pipefail|[-+][euxv]+)(?: (?:[-+][euxv]*o pipefail|[-+][euxv]+))*$/
+
+const MANAGED_PATCH_WHOLE_COMMAND_RULE =
+  'apply_patch must be the whole command (optionally after `cd <folder> &&`): Batshit applies the patch itself and runs nothing else in it. Nothing ran.'
+
+function isIgnorableManagedPatchLine(line: string): boolean {
+  const trimmed = line.trim()
+  return !trimmed || trimmed.startsWith('#')
+}
+
+function clipManagedPatchLine(text: string): string {
+  const firstLine = text.trim().split('\n', 1)[0]?.trim() ?? ''
+  return firstLine.length > 120 ? `${firstLine.slice(0, 119)}…` : firstLine
+}
+
+function refuseExtraCommand(text: string): ManagedApplyPatchCommand {
+  return {
+    kind: 'refused',
+    reason: `${MANAGED_PATCH_WHOLE_COMMAND_RULE} Send the patch by itself, then run the rest in a separate call: \`${clipManagedPatchLine(text)}\``
+  }
+}
+
+function refuseCd(): ManagedApplyPatchCommand {
+  return {
+    kind: 'refused',
+    reason:
+      'The `cd` before apply_patch must name one folder, with no variables, `~`, wildcards, options, or spaces at either end, and at most one `cd`, followed by `&&` or a new line. Nothing ran.'
+  }
+}
+
+function refuseApplyPatchLine(detail: string): ManagedApplyPatchCommand {
+  return {
+    kind: 'refused',
+    reason: `apply_patch takes the patch as a heredoc (\`apply_patch <<'PATCH'\`, the patch, then \`PATCH\`) or as one quoted argument, with nothing else on its line: ${detail}. Nothing ran.`
+  }
+}
+
+function isSetupCommand(command: ShellLexCommand): boolean {
   return (
-    (char >= 'A' && char <= 'Z') ||
-    (char >= 'a' && char <= 'z') ||
-    char === '_'
+    command.words[0]?.text === 'set' &&
+    command.words.length > 1 &&
+    !command.words.some((word) => word.expands) &&
+    command.redirects.length === 0 &&
+    command.heredocs.length === 0 &&
+    SETUP_FLAGS.test(command.words.slice(1).map((word) => word.text).join(' '))
   )
 }
 
-function isShellIdentifierChar(char: string): boolean {
-  return isShellIdentifierStart(char) || (char >= '0' && char <= '9')
+function isApplyPatchCommand(command: ShellLexCommand | undefined): boolean {
+  const program = command ? shellProgramWord(command) : null
+  return program?.word.text === 'apply_patch' && !program.word.expands
 }
 
-function skipShellWhitespace(value: string, start: number): number {
-  let index = start
-  while (index < value.length && /\s/.test(value[index] ?? '')) index += 1
-  return index
+/** The source from a command's start: a refusal names its whole first line (`node --test … | tail -5`). */
+/** `exit` or `exit <number>` right after `||`: the guard of `cd <folder> || exit 1`. */
+function isExitGuard(command: ShellLexCommand | undefined): boolean {
+  if (!command || command.precededBy !== '||' || command.words[0]?.text !== 'exit') return false
+  const [, code, ...extra] = command.words
+  return (
+    extra.length === 0 &&
+    (code === undefined || (!code.expands && /^\d+$/.test(code.text))) &&
+    command.redirects.length === 0 &&
+    command.heredocs.length === 0
+  )
 }
 
-function readShellToken(value: string, start: number): { token: string; end: number } | null {
-  const index = skipShellWhitespace(value, start)
-  if (index >= value.length) return null
+/** `apply_patch` (after assignments) with no argument, redirect, or heredoc: the bare form. */
+function isBareApplyPatch(command: ShellLexCommand): boolean {
+  const program = shellProgramWord(command)
+  return (
+    program !== null &&
+    program.index === command.words.length - 1 &&
+    command.redirects.length === 0 &&
+    command.heredocs.length === 0
+  )
+}
 
-  let end = index
-  let quote: string | null = null
-  while (end < value.length) {
-    const char = value[end] ?? ''
-    if (quote) {
-      if (char === quote) quote = null
-      end += 1
-      continue
+function commandText(source: string, command: ShellLexCommand): string {
+  return source.slice(command.start)
+}
+
+/**
+ * The patch in a heredoc body or quoted argument: only the text from `*** Begin Patch` to
+ * `*** End Patch`, with blank lines around it. Anything else in it is refused rather than dropped
+ * (an unclosed heredoc swallows the lines after it as data). Null when there is no patch at all,
+ * which the executor reports as a missing payload.
+ */
+function readPatchDocument(body: string): { document: string | null } | { refused: ManagedApplyPatchCommand } {
+  const lines = body.split('\n')
+  const first = lines.findIndex((line) => line.trim().length > 0)
+  let last = -1
+  for (let line = lines.length - 1; line >= 0; line -= 1) {
+    if (lines[line].trim().length > 0) {
+      last = line
+      break
     }
-    if (char === '"' || char === "'") {
-      quote = char
-      end += 1
-      continue
-    }
-    if (/\s/.test(char)) break
-    end += 1
   }
-
-  return {
-    token: value.slice(index, end),
-    end
+  if (first === -1) return { document: null }
+  const document = extractManagedApplyPatchPayload(body)
+  if (document === null) return { document: null }
+  if (lines[first].trim() !== APPLY_PATCH_BEGIN_MARKER) {
+    return { refused: refuseApplyPatchLine(`the patch must start at \`${APPLY_PATCH_BEGIN_MARKER}\`, found \`${clipManagedPatchLine(lines[first])}\` before it`) }
   }
+  if (lines[last].trim() !== APPLY_PATCH_END_MARKER) {
+    return { refused: refuseApplyPatchLine(`the patch must end at \`${APPLY_PATCH_END_MARKER}\`, found \`${clipManagedPatchLine(lines[last])}\` after it (is the heredoc's closing line missing?)`) }
+  }
+  return { document }
 }
 
-function isEnvironmentAssignmentToken(token: string): boolean {
-  const equalsIndex = token.indexOf('=')
-  if (equalsIndex <= 0) return false
-  const name = token.slice(0, equalsIndex)
-  if (!isShellIdentifierStart(name[0] ?? '')) return false
-  for (const char of name.slice(1)) {
-    if (!isShellIdentifierChar(char)) return false
+export function parseManagedApplyPatchCommand(command: string): ManagedApplyPatchCommand {
+  const source = normalizeManagedPatchInput(command)
+  if (!shellTextRunsProgram(source, 'apply_patch')) return { kind: 'none' }
+  let commands = lexShellCommands(source)
+  // BL-262: bare patch lines after an `apply_patch` line are data, never commands (a `(` in
+  // `function hello()` is not a subshell). When the first apply_patch has nothing after its name
+  // and ends its line, only the text up to that line is read as commands.
+  let bareBody: string | null = null
+  const firstPatch = commands.find((entry) => isApplyPatchCommand(entry))
+  if (firstPatch && isBareApplyPatch(firstPatch) && firstPatch.separator === '\n') {
+    bareBody = source.slice(firstPatch.end + 1)
+    commands = lexShellCommands(source.slice(0, firstPatch.end))
   }
-  return true
-}
+  // A subshell or group around any part of it is not a whole-command patch.
+  const grouped = commands.find(
+    (entry) => entry.precededBy === '(' || entry.precededBy === ')' || entry.separator === '(' || entry.separator === ')'
+  )
+  if (grouped) return refuseExtraCommand(source)
+  const startsLine = (entry: ShellLexCommand) => entry.precededBy === null || entry.precededBy === '\n'
 
-function stripLeadingEnvironmentAssignments(line: string): string {
+  // Before the patch only `set -e`-style lines and one `cd <folder>`, each on its own line or
+  // joined to the next by `&&`; `set` changes nothing for a patch Batshit applies itself.
+  const joinedToNext = (entry: ShellLexCommand) => entry.separator === '&&' || entry.separator === '\n'
+  const followsPrefix = (entry: ShellLexCommand) => startsLine(entry) || entry.precededBy === '&&'
   let index = 0
-  while (index < line.length) {
-    const token = readShellToken(line, index)
-    if (!token) return ''
-    if (!isEnvironmentAssignmentToken(token.token)) {
-      return line.slice(skipShellWhitespace(line, index))
+  let cdPath: string | null = null
+  while (index < commands.length) {
+    const entry = commands[index]
+    if (isSetupCommand(entry) && followsPrefix(entry) && joinedToNext(entry)) {
+      index += 1
+      continue
     }
-    index = skipShellWhitespace(line, token.end)
+    if (entry.words[0]?.text !== 'cd') break
+    const folder = entry.words[1]
+    const literal =
+      entry.words.length === 2 &&
+      entry.redirects.length === 0 &&
+      entry.heredocs.length === 0 &&
+      folder !== undefined &&
+      !folder.expands &&
+      folder.text.length > 0 &&
+      !folder.text.startsWith('-') &&
+      folder.text === folder.text.trim() // BL-254: a folder with spaces at either end is refused
+    // `cd <folder> || exit [n]` (seen in SA-126 B0) says what the executor already does: a folder
+    // that is missing stops the command before anything runs.
+    let joiner = entry
+    if (entry.separator === '||' && isExitGuard(commands[index + 1])) {
+      joiner = commands[index + 1]
+      index += 1
+    }
+    if (cdPath !== null || !literal || !followsPrefix(entry) || !joinedToNext(joiner)) return refuseCd()
+    cdPath = folder.text
+    index += 1
   }
-  return ''
+
+  // Then apply_patch itself, and nothing after it.
+  const applyPatch = commands[index]
+  if (!isApplyPatchCommand(applyPatch)) {
+    return refuseExtraCommand(applyPatch ? commandText(source, applyPatch) : source)
+  }
+  // It starts its own line, or follows the prefix it was joined to with `&&`.
+  if (!startsLine(applyPatch) && !(index > 0 && applyPatch.precededBy === '&&')) return refuseExtraCommand(source)
+  const nameIndex = shellProgramWord(applyPatch)!.index
+  // BL-261: `CHECK=$(touch x) apply_patch ...` would run `touch x` in a shell; Batshit applies the
+  // patch itself, so an assignment the shell would expand is refused, never silently skipped.
+  // Literal assignments (`LC_ALL=C`) change nothing and stay allowed.
+  if (applyPatch.words.slice(0, nameIndex).some((word) => word.expands)) {
+    return refuseApplyPatchLine('no variable assignments that expand or run commands (`$`, `$(…)`, backticks) before it')
+  }
+  const args = applyPatch.words.slice(nameIndex + 1)
+  if (applyPatch.redirects.length > 0) return refuseApplyPatchLine('no redirects')
+  if (applyPatch.heredocs.length > 1 || args.length > 1 || (args.length === 1 && applyPatch.heredocs.length === 1)) {
+    return refuseApplyPatchLine('one patch, as one heredoc or one quoted argument')
+  }
+  const rest = commands.slice(index + 1)
+  const endsAlone = applyPatch.separator === null || applyPatch.separator === '\n'
+
+  let body: string
+  if (applyPatch.heredocs.length === 1) {
+    const heredoc = applyPatch.heredocs[0]
+    // With an unquoted delimiter the shell would run `$(…)` and backticks in the body; Batshit
+    // applies the body as written, so such a body is refused rather than its commands dropped.
+    if (!heredoc.quoted && substitutionsInExpandedText(heredoc.body).length > 0) {
+      return refuseApplyPatchLine(
+        "the heredoc has an unquoted delimiter and its text holds `$(…)` or backticks, which a shell would run: quote the delimiter (`apply_patch <<'PATCH'`)"
+      )
+    }
+    body = heredoc.body
+  } else if (args.length === 1) {
+    if (args[0].text.trimStart().startsWith('-')) return refuseApplyPatchLine('no flags')
+    // The shell would change a double-quoted patch with `$` or a backtick before apply_patch saw it.
+    if (args[0].expands) return refuseApplyPatchLine('a quoted patch must not contain `$` expansions or backticks')
+    body = args[0].text
+  } else {
+    // Bare patch lines after an `apply_patch` line. They are data, never commands, so they are
+    // read as raw lines: a first `*** Begin Patch`, a last `*** End Patch`, and nothing after it.
+    const after = bareBody ?? ''
+    const lines = after.split('\n')
+    const first = lines.findIndex((line) => !isIgnorableManagedPatchLine(line))
+    if (first === -1) return endsAlone ? { kind: 'managed', cdPath, document: null } : refuseExtraCommand(rest[0] ? commandText(source, rest[0]) : String(applyPatch.separator))
+    if (lines[first].trim() !== APPLY_PATCH_BEGIN_MARKER) {
+      return refuseExtraCommand(rest[0] ? commandText(source, rest[0]) : lines[first])
+    }
+    let last = -1
+    for (let line = lines.length - 1; line >= first; line -= 1) {
+      if (lines[line].trim() === APPLY_PATCH_END_MARKER) {
+        last = line
+        break
+      }
+    }
+    const extra = last === -1 ? null : lines.slice(last + 1).find((line) => !isIgnorableManagedPatchLine(line))
+    if (extra) return refuseExtraCommand(extra)
+    return { kind: 'managed', cdPath, document: extractManagedApplyPatchPayload(lines.slice(first).join('\n')) }
+  }
+
+  if (!endsAlone || rest.length > 0) {
+    return refuseExtraCommand(rest[0] ? commandText(source, rest[0]) : String(applyPatch.separator))
+  }
+  const read = readPatchDocument(body)
+  if ('refused' in read) return read.refused
+  return { kind: 'managed', cdPath, document: read.document }
 }
 
-function startsWithApplyPatchInvocation(line: string): boolean {
-  const command = stripLeadingEnvironmentAssignments(line)
-  if (!command.toLowerCase().startsWith('apply_patch')) return false
-  const next = command.at('apply_patch'.length)
-  return !next || !isShellIdentifierChar(next)
-}
-
+/** True when the command runs `apply_patch` at all: Batshit then applies it or refuses it, and no shell runs it. */
 export function isManagedApplyPatchCommand(command: string): boolean {
-  const normalized = normalizeManagedPatchInput(command)
-  return normalized.split('\n').some((line) => startsWithApplyPatchInvocation(line))
+  return parseManagedApplyPatchCommand(command).kind !== 'none'
 }
 
 export function extractManagedApplyPatchPayload(source: string): string | null {
@@ -148,10 +333,10 @@ export function extractManagedApplyPatchPayload(source: string): string | null {
   return normalized.slice(beginIndex, endIndex + APPLY_PATCH_END_MARKER.length)
 }
 
+/** The patch of a command Batshit will apply; null for any other command, including a refused one. */
 export function extractManagedApplyPatchDocument(command: string): string | null {
-  const normalized = normalizeManagedPatchInput(command)
-  if (!isManagedApplyPatchCommand(normalized)) return null
-  return extractManagedApplyPatchPayload(normalized)
+  const parsed = parseManagedApplyPatchCommand(command)
+  return parsed.kind === 'managed' ? parsed.document : null
 }
 
 function parseManagedApplyPatchPath(line: string, prefix: string): string | null {

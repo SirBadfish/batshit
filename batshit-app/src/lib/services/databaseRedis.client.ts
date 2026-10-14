@@ -13,7 +13,7 @@
 import { sessionApiClient } from './sessionApiClient'
 import { messageApiClient } from './messageApiClient'
 import { agentStore } from './agentStore'
-import { userStore } from './userStore'
+import { userStore, type DeleteFolderOptions } from './userStore'
 
 import type {
   ChatMemoryRow,
@@ -63,10 +63,6 @@ export class DatabaseService {
 
   async unarchiveSession(id: string) {
     return sessionApiClient.unarchiveSession(id)
-  }
-
-  async touchSession(sessionId: string) {
-    return sessionApiClient.touchSession(sessionId)
   }
 
   // ========== Message Operations - Delegate to messageApiClient ==========
@@ -180,7 +176,7 @@ export class DatabaseService {
     return userStore.updateFolder(folderId, updates)
   }
 
-  async deleteFolder(folderId: string, options: { deleteSessions?: boolean } = {}) {
+  async deleteFolder(folderId: string, options: DeleteFolderOptions = {}) {
     return userStore.deleteFolder(folderId, options)
   }
 }

@@ -39,6 +39,12 @@ export class GoonLiveActivationGate {
     return true
   }
 
+  cancel(ticket: GoonLiveActivationTicket) {
+    if (!this.isPending(ticket)) return false
+    this.pending = null
+    return true
+  }
+
   retry(key: string) {
     if (!key || this.failedKey !== key) return false
     this.failedKey = ''

@@ -88,6 +88,12 @@ test('main preload retains existing narrow APIs and adds Desktop Goon commands',
     await zero.downloads.exportBackup({ includeSecrets: true }),
     ['batshit:export-backup', { includeSecrets: true }]
   );
+  // BL-378 Phase 1b: a partial request passes through as given; main validates and copies it.
+  const partial = { acknowledged: [{ key: 'upload:images:a.png', relativePath: 'images/a.png', fingerprint: 'a'.repeat(64) }] };
+  assert.deepEqual(
+    await zero.downloads.exportBackup({ includeSecrets: false, partial }),
+    ['batshit:export-backup', { includeSecrets: false, partial }]
+  );
   assert.deepEqual(await zero.dialogs.openGoonPackage(), ['batshit:open-goon-package']);
   assert.deepEqual(
     await zero.dialogs.readGoonPackageChunk({ handleId: 'selection', offset: 0, length: 4 }),

@@ -1,3 +1,4 @@
+import { hairImportCandidateIds } from "./hairImportCandidateIdentity";
 import { createHash } from "node:crypto";
 
 import type { AppearanceDialValueState } from "$lib/goons/appearanceDials.contracts";
@@ -36,6 +37,10 @@ import {
   getHairImportJobForCleanup,
   listDiscardableHairImportJobs,
   replaceHairImportJob,
+  retireHairImportJob,
+  retireDiscardableHairImportJob,
+  hairImportCleanupContext,
+  trackRetiredHairCleanupFiles,
   type HairImportJob,
   type HairImportOwnedFile,
   type HairImportTarget,
@@ -43,6 +48,7 @@ import {
 import {
   createHairImportTexturePng,
   deleteHairImportOwnedFile,
+  discoverHairImportCleanupFiles,
   readHairImportOwnedFile,
   stageHairImportPreviewGeometry,
   stageHairImportSource,
@@ -573,17 +579,6 @@ function motionPaint(value: unknown): HairMotionPaintV1 | undefined {
   }
 }
 
-function candidateIds(job: HairImportJob) {
-  if (job.target.kind === "refit") {
-    return {
-      assetId: job.target.assetId,
-      revisionId: job.target.revisionId,
-      revision: job.target.revision,
-    };
-  }
-  const assetId = `imported-hair-${job.jobId}`.toLowerCase();
-  return { assetId, revisionId: `${assetId}-r1`, revision: 1 };
-}
 
 function displayNameFromSource(value: string) {
   const base = value.replace(/\\/g, "/").split("/").at(-1) ?? "Imported Hair";
@@ -635,6 +630,7 @@ function proposalEnvelope(
       ],
     },
     motionReview: {
+      rootSelectionNotice: authored.proposal.rootSelectionNotice ?? null,
       anchoredLength: authored.proposal.weights.anchoredLength,
       weightCurve: authored.proposal.weights.weightCurve,
       defaultIntensity: authored.proposal.weights.defaultIntensity,
@@ -683,11 +679,12 @@ function immutableAssetAudit(
   };
 }
 
-async function deleteFiles(files: readonly HairImportOwnedFile[]) {
+async function deleteFiles(files: readonly HairImportOwnedFile[], job: HairImportJob) {
+  const context = hairImportCleanupContext(job, files);
   const failures: string[] = [];
   for (const file of [...files].reverse()) {
     try {
-      await deleteHairImportOwnedFile(file);
+      await deleteHairImportOwnedFile(file, context);
     } catch (error) {
       failures.push(
         `${file.ref}: ${error instanceof Error ? error.message : "unknown cleanup failure"}`,
@@ -705,6 +702,7 @@ async function deleteFiles(files: readonly HairImportOwnedFile[]) {
 }
 
 async function storeCandidateFiles(input: {
+  importOwner: { userId: string; jobId: string; stateVersion: number };
   assetId: string;
   revisionId: string;
   geometry: Uint8Array;
@@ -724,6 +722,7 @@ async function storeCandidateFiles(input: {
     const file = await storeHairAssetArtifact({
       assetId: input.assetId,
       revisionId: input.revisionId,
+      importOwner: input.importOwner,
       role,
       filename,
       mimeType,
@@ -861,7 +860,7 @@ export async function prepareHairImport(input: {
       400,
     );
   }
-  const preparing = await replaceHairImportJob(initial, {
+  let preparing = await replaceHairImportJob(initial, {
     ...initial,
     status: "preparing",
     failure: null,
@@ -905,7 +904,7 @@ export async function prepareHairImport(input: {
           keepObjectIds: selectedObjectIds,
           calibration: calibration?.sourceCalibration,
         }).glbBytes;
-    const ids = candidateIds(initial);
+    const ids = hairImportCandidateIds(initial);
     const authored = await authorHairImportProposal(
       proposeHairImportAuthoringInput({
         canonical,
@@ -956,6 +955,7 @@ export async function prepareHairImport(input: {
       recipeSource: context.recipeSource,
     };
     const stored = await storeCandidateFiles({
+      importOwner: { userId: initial.userId, jobId: initial.jobId, stateVersion: preparing.stateVersion },
       ...ids,
       geometry: authored.geometryGlb,
       follower: authored.followerDefinition,
@@ -1032,7 +1032,7 @@ export async function prepareHairImport(input: {
     });
     candidatePersisted = true;
     if (obsoletePreviousFiles.length > 0)
-      await deleteFiles(obsoletePreviousFiles);
+      await deleteFiles(obsoletePreviousFiles, reviewable);
     const settled = obsoletePreviousFiles.length
       ? await replaceHairImportJob(reviewable, {
           ...reviewable,
@@ -1052,7 +1052,10 @@ export async function prepareHairImport(input: {
   } catch (error) {
     if (!candidatePersisted && created.length > 0) {
       try {
-        await deleteFiles(created);
+        preparing = await replaceHairImportJob(preparing, {
+          ...preparing, cleanupFiles: uniqueCleanupFiles([...preparing.cleanupFiles, ...created]),
+        });
+        await deleteFiles(created, preparing);
       } catch (cleanupError) {
         const tracked = uniqueCleanupFiles([
           ...preparing.cleanupFiles,
@@ -1089,6 +1092,7 @@ export async function prepareHairImport(input: {
         userId: input.userId,
         jobId: input.jobId,
         stage: "prepare",
+        expectedStateVersion: preparing.stateVersion,
         error,
       });
     } catch (trackingError) {
@@ -1197,6 +1201,7 @@ export async function finalizeHairImport(input: {
       assetId: candidate.assetId,
       revisionId: candidate.revisionId,
       role: "preview",
+      importOwner: { userId: job.userId, jobId: job.jobId, stateVersion: job.stateVersion },
       filename: "preview.png",
       mimeType: "image/png",
       bytes: input.previewPng,
@@ -1216,7 +1221,7 @@ export async function finalizeHairImport(input: {
       previewPersisted = true;
       preview = storedPreview;
       if (priorPreview && priorPreview.ref !== storedPreview.ref) {
-        await deleteHairImportOwnedFile(priorPreview);
+        await deleteHairImportOwnedFile(priorPreview, hairImportCleanupContext(job, [priorPreview]));
         job = await replaceHairImportJob(job, {
           ...job,
           cleanupFiles: job.cleanupFiles.filter(
@@ -1227,7 +1232,8 @@ export async function finalizeHairImport(input: {
     } catch (error) {
       if (!previewPersisted) {
         try {
-          await deleteHairImportOwnedFile(storedPreview);
+          job = await replaceHairImportJob(job, { ...job, cleanupFiles: uniqueCleanupFiles([...job.cleanupFiles, storedPreview]) });
+          await deleteHairImportOwnedFile(storedPreview, hairImportCleanupContext(job, [storedPreview]));
         } catch (cleanupError) {
           const tracked = uniqueCleanupFiles([
             ...job.cleanupFiles,
@@ -1312,7 +1318,7 @@ export async function finalizeHairImport(input: {
   // Transfer file ownership only after the exact final asset verifies. Source
   // cleanup remains retryable because the job still exists until the atomic
   // asset/index registration removes it in the same Redis transaction.
-  await deleteHairImportOwnedFile(job.source);
+  await deleteHairImportOwnedFile(job.source, hairImportCleanupContext(job, [job.source], "source-consumed"));
   const asset = await commitImportedHairAssetRevision({
     userId: input.userId,
     jobId: input.jobId,
@@ -1328,8 +1334,13 @@ export async function failHairImportJob(input: {
   jobId: string;
   stage: string;
   error: unknown;
+  expectedStateVersion?: number;
 }) {
   const job = await getHairImportJob(input.userId, input.jobId);
+  if (job.status === "cancelled" || job.status === "complete" ||
+      input.expectedStateVersion !== undefined && job.stateVersion !== input.expectedStateVersion) {
+    throw new HairImportJobError("WRITE_CONFLICT", "Hair import changed while the operation was running.", 409);
+  }
   const message =
     input.error instanceof Error
       ? input.error.message
@@ -1341,86 +1352,55 @@ export async function failHairImportJob(input: {
   });
 }
 
-export async function discardHairImportJob(input: {
-  userId: string;
-  jobId: string;
-}) {
-  const job = await getHairImportJobForCleanup(input.userId, input.jobId);
-  if (job.status === "complete") {
-    throw new HairImportJobError(
-      "INVALID_STATE",
-      "Completed Hair imports own an immutable library revision and cannot be discarded as drafts.",
-      409,
-    );
-  }
+async function cleanupRetiredHairImportJob(userId: string, jobId: string,
+  initialContext: import('./hairCleanupContext').HairCleanupContext, discover: boolean) {
+  let context = initialContext;
+  const discovered = discover ? await discoverHairImportCleanupFiles(context) : [];
+  const files = uniqueCleanupFiles([...context.files, ...discovered]);
+  if (files.length !== context.files.length) context = await trackRetiredHairCleanupFiles(context, files);
   const failures: Array<{ ref: string; error: string }> = [];
-  for (const file of [...job.cleanupFiles].reverse()) {
+  let deletedFiles = 0;
+  let retainedFiles = 0;
+  let missingFiles = 0;
+  for (const file of [...files].reverse()) {
     try {
-      await deleteHairImportOwnedFile(file);
-    } catch (error) {
-      failures.push({
-        ref: file.ref,
-        error:
-          error instanceof Error ? error.message : "Unknown cleanup failure.",
-      });
-    }
+      const outcome = await deleteHairImportOwnedFile(file, context);
+      if (outcome === 'retained') retainedFiles += 1;
+      else if (outcome === 'missing') missingFiles += 1;
+      else deletedFiles += 1;
+    } catch (error) { failures.push({ ref: file.ref, error: errorMessage(error) }); }
   }
-  if (failures.length > 0) {
-    await replaceHairImportJob(job, {
-      ...job,
-      status: "failed",
-      failure: {
-        stage: "cleanup",
-        message: `Hair import cleanup failed for ${failures.length} owned file${failures.length === 1 ? "" : "s"}.`,
-      },
-    });
-    throw new HairImportJobError(
-      "CLEANUP_FAILED",
-      "Hair import cleanup did not finish. The job remains available for an exact retry.",
-      502,
-      failures,
-    );
-  }
-  await deleteHairImportJobRecord(input.userId, input.jobId);
-  return { discarded: true, deletedFiles: job.cleanupFiles.length };
+  if (failures.length) throw new HairImportJobError("CLEANUP_FAILED",
+    "Hair import cleanup did not finish. The cancelled job remains available for an exact retry.", 502, failures);
+  await deleteHairImportJobRecord(userId, jobId, context);
+  return { discarded: true, deletedFiles, retainedFiles, missingFiles };
 }
 
-export async function pruneDiscardableHairImportJobs(
-  userId: string,
-  now = new Date(),
-) {
+export async function discardHairImportJob(input: { userId: string; jobId: string }) {
+  const job = await retireHairImportJob(await getHairImportJobForCleanup(input.userId, input.jobId));
+  return cleanupRetiredHairImportJob(input.userId, input.jobId, hairImportCleanupContext(job, job.cleanupFiles), true);
+}
+
+export async function pruneDiscardableHairImportJobs(userId: string, now = new Date()) {
   const discardable = await listDiscardableHairImportJobs(userId, now);
-  const failures: Array<{ jobId: string; ref: string; error: string }> = [];
+  const failures: Array<{ jobId: string; error: string }> = [];
   let deletedJobs = 0;
   let deletedFiles = 0;
+  let retainedFiles = 0;
+  let missingFiles = 0;
   for (const job of discardable) {
-    let jobFailed = false;
-    for (const file of [...job.cleanupFiles].reverse()) {
-      try {
-        await deleteHairImportOwnedFile(file);
-        deletedFiles += 1;
-      } catch (error) {
-        jobFailed = true;
-        failures.push({
-          jobId: job.jobId,
-          ref: file.ref,
-          error:
-            error instanceof Error ? error.message : "Unknown cleanup failure.",
-        });
-      }
-    }
-    if (!jobFailed) {
-      await deleteHairImportJobRecord(userId, job.jobId);
+    try {
+      // The exact listed record owns pruning. Never reload a renewed job into
+      // authority merely because its id appeared in an earlier expiry list.
+      const context = await retireDiscardableHairImportJob(job);
+      const result = await cleanupRetiredHairImportJob(userId, job.jobId, context, job.reason === 'expired');
+      deletedFiles += result.deletedFiles;
+      retainedFiles += result.retainedFiles;
+      missingFiles += result.missingFiles;
       deletedJobs += 1;
-    }
+    } catch (error) { failures.push({ jobId: job.jobId, error: errorMessage(error) }); }
   }
-  if (failures.length > 0) {
-    throw new HairImportJobError(
-      "CLEANUP_FAILED",
-      "Obsolete or expired Hair import cleanup failed. Retry before starting another import.",
-      502,
-      failures,
-    );
-  }
-  return { deletedJobs, deletedFiles };
+  if (failures.length) throw new HairImportJobError("CLEANUP_FAILED",
+    "Obsolete or expired Hair import cleanup failed. Retry before starting another import.", 502, failures);
+  return { deletedJobs, deletedFiles, retainedFiles, missingFiles };
 }

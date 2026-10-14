@@ -97,9 +97,9 @@ describe('MessageApprovalPanel: the origin line of a woken turn', () => {
     briefs.set('dm_woke_me', { from: { kind: 'webhook', name: 'Nightly build' }, subject: 'x', snippet: 'y', screen: FLAG })
     mount({ wakeDmId: 'dm_woke_me' })
     await screen.findByTestId('approval-wake-origin')
-    expect(screen.queryByText(/Flagged by Jev/)).toBeNull()
+    expect(screen.queryByText(/Flagged by/)).toBeNull()
     expect(screen.queryByText(/confidence/)).toBeNull()
-    expect(screen.queryByText(/Jev Juice/)).toBeNull()
+    expect(screen.queryByText(/Judge Juice/)).toBeNull()
   })
 
   it('leaves BOTH buttons enabled and acting exactly as they do without a wake', async () => {

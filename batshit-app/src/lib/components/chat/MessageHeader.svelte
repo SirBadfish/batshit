@@ -243,7 +243,7 @@
     display: inline-flex;
     align-items: center;
     gap: 0.25rem;
-    color: oklch(from var(--primary) l c h / 0.8);
+    color: oklch(from var(--primary-text) l c h / 0.8);
     font-size: 0.75rem;
   }
 

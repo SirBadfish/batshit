@@ -678,7 +678,7 @@
                     type="button"
                     class={cn(
                       'flex h-12 w-12 shrink-0 items-center justify-center rounded-md border bg-background transition hover:bg-accent',
-                      isSelected(ref) && 'border-primary bg-primary/10'
+                      isSelected(ref) && 'border-primary-text bg-primary-text/5'
                     )}
                     title={labelForRef(ref)}
                     onclick={() => selectIcon(ref)}
@@ -708,7 +708,7 @@
                     type="button"
                     class={cn(
                       'flex h-12 w-12 shrink-0 items-center justify-center rounded-md border bg-background transition hover:bg-accent',
-                      isSelected(ref) && 'border-primary bg-primary/10'
+                      isSelected(ref) && 'border-primary-text bg-primary-text/5'
                     )}
                     title={labelForRef(ref)}
                     onclick={() => selectIcon(ref)}
@@ -749,7 +749,7 @@
                 <div
                   class={cn(
                     'group relative flex min-h-20 flex-col items-center justify-center gap-2 rounded-md border bg-background p-2 text-center transition hover:bg-accent',
-                    isSelected(entry.ref) && 'border-primary bg-primary/10'
+                    isSelected(entry.ref) && 'border-primary-text bg-primary-text/5'
                   )}
                 >
                   <button
@@ -788,7 +788,7 @@
                 <div
                   class={cn(
                     'group flex min-h-20 flex-col items-center justify-center gap-2 rounded-md border bg-background p-2 text-center transition hover:bg-accent',
-                    isSelected(ref) && 'border-primary bg-primary/10'
+                    isSelected(ref) && 'border-primary-text bg-primary-text/5'
                   )}
                 >
                   <button
@@ -911,7 +911,7 @@
                 <div
                   class={cn(
                     'group relative flex min-h-20 flex-col items-center justify-center gap-2 rounded-md border bg-background p-2 text-center transition hover:bg-accent',
-                    isSelected(entry.ref) && 'border-primary bg-primary/10'
+                    isSelected(entry.ref) && 'border-primary-text bg-primary-text/5'
                   )}
                 >
                   <button
@@ -985,7 +985,7 @@
                 <div
                   class={cn(
                     'group flex min-h-20 flex-col items-center justify-center gap-2 rounded-md border bg-background p-2 text-center transition hover:bg-accent',
-                    isSelected(ref) && 'border-primary bg-primary/10'
+                    isSelected(ref) && 'border-primary-text bg-primary-text/5'
                   )}
                 >
                   <button

@@ -7,6 +7,7 @@ import type {
   CacheForensicsSegmentType,
 } from '$lib/types/cacheForensics'
 import {
+  COMPILED_STANDING_MEDIA_OPEN,
   COMPILED_TEXT_PART_TYPES,
   compiledTextPartValue,
   segmentCompiledUserMessage,
@@ -135,7 +136,7 @@ function expandMessageElement(
     if (
       isCompiledTextPartType(standingHeader) &&
       typeof standingHeader?.text === 'string' &&
-      standingHeader.text.startsWith('==== AWARENESS MEDIA (STANDING) ====')
+      standingHeader.text.startsWith(COMPILED_STANDING_MEDIA_OPEN)
     ) {
       let standingEnd = 1
       while (standingEnd < content.length) {

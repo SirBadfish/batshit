@@ -110,10 +110,10 @@ describe('the two after-reply switches (SA-120 P6)', () => {
 
   it('are refused loudly on write when they are not booleans, and their labels follow the naming rule', () => {
     expect(validateJevJuiceAgentFields({ [AGENT_JEV_REPLY_CHECK_FIELD]: true, [AGENT_JEV_STYLE_COACH_FIELD]: null })).toBeNull()
-    expect(validateJevJuiceAgentFields({ [AGENT_JEV_REPLY_CHECK_FIELD]: 'on' })).toMatch(/Jev Juice: Check Replies.*true or false/)
-    expect(validateJevJuiceAgentFields({ [AGENT_JEV_STYLE_COACH_FIELD]: 1 })).toMatch(/Jev Juice: Style Coach.*true or false/)
-    expect(TYPESAFE_FEATURES.reply_check.switchLabel).toBe('Jev Juice: Check Replies')
-    expect(TYPESAFE_FEATURES.style_coach.switchLabel).toBe('Jev Juice: Style Coach')
+    expect(validateJevJuiceAgentFields({ [AGENT_JEV_REPLY_CHECK_FIELD]: 'on' })).toMatch(/Judge Juice: Check Replies.*true or false/)
+    expect(validateJevJuiceAgentFields({ [AGENT_JEV_STYLE_COACH_FIELD]: 1 })).toMatch(/Judge Juice: Style Coach.*true or false/)
+    expect(TYPESAFE_FEATURES.reply_check.switchLabel).toBe('Judge Juice: Check Replies')
+    expect(TYPESAFE_FEATURES.style_coach.switchLabel).toBe('Judge Juice: Style Coach')
   })
 })
 
@@ -137,7 +137,7 @@ describe('resolveJevSmartZipEnabled (SA-120 P5, the ONE global switch)', () => {
 
   it('names the switch the way the registry and the Settings control do', () => {
     expect(GLOBAL_JEV_SMART_ZIP_LABEL).toBe(TYPESAFE_FEATURES.smart_zip.switchLabel)
-    expect(GLOBAL_JEV_SMART_ZIP_LABEL).toBe('Jev Juice: Smart Zip')
+    expect(GLOBAL_JEV_SMART_ZIP_LABEL).toBe('Judge Juice: Smart Zip')
   })
 })
 
@@ -151,7 +151,7 @@ describe('validateJevJuiceGlobalZipFields', () => {
   })
 
   it('refuses anything else loudly, naming the switch', () => {
-    expect(validateJevJuiceGlobalZipFields({ [GLOBAL_JEV_SMART_ZIP_FIELD]: 'on' })).toMatch(/Jev Juice: Smart Zip.*true or false/)
+    expect(validateJevJuiceGlobalZipFields({ [GLOBAL_JEV_SMART_ZIP_FIELD]: 'on' })).toMatch(/Judge Juice: Smart Zip.*true or false/)
     expect(validateJevJuiceGlobalZipFields({ [GLOBAL_JEV_SMART_ZIP_FIELD]: 1 })).toMatch(/true or false/)
     expect(validateJevJuiceGlobalZipFields({ [GLOBAL_JEV_SMART_ZIP_FIELD]: null })).toMatch(/true or false/)
   })

@@ -9,6 +9,16 @@ const catalogEntries = new Map<string, any>()
 const redisMock = {
   sMembers: vi.fn(async () => Array.from(userModels)),
   get: vi.fn(async (key: string) => modelStore.get(key) ?? null),
+  set: vi.fn(async (key: string, value: SavedModel) => {
+    modelStore.set(key, value)
+  }),
+  json: {
+    setIfExists: vi.fn(async (key: string, _path: string, value: SavedModel) => {
+      if (!modelStore.has(key)) return false
+      modelStore.set(key, value)
+      return true
+    })
+  },
   del: vi.fn(async (key: string) => {
     modelStore.delete(key)
   }),
@@ -91,19 +101,16 @@ beforeEach(async () => {
   routeModule = await import('./+server')
 })
 
-describe('loadUserModelsWithPurge', () => {
-  it('removes deprecated Vercel models while keeping manual entries', async () => {
-    const vercelIds = new Set(['anthropic/claude-sonnet'])
+describe('GET keeps every preset (BL-517)', () => {
+  it('keeps gateway presets the catalog no longer lists beside manual entries, and deletes nothing', async () => {
+    const response = await routeModule.GET({ locals: { user: { id: 'user_123' } } } as any)
+    const body = await response.json()
 
-  const result = await routeModule._loadUserModelsWithPurge('user_123', vercelIds)
-
-    expect(result.models).toHaveLength(2)
-    expect(result.models.map((m) => m.id)).toContain('vercel-kept')
-    expect(result.models.map((m) => m.id)).toContain('manual-model')
-    expect(result.purged).toHaveLength(1)
-    expect(result.purged[0].id).toBe('vercel-deprecated')
-    expect(redisMock.del).toHaveBeenCalledWith('model:vercel-deprecated')
-    expect(redisMock.sRem).toHaveBeenCalledWith('user:user_123:models', 'vercel-deprecated')
+    expect(body.models.map((m: SavedModel) => m.id).sort()).toEqual(['manual-model', 'vercel-deprecated', 'vercel-kept'])
+    expect(body.meta.unlisted.map((entry: { id: string }) => entry.id).sort()).toEqual(['vercel-deprecated', 'vercel-kept'])
+    expect(body.models.find((m: SavedModel) => m.id === 'manual-model').unavailableReason).toBeUndefined()
+    expect(redisMock.del).not.toHaveBeenCalled()
+    expect(redisMock.sRem).not.toHaveBeenCalled()
   })
 })
 

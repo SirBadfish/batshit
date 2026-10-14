@@ -285,6 +285,25 @@ describe('createChatLoadQueue', () => {
     expect(queue.isLoading('chat-a')).toBe(false)
   })
 
+  it('a request made while a load runs settles only after the follow-up load (BL-382)', async () => {
+    const { started, finishers, queue } = deferredLoads()
+    let firstDone = false
+    let secondDone = false
+    void queue.request('chat-a').then(() => (firstDone = true))
+    void queue.request('chat-a').then(() => (secondDone = true))
+
+    finishers.shift()?.()
+    for (let i = 0; i < 6; i += 1) await Promise.resolve()
+    // The first answer landed, but the second caller asked after it was read: not yet.
+    expect(started).toEqual(['chat-a', 'chat-a'])
+    expect(secondDone).toBe(false)
+
+    finishers.shift()?.()
+    for (let i = 0; i < 6; i += 1) await Promise.resolve()
+    expect(secondDone).toBe(true)
+    expect(firstDone).toBe(true)
+  })
+
   it('keeps chats apart', async () => {
     const { started, finishers, queue } = deferredLoads()
 

@@ -24,8 +24,9 @@ import { resolveNativeToolUser } from '../nativeToolAuth'
  *      service-token call would be silently served as the service lane, which is the exact
  *      hole the story exists to close.
  *
- * The service, n8n-callback, and portable-skill lanes are asserted to be unchanged when no
- * agent header is present, because DL-117-03 says the rest of the chain stays byte-identical.
+ * The service and n8n-callback lanes are asserted to be unchanged when no agent header is
+ * present, because DL-117-03 says the rest of the chain stays byte-identical. (The portable-skill
+ * lane's admission changed in BL-704; `nativeToolAuth.portable.test.ts` covers it.)
  */
 
 useRedisTestServer()
@@ -91,6 +92,40 @@ async function mintRun(overrides: Record<string, unknown> = {}) {
 }
 
 describe('the agent lane comes first', () => {
+  it('exposes only the message bound at mint time for tool-result retention', async () => {
+    const { token } = await mintRun({ messageId: 'assistant-owned' })
+    const auth = await resolveNativeToolUser({
+      request: request({ [AGENT_RUN_CREDENTIAL_HEADER]: token }),
+      payload: { messageId: 'assistant-forged', sessionId: 'other-chat' }
+    })
+    expect(auth).toMatchObject({ sessionId: 'sess-1', messageId: 'assistant-owned' })
+
+    const legacy = await mintRun()
+    const withoutMessage = await resolveNativeToolUser({
+      request: request({ [AGENT_RUN_CREDENTIAL_HEADER]: legacy.token }),
+      payload: { messageId: 'assistant-forged' }
+    })
+    expect(withoutMessage).not.toHaveProperty('messageId')
+  })
+
+  it('exposes the Fetch Zip run snapshot and treats an older record as disabled', async () => {
+    const enabled = await mintRun({ fetchZipAllowed: true })
+    const enabledAuth = await resolveNativeToolUser({
+      request: request({ [AGENT_RUN_CREDENTIAL_HEADER]: enabled.token }),
+      payload: { fetchZipAllowed: false }
+    })
+    expect(enabledAuth?.fetchZipAllowed).toBe(true)
+
+    const key = agentRunCredentialKey(enabled.credentialId)
+    const { fetchZipAllowed: _dropped, ...legacy } = (await redis.json.get(key)) as Record<string, unknown>
+    await redis.json.set(key, '$', legacy as never)
+    const legacyAuth = await resolveNativeToolUser({
+      request: request({ [AGENT_RUN_CREDENTIAL_HEADER]: enabled.token }),
+      payload: { fetchZipAllowed: true }
+    })
+    expect(legacyAuth?.fetchZipAllowed).toBe(false)
+  })
+
   it('resolves the bound agent and session from the credential, not the body', async () => {
     const { credentialId, token } = await mintRun()
 
@@ -98,7 +133,9 @@ describe('the agent lane comes first', () => {
       request: request({ [AGENT_RUN_CREDENTIAL_HEADER]: token }),
       // A body claim that contradicts the credential on every field. None of it is read.
       claimedUserId: 'somebody-else',
-      payload: { agentId: 'agent-faye', sessionId: 'sess-99', userId: 'somebody-else' }
+      payload: { agentId: 'agent-faye', sessionId: 'sess-99', userId: 'somebody-else',
+        runtime: 'claude', codexToolOutputTokenLimit: 75_000,
+        processOwner: { userId: USER, kind: 'agent', id: 'agent-faye' } }
     })
 
     expect(auth).toEqual({
@@ -107,9 +144,54 @@ describe('the agent lane comes first', () => {
       agentId: COOPER,
       sessionId: 'sess-1',
       credentialId,
+      processOwner: { userId: USER, kind: 'agent', id: COOPER },
+      commandParentAgentId: COOPER,
+      fetchZipAllowed: false,
+      runtime: 'codex',
+      codexToolOutputTokenLimit: null,
+      mcpGatewayScope: [],
+      cliToolScope: [],
       // SA-117 P2 (F-P2-1): a primary run, so it CAN act as the agent it names.
       delegated: false
     })
+  })
+
+  it("BL-686: uses only the minted CLI tool list, never request claims, and old records expose none", async () => {
+    const minted = await mintRun({ cliToolScope: ['tool_a'] })
+    const requestWithToken = request({ [AGENT_RUN_CREDENTIAL_HEADER]: minted.token })
+    const auth = await resolveNativeToolUser({
+      request: requestWithToken,
+      payload: { cliToolScope: ['tool_forged'], selectedToolIds: ['tool_forged'] }
+    })
+    expect(auth?.cliToolScope).toEqual(['tool_a'])
+
+    const key = agentRunCredentialKey(minted.credentialId)
+    const { cliToolScope: _dropped, ...oldRecord } = (await redis.json.get(key)) as Record<string, unknown>
+    await redis.json.set(key, '$', oldRecord as never)
+    const oldAuth = await resolveNativeToolUser({ request: requestWithToken })
+    expect(oldAuth?.cliToolScope).toEqual([])
+  })
+
+  it('uses only the minted gateway snapshot, never request claims, and old records expose none', async () => {
+    const minted = await mintRun({ mcpGatewayScope: ['gateway-a'] })
+    const requestWithToken = request({ [AGENT_RUN_CREDENTIAL_HEADER]: minted.token })
+    const auth = await resolveNativeToolUser({
+      request: requestWithToken,
+      payload: { mcpGatewayScope: ['gateway-forged'], selectedGateways: ['gateway-forged'] }
+    })
+    expect(auth?.mcpGatewayScope).toEqual(['gateway-a'])
+    auth?.mcpGatewayScope?.push('gateway-forged')
+    const again = await resolveNativeToolUser({ request: requestWithToken })
+    expect(again?.mcpGatewayScope).toEqual(['gateway-a'])
+
+    const key = agentRunCredentialKey(minted.credentialId)
+    const { mcpGatewayScope: _dropped, ...oldRecord } = (await redis.json.get(key)) as Record<string, unknown>
+    await redis.json.set(key, '$', oldRecord as never)
+    const oldAuth = await resolveNativeToolUser({
+      request: requestWithToken,
+      payload: { mcpGatewayScope: ['gateway-forged'] }
+    })
+    expect(oldAuth?.mcpGatewayScope).toEqual([])
   })
 
   it('carries the delegated marker off a Subagent or Worker credential (F-P2-1)', async () => {
@@ -119,7 +201,9 @@ describe('the agent lane comes first', () => {
       sessionId: 'sess-1',
       runtime: 'codex',
       delegated: true,
-      scopeAgentId: 'worker_cooper_1'
+      processOwner: { userId: USER, kind: 'agent', id: COOPER },
+      scopeAgentId: 'worker_cooper_1',
+      allowedControlIds: ['use.artifact.*']
     })
 
     const auth = await resolveNativeToolUser({
@@ -130,9 +214,35 @@ describe('the agent lane comes first', () => {
       auth: 'agent',
       agentId: 'subagent_cli_worker_agent_cooper_1',
       delegated: true,
+      processOwner: { userId: USER, kind: 'agent', id: COOPER },
       // BL-75: the Worker whose skill access governs the run, off the credential.
-      scopeAgentId: 'worker_cooper_1'
+      scopeAgentId: 'worker_cooper_1',
+      // BL-81: and what it may use through the control routes, off the same record.
+      delegatedAllowedControlIds: ['use.artifact.*']
     })
+  })
+
+  it('allows nothing for a delegated credential minted before BL-81, which names no list (BL-81)', async () => {
+    const delegated = await mintRunCredential({
+      userId: USER,
+      agentId: 'subagent_cli_research_bot',
+      sessionId: 'sess-1',
+      runtime: 'codex',
+      delegated: true,
+      scopeAgentId: 'worker_research_1',
+      allowedControlIds: ['use.artifact.*', 'sys.zip.fetch']
+    })
+    // Rewrite the record in the shape every delegated credential had before this change.
+    const key = agentRunCredentialKey(delegated.credentialId)
+    const { allowedControlIds: _dropped, ...before } = (await redis.json.get(key)) as Record<string, unknown>
+    await redis.json.set(key, '$', before as never)
+
+    const auth = await resolveNativeToolUser({
+      request: request({ [AGENT_RUN_CREDENTIAL_HEADER]: delegated.token })
+    })
+
+    expect(auth).toMatchObject({ auth: 'agent', delegated: true, delegatedAllowedControlIds: [] })
+    expect(auth).not.toHaveProperty('processOwner')
   })
 
   it('beats a valid service header presented on the same request', async () => {

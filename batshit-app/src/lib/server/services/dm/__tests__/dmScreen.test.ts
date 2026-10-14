@@ -8,7 +8,7 @@ import type { TypesafeCallRecord, UntrustedTextScreen } from '$lib/types/typesaf
 import type { WakeHookRecord } from '$lib/types/wakeHook'
 
 /**
- * SA-120 P7 — the Jev Juice incoming-text screen at the DM doors.
+ * SA-120 P7 — the Judge Juice incoming-text screen at the DM doors.
  *
  * What is pinned here is WIRING and the advisory-only contract; the questions, floors, and the
  * switch live in `untrustedText.jev.test.ts`. `screenUntrustedText` is faked so each test says

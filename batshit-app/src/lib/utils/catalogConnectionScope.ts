@@ -1,6 +1,7 @@
 import type { CatalogConnectionOption, CatalogModel } from '$lib/types/modelCatalog'
 import { canonicalizeCatalogDeveloperId } from '$lib/utils/catalogDeveloperIdentity'
 import { resolveCatalogIds } from '$lib/utils/modelIdResolver'
+import { isModelAllowedForConnection } from './modelConnections'
 
 export type ConnectionScopedCatalogModel = {
   catalogId: string
@@ -58,4 +59,24 @@ export function buildConnectionScopedCatalogModels(
   }
 
   return Array.from(unique.values())
+}
+
+/** BL-1067: scope first, then compare the connection's own exact identifiers. */
+export function findConnectionScopedCatalogPreset(
+  models: CatalogModel[],
+  connection: CatalogConnectionOption | null,
+  preset: { targetId?: string | null; provider: string; modelId: string }
+): CatalogModel | undefined {
+  if (!connection) return undefined
+  const allowed = models.filter(model => isModelAllowedForConnection(model, connection))
+  const target = preset.targetId?.trim()
+  const row = target ? allowed.find(model => model.id === target || model.canonicalId === target) : undefined
+  if (row) return row
+  return allowed.find(model => {
+    const scoped = resolveConnectionScopedCatalogModel(model, connection)
+    return (target && scoped.effectiveModelId === target) || (
+      scoped.canonicalDeveloperId === canonicalizeCatalogDeveloperId(preset.provider) &&
+      scoped.modelId === preset.modelId
+    )
+  })
 }

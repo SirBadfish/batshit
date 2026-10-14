@@ -28,11 +28,12 @@ import { iconLibraryService } from '$lib/services/iconLibraryService'
 import { debounce } from '$lib/utils/debounce'
 import type { UntrustedTextScreen } from '$lib/types/typesafe'
 import {
-  UNTRUSTED_TEXT_BADGE_TEXT,
-  UNTRUSTED_TEXT_SKILL_NO_FLAG_TEXT,
   jevJuiceNoteDetail,
   jevJuiceNoteText,
+  untrustedTextBadgeText,
   untrustedTextImportLines,
+  untrustedTextScreenJudgeName,
+  untrustedTextSkillNoFlagText,
   readUntrustedTextScreen,
   untrustedTextSkippedNote
 } from '$lib/utils/jevJuice'
@@ -149,7 +150,7 @@ let importSource = $state('')
 let importSkillPath = $state('')
 let importInstallCommand = $state('')
 let importWarnings = $state<string[]>([])
-// SA-120 P7: what the Jev Juice incoming-text screen said about the imported SKILL.md, when the
+// SA-120 P7: what the Judge Juice incoming-text screen said about the imported SKILL.md, when the
 // switch is on. Advisory only: it never blocks the import or the save.
 let importScreen = $state<UntrustedTextScreen | null>(null)
 const importScreenView = $derived(readUntrustedTextScreen(importScreen))
@@ -603,12 +604,14 @@ function buildPayloadFromForm(
   const enabledAgentIds = normalizeAgentIds(formState.enabledAgentIds)
   const isSystemCommand = options?.editing === true && options?.systemCommand?.is_system === true
 
+  // BL-544: an edit never carries the per-agent list (`enabled_agent_ids`). This panel does not
+  // edit it (Settings > Agents > Access does, one agent at a time), so the copy it loaded is only
+  // ever stale: sending it back undid Access changes made since. The server derives
+  // `can_be_attached_to_agents` itself. A new command still starts with an empty list.
   if (isSystemCommand) {
     const payload: Record<string, unknown> = {
       is_active: formState.is_active,
-      enabled_for_all_agents: formState.enabledForAllAgents,
-      enabled_agent_ids: enabledAgentIds,
-      can_be_attached_to_agents: formState.enabledForAllAgents || enabledAgentIds.length > 0
+      enabled_for_all_agents: formState.enabledForAllAgents
     }
 
     if (type === 'skill') {
@@ -630,13 +633,13 @@ function buildPayloadFromForm(
     icon: null,
     is_active: formState.is_active,
     parameters: parseArgsCsv(formState.argsCsv),
-    enabled_for_all_agents: formState.enabledForAllAgents,
-    enabled_agent_ids: enabledAgentIds,
-    can_be_attached_to_agents: formState.enabledForAllAgents || enabledAgentIds.length > 0
+    enabled_for_all_agents: formState.enabledForAllAgents
   }
 
   if (!options?.editing) {
     payload.type = type
+    payload.enabled_agent_ids = enabledAgentIds
+    payload.can_be_attached_to_agents = formState.enabledForAllAgents || enabledAgentIds.length > 0
   }
 
   if (type === 'prompt') {
@@ -695,6 +698,24 @@ function buildPersistedCommandSignature(
   options: { editing: boolean; selectedCommandType?: CommandType | null; systemCommand?: SlashCommandRow | null }
 ) {
   return JSON.stringify(buildPayloadFromForm(formState, options))
+}
+
+/**
+ * BL-544: an edit sends only what the user changed since the command loaded or last saved: each
+ * top-level field that differs from that baseline (the persisted signature is its JSON), and the
+ * `skill` block whole when any part of it differs, since the route rebuilds the skill record from
+ * that block. Another panel's or an agent's change to a field the user did not touch is never
+ * written back from this panel's copy.
+ */
+function changedCommandFields(current: Record<string, unknown>, baselineSignature: string | null) {
+  if (!baselineSignature) return current
+  const baseline = JSON.parse(baselineSignature) as Record<string, unknown>
+  const changed: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(current)) {
+    if (value === undefined) continue
+    if (JSON.stringify(value) !== JSON.stringify(baseline[key])) changed[key] = value
+  }
+  return changed
 }
 
 function canAutosaveCurrentCommand(formState: FormState): boolean {
@@ -1262,13 +1283,19 @@ async function saveCommand(options?: {
       saving = true
     }
 
-    const payload = buildPayload()
-    const endpoint =
-      isEditing && selectedCommandId
-        ? `/api/slash-commands/${selectedCommandId}`
-        : '/api/slash-commands'
+    const editingSaved = isEditing && Boolean(selectedCommandId)
+    const payload = editingSaved
+      ? changedCommandFields(buildPayload(), persistedCommandSignature)
+      : buildPayload()
+    if (editingSaved && Object.keys(payload).length === 0) {
+      if (autosave) {
+        markCommandSaved()
+      }
+      return true
+    }
+    const endpoint = editingSaved ? `/api/slash-commands/${selectedCommandId}` : '/api/slash-commands'
 
-    const method = isEditing && selectedCommandId ? 'PUT' : 'POST'
+    const method = editingSaved ? 'PUT' : 'POST'
 
     const response = await fetch(endpoint, {
       method,
@@ -2412,7 +2439,7 @@ async function deleteCommand(command: SlashCommandRow) {
                     class={`batshit-settings-inline-alert ${importScreenView.severity === 'serious' ? 'is-danger' : 'is-warning'}`}
                     data-testid="jev-juice-skill-flag"
                   >
-                    <p class="batshit-settings-form-label">{UNTRUSTED_TEXT_BADGE_TEXT}</p>
+                    <p class="batshit-settings-form-label">{untrustedTextBadgeText(importScreenView.judge)}</p>
                     {#each untrustedTextImportLines(importScreenView) as line, index (index)}
                       <p class="mt-1">{line}</p>
                     {/each}
@@ -2427,7 +2454,7 @@ async function deleteCommand(command: SlashCommandRow) {
                   </p>
                 {:else if importScreen?.status === 'no_flag'}
                   <p class="batshit-settings-form-help" data-testid="jev-juice-skill-no-flag">
-                    {UNTRUSTED_TEXT_SKILL_NO_FLAG_TEXT}
+                    {untrustedTextSkillNoFlagText(untrustedTextScreenJudgeName(importScreen))}
                   </p>
                 {/if}
               </div>

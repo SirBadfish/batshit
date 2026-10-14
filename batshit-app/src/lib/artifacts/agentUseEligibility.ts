@@ -20,10 +20,16 @@ function normalizeBrainType(value: unknown): string | null {
   return trimmed || null
 }
 
-function hasNoBatshitCompletionRuntime(artifact: any): boolean {
+/**
+ * True when nothing in Batshit can run the artifact: `brain_type: none` (static, or a panel-side
+ * runtime such as ComfyUI), or a legacy record with AI switched off, no brain type, and no webhook.
+ * `/api/artifacts/complete` refuses such an artifact ("AI is disabled for this artifact"). It
+ * mirrors that route's rule: `brain_type || (webhook_url ? 'webhook' : ai_enabled === false ? 'none' : 'built_in')`.
+ */
+export function hasNoBatshitCompletionRuntime(artifact: any): boolean {
   const brainType = normalizeBrainType(artifact?.brain_type)
   if (brainType === 'none') return true
-  if (!brainType && artifact?.ai_enabled === false) return true
+  if (!brainType && !artifact?.webhook_url && artifact?.ai_enabled === false) return true
   return false
 }
 

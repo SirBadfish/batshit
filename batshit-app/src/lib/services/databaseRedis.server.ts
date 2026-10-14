@@ -6,9 +6,10 @@ import { sessionApiClient } from './sessionApiClient'
 import { messageApiClient } from './messageApiClient'
 import { agentStore } from './agentStore'
 import { slashCommandStore } from './slashCommandStore'
-import { userStore } from './userStore'
+import { userStore, type DeleteFolderOptions } from './userStore'
 import { redis } from '$lib/server/redis'
 import { mcpGatewayService } from '$lib/server/services/mcpGatewayService'
+import { readPackagedCoreSystemPromptDefault } from '$lib/server/services/systemPromptRegistry'
 import {
   type AgentSlashCapability,
   buildSkillsCommandsDcmLines,
@@ -16,7 +17,7 @@ import {
 } from '$lib/server/services/slashCommandCapabilities'
 import { normalizeSubagentType } from '$lib/utils/subagentType'
 import { resolveSubagentSlug } from '$lib/utils/subagentSlug'
-import { createZipStateView, type UnzippedItem, type ZipStateView } from '$lib/services/zipping'
+import { countOneMoreMessage, createZipStateView, type UnzippedItem, type ZipStateView } from '$lib/services/zipping'
 
 // Import types
 import type { ChatSessionRow, ChatMemoryRow, AgentRow, UserSettingsRow, ClipRow, SessionClipRow, ChatFolderRow, SubagentRow } from '$lib/types/database'
@@ -26,11 +27,17 @@ import type { Message } from '$lib/stores/messages.svelte'
 import type { GroupChatAgentSettings } from '$lib/types/groupChat'
 import {
   buildPreservedReasoningHistory,
+  collectDeadCopyToolResults,
   compileForAI,
+  type CompileDeadCopy,
   type ZipCompression,
   type ZipExposed,
   type ZipExposure
 } from '$lib/services/messageCompiler'
+import { replaceAddressSourceRanges, materializeAddressSources, type PositionedAddressSource } from '$lib/utils/addressSourceRanges'
+import { findDeadCopies, type DeadCopyReason } from '$lib/utils/zipDeadCopies'
+import { classifyToolResultSize, type ToolResultSizeGuard } from '$lib/utils/toolResultSizeGuard'
+import { describeUnzippedItemForDcm } from '$lib/utils/zipHoldWords'
 import { normalizeId } from '$lib/utils/idNormalizer'
 import { replacePromptVariables } from '$lib/utils/promptVariables'
 import { createReference, extractAllReferences } from '$lib/services/universalResolver'
@@ -100,6 +107,7 @@ import {
   calculateAgentMessagesFromEndByIndex,
   calculateRecoveryHoldByIndex
 } from '$lib/utils/zipMessageAge'
+import { resolveZipAgentControlPermission } from '$lib/utils/zipAgentControlPermission'
 import {
   calculateInterruptedReasoningRecoveryActiveByIndex,
   getActiveInterruptedReasoningRecoveryBlock
@@ -124,6 +132,7 @@ import type {
   JevJuiceSmartZipProvider
 } from '$lib/server/services/typesafe/jevJuiceHintContext'
 import { loadRezippedSources } from '$lib/server/services/zipStateInferred'
+import { zipBelongsToAnotherChat } from '$lib/utils/zipReferenceSafety'
 import {
   getPrimaryAgentSystemPromptLabel,
   getPrimaryAgentSystemPromptRedisKey,
@@ -138,11 +147,36 @@ import {
   type NativeExecutionBackend
 } from '$lib/utils/nativeExecutionBackend'
 
+import {
+  COMPILED_TAG,
+  compiledConversation,
+  compiledElement,
+  isBatshitWrittenUserMessage,
+  type CompiledMessageTag,
+  type CurrentMessageFrom
+} from '$lib/utils/compiledChatTags'
+import { isOutsideNote, type AddressSourceKind, type AddressSourcePiece } from '$lib/utils/imageAddressOrigin'
+
 export type PrecompiledHistory = {
   formattedMessages: string[]
   currentDay: string | null
   chatHistory: string
   globalZipSettings?: Record<string, any>
+  /** BL-474 step 2: the source of each piece of `chatHistory` (`compileChatHistory`). */
+  addressSources?: AddressSourcePiece[]
+}
+
+/**
+ * BL-474 step 2: what a compile delivered to the model, piece by piece, with the source of each
+ * (`imageAddressOrigin.ts`). Returned BESIDE `structuredInput`, never inside it, so no snapshot
+ * stores it; nothing here changes a byte of what the model is sent.
+ */
+export type CompiledAddressSources = {
+  pieces: AddressSourcePiece[]
+  /** Missing server provenance is a failed decision input, not an empty history. */
+  unaccountedInputs: number
+  /** Image and file parts the model got (their pixels can show an address the text does not). */
+  nonTextInputs: number
 }
 
 type GroupChatDcmContext = {
@@ -193,10 +227,14 @@ type NativeAgentBrowserDcmState = {
   extraFlagsCount: number
 }
 
-type SpeakerMap = {
-  userLabel: string
-  assistantLabelsById: Record<string, string>
-  fallbackAssistantLabel: string
+/**
+ * SA-128 (DL-02): who the compile is FOR, and the current display name of every other agent
+ * in the history. That agent's own replies compile as `<assistant>`; any other agent's as
+ * `<agent name="…">`, so a second agent joining a chat never rewrites the messages before it.
+ */
+type SpeakerView = {
+  selfAgentId: string | null
+  agentNames: Map<string, string>
 }
 
 // Simple in-memory cache to avoid hammering /api/users/:id/settings during SSR and hitting rate limits
@@ -351,19 +389,46 @@ export class DatabaseService {
     return response.json()
   }
 
-  private async getRedisStringValue(key: string): Promise<string> {
+  /**
+   * A stored prompt's text, or `null` when the key is absent (BL-230). A read that FAILS
+   * throws `SYSTEM_PROMPT_UNAVAILABLE` and rejects the compile, like the user-settings read:
+   * returning '' here sent agents with no base prompt, and silently swapped an Admin-edited
+   * guidance prompt for its packaged fallback. It reads the raw string: the facade's
+   * `redis.get` answers null for ANY error (a failed read looked like a missing key) and
+   * parses text that starts with `{` or `[` as JSON.
+   */
+  private async readStoredPromptText(key: string): Promise<string | null> {
     try {
-      // Prefer direct Redis on the server to avoid auth/rate limits
       const redisClient = await this.getRedisClient()
-      if (redisClient) {
-        const value = await redisClient.get(key)
-        return value ?? ''
-      }
-      const response = await this.apiCall(`/redis/get/${key}`)
-      return response?.value || ''
+      const value = await redisClient.execute((client) => client.get(key))
+      return value === null || value === undefined ? null : String(value)
     } catch (error) {
-      console.error(`[databaseRedis] Failed to load Redis key ${key}`, error)
-      return ''
+      throw new Error(
+        `SYSTEM_PROMPT_UNAVAILABLE: failed to read ${key}: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      )
+    }
+  }
+
+  /**
+   * BL-230: the Primary Agent base prompt is never compiled empty. The stored value wins; an
+   * absent or blank key (the boot seed is fire-and-forget, so a failed seed or a restore
+   * without the key leaves nothing stored) compiles the packaged default, the same text the
+   * seed stores, the way every guidance block falls back to its default. A failed read, or a
+   * packaged default that cannot be read, rejects the compile with `SYSTEM_PROMPT_UNAVAILABLE`.
+   */
+  private async loadPrimarySystemPrompt(key: string): Promise<string> {
+    const stored = await this.readStoredPromptText(key)
+    if (stored?.trim()) return stored
+    try {
+      return await readPackagedCoreSystemPromptDefault(key)
+    } catch (error) {
+      throw new Error(
+        `SYSTEM_PROMPT_UNAVAILABLE: ${key} is ${stored === null ? 'missing' : 'blank'} and its packaged default could not be read: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      )
     }
   }
 
@@ -390,10 +455,6 @@ export class DatabaseService {
 
   async unarchiveSession(id: string) {
     return sessionApiClient.unarchiveSession(id)
-  }
-
-  async touchSession(sessionId: string) {
-    return sessionApiClient.touchSession(sessionId)
   }
 
   // ========== Message Operations - Delegate to messageApiClient ==========
@@ -560,7 +621,7 @@ export class DatabaseService {
     return userStore.updateFolder(folderId, updates)
   }
 
-  async deleteFolder(folderId: string, options: { deleteSessions?: boolean } = {}) {
+  async deleteFolder(folderId: string, options: DeleteFolderOptions = {}) {
     return userStore.deleteFolder(folderId, options)
   }
 
@@ -610,7 +671,7 @@ export class DatabaseService {
         ? getPrimaryAgentSystemPromptRedisKey('cli')
         : getPrimaryAgentSystemPromptRedisKey(primaryAgentType)
 
-    primarySystemPrompt = await this.getRedisStringValue(primaryPromptKey)
+    primarySystemPrompt = await this.loadPrimarySystemPrompt(primaryPromptKey)
 
     if (userId && !hasFreshCachedSettings) {
       // No error caching and no fabricated defaults here: every compile attempts a fresh
@@ -689,121 +750,138 @@ export class DatabaseService {
     })
   }
 
-  private formatRoleLabel(role: string) {
-    if (!role) return 'User'
-    return role.charAt(0).toUpperCase() + role.slice(1)
+  private resolveMessageAgentId(message: Message): string | null {
+    const candidate =
+      (message as any)?.agent_id ||
+      (message as any)?.agentId ||
+      (message as any)?.metadata?.agentId
+    return typeof candidate === 'string' && candidate.trim() ? candidate.trim() : null
   }
 
-  private buildSpeakerMap(
+  /**
+   * SA-128 (DL-02): the agent this compile is for, and the current display name of every
+   * other agent whose replies are in the history. A group run names its agents in the group
+   * context; any other agent (a chat switched to a new agent, a member who left the group) is
+   * read once from its `agent:` record, then the name its reply was stored with, then its id.
+   */
+  private async buildSpeakerView(
     messages: Message[],
+    agent: any,
     groupContext?: GroupChatDcmContext
-  ): SpeakerMap {
-    const userLabel = 'U'
-    const assistantLabelsById: Record<string, string> = {}
-    const agentOrder = Array.isArray(groupContext?.agentOrder)
-      ? groupContext?.agentOrder?.filter(Boolean)
-      : []
-
-    if (agentOrder && agentOrder.length > 0) {
-      agentOrder.forEach((id, index) => {
-        assistantLabelsById[id] = `A${index + 1}`
-      })
-      return {
-        userLabel,
-        assistantLabelsById,
-        fallbackAssistantLabel: 'A1'
-      }
+  ): Promise<SpeakerView> {
+    const idOf = (value: unknown) =>
+      typeof value === 'string' && value.trim() ? value.trim() : null
+    const selfAgentId = idOf(groupContext?.currentAgentId) ?? idOf(agent?.id)
+    const agentNames = new Map<string, string>()
+    for (const [id, name] of Object.entries(groupContext?.agentDisplayNames ?? {})) {
+      if (typeof name === 'string' && name.trim()) agentNames.set(id, name.trim())
     }
 
-    const seenAgentIds: string[] = []
+    const storedNames = new Map<string, string>()
+    const unnamed: string[] = []
     for (const message of messages) {
       if (message.role !== 'assistant') continue
-      const agentId =
-        (message as any)?.agent_id ||
-        (message as any)?.agentId ||
-        (message as any)?.metadata?.agentId
-      if (typeof agentId === 'string' && agentId.trim() && !seenAgentIds.includes(agentId)) {
-        seenAgentIds.push(agentId)
-      }
+      const agentId = this.resolveMessageAgentId(message)
+      if (!agentId || agentId === selfAgentId || agentNames.has(agentId)) continue
+      const metadata = (message as any)?.metadata ?? {}
+      const stored = metadata.agentDisplayName ?? metadata.agentName
+      if (typeof stored === 'string' && stored.trim()) storedNames.set(agentId, stored.trim())
+      if (!unnamed.includes(agentId)) unnamed.push(agentId)
     }
 
-    if (seenAgentIds.length <= 1) {
-      if (seenAgentIds[0]) {
-        assistantLabelsById[seenAgentIds[0]] = 'A'
-      }
-      return {
-        userLabel,
-        assistantLabelsById,
-        fallbackAssistantLabel: 'A'
-      }
-    }
+    await Promise.all(
+      unnamed.map(async (agentId) => {
+        let name: string | null = null
+        try {
+          const record = await redis.get(`agent:${agentId}`)
+          name = idOf(record?.displayName) ?? idOf(record?.name)
+        } catch (error) {
+          console.warn(`[databaseRedis] Could not read agent ${agentId} for its display name:`, error)
+        }
+        agentNames.set(agentId, name ?? storedNames.get(agentId) ?? agentId)
+      })
+    )
 
-    seenAgentIds.forEach((id, index) => {
-      assistantLabelsById[id] = `A${index + 1}`
-    })
-
-    return {
-      userLabel,
-      assistantLabelsById,
-      fallbackAssistantLabel: 'A'
-    }
+    return { selfAgentId, agentNames }
   }
 
-  private resolveSpeakerLabel(message: Message, speakerMap?: SpeakerMap) {
-    if (!speakerMap) {
-      return this.formatRoleLabel(message.role)
-    }
-
+  /**
+   * SA-128 (DL-01, DP-1): the element a history message compiles as. `<user>` is only the
+   * human, so a user-role message Batshit wrote for someone else (a woken turn's DM, webhook,
+   * or schedule; an artifact share an agent started) is a `<note>`, like every system entry
+   * (a Compact summary, a graduation gist, the Trim notice). A reply with no agent id is the
+   * compile's own agent, today's single-agent rule (DP-4).
+   */
+  private resolveMessageElement(
+    message: Message,
+    speakers: SpeakerView
+  ): { tag: CompiledMessageTag; name: string | null } {
     if (message.role === 'user') {
-      return speakerMap.userLabel
+      const batshitWrote = isBatshitWrittenUserMessage((message as any)?.metadata)
+      return { tag: batshitWrote ? COMPILED_TAG.note : COMPILED_TAG.user, name: null }
     }
-
     if (message.role === 'assistant') {
-      const agentId =
-        (message as any)?.agent_id ||
-        (message as any)?.agentId ||
-        (message as any)?.metadata?.agentId
-      if (typeof agentId === 'string' && speakerMap.assistantLabelsById[agentId]) {
-        return speakerMap.assistantLabelsById[agentId]
+      const agentId = this.resolveMessageAgentId(message)
+      if (!agentId || agentId === speakers.selfAgentId) {
+        return { tag: COMPILED_TAG.assistant, name: null }
       }
-      return speakerMap.fallbackAssistantLabel
+      return { tag: COMPILED_TAG.agent, name: speakers.agentNames.get(agentId) ?? agentId }
     }
-
-    return this.formatRoleLabel(message.role)
+    return { tag: COMPILED_TAG.note, name: null }
   }
 
+  private formatHistoryElement(
+    compiled: string,
+    message: Message,
+    speakers: SpeakerView,
+    time: string | null
+  ) {
+    const { tag, name } = this.resolveMessageElement(message, speakers)
+    return compiledElement(tag, compiled, [
+      ['name', name],
+      ['time', time]
+    ])
+  }
+
+  /**
+   * DL-03: the first message of each day carries its full date and time, from the STORED
+   * timestamp only, so the history stays byte-stable from send to send.
+   */
   private decorateCompiledMessage(
     compiled: string,
     message: Message,
     timestamp: Date | undefined,
     lastMessageDay: string | null,
     messageIndex: number,
-    totalMessages: number,
-    speakerMap?: SpeakerMap
+    speakers: SpeakerView
   ) {
     if (!timestamp) {
-      const role = this.resolveSpeakerLabel(message, speakerMap)
-      return { formatted: `${role}: ${compiled}`, currentDay: lastMessageDay }
+      return {
+        formatted: this.formatHistoryElement(compiled, message, speakers, null),
+        currentDay: lastMessageDay
+      }
     }
 
     const messageDay = timestamp.toLocaleDateString('en-US')
     const includeDate = messageIndex === 0 || messageDay !== lastMessageDay
-    const timestampLabel = this.formatTimestamp(timestamp, includeDate)
-    const role = this.resolveSpeakerLabel(message, speakerMap)
-    const formatted = includeDate
-      ? `**${timestampLabel}**\n${role}: ${compiled}`
-      : `${role}: ${compiled}`
+    const time = includeDate ? this.formatTimestamp(timestamp, true) : null
 
     return {
-      formatted,
+      formatted: this.formatHistoryElement(compiled, message, speakers, time),
       currentDay: includeDate ? messageDay : lastMessageDay
     }
   }
 
-  private fallbackFormattedMessage(message: Message, speakerMap?: SpeakerMap) {
-    const timestamp = message.timestamp ? new Date(message.timestamp).toLocaleString() : ''
-    const role = this.resolveSpeakerLabel(message, speakerMap)
-    return `${timestamp ? `**${timestamp}**\n` : ''}${role}: ${message.content || '[No content]'}`
+  private fallbackFormattedMessage(message: Message, speakers: SpeakerView) {
+    const timestamp = message.timestamp ? new Date(message.timestamp) : null
+    const time =
+      timestamp && !Number.isNaN(timestamp.getTime()) ? this.formatTimestamp(timestamp, true) : null
+    return this.formatHistoryElement(
+      message.content || EMPTY_COMPILED_MESSAGE_TEXT,
+      message,
+      speakers,
+      time
+    )
   }
 
   private async getSessionClipState(sessionId: string, fetcher?: typeof fetch) {
@@ -899,30 +977,12 @@ export class DatabaseService {
     }
   }
 
+  /** BL-231: the one rule the Global Tool Grid shows too; OFF with nothing saved. */
   private resolveZipControlPermission(
     agent: any,
     globalZipSettings?: Record<string, any>
   ): boolean {
-    const agentPermission =
-      typeof agent?.zip_agent_control_enabled === 'boolean'
-        ? agent.zip_agent_control_enabled
-        : agent?.zip_control_mode === 'agent'
-          ? true
-          : agent?.zip_control_mode === 'user'
-            ? false
-            : undefined
-    if (typeof agentPermission === 'boolean') return agentPermission
-
-    const globalPermission =
-      typeof globalZipSettings?.zip_agent_control_enabled === 'boolean'
-        ? globalZipSettings.zip_agent_control_enabled
-        : globalZipSettings?.zip_control_mode === 'agent'
-          ? true
-          : globalZipSettings?.zip_control_mode === 'user'
-            ? false
-            : undefined
-
-    return globalPermission ?? false
+    return resolveZipAgentControlPermission(agent, globalZipSettings)
   }
 
   private resolveZipToolNotesEnabled(
@@ -969,7 +1029,7 @@ export class DatabaseService {
     const promptKey = options.hasPermission
       ? 'batshit:tool_guidance_zip_enabled_prompt'
       : 'batshit:tool_guidance_zip_disabled_prompt'
-    const storedPrompt = await this.getRedisStringValue(promptKey)
+    const storedPrompt = await this.readStoredPromptText(promptKey)
     const fallbackPrompt = buildToolGuidanceZipPromptBlock({
       runtimeFlavor: options.runtimeFlavor,
       zipControlPermission: options.hasPermission ? 'agent' : 'user',
@@ -1448,7 +1508,7 @@ export class DatabaseService {
     agent: any,
     runtimeFlavor: 'codex' | 'claude' | 'vercel'
   ) {
-    const storedPrompt = await this.getRedisStringValue('batshit:tool_guidance_memory_prompt')
+    const storedPrompt = await this.readStoredPromptText('batshit:tool_guidance_memory_prompt')
     const fallbackPrompt = buildMemoryPromptBlock({ runtimeFlavor })
     const prompt = storedPrompt?.trim() ? storedPrompt : fallbackPrompt
     const brokerNames = brokerToolNamesForScope(runtimeFlavorToScope(runtimeFlavor))
@@ -1464,7 +1524,7 @@ export class DatabaseService {
     agent: any,
     runtimeFlavor: 'codex' | 'claude' | 'vercel'
   ) {
-    const storedPrompt = await this.getRedisStringValue('batshit:dynamic_mcp_prompt')
+    const storedPrompt = await this.readStoredPromptText('batshit:dynamic_mcp_prompt')
     const fallbackPrompt = buildDynamicMcpPromptBlock({ runtimeFlavor })
     const prompt = storedPrompt?.trim() ? storedPrompt : fallbackPrompt
     const normalizedPrompt = normalizeDynamicMcpPromptContent(prompt)
@@ -1533,7 +1593,7 @@ export class DatabaseService {
     agent: any,
     runtimeFlavor: 'codex' | 'claude' | 'vercel'
   ) {
-    const storedPrompt = await this.getRedisStringValue('batshit:dm_guidance')
+    const storedPrompt = await this.readStoredPromptText('batshit:dm_guidance')
     const prompt = storedPrompt?.trim() ? storedPrompt : buildDmGuidancePromptBlock()
     const brokerNames = brokerToolNamesForScope(runtimeFlavorToScope(runtimeFlavor))
     return replacePromptVariables(prompt, agent, {
@@ -1545,7 +1605,7 @@ export class DatabaseService {
   }
 
   /**
-   * SA-120 P2 (H1) — the Jev Juice judgment-tool guidance block. Same contract as the DM
+   * SA-120 P2 (H1) — the Judge Juice judgment-tool guidance block. Same contract as the DM
    * block: stored Redis prompt first, code fallback second. Gated by the caller on
    * `resolveAgentJevJudgeToolEnabled` alone — the switch that opens `sys.judge.*` in the
    * broker — so an agent without the tool pays nothing and is never taught a control it
@@ -1555,7 +1615,7 @@ export class DatabaseService {
     agent: any,
     runtimeFlavor: 'codex' | 'claude' | 'vercel'
   ) {
-    const storedPrompt = await this.getRedisStringValue('batshit:jev_juice_guidance')
+    const storedPrompt = await this.readStoredPromptText('batshit:jev_juice_guidance')
     const prompt = storedPrompt?.trim() ? storedPrompt : buildJevJuiceGuidancePromptBlock()
     const brokerNames = brokerToolNamesForScope(runtimeFlavorToScope(runtimeFlavor))
     return replacePromptVariables(prompt, agent, {
@@ -1570,7 +1630,7 @@ export class DatabaseService {
     agent: any,
     runtimeFlavor: 'codex' | 'claude' | 'vercel'
   ) {
-    const storedPrompt = await this.getRedisStringValue('batshit:subagent_guidance')
+    const storedPrompt = await this.readStoredPromptText('batshit:subagent_guidance')
     const fallbackPrompt = buildSubagentGuidancePromptBlock({ runtimeFlavor })
     const prompt = storedPrompt?.trim() ? storedPrompt : fallbackPrompt
     const scope = runtimeFlavorToScope(runtimeFlavor)
@@ -1664,7 +1724,7 @@ export class DatabaseService {
     return ''
   }
 
-  private buildZipAppend(entries: ZipExposure[]): string {
+  private buildZipAppend(entries: ZipExposure[], delivered?: AddressSourcePiece[]): string {
     if (!entries.length) return ''
 
     const seen = new Set<string>()
@@ -1721,17 +1781,30 @@ export class DatabaseService {
         `[/${indexLines.length}]`
       ]
       contentBlocks.push(blockLines.join('\n'))
+      // BL-474: the same formatter partitions actual result text from echoed model arguments.
+      // Never let a missing/mismatched decomposition grant read provenance to the whole body.
+      if (zipData?.type === 'cool_tool' && typeof entry.expandedContent === 'string') {
+        const parts = entry.expandedContentParts
+        delivered?.push(...(parts && parts.map((part) => part.text).join('') === entry.expandedContent
+          ? parts
+          : [{ source: 'agent_words' as const, text: entry.expandedContent }]))
+      }
     }
 
     if (!indexLines.length) return ''
 
-    return [
-      '==== UNZIP INDEX (chronological) ====',
-      indexLines.join('\n'),
-      '',
-      '==== UNZIPPED ZIP CONTENT (chronological) ====',
-      contentBlocks.join('\n\n')
-    ].join('\n')
+    // SA-128 (DL-04): one `<zip_index>` element after the conversation, same contents and
+    // order as the old two headers; the zip bodies inside it are disarmed like any content.
+    return compiledElement(
+      COMPILED_TAG.zipIndex,
+      [
+        'Index (chronological):',
+        indexLines.join('\n'),
+        '',
+        'Unzipped content (chronological):',
+        contentBlocks.join('\n\n')
+      ].join('\n')
+    )
   }
 
   private async compileChatHistory(
@@ -1750,8 +1823,12 @@ export class DatabaseService {
       clipNames?: Map<string, string> | null
       /** F-P5-11: this pass's own zip state, never the browser singleton. */
       zipState: ZipStateView
+      /** SA-129 P1: the chat's project path, which relative file paths in tool results resolve against. */
+      deadCopyProjectPath?: string | null
+      /** BL-490: the chat this pass compiles for; a zip of another chat is never read. */
+      zipOwner: { sessionId: string; userId?: string | null }
     },
-    speakerMap?: SpeakerMap
+    speakers: SpeakerView
   ) {
     const formattedMessages: string[] = []
     let currentDay: string | null = null
@@ -1764,17 +1841,36 @@ export class DatabaseService {
       calculateInterruptedReasoningRecoveryActiveByIndex(messages)
     const zipExposures: ZipExposure[] = []
     // SA-120 P5: what this compile leaves compressed, in chat order. Observation only;
-    // the only reader is the route-owned Jev Juice smart-zip hint provider.
+    // the only reader is the route-owned Judge Juice smart-zip hint provider.
     const compressedZips: ZipCompression[] = []
     // ...and what it leaves expanded, for the same lane's after-reply question.
     const exposedZips: ZipExposed[] = []
     const zipCompilationCache = new Map<string, Promise<any | null>>()
+    // BL-474 step 2: the source of each piece this pass delivers, in chat order. Read only.
+    const addressSources: AddressSourcePiece[] = []
+    // BL-490: a zip that names another chat or user is read as missing, whatever allow-list
+    // the message carries: the browser posts the history, and a page once trusted an echoed
+    // reference. Read-time trust repair (`messageZipTrust.ts`) applies the same ownership rule.
+    const zipOwner = options.zipOwner
     const resolveZipForCompilation = (zipId: string) => {
       if (!zipCompilationCache.has(zipId)) {
-        zipCompilationCache.set(zipId, redis.getZip(zipId))
+        zipCompilationCache.set(
+          zipId,
+          redis
+            .getZip(zipId)
+            .then((zip: any) => (zipBelongsToAnotherChat(zip, zipOwner) ? null : zip))
+        )
       }
       return zipCompilationCache.get(zipId)!
     }
+    // SA-129 P1 (DL-01): the dead copies among this pass's own tool results, built before the
+    // history loop from the same zip reads it makes (the cache above), never shared.
+    const deadCopies = await this.findHistoryDeadCopies(
+      messages,
+      resolveZipForCompilation,
+      options.deadCopyProjectPath ?? null,
+      agentMessagesFromEndByIndex
+    )
 
     for (let i = 0; i < messages.length; i++) {
       const message = messages[i]
@@ -1793,6 +1889,9 @@ export class DatabaseService {
         continue
       }
 
+      // A message's pieces join the pass's list only when the message compiled: a fallback
+      // delivers the stored text instead, not the tool results expanded before a throw.
+      let messagePieces: PositionedAddressSource[] = []
       try {
         let compiled = ''
 
@@ -1814,13 +1913,15 @@ export class DatabaseService {
                 interruptedReasoningRecoveryActiveByIndex[i] ?? false,
               zipResolver: resolveZipForCompilation,
               zipState: options.zipState,
+              deadCopies,
               zipViewMode,
               onZipExposure:
                 zipViewMode === 'appended'
                   ? (exposure) => zipExposures.push(exposure)
                   : undefined,
               onZipCompressed: (compression) => compressedZips.push(compression),
-              onZipExposed: (exposed) => exposedZips.push(exposed)
+              onZipExposed: (exposed) => exposedZips.push(exposed),
+              onDeliveredSource: (piece) => messagePieces.push(piece)
             }
           )
 
@@ -1829,7 +1930,14 @@ export class DatabaseService {
             zipToolNotesEnabled
           )
           if (toolSummaryBlock) {
-            compiled = `${compiled}\n\n${toolSummaryBlock}`.trim()
+            const withSummary = `${compiled}\n\n${toolSummaryBlock}`
+            const leadingTrim = withSummary.length - withSummary.trimStart().length
+            const trimmed = withSummary.trim()
+            messagePieces = replaceAddressSourceRanges(messagePieces, 0, leadingTrim, '')
+            messagePieces = replaceAddressSourceRanges(
+              messagePieces, trimmed.length, withSummary.length - leadingTrim, ''
+            )
+            compiled = trimmed
           }
         }
 
@@ -1840,7 +1948,10 @@ export class DatabaseService {
         const clipCompiled = compileClipReferencesForAiView(
           compiled,
           options?.activeClipIds,
-          { clipNames: options?.clipNames }
+          { clipNames: options?.clipNames, onReplace: (start,end,replacement)=>{
+            messagePieces=replaceAddressSourceRanges(messagePieces,start,end,replacement,
+              replacement ? {source:'batshit',text:replacement} : undefined)
+          } }
         )
         if (clipCompiled !== compiled) {
           compiled = clipCompiled || EMPTY_COMPILED_MESSAGE_TEXT
@@ -1858,27 +1969,119 @@ export class DatabaseService {
           timestamp,
           currentDay,
           i,
-          totalMessages,
-          speakerMap
+          speakers
         )
 
+        // Built before the push, so nothing that can throw runs after the message is in the history
+        // (a throw after it would push the fallback a second time).
+        const messageSource: AddressSourcePiece = {
+          source: this.resolveMessageAddressSource(message),
+          text: compiled,
+          messageId: message.id
+        }
         formattedMessages.push(formatted)
         currentDay = nextDay
+        addressSources.push(messageSource, ...materializeAddressSources(compiled,messagePieces))
       } catch (error) {
-        formattedMessages.push(this.fallbackFormattedMessage(message, speakerMap))
+        formattedMessages.push(this.fallbackFormattedMessage(message, speakers))
+        addressSources.push({
+          source: this.resolveMessageAddressSource(message),
+          text: message.content || EMPTY_COMPILED_MESSAGE_TEXT,
+          messageId: message.id
+        })
       }
     }
 
-    const baseHistory = formattedMessages.join('\n\n---\n\n').trim()
+    // SA-128 (DL-01): the messages sit in `<conversation>`, one blank line apart; the tags are
+    // the separator. The zip index follows the conversation as its own element.
+    const baseHistory = compiledConversation(formattedMessages)
     const zipAppend =
-      zipViewMode === 'appended' ? this.buildZipAppend(zipExposures) : ''
+      zipViewMode === 'appended' ? this.buildZipAppend(zipExposures, addressSources) : ''
     const chatHistory = zipAppend
       ? baseHistory
         ? `${baseHistory}\n\n${zipAppend}`
         : zipAppend
       : baseHistory
 
-    return { formattedMessages, currentDay, chatHistory, compressedZips, exposedZips }
+    return { formattedMessages, currentDay, chatHistory, compressedZips, exposedZips, addressSources }
+  }
+
+  /**
+   * BL-474 step 2: the source of a history message as a whole. A user-role message Batshit wrote
+   * for someone else is a note (as its `<note>` element says): from outside (a webhook) or another
+   * agent's words (a DM, a schedule, an artifact share); every other non-assistant entry (a Compact
+   * summary, a graduation gist, the Trim notice) is a summary; an assistant message is the agent's
+   * words, its own or another agent's.
+   */
+  private resolveMessageAddressSource(message: Message): AddressSourceKind {
+    if (message.role === 'user') {
+      const metadata = (message as any)?.metadata
+      if (!isBatshitWrittenUserMessage(metadata)) return 'user'
+      return isOutsideNote(metadata) ? 'note' : 'agent_note'
+    }
+    return message.role === 'assistant' ? 'agent_words' : 'summary'
+  }
+
+  /**
+   * SA-129 P2 (BL-333): the dead copies of a whole chat, for the badge and the Zip Manager, by the
+   * rules and the project path a compile uses: the newest user message's project (what the browser
+   * sent), else the agent's default project, else the default workspace; the agent is the newest
+   * reply's. Each result is judged within its own author, as in every compile.
+   */
+  async findSessionDeadCopies(sessionId: string, userId: string): Promise<Map<string, DeadCopyReason>> {
+    const messages = (await redis.getSessionMessages(sessionId)) as Message[]
+    const newestUser = [...messages].reverse().find((message) => message.role === 'user')
+    const newestReply = [...messages].reverse().find((message) => message.role === 'assistant' && message.agent_id)
+    const requestedProjectPath =
+      typeof (newestUser as any)?.metadata?.projectPath === 'string'
+        ? ((newestUser as any).metadata.projectPath as string).trim()
+        : ''
+    let projectPath: string | null = requestedProjectPath || null
+    if (!projectPath && newestReply?.agent_id) {
+      const agent = (await redis.getAgents(userId)).find((row) => row.id === newestReply.agent_id) ?? null
+      if (agent) {
+        const { agentDefaultProjectPath, defaultWorkspacePath } = await this.loadSystemPrompts(agent as AgentRow, userId)
+        projectPath = agentDefaultProjectPath?.trim() || defaultWorkspacePath?.trim() || null
+      }
+    }
+    const zipCache = new Map<string, Promise<any | null>>()
+    const resolveZip = (zipId: string) => {
+      if (!zipCache.has(zipId)) zipCache.set(zipId, redis.getZip(zipId))
+      return zipCache.get(zipId)!
+    }
+    const { results } = await collectDeadCopyToolResults(messages, resolveZip)
+    const reasons = new Map<string, DeadCopyReason>()
+    for (const [zipId, dead] of findDeadCopies(results, { projectPath })) reasons.set(zipId, dead.reason)
+    return reasons
+  }
+
+  /**
+   * SA-129 P1 (DL-01): every tool result this pass will compile, in chat order, read through the
+   * pass's own zip resolver, then `findDeadCopies`. Each dead copy carries how many of its
+   * author's replies had finished when it died (`agentMessagesFromEndByIndex` at its message
+   * minus at the message that killed it), which decides whether its reference names the reason.
+   * A zip that cannot be read is left out, so it can neither die nor kill another copy.
+   */
+  private async findHistoryDeadCopies(
+    messages: Message[],
+    resolveZip: (zipId: string) => Promise<any | null>,
+    projectPath: string | null,
+    agentMessagesFromEndByIndex: number[]
+  ): Promise<Map<string, CompileDeadCopy>> {
+    const { results, messageIndexByZip } = await collectDeadCopyToolResults(messages, resolveZip)
+
+    const deadCopies = new Map<string, CompileDeadCopy>()
+    for (const [zipId, dead] of findDeadCopies(results, { projectPath })) {
+      const readAt = messageIndexByZip.get(zipId) ?? dead.deadAtMessageIndex
+      deadCopies.set(zipId, {
+        reason: dead.reason,
+        repliesUntilDead: Math.max(
+          0,
+          (agentMessagesFromEndByIndex[readAt] ?? 0) - (agentMessagesFromEndByIndex[dead.deadAtMessageIndex] ?? 0)
+        )
+      })
+    }
+    return deadCopies
   }
 
   private formatToolResultsSummaryForContext(message: Message, notesEnabled = true): string {
@@ -1925,10 +2128,11 @@ export class DatabaseService {
   ): Promise<PrecompiledHistory> {
     const fetchImpl = options?.fetch ?? (typeof fetch !== 'undefined' ? fetch : undefined)
 
-    const { globalZipSettings: loadedGlobalZipSettings } = await this.loadSystemPrompts(
-      agent,
-      userId
-    )
+    const {
+      globalZipSettings: loadedGlobalZipSettings,
+      agentDefaultProjectPath,
+      defaultWorkspacePath
+    } = await this.loadSystemPrompts(agent, userId)
     const globalZipSettings =
       options?.globalZipSettingsOverride ?? loadedGlobalZipSettings
     const agentForHistory =
@@ -1944,7 +2148,7 @@ export class DatabaseService {
     ])
     const zipState = createZipStateView(serverUnzipped, serverRezipped)
 
-    const speakerMap = this.buildSpeakerMap(messages, options?.groupContext)
+    const speakers = await this.buildSpeakerView(messages, agent, options?.groupContext)
 
     // SA-109: group runs compile history once and reuse it per speaker, so the
     // clip rewrite has to happen here too — no lane keeps raw clip syntax.
@@ -1954,39 +2158,51 @@ export class DatabaseService {
       fetchImpl
     )
 
-    const { formattedMessages, currentDay, chatHistory } = await this.compileChatHistory(
+    const { formattedMessages, currentDay, chatHistory, addressSources } = await this.compileChatHistory(
       messages,
       agentForHistory,
       globalZipSettings,
       {
         ...options,
         zipState,
+        // SA-129 P1: a group run has no per-send project path; the agent's default stands in.
+        deadCopyProjectPath: agentDefaultProjectPath?.trim() || defaultWorkspacePath?.trim() || null,
+        zipOwner: { sessionId, userId: userId ?? null },
         activeClipIds: clipCompileState.activeClipIds,
         clipNames: clipCompileState.clipNames
       },
-      speakerMap
+      speakers
     )
 
     return {
       formattedMessages,
       currentDay,
-      chatHistory: chatHistory ?? formattedMessages.join('\n\n---\n\n').trim(),
-      globalZipSettings
+      chatHistory: chatHistory ?? compiledConversation(formattedMessages),
+      globalZipSettings,
+      addressSources
     }
   }
 
+  /**
+   * SA-128 (DL-01, DL-03, DP-1): the new message is a `<user>` element with the time (plus the
+   * date when the day changed or there is no history). A current message Batshit wrote (a
+   * woken turn, a group follow-up, the artifact share follow-up, the voice session seed) is a
+   * `<note>`: nobody gets to put words in the user's mouth.
+   */
   private formatCurrentUserMessage(
     currentUserMessage: string,
     lastMessageDay: string | null,
     hasHistory: boolean,
-    speakerMap?: SpeakerMap
+    from: CurrentMessageFrom = 'user',
+    at?: Date
   ) {
-    const now = new Date()
+    const now = at ?? new Date()
     const nowDay = now.toLocaleDateString('en-US')
     const includeDate = !hasHistory || nowDay !== lastMessageDay
     const timestamp = this.formatTimestamp(now, includeDate)
-    const label = speakerMap?.userLabel ?? 'User'
-    return `**${timestamp}**\n${label}: ${currentUserMessage}`
+    return compiledElement(from === 'batshit' ? COMPILED_TAG.note : COMPILED_TAG.user, currentUserMessage, [
+      ['time', timestamp]
+    ])
   }
 
   private getPreviousDynamicSnapshot(messages: Message[]) {
@@ -2007,7 +2223,12 @@ export class DatabaseService {
     return null
   }
 
-  private buildZipStateSnapshot(messages: Message[], unzipped: UnzippedItem[]) {
+  private buildZipStateSnapshot(
+    messages: Message[],
+    unzipped: UnzippedItem[],
+    deadCopies: Map<string, DeadCopyReason> = new Map(),
+    sizeGuards: Map<string, ToolResultSizeGuard> = new Map()
+  ) {
     const hasZipHistory =
       unzipped.length > 0 ||
       messages.some((message) => {
@@ -2021,7 +2242,9 @@ export class DatabaseService {
 
     return {
       hasZipHistory,
-      unzipped
+      unzipped,
+      deadCopies,
+      sizeGuards
     }
   }
 
@@ -2123,6 +2346,8 @@ export class DatabaseService {
   }
 
   private async buildDynamicMcpDcm(options: {
+    /** Server-resolved turn selection; undefined keeps non-turn preview defaults. */
+    mcpGatewayScope?: string[]
     userId?: string | null
     agentId?: string | null
     projectPath?: string | null
@@ -2131,7 +2356,7 @@ export class DatabaseService {
     isCodexMode?: boolean
   }): Promise<{
     text: string
-    /** SA-120 P1: the typed refs the agent can reach, for the Jev Juice hint provider. */
+    /** SA-120 P1: the typed refs the agent can reach, for the Judge Juice hint provider. */
     discoverable: DynamicMcpDiscoverableRef[]
     resolvedGatewayIds: string[] | null
   }> {
@@ -2144,6 +2369,7 @@ export class DatabaseService {
       const result = await buildDynamicMcpIndex({
         userId,
         agentId,
+        selectedGateways: options.mcpGatewayScope,
         projectPath: options.projectPath ?? null,
         nativeDynamicMcpEnabled: options.nativeDynamicMcpEnabled,
         cliToolsEnabled:
@@ -2238,6 +2464,8 @@ export class DatabaseService {
   }
 
   private async buildDynamicInfoBlock(options: {
+    /** Server-resolved turn selection; undefined keeps non-turn preview defaults. */
+    mcpGatewayScope?: string[]
     userId?: string | null
     currentUserMessage?: string | null
     agentRecord?: any
@@ -2267,6 +2495,9 @@ export class DatabaseService {
     zipState?: {
       hasZipHistory: boolean
       unzipped: UnzippedItem[]
+      /** SA-129 P2: the held items this compile compressed as dead copies, and why. */
+      deadCopies?: Map<string, DeadCopyReason>
+      sizeGuards?: Map<string, ToolResultSizeGuard>
     }
     autoZipContent?: string[]
     autoZipTools?: string[]
@@ -2285,12 +2516,12 @@ export class DatabaseService {
     /** SA-110 P2 (DL-110-05): awareness changes newer than the stored fold snapshot. */
     awarenessPendingDcmLines?: string[]
     /**
-     * SA-120 P1 (DL-120-05): the route-owned Jev Juice hint provider. Called once with the
+     * SA-120 P1 (DL-120-05): the route-owned Judge Juice hint provider. Called once with the
      * agent's skills and discoverable refs after every other section is built; its lines
      * close the DCM (the cache-free tail). Absent on subagent and group compiles.
      */
     jevJuiceHintProvider?: JevJuiceHintProvider
-  }) {
+  }): Promise<{ text: string; addressSourcePieces: AddressSourcePiece[] }> {
     const statusIcons = {
       new: '\u2705',
       updated: '\u2733\uFE0F',
@@ -2372,13 +2603,9 @@ export class DatabaseService {
       ]
       lines.push(`Participants: ${participantParts.join(', ')}`)
 
-      const speakerParts = [
-        `U=${userName}`,
-        ...agentOrder.map((id, index) => `A${index + 1}=${agentNames[id] ?? id}`)
-      ]
-      lines.push(`Speakers: ${speakerParts.join(', ')}`)
-
-      const presets = agentOrder.map((id, index) => {
+      // SA-128 (DP-3): the history names every agent (`<assistant>` is you, `<agent name>` is
+      // anyone else), so the presets name them too; there is no letter map any more.
+      const presets = agentOrder.map((id) => {
         const settings = groupContext.speakPolicies?.[id]
         const policy = settings?.speak_policy ?? 'balanced'
         const topics = Array.isArray(settings?.speak_topics) ? settings?.speak_topics : []
@@ -2386,7 +2613,7 @@ export class DatabaseService {
           policy === 'topic_only'
             ? `(${topics.length > 0 ? topics.join(', ') : 'no topics'})`
             : ''
-        return `A${index + 1}=${policy}${topicSuffix}`
+        return `${agentNames[id] ?? id}=${policy}${topicSuffix}`
       })
       if (presets.length > 0) {
         lines.push(`Presets: ${presets.join(', ')}`)
@@ -2582,8 +2809,11 @@ export class DatabaseService {
     // per-agent state you should act on" family — Clips, DMs, Memory, in that order.
     // Open items only, so a closed DM stops costing tokens the moment it is closed;
     // omitted entirely for every agent without DMs, which keeps their bytes identical.
+    let dmRosterLineRange: { start: number; end: number } | null = null
     if (options.dmRosterDcmLines && options.dmRosterDcmLines.length > 0) {
+      const start = lines.length + 1 // the blank line below separates this DCM section
       lines.push('', ...options.dmRosterDcmLines)
+      dmRosterLineRange = { start, end: lines.length }
     }
 
     // SA-104 P4: the recall engine's memory-insert section (time awareness, Current /
@@ -2632,15 +2862,13 @@ export class DatabaseService {
         lines.push('- Unzipped: (none)')
       } else {
         for (const item of unzipped) {
-          // SA-120 P5: a third actor. `batshit-inferred` is Batshit acting on a Jev Juice
-          // judgment: temporary, never a lock, and either other actor may overwrite it.
-          const sourceLabel =
-            item?.source === 'user' ? 'user-locked' : item?.source === 'inferred' ? 'batshit-inferred' : 'agent'
-          const permanence = item?.permanent
-            ? 'permanent'
-            : `temp ${item?.messageCount ?? 0}/${item?.duration ?? '?'}`
-          const nameLabel = item?.name || item?.description || 'zip'
-          lines.push(`- ${nameLabel} | ${item.zipId} | ${sourceLabel} | ${permanence}`)
+          lines.push(
+            describeUnzippedItemForDcm(item, {
+              agentId: options.agentId ?? null,
+              deadCopy: zipState?.deadCopies?.get(normalizeId(item.zipId)) ?? null,
+              sizeGuard: zipState?.sizeGuards?.get(normalizeId(item.zipId)) ?? null
+            })
+          )
         }
       }
     }
@@ -2661,6 +2889,7 @@ export class DatabaseService {
     let resolvedGatewayIds: string[] | null = null
     if (options.agentRecord) {
       const mcpDcm = await this.buildDynamicMcpDcm({
+        mcpGatewayScope: options.mcpGatewayScope,
         userId: options.userId,
         agentId: options.agentId,
         projectPath:
@@ -2680,7 +2909,7 @@ export class DatabaseService {
       }
     }
 
-    // SA-120 P1 (DL-120-05): Jev Juice hints close the DCM. The provider owns the network
+    // SA-120 P1 (DL-120-05): Judge Juice hints close the DCM. The provider owns the network
     // call, its deadline, and its evidence; the compiler only appends what comes back.
     // A provider that throws is a bug — logged loudly, and the turn ships without hints.
     if (options.jevJuiceHintProvider) {
@@ -2695,12 +2924,31 @@ export class DatabaseService {
           lines.push('', ...hintLines)
         }
       } catch (error) {
-        console.error('[buildDynamicInfoBlock] Jev Juice hint provider threw; no hint lines this turn:', error)
+        console.error('[buildDynamicInfoBlock] Judge Juice hint provider threw; no hint lines this turn:', error)
       }
     }
 
-    if (!lines.length) return ''
-    return `==== DYNAMIC INFO (ephemeral - not stored) ====\n\n${lines.join('\n')}`
+    if (!lines.length) return { text: '', addressSourcePieces: [] }
+    // SA-128 (DL-04): one `<dynamic_info>` element; the base prompts say it is Batshit's
+    // context for this turn (never stored), not the user speaking.
+    const text = compiledElement(COMPILED_TAG.dynamicInfo, lines.join('\n'))
+    const addressSourcePieces = dmRosterLineRange
+      ? [
+          {
+            source: 'batshit' as const,
+            text: lines.slice(0, dmRosterLineRange.start - 1).join('\n')
+          },
+          {
+            source: 'agent_note' as const,
+            text: lines.slice(dmRosterLineRange.start, dmRosterLineRange.end).join('\n')
+          },
+          {
+            source: 'batshit' as const,
+            text: lines.slice(dmRosterLineRange.end).join('\n')
+          }
+        ]
+      : [{ source: 'batshit' as const, text }]
+    return { text, addressSourcePieces }
   }
 
   // ========== Complex buildFormattedChatInput - Keep in main class for now ==========
@@ -2713,6 +2961,8 @@ export class DatabaseService {
     assignedSubagents?: any[],
     userId?: string,
     options?: {
+      /** Same server-resolved turn scope used by execution and credentials. */
+      mcpGatewayScope?: string[]
       fetch?: typeof fetch
       runtimeFlavor?: 'codex' | 'claude' | 'vercel'
       projectPath?: string | null
@@ -2724,16 +2974,16 @@ export class DatabaseService {
       goonsSettings?: GoonsSettings | null
       goonsEnabled?: boolean
       goonPresentationMode?: DesktopGoonPresentationMode | null
-      /** SA-120 P1: route-owned Jev Juice hint provider; primary lanes only. */
+      /** SA-120 P1: route-owned Judge Juice hint provider; primary lanes only. */
       jevJuiceHintProvider?: JevJuiceHintProvider
       /**
-       * SA-120 P4b: route-owned Jev Juice recall-by-meaning provider, handed straight to
+       * SA-120 P4b: route-owned Judge Juice recall-by-meaning provider, handed straight to
        * the recall engine. Absent (every caller but an eligible `send-routed` turn), the
        * memory section compiles exactly as it always has.
        */
       jevJuiceMemoryRecallProvider?: MemoryInferredRecallProvider
       /**
-       * SA-120 P5: route-owned Jev Juice smart-zip provider. Called once, after the first
+       * SA-120 P5: route-owned Judge Juice smart-zip provider. Called once, after the first
        * history pass, with the zips that pass left compressed; the zips it returns are
        * expanded for THIS compile through an in-memory overlay and one more history pass.
        * The compile writes nothing (the route stores the state at the accepted-send
@@ -2742,12 +2992,39 @@ export class DatabaseService {
       jevJuiceSmartZipProvider?: JevJuiceSmartZipProvider
       /** SA-120 P5: told what the final history pass left expanded (only beside the provider above). */
       jevJuiceSmartZipExposedObserver?: (exposed: ZipExposed[]) => void
+      /**
+       * SA-128 (DP-1): who wrote the current message. `batshit` compiles it as a `<note>` (a
+       * woken turn, a group follow-up, the artifact share follow-up, the voice session seed);
+       * absent, it is the user's own message.
+       */
+      currentMessageFrom?: CurrentMessageFrom
+      /**
+       * BL-322: when the current message was written. An approval resume compiles the paused
+       * turn's message again and stamps its own time, not the click's; absent, it is now.
+       */
+      currentMessageAt?: Date
+      /**
+       * BL-474 step 2: where the words of a current message Batshit wrote came from: `note` for a
+       * webhook's wake, `agent_note` for another agent's words (a DM, a schedule, an artifact). Absent,
+       * a Batshit-written current message is `agent_note` (the careful default) and any other is
+       * the user's.
+       */
+      currentMessageAddressSource?: 'note' | 'agent_note'
+      /**
+       * SA-129 P2 (DL-08): this compile is for a new user message that will count toward every
+       * temporary hold's countdown once the send is accepted. The compile reads zip state as it
+       * will be then (`countOneMoreMessage`), as the chat page's own count used to give it; it
+       * writes nothing.
+       */
+      countsPendingUserMessage?: boolean
     }
   ): Promise<{
     structuredInput: any
     primarySystemPrompt?: string
     subagentDescription?: Record<string, string>
     resolvedProjectPath?: string | null
+    /** BL-474 step 2: what this compile delivered, piece by piece, with each piece's source. */
+    addressSources: CompiledAddressSources
   }> {
     // Server compilation must not fall back to global fetch for relative app routes.
     // SvelteKit only allows request-scoped event.fetch for those URLs.
@@ -2761,6 +3038,12 @@ export class DatabaseService {
       agentDefaultProjectPath,
       agentDefaultProjectRules
     } = await this.loadSystemPrompts(agent, userId, options)
+    // The DCM's project path, and (SA-129 P1) what relative file paths in tool results resolve against.
+    const resolvedProjectPath =
+      options?.projectPath?.trim() ||
+      agentDefaultProjectPath?.trim() ||
+      defaultWorkspacePath?.trim() ||
+      null
 
     // 2. Get user's custom system prompt from agent
     const userSystemPrompt = agent?.system_prompt || ''
@@ -2787,10 +3070,16 @@ export class DatabaseService {
     // handed to every reader explicitly (history passes, the unzipped count, the DCM).
     // Server compiles overlap in one process (parallel chats, a wake-up, a token preview),
     // so none of them reads or writes the browser's `zippingService` singleton.
-    const [serverUnzipped, serverRezipped] = await Promise.all([
+    const [storedUnzipped, serverRezipped] = await Promise.all([
       this.loadUnzippedFromRedis(sessionId),
       this.loadRezippedFromRedis(sessionId)
     ])
+    // SA-129 P2: a new user message counts once toward every temporary hold at the accepted-send
+    // boundary; this compile already sees the state as it will be then (a hold that ends with
+    // this message is gone, the others show one more message).
+    const serverUnzipped = options?.countsPendingUserMessage
+      ? countOneMoreMessage(storedUnzipped).kept
+      : storedUnzipped
     // SA-120 P5: whose rezip each marker is. Only a smart-zip turn needs it (Jev may reopen
     // its own rezip and nobody else's), so every other compile skips these reads.
     const serverRezippedSources =
@@ -2810,7 +3099,11 @@ export class DatabaseService {
       sessionRecord
     )
     const precompiledHistory = options?.precompiledHistory
-    const speakerMap = this.buildSpeakerMap(contextMessages, options?.groupContext)
+    // SA-128: read only when this compile builds its own history (a group run arrives with it
+    // precompiled), and once even when the smart-zip turn runs the history pass twice.
+    let speakersPromise: Promise<SpeakerView> | null = null
+    const speakersForHistory = () =>
+      (speakersPromise ??= this.buildSpeakerView(contextMessages, agent, options?.groupContext))
 
     // SA-109: resolved once, before the history compile, because the history
     // rewrite, the DCM roster, and content delivery all read the same answer.
@@ -2820,7 +3113,7 @@ export class DatabaseService {
       fetchImpl
     )
 
-    const compileHistoryPass = (passZipState: ZipStateView) =>
+    const compileHistoryPass = async (passZipState: ZipStateView) =>
       this.compileChatHistory(
         contextMessages,
         agent,
@@ -2828,23 +3121,28 @@ export class DatabaseService {
         {
           ...options,
           zipState: passZipState,
+          deadCopyProjectPath: resolvedProjectPath,
+          zipOwner: { sessionId, userId: userId ?? null },
           activeClipIds: clipCompileState.activeClipIds,
           clipNames: clipCompileState.clipNames
         },
-        speakerMap
+        await speakersForHistory()
       )
+    const historyAddressSourcesMissing = Boolean(precompiledHistory && !Array.isArray(precompiledHistory.addressSources))
+    if (historyAddressSourcesMissing) console.error('[BL-474] Group history has no address-source ledger; picture decisions remain pending')
     let compiledHistory = precompiledHistory
       ? {
           formattedMessages: precompiledHistory.formattedMessages,
           currentDay: precompiledHistory.currentDay,
           chatHistory: precompiledHistory.chatHistory,
-          // Group runs compile history once and get no Jev Juice provider (DL-120-06).
+          // Group runs compile history once and get no Judge Juice provider (DL-120-06).
           compressedZips: [] as ZipCompression[],
-          exposedZips: [] as ZipExposed[]
+          exposedZips: [] as ZipExposed[],
+          addressSources: precompiledHistory.addressSources ?? []
         }
       : await compileHistoryPass(zipState)
 
-    // SA-120 P5: Jev Juice smart zip. The route-owned provider is told exactly which zips
+    // SA-120 P5: Judge Juice smart zip. The route-owned provider is told exactly which zips
     // the pass above left compressed and answers with the ones Batshit opens for THIS
     // message. They are expanded through an in-memory overlay on this compile's zip state
     // (source `inferred`) and ONE more history pass, so zip activation is still decided in
@@ -2853,22 +3151,25 @@ export class DatabaseService {
     // answer, or a provider that throws: history is what the first pass produced.
     if (options?.jevJuiceSmartZipProvider && !precompiledHistory && currentUserMessage) {
       let opens: Awaited<ReturnType<JevJuiceSmartZipProvider>> = []
+      // SA-129 P1: a dead copy stays compressed through any `inferred` unzip, so it is never offered.
+      const zippedItems = compiledHistory.compressedZips.filter((zip) => !zip.deadCopy)
       try {
         opens = await options.jevJuiceSmartZipProvider({
           currentUserMessage,
-          zippedItems: compiledHistory.compressedZips
+          zippedItems
         })
       } catch (error) {
-        console.error('[buildFormattedChatInput] Jev Juice smart zip provider threw; nothing opened this turn:', error)
+        console.error('[buildFormattedChatInput] Judge Juice smart zip provider threw; nothing opened this turn:', error)
         opens = []
       }
       // Re-check every id: only a zip this compile really left compressed, and never one a
       // user or an agent zipped by hand or that is an oversized safety row, can be opened.
       const openable = new Map(
-        compiledHistory.compressedZips
+        zippedItems
           .filter(
             (zip) =>
-              !zip.forceCompress &&
+              !zip.sizeGuard &&
+              !(zip.zipType === 'cool_tool' && classifyToolResultSize(zip.tokens)) &&
               !zip.groupUnshared &&
               (zip.rezippedBy === null || zip.rezippedBy === 'inferred')
           )
@@ -2901,13 +3202,12 @@ export class DatabaseService {
       try {
         options.jevJuiceSmartZipExposedObserver?.(compiledHistory.exposedZips)
       } catch (error) {
-        console.error('[buildFormattedChatInput] Jev Juice smart zip exposed-observer threw; ignored:', error)
+        console.error('[buildFormattedChatInput] Judge Juice smart zip exposed-observer threw; ignored:', error)
       }
     }
     const { formattedMessages, currentDay, chatHistory } = compiledHistory
 
-    const resolvedChatHistory =
-      chatHistory ?? formattedMessages.join('\n\n---\n\n').trim()
+    const resolvedChatHistory = chatHistory ?? compiledConversation(formattedMessages)
 
     // 4. Format current user message if provided.
     // SA-109: the current turn carries the just-attached clip's placeholder too
@@ -2923,7 +3223,8 @@ export class DatabaseService {
           currentUserMessageForAi || EMPTY_COMPILED_MESSAGE_TEXT,
           currentDay,
           formattedMessages.length > 0,
-          speakerMap
+          options?.currentMessageFrom ?? 'user',
+          options?.currentMessageAt
         )
       : ''
 
@@ -2934,6 +3235,8 @@ export class DatabaseService {
     
     // 6. Get clipped items from SESSION STATE (NEW approach - no more embedding in messages!)
     const clippedContent = []
+    // Provenance belongs beside structuredInput, never inside its Clip/EV payload.
+    const clipAddressSourceById = new Map<string, AddressSourceKind>()
     const clipsFromMessage: string[] = []
     const trustedClipIds = new Set<string>()
     
@@ -2997,6 +3300,8 @@ export class DatabaseService {
                       )
                     : '')
 
+                clipAddressSourceById.set(clip.id,
+                  (clip as any).uploadSettings?.source === 'artifact_share' ? 'agent_note' : 'user')
                 clippedContent.push({
                   clipId: clip.id,
                   content: decoded,
@@ -3251,7 +3556,7 @@ export class DatabaseService {
       }
     }
 
-    // SA-120 P2 (H1): the Jev Juice judgment-tool guidance sits directly after the DM
+    // SA-120 P2 (H1): the Judge Juice judgment-tool guidance sits directly after the DM
     // block and before MEMORY INSTRUCTIONS — one more "thing you can reach". Gated on the
     // agent's `jev_juice_judge_tool` switch alone, the same switch that opens `sys.judge.*`
     // in the broker (DL-120-06), so a control the agent cannot call is never taught.
@@ -3261,7 +3566,7 @@ export class DatabaseService {
       const jevPrompt = await this.resolveJevJuiceGuidancePrompt(agent, runtimeFlavor)
       if (jevPrompt.trim()) {
         if (mergedSystemPrompt) mergedSystemPrompt += '\n\n'
-        mergedSystemPrompt += `==== JEV JUICE (JUDGMENT TOOL) ====\n\n${jevPrompt}`
+        mergedSystemPrompt += `==== JUDGE JUICE (JUDGMENT TOOL) ====\n\n${jevPrompt}`
       }
     }
 
@@ -3307,6 +3612,9 @@ export class DatabaseService {
     // directly against the conversation. Its bytes come verbatim from the stored
     // fold snapshot (SA-110 P2), so mid-session awareness churn never moves them.
     // Nothing may be appended to mergedSystemPrompt after this point.
+    // BL-474 step 2: every block above is Batshit's text (the user's own prompts included);
+    // Awareness is the agent's memories.
+    const systemPromptBeforeAwareness = mergedSystemPrompt
     if (memoryCompileContext?.onMyMindBlock) {
       if (mergedSystemPrompt) mergedSystemPrompt += '\n\n'
       mergedSystemPrompt += memoryCompileContext.onMyMindBlock
@@ -3418,12 +3726,14 @@ export class DatabaseService {
     const standing: any[] = []
     const live: any[] = []
     if (standingMediaItems.length > 0) {
+      // SA-128 (DL-04): the manifest is one `<awareness_media>` element; the image parts it
+      // names follow it, exactly as before.
       standing.push({
         type: 'text',
-        text: [
-          '==== AWARENESS MEDIA (STANDING) ====',
-          ...standingMediaItems.map((item) => `- ${item.filename} — image`)
-        ].join('\n')
+        text: compiledElement(
+          COMPILED_TAG.awarenessMedia,
+          standingMediaItems.map((item) => `- ${item.filename} — image`).join('\n')
+        )
       })
       for (const item of standingMediaItems) {
         standing.push({ type: 'image_url', image_url: { url: item.dataUrl } })
@@ -3435,7 +3745,20 @@ export class DatabaseService {
     let textContent = ''
 
     const previousSnapshot = this.getPreviousDynamicSnapshot(contextMessages)
-    const zipStateSnapshot = this.buildZipStateSnapshot(contextMessages, zipState.getAllUnzipped())
+    // SA-129 P2: a hold on a copy this compile compressed as dead (an agent's hold on a copy it
+    // edited since) says so in `Current Zip State`, so the agent is never surprised.
+    const heldDeadCopies = new Map<string, DeadCopyReason>()
+    const heldSizeGuards = new Map<string, ToolResultSizeGuard>()
+    for (const compression of compiledHistory.compressedZips) {
+      if (compression.deadCopy) heldDeadCopies.set(normalizeId(compression.zipId), compression.deadCopy)
+      if (compression.sizeGuard) heldSizeGuards.set(normalizeId(compression.zipId), compression.sizeGuard)
+    }
+    const zipStateSnapshot = this.buildZipStateSnapshot(
+      contextMessages,
+      zipState.getAllUnzipped(),
+      heldDeadCopies,
+      heldSizeGuards
+    )
     const autoZipSummary = this.buildAutoZipSummary({
       agent,
       globalZipSettings
@@ -3448,14 +3771,10 @@ export class DatabaseService {
       !Array.isArray(options.projectRules)
         ? options.projectRules
         : agentDefaultProjectRules ?? null
-    const resolvedProjectPath =
-      options?.projectPath?.trim() ||
-      agentDefaultProjectPath?.trim() ||
-      defaultWorkspacePath?.trim() ||
-      null
     const controlErrorLines = buildControlErrorDcmLines(contextMessages as any[])
-    const dynamicInfo = currentMessageFormatted
+    const dynamicInfoResult = currentMessageFormatted
         ? await this.buildDynamicInfoBlock({
+          mcpGatewayScope: options?.mcpGatewayScope,
           userId: userId ?? null,
           controlErrorLines,
           currentUserMessage: currentUserMessage ?? null,
@@ -3490,22 +3809,23 @@ export class DatabaseService {
           whiteboardDcmLines: memoryCompileContext?.whiteboardDcmLines ?? [],
           awarenessPendingDcmLines: memoryCompileContext?.awarenessPendingDcmLines ?? []
         })
-      : ''
+      : { text: '', addressSourcePieces: [] }
+    const dynamicInfo = dynamicInfoResult.text
     const currentMessageForLLM = currentMessageFormatted
       ? dynamicInfo
         ? `${currentMessageFormatted}\n\n${dynamicInfo}`
         : currentMessageFormatted
       : ''
     
-    // Add previous conversation with label
+    // SA-128 (DL-01): `<conversation>` (and the zip index), then the new message and its
+    // `<dynamic_info>`. The tags carry the structure, so there are no section headers.
     if (resolvedChatHistory) {
-      textContent += `==== PREVIOUS CONVERSATION ====\n\n${resolvedChatHistory}`
+      textContent += resolvedChatHistory
     }
-    
-    // Add current message with label
+
     if (currentMessageForLLM) {
       if (textContent) textContent += '\n\n'
-      textContent += `==== CURRENT USER MESSAGE ====\n\n${currentMessageForLLM}`
+      textContent += currentMessageForLLM
     }
     
     // Add text as first content item
@@ -3519,33 +3839,62 @@ export class DatabaseService {
     
     // Add clipped items (user uploads) - KEEP THIS!
     // SA-104 P4: memory-carried clips (memorySource set) render under their own
-    // REMEMBERED MEDIA header — they are recalled media, not this message's uploads.
+    // `<remembered_media>` element — they are recalled media, not this message's uploads.
     const sessionClippedItems = dedupedClippedContent.filter(
       (item) => !(item as Record<string, any>).memorySource
     )
     const memoryClippedItems = dedupedClippedContent.filter(
       (item) => (item as Record<string, any>).memorySource
     )
-    const appendClippedItems = (items: typeof dedupedClippedContent, header: string) => {
+    const clippedSources: AddressSourcePiece[] = []
+    const appendClippedItems = (
+      items: typeof dedupedClippedContent,
+      tag: typeof COMPILED_TAG.clippedItems | typeof COMPILED_TAG.rememberedMedia
+    ) => {
       if (items.length === 0) return
       if (userContent[0].text) {
-        userContent[0].text += `\n\n==== ${header} ====`
         // SA-109 (DL-109-05): one named manifest in delivery order replaces the
         // per-history `[CLIPPED ITEM: batshit-clip-id: …]` markers. It is what
         // actually correlates the image parts below with their filenames — the
-        // old marker only ever existed on the no-image text path.
+        // old marker only ever existed on the no-image text path. SA-128 (DL-04): the
+        // manifest and any text clip bodies are one element, disarmed like any content.
+        const body: string[] = []
+        const sourcedBody: Array<{ source: AddressSourceKind; text: string }> = []
         for (const item of items) {
           const label = item.filename || item.description || item.clipId
-          userContent[0].text += `\n- ${label} — ${item.contentType}`
+          const line = `- ${label} — ${item.contentType}`
+          body.push(line)
+          sourcedBody.push({
+            source:
+              item.contentType === 'text'
+                ? clipAddressSourceById.get(item.clipId) ?? 'user'
+                : 'user',
+            text: line
+          })
         }
+        for (const item of items) {
+          // For text clips, inline the content for the AI
+          if (item.contentType === 'text' && typeof item.content === 'string') {
+            const label = item.filename || item.description || item.clipId
+            const content = `CONTENT (${label}):\n${item.content}`
+            body.push('', content)
+            sourcedBody.push({
+              source: clipAddressSourceById.get(item.clipId) ?? 'user',
+              text: content
+            })
+          }
+        }
+        const element = compiledElement(tag, body.join('\n'))
+        userContent[0].text += `\n\n${element}`
+        // BL-474 step 2: preserve each text Clip's maker. Memory-carried media keeps
+        // its existing source and image bytes remain non-text inputs.
+        clippedSources.push(
+          ...(tag === COMPILED_TAG.rememberedMedia
+            ? [{ source: 'memory' as const, text: element }]
+            : sourcedBody)
+        )
       }
       for (const item of items) {
-        // For text clips, inline the content for the AI
-        if (item.contentType === 'text' && typeof item.content === 'string') {
-          const label = item.filename || item.description || item.clipId
-          userContent[0].text += `\n\nCONTENT (${label}):\n${item.content}`
-        }
-
         // Images go as separate content items for vision models
         if (item.contentType === 'image' && item.content) {
           userContent.push({
@@ -3557,8 +3906,8 @@ export class DatabaseService {
         }
       }
     }
-    appendClippedItems(sessionClippedItems, 'CLIPPED ITEMS (USER UPLOADS)')
-    appendClippedItems(memoryClippedItems, 'REMEMBERED MEDIA (MEMORY)')
+    appendClippedItems(sessionClippedItems, COMPILED_TAG.clippedItems)
+    appendClippedItems(memoryClippedItems, COMPILED_TAG.rememberedMedia)
 
     // Add user message with proper content format
     const compiledUserContent = standing.length > 0 ? [...standing, ...live] : live
@@ -3628,11 +3977,47 @@ export class DatabaseService {
         }
       }
     }
+    // BL-474 step 2: the source of every piece above, for the reply-end decision.
+    const addressPieces: AddressSourcePiece[] = [
+      { source: 'batshit', text: systemPromptBeforeAwareness },
+      { source: 'memory', text: memoryCompileContext?.onMyMindBlock ?? '' },
+      {
+        source: 'memory',
+        text: standingMediaItems.length > 0 ? standingMediaItems.map((item) => item.filename).join('\n') : ''
+      },
+      ...(compiledHistory.addressSources ?? []),
+      {
+        source:
+          options?.currentMessageFrom === 'batshit'
+            ? (options.currentMessageAddressSource ?? 'agent_note')
+            : 'user',
+        text: currentMessageFormatted ? (currentUserMessageForAi ?? '') : ''
+      },
+      ...dynamicInfoResult.addressSourcePieces,
+      {
+        source: 'memory',
+        text: [
+          ...memoryDcmLines,
+          ...(memoryCompileContext?.whiteboardDcmLines ?? []),
+          ...(memoryCompileContext?.awarenessPendingDcmLines ?? [])
+        ].join('\n')
+      },
+      ...clippedSources
+    ]
+    const addressSources: CompiledAddressSources = {
+      unaccountedInputs: historyAddressSourcesMissing ? 1 : 0,
+      pieces: addressPieces.filter((piece) => typeof piece.text === 'string' && piece.text.length > 0),
+      nonTextInputs:
+        standingMediaItems.length +
+        dedupedClippedContent.filter((item) => item.contentType !== 'text').length
+    }
+
     return {
       structuredInput,  // The actual structured data
       primarySystemPrompt: compiledMainSystemPrompt || undefined,
       subagentDescription: subagentDescription,
-      resolvedProjectPath
+      resolvedProjectPath,
+      addressSources
     }
   }
 

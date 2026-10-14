@@ -6,10 +6,11 @@
   import SettingsSaveStatus from '$lib/components/settings/SettingsSaveStatus.svelte'
   import * as Label from '$lib/components/ui/label'
   import * as Switch from '$lib/components/ui/switch'
+  import { Button } from '$lib/components/ui/button'
   import { Separator } from '$lib/components/ui/separator'
-  import { Eye, Loader2 } from '@lucide/svelte'
+  import { Eye, Loader2, RefreshCw } from '@lucide/svelte'
   import { toast } from '$lib/components/ui/sonner/settings-toast'
-  import { setUserSettings } from '$lib/stores/userSettings.svelte'
+  import { confirmUserSettings as setUserSettings } from '$lib/stores/userSettings.svelte'
   import type { UserSettingsRow } from '$lib/types/database'
 
   const SAVE_DEBOUNCE_MS = 500
@@ -51,6 +52,14 @@
 
   let visualSettings = $state<VisualSettings>({ ...DEFAULT_VISUAL_SETTINGS })
   let isLoading = $state(true)
+  // BL-962: `visualSettings` holds saved values only after a real read of `/api/user/settings`
+  // succeeded. Until then it holds the defaults, which may never be written back: the save
+  // sends all eight keys and the route stores each key it is sent. So the switches are not
+  // offered and the autosave returns. The page's own copy does not count as a loaded copy: it is
+  // from when the page opened, and it cannot tell "no record yet" from "the read failed".
+  let settingsLoaded = $state(false)
+  let loadError = $state<string | null>(null)
+  let settingsLoadBusy = $state(false)
   let saveState = $state<'idle' | 'saving' | 'saved'>('idle')
   let saveError = $state<string | null>(null)
   let persistedSignature = $state(makeSignature(DEFAULT_VISUAL_SETTINGS))
@@ -85,7 +94,7 @@
         saveError = null
       })
 
-      if (updated) {
+      if (updated || result?.settings === null) {
         setUserSettings(updated)
       }
     } catch (error) {
@@ -107,7 +116,9 @@
   }, SAVE_DEBOUNCE_MS)
 
   $effect(() => {
-    if (isLoading || !userId) return
+    // BL-962: never a write built while no read of the saved settings succeeded. The switches are
+    // not offered then either; this line keeps the eight keys from being sent if one ever is.
+    if (isLoading || !settingsLoaded || !userId) return
 
     const signature = makeSignature(visualSettings)
     if (signature === persistedSignature) {
@@ -131,6 +142,7 @@
   })
 
   async function loadSettings() {
+    settingsLoadBusy = true
     try {
       const response = await fetch('/api/user/settings')
       if (!response.ok) {
@@ -140,22 +152,30 @@
 
       const result = await response.json()
       const remoteSettings: UserSettingsRow | null = result?.settings ?? null
-      applySettings(remoteSettings ?? data?.userSettings ?? null)
+      // The read is the only source: a read that succeeded and found no record opens with the
+      // defaults, never with the page's older copy.
+      applySettings(remoteSettings)
 
-      if (remoteSettings) {
+      if (remoteSettings || result?.settings === null) {
         setUserSettings(remoteSettings)
       }
+      untrack(() => {
+        // Set in the same synchronous run that resets the signature in `finally`, so the
+        // autosave effect that wakes on this flag finds nothing changed.
+        settingsLoaded = true
+      })
     } catch (error) {
       console.error('Zip visual indicator load failed:', error)
-      toast.error(error instanceof Error ? error.message : 'Failed to load visual indicator settings')
-      applySettings(data?.userSettings ?? null)
+      const message =
+        error instanceof Error ? error.message : 'Failed to load visual indicator settings'
+      toast.error(message)
       untrack(() => {
-        saveError =
-          error instanceof Error ? error.message : 'Failed to load visual indicator settings'
+        loadError = message
       })
     } finally {
       untrack(() => {
         isLoading = false
+        settingsLoadBusy = false
         persistedSignature = makeSignature(visualSettings)
       })
     }
@@ -208,6 +228,21 @@
   <div class="batshit-settings-group batshit-settings-caption flex items-center gap-2">
     <Loader2 class="h-4 w-4 animate-spin" aria-hidden="true" />
     <span>Loading zip visual indicator settings...</span>
+  </div>
+{:else if !settingsLoaded}
+  <!-- BL-962: the switches wait for a real read of the saved settings. -->
+  <div class="batshit-settings-inline-alert is-danger" data-testid="zip-visual-indicators-load-error">
+    <div class="flex items-center justify-between gap-2">
+      <span>
+        Visual Indicators settings could not load, so the Zipped Content and Unzipped Content
+        switches are hidden. Press Retry to load them.
+        {#if loadError}Details: {loadError}{/if}
+      </span>
+      <Button variant="outline" size="sm" onclick={loadSettings} disabled={settingsLoadBusy}>
+        <RefreshCw class={settingsLoadBusy ? 'h-3.5 w-3.5 animate-spin' : 'h-3.5 w-3.5'} />
+        Retry
+      </Button>
+    </div>
   </div>
 {:else}
   <SettingsAccordionCard

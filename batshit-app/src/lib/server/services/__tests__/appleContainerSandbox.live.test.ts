@@ -12,7 +12,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import { mkdtemp, realpath, rm } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import {
   buildAppleContainerSandboxName,
   cleanupAppleContainerSandboxesForSession,
@@ -29,6 +29,21 @@ function listContainerIds(): string[] {
 }
 
 describe.runIf(LIVE)('appleContainerSandbox (live Apple Container)', () => {
+  // A `system start` this test makes would record itself for the next Batshit quit to stop
+  // (BL-62 part 2). A test never writes into the real ~/.batshit, so the record goes to a temp folder.
+  let recordDir = ''
+  let savedRecordDir: string | undefined
+  beforeAll(async () => {
+    savedRecordDir = process.env.BATSHIT_APPLE_CONTAINER_STATE_DIR
+    recordDir = await mkdtemp(path.join(os.tmpdir(), 'batshit-apple-live-record-'))
+    process.env.BATSHIT_APPLE_CONTAINER_STATE_DIR = recordDir
+  })
+  afterAll(async () => {
+    if (savedRecordDir === undefined) delete process.env.BATSHIT_APPLE_CONTAINER_STATE_DIR
+    else process.env.BATSHIT_APPLE_CONTAINER_STATE_DIR = savedRecordDir
+    await rm(recordDir, { recursive: true, force: true })
+  })
+
   it('runs a chat’s parallel first commands in one freshly created sandbox', async () => {
     const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'batshit-apple-live-race-'))
     const workspaceRoot = await realpath(tempRoot)

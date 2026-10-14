@@ -188,6 +188,96 @@ describe('n8nCallbackTokens', () => {
     ).resolves.toEqual({ valid: false })
   })
 
+  it('binds a Workflow Subagent callback to its own id as well as its parent', async () => {
+    const result = await createN8nSseCallbackToken({
+      sessionId: 'sess-1', messageId: 'msg-1', userId: 'user-1',
+      agentId: 'parent-1', subagentId: 'workflow-1'
+    })
+    const request = new Request('http://localhost/api/native-tools/dispatch', {
+      headers: { [N8N_NATIVE_TOOL_CALLBACK_TOKEN_HEADER]: result.token }
+    })
+    const callback = (agentId: string | undefined, actorType = 'subagent') =>
+      validateN8nScopedCallbackRequest(request, {
+        userId: 'user-1',
+        context: {
+          session_id: 'sess-1', message_id: 'msg-1',
+          agent_id: agentId, parent_agent_id: 'parent-1', actor_type: actorType
+        }
+      }, 'user-1')
+
+    await expect(callback('workflow-1')).resolves.toMatchObject({ valid: true })
+    await expect(callback('workflow-2')).resolves.toEqual({ valid: false })
+    await expect(callback(undefined)).resolves.toEqual({ valid: false })
+    await expect(callback('parent-1', 'primary')).resolves.toEqual({ valid: false })
+    await expect(validateN8nScopedCallbackRequest(request, {
+      userId: 'user-1', agentId: 'workflow-1', parentAgentId: 'parent-1',
+      context: {
+        session_id: 'sess-1', message_id: 'msg-1',
+        agent_id: 'workflow-2', parent_agent_id: 'parent-1', actor_type: 'subagent'
+      }
+    }, 'user-1')).resolves.toEqual({ valid: false })
+    await expect(validateN8nScopedCallbackRequest(request, {
+      userId: 'user-1',
+      context: {
+        session_id: 'sess-1', message_id: 'msg-1',
+        agentId: 'workflow-1', agent_id: 'workflow-2',
+        parentAgentId: 'parent-1', parent_agent_id: 'parent-2',
+        actorType: 'subagent', actor_type: 'primary'
+      }
+    }, 'user-1')).resolves.toEqual({ valid: false })
+    await expect(validateN8nScopedCallbackRequest(request, {
+      userId: 'user-1', sessionId: 'sess-1', messageId: 'msg-1',
+      context: {
+        session_id: 'other-session', message_id: 'msg-1',
+        agent_id: 'workflow-1', parent_agent_id: 'parent-1', actor_type: 'subagent'
+      }
+    }, 'user-1')).resolves.toEqual({ valid: false })
+    await expect(isTrustedN8nSseCallbackRequest(
+      new Request('http://localhost/api/sse', {
+        headers: { [N8N_SSE_CALLBACK_TOKEN_HEADER]: result.token }
+      }),
+      { sessionId: 'sess-1', messageId: 'msg-1' }
+    )).resolves.toBe(true)
+  })
+
+  it('does not let a legacy parent-only token choose a Workflow Subagent scope', async () => {
+    const result = await createN8nSseCallbackToken({
+      sessionId: 'sess-1', messageId: 'msg-1', userId: 'user-1', agentId: 'parent-1'
+    })
+    const request = new Request('http://localhost/api/native-tools/dispatch', {
+      headers: { [N8N_NATIVE_TOOL_CALLBACK_TOKEN_HEADER]: result.token }
+    })
+    await expect(validateN8nScopedCallbackRequest(request, {
+      userId: 'user-1',
+      context: {
+        session_id: 'sess-1', message_id: 'msg-1',
+        agent_id: 'workflow-1', parent_agent_id: 'parent-1', actor_type: 'subagent'
+      }
+    })).resolves.toEqual({ valid: false })
+    await expect(validateN8nScopedCallbackRequest(request, {
+      userId: 'user-1', agentId: 'parent-1',
+      context: {
+        session_id: 'sess-1', message_id: 'msg-1',
+        actorType: 'primary', actor_type: 'subagent',
+        agent_id: 'workflow-1', parent_agent_id: 'parent-1'
+      }
+    })).resolves.toEqual({ valid: false })
+    await expect(validateN8nScopedCallbackRequest(request, {
+      userId: 'user-1', agentId: 'parent-1',
+      context: {
+        session_id: 'sess-1', message_id: 'msg-1',
+        actor_type: 'primary', agent_id: 'other-primary'
+      }
+    })).resolves.toEqual({ valid: false })
+    await expect(validateN8nScopedCallbackRequest(request, {
+      userId: 'user-1', sessionId: 'sess-1', messageId: 'msg-1',
+      context: {
+        session_id: 'other-session', message_id: 'msg-1',
+        actor_type: 'primary', agent_id: 'parent-1'
+      }
+    })).resolves.toEqual({ valid: false })
+  })
+
   it('rejects expired callback tokens and deletes their Redis record', async () => {
     const result = await createN8nSseCallbackToken({
       sessionId: 'sess-1',

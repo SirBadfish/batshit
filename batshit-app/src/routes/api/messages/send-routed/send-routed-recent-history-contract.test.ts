@@ -19,11 +19,11 @@ describe('send-routed: every history window is the newest messages', () => {
     expect(source).not.toContain('redis.getMessages(')
   })
 
-  it('an approval’s saved context is looked up among the newest messages', () => {
-    const start = source.indexOf('async function loadProviderMessagesForApprovalsFromRedis(')
-    expect(start).toBeGreaterThan(-1)
-    const body = source.slice(start, source.indexOf('\n}\n', start))
-    expect(body).toContain('await redis.getRecentMessages(sessionId, 300)')
+  it('an approval’s saved context is read from the card’s own message, with no window at all', () => {
+    // BL-322: the paused message's stored record, by id (`message:{sessionId}:{messageId}`), so
+    // no chat is long enough to push it out of reach.
+    expect(source).toContain('const approvalResumePrior = isApprovalResumeWithoutUserTurn\n    ? await readStoredAssistantRecord(sessionId, messageId)')
+    expect(source).not.toContain('loadProviderMessagesForApprovalsFromRedis')
   })
 
   it('the three-minute card check reads the newest messages', () => {

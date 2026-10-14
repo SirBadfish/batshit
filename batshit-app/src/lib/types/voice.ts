@@ -240,11 +240,13 @@ export interface VoiceEngineLocalRuntimeSummary {
    * True only when Batshit can actually stop THIS engine in THIS runtime: it
    * holds a launch recipe it recorded, and, in Docker, the host runtime add-on
    * operator records what it starts and can stop it (protocol revision 5 or
-   * later, `stop` in its host voice controls; not on Windows yet).
+   * later, `stop` in its host voice controls; Windows needs revision 9).
    * The client must not re-derive this; it is computed where the truth lives.
    */
   canStopOnShutdown?: boolean
   stopOnShutdownUnavailableReason?: VoiceEngineStopUnavailableReason
+  /** Server-derived runtime capability; never persisted as an engine startup preference. */
+  shutdownStopPolicy?: 'per-engine' | 'all-owned'
 }
 
 export type VoiceEngineRealtimeSttTransport = 'websocket'
@@ -351,7 +353,7 @@ export interface VoiceModeTurnSettings {
   autoSubmitDelayMs?: number
   endOfTurnThreshold?: number
   /**
-   * SA-120 P9: **Jev Juice: Quick Actions** (LS-060), default OFF. A spoken turn that asks Batshit itself
+   * SA-120 P9: **Judge Juice: Quick Actions** (LS-060), default OFF. A spoken turn that asks Batshit itself
    * for a small app action (stop, hang up, show or hide the Goon, open Settings, show the Execution
    * Viewer) runs it at once, without the agent. Global only: an agent's voice profile never sets it.
    * THE reader is `resolveJevQuickActionsEnabled` (`$lib/utils/jevJuiceQuickActions.ts`).

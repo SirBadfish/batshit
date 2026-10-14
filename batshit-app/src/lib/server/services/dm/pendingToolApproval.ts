@@ -15,6 +15,7 @@
  */
 
 import { redis } from '$lib/server/redis'
+import { hasWaitingClaudeApproval } from '$lib/server/services/claudeApprovalRegistry'
 
 /**
  * The stored shape is `ToolApprovalSummary` — `{ mode, approvals[], source }` — NOT an
@@ -37,6 +38,10 @@ function countsAsPending(entry: unknown): boolean {
 }
 
 export async function hasPendingToolApproval(sessionId: string): Promise<boolean> {
+  // BL-496 (A3): a Claude card waits INSIDE its running turn, and that turn's reply is not
+  // stored until it ends, so the stored message below still shows the reply before it. The
+  // server's record of the card answers for the wait, watched or not.
+  if (hasWaitingClaudeApproval(sessionId)) return true
   try {
     const messages = await redis.getRecentMessages(sessionId, 5)
     for (let index = messages.length - 1; index >= 0; index -= 1) {

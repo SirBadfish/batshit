@@ -2,6 +2,7 @@ import {
   RECIPE_MIGRATION_PLAN_CONTRACT,
   parseRecipeMigrationPlan,
 } from "./migrationPlanContracts";
+import { RECIPE_REVIEWED_STATE_CONTRACT } from "./contractIds";
 import {
   RECIPE_ARCHIVE_CONTAINMENT_RECEIPT_CONTRACT,
   parseRecipeStoredAssetRef,
@@ -14,6 +15,7 @@ import {
   RECIPE_LIVE_STATUSES,
   parseRecipeAuthoringRevision,
   parseRecipeRevisionBundle,
+  parseRecipeStateSnapshot,
   verifyRecipeAuthoringRevision,
   verifyRecipeRevisionBundle,
   type RecipeAuthoringRevision,
@@ -34,7 +36,6 @@ import {
   GOON_LIVE_BUILD_CONTRACT,
   parseGoonLiveBuildReceipt,
 } from "./liveBuildContracts";
-
 export const GOON_RECIPE_OWNER_V2_CONTRACT = "goon-recipe/v2" as const;
 export const GOON_RECIPE_REVISION_ENVELOPE_CONTRACT =
   "goon-recipe-revision-envelope/v1" as const;
@@ -438,6 +439,12 @@ function normalizedRecipeDocumentContent(
       string,
       unknown
     >;
+  }
+  if (documentContract === RECIPE_REVIEWED_STATE_CONTRACT) {
+    // A first bake/rebake stores the verified state inside this immutable
+    // wrapper. Apply its declared sibling precision before the wrapper hash,
+    // retaining every other field and every claimed nested hash exactly.
+    return { ...content, state: parseRecipeStateSnapshot(content.state) };
   }
   return content;
 }

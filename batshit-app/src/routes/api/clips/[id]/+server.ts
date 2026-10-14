@@ -1,3 +1,4 @@
+import { saveClipRecord } from '$lib/server/services/clipPersistence.server'
 import { json } from '@sveltejs/kit'
 import type { RequestHandler } from './$types'
 import { redis } from '$lib/server/redis'
@@ -130,7 +131,7 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
 
     // Save updated clip using RedisJSON (the set method will handle it)
     const storageClip = normalizeUploadUrlsForStorageInPayload(updatedClip)
-    await redis.set(`clip:${userId}:${clipId}`, storageClip)
+    await saveClipRecord(`clip:${userId}:${clipId}`, storageClip)
 
     return json(resolveUploadUrlsForBrowserInPayload(storageClip))
   } catch (error) {

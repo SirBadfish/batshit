@@ -4,9 +4,9 @@
   import { TYPESAFE_FEATURES } from '$lib/utils/jevJuice'
 
   /**
-   * SA-120 (DL-120-01/13) — the per-agent Jev Juice switches, one spine toggle per feature.
+   * SA-120 (DL-120-01/13) — the per-agent Judge Juice switches, one spine toggle per feature.
    * Every one defaults OFF. The wording is the LS-049/LS-050 convention:
-   * `Jev Juice: <what it does>`, and each (i) says exactly what text leaves the machine
+   * `Judge Juice: <what it does>`, and each (i) says exactly what text leaves the machine
    * when it is on.
    *
    * - P1 **Suggest Skills and Tools** (LS-049): Batshit asks Jev before each reply.
@@ -61,17 +61,18 @@
 <div class="batshit-settings-toggle-row is-spine-toggle">
   <div class="batshit-settings-form-label-line">
     <span class="batshit-settings-parent-label">{TYPESAFE_FEATURES.skill_tool_hints.switchLabel}</span>
-    <SettingsInfoMenu ariaLabel="About Jev Juice skill and tool hints" contentClass="w-80">
+    <SettingsInfoMenu ariaLabel="About Judge Juice skill and tool hints" contentClass="w-80">
       <p>
-        Before each reply, Batshit asks TypeSafe's Jev model which of this agent's skills or tools the
+        Before each reply, Batshit asks your judge which of this agent's skills or tools the
         message most likely needs, and whether it needs something that is turned off for this agent.
         The agent gets a one-line hint it may ignore; you get a small note on the reply when a
         capability is missing.
       </p>
       <p>
         When this is on, the text of your message, this agent's skill names, its tool names, and the
-        names of capabilities it does not have leave this computer and go to TypeSafe's servers.
-        Nothing else is sent. Off by default; needs Jev Juice turned on in Settings → Admin.
+        names of capabilities it does not have are sent to the judge chosen in Settings → Admin →
+        Judge Juice (Jev at TypeSafe unless you changed it). The card there says where each judge
+        runs. Nothing else is sent. Off by default; needs Judge Juice turned on in Settings → Admin.
       </p>
     </SettingsInfoMenu>
   </div>
@@ -86,18 +87,19 @@
 <div class="batshit-settings-toggle-row is-spine-toggle">
   <div class="batshit-settings-form-label-line">
     <span class="batshit-settings-parent-label">{TYPESAFE_FEATURES.judge_ask.switchLabel}</span>
-    <SettingsInfoMenu ariaLabel="About the Jev Juice judgment tool" contentClass="w-80">
+    <SettingsInfoMenu ariaLabel="About the Judge Juice judgment tool" contentClass="w-80">
       <p>
-        Gives this agent a tool that hands a piece of text or data plus typed questions to TypeSafe's
-        Jev model and gets probabilities back: is this true, which of these, where on this scale. The
-        agent decides what to do with the numbers. Jev never writes text, never approves anything,
+        Gives this agent a tool that hands a piece of text or data plus typed questions to your judge
+        and gets probabilities back: is this true, which of these, where on this scale. The agent
+        decides what to do with the numbers. The judge never writes text, never approves anything,
         and never acts on its own.
       </p>
       <p>
-        When this is on, whatever the agent puts in a call leaves this computer and goes to TypeSafe's
-        servers. That can include parts of your messages, files, or search results the agent chooses
-        to send. Every call shows in the Execution Viewer. Off by default; needs Jev Juice turned on
-        in Settings → Admin.
+        When this is on, whatever the agent puts in a call is sent to the judge chosen in Settings →
+        Admin → Judge Juice (Jev at TypeSafe unless you changed it); the card there says where each
+        judge runs. That can include parts of your messages, files, or search results the agent
+        chooses to send. Every call shows in the Execution Viewer. Off by default; needs Judge Juice
+        turned on in Settings → Admin.
       </p>
     </SettingsInfoMenu>
   </div>
@@ -112,18 +114,20 @@
 <div class="batshit-settings-toggle-row is-spine-toggle">
   <div class="batshit-settings-form-label-line">
     <span class="batshit-settings-parent-label">{TYPESAFE_FEATURES.memory_rerank.switchLabel}</span>
-    <SettingsInfoMenu ariaLabel="About the Jev Juice memory search rerank" contentClass="w-80">
+    <SettingsInfoMenu ariaLabel="About the Judge Juice memory search rerank" contentClass="w-80">
       <p>
         When this agent searches its memories, Batshit looks at a longer list of matches than the
-        agent asked for and asks TypeSafe's Jev model how well each one answers the search. That
+        agent asked for and asks your judge how well each one answers the search. That
         judgment joins the usual ranking (match, freshness, importance), so a memory that truly
-        answers the search can reach the top even when it is old. If Jev does not answer, the agent
-        gets the usual ranking and is told so.
+        answers the search can reach the top even when it is old. If the judge does not answer, the
+        agent gets the usual ranking and is told so.
       </p>
       <p>
-        When this is on, the agent's search words and the text of up to 25 matching memories leave
-        this computer and go to TypeSafe's servers, each time the agent searches. Needs Agent Memory
-        on for this agent. Off by default; needs Jev Juice turned on in Settings → Admin.
+        When this is on, the agent's search words and the text of up to 25 matching memories are
+        sent to the judge chosen in Settings → Admin → Judge Juice (Jev at TypeSafe unless you
+        changed it), each time the agent searches; the card there says where each judge runs. Needs
+        Agent Memory on for this agent. Off by default; needs Judge Juice turned on in Settings →
+        Admin.
       </p>
     </SettingsInfoMenu>
   </div>
@@ -138,19 +142,21 @@
 <div class="batshit-settings-toggle-row is-spine-toggle">
   <div class="batshit-settings-form-label-line">
     <span class="batshit-settings-parent-label">{TYPESAFE_FEATURES.memory_recall.switchLabel}</span>
-    <SettingsInfoMenu ariaLabel="About Jev Juice recall by meaning" contentClass="w-80">
+    <SettingsInfoMenu ariaLabel="About Judge Juice recall by meaning" contentClass="w-80">
       <p>
         Today a long-term memory reaches this agent only when the agent stops to search for it, and
         trigger memories need their exact trigger words. With this on, before each reply Batshit
-        finds the long-term memories closest to your message and asks TypeSafe's Jev model which
+        finds the long-term memories closest to your message and asks your judge which
         ones would change the answer. Up to three are placed in the agent's context, marked as
         inferred, and they linger like any recalled memory. The agent is told Batshit brought them
-        in. If Jev does not answer in time, the message is sent without them and a small note says so.
+        in. If the judge does not answer in time, the message is sent without them and a small note says so.
       </p>
       <p>
         When this is on, the text of each message you send and the text of up to 20 of this agent's
-        long-term memories leave this computer and go to TypeSafe's servers, on every message. Needs
-        Agent Memory on for this agent. Off by default; needs Jev Juice turned on in Settings → Admin.
+        long-term memories are sent to the judge chosen in Settings → Admin → Judge Juice (Jev at
+        TypeSafe unless you changed it), on every message; the card there says where each judge runs.
+        Needs Agent Memory on for this agent. Off by default; needs Judge Juice turned on in Settings →
+        Admin.
       </p>
     </SettingsInfoMenu>
   </div>
@@ -165,11 +171,11 @@
 <div class="batshit-settings-toggle-row is-spine-toggle">
   <div class="batshit-settings-form-label-line">
     <span class="batshit-settings-parent-label">{TYPESAFE_FEATURES.reply_check.switchLabel}</span>
-    <SettingsInfoMenu ariaLabel="About the Jev Juice reply check" contentClass="w-80">
+    <SettingsInfoMenu ariaLabel="About the Judge Juice reply check" contentClass="w-80">
       <p>
         After each reply from this agent, Batshit compares what the reply says with what the turn
         really did. It already knows which tools ran, whether one failed, and whether a memory was
-        saved. It asks TypeSafe's Jev model only about the wording: does the reply say it did
+        saved. It asks your judge only about the wording: does the reply say it did
         something no tool call matches, does it promise to remember when nothing was saved, does it
         stay quiet about a failed step, did it miss part of your message. You get a small chip under
         the reply, and the agent is told once, on its next turn. The reply itself is never changed.
@@ -177,8 +183,9 @@
       <p>
         When this is on, your message, the agent's finished reply, and the one-line labels of the
         tools it used in this chat (tool names, file paths, commands, search words, web addresses,
-        never their content) leave this computer and go to TypeSafe's servers, after every reply.
-        Off by default; needs Jev Juice turned on in Settings → Admin.
+        never their content) are sent to the judge chosen in Settings → Admin → Judge Juice (Jev at
+        TypeSafe unless you changed it), after every reply; the card there says where each judge
+        runs. Off by default; needs Judge Juice turned on in Settings → Admin.
       </p>
     </SettingsInfoMenu>
   </div>
@@ -193,18 +200,19 @@
 <div class="batshit-settings-toggle-row is-spine-toggle">
   <div class="batshit-settings-form-label-line">
     <span class="batshit-settings-parent-label">{TYPESAFE_FEATURES.style_coach.switchLabel}</span>
-    <SettingsInfoMenu ariaLabel="About the Jev Juice style coach" contentClass="w-80">
+    <SettingsInfoMenu ariaLabel="About the Judge Juice style coach" contentClass="w-80">
       <p>
         After each reply from this agent, Batshit counts repeated openings, closings, and stock
-        phrases across its recent replies, on this computer. It then asks TypeSafe's Jev model two
+        phrases across its recent replies, on this computer. It then asks your judge two
         things counting cannot see: whether the agent keeps opening by praising you, and whether its
         replies lean on the same habit. You get a small chip under the reply, and the agent is told
         once, on its next turn, so it can vary its wording. The reply itself is never changed.
       </p>
       <p>
         When this is on, the agent's finished reply and its three replies before it (shortened)
-        leave this computer and go to TypeSafe's servers, after every reply. Off by default; needs
-        Jev Juice turned on in Settings → Admin.
+        are sent to the judge chosen in Settings → Admin → Judge Juice (Jev at TypeSafe unless you
+        changed it), after every reply; the card there says where each judge runs. Off by default;
+        needs Judge Juice turned on in Settings → Admin.
       </p>
     </SettingsInfoMenu>
   </div>

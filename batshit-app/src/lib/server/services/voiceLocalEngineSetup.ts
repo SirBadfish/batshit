@@ -1,4 +1,5 @@
-import { spawn } from 'node:child_process'
+import { spawn, type ChildProcess } from 'node:child_process'
+import { stripHostOperatorAuthorityFromChildEnv } from './cliChildEnv'
 import { closeSync, openSync } from 'node:fs'
 import { mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
@@ -38,6 +39,10 @@ import {
   resolveVoiceRuntimeLaunchOwner,
   writeLocalRuntimeLaunchRecord
 } from '$lib/server/services/voiceRuntimeLaunchRecords'
+import {
+  spawnReparentedRuntime,
+  type ReparentedRuntimeLaunch
+} from '$lib/server/services/voiceRuntimeReparent'
 import { logger } from '$lib/utils/logger'
 export {
   resolveLocalVoiceRuntimeLaunchRecordPath,
@@ -883,14 +888,20 @@ async function chooseSmokeVoiceId(
   return voices[0]?.id ?? null
 }
 
-async function spawnDetachedRuntime(options: {
-  command: string
-  args: string[]
-  cwd: string
-  env: Record<string, string>
-  unsetEnv?: string[]
-  logPath: string
-}): Promise<number> {
+// Starts the runtime and answers its pid once `record(pid)` has written its launch record. On macOS
+// and Linux a launch that fails stops its runtime, except in the gap `voiceRuntimeReparent.ts`
+// names (its launcher ended by a signal it cannot catch), where the error names the pid.
+async function spawnDetachedRuntime(
+  options: {
+    command: string
+    args: string[]
+    cwd: string
+    env: Record<string, string>
+    unsetEnv?: string[]
+    logPath: string
+  },
+  record: (pid: number) => Promise<void>
+): Promise<number> {
   await mkdir(path.dirname(options.logPath), { recursive: true })
 
   // The log path is a Batshit-owned runtime file opened for detached child stdout.
@@ -900,38 +911,66 @@ async function spawnDetachedRuntime(options: {
   // codeql[js/file-system-race]
   const stderrFd = openSync(options.logPath, 'a')
 
-  return await new Promise<number>((resolve, reject) => {
-    let settled = false
+  const childEnv = { ...process.env }
+  for (const envName of options.unsetEnv ?? []) {
+    delete childEnv[envName]
+  }
+  const launch = {
+    command: options.command,
+    args: options.args,
+    cwd: options.cwd,
+    env: stripHostOperatorAuthorityFromChildEnv({
+      ...childEnv,
+      ...options.env
+    }),
+    stdoutFd,
+    stderrFd
+  }
 
-    const cleanup = () => {
-      try {
-        closeSync(stdoutFd)
-      } catch {}
-      try {
-        closeSync(stderrFd)
-      } catch {}
+  try {
+    // A teardown that walks parent links (Pinokio's Stop, the native launcher's) reaches every
+    // descendant of the app, detached or not, so on macOS and Linux the runtime is started
+    // through a short-lived intermediate that owns it until its record is written and then
+    // leaves it to launchd or init (BL-1252, BL-1258). A launcher failure is a launch failure:
+    // never a direct spawn instead.
+    if (process.platform !== 'win32') {
+      return await spawnReparentedRuntime(launch, record)
     }
+    const child = await spawnDetachedChild(launch)
+    const pid = child.pid ?? 0
+    try {
+      await record(pid)
+    } catch (error) {
+      throw await stopUnrecordedChild(child, error)
+    }
+    return pid
+  } finally {
+    try {
+      closeSync(stdoutFd)
+    } catch {}
+    try {
+      closeSync(stderrFd)
+    } catch {}
+  }
+}
+
+// Windows (no Pinokio lane there): the runtime is this process's own detached child. Its handle is
+// kept, so a launch whose record cannot be written can stop the child it started (BL-1274).
+function spawnDetachedChild(launch: ReparentedRuntimeLaunch): Promise<ChildProcess> {
+  return new Promise<ChildProcess>((resolve, reject) => {
+    let settled = false
 
     const fail = (error: Error) => {
       if (settled) return
       settled = true
-      cleanup()
       reject(error)
     }
 
-    const childEnv = { ...process.env }
-    for (const envName of options.unsetEnv ?? []) {
-      delete childEnv[envName]
-    }
-
-    const child = spawn(options.command, options.args, {
-      cwd: options.cwd,
-      env: {
-        ...childEnv,
-        ...options.env
-      },
+    const child = spawn(launch.command, launch.args, {
+      cwd: launch.cwd,
+      env: launch.env,
       detached: true,
-      stdio: ['ignore', stdoutFd, stderrFd]
+      stdio: ['ignore', launch.stdoutFd, launch.stderrFd]
     })
 
     child.once('error', (error) => {
@@ -950,12 +989,49 @@ async function spawnDetachedRuntime(options: {
       setTimeout(() => {
         if (settled) return
         settled = true
-        cleanup()
         child.unref()
-        resolve(child.pid ?? 0)
+        resolve(child)
       }, 200)
     })
   })
+}
+
+const UNRECORDED_CHILD_STOP_WAIT_MS = 2_000
+
+/**
+ * A Windows launch whose record could not be written must not leave its runtime running with
+ * nothing that can stop it (BL-1274). Only this launch's own child is stopped, through its unreaped
+ * handle, and only while that handle says it still runs: an exited child, whose pid may already
+ * belong to another process, is never signalled. Only that process is stopped: programs it started
+ * itself are not reached (no process tree on Windows). The record's error stays the error; when the
+ * stop cannot be confirmed, it says so and names the process. Exported for its tests.
+ */
+export async function stopUnrecordedChild(
+  child: ChildProcess,
+  failure: unknown,
+  waitMs = UNRECORDED_CHILD_STOP_WAIT_MS
+): Promise<Error> {
+  const error = failure instanceof Error ? failure : new Error(String(failure))
+  if (child.exitCode !== null || child.signalCode !== null) return error
+  // A kill Node cannot deliver is reported as an `error` event; it must not become an uncaught one.
+  child.on('error', () => {})
+  const ended = new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => resolve(false), waitMs)
+    child.once('exit', () => {
+      clearTimeout(timer)
+      resolve(true)
+    })
+  })
+  try {
+    child.kill('SIGKILL')
+  } catch {}
+  // Its own `exit` is the only proof, whether the kill was delivered or the child ended by itself
+  // just before (the kill then finds it gone).
+  if (await ended) return error
+  return new Error(
+    `${error.message} Batshit could not confirm that it stopped the engine process it started (process ${child.pid}): it may still be running with no launch record. Restarting the computer stops it.`,
+    { cause: error }
+  )
 }
 
 export async function prepareLocalVoiceRuntimeLaunch(options: {
@@ -1047,25 +1123,27 @@ export async function startLocalVoiceRuntime(options: {
   assertCanLaunchLocalVoiceRuntimeInCurrentRuntime()
 
   const prepared = await prepareLocalVoiceRuntimeLaunch(options)
-  const pid = await spawnDetachedRuntime({
-    command: prepared.launchCommand,
-    args: prepared.launchArgs,
-    cwd: prepared.launchCwd,
-    env: prepared.launchEnv,
-    unsetEnv: prepared.launchUnsetEnv,
-    logPath: prepared.logPath
-  })
-
-  await recordDetachedLaunch({
-    engineId: normalizeEngineId(options.engineId),
-    pid,
-    command: prepared.launchCommand,
-    args: prepared.launchArgs,
-    cwd: prepared.launchCwd,
-    logPath: prepared.logPath,
-    stopOnShutdown: options.stopOnShutdown !== false,
-    endpoint: options.endpoint
-  })
+  const pid = await spawnDetachedRuntime(
+    {
+      command: prepared.launchCommand,
+      args: prepared.launchArgs,
+      cwd: prepared.launchCwd,
+      env: prepared.launchEnv,
+      unsetEnv: prepared.launchUnsetEnv,
+      logPath: prepared.logPath
+    },
+    (launchedPid) =>
+      recordDetachedLaunch({
+        engineId: normalizeEngineId(options.engineId),
+        pid: launchedPid,
+        command: prepared.launchCommand,
+        args: prepared.launchArgs,
+        cwd: prepared.launchCwd,
+        logPath: prepared.logPath,
+        stopOnShutdown: options.stopOnShutdown !== false,
+        endpoint: options.endpoint
+      })
+  )
 
   return {
     ...prepared,
@@ -1172,29 +1250,32 @@ export async function completeLocalVoiceEngineSetup(
     await writeStateSnapshot(result)
 
     try {
-      pid = await spawnDetachedRuntime({
-        command: preparedLaunch.launchCommand,
-        args: preparedLaunch.launchArgs,
-        cwd: preparedLaunch.launchCwd,
-        env: preparedLaunch.launchEnv,
-        unsetEnv: preparedLaunch.launchUnsetEnv,
-        logPath: preparedLaunch.logPath
-      })
-      await recordDetachedLaunch({
-        engineId,
-        pid,
-        command: preparedLaunch.launchCommand,
-        args: preparedLaunch.launchArgs,
-        cwd: preparedLaunch.launchCwd,
-        logPath: preparedLaunch.logPath,
-        // Re-running setup must not silently re-enable "Stop with Batshit" for
-        // someone who turned it off, the same way it preserves their existing
-        // "Start with Batshit" choice.
-        stopOnShutdown: shouldStopVoiceRuntimeOnShutdown(
-          (await getVoiceEngineRecord(userId, engineId))?.localRuntime?.startup
-        ),
-        endpoint: normalizedPayload.baseUrl
-      })
+      pid = await spawnDetachedRuntime(
+        {
+          command: preparedLaunch.launchCommand,
+          args: preparedLaunch.launchArgs,
+          cwd: preparedLaunch.launchCwd,
+          env: preparedLaunch.launchEnv,
+          unsetEnv: preparedLaunch.launchUnsetEnv,
+          logPath: preparedLaunch.logPath
+        },
+        async (launchedPid) =>
+          recordDetachedLaunch({
+            engineId,
+            pid: launchedPid,
+            command: preparedLaunch.launchCommand,
+            args: preparedLaunch.launchArgs,
+            cwd: preparedLaunch.launchCwd,
+            logPath: preparedLaunch.logPath,
+            // Re-running setup must not silently re-enable "Stop with Batshit" for
+            // someone who turned it off, the same way it preserves their existing
+            // "Start with Batshit" choice.
+            stopOnShutdown: shouldStopVoiceRuntimeOnShutdown(
+              (await getVoiceEngineRecord(userId, engineId))?.localRuntime?.startup
+            ),
+            endpoint: normalizedPayload.baseUrl
+          })
+      )
     } catch (error) {
       return blockResult(
         result,

@@ -297,6 +297,12 @@ export function formatParameterDisplayValue(definition: ParameterDefinition, val
 
 export function formatPrice(value?: number | null) {
   if (value === undefined || value === null) return null
-  const formatted = Number(value).toFixed(3)
-  return formatted.replace(/\.?0+$/, '')
+  const amount = Number(value)
+  // A real price below a tenth of a cent keeps two significant digits instead
+  // of rounding to a false "0" (the gateway lists whisper-1 at $0.0001/M).
+  const magnitude = Math.abs(amount)
+  const decimals =
+    magnitude > 0 && magnitude < 0.001 ? Math.min(12, Math.ceil(-Math.log10(magnitude)) + 1) : 3
+  const formatted = amount.toFixed(decimals)
+  return formatted.includes('.') ? formatted.replace(/\.?0+$/, '') : formatted
 }

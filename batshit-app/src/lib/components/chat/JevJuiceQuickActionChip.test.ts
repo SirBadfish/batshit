@@ -4,7 +4,7 @@ import JevJuiceQuickActionChip from './JevJuiceQuickActionChip.svelte'
 import { QUICK_ACTION_MARK_DETAIL_TEXT } from '$lib/utils/jevJuiceQuickActions'
 
 /**
- * SA-120 P9 — the mark under a spoken user message Batshit acted on: what was done, by Jev,
+ * SA-120 P9 — the mark under a spoken user message Batshit acted on: what was done, by the judge,
  * with its confidence, and whether anything went to the agent (DL-120-15: the user always sees it).
  */
 
@@ -15,7 +15,7 @@ describe('JevJuiceQuickActionChip', () => {
     })
     const chip = screen.getByTestId('jev-juice-quick-action')
     expect(chip.getAttribute('data-action-id')).toBe('open_goon_dock')
-    expect(chip.textContent).toContain('Quick action by Jev: opened the Goon Dock (98% confidence)')
+    expect(chip.textContent).toContain('Quick action by the judge: opened the Goon Dock (98% confidence)')
     await fireEvent.click(screen.getByRole('button', { name: 'Show what this quick action did' }))
     expect((await screen.findByTestId('jev-juice-quick-action-routing')).textContent).toBe('Nothing was sent to Faye.')
     expect(screen.getByText(QUICK_ACTION_MARK_DETAIL_TEXT)).toBeTruthy()

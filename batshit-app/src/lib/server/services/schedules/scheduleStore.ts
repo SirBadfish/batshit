@@ -24,6 +24,7 @@ import { randomBytes } from 'node:crypto'
 import { redis } from '$lib/server/redis'
 import { normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
 import { resolveAgentDmsEnabled } from '$lib/utils/dmControl'
+import { closeUnreadScheduleDms } from '$lib/server/services/dm/dmStore'
 import {
   MAX_SCHEDULES_PER_AGENT,
   MAX_SCHEDULES_PER_INSTANCE,
@@ -499,11 +500,21 @@ export async function patchSchedule(options: {
   return toScheduleSummary(updated)
 }
 
+/**
+ * Delete one schedule, and close the notes it left unread (BL-401 S4).
+ *
+ * A `new` note from this schedule is about a schedule that is gone, so it closes with a result
+ * that says why. A note the agent works on stays (`closeUnreadScheduleDms` says which). The
+ * notes close FIRST: a Redis failure there then fails the whole delete, and the user's retry
+ * finds the schedule still there and closes whatever is left, where the other order would
+ * answer an error about a schedule that was in fact gone.
+ */
 export async function deleteSchedule(options: {
   userId: string
   scheduleId: unknown
 }): Promise<void> {
   const record = await requireOwnedSchedule(options.userId, options.scheduleId)
+  await closeUnreadScheduleDms({ agentId: record.agentId, scheduleId: record.id })
   await redis.del(scheduleKey(record.id))
   await removeIndexMember(record.userId, record.id)
   invalidateScheduleDueCache()
@@ -665,7 +676,9 @@ export async function clearMissedRun(options: {
  * must call this BEFORE it removes the agent record.
  */
 export async function sweepAgentSchedules(agentId: string): Promise<number> {
-  const record = (await redis.get(`agent:${agentId}`)) as Record<string, any> | null
+  // BL-608: a failed read of the agent must stop the delete, not read as "no agent" (which
+  // `redis.get` answers it with) and leave its schedules ticking for a deleted agent.
+  const record = (await redis.json.get(`agent:${agentId}`)) as Record<string, any> | null
   const userId = typeof record?.user_id === 'string' ? record.user_id : null
   if (!userId) return 0
 

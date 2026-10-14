@@ -1,3 +1,4 @@
+import { storeGoonReferenceRecordForClient } from '$lib/server/services/goonCustomAssetOwnership.server'
 import { json, type RequestHandler } from '@sveltejs/kit'
 import { redis } from '$lib/server/redis'
 import {
@@ -401,7 +402,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
         updated_at: now
       }
 
-      await client.json.set(key, '$', nextLibrary as any)
+      await storeGoonReferenceRecordForClient(client, key, nextLibrary, locals.user!.id)
       return { library: nextLibrary, replacedEntry: replaced }
     })
 
@@ -497,7 +498,7 @@ export const PATCH: RequestHandler = async ({ request, locals }) => {
         updated_at: new Date().toISOString()
       }
 
-      await client.json.set(key, '$', nextLibrary as any)
+      await storeGoonReferenceRecordForClient(client, key, nextLibrary, locals.user!.id)
       return nextLibrary
     })
 
@@ -550,7 +551,7 @@ export const DELETE: RequestHandler = async ({ request, locals }) => {
 	        updated_at: new Date().toISOString()
 	      }
 
-	      await client.json.set(key, '$', nextLibrary as any)
+	      await storeGoonReferenceRecordForClient(client, key, nextLibrary, locals.user!.id)
 	      return { library: nextLibrary, removedEntries }
 	    })
 

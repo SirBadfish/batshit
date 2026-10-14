@@ -7,7 +7,7 @@ import type { TypesafeConfig } from '$lib/types/typesafe'
 import type { TypesafeClient, TypesafeSystemOneRequest } from '../../typesafe/typesafeClient'
 
 /**
- * SA-120 P4a — `searchMemoriesOp` with the Jev Juice rerank wired in, against the real
+ * SA-120 P4a — `searchMemoriesOp` with the Judge Juice rerank wired in, against the real
  * Redis 8 search index (dedicated db0 lane, `npm run test:memory`).
  *
  * Three things only real FT.HYBRID can prove:
@@ -197,9 +197,9 @@ describe.runIf(memorySearchLaneActive())('memory search rerank (dedicated Redis 
     expect(JSON.stringify(result.results)).toBe(JSON.stringify(expected))
     expect(result.results.some((row) => 'jev_relevance' in row)).toBe(false)
     expect(result.results.at(-1)).toMatchObject({ id: replaced.saved.id, superseded: true, superseded_by: winner.saved.id })
-    // The note is today's note to the last character: nothing about Jev Juice.
+    // The note is today's note to the last character: nothing about Judge Juice.
     expect(result.note.endsWith(USUAL_NOTE_END)).toBe(true)
-    expect(result.note).not.toContain('Jev Juice')
+    expect(result.note).not.toContain('Judge Juice')
   })
 
   it('the wider search really widens the vector leg on the pinned Redis', async () => {
@@ -279,7 +279,7 @@ describe.runIf(memorySearchLaneActive())('memory search rerank (dedicated Redis 
     expect(jev.calls).toBe(1)
     expect(JSON.stringify(missed.results)).toBe(JSON.stringify(off.results))
     expect(missed.note).toBe(
-      `${off.note} Jev Juice did not rerank this search (TypeSafe did not answer in time.); the order is the usual ranking.`
+      `${off.note} Judge Juice did not rerank this search (TypeSafe did not answer in time.); the order is the usual ranking.`
     )
 
     // An answer set with one memory unjudged is never partly trusted: the OFF rows again.
@@ -295,7 +295,7 @@ describe.runIf(memorySearchLaneActive())('memory search rerank (dedicated Redis 
       { query: 'Josh project note', limit: 6 }
     )
     expect(JSON.stringify(half.results)).toBe(JSON.stringify(off.results))
-    expect(half.note).toBe(`${off.note} Jev Juice did not rerank this search (an answer was missing.); the order is the usual ranking.`)
+    expect(half.note).toBe(`${off.note} Judge Juice did not rerank this search (an answer was missing.); the order is the usual ranking.`)
 
     // Master switch OFF with the agent switch ON: no call at all (DL-120-11), same rows.
     configState.config = { ...configState.config, enabled: false }
@@ -306,6 +306,6 @@ describe.runIf(memorySearchLaneActive())('memory search rerank (dedicated Redis 
     )
     expect(masterOffJev.calls).toHaveLength(0)
     expect(JSON.stringify(masterOff.results)).toBe(JSON.stringify(off.results))
-    expect(masterOff.note).toContain('Jev Juice is off in Settings → Admin.')
+    expect(masterOff.note).toContain('Judge Juice is off in Settings → Admin.')
   })
 })

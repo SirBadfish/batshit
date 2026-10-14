@@ -61,6 +61,7 @@ The official templates use Batshit's underscore payload fields:
 - `message_id`
 - `subagent_id`
 - `subagent_slug`
+- `subagent_thread_id`
 - `parent_agent_id`
 - `primary_agent_type`
 - `subagentPrompts`
@@ -89,6 +90,16 @@ The HTTP Request Tool can expose the supported Subagent helper surface, includin
 `batshit_tool_search` returns labeled references for discoverable MCP tools, saved CLI Tools, published Artifact runtime tools, and Agent Browser capabilities. `batshit_tool_use` receives the exact reference returned by search.
 
 Subagent tool scope is intentionally narrower than the parent Primary Agent. Subagents use their own Tool Grid and cannot fetch a prior Batshit Zip directly; have the Primary Agent fetch or summarize that context first.
+
+## Conversation threads
+
+Batshit sends `subagent_thread_id` with each Workflow Subagent call. A fresh call creates a new id; a resumed call reuses that Subagent's current id in the chat. Both official templates use this Redis Chat Memory key:
+
+```text
+subagent_sessions:<session_id>:subagent:<subagent_slug>:<subagent_thread_id>
+```
+
+Keep the seven-day `sessionTTL` (`604800`). The old conversation expires after a fresh call moves to a new id. Batshit backs up the current thread id, but not conversations in external n8n Redis. If an imported workflow predates thread control, re-import the current template or update that memory key and expiry; updating Batshit does not edit an already-imported workflow.
 
 ## Redis memory
 

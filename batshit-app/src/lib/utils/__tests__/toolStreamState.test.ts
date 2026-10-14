@@ -4,7 +4,8 @@ import {
   buildToolStreamStateFromEvents,
   injectZipReferencesIntoReplayEvents,
   composeToolStreamContent,
-  composeToolStreamContentFromEvents
+  composeToolStreamContentFromEvents,
+  resetToolStreamStateFromContent
 } from '$lib/utils/toolStreamState'
 
 describe('toolStreamState helpers', () => {
@@ -126,5 +127,47 @@ describe('toolStreamState helpers', () => {
     const output = composeToolStreamContentFromEvents(replay)
     expect(output.indexOf('Intro.')).toBeLessThan(output.indexOf('cool_tool_1'))
     expect(output.indexOf('cool_tool_1')).toBeLessThan(output.indexOf('Outro.'))
+  })
+
+  // BL-759: a managed lane took a segment of the reply back; the server sends the reply's text as
+  // it now reads (`content_reset`). The tab rebuilds its live text from it and keeps its tool cards:
+  // a finished card from its reference in the text, a card still running (a position only) where
+  // it was, and a card the tab drew with no reference of the server's (a missing zip) too.
+  describe('resetToolStreamStateFromContent (BL-759)', () => {
+    const card = '{{batshit-zip:cool_tool_1:::tool execution}}'
+
+    it('rebuilds the text and the finished cards from the server’s content', () => {
+      let order = 0
+      const previous = buildToolStreamStateFromContent(`Intro.\n\n${card}\n\nHalf a sen`, () => order++)
+      const next = resetToolStreamStateFromContent(previous, `Intro.\n\n${card}\n\n`, () => order++)
+      expect(composeToolStreamContent(next)).toBe(`Intro.\n\n${card}\n\n`)
+      next.textBuffer += 'The answer.'
+      expect(composeToolStreamContent(next)).toBe(`Intro.\n\n${card}\n\nThe answer.`)
+    })
+
+    it('keeps a card still running where it was, before the text that follows', () => {
+      let order = 0
+      const previous = buildToolStreamStateFromContent('Intro. Half a sen', () => order++)
+      previous.toolPositions.set('call-1', { pos: 'Intro. '.length, order: 5 })
+      const next = resetToolStreamStateFromContent(previous, 'Intro. ', () => order++)
+      expect(next.textBuffer).toBe('Intro. ')
+      expect(next.toolPositions.get('call-1')).toEqual({ pos: 'Intro. '.length, order: 5 })
+    })
+
+    it('never places a running card past the end of the text it now has', () => {
+      let order = 0
+      const previous = buildToolStreamStateFromContent('Intro. Half a sen', () => order++)
+      previous.toolPositions.set('call-1', { pos: 'Intro. Half'.length, order: order++ })
+      const next = resetToolStreamStateFromContent(previous, 'Intro. ', () => order++)
+      expect(next.toolPositions.get('call-1')?.pos).toBe('Intro. '.length)
+    })
+
+    it('keeps a card the tab drew that the server’s text does not name', () => {
+      let order = 0
+      const missing = '{{batshit-zip:cool_tool_missing_call-2:::Tool execution: bash}}'
+      const previous = buildToolStreamStateFromContent(`Intro.\n\n${missing}\n\nHalf`, () => order++)
+      const next = resetToolStreamStateFromContent(previous, 'Intro.\n\n', () => order++)
+      expect(composeToolStreamContent(next)).toBe(`Intro.\n\n${missing}`)
+    })
   })
 })

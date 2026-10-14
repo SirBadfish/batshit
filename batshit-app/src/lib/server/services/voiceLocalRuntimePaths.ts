@@ -6,6 +6,12 @@ const MANAGED_INSTALLS_ROOT_FALLBACK_SEGMENTS_BASE64 = 'WyIuYmF0c2hpdCIsImluc3Rh
 const VOICE_RUNTIME_STATE_ROOT_ENV_VAR = 'BATSHIT_VOICE_RUNTIME_STATE_ROOT'
 const VOICE_RUNTIME_STATE_ROOT_FALLBACK_SEGMENTS_BASE64 =
   'WyIuYmF0c2hpdCIsInJ1bnRpbWUiLCJ2b2ljZS1lbmdpbmVzIl0='
+// The Docker host operator's own rule for where it keeps the launch records of what it started
+// (`HOST_VOICE_STATE_DIR` in tools/docker/runtime-addon-operator.mjs).
+const OPERATOR_VOICE_STATE_DIR_ENV_VAR = 'BATSHIT_RUNTIME_ADDON_OPERATOR_STATE_DIR'
+const OPERATOR_HOST_RUNTIME_ROOT_ENV_VAR = 'BATSHIT_HOST_RUNTIME_ROOT'
+const OPERATOR_VOICE_STATE_DIR_FALLBACK_SEGMENTS_BASE64 =
+  'WyIuYmF0c2hpdCIsInJ1bnRpbWUiLCJydW50aW1lLWFkZG9uLW9wZXJhdG9yIiwidm9pY2UtZW5naW5lcyJd'
 const DEFAULT_RUNTIME_LOG_RELATIVE_PATH = path.join('logs', 'local-engine-runtime.log')
 const DEFAULT_STATE_FILE_NAME = '.batshit-local-engine-setup.json'
 const LAUNCH_RECORD_FILE_NAME = '.batshit-local-runtime-launch.json'
@@ -62,4 +68,22 @@ export function resolveLocalVoiceRuntimeStatePath(engineId: string): string {
 
 export function resolveLocalVoiceRuntimeLaunchRecordPath(engineId: string): string {
   return path.join(resolveLocalVoiceRuntimeStateDir(engineId), LAUNCH_RECORD_FILE_NAME)
+}
+
+/**
+ * Where the Docker host operator on this computer keeps the launch records of the engines it
+ * started, by the operator's own rule: its state-folder setting, else `runtime/runtime-addon-
+ * operator/voice-engines` under its host runtime root (`~/.batshit`). Batshit only reads it
+ * (BL-1292): those engines can run from the same `~/.batshit/installs` folders.
+ */
+export function resolveOperatorVoiceStateRoot(): string {
+  const configured = process.env[OPERATOR_VOICE_STATE_DIR_ENV_VAR]
+  if (typeof configured === 'string' && configured.trim().length > 0) {
+    return path.resolve(expandUserHomePath(configured.trim()))
+  }
+  const [hiddenDir, ...segments] = JSON.parse(
+    Buffer.from(OPERATOR_VOICE_STATE_DIR_FALLBACK_SEGMENTS_BASE64, 'base64').toString('utf8')
+  ) as string[]
+  const hostRoot = process.env[OPERATOR_HOST_RUNTIME_ROOT_ENV_VAR]?.trim()
+  return path.resolve(hostRoot ? expandUserHomePath(hostRoot) : path.join(os.homedir(), hiddenDir), ...segments)
 }

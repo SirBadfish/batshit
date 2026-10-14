@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { logger } from '$lib/utils/logger'
 
 /**
  * SA-102 P5 (DL-102-09, DL-102-14): ONE stored key per local AI program, shared
@@ -52,6 +53,8 @@ vi.mock('$lib/server/redis', () => ({
   }
 }))
 
+const { listLocalAiServers } = await import('$lib/server/services/localAiServers')
+
 const {
   isLocalProgramKeyService,
   readLocalProgramApiKey,
@@ -103,6 +106,30 @@ describe('SA-102 local program API keys', () => {
     expect(await resolveLocalProgramIdForBaseUrl('http://localhost:8000/v1', 'u')).toBe('omlx')
     expect(await resolveLocalProgramIdForBaseUrl('http://localhost:1234', 'u')).toBe('lmstudio')
     expect(await resolveLocalProgramIdForBaseUrl('http://localhost:9999/v1', 'u')).toBeNull()
+  })
+
+  it('the saved programs cannot be read (BL-977): no program matches, no stored key is looked up, the failure is warned, and the configured key is kept and not migrated', async () => {
+    store.set('omlx', 'sk-from-the-shared-store')
+    seedMemoryConfigWithPlaintextKey('sk-legacy-in-memory-config')
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {})
+    vi.mocked(listLocalAiServers).mockRejectedValue(new Error('Could not read the saved Local AI servers.'))
+    try {
+      expect(await resolveLocalProgramIdForBaseUrl('http://localhost:8000/v1', 'u')).toBeNull()
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('could not list programs'), expect.anything())
+
+      const result = await resolveMemoryLocalAiApiKey({
+        baseUrl: 'http://localhost:8000/v1',
+        configuredApiKey: 'sk-legacy-in-memory-config',
+        userId: 'u'
+      })
+      // The stored key of the program is not looked up, and the legacy copy is neither moved nor stripped.
+      expect(result).toEqual({ apiKey: 'sk-legacy-in-memory-config', migratedFromMemoryConfig: false })
+      expect(memoryConfigDoc?.embedding?.localAi?.apiKey).toBe('sk-legacy-in-memory-config')
+      expect(store.get('omlx')).toBe('sk-from-the-shared-store')
+    } finally {
+      vi.mocked(listLocalAiServers).mockImplementation(async () => servers as never)
+      warn.mockRestore()
+    }
   })
 
   it('prefers the shared store over a legacy memory-config key, and strips the plaintext copy', async () => {

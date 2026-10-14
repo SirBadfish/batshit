@@ -6,7 +6,9 @@ const mocks = vi.hoisted(() => ({
   recordPortableSkillTokenControlExecution: vi.fn()
 }))
 
-vi.mock('$lib/server/services/nativeToolAuth', () => ({
+// BL-704: keep the real portable policy constants the route passes; only the resolver is faked.
+vi.mock('$lib/server/services/nativeToolAuth', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('$lib/server/services/nativeToolAuth')>()),
   resolveNativeToolUser: mocks.resolveNativeToolUser
 }))
 

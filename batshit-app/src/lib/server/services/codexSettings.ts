@@ -8,30 +8,24 @@ import type {
   CodexConfigOverride
 } from '$lib/types/codex'
 import { MODE4_STYLE_PRELAUNCH } from '$lib/server/constants/mode4Policy'
+import {
+  CODEX_PERMISSION_PRESETS as PERMISSION_PRESETS,
+  resolveCodexRunAccess,
+  sanitizeCodexPermission as sanitizePermission,
+  type CodexModeLimit
+} from '$lib/utils/codexRunAccess'
 import toml from '@iarna/toml'
 
 const { parse: parseToml } = toml
 
-const PERMISSION_PRESETS: Record<CodexPermissionMode, { sandbox: CodexRuntimeSettings['sandbox']; approval: CodexRuntimeSettings['approval'] }> = {
-  chat: {
-    sandbox: 'read-only',
-    approval: 'never'
-  },
-  agent: {
-    sandbox: 'workspace-write',
-    approval: 'on-request'
-  },
-  agent_full: {
-    sandbox: 'danger-full-access',
-    approval: 'never'
-  }
-}
-
-const SANDBOX_VALUES: CodexRuntimeSettings['sandbox'][] = [
-  'read-only',
-  'workspace-write',
-  'danger-full-access'
-]
+// BL-941: the rule lives in a shared file, so the chat bar shows the level a send will use.
+export {
+  CODEX_PERMISSION_ORDER,
+  CODEX_SANDBOX_ORDER,
+  resolveCodexRunAccess,
+  type CodexModeLimit,
+  type CodexRunAccess
+} from '$lib/utils/codexRunAccess'
 
 const APPROVAL_VALUES: CodexRuntimeSettings['approval'][] = [
   'never',
@@ -57,6 +51,11 @@ const MANAGED_CONFIG_RESERVED_EXACT_KEYS = new Set([
   'sandbox_workspace_write',
   'sandbox_workspace_write.writable_roots',
   'service_tier',
+  // BL-7 review: Batshit passes `skills.bundled.enabled=false` for every managed-home run
+  // and emits user overrides after it, so an override of the switch, its table, or the whole
+  // `skills` table (which would also replace `skills.config`) would win.
+  'skills',
+  'skills.bundled',
   'skills.config',
   'web_search'
 ])
@@ -65,7 +64,8 @@ const MANAGED_CONFIG_RESERVED_PREFIXES = [
   'history.',
   'mcp_servers.',
   'projects.',
-  'sandbox_workspace_write.'
+  'sandbox_workspace_write.',
+  'skills.bundled.'
 ]
 
 export interface CodexConfigOverrideSanitizationResult {
@@ -73,23 +73,6 @@ export interface CodexConfigOverrideSanitizationResult {
   reservedKeys: string[]
   duplicateKeys: string[]
   invalidKeys: string[]
-}
-
-function sanitizePermission(value: unknown): CodexPermissionMode {
-  if (value === 'agent' || value === 'agent_full' || value === 'chat') {
-    return value
-  }
-  return 'chat'
-}
-
-function sanitizeSandbox(value: unknown): CodexRuntimeSettings['sandbox'] | undefined {
-  if (typeof value === 'string') {
-    const lower = value.toLowerCase()
-    if (SANDBOX_VALUES.includes(lower as CodexRuntimeSettings['sandbox'])) {
-      return lower as CodexRuntimeSettings['sandbox']
-    }
-  }
-  return undefined
 }
 
 function sanitizeApproval(value: unknown): CodexRuntimeSettings['approval'] | undefined {
@@ -275,29 +258,41 @@ export function resolveCodexWebSearchMode(enabled: boolean | null | undefined): 
   return enabled === false ? 'disabled' : 'live'
 }
 
+/** The runtime settings, and the reply's note when the record made the run tighter (BL-941). */
+export type CodexRunSettings = CodexRuntimeSettings & { modeLimitedByAgentSettings?: CodexModeLimit }
+
 export function buildCodexRuntimeSettings(
   providerSettings?: Record<string, any> | CodexAgentSettings | null,
   overrides?: Partial<{ permissionMode: CodexPermissionMode }>
-): CodexRuntimeSettings {
+): CodexRunSettings {
   const structuredSource = isAgentSettings(providerSettings) ? providerSettings : null
   const providerRecord = !structuredSource && providerSettings && typeof providerSettings === 'object'
     ? (providerSettings as Record<string, any>)
     : null
-  const permissionOverrideApplied = overrides?.permissionMode !== undefined
   const configScope = 'managed'
-  const permission = sanitizePermission(
-    overrides?.permissionMode ?? (structuredSource?.permissionMode ?? providerRecord?.codex_permission_mode)
-  )
-
-  const preset = PERMISSION_PRESETS[permission]
-  const sandbox =
-    overrides?.permissionMode
-      ? preset.sandbox
-      : (structuredSource?.sandbox ?? sanitizeSandbox(providerRecord?.codex_sandbox) ?? preset.sandbox)
+  const recordMode = sanitizePermission(structuredSource?.permissionMode ?? providerRecord?.codex_permission_mode)
+  const sentMode =
+    overrides?.permissionMode === undefined || overrides?.permissionMode === null
+      ? undefined
+      : sanitizePermission(overrides.permissionMode)
+  // Marked as sent only when a mode was really sent (a sent null is none).
+  const permissionOverrideApplied = sentMode !== undefined
+  const access = resolveCodexRunAccess({
+    recordMode,
+    recordSandbox: structuredSource ? structuredSource.sandbox : providerRecord?.codex_sandbox,
+    sentMode
+  })
+  const permission = access.permissionMode
+  const sandbox = access.sandbox
+  // A send's approval word follows the mode it starts with; with no sent mode the saved word stays,
+  // so the managed profile file does not move. A run's approval comes from its mode and Tool
+  // Approval in the bridge.
   const approval =
-    overrides?.permissionMode
-      ? preset.approval
-      : (sanitizeApproval(structuredSource?.approval) ?? sanitizeApproval(providerRecord?.codex_approval) ?? preset.approval)
+    sentMode !== undefined
+      ? PERMISSION_PRESETS[permission].approval
+      : (sanitizeApproval(structuredSource?.approval) ??
+          sanitizeApproval(providerRecord?.codex_approval) ??
+          PERMISSION_PRESETS[recordMode].approval)
 
   const sanitizedStructuredOverrides = sanitizeCodexConfigOverrides(structuredSource?.configOverrides)
   const sanitizedLegacyOverrides = sanitizeCodexConfigOverrides(
@@ -317,7 +312,7 @@ export function buildCodexRuntimeSettings(
       : []
   )
 
-  const settings: CodexRuntimeSettings = {
+  const settings: CodexRunSettings = {
     mode4Style: MODE4_STYLE_PRELAUNCH,
     permissionMode: permission,
     includeProjectInstructions:
@@ -339,12 +334,13 @@ export function buildCodexRuntimeSettings(
     permissionOverridden: permissionOverrideApplied,
     fullAuto: structuredSource
       ? structuredSource.permissionMode === 'agent_full'
-      : Boolean(providerRecord?.codex_full_auto ?? (permission === 'agent_full')),
+      : Boolean(providerRecord?.codex_full_auto ?? ((sentMode ?? recordMode) === 'agent_full')),
     streamingEffect: true,
     search: structuredSource ? structuredSource.search !== false : providerRecord?.codex_search === false ? false : true,
-    addDirs: structuredSource ? [...structuredSource.addDirs] : toStringArray(providerRecord?.codex_additional_dirs),
-    enableFeatures: structuredSource ? [...structuredSource.enableFeatures] : toStringArray(providerRecord?.codex_feature_enable),
-    disableFeatures: structuredSource ? [...structuredSource.disableFeatures] : toStringArray(providerRecord?.codex_feature_disable),
+    // A block written key by key can hold its mode and model but lack the lists.
+    addDirs: structuredSource ? copyList(structuredSource.addDirs) : toStringArray(providerRecord?.codex_additional_dirs),
+    enableFeatures: structuredSource ? copyList(structuredSource.enableFeatures) : toStringArray(providerRecord?.codex_feature_enable),
+    disableFeatures: structuredSource ? copyList(structuredSource.disableFeatures) : toStringArray(providerRecord?.codex_feature_disable),
     configOverrides: structuredSource
       ? sanitizedStructuredOverrides.overrides
       : sanitizedLegacyOverrides.overrides,
@@ -375,9 +371,17 @@ export function buildCodexRuntimeSettings(
       'none'
   }
 
+  if (access.modeLimitedByAgentSettings) {
+    settings.modeLimitedByAgentSettings = access.modeLimitedByAgentSettings
+  }
+
   // Leave `xhigh` intact here; Codex itself validates model support.
 
   return settings
+}
+
+function copyList(value: unknown): string[] {
+  return Array.isArray(value) ? [...value] : []
 }
 
 function isAgentSettings(value: any): value is CodexAgentSettings {

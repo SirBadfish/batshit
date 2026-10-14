@@ -2,6 +2,7 @@
   import { Button } from '$lib/components/ui/button'
   import { formatToolDisplayName } from '$lib/utils/toolNameFormatter'
   import {
+    describeApprovalExpiry,
     formatControlApprovalRiskWord,
     formatControlApprovalTitle
   } from '$lib/utils/controlApprovalPresentation'
@@ -139,7 +140,7 @@
               </span>
             {:else if approval.status === 'expired'}
               <span class="message-approval-status is-expired">
-                Expired (3m)
+                {describeApprovalExpiry(approval)}
               </span>
             {:else}
               <Button

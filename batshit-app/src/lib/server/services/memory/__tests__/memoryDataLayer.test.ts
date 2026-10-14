@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, describe, expect, it } from 'vitest'
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -116,6 +116,148 @@ describe.runIf(memorySearchLaneActive())('memory data layer (dedicated Redis 8 d
     // Nothing extra: the harness tears the disposable instance down completely.
   })
 
+  describe('date validation before embedding (BL-825)', () => {
+    it.each([
+      ['event_at', '2026-02-31', /not a real calendar day/],
+      ['expires_at', '2026-02-31', /not a real calendar day/],
+      ['event_at', 'invalid-timestamp', /event_at is not a valid timestamp/],
+      ['expires_at', 'invalid-timestamp', /expires_at is not a valid timestamp/]
+    ] as const)('refuses %s=%s without embedding or changing stored records', async (field, value, error) => {
+      const original = await createMemory(memoryInput(), { embedder: fakeEmbedder })
+      const key = memoryKey('agent_test', original.id)
+      const rawBefore = await harness.adminClient().sendCommand(['JSON.GET', key])
+      const keysBefore = (await harness.adminClient().keys('memory:agent_test:*')).sort()
+      const embedDocuments = vi.fn(fakeEmbedder.embedDocuments)
+      const embedder = { ...fakeEmbedder, embedDocuments }
+
+      for (const id of [original.id, 'mem_bl825_refused']) {
+        await expect(createMemory(memoryInput({ id, [field]: value }), { embedder }))
+          .rejects.toThrow(error)
+      }
+
+      expect(embedDocuments).not.toHaveBeenCalled()
+      expect(await harness.adminClient().sendCommand(['JSON.GET', key])).toBe(rawBefore)
+      expect((await harness.adminClient().keys('memory:agent_test:*')).sort()).toEqual(keysBefore)
+      expect(await getMemory('agent_test', 'mem_bl825_refused')).toBeNull()
+    })
+
+    it('embeds accepted explicit dates once and preserves the complete saved record', async () => {
+      const embedDocuments = vi.fn(async (texts: string[]) =>
+        texts.map(() => [1, 0, 0, 0, 0, 0, 0, 0]))
+      const input = memoryInput({
+        event_at: '2026-06-01T08:30:00.000-04:00',
+        expires_at: '2026-07-01T08:30:00.000-04:00',
+        gist: 'Maggie',
+        links: ['https://example.test/maggie']
+      })
+      const created = await createMemory(input, { embedder: { ...fakeEmbedder, embedDocuments } })
+
+      expect(embedDocuments).toHaveBeenCalledExactlyOnceWith([input.content])
+      expect(created).toMatchObject({
+        ...input,
+        event_ts: Date.parse(input.event_at!),
+        expires_ts: Date.parse(input.expires_at!),
+        embedding: [1, 0, 0, 0, 0, 0, 0, 0],
+        embedding_model: fakeEmbedder.modelId
+      })
+      expect(created.saved_ts).toBe(Date.parse(created.saved_at))
+      expect(await harness.adminClient().json.get(memoryKey(input.agent_id, created.id))).toEqual(created)
+      expect(await getMemory(input.agent_id, created.id)).toEqual(created)
+    })
+  })
+
+  describe('repeated final-hour expiry storage (BL-1237)', () => {
+    // Exact binary vectors keep full-record equality focused on expiry/preservation, without
+    // comparing the original embedder's pre-serialization rounding to Redis JSON's output.
+    const calendarEmbedder: MemoryEmbedder = {
+      ...fakeEmbedder,
+      async embedDocuments(texts) {
+        return texts.map(() => [1, 0, 0, 0, 0, 0, 0, 0])
+      }
+    }
+
+    async function inSantiago(check: () => Promise<void>) {
+      const previous = process.env.TZ
+      process.env.TZ = 'America/Santiago'
+      try {
+        expect(new Date('2026-04-05T02:30:00.000Z').getTimezoneOffset()).toBe(180)
+        expect(new Date('2026-04-05T03:30:00.000Z').getTimezoneOffset()).toBe(240)
+        await check()
+      } finally {
+        if (previous === undefined) delete process.env.TZ
+        else process.env.TZ = previous
+      }
+    }
+
+    it('create stores both expiry fields through the second final hour and keeps Awareness eligible', async () => {
+      await inSantiago(async () => {
+        const created = await createMemory(memoryInput({
+          lane: 'awareness',
+          expires_at: '2026-04-04',
+          event_at: '2026-04-04'
+        }), { embedder: calendarEmbedder })
+        expect(await harness.adminClient().json.get(memoryKey('agent_test', created.id))).toEqual(created)
+        const stored = await getMemory('agent_test', created.id)
+        expect(stored).toEqual(created)
+        expect(stored?.expires_at).toBe('2026-04-05T03:59:59.999Z')
+        expect(stored?.expires_ts).toBe(Date.parse('2026-04-05T03:59:59.999Z'))
+        expect(stored?.event_at).toBe('2026-04-04T03:00:00.000Z')
+        if (!stored) throw new Error('Created memory was not stored')
+        const { selectAwarenessState } = await import('../memoryRecall')
+        const budgets = { onMyMind: 1000, triggers: 1000, recalled: 1000 }
+        expect(selectAwarenessState([stored], budgets, Date.parse('2026-04-05T03:30:00.000Z')).entries)
+          .toEqual([stored])
+        expect(selectAwarenessState([stored], budgets, Date.parse('2026-04-05T04:00:00.000Z')).entries)
+          .toEqual([])
+      })
+    })
+
+    it('update stores a newly chosen bare expiry without changing the other record fields', async () => {
+      await inSantiago(async () => {
+        const original = await createMemory(memoryInput({
+          expires_at: '2026-04-05T02:59:59.999Z'
+        }), { embedder: calendarEmbedder })
+        const updated = await updateMemory('agent_test', original.id, {
+          expires_at: ' 2026-04-04 '
+        }, { embedder: calendarEmbedder })
+        expect(await harness.adminClient().json.get(memoryKey('agent_test', original.id))).toEqual(updated)
+        expect(await getMemory('agent_test', original.id)).toEqual(updated)
+        expect(updated.expires_at).toBe('2026-04-05T03:59:59.999Z')
+        expect(updated.expires_ts).toBe(Date.parse('2026-04-05T03:59:59.999Z'))
+        const { expires_at, expires_ts, updated_at, ...unchanged } = updated
+        const { expires_at: oldExpiry, expires_ts: oldTs, ...originalFields } = original
+        expect(unchanged).toEqual(originalFields)
+      })
+    })
+
+    it('preserves old explicit expiry bytes on unrelated writes and invalid-day refusal', async () => {
+      await inSantiago(async () => {
+        const oldExpiry = '2026-04-04T23:59:59.999-03:00'
+        const original = await createMemory(memoryInput({ expires_at: oldExpiry }), {
+          embedder: calendarEmbedder
+        })
+        expect(original.expires_at).toBe(oldExpiry)
+        const updated = await updateMemory('agent_test', original.id, { importance: 8 })
+        expect(await harness.adminClient().json.get(memoryKey('agent_test', original.id))).toEqual(updated)
+        expect(await getMemory('agent_test', original.id)).toEqual(updated)
+        expect(updated.expires_at).toBe(oldExpiry)
+        expect(updated.expires_ts).toBe(original.expires_ts)
+        expect(updated).toEqual({ ...original, importance: 8, updated_at: updated.updated_at })
+        const rawBeforeRefusal = await harness.adminClient().sendCommand(['JSON.GET', memoryKey('agent_test', original.id)])
+        await expect(updateMemory('agent_test', original.id, { expires_at: '2026-02-31' }))
+          .rejects.toThrow(/not a real calendar day/)
+        expect(await harness.adminClient().sendCommand(['JSON.GET', memoryKey('agent_test', original.id)]))
+          .toBe(rawBeforeRefusal)
+        expect(await harness.adminClient().json.get(memoryKey('agent_test', original.id))).toEqual(updated)
+        expect(await getMemory('agent_test', original.id)).toEqual(updated)
+        const cleared = await updateMemory('agent_test', original.id, { expires_at: null })
+        expect(Object.prototype.hasOwnProperty.call(cleared, 'expires_at')).toBe(false)
+        expect(Object.prototype.hasOwnProperty.call(cleared, 'expires_ts')).toBe(false)
+        expect((await getMemory('agent_test', original.id))?.content).toBe(original.content)
+      })
+    })
+  })
+
   it('bootstraps idempotently and records index meta', async () => {
     const again = await ensureMemoryIndexes()
     expect(again.status).toBe('ready')
@@ -214,6 +356,87 @@ describe.runIf(memorySearchLaneActive())('memory data layer (dedicated Redis 8 d
         { embedder: fakeEmbedder }
       )
     ).rejects.toThrow(/capped at 4 images/)
+  })
+
+  // BL-438: a superseded record's always-on images stop counting toward the cap, so the agent can
+  // fill the slots; restoring it with no check left the agent over the cap, and every send then
+  // failed at the compile until the user fixed it in the panel.
+  it('unsupersede refuses to restore always-on images past the 4-image cap, before any write (BL-438)', async () => {
+    const media = (id: string) => ({
+      id,
+      filename: `agent_test/mem_bl438/${id}.png`,
+      display_name: `${id}.png`,
+      mime_type: 'image/png' as const,
+      bytes: 3,
+      width: 1,
+      height: 1,
+      token_estimate: 1,
+      sha256: id.padEnd(64, 'b').slice(0, 64)
+    })
+    const pair = await createMemory(
+      memoryInput({
+        lane: 'awareness',
+        content: 'Standing pair of photos',
+        media_mode: 'always',
+        media: ['p1', 'p2'].map(media)
+      }),
+      { embedder: fakeEmbedder }
+    )
+    const winner = await createMemory(
+      memoryInput({ lane: 'awareness', content: 'The winner without photos' }),
+      { embedder: fakeEmbedder }
+    )
+    await supersedeMemory('agent_test', winner.id, [pair.id])
+    // The superseded pair no longer counts, so three more standing images fit.
+    const trio = await createMemory(
+      memoryInput({
+        lane: 'awareness',
+        content: 'Standing trio of photos',
+        media_mode: 'always',
+        media: ['t1', 't2', 't3'].map(media)
+      }),
+      { embedder: fakeEmbedder }
+    )
+
+    await expect(unsupersedeMemory('agent_test', pair.id)).rejects.toThrow(
+      /capped at 4 images per agent; this change would make 5\./
+    )
+    // Refused before the first write: the pair and its winner are exactly as they were.
+    const stillSuperseded = await getMemory('agent_test', pair.id)
+    expect(stillSuperseded?.is_superseded).toBe('y')
+    expect(stillSuperseded?.superseded_by).toBe(winner.id)
+    expect((await getMemory('agent_test', winner.id))?.supersedes).toContain(pair.id)
+
+    // An expired always-on record shows no images, so restoring it is never refused, even with
+    // every slot taken. (Created while a slot is free: a save counts its own images.)
+    const expired = await createMemory(
+      memoryInput({
+        lane: 'awareness',
+        content: 'Expired standing photo',
+        media_mode: 'always',
+        media: [media('e1')],
+        expires_at: '2020-01-01T00:00:00.000Z'
+      }),
+      { embedder: fakeEmbedder }
+    )
+    await supersedeMemory('agent_test', winner.id, [expired.id])
+    const single = await createMemory(
+      memoryInput({
+        lane: 'awareness',
+        content: 'Standing single photo',
+        media_mode: 'always',
+        media: [media('s1')]
+      }),
+      { embedder: fakeEmbedder }
+    )
+    expect((await unsupersedeMemory('agent_test', expired.id)).is_superseded).toBe('n')
+
+    // With slots freed (the trio arrives on recall), the pair restores as before: 1 + 2 = 3.
+    await updateMemory('agent_test', trio.id, { media_mode: 'on_recall' }, { embedder: fakeEmbedder })
+    const restored = await unsupersedeMemory('agent_test', pair.id)
+    expect(restored.is_superseded).toBe('n')
+    expect(restored.media_mode).toBe('always')
+    expect((await getMemory('agent_test', single.id))?.media_mode).toBe('always')
   })
 
   it('refuses any write that leaves an stm record without trigger terms (2026-08-28)', async () => {
@@ -583,6 +806,102 @@ describe.runIf(memorySearchLaneActive())('memory data layer (dedicated Redis 8 d
     const second = await openEpisode({ session_id: 'sess_ep', agent_id: 'agent_test' })
     const ledger = await listEpisodes('sess_ep')
     expect(ledger.map((entry) => entry.id)).toEqual([episode.id, second.id])
+  })
+
+  it('BL-549: a conditional whiteboard write lands only on the board its writer read', async () => {
+    const {
+      openEpisode,
+      closeEpisode,
+      episodeKey,
+      getEpisode,
+      readWhiteboard,
+      updateEpisodeWhiteboard,
+      EpisodeNotOpenError,
+      EpisodeWhiteboardChangedError
+    } = await import('../memoryEpisodes')
+    const { redis } = await import('$lib/server/redis')
+
+    const episode = await openEpisode({ session_id: 'sess_cond', agent_id: 'agent_test' })
+    const key = episodeKey('sess_cond', episode.id)
+    const napBoard = { content: 'nap v1', updated_at: '2026-09-27T10:00:00.000Z', written_by: 'nap' }
+    const setBoard = (board: unknown) => redis.json.set(key, '$.whiteboard', board as never)
+    const boardNow = async () => (await getEpisode('sess_cond', episode.id))?.whiteboard ?? null
+
+    // Read empty, still empty: the write lands and answers the stored record.
+    const filled = await updateEpisodeWhiteboard('sess_cond', episode.id, 'nap fill', 'nap', {
+      onlyIf: readWhiteboard(null)
+    })
+    expect(filled.whiteboard).toMatchObject({ content: 'nap fill', written_by: 'nap' })
+    expect(await boardNow()).toEqual(filled.whiteboard)
+
+    // Read empty, written since: refused, nothing written.
+    await setBoard({ content: 'agent board', updated_at: '2026-09-27T10:05:00.000Z', written_by: 'agent' })
+    await expect(
+      updateEpisodeWhiteboard('sess_cond', episode.id, 'nap fill', 'nap', { onlyIf: readWhiteboard(null) })
+    ).rejects.toBeInstanceOf(EpisodeWhiteboardChangedError)
+    expect((await boardNow())?.content).toBe('agent board')
+
+    // Only the AUTHOR changed since the read (same update time): refused.
+    await setBoard(napBoard)
+    const napRead = readWhiteboard(napBoard as never)
+    await redis.json.set(key, '$.whiteboard.written_by', 'agent' as never)
+    await expect(
+      updateEpisodeWhiteboard('sess_cond', episode.id, 'nap refresh', 'nap', { onlyIf: napRead })
+    ).rejects.toBeInstanceOf(EpisodeWhiteboardChangedError)
+    expect((await boardNow())?.content).toBe('nap v1')
+
+    // Only the UPDATE TIME changed since the read (another nap wrote it): refused.
+    await setBoard(napBoard)
+    await redis.json.set(key, '$.whiteboard.updated_at', '2026-09-27T10:09:00.000Z' as never)
+    await expect(
+      updateEpisodeWhiteboard('sess_cond', episode.id, 'nap refresh', 'nap', { onlyIf: napRead })
+    ).rejects.toBeInstanceOf(EpisodeWhiteboardChangedError)
+    expect((await boardNow())?.updated_at).toBe('2026-09-27T10:09:00.000Z')
+
+    // Read a board, board cleared since: refused.
+    await setBoard(null)
+    await expect(
+      updateEpisodeWhiteboard('sess_cond', episode.id, 'nap refresh', 'nap', { onlyIf: napRead })
+    ).rejects.toBeInstanceOf(EpisodeWhiteboardChangedError)
+    expect(await boardNow()).toBeNull()
+
+    // Unchanged since the read: the refresh lands.
+    await setBoard(napBoard)
+    const refreshed = await updateEpisodeWhiteboard('sess_cond', episode.id, 'nap refresh', 'nap', {
+      onlyIf: napRead
+    })
+    expect(refreshed.whiteboard?.content).toBe('nap refresh')
+
+    // A record older than the author field reads as it is stored: an absent author stays absent.
+    await setBoard({ content: 'old board', updated_at: '2026-09-01T00:00:00.000Z' })
+    const oldRead = readWhiteboard((await boardNow()) as never)
+    expect(oldRead).toEqual({ updated_at: '2026-09-01T00:00:00.000Z', written_by: null })
+    await updateEpisodeWhiteboard('sess_cond', episode.id, 'over the old board', 'nap', { onlyIf: oldRead })
+    expect((await boardNow())?.content).toBe('over the old board')
+
+    // The agent's write has no condition: it lands over any board.
+    await setBoard(napBoard)
+    const agentWrite = await updateEpisodeWhiteboard('sess_cond', episode.id, 'agent wins', 'agent')
+    expect(agentWrite.whiteboard).toMatchObject({ content: 'agent wins', written_by: 'agent' })
+
+    // A closed episode refuses both kinds of write with the same words as before.
+    await closeEpisode('sess_cond', episode.id, 'agent_mark')
+    await expect(updateEpisodeWhiteboard('sess_cond', episode.id, 'late', 'agent')).rejects.toThrow(
+      /is closed; the whiteboard belongs to the open episode/
+    )
+    await expect(
+      updateEpisodeWhiteboard('sess_cond', episode.id, 'late', 'nap', {
+        onlyIf: readWhiteboard((await boardNow()) as never)
+      })
+    ).rejects.toThrow(/is closed; the whiteboard belongs to the open episode/)
+    // A typed refusal, so a writer can tell "the episode closed while I waited" from a failure.
+    await expect(updateEpisodeWhiteboard('sess_cond', episode.id, 'late', 'agent')).rejects.toBeInstanceOf(
+      EpisodeNotOpenError
+    )
+    expect((await boardNow())?.content).toBe('agent wins')
+    await expect(updateEpisodeWhiteboard('sess_cond', 'ep_missing', 'x', 'agent')).rejects.toThrow(
+      /Episode ep_missing not found for session sess_cond/
+    )
   })
 
   it('parallel episode field updaters cannot erase each other (SA-110 whiteboard drift race)', async () => {

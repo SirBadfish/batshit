@@ -67,6 +67,8 @@ A token can have more than one scope. For the simplest setup, create one token w
 
 Never give an outside agent `BATSHIT_TOKEN`. Portable Skill Tokens are narrower, revocable, and stored in Batshit as hashes.
 
+A Portable Skill Token only works on the two control endpoints above, and only for the controls its scopes include. It is not a general login for your Batshit app: every other app endpoint turns it away, even one that would let you do the same thing while signed in. For example, a token with the CLI Tools scope can save and test a CLI tool through `POST /api/controls/use`, but it cannot run your saved CLI tools directly. A wrong, revoked, or out-of-scope token is simply refused. Batshit never treats a refused token as your signed-in browser session.
+
 ## Private env file option
 
 If you do not want to paste the token repeatedly, use a private env file on your own machine:
@@ -102,7 +104,7 @@ See [Portable Skill downloads](../reference/portable-skills.md) for the current 
 
 Download the zip for the skill you need, then extract it so your outside agent can read the folder.
 
-The Portable Skills tab also shows one install prompt per skill. Copy that line into your outside agent when you want it to install a bundle for you.
+The Portable Skills tab also shows one install prompt per skill. Copy that line into your outside agent when you want it to install a bundle for you. The copied prompt uses the shared env-file path shown by your instance. Use that displayed path if it differs from the default in the examples below.
 
 The prompt format is:
 

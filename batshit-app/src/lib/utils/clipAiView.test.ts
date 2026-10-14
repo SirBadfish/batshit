@@ -6,6 +6,7 @@ import {
   formatClipLog,
   CLIP_LOG_UNNAMED_LABEL
 } from './clipAiView'
+import { unclosedReferenceReplies } from '$lib/test-utils/unclosedReferenceReplies'
 
 /**
  * SA-109 — the AI view's clip vocabulary.
@@ -67,6 +68,20 @@ describe('compileClipReferencesForAiView', () => {
       'a **(Clip Log: legacy.md)** b'
     )
     expect(compileClipReferencesForAiView(content, attached('clip_old'))).toBe('a  b')
+  })
+
+  it('compiles a 1 MB message of 20,000 unclosed clip openers in well under 200 ms', () => {
+    // The clip patterns the reference scans replaced cost (unclosed openers) x (text length) on
+    // every compile of the message: seconds to a minute of the one Node process for these texts.
+    const shapes = { ...unclosedReferenceReplies('clip'), ...unclosedReferenceReplies('legacyClip') }
+    for (const [shape, content] of Object.entries(shapes)) {
+      expect(content.length, shape).toBeGreaterThanOrEqual(1_000_000)
+      const started = performance.now()
+      const compiled = compileClipReferencesForAiView(content, attached())
+      const elapsed = performance.now() - started
+      expect(compiled, shape).toBe(content)
+      expect(elapsed, shape).toBeLessThan(200)
+    }
   })
 
   it('returns clip-free content byte-for-byte (clip-free chats pay nothing)', () => {

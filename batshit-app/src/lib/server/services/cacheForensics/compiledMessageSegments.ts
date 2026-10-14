@@ -1,4 +1,5 @@
 import type { CacheForensicsSegment, CacheForensicsSegmentType } from '$lib/types/cacheForensics'
+import { COMPILED_MESSAGE_TAGS, COMPILED_TAG } from '$lib/utils/compiledChatTags'
 import type { CacheForensicsSegmentInput } from './fingerprint'
 
 /**
@@ -28,14 +29,33 @@ import type { CacheForensicsSegmentInput } from './fingerprint'
  * closes that gap.
  */
 
-/** Written by `buildFormattedChatInput` ahead of the compiled chat history. */
-export const COMPILED_HISTORY_MARKER = '==== PREVIOUS CONVERSATION ===='
-/** Written by `buildFormattedChatInput` ahead of the current turn + DCM. */
-export const COMPILED_CURRENT_MARKER = '==== CURRENT USER MESSAGE ===='
-/** `compileChatHistory` joins formatted history messages with this separator. */
-export const COMPILED_HISTORY_SEPARATOR = '\n\n---\n\n'
-/** `buildZipAppend` opens the agent-managed appended-zip block with this line. */
-export const COMPILED_ZIP_APPEND_MARKER = '==== UNZIP INDEX (chronological) ===='
+/**
+ * SA-128 (splitter v4): the compiled message is tags now (`$lib/utils/compiledChatTags`). The
+ * history is `<conversation>` holding one element per message, the appended zips are one
+ * `<zip_index>` element after it, and the new message (`<user>` or `<note>`) plus
+ * `<dynamic_info>` and the live media follow. The compiler disarms every tag of that grammar
+ * inside content, so a real tag can only be the compiler's own: the split below is exact.
+ */
+/** Opens the compiled chat history. */
+export const COMPILED_HISTORY_OPEN = `<${COMPILED_TAG.conversation}>\n`
+/** Closes the compiled chat history. */
+export const COMPILED_HISTORY_CLOSE = `\n</${COMPILED_TAG.conversation}>`
+/** `compileChatHistory` puts one blank line between history elements. */
+export const COMPILED_HISTORY_SEPARATOR = '\n\n'
+/** `buildZipAppend` writes the agent-managed appended zips as this element. */
+export const COMPILED_ZIP_APPEND_OPEN = `<${COMPILED_TAG.zipIndex}>\n`
+export const COMPILED_ZIP_APPEND_CLOSE = `\n</${COMPILED_TAG.zipIndex}>`
+/** The standing media manifest, the first text part when an Awareness image is standing. */
+export const COMPILED_STANDING_MEDIA_OPEN = `<${COMPILED_TAG.awarenessMedia}>\n`
+
+// The new message opens with one of these (the user's own, or Batshit's note).
+const CURRENT_MESSAGE_START = new RegExp(`^<(?:${COMPILED_TAG.user}|${COMPILED_TAG.note})(?: [^>\\n]*)?>\\n`)
+
+/** Each history element, in order. A fresh expression per call (`/g` keeps `lastIndex`). */
+function historyElementPattern(): RegExp {
+  const names = COMPILED_MESSAGE_TAGS.join('|')
+  return new RegExp(`<(${names})(?: [^>\\n]*)?>\\n[\\s\\S]*?\\n</\\1>`, 'g')
+}
 
 /**
  * Oldest-first cap on per-message history sub-segments (DL-108-04). The prefix
@@ -86,13 +106,25 @@ export interface CompiledUserMessageSplit {
 }
 
 /**
- * Splits one compiled user message into its Batshit-owned parts.
- *
- * The trailing whitespace handling mirrors the compiler: `compileChatHistory`
- * trims the joined history, so the last history chunk is trimmed here too and
- * a message therefore hashes identically whether it is currently last or has
- * been followed by newer turns.
+ * The history elements inside `<conversation>`, oldest first. Each element is hashed exactly as
+ * the compiler wrote it, so a message hashes identically whether it is currently last or has
+ * been followed by newer turns. A body that is not a clean run of elements (never written by
+ * the compiler) stays one segment rather than being guessed at.
  */
+function splitHistoryElements(body: string): string[] {
+  const elements: string[] = []
+  let cursor = 0
+  for (const match of body.matchAll(historyElementPattern())) {
+    const gap = body.slice(cursor, match.index)
+    if (gap !== (elements.length === 0 ? '' : COMPILED_HISTORY_SEPARATOR)) return [body]
+    elements.push(match[0])
+    cursor = (match.index ?? 0) + match[0].length
+  }
+  if (cursor !== body.length) return [body]
+  return elements
+}
+
+/** Splits one compiled user message into its Batshit-owned parts. */
 export function splitCompiledUserMessageContent(text: unknown): CompiledUserMessageSplit {
   const empty: CompiledUserMessageSplit = {
     matched: false,
@@ -102,28 +134,28 @@ export function splitCompiledUserMessageContent(text: unknown): CompiledUserMess
   }
   if (typeof text !== 'string' || text.length === 0) return empty
 
-  const currentIndex = text.indexOf(COMPILED_CURRENT_MARKER)
-  const hasHistoryHeader = text.startsWith(COMPILED_HISTORY_MARKER)
-  if (currentIndex === -1 && !hasHistoryHeader) return empty
+  const hasHistory = text.startsWith(COMPILED_HISTORY_OPEN)
+  const opensWithZips = text.startsWith(COMPILED_ZIP_APPEND_OPEN)
+  if (!hasHistory && !opensWithZips && !CURRENT_MESSAGE_START.test(text)) return empty
 
-  const current = currentIndex === -1 ? null : text.slice(currentIndex)
-  let head = currentIndex === -1 ? text : text.slice(0, currentIndex)
-
-  if (head.startsWith(COMPILED_HISTORY_MARKER)) {
-    head = head.slice(COMPILED_HISTORY_MARKER.length).replace(/^\n+/, '')
+  let rest = text
+  let historyMessages: string[] = []
+  if (hasHistory) {
+    const close = rest.indexOf(COMPILED_HISTORY_CLOSE)
+    if (close === -1) return empty
+    historyMessages = splitHistoryElements(rest.slice(COMPILED_HISTORY_OPEN.length, close))
+    rest = rest.slice(close + COMPILED_HISTORY_CLOSE.length).replace(/^\n+/, '')
   }
 
   let zipAppend: string | null = null
-  const zipIndex = head.indexOf(COMPILED_ZIP_APPEND_MARKER)
-  if (zipIndex !== -1) {
-    zipAppend = head.slice(zipIndex).trimEnd()
-    head = head.slice(0, zipIndex)
+  if (rest.startsWith(COMPILED_ZIP_APPEND_OPEN)) {
+    const close = rest.indexOf(COMPILED_ZIP_APPEND_CLOSE)
+    if (close === -1) return empty
+    zipAppend = rest.slice(0, close + COMPILED_ZIP_APPEND_CLOSE.length)
+    rest = rest.slice(zipAppend.length).replace(/^\n+/, '')
   }
 
-  const historyText = head.trimEnd()
-  const historyMessages =
-    historyText.length > 0 ? historyText.split(COMPILED_HISTORY_SEPARATOR) : []
-
+  const current = rest.length > 0 ? rest : null
   return { matched: true, historyMessages, zipAppend, current }
 }
 

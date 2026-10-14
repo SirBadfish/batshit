@@ -1,0 +1,28 @@
+{
+  "case": "which-git-json",
+  "capturedAt": "2026-09-22T14:25:40.010Z",
+  "pinokio": {
+    "desktop": "8.2.0",
+    "pinokiod": "8.2.0",
+    "pterm": "0.0.25",
+    "script": "8.0.0"
+  },
+  "platform": "macOS 27.0 (26A428), Apple Silicon, Node 24.12.0 (Homebrew) running pterm through its shebang",
+  "sanitized": {
+    "/Users/tester": "the real home folder",
+    "192.168.1.10": "the real LAN address"
+  },
+  "argv": [
+    "pterm",
+    "which",
+    "git",
+    "--json"
+  ],
+  "exitCode": 0,
+  "signal": null,
+  "timedOut": false,
+  "durationMs": 1797,
+  "stdout": "{\n  \"path\": \"/Users/tester/pinokio/bin/miniforge/bin/git\"\n}\n",
+  "stderr": "",
+  "note": "pterm which git --json"
+}

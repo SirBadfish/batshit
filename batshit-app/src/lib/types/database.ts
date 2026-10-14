@@ -145,8 +145,12 @@ export interface AgentRow {
   zip_disabled_error?: boolean
   zip_disabled_image?: boolean
   zip_disabled_subagent?: boolean
-  zip_control_mode?: 'user' | 'agent' | null  // DEPRECATED (legacy agent-managed toggle)
-  zip_agent_control_enabled?: boolean | null
+  /**
+   * SA-129 DL-06 (BL-1484): the parked zip control permission, ON only when exactly `true`; no
+   * Settings surface reads or writes it. The older `zip_agent_control_enabled` and
+   * `zip_control_mode` are ignored, and startup removes them (`retiredZipControlFields.ts`).
+   */
+  zip_agent_control_experiment?: boolean | null
   zip_ai_view_mode?: 'inline' | 'appended' | null
   zip_tool_notes_enabled?: boolean | null
   zip_threshold_error?: number
@@ -176,7 +180,7 @@ export interface AgentRow {
   dms_enabled?: boolean | null
   dm_senders?: 'all' | 'selected' | null
   dm_sender_agent_ids?: string[] | null
-  // SA-120 P1 (DL-120-01): the per-agent Jev Juice switch for skill and tool hints.
+  // SA-120 P1 (DL-120-01): the per-agent Judge Juice switch for skill and tool hints.
   // Absent means OFF. Resolved ONLY through `resolveAgentJevSkillToolHintsEnabled` in
   // `$lib/utils/jevJuiceControl.ts`.
   jev_juice_skill_tool_hints?: boolean | null
@@ -279,22 +283,6 @@ export interface AgentRow {
   primary_model_stop_sequences?: string[]
   primary_model_reasoning_effort?: string
   provider_specific_settings?: Record<string, any>
-  fallback_model_enabled?: boolean
-  fallback_model_provider?: string
-  fallback_model_name?: string
-  fallback_model_preset_id?: string
-  fallback_model_connection?: ModelConnectionInfo | null
-  fallback_model_temperature?: number
-  fallback_model_max_tokens?: number
-  fallback_model_top_p?: number
-  fallback_model_top_k?: number
-  fallback_model_frequency_penalty?: number
-  fallback_model_presence_penalty?: number
-  fallback_model_seed?: number
-  fallback_model_stop_sequences?: string[]
-  fallback_model_reasoning_effort?: string
-  fallback_model_capabilities?: ModelCapabilities | null
-  fallback_provider_specific_settings?: Record<string, any>
   custom_model_settings?: string  // Advanced key=value pairs for power users
   ai_permissions?: any  // JSONB
   assigned_subagent_ids?: string[]  // Track which subagents are assigned to this agent
@@ -386,8 +374,8 @@ export interface UserSettingsRow {
     buffer_size?: number
     zip_threshold?: number
 
-    // Agent zip control permission (default for agents)
-    zip_agent_control_enabled?: boolean
+    // The parked agent zip control permission (BL-1484): ON only when exactly true; no UI.
+    zip_agent_control_experiment?: boolean
 
     // AI zip layout (inline vs appended)
     zip_ai_view_mode?: 'inline' | 'appended'
@@ -395,7 +383,7 @@ export interface UserSettingsRow {
     // Tool Notes enable/disable
     zip_tool_notes_enabled?: boolean
 
-    // SA-120 P5 (LS-054): "Jev Juice: Smart Zip". Absent means OFF.
+    // SA-120 P5 (LS-054): "Judge Juice: Smart Zip". Absent means OFF.
     jev_juice_smart_zip?: boolean
     
     // AI Content Blocks
@@ -468,6 +456,10 @@ export interface SubagentRow {
   user_id: string
   displayName: string
   description?: string
+  // BL-762: the slug `resolveSubagentSlug` reads ahead of `id`/`displayName` to name the
+  // Subagent's managed CLI profile folder; not written by the panel today, but a stored value
+  // takes precedence and must be preserved by an edit, like an Agent's own `slug` above.
+  slug?: string
 
   // Canonical subagent contract (SA-062)
   subagentType?: StoredSubagentType
@@ -497,6 +489,13 @@ export interface SubagentRow {
   // AI Provider settings
   primary_model_provider?: string
   primary_model_name?: string
+  /**
+   * BL-266: the saved preset behind an own model, and a copy of its connection, written by the
+   * Subagent's model picker the way a primary's are. An API Subagent runs through the preset's
+   * connection (`subagentModelSelection.ts`); an own model without one is refused, never guessed.
+   */
+  primary_model_preset_id?: string | null
+  primary_model_connection?: ModelConnectionInfo | null
   /** Optional per-call timeout override. Blank uses the type default. */
   timeout_seconds?: number
   primary_model_temperature?: number

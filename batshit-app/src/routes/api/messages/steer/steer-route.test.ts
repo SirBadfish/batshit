@@ -3,6 +3,7 @@ import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { redis } from '$lib/server/redis'
 import {
   __resetStreamAbortRegistryForTests,
+  queueSessionTurn,
   registerSessionTurn,
   registerStreamAbort
 } from '$lib/server/services/streamAbortRegistry'
@@ -599,5 +600,34 @@ describe('POST /api/messages/steer — deliver (DL-119-05)', () => {
     const response = await call(goodBody({ deliver: 'end' }))
     expect(response.status).toBe(409)
     expect((await response.json()).code).toBe('not_steerable')
+  })
+})
+
+/**
+ * BL-4 — a send that meets another turn waits in the chat's line, and a text Queue from this
+ * route would jump that line: the steer inbox is promoted inside the running request, before the
+ * lock goes to the first waiting send. So while sends wait, a Queue is refused with the tag that
+ * means "send it as an ordinary message", and it joins the line behind them, in order. A Steer
+ * still lands inside the running reply: it is part of that reply, not a later message.
+ */
+describe('POST /api/messages/steer — a line of sends is waiting (BL-4)', () => {
+  it('sends a queued message the ordinary way, so it waits behind the sends already in line', async () => {
+    await seed()
+    activeTurn()
+    queueSessionTurn(SESSION, { kind: 'single', messageId: 'msg_b_reply', userMessageId: 'msg_b' })
+
+    const response = await call(goodBody({ deliver: 'end' }))
+    expect(response.status).toBe(409)
+    expect(await response.json()).toMatchObject({ code: 'not_steerable', refusal: 'reply_finished' })
+    expect(listPendingSteers(SESSION)).toEqual([])
+  })
+
+  it('still lands a steer inside the running reply', async () => {
+    await seed()
+    activeTurn()
+    queueSessionTurn(SESSION, { kind: 'single', messageId: 'msg_b_reply', userMessageId: 'msg_b' })
+
+    expect((await call(goodBody({ deliver: 'now' }))).status).toBe(202)
+    expect(listPendingSteers(SESSION)).toHaveLength(1)
   })
 })

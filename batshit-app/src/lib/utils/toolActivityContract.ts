@@ -6,9 +6,12 @@ import {
   slugToolName
 } from './toolNameNormalization'
 import { countTextLines, extractWriteContentFromSources } from './writePreview'
+import { isCliHelperMcpServerName } from './cliHelperToolNames'
+import { TOOL_RESULT_LARGE_TOKENS } from './toolResultSizeGuard'
+import { isToolModelCutView, SAVED_TOOL_MODEL_CUT_VIEW_MAX_CHARS } from './toolModelTextSizeGuard'
 
 export const TOOL_ACTIVITY_SCHEMA_VERSION = 1
-export const TOOL_ACTIVITY_FORCE_COMPRESS_TOKENS = 10_000
+export const TOOL_ACTIVITY_FORCE_COMPRESS_TOKENS = TOOL_RESULT_LARGE_TOKENS
 
 const FILE_PREVIEW_CHARS = 150_000
 const FILE_PREVIEW_LINES = 4_000
@@ -31,6 +34,9 @@ const GENERIC_MAX_DEPTH = 4
 const GENERIC_MAX_KEYS = 24
 const GENERIC_MAX_ARRAY_ITEMS = 20
 const GENERIC_MAX_STRING_CHARS = 2_000
+// Saved cards can show the CLI's model-facing cut text without treating that text as a
+// trusted Fetch Zip response. This is a presentation bound; the raw sidecar is separate.
+const CLI_MCP_CARD_TEXT_CHARS = 120_000
 const BINARY_LIKE_MIN_CHARS = 512
 const FETCH_ZIP_CONTENT_PREVIEW_CHARS = 16_000
 const FETCH_ZIP_CONTENT_PREVIEW_LINES = 800
@@ -113,7 +119,6 @@ type TextPreview = {
   truncated: boolean
 }
 
-const MODE4_INTERNAL_HELPER_SUFFIX = 'mode4-controls.'
 const MODE4_INTERNAL_HELPER_TOOL_NAMES = new Set([
   'batshit_tool_search',
   'batshit_tool_use',
@@ -150,11 +155,8 @@ function normalizeInternalMode4HelperName(value: string | undefined | null): str
 
   const toolSegment = parts.pop() ?? normalized
   const serverSegment = parts.slice(1).join('.')
-  const isMode4HelperServer =
-    collapseAlphaNumeric(serverSegment).includes('mode4controls') ||
-    normalized.includes(MODE4_INTERNAL_HELPER_SUFFIX)
-
-  if (!isMode4HelperServer) {
+  // BL-5: `batshit_helpers` now, and the per-agent `…-mode4-controls` names stored chats carry.
+  if (!isCliHelperMcpServerName(serverSegment)) {
     return normalized
   }
 
@@ -206,6 +208,47 @@ function unwrapNativeAutomationData(value: unknown): unknown {
     return unwrapMcpTextContentPayload(value)
   }
   return candidate.data ?? candidate
+}
+
+export function modelFacingMcpText(value: unknown): string | null {
+  const blocks = Array.isArray(value)
+    ? value
+    : isPlainObject(value) && Array.isArray(value.content)
+      ? value.content
+      : null
+  if (!blocks) return null
+  const texts = blocks
+    .filter((block): block is { type: 'text'; text: string } =>
+      isPlainObject(block) && block.type === 'text' && typeof block.text === 'string')
+    .map((block) => block.text)
+  return texts.length ? texts.join('\n') : null
+}
+
+function plainMcpText(value: unknown): string | null {
+  const blocks = Array.isArray(value)
+    ? value
+    : isPlainObject(value) && Array.isArray(value.content)
+      ? value.content
+      : null
+  if (!blocks || blocks.length !== 1) return null
+  const block = blocks[0]
+  if (!isPlainObject(block) || block.type !== 'text' || typeof block.text !== 'string') return null
+  return typeof parseMaybeJson(block.text) === 'string' ? block.text : null
+}
+
+function savedPlainMcpText(text: string): { content: string; contentLength: number; contentTruncated: boolean } {
+  if (text.length <= CLI_MCP_CARD_TEXT_CHARS) {
+    return { content: text, contentLength: text.length, contentTruncated: false }
+  }
+  // Leave room inside the cap for the explicit omission sentence itself.
+  const visibleChars = CLI_MCP_CARD_TEXT_CHARS - 128
+  const head = Math.floor(visibleChars / 2)
+  const tail = visibleChars - head
+  return {
+    content: `${text.slice(0, head)}\n[Saved card omitted ${text.length - head - tail} characters from the middle.]\n${text.slice(-tail)}`,
+    contentLength: text.length,
+    contentTruncated: true
+  }
 }
 
 /**
@@ -1698,12 +1741,27 @@ function extractFetchZipPayload(toolResult: any): Record<string, any> | null {
   const normalizedRecord = pickPlainObject(normalized)
   const resultRecord = pickPlainObject(normalizedRecord?.result)
   const dataRecord = pickPlainObject(normalizedRecord?.data)
-  return resultRecord ?? dataRecord ?? normalizedRecord
+  const payload = resultRecord ?? dataRecord ?? normalizedRecord
+  if (!payload) return null
+  if (typeof payload.found === 'boolean' || typeof payload.success === 'boolean') return payload
+  if (normalizedRecord &&
+      (typeof normalizedRecord.found === 'boolean' || typeof normalizedRecord.success === 'boolean')) {
+    return { ...normalizedRecord, ...payload }
+  }
+  return null
 }
 
 function summarizeFetchZipResult(toolArgs: Record<string, any>, toolResult: any): { result: any; flags: CompactToolFlags } {
   const payload = extractFetchZipPayload(toolResult)
   if (!payload) {
+    const plainText = plainMcpText(toolResult)
+    if (plainText !== null) {
+      const result = savedPlainMcpText(plainText)
+      return {
+        result,
+        flags: { compacted: result.contentTruncated, truncated: result.contentTruncated, binaryLikeOmitted: false }
+      }
+    }
     const summarized = summarizeValue(unwrapNativeAutomationData(toolResult))
     return {
       result: summarized,
@@ -1870,13 +1928,14 @@ function summarizeListResult(
         : null
 
   if (filesCandidate) {
-    const files = filesCandidate
+    const allFiles = filesCandidate
       .map((entry: any) => simplifyFileEntry(entry, defaultListEntryType))
       .filter((entry: SimplifiedListEntry | null): entry is SimplifiedListEntry => Boolean(entry))
-      .slice(0, LIST_ITEM_LIMIT)
-    const totalDirectories = files.filter((entry: SimplifiedListEntry) => entry.type === 'directory').length
-    const totalFiles = files.filter((entry: SimplifiedListEntry) => entry.type === 'file').length
-    const totalUnknownItems = files.filter((entry: SimplifiedListEntry) => entry.type === 'unknown').length
+    const files = allFiles.slice(0, LIST_ITEM_LIMIT)
+    // BL-166: the counts are the listing's, never the rows this payload keeps.
+    const totalDirectories = allFiles.filter((entry: SimplifiedListEntry) => entry.type === 'directory').length
+    const totalFiles = allFiles.filter((entry: SimplifiedListEntry) => entry.type === 'file').length
+    const totalUnknownItems = allFiles.filter((entry: SimplifiedListEntry) => entry.type === 'unknown').length
     return {
       result: {
         files,
@@ -1884,7 +1943,8 @@ function summarizeListResult(
         totalDirectories: (normalizedToolResult as any)?.totalDirectories ?? totalDirectories,
         totalUnknownItems: (normalizedToolResult as any)?.totalUnknownItems ?? totalUnknownItems,
         totalItems: (normalizedToolResult as any)?.totalItems ?? filesCandidate.length,
-        ...failureFields
+        ...failureFields,
+        ...outputCutFields(normalizedToolResult)
       },
       flags: {
         compacted: filesCandidate.length > files.length,
@@ -1912,8 +1972,8 @@ function summarizeListResult(
     if (parsedLsFiles.length > 0) {
       const files = parsedLsFiles.slice(0, LIST_ITEM_LIMIT)
       const totalItems = parsedLsFiles.length
-      const totalDirectories = files.filter((entry: { type: 'directory' | 'file' }) => entry.type === 'directory').length
-      const totalFiles = files.filter((entry: { type: 'directory' | 'file' }) => entry.type === 'file').length
+      const totalDirectories = parsedLsFiles.filter((entry: { type: 'directory' | 'file' }) => entry.type === 'directory').length
+      const totalFiles = parsedLsFiles.filter((entry: { type: 'directory' | 'file' }) => entry.type === 'file').length
 
       return {
         result: {
@@ -1922,7 +1982,8 @@ function summarizeListResult(
           totalDirectories,
           totalUnknownItems: 0,
           totalItems,
-          ...failureFields
+          ...failureFields,
+          ...outputCutFields(normalizedToolResult)
         },
         flags: {
           compacted: totalItems > files.length,
@@ -1939,17 +2000,17 @@ function summarizeListResult(
         .filter(Boolean)
         .map((line) => ({ line, dir: section.dir }))
     )
-    const files = sectionLines
+    const allFiles = sectionLines
       .map(({ line, dir }) => {
         const entry = simplifyFileEntry(line, defaultListEntryType)
         return entry ? inSection(entry, dir) : null
       })
       .filter((entry): entry is SimplifiedListEntry => Boolean(entry))
-      .slice(0, LIST_ITEM_LIMIT)
+    const files = allFiles.slice(0, LIST_ITEM_LIMIT)
     const totalItems = sectionLines.length
-    const totalDirectories = files.filter((entry) => entry.type === 'directory').length
-    const totalFiles = files.filter((entry) => entry.type === 'file').length
-    const totalUnknownItems = files.filter((entry) => entry.type === 'unknown').length
+    const totalDirectories = allFiles.filter((entry) => entry.type === 'directory').length
+    const totalFiles = allFiles.filter((entry) => entry.type === 'file').length
+    const totalUnknownItems = allFiles.filter((entry) => entry.type === 'unknown').length
 
     if (files.length > 0) {
       return {
@@ -1959,7 +2020,8 @@ function summarizeListResult(
           totalDirectories,
           totalUnknownItems,
           totalItems,
-          ...failureFields
+          ...failureFields,
+          ...outputCutFields(normalizedToolResult)
         },
         flags: {
           compacted: totalItems > files.length,
@@ -1976,7 +2038,8 @@ function summarizeListResult(
       output: preview.text,
       stdout: preview.text,
       truncated: preview.truncated,
-      ...failureFields
+      ...failureFields,
+      ...outputCutFields(normalizedToolResult)
     },
     flags: {
       compacted: preview.truncated,
@@ -2039,7 +2102,8 @@ function summarizeSearchResult(
           (normalizedToolResult as any)?.totalMatches ??
           files.reduce((sum: number, entry: Record<string, any>) => sum + (entry.matchCount || 0), 0),
         totalMatchingFiles: (normalizedToolResult as any)?.totalMatchingFiles ?? structuredResults.length,
-        ...failureFields
+        ...failureFields,
+        ...outputCutFields(normalizedToolResult)
       },
       flags: {
         compacted: structuredResults.length > files.length,
@@ -2066,7 +2130,8 @@ function summarizeSearchResult(
         ...(query ? { query } : {}),
         totalMatches: parsedFiles.reduce((sum, entry) => sum + entry.matchCount, 0),
         totalMatchingFiles: parsedFiles.length,
-        ...failureFields
+        ...failureFields,
+        ...outputCutFields(normalizedToolResult)
       },
       flags: {
         compacted: truncated,
@@ -2104,7 +2169,8 @@ function summarizeSearchResult(
           ...(query ? { query } : {}),
           totalMatches: filesOnlyResults.length,
           totalMatchingFiles: filesOnlyResults.length,
-          ...failureFields
+          ...failureFields,
+          ...outputCutFields(normalizedToolResult)
         },
         flags: {
           compacted: truncated,
@@ -2123,7 +2189,8 @@ function summarizeSearchResult(
       stdout: preview.text,
       truncated: preview.truncated,
       // A lane that merges its streams (Codex, Claude Code) already stores a failure's words here.
-      ...shellFailureFields(toolArgs, toolResult, previewSource)
+      ...shellFailureFields(toolArgs, toolResult, previewSource),
+      ...outputCutFields(normalizedToolResult)
     },
     flags: {
       compacted: preview.truncated,
@@ -2195,6 +2262,32 @@ function summarizeWebSearchResult(toolArgs: Record<string, any>, toolResult: any
   }
 }
 
+/**
+ * How much of a command's output its stored preview shows (220 lines or 6,000 characters of
+ * stdout, 120 lines or 2,500 of stderr), when the preview was cut: "first 220 of 1,000 lines", or
+ * "first 220 lines" for a zip stored before `totalLines` existed. Undefined when nothing was cut.
+ * The Bash card and the AI view both say it, because 220 lines shown as the whole output read as
+ * all the command printed.
+ */
+export function describeCommandPreview(result: unknown): string | undefined {
+  const record = pickPlainObject(result)
+  if (!record || (record.stdoutTruncated !== true && record.stderrTruncated !== true)) return undefined
+  const shown = countOutputLines([
+    typeof record.stdout === 'string' ? record.stdout : '',
+    typeof record.stderr === 'string' ? record.stderr : ''
+  ])
+  const total = typeof record.totalLines === 'number' && Number.isFinite(record.totalLines) ? record.totalLines : undefined
+  return total !== undefined && total > shown
+    ? `first ${shown.toLocaleString('en-US')} of ${total.toLocaleString('en-US')} lines`
+    : `first ${shown.toLocaleString('en-US')} lines`
+}
+
+/** The lines of a command's streams, counted as a zip description counts a command's (`laneResultLineCount`). */
+function countOutputLines(streams: string[]): number {
+  const text = streams.filter(Boolean).join('\n')
+  return text.length === 0 ? 0 : text.split('\n').length
+}
+
 function summarizeBashResult(toolArgs: Record<string, any>, toolResult: any): { result: any; flags: CompactToolFlags } {
   const normalizedToolResult = unwrapNativeAutomationData(toolResult)
   const mappedToolInput = extractNativeMappedToolInput(toolResult)
@@ -2241,7 +2334,13 @@ function summarizeBashResult(toolArgs: Record<string, any>, toolResult: any): { 
     interrupted: (normalizedToolResult as any)?.interrupted === true,
     isImage: (normalizedToolResult as any)?.isImage === true,
     stdoutTruncated: stdoutPreview.truncated,
-    stderrTruncated: stderrPreview.truncated
+    stderrTruncated: stderrPreview.truncated,
+    // BL-166: the preview keeps at most 220 lines of stdout and 120 of stderr; the lines the
+    // command printed are counted from its whole output, the way the preview's own are counted.
+    ...(!stdoutBinary && !stderrBinary && (stdoutPreview.truncated || stderrPreview.truncated)
+      ? { totalLines: countOutputLines([stdoutSource.trimEnd(), stderrSource.trimEnd()]) }
+      : {}),
+    ...outputCutFields(normalizedToolResult)
   }
 
   return {
@@ -2444,6 +2543,117 @@ export function commandFoundNothing(result: unknown, command?: unknown): boolean
 }
 
 /**
+ * A command's output that its lane cut before Batshit shaped it (BL-8): Claude Code keeps only the
+ * first 30,000 bytes of a big output. A listing, a search, or a plain command keeps only the whole
+ * lines kept, so the entries, matches, and lines Batshit counts are the FIRST ones, and every shaper
+ * keeps this beside them. `totalBytes` is absent when the lane named no total.
+ */
+export type ToolOutputCut = { by: string; keptBytes: number; totalBytes?: number }
+
+export function toolOutputCut(result: unknown): ToolOutputCut | undefined {
+  const cut = pickPlainObject(result)?.outputCut
+  return isPlainObject(cut) && typeof cut.by === 'string' && typeof cut.keptBytes === 'number'
+    ? (cut as ToolOutputCut)
+    : undefined
+}
+
+/** The cut, for a rebuild that keeps only the fields it names (nothing when nothing was cut). */
+export function outputCutFields(result: unknown): { outputCut?: ToolOutputCut } {
+  const cut = toolOutputCut(result)
+  return cut ? { outputCut: cut } : {}
+}
+
+/**
+ * BL-166: how the API lane's shell runners end a stream they cut. The local shell and Docker
+ * Sandbox runner (`limitedOutput`, commandOutputLimit.ts) ends with the first line below, which
+ * names its limit; Apple Container (`truncateOutput`, appleContainerSandbox.ts) keeps the first N
+ * characters, mid-line, and ends with the second. No lookbehind: Safari before 16.4 cannot parse
+ * one, and this module loads on every chat page.
+ */
+const BATSHIT_OUTPUT_CUT_LINE = /(?:^|\n)\[Output cut here by Batshit: the command printed more than ([\d,]+) characters\.\]$/
+const APPLE_CONTAINER_OUTPUT_CUT_LINE = /\n\.\.\.\[truncated \d+ chars\]$/
+/** The smallest limit a bash call can ask for (`maxOutputChars`, nativeTools.ts). */
+const SMALLEST_NATIVE_OUTPUT_LIMIT = 1_000
+
+function utf8ByteLength(text: string): number {
+  return new TextEncoder().encode(text).length
+}
+
+/**
+ * What a cut stream keeps: its whole lines, unless the last of them ends more than a quarter of
+ * `limit` before the cut, when the start of the long line is kept too (the rule `limitedOutput`
+ * cuts by; a header and one long line of minified JSON must not keep only the header).
+ */
+function keptBeforeCut(text: string, limit: number): string {
+  const wholeLinesEnd = text.lastIndexOf('\n') + 1
+  return text.length - wholeLinesEnd <= limit / 4 ? text.slice(0, wholeLinesEnd) : text
+}
+
+/**
+ * The part of one stream its runner kept, or null when the stream was not cut. A cut line counts
+ * only where the runner could have written it: `limitedOutput` always leaves at least three
+ * quarters of its limit, and Apple Container at least the smallest limit, so a command that
+ * printed the line itself, in a shorter stream, is not taken for a cut.
+ */
+function nativeStreamCut(text: string): string | null {
+  const batshit = BATSHIT_OUTPUT_CUT_LINE.exec(text)
+  if (batshit) {
+    const limit = Number(batshit[1].replace(/,/g, ''))
+    if (!Number.isFinite(limit) || text.length < limit - 1 - limit / 4) return null
+    return text.slice(0, batshit.index + (batshit[0].startsWith('\n') ? 1 : 0))
+  }
+  const apple = APPLE_CONTAINER_OUTPUT_CUT_LINE.exec(text)
+  if (!apple || apple.index < SMALLEST_NATIVE_OUTPUT_LIMIT) return null
+  const kept = text.slice(0, apple.index)
+  return keptBeforeCut(kept, kept.length)
+}
+
+/**
+ * A native bash result (`nativeBashExecute`: it carries the mapper's `mappedToolName`) whose run
+ * cut a stream says so with `truncated: true`, which no rebuild kept (BL-166): a cut output read as
+ * the whole output. This returns the result as a listing, search, or command lane stores it, the
+ * way BL-8 stores Claude Code's cut: each cut stream holds what its runner kept, without the
+ * runner's cut line, beside one `outputCut`, so every count reads as the FIRST entries, matches,
+ * or lines. A read keeps the cut line in its content instead, where it tells the reader where the
+ * file stops. A cut line is honored only when the run's own flag says it cut. Any other result,
+ * and a result that already names its cut, is returned as it was.
+ */
+export function withNativeBashOutputCut(result: unknown): unknown {
+  const record = pickPlainObject(result)
+  if (!record || record.truncated !== true || typeof record.mappedToolName !== 'string') return result
+  if (toolOutputCut(record)) return result
+
+  const next: Record<string, any> = { ...record }
+  let keptBytes = 0
+  let cutLineSeen = false
+  for (const key of ['stdout', 'stderr'] as const) {
+    const text = record[key]
+    if (typeof text !== 'string') continue
+    const kept = nativeStreamCut(text)
+    if (kept === null) continue
+    next[key] = kept
+    keptBytes += utf8ByteLength(kept)
+    cutLineSeen = true
+  }
+  // A runner that cut without a line of its own (the Docker host operator): the flag is the truth.
+  if (!cutLineSeen) {
+    keptBytes = [record.stdout, record.stderr]
+      .filter((value): value is string => typeof value === 'string')
+      .reduce((sum, value) => sum + utf8ByteLength(value), 0)
+  }
+  next.outputCut = { by: 'Batshit', keptBytes }
+  return next
+}
+
+/** The cut in words, for the card and the AI view, in the words of the read lane's cut line. */
+export function describeOutputCut(cut: ToolOutputCut): string {
+  const kept = cut.keptBytes.toLocaleString('en-US')
+  return typeof cut.totalBytes === 'number'
+    ? `${cut.by} cut this output: ${kept} of ${cut.totalBytes.toLocaleString('en-US')} bytes kept.`
+    : `${cut.by} cut this output: only the first ${kept} bytes kept.`
+}
+
+/**
  * True when a shell command stored as a file action failed: it reported a failing exit code, or
  * it never reported one and its result says it did not succeed (a command Codex declined, a
  * sandbox that never started, a policy block).
@@ -2539,7 +2749,8 @@ function summarizeReadResult(
     toolResult?.lineCount ??
     toolResult?.numLines ??
     toolResult?.totalLines ??
-    (normalizedContent ? normalizedContent.split('\n').length : 0)
+    // A final newline ends the last line; it does not start another (the write lane's rule).
+    countTextLines(normalizedContent)
   const size =
     toolResult?.size ??
     toolResult?.bytes ??
@@ -3414,6 +3625,21 @@ export function normalizeCompactTool(input: CompactToolInput): CompactToolNormal
   const rawSidecarPolicy = resolveRawSidecarPolicy(operationKind)
   const toolArgs = input.toolArgs && isPlainObject(input.toolArgs) ? { ...input.toolArgs } : {}
   const toolResult = input.toolResult
+  const unwrappedText = unwrapNativeAutomationData(toolResult)
+  // Reload normalizes the already-saved compact result again. Preserve its plain-text
+  // view; reinterpreting it as typed Bash/Fetch Zip data invents an empty/failure card.
+  const savedModelText = isPlainObject(toolResult) && toolResult.modelTextOnly === true &&
+    typeof toolResult.content === 'string' ? toolResult.content : null
+  const plainText = savedModelText ?? plainMcpText(toolResult) ??
+    (typeof unwrappedText === 'string' ? unwrappedText : null)
+  // BL-678: only the guard's exact notice at the end makes a cut view; the words anywhere
+  // else (a Read of Batshit's own source, a search for them) are the tool's ordinary text.
+  // A card saved by the P2 guard (before BL-677) can be up to 100,000 characters; only an
+  // already-saved view gets that ceiling, and it still needs the exact notice at the end.
+  const modelCut = plainText !== null && isToolModelCutView(
+    plainText,
+    savedModelText !== null ? SAVED_TOOL_MODEL_CUT_VIEW_MAX_CHARS : undefined
+  )
   const artifactControlPresentation = buildArtifactControlPresentation({
     operationKind,
     rendererFamily,
@@ -3421,7 +3647,7 @@ export function normalizeCompactTool(input: CompactToolInput): CompactToolNormal
     toolArgs,
     toolResult
   })
-  if (artifactControlPresentation) return artifactControlPresentation
+  if (artifactControlPresentation && !modelCut) return artifactControlPresentation
 
   const compactArgs = compactToolArgs(operationKind, toolArgs, toolResult)
 
@@ -3574,19 +3800,35 @@ export function normalizeCompactTool(input: CompactToolInput): CompactToolNormal
     case 'unknown_tool':
     default: {
       const normalizedGenericResult = unwrapNativeAutomationData(toolResult)
-      compactResult = summarizeValue(normalizedGenericResult)
+      const plainText = plainMcpText(toolResult)
+      // Keep a visible cut notice or a very large CLI text result intact in the card. The
+      // notice is untrusted display text; it never grants access to the retained raw zip.
+      const keepPlainText = plainText !== null &&
+        (isToolModelCutView(plainText) || plainText.length >= 70_000)
+      compactResult = keepPlainText ? savedPlainMcpText(plainText) : summarizeValue(normalizedGenericResult)
       flags = {
         compacted: safeStringify(compactResult).length < safeStringify(toolResult).length,
-        truncated: safeStringify(compactResult).length < safeStringify(toolResult).length,
+        truncated: keepPlainText
+          ? compactResult.contentTruncated
+          : safeStringify(compactResult).length < safeStringify(toolResult).length,
         binaryLikeOmitted: false
       }
       break
     }
   }
 
+  // A guard cut is no longer a complete typed result. Its text is the saved CLI view,
+  // not an empty Bash object, failed fetch, or partial list. This is display-only metadata:
+  // never parse a raw id from the notice or turn it into a trusted reference.
+  if (modelCut) {
+    const saved = savedPlainMcpText(plainText!)
+    compactResult = { ...saved, modelTextOnly: true }
+    flags = { compacted: saved.contentTruncated, truncated: saved.contentTruncated, binaryLikeOmitted: false }
+  }
+  const shell = pickPlainObject(unwrapNativeAutomationData(toolResult))?.shell
   return {
     operationKind,
-    rendererFamily,
+    rendererFamily: modelCut ? 'generic_tool' : rendererFamily,
     // A brokered zip fetch names its control too (`sys.zip.fetch` → Fetch Zip); a direct
     // helper fetch names none and keeps its own tool label.
     displayToolName:
@@ -3595,7 +3837,9 @@ export function normalizeCompactTool(input: CompactToolInput): CompactToolNormal
           ?? undefined
         : undefined,
     toolArgs: compactArgs,
-    toolResult: compactResult,
+    toolResult: typeof shell === 'string' && compactResult && typeof compactResult === 'object'
+      ? { ...compactResult, shell }
+      : compactResult,
     flags,
     rawSidecarPolicy,
     rawReason:

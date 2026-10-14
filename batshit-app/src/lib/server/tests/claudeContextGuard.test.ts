@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from 'vitest'
 
 import {
   DEFAULT_CLAUDE_CONTEXT_GUARD_THRESHOLD,
-  DEFAULT_CLAUDE_CONTEXT_WINDOW,
   applyClaudeContextGuard,
   buildClaudeContextGuardStopMessage,
   extractClaudeContextUsedTokens,
@@ -10,6 +9,7 @@ import {
   resolveClaudeContextWindow,
 } from '../services/claudeContextGuard'
 import { isContextExhaustionError } from '../services/contextExhaustion'
+import { capturedClaudePrimaryEvents } from './fixtures/claudePrimaryContext'
 
 function assistantEvent(usage: Record<string, unknown> | undefined, extra: Record<string, unknown> = {}) {
   return {
@@ -82,13 +82,9 @@ describe('resolveClaudeContextWindow', () => {
     ).toBe(500_000)
   })
 
-  it('ignores zero/invalid preset values (CLI presets default to 0)', () => {
-    expect(resolveClaudeContextWindow({ presetContextWindow: 0, model: 'claude-opus-4-8' })).toBe(
-      DEFAULT_CLAUDE_CONTEXT_WINDOW,
-    )
-    expect(resolveClaudeContextWindow({ presetContextWindow: NaN, model: null })).toBe(
-      DEFAULT_CLAUDE_CONTEXT_WINDOW,
-    )
+  it('ignores zero/invalid preset values and uses only a verified choice', () => {
+    expect(resolveClaudeContextWindow({ presetContextWindow: 0, model: 'claude-opus-4-8' })).toBe(1_000_000)
+    expect(resolveClaudeContextWindow({ presetContextWindow: NaN, model: null })).toBeNull()
   })
 
   it('detects the 1M-token beta from a [1m] model suffix', () => {
@@ -97,11 +93,11 @@ describe('resolveClaudeContextWindow', () => {
     )
     expect(
       resolveClaudeContextWindow({ presetContextWindow: null, model: 'claude-sonnet-4-6[1M]' }),
-    ).toBe(1_000_000)
+    ).toBeNull()
   })
 
-  it('falls back to the standard 200k window', () => {
-    expect(resolveClaudeContextWindow({})).toBe(200_000)
+  it('keeps an unresolved default unknown until the CLI names a model', () => {
+    expect(resolveClaudeContextWindow({})).toBeNull()
   })
 })
 
@@ -163,6 +159,239 @@ describe('buildClaudeContextGuardStopMessage', () => {
 })
 
 describe('applyClaudeContextGuard', () => {
+  it('accepts the captured initialized [1m] row as fresh primary runtime evidence', async () => {
+    const events = capturedClaudePrimaryEvents()
+    const reports: any[] = []
+    const result = await collect(applyClaudeContextGuard(streamOf(events), {
+      contextWindow: 1_000_000, threshold: 0.8, model: 'sonnet[1m]',
+      onReport: report => reports.push(report), onTrip: vi.fn()
+    }))
+    expect(result).toEqual({ events, error: null })
+    expect(extractClaudeContextUsedTokens(events[1])).toBe(13_529)
+    expect(reports.at(-1)).toMatchObject({ model: 'sonnet[1m]', actualModel: 'claude-sonnet-5-5',
+      contextWindow: 1_000_000, evidence: 'runtime' })
+  })
+
+  it.each([false, true])('lets a differing runtime limit override preset/choice with disable1M=%s', async disableClaude1M => {
+    const events = capturedClaudePrimaryEvents()
+    events[2].modelUsage['claude-sonnet-5-5[1m]'].contextWindow = 550_000
+    const reports = vi.fn()
+    await collect(applyClaudeContextGuard(streamOf(events), {
+      contextWindow: 200_000, presetContextWindow: 200_000, threshold: 0.8, model: 'sonnet[1m]',
+      disableClaude1M, onReport: reports, onTrip: vi.fn()
+    }))
+    expect(reports).toHaveBeenLastCalledWith(expect.objectContaining({
+      evidence: 'runtime', contextWindow: 550_000, disableClaude1M
+    }))
+  })
+
+  it.each([
+    ['canonical-only worker key', { 'worker-model': { canonicalModel: 'claude-sonnet-5-5', contextWindow: 17_000 } }],
+    ['unobserved suffixed key', { 'claude-sonnet-5-5[other]': { canonicalModel: 'claude-sonnet-5-5', contextWindow: 17_000 } }],
+    ['missing canonical identity', { 'claude-sonnet-5-5[1m]': { contextWindow: 17_000 } }],
+    ['contradictory initialized row', { 'claude-sonnet-5-5[1m]': { canonicalModel: 'claude-haiku-5-5', contextWindow: 17_000 } }],
+    ['contradictory exact row', { 'claude-sonnet-5-5': { canonicalModel: 'claude-haiku-5-5', contextWindow: 17_000 } }],
+    ['two primary rows', {
+      'claude-sonnet-5-5': { canonicalModel: 'claude-sonnet-5-5', contextWindow: 500_000 },
+      'claude-sonnet-5-5[1m]': { canonicalModel: 'claude-sonnet-5-5', contextWindow: 1_000_000 }
+    }],
+    ['malformed row', { 'claude-sonnet-5-5[1m]': [] }],
+    ['malformed usage', []]
+  ])('refuses fresh runtime evidence for %s', async (_label, modelUsage) => {
+    const events = capturedClaudePrimaryEvents()
+    events[2].modelUsage = modelUsage
+    const reports: any[] = []
+    const result = await collect(applyClaudeContextGuard(streamOf(events), {
+      contextWindow: 1_000_000, threshold: 0.8, model: 'sonnet[1m]',
+      onReport: report => reports.push(report), onTrip: vi.fn()
+    }))
+    expect(result.error).toBeNull()
+    expect(reports.some(report => report.evidence === 'runtime')).toBe(false)
+    expect(reports.at(-1).contextWindow).toBe(1_000_000)
+  })
+
+  it.each([0, -1, 0.1, NaN, Infinity, Number.MAX_VALUE, '550000', null])('rejects invalid runtime window %s', async window => {
+    const events = capturedClaudePrimaryEvents()
+    events[2].modelUsage['claude-sonnet-5-5[1m]'].contextWindow = window
+    const reports = vi.fn()
+    await collect(applyClaudeContextGuard(streamOf(events), {
+      contextWindow: 1_000_000, threshold: null, model: 'sonnet[1m]',
+      onReport: reports, onTrip: vi.fn()
+    }))
+    expect(reports.mock.calls.some(([report]) => report.evidence === 'runtime')).toBe(false)
+  })
+
+  it('ignores sidechain init, assistant and result identities without losing the primary match', async () => {
+    const events = capturedClaudePrimaryEvents()
+    const worker = { parent_tool_use_id: 'worker-call' }
+    events.splice(2, 0,
+      { type: 'system', subtype: 'init', model: 'claude-haiku-5-5', ...worker },
+      { type: 'assistant', message: { model: 'claude-haiku-5-5', usage: { input_tokens: 999_999 } }, ...worker },
+      { type: 'result', modelUsage: { 'claude-sonnet-5-5': { contextWindow: 17_000 } }, ...worker })
+    const reports: any[] = []
+    const trip = vi.fn()
+    const result = await collect(applyClaudeContextGuard(streamOf(events), {
+      contextWindow: 1_000_000, threshold: 0.8, model: 'sonnet[1m]',
+      onReport: report => reports.push(report), onTrip: trip
+    }))
+    expect(result.error).toBeNull()
+    expect(trip).not.toHaveBeenCalled()
+    expect(reports.filter(report => report.evidence === 'runtime')).toEqual([
+      expect.objectContaining({ actualModel: 'claude-sonnet-5-5', contextWindow: 1_000_000 })
+    ])
+  })
+
+  it('cannot borrow the initialized model after the top-level primary changes', async () => {
+    const events = capturedClaudePrimaryEvents()
+    events[1].message.model = 'claude-haiku-5-5'
+    events[2].modelUsage['claude-sonnet-5-5[1m]'].canonicalModel = 'claude-haiku-5-5'
+    const reports = vi.fn()
+    await collect(applyClaudeContextGuard(streamOf(events), {
+      contextWindow: 1_000_000, threshold: null, model: 'sonnet[1m]',
+      onReport: reports, onTrip: vi.fn()
+    }))
+    expect(reports.mock.calls.some(([report]) => report.evidence === 'runtime')).toBe(false)
+  })
+
+  it('keeps an unknown primary window unknown when only a worker reports a limit', async () => {
+    const events = capturedClaudePrimaryEvents()
+    events[0].model = 'unknown-primary[1m]'
+    events[1].message.model = 'unknown-primary'
+    const reports = vi.fn()
+    await collect(applyClaudeContextGuard(streamOf(events), {
+      contextWindow: null, threshold: 0.8, model: 'default',
+      onReport: reports, onTrip: vi.fn()
+    }))
+    expect(reports).toHaveBeenLastCalledWith(expect.objectContaining({ evidence: 'unresolved', contextWindow: null }))
+    expect(reports.mock.calls.some(([report]) => report.evidence === 'runtime')).toBe(false)
+  })
+
+  // What the previous [1m] run saved: the assistant's base name and its result row's limit.
+  const savedBaseReport = (extra: Record<string, unknown> = {}): any => ({
+    runtime: 'claude', model: 'sonnet[1m]', actualModel: 'claude-sonnet-5-5', contextWindow: 550_000,
+    evidence: 'runtime', disableClaude1M: false, reportedAt: 1_760_184_000_000, ...extra
+  })
+
+  it('keeps the saved base-name window at the next exact [1m] init, with no new report', async () => {
+    const reported = savedBaseReport()
+    const saved = structuredClone(reported)
+    const events = capturedClaudePrimaryEvents().slice(0, 2)
+    events[1].message.usage = { input_tokens: 450_000, output_tokens: 0 }
+    const reports = vi.fn()
+    const trip = vi.fn()
+    const result = await collect(applyClaudeContextGuard(streamOf(events), {
+      contextWindow: 550_000, threshold: 0.8, model: 'sonnet[1m]', reported,
+      onReport: reports, onTrip: trip
+    }))
+    // The 1M estimate would not trip at 450k; the retained 550k window does.
+    expect(result.error?.message).toContain('550,000')
+    expect(trip).toHaveBeenCalledOnce()
+    // An init is not fresh telemetry: nothing is reported and the saved report keeps its time.
+    expect(reports).not.toHaveBeenCalled()
+    expect(reported).toEqual(saved)
+  })
+
+  it('lets the fresh result replace a retained [1m] baseline', async () => {
+    const reports = vi.fn()
+    await collect(applyClaudeContextGuard(streamOf(capturedClaudePrimaryEvents()), {
+      contextWindow: 550_000, threshold: 0.8, model: 'sonnet[1m]', reported: savedBaseReport(),
+      onReport: reports, onTrip: vi.fn()
+    }))
+    expect(reports).toHaveBeenCalledOnce()
+    expect(reports).toHaveBeenCalledWith(expect.objectContaining({
+      evidence: 'runtime', actualModel: 'claude-sonnet-5-5', contextWindow: 1_000_000
+    }))
+  })
+
+  it.each([
+    ['another suffix', 'claude-sonnet-5-5[2m]'],
+    ['a differently cased suffix', 'claude-sonnet-5-5[1M]'],
+    ['another model with [1m]', 'claude-opus-5-5[1m]'],
+    ['a family prefix with [1m]', 'claude-sonnet-5[1m]']
+  ])('drops the saved window at an init with %s', async (_label, initModel) => {
+    const events = capturedClaudePrimaryEvents().slice(0, 1)
+    events[0].model = initModel
+    const reports = vi.fn()
+    await collect(applyClaudeContextGuard(streamOf(events), {
+      contextWindow: 550_000, threshold: 0.8, model: 'sonnet[1m]', reported: savedBaseReport(),
+      onReport: reports, onTrip: vi.fn()
+    }))
+    expect(reports).toHaveBeenCalledOnce()
+    expect(reports.mock.calls[0][0]).toMatchObject({ actualModel: initModel })
+    expect(reports.mock.calls[0][0].evidence).not.toBe('runtime')
+  })
+
+  it.each([
+    ['another requested model', { model: 'sonnet' }, 'claude-sonnet-5-5[1m]'],
+    ['another 1M cap setting', { disableClaude1M: true }, 'claude-sonnet-5-5[1m]'],
+    ['estimate-only evidence', { evidence: 'resolved' }, 'claude-sonnet-5-5[1m]'],
+    ['no saved actual model', { actualModel: undefined }, 'undefined[1m]']
+  ])('drops a saved window with %s at the [1m] init', async (_label, extra, initModel) => {
+    const events = capturedClaudePrimaryEvents().slice(0, 1)
+    events[0].model = initModel
+    const reports = vi.fn()
+    await collect(applyClaudeContextGuard(streamOf(events), {
+      contextWindow: 550_000, threshold: 0.8, model: 'sonnet[1m]', reported: savedBaseReport(extra),
+      onReport: reports, onTrip: vi.fn()
+    }))
+    expect(reports).toHaveBeenCalledOnce()
+    expect(reports.mock.calls[0][0].evidence).not.toBe('runtime')
+  })
+
+  it('drops a retained [1m] baseline when a later top-level primary differs', async () => {
+    const events = capturedClaudePrimaryEvents().slice(0, 2)
+    events[1].message.model = 'claude-haiku-5-5'
+    const reports = vi.fn()
+    await collect(applyClaudeContextGuard(streamOf(events), {
+      contextWindow: 550_000, threshold: null, model: 'sonnet[1m]', reported: savedBaseReport(),
+      onReport: reports, onTrip: vi.fn()
+    }))
+    // The init kept it (no report), then the different primary discarded it.
+    expect(reports).toHaveBeenCalledOnce()
+    expect(reports.mock.calls[0][0]).toMatchObject({ actualModel: 'claude-haiku-5-5' })
+    expect(reports.mock.calls[0][0].evidence).not.toBe('runtime')
+  })
+
+  it('gives an assistant that names the suffixed model no [1m] init allowance', async () => {
+    const events = capturedClaudePrimaryEvents().slice(1, 2)
+    events[0].message.model = 'claude-sonnet-5-5[1m]'
+    const reports = vi.fn()
+    await collect(applyClaudeContextGuard(streamOf(events), {
+      contextWindow: 550_000, threshold: null, model: 'sonnet[1m]', reported: savedBaseReport(),
+      onReport: reports, onTrip: vi.fn()
+    }))
+    expect(reports).toHaveBeenCalledOnce()
+    expect(reports.mock.calls[0][0]).toMatchObject({ actualModel: 'claude-sonnet-5-5[1m]' })
+    expect(reports.mock.calls[0][0].evidence).not.toBe('runtime')
+  })
+
+  it('uses the actual model in captured managed CLI init, assistant and result events', async () => {
+    // Sanitized from the managed Claude 2.1.283 no-tool proof, 2026-09-29.
+    const reports: any[] = []
+    const events = [
+      { type: 'system', subtype: 'init', model: 'claude-sonnet-5' },
+      assistantEvent({
+        input_tokens: 2, cache_creation_input_tokens: 16_252,
+        cache_read_input_tokens: 3_397, output_tokens: 4
+      }, { message: { role: 'assistant', model: 'claude-sonnet-5', usage: {
+        input_tokens: 2, cache_creation_input_tokens: 16_252,
+        cache_read_input_tokens: 3_397, output_tokens: 4
+      } } }),
+      { type: 'result', modelUsage: {
+        'claude-sonnet-5': { contextWindow: 1_000_000, canonicalModel: 'claude-sonnet-5' },
+        'worker-model': { contextWindow: 17_000 }
+      } }
+    ]
+    const result = await collect(applyClaudeContextGuard(streamOf(events), {
+      contextWindow: null, threshold: 0.8, model: 'sonnet',
+      onReport: (report) => reports.push(report), onTrip: vi.fn()
+    }))
+    expect(result.error).toBeNull()
+    expect(reports.at(-1)).toMatchObject({
+      runtime: 'claude', model: 'sonnet', actualModel: 'claude-sonnet-5', contextWindow: 1_000_000
+    })
+    expect(reports.every((report) => report.contextWindow !== 17_000)).toBe(true)
+  })
   const guardConfig = { contextWindow: 200_000, threshold: 0.8 }
 
   it('passes events through untouched below the threshold', async () => {

@@ -1,3 +1,5 @@
+import { steerInputSource, type UserInputSource, type ApiInputObservation } from './imageAddressApiInput'
+import type { ObservedUsage } from '$lib/types/executionViewer'
 /**
  * Vercel AI SDK Brain Service - API runtime Native AI Orchestration
  * Story 5.7: Clean streaming architecture with direct provider access
@@ -60,9 +62,47 @@ import {
 import { normalizeSubagentType, type SubagentType } from '$lib/utils/subagentType'
 import { isOpenAIReasoningParameterRestrictedModelId } from '$lib/utils/parameterFilter'
 import { collectReasoningTextFromFinish } from '$lib/utils/reasoningDisplay'
-import { applyApiPromptCachePolicy } from '$lib/server/services/apiPromptCachePolicy'
+import {
+  applyApiPromptCachePolicy,
+  placeToolLoopTailMarker,
+  type ToolLoopTailMarker
+} from '$lib/server/services/apiPromptCachePolicy'
 import { normalizeUsageLike, withHonestLocalCacheUsage } from '$lib/server/services/apiProviderUsage'
 import { resolveLocalPromptCacheReporting } from '$lib/data/localAiServers'
+import { StreamStoppedError, isStopError, judgeStreamEnd } from '$lib/server/services/streamStop'
+import { relayAbort } from '$lib/server/services/turnAbortRelay'
+import { providerStreamErrorFrom } from '$lib/server/services/streamFailureEvidence'
+import { stepContentReachedToolBoundary, toolErrorAsFailedToolResult } from './toolErrorPart'
+import { findCommandModelCapture } from './commandModelCaptureResponse'
+import { guardToolModelText, type ToolModelResultContext } from './toolModelResultGuard'
+import { estimateTokens } from '$lib/utils/tokens'
+import { TOOL_RESULT_TOO_LARGE_TOKENS } from '$lib/utils/toolResultSizeGuard'
+import type { PlanLease } from './chatgptPlanRuntime'
+import { isPlanSelection, planModelForLease, planClientTools, planProviderOptions, assertPlanSettings } from './chatgptPlanInference'
+import { guardResponsesTerminal } from './responsesTerminalGuard'
+
+/**
+ * BL-452: the error a delegated run's `error` stream part carries, as an Error with the
+ * provider's own sentence. The part's `error` is `unknown` (AI SDK 7 `TextStreamErrorPart`):
+ * an `APICallError` / `RetryError` for a failed request, a `StreamProviderError` for a mid-stream
+ * failure (since ai 7.0.80 the SDK turns the provider's object, Anthropic's
+ * `{ type: 'overloaded_error', message }`, into one with the same message and the object in
+ * `.data`), or a type validation error wrapping the provider's chunk (BL-245,
+ * `providerStreamErrorFrom`).
+ */
+function delegatedStreamErrorFrom(rawError: unknown): Error {
+  const providerError = providerStreamErrorFrom(rawError)
+  if (providerError) return providerError
+  if (rawError instanceof Error) return rawError
+  const message =
+    typeof rawError === 'string' && rawError.trim().length > 0
+      ? rawError.trim()
+      : typeof (rawError as { message?: unknown } | null)?.message === 'string' &&
+          ((rawError as { message: string }).message.trim().length > 0)
+        ? (rawError as { message: string }).message.trim()
+        : 'The model call failed without a reason.'
+  return new Error(message, { cause: rawError })
+}
 
 /**
  * Subagent tool metadata (Story 6.7c)
@@ -180,7 +220,67 @@ function buildDefaultToolModelOutput(output: unknown): any {
     : { type: 'json', value: output ?? null }
 }
 
+/** The SDK's content variant can mix text and image/file blocks. Only readable text counts. */
+async function guardReadableToolModelOutput(
+  modelOutput: any,
+  context: ToolModelResultContext
+): Promise<any> {
+  if (!modelOutput || typeof modelOutput !== 'object') return modelOutput
+  if ((modelOutput.type === 'text' || modelOutput.type === 'error-text') &&
+      typeof modelOutput.value === 'string') {
+    if (estimateTokens(modelOutput.value) < TOOL_RESULT_TOO_LARGE_TOKENS) return modelOutput
+    return { ...modelOutput, value: await guardToolModelText(modelOutput.value, context) }
+  }
+  if (modelOutput.type !== 'content' || !Array.isArray(modelOutput.value)) return modelOutput
+
+  const parts = modelOutput.value as Array<any>
+  const readableParts = parts.flatMap((part) => {
+    if (part?.type === 'text' && typeof part.text === 'string') return [part.text]
+    if (part?.type === 'file' && part.data?.type === 'text' &&
+        typeof part.data.text === 'string') return [part.data.text]
+    return []
+  })
+  if (readableParts.length === 0) return modelOutput
+  const readableText = readableParts.join('\n')
+  if (estimateTokens(readableText) < TOOL_RESULT_TOO_LARGE_TOKENS) return modelOutput
+
+  const cutText = await guardToolModelText(readableText, context)
+  let inserted = false
+  const cutParts = parts.flatMap((part) => {
+    const isText = part?.type === 'text' && typeof part.text === 'string'
+    const isInlineFileText = part?.type === 'file' && part.data?.type === 'text' &&
+      typeof part.data.text === 'string'
+    if (!isText && !isInlineFileText) return [part]
+    if (inserted) return []
+    inserted = true
+    // Preserve all media blocks and top-level options. A cut inline text file becomes a
+    // text notice so the model does not receive the unbounded original file body.
+    return [{ type: 'text', text: cutText, ...(part.providerOptions ? { providerOptions: part.providerOptions } : {}) }]
+  })
+  return { ...modelOutput, value: cutParts }
+}
+
 export interface NativeModeRequest extends ThinkRequest {
+  /** Server-owned request capability; never accepted from an HTTP body. */
+  chatgptPlanLease?: PlanLease
+  /** Constructed by send-routed from its compile and persisted server replay, never body metadata. */
+  imageOriginInput?: { compiledPrefixCount: number; userSources: UserInputSource[] }
+  onApiModelInput?: (input: ApiInputObservation) => void
+
+  /** CLI runtime evidence for this primary reply's context meter; API runs never call it. */
+  onCliContext?: (report: import('$lib/utils/cliContextWindow').CliContextWindowReport) => void
+  /** Ephemeral raw CLI result evidence, before display enrichment; never serialized. */
+  onCliModelResult?: (delivery: { callId: string; texts: readonly string[]; nonTextInputs: number; unaccountedInputs: number }) => void
+  /** Server-owned primary preflight selection, never read from request metadata. */
+  cliContextSelection?: import('$lib/utils/cliContextWindow').CliContextSelection
+  /** Internal delegated-run owner; a Worker belongs to its parent, not its virtual CLI id. */
+  processOwner?: { userId: string; kind: 'agent' | 'subagent'; id: string }
+  /** Actual delegated record's Bash grant, before preset settings are merged. */
+  delegatedBashEnabled?: boolean
+  /** Server-vouched stored parent agent for a delegated Native Bash command. */
+  commandParentAgentId?: string | null
+  /** Server-owned parent reply for a delegated Codex run's late cleanup warning. */
+  processCleanupMessageId?: string
   /**
    * SA-105 P2 (DL-105-06): the saved model's capabilities, so the tool-result
    * image lane uses the same vision rule as attached clips. Optional and
@@ -242,6 +342,13 @@ export interface NativeModeRequest extends ThinkRequest {
    */
   scopeAgentId?: string | null
   /**
+   * BL-81 — what a Subagent or Worker run may use through the control routes: the control ids
+   * its DCM index offers it (`resolveDelegatedRunAllowedControlIds`). Set only by
+   * `subagentRunner.ts`, beside `delegatedRun`. The CLI bridges mint it onto the run credential,
+   * and `/api/controls/use` and `/api/controls/find` answer that credential with it alone.
+   */
+  delegatedAllowedControlIds?: string[] | null
+  /**
    * SA-114 P1 (DL-114-05): takes every steer waiting for this turn and marks it delivered.
    *
    * Only send-routed's PRIMARY API turn supplies it. A subagent run, a Worker, a group
@@ -277,7 +384,14 @@ export interface NativeModeRequest extends ThinkRequest {
     totalUsage?: any
     reasoning?: string[]
     responseMessages?: ModelMessage[]
+    apiUserSources?: UserInputSource[]
+    /** BL-474 step 2: pictures handed to the model in a synthetic message during the run. */
+    imageInputsRegistered?: number
+    /** Partial reported portions, never the whole-run usage or a successful call. */
+    observedUsage?: ObservedUsage
   }) => void | Promise<void>
+  /** In-process Codex delegation custody; registration never reads the running source. */
+  registerObservedUsageSource?: (source: () => ObservedUsage | undefined) => void
   onAbort?: (params: { steps?: any[] }) => void
 }
 
@@ -299,9 +413,13 @@ export class VercelAIBrain {
    * sent (`toReadableToolModelOutput`). A tool's own `toModelOutput` still runs first; a
    * tool without one gets the SDK's default shape, which this normalizes the same way.
    *
-   * F-P4-9: it no longer reserves a zip id or appends a zip-id notice.
+   * F-P4-9: it never reserves or announces a card zip id. BL-494 may name a separately
+   * retained raw copy only after the server has saved it.
    */
-  private wrapToolsWithReadableModelOutput(tools: Record<string, any>): Record<string, any> {
+  private wrapToolsWithReadableModelOutput(
+    tools: Record<string, any>,
+    context: Omit<ToolModelResultContext, 'toolName'>
+  ): Record<string, any> {
     const wrappedTools: Record<string, any> = {}
     for (const [toolName, toolDefinition] of Object.entries(tools)) {
       if (
@@ -332,7 +450,26 @@ export class VercelAIBrain {
               ? await originalToModelOutput.call(toolDefinition, params)
               : buildDefaultToolModelOutput(params.output)
 
-          return toReadableToolModelOutput(modelOutput)
+          const memoryResult = toolName === 'native_batshit_tool_use' &&
+            params.output !== null && typeof params.output === 'object' &&
+            (params.output as any).family === 'fabric' &&
+            /^sys\.memory\.[a-z0-9_-]+$/.test((params.output as any).target ?? '')
+          const captured = findCommandModelCapture(params.output)
+          if (captured && Math.ceil(captured.originalTextChars / 4) >= TOOL_RESULT_TOO_LARGE_TOKENS) {
+            const cut = await guardToolModelText(captured.text, {
+              ...context, toolName, originalTextChars: captured.originalTextChars
+            })
+            const readable = toReadableToolModelOutput(modelOutput)
+            if (readable?.type === 'content' && Array.isArray(readable.value)) {
+              return { ...readable, value: [{ type: 'text', text: cut }, ...readable.value.filter((part: any) =>
+                part?.type !== 'text' && !(part?.type === 'file' && part.data?.type === 'text'))] }
+            }
+            return { ...readable, type: readable?.type === 'error-text' ? 'error-text' : 'text', value: cut }
+          }
+          return await guardReadableToolModelOutput(
+            toReadableToolModelOutput(modelOutput),
+            { ...context, toolName, ...(memoryResult ? { memoryResult: true } : {}) }
+          )
         }
       }
     }
@@ -371,6 +508,18 @@ export class VercelAIBrain {
    */
   async processNativeMode(request: NativeModeRequest): Promise<ThoughtResponse> {
     const startTime = Date.now()
+    // The model loop's own signal: the runner's (Stop, the time limit) relayed in, plus the
+    // run's own abort when it ends early on a failed model call, so the SDK's loop, the
+    // provider request, and any running tool are cancelled rather than left suspended.
+    // `runOver` removes the relay's listener when the run ends (BL-246).
+    const runController = new AbortController()
+    const runOver = new AbortController()
+    relayAbort({
+      from: request.chatgptPlanLease?.signal ?? request.abortSignal,
+      to: runController,
+      reason: (source: AbortSignal) => source.reason,
+      until: runOver.signal,
+    })
 
     logger.debug('[VercelBrain API] Processing native mode request', {
       sessionId: request.sessionId,
@@ -382,6 +531,7 @@ export class VercelAIBrain {
 
     try {
       // Validate messages
+      if (request.chatgptPlanLease) assertPlanSettings(request.providerSettings)
       if (!request.messages || request.messages.length === 0) {
         throw new Error('No messages provided to processNativeMode()')
       }
@@ -392,6 +542,8 @@ export class VercelAIBrain {
         request.connection,
         request.userId,
         request.taggedReasoningTagName,
+        undefined,
+        request.chatgptPlanLease,
       )
 
       // Convert messages - uses existing compilation!
@@ -428,6 +580,8 @@ export class VercelAIBrain {
         request.toolApprovalMode,
         {
           providerSettings: request.providerSettings ?? null,
+          processOwner: request.processOwner,
+          delegatedBashEnabled: request.delegatedBashEnabled,
           projectPath: request.projectPath ?? null,
           selectedCliToolIds: request.selectedCliToolIds,
           memoryControlsEnabled: request.memoryControlsEnabled,
@@ -446,7 +600,7 @@ export class VercelAIBrain {
         }
       )
 
-      let toolsForRequest = tools
+      let toolsForRequest = request.chatgptPlanLease ? planClientTools(tools, request.chatgptPlanLease)! : tools
       const openaiTools = await this.buildOpenAITools(request)
       if (openaiTools) {
         toolsForRequest = this.mergeToolSets(toolsForRequest, openaiTools)
@@ -484,36 +638,60 @@ export class VercelAIBrain {
         ...(Object.keys(toolApprovals).length > 0 ? { toolApproval: toolApprovals } : {}),
         stopWhen: isStepCount(request.maxToolRounds || 10), // Multi-round tool execution
         ...this.buildGenerationSettings(request),
-        providerOptions: cachePolicy.providerOptions,
+        providerOptions: request.chatgptPlanLease ? planProviderOptions(cachePolicy.providerOptions) : cachePolicy.providerOptions,
         // SA-107: per-session cache-affinity headers (xAI/Baseten/Fireworks direct lanes).
         ...(cachePolicy.headers ? { headers: cachePolicy.headers } : {}),
         ...(downloadGuard ? { experimental_download: downloadGuard } : {}),
-        // SA-105 P2 (DL-105-03): on lanes whose tool results serialize as text,
-        // images recalled during this run are appended as ONE user message for
-        // the next step. Present only when a registry exists — i.e. only on
-        // `synthetic_user` lanes — so no other run's call shape changes.
-        ...(ephemeralImages
-          ? { prepareStep: this.buildEphemeralImagePrepareStep(ephemeralImages) }
-          : {})
+        // BL-449: the runner's signal, which fires on the parent's Stop and on the Subagent time
+        // limit. Without it a stopped or timed-out run went on calling the model and running
+        // tools after the parent had been answered, and a tool that runs a process never heard
+        // the Stop (the SDK hands this signal to every tool's `options.abortSignal`).
+        abortSignal: runController.signal,
+        // The same composed hook the streaming path registers (SA-114 P1). A delegated run
+        // (API Subagent or Worker) never takes a steer (DL-114-09), so it composes SA-105's
+        // synthetic image lane with BL-77's tool-loop cache point only. BL-183: before this,
+        // the hook was registered only on the image lane, so a delegated tool loop re-sent
+        // its whole conversation at the full input price on every step. It returns
+        // `undefined` whenever neither has anything to add, so a run with no images on a
+        // lane without Anthropic cache control sends byte-identical requests.
+        prepareStep: this.buildTurnPrepareStep({
+          ephemeralImages: ephemeralImages ?? null,
+          takeSteers: null,
+          toolLoopProviderOptions: cachePolicy.stepProviderOptions ?? null,
+          toolLoopTailMarker: cachePolicy.toolLoopTailMarker
+            ? { marker: cachePolicy.toolLoopTailMarker, firstLoopIndex: cachePolicy.messages.length }
+            : null
+        })
       })
 
       // Process the full response
       let content = ''
       const intermediateSteps: ThoughtResponse['intermediateSteps'] = []
+      // BL-452: a failed model call (a 429, an overloaded provider) reaches the loop as an
+      // `error` part and the stream then closes normally; the FIRST one is the run's failure.
+      let streamRuntimeError: Error | null = null
+      // The SDK can end an aborted stream normally, with its `abort` part (`streamStop.ts`).
+      let sawAbortPart = false
 
       // Collect the full response (AI SDK 7: `stream` replaces `fullStream`)
-      for await (const part of result.stream) {
+      streamLoop: for await (const part of result.stream) {
         switch (part.type) {
           case 'text-delta':
             content += part.text
             break
 
-          case 'tool-result': {
+          case 'tool-result':
+          case 'tool-error': {
+            // BL-611: a call that FAILED (arguments its schema refused, a tool that does not
+            // exist, an `execute` that threw) arrives as a `tool-error` part. It is recorded as
+            // the failed result the chat's loop records since BL-450, so the delegated run's
+            // record keeps the call and why it failed instead of dropping it.
+            const toolPart = part.type === 'tool-error' ? toolErrorAsFailedToolResult(part as any) : part
             // Story 6.4: Record intermediate step with complete metadata
-            const toolName = (part as any)?.toolName
+            const toolName = (toolPart as any)?.toolName
             if (typeof toolName === 'string') {
-              const toolInput = (part as any).input ?? (part as any).args ?? {}
-              const toolOutput = (part as any).output ?? (part as any).result
+              const toolInput = (toolPart as any).input ?? (toolPart as any).args ?? {}
+              const toolOutput = (toolPart as any).output ?? (toolPart as any).result
 
               // Detect tool source and get metadata
               const toolMetadata = this.detectMode3ToolSource(toolName, toolMaps)
@@ -532,12 +710,36 @@ export class VercelAIBrain {
             break
           }
 
+          case 'error':
+            // The first error ends the run, as it ends the streaming path's loop (send-routed's
+            // `shouldBreakStream`): a non-final error part (a missing text part, a tool call
+            // that did not parse) must not go on to call the model and run tools. Leaving the
+            // loop only suspends the SDK (its stream is a tee), so the run is aborted too.
+            streamRuntimeError = delegatedStreamErrorFrom(part.error)
+            runController.abort(streamRuntimeError)
+            break streamLoop
+
+          case 'abort':
+            sawAbortPart = true
+            break
+
           default:
             // Ignore other event types (start, start-step, text-start, text-end, finish-step, etc.)
-            // Vercel AI SDK sends many event types - we only need text-delta and tool-result
+            // Vercel AI SDK sends many event types - we only need the ones above
             break
         }
       }
+
+      // Judged BEFORE the result's usage or steps are read: a Stop is a Stop whatever else the
+      // stream reported, and a failed run throws the provider's own error, never the partial
+      // words as a finished answer (the runner would stamp them completed) and never the SDK's
+      // generic "No output generated" that `result.usage` rejects with after a first-step failure.
+      const streamEnd = judgeStreamEnd({
+        stopped: sawAbortPart || request.abortSignal?.aborted === true,
+        runtimeError: streamRuntimeError,
+      })
+      if (streamEnd.kind === 'stopped') throw new StreamStoppedError()
+      if (streamEnd.kind === 'failed') throw streamEnd.error
 
       // Get usage information
       const localCacheReporting = resolveLocalPromptCacheReporting(runtimeProviderId)
@@ -619,7 +821,8 @@ export class VercelAIBrain {
       return thoughtResponse
 
     } catch (error: any) {
-      console.error('[VercelBrain API] Error in processNativeMode:', error)
+      const stopped = isStopError(error, [request.abortSignal])
+      if (!stopped) console.error('[VercelBrain API] Error in processNativeMode:', error)
 
       // Ensure cleanup even on error
       try {
@@ -629,22 +832,28 @@ export class VercelAIBrain {
         console.error('[VercelBrain] Error cleaning up MCP clients on error:', cleanupError)
       }
 
-      // Handle specific error types
+      // A Stop (the parent's, or the Subagent time limit) stays a Stop, never a provider failure.
+      if (stopped) throw error instanceof StreamStoppedError ? error : new StreamStoppedError()
+
+      // Handle specific error types. BL-452: thrown as Errors that keep the provider's own
+      // sentence. The only caller (`subagentRunner.runApiSubagent`) reports `error.message` to
+      // the parent; the plain objects these used to be read as "[object Object]", and the rate
+      // limit one replaced the provider's reason with a generic sentence.
       if (error.message?.includes('API key')) {
-        throw {
-          code: 'PROVIDER_AUTH_ERROR',
-          message: `Authentication failed for provider: ${error.message}`
-        }
+        throw Object.assign(new Error(`Authentication failed for provider: ${error.message}`, { cause: error }), {
+          code: 'PROVIDER_AUTH_ERROR'
+        })
       }
 
       if (error.message?.includes('rate limit')) {
-        throw {
-          code: 'RATE_LIMIT',
-          message: 'Provider rate limit exceeded'
-        }
+        throw Object.assign(new Error(`Provider rate limit exceeded: ${error.message}`, { cause: error }), {
+          code: 'RATE_LIMIT'
+        })
       }
 
       throw error
+    } finally {
+      runOver.abort()
     }
   }
 
@@ -872,7 +1081,7 @@ export class VercelAIBrain {
         imagesProcessed = true // Only add images to first user message
       } else if (msg.role === 'user' && sessionId && userId) {
         // SA-109 (DL-109-10): clip CONTENT is delivered once, by the canonical
-        // compiler, under `CLIPPED ITEMS (USER UPLOADS)`. This lane used to
+        // compiler, in `<clipped_items>`. This lane used to
         // resolve the same placeholders a second time and append every text
         // clip's body again, so every text clip reached the model twice on the
         // no-image path. It is now syntax normalization only — defense in depth
@@ -962,6 +1171,8 @@ export class VercelAIBrain {
     toolApprovalMode?: ToolApprovalMode,
     nativeContext?: {
       providerSettings?: Record<string, any> | null
+      processOwner?: NativeModeRequest['processOwner']
+      delegatedBashEnabled?: boolean
       projectPath?: string | null
       selectedCliToolIds?: string[]
       dcmDisplaySettings?: AgentDcmDisplaySettings | null
@@ -1002,6 +1213,7 @@ export class VercelAIBrain {
     // no longer decides WHETHER the hook exists — only whether the image half of it has
     // anything to inject.
     let ephemeralImages: EphemeralImageRegistry | null = null
+    let fetchZipAllowed = false
 
     // Story 6.4, 6.7c, SA-005: Track metadata for O(1) detection
     const toolMaps: ToolSourceMaps = {
@@ -1044,9 +1256,13 @@ export class VercelAIBrain {
         }
 
         const nativeToolSet = await nativeToolService.buildMode3NativeTools({
+          abortSignal: nativeContext?.abortSignal,
           userId,
           agentId: agentId ?? null,
+          processOwner: nativeContext?.processOwner,
+          delegatedBashEnabled: nativeContext?.delegatedBashEnabled,
           sessionId,
+          messageId: nativeContext?.parentMessageId ?? undefined,
           selectedGateways,
           toolSelections,
           selectedCliToolIds: nativeContext?.selectedCliToolIds,
@@ -1083,6 +1299,7 @@ export class VercelAIBrain {
         })
         Object.assign(tools, nativeToolSet.tools)
         Object.assign(toolApprovals, nativeToolSet.toolApprovals)
+        fetchZipAllowed = nativeToolSet.fetchZipAvailable === true
       } catch (error) {
         console.error('[VercelBrain API] Failed to build native tools:', error)
       }
@@ -1145,15 +1362,8 @@ export class VercelAIBrain {
                 (baseInput as any).sessionId ??
                 sessionId ??
                 null
-              const normalizedParentAgentId =
-                (baseInput as any).parent_agent_id ??
-                (baseInput as any).parentAgentId ??
-                (baseInput as any).primary_agent_id ??
-                (baseInput as any).primaryAgentId ??
-                (baseInput as any).agent_id ??
-                (baseInput as any).agentId ??
-                agentId ??
-                null
+              // The model's input is the Subagent's task, never its parent authority.
+              const normalizedParentAgentId = agentId ?? null
               if (!normalizedUserId || !normalizedSessionId) {
                 return 'Subagent execution is missing required user/session context.'
               }
@@ -1254,14 +1464,15 @@ export class VercelAIBrain {
       }
     }
 
+    // A provided list is the authority, an empty one included: a Subagent or Worker run passes
+    // `[]` (depth 1; its `agentId` is the PARENT, whose record must not be read here), and a
+    // primary send passes its compatible list. Only a caller that passes no list reads the record.
     const providedSubagents = Array.isArray(agentContext?.assignedSubagents)
-      ? agentContext?.assignedSubagents ?? null
+      ? agentContext.assignedSubagents
       : null
 
-    if (providedSubagents?.length) {
-      if (providedSubagents.length === 0) {
-        console.warn('[VercelBrain API] No compatible subagents in provided list; skipping subagent tool registration')
-      } else {
+    if (providedSubagents) {
+      if (providedSubagents.length > 0) {
         await processAssignedSubagents(providedSubagents)
       }
     } else if (agentId && userId) {
@@ -1401,7 +1612,13 @@ export class VercelAIBrain {
       }
     }
 
-    const wrappedTools = this.wrapToolsWithReadableModelOutput(tools)
+    const wrappedTools = this.wrapToolsWithReadableModelOutput(tools, {
+      userId: userId ?? '',
+      sessionId: sessionId ?? '',
+      messageId: nativeContext?.parentMessageId ?? '',
+      agentId: agentId ?? '',
+      fetchZipAllowed
+    })
 
     // Story 6.4: Return both tools and metadata maps for detection
     return {
@@ -1514,14 +1731,34 @@ export class VercelAIBrain {
     connection?: ModelConnectionInfo | null,
     userId?: string | null,
     taggedReasoningTagName?: NativeModeRequest['taggedReasoningTagName'],
+    observeInput?: (params: { prompt: unknown; tools?: readonly any[] }) => void,
+    planLease?: PlanLease,
   ): Promise<LanguageModel> {
-    const manager = await this.getProviderManagerForUser(userId)
     const transport = connection?.type
     const service = connection?.service ?? undefined
-    const model = manager.getModel(modelName, {
+    let model: LanguageModel = isPlanSelection(connection) ? planModelForLease(planLease, userId, connection, modelName) : (await this.getProviderManagerForUser(userId)).getModel(modelName, {
       transport,
       service
     })
+    if (!isPlanSelection(connection) && typeof model === 'object' && model.specificationVersion === 'v4') model = guardResponsesTerminal(model)
+    if (observeInput) {
+      if (typeof model === 'object' && model !== null && model.specificationVersion === 'v4') {
+        // Innermost: observe the exact provider-call parameters, before output-only middleware.
+        model = wrapLanguageModel({ model, middleware: {
+          specificationVersion: 'v4',
+          wrapStream: async ({ params, doStream }) => {
+            try { observeInput(params) } catch {
+              console.error('[VercelBrain API] Picture input observer failed; no delivery evidence is available')
+              try { observeInput({ prompt: undefined }) } catch { /* Observation never fails the request. */ }
+            }
+            return doStream()
+          }
+        } })
+      } else {
+        observeInput({ prompt: undefined })
+        console.error('[VercelBrain API] Picture input observation requires a v4 model; its record stays incomplete')
+      }
+    }
     if (!taggedReasoningTagName) return model
 
     if (
@@ -1626,6 +1863,35 @@ export class VercelAIBrain {
    * measured that `stepNumber === steps.length`, and that a reply with NO tool step calls
    * this hook exactly once (with `steps` empty), which is why a steer typed during a
    * text-only reply can only be promoted (DL-114-07).
+   *
+   * BL-77 adds the tool loop's cache point: from the turn's SECOND step on, the hook also
+   * returns `toolLoopProviderOptions` (the cache policy's `stepProviderOptions`) as that
+   * step's `providerOptions`. The SDK merges them into that one step's call options — unlike
+   * returned messages, they are not carried forward — and the provider sends them as the
+   * request-level cache point Anthropic places on the last block, so each step reads the
+   * previous step's whole request from the cache instead of paying for it again. It is not
+   * a message: nothing is added to, moved in, or removed from what the model reads, and a
+   * steer stays the last thing it reads. Step one never carries it, so a one-step reply never
+   * pays for a cache write nobody reads. Lanes without Anthropic cache control get no
+   * options, so their requests are unchanged.
+   *
+   * The rule holds for an approval resume too (BL-200, measured 2026-09-25, when a resume
+   * recompiled the one user message with the paused reply moved into the conversation, so it
+   * could never read what the paused run wrote; a point on its first call made resume input 22%
+   * dearer). Since BL-322 (2026-09-26) a resume compiles the paused call again and replays its
+   * steps, so its prefix can match the paused run's; whether a first-call point pays now is
+   * BL-332's measurement, and until then the rule stands.
+   *
+   * BL-183: `processNativeMode` (API Subagents and Workers) registers this same hook with
+   * `takeSteers: null`.
+   *
+   * BL-185: on OpenRouter the tail point is not a call option but an explicit marker on the
+   * last message's last part (`toolLoopTailMarker`), because OpenRouter's Amazon Bedrock route
+   * accepts the request-level field and ignores it. It is placed LAST, after the images and the
+   * steer, so it lands on whatever the model reads last. Returned messages are carried to the
+   * next step, so `placeToolLoopTailMarker` strips the previous step's marker first: a request
+   * carries the system point and one tail point, and the SDK's own response objects, which
+   * send-routed saves and replays, are never marked (only copies are).
    */
   private buildTurnPrepareStep(options: {
     ephemeralImages: EphemeralImageRegistry | null
@@ -1635,10 +1901,20 @@ export class VercelAIBrain {
      * artifact completion is not the user's turn, so it never receives one (DL-114-09).
      */
     takeSteers: ((step: number) => DeliveredSteer[]) | null
+    /** BL-77: the cache policy's `stepProviderOptions`, or null on lanes that get none. */
+    toolLoopProviderOptions: Record<string, Record<string, any>> | null
+    /**
+     * BL-185: the cache policy's `toolLoopTailMarker` and the number of messages Batshit compiled
+     * (never marked), or null on lanes that get none.
+     */
+    toolLoopTailMarker: { marker: ToolLoopTailMarker; firstLoopIndex: number } | null
+    registerUserSource?: (source: UserInputSource) => void
   }) {
     const images = options.ephemeralImages
       ? this.buildEphemeralImagePrepareStep(options.ephemeralImages)
       : null
+    const toolLoopProviderOptions = options.toolLoopProviderOptions
+    const toolLoopTailMarker = options.toolLoopTailMarker
 
     return ({ messages, steps }: { messages: any[]; steps: any[] }) => {
       const base = images ? images({ messages, steps }) : undefined
@@ -1650,13 +1926,13 @@ export class VercelAIBrain {
       // story rests on, and it is the same rule both CLI lanes follow. A step that
       // produced no tool result means the model has stopped calling tools and the reply is
       // about to end, so anything still waiting is promoted instead.
-      const previousHadToolResult = (previous?.content ?? []).some(
-        (part: any) => part?.type === 'tool-result'
-      )
+      // BL-450: a step whose call failed (a `tool-error`) is a tool boundary too.
+      const previousHadToolResult = stepContentReachedToolBoundary(previous?.content)
 
       if (options.takeSteers && previousHadToolResult) {
         const steers = options.takeSteers(steps.length)
         if (steers.length > 0) {
+          options.registerUserSource?.(steerInputSource(steers))
           injected.push({
             role: 'user',
             content: [{ type: 'text', text: buildSteerInjectionText(steers) }]
@@ -1665,7 +1941,29 @@ export class VercelAIBrain {
         }
       }
 
-      return changed ? { messages: injected } : undefined
+      // BL-77: a fresh copy per step, so the SDK's per-step merge never shares Batshit's object.
+      const providerOptions =
+        toolLoopProviderOptions && steps.length >= 1
+          ? structuredClone(toolLoopProviderOptions)
+          : undefined
+
+      // BL-185: last, so the marker lands on whatever the model reads last (a steer included).
+      let stepMessages = injected
+      if (toolLoopTailMarker && steps.length >= 1) {
+        stepMessages = placeToolLoopTailMarker(
+          injected,
+          toolLoopTailMarker.firstLoopIndex,
+          toolLoopTailMarker.marker
+        )
+        // It hands back the same array when it had nothing to mark.
+        if (stepMessages !== injected) changed = true
+      }
+
+      if (!changed && !providerOptions) return undefined
+      return {
+        ...(changed ? { messages: stepMessages } : {}),
+        ...(providerOptions ? { providerOptions } : {})
+      }
     }
   }
 
@@ -1923,6 +2221,9 @@ export class VercelAIBrain {
   }
 
   private buildGenerationSettings(request: NativeModeRequest): Record<string, unknown> {
+    // Explicit user settings are checked at the owning selection boundary.
+    // Operational API defaults (including max output) are not plan wire fields.
+    if (request.chatgptPlanLease) return {}
     const settings: Record<string, unknown> = {}
 
     if (typeof request.maxTokens === 'number') {
@@ -2649,11 +2950,19 @@ export class VercelAIBrain {
     })
 
     try {
+      if (request.chatgptPlanLease) assertPlanSettings(request.providerSettings)
+      let imageInputContext: Omit<ApiInputObservation, 'promptMessages' | 'toolDefinitions'> | null = null
       const model = await this.getModel(
         request.model,
         request.connection,
         request.userId,
         request.taggedReasoningTagName,
+        request.onApiModelInput ? (params) => request.onApiModelInput!({
+          ...(imageInputContext ?? { compiledMessages: [], compiledPrefixCount: -1, initialSystem: null, userSources: [] }),
+          promptMessages: params.prompt,
+          toolDefinitions: params.tools
+        }) : undefined,
+        request.chatgptPlanLease,
       )
       // NEW (SA-002): Pass sessionId and userId for clip resolution
       const baseMessages = await this.convertMessages(
@@ -2701,6 +3010,8 @@ export class VercelAIBrain {
           request.toolApprovalMode,
           {
             providerSettings: request.providerSettings ?? null,
+            processOwner: request.processOwner,
+            delegatedBashEnabled: request.delegatedBashEnabled,
             projectPath: request.projectPath ?? null,
             selectedCliToolIds: request.selectedCliToolIds,
             dcmDisplaySettings: request.dcmDisplaySettings ?? null,
@@ -2722,7 +3033,7 @@ export class VercelAIBrain {
           }
         )
         toolMaps = maps
-        toolsForRequest = tools
+        toolsForRequest = request.chatgptPlanLease ? planClientTools(tools, request.chatgptPlanLease) : tools
         toolApprovalsForRequest = toolApprovals
         ephemeralImagesForRequest = ephemeralImages
 
@@ -2738,6 +3049,10 @@ export class VercelAIBrain {
       // AI SDK 7 semantics: event.usage is the AGGREGATE across all steps (what
       // v6 called totalUsage); last-step numbers live on event.finalStep.usage.
       // Batshit's internal onFinish contract keeps totalUsage = run aggregate.
+      const apiUserSources = [...(request.imageOriginInput?.userSources ?? [])]
+      const registerUserSource = (source: UserInputSource) => {
+        if (!apiUserSources.some((known) => known.textHash === source.textHash && JSON.stringify(known.spans) === JSON.stringify(source.spans))) apiUserSources.push(source)
+      }
       const wrappedOnEnd = request.onFinish ? async ({ text, steps, usage, totalUsage, responseMessages: eventResponseMessages, finalStep }: any) => {
         const responseMessages =
           Array.isArray(eventResponseMessages) && eventResponseMessages.length > 0
@@ -2775,7 +3090,9 @@ export class VercelAIBrain {
           totalUsage: aggregateUsage,
           usage: aggregateUsage,
           reasoning: finishReasoning ? [finishReasoning] : undefined,
-          responseMessages
+          responseMessages,
+          apiUserSources,
+          imageInputsRegistered: ephemeralImagesForRequest?.registered() ?? 0
         })
       } : undefined
 
@@ -2798,6 +3115,22 @@ export class VercelAIBrain {
 
       const downloadGuard = await this.resolveDownloadHandler(request, geminiFileUris)
 
+      // Copy only the immutable text projection needed by provenance. Do not retain image bytes
+      // or let prepareStep's replacement list redefine which compiled text was dispatched.
+      const compiledMessages = Object.freeze(cachePolicy.messages.map((message) => Object.freeze({
+        role: message.role,
+        content: typeof message.content === 'string' ? message.content : Object.freeze(
+          message.content.filter((part: any) => part.type === 'text').map((part: any) => Object.freeze({ type: 'text', text: part.text }))
+        )
+      })))
+      imageInputContext = {
+        compiledMessages,
+        compiledPrefixCount: cachePolicy.messages.length === request.messages.length
+          ? request.imageOriginInput?.compiledPrefixCount ?? -1 : -1,
+        initialSystem: compiledMessages.filter((message) => message.role === 'system'),
+        userSources: apiUserSources
+      }
+
       const result = await streamText({
         model,
         messages: cachePolicy.messages,
@@ -2812,7 +3145,7 @@ export class VercelAIBrain {
           : {}),
         stopWhen: isStepCount(request.maxToolRounds || 10),
         ...this.buildGenerationSettings(request),
-        providerOptions: cachePolicy.providerOptions,
+        providerOptions: request.chatgptPlanLease ? planProviderOptions(cachePolicy.providerOptions) : cachePolicy.providerOptions,
         // SA-107: per-session cache-affinity headers (xAI/Baseten/Fireworks direct lanes).
         ...(cachePolicy.headers ? { headers: cachePolicy.headers } : {}),
         abortSignal: request.abortSignal, // Forward abort signal
@@ -2847,10 +3180,17 @@ export class VercelAIBrain {
         onAbort: request.onAbort,
         // SA-114 P1 (DL-114-05): ONE composed hook, always registered — SA-105's synthetic
         // image lane first, then the steer. It returns `undefined` when neither has
-        // anything pending, so a run with no images and no steers is unchanged.
+        // anything pending, so a run with no images and no steers is unchanged. BL-77: on
+        // lanes that take Anthropic cache control it also adds the tool loop's cache point
+        // from the second step on (not a message).
         prepareStep: this.buildTurnPrepareStep({
           ephemeralImages: ephemeralImagesForRequest,
-          takeSteers: request.takeSteers ?? null
+          takeSteers: request.takeSteers ?? null,
+          registerUserSource: request.onApiModelInput ? registerUserSource : undefined,
+          toolLoopProviderOptions: cachePolicy.stepProviderOptions ?? null,
+          toolLoopTailMarker: cachePolicy.toolLoopTailMarker
+            ? { marker: cachePolicy.toolLoopTailMarker, firstLoopIndex: cachePolicy.messages.length }
+            : null
         })
       })
 

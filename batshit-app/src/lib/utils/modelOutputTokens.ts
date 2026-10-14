@@ -95,25 +95,34 @@ export function sanitizeCatalogMaxOutputTokens({
 
 export function resolvePresetMaxOutputTokens({
   maxOutputTokens,
-  contextWindow
+  contextWindow,
+  loadedContextWindow
 }: {
   maxOutputTokens?: unknown
   contextWindow?: unknown
+  loadedContextWindow?: unknown
 }): number {
-  return resolvePresetMaxOutputTokenResolution({ maxOutputTokens, contextWindow }).maxOutputTokens
+  return resolvePresetMaxOutputTokenResolution({ maxOutputTokens, contextWindow, loadedContextWindow }).maxOutputTokens
 }
 
 export function resolvePresetMaxOutputTokenResolution({
   maxOutputTokens,
-  contextWindow
+  contextWindow,
+  loadedContextWindow
 }: {
   maxOutputTokens?: unknown
   contextWindow?: unknown
+  loadedContextWindow?: unknown
 }): MaxOutputTokenResolution {
+  // A reported running window bounds output without becoming a published preset ceiling.
+  const knownWindows = [contextWindow, loadedContextWindow]
+    .map(normalizePositiveInteger)
+    .filter((value): value is number => value !== undefined)
+  const outputContextWindow = knownWindows.length ? Math.min(...knownWindows) : undefined
   const normalizedMaxOutputTokens = normalizePositiveInteger(maxOutputTokens)
   const safeMaxOutputTokens = sanitizeCatalogMaxOutputTokens({
     maxOutputTokens: normalizedMaxOutputTokens,
-    contextWindow,
+    contextWindow: outputContextWindow,
     rejectNearContext: true
   })
 
@@ -126,7 +135,7 @@ export function resolvePresetMaxOutputTokenResolution({
   }
 
   return {
-    maxOutputTokens: getSafeDefaultMaxOutputTokens(contextWindow),
+    maxOutputTokens: getSafeDefaultMaxOutputTokens(outputContextWindow),
     estimated: true,
     reason: normalizedMaxOutputTokens === undefined ? 'missing' : 'unsafe'
   }

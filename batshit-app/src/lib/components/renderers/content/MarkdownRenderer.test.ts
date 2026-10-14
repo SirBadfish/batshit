@@ -89,7 +89,7 @@ describe('MarkdownRenderer file mentions', () => {
       }
     })
 
-    const header = screen.getByRole('button', { name: /Code.*Ts.*1 lines/i })
+    const header = screen.getByRole('button', { name: /Code.*Ts.*\b1 line\b/i })
     expect(header).toHaveAttribute('aria-expanded', 'true')
     expect(container.querySelector('.batshit-zip-wrapper')).toBeNull()
     expect(container.textContent).toContain('const')
@@ -119,12 +119,12 @@ describe('MarkdownRenderer file mentions', () => {
       }
     })
 
-    const firstHeader = screen.getByRole('button', { name: /Code.*Ts.*1 lines/i })
+    const firstHeader = screen.getByRole('button', { name: /Code.*Ts.*\b1 line\b/i })
 
     await rerender({
       content: '```ts\nconst answer = 4242\n```'
     })
 
-    expect(screen.getByRole('button', { name: /Code.*Ts.*1 lines/i })).toBe(firstHeader)
+    expect(screen.getByRole('button', { name: /Code.*Ts.*\b1 line\b/i })).toBe(firstHeader)
   })
 })

@@ -1,6 +1,6 @@
 # HuggingFace Artifact Guide
 
-You're helping a user build an artifact involving HuggingFace. This is usually one of two things: embedding an HF Space directly (the easy path) or building an artifact that calls HuggingFace's Inference API. This guide covers both.
+**Load when:** the request involves HuggingFace: embedding an HF Space as it is (a user-only Gradio embed), or a native artifact that calls the HF Inference API. A native tool merely inspired by a Space is a normal build: use `brain-general.md` instead.
 
 ## Step 0: Pick the Contract Before You Code
 
@@ -24,7 +24,7 @@ Do not blur these two paths together. If you start with embed-style HTML for a b
 Ask the user if their intent isn't clear:
 
 - **"Embed the Space"** → The user wants the actual HF Space running inside Batshit. Quick, easy, ~10 lines of HTML. This is Path A below.
-- **"Build a custom tool"** → The user is inspired by a Space but wants a native Batshit artifact with theming, agent access, and action buttons. This is really a standard artifact build — load `brain-general` instead of this doc.
+- **"Build a custom tool"** → The user is inspired by a Space but wants a native Batshit artifact with theming, agent access, and action buttons. This is really a standard artifact build — load `brain-general` instead of this doc. Check `user_api_keys_configured` first: a saved Fal, OpenAI, or other provider key may already serve the same model.
 - **"Use HuggingFace's API"** → The user wants an artifact that calls HF Inference endpoints directly. This is Path B below.
 
 **Always mention the Fabric tradeoff** when the user is considering an embed: "Embedded Spaces can't be used by your AI agents as tools, and the Share/Save/Download buttons won't be available. If you want those features, I can build a custom version instead."
@@ -144,7 +144,7 @@ const url = URL.createObjectURL(blob);
 
 ### For the Full Build Process
 
-This is a standard artifact build that happens to use HF's API. Load `brain-general` for the step-by-step build process, then load `fabric-and-agent-use` when you're ready to publish.
+This is a standard artifact build that happens to use HF's API: follow `brain-general.md`, with the key rules in `runtime-api.md` (`window.batshit.env`).
 
 ---
 

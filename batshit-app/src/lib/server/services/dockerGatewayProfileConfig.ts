@@ -53,6 +53,39 @@ const activeProfileEnvPath = () => {
   }
 }
 
+/**
+ * BL-1386: the answer when the profile file write after a stored gateway save failed. It may have
+ * written part or all of the file, so it never says the file is unchanged. PUT and POST
+ * /api/mcp/gateways use it.
+ */
+export const DOCKER_PROFILE_FILE_NOT_FINISHED =
+  'The Docker MCP Gateway settings were saved, but Batshit could not finish writing the Docker profile file. Change the profile, or another Gateway Setting, to write it again.'
+
+/**
+ * BL-1386: throws the refusal `writeDockerMcpProfileEnv` would throw for this runtime (containerized:
+ * the profile belongs to .env.docker), so a gateway save can refuse BEFORE it writes the gateway.
+ */
+export function assertDockerMcpProfileWritable() {
+  activeProfileEnvPath()
+}
+
+// BL-1386: the profile file writes of this process, one at a time, in the order they were asked.
+let profileWrites: Promise<void> = Promise.resolve()
+
+/**
+ * BL-1386: runs one profile file write after every write asked before it. A gateway save asks
+ * only after its gateway write is stored, and the operation reads the profile as stored when it
+ * runs, so the last write carries the newest stored profile whatever order the saves finish in.
+ * The caller gets the operation's own failure; a failed write never stops the next one, but one
+ * that never ends (a stuck read or file write) holds every later one: there is no timeout. One app
+ * process: two processes writing one file are not ordered by this.
+ */
+export function runDockerMcpProfileWrite(operation: () => Promise<void>): Promise<void> {
+  const run = profileWrites.then(operation)
+  profileWrites = run.catch(() => undefined)
+  return run
+}
+
 export async function writeDockerMcpProfileEnv(profile: string) {
   const normalizedProfile = normalizeDockerMcpProfile(profile)
   const target = activeProfileEnvPath()

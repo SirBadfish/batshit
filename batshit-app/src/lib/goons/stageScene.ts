@@ -26,7 +26,7 @@ export type GoonStageAnchorId = 'hips' | 'head' | 'feet'
 export type GoonStageSceneHost = {
   setPostureDefinitions(postures: GoonPostureMap): void
   setGroundProjectionLine(line: number): void
-  setSkyboxBackground(url: string | null): Promise<void>
+  setSkyboxBackground(url: string | null, options?: { mimeType?: string }): Promise<void>
   setRoomShellTransform(transform: GoonSceneRoomShellTransform | null): void
   setRoomCameraBoundary(boundary: GoonSceneCameraBoundary | null): void
   setRoomShell(url: string | null): Promise<void>
@@ -67,6 +67,7 @@ export function buildGoonSceneSignature(scene?: GoonSceneDefinition | null) {
   return JSON.stringify({
     id: scene.id,
     skybox: scene.skybox?.url ?? null,
+    skyboxMimeType: scene.skybox?.mimeType ?? null,
     groundProjectionLine: normalizeGroundProjectionLine(scene.groundProjectionLine),
     roomShellUrl: shouldUseBuilder ? null : scene.roomShell?.url ?? null,
     roomShellTransform: shouldUseBuilder
@@ -90,7 +91,7 @@ export async function applyGoonSceneDefinition(
 ) {
   host.setPostureDefinitions(postureDefinitions)
   host.setGroundProjectionLine(normalizeGroundProjectionLine(scene?.groundProjectionLine))
-  await host.setSkyboxBackground(scene?.skybox?.url ?? null)
+  await host.setSkyboxBackground(scene?.skybox?.url ?? null, { mimeType: scene?.skybox?.mimeType })
 
   const shouldUseBuilder = Boolean(scene && (scene.roomShellBuilder || !scene.roomShell?.url))
   const builder = shouldUseBuilder ? normalizeRoomShellBuilder(scene?.roomShellBuilder) : null

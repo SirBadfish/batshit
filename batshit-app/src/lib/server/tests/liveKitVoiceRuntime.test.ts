@@ -2,16 +2,24 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
   retrieve: vi.fn(),
+  exists: vi.fn(),
   getAgents: vi.fn(),
   getMessages: vi.fn(),
   getUserSettings: vi.fn(),
-  buildFormattedChatInput: vi.fn()
+  buildFormattedChatInput: vi.fn(),
+  refuseDispatch: vi.fn()
+}))
+
+// The default dispatch admission (BL-1311) lives in the sidecar module.
+vi.mock('$lib/server/services/liveKitSidecarRuntime', () => ({
+  refuseLiveKitDispatchUnlessOwnSidecar: mocks.refuseDispatch
 }))
 
 vi.mock('$lib/services/apiKey.server', () => ({
   apiKeyService: {
     retrieve: mocks.retrieve
-  }
+  },
+  normalizeApiKeyServiceName: (service: string) => service.trim().toLowerCase()
 }))
 
 vi.mock('$lib/server/redis', () => ({
@@ -19,6 +27,7 @@ vi.mock('$lib/server/redis', () => ({
     getAgents: mocks.getAgents,
     getMessages: mocks.getMessages,
     getUserSettings: mocks.getUserSettings,
+    exists: mocks.exists,
     json: {
       get: vi.fn()
     }
@@ -35,10 +44,94 @@ import {
   createLiveKitVoiceSession,
   getLiveKitVoiceSetupHint,
   normalizeLiveKitServerUrl,
+  readLiveKitVoiceRuntimeConfigForUser,
   resolveLiveKitVoiceRuntimeConfigForUser,
   resolveLiveKitVoiceRuntimeConfig,
   sanitizeLiveKitName
 } from '../services/liveKitVoiceRuntime'
+
+describe('readLiveKitVoiceRuntimeConfigForUser (BL-1300)', () => {
+  // The launch-record tidy reads LiveKit's settings this way: "not configured" lets it treat
+  // LiveKit as gone, so a read that failed must never look like that.
+  const saved: Record<string, string> = {
+    livekit_url: 'ws://127.0.0.1:7880',
+    livekit_api_key: 'saved-key',
+    livekit_api_secret: 'saved-secret'
+  }
+  beforeEach(() => {
+    mocks.retrieve.mockReset()
+    mocks.exists.mockReset()
+    mocks.retrieve.mockImplementation(async (service: string) => saved[service] ?? null)
+    mocks.exists.mockImplementation(async (key: string) => Object.keys(saved).some((service) => key.endsWith(`:${service}`)))
+  })
+
+  it('reads the saved settings, and null when LiveKit is not configured', async () => {
+    await expect(readLiveKitVoiceRuntimeConfigForUser('user-1', {})).resolves.toMatchObject({ serverUrl: 'ws://127.0.0.1:7880', apiKey: 'saved-key' })
+    mocks.retrieve.mockResolvedValue(null)
+    mocks.exists.mockResolvedValue(false)
+    await expect(readLiveKitVoiceRuntimeConfigForUser('user-1', {})).resolves.toBeNull()
+  })
+
+  it('throws when a saved setting does not decrypt, or a read fails, never "not configured"', async () => {
+    mocks.retrieve.mockImplementation(async (service: string) => (service === 'livekit_api_secret' ? null : saved[service]))
+    await expect(readLiveKitVoiceRuntimeConfigForUser('user-1', {})).rejects.toThrow(/"livekit_api_secret" cannot be read/)
+    mocks.retrieve.mockRejectedValue(new Error('redis down'))
+    await expect(readLiveKitVoiceRuntimeConfigForUser('user-1', {})).rejects.toThrow('redis down')
+  })
+})
+
+describe('LiveKit agent dispatch admission (BL-1311)', () => {
+  const env = { LIVEKIT_URL: 'ws://127.0.0.1:7880', LIVEKIT_API_KEY: 'devkey', LIVEKIT_API_SECRET: 'secret' }
+  const request = (required: boolean) => ({ agentDispatch: { enabled: true, required, agentName: 'batshit-livekit-agent' } })
+
+  it('dispatches nothing and fails a required dispatch with the refusal', async () => {
+    const dispatchFactory = vi.fn(async () => ({ id: 'dispatch-1' }))
+    await expect(
+      createLiveKitVoiceSession('user-1', request(true), {
+        env,
+        tokenFactory: async () => 'jwt',
+        dispatchFactory,
+        admitAgentDispatch: async () => 'Another Batshit owns that agent.'
+      })
+    ).rejects.toThrow('Another Batshit owns that agent.')
+    expect(dispatchFactory).not.toHaveBeenCalled()
+  })
+
+  it('dispatches nothing and says why when the dispatch is not required', async () => {
+    const dispatchFactory = vi.fn(async () => ({ id: 'dispatch-1' }))
+    const session = await createLiveKitVoiceSession('user-1', request(false), {
+      env,
+      tokenFactory: async () => 'jwt',
+      dispatchFactory,
+      admitAgentDispatch: async () => 'The LiveKit agent is not running.'
+    })
+    expect(session.agentDispatch).toEqual({ requested: true, required: false, warning: 'The LiveKit agent is not running.' })
+    expect(dispatchFactory).not.toHaveBeenCalled()
+  })
+
+  it('checks with the sidecar module by default, and dispatches when it admits', async () => {
+    const dispatchFactory = vi.fn(async () => ({ id: 'dispatch-1' }))
+    mocks.refuseDispatch.mockResolvedValueOnce('not this Batshit\'s agent')
+    await expect(
+      createLiveKitVoiceSession('user-1', request(true), { env, tokenFactory: async () => 'jwt', dispatchFactory })
+    ).rejects.toThrow("not this Batshit's agent")
+    expect(dispatchFactory).not.toHaveBeenCalled()
+
+    mocks.refuseDispatch.mockResolvedValueOnce(null)
+    const session = await createLiveKitVoiceSession('user-1', request(true), { env, tokenFactory: async () => 'jwt', dispatchFactory })
+    expect(session.agentDispatch).toMatchObject({ dispatchId: 'dispatch-1' })
+    expect(mocks.refuseDispatch).toHaveBeenCalledTimes(2)
+  })
+
+  it('never checks or dispatches when no dispatch is requested', async () => {
+    const dispatchFactory = vi.fn(async () => ({ id: 'dispatch-1' }))
+    const admit = vi.fn(async () => 'refused')
+    const session = await createLiveKitVoiceSession('user-1', {}, { env, tokenFactory: async () => 'jwt', dispatchFactory, admitAgentDispatch: admit })
+    expect(session.agentDispatch).toBeUndefined()
+    expect(admit).not.toHaveBeenCalled()
+    expect(dispatchFactory).not.toHaveBeenCalled()
+  })
+})
 
 describe('liveKitVoiceRuntime', () => {
   beforeEach(() => {
@@ -135,7 +228,8 @@ describe('liveKitVoiceRuntime', () => {
           LIVEKIT_VOICE_AGENT_NAME: 'batshit-livekit-agent'
         },
         tokenFactory: vi.fn(async () => 'signed-token'),
-        dispatchFactory
+        dispatchFactory,
+        admitAgentDispatch: async () => null
       }
     )
 
@@ -166,7 +260,8 @@ describe('liveKitVoiceRuntime', () => {
           LIVEKIT_API_SECRET: 'secret'
         },
         tokenFactory: vi.fn(async () => 'signed-token'),
-        dispatchFactory
+        dispatchFactory,
+        admitAgentDispatch: async () => null
       }
     )
 
@@ -320,7 +415,8 @@ describe('liveKitVoiceRuntime', () => {
         now: new Date('2026-05-18T12:00:00.000Z'),
         nonce: 'nonce-1',
         tokenFactory,
-        dispatchFactory
+        dispatchFactory,
+        admitAgentDispatch: async () => null
       }
     )
 
@@ -384,7 +480,8 @@ describe('liveKitVoiceRuntime', () => {
         now: new Date('2026-05-18T12:00:00.000Z'),
         nonce: 'nonce-1',
         tokenFactory: vi.fn(async () => 'signed-token'),
-        dispatchFactory
+        dispatchFactory,
+        admitAgentDispatch: async () => null
       }
     )
 

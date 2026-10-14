@@ -1,0 +1,396 @@
+{
+  "1": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "qwen_image_edit_2509_fp8_e4m3fn.safetensors",
+      "weight_dtype": "default"
+    }
+  },
+  "2": {
+    "class_type": "ModelSamplingAuraFlow",
+    "inputs": {
+      "model": [
+        "1",
+        0
+      ],
+      "shift": 3.0
+    }
+  },
+  "3": {
+    "class_type": "CFGNorm",
+    "inputs": {
+      "model": [
+        "2",
+        0
+      ],
+      "strength": 1.0
+    }
+  },
+  "5": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+      "type": "qwen_image",
+      "device": "cpu"
+    }
+  },
+  "6": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "qwen_image_vae.safetensors"
+    }
+  },
+  "19": {
+    "class_type": "UpscaleModelLoader",
+    "inputs": {
+      "model_name": "RealESRGAN_x2plus.pth"
+    }
+  },
+  "7": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "night-city-seam-input.png"
+    }
+  },
+  "30": {
+    "class_type": "ImageCrop",
+    "inputs": {
+      "image": [
+        "7",
+        0
+      ],
+      "width": 1024,
+      "height": 1024,
+      "x": 1024,
+      "y": 0
+    }
+  },
+  "31": {
+    "class_type": "ImageCrop",
+    "inputs": {
+      "image": [
+        "7",
+        0
+      ],
+      "width": 1024,
+      "height": 1024,
+      "x": 0,
+      "y": 0
+    }
+  },
+  "32": {
+    "class_type": "ImageStitch",
+    "inputs": {
+      "image1": [
+        "30",
+        0
+      ],
+      "image2": [
+        "31",
+        0
+      ],
+      "direction": "right",
+      "match_image_size": true,
+      "spacing_width": 0,
+      "spacing_color": "black"
+    }
+  },
+  "33": {
+    "class_type": "SolidMask",
+    "inputs": {
+      "value": 0.0,
+      "width": 2048,
+      "height": 1024
+    }
+  },
+  "34": {
+    "class_type": "SolidMask",
+    "inputs": {
+      "value": 1.0,
+      "width": 256,
+      "height": 1024
+    }
+  },
+  "35": {
+    "class_type": "MaskComposite",
+    "inputs": {
+      "destination": [
+        "33",
+        0
+      ],
+      "source": [
+        "34",
+        0
+      ],
+      "x": 896,
+      "y": 0,
+      "operation": "add"
+    }
+  },
+  "36": {
+    "class_type": "FeatherMask",
+    "inputs": {
+      "mask": [
+        "34",
+        0
+      ],
+      "left": 32,
+      "top": 0,
+      "right": 32,
+      "bottom": 0
+    }
+  },
+  "37": {
+    "class_type": "MaskComposite",
+    "inputs": {
+      "destination": [
+        "33",
+        0
+      ],
+      "source": [
+        "36",
+        0
+      ],
+      "x": 896,
+      "y": 0,
+      "operation": "add"
+    }
+  },
+  "38": {
+    "class_type": "EmptyImage",
+    "inputs": {
+      "width": 2048,
+      "height": 1024,
+      "batch_size": 1,
+      "color": 16777215
+    }
+  },
+  "39": {
+    "class_type": "ImageCompositeMasked",
+    "inputs": {
+      "destination": [
+        "32",
+        0
+      ],
+      "source": [
+        "38",
+        0
+      ],
+      "x": 0,
+      "y": 0,
+      "resize_source": false,
+      "mask": [
+        "37",
+        0
+      ]
+    }
+  },
+  "12": {
+    "class_type": "TextEncodeQwenImageEditPlus",
+    "inputs": {
+      "clip": [
+        "5",
+        0
+      ],
+      "vae": [
+        "6",
+        0
+      ],
+      "image1": [
+        "39",
+        0
+      ],
+      "prompt": "Remove the visible vertical seam in the middle of the image. Remove the white bar by reconstructing the missing nighttime city and starry sky. Keep the rest of the image exactly the same. Continue nearby roof edges and facades naturally across the repaired strip. Keep the horizon level, preserve the vivid cyan, violet, magenta and amber lighting, dark navy sky and detailed worn architecture. Seamless 360 equirectangular panorama. Do not add new foreground objects or alter the composition."
+    }
+  },
+  "13": {
+    "class_type": "TextEncodeQwenImageEditPlus",
+    "inputs": {
+      "clip": [
+        "5",
+        0
+      ],
+      "vae": [
+        "6",
+        0
+      ],
+      "image1": [
+        "39",
+        0
+      ],
+      "prompt": ""
+    }
+  },
+  "40": {
+    "class_type": "InpaintModelConditioning",
+    "inputs": {
+      "positive": [
+        "12",
+        0
+      ],
+      "negative": [
+        "13",
+        0
+      ],
+      "vae": [
+        "6",
+        0
+      ],
+      "pixels": [
+        "32",
+        0
+      ],
+      "mask": [
+        "35",
+        0
+      ],
+      "noise_mask": true
+    }
+  },
+  "15": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model": [
+        "3",
+        0
+      ],
+      "positive": [
+        "40",
+        0
+      ],
+      "negative": [
+        "40",
+        1
+      ],
+      "latent_image": [
+        "40",
+        2
+      ],
+      "seed": 360908,
+      "steps": 20,
+      "cfg": 4.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1.0
+    }
+  },
+  "16": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "15",
+        0
+      ],
+      "vae": [
+        "6",
+        0
+      ]
+    }
+  },
+  "41": {
+    "class_type": "ImageCompositeMasked",
+    "inputs": {
+      "destination": [
+        "32",
+        0
+      ],
+      "source": [
+        "16",
+        0
+      ],
+      "x": 0,
+      "y": 0,
+      "resize_source": false,
+      "mask": [
+        "37",
+        0
+      ]
+    }
+  },
+  "42": {
+    "class_type": "ImageCrop",
+    "inputs": {
+      "image": [
+        "41",
+        0
+      ],
+      "width": 1024,
+      "height": 1024,
+      "x": 1024,
+      "y": 0
+    }
+  },
+  "43": {
+    "class_type": "ImageCrop",
+    "inputs": {
+      "image": [
+        "41",
+        0
+      ],
+      "width": 1024,
+      "height": 1024,
+      "x": 0,
+      "y": 0
+    }
+  },
+  "44": {
+    "class_type": "ImageStitch",
+    "inputs": {
+      "image1": [
+        "42",
+        0
+      ],
+      "image2": [
+        "43",
+        0
+      ],
+      "direction": "right",
+      "match_image_size": true,
+      "spacing_width": 0,
+      "spacing_color": "black"
+    }
+  },
+  "17": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": [
+        "44",
+        0
+      ],
+      "filename_prefix": "h3-equi360/night-city-seam-repaired-native"
+    }
+  },
+  "18": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": [
+        "41",
+        0
+      ],
+      "filename_prefix": "h3-equi360/night-city-seam-repaired-shifted"
+    }
+  },
+  "20": {
+    "class_type": "ImageUpscaleWithModel",
+    "inputs": {
+      "upscale_model": [
+        "19",
+        0
+      ],
+      "image": [
+        "44",
+        0
+      ]
+    }
+  },
+  "21": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": [
+        "20",
+        0
+      ],
+      "filename_prefix": "h3-equi360/night-city-seam-repaired-4k"
+    }
+  }
+}

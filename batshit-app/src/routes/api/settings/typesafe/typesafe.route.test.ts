@@ -29,7 +29,17 @@ vi.mock('$lib/server/services/typesafe/typesafeAvailability', () => ({
   getTypesafeKeyStatus: vi.fn(async () => ({ present: true, source: 'user' }))
 }))
 
+// SA-120 P10a: presence of every judge key, never a value.
+vi.mock('$lib/server/services/typesafe/judgeProviderEndpoint', () => ({
+  getJudgeKeyStatuses: vi.fn(async (_userId: string, typesafe: unknown) => ({
+    typesafe,
+    cloudflare_workers_ai: { present: false, source: null },
+    systemone_url: { present: true, source: 'user' }
+  }))
+}))
+
 import { GET, PUT } from './+server'
+import { setTypesafeConfig, TypesafeConfigValidationError } from '$lib/server/services/typesafe/typesafeConfig'
 
 const admin = { user: { id: 'josh', is_admin: true } }
 const member = { user: { id: 'guest', is_admin: false } }
@@ -116,6 +126,74 @@ describe('PUT /api/settings/typesafe', () => {
     expect((await typo.json()).error).toBe('"Screen Incoming Text" must be true or false.')
     const guest = await PUT({ locals: member, request: putRequest({ screenIncomingText: true }) } as any)
     expect(guest.status).toBe(403)
+    expect(state.setCalls).toHaveLength(0)
+  })
+})
+
+describe('SA-120 P10a: judges through /api/settings/typesafe', () => {
+  const OLLAMA = { id: 'ollama-pc', kind: 'ollama', label: 'Ollama on the PC', baseUrl: 'http://192.168.1.20:11434', modelId: 'clef-flash' }
+
+  it('GET reports every judge key by presence only', async () => {
+    const payload = await (await GET({ locals: member } as any)).json()
+    expect(payload.keys).toEqual({
+      typesafe: { present: true, source: 'user' },
+      cloudflare_workers_ai: { present: false, source: null },
+      systemone_url: { present: true, source: 'user' }
+    })
+    expect(payload.limits.maxJudgeProviders).toBe(16)
+  })
+
+  it('stores the judges, the default, and the per-feature choices for an admin, normalized', async () => {
+    const response = await PUT({
+      locals: admin,
+      request: putRequest({
+        providers: [{ ...OLLAMA, baseUrl: 'http://192.168.1.20:11434/', label: ' Ollama on the PC ' }],
+        defaultProviderId: 'ollama-pc',
+        laneProviders: { untrusted_text: 'typesafe', reply_check: null }
+      })
+    } as any)
+    expect(response.status).toBe(200)
+    expect(state.setCalls).toEqual([{ providers: [OLLAMA], defaultProviderId: 'ollama-pc', laneProviders: { untrusted_text: 'typesafe' } }])
+    expect((await response.json()).keys.systemone_url).toEqual({ present: true, source: 'user' })
+  })
+
+  it.each([
+    [{ providers: 'nope' }, '`providers` must be a list.'],
+    [{ providers: [{ ...OLLAMA, kind: 'lmstudio' }] }, /must be Ollama, Cloudflare Workers AI, or a System One URL/],
+    [{ providers: [{ ...OLLAMA, baseUrl: 'file:///etc/passwd' }] }, /http or https URL/],
+    [{ providers: [{ ...OLLAMA, baseUrl: 'http://josh:secret@192.168.1.20:11434' }] }, /without a user name/],
+    [{ providers: [{ id: 'cf', kind: 'cloudflare', label: 'CF', accountId: 'x', modelId: 'clef' }] }, /32 letters and digits/],
+    [{ providers: [{ id: 'cf', kind: 'cloudflare', label: 'CF', accountId: '0123456789abcdef0123456789abcdef', modelId: 'llama' }] }, /clef or clef-flash/],
+    [{ providers: [{ ...OLLAMA, modelId: 'clef flash!' }] }, /Ollama model name/],
+    [{ providers: [{ ...OLLAMA, sendsKey: true }] }, /only a System One URL judge/],
+    [{ providers: [OLLAMA, OLLAMA] }, 'Two judges share the id ollama-pc.'],
+    [{ providers: [{ ...OLLAMA, id: 'typesafe' }] }, /id Batshit cannot use/],
+    [{ defaultProviderId: 7 }, /`defaultProviderId` must name a judge/],
+    [{ laneProviders: { connection_test: 'typesafe' } }, /not a Judge Juice feature/],
+    [{ laneProviders: { smart_zip: { id: 'x' } } }, /is not a judge id/]
+  ])('refuses %j with a readable error and stores nothing', async (body, error) => {
+    const response = await PUT({ locals: admin, request: putRequest(body) } as any)
+    expect(response.status).toBe(400)
+    const message = (await response.json()).error as string
+    if (typeof error === 'string') expect(message).toBe(error)
+    else expect(message).toMatch(error)
+    expect(state.setCalls).toHaveLength(0)
+  })
+
+  it('a refused merge (a choice naming no judge) is a 400; a storage failure is a 500', async () => {
+    vi.mocked(setTypesafeConfig).mockRejectedValueOnce(new TypesafeConfigValidationError('These choices name a judge that is not in the list: default.'))
+    const refused = await PUT({ locals: admin, request: putRequest({ providers: [] }) } as any)
+    expect(refused.status).toBe(400)
+    expect((await refused.json()).error).toMatch(/not in the list: default/)
+
+    vi.mocked(setTypesafeConfig).mockRejectedValueOnce(new Error('connection lost'))
+    const broken = await PUT({ locals: admin, request: putRequest({ enabled: true }) } as any)
+    expect(broken.status).toBe(500)
+  })
+
+  it('refuses a non-admin before reading any judge field', async () => {
+    const response = await PUT({ locals: member, request: putRequest({ providers: [OLLAMA], defaultProviderId: 'ollama-pc' }) } as any)
+    expect(response.status).toBe(403)
     expect(state.setCalls).toHaveLength(0)
   })
 })

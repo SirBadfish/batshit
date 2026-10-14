@@ -10,7 +10,7 @@ const source = readFileSync('src/routes/api/messages/send-routed/+server.ts', 'u
  * the DM id from the SERVER's wake registry and never from the request body, with no compiler
  * option of its own, and with NOTHING of it anywhere near the approval resume paths.
  */
-describe('send-routed Jev Juice incoming-text screen contracts', () => {
+describe('send-routed Judge Juice incoming-text screen contracts', () => {
   const streamStart = source.indexOf('async function handleBatshitAgentStream({')
   const seam = source.indexOf('const jevJuiceHintProvider = jevJuiceGroupSelection', streamStart)
   const compile = source.indexOf('await databaseService.buildFormattedChatInput(', seam)

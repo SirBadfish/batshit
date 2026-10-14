@@ -8,7 +8,7 @@ Because Batshit is single-user-per-instance for alpha, "user" here means *you*, 
 
 The User area holds four things:
 
-- **Profile** — your display name and avatar. This is also where you change your password. Profile edits save inline as you make them.
+- **Profile** — your display name and avatar. This is also where you change your password. Profile edits save inline as you make them. When you upload a new avatar picture, clear it, or choose an icon, the old picture is deleted once the change saves; if the change can't save, the old picture stays.
 - **Global System Prompt** — your own standing instructions that apply across agents when enabled. This is the place to put a preference you want to carry everywhere (a tone, a formatting rule, a recurring constraint), rather than repeating it on every agent. It's saved through its own editor, and you can turn its inclusion on or off per agent when you set agents up.
 - **Session** — session-related preferences for your account.
 - **Chat** — one setting, **When You Send While the Agent Is Busy**: **Steer (default)** lands your message inside the reply the agent is already writing, and **Queue** holds it and sends it the moment the reply ends. Whichever you pick is what Enter does; Cmd/Ctrl+Enter does the other one. See [Steer or Queue](../chat/overview.md#steer-or-queue-while-the-agent-is-busy).

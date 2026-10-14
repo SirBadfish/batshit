@@ -6,7 +6,7 @@ Batshit is alpha self-hosted software. Expect active iteration and some rough ed
 
 - Docs: [docs.batshit.ai](https://docs.batshit.ai/)
 - Intro playlist: [Informal Alpha Release: Introduction to Batshit](https://www.youtube.com/watch?v=hS3NfNPgW70&list=PLeodpgBXojRy4Ssreao79TIX7PylhiI1D)
-- Community: [Batshit Discord](https://discord.gg/3saVHX5xn)
+- Community: [Batshit Discord](https://discord.gg/8cgK2qaN2c)
 
 ## GitHub issues
 

@@ -8,6 +8,7 @@ import { apiKeyService } from '$lib/services/apiKey.server'
 import { redis } from '$lib/server/redis'
 import { getConfiguredInternalToken } from '$lib/server/services/internalRequestAuth'
 import {
+  LIVEKIT_NATIVE_SERVER_ENGINE_ID,
   fetchLiveKitServerReady,
   getLocalLiveKitPort,
   getNativeLiveKitInstallStatus,
@@ -16,12 +17,14 @@ import {
   installLiveKitServerBinary,
   installLiveKitSidecarPackage,
   liveKitServerHttpUrl,
+  resolveNativeLiveKitServerInstallRoot,
   resolveNativeLiveKitSidecarInstallRoot,
   startNativeLiveKitServerRuntime,
   type LiveKitNativeInstallResult
 } from '$lib/server/services/liveKitNativeRuntimeInstaller'
 import {
   DEFAULT_LIVEKIT_AGENT_NAME,
+  readLiveKitVoiceRuntimeConfigForUser,
   resolveLiveKitVoiceRuntimeConfigForUser
 } from '$lib/server/services/liveKitVoiceRuntime'
 import { resolveLiveKitSidecarBatshitBaseUrl } from '$lib/server/services/liveKitSidecarUrls'
@@ -31,6 +34,20 @@ import {
   type RuntimeAddonStatus
 } from '$lib/server/services/runtimeAddons'
 import { startLocalVoiceRuntime } from '$lib/server/services/voiceLocalEngineSetup'
+import {
+  isLocalRuntimeProcessAlive,
+  listLocalRuntimeLaunchRecords,
+  readRuntimeUseState,
+  recordVerifiedRuntimeUse,
+  resolveVoiceRuntimeRegistryIdentity,
+  verifyOwnLaunchServes,
+  type OwnLaunchCheck,
+  setLocalRuntimeStopChoice,
+  stopSolelyOwnedLaunchForRestart,
+  type LocalRuntimeEngineRef,
+  type SolelyOwnedRestartStop,
+  type StoredLocalVoiceRuntimeLaunchRecord
+} from '$lib/server/services/voiceRuntimeLaunchRecords'
 import {
   normalizeVoiceSettings,
   shouldStopVoiceRuntimeOnShutdown
@@ -245,7 +262,55 @@ async function waitForSidecarStopped(port: number): Promise<boolean> {
   return !health.ready
 }
 
-async function stopLiveKitSidecarOnPort(port: number): Promise<boolean> {
+function sidecarRestartRefusal(result: Exclude<SolelyOwnedRestartStop, { stopped: true }>, port: number): string {
+  switch (result.refusal) {
+    case 'not-started':
+      return `LiveKit sidecar is running on port ${port}, but Batshit did not start that process, so it did not restart it. Stop it yourself first.`
+    case 'shared':
+      return `Batshit did not restart the LiveKit sidecar on port ${port}: another Batshit on this computer, or another engine, also uses it (process ${result.pid}; ${result.recordPaths.join(', ')}). Restart it from the Batshit that started it, or once nothing else uses it.`
+    case 'unreadable':
+      return `Batshit did not restart the LiveKit sidecar on port ${port}: ${result.reasons.join('; ')}, and Batshit cannot tell whether that record names this sidecar. Repair or remove it, then try again.`
+    case 'unverified':
+      return `Batshit did not restart the LiveKit sidecar on port ${port}: ${result.reason}. Make sure nothing else uses that port, then try again.`
+  }
+}
+
+/**
+ * Send `signal` to the LiveKit sidecar launch on `port` only when this Batshit alone launched it
+ * (`stopSolelyOwnedLaunchForRestart`). The listener can be a child of the launch, so the launch's
+ * whole process group gets the signal. `sameAs`: only that very launch, checked afresh.
+ */
+async function signalOwnSidecarLaunch(
+  port: number,
+  listeners: number[],
+  signal: NodeJS.Signals,
+  sameAs?: StoredLocalVoiceRuntimeLaunchRecord
+): Promise<StoredLocalVoiceRuntimeLaunchRecord> {
+  const result = await stopSolelyOwnedLaunchForRestart(LIVEKIT_SIDECAR_ENGINE_ID, listeners, async (record) => {
+    if (
+      sameAs &&
+      (record.recordPath !== sameAs.recordPath || record.pid !== sameAs.pid || record.launchedAt !== sameAs.launchedAt)
+    ) {
+      throw new Error(`The LiveKit sidecar on port ${port} changed while it was stopping, so Batshit did not force it to stop.`)
+    }
+    try {
+      process.kill(-(record.pid as number), signal)
+    } catch (error) {
+      const code = typeof error === 'object' && error && 'code' in error ? error.code : null
+      if (code !== 'ESRCH') throw error
+    }
+  })
+  if (!result.stopped) throw new Error(sidecarRestartRefusal(result, port))
+  return result.record
+}
+
+/**
+ * Stop the LiveKit sidecar answering on `port` for a restart (BL-1297). Another Batshit's sidecar,
+ * or one the user runs, can answer on the same port: only this Batshit's own launch is signalled,
+ * as a process group, and anything else is refused with the reason, signalling nothing. A launch
+ * that outlives SIGTERM gets SIGKILL only after the same check passes again on the same launch.
+ */
+export async function stopLiveKitSidecarOnPort(port: number): Promise<boolean> {
   const currentHealth = await inspectLiveKitSidecarHealth(port)
   if (!currentHealth.ready) return false
 
@@ -256,25 +321,17 @@ async function stopLiveKitSidecarOnPort(port: number): Promise<boolean> {
     )
   }
 
-  for (const pid of pids) {
-    try {
-      process.kill(pid, 'SIGTERM')
-    } catch (error) {
-      const code = typeof error === 'object' && error && 'code' in error ? error.code : null
-      if (code !== 'ESRCH') throw error
-    }
-  }
-
+  const launch = await signalOwnSidecarLaunch(port, pids, 'SIGTERM')
   if (await waitForSidecarStopped(port)) return true
 
-  for (const pid of pids) {
-    try {
-      process.kill(pid, 'SIGKILL')
-    } catch (error) {
-      const code = typeof error === 'object' && error && 'code' in error ? error.code : null
-      if (code !== 'ESRCH') throw error
-    }
+  // Still answering: force only that same launch, with the listener, its group and every record
+  // read again now, never a process that changed hands meanwhile.
+  const listeners = await findListenerPids(port)
+  if (listeners.length === 0) {
+    if (await waitForSidecarStopped(port)) return true
+    throw new Error(`The LiveKit sidecar on port ${port} still answers, but Batshit can no longer find the process listening there, so it did not force it to stop.`)
   }
+  await signalOwnSidecarLaunch(port, listeners, 'SIGKILL', launch)
 
   if (await waitForSidecarStopped(port)) return true
   throw new Error(`LiveKit sidecar on port ${port} did not stop before restart timeout.`)
@@ -385,6 +442,79 @@ async function inspectManagedLocalLiveKitServer(config: {
   }
 }
 
+/**
+ * The LiveKit agent sidecar serves only the Batshit that launched it: its base URL, service token
+ * and LiveKit keys are that Batshit's (BL-1311). So one answering on its port is used only when it
+ * is this Batshit's own current launch (`verifyOwnLaunchServes`); anything else is refused with
+ * this reason, and never stopped or adopted. A worker no record names is unknown, whoever runs it,
+ * and an explicit LIVEKIT_AGENT_INSTALL_ROOT (where the package is) does not change that.
+ */
+function sidecarNotOwnRefusal(check: Exclude<OwnLaunchCheck, { verified: true }>, port: number): string {
+  switch (check.refusal) {
+    case 'unknown':
+      return `Something already answers on the LiveKit sidecar port ${port}, but no launch record of this Batshit names it, so Batshit cannot tell which Batshit it serves and did not use it. Stop that process, then start LiveKit here.`
+    case 'foreign':
+      return `Another Batshit's LiveKit agent runs on port ${port} and serves that Batshit (${check.reason}), so this Batshit did not use it. Stop LiveKit there, then start it here.`
+    case 'unreadable':
+      return `Batshit did not use the LiveKit sidecar on port ${port}: ${check.reason}, so it cannot tell which Batshit it serves. Repair or remove that record, then try again.`
+    case 'unverified':
+      return `Batshit did not use the LiveKit sidecar on port ${port}: ${check.reason}. Make sure nothing else uses that port, then start LiveKit here.`
+    case 'unaddressed':
+      return `This Batshit's own LiveKit sidecar on port ${port} was started before its launch record carried its address (${check.reason}). Press Start to restart it so it does.`
+  }
+}
+
+/**
+ * Before a LiveKit voice session dispatches its agent (BL-1311): in native Batshit the agent worker
+ * that takes the job must be this Batshit's own current sidecar launch, or the session's compiled
+ * instructions and turns could go to a worker serving another Batshit, or to one nobody here can
+ * vouch for. Returns null when admitted, else the refusal to show (the caller dispatches nothing).
+ * Docker Batshit runs the agent as its LiveKit add-on, a separate contract, so it is not checked
+ * here. Limit: this proves this Batshit's own worker runs here; it cannot make LiveKit choose it over
+ * another worker registered under the same agent name on a shared server.
+ */
+export async function refuseLiveKitDispatchUnlessOwnSidecar(): Promise<string | null> {
+  if (isContainerizedRuntime()) return null
+  const port = resolveAgentHealthPort()
+  const listeners = await findListenerPids(port)
+  if (listeners.length === 0) {
+    return `The LiveKit agent is not running on port ${port}, so Batshit did not send this session to any agent. Start LiveKit in Settings -> Voice -> Voice Runtimes, then try again.`
+  }
+  const own = await verifyOwnLaunchServes({ engineId: LIVEKIT_SIDECAR_ENGINE_ID, endpoint: liveKitSidecarEndpoint(port), listeners })
+  return own.verified ? null : `${sidecarNotOwnRefusal(own, port)} Batshit did not send this session to it.`
+}
+
+/** The address a LiveKit sidecar's launch record names: its health port. */
+function liveKitSidecarEndpoint(port: number): string {
+  return `http://127.0.0.1:${port}`
+}
+
+/**
+ * Before using a LiveKit server that was already running (BL-1298): record this Batshit's use of
+ * it, with its saved "Stop with Batshit" choice, when another Batshit launched it, so that
+ * Batshit's quit or restart sees this one. One no record can carry is not used, with what to do;
+ * one no Batshit started is used as before and never owned.
+ */
+async function recordLiveKitServerUse(
+  config: { serverUrl: string; stopOnShutdown?: boolean },
+  summary: LiveKitLocalServerSummary
+): Promise<LiveKitLocalServerSummary> {
+  const port = getLocalLiveKitServerPort(config.serverUrl)
+  if (!port) return summary
+  const use = await recordVerifiedRuntimeUse({
+    engineId: LIVEKIT_NATIVE_SERVER_ENGINE_ID,
+    endpoint: liveKitServerHttpUrl(config.serverUrl, port),
+    stopOnShutdown: config.stopOnShutdown !== false,
+    listeners: (await inspectLocalLiveKitPortOwner(port)).pids
+  })
+  if (use.outcome !== 'unrecordable') return summary
+  return {
+    ...summary,
+    status: 'error',
+    statusHint: `Batshit did not use the LiveKit server already running on port ${port}: ${use.reason}. Update that Batshit and restart LiveKit there, or stop LiveKit there, then start LiveKit here again.`
+  }
+}
+
 async function ensureManagedLocalLiveKitServer(config: {
   userId: string
   serverUrl: string
@@ -394,7 +524,8 @@ async function ensureManagedLocalLiveKitServer(config: {
   stopOnShutdown?: boolean
 }): Promise<LiveKitLocalServerSummary> {
   const inspected = await inspectManagedLocalLiveKitServer(config)
-  if (!inspected.managed || (inspected.status === 'ready' && !config.forceRestart)) return inspected
+  if (!inspected.managed) return inspected
+  if (inspected.status === 'ready' && !config.forceRestart) return recordLiveKitServerUse(config, inspected)
 
   try {
     const started = await startNativeLiveKitServerRuntime({
@@ -405,7 +536,7 @@ async function ensureManagedLocalLiveKitServer(config: {
       forceRestart: config.forceRestart,
       stopOnShutdown: config.stopOnShutdown
     })
-    return {
+    const summary: LiveKitLocalServerSummary = {
       ...inspected,
       status: started.started || started.alreadyRunning ? 'ready' : 'error',
       statusHint: started.statusHint,
@@ -414,6 +545,10 @@ async function ensureManagedLocalLiveKitServer(config: {
       pid: started.pid,
       logPath: started.logPath
     }
+    // Answering now, after this Batshit's launch or because something answered first: record the
+    // use the same way, since the launch can lose the port to another Batshit's LiveKit starting
+    // at the same moment (its own launch serving is "own" and records nothing more).
+    return started.started || started.alreadyRunning ? await recordLiveKitServerUse(config, summary) : summary
   } catch (error) {
     return {
       ...inspected,
@@ -592,11 +727,23 @@ export async function getLiveKitSidecarRuntimeSummary(
     }
   }
   const pids = health.ready ? await findListenerPids(port) : []
+  // An answering sidecar is this Batshit's only when its own current launch serves it (BL-1311).
+  const sidecar = health.ready
+    ? await verifyOwnLaunchServes({ engineId: LIVEKIT_SIDECAR_ENGINE_ID, endpoint: liveKitSidecarEndpoint(port), listeners: pids })
+    : null
+  const sidecarRefusal = sidecar && !sidecar.verified ? sidecarNotOwnRefusal(sidecar, port) : null
   const serverBlocksRuntime = server?.managed === true && server.status !== 'ready'
+  // Where the running LiveKit's launch records do not hold the saved Stop with Batshit choice
+  // (BL-1301), the row says so; a failed read of them is said too, never hidden.
+  const stopChoiceGap = await describeLiveKitStopChoiceGap(userId, preferences.stopOnShutdown).catch(
+    (error) => `Batshit could not read LiveKit's settings or launch records (${error instanceof Error ? error.message : String(error)}), so it cannot tell whether your Stop with Batshit choice reached them.`
+  )
   const status: LiveKitSidecarStatus = health.ready
-    ? serverBlocksRuntime
-      ? 'unreachable'
-      : 'ready'
+    ? sidecarRefusal
+      ? 'error'
+      : serverBlocksRuntime
+        ? 'unreachable'
+        : 'ready'
     : 'unreachable'
   return {
     id: LIVEKIT_SIDECAR_RUNTIME_ID,
@@ -606,12 +753,19 @@ export async function getLiveKitSidecarRuntimeSummary(
     selected: preferences.selected,
     autoStartOnLaunch: preferences.autoStartOnLaunch,
     status,
-    statusHint: health.ready
-      ? appendServerHint(
-          `${health.statusHint} Use Restart after Batshit updates or LiveKit sidecar changes.`,
-          server
-        )
-      : appendServerHint(health.statusHint, server),
+    statusHint: [
+      sidecarRefusal
+        ? appendServerHint(sidecarRefusal, server)
+        : health.ready
+          ? appendServerHint(
+              `${health.statusHint} Use Restart after Batshit updates or LiveKit sidecar changes.`,
+              server
+            )
+          : appendServerHint(health.statusHint, server),
+      stopChoiceGap
+    ]
+      .filter(Boolean)
+      .join(' '),
     healthUrl,
     agentName: health.agentName,
     activeJobs: health.activeJobs,
@@ -636,7 +790,16 @@ async function waitForSidecarReady(
 
 export async function startLiveKitSidecarRuntime(
   userId: string,
-  options: { forceRestart?: boolean; forceServerRestart?: boolean } = {}
+  options: {
+    forceRestart?: boolean
+    forceServerRestart?: boolean
+    /**
+     * The user pressed Start: this Batshit's own running sidecar whose launch record carries no
+     * address (launched before records carried it) is restarted, so the new launch records it
+     * (BL-1311). Never at boot.
+     */
+    repairOwnLaunch?: boolean
+  } = {}
 ): Promise<LiveKitSidecarStartResult> {
   const installRoot = resolveSidecarInstallRoot()
   let installed = sidecarPackageInstalled(installRoot)
@@ -773,27 +936,55 @@ export async function startLiveKitSidecarRuntime(
       await stopLiveKitSidecarOnPort(port)
     } else {
       const pids = await findListenerPids(port)
-      return {
-        id: LIVEKIT_SIDECAR_RUNTIME_ID,
-        name: 'LiveKit',
-        kind: 'voice-session-runtime',
-        installed,
-        selected: preferences.selected,
-        autoStartOnLaunch: preferences.autoStartOnLaunch,
-        status: 'ready',
-        statusHint: appendServerHint(
-          `${currentHealth.statusHint} Use Restart after Batshit updates or LiveKit sidecar changes.`,
+      // Already running: used only when it is this Batshit's own current launch (BL-1311).
+      const own = await verifyOwnLaunchServes({ engineId: LIVEKIT_SIDECAR_ENGINE_ID, endpoint: liveKitSidecarEndpoint(port), listeners: pids })
+      const repair = !own.verified && own.refusal === 'unaddressed' && options.repairOwnLaunch === true
+      if (!own.verified && !repair) {
+        return {
+          id: LIVEKIT_SIDECAR_RUNTIME_ID,
+          name: 'LiveKit',
+          kind: 'voice-session-runtime',
+          installed,
+          selected: preferences.selected,
+          autoStartOnLaunch: preferences.autoStartOnLaunch,
+          status: 'error',
+          statusHint: appendServerHint(sidecarNotOwnRefusal(own, port), server),
+          healthUrl,
+          agentName: currentHealth.agentName,
+          activeJobs: currentHealth.activeJobs,
+          logPath: null,
+          pid: pids[0] ?? null,
+          started: false,
+          alreadyRunning: false,
           server
-        ),
-        healthUrl,
-        agentName: currentHealth.agentName,
-        activeJobs: currentHealth.activeJobs,
-        logPath: null,
-        pid: pids[0] ?? null,
-        started: false,
-        alreadyRunning: true,
-        server
+        }
       }
+      if (own.verified) {
+        return {
+          id: LIVEKIT_SIDECAR_RUNTIME_ID,
+          name: 'LiveKit',
+          kind: 'voice-session-runtime',
+          installed,
+          selected: preferences.selected,
+          autoStartOnLaunch: preferences.autoStartOnLaunch,
+          status: 'ready',
+          statusHint: appendServerHint(
+            `${currentHealth.statusHint} Use Restart after Batshit updates or LiveKit sidecar changes.`,
+            server
+          ),
+          healthUrl,
+          agentName: currentHealth.agentName,
+          activeJobs: currentHealth.activeJobs,
+          logPath: null,
+          pid: pids[0] ?? null,
+          started: false,
+          alreadyRunning: true,
+          server
+        }
+      }
+      // This Batshit's own launch from before its record carried the address: on the user's Start,
+      // restart it through the sole-ownership stop, so the new launch records it.
+      await stopLiveKitSidecarOnPort(port)
     }
   }
 
@@ -830,6 +1021,8 @@ export async function startLiveKitSidecarRuntime(
       installRoot,
       installOwnership: resolveSidecarInstallOwnership(),
       stopOnShutdown: preferences.stopOnShutdown,
+      // Recorded so another Batshit that finds it running can record its use of it (BL-1298).
+      endpoint: liveKitSidecarEndpoint(port),
       launch: {
         command: process.execPath,
         args: ['node_modules/tsx/dist/cli.mjs', 'src/livekit-agent-sidecar.ts', 'start'],
@@ -852,6 +1045,32 @@ export async function startLiveKitSidecarRuntime(
     })
 
     const health = await waitForSidecarReady(port)
+    // What answers may be another Batshit's sidecar (or another worker) that took the port first:
+    // ready only when it is this launch (BL-1311).
+    const own = health.ready
+      ? await verifyOwnLaunchServes({ engineId: LIVEKIT_SIDECAR_ENGINE_ID, endpoint: liveKitSidecarEndpoint(port), listeners: await findListenerPids(port) })
+      : null
+    if (own && !own.verified) {
+      return {
+        id: LIVEKIT_SIDECAR_RUNTIME_ID,
+        name: 'LiveKit',
+        kind: 'voice-session-runtime',
+        installed,
+        selected: preferences.selected,
+        autoStartOnLaunch: preferences.autoStartOnLaunch,
+        status: 'error',
+        statusHint: appendServerHint(sidecarNotOwnRefusal(own, port), server),
+        healthUrl,
+        agentName: health.agentName ?? agentName,
+        activeJobs: health.activeJobs,
+        logPath: started.logPath,
+        pid: started.pid,
+        started: false,
+        alreadyRunning: false,
+        restarted: options.forceRestart,
+        server
+      }
+    }
     return {
       id: LIVEKIT_SIDECAR_RUNTIME_ID,
       name: 'LiveKit',
@@ -918,4 +1137,121 @@ export async function autoStartLiveKitSidecarRuntime(
   const preferences = await resolveRuntimePreferences(userId)
   if (!preferences.autoStartOnLaunch) return null
   return startLiveKitSidecarRuntime(userId)
+}
+
+const LIVEKIT_RECORD_IDS = [LIVEKIT_NATIVE_SERVER_ENGINE_ID, LIVEKIT_SIDECAR_ENGINE_ID] as const
+
+/**
+ * The LiveKit runtimes this user's Batshit runs natively, as the launch-record tidy's engine
+ * references (`pruneLocalRuntimeLaunchRecords`, BL-1300): the sidecar whenever LiveKit is
+ * configured, the server when it is the Batshit-managed local one, each at the address its launch
+ * records. LiveKit is not a voice engine, so without them the tidy read LiveKit as deleted: it
+ * released LiveKit's "keep running" and would drop another Batshit's attach to it. Empty when
+ * LiveKit is not configured (then the tidy treats its records as any deleted engine's) or runs in
+ * Docker. A settings read that fails throws, and the caller skips that tidy.
+ */
+export async function resolveLiveKitRuntimeEngineRefs(userId: string): Promise<LocalRuntimeEngineRef[]> {
+  if (isContainerizedRuntime()) return []
+  const config = await readLiveKitVoiceRuntimeConfigForUser(userId)
+  if (!config) return []
+  const refs: LocalRuntimeEngineRef[] = [
+    {
+      id: LIVEKIT_SIDECAR_ENGINE_ID,
+      baseUrl: liveKitSidecarEndpoint(resolveAgentHealthPort()),
+      localRuntime: { launch: { command: process.execPath } }
+    }
+  ]
+  const port = getLocalLiveKitServerPort(config.serverUrl)
+  if (port && isBatshitManagedLocalLiveKitServerConfig(config)) {
+    refs.push({
+      id: LIVEKIT_NATIVE_SERVER_ENGINE_ID,
+      baseUrl: liveKitServerHttpUrl(config.serverUrl, port),
+      localRuntime: {
+        launch: {
+          command: path.join(resolveNativeLiveKitServerInstallRoot(), process.platform === 'win32' ? 'livekit-server.exe' : 'livekit-server')
+        }
+      }
+    })
+  }
+  return refs
+}
+
+/**
+ * Bring this Batshit's LiveKit launch records in line with the saved "Stop with Batshit" choice
+ * (BL-1301); call it only after a save is confirmed. The choice is read from the saved settings
+ * (a failed read throws: a default is never written over a saved choice), and read again after
+ * writing: a save that landed meanwhile is written too, so two saves close together end with the
+ * latest saved choice (at most three rounds, else it is reported). Only this registry's records
+ * change (`setLocalRuntimeStopChoice`). Where this Batshit has no live record of the LiveKit
+ * server it may be using another Batshit's running one: its use is recorded, verified, with the
+ * choice (BL-1298). Never for the sidecar, which serves only the Batshit that launched it (BL-1311). Anything that did not take the choice is returned, and shown in the LiveKit row
+ * (`describeLiveKitStopChoiceGap`), never dropped silently.
+ */
+export async function syncLiveKitStopPreference(userId: string): Promise<{ complete: boolean; problems: string[] }> {
+  const savedChoice = async () =>
+    shouldStopVoiceRuntimeOnShutdown(normalizeVoiceSettings((await redis.getUserSettings(userId))?.voice_settings).voiceRuntimes?.livekit?.startup)
+  let stopOnShutdown = await savedChoice()
+  for (let round = 1; ; round += 1) {
+    const problems = await applyLiveKitStopChoice(userId, stopOnShutdown)
+    const now = await savedChoice()
+    if (now === stopOnShutdown) return { complete: problems.length === 0, problems }
+    if (round === 3) {
+      return { complete: false, problems: [...problems, 'the saved Stop with Batshit choice kept changing while Batshit applied it'] }
+    }
+    stopOnShutdown = now
+  }
+}
+
+async function applyLiveKitStopChoice(userId: string, stopOnShutdown: boolean): Promise<string[]> {
+  const problems: string[] = []
+  for (const ref of await resolveLiveKitRuntimeEngineRefs(userId)) {
+    const { live, unreadable } = await setLocalRuntimeStopChoice(ref.id, stopOnShutdown)
+    problems.push(...unreadable.map((reason) => `${ref.id}: ${reason}`))
+    // The sidecar serves only the Batshit that launched it: never attach to one (BL-1311).
+    if (live || !ref.baseUrl || ref.id === LIVEKIT_SIDECAR_ENGINE_ID) continue
+    const listeners = await liveKitListeners(ref)
+    const use = await recordVerifiedRuntimeUse({ engineId: ref.id, endpoint: ref.baseUrl, stopOnShutdown, listeners })
+    if (use.outcome === 'unrecordable') problems.push(`${ref.id}: ${use.reason}`)
+  }
+  return problems
+}
+
+/** The live processes listening at a LiveKit runtime's address. */
+async function liveKitListeners(ref: LocalRuntimeEngineRef): Promise<number[]> {
+  const port = Number(new URL(ref.baseUrl as string).port)
+  return ref.id === LIVEKIT_NATIVE_SERVER_ENGINE_ID ? (await inspectLocalLiveKitPortOwner(port)).pids : findListenerPids(port)
+}
+
+/**
+ * What the LiveKit row must say about this Batshit's records of the running LiveKit, derived each
+ * time from the records themselves (BL-1301, BL-1298): one of its running launch records does not
+ * hold the saved "Stop with Batshit" choice; a record cannot be read; or it uses a LiveKit another
+ * Batshit started with no record of that use (that Batshit relaunched it over this one's attach,
+ * or the use was never recorded), so that Batshit's quit or restart can stop it. Null when none.
+ */
+async function describeLiveKitStopChoiceGap(userId: string, stopOnShutdown: boolean): Promise<string | null> {
+  const registry = await resolveVoiceRuntimeRegistryIdentity()
+  for (const id of LIVEKIT_RECORD_IDS) {
+    for (const entry of await listLocalRuntimeLaunchRecords(id)) {
+      if (entry.unreadable) {
+        return `A LiveKit launch record cannot be read (${entry.reason}), so Batshit cannot tell whether your Stop with Batshit choice reached it.`
+      }
+      if (entry.registry !== registry) continue
+      if (isLocalRuntimeProcessAlive(entry.pid) && (entry.stopOnShutdown === false) === stopOnShutdown) {
+        return 'Your saved Stop with Batshit choice has not reached the running LiveKit yet, so quitting follows its earlier choice until LiveKit restarts.'
+      }
+    }
+  }
+  for (const ref of await resolveLiveKitRuntimeEngineRefs(userId)) {
+    // A sidecar that is not this Batshit's own is refused in the row already (BL-1311).
+    if (!ref.baseUrl || ref.id === LIVEKIT_SIDECAR_ENGINE_ID) continue
+    const state = await readRuntimeUseState(ref.id, await liveKitListeners(ref))
+    if (state === 'unrecorded') {
+      return `This Batshit uses the running LiveKit server another Batshit started, but has no record of that use, so that Batshit's quit or restart can stop it under this one. Start or Restart LiveKit here to record it.`
+    }
+    if (state === 'unreadable') {
+      return `A LiveKit server launch record cannot be read, so Batshit cannot tell whether your Stop with Batshit choice reached it.`
+    }
+  }
+  return null
 }

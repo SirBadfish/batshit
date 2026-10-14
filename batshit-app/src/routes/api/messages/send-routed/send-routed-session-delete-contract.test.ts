@@ -65,9 +65,11 @@ describe('send-routed: a chat being deleted takes no new turn', () => {
     expect(source.slice(keepId, outerTry)).not.toContain('await ')
     // The first thing inside the try, ahead of the pre-run sandbox cleanup, so the `finally`
     // below (the only release) lets the lock go.
-    const afterTry = source.slice(outerTry, outerTry + 900)
+    const afterTry = source.slice(outerTry, outerTry + 1600)
+    // Then the pre-run sandbox sweep, which stands aside while another request of the chat
+    // still runs (BL-198).
     expect(afterTry).toMatch(
-      /^\n {4}try \{\n(?: {6}\/\/[^\n]*\n)*? {6}if \(!\(await redis\.getSession\(sessionId\)\)\) \{\n {8}return sessionDeletedResponse\(\)\n {6}\}\n {6}try \{\n {8}const sandboxCleanupWarnings =\n/
+      /^\n {4}try \{\n(?: {6}\/\/[^\n]*\n)*? {6}if \(!\(await redis\.getSession\(sessionId\)\)\) \{\n {8}return sessionDeletedResponse\(\)\n {6}\}\n(?: {6}\/\/[^\n]*\n)* {6}if \(isAnotherRequestRunning\(sessionId, sessionTurnId\)\) \{\n[\s\S]*?\n {6}\} else \{\n {8}try \{\n {10}const sandboxCleanupWarnings =\n/
     )
     expect(source.split('releaseSessionTurn(').length - 1).toBe(1)
   })
@@ -104,7 +106,7 @@ describe('send-routed: a reply stopped because its chat was deleted', () => {
     expect(earlyStart).toBeGreaterThan(-1)
     expect(earlyEnd).toBeGreaterThan(earlyStart)
     expect(earlyStop.split("...(stoppedForDeletedChat() ? { chatDeleted: true } : {}),").length - 1).toBe(2)
-    expect(earlyStop).toContain("await finalizeAssistantMessage('error')")
+    expect(earlyStop).toContain("await finalizeStoppedReply('Failed to finalize a stopped early approval resume')")
     expect(earlyStop).toContain('await streamAdapter.emitComplete({')
 
     const replyStart = source.indexOf('    if (isAbortError) {', earlyEnd)

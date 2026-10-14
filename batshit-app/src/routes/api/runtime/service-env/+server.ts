@@ -17,6 +17,16 @@ function isMacAppRuntime() {
   return env.BATSHIT_RUNTIME_OWNER === 'mac-app'
 }
 
+// The Pinokio launcher keeps BATSHIT_TOKEN in its data folder and passes it to batshit-server
+// itself; nothing may write a secret into the install folder, which Update replaces.
+function isPinokioRuntime() {
+  return !isContainerizedRuntime() && env.BATSHIT_RUNTIME_OWNER === 'pinokio'
+}
+
+function isLauncherManagedRuntime() {
+  return isContainerizedRuntime() || isMacAppRuntime() || isPinokioRuntime()
+}
+
 function runtimeToken() {
   return (env.BATSHIT_TOKEN || '').trim()
 }
@@ -24,6 +34,7 @@ function runtimeToken() {
 function runtimeLabel() {
   if (isMacAppRuntime()) return 'Mac runtime'
   if (isContainerizedRuntime()) return 'Docker Compose environment variables'
+  if (isPinokioRuntime()) return 'Pinokio launcher'
   return 'source runtime environment'
 }
 
@@ -113,7 +124,7 @@ export const GET: RequestHandler = async ({ url, locals, request }) => {
     return json({ ok: true })
   }
 
-  if (isContainerizedRuntime() || isMacAppRuntime()) {
+  if (isLauncherManagedRuntime()) {
     return json(resolveRuntimeManagedStatus(request))
   }
 
@@ -141,7 +152,7 @@ export const POST: RequestHandler = async ({ locals, request }) => {
   const userId = locals.user?.id
   if (!userId) return json({ error: 'Unauthorized' }, { status: 401 })
 
-  if (isContainerizedRuntime() || isMacAppRuntime()) {
+  if (isLauncherManagedRuntime()) {
     return json({
       success: true,
       ...resolveRuntimeManagedStatus(request)
@@ -184,7 +195,7 @@ export const DELETE: RequestHandler = async ({ locals }) => {
   const userId = locals.user?.id
   if (!userId) return json({ error: 'Unauthorized' }, { status: 401 })
 
-  if (isContainerizedRuntime() || isMacAppRuntime()) {
+  if (isLauncherManagedRuntime()) {
     return json({
       success: true,
       managedByRuntime: true,

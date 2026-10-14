@@ -19,6 +19,8 @@ RUN apt-get update \
 
 WORKDIR /opt/batshit-agent-browser-sidecar
 COPY tools/docker/agent-browser-sidecar/server.mjs ./server.mjs
+COPY tools/docker/agent-browser-sidecar/output-limit.mjs ./output-limit.mjs
+COPY tools/docker/agent-browser-sidecar/model-capture.mjs ./model-capture.mjs
 
 EXPOSE 8091
 

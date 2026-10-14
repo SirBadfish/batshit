@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { CodexEventAdapter } from '../codexEventAdapter'
+import { CodexReplyBaseline } from '../codexReplyBaseline'
 import type { NativeModeRequest } from '../vercelBrain'
 import {
   CAPTURED_ADD_DELETE_MOVE_EDIT,
@@ -13,6 +14,7 @@ import {
 } from '$lib/test-utils/codex-app-server-file-changes'
 import { codexCommandEvents, codexFileChangeEvents } from '$lib/test-utils/shell-command-steps'
 import { buildSnapshotEditPreview } from '$lib/utils/editDiff'
+import { buildCliSubagentMcpServerName } from '$lib/utils/cliSubagentToolNames'
 
 function buildRequest(overrides: Partial<NativeModeRequest> = {}): NativeModeRequest {
   return {
@@ -48,6 +50,60 @@ afterEach(() => {
 })
 
 describe('CodexEventAdapter', () => {
+  describe('BL-1361 observed portions through the one finalizer', () => {
+    const reported = { input_tokens: 100, output_tokens: 10, cached_input_tokens: 20, cache_write_input_tokens: 30 }
+    const expected = { completeness: 'partial', parts: [{ source: 'codex-app-server-progress', counts: { inputTokens: 100, outputTokens: 10, totalTokens: 110, cachedInputTokens: 20, cacheCreationInputTokens: 30 } }] }
+
+    it.each(['failed', 'error', 'returned'])('retains observations after %s without a successful finish or total', async (ending) => {
+      const finish = vi.fn()
+      const getter = vi.fn(() => reported)
+      const adapter = new CodexEventAdapter({ request: buildRequest(), transport: 'cli', getObservedUsage: getter, onFinish: finish })
+      async function* events() {
+        if (ending === 'returned') {
+          yield { type: 'item.completed', item: { type: 'agent_message', id: 'text-1', text: 'Partial words' } } as any
+          yield { type: 'turn.completed', usage: reported } as any
+        } else if (ending === 'failed') yield { type: 'turn.failed', error: { message: 'observed failure' } } as any
+        else yield { type: 'error', message: 'observed error' } as any
+      }
+      const stream = adapter.stream(events())
+      if (ending === 'returned') {
+        expect((await stream.next()).value.type).toBe('text-delta')
+        await stream.return(undefined)
+      } else await expect(collectChunks(stream)).rejects.toThrow(/observed (failure|error)/)
+      await adapter.finalize()
+      expect(finish).toHaveBeenCalledTimes(1)
+      expect(getter).toHaveBeenCalledTimes(1)
+      expect(finish.mock.calls[0][0].totalUsage).toBeUndefined()
+      expect(finish.mock.calls[0][0].observedUsage).toEqual(expected)
+    })
+
+    it('keeps a successful completed report authoritative and never reads the partial fallback', async () => {
+      const getter = vi.fn(() => reported)
+      const finish = vi.fn()
+      const adapter = new CodexEventAdapter({ request: buildRequest(), transport: 'cli', getObservedUsage: getter, onFinish: finish })
+      async function* events() { yield { type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 2 } } as any }
+      const chunks = await collectChunks(adapter.stream(events()))
+      expect(chunks).toEqual([{ type: 'finish', usage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 }, totalUsage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 } }])
+      expect(getter).not.toHaveBeenCalled()
+      expect(finish.mock.calls[0][0].observedUsage).toBeUndefined()
+    })
+
+    it('exposes only admitted partial evidence when finish was produced but delegated consumption is paused', async () => {
+      const finish = vi.fn()
+      const getter = vi.fn(() => reported)
+      const adapter = new CodexEventAdapter({ request: buildRequest(), transport: 'cli', getObservedUsage: getter, onFinish: finish })
+      async function* events() { yield { type: 'turn.completed', usage: reported } as any }
+      const stream = adapter.stream(events())
+      expect((await stream.next()).value.type).toBe('finish')
+      expect(finish).not.toHaveBeenCalled()
+      // A helper deadline has not consumed/reported that chunk to its accounting latch.
+      expect(adapter.takeObservedUsage()).toEqual(expected)
+      await stream.next()
+      expect(finish).toHaveBeenCalledTimes(1)
+      expect(finish.mock.calls[0][0].totalUsage).toEqual(expected.parts[0].counts)
+      expect(finish.mock.calls[0][0].observedUsage).toBeUndefined() // Primary rule unchanged.
+    })
+  })
   /**
    * SA-114 P2 (DL-114-06): the lane's `steer.delivered` becomes one `steer` chunk carrying
    * ids only. The adapter does not touch the steer inbox — send-routed's own `case` marks
@@ -88,7 +144,7 @@ describe('CodexEventAdapter', () => {
         item: {
           id: 'mcp-1',
           type: 'mcp_tool_call',
-          server: 'batshit_gateway_managed-codex-mode4-controls',
+          server: 'batshit_helpers',
           tool: 'batshit_tool_use',
           arguments: { ref: 'fabric:sys.memory.recall' }
         }
@@ -98,7 +154,7 @@ describe('CodexEventAdapter', () => {
         item: {
           id: 'mcp-1',
           type: 'mcp_tool_call',
-          server: 'batshit_gateway_managed-codex-mode4-controls',
+          server: 'batshit_helpers',
           tool: 'batshit_tool_use',
           arguments: { ref: 'fabric:sys.memory.recall' },
           result: {
@@ -246,6 +302,99 @@ describe('CodexEventAdapter', () => {
     })
   })
 
+  describe('BL-1376: the finish usage holds only the counts Codex reported', () => {
+    async function finishOf(usage: unknown) {
+      const finishUsages: unknown[] = []
+      const adapter = new CodexEventAdapter({
+        request: buildRequest(),
+        transport: 'cli',
+        onFinish: ({ totalUsage }) => {
+          finishUsages.push(totalUsage)
+        }
+      })
+      async function* mockEvents() {
+        yield { type: 'turn.completed', usage } as any
+      }
+      const chunks = await collectChunks(adapter.stream(mockEvents()))
+      expect(finishUsages).toHaveLength(1)
+      return { finish: chunks.find((chunk) => chunk.type === 'finish'), totalUsage: finishUsages[0] }
+    }
+
+    it('gives no usage, not zeros, when the turn reported no counts', async () => {
+      for (const usage of [null, undefined, {}]) {
+        const { finish, totalUsage } = await finishOf(usage)
+        expect(finish).toEqual({ type: 'finish' })
+        expect(totalUsage).toBeUndefined()
+      }
+    })
+
+    it('leaves a missing count and the total unset instead of summing a 0 in', async () => {
+      const onlyOutput = await finishOf({ output_tokens: 7 })
+      expect(onlyOutput.totalUsage).toEqual({ outputTokens: 7 })
+      const onlyInput = await finishOf({ input_tokens: 40, cached_input_tokens: 30 })
+      expect(onlyInput.totalUsage).toEqual({ inputTokens: 40, cachedInputTokens: 30 })
+      expect(onlyInput.finish).toEqual({ type: 'finish', totalUsage: onlyInput.totalUsage, usage: onlyInput.totalUsage })
+    })
+
+    it('keeps reported zeros as counts', async () => {
+      const { totalUsage } = await finishOf({
+        input_tokens: 0,
+        cached_input_tokens: 0,
+        cache_write_input_tokens: 0,
+        output_tokens: 0,
+        reasoning_output_tokens: 0
+      })
+      expect(totalUsage).toEqual({
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        reasoningTokens: 0,
+        cachedInputTokens: 0,
+        cacheCreationInputTokens: 0
+      })
+    })
+
+    it('maps cache writes separately in the finish chunk and its one callback (BL-1383)', async () => {
+      const { finish, totalUsage } = await finishOf({
+        input_tokens: 100, cached_input_tokens: 20, cache_write_input_tokens: 30, output_tokens: 10
+      })
+      expect(totalUsage).toEqual({ inputTokens: 100, cachedInputTokens: 20, cacheCreationInputTokens: 30, outputTokens: 10, totalTokens: 110 })
+      expect(finish).toEqual({ type: 'finish', totalUsage, usage: totalUsage })
+    })
+
+    it('keeps a defensive cache-write-only count without making up input, output or total', async () => {
+      const { finish, totalUsage } = await finishOf({ cache_write_input_tokens: 30 })
+      expect(totalUsage).toEqual({ cacheCreationInputTokens: 30 })
+      expect(finish).toEqual({ type: 'finish', totalUsage, usage: totalUsage })
+    })
+
+    it.each([undefined, null, NaN, Infinity, -Infinity])('leaves absent or non-finite cache writes unknown (%s)', async (cache_write_input_tokens) => {
+      const knownInput = await finishOf({ input_tokens: 100, cache_write_input_tokens })
+      expect(knownInput.totalUsage).toEqual({ inputTokens: 100 })
+      const noCounts = await finishOf({ cache_write_input_tokens })
+      expect(noCounts.totalUsage).toBeUndefined()
+      expect(noCounts.finish).toEqual({ type: 'finish' })
+    })
+
+    it('gives a failed turn no usage from its one finish callback', async () => {
+      const finishUsages: unknown[] = []
+      const adapter = new CodexEventAdapter({
+        request: buildRequest(),
+        transport: 'cli',
+        onFinish: ({ totalUsage }) => {
+          finishUsages.push(totalUsage)
+        }
+      })
+      async function* mockEvents() {
+        yield { type: 'turn.failed', error: { message: 'Codex turn ended with status failed' } } as any
+      }
+      await expect(collectChunks(adapter.stream(mockEvents()))).rejects.toThrow(
+        'Codex turn ended with status failed'
+      )
+      expect(finishUsages).toEqual([undefined])
+    })
+  })
+
   it('throws top-level Codex stream errors instead of dropping them', async () => {
     const adapter = new CodexEventAdapter({
       request: buildRequest(),
@@ -264,17 +413,97 @@ describe('CodexEventAdapter', () => {
     )
   })
 
+  it('observes raw MCP content text only and marks structured or unknown result material unaccounted', async () => {
+    const observations: any[] = []
+    const events = async function* () {
+      yield {
+        type: 'item.started',
+        item: { id: 'mcp-raw', type: 'mcp_tool_call', server: 'docs', tool: 'lookup', arguments: {} }
+      }
+      yield {
+        type: 'item.completed',
+        item: {
+          id: 'mcp-raw',
+          type: 'mcp_tool_call',
+          status: 'completed',
+          result: {
+            content: [
+              { type: 'text', text: 'Raw MCP content https://mcp-content.example/read.png' },
+              { type: 'image', data: 'AAAA' },
+              { type: 'future_block', data: 'not classified' }
+            ],
+            structured_content: { url: 'https://structured-only.example/not-read.png' }
+          }
+        }
+      }
+      yield { type: 'turn.completed', usage: {} }
+    }
+    const run = async (onCliModelResult?: NativeModeRequest['onCliModelResult']) => {
+      const adapter = new CodexEventAdapter({ request: buildRequest({ onCliModelResult }), transport: 'cli' })
+      const chunks = await collectChunks(adapter.stream(events() as any))
+      return { chunks, steps: adapter.getIntermediateSteps() }
+    }
+
+    const observed: any[] = []
+    const withObserver = await run((delivery) => observed.push(delivery))
+    const withoutObserver = await run()
+
+    expect(observed).toEqual([{
+      callId: 'mcp-raw',
+      texts: ['Raw MCP content https://mcp-content.example/read.png'],
+      nonTextInputs: 1,
+      unaccountedInputs: 2
+    }])
+    expect(JSON.stringify(observed)).not.toContain('structured-only.example')
+    expect(JSON.stringify(withObserver.chunks)).toContain('structured-only.example')
+    expect(withObserver.chunks).toEqual(withoutObserver.chunks)
+    const withoutStepTimestamps = (steps: any[]) => steps.map(({ timestamp, ...step }) => step)
+    expect(withoutStepTimestamps(withObserver.steps)).toEqual(withoutStepTimestamps(withoutObserver.steps))
+  })
+
+  it('contains an observer failure, logs no result text, and marks the result unaccounted if possible', async () => {
+    const privateResult = 'https://private-result.example/do-not-log.png'
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    let firstCall = true
+    const fallbackObservations: any[] = []
+    const adapter = new CodexEventAdapter({
+      request: buildRequest({
+        onCliModelResult: (delivery) => {
+          if (firstCall) {
+            firstCall = false
+            throw new Error(privateResult)
+          }
+          fallbackObservations.push(delivery)
+        }
+      }),
+      transport: 'cli'
+    })
+    async function* mockEvents() {
+      yield { type: 'item.started', item: { id: 'command-1', type: 'command_execution', command: 'pwd', aggregated_output: '', status: 'in_progress' } }
+      yield { type: 'item.completed', item: { id: 'command-1', type: 'command_execution', command: 'pwd', aggregated_output: privateResult, exit_code: 0, status: 'completed' } }
+      yield { type: 'turn.completed', usage: {} }
+    }
+
+    const chunks = await collectChunks(adapter.stream(mockEvents() as any))
+
+    expect(chunks.some((chunk) => chunk.type === 'finish')).toBe(true)
+    expect(fallbackObservations).toEqual([{
+      callId: 'command-1', texts: [], nonTextInputs: 0, unaccountedInputs: 1
+    }])
+    expect(JSON.stringify(consoleError.mock.calls)).not.toContain(privateResult)
+  })
+
   // F-P6-5 follow-up: a command that failed changed nothing Batshit can show. With a project path
   // the adapter reads files back through batshit-server, so these cases would reach `fetch` if
   // it still read a failed write or edit back.
   describe('a failed command claims nothing about the file', () => {
     const OLD_CONTENT = 'old content\n'
 
-    function stubFileReadBack() {
+    function stubFileReadBack(content = OLD_CONTENT) {
       // batshit-server reads are service-token-gated: without the token the adapter never calls
       // fetch at all, and "fetch was not called" would prove nothing.
       vi.stubEnv('BATSHIT_TOKEN', 'codex-adapter-test-token')
-      const fetchSpy = vi.fn(async () => ({ ok: true, json: async () => ({ content: OLD_CONTENT }) }))
+      const fetchSpy = vi.fn(async () => ({ ok: true, json: async () => ({ content }) }))
       vi.stubGlobal('fetch', fetchSpy)
       return fetchSpy
     }
@@ -307,6 +536,76 @@ describe('CodexEventAdapter', () => {
 
       expect(result.result).toMatchObject({ exitCode: 0, content: OLD_CONTENT })
       expect(fetchSpy).toHaveBeenCalled()
+    })
+
+    it('observes raw command output before a successful write is enriched with a read-back', async () => {
+      const rawOutput = 'command response https://raw-command.example/result.png'
+      const readBack = 'Batshit read-back https://readback-only.example/file.png'
+      const fetchSpy = stubFileReadBack(readBack)
+
+      const run = async (onCliModelResult?: NativeModeRequest['onCliModelResult']) => {
+        const adapter = new CodexEventAdapter({
+          request: buildRequest({ projectPath: '/repo', onCliModelResult }),
+          transport: 'cli'
+        })
+        async function* mockEvents() {
+          yield* command('write-result', 'echo complete > /repo/out.txt', {
+            aggregated_output: rawOutput,
+            exit_code: 0,
+            status: 'completed'
+          })
+          yield { type: 'turn.completed', usage: {} }
+        }
+        const chunks = await collectChunks(adapter.stream(mockEvents() as any))
+        return { chunks, steps: adapter.getIntermediateSteps() }
+      }
+
+      const observations: any[] = []
+      const observed = await run((delivery) => observations.push(delivery))
+      const unobserved = await run()
+
+      expect(observations).toEqual([{
+        callId: 'write-result',
+        texts: [rawOutput],
+        nonTextInputs: 0,
+        unaccountedInputs: 0
+      }])
+      expect(observed.chunks).toEqual(unobserved.chunks)
+      // Separate executions have different wall-clock stamps; every payload field must agree.
+      const withoutStepTimestamps = (steps: any[]) => steps.map(({ timestamp, ...step }) => step)
+      expect(withoutStepTimestamps(observed.steps)).toEqual(withoutStepTimestamps(unobserved.steps))
+      expect([...observed.steps, ...unobserved.steps].every((step) => Number.isFinite(step.timestamp))).toBe(true)
+      expect(JSON.stringify(observed.steps)).toContain(readBack)
+      expect(JSON.stringify(observations)).not.toContain(readBack)
+      expect(fetchSpy).toHaveBeenCalledTimes(2)
+    })
+
+    it('does not observe a failed file_change diff as model-result text', async () => {
+      const proposedUrl = 'https://proposed-patch.example/never-read.png'
+      const change = {
+        path: '/repo/notes.md',
+        kind: 'update',
+        diff: `@@ -1 +1 @@\n-old text\n+${proposedUrl}`
+      }
+      const observations: any[] = []
+      const adapter = new CodexEventAdapter({
+        request: buildRequest({
+          projectPath: '/repo',
+          onCliModelResult: (delivery) => observations.push(delivery)
+        }),
+        transport: 'cli'
+      })
+      async function* mockEvents() {
+        yield { type: 'item.started', item: { id: 'failed-patch', type: 'file_change', changes: [change], status: 'in_progress' } }
+        yield { type: 'item.completed', item: { id: 'failed-patch', type: 'file_change', changes: [change], status: 'failed' } }
+        yield { type: 'turn.completed', usage: {} }
+      }
+
+      const chunks = await collectChunks(adapter.stream(mockEvents() as any))
+
+      expect(observations).toEqual([])
+      expect(JSON.stringify(chunks)).toContain(proposedUrl)
+      expect(JSON.stringify(adapter.getIntermediateSteps())).toContain(proposedUrl)
     })
 
     it('does not read a failed write back as its written content', async () => {
@@ -771,6 +1070,57 @@ describe('CodexEventAdapter', () => {
     })
   })
 
+  /**
+   * BL-12 (2026-09-22): the adapter kept its own copy of the old loose `-c` unwrap, which read the
+   * first quoted `-c` value anywhere on a line as the command. Every real Codex command carries its
+   * shell's `-lc` wrapper, which that copy read the way the shared mapper does, so the copy changed
+   * nothing a user saw; but a line without one fell to its `-c` branch, which named another
+   * program's option value as a terse Codex verb. The adapter now asks the mapper's unwrap.
+   */
+  it("reads another program's -c value as that program's, never as a terse Codex verb", async () => {
+    const adapter = new CodexEventAdapter({ request: buildRequest(), transport: 'cli' })
+    async function* mockEvents() {
+      for (const [id, command] of [
+        ['cmd-grep', "grep -c 'read_file x' notes.md"],
+        ['cmd-rg', 'rg -c "edit_file" src']
+      ]) {
+        yield { type: 'item.started', item: { id, type: 'command_execution', command } }
+        yield {
+          type: 'item.completed',
+          item: { id, type: 'command_execution', command, aggregated_output: '3\n', exit_code: 0, status: 'completed' }
+        }
+      }
+      yield { type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } }
+    }
+
+    const calls = (await collectChunks(adapter.stream(mockEvents() as any))).filter(
+      (chunk) => chunk.type === 'tool-call'
+    )
+
+    expect(calls.map((call) => [call.toolName, call.args.innerCommand, call.args.filePath])).toEqual([
+      ['batshit_server_search_files', "grep -c 'read_file x' notes.md", undefined],
+      ['batshit_server_search_files', 'rg -c "edit_file" src', undefined]
+    ])
+  })
+
+  it('still unwraps a terse verb from the login shell Codex wraps it in', async () => {
+    const adapter = new CodexEventAdapter({ request: buildRequest(), transport: 'cli' })
+    const command = `/bin/zsh -lc 'read_file{"path":"/tmp/foo.md"}'`
+    async function* mockEvents() {
+      yield { type: 'item.started', item: { id: 'cmd-1', type: 'command_execution', command } }
+      yield { type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } }
+    }
+
+    const [call] = (await collectChunks(adapter.stream(mockEvents() as any))).filter(
+      (chunk) => chunk.type === 'tool-call'
+    )
+
+    expect(call).toMatchObject({
+      toolName: 'batshit_server_read_file',
+      args: { command, innerCommand: 'read_file{"path":"/tmp/foo.md"}', path: '/tmp/foo.md' }
+    })
+  })
+
   it('maps Codex file_change updates to edit_file without a started event', async () => {
     const adapter = new CodexEventAdapter({
       request: buildRequest(),
@@ -954,6 +1304,54 @@ describe('CodexEventAdapter', () => {
     expect(resultChunk?.metadata?.toolSource).toBe('workflow-webhook')
     expect(resultChunk?.result).toMatchObject({ output: 'Hello from SA' })
     expect(resultChunk?.metadata?.subagentName).toBe('Batshit Subagent')
+  })
+
+  // BL-272: the subagent was the first `subagent_` anywhere in the tool name. An agent slugged
+  // `subagent` registers its bridge as `batshit_gateway_subagent_<hash>`, so its Subagent card
+  // named the hash and its Workers call read as a Subagent call. The managed shape decides now.
+  it('reads the subagent from the tool of the managed shape, never from the bridge name (BL-272)', async () => {
+    const server = buildCliSubagentMcpServerName({ id: 'subagent', slug: 'subagent' })!
+    expect(server).toMatch(/^batshit_gateway_subagent_[0-9a-f]{6}$/)
+    const adapter = new CodexEventAdapter({
+      request: buildRequest(),
+      transport: 'cli'
+    })
+
+    async function* mockEvents() {
+      yield {
+        type: 'item.started',
+        item: { id: 'mcp-sa', type: 'mcp_tool_call', server, tool: 'subagent_researcher', arguments: { chatInput: 'look it up' } }
+      }
+      yield {
+        type: 'item.completed',
+        item: { id: 'mcp-sa', type: 'mcp_tool_call', result: [{ type: 'text', text: 'Found it.' }] }
+      }
+      yield {
+        type: 'item.started',
+        item: { id: 'mcp-w', type: 'mcp_tool_call', server, tool: 'spawn_workers', arguments: { tasks: [{ prompt: 'count' }] } }
+      }
+      yield {
+        type: 'item.completed',
+        item: { id: 'mcp-w', type: 'mcp_tool_call', result: [{ type: 'text', text: 'Workers done.' }] }
+      }
+      yield { type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } }
+    }
+
+    await collectChunks(adapter.stream(mockEvents()))
+    const [subagentStep, workersStep] = adapter.getIntermediateSteps() as any[]
+
+    expect(subagentStep).toMatchObject({
+      toolName: `mcp.${server}.subagent_researcher`,
+      toolProvider: 'subagent',
+      isSubagent: true,
+      subagentId: 'researcher',
+      subagentName: 'Researcher'
+    })
+    expect(subagentStep.toolInput).toEqual({ chatInput: 'look it up' })
+    expect(workersStep.toolName).toBe(`mcp.${server}.spawn_workers`)
+    expect(workersStep.isSubagent).toBeUndefined()
+    expect(workersStep.toolProvider).toBe('mcp')
+    expect(workersStep.toolInput).toEqual({ arguments: { tasks: [{ prompt: 'count' }] } })
   })
 
   it('marks managed CLI subagent MCP results with managed subagent metadata', async () => {
@@ -1305,32 +1703,241 @@ describe('Codex native patch records and start copies', () => {
 
     // On the app-server lane a command's start reaches Batshit after the command has run, so a
     // copy read then matches a REAL edit too: saying "No change seen" hid a `sed -i` that worked.
-    it('read only at the command\'s own start, and matching, proves nothing: the git diff stays the best record', async () => {
+    // BL-9: and with no baseline for the reply, git's diff is not a record of this command.
+    it('read only at the command\'s own start, and matching, proves nothing: with no baseline the diff is unavailable', async () => {
       stubReads([NOW, NOW])
       const { result } = await run(sedNoMatch(), repo)
 
       expect(result?.result?.diff).not.toContain('No change seen')
-      expect(result?.result?.diff).toContain('diff --git a/notes.md b/notes.md')
+      expect(result?.result?.diff).not.toContain('Unrelated line added earlier')
+      expect(result?.result?.diff).toContain('Diff unavailable')
     })
 
-    it('that is missing still leaves the git diff as the best record', async () => {
-      stubReads([null, NOW])
-      const { result } = await run(sedNoMatch(), repo)
+    /**
+     * BL-9 — the reply's git baseline, taken before Codex started, over the real repository.
+     * batshit-server's `read_file` is answered from the real disk, so the baseline's copies and
+     * the adapter's read-backs see the same file.
+     */
+    describe('and the reply\'s git baseline (BL-9)', () => {
+      const git = (...args: string[]) => execFileSync('git', ['-C', repo, ...args], { stdio: 'ignore' })
+      const notes = () => path.join(repo, 'notes.md')
+      const setNotes = (text: string) => () => writeFileSync(notes(), text)
+      const commitNotes = () => {
+        git('add', 'notes.md')
+        git('commit', '-qm', 'notes as they are now')
+      }
 
-      expect(result?.result?.diff).toContain('diff --git a/notes.md b/notes.md')
-      expect(result?.result?.diff).toContain('+Unrelated line added earlier.')
-    })
+      /** Signals the hanging reads were given (review finding 4). */
+      const hungReadSignals: Array<AbortSignal | undefined> = []
+      /** batshit-server's reads from the real disk; a file `hangReadsOf()` names never answers. */
+      function stubRepoDisk(hangReadsOf?: () => string | null) {
+        vi.stubEnv('BATSHIT_TOKEN', 'codex-adapter-test-token')
+        hungReadSignals.length = 0
+        vi.stubGlobal(
+          'fetch',
+          vi.fn(async (_url: unknown, init?: { body?: string; signal?: AbortSignal }) => {
+            const body = JSON.parse(init?.body ?? '{}')
+            const file = path.join(body?.params?.projectPath ?? '/', body?.input?.filePath ?? '')
+            if (hangReadsOf?.() === file) {
+              hungReadSignals.push(init?.signal)
+              return new Promise(() => {})
+            }
+            return existsSync(file)
+              ? { ok: true, json: async () => ({ content: readFileSync(file, 'utf8') }) }
+              : { ok: false, json: async () => ({}) }
+          })
+        )
+      }
 
-    // A patch always changes its file, so a matching copy was read after the patch landed.
-    it('that matches a native patch without Codex\'s record keeps the fallback, never "No change seen"', async () => {
-      stubReads([NOW, NOW])
-      const { result } = await run(
-        codexFileChangeEvents({ id: 'exec-patch', changes: [{ path: `${repo}/notes.md`, kind: 'update' }], status: 'completed' }),
-        repo
-      )
+      async function reply(
+        steps: Array<any>,
+        options: { maxCopies?: number; copyReadTimeoutMs?: number; hangReadsOf?: () => string | null } = {}
+      ) {
+        stubRepoDisk(options.hangReadsOf)
+        const replyBaseline = await CodexReplyBaseline.take({
+          projectPath: repo,
+          ...(options.maxCopies !== undefined ? { maxCopies: options.maxCopies } : {})
+        })
+        const adapter = new CodexEventAdapter({
+          request: buildRequest({ projectPath: repo }),
+          transport: 'cli',
+          replyBaseline,
+          ...(options.copyReadTimeoutMs !== undefined ? { copyReadTimeoutMs: options.copyReadTimeoutMs } : {})
+        })
+        async function* stream() {
+          for (const step of steps) {
+            if (typeof step === 'function') step()
+            else yield step
+          }
+          yield { type: 'turn.completed', usage: {} }
+        }
+        try {
+          const chunks = await collectChunks(adapter.stream(stream() as any))
+          return chunks.filter((chunk) => chunk.type === 'tool-result')
+        } finally { await replyBaseline.dispose() }
+      }
 
-      expect(result?.result?.diff).toContain('diff --git a/notes.md b/notes.md')
-      expect(result?.result?.diff).not.toContain('No change seen')
+      const sedEdit = (id: string, from: string, to: string, exitCode = 0) =>
+        codexCommandEvents({
+          id,
+          command: `sed -i 's/${from}/${to}/' ${repo}/notes.md`,
+          output: exitCode === 0 ? '' : 'sed: something went wrong\n',
+          exitCode,
+          status: exitCode === 0 ? 'completed' : 'failed'
+        })
+
+      // The bug: a `sed -i` that changed nothing showed the file's older, unrelated edit.
+      it('a no-op sed -i on a file with older changes says no change was seen, never the older edit', async () => {
+        const [edit] = await reply(sedNoMatch())
+
+        expect(edit?.result?.diff).toBe(
+          `No change seen: ${repo}/notes.md matches the copy Batshit read before this command ran.`
+        )
+      })
+
+      it('a real sed -i on a file with older changes shows only its own change', async () => {
+        const AFTER = NOW.replace('First line.', 'Line one.')
+        const [edit] = await reply([setNotes(AFTER), ...sedEdit('real', 'First line.', 'Line one.')])
+
+        // Before is the start-of-reply copy, which already had the older line: it is context,
+        // never a change of this command's.
+        expect(edit?.result?.diff).toBe(buildSnapshotEditPreview({ filePath: `${repo}/notes.md`, before: NOW, after: AFTER }))
+      })
+
+      it('a real sed -i on a clean tracked file it never read shows the exact text changes', async () => {
+        commitNotes()
+        const [edit] = await reply([setNotes(NOW.replace('Second line.', 'Line two.')), ...sedEdit('real', 'Second line.', 'Line two.')])
+
+        expect(edit?.result?.diff).toBe(buildSnapshotEditPreview({ filePath: `${repo}/notes.md`, before: NOW, after: NOW.replace('Second line.', 'Line two.') }))
+        expect(edit?.result?.diff).not.toMatch(/\+\s+\d+ \| Unrelated line added earlier/)
+      })
+
+      it('a no-op sed -i on a clean tracked file it never read says no change was seen', async () => {
+        commitNotes()
+        const [edit] = await reply(sedNoMatch())
+
+        expect(edit?.result?.diff).toBe(
+          `No change seen: ${repo}/notes.md matches the version git had before this command ran.`
+        )
+      })
+
+      it('a file with older changes the baseline could not copy says the diff is unavailable, never its older edit', async () => {
+        const [edit] = await reply(sedNoMatch(), { maxCopies: 0 })
+
+        expect(edit?.result?.diff).toContain('Diff unavailable')
+        expect(edit?.result?.diff).not.toContain('Unrelated line added earlier')
+      })
+
+      it('a script that leaves a file changed becomes its new starting point', async () => {
+        commitNotes()
+        const SCRIPTED = `${NOW}Added by a script.\n`
+        const EDITED = SCRIPTED.replace('First line.', 'Line one.')
+        const [, noop, real] = await reply([
+          setNotes(SCRIPTED),
+          ...codexCommandEvents({ id: 'script', command: 'python3 tidy.py', output: '', exitCode: 0, status: 'completed' }),
+          ...sedNoMatch(),
+          setNotes(EDITED),
+          ...sedEdit('real', 'First line.', 'Line one.')
+        ])
+
+        // Review finding 1: the copy was read when the script's step completed, which a parallel
+        // batch can make later than the edit, so a match proves nothing and is never "No change
+        // seen"; a copy that differs still gives the edit's own lines.
+        expect(noop?.result?.diff).not.toContain('No change seen')
+        expect(noop?.result?.diff).toContain('Diff unavailable')
+        expect(real?.result?.diff).toBe(buildSnapshotEditPreview({ filePath: `${repo}/notes.md`, before: SCRIPTED, after: EDITED }))
+      })
+
+      it('a file a failed edit may have changed is no longer vouched for by git', async () => {
+        commitNotes()
+        const HALF = NOW.replace('First line.', 'Half-done.')
+        const [, next] = await reply([setNotes(HALF), ...sedEdit('broken', 'First line.', 'Half-done.', 1), ...sedNoMatch()])
+
+        // Vouched for, git's diff would draw the failed edit's change as this no-op's.
+        expect(next?.result?.diff).toContain('Diff unavailable')
+        expect(next?.result?.diff).not.toContain('Half-done')
+      })
+
+      /**
+       * Review finding 1: with parallel tool calls a batch's commands all run before Batshit sees
+       * any of them, so a copy read when one of them completes (`pwd` here) can already hold what
+       * another one (`sed -i`) wrote. Taken as the edit's "before", it said "No change seen" for a
+       * real edit.
+       */
+      const pwd = () => codexCommandEvents({ id: 'pwd', command: 'pwd', output: `${repo}\n`, exitCode: 0, status: 'completed' })
+
+      it('a copy taken while a parallel batch ran never says a real edit changed nothing: a file the batch changed', async () => {
+        commitNotes()
+        const EDITED = NOW.replace('First line.', 'Line one.')
+        const [, edit] = await reply([setNotes(EDITED), ...pwd(), ...sedEdit('real', 'First line.', 'Line one.')])
+
+        expect(edit?.result?.diff).not.toContain('No change seen')
+        expect(edit?.result?.diff).toContain('Diff unavailable')
+      })
+
+      it('a copy taken while a parallel batch ran never says a real edit changed nothing: a file Batshit already knew', async () => {
+        commitNotes()
+        const EDITED = NOW.replace('First line.', 'Line one.')
+        const [, , edit] = await reply([
+          ...codexCommandEvents({ id: 'look', command: `sed -n 1,2p ${repo}/notes.md`, output: '# Notes\n\n', exitCode: 0, status: 'completed' }),
+          setNotes(EDITED),
+          ...pwd(),
+          ...sedEdit('real', 'First line.', 'Line one.')
+        ])
+
+        expect(edit?.result?.diff).not.toContain('No change seen')
+        expect(edit?.result?.diff).toContain('Diff unavailable')
+      })
+
+      // Review finding 3: a step's re-reads go through batshit-server, whose read has no deadline.
+      it('a re-read that never comes back cannot hold the reply, and its file keeps no copy', async () => {
+        commitNotes()
+        let hang: string | null = null
+        const started = Date.now()
+        const [, edit] = await reply(
+          [
+            () => {
+              writeFileSync(notes(), `${NOW}Added by a script.\n`)
+              hang = notes()
+            },
+            ...codexCommandEvents({ id: 'script', command: 'python3 tidy.py', output: '', exitCode: 0, status: 'completed' }),
+            () => {
+              hang = null
+            },
+            ...sedNoMatch()
+          ],
+          { copyReadTimeoutMs: 200, hangReadsOf: () => hang }
+        )
+
+        expect(Date.now() - started).toBeLessThan(4000)
+        expect(edit?.result?.diff).not.toContain('No change seen')
+        expect(edit?.result?.diff).toContain('Diff unavailable')
+        // Review finding 4: the late read is told to stop, not only left behind.
+        expect(hungReadSignals.length).toBeGreaterThan(0)
+        expect(hungReadSignals.every((signal) => signal?.aborted === true)).toBe(true)
+      })
+
+      // A patch always changes its file, so a matching copy was read after the patch landed.
+      it('a native patch without Codex\'s record on a clean file shows git\'s diff of the patch, never "No change seen"', async () => {
+        commitNotes()
+        const [patch] = await reply([
+          setNotes(NOW.replace('Second line.', 'Patched line.')),
+          ...codexFileChangeEvents({ id: 'exec-patch', changes: [{ path: `${repo}/notes.md`, kind: 'update' }], status: 'completed' })
+        ])
+
+        expect(patch?.result?.diff).toBe(buildSnapshotEditPreview({ filePath: `${repo}/notes.md`, before: NOW, after: NOW.replace('Second line.', 'Patched line.') }))
+        expect(patch?.result?.diff).not.toContain('No change seen')
+      })
+
+      it('a native patch that git shows no change for never says "No change seen": a patch always changes its file', async () => {
+        commitNotes()
+        const [patch] = await reply(
+          codexFileChangeEvents({ id: 'exec-patch', changes: [{ path: `${repo}/notes.md`, kind: 'update' }], status: 'completed' })
+        )
+
+        expect(patch?.result?.diff).not.toContain('No change seen')
+        expect(patch?.result?.diff).toContain('Diff unavailable')
+      })
     })
 
     it('that differs only in line endings says so', async () => {

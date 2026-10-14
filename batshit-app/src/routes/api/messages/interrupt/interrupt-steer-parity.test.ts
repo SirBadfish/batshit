@@ -23,6 +23,9 @@ describe('the interrupt path is untouched by steering', () => {
     expect(interruptRoute).toContain('abortWokenTurnForInterrupt(sessionId)')
     expect(interruptRoute).toContain("abortStream(sessionId, 'user')")
     expect(interruptRoute).toContain("abortGroupChat(sessionId, 'user')")
+    // Only an actual abort/setup Stop owns the local Voice completion fallback.
+    expect(interruptRoute).toContain("reason: aborted.ok || abortedGroup.ok ? 'aborted' : abortedWokenTurn ? 'wake_run_aborted' : 'no_active_stream'")
+    expect(interruptRoute).toContain(": 'stale_turn_cleared'")
   })
 
   it('the stream abort registry has no steer state (DL-114-02: a separate map)', () => {
@@ -56,6 +59,8 @@ describe('the interrupt path is untouched by steering', () => {
     expect(finallyBlock).toBeGreaterThan(-1)
 
     const promotionLoop = sendRouted.indexOf('while (steerPromotions < MAX_STEER_PROMOTIONS) {')
-    expect(sendRouted.slice(promotionLoop, promotionLoop + 900)).toContain('if (interrupted) break')
+    const stopped = sendRouted.slice(sendRouted.indexOf('if (interrupted) {', promotionLoop), sendRouted.indexOf('// DL-114-13:', promotionLoop))
+    expect(stopped).toContain('break')
+    expect(stopped).not.toContain('promoteSteersToNextTurn')
   })
 })

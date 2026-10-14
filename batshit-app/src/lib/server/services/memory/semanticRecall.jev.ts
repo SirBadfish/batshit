@@ -1,5 +1,5 @@
 /**
- * SA-120 P4b (design record A2) — Jev Juice recall by meaning.
+ * SA-120 P4b (design record A2) — Judge Juice recall by meaning.
  *
  * THE constants module for this feature (DL-120-03): the question, its criteria, the floor,
  * and every cap live here, so a reviewer reads the whole decision surface in one file.
@@ -7,7 +7,7 @@
  *
  * What it does. Today a long-term (LTM) memory reaches the agent only when the agent spends
  * a tool call to search and recall it; trigger-word (STM) memories fire on exact words. With
- * "Jev Juice: Recall by Meaning" ON, each accepted user turn:
+ * "Judge Juice: Recall by Meaning" ON, each accepted user turn:
  *   1. a hybrid pre-filter (the memory index, the message as the query, any-word lexical
  *      leg) shortlists up to `maxCandidates` current LTM memories that are not already in
  *      this turn's context;
@@ -35,8 +35,9 @@
  * each shortlisted memory, clipped.
  */
 
-import type { JevJuiceNote, TypesafeCallRecord } from '$lib/types/typesafe'
+import type { JevJuiceNote, JudgeProvider, TypesafeCallRecord } from '$lib/types/typesafe'
 import { resolveAgentJevMemoryRecallEnabled } from '$lib/utils/jevJuiceControl'
+import { judgeProviderRef } from '$lib/utils/judgeProviders'
 import { resolveTypesafeAccess, runTypesafeJudgment } from '../typesafe/typesafeAvailability'
 import type { JevNoulAnswer, JevNoulQuestion, JevQuestions, TypesafeClient } from '../typesafe/typesafeClient'
 import { buildJevJuiceNote, createTypesafeCallRecord } from '../typesafe/typesafeEvidence'
@@ -261,11 +262,14 @@ function localRecord(
   model: string | null,
   startedAt: number,
   now: () => number,
-  fields: Pick<TypesafeCallRecord, 'status' | 'reason' | 'deadlineHit' | 'detail'>
+  fields: Pick<TypesafeCallRecord, 'status' | 'reason' | 'deadlineHit' | 'detail'>,
+  provider?: JudgeProvider
 ): TypesafeCallRecord {
   return {
     feature: SEMANTIC_RECALL_FEATURE_ID,
     model,
+    // SA-120 P10a: the judge this send would have asked.
+    ...(provider ? { provider: judgeProviderRef(provider) } : {}),
     latencyMs: Math.max(0, now() - startedAt),
     usage: null,
     questionCount: 0,
@@ -296,7 +300,9 @@ export async function computeSemanticRecall(input: ComputeSemanticRecallInput): 
   if (!access.allowed) {
     const record = createTypesafeCallRecord({
       featureId: SEMANTIC_RECALL_FEATURE_ID,
-      requestedModel: access.config.modelId,
+      requestedModel: access.provider?.modelId ?? null,
+      provider: access.provider ? judgeProviderRef(access.provider) : undefined,
+      chosenProviderId: access.provider ? undefined : access.providerId,
       questionCount: 0,
       outcome: null,
       deniedReason: access.reason
@@ -316,13 +322,13 @@ export async function computeSemanticRecall(input: ComputeSemanticRecallInput): 
   } catch (error) {
     // The memory index or the embedder failed. Saves and searches fail loudly on their own;
     // here the send proceeds without inferred recalls and the miss is visible.
-    console.error('[Jev Juice] recall by meaning: the memory pre-filter failed:', error)
+    console.error('[Judge Juice] recall by meaning: the memory pre-filter failed:', error)
     const record = localRecord(access.model, startedAt, now, {
       status: 'error',
       reason: 'local_error',
       deadlineHit: false,
       detail: `memory pre-filter failed: ${error instanceof Error ? error.message : String(error)}`.slice(0, 200)
-    })
+    }, access.provider)
     return { recalls: [], record, note: buildJevJuiceNote(record), decision: null }
   }
 
@@ -341,7 +347,7 @@ export async function computeSemanticRecall(input: ComputeSemanticRecallInput): 
       reason: 'deadline',
       deadlineHit: true,
       detail: `the memory pre-filter took ${prefilterMs} ms of the ${waitLimitMs} ms In-Chat Wait Limit; no call was made`
-    })
+    }, access.provider)
     return { recalls: [], record, note: buildJevJuiceNote(record), decision: null }
   }
 

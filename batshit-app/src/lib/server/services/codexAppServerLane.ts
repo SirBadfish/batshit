@@ -19,8 +19,17 @@
 
 import { spawn, type ChildProcess } from 'node:child_process'
 import readline from 'node:readline'
-import type { FileUpdateChange, ThreadEvent, ThreadItem, Usage } from '$lib/types/codexProtocol'
+import type {
+  FileUpdateChange,
+  ThreadEvent,
+  ThreadItem,
+  TodoItem,
+  Usage,
+  WebSearchAction,
+} from '$lib/types/codexProtocol'
 import { logger } from '$lib/utils/logger'
+import { CodexRunProcesses } from './codexRunProcesses'
+import type { HostCommandLease } from './hostCommandOwnership'
 import {
   CONTEXT_GUARD_CLASSIFIER_MARKER,
   DEFAULT_CONTEXT_GUARD_THRESHOLD,
@@ -56,6 +65,7 @@ type AppServerTokenUsage = {
   last?: {
     inputTokens?: number
     cachedInputTokens?: number
+    cacheWriteInputTokens?: number
     outputTokens?: number
     reasoningOutputTokens?: number
     totalTokens?: number
@@ -63,6 +73,7 @@ type AppServerTokenUsage = {
   total?: {
     inputTokens?: number
     cachedInputTokens?: number
+    cacheWriteInputTokens?: number
     outputTokens?: number
     reasoningOutputTokens?: number
     totalTokens?: number
@@ -70,14 +81,28 @@ type AppServerTokenUsage = {
   modelContextWindow?: number | null
 }
 
-export function mapAppServerUsage(usage: AppServerTokenUsage | null): Usage {
-  const total = usage?.total ?? {}
-  return {
-    input_tokens: total.inputTokens ?? 0,
-    cached_input_tokens: total.cachedInputTokens ?? 0,
-    output_tokens: total.outputTokens ?? 0,
-    reasoning_output_tokens: total.reasoningOutputTokens ?? 0,
+/**
+ * The turn's usage as Codex reported it, in the exec shape (BL-1376). A count Codex reported is
+ * kept, a reported 0 included; a count it left out is left out, and a turn that got no
+ * `thread/tokenUsage/updated` (or one with no counts) has no usage at all (`null`). Filling the
+ * gaps with 0 made such a turn read as an exact zero in the Execution Viewer and the message's
+ * usage.
+ */
+export function mapAppServerUsage(usage: AppServerTokenUsage | null): Partial<Usage> | null {
+  const total = usage?.total
+  if (!total) return null
+  const mapped: Partial<Usage> = {}
+  const counts: Array<[keyof Usage, unknown]> = [
+    ['input_tokens', total.inputTokens],
+    ['cached_input_tokens', total.cachedInputTokens],
+    ['cache_write_input_tokens', total.cacheWriteInputTokens],
+    ['output_tokens', total.outputTokens],
+    ['reasoning_output_tokens', total.reasoningOutputTokens],
+  ]
+  for (const [key, value] of counts) {
+    if (typeof value === 'number' && Number.isFinite(value)) mapped[key] = value
   }
+  return Object.keys(mapped).length > 0 ? mapped : null
 }
 
 /**
@@ -146,6 +171,35 @@ function mapAppServerFileChange(raw: unknown): FileUpdateChange {
 }
 
 /**
+ * BL-460 — a `webSearch` item's action, in the exec stream's shape the event adapter reads. The app
+ * server writes it camelCase (`{ type: 'openPage', url }`, `{ type: 'findInPage', url, pattern }`,
+ * `{ type: 'search', query, queries }`, `{ type: 'other' }`, with `null` for a missing field;
+ * codex-cli 0.160.0), and the exec stream snake_case with missing fields left out. The adapter takes
+ * an opened page's URL, the query list and the "Opened page" row from it; until this was mapped the
+ * action was dropped, so an opened page was stored with no URL and 0 results.
+ */
+function mapAppServerWebSearchAction(raw: unknown): WebSearchAction | undefined {
+  if (!raw || typeof raw !== 'object') return undefined
+  const action = raw as Record<string, any>
+  const text = (key: string) => (typeof action[key] === 'string' ? { [key]: action[key] as string } : {})
+  switch (action.type) {
+    case 'search': {
+      const queries = Array.isArray(action.queries)
+        ? action.queries.filter((query: unknown): query is string => typeof query === 'string')
+        : null
+      return { type: 'search', ...text('query'), ...(queries ? { queries } : {}) }
+    }
+    case 'openPage':
+      return { type: 'open_page', ...text('url') }
+    case 'findInPage':
+      return { type: 'find_in_page', ...text('url'), ...text('pattern') }
+    default:
+      // The exec stream writes every other action as `other` (Codex's own `#[serde(other)]`).
+      return { type: 'other' }
+  }
+}
+
+/**
  * Maps an app-server thread item (camelCase) to the exec-JSONL ThreadItem
  * shape (snake_case) the event adapter consumes. Returns null for item kinds
  * the exec stream never emits (e.g. userMessage echoes) — those are skipped.
@@ -199,8 +253,10 @@ export function mapAppServerItem(raw: unknown): ThreadItem | null {
         ...(item.error?.message ? { error: { message: item.error.message } } : {}),
         status: mapStatus(item.status) as any,
       }
-    case 'webSearch':
-      return { id, type: 'web_search', query: item.query ?? '' }
+    case 'webSearch': {
+      const action = mapAppServerWebSearchAction(item.action)
+      return { id, type: 'web_search', query: item.query ?? '', ...(action ? { action } : {}) }
+    }
     case 'todoList':
       return {
         id,
@@ -224,6 +280,24 @@ export function mapAppServerItem(raw: unknown): ThreadItem | null {
   }
 }
 
+/**
+ * BL-459 — a `turn/plan/updated` plan as the exec stream's to-do list: each step's text, and
+ * `completed` only for a completed step (`pending` and `inProgress` are not done yet). This is
+ * Codex's own mapping for `codex exec --json` (`map_todo_items`, codex-cli 0.160.0).
+ */
+export function mapAppServerPlan(plan: unknown): TodoItem[] {
+  if (!Array.isArray(plan)) return []
+  return plan.map((step: any) => ({
+    text: typeof step?.step === 'string' ? step.step : '',
+    completed: step?.status === 'completed',
+  }))
+}
+
+/** BL-464: a reasoning item's summary parts so far, joined the way `reasoningText` joins a finished one. */
+function joinReasoningSummary(parts: Array<string | undefined>): string {
+  return parts.filter((part): part is string => typeof part === 'string').join('\n')
+}
+
 export type CodexAppServerThreadParams = {
   ephemeral: boolean
   cwd?: string
@@ -243,9 +317,19 @@ export type CodexAppServerRunInput = {
   prompt: string
   imagePaths?: string[]
   signal?: AbortSignal
+  onProcessCleanupFailure?: (error: Error) => void | Promise<void>
+  onProcessesExited?: () => void | Promise<void>
+  hostCommandLease?: HostCommandLease
   contextGuardThreshold?: number
+  onContextWindow?: (contextWindow: number) => void
   /** Disable the proactive guard entirely (e.g. for tests). */
   contextGuardEnabled?: boolean
+  /**
+   * BL-7 — called ONCE when Codex has finished starting: the app server answered
+   * `initialize` (its SQLite migrations and skills setup run before it can), or the run
+   * ended first. `codexHomeStartGate.ts` holds the agent's home until then.
+   */
+  onStartupSettled?: () => void
 }
 
 /**
@@ -262,6 +346,8 @@ export type CodexSteerResult =
 export type CodexAppServerRun = {
   events: AsyncGenerator<ThreadEvent>
   cleanup: () => Promise<void>
+  /** BL-1361: frozen, identity-bound observations, not a complete failed-run bill. */
+  getObservedUsage: () => Partial<Usage> | null
   /**
    * SA-114 P2 (DL-114-06) — append the user's mid-reply words to the turn that is running.
    *
@@ -271,6 +357,12 @@ export type CodexAppServerRun = {
    * its own `userMessage` item for this text (AMD-114-02).
    */
   steer: (payload: { steerIds: string[]; text: string }) => Promise<CodexSteerResult>
+  /**
+   * BL-287: the app-server process. Its stream ends when Batshit SENDS it SIGTERM, not when it
+   * has exited, so a caller that must outlast the process (a Subagent delete, which removes the
+   * folder the process writes into) waits for its exit from here.
+   */
+  process: ChildProcess
 }
 
 type PendingRpc = {
@@ -346,16 +438,41 @@ export function startCodexAppServerRun(
     }
     return resolveContextGuardThreshold(input.env)
   })()
-  const child: ChildProcess = spawn(input.executable, input.spawnArgs ?? ['app-server'], {
-    cwd: input.cwd,
-    env: input.env,
-    stdio: ['pipe', 'pipe', 'pipe'],
+  input.hostCommandLease?.markSpawnAttempt()
+  let child: ChildProcess
+  try {
+    child = spawn(input.executable, input.spawnArgs ?? ['app-server'], {
+      cwd: input.cwd,
+      env: input.env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      detached: process.platform !== 'win32',
+    })
+  } catch (error) {
+    // A synchronous spawn exception returned no process: this admission never ran.
+    input.hostCommandLease?.complete()
+    throw error
+  }
+  const processes = new CodexRunProcesses(child, {
+    onFailure: async error => {
+      try { input.hostCommandLease?.unresolved() } finally { await input.onProcessCleanupFailure?.(error) }
+    },
+    onExit: input.onProcessesExited,
+    onCapture: rows => input.hostCommandLease?.observe(rows),
+    onVerifiedExit: () => input.hostCommandLease?.complete(),
   })
+  input.hostCommandLease?.onCleanup(async () => {
+    await processes.prepareStop()
+    await processes.retryEnd()
+  })
+  const endProcesses = () => {
+    void processes.end().catch((error) => console.error('[CodexAppServer] Process cleanup incomplete', error))
+  }
 
   const queue = new AsyncEventQueue<ThreadEvent>()
   const pending = new Map<number, PendingRpc>()
   const agentTextById = new Map<string, string>()
-  const itemTypeById = new Map<string, string>()
+  /** BL-464: each streaming reasoning item's summary parts so far, by `summaryIndex`. */
+  const reasoningSummaryById = new Map<string, Array<string | undefined>>()
 
   let nextRpcId = 1
   let threadId: string | null = null
@@ -374,11 +491,57 @@ export function startCodexAppServerRun(
     resolveTurnReady = resolve
   })
   let latestUsage: AppServerTokenUsage | null = null
+  // Accounting is separate from live guard pressure. RPC replies vouch for these identities;
+  // an early notification is retained by identity until the replies can admit it.
+  let accountingThreadId: string | null = null
+  let accountingTurnId: string | null = null
+  let observedUsage: Partial<Usage> | null = null
+  let accountingFrozen = false
+  let accountingTaken = false
+  const earlyUsage = new Map<string, { threadId: string; turnId: string; usage: Partial<Usage> }>()
+  const usageIdentity = (thread: string, turn: string) => JSON.stringify([thread, turn])
+  const admitEarlyUsage = () => {
+    if (accountingTaken) return
+    if (!accountingThreadId || !accountingTurnId) return
+    const candidate = earlyUsage.get(usageIdentity(accountingThreadId, accountingTurnId))
+    if (candidate) observedUsage = { ...candidate.usage }
+    earlyUsage.clear()
+  }
+  const observeAccounting = (params: Record<string, any>) => {
+    if (accountingFrozen || closed) return
+    const thread = params.threadId
+    const turn = params.turnId
+    if (typeof thread !== 'string' || !thread || typeof turn !== 'string' || !turn) return
+    if (accountingThreadId && thread !== accountingThreadId) return
+    if (accountingTurnId && turn !== accountingTurnId) return
+    const mapped = mapAppServerUsage(params.tokenUsage ?? null)
+    if (!mapped) return // A malformed/no-count report cannot erase observed accounting.
+    if (accountingThreadId && accountingTurnId) observedUsage = { ...mapped }
+    else earlyUsage.set(usageIdentity(thread, turn), { threadId: thread, turnId: turn, usage: mapped })
+  }
+  const freezeAccounting = () => { accountingFrozen = true }
+  const getObservedUsage = () => {
+    freezeAccounting()
+    accountingTaken = true
+    earlyUsage.clear() // Unconfirmed identities cannot become evidence after the final read.
+    return observedUsage ? { ...observedUsage } : null
+  }
   let guardTripped = false
   let guardStopMessage: string | null = null
   let interruptRequested = false
   let stderrTail = ''
   let closed = false
+  let startupSettled = false
+  /** BL-7: tells the start gate once, on `initialize`'s answer or on whatever ends the run first. */
+  const settleStartup = () => {
+    if (startupSettled) return
+    startupSettled = true
+    try {
+      input.onStartupSettled?.()
+    } catch (error) {
+      console.warn('[CodexAppServer] onStartupSettled threw', error)
+    }
+  }
   /**
    * SA-114 P2 (AMD-114-02) — steers sent but not yet echoed, oldest first.
    *
@@ -453,7 +616,7 @@ export function startCodexAppServerRun(
   }
 
   const requestInterrupt = (reason: 'guard' | 'abort') => {
-    if (interruptRequested || !threadId || !turnId) return false
+    if (closed || interruptRequested || !threadId || !turnId) return false
     interruptRequested = true
     const interruptThreadId = threadId
     const interruptTurnId = turnId
@@ -463,7 +626,7 @@ export function startCodexAppServerRun(
     // pressed in the first moments of a reply was refused and waited out the backstop below:
     // 11.0 s measured (`_local/stopfix-proof/before-codex-stop-300.json`). A run that ends
     // before its turn starts settles `turnReady` false and needs no interrupt.
-    void turnReady.then((ready) => {
+    void processes.prepareStop().then(() => turnReady).then((ready) => {
       if (!ready || closed) return
       logger.debug('[CodexAppServer] Sending turn/interrupt', {
         reason,
@@ -475,7 +638,7 @@ export function startCodexAppServerRun(
           console.error('[CodexAppServer] turn/interrupt failed', { reason, error })
         },
       )
-    })
+    }).catch((error) => finishWithError(error instanceof Error ? error : new Error(String(error))))
     // Backstop: if codex does not finish the turn after an interrupt, fail loudly.
     setTimeout(() => {
       if (!closed) {
@@ -604,16 +767,16 @@ export function startCodexAppServerRun(
 
   const finishWithError = (error: Error) => {
     if (closed) return
+    freezeAccounting()
     closed = true
     resolveTurnReady(false)
     failPending(error.message)
     queue.finish(error)
-    try {
-      if (!child.killed) child.kill()
-    } catch {}
+    endProcesses()
   }
 
   const finishNormally = () => {
+    freezeAccounting()
     if (closed) return
     closed = true
     // DL-118-06: `finishWithError` and `cleanup` both settle `turnReady`; this path did
@@ -622,12 +785,22 @@ export function startCodexAppServerRun(
     resolveTurnReady(false)
     failPending('the turn finished')
     queue.finish()
-    try {
-      if (!child.killed) child.kill()
-    } catch {}
+    endProcesses()
   }
 
-  const onAbort = () => requestInterrupt('abort')
+  const onAbort = () => {
+    // A terminal notification wins over a later Stop. Do not turn cleanup of an already
+    // completed turn into a new request to stop its independently grouped background work.
+    if (closed) return
+    void processes.prepareStop().then(() => {
+      if (closed) return
+      if (!threadId || !turnId) {
+        const error = new Error('Codex run aborted by user')
+        error.name = 'AbortError'
+        finishWithError(error)
+      } else requestInterrupt('abort')
+    }).catch((error) => finishWithError(error instanceof Error ? error : new Error(String(error))))
+  }
   if (input.signal) {
     if (input.signal.aborted) onAbort()
     else input.signal.addEventListener('abort', onAbort, { once: true })
@@ -644,6 +817,12 @@ export function startCodexAppServerRun(
       new Error(`Codex app-server failed to start: ${(error as Error).message}`),
     )
   })
+
+  // BL-7: a run that ends before `initialize` answered frees the start gate when its
+  // process is GONE, not when it is told to go: a killed start could otherwise still be
+  // half way through its migrations when the next one begins.
+  child.once('close', settleStartup)
+  child.once('error', settleStartup)
 
   child.once('close', (code, signalName) => {
     if (closed) return
@@ -666,7 +845,12 @@ export function startCodexAppServerRun(
     }
 
     if (method === 'thread/tokenUsage/updated') {
+      observeAccounting(params)
       latestUsage = params.tokenUsage ?? null
+      if (typeof latestUsage?.modelContextWindow === 'number' &&
+          Number.isFinite(latestUsage.modelContextWindow) && latestUsage.modelContextWindow > 0) {
+        input.onContextWindow?.(latestUsage.modelContextWindow)
+      }
       maybeRequestContextGuardInterrupt()
       return
     }
@@ -680,10 +864,31 @@ export function startCodexAppServerRun(
       return
     }
 
+    if (method === 'turn/plan/updated') {
+      // BL-459: the app server reports the agent's plan only here (it sends no to-do list item),
+      // so each update becomes the exec stream's `todo_list` item under ONE id for the turn, and
+      // the reply shows each new list in place of the last. Only `item.updated`, which the adapter
+      // shows as the plan and keeps no tool for. Codex's own exec stream also starts the list and
+      // completes it at the turn's end; here a completion with no start would do nothing, and a
+      // started list would add a plan step at the turn's end that every reader filters out again.
+      const planTurnId = typeof params.turnId === 'string' && params.turnId ? params.turnId : turnId
+      queue.push({
+        type: 'item.updated',
+        item: {
+          id: `turn-plan-${planTurnId ?? 'turn'}`,
+          type: 'todo_list',
+          items: mapAppServerPlan(params.plan),
+        },
+      })
+      return
+    }
+
     if (method === 'item/started' || method === 'item/completed' || method === 'item/updated') {
       const rawItem = params.item
-      if (rawItem?.id && typeof rawItem.type === 'string') {
-        itemTypeById.set(rawItem.id, rawItem.type)
+      // BL-464: a reasoning item starts its summary afresh, and its own finished text replaces
+      // the streamed parts.
+      if (rawItem?.type === 'reasoning' && typeof rawItem.id === 'string') {
+        reasoningSummaryById.delete(rawItem.id)
       }
       // SA-114 P2 (AMD-114-02): the app server's own echo of a steer Batshit sent is the
       // delivery signal. `mapAppServerItem` returns null for every `userMessage` item, so
@@ -730,24 +935,29 @@ export function startCodexAppServerRun(
       return
     }
 
-    if (/^item\/.+\/delta$/.test(method)) {
-      // Reasoning (and any future) deltas: surface as item.updated when we know
-      // the item kind; reasoning text streams are summary-only and the adapter
-      // tolerates repeated updates.
+    if (method === 'item/reasoning/summaryTextDelta') {
+      // BL-464: the reasoning summary as it is written. The app server streams each summary part
+      // by `summaryIndex`; the update carries the whole summary so far, joined as the finished
+      // item's text is, because every reader keeps reasoning as one snapshot it replaces. Raw
+      // reasoning (`item/reasoning/textDelta`) is not streamed: Batshit shows the summary. The old
+      // branch here waited for a method ending in `/delta`, which the app server never sends for
+      // reasoning, so reasoning appeared only when each item finished.
       const itemId = params.itemId
-      const knownType = typeof itemId === 'string' ? itemTypeById.get(itemId) : undefined
-      if (knownType === 'reasoning' && typeof params.delta === 'string') {
-        const accumulated = (agentTextById.get(itemId) ?? '') + params.delta
-        agentTextById.set(itemId, accumulated)
-        queue.push({
-          type: 'item.updated',
-          item: { id: itemId, type: 'reasoning', text: accumulated },
-        })
-      }
+      if (typeof itemId !== 'string' || typeof params.delta !== 'string') return
+      const index =
+        Number.isInteger(params.summaryIndex) && params.summaryIndex >= 0 ? params.summaryIndex : 0
+      const parts = reasoningSummaryById.get(itemId) ?? []
+      parts[index] = (parts[index] ?? '') + params.delta
+      reasoningSummaryById.set(itemId, parts)
+      queue.push({
+        type: 'item.updated',
+        item: { id: itemId, type: 'reasoning', text: joinReasoningSummary(parts) },
+      })
       return
     }
 
     if (/^turn\/(completed|failed|aborted)$/.test(method)) {
+      freezeAccounting()
       const turn = params.turn ?? {}
       const status = typeof turn.status === 'string' ? turn.status : method.split('/')[1]
       if (status === 'completed') {
@@ -782,9 +992,35 @@ export function startCodexAppServerRun(
       return
     }
 
+    if (method === 'error' && params?.willRetry === true) {
+      // BL-457: Codex is retrying by itself ("Reconnecting... 1/5" after a dropped response
+      // stream) and the turn goes on. Only a real error (`willRetry: false`, or a shape that
+      // does not say) or `turn/completed` with a failed status ends the reply; ending it here
+      // turned a short network drop into a failed reply and cleanup stopped the retrying Codex.
+      const message = params?.error?.message ?? params?.message ?? null
+      const additionalDetails = params?.error?.additionalDetails ?? null
+      console.warn('[CodexAppServer] Codex is retrying after an error; the turn goes on', {
+        message,
+        additionalDetails,
+        codexErrorInfo: params?.error?.codexErrorInfo ?? null,
+        threadId,
+        turnId,
+      })
+      // BL-759: Codex starts the answer again as a new item and never completes the one that
+      // dropped, whose text the adapter already sent. The adapter takes that text back at this
+      // event, so it must reach the adapter in its place in the stream.
+      queue.push({
+        type: 'stream.retry',
+        message: typeof message === 'string' ? message : null,
+        details: typeof additionalDetails === 'string' ? additionalDetails : null,
+      })
+      return
+    }
+
     if (method === 'error' || /\berror\b/i.test(method)) {
       const message = params?.message ?? params?.error?.message
       if (typeof message === 'string' && message) {
+        freezeAccounting()
         queue.push({ type: 'error', message })
       }
     }
@@ -840,10 +1076,15 @@ export function startCodexAppServerRun(
 
   const run = (async () => {
     try {
+      await processes.ready
+      if (closed || input.signal?.aborted) return
       const init = await request('initialize', {
         clientInfo: { name: 'batshit', title: 'Batshit', version: '0.1.0' },
       })
       void init
+      // BL-7: the app server builds its SQLite state and its skills manager before it can
+      // answer, so the one-time setup in this CODEX_HOME is done and the next start may begin.
+      settleStartup()
       send({ jsonrpc: '2.0', method: 'initialized', params: {} })
 
       const threadResult = await request('thread/start', {
@@ -865,6 +1106,8 @@ export function startCodexAppServerRun(
           `Codex app-server thread/start returned no thread id: ${JSON.stringify(threadResult).slice(0, 300)}`,
         )
       }
+      accountingThreadId = threadId
+      admitEarlyUsage()
       queue.push({ type: 'thread.started', thread_id: threadId })
 
       const inputItems: Array<Record<string, unknown>> = [
@@ -890,6 +1133,8 @@ export function startCodexAppServerRun(
           `Codex app-server turn/start returned no turn id: ${JSON.stringify(turnResult).slice(0, 300)}`,
         )
       }
+      accountingTurnId = turnId
+      admitEarlyUsage()
       if (input.signal?.aborted) requestInterrupt('abort')
     } catch (error) {
       finishWithError(error instanceof Error ? error : new Error(String(error)))
@@ -906,16 +1151,15 @@ export function startCodexAppServerRun(
   }
 
   const cleanup = async () => {
+    freezeAccounting()
     closed = true
     resolveTurnReady(false)
     failPending('the lane was cleaned up')
     queue.finish()
     rl.close()
     input.signal?.removeEventListener('abort', onAbort)
-    try {
-      if (!child.killed) child.kill()
-    } catch {}
+    await processes.end()
   }
 
-  return { events: events(), cleanup, steer }
+  return { events: events(), cleanup, getObservedUsage, steer, process: child }
 }

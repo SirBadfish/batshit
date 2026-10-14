@@ -49,6 +49,7 @@ function startWakeRun(sessionId: string) {
     userId: USER,
     origin: buildSessionOrigin({ kind: 'dm', label: 'Faye', chainDepth: 1 }),
     startedAt: Date.now(),
+    assistantMessageId: 'msg-woken-turn',
     controller,
     timer
   })

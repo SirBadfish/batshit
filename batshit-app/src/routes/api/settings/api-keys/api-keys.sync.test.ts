@@ -4,7 +4,8 @@ const apiKeyService = {
   getAllMasked: vi.fn().mockResolvedValue({}),
   store: vi.fn().mockResolvedValue(undefined),
   getMasked: vi.fn().mockResolvedValue('****1234'),
-  delete: vi.fn().mockResolvedValue(undefined)
+  delete: vi.fn().mockResolvedValue(undefined),
+  storedKeyName: (service: string, userId: string) => `api_keys:${userId}:${service}`
 }
 
 const syncAgentCodexProfiles = vi.fn()
@@ -76,7 +77,16 @@ describe('/api/settings/api-keys managed profile sync hooks', () => {
     } as any)
 
     expect(response.status).toBe(200)
-    expect(apiKeyService.delete).toHaveBeenCalledWith('n8n_instance_mcp_token', 'josh')
+    // BL-1397: the saved key and every legacy gateway copy go in one guarded step, not a bare delete.
+    const { redis } = await import('$lib/server/redis')
+    expect(redis.json.deleteN8nToken).toHaveBeenCalledWith(
+      'api_keys:josh:n8n_instance_mcp_token',
+      'mcp_gateways:josh',
+      '',
+      '',
+      []
+    )
+    expect(apiKeyService.delete).not.toHaveBeenCalled()
     expect(syncAgentCodexProfiles).toHaveBeenCalledWith('josh')
     expect(syncAgentClaudeProfiles).toHaveBeenCalledWith('josh')
   })
@@ -214,6 +224,35 @@ describe('/api/settings/api-keys managed profile sync hooks', () => {
     expect(apiKeyService.getAllMasked).toHaveBeenCalledWith('josh', {
       skipServices: ['batshit_token']
     })
+  })
+
+  it('GET and POST name the Pinokio launcher as the manager of the internal token', async () => {
+    dynamicPrivateEnv.env.BATSHIT_TOKEN = 'test-io-runtime-token-2468'
+    dynamicPrivateEnv.env.BATSHIT_RUNTIME_OWNER = 'pinokio'
+
+    const getResponse = await routeModule.GET({
+      request: new Request('http://127.0.0.1:5650/api/settings/api-keys'),
+      locals: { user: { id: 'josh' } }
+    } as any)
+    const getPayload = await getResponse.json()
+    expect(getPayload.keys.batshit_token).toMatchObject({
+      masked: '****...2468',
+      managedByRuntime: true,
+      runtimeLabel: 'Managed by the Pinokio launcher'
+    })
+
+    const postResponse = await routeModule.POST({
+      request: new Request('http://127.0.0.1:5650/api/settings/api-keys', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ service: 'batshit_token', apiKey: 'typed-by-user' })
+      }),
+      locals: { user: { id: 'josh' } }
+    } as any)
+    const postPayload = await postResponse.json()
+    expect(postPayload).toMatchObject({ success: true, managedByRuntime: true })
+    expect(postPayload.message).toContain('Pinokio launcher')
+    expect(apiKeyService.store).not.toHaveBeenCalled()
   })
 
   it('GET reports Artifact Complete URL default instead of missing in host runtime', async () => {

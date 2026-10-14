@@ -15,6 +15,7 @@ import {
   type RecipeStoredAssetRef
 } from './archiveContainmentContracts'
 import { bakeLiveGoonInWorker, type LiveGoonBakerClientOptions } from './liveGoonBakerClient'
+import { RECIPE_ROLLBACK_PREVIEW_RESULT_CONTRACT } from './recipeRollbackPreviewResult'
 import type { LiveGoonHairBakeInput } from './liveGoonBaker'
 import { withoutAnatomyFitRecipeSibling } from './anatomyFitContracts'
 import { verifyGoonLiveBuildReceipt, type GoonLiveBuildReceipt } from './liveBuildContracts'
@@ -172,6 +173,7 @@ export type RecipeJobRecoveryResponse = {
 export type RecipeJobAction =
   | { action: 'retry' }
   | { action: 'discard' }
+  | { action: 'renew' }
   | {
       action: 'advance'
       nextStatus: 'planning' | 'baking' | 'packaging' | 'verifying'
@@ -639,7 +641,7 @@ export async function buildRecipeSiblingInputs(
     }
   }
 
-  for (const sibling of collectPackageRecipeSiblingRecords({
+  for (const sibling of await collectPackageRecipeSiblingRecords({
     state,
     targetManifest: input.targetManifest
   })) {
@@ -971,6 +973,42 @@ function throwIfAborted(signal?: AbortSignal) {
   if (signal?.aborted) throw abortError()
 }
 
+const RECIPE_LEASE_HEARTBEAT_MS = 60_000
+const RECIPE_LEASE_RENEW_TIMEOUT_MS = 15_000
+const RECIPE_BROWSER_BUILD_DEADLINE_MS = 15 * 60_000
+
+/** One renewal at a time. Stopping joins the in-flight renewal before the
+ * candidate registration/stage transition, so no late timer can touch it. */
+function startRecipeLeaseHeartbeat(
+  renew: () => Promise<void>,
+  onFailure: (error: unknown) => void
+) {
+  let stopped = false
+  let timer: ReturnType<typeof setTimeout> | null = null
+  let pending: Promise<void> | null = null
+  const schedule = () => {
+    if (stopped) return
+    timer = setTimeout(() => {
+      timer = null
+      pending = renew()
+        .catch((error) => {
+          stopped = true
+          onFailure(error)
+        })
+        .finally(() => {
+          pending = null
+          schedule()
+        })
+    }, RECIPE_LEASE_HEARTBEAT_MS)
+  }
+  schedule()
+  return async () => {
+    stopped = true
+    if (timer !== null) clearTimeout(timer)
+    if (pending) await pending
+  }
+}
+
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
 }
@@ -1002,16 +1040,22 @@ export function resolveRecipePreviewGoonAssetUrls(
   const packageFile = resolveFile(customAvatar.package)
   const modelFile = resolveFile(customAvatar.model)
   const manifestFile = resolveFile(customAvatar.manifest)
+  // Staged lifecycle responses retain portable upload refs. Animation preloads
+  // share this preview boundary with the model and must use the file server too.
+  const animations = goon.files.animations?.map((file) => resolveFile(file)!)
+  const animationsChanged = animations?.some((file, index) => file !== goon.files.animations?.[index]) ?? false
   if (
     packageFile === customAvatar.package &&
     modelFile === customAvatar.model &&
-    manifestFile === customAvatar.manifest
+    manifestFile === customAvatar.manifest &&
+    !animationsChanged
   ) {
     return goon
   }
 
   return {
     ...goon,
+    files: animationsChanged ? { ...goon.files, animations } : goon.files,
     customAvatar: {
       ...customAvatar,
       package: packageFile,
@@ -1464,10 +1508,29 @@ export class RecipeWorkflowClient {
   async previewRollback(
     options: RecipeWorkflowRequestOptions = {}
   ): Promise<RecipeRollbackPreviewResponse> {
-    const payload = record(
+    const result = record(
       await this.request('/rollback', { signal: options.signal }),
-      'Recipe rollback preview response'
+      'Recipe rollback preview result'
     )
+    if (result.contract !== RECIPE_ROLLBACK_PREVIEW_RESULT_CONTRACT) {
+      throw new Error('Recipe rollback preview returned an unsupported result contract.')
+    }
+    if (result.kind === 'error') {
+      if (!Number.isInteger(result.status) || (result.status as number) < 400 || (result.status as number) > 599 ||
+        typeof result.error !== 'string' || !result.error ||
+        (result.code !== null && typeof result.code !== 'string')) {
+        throw new Error('Recipe rollback preview returned an invalid error result.')
+      }
+      throw new RecipeWorkflowHttpError(result.error, {
+        status: result.status as number,
+        code: result.code as string | null,
+        responseBody: result
+      })
+    }
+    if (result.kind !== 'success') {
+      throw new Error('Recipe rollback preview returned an unknown result kind.')
+    }
+    const payload = record(result.preview, 'Recipe rollback preview response')
     const { goon, owner } = await parseRecipeGoon(
       payload.goon,
       'Recipe rollback preview response.goon'
@@ -1487,13 +1550,17 @@ export class RecipeWorkflowClient {
     return { goon, owner, previous }
   }
 
+  private assetFetchUrl(ref: string) {
+    return ref.startsWith('/uploads/') ? this.resolveAssetUrl(ref) : ref
+  }
+
   private async fetchExactBytes(
     ref: string,
     expectedSha256?: string,
     expectedBytes?: number,
     signal?: AbortSignal
   ) {
-    const url = ref.startsWith('/uploads/') ? await this.resolveAssetUrl(ref) : ref
+    const url = await this.assetFetchUrl(ref)
     let response: Response
     try {
       response = await this.fetchImpl(url, { signal })
@@ -1677,22 +1744,64 @@ export class RecipeWorkflowClient {
       input.start.kind === 'package-update'
         ? await this.startPackageUpdate(input.start.request)
         : await this.startBake(input.start.request)
+    const buildAbort = new AbortController()
+    const onInputAbort = () => buildAbort.abort(input.signal?.reason)
+    if (input.signal?.aborted) onInputAbort()
+    else input.signal?.addEventListener('abort', onInputAbort, { once: true })
+    let heartbeatFailure: unknown = null
+    const stopHeartbeat = startRecipeLeaseHeartbeat(async () => {
+      const requestAbort = new AbortController()
+      let timeout: ReturnType<typeof setTimeout> | null = null
+      try {
+        await Promise.race([
+          this.actOnJob(started.job.jobId, {
+            action: 'renew',
+            expectedWriteVersion: (started.goon.recipe as GoonRecipeV2).writeVersion,
+            expectedJobStateVersion: started.job.stateVersion
+          }, { signal: requestAbort.signal }),
+          new Promise<never>((_, reject) => {
+            timeout = setTimeout(() => {
+              requestAbort.abort()
+              reject(new Error('Keeping the Goon update active took too long. Try again.'))
+            }, RECIPE_LEASE_RENEW_TIMEOUT_MS)
+          })
+        ])
+      } finally {
+        if (timeout !== null) clearTimeout(timeout)
+      }
+    }, (error) => {
+      heartbeatFailure = error
+      buildAbort.abort(error)
+    })
+    let deadlineFailure: Error | null = null
+    const deadlineTimer = setTimeout(() => {
+      deadlineFailure = new Error('Building the Goon took too long. Try again.')
+      buildAbort.abort(deadlineFailure)
+      // The upload API must settle before its receipt can be cleaned up, but
+      // no stalled browser build may renew its server lease indefinitely.
+      void stopHeartbeat()
+    }, RECIPE_BROWSER_BUILD_DEADLINE_MS)
+    const throwIfBuildStopped = () => {
+      if (heartbeatFailure) throw heartbeatFailure
+      if (deadlineFailure) throw deadlineFailure
+      throwIfAborted(input.signal)
+    }
     let uploadedArchiveReceipt: unknown = null
     let failureStage: RecipeFailureStage = 'validating'
     try {
-      throwIfAborted(input.signal)
+      throwIfBuildStopped()
       input.onProgress?.('fetching-source')
       const [sourceBytes, hair] = await Promise.all([
-        this.fetchJobSource(started.job, input.signal),
+        this.fetchJobSource(started.job, buildAbort.signal),
         this.fetchJobHair(
           started.reviewedState.state,
           started.job.stagedSource.source,
-          input.signal
+          buildAbort.signal
         )
       ])
       failureStage = 'baking'
       const bakeOptions: LiveGoonBakerClientOptions = {
-        signal: input.signal,
+        signal: buildAbort.signal,
         onProgress: input.onProgress
       }
       const bake = await this.bake(
@@ -1709,7 +1818,7 @@ export class RecipeWorkflowClient {
         bakeOptions
       )
       const buildReceipt = await verifyGoonLiveBuildReceipt(bake.receipt)
-      throwIfAborted(input.signal)
+      throwIfBuildStopped()
       failureStage = 'upload'
       input.onProgress?.('uploading-candidate')
       const upload = await this.uploadCustomPackage(
@@ -1725,6 +1834,8 @@ export class RecipeWorkflowClient {
       // The verified archive receipt is sufficient to bind cleanup ownership.
       // Register it before any build-receipt comparison or cancellation check.
       const live = await deriveRecipeAssetSetFromUpload(upload)
+      await stopHeartbeat()
+      clearTimeout(deadlineTimer)
       failureStage = 'packaging'
       input.onProgress?.('registering-candidate')
       const registered = await this.registerCandidateAssets(started.job.jobId, {
@@ -1732,6 +1843,7 @@ export class RecipeWorkflowClient {
         expectedJobStateVersion: started.job.stateVersion,
         live
       })
+      throwIfBuildStopped()
       await deriveRecipeAssetSetFromUpload(upload, buildReceipt)
       throwIfAborted(input.signal)
       failureStage = 'verifying'
@@ -1741,7 +1853,7 @@ export class RecipeWorkflowClient {
         expectedJobStateVersion: registered.job.stateVersion,
         liveBuildReceipt: buildReceipt,
         live
-      })
+      }, { signal: input.signal })
       throwIfAborted(input.signal)
       failureStage = 'preview-load'
       input.onProgress?.('previewing-candidate')
@@ -1755,7 +1867,9 @@ export class RecipeWorkflowClient {
       })
       input.onProgress?.('complete')
       return { started, bake, upload, live, registered, staged, committed }
-    } catch (error) {
+    } catch (caught) {
+      await stopHeartbeat()
+      const error = heartbeatFailure ?? deadlineFailure ?? caught
       let durabilityError: unknown = null
       let cleanupError: unknown = null
       try {
@@ -1788,6 +1902,10 @@ export class RecipeWorkflowClient {
         throw combined
       }
       throw error
+    } finally {
+      await stopHeartbeat()
+      clearTimeout(deadlineTimer)
+      input.signal?.removeEventListener('abort', onInputAbort)
     }
   }
 

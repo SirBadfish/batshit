@@ -1,3 +1,5 @@
+import type { LocalContextBudgetEvidence } from '$lib/types/localContextBudget'
+import { LOCAL_AI_SERVER_IDS } from '$lib/data/localAiServers'
 import type { Agent } from '$lib/stores/agents.svelte'
 import type { Message } from '$lib/stores/messages.svelte'
 import type { SavedModel } from '$lib/types/savedModels'
@@ -8,6 +10,14 @@ import type {
 import { countMessageTokens, countTotalTokens } from '$lib/utils/tokenCounter'
 import { resolveSavedModelConnection } from '$lib/utils/modelConnections'
 import { normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
+import { resolveRuntimeModelSelection } from '$lib/utils/modelPresetRuntime'
+import {
+  cliContextSettingsKey, latestCliContextReport, latestCliContextSnapshot, matchingCliContextReport,
+  resolveEffectiveAgentCliModel, resolveCliContextWindow,
+  type CliContextRuntime
+} from '$lib/utils/cliContextWindow'
+import { claudeContextCappedByFlags, type ClaudeContextEnvironment } from '$lib/utils/cliContextWindow'
+import { scanLooseClipReferences, scanLooseZipReferences } from '$lib/utils/zipReferenceSafety'
 
 export const CLI_WRAPPER_OVERHEAD_TOKENS = 17_000
 const MANUAL_TRIM_NOTICE_ID = 'batshit_manual_context_trim_notice'
@@ -119,15 +129,17 @@ export function extendTrimmedMessageIds(
   return nextIds
 }
 
+/**
+ * The zip or clip ids a message's words reference (the older shape), read once (BL-707): the old
+ * patterns searched to the first `}` again from every opener. The server runs this in the trim
+ * preview, the context preview, and memory graduation.
+ */
 function extractReferenceIds(content: string, type: 'zip' | 'clip'): string[] {
   if (!content) return []
-  const pattern =
-    type === 'zip'
-      ? /\{\{batshit-zip:([^:}]+)(?::::[^}]*)?\}\}/g
-      : /\{\{batshit-clip:([^:}]+)(?::::[^}]*)?\}\}/g
+  const references = type === 'zip' ? scanLooseZipReferences(content) : scanLooseClipReferences(content)
   const ids = new Set<string>()
-  for (const match of content.matchAll(pattern)) {
-    const id = match[1]?.trim()
+  for (const reference of references) {
+    const id = reference.id.trim()
     if (id) ids.add(id)
   }
   return Array.from(ids)
@@ -457,6 +469,117 @@ function getFlatPrice(value: SavedModel['pricing']['input'] | SavedModel['pricin
   return typeof value === 'number' && Number.isFinite(value) ? value : null
 }
 
+type CacheTtl = '5m' | '1h'
+
+/**
+ * BL-184: what a cache WRITE costs, as a multiple of the model's input price. Anthropic bills
+ * a write at 1.25x for its 5-minute cache and 2x for its 1-hour cache (platform.claude.com
+ * pricing, 2026-09-25), and every lane that serves a Claude model passes that on: direct
+ * Anthropic, OpenRouter, Vercel AI Gateway, Bedrock, and Vertex.
+ */
+const ANTHROPIC_CACHE_WRITE_MULTIPLIERS: Record<CacheTtl, number> = { '5m': 1.25, '1h': 2 }
+
+const ANTHROPIC_BILLED_PROVIDER_IDS = new Set(['anthropic', 'anthropic-claude-cli', 'claude-cli'])
+
+function isAnthropicBilledModel(modelId: string | null | undefined, providerId: string | null | undefined): boolean {
+  return normalize(modelId).includes('claude') || ANTHROPIC_BILLED_PROVIDER_IDS.has(normalize(providerId))
+}
+
+function readCacheTtl(value: unknown): CacheTtl | null {
+  return value === '5m' || value === '1h' ? value : null
+}
+
+/** The one lifetime Batshit's cache policy recorded for an API run (`apiPromptCachePolicy.ts`). */
+function readSnapshotCacheTtl(snapshot: ExecutionSnapshot): CacheTtl | null {
+  return readCacheTtl(snapshot.runtime?.metadata?.promptCachePolicy?.cacheTtl)
+}
+
+interface CacheWriteRate {
+  multiplier: number
+  /** False when Batshit cannot vouch for the multiplier; the cost is then an estimate. */
+  known: boolean
+}
+
+/**
+ * A Claude model's write costs its cache lifetime's multiplier; an unknown lifetime is priced
+ * at the lower (5-minute) one and marked unknown. Any other provider's write price is not
+ * something Batshit knows (OpenRouter lists 1x, 1.25x, or input plus storage, by provider), so
+ * it is priced at the input price and marked unknown.
+ */
+function resolveCacheWriteRate(anthropicBilled: boolean, ttl: CacheTtl | null): CacheWriteRate {
+  if (!anthropicBilled) return { multiplier: 1, known: false }
+  if (ttl) return { multiplier: ANTHROPIC_CACHE_WRITE_MULTIPLIERS[ttl], known: true }
+  return { multiplier: ANTHROPIC_CACHE_WRITE_MULTIPLIERS['5m'], known: false }
+}
+
+interface PricedInput {
+  cost: number
+  /** Cache reads were priced at the input price because the model has no cached-input price. */
+  cachedPriceUnknown: boolean
+  /** Cache writes were priced at a rate Batshit cannot vouch for (see `resolveCacheWriteRate`). */
+  writePriceUnknown: boolean
+}
+
+/**
+ * Prices one run's input: fresh tokens at the input price, cache reads at the cached-input
+ * price, and cache writes at the write rate. Every lane reports `inputTokens` as the WHOLE
+ * prompt (fresh + cache read + cache write; `execution-viewer.md` → API Evidence), so the
+ * fresh part is what remains after both. A price of zero stays exactly zero whatever the rate.
+ */
+function priceRunInput(args: {
+  inputTokens: number
+  cachedInputTokens: number | null | undefined
+  cacheWriteTokens: number | null | undefined
+  inputPrice: number
+  cachedInputPrice: number | null
+  writeRate: () => CacheWriteRate
+}): PricedInput {
+  const cached =
+    typeof args.cachedInputTokens === 'number' && Number.isFinite(args.cachedInputTokens) && args.cachedInputTokens > 0
+      ? args.cachedInputTokens
+      : 0
+  const written =
+    typeof args.cacheWriteTokens === 'number' && Number.isFinite(args.cacheWriteTokens) && args.cacheWriteTokens > 0
+      ? args.cacheWriteTokens
+      : 0
+  const fresh = Math.max(0, args.inputTokens - cached - written)
+
+  let cachedPriceUnknown = false
+  let writePriceUnknown = false
+  let cost = (fresh / 1_000_000) * args.inputPrice
+  if (cached > 0) {
+    // A price of zero stays an exact zero, for reads as for writes.
+    if (args.cachedInputPrice === null && args.inputPrice !== 0) cachedPriceUnknown = true
+    cost += (cached / 1_000_000) * (args.cachedInputPrice ?? args.inputPrice)
+  }
+  if (written > 0) {
+    const rate = args.writeRate()
+    if (!rate.known && args.inputPrice !== 0) writePriceUnknown = true
+    cost += (written / 1_000_000) * args.inputPrice * rate.multiplier
+  }
+  return { cost, cachedPriceUnknown, writePriceUnknown }
+}
+
+/** A model id without its developer prefix: `anthropic/claude-sonnet-5` is `claude-sonnet-5`. */
+function modelKey(value?: string | null): string {
+  const normalized = normalize(value)
+  return splitDeveloperModel(normalized)?.modelId ?? normalized
+}
+
+/** A connection id without the `direct:` prefix: a direct preset's id is `direct:<service>`. */
+function connectionKey(value?: string | null): string {
+  const normalized = normalize(value)
+  return normalized.startsWith('direct:') ? normalized.slice('direct:'.length) : normalized
+}
+
+/**
+ * Does this run match the active preset? A run records the id of the request's connection
+ * (`direct:anthropic`, `openrouter`) and the model id it sent (`anthropic/claude-sonnet-5` on
+ * OpenRouter), so both sides are compared without the `direct:` and developer prefixes. Until
+ * 2026-09-25 (bug batch, new find 2) the connection id was compared with the service name and
+ * the prefixed model id with the bare one, so every direct and every OpenRouter run read as an
+ * estimate.
+ */
 function buildRuntimeSignals(
   snapshot: ExecutionSnapshot,
   activeModel: SavedModel,
@@ -465,9 +588,22 @@ function buildRuntimeSignals(
   const runtime = snapshot.runtime
   const currentConnection = resolveSavedModelConnection(activeModel)
   const parsedCurrentModel = splitDeveloperModel(agent?.primary_model_name ?? activeModel.modelId)
-  const currentModelId = normalize(parsedCurrentModel?.modelId ?? activeModel.modelId)
   const currentDeveloperId = normalize(parsedCurrentModel?.developerId ?? activeModel.provider)
   const currentConnectionService = normalize(currentConnection.service ?? '')
+  const currentModelKeys = new Set(
+    [agent?.primary_model_name, activeModel.modelId, activeModel.effectiveModelId]
+      .map(modelKey)
+      .filter(Boolean)
+  )
+  const currentConnectionKeys = new Set(
+    [
+      currentConnection.id,
+      currentConnection.service,
+      currentConnection.type === 'direct' ? null : currentConnection.type
+    ]
+      .map(connectionKey)
+      .filter(Boolean)
+  )
 
   const runtimeModel = normalize(runtime?.modelName)
   const runtimeProvider = normalize(runtime?.providerId)
@@ -475,12 +611,12 @@ function buildRuntimeSignals(
 
   return {
     missingRuntimeIdentity: !runtimeModel && !runtimeProvider && !runtimeConnection,
-    sameModel: !runtimeModel || runtimeModel === currentModelId,
+    sameModel: !runtimeModel || currentModelKeys.has(modelKey(runtimeModel)),
     sameProvider:
       !runtimeProvider ||
       runtimeProvider === currentDeveloperId ||
       runtimeProvider === currentConnectionService,
-    sameConnection: !runtimeConnection || runtimeConnection === currentConnectionService
+    sameConnection: !runtimeConnection || currentConnectionKeys.has(connectionKey(runtimeConnection))
   }
 }
 
@@ -572,6 +708,31 @@ function findLatestCompiledSnapshot(
   return preferred ?? sorted.find(hasCompiledPayload) ?? null
 }
 
+function cliRuntimeAndModel(agent: Agent | null | undefined, model: SavedModel | null): {
+  runtime: CliContextRuntime
+  model: string | null
+  selectedSettings: Record<string, any> | null
+  selectedModelId: string | null
+} | null {
+  if (normalizePrimaryAgentType(agent) !== 'cli') return null
+  const rawAgent = agent as Record<string, any>
+  const service = model?.connection?.service ?? agent?.primary_model_connection?.service ??
+    agent?.primary_model_provider ?? ''
+  const selection = resolveRuntimeModelSelection({
+    preset: model, modelId: agent?.primary_model_name,
+    settings: rawAgent.provider_specific_settings ?? null
+  })
+  const selectedSettings = selection.settings
+  const selectedModelId = selection.modelId
+  if (service === 'openai-codex' || service === 'codex') {
+    return { runtime: 'codex', model: resolveEffectiveAgentCliModel('codex', rawAgent, selectedSettings, selectedModelId), selectedSettings, selectedModelId }
+  }
+  if (service === 'anthropic-claude-cli' || service === 'claude-cli') {
+    return { runtime: 'claude', model: resolveEffectiveAgentCliModel('claude', rawAgent, selectedSettings, selectedModelId), selectedSettings, selectedModelId }
+  }
+  return null
+}
+
 function resolveReserveTokens(activeModel: SavedModel | null): number | null {
   const maxTokens = activeModel?.settings?.maxTokens
   if (typeof maxTokens === 'number' && Number.isFinite(maxTokens) && maxTokens > 0) {
@@ -608,9 +769,64 @@ export function summarizeContextUsage(params: {
   manualTrimEstimateTokens?: number | null
   liveContextEstimateTokens?: number | null
   liveContextEstimateReason?: string | null
+  /** Server preview knows instance-only CLI settings such as disabled 1M context. */
+  liveContextLimit?: number | null
+  liveLocalContext?: LocalContextBudgetEvidence | null
+  now?: number
+  liveContextWindowWarning?: string | null
+  liveContextCheckedAt?: number | null
+  claudeContextEnvironment?: ClaudeContextEnvironment | null
 }): ContextUsageSummary {
   const { messages, snapshots, activeModel, agent } = params
-  const contextLimit = activeModel?.contextWindow ?? null
+  const cli = cliRuntimeAndModel(agent, activeModel)
+  const savedReport = cli ? latestCliContextReport(snapshots, agent?.id, cli.runtime) : null
+  const claudeCap = cli?.runtime === 'claude'
+    ? claudeContextCappedByFlags(cli.model, params.claudeContextEnvironment) : false
+  const matchedReport = cli && agent ? matchingCliContextReport(savedReport,
+    cliContextSettingsKey(cli.runtime, agent as Record<string, any>, activeModel?.contextWindow,
+      cli.selectedSettings, cli.selectedModelId)) : null
+  const matchingReport = matchedReport && (cli?.runtime !== 'claude' ||
+    Boolean(matchedReport.disableClaude1M) === claudeCap) ? matchedReport : null
+  const cliResolution = cli ? resolveCliContextWindow({
+    ...cli,
+    presetContextWindow: activeModel?.contextWindow,
+    reported: matchingReport,
+    disableClaude1M: claudeCap
+  }) : null
+  const serverLimit = typeof params.liveContextLimit === 'number' &&
+    Number.isFinite(params.liveContextLimit) && params.liveContextLimit > 0
+      ? params.liveContextLimit : null
+  const latestCliSnapshot = cli ? latestCliContextSnapshot(snapshots, agent?.id, cli.runtime) : null
+  const savedBudget = latestCliSnapshot?.executionMetadata?.promptBudget
+  const activeSettingsKey = cli && agent ? cliContextSettingsKey(cli.runtime, agent as Record<string, any>,
+    activeModel?.contextWindow, cli.selectedSettings, cli.selectedModelId) : null
+  const savedWarning = activeSettingsKey && savedBudget?.contextWindowSettingsKey === activeSettingsKey &&
+    typeof savedBudget?.contextWindowWarning === 'string'
+      ? savedBudget.contextWindowWarning.trim() : null
+  const previewIsNewer = typeof params.liveContextCheckedAt === 'number' &&
+    params.liveContextCheckedAt > (savedBudget?.contextWindowCheckedAt ?? Infinity)
+  const newestWarningAt = Math.max(
+    savedWarning ? savedBudget?.contextWindowCheckedAt ?? Infinity : 0,
+    params.liveContextWindowWarning ? params.liveContextCheckedAt ?? Infinity : 0
+  )
+  const newerRuntimeEvidence = matchingReport?.evidence === 'runtime' &&
+    typeof matchingReport.reportedAt === 'number' && matchingReport.reportedAt > newestWarningAt
+  const contextWindowWarning = cli && !newerRuntimeEvidence
+    ? params.liveContextWindowWarning?.trim() || (!previewIsNewer ? savedWarning : null)
+    : null
+  const apiSelection = resolveRuntimeModelSelection({ preset: activeModel,
+    provider: agent?.primary_model_provider, modelId: agent?.primary_model_name,
+    connection: agent?.primary_model_connection, settings: agent?.provider_specific_settings })
+  const local = !cli && LOCAL_AI_SERVER_IDS.has(apiSelection.provider as any)
+  const localEvidence = params.liveLocalContext
+  const freshLocal = localEvidence && localEvidence.providerId === apiSelection.provider &&
+    localEvidence.modelId === apiSelection.modelId && localEvidence.expiresAt > (params.now ?? Date.now())
+      ? localEvidence : null
+  const localNote = local ? freshLocal?.note ?? 'The Local AI context limit is waiting for a fresh server reading.' : ''
+  const contextLimit = contextWindowWarning || (cli && matchingReport?.evidence === 'unresolved')
+    ? null
+    : cli ? (serverLimit ?? cliResolution?.contextWindow ?? null)
+      : local ? (freshLocal ? serverLimit : null) : activeModel?.contextWindow ?? null
   const agentType = normalizePrimaryAgentType(agent)
   const cliWrapperOverheadTokens = agentType === 'cli' ? CLI_WRAPPER_OVERHEAD_TOKENS : 0
   const visibleEstimateTokens = countTotalTokens(messages)
@@ -627,9 +843,9 @@ export function summarizeContextUsage(params: {
       : null
   const reserveTokens = resolveReserveTokens(activeModel)
   const reserveNote =
-    reserveTokens !== null
+    (reserveTokens !== null
       ? ` Batshit also keeps ${formatCompactTokens(reserveTokens)} tokens in mind for output/reasoning headroom when warning near the edge.`
-      : ''
+      : '') + (contextWindowWarning ? ` ${contextWindowWarning}` : '') + (localNote ? ` ${localNote}` : '')
   const liveContextEstimateTokens =
     typeof params.liveContextEstimateTokens === 'number' &&
     Number.isFinite(params.liveContextEstimateTokens)
@@ -785,7 +1001,7 @@ export function summarizeContextUsage(params: {
       state: 'unknown',
       label: 'Unknown',
       detail:
-        'Context usage is unavailable because this agent does not have a known model context window yet.',
+        contextWindowWarning ?? 'Context usage is unavailable because this agent does not have a known model context window yet.',
       trimAvailable: messages.length > 1,
       trimUnavailableReason
     }
@@ -882,17 +1098,41 @@ function findDelegatedSavedModel(
   return matches[0] ?? null
 }
 
-function summarizeDelegatedCost(
-  snapshots: ExecutionSnapshot[],
-  models: SavedModel[],
-): Pick<
+/**
+ * BL-184: the cache lifetime of a delegated run's writes. An API Subagent or Worker run carries
+ * no request-level cache setting (`runApiSubagent` passes the preset's other provider options,
+ * but `withoutRequestCacheSetting` in `subagentModelSelection.ts` strips its Prompt cache TTL
+ * first), so every cache point on it is one the cache policy placed with Anthropic's default
+ * five-minute lifetime, or the gateway's own five-minute default. A CLI run's lifetime is the CLI's own and unknown. A
+ * Worker follows its parent's runtime family (SA-111 P4, DL-111-10), so the parent's run says
+ * which lane it used.
+ */
+function resolveDelegatedCacheTtl(runType: string, parent: ExecutionSnapshot): CacheTtl | null {
+  const type = normalize(runType)
+  if (type === 'api') return '5m'
+  if (type === 'worker' || type.startsWith('worker of ')) {
+    return parent.runtime?.runtimeId === 'vercel' ? '5m' : null
+  }
+  return null
+}
+
+type DelegatedCostSummary = Pick<
   RunningCostSummary,
   | 'delegatedTokens'
   | 'delegatedCost'
   | 'delegatedRunCount'
   | 'delegatedUsageUnknownRuns'
   | 'delegatedCostUnknownRuns'
-> {
+>
+
+function summarizeDelegatedCost(
+  snapshots: ExecutionSnapshot[],
+  models: SavedModel[],
+): DelegatedCostSummary & { priceEstimated: boolean } {
+  // A price that went into the total is not known exactly: a cache-write rate Batshit cannot
+  // vouch for (BL-184), or cache reads priced at the input price because the model has no
+  // cached-input price (bug batch 2026-09-25, new find 3; the parent run already said so).
+  let priceEstimated = false
   let delegatedTokens = 0
   let delegatedCost = 0
   let delegatedRunCount = 0
@@ -924,6 +1164,7 @@ function summarizeDelegatedCost(
         delegatedUsageUnknownRuns += 1
       }
 
+      if (run.provider === 'chatgpt-plan') { delegatedCostUnknownRuns += 1; continue }
       const model = findDelegatedSavedModel(run.model, run.provider, models)
       const inputPrice = model ? getFlatPrice(model.pricing.input) : null
       const outputPrice = model ? getFlatPrice(model.pricing.output) : null
@@ -938,14 +1179,24 @@ function summarizeDelegatedCost(
         continue
       }
 
-      const cachedTokens = Math.max(0, usage.cachedInputTokens ?? 0)
-      const uncachedTokens = Math.max(0, usage.inputTokens - cachedTokens)
       const cachedPrice =
         typeof model.pricing.cachedInput === 'number' && Number.isFinite(model.pricing.cachedInput)
           ? model.pricing.cachedInput
-          : inputPrice
-      delegatedCost += (uncachedTokens / 1_000_000) * inputPrice
-      delegatedCost += (cachedTokens / 1_000_000) * cachedPrice
+          : null
+      const priced = priceRunInput({
+        inputTokens: usage.inputTokens,
+        cachedInputTokens: usage.cachedInputTokens,
+        cacheWriteTokens: usage.cacheCreationInputTokens,
+        inputPrice,
+        cachedInputPrice: cachedPrice,
+        writeRate: () =>
+          resolveCacheWriteRate(
+            isAnthropicBilledModel(run.model, run.provider),
+            resolveDelegatedCacheTtl(run.type, snapshot),
+          ),
+      })
+      if (priced.cachedPriceUnknown || priced.writePriceUnknown) priceEstimated = true
+      delegatedCost += priced.cost
       delegatedCost += (usage.outputTokens / 1_000_000) * outputPrice
       costKnownRuns += 1
     }
@@ -957,6 +1208,7 @@ function summarizeDelegatedCost(
     delegatedRunCount,
     delegatedUsageUnknownRuns,
     delegatedCostUnknownRuns,
+    priceEstimated,
   }
 }
 
@@ -966,7 +1218,10 @@ export function summarizeRunningCost(
   agent: Agent | null | undefined,
   models: SavedModel[] = [],
 ): RunningCostSummary {
-  const delegated = summarizeDelegatedCost(snapshots, models)
+  const { priceEstimated: delegatedPriceEstimated, ...delegated } = summarizeDelegatedCost(
+    snapshots,
+    models,
+  )
   if (!activeModel) {
     return {
       cost: null,
@@ -974,6 +1229,10 @@ export function summarizeRunningCost(
       note: 'Model pricing is unavailable for this agent.',
       ...delegated,
     }
+  }
+
+  if (activeModel.connection?.service === 'chatgpt-plan' || activeModel.connection?.id?.startsWith('chatgpt-plan:')) return {
+    cost: null, state: 'unknown', note: 'ChatGPT plan usage is managed at https://chatgpt.com/settings/usage. Batshit has no documented quota or monetary cost telemetry for this connection.', ...delegated,
   }
 
   const inputPrice = getFlatPrice(activeModel.pricing.input)
@@ -1001,32 +1260,58 @@ export function summarizeRunningCost(
   let total = 0
   let hasUsage = false
   let estimated = false
+  // Missing usage is unknown, never zero: a run with no usage, or without both counts (a
+  // stopped reply, a lane that reported nothing, a reply still running), leaves its cost out,
+  // so the total is at best an estimate, and unknown when no run reported any.
+  let runsWithoutUsage = 0
 
   for (const snapshot of snapshots) {
     const usage = resolveUsage(snapshot)
-    if (!usage) continue
+    if (!usage) {
+      runsWithoutUsage += 1
+      estimated = true
+      continue
+    }
 
     const rawInputTokens = usage.inputTokens?.value
     const rawOutputTokens = usage.outputTokens?.value
-    if (!Number.isFinite(rawInputTokens) || !Number.isFinite(rawOutputTokens)) continue
+    if (!Number.isFinite(rawInputTokens) || !Number.isFinite(rawOutputTokens)) {
+      runsWithoutUsage += 1
+      estimated = true
+      continue
+    }
 
     const inputTokens = rawInputTokens as number
     const outputTokens = rawOutputTokens as number
 
     hasUsage = true
 
-    const rawCachedInputTokens = usage.cachedInputTokens?.value
-    if (Number.isFinite(rawCachedInputTokens) && (rawCachedInputTokens as number) > 0) {
-      const cachedInputTokens = rawCachedInputTokens as number
-      if (cachedInputPrice === null) {
-        estimated = true
-      }
-      const uncachedInputTokens = Math.max(0, inputTokens - cachedInputTokens)
-      total += (uncachedInputTokens / 1_000_000) * inputPrice
-      total += (cachedInputTokens / 1_000_000) * (cachedInputPrice ?? inputPrice)
-    } else {
-      total += (inputTokens / 1_000_000) * inputPrice
+    const priced = priceRunInput({
+      inputTokens,
+      cachedInputTokens: usage.cachedInputTokens?.value,
+      cacheWriteTokens: usage.cacheCreationInputTokens?.value,
+      inputPrice,
+      cachedInputPrice,
+      writeRate: () =>
+        resolveCacheWriteRate(
+          isAnthropicBilledModel(
+            snapshot.runtime?.modelName || activeModel.modelId,
+            snapshot.runtime?.providerId || activeModel.provider,
+          ),
+          readSnapshotCacheTtl(snapshot),
+        ),
+    })
+    if (priced.cachedPriceUnknown || priced.writePriceUnknown) estimated = true
+    // A cache count the run names but does not know (`value: null`: an approval resume whose
+    // halves did not both report it, BL-525) is priced as no cache at all, the whole input at the
+    // input price, so the total is an estimate, never exact.
+    if (
+      usage.cachedInputTokens?.value === null ||
+      usage.cacheCreationInputTokens?.value === null
+    ) {
+      estimated = true
     }
+    total += priced.cost
 
     total += (outputTokens / 1_000_000) * outputPrice
 
@@ -1045,11 +1330,19 @@ export function summarizeRunningCost(
     total += delegated.delegatedCost
     hasUsage = true
   }
-  if (delegated.delegatedCostUnknownRuns > 0) {
+  if (delegated.delegatedCostUnknownRuns > 0 || delegatedPriceEstimated) {
     estimated = true
   }
 
   if (!hasUsage) {
+    if (runsWithoutUsage > 0) {
+      return {
+        cost: null,
+        state: 'unknown',
+        note: 'Runs were recorded, but none reported the token usage a truthful cost total needs.',
+        ...delegated,
+      }
+    }
     if (delegated.delegatedRunCount > 0) {
       return {
         cost: null,
@@ -1070,7 +1363,7 @@ export function summarizeRunningCost(
     return {
       cost: total,
       state: 'estimated',
-      note: 'Running cost includes parent and delegated run usage. Mixed models, missing usage, or missing runtime identity make this an estimate.',
+      note: 'Running cost includes parent and delegated run usage. Mixed models, missing usage, missing runtime identity, or a cache-write price Batshit does not know make this an estimate.',
       ...delegated,
     }
   }

@@ -9,7 +9,13 @@
  * behavior change for the Compact feature — pure move.
  */
 
-import { generateText } from 'ai'
+import { generateText, streamText } from 'ai'
+import { chatgptPlanAccountId } from '$lib/utils/chatgptPlanConnection'
+import { getChatgptPlanRuntime } from './chatgptPlanHost'
+import { PLAN_COMPACT, type PlanLease } from './chatgptPlanRuntime'
+import { ChatgptPlanError } from './chatgptPlanVault'
+import { isPlanSelection, assertPlanSettings, planProviderOptions } from './chatgptPlanInference'
+import { estimateTokens } from '$lib/utils/tokens'
 import { redis } from '$lib/server/redis'
 import { buildCodexRuntimeSettings } from '$lib/server/services/codexSettings'
 import { ProviderManager } from '$lib/server/services/providers'
@@ -18,10 +24,12 @@ import type { SavedModel, ModelConnectionInfo, ModelCapabilities } from '$lib/ty
 import type { ParameterValue } from '$lib/data/parameter-schemas'
 import {
   buildRuntimeModelSettings,
-  normalizeRuntimeMaxTokens
+  normalizeRuntimeMaxTokens,
+  type RuntimeModelStandardSettings
 } from '$lib/utils/modelSettingsMapper'
 import { resolveModelIds } from '$lib/utils/modelIdResolver'
-import { resolveRuntimeModelSelection } from '$lib/utils/modelPresetRuntime'
+import { resolveAgentModelFallbacks, resolveRuntimeModelSelection } from '$lib/utils/modelPresetRuntime'
+import { loadRuntimeModelPreset } from '$lib/server/services/runtimeModelPreset'
 import { resolveSavedModelConnection } from '$lib/utils/modelConnections'
 import { normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
 import { resolveCurrentModelCompactRuntime } from '$lib/utils/contextCompaction'
@@ -31,6 +39,22 @@ import { resolveCurrentModelCompactRuntime } from '$lib/utils/contextCompaction'
  * Not a user preset default — see the comment at its use site.
  */
 const BATSHIT_SUMMARY_OUTPUT_TOKEN_BOUND = 6_000
+
+/**
+ * BL-622 (rule C6): how long one summary call on the API lane may take, the Codex lane's own limit
+ * (`generateHiddenText`). A Compact or a nap waits on this call; with no limit a model that never
+ * answered left the Compact's composer busy, with a Stop that stopped nothing, for as long as it
+ * took.
+ */
+export const SUMMARY_CALL_LIMIT_MS = 180_000
+
+export class SummaryCallLimitError extends Error {
+  readonly code = 'summary_call_limit'
+  constructor() {
+    super(`The summary model did not answer within ${SUMMARY_CALL_LIMIT_MS / 1000} seconds.`)
+    this.name = 'SummaryCallLimitError'
+  }
+}
 
 type AgentRecord = AgentRow & Record<string, any>
 
@@ -51,6 +75,25 @@ async function loadSavedModel(presetId: string | null): Promise<SavedModel | nul
   if (!presetId) return null
   const model = await redis.get(`model:${presetId}`).catch(() => null)
   return model && typeof model === 'object' ? (model as SavedModel) : null
+}
+
+/**
+ * The values a compact-model PRESET fills in where its own settings left a gap (the choice made
+ * for this Compact, not the agent's model). The agent's "current model" takes its fallbacks from
+ * `resolveAgentModelFallbacks` instead.
+ */
+function compactPresetFallbacks(preset: SavedModel | null): RuntimeModelStandardSettings {
+  const settings = preset?.settings
+  return {
+    temperature: settings?.temperature,
+    maxTokens: settings?.maxTokens,
+    topP: settings?.topP,
+    topK: settings?.topK,
+    presencePenalty: settings?.presencePenalty,
+    frequencyPenalty: settings?.frequencyPenalty,
+    seed: settings?.seed,
+    stopSequences: settings?.stopSequences
+  }
 }
 
 function isCliLikeSelection(params: {
@@ -107,23 +150,39 @@ async function resolveSummaryModel(params: {
     )
   }
 
-  const preset =
+  const compactPreset =
     params.choice.modelMode === 'preset'
       ? await loadSavedModel(params.choice.modelPresetId)
       : null
 
-  if (params.choice.modelMode === 'preset' && !preset) {
+  if (params.choice.modelMode === 'preset' && !compactPreset) {
     throw new Error('The selected compact model preset was not found.')
   }
 
+  // BL-801: "current model" is the agent's own model, and an agent that names a preset runs on
+  // that preset as it is now, read fresh the way the send path does since BL-515. The agent's
+  // copied model, connection and settings are what the picker stored when the preset was picked;
+  // a preset edited since is not what the Compact would have run on. A preset that is gone fails
+  // loudly with the send path's own error, never quietly on the copies. An agent that names no
+  // preset (a record from before presets) keeps its copies.
+  const agentPreset =
+    params.choice.modelMode === 'current'
+      ? await loadRuntimeModelPreset(params.agent.primary_model_preset_id, 'primary')
+      : null
+  const preset = compactPreset ?? agentPreset
+
   const selection = resolveRuntimeModelSelection({
     preset,
-    presetId: params.choice.modelPresetId,
+    presetId: compactPreset ? params.choice.modelPresetId : params.agent.primary_model_preset_id ?? null,
     provider: params.agent.primary_model_provider,
     modelId: params.agent.primary_model_name,
-    connection: preset ? resolveSavedModelConnection(preset) : params.agent.primary_model_connection ?? null,
+    connection: compactPreset
+      ? resolveSavedModelConnection(compactPreset)
+      : params.agent.primary_model_connection ?? null,
     capabilities: (preset?.capabilities ?? params.agent.primary_model_capabilities ?? null) as ModelCapabilities | null,
-    settings: (preset?.settings ?? params.agent.provider_specific_settings ?? null) as Record<string, any> | null
+    // The compact preset's own settings; for the agent's model, the agent's bag, of which the
+    // resolver keeps only the agent's own keys when a preset is named (BL-515).
+    settings: (compactPreset?.settings ?? params.agent.provider_specific_settings ?? null) as Record<string, any> | null
   })
 
   if (isCliLikeSelection({
@@ -161,50 +220,23 @@ async function resolveSummaryModel(params: {
     contextWindow: selection.contextWindow,
     capabilities: selection.capabilities,
     settings: selection.settings as Record<string, ParameterValue> | null,
-    fallbacks: {
-      temperature:
-        params.choice.modelMode === 'preset'
-          ? preset?.settings?.temperature
-          : params.agent.primary_model_temperature,
-      maxTokens:
-        params.choice.modelMode === 'preset'
-          ? preset?.settings?.maxTokens
-          : params.agent.primary_model_max_tokens,
-      topP:
-        params.choice.modelMode === 'preset'
-          ? preset?.settings?.topP
-          : params.agent.primary_model_top_p,
-      topK:
-        params.choice.modelMode === 'preset'
-          ? preset?.settings?.topK
-          : params.agent.primary_model_top_k,
-      presencePenalty:
-        params.choice.modelMode === 'preset'
-          ? preset?.settings?.presencePenalty
-          : params.agent.primary_model_presence_penalty,
-      frequencyPenalty:
-        params.choice.modelMode === 'preset'
-          ? preset?.settings?.frequencyPenalty
-          : params.agent.primary_model_frequency_penalty,
-      seed:
-        params.choice.modelMode === 'preset'
-          ? preset?.settings?.seed
-          : params.agent.primary_model_seed,
-      stopSequences:
-        params.choice.modelMode === 'preset'
-          ? preset?.settings?.stopSequences
-          : params.agent.primary_model_stop_sequences
-    }
+    fallbacks:
+      params.choice.modelMode === 'preset'
+        ? compactPresetFallbacks(compactPreset)
+        : resolveAgentModelFallbacks({ preset: agentPreset, agent: params.agent })
   })
 
-  const manager = await ProviderManager.createForUser(params.userId)
-  const model = manager.getModel(effectiveModelId, {
+  const plan = isPlanSelection(selection.connection)
+  if (plan) assertPlanSettings(selection.settings)
+  const model = plan ? null : (await ProviderManager.createForUser(params.userId)).getModel(effectiveModelId, {
     transport: selection.connection?.type,
     service: selection.connection?.service ?? null,
     allowAutoFallback: false
   })
 
   return {
+    plan,
+    connection: selection.connection,
     model,
     effectiveModelId,
     provider:
@@ -262,6 +294,8 @@ async function generateApiSummary(params: {
   choice: SummaryModelChoice
   prompt: string
   summaryHardMaxTokens: number
+  abortSignal?: AbortSignal
+  retainPlanLease?: (lease: PlanLease) => void
 }): Promise<SummaryGenerationResult> {
   const summaryModel = await resolveSummaryModel({
     userId: params.userId,
@@ -269,16 +303,56 @@ async function generateApiSummary(params: {
     choice: params.choice
   })
 
-  const result = await generateText({
-    model: summaryModel.model,
-    messages: [{ role: 'user', content: params.prompt }],
-    providerOptions: summaryModel.providerOptions,
-    ...summaryModel.generationSettings,
-    maxOutputTokens: Math.min(
-      summaryModel.generationSettings.maxOutputTokens,
-      params.summaryHardMaxTokens
-    )
-  })
+  // BL-622 (C6): the call ends at its limit, or when its caller stops it (a Compact's Stop).
+  const limit = new AbortController()
+  const limitTimer = setTimeout(() => limit.abort(new SummaryCallLimitError()), SUMMARY_CALL_LIMIT_MS)
+  limitTimer.unref?.()
+  const abortSignal = params.abortSignal
+    ? AbortSignal.any([params.abortSignal, limit.signal])
+    : limit.signal
+  let result: { text: string }
+  try {
+    if (summaryModel.plan) {
+      // Only Compact's route accepts responsibility through its actual writes.
+      // Shared memory/nap callers cannot silently acquire this grant.
+      if (!params.retainPlanLease) throw new ChatgptPlanError('consumer_unsupported', 'This summary feature cannot use ChatGPT plan credentials. Choose a separate API-compatible summary preset.')
+      const runtime = getChatgptPlanRuntime(), accountId = chatgptPlanAccountId(summaryModel.connection?.id)
+      if (!accountId) throw new ChatgptPlanError('connection_invalid', 'Choose the connected ChatGPT account again.')
+      const lease = runtime.acquire(params.userId, accountId, PLAN_COMPACT, abortSignal)
+      try { params.retainPlanLease(lease) } catch (error) { lease.release(); throw error }
+      const streaming = streamText({ model: runtime.model(lease, summaryModel.effectiveModelId), messages: [{ role: 'user', content: params.prompt }], providerOptions: planProviderOptions(summaryModel.providerOptions), abortSignal: lease.signal, maxRetries: 0, onError: () => {} })
+      let text = ''
+      for await (const part of streaming.stream) {
+        if (part.type === 'error') throw part.error
+        if (part.type === 'text-delta') {
+          text += part.text
+          if (estimateTokens(text) > params.summaryHardMaxTokens) {
+            limit.abort('summary_output_limit')
+            throw new ChatgptPlanError('summary_output_limit', 'ChatGPT exceeded the Compact summary budget. Nothing was compacted. Choose a larger summary budget or another summary preset.')
+          }
+        }
+      }
+      runtime.assertLease(lease)
+      result = { text }
+    } else {
+    result = await generateText({
+      model: summaryModel.model!,
+      messages: [{ role: 'user', content: params.prompt }],
+      providerOptions: summaryModel.providerOptions,
+      ...summaryModel.generationSettings,
+      maxOutputTokens: Math.min(
+        summaryModel.generationSettings.maxOutputTokens,
+        params.summaryHardMaxTokens
+      ),
+      abortSignal
+    })
+    }
+  } catch (error) {
+    if (limit.signal.reason instanceof SummaryCallLimitError) throw limit.signal.reason
+    throw error
+  } finally {
+    clearTimeout(limitTimer)
+  }
 
   const summary = result.text?.trim()
   if (!summary) {
@@ -307,6 +381,7 @@ async function generateCodexCliSummary(params: {
   userId: string
   agent: AgentRecord
   prompt: string
+  abortSignal?: AbortSignal
 }): Promise<SummaryGenerationResult> {
   const { CodexBridge } = await import('$lib/server/services/codexBridge')
   const bridge = new CodexBridge()
@@ -319,7 +394,8 @@ async function generateCodexCliSummary(params: {
     agentId: params.agent.id,
     model: params.agent.primary_model_name,
     providerSettings: params.agent.provider_specific_settings ?? null,
-    codexSettings
+    codexSettings,
+    abortSignal: params.abortSignal
   })
 
   return {
@@ -342,6 +418,13 @@ export async function generateModelSummary(params: {
   choice: SummaryModelChoice
   prompt: string
   summaryHardMaxTokens: number
+  /**
+   * A Compact's Stop ends its API or hidden Codex summary. API calls also end at
+   * `SUMMARY_CALL_LIMIT_MS`; the Codex worker retains its own independent 180 s limit.
+   */
+  abortSignal?: AbortSignal
+  /** Internal Compact owner, absent from shared memory/nap consumers. */
+  retainPlanLease?: (lease: PlanLease) => void
 }): Promise<SummaryGenerationResult> {
   if (params.choice.modelMode === 'current') {
     const runtime = resolveCurrentModelCompactRuntime(params.agent)
@@ -349,7 +432,8 @@ export async function generateModelSummary(params: {
       return generateCodexCliSummary({
         userId: params.userId,
         agent: params.agent,
-        prompt: params.prompt
+        prompt: params.prompt,
+        abortSignal: params.abortSignal
       })
     }
     if (runtime === 'claude-cli') {

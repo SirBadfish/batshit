@@ -2,10 +2,7 @@ const BaseUploadStrategy = require('./baseStrategy');
 const redisService = require('../redisService');
 const logger = require('../../utils/logger');
 const { writeErrorLog } = require('../../utils/logSafety');
-const {
-  deleteFileBackedPayload,
-  persistFileBackedUpload
-} = require('../fileBackedUploadService');
+const { persistFileBackedUpload } = require('../fileBackedUploadService');
 
 function stripTrailingSlash(value) {
   let end = value.length;
@@ -173,18 +170,10 @@ class LocalStorageStrategy extends BaseUploadStrategy {
     return false;
   }
 
-  async delete(redisKey) {
-    try {
-      const payload = await redisService.get(redisKey);
-      const deleted = await redisService.delete(redisKey);
-      if (!deleted) throw new Error(`Redis refused to delete upload metadata for ${redisKey}.`);
-      if (payload) await deleteFileBackedPayload(payload);
-      return true;
-    } catch (error) {
-      writeErrorLog(logger, '[LocalStrategy] Delete error', error);
-      return false;
-    }
-  }
+  // No delete here (BL-282, 2026-09-27): the one this class had read the record through
+  // `redisService.get`, which answers null on a Redis error, and so deleted the key and kept
+  // the file (BL-144's bug). Nothing called it. Upload deletes go through
+  // `deleteStoredUploadRecord` in `upload-redis.js`, whose read throws.
 }
 
 module.exports = LocalStorageStrategy;

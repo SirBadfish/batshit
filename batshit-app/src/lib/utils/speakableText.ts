@@ -1,8 +1,6 @@
-import {
-  pairedBlockRegexGlobal,
-  ttsHiddenTagNames,
-  unclosedTailRegexGlobal
-} from './controlTags'
+import { CONTROL_TAGS, findControlBlocks, removeControlBlocks, type ControlTagId } from './controlTags'
+import { findCodeRegions } from './markdownCodeRegions'
+import { replaceBracedTokens } from './braceScan'
 
 const SPEAKABLE_HTML_TAGS = new Set([
   'a',
@@ -84,39 +82,136 @@ function shouldSilenceItalics(options?: SpeakableTextOptions): boolean {
   return options?.italicBehavior === 'silent'
 }
 
-function shouldDropXmlBlock(tagName: string): boolean {
-  return !SPEAKABLE_HTML_TAGS.has(tagName.toLowerCase())
+const XML_NAME_CHAR = /[a-z0-9:_-]/i
+
+function isXmlWordChar(char: string | undefined): boolean {
+  return char !== undefined && /[A-Za-z0-9_]/.test(char)
 }
 
-function stripUnsupportedXmlBlocks(text: string): string {
-  let output = text
-  let changed = true
+/**
+ * The names an XML-style tag starting at `at` (a `<` followed by a letter) may have, longest first,
+ * as the regex `<([a-z][a-z0-9:_-]*)\b` reads them: the name run, shortened back to each place a
+ * word boundary allows.
+ */
+function xmlTagNamesAt(text: string, at: number): string[] {
+  let runEnd = at + 2
+  while (runEnd < text.length && XML_NAME_CHAR.test(text[runEnd])) runEnd += 1
+  const names: string[] = []
+  for (let end = runEnd; end >= at + 2; end -= 1) {
+    if (isXmlWordChar(text[end - 1]) !== isXmlWordChar(text[end])) names.push(text.slice(at + 1, end))
+  }
+  return names
+}
 
+/**
+ * One pass of `text.replace(/<([a-z][a-z0-9:_-]*)\b[^>]*\/>/gi, keepOrDrop)`, in linear time (the
+ * regex scanned from every `<name` to the next `>`). `drop` decides by the tag's name.
+ */
+function replaceSelfClosingXmlTags(text: string, drop: (tagName: string) => boolean): string {
+  const kept: string[] = []
+  let cursor = 0
+  let closeAngle = -1
+  for (let at = text.indexOf('<'); at >= 0; at = text.indexOf('<', Math.max(at + 1, cursor))) {
+    if (!/[a-z]/i.test(text[at + 1] ?? '')) continue
+    if (closeAngle < at) closeAngle = text.indexOf('>', at)
+    if (closeAngle < 0) break
+    if (text[closeAngle - 1] !== '/') continue
+    // The name ends before the `/` (a `/` is not a name character), so any `\b` place fits.
+    const names = xmlTagNamesAt(text, at)
+    if (names.length === 0) continue
+    if (drop(names[0])) {
+      kept.push(text.slice(cursor, at))
+      cursor = closeAngle + 1
+    } else {
+      kept.push(text.slice(cursor, closeAngle + 1))
+      cursor = closeAngle + 1
+    }
+  }
+  if (cursor === 0) return text
+  kept.push(text.slice(cursor))
+  return kept.join('')
+}
+
+/**
+ * One pass of `text.replace(/<([a-z][a-z0-9:_-]*)\b[^>]*>[\s\S]*?<\/\1>/gi, keepOrDrop)`, in linear
+ * time: that regex tried every opening tag against the rest of the text (the BL-640 shape, in the
+ * browser's speech). Returns the text and whether a block was dropped.
+ */
+function replacePairedXmlBlocks(text: string, drop: (tagName: string) => boolean): { text: string; dropped: boolean } {
+  const folded = text.replace(/[A-Z]+/g, (letters) => letters.toLowerCase())
+  // Every `</name>` by name, in order.
+  const closings = new Map<string, number[]>()
+  for (let at = folded.indexOf('</'); at >= 0; at = folded.indexOf('</', at + 2)) {
+    let end = at + 2
+    while (end < folded.length && XML_NAME_CHAR.test(folded[end])) end += 1
+    if (end === at + 2 || folded[end] !== '>') continue
+    const name = folded.slice(at + 2, end)
+    const list = closings.get(name)
+    if (list) list.push(at)
+    else closings.set(name, [at])
+  }
+  const firstClosingAfter = (name: string, from: number): number => {
+    const list = closings.get(name)
+    if (!list) return -1
+    let low = 0
+    let high = list.length
+    while (low < high) {
+      const mid = (low + high) >> 1
+      if (list[mid] < from) low = mid + 1
+      else high = mid
+    }
+    return low < list.length ? list[low] : -1
+  }
+  const kept: string[] = []
+  let cursor = 0
+  let dropped = false
+  let closeAngle = -1
+  for (let at = folded.indexOf('<'); at >= 0; at = folded.indexOf('<', Math.max(at + 1, cursor))) {
+    if (!/[a-z]/.test(folded[at + 1] ?? '')) continue
+    if (closeAngle < at) closeAngle = folded.indexOf('>', at)
+    if (closeAngle < 0) break
+    let match: { name: string; end: number } | null = null
+    for (const name of xmlTagNamesAt(folded, at)) {
+      const closing = firstClosingAfter(name, closeAngle + 1)
+      if (closing >= 0) {
+        match = { name, end: closing + name.length + 3 }
+        break
+      }
+    }
+    if (!match) continue
+    if (drop(match.name)) {
+      kept.push(text.slice(cursor, at))
+      dropped = true
+    } else {
+      kept.push(text.slice(cursor, match.end))
+    }
+    cursor = match.end
+  }
+  if (cursor === 0) return { text, dropped: false }
+  kept.push(text.slice(cursor))
+  return { text: kept.join(''), dropped }
+}
+
+/** Exported, with the speakable set as a parameter, for the old-against-new comparison test. */
+export function stripUnsupportedXmlBlocks(
+  text: string,
+  speakableTags: ReadonlySet<string> = SPEAKABLE_HTML_TAGS
+): string {
+  const drop = (tagName: string) => !speakableTags.has(tagName.toLowerCase())
   // Remove unsupported self-closing tags before paired tags so a tag like
   // `<emote name="smile" />` is not mistaken for an opener when another
   // `</emote>` appears later in the same reply.
-  output = output.replace(/<([a-z][a-z0-9:_-]*)\b[^>]*\/>/gi, (match, tagName) => {
-    return shouldDropXmlBlock(tagName) ? '' : match
-  })
+  let output = replaceSelfClosingXmlTags(text, drop)
 
   // Remove unsupported paired tags repeatedly so nested tags are fully stripped.
-  while (changed) {
-    changed = false
-    output = output.replace(/<([a-z][a-z0-9:_-]*)\b[^>]*>[\s\S]*?<\/\1>/gi, (match, tagName) => {
-      if (shouldDropXmlBlock(tagName)) {
-        changed = true
-        return ''
-      }
-      return match
-    })
+  for (;;) {
+    const pass = replacePairedXmlBlocks(output, drop)
+    output = pass.text
+    if (!pass.dropped) break
   }
 
   // Remove unsupported self-closing tags.
-  output = output.replace(/<([a-z][a-z0-9:_-]*)\b[^>]*\/>/gi, (match, tagName) => {
-    return shouldDropXmlBlock(tagName) ? '' : match
-  })
-
-  return output
+  return replaceSelfClosingXmlTags(output, drop)
 }
 
 function stripEmojiComboJoiners(text: string): string {
@@ -197,25 +292,18 @@ function stripHtmlBlocksByTagName(text: string, tagName: string): string {
   return output
 }
 
-function stripRemainingHtmlTags(text: string): string {
-  let output = ''
-  let index = 0
-  while (index < text.length) {
-    const openIndex = text.indexOf('<', index)
-    if (openIndex < 0) {
-      output += text.slice(index)
-      break
-    }
+/**
+ * BL-442 R5 (BL-477): only a real tag is removed from speech: `<`, a tag name (after an optional
+ * `/`), attributes written as HTML writes them (`name`, `name="value"`), and a closing `>`. Words
+ * that only happen to sit between a `<` and a `>` ("<batshit-memory then f = () =>") are spoken. A lone `<` or `>` is spoken:
+ * "x < 5 and y > 3" used to be spoken as "x 3", and "If the count is < 5, retry" as "If the count
+ * is". One linear pass: each `<` is read up to the next `<` or `>` at most.
+ */
+const REAL_TAG_FOR_SPEECH =
+  /<\/?[A-Za-z][A-Za-z0-9:_-]*(?:\s+[A-Za-z_:][A-Za-z0-9_:.-]*(?:\s*=\s*(?:"[^"<>]*"|'[^'<>]*'|[^\s"'=<>`]+))?)*\s*\/?>/g
 
-    output += text.slice(index, openIndex)
-    const closeIndex = text.indexOf('>', openIndex + 1)
-    if (closeIndex < 0) {
-      break
-    }
-    output += ' '
-    index = closeIndex + 1
-  }
-  return output
+function stripRemainingHtmlTags(text: string): string {
+  return text.replace(REAL_TAG_FOR_SPEECH, ' ')
 }
 
 function stripHtmlItalicNarrationForSpeech(text: string): string {
@@ -351,37 +439,113 @@ function stripToolResultsSummarySections(text: string): string {
   return kept.join('\n')
 }
 
-function stripKnownControlTails(text: string): string {
-  // Registry-driven (SA-104 P1): every TTS-hidden control tag is stripped in
-  // both its closed form and its unclosed trailing form. The unclosed form is
-  // load-bearing — realtime TTS can see a message end mid-block, and without
-  // this the generic tag stripper would keep the payload text and speak it.
-  let output = text
-  for (const tag of ttsHiddenTagNames()) {
-    output = output
-      .replace(pairedBlockRegexGlobal(tag), '')
-      .replace(unclosedTailRegexGlobal(tag), '')
+const TTS_HIDDEN_TAG_IDS: ReadonlySet<ControlTagId> = new Set(
+  CONTROL_TAGS.filter((spec) => spec.hideFromTts).map((spec) => spec.id)
+)
+
+/**
+ * Every registered control block, as the registry's scanner reads a finished reply (BL-442): a
+ * complete block and a real block left open at the end are never spoken (the open one is
+ * load-bearing: realtime TTS can see a message end mid-block). An example in code and a tag named
+ * in a sentence are not blocks: they are spoken as code and words are.
+ */
+function stripControlBlocksForSpeech(text: string): string {
+  const blocks = findControlBlocks(text, { final: true }).filter((block) => TTS_HIDDEN_TAG_IDS.has(block.id))
+  return removeControlBlocks(text, blocks)
+}
+
+/**
+ * Bounded opening/closing patterns scan disjoint spans. With no closing match,
+ * no later opener can match either, so the unread tail needs no retry (BL-694).
+ * Thinking/mute retain their old permissive prefix plus first-`>` grammar.
+ */
+function stripClosedLegacySpeechBlocks(
+  text: string,
+  opening: RegExp,
+  closing: RegExp,
+  requireOpeningAngle = false
+): string {
+  const kept: string[] = []
+  let cursor = 0
+  let match: RegExpExecArray | null
+  while ((match = opening.exec(text))) {
+    let payloadStart = match.index + match[0].length
+    if (requireOpeningAngle) {
+      const angle = text.indexOf('>', payloadStart)
+      if (angle < 0) break
+      payloadStart = angle + 1
+    }
+    closing.lastIndex = payloadStart
+    const end = closing.exec(text)
+    if (!end) break
+    kept.push(text.slice(cursor, match.index))
+    cursor = end.index + end[0].length
+    opening.lastIndex = cursor
   }
+  if (cursor === 0) return text
+  kept.push(text.slice(cursor))
+  return kept.join('')
+}
+
+/** Legacy thinking/mute/tool-results blocks and notes key, not registered control tags. */
+export function stripLegacySpeechBlocks(text: string): string {
+  let output = stripClosedLegacySpeechBlocks(text, /<thinking/gi, /<\/thinking>/gi, true)
+  output = stripClosedLegacySpeechBlocks(output, /<mute/gi, /<\/mute>/gi, true)
+  output = stripClosedLegacySpeechBlocks(
+    output,
+    /<tool[-_ ]?results(?:[-_ ]?summary)?\b/gi,
+    /<\/tool[-_ ]?results(?:[-_ ]?summary)?>/gi
+  )
   return output
-    .replace(/<tool[-_ ]?results(?:[-_ ]?summary)?\b[\s\S]*?<\/tool[-_ ]?results(?:[-_ ]?summary)?>/gi, '')
     .replace(/<tool[-_ ]?results(?:[-_ ]?summary)?\b[\s\S]*$/gi, '')
-    .replace(/\btoolResultsSummary\b[\s\S]*$/i, '')
+    // A legacy notes payload's key, not the word in a sentence (BL-477).
+    .replace(/\btoolResultsSummary\b(?=["']?\s*:)[\s\S]*$/i, '')
+}
+
+/**
+ * Trap 2 (BL-442, BL-618): code is found on the text as written, before any pass removes its
+ * backticks, and the angle brackets inside it are set aside until the tag passes are done, so no
+ * tag pass reads code as a tag. "Put it in a `<script>` tag at the end" was spoken as "Put it in
+ * a": the Markdown pass removed the backticks, and the script pass then cut everything after the
+ * `<script>`. The brackets come back at the end; a tag written in code is spoken as its name.
+ */
+const CODE_LT = '\uF8F0'
+const CODE_GT = '\uF8F1'
+
+function setCodeBracketsAside(text: string): string {
+  if (!text.includes('<') && !text.includes('>')) return text
+  if (!text.includes('`') && !text.includes('~~~') && !/^(?: {4}|\t)/m.test(text)) return text
+  const regions = findCodeRegions(text)
+  if (regions.length === 0) return text
+  let output = ''
+  let cursor = 0
+  for (const region of regions) {
+    output += text.slice(cursor, region.start)
+    output += text.slice(region.start, region.end).replace(/</g, CODE_LT).replace(/>/g, CODE_GT)
+    cursor = region.end
+  }
+  return output + text.slice(cursor)
+}
+
+function restoreCodeBrackets(text: string): string {
+  if (!text.includes(CODE_LT) && !text.includes(CODE_GT)) return text
+  return text
+    .replace(new RegExp(`${CODE_LT}\\/?([A-Za-z][A-Za-z0-9:_-]*)[^${CODE_LT}${CODE_GT}]*${CODE_GT}`, 'g'), '$1')
+    .replace(new RegExp(CODE_LT, 'g'), '<')
+    .replace(new RegExp(CODE_GT, 'g'), '>')
 }
 
 export function extractSpeakableText(content: string, options: SpeakableTextOptions = {}): string {
   if (!content) return ''
 
-  let text = content
+  // The control blocks first, by the registry's scanner, which reads code itself and knows that a
+  // backtick inside a block's payload is payload. Code found BEFORE that would pair a lone
+  // backtick in one block with the next block and hide its tags from this step (review).
+  // Trap 2: then code is found before any other pass changes the text (`setCodeBracketsAside`).
+  let text = setCodeBracketsAside(stripControlBlocksForSpeech(content))
 
-  // Remove thinking blocks entirely (never read aloud).
-  text = text.replace(/<thinking[\s\S]*?>[\s\S]*?<\/thinking>/gi, '')
-
-  // Remove mute blocks entirely (never read aloud).
-  text = text.replace(/<mute[\s\S]*?>[\s\S]*?<\/mute>/gi, '')
-
-  // Remove every registered control tag (closed and unclosed trailing forms),
-  // including partial tails seen by realtime TTS.
-  text = stripKnownControlTails(text)
+  // Legacy thinking/mute/tool-results blocks (the registered controls went first, above).
+  text = stripLegacySpeechBlocks(text)
 
   // Remove Tool Results Summary blocks from speech; they remain visible app metadata in chat.
   text = stripToolResultsSummarySections(text)
@@ -398,8 +562,8 @@ export function extractSpeakableText(content: string, options: SpeakableTextOpti
   text = stripMarkdownForSpeech(text, options)
 
   // Remove zip references (new + legacy) so we never read `{{batshit-zip:...}}`.
-  text = text.replace(/\{\{batshit-zip:[^}]+\}\}/g, '')
-  text = text.replace(/\{\{batshit\|id:[^}]+\}\}/g, '')
+  text = replaceBracedTokens(text, '{{batshit-zip:', () => '')
+  text = replaceBracedTokens(text, '{{batshit|id:', () => '')
 
   // Remove script/style blocks entirely (avoid reading embedded JSON payloads).
   text = stripHtmlBlocksByTagName(text, 'script')
@@ -430,5 +594,5 @@ export function extractSpeakableText(content: string, options: SpeakableTextOpti
   // Normalize whitespace.
   text = text.replace(/\n{3,}/g, '\n\n').trim()
 
-  return text
+  return restoreCodeBrackets(text)
 }

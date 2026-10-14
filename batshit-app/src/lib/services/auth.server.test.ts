@@ -1,5 +1,21 @@
 import { describe, expect, it } from 'vitest'
-import { resolveAuthRedisUrl, resolveSessionCookieName } from './auth.server'
+import { resolveAuthRedisDatabase, resolveAuthRedisUrl, resolveSessionCookieName } from './auth.server'
+
+describe('resolveAuthRedisDatabase', () => {
+  it.each([
+    ['redis://127.0.0.1:6379', 0],
+    ['redis://127.0.0.1:6379/', 0],
+    ['redis://127.0.0.1:6379/0', 0],
+    ['redis://127.0.0.1:6379/15', 15],
+    ['rediss://fixture:synthetic-secret@redis.example:6380/3', 3]
+  ])('selects the database in %s explicitly', (url, database) => {
+    expect(resolveAuthRedisDatabase(url)).toBe(database)
+  })
+
+  it.each(['/oops', '/-1', '/1.5', '/15/other', '/9007199254740992'])('refuses malformed database %s', (suffix) => {
+    expect(() => resolveAuthRedisDatabase(`redis://127.0.0.1:6379${suffix}`)).toThrow('valid database number')
+  })
+})
 
 describe('resolveAuthRedisUrl', () => {
   it('uses REDIS_URL when present', () => {

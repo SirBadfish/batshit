@@ -20,7 +20,7 @@ Canonical terms:
 - Batshit-original concepts (little or no outside equivalent; teach from zero): Zips, Clips, Tool Grid, DCM (Dynamic Current Message), Schema Hints, Group Chat single-speaker queue, Execution Viewer, Artifact Zones, Goons/Goon Dock, Memory & Infinite Sessions (Awareness/STM/LTM lanes, episodes, naps, dreaming).
 - Do not use retired numbered primary-agent labels or describe n8n as a Primary Agent type.
 - Use Batshit in prose. All-caps brand spelling appears only inside literal env var names.
-- Zip buffer counts previous agent/assistant responses, not user messages or individual tool calls. `Off` never zips; `Normal` uses buffer/threshold; `Auto` zips immediately by default. Very large tool transcripts may stay compressed even inside the buffer to protect model request size.
+- Zip buffer counts previous agent/assistant responses, not user messages or individual tool calls. `Off` keeps output open below the 25,000-token Cool Tool size guard; `Normal` uses buffer/threshold; `Auto` zips immediately by default. A 10,000–24,999-token Cool Tool result compresses by default even inside the buffer but an explicit Hold or Off can open it. At 25,000 tokens it stays compressed in later model prompts under any setting.
 
 UserDocs information architecture:
 - Pages are grouped by subject/feature, not by document type. Each subject owns its own folder.

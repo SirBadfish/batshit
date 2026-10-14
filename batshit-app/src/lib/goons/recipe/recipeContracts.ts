@@ -5,6 +5,12 @@ import {
 import { RECIPE_MIGRATION_REPORT_CONTRACT } from "./contractIds";
 import { GOON_LIVE_BUILD_CONTRACT } from "./liveBuildContracts";
 import {
+  ANATOMY_FIT_RECIPE_SIBLING_ID,
+  ANATOMY_FIT_STATE_CONTRACT,
+  normalizeAnatomyFitState,
+  parseAnatomyFitState,
+} from "./anatomyFitSchema";
+import {
   parseRecipeSourceIdentity,
   type RecipeSourceIdentity,
 } from "./packageMetadata";
@@ -12,7 +18,6 @@ import {
   canonicalRecipeSha256,
   canonicalRecipeString,
 } from "./recipeCanonical";
-
 export const GOON_RECIPE_CONTRACT = "goon-recipe/v1" as const;
 export const GOON_RECIPE_AUTHORING_REVISION_CONTRACT =
   "goon-recipe-authoring-revision/v1" as const;
@@ -387,13 +392,34 @@ function parseSiblingState(
   if (contract === APPEARANCE_DIAL_VALUES_CONTRACT) {
     fail(`${context}.contract cannot duplicate the owned Appearance state`);
   }
-  const state = parseJsonValue(source.state, `${context}.state`);
-  if (state === null || Array.isArray(state) || typeof state !== "object") {
+  if (
+    ["sphericalEyelid", "clothingState", "clothing-state", "anatomyPresence", "anatomy-presence"].includes(source.id as string) ||
+    ["spherical-eyelid-state/v1", "clothing-state/v1", "anatomy-presence-state/v1"].includes(contract)
+  ) {
+    fail(`${context}.contract is unsupported in this public release`);
+  }
+  const parsedState = parseJsonValue(source.state, `${context}.state`);
+  if (parsedState === null || Array.isArray(parsedState) || typeof parsedState !== "object") {
     fail(`${context}.state must be an object`);
   }
+  let state: RecipeSiblingStateRecord["state"] = parsedState;
   const declaredStateContract = state.schemaVersion ?? state.contract;
   if (declaredStateContract !== contract) {
     fail(`${context}.state must declare the same versioned contract`);
+  }
+  if (contract === ANATOMY_FIT_STATE_CONTRACT) {
+    if (source.id !== ANATOMY_FIT_RECIPE_SIBLING_ID) {
+      fail(`${context}.id must identify the declared Anatomy Fit state`);
+    }
+    // Anatomy Fit owns a declared numeric precision. RedisJSON can emit an
+    // adjacent double even for already canonical values; apply that same
+    // schema before every enclosing state/revision hash. Other siblings keep
+    // their exact JSON values, and all claimed hashes remain unchanged.
+    const normalized = normalizeAnatomyFitState(state);
+    if (normalized.definitionSha256 !== source.definitionSha256) {
+      fail(`${context}.definitionSha256 must match its Anatomy Fit state`);
+    }
+    state = normalized;
   }
   return {
     id: stableId(source.id, `${context}.id`),
@@ -924,6 +950,9 @@ export async function verifyRecipeStateSnapshot(
 ): Promise<RecipeStateSnapshot> {
   const state = parseRecipeStateSnapshot(value);
   for (const sibling of state.siblings) {
+    if (sibling.contract === ANATOMY_FIT_STATE_CONTRACT) {
+      await parseAnatomyFitState(sibling.state);
+    }
     const actual = await recipeSiblingStateSha256(sibling.state);
     if (actual !== sibling.stateSha256) {
       throw new Error(

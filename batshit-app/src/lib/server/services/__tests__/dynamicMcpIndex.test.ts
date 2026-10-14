@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { CLI_TOOL_GRID_GROUP_NAME, CLI_TOOL_GRID_ID } from '$lib/utils/toolGridCli'
+import { isControlIdAllowedByList } from '$lib/utils/brokerAvailability'
 import {
   ARTIFACT_TOOL_GRID_GROUP_NAME,
   ARTIFACT_TOOL_GRID_ID,
@@ -135,9 +136,10 @@ describe('buildDynamicMcpIndex', () => {
     })
     listCliToolsMock.mockResolvedValue([])
     listVisibleControlsMock.mockResolvedValue([])
+    // BL-686: the index hands its caller's server-resolved list over as `cliToolScope`.
     resolveCliToolSelectionScopeMock.mockImplementation(
-      async ({ selectedToolIds }: { selectedToolIds?: string[] }) => ({
-        toolIds: Array.isArray(selectedToolIds) ? selectedToolIds : []
+      async ({ cliToolScope }: { cliToolScope?: string[] }) => ({
+        toolIds: Array.isArray(cliToolScope) ? cliToolScope : []
       })
     )
   })
@@ -306,8 +308,11 @@ describe('buildDynamicMcpIndex', () => {
       })
 
       // Two native helper controls are allowed by `sys.comfyui.*` plus fetch-zip, and one
-      // registry control, so the truthful count is four.
-      expect(result.text).toContain(`- ${FABRIC_TOOL_GRID_GROUP_NAME} (4 tools)`)
+      // registry control, so the truthful count is four. SA-072 P2 step 0: the line also
+      // names the families those four belong to.
+      expect(result.text.split('\n')).toContain(
+          `- ${FABRIC_TOOL_GRID_GROUP_NAME} (4 tools: ComfyUI, voice engines, zips)`
+        )
       expect(result.text).not.toContain('sys.voice.engine.enable')
       expect(result.text).toContain('tool_discovery')
     })
@@ -332,7 +337,7 @@ describe('buildDynamicMcpIndex', () => {
         }
       })
 
-      expect(result.text).toContain(`- ${FABRIC_TOOL_GRID_GROUP_NAME} (1 tool):`)
+      expect(result.text).toContain(`- ${FABRIC_TOOL_GRID_GROUP_NAME} (1 tool: zips):`)
       expect(result.text).toContain('  - sys.zip.fetch — Fetch Zip — zipId (required)')
     })
 
@@ -372,7 +377,7 @@ describe('buildDynamicMcpIndex', () => {
         brokerToggles: { ...ALL_BROKER_OFF, batshitToolsEnabled: true },
         allowFabricControlTools: false
       })
-      expect(withMemory.text).toContain(`- ${FABRIC_TOOL_GRID_GROUP_NAME} (3 tools)`)
+      expect(withMemory.text).toContain(`- ${FABRIC_TOOL_GRID_GROUP_NAME} (3 tools: memory)`)
 
       const memoryCall = listVisibleControlsMock.mock.calls.find((call: any[]) =>
         call[0]?.allowedControlIds?.includes('sys.memory.*')
@@ -424,6 +429,132 @@ describe('buildDynamicMcpIndex', () => {
       expect(result.text).toContain('- HuggingFace (3 tools)')
       expect(result.text).toContain(FABRIC_TOOL_GRID_GROUP_NAME)
       expect(result.text).toContain(`- ${ARTIFACT_TOOL_GRID_GROUP_NAME} (1 tool):`)
+    })
+
+    describe('SA-072 P2 step 0: the Fabric line names the families the agent can reach', () => {
+      // The registry is mocked, so the mock applies the allowlist the index hands it with the
+      // real matcher: what the index names must follow what the agent is allowed to reach.
+      const REGISTRY = [
+        fabricControl('sys.artifact.create', 'Create artifact'),
+        { ...fabricControl('artifact.art_1.field.model.set', 'Poster: model'), artifactId: 'art_1' },
+        fabricControl('sys.cli_tool.search', 'CLI tool search'),
+        fabricControl('sys.dm.send', 'Send DM'),
+        fabricControl('sys.memory.save', 'Memory Save'),
+        fabricControl('sys.pinokio.run', 'Pinokio Run'),
+        fabricControl('sys.pinokio.status', 'Pinokio Status'),
+        fabricControl('sys.runtime_addon.start', 'Start runtime add-on')
+      ]
+
+      beforeEach(() => {
+        listVisibleControlsMock.mockImplementation(async ({ allowedControlIds }: any) =>
+          allowedControlIds?.includes('use.artifact.*')
+            ? []
+            : REGISTRY.filter((control) =>
+                isControlIdAllowedByList(control.controlId, allowedControlIds)
+              )
+        )
+      })
+
+      it('names each reachable family once, in a fixed order, with Pinokio among them', async () => {
+        const result = await buildDynamicMcpIndex({
+          userId: 'josh',
+          runtime: 'api',
+          brokerToggles: { ...ALL_BROKER_OFF, batshitToolsEnabled: true },
+          memoryControlsEnabled: true,
+          dmControlsEnabled: false,
+          judgeControlsEnabled: false
+        })
+
+        // Two ComfyUI helpers + seven registry controls (the DM one is not allowed). The two
+        // artifact ids share one word, and so do the two Pinokio ids.
+        expect(result.text.split('\n')).toContain(
+          `- ${FABRIC_TOOL_GRID_GROUP_NAME} (9 tools: artifacts, CLI tools, ComfyUI, memory, Pinokio, runtime add-ons)`
+        )
+        expect(result.groups.find((group) => group.name === FABRIC_TOOL_GRID_GROUP_NAME)?.families)
+          .toEqual(['artifacts', 'CLI tools', 'ComfyUI', 'memory', 'Pinokio', 'runtime add-ons'])
+        expect(result.text).not.toContain('agent DMs')
+      })
+
+      it('gives a Subagent-shaped scope no Pinokio, because it cannot reach a Pinokio control', async () => {
+        const result = await buildDynamicMcpIndex({
+          userId: 'josh',
+          runtime: 'api',
+          brokerToggles: { ...ALL_BROKER_OFF, fetchZipEnabled: true, batshitToolsEnabled: true },
+          allowFabricControlTools: false,
+          memoryControlsEnabled: false,
+          dmControlsEnabled: false,
+          scheduleControlsEnabled: false,
+          judgeControlsEnabled: false
+        })
+
+        expect(result.text.split('\n')).toContain(
+          `- ${FABRIC_TOOL_GRID_GROUP_NAME} (1 tool: zips)`
+        )
+        expect(result.text).not.toContain('Pinokio')
+      })
+
+      it('drops a family whose only controls the agent hid, and keeps the count in step', async () => {
+        const result = await buildDynamicMcpIndex({
+          userId: 'josh',
+          runtime: 'api',
+          brokerToggles: { ...ALL_BROKER_OFF, batshitToolsEnabled: true },
+          memoryControlsEnabled: false,
+          dmControlsEnabled: false,
+          judgeControlsEnabled: false,
+          dcmDisplaySettings: {
+            version: 1,
+            groups: {},
+            tools: {
+              [buildCompositeKey(FABRIC_TOOL_GRID_ID, 'sys.pinokio.run')]: 'hidden',
+              [buildCompositeKey(FABRIC_TOOL_GRID_ID, 'sys.pinokio.status')]: 'hidden'
+            }
+          }
+        })
+
+        expect(result.text.split('\n')).toContain(
+          `- ${FABRIC_TOOL_GRID_GROUP_NAME} (6 tools: artifacts, CLI tools, ComfyUI, runtime add-ons)`
+        )
+        expect(result.text).not.toContain('Pinokio')
+      })
+
+      it('prints an unmapped family as its raw id segment rather than hiding it', async () => {
+        listVisibleControlsMock.mockImplementation(async ({ allowedControlIds }: any) =>
+          allowedControlIds?.includes('use.artifact.*')
+            ? []
+            : [fabricControl('sys.zz_future_family.do', 'A family added later')]
+        )
+
+        const result = await buildDynamicMcpIndex({
+          userId: 'josh',
+          runtime: 'api',
+          brokerToggles: { ...ALL_BROKER_OFF, batshitToolsEnabled: true }
+        })
+
+        expect(result.text.split('\n')).toContain(
+          `- ${FABRIC_TOOL_GRID_GROUP_NAME} (3 tools: ComfyUI, zz_future_family)`
+        )
+      })
+
+      it('prints the same bytes whatever order the registry returns its controls in', async () => {
+        const build = () =>
+          buildDynamicMcpIndex({
+            userId: 'josh',
+            runtime: 'api',
+            brokerToggles: { ...ALL_BROKER_OFF, batshitToolsEnabled: true },
+            memoryControlsEnabled: true
+          })
+        const forward = await build()
+        listVisibleControlsMock.mockImplementation(async ({ allowedControlIds }: any) =>
+          allowedControlIds?.includes('use.artifact.*')
+            ? []
+            : [...REGISTRY]
+                .reverse()
+                .filter((control) => isControlIdAllowedByList(control.controlId, allowedControlIds))
+        )
+        const reversed = await build()
+
+        expect(reversed.text).toBe(forward.text)
+      })
     })
 
     it('emits no text at all when every family is empty', async () => {

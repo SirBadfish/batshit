@@ -1,3 +1,4 @@
+import { saveClipRecord } from '$lib/server/services/clipPersistence.server'
 import type { ClipRow } from '$lib/types/database'
 import { redis } from '$lib/server/redis'
 
@@ -22,7 +23,7 @@ async function ensureTextContent(
     content,
     localTokens: clip.localTokens ?? Math.ceil(content.length / 4)
   }
-  await redis.set(redisKey, updated)
+  await saveClipRecord(redisKey, updated)
   return updated
 }
 

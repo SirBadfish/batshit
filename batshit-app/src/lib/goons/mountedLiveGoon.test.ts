@@ -75,10 +75,15 @@ const animationFiles: GoonFileRef[] = [
 ]
 
 function createEngineHarness() {
+  const goonLoadToken = 7
   const calls = {
     init: vi.fn().mockResolvedValue(undefined),
     setCameraFov: vi.fn(),
+    beginGoonLoad: vi.fn(() => goonLoadToken),
+    isCurrentGoonLoad: vi.fn((token: number) => token === goonLoadToken),
+    finishGoonLoad: vi.fn((_token: number) => undefined),
     loadGoon: vi.fn().mockResolvedValue(undefined),
+    loadCustomGoonPrepared: vi.fn().mockResolvedValue('loaded'),
     setMood: vi.fn(),
     applyCamera: vi.fn(),
     setDefaultCamera: vi.fn(),
@@ -109,7 +114,11 @@ function createEngineHarness() {
     setSceneMarkers: vi.fn(),
     setSceneAmbience: vi.fn()
   }
-  return { calls, engine: calls as unknown as GoonEngine }
+  return {
+    calls,
+    engine: calls as unknown as GoonEngine,
+    goonLoadToken
+  }
 }
 
 describe('mounted Live Goon planning', () => {
@@ -174,7 +183,7 @@ describe('mounted Live Goon planning', () => {
 
 describe('mounted Live Goon loading', () => {
   it('loads the canonical avatar/camera/mood/animation/outfit path while skipping every scene call in scene-free mode', async () => {
-    const { engine, calls } = createEngineHarness()
+    const { engine, calls, goonLoadToken } = createEngineHarness()
     const plan = buildMountedLiveGoonLoadPlan(baseGoon, {
       goonsSettings,
       animationFiles,
@@ -185,7 +194,7 @@ describe('mounted Live Goon loading', () => {
     const result = await loadMountedLiveGoon(engine, plan)
 
     expect(calls.init).toHaveBeenCalledOnce()
-    expect(calls.loadGoon).toHaveBeenCalledWith('/goons/mounted-live.vrm', null)
+    expect(calls.loadGoon).toHaveBeenCalledWith('/goons/mounted-live.vrm', null, goonLoadToken)
     expect(calls.setMood).toHaveBeenCalledWith('calm', plan.baseLoopDefinition)
     expect(calls.applyCamera).toHaveBeenCalledWith(baseGoon.camera)
     expect(calls.setDefaultCamera).toHaveBeenCalledWith(baseGoon.camera)
@@ -198,8 +207,37 @@ describe('mounted Live Goon loading', () => {
     expect(calls.setPostureDefinitions).not.toHaveBeenCalled()
     expect(calls.setSkyboxBackground).not.toHaveBeenCalled()
     expect(calls.setRoomShell).not.toHaveBeenCalled()
+    expect(result.status).toBe('loaded')
+    if (result.status !== 'loaded') throw new Error('Expected mounted Goon to load')
     expect(result.sceneSignature).toBe('none')
     expect(result.viewFov).toBe(42)
+  })
+
+  it('does not publish scene, mood, camera, or animation state after avatar loading is cancelled', async () => {
+    const { engine, calls } = createEngineHarness()
+    calls.loadGoon.mockImplementation(async () => {
+      calls.isCurrentGoonLoad.mockReturnValue(false)
+    })
+    const plan = buildMountedLiveGoonLoadPlan(baseGoon, {
+      goonsSettings,
+      animationFiles,
+      sceneMode: 'saved'
+    })
+
+    const result = await loadMountedLiveGoon(engine, plan)
+
+    expect(result).toEqual({ status: 'cancelled', kind: 'vrm' })
+    expect(calls.setCameraFov).not.toHaveBeenCalled()
+    expect(calls.setPostureDefinitions).not.toHaveBeenCalled()
+    expect(calls.setGroundProjectionLine).not.toHaveBeenCalled()
+    expect(calls.setSkyboxBackground).not.toHaveBeenCalled()
+    expect(calls.setSceneProps).not.toHaveBeenCalled()
+    expect(calls.setMood).not.toHaveBeenCalled()
+    expect(calls.applyCamera).not.toHaveBeenCalled()
+    expect(calls.setDefaultCamera).not.toHaveBeenCalled()
+    expect(calls.resetCamera).not.toHaveBeenCalled()
+    expect(calls.syncAnimations).not.toHaveBeenCalled()
+    expect(calls.setGoonVisible).not.toHaveBeenCalled()
   })
 
   it('applies the saved Dock scene through the same loader when requested', async () => {
@@ -214,7 +252,7 @@ describe('mounted Live Goon loading', () => {
 
     expect(calls.setPostureDefinitions).toHaveBeenCalledWith({})
     expect(calls.setGroundProjectionLine).toHaveBeenCalledWith(0.72)
-    expect(calls.setSkyboxBackground).toHaveBeenCalledWith(null)
+    expect(calls.setSkyboxBackground).toHaveBeenCalledWith(null, { mimeType: undefined })
     expect(calls.setSceneProps).toHaveBeenCalledWith([])
   })
 

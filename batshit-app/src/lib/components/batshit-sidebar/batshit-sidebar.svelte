@@ -18,8 +18,15 @@ import SettingsPanel from '$lib/components/settings/SettingsPanel.svelte';
 import { resolveSessionStoredAgentId } from '$lib/components/agents/sessionTargetSync';
 import { evaluateActiveChatCapacity } from '$lib/utils/activeChatCapacity';
 import { startUserChannel } from '$lib/services/userChannel';
-	
+import { getUserSettings } from '$lib/stores/userSettings.svelte';
+
 	const { data } = $props();
+
+	// BL-485: the footer used the layout's page-LOAD `data.userSettings`, which never
+	// refreshes after a Settings > User save, so a rename/avatar change looked like it had
+	// failed until a full reload. The live settings store (updated on save, `ChatMessage.svelte`
+	// uses the same `?? page-load copy` pattern) takes over the moment it is seeded.
+	const liveUserSettings = $derived(getUserSettings() ?? data?.userSettings);
 	
 	type SettingsTab =
 		| 'user'
@@ -364,9 +371,11 @@ function handleUiSettingsClick() {
 		min-width: 0;
 	}
 
+	/* Josh's solid bat #2 (MP-00b), a vector so it stays sharp on Retina screens; 20 px tall, the
+	   bat's size in the website headers. The collapsed rail narrows it to fit. */
 	.batshit-logo {
-		width: 36px;
-		height: 18px;
+		width: auto;
+		height: 20px;
 		object-fit: contain;
 		flex-shrink: 0;
 	}
@@ -560,9 +569,11 @@ function handleUiSettingsClick() {
 			<!-- Batshit Icon -->
 			<div class="main-sidebar-logo-cell">
 				<img
-					src="/batshit-logo-small.png"
+					src="/batshit-logo-small.svg"
 					alt="Batshit"
 					class="batshit-logo"
+					width="41"
+					height="20"
 				/>
 			</div>
 			
@@ -718,16 +729,16 @@ function handleUiSettingsClick() {
 				data-ab-control="open-user-settings"
 			>
 				<EntityAvatar
-					avatarUrl={data?.userSettings?.avatar_url || (data?.userSettings?.avatar_icon_ref ? null : '/assets/batshit_default_User_Avatar.png')}
-					iconRef={data?.userSettings?.avatar_icon_ref ?? null}
-					iconFit={data?.userSettings?.avatar_icon_fit ?? 'fill'}
-					label={data?.userSettings?.displayName || data?.user?.email || 'User'}
-					fallback={data?.userSettings?.displayName || data?.user?.email || 'User'}
+					avatarUrl={liveUserSettings?.avatar_url || (liveUserSettings?.avatar_icon_ref ? null : '/assets/batshit_default_User_Avatar.png')}
+					iconRef={liveUserSettings?.avatar_icon_ref ?? null}
+					iconFit={liveUserSettings?.avatar_icon_fit ?? 'fill'}
+					label={liveUserSettings?.displayName || data?.user?.email || 'User'}
+					fallback={liveUserSettings?.displayName || data?.user?.email || 'User'}
 					class="main-sidebar-user-avatar main-sidebar-user-fallback"
 					iconClass="text-primary-foreground"
 				/>
 				<span class="main-sidebar-user-label">
-					{data?.userSettings?.displayName || data?.user?.email || 'User'}
+					{liveUserSettings?.displayName || data?.user?.email || 'User'}
 				</span>
 			</button>
 			<Button 

@@ -135,7 +135,7 @@
   }
 
   .chat-slash-source-dot.is-batshit {
-    background: var(--primary);
+    background: var(--primary-text);
   }
 
   .chat-autocomplete-copy {

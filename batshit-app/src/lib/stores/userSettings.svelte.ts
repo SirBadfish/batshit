@@ -5,7 +5,7 @@ import type { AvatarIconFit, IconRef } from '$lib/icons/iconTypes'
 import type { GlobalAutoCompactSettings } from '$lib/utils/contextCompaction'
 import type { GlobalChatSettings } from '$lib/utils/steerControl'
 
-interface UserSettings {
+export interface UserSettings {
   displayName?: string
   avatar_url?: string | null
   avatar_icon_ref?: IconRef | null
@@ -77,6 +77,40 @@ interface UserSettings {
 
 // Create a state for user settings using Svelte 5 $state rune
 let userSettingsStore = $state<UserSettings | null>(null)
+export type UserSettingsReadState = 'unread' | 'confirmed' | 'failed'
+let userSettingsReadState = $state<UserSettingsReadState>('unread')
+let userSettingsReadError = $state<string | null>(null)
+
+export function getUserSettingsReadState(): UserSettingsReadState {
+  return userSettingsReadState
+}
+
+export function getUserSettingsReadError(): string | null {
+  return userSettingsReadError
+}
+
+/** Only a successful server read/save answer establishes a writable settings baseline. */
+export function confirmUserSettings(settings: UserSettings | null) {
+  if (settings !== null && (typeof settings !== 'object' || Array.isArray(settings))) {
+    throw new Error('Settings response did not include a valid user settings record')
+  }
+  userSettingsStore = settings ?? {}
+  userSettingsReadState = 'confirmed'
+  userSettingsReadError = null
+}
+
+/** A failed refresh cannot discard a previously confirmed copy. */
+export function failUserSettingsRead(error: unknown) {
+  if (userSettingsReadState !== 'confirmed') userSettingsReadState = 'failed'
+  userSettingsReadError = error instanceof Error && error.message
+    ? error.message : 'User settings could not load'
+}
+
+export function resetUserSettings() {
+  userSettingsStore = null
+  userSettingsReadState = 'unread'
+  userSettingsReadError = null
+}
 
 // Helper function to update specific settings
 export function updateUserSettings(updates: Partial<UserSettings>) {

@@ -3,6 +3,29 @@ import { describe, expect, it } from 'vitest'
 import { buildDelegatedExecutionSummary } from '../delegatedRunAccounting'
 
 describe('buildDelegatedExecutionSummary', () => {
+  it('keeps returned Codex observations separate from known sibling usage and deduplicates results', () => {
+    const observedUsage = { completeness: 'partial', parts: [{ source: 'codex-app-server-progress', counts: { inputTokens: 100, outputTokens: 0 } }] }
+    const failed = { toolCallId: 'failed-codex', toolOutput: { kind: 'subagent', status: 'failed', subagentType: 'cli', provider: 'openai-codex', usage: { inputTokens: 100, outputTokens: 0 }, observedUsage } }
+    const known = { toolCallId: 'known', toolOutput: { kind: 'subagent', status: 'completed', provider: 'openai', usage: { inputTokens: 20, outputTokens: 2, totalTokens: 22 } } }
+    const summary = buildDelegatedExecutionSummary([failed, known, failed])!
+    expect(summary.runs).toHaveLength(2)
+    expect(summary.runs[0]).toMatchObject({ status: 'failed', usage: null, observedUsage })
+    expect(summary.runs[1].usage).toMatchObject({ inputTokens: 20, outputTokens: 2, totalTokens: 22 })
+    expect(summary.totals).toMatchObject({ runs: 2, failed: 1, completed: 1, usageKnownRuns: 1, usageUnknownRuns: 1, usage: { totalTokens: 22 } })
+  })
+
+  it('retains malformed child rows visibly while conserving valid Worker siblings', () => {
+    const summary = buildDelegatedExecutionSummary([{ toolCallId: 'batch', toolOutput: { kind: 'workers', workers: [
+      { name: 'Malformed', status: 'timed_out', usage: { totalTokens: 999 }, observedUsage: { completeness: 'partial', parts: [null] } },
+      { name: 'Observed zero', status: 'failed', usage: null, observedUsage: { completeness: 'partial', parts: [{ source: 'codex-app-server-progress', counts: { outputTokens: 0 } }] } },
+      { name: 'Known', status: 'completed', usage: { totalTokens: 22 } },
+    ] } }])!
+    expect(summary.runs).toHaveLength(3)
+    expect(summary.runs[0]).toMatchObject({ name: 'Malformed', status: 'timed_out', usage: null, observedUsageUnavailable: 'invalid' })
+    expect(summary.runs[1]).toMatchObject({ name: 'Observed zero', usage: null, observedUsage: { parts: [{ counts: { outputTokens: 0 } }] } })
+    expect(summary.runs[2]).toMatchObject({ name: 'Known', usage: { totalTokens: 22 } })
+    expect(summary.totals).toMatchObject({ usageKnownRuns: 1, usageUnknownRuns: 2, usage: { totalTokens: 22 } })
+  })
   it('normalizes direct API Subagent results and preserves unknown values honestly', () => {
     const summary = buildDelegatedExecutionSummary([
       {

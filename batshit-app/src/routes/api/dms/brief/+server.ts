@@ -9,7 +9,7 @@ import { readUntrustedTextScreen, type UntrustedTextScreenView, type WakeOrigin 
 /**
  * SA-120 P7 — a chat page's short read of some DMs, keyed by DM id: who wrote each one (the
  * origin line on an approval card in a woken turn), its subject and the start of its body (the
- * quote on the Jev Juice notice card), and what the incoming-text screen said about it, if
+ * quote on the Judge Juice notice card), and what the incoming-text screen said about it, if
  * anything may be drawn.
  *
  * READ ONLY, and deliberately the BROWSER's read. The notice card and the origin line are put

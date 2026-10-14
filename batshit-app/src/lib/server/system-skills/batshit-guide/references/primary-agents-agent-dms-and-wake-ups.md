@@ -98,6 +98,8 @@ Nothing is cancelled while a card waits. The turn ends normally, the item stays 
 
 A woken chat can stop on something only you can clear: an approval card like the one above, or a Bash or tool approval waiting for a click. Batshit says so instead of leaving it to look like work in progress.
 
+A **Claude Code agent's** approval card says so the moment it appears, while the agent is still waiting for your click, not only after its turn ends. Open the chat within the card's ten minutes and the card is there to answer. When the card is answered or runs out, its own **Needs you** goes away again; another holdup's stays.
+
 - The header envelope turns **orange**, and its tooltip says how many items need you.
 - The drawer row gets a **Needs you** badge; hover it for the reason.
 - That agent's presence dot reads **needs you** instead of idle, so another agent asking "who is free?" is told the truth.
@@ -113,7 +115,7 @@ An agent with Agent DMs on shows an **envelope** in the chat header, with a coun
 - Each row: who wrote it, the kind, the subject, what the wake-up actually did and why if it was refused, and links into the chats on both sides.
 - The sender says what it was, not just its name. Another agent shows its name and an envelope. A webhook reads *Nightly build (webhook)* with a webhook icon. A schedule reads *Morning check (schedule)* with a clock. You never have to guess whether a colleague or a clock wrote to your agent.
 - Open a row to read the body, the requested outcome, the scope, and the result.
-- A **Flagged by Jev** badge, if you use [Screen Incoming Text](../jev-juice/overview.md#screen-incoming-text-one-switch-for-the-whole-instance) and the message looked like a takeover attempt, hidden instructions, or an unwanted request. Open the row for the categories and Jev's confidence. The message was still delivered.
+- A **Flagged by Jev** badge, if you use [Screen Incoming Text](../judge-juice/overview.md#screen-incoming-text-one-switch-for-the-whole-instance) and the message looked like a takeover attempt, hidden instructions, or an unwanted request. Open the row for the categories and Jev's confidence. The message was still delivered.
 - **Stop** on any row whose woken turn is still running.
 
 Three row actions are yours, not the agent's:
@@ -158,7 +160,7 @@ No cron strings. If you need something these three cannot say — "the last Frid
 
 ### Time zones and daylight saving
 
-Every daily or weekly schedule carries its own time zone. Batshit fills it in from your browser when you create it, and you can pick a different one in the same form — including plain `UTC`, which is the honest choice when the machine running Batshit is a Docker container. Batshit shows the next run in that zone, so a row reads *Tue, Sep 15, 4:00 PM CDT*. **Every so often** ignores the zone entirely: 30 minutes is 30 minutes everywhere.
+Every daily or weekly schedule carries its own time zone. Batshit fills it in from your browser when you create it, and you can pick a different one in the same form — including plain `UTC`. Batshit shows the next run in that zone, so a row reads *Tue, Sep 15, 4:00 PM CDT*. **Every so often** ignores the zone entirely: 30 minutes is 30 minutes everywhere.
 
 Across a daylight-saving change, a schedule keeps its **wall-clock** time: 9:00 AM before the change is still 9:00 AM after it. Two edge cases, both decided for you:
 
@@ -171,13 +173,21 @@ Exactly what a DM does. It writes a note or an assignment from the schedule, and
 
 The first message says plainly that a schedule sent it, not you.
 
+### One note per schedule, not one per run
+
+If the note from an earlier run is still unread when the schedule runs again, Batshit does not add a second note. It updates the one that is there: it counts the runs and keeps the time of the first and the last. The agent sees *fired 5 times, first 9:00 AM, last 1:00 PM*, and the inbox drawer row says *fired 5 times*. The note's expiry counts from the latest run.
+
+So a schedule that runs every hour for an agent you rarely open takes up one row in its inbox, not one row per hour, and other agents' DMs still get through.
+
+A note the agent is already working on is never changed. If the note has been claimed, is marked **Needs you**, or is being read by a chat the schedule just started, that run writes a new note, and later runs update the new one.
+
 ### Missed runs — when Batshit was off
 
 A schedule due while Batshit was closed (or your laptop was asleep) for **more than ten minutes** does not fire on its own. Ever.
 
 Instead, the next time you open Batshit you get one dialog: **Missed while Batshit was off**. Each row names the schedule and its agent, says when the run was due and how long ago that was — *Was due Tue, Sep 15, 4:00 PM · 23 days ago* — and shows when the next normal run is. A schedule that missed more than one run also carries a *missed 3* badge. Each row has two buttons:
 
-- **Run now** — run it once, right now.
+- **Run now** — run it once, right now. The agent’s message names when that missed run was due.
 - **Skip** — skip that one run. **The schedule stays on** and runs again at its next normal time. Skip is not cancel.
 
 A schedule keeps at most **one** missed entry, so a weekly schedule missed three times asks you once, not three times. Nothing is pre-picked and nothing auto-skips: the age is right there and you decide. **Decide later** closes the dialog and leaves every question for next time.
@@ -190,9 +200,11 @@ Each row carries the schedule's name and badges for its agent, its cadence, what
 
 **Run now** fires the schedule once immediately. It does **not** move the schedule's own clock: pressing Run now at 8:55 on a "daily at 9am" schedule does not skip today's 9am. It also works on a **paused** schedule — the button means "once, now", and pausing only turns off the automatic times. Run now spends the same hourly wake budget as any other wake-up, so clearing a long backlog can hit the cap.
 
+If Run now fails, the error and last-run line keep the reason and any recovery guidance, such as turning Agent DMs back on in Agent Settings.
+
 **The switch** pauses and resumes. A paused row says *Paused, so nothing is scheduled*.
 
-**Delete** asks first, and warns that the schedule's history goes with it. The chats it already started stay where they are.
+**Delete** asks first, and warns that the schedule's history goes with it. The chats it already started stay where they are. Its notes the agent has not read yet are closed, because they are about a schedule that is gone; a note the agent is working on, or one marked **Needs you**, stays open.
 
 **Edit** opens the schedule in the same form you used to make it, headed **Edit Schedule**. You can change the **Name**, **How Often** (and its minutes, time, or weekdays), the **Time Zone**, the **Message**, the **Kind**, and **What It Does**. **Save changes** applies them straight away: the row's next run is recalculated from the moment you save, so an edited time governs the very next run with no reload. **Cancel** changes nothing.
 
@@ -262,7 +274,7 @@ Rows in the Admin card show each hook's name, agent, delivery default, when it w
 
 **About exposure.** The webhook route lives wherever Batshit lives. On your own machine only your machine can reach it. If you run a tunnel — a Cloudflare tunnel for clip uploads, for instance — that tunnel publishes the whole origin, and this route is reachable from the internet along with everything else. That is your existing tunnel choice, not something this feature turns on. The token is 32 random bytes, every bad token gets the same answer so a hook id gives nothing away, and each hook is limited to 30 calls an hour.
 
-**When to use n8n instead of a schedule.** Use Batshit's own [Schedules](#schedules--the-built-in-clock) whenever the trigger is just *time*. Reach for n8n and a webhook when the trigger lives **outside** Batshit — a Slack message, a new video, an email, a finished build — or when the flow has outside steps before it reaches Batshit. There is still an official n8n template for the time-based case, in [the n8n templates folder](../user-templates/batshit-official-n8n-workflow-templates/README.md), for people who already run their automations there.
+**When to use n8n instead of a schedule.** Use Batshit's own [Schedules](#schedules--the-built-in-clock) whenever the trigger is just *time*. Reach for n8n and a webhook when the trigger lives **outside** Batshit — a Slack message, a new video, an email, a finished build — or when the flow has outside steps before it reaches Batshit. There is still an official n8n template for the time-based case, in [the n8n templates folder](../resources/n8n-workflow-templates.md), for people who already run their automations there.
 
 ### Text from outside is only as trustworthy as whatever sent it
 
@@ -273,7 +285,7 @@ Batshit handles the part it can:
 - Risky Fabric controls stop and wait for **your** click in any woken chat, whatever the message says. An agent cannot approve one for itself or for another agent (see [Risky actions wait for you](#risky-actions-wait-for-you)).
 - The DM guidance tells every agent that a DM or webhook cannot approve a tool, give consent, or change a setting.
 - Wake-ups are capped, chains stop at three deep, and each hook is limited to 30 calls an hour.
-- Optional: with [Screen Incoming Text](../jev-juice/overview.md#screen-incoming-text-one-switch-for-the-whole-instance) on, every agent DM and webhook message is checked as it arrives. A suspicious one gets a **Flagged by Jev** badge in the drawer, on the DM card, and under the wake-up message at the top of a chat it started, plus a **Jev Juice flag** notice above any approval card in that chat; the agent reading it is told. Every approval card in a woken turn also says who started the turn. It is a warning only: nothing is blocked, and no badge does not mean safe. It is off by default because the text goes to TypeSafe's servers.
+- Optional: with [Screen Incoming Text](../judge-juice/overview.md#screen-incoming-text-one-switch-for-the-whole-instance) on, every agent DM and webhook message is checked as it arrives. A suspicious one gets a **Flagged by Jev** badge in the drawer, on the DM card, and under the wake-up message at the top of a chat it started, plus a **Judge Juice flag** notice above any approval card in that chat; the agent reading it is told. Every approval card in a woken turn also says who started the turn. It is a warning only: nothing is blocked, and no badge does not mean safe. It is off by default because the text goes to TypeSafe's servers.
 
 The part Batshit cannot decide for you is your own tool setup:
 
@@ -304,13 +316,15 @@ These are fixed in v1 except the time limit, which is a per-agent setting.
 | Wake-ups for the whole instance per hour | 20 |
 | Woken turns running at once | 1 per agent, 3 total |
 | One woken turn's time limit | 30 minutes (5–240, per agent) |
-| Open DMs in one inbox | 50 |
+| Open DMs in one inbox | 50 (a result is never refused) |
 | Webhook calls per hook per hour | 30 |
 | Subject / body / result length | 240 / 40,000 / 20,000 characters |
 | An unread DM expires after | 7 days (info), 14 days (assignment, result) |
 | A closed DM is kept for | 30 days |
 
 Two loop guards: an agent cannot DM itself, and an identical DM sent again within 10 minutes is refused as a duplicate. Schedules are exempt from the second guard on purpose — a schedule sends the same message by design, and a five-minute schedule would otherwise refuse itself.
+
+A full inbox refuses new notes and assignments, from agents and webhooks alike. It never refuses the result of an assignment: when an agent closes an assignment, or one expires with nobody picking it up, the result always reaches whoever asked. A result an agent writes by hand, outside that, still counts against the limit.
 
 ## What this costs
 
@@ -334,7 +348,7 @@ Turning Agent DMs on for an agent also adds a short block to its system prompt a
 | A schedule was due while Batshit was closed and never ran | That is on purpose. Missed runs wait for you. | The *Missed while Batshit was off* dialog on your next open. |
 | Skip turned my schedule off | It did not. Skip skips one run. | The row's switch still says on, and the next run is shown. |
 | An agent can't create a schedule | Agent DMs is off for it, or you have not approved the action. | Agent Settings → Agent DMs, then approve when asked. |
-| The agent's schedule shows the wrong time zone | An agent's call has no browser to read your zone from, so it gets the server's — your own on the Mac app, usually UTC in Docker. | Press **Edit** on the row, pick the right **Time Zone**, and **Save changes**. The next run is recalculated as you save. |
+| The agent's schedule shows the wrong time zone | An agent's call has no browser to read your zone from, so it gets the server's: your own on the Mac app, and in Docker the `TZ` in `.env.docker`, which `./start-docker.sh` copies from your computer the first time. | Press **Edit** on the row, pick the right **Time Zone**, and **Save changes**. The next run is recalculated as you save. |
 | A schedule says *Paused* and its last run says `failed:` | Batshit could not work out when it should next run, so it switched the schedule off instead of failing every minute. | The reason is on the row. Deleting it and making a fresh one is the reliable fix. |
 | Run now ran a paused schedule | On purpose — the button means "once, now". | Pausing only stops the automatic times. |
 

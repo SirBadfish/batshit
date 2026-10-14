@@ -1,4 +1,6 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
+import { toolTextBudgetHeaders } from '$lib/server/services/toolTextBudget'
+import { commandModelCaptureResponse } from '$lib/server/services/commandModelCaptureResponse'
 import { apiFailure } from '$lib/server/services/apiResponses'
 
 import { redis } from '$lib/server/redis'
@@ -18,6 +20,8 @@ type SkillRuntimeRequest = {
   action?: SkillRuntimeAction
   path?: string
   maxChars?: number
+  /** `read`: where the window starts, in characters (find 1). */
+  offset?: number
 }
 
 type ResolvedAuth = NonNullable<Awaited<ReturnType<typeof resolveNativeToolUser>>>
@@ -120,16 +124,22 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       actor: actor.actor,
       action: body.action,
       path: typeof body.path === 'string' ? body.path : undefined,
-      maxChars: typeof body.maxChars === 'number' ? body.maxChars : undefined
+      maxChars: typeof body.maxChars === 'number' ? body.maxChars : undefined,
+      // Passed through as sent, so a malformed offset is refused by the service, not dropped.
+      ...(body.offset !== undefined ? { offset: body.offset } : {})
     })
 
-    return json(
+    return commandModelCaptureResponse(
       {
         auth: auth.auth,
         userId: auth.userId,
         ...result
       },
-      { status: statusForSkillRuntimeResult(result) }
+      auth.auth === 'agent', statusForSkillRuntimeResult(result), {
+        ...toolTextBudgetHeaders(auth),
+        ...(auth.auth === 'agent' && result.success && body.action === 'read'
+          ? { 'x-batshit-tool-page-kind': 'skill-read' } : {})
+      }
     )
   } catch (error) {
     console.error('[Skills Runtime] failed:', error)

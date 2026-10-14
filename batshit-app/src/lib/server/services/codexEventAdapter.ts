@@ -6,18 +6,17 @@ import type {
   ThreadItem,
   Usage,
 } from "$lib/types/codexProtocol";
+import type { ObservedUsage } from "$lib/types/executionViewer";
 import type { NativeModeRequest } from "./vercelBrain";
 import path from "node:path";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { logger } from "$lib/utils/logger";
 import { buildCompactEditPreview, buildSnapshotEditPreview } from "$lib/utils/editDiff";
-import { mapBashCommandToMode4Tool } from "./bashCommandMapper";
+import { extractShellCommand, mapBashCommandToMode4Tool } from "./bashCommandMapper";
 import {
-  hasSubagentToolSegment,
   isDynamicMcpFindToolName,
   isDynamicMcpUseToolName
 } from "$lib/utils/toolNameNormalization";
+import { parseCliSubagentToolName } from "$lib/utils/cliSubagentToolNames";
 import {
   unwrapStructuredToolValue,
   unwrapSubagentToolResult
@@ -28,32 +27,30 @@ import {
 } from "./batshitServerUrls";
 import { stripToolZipControl } from "./toolZipControlNotice";
 import { stripMcpImageContentBlocks } from "./toolResultImageDelivery";
+import {
+  CODEX_MAX_KNOWN_COPIES,
+  CODEX_MAX_KNOWN_COPY_CHARS,
+  type CodexReplyBaseline,
+} from "./codexReplyBaseline";
 
 type CodexTransport = "sdk" | "cli";
-const execFileAsync = promisify(execFile);
-const GIT_DIFF_MAX_BUFFER_BYTES = 5_000_000;
+type CliModelResultDelivery = Parameters<NonNullable<NativeModeRequest['onCliModelResult']>>[0];
 // F-P6-5: a failure Codex reports without an exit code keeps its failure as a reason.
 const CODEX_COMMAND_FAILED_WITHOUT_EXIT_CODE =
   "Codex reported this command as failed and gave no exit code.";
 const CODEX_PATCH_FAILED = "Codex reported that this patch failed.";
+const CODEX_MCP_CALL_FAILED = "Codex reported that this tool call failed.";
 // Known copies: the most files kept, and the largest copy kept (bigger files are read again).
-const MAX_KNOWN_COPIES = 32;
-const MAX_KNOWN_COPY_CHARS = 2_000_000;
+const MAX_KNOWN_COPIES = CODEX_MAX_KNOWN_COPIES;
+const MAX_KNOWN_COPY_CHARS = CODEX_MAX_KNOWN_COPY_CHARS;
+/** Review finding 3: a step's re-reads, all together; a copy not back in time is dropped. */
+const COPY_REREAD_LIMIT_MS = 5_000;
+const COPY_READ_TIMED_OUT = Symbol("copy read timed out");
 
 /** The key a known copy is kept under: the file's absolute path. */
 function copyKey(filePath: string, projectPath: string | null): string {
   if (path.isAbsolute(filePath)) return path.normalize(filePath);
   return path.resolve(projectPath && projectPath.trim().length > 0 ? projectPath : "/", filePath);
-}
-
-function extractShellCommand(command: string): string {
-  const trimmed = command.trim();
-  if (!trimmed) return command;
-  const match = trimmed.match(/-lc\s+(['"])([\s\S]*?)\1/);
-  if (match?.[2]) return match[2];
-  const simpleMatch = trimmed.match(/-c\s+(['"])([\s\S]*?)\1/);
-  if (simpleMatch?.[2]) return simpleMatch[2];
-  return command;
 }
 
 function normalizeWebSearchResults(rawResults: any): Array<Record<string, any>> {
@@ -74,6 +71,41 @@ function normalizeWebSearchResults(rawResults: any): Array<Record<string, any>> 
         entry?.text,
     };
   });
+}
+
+/**
+ * BL-461 — why a Codex MCP tool call failed, or null when it did not. Codex's MCP result has no
+ * `isError`: a tool that answered with an error result keeps that result and the item says
+ * `status: 'failed'`, and a call that never reached its tool says `failed` with an `error.message`
+ * and no result (codex-cli 0.160.0, `mcp_tool_call.rs`; the exec stream and the app server alike).
+ * The reason is Codex's error message, else the result's first text block.
+ */
+function codexMcpCallFailureReason(item: Extract<ThreadItem, { type: "mcp_tool_call" }>): string | null {
+  if (item.status !== "failed" && !item.error) return null;
+  const errorMessage = typeof item.error?.message === "string" ? item.error.message.trim() : "";
+  if (errorMessage) return errorMessage;
+  const content: unknown[] = Array.isArray(item.result?.content) ? item.result.content : [];
+  for (const block of content) {
+    const text = (block as any)?.type === "text" && typeof (block as any).text === "string" ? (block as any).text.trim() : "";
+    if (text) return text;
+  }
+  return CODEX_MCP_CALL_FAILED;
+}
+
+/**
+ * BL-461: a failed MCP call's result carries `success: false` and its reason, as a failed Codex
+ * command's does (F-P6-5), so the zip, the card, the Execution Viewer and the model's later view
+ * read it as a failure. Before, it was stored as the tool's answer, a success. What the tool
+ * returned stays: an object keeps its fields (an error text of its own too), anything else is kept
+ * as `content`.
+ */
+function withCodexMcpCallFailure(result: unknown, reason: string): Record<string, unknown> {
+  if (result && typeof result === "object" && !Array.isArray(result)) {
+    const record = result as Record<string, unknown>;
+    const ownError = typeof record.error === "string" && record.error.trim() ? record.error : null;
+    return { ...record, success: false, error: ownError ?? reason };
+  }
+  return { success: false, error: reason, ...(result != null ? { content: result } : {}) };
 }
 
 function firstNonEmptyArray(...candidates: any[]): any[] | null {
@@ -159,7 +191,18 @@ function buildCodexWebSearchResult(item: any, fallbackResult?: any) {
 }
 
 export type CodexStreamChunk =
-  | { type: "text-delta"; text: string }
+  /**
+   * BL-759: `segmentId` names the Codex agent message the text belongs to (its item id), so a
+   * reader can take that message back by name when Codex drops and retries it.
+   */
+  | { type: "text-delta"; text: string; segmentId?: string }
+  /**
+   * BL-759 — Codex dropped a model response and is answering again: every reader removes the
+   * text of `segmentId` (an agent message that started and never completed) and nothing else.
+   * Only a retry takes text back; a reply that fails keeps its partial text. `message` is
+   * Codex's own notice (`Reconnecting... 1/5`).
+   */
+  | { type: "text-retract"; segmentId: string; reason: "retry"; message: string | null }
   /**
    * SA-114 P2 (DL-114-06) — the app server confirmed a steer reached this turn.
    *
@@ -190,6 +233,7 @@ export type CodexStreamChunk =
         totalTokens?: number;
         reasoningTokens?: number;
         cachedInputTokens?: number;
+        cacheCreationInputTokens?: number;
       };
       usage?: {
         inputTokens?: number;
@@ -197,6 +241,7 @@ export type CodexStreamChunk =
         totalTokens?: number;
         reasoningTokens?: number;
         cachedInputTokens?: number;
+        cacheCreationInputTokens?: number;
       };
     }
   | {
@@ -209,6 +254,19 @@ export type CodexStreamChunk =
 interface CodexEventAdapterOptions {
   request: NativeModeRequest;
   transport: CodexTransport;
+  /** Reported-so-far accounting is separate from successful completion usage. */
+  getObservedUsage?: () => Partial<Usage> | null;
+  /**
+   * BL-9: this reply's git baseline, taken before Codex started (`codexReplyBaseline.ts`). Its
+   * start-of-reply copies seed the known copies, and it is the only way an edit with no copy
+   * from before its command gets a diff. Without one, such an edit's diff is unavailable.
+   */
+  replyBaseline?: CodexReplyBaseline | null;
+  /**
+   * How long a step's re-reads of the known copies may take together (they go through
+   * batshit-server, whose read has no deadline of its own). Default `COPY_REREAD_LIMIT_MS`.
+   */
+  copyReadTimeoutMs?: number;
   onFinish?: (payload: {
     text: string;
     steps: any[];
@@ -218,8 +276,10 @@ interface CodexEventAdapterOptions {
       totalTokens?: number;
       reasoningTokens?: number;
       cachedInputTokens?: number;
+      cacheCreationInputTokens?: number;
     };
     reasoning?: string[];
+    observedUsage?: ObservedUsage;
   }) => Promise<void> | void;
 }
 
@@ -608,9 +668,19 @@ function buildCodexPatchDiff(
     .join('\n')
 }
 
+/** BL-9: the reader the reply baseline copies files with, so its copies match the adapter's. */
+export function readCodexProjectFileCopy(
+  filePath: string,
+  projectPath: string | null,
+  signal?: AbortSignal,
+) {
+  return readFileFromCommander(filePath, projectPath, signal);
+}
+
 async function readFileFromCommander(
   filePath: string,
   projectPath: string | null,
+  signal?: AbortSignal,
 ): Promise<string | null> {
   if (!filePath) return null;
   let normalizedProject = projectPath?.replace(/\/+$/, "") ?? null;
@@ -642,6 +712,7 @@ async function readFileFromCommander(
         input: { filePath: resolvedPath },
         params: { projectPath: normalizedProject },
       }),
+      ...(signal ? { signal } : {}),
     });
 
     if (!response.ok) return null;
@@ -649,37 +720,10 @@ async function readFileFromCommander(
     if (typeof result?.content === "string") return result.content;
     return null;
   } catch (error) {
-    console.warn("[CodexEventAdapter] Failed to read file via batshit-server:", error);
-    return null;
-  }
-}
-
-async function readGitDiffForFile(
-  filePath: string,
-  projectPath: string | null,
-): Promise<string | null> {
-  const normalizedProject = projectPath?.trim().replace(/\/+$/, "") ?? null;
-  if (!normalizedProject) return null;
-
-  const resolvedPath = path.isAbsolute(filePath)
-    ? filePath
-    : path.resolve(normalizedProject, filePath);
-  const relativePath = path.relative(normalizedProject, resolvedPath);
-  if (!relativePath || relativePath.startsWith("..") || path.isAbsolute(relativePath)) {
-    return null;
-  }
-
-  try {
-    const { stdout } = await execFileAsync(
-      "git",
-      ["-C", normalizedProject, "diff", "--no-ext-diff", "--no-color", "--", relativePath],
-      {
-        maxBuffer: GIT_DIFF_MAX_BUFFER_BYTES,
-        timeout: 5000,
-      },
-    );
-    return typeof stdout === "string" && stdout.trim().length > 0 ? stdout : null;
-  } catch {
+    // A read told to stop (a Stop, or a copy's time limit) is not a failure worth a warning.
+    if (!signal?.aborted) {
+      console.warn("[CodexEventAdapter] Failed to read file via batshit-server:", error);
+    }
     return null;
   }
 }
@@ -688,6 +732,8 @@ export class CodexEventAdapter {
   private readonly request: NativeModeRequest;
   private readonly transport: CodexTransport;
   private readonly onFinish?: CodexEventAdapterOptions["onFinish"];
+  private readonly getObservedUsage?: CodexEventAdapterOptions["getObservedUsage"];
+  private successfulCompletionSeen = false;
   private readonly toolStates = new Map<string, CodexToolState>();
   private readonly intermediateSteps: any[] = [];
   private readonly rawEvents: ThreadEvent[] = [];
@@ -704,8 +750,22 @@ export class CodexEventAdapter {
    * late for a fast command: it matched the edited file, and a real `sed -i` said "No change
    * seen". A copy read when an EARLIER item completed was read before the model even chose this
    * command. The one gap: a model that sends a read and an edit of the same file in one reply.
+   *
+   * BL-9: the reply's git baseline seeds this with a start-of-reply copy of every file that
+   * already had unstaged changes, so such a file's "before" is never its git diff.
    */
   private readonly knownCopies = new Map<string, string>();
+  /**
+   * Review finding 1: known copies read again after a step Batshit cannot follow. With parallel
+   * tool calls a batch's commands all run before Batshit sees any of them, so such a copy can
+   * already hold what a sibling command (a `sed -i` beside a `pwd`) wrote. It still shows an
+   * edit's lines when it differs from the file, but a match proves nothing: never "No change
+   * seen". A copy read when a read completes, or an edit's read-back, clears the mark.
+   */
+  private readonly provisionalCopies = new Set<string>();
+  private readonly copyReadTimeoutMs: number;
+  /** BL-9: this reply's git baseline, or null (then an edit with no copy has no diff). */
+  private readonly replyBaseline: CodexReplyBaseline | null;
   /**
    * Each edit's "before", keyed by the item: its file's known copy (`known: true`), or else a copy
    * read at the item's own start, which only a slow command lets Batshit read in time.
@@ -719,17 +779,87 @@ export class CodexEventAdapter {
         totalTokens?: number;
         reasoningTokens?: number;
         cachedInputTokens?: number;
+        cacheCreationInputTokens?: number;
       }
     | undefined;
   private completed = false;
   private readonly reasoningSegments = new Map<string, string>();
   private readonly reasoningOrder: string[] = [];
+  /** The text each agent message that started and has not completed has sent so far, by item. */
   private readonly agentMessageText = new Map<string, string>();
+  /**
+   * BL-759: the segment name each open agent message's chunks carry: its item id, or, for an item
+   * id Codex used again after a retry took it back, that id with its restart count, so a retract
+   * of the dropped attempt can never name the new one's text.
+   */
+  private readonly agentMessageSegments = new Map<string, string>();
+  /** BL-759: agent messages a retry dropped. A late delta or completion of one is ignored. */
+  private readonly retractedAgentMessages = new Set<string>();
+  private readonly agentMessageRestarts = new Map<string, number>();
+  /**
+   * BL-759: the retracts of messages a retry dropped, held until Codex writes again (the first
+   * text, tool call, tool result, or reasoning of the new attempt). A reply that fails or ends
+   * before that keeps its partial text: only a retry that answers takes text back.
+   */
+  private heldRetracts: CodexStreamChunk[] = [];
 
   constructor(options: CodexEventAdapterOptions) {
     this.request = options.request;
     this.transport = options.transport;
     this.onFinish = options.onFinish;
+    this.getObservedUsage = options.getObservedUsage;
+    this.replyBaseline = options.replyBaseline ?? null;
+    this.copyReadTimeoutMs = options.copyReadTimeoutMs ?? COPY_REREAD_LIMIT_MS;
+    for (const [filePath, text] of this.replyBaseline?.startCopies ?? []) {
+      this.rememberCopy(filePath, text);
+    }
+  }
+
+  /** Observation only: raw model-result evidence never enters chunks, steps, or event logs. */
+  private reportCliModelResult(delivery: CliModelResultDelivery): void {
+    const observer = this.request.onCliModelResult;
+    if (!observer) return;
+    try {
+      observer(delivery);
+    } catch {
+      // The source text can be sensitive. Keep it out of this log and make the turn's evidence
+      // incomplete through the same metadata-only callback when the observer remains available.
+      console.error("[CodexEventAdapter] Raw CLI result observer failed; result marked unaccounted.");
+      try {
+        observer({ callId: delivery.callId, texts: [], nonTextInputs: 0, unaccountedInputs: 1 });
+      } catch {
+        // A failing metadata observer never interrupts the CLI stream.
+      }
+    }
+  }
+
+  private reportRawMcpResult(item: Extract<ThreadItem, { type: "mcp_tool_call" }>): void {
+    const texts: string[] = [];
+    let nonTextInputs = 0;
+    let unaccountedInputs = 0;
+    const result = item.result as any;
+    const content = Array.isArray(result) ? result : Array.isArray(result?.content) ? result.content : null;
+
+    if (!content) {
+      unaccountedInputs += 1;
+    } else {
+      for (const part of content) {
+        if (part?.type === "text" && typeof part.text === "string") {
+          if (part.text.length > 0) texts.push(part.text);
+        } else if (part?.type === "image" || part?.type === "file" || part?.type === "audio") {
+          nonTextInputs += 1;
+        } else {
+          unaccountedInputs += 1;
+        }
+      }
+    }
+
+    if (result && !Array.isArray(result) && result.structured_content != null) {
+      unaccountedInputs += 1;
+    }
+    if (item.error != null) unaccountedInputs += 1;
+
+    this.reportCliModelResult({ callId: item.id, texts, nonTextInputs, unaccountedInputs });
   }
 
   private parseCommandArgs(raw: string | undefined | null): any {
@@ -833,21 +963,26 @@ export class CodexEventAdapter {
     return typeof this.request.projectPath === "string" ? this.request.projectPath : null;
   }
 
-  private rememberCopy(filePath: string, text: string): void {
+  private rememberCopy(filePath: string, text: string, provisional = false): void {
     const key = copyKey(filePath, this.requestProjectPath());
     this.knownCopies.delete(key);
+    this.provisionalCopies.delete(key);
     if (text.length > MAX_KNOWN_COPY_CHARS) return;
     this.knownCopies.set(key, text);
+    if (provisional) this.provisionalCopies.add(key);
     while (this.knownCopies.size > MAX_KNOWN_COPIES) {
       const oldest = this.knownCopies.keys().next().value;
       if (oldest === undefined) break;
       this.knownCopies.delete(oldest);
+      this.provisionalCopies.delete(oldest);
     }
   }
 
   private forgetCopy(filePath: unknown): void {
     if (typeof filePath !== "string" || filePath.trim().length === 0) return;
-    this.knownCopies.delete(copyKey(filePath, this.requestProjectPath()));
+    const key = copyKey(filePath, this.requestProjectPath());
+    this.knownCopies.delete(key);
+    this.provisionalCopies.delete(key);
   }
 
   /** Read the whole file now and keep it as its known copy (or forget it if it cannot be read). */
@@ -858,16 +993,55 @@ export class CodexEventAdapter {
     else this.forgetCopy(filePath);
   }
 
-  /** A command Batshit cannot follow may have changed any file: read every known one again. */
-  private async refreshKnownCopies(): Promise<void> {
-    await Promise.all([...this.knownCopies.keys()].map((key) => this.learnCopy(key)));
+  /**
+   * A command Batshit cannot follow may have changed any file: read every known one again, and
+   * (BL-9) list the project again, so a file the command left with changes gets its copy now,
+   * as its new starting point.
+   */
+  private async refreshAfterUnfollowedStep(): Promise<void> {
+    const replyStop = this.request.abortSignal;
+    const newlyChanged = (await this.replyBaseline?.relist(replyStop)) ?? [];
+    const paths = [...new Set([...this.knownCopies.keys(), ...newlyChanged.slice(0, MAX_KNOWN_COPIES)])];
+    // Review finding 3: the re-reads share one time limit; a read not back in time is dropped
+    // (its late answer is never applied), so its file has no copy rather than a stale one.
+    // Review finding 4: the reads themselves are aborted at the time limit or on the reply's Stop.
+    const stopReads = new AbortController();
+    const onReplyStop = () => stopReads.abort();
+    replyStop?.addEventListener("abort", onReplyStop, { once: true });
+    if (replyStop?.aborted) stopReads.abort();
+    let limit: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<typeof COPY_READ_TIMED_OUT>((resolve) => {
+      limit = setTimeout(() => {
+        stopReads.abort();
+        resolve(COPY_READ_TIMED_OUT);
+      }, this.copyReadTimeoutMs);
+      limit.unref?.();
+    });
+    const reads = await Promise.all(
+      paths.map(async (key) => [
+        key,
+        await Promise.race([
+          readFileFromCommander(key, this.requestProjectPath(), stopReads.signal),
+          timedOut,
+        ]),
+      ] as const),
+    );
+    clearTimeout(limit);
+    replyStop?.removeEventListener("abort", onReplyStop);
+    for (const [key, text] of reads) {
+      // Review finding 1: read while a parallel batch may still have been running.
+      if (typeof text === "string") this.rememberCopy(key, text, true);
+      else this.forgetCopy(key);
+    }
   }
 
   private async captureStartCopy(itemId: string, filePath: unknown): Promise<void> {
     if (typeof filePath !== "string" || filePath.trim().length === 0) return;
-    const known = this.knownCopies.get(copyKey(filePath, this.requestProjectPath()));
+    const key = copyKey(filePath, this.requestProjectPath());
+    const known = this.knownCopies.get(key);
     if (known !== undefined) {
-      this.startCopies.set(itemId, { text: known, known: true });
+      // A provisional copy (review finding 1) gives a diff when it differs, never "No change seen".
+      this.startCopies.set(itemId, { text: known, known: !this.provisionalCopies.has(key) });
       return;
     }
     const content = await readFileFromCommander(filePath, this.requestProjectPath());
@@ -914,15 +1088,24 @@ export class CodexEventAdapter {
       return `No change seen: ${options.filePath} matches the copy Batshit read before this command ran.`;
     }
 
-    // No copy from before the command, or a patch that beat its copy: the file's git diff is the
-    // best record left, then the summary.
+    // BL-9: no copy from before the command, or a patch that beat its copy. Git's own record is
+    // exact only for a file the reply's baseline vouches for (tracked, no changes of its own
+    // when Batshit last listed the project, none from an earlier step since): its diff against
+    // the index is exactly what changed. For any other file the diff is unavailable. Never
+    // `git diff -- <file>` as such, which is every unstaged change in the file and drew a
+    // no-op `sed -i` as the file's older edits.
+    const vouched = this.replyBaseline
+      ? await this.replyBaseline.readDiff(options.filePath)
+      : null;
+    if (vouched?.kind === "diff") return vouched.diff;
+    if (vouched?.kind === "unchanged" && options.matchingCopyMeansNoChange) {
+      return `No change seen: ${options.filePath} matches the version git had before this command ran.`;
+    }
     return (
-      (await readGitDiffForFile(options.filePath, options.projectPath)) ??
       buildCompactEditPreview({
         filePath: options.filePath,
         after: options.after,
-      }) ??
-      `Updated ${options.filePath}. Diff unavailable.`
+      }) ?? `Updated ${options.filePath}. Diff unavailable.`
     );
   }
 
@@ -1003,21 +1186,26 @@ export class CodexEventAdapter {
       for await (const event of events) {
         this.rawEvents.push(event);
         if (event.type === "item.started") {
-          yield* this.handleItemStarted(event);
+          yield* this.releasingHeldRetracts(this.handleItemStarted(event));
         } else if (event.type === "item.updated") {
-          yield* this.handleItemUpdated(event);
+          yield* this.releasingHeldRetracts(this.handleItemUpdated(event));
         } else if (event.type === "item.completed") {
-          yield* this.handleItemCompleted(event);
+          yield* this.releasingHeldRetracts(this.handleItemCompleted(event));
         } else if (event.type === "steer.delivered") {
           // Straight through. The adapter deliberately does NOT mark the steer delivered
           // itself (F-P1-3's rule for a CLI lane): send-routed's own `case` does that, so
           // the transcript marker lands exactly where this chunk sits in the stream.
-          yield {
-            type: "steer",
-            steerIds: [...event.steer_ids],
-            lane: "codex",
-          };
+          yield* this.releasingHeldRetracts([
+            {
+              type: "steer",
+              steerIds: [...event.steer_ids],
+              lane: "codex",
+            },
+          ]);
+        } else if (event.type === "stream.retry") {
+          this.handleStreamRetry(event.message);
         } else if (event.type === "turn.completed") {
+          this.dropHeldRetracts("the turn completed");
           yield this.handleTurnCompleted(event.usage);
         } else if (event.type === "turn.failed") {
           throw new Error(event.error?.message || "Codex run failed");
@@ -1029,7 +1217,7 @@ export class CodexEventAdapter {
                 : "Codex stream emitted an unrecoverable error"),
           );
         } else if (this.isReasoningSummaryStreamEvent(event)) {
-          yield* this.handleReasoningSummaryStreamEvent(event);
+          yield* this.releasingHeldRetracts(this.handleReasoningSummaryStreamEvent(event));
         }
       }
     } finally {
@@ -1099,7 +1287,8 @@ export class CodexEventAdapter {
 
       case "mcp_tool_call": {
         const toolName = `mcp.${item.server}.${item.tool}`;
-        const isSubagentCall = hasSubagentToolSegment(toolName);
+        // BL-272: the managed shape decides, never a `subagent_` anywhere in the name.
+        const isSubagentCall = parseCliSubagentToolName(toolName) !== null;
         const input =
           item.arguments && typeof item.arguments === "object" && !Array.isArray(item.arguments)
             ? item.arguments as Record<string, unknown>
@@ -1166,6 +1355,7 @@ export class CodexEventAdapter {
       }
 
       case "agent_message": {
+        this.openAgentMessageSegment(item.id);
         this.agentMessageText.set(item.id, coerceThreadText(item.text));
         break;
       }
@@ -1173,6 +1363,108 @@ export class CodexEventAdapter {
       default:
         break;
     }
+  }
+
+  /**
+   * BL-759: the segment an agent message's chunks carry. A started item is named by its id; an id
+   * a retry took back and Codex then started again is a new segment (`<id>#<restart>`), so the
+   * dropped attempt's retract never names the new attempt's text.
+   */
+  private openAgentMessageSegment(itemId: string): string {
+    if (this.retractedAgentMessages.delete(itemId)) {
+      const restart = (this.agentMessageRestarts.get(itemId) ?? 0) + 1;
+      this.agentMessageRestarts.set(itemId, restart);
+      this.agentMessageSegments.set(itemId, `${itemId}#${restart}`);
+    } else if (!this.agentMessageSegments.has(itemId)) {
+      this.agentMessageSegments.set(itemId, itemId);
+    }
+    return this.agentMessageSegments.get(itemId)!;
+  }
+
+  /**
+   * BL-759 — Codex dropped a model response and is answering again. It starts the answer as a
+   * new item and never completes the one that dropped, whose text every reader already has. So
+   * each agent message that started and has not completed is dropped (a late event for it is
+   * ignored), and one that sent text gets a retract by its segment name, the newest first. The
+   * retracts are HELD until Codex writes again (`releasingHeldRetracts`): a retry can fail before
+   * it writes anything, and a reply that fails keeps its partial text. One that sent no text
+   * reached no reader and is only forgotten. Reasoning is not taken back. Since BL-464 the
+   * app-server lane streams a reasoning summary as it is written, so a dropped reasoning item's
+   * partial summary has reached the readers; but each live reader (send-routed, the page) keeps
+   * reasoning as one snapshot that each new reasoning update replaces, and the retried attempt
+   * reasons again under a new id (build check 2, measured on codex-cli 0.157.1), so its summary
+   * takes the partial one's place. A retried attempt that writes no reasoning leaves the partial
+   * summary shown. This adapter's own finish list (`reasoning`) keeps both; send-routed reads it
+   * only when no reasoning streamed.
+   */
+  private handleStreamRetry(message: string | null): void {
+    for (const [itemId, sentText] of [...this.agentMessageText].reverse()) {
+      const segmentId = this.agentMessageSegments.get(itemId) ?? itemId;
+      this.agentMessageText.delete(itemId);
+      this.agentMessageSegments.delete(itemId);
+      this.retractedAgentMessages.add(itemId);
+      if (sentText.length > 0) {
+        this.heldRetracts.push({ type: "text-retract", segmentId, reason: "retry", message });
+      }
+    }
+  }
+
+  /**
+   * BL-759: hands on the held retracts right before the new attempt's first text, tool call,
+   * tool result, or finished reasoning, so the retried answer takes the fragment's place; and
+   * before a steer, whose transcript marker is the one piece of text with no segment that could
+   * otherwise land between the fragment and its retract (then the zip detector could not take the
+   * fragment back exactly; see `zipDetection.ts`, `superseded`). The cost: a steer delivered during
+   * a retry's backoff, then every retry fails, loses the partial text.
+   *
+   * A reasoning summary still being written (BL-464) and a plan update (BL-459) do not hand them
+   * on: neither reaches the reply's text or the zip detector, so neither can come between the
+   * fragment and its retract, and a retry that drops again while it is reasoning or planning, then
+   * fails, keeps the partial text as it did before either streamed.
+   */
+  private async *releasingHeldRetracts(
+    chunks: AsyncIterable<CodexStreamChunk> | Iterable<CodexStreamChunk>,
+  ): AsyncGenerator<CodexStreamChunk> {
+    for await (const chunk of chunks) {
+      if (this.heldRetracts.length > 0 && this.releasesHeldRetracts(chunk)) {
+        yield* this.heldRetracts.splice(0);
+      }
+      yield chunk;
+    }
+  }
+
+  /** BL-759: does this chunk start the retried answer (see `releasingHeldRetracts`)? */
+  private releasesHeldRetracts(chunk: CodexStreamChunk): boolean {
+    switch (chunk.type) {
+      case "text-delta":
+      case "steer":
+        return true;
+      case "tool-call":
+      case "tool-result":
+        return chunk.toolName !== "codex_plan_update";
+      case "thinking":
+        return chunk.final === true;
+      default:
+        return false;
+    }
+  }
+
+  /** BL-759: Codex ended the turn after a retry without writing again: the partial text stays. */
+  private dropHeldRetracts(why: string) {
+    if (this.heldRetracts.length === 0) return;
+    console.warn("[CodexEventAdapter] BL-759: Codex retried and wrote nothing again; the partial text stays", {
+      why,
+      segmentIds: this.heldRetracts.map((chunk) => (chunk as { segmentId?: string }).segmentId),
+    });
+    this.heldRetracts = [];
+  }
+
+  /** BL-759: a delta or completion of a message a retry dropped. Ignored, and said so. */
+  private reportLateRetractedEvent(itemId: string, eventType: string) {
+    console.error("[CodexEventAdapter] BL-759: ignored a late event of a message a retry dropped", {
+      itemId,
+      eventType,
+    });
   }
 
   private *handleItemUpdated(
@@ -1191,6 +1483,12 @@ export class CodexEventAdapter {
         metadata: { status: "updated" },
       };
     } else if (item.type === "agent_message") {
+      // BL-759: a late update of a message a retry dropped must not bring its text back.
+      if (this.retractedAgentMessages.has(item.id)) {
+        this.reportLateRetractedEvent(item.id, event.type);
+        return;
+      }
+      const segmentId = this.openAgentMessageSegment(item.id);
       const previous = this.agentMessageText.get(item.id) ?? "";
       const nextText = coerceThreadText(item.text);
       if (nextText.length > previous.length) {
@@ -1199,6 +1497,7 @@ export class CodexEventAdapter {
           yield {
             type: "text-delta",
             text: delta,
+            segmentId,
           };
         }
       }
@@ -1212,6 +1511,12 @@ export class CodexEventAdapter {
     const item = event.item as ThreadItem;
 
     if (item.type === "agent_message") {
+      // BL-759: a message a retry dropped is not the answer, even if Codex completes it late.
+      if (this.retractedAgentMessages.has(item.id)) {
+        this.reportLateRetractedEvent(item.id, event.type);
+        return;
+      }
+      const segmentId = this.openAgentMessageSegment(item.id);
       const previous = this.agentMessageText.get(item.id) ?? "";
       const finalText = coerceThreadText(item.text);
       this.finalText = finalText;
@@ -1221,10 +1526,12 @@ export class CodexEventAdapter {
           yield {
             type: "text-delta",
             text: delta,
+            segmentId,
           };
         }
       }
       this.agentMessageText.delete(item.id);
+      this.agentMessageSegments.delete(item.id);
       return;
     }
 
@@ -1255,6 +1562,13 @@ export class CodexEventAdapter {
     let toolResult: any = null;
     let executedToolName: string | undefined;
     if (item.type === "command_execution") {
+      const rawOutput = (item as any).aggregated_output;
+      this.reportCliModelResult({
+        callId: item.id,
+        texts: typeof rawOutput === "string" && rawOutput.length > 0 ? [rawOutput] : [],
+        nonTextInputs: 0,
+        unaccountedInputs: typeof rawOutput === "string" ? 0 : 1,
+      });
       const projectPath =
         typeof this.request.projectPath === "string"
           ? this.request.projectPath
@@ -1376,8 +1690,18 @@ export class CodexEventAdapter {
           tracked.toolName !== "batshit_server_list_files" &&
           tracked.toolName !== "batshit_server_search_files"
         ) {
-          await this.refreshKnownCopies();
+          await this.refreshAfterUnfollowedStep();
         }
+      }
+      // BL-9: a write or an edit changed its file (or, failed, may have), so from here on the
+      // baseline no longer vouches for that file's git diff. After this item's own diff.
+      if (
+        tracked.toolName === "batshit_server_overwrite_file" ||
+        tracked.toolName === "batshit_server_edit_file"
+      ) {
+        this.replyBaseline?.markChanged(
+          tracked.args?.filePath ?? tracked.args?.path ?? tracked.args?.input,
+        );
       }
       this.startCopies.delete(item.id);
     } else if (item.type === "file_change") {
@@ -1465,6 +1789,8 @@ export class CodexEventAdapter {
           .filter((value): value is string => typeof value === "string" && value.length > 0),
       );
       for (const patchPath of patchPaths) {
+        // BL-9: after this patch's own diff, the baseline no longer vouches for its files.
+        this.replyBaseline?.markChanged(patchPath);
         const text = readBack.get(patchPath);
         if (patchFailed) this.forgetCopy(patchPath);
         else if (text !== undefined) this.rememberCopy(patchPath, text);
@@ -1472,6 +1798,7 @@ export class CodexEventAdapter {
       }
       this.startCopies.delete(item.id);
     } else if (item.type === "mcp_tool_call") {
+      this.reportRawMcpResult(item);
       // SA-105 P3: an MCP result can now carry image content blocks (the helper
       // bridge delivers recalled memory photos that way on this runtime). The
       // object below becomes an intermediate step, then a zip, then compiled
@@ -1482,7 +1809,7 @@ export class CodexEventAdapter {
         item.result ?? (item.error ? { error: item.error } : null),
       );
 
-      const isSubagentCall = hasSubagentToolSegment(tracked.toolName);
+      const isSubagentCall = parseCliSubagentToolName(tracked.toolName) !== null;
       if (isSubagentCall) {
         toolResult = unwrapSubagentToolResult(toolResult);
       }
@@ -1535,8 +1862,11 @@ export class CodexEventAdapter {
           ...(query ? { query } : {})
         };
       }
+      // BL-461: after the shaping above, so no unwrap drops the failure.
+      const failureReason = codexMcpCallFailureReason(item);
+      if (failureReason !== null) toolResult = withCodexMcpCallFailure(toolResult, failureReason);
       // An MCP tool may write a file (a helper's own write tools do), so read every known one again.
-      await this.refreshKnownCopies();
+      await this.refreshAfterUnfollowedStep();
     } else if (item.type === "todo_list") {
       toolResult = item.items;
     } else if (item.type === "web_search") {
@@ -1596,7 +1926,12 @@ export class CodexEventAdapter {
     this.toolStates.delete(item.id);
   }
 
-  private handleTurnCompleted(usage: Usage): CodexStreamChunk {
+  /**
+   * BL-1376: only the counts Codex reported. A count it left out stays unset (unknown, never 0),
+   * the total is the sum only when both input and output were reported, and a turn with no counts
+   * has no usage: the finish callback then gets none, and the run's usage reads unknown.
+   */
+  private normalizeUsage(usage: Partial<Usage> | null | undefined): ObservedUsage['parts'][number]['counts'] | undefined {
     const rawUsage = usage as any;
     const inputTokens = rawUsage?.input_tokens;
     const outputTokens = rawUsage?.output_tokens;
@@ -1608,13 +1943,30 @@ export class CodexEventAdapter {
       rawUsage?.cached_input_tokens ??
       rawUsage?.input_tokens_details?.cached_tokens ??
       rawUsage?.inputTokenDetails?.cacheReadTokens;
+    // Codex input already includes cache reads and writes; keep the write count separately.
+    const cacheCreationInputTokens = rawUsage?.cache_write_input_tokens;
     const summary = {
-      inputTokens,
-      outputTokens,
-      totalTokens: (inputTokens ?? 0) + (outputTokens ?? 0),
+      ...(typeof inputTokens === "number" ? { inputTokens } : {}),
+      ...(typeof outputTokens === "number" ? { outputTokens } : {}),
+      ...(typeof inputTokens === "number" && typeof outputTokens === "number"
+        ? { totalTokens: inputTokens + outputTokens }
+        : {}),
       ...(typeof reasoningTokens === "number" ? { reasoningTokens } : {}),
       ...(typeof cachedInputTokens === "number" ? { cachedInputTokens } : {}),
+      ...(typeof cacheCreationInputTokens === "number" && Number.isFinite(cacheCreationInputTokens)
+        ? { cacheCreationInputTokens }
+        : {}),
     };
+    if (Object.keys(summary).length === 0) {
+      return undefined;
+    }
+    return summary;
+  }
+
+  private handleTurnCompleted(usage: Partial<Usage> | null | undefined): CodexStreamChunk {
+    this.successfulCompletionSeen = true;
+    const summary = this.normalizeUsage(usage);
+    if (!summary) return { type: "finish" };
     this.usageSummary = summary;
 
     return {
@@ -1625,10 +1977,11 @@ export class CodexEventAdapter {
   }
 
   private detectToolMetadata(toolName: string, args?: any, result?: any) {
-    const lower = toolName.toLowerCase();
-    if (lower.includes("subagent_")) {
-      const match = lower.match(/subagent_([a-z0-9_-]+)/);
-      const slug = match?.[1];
+    // BL-272: the Subagent is the tool of the managed shape (`mcp.<batshit_gateway_…>.subagent_<key>`).
+    // The first `subagent_` anywhere was the bridge's own name for an agent slugged `subagent`.
+    const subagentCall = parseCliSubagentToolName(toolName);
+    if (subagentCall) {
+      const slug = subagentCall.toolKey;
       const unslugged = slug ? slug.replace(/[_-]+/g, " ").trim() : undefined;
       const displayName = unslugged
         ? unslugged
@@ -1725,15 +2078,24 @@ export class CodexEventAdapter {
     };
   }
 
-  private async finalize() {
+  /** Delegated boundary may precede consumption of an already-produced finish chunk. */
+  takeObservedUsage(): ObservedUsage | undefined {
+    const counts = this.normalizeUsage(this.getObservedUsage?.());
+    return counts ? { completeness: 'partial', parts: [{ source: 'codex-app-server-progress', counts }] } : undefined;
+  }
+
+  /** Also called by the wrapper when return/throw never entered this generator's finally. */
+  async finalize() {
     if (this.completed) return;
     this.completed = true;
     const combinedText = this.finalText || "";
+    const observedUsage = !this.successfulCompletionSeen ? this.takeObservedUsage() : undefined;
     await this.onFinish?.({
       text: combinedText,
       steps: this.intermediateSteps,
       totalUsage: this.usageSummary,
       reasoning: this.getOrderedReasoningSegments(),
+      ...(observedUsage ? { observedUsage } : {}),
     });
   }
 

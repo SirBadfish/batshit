@@ -10,7 +10,8 @@
 	import * as groupStore from '$lib/stores/groups.svelte';
 	import { GroupService } from '$lib/services/groups';
 	import { DatabaseService } from '$lib/services/databaseRedis.client';
-	import { onMount } from 'svelte';
+	import { onMount, tick } from 'svelte';
+	import { appActionObservation } from '$lib/appActions/owners';
 	import { toast } from 'svelte-sonner';
 	import SettingsPanel from '$lib/components/settings/SettingsPanel.svelte';
 	import {
@@ -141,11 +142,15 @@ async function loadGroups() {
 				const loadedAgents = agentStore.getAgents();
 				const firstAvailableAgent = getFirstAvailableAgent(loadedAgents);
 
-				// If no agents exist, prompt user to create one
+				// Use the sidebar's human launcher so a concurrent gear click shares
+				// this sheet. A human-opened Settings view takes precedence over setup.
 				if (loadedAgents.length === 0 && firstRunSetupFinished) {
-					settingsPanelInitialTab = 'agents';
-					settingsPanelInitialAgentId = AGENT_CREATE_SENTINEL;
-					settingsPanelOpen = true;
+					await tick();
+					if (appActionObservation().settings?.open !== true) {
+						window.dispatchEvent(new CustomEvent('batshit:open-settings', {
+							detail: { tab: 'agents', agentId: AGENT_CREATE_SENTINEL }
+						}));
+					}
 				} else {
 					// Try to restore last selected agent from localStorage
 					const lastSelectedAgentId = localStorage.getItem('lastSelectedAgent');
@@ -568,7 +573,7 @@ function handleEditClick(e: Event, agentId: string) {
 						? 'Infinite Session'
 						: null}
 				{@const unavailableReason = frozenReason}
-				<div class="agent-selector-menu-row flex items-center gap-2 {agent.id === currentAgent?.id ? 'border-l-2 border-r-2 border-primary pl-2 pr-2' : 'pl-3 pr-3'}" class:is-unavailable={Boolean(unavailableReason)}>
+				<div class="agent-selector-menu-row flex items-center gap-2 {agent.id === currentAgent?.id ? 'border-l-2 border-r-2 border-primary-text pl-2 pr-2' : 'pl-3 pr-3'}" class:is-unavailable={Boolean(unavailableReason)}>
 					<DropdownMenu.Item
 						onSelect={() => handleSelect(agent.id)}
 						disabled={Boolean(unavailableReason)}
@@ -621,7 +626,7 @@ function handleEditClick(e: Event, agentId: string) {
 					{@const validAgentIds = getValidGroupAgentIds(group)}
 					{@const isRunnable = validAgentIds.length >= 2}
 					{@const groupFrozen = isFixedSession(currentSession)}
-					<div class="agent-selector-menu-row flex items-center gap-2 {group.id === activeGroupId ? 'border-l-2 border-r-2 border-primary pl-2 pr-2' : 'pl-3 pr-3'}" class:is-unavailable={groupFrozen}>
+					<div class="agent-selector-menu-row flex items-center gap-2 {group.id === activeGroupId ? 'border-l-2 border-r-2 border-primary-text pl-2 pr-2' : 'pl-3 pr-3'}" class:is-unavailable={groupFrozen}>
 						<DropdownMenu.Item
 							onSelect={() => handleSelectGroup(group.id)}
 							disabled={!isRunnable || groupFrozen}

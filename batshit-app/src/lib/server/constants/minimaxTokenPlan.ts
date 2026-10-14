@@ -14,7 +14,9 @@ export const MINIMAX_TOKEN_PLAN_TEXT_MODELS = [
     developerId: 'minimax',
     displayName: 'MiniMax M2.7',
     tags: ['chat', 'reasoning', 'code', 'vision', 'multimodal', 'long-context'],
-    contextWindow: 1_048_576,
+    // Both the gateway and OpenRouter list 204,800 (BL-132 publishes this number
+    // as the Token Plan connection's own window).
+    contextWindow: 204_800,
     modelType: 'chat'
   },
   {
@@ -22,7 +24,9 @@ export const MINIMAX_TOKEN_PLAN_TEXT_MODELS = [
     developerId: 'minimax',
     displayName: 'MiniMax M2.7 HighSpeed',
     tags: ['chat', 'reasoning', 'code', 'vision', 'multimodal', 'long-context', 'fast'],
-    contextWindow: 1_048_576,
+    // Both the gateway and OpenRouter list 204,800 (BL-132 publishes this number
+    // as the Token Plan connection's own window).
+    contextWindow: 204_800,
     modelType: 'chat'
   }
 ] as const

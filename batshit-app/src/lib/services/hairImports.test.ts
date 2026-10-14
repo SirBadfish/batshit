@@ -253,7 +253,19 @@ describe("hair import browser service", () => {
     ).resolves.toEqual(INSPECTION);
   });
 
-  it("prepares the selected objects and bounded transform through the session route", async () => {
+  it.each([
+    "Automatic roots follow this Goon’s scalp.",
+    "Batshit estimated the roots from the head shape. Check the motion map carefully before continuing.",
+    null,
+    undefined,
+  ])("preserves the root notice %s through the prepare response", async (rootSelectionNotice) => {
+    const proposals = {
+      ...PROPOSALS,
+      motionReview: {
+        ...PROPOSALS.motionReview,
+        ...(rootSelectionNotice === undefined ? {} : { rootSelectionNotice }),
+      },
+    };
     const asset = await hairAssetFixture();
     const candidate = {
       asset,
@@ -280,7 +292,7 @@ describe("hair import browser service", () => {
           reviewedAppearanceState: null,
         });
         return jsonResponse({
-          proposals: PROPOSALS,
+          proposals,
           candidate,
         });
       },
@@ -299,7 +311,7 @@ describe("hair import browser service", () => {
         { fetcher: fetcher as typeof fetch },
       ),
     ).resolves.toEqual({
-      proposals: PROPOSALS,
+      proposals,
       candidate,
     });
   });
@@ -438,6 +450,13 @@ describe("hair import browser service", () => {
         fetcher: cancelFetcher as typeof fetch,
       }),
     ).resolves.toEqual({ discarded: true, deletedFiles: 4 });
+  });
+
+  it("keeps expected Hair dependency notices readable while preserving the error code", async () => {
+    const message = 'This Hair is still needed by Previous Version (rollback) of “My Goon”.';
+    await expect(deleteHairAssetRevision("hair", "r1", {
+      fetcher: vi.fn(async () => jsonResponse({ error: message, code: "ASSET_IN_USE" }, 409)) as typeof fetch,
+    })).rejects.toMatchObject({ code: "ASSET_IN_USE", status: 409, message });
   });
 
   it("deletes one exact imported Hair revision only after server confirmation", async () => {

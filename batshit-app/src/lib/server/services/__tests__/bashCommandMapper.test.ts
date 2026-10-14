@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   extractInPlaceEditTargetPaths,
+  extractShellCommand,
   mapBashCommandToMode4Tool,
   mapBashCommandToRendererTool,
   resolveNativeBashMapping
@@ -546,6 +547,109 @@ describe('a piped read takes its path from its own stage (item 7)', () => {
   })
 })
 
+/**
+ * BL-13 (2026-09-22): sed's read path is the last word of its command, and a trailing output
+ * redirect was that word, so a sed read that only silenced or merged its errors showed as a plain
+ * command (`sed -n '1,5p' app.js 2>/dev/null`), and one that wrote the redirect as two words was a
+ * read of `/dev/null`. A redirect is never the file sed reads; the words before it are.
+ */
+describe('a sed read ending in an output redirect (BL-13)', () => {
+  it.each([
+    "sed -n '1,5p' app.js 2>/dev/null",
+    'sed -n 1,5p app.js 2>&1',
+    "sed -n '1,5p' app.js 2> /dev/null",
+    'sed -n 1,5p app.js >/dev/null 2>&1',
+    'sed -n 1,5p app.js > /dev/null 2>&1',
+    'sed -n 1,5p app.js &>/dev/null',
+    'sed -n 1,5p app.js 2>>/dev/null',
+    'sed -n 1,5p app.js 1>&2',
+    // The pipeline case the item-7 fix left a plain command.
+    'sed -n 1,5p app.js 2>&1 | grep y',
+    "sed -n '1,5p' app.js 2>/dev/null | head -3",
+    // How Codex sends it.
+    `/bin/zsh -lc "sed -n '1,5p' app.js 2>/dev/null"`
+  ])('maps `%s` as a read of app.js', (command) => {
+    expect(mapBashCommandToRendererTool(command)).toMatchObject({
+      toolName: 'batshit_server_read_file',
+      reason: 'read-command',
+      args: { filePath: 'app.js', path: 'app.js' }
+    })
+  })
+
+  it('reads the same file on every lane', () => {
+    const command = "sed -n '1,5p' app.js 2>/dev/null"
+    expect(mapBashCommandToMode4Tool(command)).toMatchObject({
+      toolName: 'batshit_server_read_file',
+      args: { filePath: 'app.js' }
+    })
+    expect(resolveNativeBashMapping({ toolName: 'native_bash_execute', args: { command } })).toMatchObject({
+      mappedToolName: 'batshit_server_read_file',
+      mappedArgs: { filePath: 'app.js' }
+    })
+  })
+
+  // Unchanged: a redirect into a real file is still that file's write, and an input redirect names
+  // the file sed reads.
+  it.each([
+    ['sed -n 1,5p app.js > out.txt', 'batshit_server_overwrite_file', 'out.txt'],
+    ['sed -n 1,5p app.js 2> err.log', 'batshit_server_overwrite_file', 'err.log'],
+    ['sed -n 1,5p < app.js', 'batshit_server_read_file', 'app.js'],
+    // The write rule sees a write that no plain redirect (`>`, `2>`) stands before.
+    ['sed -n 1,2p notes.md &>/dev/null >>app.js', 'batshit_server_overwrite_file', 'app.js'],
+    ["sed -n '1,5p' app.js", 'batshit_server_read_file', 'app.js']
+  ])('keeps `%s` as it was', (command, toolName, filePath) => {
+    expect(mapBashCommandToRendererTool(command)).toMatchObject({ toolName, args: { filePath } })
+  })
+
+  // BL-13 review: skipping every redirect showed a read card that hid a write, when the write came
+  // after a redirect into the null device (which the write rule above stops at). Only the null
+  // device and other descriptors are skipped; any other target leaves a plain command card.
+  it.each([
+    'sed -n 1,2p notes.md >/dev/null 2>app.js',
+    'sed -n 1,2p notes.md >/dev/null 2> app.js',
+    'sed -n 1,2p notes.md 2>&1 >out.txt',
+    'sed -n 1,2p notes.md 2>/dev/null 1>app.js',
+    'sed -n 1,2p >/dev/null 2>app.js notes.md'
+  ])('never shows `%s`, which also writes a file, as a read', (command) => {
+    const mapped = mapBashCommandToRendererTool(command)
+    expect(mapped.toolName).toBe('batshit_server_overwrite_file')
+    expect(mapped.args.filePath).toBe(command.includes('out.txt') ? 'out.txt' : 'app.js')
+  })
+
+  it('never takes a redirect alone for the file', () => {
+    expect(mapBashCommandToRendererTool('sed 2>/dev/null').args.filePath).toBeUndefined()
+  })
+
+  // A read with no file of its own looks for sed's words; a name that only contains `sed` has none.
+  it.each(['head -n 5 < sed.txt', 'head -n 5 < sed.txt 2>/dev/null'])('names no file for `%s`', (command) => {
+    const mapped = mapBashCommandToRendererTool(command)
+    expect(mapped.toolName).toBe('native_bash_execute')
+    expect(mapped.args.filePath).toBeUndefined()
+  })
+
+  // The read stage ends at the first `|` outside quotes, even one inside `$(… | head -1)`; the words
+  // left over belong to the substitution, never to the file sed reads (seen in a real command).
+  it.each([
+    `sed -n "$(grep -n 'x' src/app.ts 2>/dev/null | head -1 | cut -d: -f1),+5p" $(grep -rln 'x' src/lib src/routes 2>/dev/null | head -1)`,
+    'sed -n 1p $(ls src/*.md | head -1)',
+    'sed -n 1p `ls src/*.md | head -1`',
+    // A single quote inside double quotes is a letter: the substitution after it is still open.
+    `sed "s/it's/it is/" $(ls src/*.md | head -1)`
+  ])('names no file for `%s`, whose stage ends inside a substitution', (command) => {
+    const mapped = mapBashCommandToRendererTool(command)
+    expect(mapped.toolName).toBe('native_bash_execute')
+    expect(mapped.args.filePath).toBeUndefined()
+  })
+
+  it.each([
+    `sed -n "$(echo 1,5)p" app.js 2>/dev/null`,
+    // `$(` inside a single-quoted sed script is the script's text, never a substitution.
+    "sed 's/$(/x/' app.js 2>/dev/null"
+  ])('still reads the literal file in `%s`', (command) => {
+    expect(mapBashCommandToRendererTool(command).args.filePath).toBe('app.js')
+  })
+})
+
 describe('resolveNativeBashMapping', () => {
   it('returns mapped renderer metadata for native_bash_execute calls', () => {
     const resolved = resolveNativeBashMapping({
@@ -643,5 +747,28 @@ describe('mapBashCommandToMode4Tool', () => {
 
     expect(mapped.toolName).toBe('batshit_server_execute_command')
     expect(mapped.reason).toBe('fallback-command')
+  })
+})
+
+
+describe('weekly shell mapping regressions', () => {
+  it.each([
+    ['grep -n apply_patch notes.md', 'batshit_server_search_files', undefined],
+    ["sed -n '1,2p;4,5p' notes.md", 'batshit_server_read_file', 'notes.md'],
+    ['cat 2>/dev/null app.js', 'batshit_server_read_file', 'app.js'],
+    ["sed -n '1,5p'", 'native_bash_execute', undefined],
+    ['cat app.js >/dev/null >copy.js', 'batshit_server_overwrite_file', 'copy.js'],
+    ['head app.js >copy.js', 'batshit_server_overwrite_file', 'copy.js'],
+    ["su - josh -c 'cat notes.md'", 'batshit_server_read_file', 'notes.md'],
+    ["printf x; head -c 5 /dev/zero | tr '\\0' x", 'native_bash_execute', undefined],
+    ["cat >danger.js <<'EOF'\nbash -c 'echo x >notes.md'\nEOF", 'batshit_server_overwrite_file', 'danger.js'],
+  ])('maps %s without inventing a read or losing a write', (command, toolName, filePath) => {
+    const mapped = mapBashCommandToRendererTool(command)
+    expect(mapped.toolName).toBe(toolName)
+    expect(mapped.args.filePath).toBe(filePath)
+  })
+  it('decodes escaped quotes in a real Codex wrapper without truncation', () => {
+    expect(extractShellCommand('/bin/zsh -lc "rg \\"two words\\" notes.md"'.replaceAll('\\\\', '\\')))
+      .toBe('rg "two words" notes.md')
   })
 })

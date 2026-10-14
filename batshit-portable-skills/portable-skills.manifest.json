@@ -27,13 +27,22 @@
       "sourceSkillRoot": "batshit-app/src/lib/server/system-skills/artifacts",
       "portableRoot": "batshit-portable-skills/artifact-creator",
       "sharedReferences": [
+        "references/ai-capabilities.md",
+        "references/ai-models.md",
         "references/brain-comfyui.md",
         "references/brain-general.md",
         "references/brain-huggingface.md",
         "references/brain-n8n.md",
         "references/builder-kit-api.md",
+        "references/comfyui-build.md",
+        "references/comfyui-reference.md",
+        "references/editing.md",
         "references/embed-gradio.md",
         "references/fabric-and-agent-use.md",
+        "references/n8n-troubleshooting.md",
+        "references/runtime-api.md",
+        "references/runtime-location.md",
+        "references/runtime-pinokio.md",
         "references/templates-gallery.md",
         "references/zone-patterns.md"
       ]
@@ -59,13 +68,19 @@
       "sharedReferences": [
         "references/batshit-scene-spec.md",
         "references/skybox-generation.md",
-        "references/qwen360-skybox-workflow.md",
+          "references/qwen360-skybox-workflow.md",
+          "references/image-first-panorama.md",
+          "references/animated-panorama.md",
         "references/lofi-showcase-aesthetics.md"
       ],
       "sharedFiles": [
         "assets/comfyui/qwen360-skybox-api-workflow.json",
         "assets/comfyui/qwen360-skybox-ui-workflow.json",
-        "assets/comfyui/qwen360-skybox-metadata.json"
+          "assets/comfyui/qwen360-skybox-metadata.json",
+          "assets/comfyui/night-city-full-reference-pano.api.json",
+          "assets/comfyui/night-city-seam-repair.api.json",
+          "assets/comfyui/night-city-8k-clean.api.json",
+          "assets/animation/animate-panorama.py"
       ]
     },
     {
@@ -85,6 +100,7 @@
         "references/architecture-zips-and-clips.md",
         "references/artifacts-agent-use.md",
         "references/artifacts-overview.md",
+        "references/artifacts-pinokio.md",
         "references/chat-artifact-zones.md",
         "references/chat-clips-manager.md",
         "references/chat-compact-and-trim.md",
@@ -98,7 +114,7 @@
         "references/goons-overview.md",
         "references/goons-setup-and-packages.md",
         "references/groups-overview.md",
-        "references/jev-juice-overview.md",
+        "references/judge-juice-overview.md",
         "references/installation-choose-mac-app-or-docker.md",
         "references/installation-docker-runtime-and-add-ons.md",
         "references/installation-first-run.md",
@@ -119,6 +135,7 @@
         "references/quick-start-overview.md",
         "references/reference-env-vars.md",
         "references/reference-glossary.md",
+        "references/reference-paths.md",
         "references/reference-portable-skills.md",
         "references/reference-ports-and-urls.md",
         "references/reference-provider-prompt-caching.md",

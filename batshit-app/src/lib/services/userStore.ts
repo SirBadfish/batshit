@@ -4,6 +4,11 @@
 import { RedisStoreBase } from './redisCore'
 import type { UserSettingsRow, ClipRow, ChatFolderRow, ProjectRow } from '$lib/types/database'
 
+/** Delete Folder + Sessions names the chats its dialog showed (BL-388); the server refuses it otherwise. */
+export type DeleteFolderOptions =
+  | { deleteSessions?: false }
+  | { deleteSessions: true; expectedChatIds: string[] }
+
 export type UserSettingsRuntimeDefaults = {
   nativeExecutionBackend: 'docker_sandbox' | 'apple_container' | null
 }
@@ -165,11 +170,15 @@ export class UserStore extends RedisStoreBase {
 
   async deleteFolder(
     folderId: string,
-    options: { deleteSessions?: boolean } = {}
+    options: DeleteFolderOptions = {}
   ): Promise<{ success: boolean; moved_to?: string; deleted_sessions?: number }> {
     const params = options.deleteSessions ? '?deleteSessions=true' : ''
     const response = await this.apiCall(`/folders/${folderId}${params}`, {
-      method: 'DELETE'
+      method: 'DELETE',
+      // BL-388: the server deletes the chats only when they are the ones the user was shown.
+      ...(options.deleteSessions
+        ? { body: JSON.stringify({ expectedChatIds: options.expectedChatIds }) }
+        : {})
     })
     return response
   }

@@ -227,3 +227,19 @@ describe('goons cue parser smoke', () => {
     expect(cues[0]?.definition?.name).toBe('dance')
   })
 })
+
+describe('cue blocks count only as the registry reads them (BL-442)', () => {
+  it('never fires a cue shown in code or named in a sentence, and fires the real one', () => {
+    const input = [
+      'Example:',
+      '```',
+      '<batshit-cue>{"goon_mood":"dance"}</batshit-cue>',
+      '```',
+      'Use `<batshit-cue>{"goon_mood":"calm"}</batshit-cue>` for moods; the <batshit-cue> tag. If x < 5.',
+      '<batshit-cue>{"goon_mood":"focus"}</batshit-cue> Now.'
+    ].join('\n')
+    const cues = parseGoonCues(input, {}, CUE_MAP)
+    expect(cues.map((cue) => [cue.name, cue.source])).toEqual([['focus', 'cue']])
+    expect(input.slice(cues[0].spanStart, cues[0].spanEnd)).toBe('<batshit-cue>{"goon_mood":"focus"}</batshit-cue>')
+  })
+})

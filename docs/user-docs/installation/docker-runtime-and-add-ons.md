@@ -10,7 +10,7 @@ The core Docker stack is small:
 
 - `app`: Batshit web app and app APIs, published on `http://localhost:5620` by default
 - `batshit-server`: upload and helper service, published on `http://localhost:5600` by default
-- `redis`: Redis 8, which includes the JSON support Batshit stores records with, internal-only by default
+- `redis`: Redis 8, which includes the JSON support Batshit stores records with, internal-only by default. It keeps your data in the `batshit_redis_data` volume with append-only persistence: every change reaches disk within about a second, so a crash, a power cut, or a force-quit of Docker Desktop loses only about the last second of changes. A small setup step, `redis-init`, prepares that volume before Redis starts.
 
 Optional services aren't part of the core app container. That includes n8n, Cloudflared, FBX-to-VRMA, Agent Browser, LiveKit, ComfyUI-style services, Local AI runtimes, and voice engines.
 
@@ -64,7 +64,9 @@ docker compose --env-file .env.docker stop
 docker compose --env-file .env.docker restart
 ```
 
-Docker Desktop's Play button resumes existing containers. It does not rebuild images or recreate containers after a Batshit update. To apply an update, use `./start-docker.sh` or an equivalent `docker compose --env-file .env.docker up -d --build` so containers are recreated from the updated images while volumes stay intact. An optional add-on runs under its own profile, so an update reaches it only when you name that profile (for example `./start-docker.sh --profile agent-browser`) or stop and start the add-on in Settings -> Admin, whose Start rebuilds it.
+Docker Desktop's Play button resumes existing containers. It does not rebuild images or recreate containers after a Batshit update. To apply an update, use `./start-docker.sh` or an equivalent `docker compose --env-file .env.docker up -d --build` so containers are recreated from the updated images while volumes stay intact. An optional add-on runs under its own profile, so an update reaches it only when you name that profile (for example `./start-docker.sh --profile agent-browser`) or stop and start the add-on in Settings -> Admin, whose Start rebuilds it. The Agent Browser Runtime card there says when its running sidecar was built before Batshit could stop its commands; until you rebuild it, a Stop waits for the sidecar's current command to finish.
+
+To go back to an older Batshit version, move your data with an Admin backup instead of starting the older version on the same Docker volume. Versions up to 0.1.0-alpha.2 read and write only Redis's snapshot, so when you update again, Redis reads its append-only file and the changes you made on the older version are lost.
 
 Don't use private development launchers as public Docker install commands.
 

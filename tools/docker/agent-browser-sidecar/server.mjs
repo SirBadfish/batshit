@@ -4,6 +4,9 @@ import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
+import { StringDecoder } from 'node:string_decoder'
+import { limitedOutput } from './output-limit.mjs'
+import { attachCommandModelCapture, createCommandModelCapture, getCommandModelCapture } from './model-capture.mjs'
 
 const HOST = process.env.BATSHIT_AGENT_BROWSER_HOST || '0.0.0.0'
 const PORT = Number(process.env.BATSHIT_AGENT_BROWSER_PORT || 8091)
@@ -18,9 +21,14 @@ const MAX_TIMEOUT_MS = 120_000
 // app sends (1 s to 120 s), and ends its CLI call, never the daemon, when the app's request goes
 // before the answer (a Stop). The app hands the Stop to a sidecar that reports 2 or more; an
 // older one ran every call for 45 s and ran on after a Stop, so Batshit keeps waiting for it.
-const SIDECAR_REVISION = 2
+// 3 (BL-313): an output past its limit keeps whole lines and ends with the app's cut line
+// (`output-limit.mjs`); 2 and older kept the first N characters, mid-line, with no mark.
+// 4 (BL-494 P2): /v1/run returns a bounded private original-output capture beside the visible run.
+// The app requires this revision before sending a command whose model result might need paging.
+const SIDECAR_REVISION = 4
 const DEFAULT_MAX_OUTPUT_CHARS = 200_000
 const ABSOLUTE_MAX_OUTPUT_CHARS = 400_000
+const INCOMPLETE_OUTPUT_NOTE = '[Remaining command pipe output was not kept after the command ended.]\n'
 const ALLOWED_ENV_KEYS = new Set([
   'BROWSERBASE_API_KEY',
   'BROWSERBASE_PROJECT_ID',
@@ -43,12 +51,6 @@ function clampNumber(value, fallback, min, max) {
   if (parsed > max) return max
   if (parsed < min) return min
   return parsed
-}
-
-function appendWithLimit(current, chunk, limit) {
-  const next = current + String(chunk)
-  if (next.length <= limit) return { text: next, truncated: false }
-  return { text: next.slice(0, limit), truncated: true }
 }
 
 function sendJson(res, status, payload) {
@@ -123,10 +125,15 @@ function runAgentBrowser(args, options = {}) {
   )
   const startedAt = Date.now()
   const signal = options.signal
+  const modelCapture = options.captureModelOutput ? createCommandModelCapture() : null
+  let outputIncomplete = false
+  const withCapture = (run) => modelCapture
+    ? attachCommandModelCapture(run, modelCapture.finish({ ...run, outputIncomplete }))
+    : run
 
   // The app went before this call started: it never runs.
   if (signal?.aborted) {
-    return Promise.resolve({
+    return Promise.resolve(withCapture({
       command: 'agent-browser',
       args,
       stdout: '',
@@ -137,7 +144,7 @@ function runAgentBrowser(args, options = {}) {
       stopped: true,
       durationMs: 0,
       truncated: false
-    })
+    }))
   }
 
   return new Promise((resolve) => {
@@ -151,9 +158,17 @@ function runAgentBrowser(args, options = {}) {
       stdio: ['ignore', 'pipe', 'pipe']
     })
 
-    let stdout = ''
-    let stderr = ''
-    let truncated = false
+    const stdout = limitedOutput(maxOutputChars)
+    const stderr = limitedOutput(maxOutputChars)
+    const visibleStderr = () => {
+      if (!outputIncomplete) return stderr.text
+      const marked = limitedOutput(maxOutputChars)
+      marked.append(INCOMPLETE_OUTPUT_NOTE)
+      marked.append(stderr.text)
+      return marked.text
+    }
+    const stdoutDecoder = new StringDecoder('utf8')
+    const stderrDecoder = new StringDecoder('utf8')
     let timedOut = false
     let stopped = false
     let ending = false
@@ -167,6 +182,8 @@ function runAgentBrowser(args, options = {}) {
       ending = true
       child.kill('SIGTERM')
       setTimeout(() => {
+        if (settled) return
+        outputIncomplete = !child.stdout.readableEnded || !child.stderr.readableEnded
         child.kill('SIGKILL')
         child.stdout.destroy()
         child.stderr.destroy()
@@ -192,49 +209,50 @@ function runAgentBrowser(args, options = {}) {
     }
 
     child.stdout.on('data', (chunk) => {
-      const next = appendWithLimit(stdout, chunk, maxOutputChars)
-      stdout = next.text
-      truncated = truncated || next.truncated
+      stdout.append(stdoutDecoder.write(chunk))
+      modelCapture?.appendStdout(chunk)
     })
-
     child.stderr.on('data', (chunk) => {
-      const next = appendWithLimit(stderr, chunk, maxOutputChars)
-      stderr = next.text
-      truncated = truncated || next.truncated
+      stderr.append(stderrDecoder.write(chunk))
+      modelCapture?.appendStderr(chunk)
     })
 
     child.on('error', (error) => {
       if (settled) return
       finish()
-      resolve({
+      stdout.append(stdoutDecoder.end())
+      stderr.append(stderrDecoder.end())
+      resolve(withCapture({
         command: 'agent-browser',
         args,
-        stdout,
-        stderr,
+        stdout: stdout.text,
+        stderr: visibleStderr(),
         exitCode: null,
         signal: null,
         timedOut,
         durationMs: Date.now() - startedAt,
-        truncated,
+        truncated: stdout.cut || stderr.cut || outputIncomplete,
         error: error.message
-      })
+      }))
     })
 
     child.on('close', (exitCode, exitSignal) => {
       if (settled) return
       finish()
-      resolve({
+      stdout.append(stdoutDecoder.end())
+      stderr.append(stderrDecoder.end())
+      resolve(withCapture({
         command: 'agent-browser',
         args,
-        stdout,
-        stderr,
+        stdout: stdout.text,
+        stderr: visibleStderr(),
         exitCode,
         signal: exitSignal,
         timedOut,
         ...(stopped ? { stopped: true } : {}),
         durationMs: Date.now() - startedAt,
-        truncated
-      })
+        truncated: stdout.cut || stderr.cut || outputIncomplete
+      }))
     })
   })
 }
@@ -283,12 +301,20 @@ async function handleRun(req, res) {
       maxOutputChars: body.maxOutputChars,
       timeoutMs: body.timeoutMs,
       cwd: TMP_DIR,
+      captureModelOutput: true,
       signal: hungUp.signal
     })
     res.off('close', onClose)
     // Nobody is waiting for the answer any more.
     if (hungUp.signal.aborted) return
-    sendJson(res, 200, { ok: run.exitCode === 0 && !run.timedOut, run })
+    const modelCapture = getCommandModelCapture(run)
+    if (!modelCapture) throw new Error('Agent Browser command capture is unavailable.')
+    sendJson(res, 200, {
+      ok: run.exitCode === 0 && !run.timedOut,
+      sidecarRevision: SIDECAR_REVISION,
+      run,
+      modelCapture
+    })
   } catch (error) {
     sendJson(res, 400, {
       ok: false,

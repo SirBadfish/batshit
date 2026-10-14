@@ -92,7 +92,7 @@ describe('updateStatusService', () => {
           html_url: 'https://github.com/SirBadfish/batshit/releases/tag/v0.1.0-alpha.3',
           assets: [
             {
-              name: 'Batshit-0.1.0-macos-ReleaseSafe.dmg',
+              name: 'Batshit-0.1.0-alpha.3-arm64.dmg',
               browser_download_url: 'https://example.com/Batshit.dmg'
             }
           ]
@@ -125,7 +125,7 @@ describe('updateStatusService', () => {
           html_url: 'https://github.com/SirBadfish/batshit/releases/tag/v0.1.0-alpha.2',
           assets: [
             {
-              name: 'Batshit-0.1.0-macos-ReleaseSafe.dmg',
+              name: 'Batshit-0.1.0-alpha.2-arm64.dmg',
               browser_download_url: 'https://example.com/alpha-2.dmg'
             }
           ]

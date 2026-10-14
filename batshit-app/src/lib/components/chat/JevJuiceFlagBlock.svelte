@@ -1,20 +1,21 @@
 <script lang="ts">
   /**
-   * SA-120 P7 — the Jev Juice flag as the USER reads it, one block for every surface that
+   * SA-120 P7 — the Judge Juice flag as the USER reads it, one block for every surface that
    * draws it in a chat: the Agent DM tool card, the wake-up message at the top of a woken
    * chat, and the notice card above an approval card.
    *
-   * The words are Josh's (2026-09-17 review): "Flagged by Jev" (Jev is the model that did
-   * it; Jev Juice is the feature), one CATEGORY per finding with "(96% confidence)" on every
+   * The words are Josh's (2026-09-17 review): "Flagged by <model>" (the model is the one that
+   * did it; Judge Juice is the feature; SA-120 P10b: the name is the judge that judged, Jev only
+   * when TypeSafe did), one CATEGORY per finding with "(96% confidence)" on every
    * line, "Potential harm: serious | minor", then the promise that it is a guess and blocked
    * nothing. It draws ONLY a flag. A DM with no flag never reaches this block, so nothing
    * here can read as "clean" (DL-120-12).
    */
   import { Zap } from '@lucide/svelte'
   import {
-    UNTRUSTED_TEXT_ADVISORY_TEXT,
-    UNTRUSTED_TEXT_BADGE_TEXT,
     UNTRUSTED_TEXT_CLIPPED_TEXT,
+    untrustedTextAdvisoryText,
+    untrustedTextBadgeText,
     untrustedTextCategoryLines,
     untrustedTextHarmText,
     type UntrustedTextFlagView
@@ -38,7 +39,7 @@
   {#if showTitle}
     <div class="jev-flag-title">
       <Zap class="jev-flag-icon" aria-hidden="true" />
-      <span>{UNTRUSTED_TEXT_BADGE_TEXT}</span>
+      <span>{untrustedTextBadgeText(view.judge)}</span>
     </div>
   {/if}
   <div class="jev-flag-lines">
@@ -48,7 +49,7 @@
     <div class="jev-flag-line">{untrustedTextHarmText(view)}</div>
   </div>
   <div class="jev-flag-note">
-    {UNTRUSTED_TEXT_ADVISORY_TEXT}
+    {untrustedTextAdvisoryText(view.judge)}
     {#if view.clipped}
       {UNTRUSTED_TEXT_CLIPPED_TEXT}
     {/if}

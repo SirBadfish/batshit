@@ -1,3 +1,5 @@
+import { createRequire } from "node:module";
+import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 import {
@@ -45,6 +47,18 @@ const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
 const HASH_C = "c".repeat(64);
 const REAL_REDIS_LANE = process.env.VITEST_USE_REAL_REDIS === "true";
+
+function controlledFileFence() {
+  const claims = createRequire(import.meta.url)(path.resolve('../batshit-server/server/src/services/goonCustomAssetClaims.js'));
+  return {
+    reserveOwnedFile: vi.fn(async (ref: { ref: string }) => REAL_REDIS_LANE
+      ? (await redis.execute((client) => claims.reserveCustomRecipeDeletion(client, 'goon_hair_assets', ref.ref.split('/').at(-1)))).reservation
+      : { contract: 'goon-asset-deletion/v1' as const, token: '00000000-0000-4000-8000-000000000001', phase: 'reserved' as const }),
+    releaseOwnedFile: vi.fn(async (ref: { ref: string }, reservation: { token: string }) => REAL_REDIS_LANE
+      ? redis.execute((client: any) => client.eval(`local marker=cjson.decode(redis.call('GET', KEYS[1])); if marker.token~=ARGV[1] or marker.phase~='reserved' then return 0 end return redis.call('DEL', KEYS[1])`, {
+        keys: ['goon_asset_delete:goon_hair_assets:'+ref.ref.split('/').at(-1)], arguments: [reservation.token] })) : 1),
+  };
+}
 
 function ref(name: string, sha256: string) {
   return {
@@ -409,6 +423,7 @@ describe("Hair Asset immutable Redis repository", () => {
         bytes: 128,
         mimeType: "text/plain",
       };
+      await redis.json.set(`upload:${source.uploadType}:${source.filename}`, "$", { size: source.bytes, sha256: source.sha256 });
       const created = await createHairImportJob({
         userId: USER_ID,
         goonId: "goon-import-owner",
@@ -472,6 +487,31 @@ describe("Hair Asset immutable Redis repository", () => {
     },
   );
 
+  it("explains a rollback-only dependency and preserves the saved version and Hair", async () => {
+    const asset = await userAsset();
+    await seedOwnedFileRecords(asset);
+    await putUserHairAssetRevision(USER_ID, asset);
+    const previousKey = `goon_recipe_revision:${USER_ID}:goon-rollback:previous`;
+    await redis.sAdd(`user:${USER_ID}:goons`, "goon-rollback");
+    await redis.json.set("goon:goon-rollback", "$", {
+      name: "My Goon",
+      hairState: createHairState(),
+      recipe: { previousRevision: { ref: previousKey } },
+    });
+    const previous = { revision: { state: { siblings: [{ state: createHairState(asset) }] } } };
+    await redis.json.set(previousKey, "$", previous);
+    const deleteOwnedFile = vi.fn();
+    await expect(deleteUserHairAssetRevision(USER_ID, asset.assetId, asset.revisionId, {
+      deleteOwnedFile, ...controlledFileFence(),
+    })).rejects.toMatchObject({
+      code: "ASSET_IN_USE",
+      message: expect.stringContaining('Previous Version (rollback) of “My Goon”'),
+    });
+    expect(deleteOwnedFile).not.toHaveBeenCalled();
+    expect(await redis.json.get(previousKey)).toEqual(previous);
+    expect(await redis.json.get(userHairAssetRevisionKey(USER_ID, asset.assetId, asset.revisionId))).toEqual(asset);
+  });
+
   it("blocks referenced deletion, then removes metadata and unshared owned files", async () => {
     const asset = await userAsset();
     const sourceRecord = refitSource(asset);
@@ -485,16 +525,18 @@ describe("Hair Asset immutable Redis repository", () => {
     await redis.sAdd(`user:${USER_ID}:goons`, "goon-with-hair");
     await redis.json.set("goon:goon-with-hair", "$", {
       id: "goon-with-hair",
+      name: "Current Hair Goon",
       user_id: USER_ID,
       hairState: createHairState(asset),
     });
 
     await expect(
       deleteUserHairAssetRevision(USER_ID, asset.assetId, asset.revisionId, {
-        deleteOwnedFile: vi.fn(),
+        deleteOwnedFile: vi.fn(), ...controlledFileFence(),
       }),
     ).rejects.toMatchObject<Partial<HairAssetRepositoryError>>({
       code: "ASSET_IN_USE",
+      message: expect.stringContaining('the saved Goon “Current Hair Goon”'),
       status: 409,
     });
 
@@ -503,7 +545,7 @@ describe("Hair Asset immutable Redis repository", () => {
     const deleteOwnedFile = vi.fn().mockResolvedValue(undefined);
     await expect(
       deleteUserHairAssetRevision(USER_ID, asset.assetId, asset.revisionId, {
-        deleteOwnedFile,
+        deleteOwnedFile, ...controlledFileFence(),
       }),
     ).resolves.toEqual(asset);
     expect(deleteOwnedFile).toHaveBeenCalledTimes(4);

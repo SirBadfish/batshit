@@ -1,5 +1,5 @@
 import type { CacheForensicsRecord } from '$lib/types/cacheForensics'
-import type { DelegatedExecutionSummary } from '$lib/types/delegation'
+import type { DelegatedExecutionSummary, DelegatedUsage } from '$lib/types/delegation'
 
 /**
  * SA-106: `n8n` retired with the n8n Primary Agent type. Execution snapshots recorded
@@ -78,11 +78,21 @@ export interface ExecutionLlmSummary {
   breakdownConfidence: ExecutionConfidenceLevel
 }
 
+/** Reported portions of an unfinished reply, never its complete usage or invoice. */
+export interface ObservedUsage {
+  completeness: 'partial'
+  parts: Array<{
+    source: 'codex-app-server-progress' | 'run-usage-prefix'
+    counts: DelegatedUsage
+  }>
+}
+
 export interface ExecutionResponseSummary {
   content: { value: string; confidence: ExecutionConfidenceLevel }
   usage: ExecutionTokenUsage
   toolCallsCount: ExecutionTokenStat
   notes?: string[]
+  observedUsage?: ObservedUsage
 }
 
 export interface ExecutionReasoningPersistence {
@@ -130,7 +140,7 @@ export interface ExecutionSnapshot {
   compiledMessages?: Array<{ role: string; content: any }>
   compileMetadata?: Record<string, any>
   /**
-   * Free-form run metadata. SA-120 Jev Juice lanes add `typesafeCalls: TypesafeCallRecord[]`
+   * Free-form run metadata. SA-120 Judge Juice lanes add `typesafeCalls: TypesafeCallRecord[]`
    * (`$lib/types/typesafe`): one row per TypeSafe call with model, latency, usage or
    * honest `null`, deadline state, status, reason, and the decision taken (DL-120-07).
    */

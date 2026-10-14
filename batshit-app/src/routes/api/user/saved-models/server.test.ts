@@ -2,6 +2,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const redisMock = vi.hoisted(() => ({
   getAgents: vi.fn(),
+  sMembers: vi.fn(async () => []),
+  getUserSettings: vi.fn(async () => null),
+  json: { get: vi.fn(async () => null) },
   del: vi.fn(),
   sRem: vi.fn()
 }))
@@ -48,13 +51,16 @@ describe('DELETE /api/user/saved-models', () => {
 
     expect(response.status).toBe(409)
     expect(payload.code).toBe('model_preset_in_use')
-    expect(payload.dependencies.agents).toEqual([
+    expect(payload.dependencies.references).toEqual([
       {
-        agentId: 'agent-1',
-        agentName: 'Ava',
-        field: 'primary'
+        kind: 'agent_model',
+        ownerId: 'agent-1',
+        label: "Ava's model"
       }
     ])
+    expect(payload.error).toBe(
+      "This model preset is still used by Ava's model. Pick a different model in each of those places before deleting it."
+    )
     expect(redisMock.del).not.toHaveBeenCalled()
   })
 

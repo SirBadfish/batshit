@@ -255,3 +255,93 @@ describe('parseSystemOneResponse', () => {
     expect(parsed?.answers.tone.legend['1']).toBe('annoyed')
   })
 })
+
+describe('SA-120 P10a: one client for every Jev-compatible judge', () => {
+  it('posts to the endpoint it was built for and sends no Authorization header at all for a keyless judge', async () => {
+    const calls: Array<{ url: string; init: TypesafeFetchInit }> = []
+    const client = createTypesafeClient({
+      baseUrl: 'http://127.0.0.1:11434/',
+      path: '/v1/systemone',
+      dispatcher: null,
+      fetch: async (url, init) => {
+        calls.push({ url, init })
+        return jsonResponse(200, { ...OK_BODY, model: 'clef-flash' })
+      }
+    })
+    const outcome = await client.systemOne(baseRequest({ apiKey: null, model: 'clef-flash' }))
+    expect(outcome.status).toBe('ok')
+    expect(calls[0].url).toBe('http://127.0.0.1:11434/v1/systemone')
+    const headers = calls[0].init.headers as Record<string, string>
+    expect(Object.keys(headers).map((name) => name.toLowerCase())).not.toContain('authorization')
+    expect(JSON.parse(String(calls[0].init.body)).model).toBe('clef-flash')
+    // Round 1, S1: a redirect is never followed (it would re-send the user's text to another host).
+    expect(calls[0].init.redirect).toBe('error')
+  })
+
+  it('round 1, S1: a redirect refusal reads as an unreachable judge, and nothing is sent anywhere else', async () => {
+    const urls: string[] = []
+    const client = createTypesafeClient({
+      baseUrl: 'http://127.0.0.1:11434',
+      dispatcher: null,
+      fetch: async (url, init) => {
+        urls.push(url)
+        // What fetch does with redirect: 'error' when the server answers 307: it rejects.
+        if (init.redirect === 'error') throw new TypeError('fetch failed: unexpected redirect')
+        return jsonResponse(200, OK_BODY)
+      }
+    })
+    expect(await client.systemOne(baseRequest({ apiKey: null }))).toMatchObject({ status: 'unavailable', reason: 'network' })
+    expect(urls).toEqual(['http://127.0.0.1:11434/v1/systemone'])
+  })
+
+  it('tolerates the extra fields other runtimes add and stays strict on the typed answer', () => {
+    // Shapes from the verified sweep: Ollama adds `confidence` (and may echo `criteria`) on a Noul, a `legend` on a
+    // Choice, `latency_ms` and other top-level counters (the real call added `prompt_eval_cached_count`).
+    const body = {
+      model: 'clef-flash',
+      answers: {
+        yes: { type: 'noul', noul: 0.96, confidence: 0.92, criteria: { true: 'Success', false: 'Failure' } },
+        pick: { type: 'choice', choice: 'b', probabilities: { a: 0.1, b: 0.9 }, confidence: 0.8, legend: { a: 'A', b: 'B' } }
+      },
+      usage: { input_tokens: 154, output_tokens: 0 },
+      latency_ms: 31,
+      prompt_eval_cached_count: 0
+    }
+    expect(parseSystemOneResponse(body, QUESTIONS)).toEqual({
+      model: 'clef-flash',
+      answers: {
+        yes: { type: 'noul', noul: 0.96 },
+        pick: { type: 'choice', choice: 'b', probabilities: { a: 0.1, b: 0.9 }, confidence: 0.8 }
+      },
+      usage: { inputTokens: 154, outputTokens: 0 }
+    })
+    // Strict: a Choice must name one of the question's own options, and a Noul is a probability.
+    const withPick = (choice: string) => ({ ...body, answers: { ...body.answers, pick: { ...body.answers.pick, choice } } })
+    expect(parseSystemOneResponse(withPick('c'), QUESTIONS)).toBeNull()
+    expect(parseSystemOneResponse(withPick('0'), QUESTIONS)).toBeNull()
+    expect(parseSystemOneResponse({ ...body, answers: { ...body.answers, yes: { type: 'noul', noul: 1.4 } } }, QUESTIONS)).toBeNull()
+    expect(parseSystemOneResponse({ ...body, answers: { ...body.answers, yes: { type: 'noul', noul: 'high' } } }, QUESTIONS)).toBeNull()
+  })
+
+  it("reads an answer inside Cloudflare's REST envelope, and nothing else from it", () => {
+    const answers = { yes: { type: 'noul', noul: 0.7 }, pick: { type: 'choice', choice: 'a', probabilities: { a: 0.9, b: 0.1 }, confidence: 0.9 } }
+    const wrapped = { result: { model: 'clef-flash', answers, usage: { input_tokens: 5, output_tokens: 0 } }, success: true, errors: [], messages: [] }
+    expect(parseSystemOneResponse(wrapped, QUESTIONS)?.answers.yes.noul).toBe(0.7)
+    expect(parseSystemOneResponse({ result: { nothing: true }, success: true }, QUESTIONS)).toBeNull()
+  })
+
+  it('maps a 422 STATE_TRUNCATED (a runtime that refuses rather than cuts) to provider_limit, and any other 422 to bad_request', async () => {
+    const truncated = createTypesafeClient({
+      dispatcher: null,
+      fetch: async () => jsonResponse(422, { error: { code: 'STATE_TRUNCATED', message: 'state exceeds the context window' } })
+    })
+    expect(await truncated.systemOne(baseRequest({ apiKey: null }))).toMatchObject({
+      status: 'unavailable',
+      reason: 'provider_limit',
+      httpStatus: 422,
+      attempts: 1
+    })
+    const invalid = createTypesafeClient({ dispatcher: null, fetch: async () => jsonResponse(422, { error: 'questions.pick.criteria is required' }) })
+    expect(await invalid.systemOne(baseRequest())).toMatchObject({ status: 'error', reason: 'bad_request' })
+  })
+})

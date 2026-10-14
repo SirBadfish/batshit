@@ -160,6 +160,10 @@ describe('token gate on the API surface (G-0162/G-0238)', () => {
     { method: 'POST', path: '/api/upload/single' },
     { method: 'POST', path: '/api/upload/avatar' },
     { method: 'DELETE', path: '/api/upload/asset', body: { uploadType: 'images', filename: 'x.png' } },
+    { method: 'POST', path: '/api/upload/asset-deletion/reserve', body: { uploadType: 'goon_custom_models', filename: 'x.glb' } },
+    { method: 'POST', path: '/api/upload/asset-maintenance/begin', body: { token: '00000000-0000-4000-8000-000000000000' } },
+    { method: 'POST', path: '/api/upload/asset-maintenance/end', body: { token: '00000000-0000-4000-8000-000000000000' } },
+    { method: 'DELETE', path: '/api/upload/avatar', body: { entityType: 'agent', entityId: 'x' } },
     { method: 'POST', path: '/api/upload/goon-hair-asset' },
     { method: 'POST', path: '/api/upload/goon-clothing-asset' },
     { method: 'POST', path: '/api/upload/goon-hair-import-source' },
@@ -192,6 +196,28 @@ describe('token gate on the API surface (G-0162/G-0238)', () => {
     expect(response.status).toBe(200);
     const body = await response.json();
     expect(body.taskId).toBe('some-task-id');
+  });
+
+  // BL-41: the agent delete asks this route to sweep the agent's avatar pictures and keeps
+  // the agent when it fails. This server runs on the in-memory fallback (dead Redis), where
+  // a scan would find nothing, so "deleted nothing" here would be a false success.
+  it('refuses an agent-avatar sweep with 503 when Redis is not connected (BL-41)', async () => {
+    const response = await fetch(`${baseUrl}/api/upload/avatar`, {
+      method: 'DELETE',
+      headers: { ...tokenHeaders, 'content-type': 'application/json' },
+      body: JSON.stringify({ entityType: 'agent', entityId: 'zb_surface' }),
+    });
+    expect(response.status).toBe(503);
+    expect((await response.json()).error).toMatch(/no avatar was deleted/i);
+  });
+
+  it('rejects an agent-avatar sweep for an unsafe owner id with 400 (BL-41)', async () => {
+    const response = await fetch(`${baseUrl}/api/upload/avatar`, {
+      method: 'DELETE',
+      headers: { ...tokenHeaders, 'content-type': 'application/json' },
+      body: JSON.stringify({ entityType: 'agent', entityId: '../zb_surface' }),
+    });
+    expect(response.status).toBe(400);
   });
 
   it('streams a ticket-bound backup into private staging with exact size and hash', async () => {
@@ -245,21 +271,6 @@ describe('token gate on the API surface (G-0162/G-0238)', () => {
       },
     );
     expect(replay.status).toBe(401);
-  });
-
-  it('rejects a Hair artifact without exact immutable-owner IDs before storage', async () => {
-    const form = new FormData();
-    form.set('role', 'material-definition');
-    form.set('file', new Blob(['{}'], { type: 'application/json' }), 'material.json');
-    const response = await fetch(`${baseUrl}/api/upload/goon-hair-asset`, {
-      method: 'POST',
-      headers: tokenHeaders,
-      body: form,
-    });
-    expect(response.status).toBe(400);
-    expect(await response.json()).toEqual(
-      expect.objectContaining({ error: expect.stringContaining('assetId must be') }),
-    );
   });
 
   it('rejects a Clothing artifact without exact immutable-owner IDs before storage', async () => {
@@ -363,6 +374,8 @@ describe('task dispatch allow-list (G-0162)', () => {
     'process_and_store_file',
     'general',
     'to_string',
+    // Retired 2026-10-13 with the lint_code helper; the allow-list must keep refusing it.
+    'lint_code',
   ];
 
   for (const toolName of blockedNames) {

@@ -8,6 +8,7 @@ import {
   removeRetiredSystemPrompts
 } from '$lib/server/services/systemPromptRegistry'
 import { removeRetiredSystemClips } from '$lib/server/services/retiredSystemClips'
+import { removeRetiredZipControlFields } from '$lib/server/services/retiredZipControlFields'
 import { ensureMemoryIndexes } from '$lib/server/services/memory/memoryIndex'
 import { startMemoryDreamingScheduler } from '$lib/server/services/memory/memoryDreamingScheduler'
 import { startScheduleTicker } from '$lib/server/services/schedules/scheduleTicker'
@@ -18,6 +19,7 @@ import { isAuthRateLimitedPath, shouldApplyBroadApiRateLimit } from '$lib/middle
 import { disconnectAllRedisServices } from '$lib/server/redis'
 import { cleanupAllMonitoring } from '$lib/server/visualIndicatorService'
 import { closeRegisteredRuntimeResources } from '$lib/server/services/runtimeShutdown'
+import { registerDockerVoiceEngineShutdown } from '$lib/server/services/voiceEngineRegistry'
 import {
   appendArtifactRuntimeCors,
   artifactRuntimeCorsHeaders,
@@ -37,6 +39,30 @@ import { sequence } from '@sveltejs/kit/hooks'
 
 let startupIntegrityInitialized = false
 let startupIntegrityPromise: Promise<void> | null = null
+
+/**
+ * BL-793: a native dev lane arms its own schedule ticker (`startScheduleTicker`) and memory
+ * dreaming scheduler (`startMemoryDreamingScheduler`) on its first request, same as any other
+ * lane on the same `hooks.server.ts` — because it reads and writes the SAME DB0 as every other
+ * lane and Josh's packaged Mac app, a proof lane fires due schedules and dreaming passes for
+ * real, beside whichever other lane already owns that data. No switch existed to stop it.
+ *
+ * `BATSHIT_DISABLE_SCHEDULERS=1` (the `BATSHIT_DISABLE_API_RATE_LIMITS` naming pattern) turns
+ * both OFF for this process only when explicitly set; the default stays ON for every lane that
+ * does not set it, including the one lane that actually owns DB0. Exported so a proof lane's
+ * boot log, and this behavior, can be asserted directly without exercising the rest of
+ * `ensureStartupIntegrityPass`'s startup side effects.
+ */
+export function armBackgroundSchedulers(currentEnv: Record<string, string | undefined> = env): void {
+  if (currentEnv.BATSHIT_DISABLE_SCHEDULERS === '1') {
+    console.info(
+      '[Startup] BATSHIT_DISABLE_SCHEDULERS=1 — schedule ticker and memory dreaming scheduler are OFF for this process.'
+    )
+    return
+  }
+  startMemoryDreamingScheduler()
+  startScheduleTicker()
+}
 
 type BatshitRuntimeShutdownGlobal = typeof globalThis & {
   __batshitRuntimeShutdownRegistered?: boolean
@@ -97,6 +123,9 @@ async function closeRuntimeResources(reason: string) {
 }
 
 registerRuntimeShutdownHandler()
+// Docker: the host voice engines this Batshit's operator started stop with the container, from the
+// moment the server starts, not from the first signed-in page load (BL-19).
+registerDockerVoiceEngineShutdown()
 
 function isUnsafePlaceholderSecret(value: string): boolean {
   return value.trim().toLowerCase().startsWith('replace-with-')
@@ -139,6 +168,11 @@ function ensureStartupIntegrityPass() {
       void removeRetiredSystemClips().catch((error) => {
         console.error('[Startup] Failed to remove retired system clips:', error)
       })
+      // BL-1484: the parked zip control permission's two older keys are removed for real; the
+      // permission reads only its hidden experiment key. Idempotent; logs only when it removed.
+      void removeRetiredZipControlFields().catch((error) => {
+        console.error('[Startup] Failed to remove retired zip control fields; the next start retries:', error)
+      })
       void ensureMemoryIndexes()
         .then((result) => {
           if (result.status !== 'ready') {
@@ -164,12 +198,12 @@ function ensureStartupIntegrityPass() {
         })
       // SA-104 P7: the between-conversation dreaming scheduler (DL-104-15). Arms on
       // the first request after boot; each pass re-checks eligibility and live turns.
-      startMemoryDreamingScheduler()
       // SA-115 P1: Batshit's clock (DL-115-06). Same arming point and the same reason it
       // works with no tab open — the Mac supervisor and the Docker healthcheck both poll
       // this server forever. A due-while-off schedule is collapsed by the first sweep,
       // never fired, so nothing starts an agent turn just because Batshit booted.
-      startScheduleTicker()
+      // BL-793: both are skipped, with a boot log line, when BATSHIT_DISABLE_SCHEDULERS=1.
+      armBackgroundSchedulers()
     })()
   }
   return startupIntegrityPromise ?? Promise.resolve()

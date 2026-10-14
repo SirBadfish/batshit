@@ -392,7 +392,11 @@ export async function recordWakeHookUse(hookId: string): Promise<void> {
  * the same user are untouched.
  */
 export async function sweepAgentWakeHooks(agentId: string): Promise<number> {
-  const record = (await redis.get(`agent:${agentId}`)) as Record<string, any> | null
+  // BL-608: `redis.json.get`, not `redis.get`, which answers a failed read with null (the same
+  // answer as a missing agent), so a read error swept no hook and the delete went on, leaving
+  // live hook credentials for an agent that no longer exists. A failed read now throws and
+  // stops `redis.deleteAgent` before the agent record goes.
+  const record = (await redis.json.get(`agent:${agentId}`)) as Record<string, any> | null
   const userId = typeof record?.user_id === 'string' ? record.user_id : null
   if (!userId) return 0
 

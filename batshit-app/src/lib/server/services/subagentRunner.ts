@@ -1,14 +1,22 @@
+import type { ChildProcess } from 'node:child_process'
 import { randomUUID } from 'crypto'
+import { chatgptPlanAccountId } from '$lib/utils/chatgptPlanConnection'
+import { getChatgptPlanRuntime } from './chatgptPlanHost'
+import { PLAN_AGENT, type PlanLease } from './chatgptPlanRuntime'
+import { isPlanSelection, assertPlanSettings } from './chatgptPlanInference'
 import { env } from '$env/dynamic/private'
 import { redis } from '$lib/server/redis'
 import type { SubagentRow, MCPToolSelections } from '$lib/types/database'
 import type { ToolApprovalMode } from '$lib/types/tool-approvals'
 import type { ModelConnectionInfo } from '$lib/types/savedModels'
 import type { DelegatedRunStatus, DelegatedUsage } from '$lib/types/delegation'
+import { createCodexDelegatedAccounting, type CodexDelegatedAccounting } from './observedUsage'
 import { buildCodexRuntimeSettings } from '$lib/server/services/codexSettings'
 import { buildClaudeRuntimeSettings } from '$lib/server/services/claudeSettings'
 import { CodexBridge } from '$lib/server/services/codexBridge'
+import { pinHostCommandOwner, prepareHostCommand, validateHostCommandOwner, type HostCommandLease } from './hostCommandOwnership'
 import { ClaudeBridge } from '$lib/server/services/claudeBridge'
+import { withManagedProfileRunWrite } from './agentProfileFolderGate'
 import {
   buildAgentProfileId,
   prepareManagedCodexSubagentProfile,
@@ -38,10 +46,16 @@ import {
 } from '$lib/utils/subagentRuntimePrompt'
 import {
   buildCliSubagentRuntimeId,
+  buildCliWorkerRuntimeId,
   resolveSubagentSlug
 } from '$lib/utils/subagentSlug'
 import { stripLeadingSubagentEchoText } from '$lib/server/services/finalAssistantTextSanitizer'
+import {
+  resolveDelegatedRunAllowedControlIds,
+  resolveDelegatedRunBrokerInputs,
+} from '$lib/utils/brokerAvailability'
 import { callWorkflow } from '$lib/server/services/workflowExecutor'
+import { buildCliSubagentProviderSettings } from '$lib/server/services/cliSubagentProfile'
 import { apiKeyService } from '$lib/services/apiKey.server'
 import {
   resolveRuntimeN8nBaseUrl,
@@ -79,9 +93,23 @@ import {
 } from '$lib/server/services/cacheForensics/evIntegration'
 import { normalizeUsageLike } from '$lib/server/services/apiProviderUsage'
 import {
+  resolveApiSubagentModel,
+  SubagentModelSelectionError,
+  type ApiSubagentModel,
+} from '$lib/server/services/subagentModelSelection'
+import { RuntimeModelPresetError } from '$lib/server/services/runtimeModelPreset'
+import { isModelSettingRefusal } from '$lib/utils/anthropicThinkingGuard'
+import {
+  SubagentDeletedError,
+  beginSubagentRun,
+  type SubagentRunHandle,
+} from '$lib/server/services/subagentRunRegistry'
+import { settleSubagentRunWork } from '$lib/server/services/subagentRunSettle'
+import {
   getSubagentTimeoutValidationError,
   normalizeSubagentTimeoutSeconds,
 } from '$lib/utils/subagentTimeout'
+import { SegmentedText } from '$lib/utils/segmentedText'
 
 const MAX_SUBAGENT_MEMORY_MESSAGES = 24
 
@@ -158,11 +186,34 @@ export type ManagedSubagentExecutionParams = {
   delegationSlug?: string
 }
 
+/**
+ * What the lanes receive once `executeManagedSubagent` has resolved the run's scope. The fields
+ * here are the runner's own, never a caller's.
+ */
+type ResolvedManagedSubagentParams = ManagedSubagentExecutionParams & {
+  codexAccounting?: ReturnType<typeof createCodexDelegatedAccounting>
+  /**
+   * BL-81 — the control ids this run may use through the control routes: exactly the Fabric and
+   * Artifact Tools groups its DCM index offers it (`resolveDelegatedRunAllowedControlIds`),
+   * computed from the same resolved scope that index is built from. A CLI run carries it on its
+   * credential; the API lane enforces the same list through its own broker registration.
+   */
+  delegatedAllowedControlIds: string[]
+  /**
+   * BL-287: told of each CLI process the lane starts, so a Subagent's registered run lasts
+   * until that process has EXITED (its delete removes the folder the process writes into).
+   * Absent on a Worker run, which is never registered.
+   */
+  onCliProcess?: (child: ChildProcess) => void
+}
+
 export type ManagedSubagentExecutionResult = {
   output: string
   intermediateSteps: any[]
   subagentType: SubagentType
   usage: DelegatedUsage | null
+  observedUsage?: CodexDelegatedAccounting['observedUsage']
+  observedUsageUnavailable?: 'invalid'
   modelId: string | null
   provider: string | null
   durationMs: number
@@ -211,6 +262,12 @@ async function executeWithManagedSubagentTimeout<T>(args: {
   parentAbortSignal?: AbortSignal
   work: (abortSignal: AbortSignal) => Promise<T>
 }): Promise<T> {
+  // A call stopped before its lane started (a Stop, or its Subagent's delete, during the
+  // setup or while it queued for the lock) never starts the lane: the lane would still write
+  // the CLI profile folder and open the thread for a call nobody is waiting for (BL-287).
+  if (args.parentAbortSignal?.aborted) {
+    throw new Error('Managed Subagent call was cancelled.')
+  }
   const controller = new AbortController()
   let timeout: ReturnType<typeof setTimeout> | undefined
   let rejectCancellation: ((error: Error) => void) | null = null
@@ -222,13 +279,9 @@ async function executeWithManagedSubagentTimeout<T>(args: {
     rejectCancellation?.(new Error('Managed Subagent call was cancelled.'))
   }
 
-  if (args.parentAbortSignal?.aborted) {
-    abortFromParent()
-  } else {
-    args.parentAbortSignal?.addEventListener('abort', abortFromParent, {
-      once: true,
-    })
-  }
+  args.parentAbortSignal?.addEventListener('abort', abortFromParent, {
+    once: true,
+  })
 
   timeout = setTimeout(() => {
     rejectCancellation?.(new ManagedSubagentTimeoutError(args.timeoutMs))
@@ -249,6 +302,9 @@ async function executeWithManagedSubagentTimeout<T>(args: {
  * or a built-in Worker's `worker_…` id). Neither run lane's `agentId` can stand in for it: an
  * API run passes the PARENT, a CLI run a `subagent_cli_…` runtime id. A record with no id has
  * no list, so the run fails loudly instead of borrowing the parent's skills.
+ *
+ * The same id judges the run's artifact allowlists, the id its DCM index lists them by: on a
+ * CLI run's credential (BL-81), and in an API run's in-process broker (BL-186).
  */
 function requireDelegatedSkillScopeId(subagent: SubagentRow): string {
   const id = typeof subagent.id === 'string' ? subagent.id.trim() : ''
@@ -545,33 +601,6 @@ function joinCallbackPath(base: string, pathname: string): string {
   }
 }
 
-function cloneProviderSettings(value: Record<string, any> | null | undefined): Record<string, any> {
-  if (!value || typeof value !== 'object') {
-    return {}
-  }
-  return structuredClone(value)
-}
-
-function buildCliSubagentProviderSettings(
-  subagent: SubagentRow,
-): Record<string, any> {
-  const base = cloneProviderSettings(subagent.provider_specific_settings ?? null)
-  const nativeTools =
-    base.nativeTools && typeof base.nativeTools === 'object'
-      ? { ...base.nativeTools }
-      : base.batshitNativeTools && typeof base.batshitNativeTools === 'object'
-        ? { ...base.batshitNativeTools }
-        : {}
-
-  nativeTools.fetchZipEnabled = false
-  nativeTools.batshitToolsEnabled = false
-
-  base.nativeTools = nativeTools
-  delete base.batshitNativeTools
-
-  return base
-}
-
 function shouldSkipCliSubagentToolResult(toolName?: string | null, dynamic?: boolean): boolean {
   if (dynamic) return true
   const normalized = toolName?.trim().toLowerCase() ?? ''
@@ -582,8 +611,10 @@ async function collectCliSubagentStreamResult(
   streamResult:
     | Awaited<ReturnType<CodexBridge['streamNativeMode']>>
     | Awaited<ReturnType<ClaudeBridge['streamNativeMode']>>,
+  reportCompletedUsage?: (usage: unknown) => void,
 ): Promise<{ output: string; intermediateSteps: any[]; usage: unknown }> {
-  const outputChunks: string[] = []
+  // BL-759: pieces by segment, so a message Codex dropped and started again is taken back.
+  const output = new SegmentedText()
   const intermediateSteps: any[] = []
   let usage: unknown = null
   const detectToolSource =
@@ -595,12 +626,18 @@ async function collectCliSubagentStreamResult(
     if (!chunk || typeof chunk !== 'object') continue
 
     if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
-      outputChunks.push(chunk.text)
+      output.append(chunk.text, chunk.segmentId)
+      continue
+    }
+
+    if (chunk.type === 'text-retract' && typeof chunk.segmentId === 'string') {
+      output.retract(chunk.segmentId)
       continue
     }
 
     if (chunk.type === 'finish') {
       usage = chunk.totalUsage ?? chunk.usage ?? usage
+      reportCompletedUsage?.(usage)
       continue
     }
 
@@ -625,7 +662,7 @@ async function collectCliSubagentStreamResult(
   }
 
   return {
-    output: outputChunks.join(''),
+    output: output.toString(),
     intermediateSteps,
     usage,
   }
@@ -721,6 +758,7 @@ async function runWorkflowBackedSubagent(
     messageId,
     userId: params.userId,
     agentId: normalizedParentAgentId,
+    subagentId: params.subagent.id,
   })
   const workflowPayload = rewriteBatshitCallbackUrlsForN8nRuntime(
     {
@@ -866,9 +904,52 @@ async function runApiSubagent(
   timeoutMs: number,
 ): Promise<ManagedSubagentExecutionResult> {
   const startedAt = Date.now()
-  const modelId = resolveSubagentModelId(params.subagent, params.parentModelId)
-  if (!modelId) {
-    throw new Error('API Subagent needs a model selection or a parent model to inherit.')
+  // BL-266: the Subagent's own model runs through the connection its preset names, the way a
+  // primary's does; no model of its own means the parent's model and the parent's connection.
+  // Resolved before the thread opens, so a refusal (an own model saved without a preset) leaves
+  // a stored thread exactly as it was and comes back as a failed run the parent can read.
+  let selection: ApiSubagentModel
+  try {
+    selection = await resolveApiSubagentModel({
+      subagent: params.subagent,
+      parentModelId: params.parentModelId,
+      parentConnection: params.parentConnection,
+    })
+  } catch (error) {
+    if (
+      !(error instanceof SubagentModelSelectionError) &&
+      !(error instanceof RuntimeModelPresetError) &&
+      // A model setting the model refuses (anthropicThinkingGuard.ts) is the user's to change.
+      !isModelSettingRefusal(error)
+    ) {
+      throw error
+    }
+    return {
+      output: delegatedFailureOutput({
+        label: params.subagent.displayName || subagentSlug,
+        status: 'failed',
+        timeoutMs,
+        error,
+      }),
+      intermediateSteps: [],
+      subagentType: 'api',
+      usage: null,
+      modelId: resolveSubagentModelId(params.subagent, params.parentModelId),
+      provider: params.subagent.primary_model_provider?.trim() || null,
+      durationMs: Math.max(0, Date.now() - startedAt),
+      status: 'failed',
+      thread: null,
+    }
+  }
+  const modelId = selection.modelId
+  const runtimeSettings = selection.runtimeSettings
+  let planLease: PlanLease | undefined
+  try {
+  if (isPlanSelection(selection.connection)) {
+    assertPlanSettings(selection.settings)
+    const accountId = chatgptPlanAccountId(selection.connection?.id)
+    if (!accountId) throw new Error('Choose the connected ChatGPT account again.')
+    planLease = getChatgptPlanRuntime().acquire(params.userId, accountId, PLAN_AGENT, params.abortSignal)
   }
 
   const thread = await openThreadForPlan(params.sessionId, subagentSlug, plan)
@@ -886,22 +967,30 @@ async function runApiSubagent(
   const { VercelAIBrain } = await loadVercelBrainModule()
   const brain = new VercelAIBrain()
   const runMessageId = `subagent-${params.subagent.id}-${randomUUID()}`
-  const provider =
-    params.subagent.primary_model_provider?.trim() ||
-    params.parentConnection?.service?.trim() ||
-    null
+  const provider = planLease ? 'chatgpt-plan' : selection.provider
   let response: Awaited<ReturnType<(typeof brain)['processNativeMode']>>
   try {
     response = await brain.processNativeMode({
       sessionId: params.sessionId,
       messageId: runMessageId,
       userId: params.userId,
+      // The PARENT: the identity gate, approvals and the audit keep it (BL-187). The run's own
+      // id rides `scopeAgentId` and governs its skills (BL-75) and artifact allowlists (BL-186).
       agentId: params.parentAgentId ?? undefined,
+      // Physical commands retire with the actual Subagent; a Worker belongs to its parent.
+      // This is separate from agentId's long-standing audit and approval identity.
+      processOwner: {
+        userId: params.userId,
+        kind: params.delegationKind === 'worker' ? 'agent' : 'subagent',
+        id: params.delegationKind === 'worker' ? params.parentAgentId! : params.subagent.id,
+      },
+      // A preset may override provider settings for inference, but never this Subagent's
+      // own command grant. The parent supplies project and approval context only.
+      delegatedBashEnabled: resolveNativeToolSettings(params.subagent.provider_specific_settings ?? null).bashEnabled,
       scopeAgentId: requireDelegatedSkillScopeId(params.subagent),
       model: modelId,
-      connection: params.subagent.primary_model_name?.trim()
-        ? undefined
-        : (params.parentConnection ?? undefined),
+      connection: selection.connection ?? undefined,
+      chatgptPlanLease: planLease,
       messages,
       toolsEnabled: true,
       maxToolRounds: 10,
@@ -913,7 +1002,24 @@ async function runApiSubagent(
       dcmDisplaySettings: params.dcmDisplaySettings ?? undefined,
       defaultGateways: params.defaultGateways ?? undefined,
       toolApprovalMode: 'off',
-      providerSettings: params.subagent.provider_specific_settings ?? null,
+      providerSettings: selection.settings,
+      // BL-800: the model call is built from these request fields, not from `providerSettings`
+      // (that is the tool scope). `runtimeSettings` is the preset's values through the mapper a
+      // primary's send uses, so blank is undefined (nothing is sent), zero is real, and a value
+      // the model rejects is already out; `processNativeMode` reads them as `send-routed`'s
+      // `buildStreamRequest` does.
+      temperature: runtimeSettings.standard.temperature,
+      maxTokens: runtimeSettings.standard.maxTokens,
+      topP: runtimeSettings.standard.topP,
+      topK: runtimeSettings.standard.topK,
+      presencePenalty: runtimeSettings.standard.presencePenalty,
+      frequencyPenalty: runtimeSettings.standard.frequencyPenalty,
+      seed: runtimeSettings.standard.seed,
+      stopSequences: runtimeSettings.standard.stopSequences,
+      providerOptions:
+        Object.keys(runtimeSettings.providerOptions).length > 0
+          ? runtimeSettings.providerOptions
+          : undefined,
       allowArtifactRuntimeTools: true,
       allowFabricControlTools: false,
       // SA-104 P3: memory tools are PA-only in v1 — subagent memory access is a deferred
@@ -960,9 +1066,7 @@ async function runApiSubagent(
     params,
     messages,
     usage: response.usage ?? null,
-    connectionId: params.subagent.primary_model_name?.trim()
-      ? null
-      : (params.parentConnection?.id ?? params.parentConnection?.service ?? null),
+    connectionId: selection.connection?.id ?? selection.connection?.service ?? null,
     modelId,
     runMessageId,
   })
@@ -993,10 +1097,17 @@ async function runApiSubagent(
     thread: thread.outcome,
     ...(threadNote ? { threadNote } : {}),
   }
+  } finally { planLease?.release() }
+}
+
+/** BL-287: hand the lane's CLI process (when the bridge started one) to the run's registration. */
+function reportCliProcess(params: ResolvedManagedSubagentParams, streamResult: unknown) {
+  const child = (streamResult as { __cliProcess?: ChildProcess | null } | null)?.__cliProcess
+  if (child) params.onCliProcess?.(child)
 }
 
 async function runCliSubagent(
-  params: ManagedSubagentExecutionParams,
+  params: ResolvedManagedSubagentParams,
   subagentSlug: string,
   systemPrompt: string,
   plan: ThreadPlan,
@@ -1029,7 +1140,12 @@ async function runCliSubagent(
     { role: 'user' as const, content: params.chatInput },
   ]
 
-  const runtimeId = buildCliSubagentRuntimeId(subagentSlug)
+  // BL-285: a Worker slot has its own runtime id namespace, so its profile folder is never a
+  // Subagent's (one slugged `worker_<agent>_<n>` shared it before).
+  const runtimeId =
+    params.delegationKind === 'worker'
+      ? buildCliWorkerRuntimeId(subagentSlug)
+      : buildCliSubagentRuntimeId(subagentSlug)
   const profileId = buildAgentProfileId(runtimeId)
   const profileLabel = `${params.subagent.displayName || subagentSlug} ${
     params.delegationKind === 'worker' ? 'CLI Worker' : 'CLI Subagent'
@@ -1040,6 +1156,36 @@ async function runCliSubagent(
   let collectedUsage: unknown = null
   const runMessageId = `subagent-${params.subagent.id}-${randomUUID()}`
   const provider = params.subagent.primary_model_provider?.trim() || runtime
+  let hostCommandLease: HostCommandLease | undefined
+  // The stored owner is the Subagent, or the parent Agent for an ephemeral Worker.
+  // A virtual CLI runtime id is never a Redis owner and must not admit a profile write.
+  const processOwner = {
+    userId: params.userId,
+    kind: params.delegationKind === 'worker' ? 'agent' as const : 'subagent' as const,
+    id: params.delegationKind === 'worker' ? params.parentAgentId! : params.subagent.id,
+  }
+
+  const failedResult = (error: unknown): ManagedSubagentExecutionResult => {
+    hostCommandLease?.abortBeforeSpawn()
+    if (params.abortSignal?.aborted && !isManagedSubagentTimeoutError(error)) throw error
+    const status: DelegatedRunStatus = isManagedSubagentTimeoutError(error) ? 'timed_out' : 'failed'
+    return {
+      output: delegatedFailureOutput({
+        label: params.subagent.displayName || subagentSlug,
+        status,
+        timeoutMs,
+        error,
+      }),
+      intermediateSteps: [],
+      subagentType: 'cli',
+      ...(runtime === 'codex' && params.codexAccounting ? params.codexAccounting.freeze() : { usage: null }),
+      modelId,
+      provider,
+      durationMs: Math.max(0, Date.now() - startedAt),
+      status,
+      thread: thread.outcome,
+    }
+  }
 
   try {
     if (runtime === 'codex') {
@@ -1051,7 +1197,15 @@ async function runCliSubagent(
       codexSettings.historyPersistence = 'none'
       codexSettings.includeProjectInstructions = true
 
-      const profile = await prepareManagedCodexSubagentProfile({
+      if (process.platform !== 'win32') {
+        const pin = pinHostCommandOwner(processOwner, profileId)
+        hostCommandLease = await prepareHostCommand(pin, {
+          kind: 'codex', program: 'codex', sessionId: params.sessionId, messageId: params.parentMessageId,
+        })
+        await validateHostCommandOwner(processOwner)
+      }
+
+      const profile = await withManagedProfileRunWrite(processOwner, profileId, () => prepareManagedCodexSubagentProfile({
         userId: params.userId,
         profileId,
         runtimeId,
@@ -1064,12 +1218,15 @@ async function runCliSubagent(
         defaultCliToolIds: params.selectedCliToolIds ?? null,
         workingDirectory: params.projectPath ?? null,
         runtimeSettings: codexSettings,
-      })
+      }))
 
       const bridge = new CodexBridge()
       const result = await bridge.streamNativeMode({
         sessionId: params.sessionId,
         messageId: runMessageId,
+        processCleanupMessageId: params.parentMessageId ?? undefined,
+        processOwner,
+        commandParentAgentId: params.parentAgentId!,
         userId: params.userId,
         agentId: runtimeId,
         // SA-117 F-P2-1: `runtimeId` is `subagent_cli_<slug>`, a per-run identity with no
@@ -1077,6 +1234,8 @@ async function runCliSubagent(
         // (the helper needs one) and marks it as unable to act as an agent.
         delegatedRun: true,
         scopeAgentId: requireDelegatedSkillScopeId(params.subagent),
+        // BL-81: what the helper may use through the control routes, onto the credential.
+        delegatedAllowedControlIds: params.delegatedAllowedControlIds,
         agentSlug: subagentSlug,
         model: modelId,
         messages,
@@ -1091,8 +1250,11 @@ async function runCliSubagent(
         providerSettings: runtimeProviderSettings,
         codexSettings,
         abortSignal: params.abortSignal,
-      })
-      const collected = await collectCliSubagentStreamResult(result)
+        registerObservedUsageSource: params.codexAccounting?.register,
+        onFinish: params.codexAccounting?.reportFinish,
+      }, hostCommandLease)
+      reportCliProcess(params, result)
+      const collected = await collectCliSubagentStreamResult(result, params.codexAccounting?.reportCompleted)
       output = stripLeadingSubagentEchoText(collected.output, collected.intermediateSteps)
       intermediateSteps = collected.intermediateSteps
       collectedUsage = collected.usage
@@ -1104,7 +1266,7 @@ async function runCliSubagent(
       claudeSettings.model = modelId
       claudeSettings.includeProjectInstructions = true
 
-      const profile = await prepareManagedClaudeSubagentProfile({
+      const profile = await withManagedProfileRunWrite(processOwner, profileId, () => prepareManagedClaudeSubagentProfile({
         userId: params.userId,
         profileId,
         runtimeId,
@@ -1116,7 +1278,7 @@ async function runCliSubagent(
         defaultMCPToolSelections: params.toolSelections ?? null,
         defaultCliToolIds: params.selectedCliToolIds ?? null,
         runtimeSettings: claudeSettings,
-      })
+      }))
 
       const bridge = new ClaudeBridge()
       const result = await bridge.streamNativeMode({
@@ -1124,11 +1286,15 @@ async function runCliSubagent(
         messageId: runMessageId,
         userId: params.userId,
         agentId: runtimeId,
+        processOwner,
+        commandParentAgentId: params.parentAgentId!,
         // SA-117 F-P2-1: `runtimeId` is `subagent_cli_<slug>`, a per-run identity with no
         // `agent:` record behind it. The bridge mints this run's credential for it anyway
         // (the helper needs one) and marks it as unable to act as an agent.
         delegatedRun: true,
         scopeAgentId: requireDelegatedSkillScopeId(params.subagent),
+        // BL-81: what the helper may use through the control routes, onto the credential.
+        delegatedAllowedControlIds: params.delegatedAllowedControlIds,
         agentSlug: subagentSlug,
         model: modelId,
         messages,
@@ -1144,68 +1310,56 @@ async function runCliSubagent(
         claudeSettings,
         abortSignal: params.abortSignal,
       })
+      reportCliProcess(params, result)
       const collected = await collectCliSubagentStreamResult(result)
       output = stripLeadingSubagentEchoText(collected.output, collected.intermediateSteps)
       intermediateSteps = collected.intermediateSteps
       collectedUsage = collected.usage
     }
   } catch (error) {
-    if (params.abortSignal?.aborted && !isManagedSubagentTimeoutError(error)) throw error
-    const status: DelegatedRunStatus = isManagedSubagentTimeoutError(error) ? 'timed_out' : 'failed'
+    return failedResult(error)
+  }
+
+  const completeResult = async (): Promise<ManagedSubagentExecutionResult> => {
+    captureManagedSubagentForensics({
+      lane: runtime,
+      params,
+      messages,
+      usage: collectedUsage,
+      connectionId: null,
+      modelId,
+      runMessageId,
+    })
+
+    const threadNote =
+      plan.kind === 'stored'
+        ? await commitManagedSubagentThread({
+            sessionId: params.sessionId,
+            slug: subagentSlug,
+            previousMessages: memory,
+            newMessages: [
+              { role: 'user', content: params.chatInput },
+              { role: 'assistant', content: output },
+            ],
+            lock: plan.lock,
+          })
+        : undefined
+
     return {
-      output: delegatedFailureOutput({
-        label: params.subagent.displayName || subagentSlug,
-        status,
-        timeoutMs,
-        error,
-      }),
-      intermediateSteps: [],
+      output,
+      intermediateSteps,
       subagentType: 'cli',
-      usage: null,
+      ...(runtime === 'codex' && params.codexAccounting ? params.codexAccounting.freeze() : { usage: normalizeUsageLike(collectedUsage) ?? null }),
       modelId,
       provider,
       durationMs: Math.max(0, Date.now() - startedAt),
-      status,
+      status: 'completed',
       thread: thread.outcome,
+      ...(threadNote ? { threadNote } : {}),
     }
   }
-
-  captureManagedSubagentForensics({
-    lane: runtime,
-    params,
-    messages,
-    usage: collectedUsage,
-    connectionId: null,
-    modelId,
-    runMessageId,
-  })
-
-  const threadNote =
-    plan.kind === 'stored'
-      ? await commitManagedSubagentThread({
-          sessionId: params.sessionId,
-          slug: subagentSlug,
-          previousMessages: memory,
-          newMessages: [
-            { role: 'user', content: params.chatInput },
-            { role: 'assistant', content: output },
-          ],
-          lock: plan.lock,
-        })
-      : undefined
-
-  return {
-    output,
-    intermediateSteps,
-    subagentType: 'cli',
-    usage: normalizeUsageLike(collectedUsage) ?? null,
-    modelId,
-    provider,
-    durationMs: Math.max(0, Date.now() - startedAt),
-    status: 'completed',
-    thread: thread.outcome,
-    ...(threadNote ? { threadNote } : {}),
-  }
+  if (runtime !== 'codex') return completeResult()
+  try { return await completeResult() } catch (error) { return failedResult(error) }
 }
 
 export async function executeManagedSubagent(
@@ -1233,6 +1387,58 @@ export async function executeManagedSubagent(
     params.subagent,
     isWorkerRun ? 'worker' : subagentType,
   )
+  const label = params.subagent.displayName || subagentSlug
+
+  // BL-287: a Subagent's own run is registered before anything else of it happens, and stays
+  // registered until its call is done AND its lane's work (a CLI's shutdown included) has
+  // settled, so the Subagent's delete can stop it the way a Stop does and wait for it before
+  // the profile folder goes. A Subagent that is being deleted, or whose record is gone (a turn
+  // that loaded it before its delete), does not start. A Worker is never registered: it runs
+  // in its own slot folder (BL-285), and a built-in Worker has no record at all. A record with
+  // no id fails in its lane, loudly (`requireDelegatedSkillScopeId`).
+  const registeredSubagentId =
+    !isWorkerRun && typeof params.subagent.id === 'string' ? params.subagent.id.trim() : ''
+  const runHandle = registeredSubagentId
+    ? await beginSubagentRun({ userId: params.userId, subagentId: registeredSubagentId, label })
+    : null
+  const abortSignal = !runHandle
+    ? params.abortSignal
+    : params.abortSignal
+      ? AbortSignal.any([params.abortSignal, runHandle.signal])
+      : runHandle.signal
+  try {
+    return await runManagedSubagentCall(params, {
+      subagentType,
+      isWorkerRun,
+      subagentSlug,
+      timeoutMs,
+      label,
+      abortSignal,
+      runHandle,
+    })
+  } catch (error) {
+    if (runHandle?.stoppedForDelete()) throw new SubagentDeletedError(label)
+    throw error
+  } finally {
+    runHandle?.end()
+  }
+}
+
+/** The run itself, once `executeManagedSubagent` has registered it (BL-287). */
+async function runManagedSubagentCall(
+  params: ManagedSubagentExecutionParams,
+  run: {
+    subagentType: SubagentType
+    isWorkerRun: boolean
+    subagentSlug: string
+    timeoutMs: number
+    label: string
+    /** The caller's stop signal, and for a registered run its delete's too. */
+    abortSignal: AbortSignal | undefined
+    runHandle: SubagentRunHandle | null
+  },
+): Promise<ManagedSubagentExecutionResult> {
+  const { subagentType, isWorkerRun, subagentSlug, timeoutMs, label, abortSignal, runHandle } = run
   const resolvedScope = await resolveManagedSubagentScope({
     userId: params.userId,
     subagent: params.subagent,
@@ -1250,23 +1456,34 @@ export async function executeManagedSubagent(
         }
       : undefined,
   )
+  // BL-81: the DCM index is built from THIS resolved scope, and so is the control scope below,
+  // so the tools the run is shown are exactly the tools it may use.
   const dynamicInfo = await buildManagedSubagentDynamicInfo({
     userId: params.userId,
     subagent: params.subagent,
     sessionId: params.sessionId,
     projectPath: resolvedScope.projectPath,
+    scope: resolvedScope,
   })
   systemPrompt = appendManagedSubagentDynamicInfo(systemPrompt, dynamicInfo)
+  const delegatedAllowedControlIds = resolveDelegatedRunAllowedControlIds(
+    resolveDelegatedRunBrokerInputs(resolvedScope),
+  )
 
   let reportedThreadOutcome: SubagentThreadOutcome | null = null
-  const resolvedParams: ManagedSubagentExecutionParams = {
+  const codexAccounting = isCliSubagentType(subagentType) && resolveCliSubagentRuntime(params.subagent) === 'codex'
+    ? createCodexDelegatedAccounting()
+    : undefined
+  const resolvedParams: ResolvedManagedSubagentParams = {
     ...params,
+    delegatedAllowedControlIds,
     projectPath: resolvedScope.projectPath,
     selectedGateways: resolvedScope.resolvedGateways,
     toolSelections: resolvedScope.defaultMcpToolSelections ?? undefined,
     selectedCliToolIds: resolvedScope.resolvedCliToolIds,
     defaultGateways: resolvedScope.defaultMcpGateways,
     dcmDisplaySettings: resolvedScope.dcmDisplaySettings,
+    codexAccounting,
     reportThreadOutcome: (outcome) => {
       reportedThreadOutcome = outcome
       params.reportThreadOutcome?.(outcome)
@@ -1288,13 +1505,13 @@ export async function executeManagedSubagent(
     : await acquireSubagentRunLock({
         sessionId: params.sessionId,
         slug: subagentSlug,
-        subagentLabel: params.subagent.displayName || subagentSlug,
+        subagentLabel: label,
         ttlMs: resolveSubagentLockTtlMs(timeoutMs),
         // How long a lock LIVES and how long other calls QUEUE for it are separate
         // decisions; see `resolveSubagentLockWaitMs` for why the queue budget is a full
         // holder lifetime and what that costs in wall clock.
         waitBudgetMs: resolveSubagentLockWaitMs(timeoutMs),
-        abortSignal: params.abortSignal,
+        abortSignal,
       })
   const threadPlan: ThreadPlan = isWorkerRun
     ? { kind: 'none' }
@@ -1304,35 +1521,50 @@ export async function executeManagedSubagent(
   try {
     const result = await executeWithManagedSubagentTimeout({
       timeoutMs,
-      parentAbortSignal: params.abortSignal,
-      work: async (abortSignal) => {
-        const timedParams = { ...resolvedParams, abortSignal }
-        if (isApiSubagentType(subagentType)) {
-          return runApiSubagent(timedParams, subagentSlug, systemPrompt, threadPlan, timeoutMs)
+      parentAbortSignal: abortSignal,
+      work: (laneSignal) => {
+        // BL-287: after a Stop (or the delete, or the time limit) the call answers at once, but
+        // the lane unwinds after that and its CLI exits after THAT. The run stays registered
+        // until both are over, within a bound (`subagentRunSettle.ts`).
+        const cliProcesses: ChildProcess[] = []
+        const timedParams: ResolvedManagedSubagentParams = {
+          ...resolvedParams,
+          abortSignal: laneSignal,
+          ...(runHandle ? { onCliProcess: (child: ChildProcess) => cliProcesses.push(child) } : {}),
         }
+        const running = (async () => {
+          if (isApiSubagentType(subagentType)) {
+            return runApiSubagent(timedParams, subagentSlug, systemPrompt, threadPlan, timeoutMs)
+          }
 
-        if (isCliSubagentType(subagentType)) {
-          return runCliSubagent(timedParams, subagentSlug, systemPrompt, threadPlan, timeoutMs)
-        }
+          if (isCliSubagentType(subagentType)) {
+            return runCliSubagent(timedParams, subagentSlug, systemPrompt, threadPlan, timeoutMs)
+          }
 
-        if (isWorkflowBackedSubagentType(subagentType)) {
-          return runWorkflowBackedSubagent(
-            timedParams,
-            subagentType,
-            subagentSlug,
-            systemPrompt,
-            timeoutMs,
+          if (isWorkflowBackedSubagentType(subagentType)) {
+            return runWorkflowBackedSubagent(
+              timedParams,
+              subagentType,
+              subagentSlug,
+              systemPrompt,
+              timeoutMs,
+            )
+          }
+
+          throw new Error(
+            `${getSubagentTypeDisplayLabel(subagentType)} does not run through the managed subagent runner.`,
           )
+        })()
+        if (runHandle) {
+          const settlement = settleSubagentRunWork({ work: running, cliProcesses, stopSignal: laneSignal, label })
+          runHandle.track(settlement.completion, { retry: settlement.retryCleanup })
         }
-
-        throw new Error(
-          `${getSubagentTypeDisplayLabel(subagentType)} does not run through the managed subagent runner.`,
-        )
+        return running
       },
     })
     return withQueueWaitNote(result, lock)
   } catch (error) {
-    if (!isManagedSubagentTimeoutError(error)) throw error
+    if (!isManagedSubagentTimeoutError(error)) { codexAccounting?.discard(); throw error }
     const runtime = isCliSubagentType(subagentType)
       ? resolveCliSubagentRuntime(params.subagent)
       : null
@@ -1346,14 +1578,14 @@ export async function executeManagedSubagent(
     return withQueueWaitNote(
       {
         output: delegatedFailureOutput({
-          label: params.subagent.displayName || subagentSlug,
+          label,
           status: 'timed_out',
           timeoutMs,
           error,
         }),
         intermediateSteps: [],
         subagentType,
-        usage: null,
+        ...(codexAccounting ? codexAccounting.freeze() : { usage: null }),
         modelId,
         provider,
         durationMs: Math.max(0, Date.now() - executionStartedAt),

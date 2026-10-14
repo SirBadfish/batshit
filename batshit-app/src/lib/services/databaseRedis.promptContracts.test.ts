@@ -1,13 +1,20 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-const redisMock = vi.hoisted(() => ({
-  get: vi.fn(),
-  getSession: vi.fn(async () => null),
-  getUserSettings: vi.fn(),
-  getProjects: vi.fn(),
-  sMembers: vi.fn(),
-  getZips: vi.fn()
-}))
+const redisMock = vi.hoisted(() => {
+  const mock = {
+    get: vi.fn(),
+    getSession: vi.fn(async () => null),
+    getUserSettings: vi.fn(),
+    getProjects: vi.fn(),
+    sMembers: vi.fn(),
+    getZips: vi.fn(),
+    // BL-230: stored prompts are read as raw strings through `execute`, not the facade `get`.
+    execute: vi.fn(async (operation: (client: any) => Promise<unknown>) =>
+      operation({ get: (key: string) => mock.get(key) })
+    )
+  }
+  return mock
+})
 
 vi.mock('$lib/server/redis', () => ({
   redis: redisMock
@@ -61,6 +68,15 @@ import {
   WORKERS_MAX_RUNS_PER_TURN
 } from '$lib/utils/delegationCapabilities'
 
+async function dynamicInfoText(service: DatabaseService, options: Record<string, unknown>): Promise<string> {
+  const result = await (service as any).buildDynamicInfoBlock(options)
+  expect(result).toMatchObject({
+    text: expect.any(String),
+    addressSourcePieces: expect.any(Array)
+  })
+  return result.text
+}
+
 describe('DatabaseService prompt and DCM contract helpers', () => {
   afterEach(() => {
     vi.useRealTimers()
@@ -108,17 +124,17 @@ describe('DatabaseService prompt and DCM contract helpers', () => {
     })
   })
 
-  it('labels the current user message before DCM content is appended', () => {
+  it('tags the current user message before DCM content is appended (SA-128)', () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-05-15T16:30:00.000Z'))
 
     const service = new DatabaseService()
-    const formatted = (service as any).formatCurrentUserMessage('Run diagnostics please', null, false, {
-      userLabel: 'Josh'
-    })
+    const formatted = (service as any).formatCurrentUserMessage('Run diagnostics please', null, false)
+    expect(formatted).toMatch(/^<user time="[^"]+">\nRun diagnostics please\n<\/user>$/)
 
-    expect(formatted).toContain('Josh: Run diagnostics please')
-    expect(formatted).toMatch(/^\*\*.+\*\*\nJosh: Run diagnostics please$/)
+    // Batshit's own current message (a woken turn, a group follow-up) is a note, never the user.
+    const note = (service as any).formatCurrentUserMessage('[Schedule — not from the user] Check in', null, false, 'batshit')
+    expect(note).toMatch(/^<note time="[^"]+">\n\[Schedule — not from the user\] Check in\n<\/note>$/)
   })
 
   it('exposes the resolved agent default project path from prompt compilation', async () => {
@@ -138,9 +154,13 @@ describe('DatabaseService prompt and DCM contract helpers', () => {
     ;(service as any).compileChatHistory = vi.fn().mockResolvedValue({
       formattedMessages: [],
       currentDay: null,
-      chatHistory: ''
+      chatHistory: '',
+      addressSources: [],
+      // The real history pass always reports what it compressed and exposed (SA-120 P5, SA-129).
+      compressedZips: [],
+      exposedZips: []
     })
-    ;(service as any).buildDynamicInfoBlock = vi.fn().mockResolvedValue('')
+    ;(service as any).buildDynamicInfoBlock = vi.fn().mockResolvedValue({ text: '', addressSourcePieces: [] })
 
     const result = await service.buildFormattedChatInput(
       'session-1',
@@ -195,7 +215,7 @@ describe('DatabaseService prompt and DCM contract helpers', () => {
   it('shows exact CLI MCP tool names for assigned subagents in Codex/Claude DCM', async () => {
     const service = new DatabaseService()
 
-    const block = await (service as any).buildDynamicInfoBlock({
+    const block = await dynamicInfoText(service, {
       agentRecord: {
         id: 'sample_codex_primary',
         slug: 'sample_codex_primary'
@@ -243,7 +263,7 @@ describe('DatabaseService prompt and DCM contract helpers', () => {
   it('SA-111 P1: the roster prints each subagent\u2019s capabilities (DL-111-03)', async () => {
     const service = new DatabaseService()
 
-    const block = await (service as any).buildDynamicInfoBlock({
+    const block = await dynamicInfoText(service, {
       agentId: 'sample_api_primary',
       agentRecord: { id: 'sample_api_primary' },
       subagentDescriptions: {
@@ -276,7 +296,7 @@ describe('DatabaseService prompt and DCM contract helpers', () => {
     const service = new DatabaseService()
     expect(WORKERS_FEATURE_ENABLED).toBe(true)
 
-    const enabled = await (service as any).buildDynamicInfoBlock({
+    const enabled = await dynamicInfoText(service, {
       agentId: 'sample_api_primary',
       agentRecord: { id: 'sample_api_primary', workers_enabled: true },
       subagentDescriptions: { researcher: 'Digs through docs' },
@@ -286,7 +306,7 @@ describe('DatabaseService prompt and DCM contract helpers', () => {
       `workers: enabled (max ${WORKERS_MAX_CONCURRENT} parallel, ${WORKERS_MAX_RUNS_PER_TURN} per turn)`
     )
 
-    const disabled = await (service as any).buildDynamicInfoBlock({
+    const disabled = await dynamicInfoText(service, {
       agentId: 'sample_api_primary',
       agentRecord: { id: 'sample_api_primary', workers_enabled: false },
       subagentDescriptions: { researcher: 'Digs through docs' },
@@ -295,7 +315,7 @@ describe('DatabaseService prompt and DCM contract helpers', () => {
     expect(disabled).toContain('workers: disabled')
 
     // Default ON for a primary agent that never stored the field (DL-111-11).
-    const defaulted = await (service as any).buildDynamicInfoBlock({
+    const defaulted = await dynamicInfoText(service, {
       agentId: 'sample_api_primary',
       agentRecord: { id: 'sample_api_primary' },
       subagentDescriptions: {},
@@ -307,7 +327,7 @@ describe('DatabaseService prompt and DCM contract helpers', () => {
 
     // AMD-111-01's rule applies to the worker tool too: on a managed CLI lane the roster
     // prints the exact name the CLI exposes, so the agent never has to guess it.
-    const codex = await (service as any).buildDynamicInfoBlock({
+    const codex = await dynamicInfoText(service, {
       agentId: 'sample_codex_primary',
       agentRecord: { id: 'sample_codex_primary', slug: 'sample_codex_primary' },
       isCodexMode: true,
@@ -325,7 +345,7 @@ describe('DatabaseService prompt and DCM contract helpers', () => {
   it('adds concise speech-to-text guidance when the current user message was transcribed', async () => {
     const service = new DatabaseService()
 
-    const block = await (service as any).buildDynamicInfoBlock({
+    const block = await dynamicInfoText(service, {
       agentId: 'voice-agent',
       voiceState: {
         stt: true,
@@ -344,7 +364,7 @@ describe('DatabaseService prompt and DCM contract helpers', () => {
   it('does not add voice runtime context for saved provider config alone', async () => {
     const service = new DatabaseService()
 
-    const block = await (service as any).buildDynamicInfoBlock({
+    const block = await dynamicInfoText(service, {
       agentId: 'voice-agent',
       voiceState: {
         stt: false,
@@ -363,7 +383,7 @@ describe('DatabaseService prompt and DCM contract helpers', () => {
   it('keeps provider and engine guidance out of STT-only turns', async () => {
     const service = new DatabaseService()
 
-    const block = await (service as any).buildDynamicInfoBlock({
+    const block = await dynamicInfoText(service, {
       agentId: 'voice-agent',
       voiceState: {
         stt: true,
@@ -384,7 +404,7 @@ describe('DatabaseService prompt and DCM contract helpers', () => {
   it('adds spoken-reply brevity guidance when Voice Mode is active', async () => {
     const service = new DatabaseService()
 
-    const block = await (service as any).buildDynamicInfoBlock({
+    const block = await dynamicInfoText(service, {
       agentId: 'voice-agent',
       voiceState: {
         stt: true,
@@ -405,7 +425,7 @@ describe('DatabaseService prompt and DCM contract helpers', () => {
   it('adds TTS engine prompt guidance only for spoken replies', async () => {
     const service = new DatabaseService()
 
-    const block = await (service as any).buildDynamicInfoBlock({
+    const block = await dynamicInfoText(service, {
       agentId: 'voice-agent',
       voiceState: {
         stt: false,
@@ -428,7 +448,7 @@ describe('DatabaseService prompt and DCM contract helpers', () => {
   it('adds compact runtime network guidance without baseline runtime URL aliases', async () => {
     const service = new DatabaseService()
 
-    const block = await (service as any).buildDynamicInfoBlock({
+    const block = await dynamicInfoText(service, {
       agentRecord: {
         id: 'api-agent',
         primary_agent_type: 'api'
@@ -453,7 +473,7 @@ describe('DatabaseService prompt and DCM contract helpers', () => {
   it('states the enforced Plan-mode read-only boundary in dynamic context', async () => {
     const service = new DatabaseService()
 
-    const block = await (service as any).buildDynamicInfoBlock({
+    const block = await dynamicInfoText(service, {
       agentRecord: {
         id: 'api-plan-agent',
         primary_agent_type: 'api',
@@ -494,9 +514,13 @@ describe('DatabaseService prompt and DCM contract helpers', () => {
     ;(service as any).compileChatHistory = vi.fn().mockResolvedValue({
       formattedMessages: [],
       currentDay: null,
-      chatHistory: ''
+      chatHistory: '',
+      addressSources: [],
+      // The real history pass always reports what it compressed and exposed (SA-120 P5, SA-129).
+      compressedZips: [],
+      exposedZips: []
     })
-    ;(service as any).buildDynamicInfoBlock = vi.fn().mockResolvedValue('')
+    ;(service as any).buildDynamicInfoBlock = vi.fn().mockResolvedValue({ text: '', addressSourcePieces: [] })
 
     await service.buildFormattedChatInput(
       'livekit-session',

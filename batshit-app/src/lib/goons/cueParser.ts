@@ -1,5 +1,11 @@
 import type { GoonCueDefinition, GoonCueMap, GoonEmojiMap } from '$lib/types/goons'
-import { extractBatshitCuePayload } from '$lib/utils/batshitCue'
+import { extractBatshitCuePayload, findCueBlocks } from '$lib/utils/batshitCue'
+import {
+  findNamedEmoteTags,
+  findPairedEmoteTags,
+  findSelfClosingEmoteTags,
+  findSelfClosingNamedEmoteTags
+} from './emoteTagScan'
 
 export type ParsedGoonCue = {
   name: string
@@ -11,13 +17,6 @@ export type ParsedGoonCue = {
 }
 
 const STAGE_CUE_REGEX = /\*goon:\s*([a-zA-Z0-9 _-]+)\s*\*/g
-const CONTROL_TAG_REGEX = /<batshit-cue[^>]*>([\s\S]*?)<\/batshit-cue>/gi
-const PAIRED_EMOTE_TAG_REGEX =
-  /<(?:emote|goon-emote)\b([^>]*)>([\s\S]*?)<\/(?:emote|goon-emote)>/gi
-const SELF_CLOSING_EMOTE_TAG_REGEX = /<(?:emote|goon-emote)\b([^>]*)\/>/gi
-const NAMED_EMOTE_TAG_REGEX =
-  /<((?:emote|goon-emote)-([a-zA-Z0-9_-]+))\b[^>]*>[\s\S]*?<\/\1>/gi
-const SELF_CLOSING_NAMED_EMOTE_TAG_REGEX = /<(?:emote|goon-emote)-([a-zA-Z0-9_-]+)\b[^>]*\/>/gi
 const EMOJI_REGEX = /\p{Extended_Pictographic}/gu
 const EMOJI_TEST_REGEX = /\p{Extended_Pictographic}/u
 const EMOJI_PAREN_COMBO_REGEX = /\(([^)]*)\)/g
@@ -396,12 +395,14 @@ export function parseGoonCues(
     })
   }
 
-  while ((match = CONTROL_TAG_REGEX.exec(text)) !== null) {
-    const payload = match[1]
+  // BL-442: the registry's scanner finds the cue blocks, so a cue shown as an example in code,
+  // or named in a sentence, never fires the Goon.
+  for (const block of findCueBlocks(text)) {
+    const payload = text.slice(block.bodyStart, block.bodyEnd)
     if (!payload) continue
     const { moods, cues: controlCues } = parseControlPayload(payload)
-    const baseIndex = match.index ?? 0
-    const spanEnd = baseIndex + match[0].length
+    const baseIndex = block.start
+    const spanEnd = block.end
     moods.forEach((mood, idx) => {
       if (!mood) return
       const canonicalName = resolveCanonicalCueName(mood, cueMap)
@@ -428,36 +429,33 @@ export function parseGoonCues(
     })
   }
 
-  while ((match = PAIRED_EMOTE_TAG_REGEX.exec(text)) !== null) {
-    const baseIndex = match.index ?? 0
+  // One pass each, the same matches the four emote regexes returned (`emoteTagScan.ts`).
+  for (const tag of findPairedEmoteTags(text)) {
     pushEmoteTagCue(
       cues,
-      resolveEmoteTagCueName(match[1], match[2]),
-      baseIndex,
-      baseIndex + match[0].length,
+      resolveEmoteTagCueName(tag.groups[0], tag.groups[1]),
+      tag.index,
+      tag.index + tag.text.length,
       cueMap
     )
   }
 
-  while ((match = NAMED_EMOTE_TAG_REGEX.exec(text)) !== null) {
-    const baseIndex = match.index ?? 0
-    pushEmoteTagCue(cues, match[2] ?? null, baseIndex, baseIndex + match[0].length, cueMap)
+  for (const tag of findNamedEmoteTags(text)) {
+    pushEmoteTagCue(cues, tag.groups[1] ?? null, tag.index, tag.index + tag.text.length, cueMap)
   }
 
-  while ((match = SELF_CLOSING_EMOTE_TAG_REGEX.exec(text)) !== null) {
-    const baseIndex = match.index ?? 0
+  for (const tag of findSelfClosingEmoteTags(text)) {
     pushEmoteTagCue(
       cues,
-      resolveEmoteTagCueName(match[1]),
-      baseIndex,
-      baseIndex + match[0].length,
+      resolveEmoteTagCueName(tag.groups[0]),
+      tag.index,
+      tag.index + tag.text.length,
       cueMap
     )
   }
 
-  while ((match = SELF_CLOSING_NAMED_EMOTE_TAG_REGEX.exec(text)) !== null) {
-    const baseIndex = match.index ?? 0
-    pushEmoteTagCue(cues, match[1] ?? null, baseIndex, baseIndex + match[0].length, cueMap)
+  for (const tag of findSelfClosingNamedEmoteTags(text)) {
+    pushEmoteTagCue(cues, tag.groups[0] ?? null, tag.index, tag.index + tag.text.length, cueMap)
   }
 
   if (emojiMap && Object.keys(emojiMap).length > 0) {

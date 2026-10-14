@@ -118,11 +118,12 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
 			}
 		}
 
-		// Update agent's assigned_subagent_ids field
-		agent.assigned_subagent_ids = subagentIds
-		agent.assignedSubagents = subagentIds
-		agent.updated_at = new Date().toISOString()
-		await service.set(`agent:${params.id}`, agent)
+		// BL-770: write only the two assignment fields, by path (updateAgent's script stamps
+		// updated_at). It wrote the whole record it read above, taking back any save made meanwhile.
+		await service.updateAgent(params.id!, {
+			assigned_subagent_ids: subagentIds,
+			assignedSubagents: subagentIds
+		} as any)
 
 		// Keep Mode 4 managed profiles in sync when subagent assignments change.
 		// This ensures Codex/Claude stdio subagent bridge entries are added/removed immediately.

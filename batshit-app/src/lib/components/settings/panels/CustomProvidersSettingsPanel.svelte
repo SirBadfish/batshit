@@ -9,7 +9,7 @@
   import SettingsInfoMenu from '$lib/components/settings/SettingsInfoMenu.svelte'
   import { toast } from '$lib/components/ui/sonner/settings-toast'
   import { confirmDialog } from '$lib/stores/confirmDialog'
-  import type { CustomProviderSummary } from '$lib/types/customProviders'
+  import { CUSTOM_PROVIDER_KEY_NOT_USABLE, type CustomProviderSummary } from '$lib/types/customProviders'
   import { dispatchModelConnectionsUpdated } from '$lib/utils/liveSettingsEvents'
 
   type ProviderFormState = {
@@ -285,7 +285,11 @@
             id="custom-provider-api-key"
             type="password"
             value={form.apiKey}
-            placeholder={form.id ? 'Leave blank to keep existing' : 'Paste API key…'}
+            placeholder={!form.id
+              ? 'Paste API key…'
+              : providers.find((provider) => provider.id === form.id)?.apiKeyUsable === false
+                ? 'Enter its API key'
+                : 'Leave blank to keep existing'}
             oninput={(event) => (form = { ...form, apiKey: (event.target as HTMLInputElement).value })}
           />
         </div>
@@ -355,11 +359,16 @@
               <div class="space-y-1">
                 <div class="flex items-center gap-2">
                   <p class="batshit-settings-form-label">{provider.label}</p>
-                  <Badge variant="secondary">Ready</Badge>
+                  <Badge variant={provider.apiKeyUsable ? 'secondary' : 'outline'}>
+                    {provider.apiKeyUsable ? 'Ready' : 'Not Configured'}
+                  </Badge>
                 </div>
                 <p class="batshit-settings-form-label">{provider.baseUrl}</p>
                 <p class="batshit-settings-form-label">Stored key: {provider.maskedKey || '****'}</p>
                 <p class="batshit-settings-form-label">{formatUpdatedAt(provider.updatedAt)}</p>
+                {#if !provider.apiKeyUsable}
+                  <p class="batshit-settings-form-help is-warning">{CUSTOM_PROVIDER_KEY_NOT_USABLE}</p>
+                {/if}
               </div>
               <div class="flex flex-wrap items-center gap-2">
                 <Button size="sm" variant="secondary" onclick={() => editProvider(provider)}>

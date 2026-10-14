@@ -6,15 +6,17 @@ Docker remains the cross-platform path. Manual source-checkout setup is advanced
 
 ## Download
 
-[Download Batshit for Mac](https://github.com/SirBadfish/batshit/releases/download/v0.1.0-alpha.1/Batshit-0.1.0-macos-ReleaseSafe.dmg)
+[Download Batshit for Mac](https://github.com/SirBadfish/batshit/releases/latest)
 
-Public alpha releases are published through GitHub Releases, but the link above downloads the DMG directly. After it downloads, open the DMG, drag `Batshit.app` to Applications if prompted, then open `Batshit.app`.
+The link opens the newest Batshit release on GitHub. Under **Assets**, download the file whose name ends in `-arm64.dmg`, such as `Batshit-0.1.0-alpha.2-arm64.dmg`. The name carries the version, and `arm64` means Apple Silicon Macs. Open the DMG, drag `Batshit.app` to Applications if prompted, then open `Batshit.app`.
 
-SHA-256 checksum:
+To check that the download is intact, also save the `.sha256` file from the same release into the same folder, then run this in Terminal from that folder, using the name of the file you downloaded:
 
-```text
-0b3ea4bbc4bdb8c89b6127fea5f4428029aee0ba1181a47b606b1e26c55de0c9
+```bash
+shasum -a 256 -c Batshit-0.1.0-alpha.2-arm64.dmg.sha256
 ```
+
+It prints `OK` when the DMG matches.
 
 ## Current release truth
 
@@ -40,18 +42,18 @@ Runtime Doctor checks the Mac app's required runtime and reports anything missin
 | macOS on Apple Silicon | Current Mac app and Apple Container proof target |
 | App-owned Node 24 runtime | Runs the packaged SvelteKit app/server payload |
 | App-owned Redis 8 with the JSON module and `redis-cli` | Stores chats, agents, settings, zips, clips, prompts, and sessions |
-| App-owned FFmpeg and FFprobe | Needed by batshit-server for media and Goon preview workflows |
+| App-owned FFmpeg and FFprobe | Media/Goon previews and Scene-video upload inspection, including software AV1 decoding |
 | Apple Container | Default Mac app command sandbox backend on supported Macs |
 
 Normal Mac users should not need to install Node, Redis, or ffmpeg globally for a release package that includes Batshit's managed runtime assets. Local development packages may still report a missing managed runtime if a curated binary was not included in that build; in that case, use the release notes or an advanced repair fallback rather than pointing Batshit at unrelated global services.
 
-Apple Container installs from Apple's signed package. Runtime Doctor links to Apple's official release page when the CLI is missing, and can start the Apple Container system when it is installed but stopped.
+Apple Container installs from Apple's signed package. Runtime Doctor links to Apple's official release page when the CLI is missing. Once it is installed, you do not need to start it yourself: Batshit starts it when a sandboxed command needs it. When you quit Batshit, it first removes the sandboxes its own chats left running (quitting in the middle of a reply leaves one). Then it stops Apple Container again if Batshit started it and no other container is running in it. If you started Apple Container yourself, Batshit leaves it running. Batshit never removes a container it did not create.
 
 ## Open the app
 
 For a public release build, open the DMG, drag `Batshit.app` to Applications if the DMG asks you to, then open `Batshit.app`. For a local development build shared as a raw `.app`, open `Batshit.app` directly.
 
-Runtime Doctor runs at startup. If the runtime is healthy, it opens Batshit automatically. If the runtime needs attention, Runtime Doctor shows Batshit app health, batshit-server health, Redis health, streamable MCP helper health, missing requirements, data and log folders, and Apple Container status with a repair action.
+Runtime Doctor runs at startup. If the runtime is healthy, it opens Batshit automatically. If the runtime needs attention, Runtime Doctor shows Batshit app health, batshit-server health, Redis health, streamable MCP helper health, missing requirements, data and log folders, and Apple Container status, with an install link when it is missing and a repair action when it does not answer.
 
 Use **Start Runtime** when services are stopped, **Restart** if a service is stuck, and **Open Batshit** once the doctor reports the runtime is ready.
 
@@ -140,7 +142,7 @@ Provider API keys saved in Batshit are not the same as CLI login. CLI agents nee
 
 ## Agent command sandboxing
 
-Apple Container is the normal Mac app sandbox backend for agent command execution on supported Macs. Runtime Doctor reports Apple Container status, can start the Apple Container system when it is installed but stopped, and surfaces repair actions when the sandbox needs attention.
+Apple Container is the normal Mac app sandbox backend for agent command execution on supported Macs. Runtime Doctor reports Apple Container status and offers a repair action when it is installed but does not answer. An installed Apple Container that is not running yet is normal: Batshit starts it with the first sandboxed command.
 
 Docker Sandbox remains available as a selectable backup for Mac users who want that backend, and it remains the cross-platform sandbox path for Docker, Windows, and Linux installs. On a Mac it needs Docker's `sbx` tool: see [Set up Docker Sandbox](install-docker.md#set-up-docker-sandbox).
 
@@ -178,6 +180,18 @@ Don't run source-checkout Batshit against the same ports already published by Do
 
 Use **Refresh**, **Restart**, or Settings → Admin → Runtimes → **Mac App Required Runtime** after fixing the named issue. For a normal release package, missing Node, Redis, or ffmpeg usually means the package is incomplete or damaged, so reinstall Batshit or use a newer package. Advanced source-checkout repair can still use host-installed fallbacks.
 
+### Apple Container has no Linux kernel yet
+
+Apple Container runs each sandbox in a small Linux virtual machine, and it needs a Linux kernel for that. A fresh Apple Container install has none. Batshit does not download one for you, because the download is large. Instead, the first sandboxed command stops with a message that names this step.
+
+Run this once in Terminal:
+
+```bash
+container system kernel set --recommended
+```
+
+It downloads Apple's recommended kernel (about 600 MB) and makes it the default. Then send your message again. You only need to do this once.
+
 ### Port already in use
 
 Batshit expects app `5620`, batshit-server `5600`, streamable MCP helper `5601`, n8n `5678`, and Redis `5639` for the Mac app (`6379` for advanced source-checkout repair). Runtime Doctor refuses to use a Redis process on `5639` unless it is Batshit's Mac-app-owned Redis with the expected data directory. Stop the conflicting process or change the matching env values before starting.
@@ -193,6 +207,8 @@ Check that the workflow is the current official Workflow Subagent template, that
 ### Goon or media preview fails
 
 Check Runtime Doctor for FFmpeg status. A normal release package should include app-owned FFmpeg; advanced local-alpha repair can install a host fallback and restart the runtime from Runtime Doctor.
+
+For a Scene video, distinguish an upload/thumbnail error from a playback error after upload. The Mac package's software AV1 decoder handles inspection and thumbnails; Scene playback uses Electron's browser decoder and the Mac's capabilities. Updating a host FFmpeg installation does not add codecs to the packaged app. Use a package with the required decoder for upload errors, and test a separate HEVC/H.265 MP4 copy if AV1 playback is unsupported or slow. Keep the original panorama.
 
 ### Mac app setup does not fit your machine
 

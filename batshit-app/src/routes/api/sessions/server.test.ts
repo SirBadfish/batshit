@@ -69,3 +69,34 @@ describe('POST /api/sessions', () => {
     )
   })
 })
+
+/**
+ * BL-541: a chat id becomes part of the KEYS patterns `redis.deleteSession` sweeps with, so an
+ * id carrying a Redis glob character (`a*`) made deleting that chat delete other chats' records.
+ * The create route refuses them, as it refuses `:`.
+ */
+describe('POST /api/sessions refuses Redis glob characters in a chosen id (BL-541)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    redisMock.getSessions.mockResolvedValue([])
+    redisMock.createSession.mockImplementation(async (session) => session)
+  })
+
+  for (const id of ['a*', 'a?', 'a[b]', 'a]', 'a\\b']) {
+    it(`refuses ${JSON.stringify(id)}`, async () => {
+      const { POST } = await import('./+server')
+      const response = await POST({
+        request: new Request('http://localhost/api/sessions', {
+          method: 'POST',
+          body: JSON.stringify({ id, name: 'Glob' })
+        }),
+        locals: { user: { id: 'user-1' } }
+      } as any)
+      const payload = await response.json()
+
+      expect(response.status).toBe(400)
+      expect(payload.error).toMatch(/\*/)
+      expect(redisMock.createSession).not.toHaveBeenCalled()
+    })
+  }
+})

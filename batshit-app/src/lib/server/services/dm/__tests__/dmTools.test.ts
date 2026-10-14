@@ -18,7 +18,7 @@ import {
   registerSteerRun,
   takeMissedDmSteers
 } from '$lib/server/services/steerInboxRegistry'
-import { STEER_MISSED_REASON } from '$lib/utils/dmControl'
+import { MAX_OPEN_DMS_PER_INBOX, STEER_MISSED_REASON } from '$lib/utils/dmControl'
 import {
   __resetDmLocksForTests,
   createDm,
@@ -395,9 +395,45 @@ describe('reading, claiming, and closing', () => {
       body: 'x',
       deliver: 'wait'
     })
-    await expect(
-      readDmOp({ userId: USER, agentId: FAYE, sessionId: null }, { dm_id: note.id })
-    ).rejects.toThrow(/not in your inbox/i)
+    const refusal = await readDmOp(
+      { userId: USER, agentId: FAYE, sessionId: null },
+      { dm_id: note.id }
+    ).catch((error) => error)
+    // BL-40: a real non-recipient keeps the PERMISSION answer, and it names nobody: the id is
+    // one the caller already had, so the answer adds no recipient and no body.
+    expect(refusal).toMatchObject({
+      message: `DM "${note.id}" is not in your inbox.`,
+      hint: 'Only the recipient can read a DM.'
+    })
+    expect(JSON.stringify({ message: refusal.message, hint: refusal.hint })).not.toMatch(
+      /cooper|for cooper/i
+    )
+    // Nothing was read or acknowledged on the refused path.
+    expect((await getDm(note.id))?.status).toBe('new')
+  })
+
+  it('says an id that does not exist was not found, not that it is somebody else’s (BL-40)', async () => {
+    // Bob (2026-09-18) read a DM id that existed nowhere, was told it was "not in your inbox"
+    // with "Only the recipient can read a DM", and reported a phantom permissions bug.
+    const missing = 'dm_1758186000000_abc123'
+    const readRefusal = await readDmOp(
+      { userId: USER, agentId: COOPER, sessionId: null },
+      { dm_id: missing }
+    ).catch((error) => error)
+
+    expect(readRefusal).toBeInstanceOf(Error)
+    expect(readRefusal.message).toBe(`DM "${missing}" was not found (it may have expired).`)
+    // No permission hint: the model must not be told to go and find "the recipient".
+    expect(readRefusal.hint).toBeUndefined()
+
+    // One wording for one fact: `claim` answers the same missing id through the store's own
+    // ownership rule (`requireOwnedDm`), and read must not drift from it again.
+    const claimRefusal = await claimDmOp(
+      { userId: USER, agentId: COOPER, sessionId: null },
+      { dm_id: missing }
+    ).catch((error) => error)
+    expect(claimRefusal.message).toBe(readRefusal.message)
+    expect(claimRefusal.hint).toBe(readRefusal.hint)
   })
 
   it('closing an assignment creates and delivers its result in the same act', async () => {
@@ -513,6 +549,7 @@ describe('presence (DL-113-16)', () => {
         chainDepth: 1
       } as never,
       startedAt: Date.now(),
+      assistantMessageId: 'msg-woken-turn',
       controller: new AbortController(),
       timer: setTimeout(() => {}, 60_000)
     })
@@ -1149,13 +1186,14 @@ describe('scheduled wake-ups (SA-115, DL-115-05)', () => {
       '(This run was due Tue, Sep 8, 9:00 AM CDT and is running late.)'
     )
 
-    // The on-time body has no note, which also makes it a different body — so the DM
-    // store's ten-minute duplicate guard does not swallow the second send.
+    // BL-401: the second fire finds the first note still unread and updates it, so the
+    // note now carries the on-time fire's words, without the late line.
     const onTime = await deliverScheduledDm(schedule, {
       trigger: 'tick',
       dueAt,
       now: new Date(dueAt.getTime() + 5_000)
     })
+    expect(onTime.dmId).toBe(late.dmId)
     expect((await getDm(onTime.dmId))?.body).toBe('Say good morning.')
   })
 
@@ -1174,6 +1212,190 @@ describe('scheduled wake-ups (SA-115, DL-115-05)', () => {
     await expect(deliverScheduledDm(schedule, { trigger: 'tick' })).rejects.toThrow(
       /no longer exists/i
     )
+  })
+})
+
+describe('BL-401 — a schedule keeps one unread note (the fire path)', () => {
+  async function seedSchedule(overrides: Record<string, any> = {}) {
+    return createSchedule({
+      userId: USER,
+      agentId: COOPER,
+      name: 'Queue check',
+      cadence: { type: 'interval', everyMinutes: 60 },
+      timeZone: 'America/Chicago',
+      message: 'Check the queue.',
+      deliver: 'wait',
+      ...overrides
+    })
+  }
+
+  it('a wait schedule fired five times leaves ONE note, fired five times', async () => {
+    const schedule = await seedSchedule()
+    const ids = new Set<string>()
+    for (let index = 0; index < 5; index += 1) {
+      const result = await deliverScheduledDm(schedule, { trigger: 'tick' })
+      expect(result).toMatchObject({ deliveredAs: 'wait', outcome: 'waiting in inbox' })
+      ids.add(result.dmId)
+    }
+    expect(ids.size).toBe(1)
+    const inbox = await listInbox(COOPER)
+    expect(inbox).toHaveLength(1)
+    expect(inbox[0]).toMatchObject({ fireCount: 5, from: { kind: 'schedule', scheduleId: schedule.id } })
+  })
+
+  it('a wake schedule whose wakes are refused keeps one note, with this fire\'s reason', async () => {
+    const schedule = await seedSchedule({ deliver: 'wake' })
+    await redis.updateAgent(COOPER, { wake_enabled: false } as any)
+
+    const first = await deliverScheduledDm(schedule, { trigger: 'tick' })
+    const second = await deliverScheduledDm(schedule, { trigger: 'tick' })
+
+    expect(second.dmId).toBe(first.dmId)
+    expect(second.deliveredAs).toBe('wait')
+    const stored = await getDm(first.dmId)
+    expect(stored?.fireCount).toBe(2)
+    expect(stored?.delivery).toMatchObject({ requested: 'wake', actual: 'wait' })
+    expect(stored?.delivery.reason).toMatch(/May be woken/i)
+    expect(await listInbox(COOPER)).toHaveLength(1)
+  })
+
+  it('an unread note wakes again on the next fire, as the same DM', async () => {
+    const schedule = await seedSchedule({ deliver: 'wake', kind: 'assignment' })
+    await redis.updateAgent(COOPER, { wake_enabled: false } as any)
+    const refused = await deliverScheduledDm(schedule, { trigger: 'tick' })
+    expect(refused.deliveredAs).toBe('wait')
+
+    await redis.updateAgent(COOPER, { wake_enabled: true } as any)
+    const woke = await deliverScheduledDm(schedule, { trigger: 'tick' })
+    expect(woke.deliveredAs).toBe('wake')
+    expect(woke.dmId).toBe(refused.dmId)
+    const stored = await getDm(woke.dmId)
+    expect(stored?.delivery).toMatchObject({ requested: 'wake', actual: 'wake', sessionId: woke.sessionId })
+    expect(stored?.delivery.reason).toBeUndefined()
+    const messages = await redis.getMessages(woke.sessionId as string, 10)
+    expect(messages[0].content).toContain(`DM id: ${woke.dmId}`)
+  })
+
+  it('sys.dm.list says how often the note fired', async () => {
+    const schedule = await seedSchedule()
+    await deliverScheduledDm(schedule, { trigger: 'tick' })
+    await deliverScheduledDm(schedule, { trigger: 'tick' })
+
+    const listed = await listDmsOp({ userId: USER, agentId: COOPER, sessionId: null })
+    expect(listed.open).toHaveLength(1)
+    const [summary] = listed.open as Array<Record<string, any>>
+    expect(summary.fireCount).toBe(2)
+    expect(summary.firstFiredAt).toBeTruthy()
+    expect(summary.lastFiredAt).toBeTruthy()
+    expect(summary.fired).toMatch(/^fired 2 times, first .+, last .+$/)
+  })
+})
+
+describe('BL-401 S5 — a result is never refused by a full inbox', () => {
+  async function fillInbox(agentId: string) {
+    for (let index = 0; index < MAX_OPEN_DMS_PER_INBOX; index += 1) {
+      await createDm({
+        userId: USER,
+        from: { kind: 'agent', agentId: OPIE, name: 'Opie' },
+        to: agentId,
+        kind: 'info',
+        subject: `Note ${index}`,
+        body: 'x',
+        deliver: 'wait'
+      })
+    }
+  }
+
+  it('closing an assignment still delivers its result when the asker\'s inbox is full', async () => {
+    await seedAgent(OPIE)
+    const sent = await sendOne(baseContext(), assignmentInput())
+    await claimDmOp({ userId: USER, agentId: COOPER, sessionId: 'sess-cooper' }, {
+      dm_id: sent.dm_id
+    })
+    await fillInbox(FAYE)
+
+    const closed = await closeDmOp(
+      { userId: USER, agentId: COOPER, sessionId: 'sess-cooper' },
+      { dm_id: sent.dm_id, result: 'The audit passed.' },
+      'done'
+    )
+    expect(closed.result_dm_id).toBeTruthy()
+    const report = await getDm(closed.result_dm_id as string)
+    expect(report).toMatchObject({ kind: 'result', to: FAYE, relatedDmId: sent.dm_id })
+  })
+
+  it('an expired unclaimed assignment still reports to a full inbox', async () => {
+    await seedAgent(OPIE)
+    const sent = await sendOne(baseContext(), assignmentInput({ expires_in_hours: 1 }))
+    await redis.json.set(
+      `dm:${sent.dm_id}`,
+      '$.expiresAt',
+      new Date(Date.now() - 60_000).toISOString() as never
+    )
+    await fillInbox(FAYE)
+
+    await listDmsOp({ userId: USER, agentId: COOPER, sessionId: null })
+    const reportId = (await getDm(sent.dm_id))?.resultDmId
+    expect(reportId).toBeTruthy()
+    expect((await getDm(reportId as string))?.body).toMatch(/expired unclaimed/i)
+  })
+
+  it('a THIRD agent named in report_back_to still meets the cap on close and on expiry', async () => {
+    // Review finding 1: the exemption is for the assignment's own sender only. Otherwise an
+    // agent could name a third agent in report_back_to on many assignments and every close
+    // or expiry would land in that agent's inbox with no limit.
+    await seedAgent(OPIE)
+    const closing = await sendOne(baseContext(), assignmentInput({ report_back_to: OPIE }))
+    const expiring = await sendOne(
+      baseContext(),
+      assignmentInput({ subject: 'Expires', report_back_to: OPIE, expires_in_hours: 1 })
+    )
+    for (let index = 0; index < MAX_OPEN_DMS_PER_INBOX; index += 1) {
+      await createDm({
+        userId: USER,
+        from: { kind: 'agent', agentId: COOPER, name: 'Cooper' },
+        to: OPIE,
+        kind: 'info',
+        subject: `Note ${index}`,
+        body: 'x',
+        deliver: 'wait'
+      })
+    }
+
+    await claimDmOp({ userId: USER, agentId: COOPER, sessionId: 'sess-cooper' }, {
+      dm_id: closing.dm_id
+    })
+    await expect(
+      closeDmOp(
+        { userId: USER, agentId: COOPER, sessionId: 'sess-cooper' },
+        { dm_id: closing.dm_id, result: 'Done.' },
+        'done'
+      )
+    ).rejects.toThrow(/inbox is full/i)
+
+    await redis.json.set(
+      `dm:${expiring.dm_id}`,
+      '$.expiresAt',
+      new Date(Date.now() - 60_000).toISOString() as never
+    )
+    await listDmsOp({ userId: USER, agentId: COOPER, sessionId: null })
+    expect((await getDm(expiring.dm_id))?.resultDmId).toBeUndefined()
+    expect(await listInbox(OPIE)).toHaveLength(MAX_OPEN_DMS_PER_INBOX)
+  })
+
+  it('a result an agent sends itself with sys.dm.send still meets the cap', async () => {
+    await seedAgent(OPIE)
+    await fillInbox(FAYE)
+    await expect(
+      sendOne(baseContext(COOPER, 'sess-cooper'), {
+        to: FAYE,
+        kind: 'result',
+        subject: 'Result: anything',
+        body: 'Unasked-for.',
+        related_dm_id: 'dm_1757000000000_abcdef',
+        deliver: 'wait'
+      })
+    ).rejects.toThrow(/inbox is full/i)
   })
 })
 

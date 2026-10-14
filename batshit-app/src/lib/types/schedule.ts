@@ -77,6 +77,10 @@ export interface ScheduleRecord {
   lastRunAt: string | null
   /** A readable sentence: `woke: <sessionId>`, `waiting in inbox`, `waited: …`, `failed: …`. */
   lastOutcome: string | null
+  /**
+   * The note the last fire wrote OR updated. Since BL-401 a fire whose previous note is still
+   * unread updates that note (`fileScheduleDm`), so one id can stand for several fires.
+   */
   lastDmId: string | null
   runCount: number
   /**

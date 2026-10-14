@@ -42,6 +42,22 @@ On Windows, Claude Code may print `Paste code here if prompted >` after the brow
 
 Docker Claude runs as the non-root `batshit-cli` user so Claude Code Bypass Permissions can work. If a Docker Claude agent still reports that Bypass Permissions cannot run as root, rebuild the app image from current source and use the exact login command shown in Agent Settings.
 
+## A CLI agent says its model is no longer offered
+
+Batshit's Codex and Claude model lists change as OpenAI and Anthropic change theirs. An agent or Subagent saved with a model that has since left the list keeps it. Batshit then does not start its runs, and the chat says which agent it is and where to change it. Open Settings → Agents → the agent (or the Subagent) → **Codex CLI Defaults** → **Default Codex Model** (or **Claude Code CLI Defaults** → **Default Claude Model**) and pick another model. The picker marks the old model with a line under it.
+
+A model name you typed yourself is never refused, because it may be valid for your account.
+
+If Codex answers that a model "requires a newer version of Codex", the Codex that Batshit found on your computer is older than the one it installs. The install card in Agent Settings says so. Install Batshit's copy there, or pick an older model.
+
+Claude agents in Plan mode write their plan in the reply. Batshit does not let them save plan files in your own `~/.claude/plans` folder, and Claude Code no longer saves its own copy of each chat in `~/.claude/projects`. Batshit keeps the chat.
+
+## A Codex edit says “Diff unavailable”
+
+This means Batshit could not establish a reliable before-and-after comparison. It does not mean the command failed or the file stayed unchanged. Check the command result and the current file.
+
+A preview may be unavailable for an untracked file, a file using Git conversion filters, an oversized or non-text file, or a project path that changed while Batshit read it. Batshit also withholds the Git-based preview when its safe project reader is missing or unsupported; native Windows does not yet have this reader. Do not loosen file permissions or disable path checks to make a preview appear.
+
 ## Tools are missing from the agent
 
 Check the agent's Tool Grid and access settings. Common causes:
@@ -130,7 +146,7 @@ Current user-only panel artifacts don't become agent tools: HuggingFace embeds, 
 
 Primary Agents fetch a saved Zip through the tool broker: `batshit_tool_use` with ref `fabric:sys.zip.fetch`.
 
-Fetch Zip is not available for subagent runs in either form. If a subagent needs prior zipped content, have the Primary Agent fetch or summarize it, then call the subagent with the relevant context.
+Fetch Zip reaches a Subagent only on the API lane, when its Fetch Zip toggle is on. CLI and n8n Workflow Subagents never get it. If one of those needs prior zipped content, have the Primary Agent fetch or summarize it, then call the Subagent with the relevant context.
 
 If a Primary Agent cannot fetch a Zip, verify the Zip ID exists in the session, the current agent/session can access it, and the message was saved with trusted Zip references.
 

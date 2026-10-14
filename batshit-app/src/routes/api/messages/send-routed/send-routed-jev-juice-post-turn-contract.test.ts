@@ -12,7 +12,7 @@ const source = readFileSync('src/routes/api/messages/send-routed/+server.ts', 'u
  * complete and the snapshot has had its last write, beside smart zip's step with the
  * Execution Viewer rows appended one writer at a time.
  */
-describe('send-routed Jev Juice after-reply check contracts', () => {
+describe('send-routed Judge Juice after-reply check contracts', () => {
   const streamStart = source.indexOf('async function handleBatshitAgentStream({')
   const zipTurn = source.indexOf('const jevJuiceSmartZip = jevJuiceGroupSelection', streamStart)
   const checkTurn = source.indexOf('const jevJuicePostTurnCheck = jevJuiceGroupSelection', zipTurn)
@@ -47,7 +47,9 @@ describe('send-routed Jev Juice after-reply check contracts', () => {
   })
 
   it('marks the notes as told only at the accepted-send boundary', () => {
-    const consumeGate = source.indexOf('if (consumeSessionClips) {\n    await consumePostCompileSessionClips(sessionId)', compileEnd)
+    // BL-527: after the clip/countdown/memory block, not inside it, so a managed CLI
+    // control-approval resume (no clip spend) still marks what its compile told.
+    const consumeGate = source.indexOf('if (consumeSessionClips && !isApprovalResumeWithoutUserTurn) {\n', compileEnd)
     const zipGate = source.indexOf('if (jevJuiceSmartZip && messageForCompilation && !groupContext) {', consumeGate)
     const checkGate = source.indexOf('if (jevJuicePostTurnCheck && messageForCompilation && !groupContext) {', zipGate)
     const told = source.indexOf('if (toldMessageId) await markPostTurnRecordTold(sessionId, toldMessageId)', checkGate)
@@ -63,33 +65,68 @@ describe('send-routed Jev Juice after-reply check contracts', () => {
     expect(source.split('markPostTurnRecordTold(').length - 1).toBe(1)
   })
 
-  it('checks the reply only once it is complete and its snapshot has had its last write, never a silent or paused reply', () => {
+  it('checks the reply only once it is complete and its snapshot has had its last write, never a silent, paused, or cut reply', () => {
     const finalize = source.indexOf("await finalizeAssistantMessage('postStream')", compileEnd)
     const complete = source.indexOf('await streamAdapter.emitComplete()', finalize)
     const snapshot = source.indexOf("await persistRuntimeSnapshot('succeeded')", complete)
-    const gate = source.indexOf('if (!silentResponse && (jevJuiceSmartZip || jevJuicePostTurnCheck)) {', snapshot)
-    const step = source.indexOf('? jevJuicePostTurnCheck.runPostTurn({', gate)
+    const awaits = source.indexOf(
+      'const replyAwaitsApproval = approvalSummaryIsPending(finishSummary.metadata?.toolApprovals)',
+      snapshot
+    )
+    const gate = source.indexOf(
+      '      !silentResponse &&\n      !replyAwaitsApproval &&\n      !replyOutputLimitFailure &&\n      (afterReplySmartZip || afterReplyCheck)\n',
+      awaits
+    )
+    const step = source.indexOf('? afterReplyCheck.runPostTurn({', gate)
     const awaited = source.indexOf('await Promise.all([smartZipStep, postTurnCheckStep])', step)
     const responseBuilt = source.indexOf('const response = json({', step)
 
     expect(complete).toBeGreaterThan(finalize)
     // The user already has the whole reply before Jev is asked anything.
     expect(snapshot).toBeGreaterThan(complete)
-    expect(gate).toBeGreaterThan(snapshot)
+    expect(awaits).toBeGreaterThan(snapshot)
+    // BL-527: a reply waiting at a card or cut at the output limit is not finished; neither step runs.
+    expect(gate).toBeGreaterThan(awaits)
     expect(step).toBeGreaterThan(gate)
     expect(awaited).toBeGreaterThan(step)
     expect(responseBuilt).toBeGreaterThan(awaited)
+    // The run's own answer says the same thing the gate decided.
+    expect(source.indexOf('awaitsApproval: replyAwaitsApproval,', responseBuilt)).toBeGreaterThan(responseBuilt)
 
+    // The send's own check, else (BL-527) the check given to a run that finishes an earlier run's reply.
+    expect(source).toContain('const afterReplyCheck = jevJuicePostTurnCheck ?? jevJuiceContinuedReply?.postTurnCheck')
     const body = source.slice(step, awaited)
     expect(body).toContain('reply: finishedReply,')
     expect(body).toContain('newZipIds,')
     expect(body).toContain('toolSteps:')
-    // A reply that stopped for an approval is not finished; there is nothing to check yet.
-    expect(body).toContain('streamedApprovalRequests.size > 0 || Boolean(finishSummary.metadata?.toolApprovals)')
+    expect(body).toContain('awaitingApproval: replyAwaitsApproval,')
+    // The whole reply: the parts the earlier runs stored ride along.
+    expect(body).toContain('earlierParts,')
     // Appending rows is a read-modify-write: this lane appends after smart zip's step settles.
     expect(body).toContain('appendRowsAfter: smartZipStep,')
     // ONE site: never on the error, abort, or interrupted paths.
-    expect(source.split('jevJuicePostTurnCheck.runPostTurn(').length - 1).toBe(1)
+    expect(source.split('.runPostTurn(').length - 1).toBe(2)
+    expect(source.split('afterReplyCheck.runPostTurn(').length - 1).toBe(1)
+  })
+
+  it('gives a run that finishes an earlier run\'s reply the after-reply steps alone, from the request that reply answers (BL-527)', () => {
+    const continued = source.indexOf('const jevJuiceContinuedReply =', checkTurn)
+    expect(continued).toBeGreaterThan(checkTurn)
+    expect(continued).toBeLessThan(seam)
+    const body = source.slice(continued, seam)
+    expect(body).toContain('jevJuiceGroupSelection || !(isApprovalResumeWithoutUserTurn || isContextContinuationRun)')
+    expect(body).toContain('? approvalResumeReplyTurn(pausedApprovalTurn, approvalResumePrior)')
+    expect(body).toContain(': findContextContinuationTurn(previousMessages, contextContinuationRaw?.previousMessageId),')
+    // It reaches the compiler through nothing (no provider before the reply) and the accepted-send
+    // boundary through nothing (no told mark): only the after-reply site reads it.
+    expect(source.slice(seam, compileEnd)).not.toContain('jevJuiceContinuedReply')
+    const uses = source.split('\n').filter((line) => line.includes('jevJuiceContinuedReply') && !line.trim().startsWith('//'))
+    expect(uses.map((line) => line.trim())).toEqual([
+      'const jevJuiceContinuedReply =',
+      'const afterReplySmartZip = jevJuiceSmartZip ?? jevJuiceContinuedReply?.smartZip',
+      'const afterReplyCheck = jevJuicePostTurnCheck ?? jevJuiceContinuedReply?.postTurnCheck',
+      'const earlierParts = jevJuiceContinuedReply?.earlierParts ?? []'
+    ])
   })
 
   it('never asks the lane directly and never writes its records itself', () => {

@@ -1,5 +1,91 @@
 import { describe, expect, it } from 'vitest'
-import { extractSpeakableText } from './speakableText'
+import { extractSpeakableText, stripLegacySpeechBlocks, stripUnsupportedXmlBlocks } from './speakableText'
+
+describe('speech reference removal preserves its old grammar without repeated tail scans (BL-708 subset)', () => {
+  function oldRemoveReferences(text: string): string {
+    return text
+      .replace(/\{\{batshit-zip:[^}]+\}\}/g, '')
+      .replace(/\{\{batshit\|id:[^}]+\}\}/g, '')
+  }
+
+  it.each([
+    ['A{{batshit-zip:id:::body}}B', 'AB'],
+    ['A{{batshit|id:with spaces\nand lines}}B', 'AB'],
+    ['A{{batshit-zip:}}B{{batshit|id:}}C', 'A{{batshit-zip:}}B{{batshit|id:}}C'],
+    ['A{{batshit-zip:x}y}}B', 'A{{batshit-zip:x}y}}B'],
+    ['A{{batshit-zip:outer{{batshit|id:inner}}B}}C', 'AB}}C'],
+    ['A{{batshit-zip:x}}}B', 'A}B'],
+    ['A{{BATSHIT-ZIP:x}}B{{Batshit|id:y}}C', 'A{{BATSHIT-ZIP:x}}B{{Batshit|id:y}}C'],
+    ['A{{bat{{batshit-zip:x}}shit|id:y}}B', 'AB'],
+    ['A{{bat{{batshit|id:x}}shit-zip:y}}B', 'A{{batshit-zip:y}}B']
+  ])('retains the exact spoken output for %s', (text, expected) => {
+    expect(extractSpeakableText(text)).toBe(expected)
+  })
+
+  it('matches the former two passes on generated plain malformed and mixed reference text', () => {
+    const pieces = ['{{batshit-zip:', '{{batshit|id:', '{{BATSHIT-ZIP:', '{{Batshit|id:', '{{bat', 'shit-zip:', 'shit|id:', '{{', '{', '}', '}}', '}}}', ':', ':::', 'id', 'body']
+    let state = 708
+    const random = () => {
+      state = (state * 1664525 + 1013904223) >>> 0
+      return state / 2 ** 32
+    }
+    for (let sample = 0; sample < 5_000; sample += 1) {
+      let text = 'p'
+      const length = Math.floor(random() * 12)
+      for (let part = 0; part < length; part += 1) text += pieces[Math.floor(random() * pieces.length)]
+      text += 'q'
+      expect(extractSpeakableText(text), JSON.stringify(text)).toBe(oldRemoveReferences(text))
+    }
+  })
+
+  it.each(['{{batshit-zip:', '{{batshit|id:'])('prepares 20,000 unclosed %s references within the existing 2-second scan budget', (opener) => {
+    const text = `prefix ${(opener + 'broken:::tail ').repeat(20_000)}suffix`
+    const started = performance.now()
+    const result = extractSpeakableText(text)
+    const elapsed = performance.now() - started
+    console.info(JSON.stringify({ speechReferenceFixture: opener, characters: text.length, milliseconds: elapsed }))
+    expect(result).toBe(text)
+    expect(elapsed).toBeLessThan(2_000)
+  })
+})
+
+describe('legacy speech blocks preserve their old grammar without repeated tail scans (BL-694)', () => {
+  function oldStrip(text: string): string {
+    return text
+      .replace(/<thinking[\s\S]*?>[\s\S]*?<\/thinking>/gi, '')
+      .replace(/<mute[\s\S]*?>[\s\S]*?<\/mute>/gi, '')
+      .replace(/<tool[-_ ]?results(?:[-_ ]?summary)?\b[\s\S]*?<\/tool[-_ ]?results(?:[-_ ]?summary)?>/gi, '')
+      .replace(/<tool[-_ ]?results(?:[-_ ]?summary)?\b[\s\S]*$/gi, '')
+      .replace(/\btoolResultsSummary\b(?=["']?\s*:)[\s\S]*$/i, '')
+  }
+
+  it('matches the former strips on malformed, nested, mixed-case and mismatched legacy blocks', () => {
+    const pieces = ['<thinking>', '</thinking>', '<THINKING note="x">', '<thinking-extra>', '<thinking', '<mute>', '</MUTE>', '<muteish>', '<tool-results>', '</tool_results>', '<tool results summary>', '</tool-results-summary>', '<toolresults', '<tool-resultsx>', 'toolResultsSummary:', 'toolResultsSummary says hello', '<', '>', 'text', ' ', '\n']
+    let state = 694
+    const random = () => {
+      state = (state * 1664525 + 1013904223) >>> 0
+      return state / 2 ** 32
+    }
+    for (let sample = 0; sample < 5_000; sample += 1) {
+      let text = ''
+      const length = Math.floor(random() * 12)
+      for (let part = 0; part < length; part += 1) text += pieces[Math.floor(random() * pieces.length)]
+      expect(stripLegacySpeechBlocks(text), JSON.stringify(text)).toBe(oldStrip(text))
+    }
+  })
+
+  it.each(['thinking', 'mute'])('handles 1,500 unclosed %s tags within the existing 2-second scan budget', (tag) => {
+    const text = `x <${tag}> y `.repeat(1_500)
+    const started = performance.now()
+    expect(stripLegacySpeechBlocks(text)).toBe(text)
+    expect(performance.now() - started).toBeLessThan(2_000)
+  })
+
+  it('retains protected code examples and spoken words around closed legacy blocks', () => {
+    expect(extractSpeakableText('Say `<thinking>example</thinking>` aloud. <thinking>hidden</thinking> Then <mute>silent</mute> speak.')).toBe('Say thinkingexamplethinking aloud. Then speak.')
+    expect(extractSpeakableText('Before <tool-results>hidden</tool_results> after.')).toBe('Before after.')
+  })
+})
 
 describe('extractSpeakableText', () => {
   it('removes control tags and unsupported XML blocks entirely', () => {
@@ -254,5 +340,120 @@ describe('extractSpeakableText control-tag registry coverage (SA-104 P1)', () =>
         'First part. <batshit-cue>{"goon_mood":"excited"}</batshit-cue> Second part.'
       )
     ).toBe('First part. Second part.')
+  })
+})
+
+describe('extractSpeakableText: what counts as a control block (BL-442)', () => {
+  it('speaks a lone < and >, and a reply that ends in one (R5, BL-477)', () => {
+    expect(extractSpeakableText('If the count is < 5, retry the upload.')).toBe('If the count is < 5, retry the upload.')
+    expect(extractSpeakableText('x < 5 and y > 3')).toBe('x < 5 and y > 3')
+    expect(extractSpeakableText('The last one is <')).toBe('The last one is <')
+    expect(extractSpeakableText('Hello <b>bold</b> and <i>more</i>.')).toBe('Hello bold and more.')
+  })
+
+  it('never speaks part of a cut tag name, and speaks a short start (R4)', () => {
+    expect(extractSpeakableText('The answer was cut <batshit-tool-no')).toBe('The answer was cut')
+    expect(extractSpeakableText('The answer ends in <bat')).toBe('The answer ends in <bat')
+  })
+
+  it('never speaks a closed block with a bad payload (R2 b)', () => {
+    expect(extractSpeakableText('Saved. <batshit-memory>lane ltm, content: secret</batshit-memory> Next.')).toBe('Saved. Next.')
+  })
+
+  it('reads code before the Markdown pass removes its backticks (trap 2, BL-618)', () => {
+    expect(extractSpeakableText('Put it in a `<script>` tag at the end.')).toBe('Put it in a script tag at the end.')
+    expect(extractSpeakableText('Use `a < b` here, then go on.')).toBe('Use a < b here, then go on.')
+  })
+
+  it('speaks the rest of a reply that names a tag in a sentence (BL-473)', () => {
+    expect(extractSpeakableText('I write a <batshit-memory> block when you ask me to remember something.')).toBe(
+      'I write a block when you ask me to remember something.'
+    )
+    expect(extractSpeakableText('The toolResultsSummary field is gone now, and this is still spoken.')).toBe(
+      'The toolResultsSummary field is gone now, and this is still spoken.'
+    )
+  })
+
+  it('skips an example block as code, speaks what follows, and never speaks a real block', () => {
+    const reply = [
+      'Here is how I save a memory:',
+      '```',
+      '<batshit-memory>{"lane":"ltm","content":"example"}</batshit-memory>',
+      '```',
+      'I write a <batshit-memory> block, and `<batshit-memory>` in code. If x < 5 it waits.',
+      '<batshit-memory>{"lane":"ltm","content":"Josh likes tea"}</batshit-memory>',
+      'The end <'
+    ].join('\n')
+    const spoken = extractSpeakableText(reply)
+    expect(spoken).toBe(
+      'Here is how I save a memory:\n\nI write a block, and batshit-memory in code. If x < 5 it waits.\n\nThe end <'
+    )
+    expect(spoken).not.toContain('Josh likes tea')
+  })
+})
+
+describe('stripUnsupportedXmlBlocks: the old regexes, in one pass', () => {
+  const SPEAKABLE = new Set(['b', 'em', 'p', 'code', 'strong'])
+  function oldStripUnsupportedXmlBlocks(text: string): string {
+    const drop = (tagName: string) => !SPEAKABLE.has(tagName.toLowerCase())
+    let output = text
+    let changed = true
+    output = output.replace(/<([a-z][a-z0-9:_-]*)\b[^>]*\/>/gi, (match, tagName) => (drop(tagName) ? '' : match))
+    while (changed) {
+      changed = false
+      output = output.replace(/<([a-z][a-z0-9:_-]*)\b[^>]*>[\s\S]*?<\/\1>/gi, (match, tagName) => {
+        if (drop(tagName)) {
+          changed = true
+          return ''
+        }
+        return match
+      })
+    }
+    return output.replace(/<([a-z][a-z0-9:_-]*)\b[^>]*\/>/gi, (match, tagName) => (drop(tagName) ? '' : match))
+  }
+
+  it('matches them on 5,000 generated texts', () => {
+    const pieces = ['<a>', '</a>', '<b>', '</b>', '<ab-c>', '</ab>', '</ab->', '<ab->', '<x:y>', '</x:y>', '<emote/>', '<p/>', '<P>', '</p>', '<em x="1">', '</EM>', '<', '>', '/', '-', ':', 'text', ' ', '\n', '<<a>>', 'z']
+    let state = 105
+    const random = () => {
+      state = (state * 1664525 + 1013904223) >>> 0
+      return state / 2 ** 32
+    }
+    for (let sample = 0; sample < 5000; sample += 1) {
+      let text = ''
+      const length = Math.floor(random() * 12)
+      for (let part = 0; part < length; part += 1) text += pieces[Math.floor(random() * pieces.length)]
+      // The test's own speakable set stands in for the module's: the pairing is what is compared.
+      expect(stripUnsupportedXmlBlocks(text, SPEAKABLE), JSON.stringify(text)).toBe(oldStripUnsupportedXmlBlocks(text))
+    }
+  })
+
+  it('strips a reply of 50,000 unclosed tags in one pass', () => {
+    const text = 'x <div class="a"> y '.repeat(50_000)
+    const started = performance.now()
+    expect(stripUnsupportedXmlBlocks(text)).toBe(text)
+    expect(performance.now() - started).toBeLessThan(2_000)
+  })
+})
+
+describe('extractSpeakableText: a backtick inside one block never makes the next block code (BL-442 review)', () => {
+  it('never speaks a memory block that follows a Tool Notes block holding a lone backtick', () => {
+    const reply =
+      'Done.\n<batshit-tool-notes>{"notes":[{"toolName":"bash","summary":"make: No rule to make target `all\'"}]}</batshit-tool-notes>\n' +
+      '<batshit-memory>{"lane":"ltm","content":"canary: Josh builds with `make release`"}</batshit-memory>\nThe next step is ready.'
+    expect(extractSpeakableText(reply)).toBe('Done.\n\nThe next step is ready.')
+  })
+})
+
+describe('extractSpeakableText: R4 strict (Faye, 2026-09-27)', () => {
+  it('speaks every word of the three review inputs and no part of a bare cut start', () => {
+    expect(extractSpeakableText("Wrap it in a <batshit-memory tag and it's saved.")).toBe("Wrap it in a <batshit-memory tag and it's saved.")
+    expect(extractSpeakableText('Use <batshit-memory with a "content" key.')).toBe('Use <batshit-memory with a "content" key.')
+    expect(
+      extractSpeakableText('Write <batshit-memory then an object, e.g. f = () => {"content":"x"} and it works.\nMore text after.')
+    ).toBe('Write <batshit-memory then an object, e.g. f = () => {"content":"x"} and it works.\nMore text after.')
+    for (const tail of ['<batshit-', '<batshit-mem', '<batshit-memory ']) {
+      expect(extractSpeakableText(`The answer. ${tail}`)).toBe('The answer.')
+    }
   })
 })

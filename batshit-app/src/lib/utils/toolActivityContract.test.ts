@@ -1,16 +1,23 @@
+import { buildCoolToolAiContent } from './coolToolAiContent'
 import { describe, expect, it } from 'vitest'
+import { guardCutNotice } from '$lib/test-utils/guard-cut-notice'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import {
   commandFoundNothing,
+  describeOutputCut,
   failedCommandExitCode,
   failedCommandOutput,
   isBinaryLikeText,
   joinListingSectionPath,
+  modelFacingMcpText,
   normalizeCompactTool,
   resolveToolActivitySettingsName,
   shellCommandFailed,
   shouldForceCompressToolPayload,
   splitLsSections,
-  stripShellErrorLines
+  stripShellErrorLines,
+  toolOutputCut
 } from './toolActivityContract'
 import {
   FETCHED_ZIP_DESCRIPTION,
@@ -22,6 +29,12 @@ import {
   fetchedZipContent,
   storedBashToolPayload
 } from '$lib/test-utils/zip-fetch-steps'
+import {
+  CLI_HELPER_STEP_CASES,
+  LEGACY_CLI_HELPER_SERVER,
+  renameHelperServer
+} from '$lib/test-utils/cli-helper-steps'
+import { CLI_HELPER_MCP_SERVER_NAME } from './cliHelperToolNames'
 
 describe('toolActivityContract', () => {
   it('normalizes native skill reads into the skill_read lane', () => {
@@ -1822,6 +1835,122 @@ describe('toolActivityContract zip fetch identity (F-P5-2)', () => {
     })
   })
 
+  it('BL-666 keeps a cut, incomplete MCP Fetch Zip reply as plain text without inventing failure', () => {
+    const text = `${'{"success":true,"content":"'}${'A'.repeat(99_000)}\n[Output cut here by Batshit; fetch the next page.]`
+    const result = normalizeCompactTool({
+      toolName: `mcp.${MANAGED_HELPER_SERVER}.batshit_server_fetch_zip`,
+      toolArgs: { zipId: FETCHED_ZIP_ID },
+      toolResult: [{ type: 'text', text }]
+    })
+
+    expect(result.operationKind).toBe('fetch_zip')
+    expect(result.toolResult).toMatchObject({ content: text, contentLength: text.length, contentTruncated: false })
+    expect(result.toolResult).not.toHaveProperty('found')
+    expect(modelFacingMcpText([{ type: 'text', text: 'first' }, { type: 'image', data: 'x' }, { type: 'text', text: 'second' }]))
+      .toBe('first\nsecond')
+
+    const plainError = normalizeCompactTool({
+      toolName: `mcp.${MANAGED_HELPER_SERVER}.batshit_server_fetch_zip`,
+      toolArgs: { zipId: FETCHED_ZIP_ID },
+      toolResult: [{ type: 'text', text: 'The helper could not finish this request.' }]
+    })
+    expect(plainError.toolResult.content).toBe('The helper could not finish this request.')
+    expect(plainError.toolResult).not.toHaveProperty('found')
+  })
+
+  it.each(['read_file', 'skill_read', 'write_file', 'edit_file', 'list_files', 'search_files', 'bash', 'cli_tool', 'subagent', 'workers', 'artifact_use', 'fabric_use'])('preserves a guard-cut %s view through card normalization and later expansion', (operationKind) => {
+    const text = `${'head\n'.repeat(2_000)}${guardCutNotice(10_000)}`
+    const compact = normalizeCompactTool({
+      toolName: 'mcp.batshit_helpers.batshit_tool_use',
+      metadata: { operationKind }, toolArgs: { controlId: 'sys.artifact.create', content: '<html>original args</html>' },
+      toolResult: [{ type: 'text', text }]
+    })
+    expect(compact.operationKind).toBe(operationKind)
+    expect(compact.rendererFamily).toBe('generic_tool')
+    expect(compact.toolResult).toMatchObject({ content: text, modelTextOnly: true })
+    const expanded = buildCoolToolAiContent('card', {}, { ...compact, toolName: operationKind })
+    expect(expanded).toContain(text)
+    expect(expanded).not.toContain('original args')
+  })
+
+  // Review of BL-677: a card the P2 guard saved at up to 100,000 characters must reload as its cut.
+  it('re-normalizes a P2-era saved cut of 99,500 characters as the cut view, not an empty Bash result', () => {
+    const notice = guardCutNotice(99_000, 'tool_raw_1790000000000_p2', 400_000)
+    const view = (length: number) => `${'y'.repeat(length - 1 - notice.length)}\n${notice}`
+    const saved = (content: string) => normalizeCompactTool({
+      toolName: 'mcp.batshit_helpers.batshit_server_bash_execute',
+      metadata: { operationKind: 'bash' },
+      toolArgs: { command: 'cat /tmp/huge.log' },
+      toolResult: { content, contentLength: content.length, contentTruncated: false, modelTextOnly: true }
+    })
+    const p2 = saved(view(99_500))
+    expect(p2.rendererFamily).toBe('generic_tool')
+    expect(p2.toolResult).toMatchObject({ content: view(99_500), modelTextOnly: true })
+    expect(p2.toolResult).not.toHaveProperty('stdout')
+
+    // Not a saved view: a new MCP text that long is not a cut the current guard could make.
+    const incoming = normalizeCompactTool({
+      toolName: 'mcp.batshit_helpers.batshit_server_bash_execute',
+      metadata: { operationKind: 'bash' },
+      toolArgs: { command: 'cat /tmp/huge.log' },
+      toolResult: [{ type: 'text', text: view(99_500) }]
+    })
+    expect(incoming.toolResult).not.toHaveProperty('modelTextOnly')
+    expect(saved(view(100_001)).toolResult).not.toHaveProperty('modelTextOnly')
+  })
+
+  it('BL-678 keeps a CLI read of the guard\'s own source as a read, not a cut card', () => {
+    const source = readFileSync(resolve(process.cwd(), 'src/lib/utils/toolModelTextSizeGuard.ts'), 'utf8')
+    expect(source).toContain('[Output cut here by Batshit: this result is about ')
+    const compact = normalizeCompactTool({
+      toolName: 'mcp.filesystem.read_text_file',
+      metadata: { operationKind: 'read_file' },
+      toolArgs: { path: '/repo/batshit-app/src/lib/utils/toolModelTextSizeGuard.ts' },
+      toolResult: [{ type: 'text', text: source }]
+    })
+    expect(compact.operationKind).toBe('read_file')
+    expect(compact.rendererFamily).not.toBe('generic_tool')
+    expect(compact.toolResult).not.toHaveProperty('modelTextOnly')
+  })
+
+  it('BL-666 keeps plain MCP cut text visible for generic tools, but leaves ordinary summaries compact', () => {
+    const cut = `${'A'.repeat(4_000)}\n${guardCutNotice(4_000)}`
+    const input = (text: string) => ({ toolName: 'mcp.example.sample', toolArgs: {}, toolResult: [{ type: 'text', text }] })
+    const visible = normalizeCompactTool(input(cut))
+    expect(visible.toolResult.content).toBe(cut)
+    expect(visible.toolResult.contentTruncated).toBe(false)
+
+    // BL-678: a look-alike line, or the notice with text after it, is the tool's own text.
+    for (const text of [
+      `${'A'.repeat(4_000)}\n[Output cut here by Batshit; fetch the next page.]`,
+      `${'A'.repeat(4_000)}\n${guardCutNotice(4_000)}\nmore output`
+    ]) {
+      const plain = normalizeCompactTool(input(text))
+      expect(plain.toolResult).not.toHaveProperty('modelTextOnly')
+      expect(plain.toolResult).not.toHaveProperty('content')
+    }
+
+    const ordinary = normalizeCompactTool(input('A'.repeat(4_000)))
+    expect(ordinary.toolResult).not.toHaveProperty('content')
+    expect(JSON.stringify(ordinary.toolResult).length).toBeLessThan(4_000)
+
+    const structured = normalizeCompactTool(input(JSON.stringify({ status: 'ok', body: 'small' })))
+    expect(structured.toolResult).toMatchObject({ status: 'ok', body: 'small' })
+  })
+
+  it('BL-666 marks a saved-card-only middle cut while retaining the CLI notice at the tail', () => {
+    const text = `${'A'.repeat(130_000)}\n[Output cut here by Batshit; fetch the next page.]`
+    const result = normalizeCompactTool({
+      toolName: `mcp.${MANAGED_HELPER_SERVER}.batshit_server_fetch_zip`,
+      toolArgs: { zipId: FETCHED_ZIP_ID },
+      toolResult: [{ type: 'text', text }]
+    })
+    expect(result.toolResult.content).toContain('[Saved card omitted')
+    expect(result.toolResult.content).toContain('[Output cut here by Batshit')
+    expect(result.toolResult.contentLength).toBe(text.length)
+    expect(result.toolResult.contentTruncated).toBe(true)
+  })
+
   it('reports a failed direct-helper fetch as not found, with its reason', () => {
     const result = normalizeCompactTool({
       toolName: `mcp.${MANAGED_HELPER_SERVER}.batshit_server_fetch_zip`,
@@ -1959,5 +2088,170 @@ describe('toolActivityContract zip fetch identity (F-P5-2)', () => {
 
     expect(result.operationKind).toBe('dynamic_use')
     expect(result.toolArgs.toolName).toBe('mcp_github_search_issues')
+  })
+})
+
+/**
+ * BL-8 (2026-09-22): a listing, a search, or a command whose lane cut its output (Claude Code keeps a
+ * big output's first 30,000 bytes) holds only its first entries, matches, or lines. The cut rides
+ * beside them through every return path of the summary that rebuilds each lane, since a rebuild keeps
+ * only the fields it names.
+ */
+describe('an output its lane cut (BL-8)', () => {
+  const cut = { by: 'Claude Code', keptBytes: 29_948, totalBytes: 60_300 }
+  const shell = (command: string) => ({ command, innerCommand: command })
+
+  it.each([
+    ['a listing with parsed entries', 'batshit_server_list_files', shell('ls -1 /tmp/tree'), { files: [{ name: 'a.md', path: 'a.md', type: 'unknown' }] }],
+    ['an ls -l listing', 'batshit_server_list_files', shell('ls -la /tmp/tree'), { stdout: 'total 8\n-rw-r--r--  1 josh  staff  12 Sep 22 10:00 a.md' }],
+    ['a plain listing', 'batshit_server_list_files', shell('ls -1 /tmp/tree'), { stdout: 'a.md\nb.md' }],
+    ['a listing it could not parse', 'batshit_server_list_files', shell('du -a /tmp/tree'), { stdout: '4\t/tmp/tree/a.md' }],
+    ['a search with parsed results', 'batshit_server_search_files', shell('rg -n entry src'), { results: [{ path: 'src/a.ts', matchCount: 1, matches: [] }] }],
+    ['a search it parsed from text', 'batshit_server_search_files', shell('rg -n entry src'), { stdout: 'src/a.ts:1:entry' }],
+    ['a files-only search', 'batshit_server_search_files', shell('grep -rl entry src'), { stdout: 'src/a.ts\nsrc/b.ts' }],
+    ['a search it could not parse', 'batshit_server_search_files', shell('rg -c entry src'), { stdout: '3' }],
+    ['a plain command', 'batshit_server_execute_command', shell('node print-rows.js'), { stdout: 'entry line 0001', stderr: '' }]
+  ])('keeps the cut for %s', (_label, toolName, toolArgs, toolResult) => {
+    const compact = normalizeCompactTool({ toolName, toolArgs, toolResult: { ...toolResult, outputCut: cut } })
+    const uncut = normalizeCompactTool({ toolName, toolArgs, toolResult })
+
+    expect(compact.toolResult.outputCut).toEqual(cut)
+    expect(uncut.toolResult).not.toHaveProperty('outputCut')
+  })
+
+  it('says how much was kept, with or without a total', () => {
+    expect(describeOutputCut(cut)).toBe('Claude Code cut this output: 29,948 of 60,300 bytes kept.')
+    expect(describeOutputCut({ by: 'Claude Code', keptBytes: 2_592 })).toBe(
+      'Claude Code cut this output: only the first 2,592 bytes kept.'
+    )
+  })
+
+  // A tool of someone else's can name a field `outputCut`; only the lane's own shape is a cut.
+  it.each([[true], [{}], [{ by: 'Claude Code' }], [{ keptBytes: 12 }], [{ by: 1, keptBytes: 12 }]])(
+    'reads no cut from %j',
+    (value) => {
+      expect(toolOutputCut({ outputCut: value })).toBeUndefined()
+    }
+  )
+})
+
+/* -------------------------------------------------------------------------------------------- *
+ * BL-5 — the helper bridge's server was renamed from `batshit_gateway_<agent>-mode4-controls` to
+ * `batshit_helpers`. A step under either name is the same step: chats stored before the rename
+ * must keep their cards, and a new step must get the card the old name got.
+ * -------------------------------------------------------------------------------------------- */
+describe('BL-5: a helper step normalizes the same under its old and its new server name', () => {
+  for (const testCase of CLI_HELPER_STEP_CASES) {
+    it(testCase.label, () => {
+      const legacy = normalizeCompactTool(testCase.build(LEGACY_CLI_HELPER_SERVER))
+      const current = normalizeCompactTool(testCase.build(CLI_HELPER_MCP_SERVER_NAME))
+
+      expect(legacy.operationKind).toBe(testCase.expectedKind)
+      expect(current.operationKind).toBe(testCase.expectedKind)
+      expect(current.rendererFamily).toBe(legacy.rendererFamily)
+      expect(current).toEqual(
+        renameHelperServer(legacy, LEGACY_CLI_HELPER_SERVER, CLI_HELPER_MCP_SERVER_NAME)
+      )
+    })
+  }
+})
+
+// BL-166: a listing's per-type counts counted only the 200 rows the payload keeps, so a listing of
+// 250 files and 250 folders read as 200 files and no folders.
+describe("a listing's counts are the whole listing's, not the 200 rows it keeps (BL-166)", () => {
+  const DIR = '/tmp/batshit-example/big'
+  const longLs = (kind: 'd' | '-', name: string) => `${kind}rw-r--r--  1 josh  staff  96 Sep 25 10:00 ${name}`
+  const padded = (i: number) => String(i).padStart(3, '0')
+
+  it('counts a long listing by type over every entry', () => {
+    const stdout = [
+      'total 1000',
+      ...Array.from({ length: 250 }, (_, i) => longLs('-', `a-file-${padded(i)}.txt`)),
+      ...Array.from({ length: 250 }, (_, i) => longLs('d', `z-dir-${padded(i)}`))
+    ].join('\n')
+    const result = normalizeCompactTool({
+      toolName: 'batshit_server_list_files',
+      toolArgs: { command: `ls -la ${DIR}`, innerCommand: `ls -la ${DIR}`, dirPath: DIR },
+      toolResult: { stdout }
+    })
+
+    expect(result.toolResult.files).toHaveLength(200)
+    expect(result.toolResult).toMatchObject({ totalItems: 500, totalFiles: 250, totalDirectories: 250 })
+  })
+
+  it('counts a plain listing by type over every entry', () => {
+    const stdout = [
+      ...Array.from({ length: 250 }, (_, i) => `a-file-${padded(i)}.txt`),
+      ...Array.from({ length: 100 }, (_, i) => `z-dir-${padded(i)}/`)
+    ].join('\n')
+    const result = normalizeCompactTool({
+      toolName: 'batshit_server_list_files',
+      toolArgs: { command: `ls -p ${DIR}`, innerCommand: `ls -p ${DIR}`, dirPath: DIR },
+      toolResult: { stdout }
+    })
+
+    expect(result.toolResult.files).toHaveLength(200)
+    expect(result.toolResult).toMatchObject({ totalItems: 350, totalDirectories: 100, totalUnknownItems: 250 })
+  })
+
+  it('counts a structured listing by type over every entry', () => {
+    const files = [
+      ...Array.from({ length: 250 }, (_, i) => ({ name: `a-file-${padded(i)}.txt`, type: 'file' })),
+      ...Array.from({ length: 50 }, (_, i) => ({ name: `z-dir-${padded(i)}`, type: 'directory' }))
+    ]
+    const result = normalizeCompactTool({
+      toolName: 'batshit_server_list_files',
+      toolArgs: { dirPath: DIR },
+      toolResult: { files }
+    })
+
+    expect(result.toolResult.files).toHaveLength(200)
+    expect(result.toolResult).toMatchObject({ totalItems: 300, totalFiles: 250, totalDirectories: 50 })
+  })
+})
+
+// Found in BL-233's proof: a final newline was counted as one more line of a read.
+describe('a read counts its lines the way the write lane does', () => {
+  it.each([
+    ['a\nb\n', 2],
+    ['a\nb', 2],
+    ['', 0],
+    ['a\n\n', 2]
+  ])('counts %j as %i lines', (content, lines) => {
+    const result = normalizeCompactTool({
+      toolName: 'batshit_server_read_file',
+      toolArgs: { filePath: '/tmp/a.md' },
+      toolResult: { content }
+    })
+
+    expect(result.toolResult.lineCount).toBe(lines)
+  })
+})
+
+// Review of BL-166 (finding 4): Safari before 16.4 cannot parse a regex lookbehind, and one in a
+// module every chat page loads breaks every tool card there. Browser-loaded code uses none.
+describe('browser-loaded code has no regex lookbehind', () => {
+  it('finds no `(?<=` or `(?<!` outside server-only code', async () => {
+    const fs = await import('node:fs')
+    const path = await import('node:path')
+    const root = path.resolve(__dirname, '..', '..')
+    const found: string[] = []
+    const walk = (dir: string) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name)
+        if (entry.isDirectory()) {
+          if (entry.name === 'server' || entry.name === 'node_modules' || entry.name.startsWith('__tests__')) continue
+          walk(full)
+          continue
+        }
+        if (!/\.(ts|js|svelte)$/.test(entry.name)) continue
+        if (/\.(test|spec)\.|\.server\.(ts|js)$|^\+server\.(ts|js)$/.test(entry.name)) continue
+        const text = fs.readFileSync(full, 'utf8')
+        if (/\(\?<[=!]/.test(text)) found.push(path.relative(root, full))
+      }
+    }
+    walk(path.join(root, 'lib'))
+    walk(path.join(root, 'routes'))
+    expect(found).toEqual([])
   })
 })

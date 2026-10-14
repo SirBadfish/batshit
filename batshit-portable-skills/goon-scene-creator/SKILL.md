@@ -83,13 +83,14 @@ This portable skill can:
 - choose one built-in Scene Atmosphere preset and placement;
 - remember that Outside atmosphere needs an open or transparent room surface to be visible;
 - guide ComfyUI skybox generation with the bundled Qwen 360 workflow files;
+- create an image-first panorama and author a seamless animated background using optional references and the bundled renderer;
 - produce copy-ready Scene Editor import steps in current order: World, Room Builder, Props, Markers.
 
 This portable skill cannot currently:
 
 - create, update, or save Batshit Goon scene records through Fabric controls;
 - upload scene files into Batshit by bypassing the app;
-- promise custom ambience sprites, multiple ambience layers, animated props, GIFs, or video textures;
+- promise custom ambience sprites, multiple ambience layers, animated props, GIFs, or video room/prop textures (skyboxes separately support muted looping MP4/WebM backgrounds);
 - create mixed half-ground / half-overlook panoramas that require masked transition geometry.
 
 If future Batshit Goons/Scenes Fabric controls exist, discover their schema first with `/api/controls/find` and use them only when the token family allows them. Until then, hand off clean Scene Editor steps.
@@ -100,6 +101,8 @@ Read references before producing final scene instructions:
 
 - Always read `references/batshit-scene-spec.md`.
 - Read `references/skybox-generation.md` when prompting or validating a skybox.
+- Read `references/image-first-panorama.md` only when starting from a perspective hero/reference image.
+- Read `references/animated-panorama.md` only when creating, importing, or troubleshooting video backgrounds. Still-only work does not need the animation guide.
 - Read `references/qwen360-skybox-workflow.md` when installing, using, or troubleshooting the bundled ComfyUI workflow.
 - Read `references/lofi-showcase-aesthetics.md` for cozy, lofi, cinematic, ambience-heavy, or showcase scenes.
 
@@ -123,7 +126,7 @@ Choose texture resolution deliberately.
 
 Recommend Hero 8K for final skyboxes. Use Standard 4K for smaller or lower-memory Macs/PCs, unusually heavy scenes, many mounted skyboxes, or performance trouble. Draft remains an iteration mode rather than the preferred final export.
 
-Runtime note: the embedded Mac app gives skyboxes their own texture budget. Ultra can use Hero 8K when the graphics device supports it, Auto/High use up to Standard 4K, and Low uses up to 2K. Avatar and room textures keep separate budgets.
+Still-image runtime note: the embedded Mac app gives skyboxes their own texture budget. Ultra can use Hero 8K when the graphics device supports it, Auto/High use up to Standard 4K, and Low uses up to 2K. Avatar and room textures keep separate budgets. Video plays at its uploaded resolution; choose an export supported by the target decoder.
 
 Even when the final output is 4K, include high-detail language in the prompt:
 

@@ -1,4 +1,7 @@
 <script lang="ts">
+  import { onMount, tick, untrack } from 'svelte'
+  import { refuse } from '$lib/appActions/catalog'
+  import { appActionsHaveDrafts, registerAppAction, registerAppActionObservation, retireAppActionNavigation, type ActionOutcome } from '$lib/appActions/owners'
   import * as Sheet from '$lib/components/ui/sheet'
   import * as Collapsible from '$lib/components/ui/collapsible'
   import * as Switch from '$lib/components/ui/switch'
@@ -12,6 +15,7 @@
     typesafeCallStatusLabel,
     typesafeFeatureLabel
   } from '$lib/utils/jevJuice'
+  import { judgeModelName, UNREADABLE_JUDGE_CHOICE } from '$lib/utils/judgeProviders'
   import { getUserSettings } from '$lib/stores/userSettings.svelte'
   import { approximateTokenCount } from '$lib/utils/tokenCounter'
   import { normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
@@ -33,6 +37,7 @@
     ExecutionReasoningPersistence,
     ExecutionTokenStat,
     ExecutionTokenUsage,
+    ObservedUsage,
     ExecutionSnapshot
   } from '$lib/types/executionViewer'
 
@@ -49,6 +54,37 @@
   let snapshots = $state<ExecutionSnapshot[]>([])
   let selectedId = $state<string | null>(null)
   let truncateBase64 = $state(true)
+  let viewerBody = $state<HTMLDivElement | null>(null)
+  let loadedSessionId = $state<string | null | undefined>(undefined)
+  let loadSequence = 0
+  onMount(() => {
+    const removeObservation = registerAppActionObservation('execution', () => ({ open, sessionId: sessionId ?? null,
+      loadedSessionId: loadedSessionId ?? null, loading, loadFailed: Boolean(error),
+      view: !sessionId ? 'no_session' : snapshots.length ? 'records' : 'empty' }))
+    const unregister = registerAppAction('execution.open', async (_, context): Promise<ActionOutcome> => {
+      context.check()
+      const targetSessionId = sessionId ?? null
+      if (targetSessionId !== context.sessionId) refuse('stale_session')
+      const matching = open
+      if (!matching) {
+        if (appActionsHaveDrafts()) refuse('unsaved_changes')
+        context.effect()
+        open = true
+        context.report({ status: 'unknown_outcome', visible: 'applied', saved: 'not_requested' })
+      }
+      await tick()
+      await context.wait(() => {
+        if (!open || (sessionId ?? null) !== targetSessionId) refuse('user_navigation')
+        if (error) refuse('viewer_load_failed')
+        return viewerBody?.isConnected && !loading && loadedSessionId === targetSessionId ? true : undefined
+      })
+      context.check()
+      return { status: matching ? 'no_op' : 'completed', visible: matching ? 'unchanged' : 'applied',
+        saved: 'not_requested', sessionId: targetSessionId,
+        viewer: !targetSessionId ? 'no_session' : snapshots.length ? 'records' : 'empty' }
+    }, () => !open && appActionsHaveDrafts() ? 'unsaved_changes' : 'available')
+    return () => { unregister(); removeObservation(); loadSequence++; retireAppActionNavigation() }
+  })
 
   const currentSnapshot = $derived(
     (() => {
@@ -96,42 +132,54 @@
   }
 
   // SA-120 P3: `executionMetadata.groupChat.speakerSelection` exists only when a `smart`
-  // agent was a candidate for this event (the Jev Juice group lane ran or tried to).
+  // agent was a candidate for this event (the Judge Juice group lane ran or tried to).
   const groupSpeakerSelection = $derived.by<Record<string, any> | null>(() => {
     const selection = groupMeta?.speakerSelection
     return selection && typeof selection === 'object' && !Array.isArray(selection) ? selection : null
   })
 
-  const describeGroupSpeakerSelection = (selection: Record<string, any>) => {
+  // SA-120 P10a (DL-120-18): these sentences name the judge that decided, from this event's own Judge Juice row
+  // (TypeSafe's model is Jev; a row from before P10a has no judge and is Jev too).
+  const describeGroupSpeakerSelection = (selection: Record<string, any>, chosenJudge: string | null = 'Jev') => {
+    const judge = chosenJudge ?? 'No judge'
+    if (selection.reason === 'no_reply') {
+      const confidence = typeof selection.noReplyConfidence === 'number' && Number.isFinite(selection.noReplyConfidence)
+        ? ` (${Math.round(selection.noReplyConfidence * 100)}% confidence)` : ''
+      return `Reply skipped by ${judge}${confidence}. No agent was run for this group turn.`
+    }
     const share =
       typeof selection.probability === 'number' && Number.isFinite(selection.probability)
         ? ` (${Math.round(selection.probability * 100)}% confidence)`
         : ''
     const chooser =
       selection.by === 'jev'
-        ? `Speaker picked by Jev${share}`
+        ? `Speaker picked by ${judge}${share}`
         : selection.reason === 'low_confidence'
-          ? 'Speaker picked by the usual rules (Jev was not confident)'
+          ? `Speaker picked by the usual rules (${judge} was not confident)`
+          : selection.reason === 'preset_rules'
+            ? 'Speaker picked by its own speaking preset rules'
+            : selection.reason === 'only_candidate'
+              ? 'Speaker picked by the usual rules (only eligible candidate)'
+              : selection.reason === 'receipt_not_saved'
+                ? 'Speaker picked by the usual rules (no-reply receipt not saved)'
           : selection.reason === 'unavailable' || selection.reason === 'error'
-            ? 'Speaker picked by the usual rules (Jev did not answer)'
+            ? chosenJudge === null
+              ? 'Speaker picked by the usual rules (no judge is set up for this feature)'
+              : `Speaker picked by the usual rules (${judge} did not answer)`
             : 'Speaker picked by the usual rules'
     const skipped = Array.isArray(selection.skipped) ? selection.skipped : []
     if (skipped.length === 0) return `${chooser}.`
-    const names = skipped
-      .map((entry: Record<string, any>) => {
-        const value =
-          typeof entry?.addsValue === 'number' && Number.isFinite(entry.addsValue)
-            ? ` (${Math.round(entry.addsValue * 100)}% confidence)`
-            : ''
-        return `${entry?.agentName ?? entry?.agentId ?? 'agent'}${value}`
-      })
-      .join(', ')
-    return `${chooser}. Skipped by Jev for adding little: ${names}.`
+    const names = skipped.map((entry: Record<string, any>) => entry?.agentName ?? entry?.agentId ?? 'agent').join(', ')
+    const noReply = typeof selection.noReplyConfidence === 'number' && Number.isFinite(selection.noReplyConfidence)
+      ? `because ${judge} judged no reply was needed (${Math.round(selection.noReplyConfidence * 100)}% confidence)`
+      : 'for adding little or needing no reply on this follow-up'
+    return `${chooser}. Smart agents skipped by ${judge} ${noReply}: ${names}.`
+
   }
 
   type ExecutionViewerModeKind = 'vercel' | 'codex' | 'claude' | 'unknown'
   type UsageDetailEntry = {
-    key: string
+    key: keyof ExecutionTokenUsage
     label: string
     stat: ExecutionTokenStat | null
     unavailableText: string
@@ -190,9 +238,27 @@
     Array.isArray(currentSnapshot?.intermediateSteps) ? currentSnapshot?.intermediateSteps : null,
   )
   const responseSummary = $derived(currentSnapshot?.responseSummary ?? null)
+  const observedUsageEvidence = $derived.by<
+    { state: 'absent' | 'invalid' } | { state: 'available'; value: ObservedUsage }
+  >(() => {
+    const value: unknown = responseSummary?.observedUsage
+    if (value === null || value === undefined) return { state: 'absent' }
+    return isDisplayableObservedUsage(value)
+      ? { state: 'available', value }
+      : { state: 'invalid' }
+  })
   const delegated = $derived(currentSnapshot?.delegated ?? null)
   // SA-120 (DL-120-07): one row per Jev call. Missing usage renders as unknown, never zero.
   const typesafeCalls = $derived(readTypesafeCallRecords(currentSnapshot?.executionMetadata))
+  /**
+   * SA-120 P10a: the judge this event's group speaker call went to, by name (Jev for TypeSafe and older rows), or
+   * `null` when the chosen judge was missing (`no_provider`): those lines then say no judge is set up (round 1, S5).
+   */
+  const groupSpeakerJudge = $derived.by<string | null>(() => {
+    const call = typesafeCalls.find((entry) => entry.feature === 'group_speaker')
+    if (call?.reason === 'no_provider') return null
+    return call?.provider ? judgeModelName({ kind: call.provider.kind, modelId: call.model }) : 'Jev'
+  })
   const typesafeUsageUnknownCount = $derived(
     typesafeCalls.filter((call) => call.status === 'ok' && call.usage === null).length
   )
@@ -411,18 +477,21 @@
       }))
   })
 
-  async function loadSessionApprovals(targetSessionId: string) {
+  async function loadSessionApprovals(targetSessionId: string, sequence: number) {
     try {
       const response = await fetch(
         `/api/sessions/${encodeURIComponent(targetSessionId)}/control-approvals`
       )
+      if (sequence !== loadSequence || sessionId !== targetSessionId || !open) return
       if (!response.ok) {
         sessionApprovals = []
         return
       }
       const payload = await response.json()
+      if (sequence !== loadSequence || sessionId !== targetSessionId || !open) return
       sessionApprovals = Array.isArray(payload?.approvals) ? payload.approvals : []
     } catch {
+      if (sequence !== loadSequence || sessionId !== targetSessionId || !open) return
       // A history panel must never break the sheet it lives in.
       sessionApprovals = []
     }
@@ -570,6 +639,18 @@
     }
   }
 
+  // BL-108: on a CLI run the Request block is what Batshit handed the CLI, not all the model got.
+  function cliRequestNote(kind: ExecutionViewerModeKind): string | null {
+    switch (kind) {
+      case 'codex':
+        return 'Codex adds its own instructions, tools, and project files (such as AGENTS.md) that Batshit cannot see, so the input Codex reports is larger than the request shown here.'
+      case 'claude':
+        return 'Claude Code adds its own tools and project files (such as CLAUDE.md) that Batshit cannot see, so the input Claude Code reports is larger than the request shown here.'
+      default:
+        return null
+    }
+  }
+
   function runtimeUnavailableMessage(kind: ExecutionViewerModeKind): string {
     switch (kind) {
       case 'vercel':
@@ -654,6 +735,23 @@
         unavailableText: unavailableForUsageDetail(kind, 'reasoningTokens')
       }
     ]
+  }
+
+  /** Saved/restore data can be malformed. Reject the entire evidence view explicitly,
+   * without mutating or silently filtering its parts, and keep the rest of the sheet. */
+  function isDisplayableObservedUsage(value: unknown): value is ObservedUsage {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+    const evidence = value as ObservedUsage
+    if (evidence.completeness !== 'partial' || !Array.isArray(evidence.parts) || evidence.parts.length === 0) return false
+    const fields = usageDetailEntries(null, modeKind).map((entry) => entry.key)
+    return evidence.parts.every((part) => {
+      if (!part || typeof part !== 'object' || Array.isArray(part) ||
+          (part.source !== 'codex-app-server-progress' && part.source !== 'run-usage-prefix') ||
+          !part.counts || typeof part.counts !== 'object' || Array.isArray(part.counts)) return false
+      return fields.some((field) => typeof part.counts[field] === 'number' && Number.isFinite(part.counts[field])) &&
+        fields.every((field) => part.counts[field] === undefined || part.counts[field] === null ||
+          (typeof part.counts[field] === 'number' && Number.isFinite(part.counts[field])))
+    })
   }
 
   function formatOptionalValue(
@@ -869,30 +967,40 @@
 
   async function loadSnapshots(options: { defaultToLatest?: boolean } = {}) {
     const { defaultToLatest = false } = options
+    const targetSessionId = sessionId ?? null
+    const sequence = ++loadSequence
+    loadedSessionId = undefined
 
-    if (!sessionId) {
+    if (!targetSessionId) {
       snapshots = []
       selectedId = null
       sessionApprovals = []
+      loading = false
+      error = null
+      loadedSessionId = null
       return
     }
 
     loading = true
     error = null
+    snapshots = []
     // SA-116 (DL-116-12): the approval history rides alongside the snapshots and never
     // blocks them — a failed read leaves the rows empty, not the sheet broken.
-    void loadSessionApprovals(sessionId)
+    void loadSessionApprovals(targetSessionId, sequence)
 
     try {
-      const response = await fetch(`/api/sessions/${sessionId}/execution-log`)
+      const response = await fetch(`/api/sessions/${encodeURIComponent(targetSessionId)}/execution-log`)
       if (!response.ok) {
         const data = await response.json().catch(() => ({ error: 'Failed to load execution log' }))
         throw new Error(data.error || 'Failed to load execution log')
       }
 
       const data = await response.json()
-      const entries: ExecutionSnapshot[] = Array.isArray(data.entries) ? data.entries : []
+      if (sequence !== loadSequence || (sessionId ?? null) !== targetSessionId || !open) return
+      if (!Array.isArray(data.entries)) throw new Error('Execution log response did not include entries')
+      const entries: ExecutionSnapshot[] = data.entries
       snapshots = entries
+      loadedSessionId = targetSessionId
 
       if (entries.length > 0) {
         const latestId = entries[0].id
@@ -905,9 +1013,10 @@
         selectedId = null
       }
     } catch (err: any) {
+      if (sequence !== loadSequence || (sessionId ?? null) !== targetSessionId || !open) return
       error = err?.message || 'Failed to load execution data'
     } finally {
-      loading = false
+      if (sequence === loadSequence) loading = false
     }
   }
 
@@ -968,14 +1077,24 @@
   let openRawProviderResponses = $state(false)
 
   let wasOpen = $state(false)
+  let requestedSessionId: string | null | undefined = undefined
 
   $effect(() => {
-    if (open && !wasOpen) {
-      wasOpen = true
-      loadSnapshots({ defaultToLatest: true })
-    } else if (!open && wasOpen) {
-      wasOpen = false
-    }
+    const visible = open
+    const selected = sessionId ?? null
+    untrack(() => {
+      if (visible && (!wasOpen || selected !== requestedSessionId)) {
+        wasOpen = true
+        requestedSessionId = selected
+        void loadSnapshots({ defaultToLatest: true })
+      } else if (!visible && wasOpen) {
+        wasOpen = false
+        loadSequence++
+        loading = false
+        loadedSessionId = undefined
+        requestedSessionId = undefined
+      }
+    })
   })
 
   const reasoningPersistenceText = (value: ExecutionReasoningPersistence) => {
@@ -1006,8 +1125,10 @@
       </Sheet.Description>
     </Sheet.Header>
 
-    <div class="execution-viewer-body">
-      {#if loading && snapshots.length === 0}
+    <div class="execution-viewer-body" bind:this={viewerBody}>
+      {#if !sessionId}
+        <div class="execution-viewer-empty">No session is selected.</div>
+      {:else if loading && snapshots.length === 0}
         <div class="execution-viewer-loading">
           Loading execution data...
         </div>
@@ -1115,10 +1236,19 @@
                     </div>
                   {/if}
                   {#if groupSpeakerSelection}
-                    <!-- SA-120 P3: who chose this speaker, and whom Jev Juice skipped this turn. -->
+                    <!-- SA-120 P3: who chose this speaker, and whom Judge Juice skipped this turn. -->
                     <div class="execution-viewer-helper" data-testid="execution-viewer-group-speaker-selection">
-                      {describeGroupSpeakerSelection(groupSpeakerSelection)}
+                      {describeGroupSpeakerSelection(groupSpeakerSelection, groupSpeakerJudge)}
                     </div>
+                  {/if}
+                  {#if groupMeta.noReplyReceipt === 'stopped'}
+                    <div class="execution-viewer-helper">{groupSpeakerJudge} proposed no reply, but the turn was stopped before its skip receipt was saved. No agent was run.</div>
+                  {:else if groupMeta.noReplyReceipt === 'refused'}
+                    <div class="execution-viewer-helper">{groupSpeakerJudge} proposed no reply, but Batshit refused to save the receipt. The scheduler may use the usual rules; this entry does not record a speaker.</div>
+                  {:else if groupMeta.noReplyReceipt === 'unconfirmed'}
+                    <div class="execution-viewer-helper">Batshit could not confirm whether the skip receipt was saved. This turn ended without running an agent, to avoid both a saved skip and a reply. No automatic replay occurred.</div>
+                  {:else if groupMeta.noReplyReceipt === 'pending'}
+                    <div class="execution-viewer-helper">{groupSpeakerJudge} proposed no reply. This entry could not confirm the saved outcome; check the user message for its reply-skipped mark.</div>
                   {/if}
                 </div>
               {/if}
@@ -1653,6 +1783,11 @@
 
         <div class="execution-viewer-stack-lg">
           <div class="execution-viewer-eyebrow">Request</div>
+          {#if cliRequestNote(modeKind)}
+            <div class="execution-viewer-note" data-testid="execution-viewer-cli-request-note">
+              {cliRequestNote(modeKind)}
+            </div>
+          {/if}
 
           <Collapsible.Root bind:open={openPrimaryPrompt} disabled={!currentSnapshot.primarySystemPrompt}>
             <Collapsible.Trigger class="execution-viewer-section-trigger execution-viewer-section-trigger-disabled">
@@ -1796,7 +1931,7 @@
                             <div class="execution-viewer-helper">{run.provider ?? 'Unknown provider'}</div>
                           </td>
                           <td class="execution-viewer-table-cell">
-                            {formatTokenValue(delegatedTokenTotal(run.usage))}
+                            {formatTokenValue(delegatedTokenTotal(run.observedUsage != null || run.observedUsageUnavailable != null ? null : run.usage))}
                           </td>
                           <td class="execution-viewer-table-muted-cell">
                             {formatDuration(run.durationMs)}
@@ -1810,6 +1945,41 @@
                             </Badge>
                           </td>
                         </tr>
+                        {#if run.observedUsageUnavailable != null || (run.observedUsage != null && !isDisplayableObservedUsage(run.observedUsage))}
+                          <tr class="execution-viewer-table-row">
+                            <td colspan="6" class="execution-viewer-table-cell">
+                              <div class="execution-viewer-note execution-viewer-note-sm">
+                                Observed usage for this helper is unavailable because the saved partial evidence is invalid. No usage total or cost is inferred from it.
+                              </div>
+                            </td>
+                          </tr>
+                        {:else if run.observedUsage && isDisplayableObservedUsage(run.observedUsage)}
+                          <tr class="execution-viewer-table-row">
+                            <td colspan="6" class="execution-viewer-table-cell">
+                              <div class="execution-viewer-note execution-viewer-note-sm">
+                                Observed before this helper ended. Whole-run usage and cost are unknown; later work may be unreported.
+                              </div>
+                              {#each run.observedUsage.parts as part, partIndex}
+                                <div class="execution-viewer-stack-xs">
+                                  <div class="execution-viewer-eyebrow">Observed helper portion {partIndex + 1}</div>
+                                  <div class="execution-viewer-stats-grid execution-viewer-stats-grid-five">
+                                    {#each usageDetailEntries(null, modeKind) as detail}
+                                      {@const value = part.counts[detail.key]}
+                                      <div class="execution-viewer-stat-card">
+                                        <div class="execution-viewer-stat-label">{detail.label}</div>
+                                        {#if typeof value === 'number' && Number.isFinite(value)}
+                                          <span class="execution-viewer-stat-value">{formatTokenValue(value)}</span>
+                                        {:else}
+                                          <div class="execution-viewer-stat-unavailable">Not reported in this portion.</div>
+                                        {/if}
+                                      </div>
+                                    {/each}
+                                  </div>
+                                </div>
+                              {/each}
+                            </td>
+                          </tr>
+                        {/if}
                       {/each}
                     </tbody>
                   </table>
@@ -1826,14 +1996,14 @@
 
         {#if typesafeCalls.length > 0}
           <div class="execution-viewer-stack-lg execution-viewer-section-block">
-            <div class="execution-viewer-eyebrow">Jev Juice</div>
+            <div class="execution-viewer-eyebrow">Judge Juice</div>
 
             <Collapsible.Root bind:open={openJevJuice}>
               <Collapsible.Trigger class="execution-viewer-section-trigger">
                 <div class="execution-viewer-section-label">
-                  <span class="execution-viewer-section-heading">Jev Juice calls</span>
+                  <span class="execution-viewer-section-heading">Judge Juice calls</span>
                   <span class="execution-viewer-helper">
-                    Typed judgments Batshit asked TypeSafe for during this run, and what it did with them
+                    Typed judgments Batshit asked a judge for during this run, and what it did with them
                   </span>
                 </div>
                 <div class="execution-viewer-inline-row">
@@ -1866,7 +2036,23 @@
                             </div>
                           </td>
                           <td class="execution-viewer-table-cell">
-                            <div class="execution-viewer-value">{call.model ?? 'Unknown'}</div>
+                            <!-- SA-120 P10a: the judge that answered, by name, then its model id and where it ran. -->
+                            {#if call.reason === 'no_provider'}
+                              <!-- Round 1, S5: the chosen judge was missing; never name Jev for it. -->
+                              <div class="execution-viewer-value">No judge</div>
+                              <div class="execution-viewer-helper" data-testid="execution-viewer-jev-juice-provider">
+                                {call.chosenProviderId === UNREADABLE_JUDGE_CHOICE
+                                  ? 'chosen: a damaged choice'
+                                  : call.chosenProviderId
+                                    ? `chosen: ${call.chosenProviderId}`
+                                    : 'no judge was found'}
+                              </div>
+                            {:else}
+                              <div class="execution-viewer-value">{judgeModelName({ kind: call.provider?.kind ?? 'typesafe', modelId: call.model })}</div>
+                              <div class="execution-viewer-helper" data-testid="execution-viewer-jev-juice-provider">
+                                {call.model ?? 'Unknown'} · {call.provider?.label ?? 'TypeSafe'}
+                              </div>
+                            {/if}
                           </td>
                           <td class="execution-viewer-table-cell">
                             <Badge
@@ -1883,7 +2069,7 @@
                             </Badge>
                             {#if call.status !== 'ok'}
                               <div class="execution-viewer-helper">
-                                {describeTypesafeReason(call.reason)}{call.deadlineHit ? ' Deadline hit.' : ''}
+                                {describeTypesafeReason(call.reason, call.provider)}{call.deadlineHit ? ' Deadline hit.' : ''}
                               </div>
                             {/if}
                           </td>
@@ -1987,6 +2173,36 @@
                       </div>
                     {/each}
                   </div>
+
+                  {#if observedUsageEvidence.state === 'invalid'}
+                    <div class="execution-viewer-note execution-viewer-note-sm">
+                      Observed usage is unavailable because the saved partial evidence is invalid. No usage total or cost is inferred from it.
+                    </div>
+                  {:else if observedUsageEvidence.state === 'available'}
+                    <div class="execution-viewer-note execution-viewer-note-sm">
+                      Observed before ending. Whole-run usage and cost are unknown; later work may be unreported.
+                    </div>
+                    {#each observedUsageEvidence.value.parts as part, index}
+                      <div class="execution-viewer-stack-xs">
+                        <div class="execution-viewer-eyebrow">
+                          {part.source === 'codex-app-server-progress' ? 'Observed Codex portion' : 'Recorded reply portion'} {index + 1}
+                        </div>
+                        <div class="execution-viewer-stats-grid execution-viewer-stats-grid-five">
+                          {#each usageDetailEntries(null, modeKind) as detail}
+                            {@const value = part.counts[detail.key]}
+                            <div class="execution-viewer-stat-card">
+                              <div class="execution-viewer-stat-label">{detail.label}</div>
+                              {#if typeof value === 'number' && Number.isFinite(value)}
+                                <span class="execution-viewer-stat-value">{formatTokenValue(value)}</span>
+                              {:else}
+                                <div class="execution-viewer-stat-unavailable">Not reported in this portion.</div>
+                              {/if}
+                            </div>
+                          {/each}
+                        </div>
+                      </div>
+                    {/each}
+                  {/if}
 
                   {#if reasoningPersistence}
                     <div class="execution-viewer-note execution-viewer-note-sm">

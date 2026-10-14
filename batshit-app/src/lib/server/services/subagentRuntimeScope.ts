@@ -13,11 +13,17 @@ import { resolveDynamicMcpGatewayScope } from '$lib/server/services/mcpSelection
 import { resolveCliToolSelectionScope } from '$lib/server/services/cliToolRegistry'
 import { resolveNativeToolSettings } from '$lib/server/services/nativeTools'
 import {
-  isApiSubagentType,
+  DELEGATED_RUN_BROKER_SCOPE,
+  resolveDelegatedRunBrokerInputs,
+} from '$lib/utils/brokerAvailability'
+import {
+  isCliSubagentType,
   isN8nSubnodeSubagentType,
   normalizeSubagentType,
   type SubagentType,
 } from '$lib/utils/subagentType'
+import { buildCliSubagentProviderSettings } from '$lib/server/services/cliSubagentProfile'
+import { COMPILED_TAG, compiledElement } from '$lib/utils/compiledChatTags'
 
 function normalizeStringArray(value: unknown): string[] | null {
   if (!Array.isArray(value)) return null
@@ -112,8 +118,13 @@ export async function resolveManagedSubagentScope(options: {
 
   return {
     subagentType,
+    // BL-81 follow-up: a CLI Subagent or Worker runs with its CLI profile's settings (Fetch Zip
+    // and Batshit Tools off), so its DCM index and its credential's control list are built from
+    // those, the same settings its helper gets. An API Subagent keeps its own toggles.
     nativeToolSettings: resolveNativeToolSettings(
-      options.subagent.provider_specific_settings ?? null,
+      isCliSubagentType(subagentType)
+        ? buildCliSubagentProviderSettings(options.subagent)
+        : options.subagent.provider_specific_settings ?? null,
     ),
     defaultMcpGateways,
     resolvedGateways: gatewayScope.resolvedGateways,
@@ -132,8 +143,8 @@ export async function buildManagedSubagentDynamicInfo(options: {
   projectPath?: string | null
   /**
    * A caller that has already resolved the scope or the slash capabilities can pass them in,
-   * so they are not read twice. (The chat compiler no longer builds a subagent's DYNAMIC
-   * INFO: it resolves only the roster facts, 2026-09-18.)
+   * so they are not read twice. (The chat compiler no longer builds a subagent's
+   * `<dynamic_info>`: it resolves only the roster facts, 2026-09-18.)
    */
   scope?: SubagentResolvedScope
   capabilities?: AgentSlashCapability[]
@@ -149,7 +160,14 @@ export async function buildManagedSubagentDynamicInfo(options: {
 
   // SA-096 P4: the capability index now covers Fabric and published artifact runtime tools
   // as well, so the subagent's own artifact block is gone. Subagents keep artifact runtime
-  // but never the Fabric control plane (SA-064), which `allowFabricControlTools` expresses.
+  // but never the Fabric control plane (SA-064), nor memory (SA-104, a deferred decision), DMs
+  // (SA-113: no inbox, no identity), schedules (SA-115: nothing that outlives the run) or the
+  // judgment tool (SA-120: the primary decides). `DELEGATED_RUN_BROKER_SCOPE` holds all six.
+  //
+  // BL-81: the runtime, the toggles and the flags come from the same two definitions the
+  // delegated control scope is minted from (`resolveDelegatedRunAllowedControlIds`), so the
+  // tools this index offers are exactly the tools a CLI run's credential allows.
+  const brokerInputs = resolveDelegatedRunBrokerInputs(scope)
   const mcpIndex = await buildDynamicMcpIndex({
     userId: options.userId,
     controlAgentId: options.subagent.id,
@@ -159,24 +177,9 @@ export async function buildManagedSubagentDynamicInfo(options: {
     nativeDynamicMcpEnabled: scope.nativeToolSettings.dynamicMcpEnabled,
     cliToolsEnabled: scope.nativeToolSettings.cliToolsEnabled,
     dcmDisplaySettings: scope.dcmDisplaySettings,
-    runtime: isApiSubagentType(scope.subagentType) ? 'api' : 'cli',
-    brokerToggles: {
-      fetchZipEnabled: scope.nativeToolSettings.fetchZipEnabled,
-      dynamicMcpEnabled: scope.nativeToolSettings.dynamicMcpEnabled,
-      cliToolsEnabled: scope.nativeToolSettings.cliToolsEnabled,
-      artifactRuntimeEnabled: scope.nativeToolSettings.artifactRuntimeEnabled,
-      batshitToolsEnabled: scope.nativeToolSettings.batshitToolsEnabled,
-      agentBrowserEnabled: scope.nativeToolSettings.agentBrowserEnabled,
-    },
-    allowFabricControlTools: false,
-    // SA-104 P3: memory tools are PA-only in v1 (deferred subagent-memory decision).
-    memoryControlsEnabled: false,
-    // SA-113 P2 (DL-113-11): a subagent has no inbox and no identity to DM from.
-    dmControlsEnabled: false,
-    // SA-115 P2 (DL-115-10): a delegated run cannot put anything on a clock.
-    scheduleControlsEnabled: false,
-    // SA-120 P2 (DL-120-06): a delegated run never judges through Jev; the primary decides.
-    judgeControlsEnabled: false,
+    runtime: brokerInputs.runtime,
+    brokerToggles: brokerInputs.toggles,
+    ...DELEGATED_RUN_BROKER_SCOPE,
   })
   if (mcpIndex.text.trim()) {
     lines.push('', mcpIndex.text.trim())
@@ -196,7 +199,9 @@ export async function buildManagedSubagentDynamicInfo(options: {
   })
 
   if (content.length === 0) return ''
-  return `==== DYNAMIC INFO (ephemeral - not stored) ====\n${content.join('\n')}`
+  // BL-225: the same `<dynamic_info>` element a primary's DCM is (SA-128), through the one
+  // builder that disarms this grammar's tags inside the lines.
+  return compiledElement(COMPILED_TAG.dynamicInfo, content.join('\n'))
 }
 
 export function appendManagedSubagentDynamicInfo(

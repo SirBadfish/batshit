@@ -31,6 +31,7 @@ const WORKERS_MAX_PER_CALL = 3
 const WORKERS_MAX_CONCURRENT = 3
 const WORKERS_MAX_RUNS_PER_TURN = 9
 const fetchFn = globalThis.fetch || require('node-fetch')
+const { guardCallToolContent } = require(path.join(__dirname, 'lib', 'cli-tool-result-guard.cjs'))
 
 // --- CLI args --------------------------------------------------------------
 const args = Object.fromEntries(process.argv.slice(2).reduce((acc, cur) => {
@@ -60,7 +61,6 @@ const MANAGED_SUBAGENT_ROUTE = '/api/subagents/managed-execute'
 // Transport safety only. Execution timeout policy lives in subagentRunner (10 minute max),
 // and a queued same-subagent call may wait for one complete call before running itself.
 const MANAGED_SUBAGENT_TRANSPORT_TIMEOUT_MS = 2 * 600000 + 15000
-const AMBIGUOUS_CODEX_SESSION = '__batshit_ambiguous_codex_session__'
 /**
  * SA-117 DL-117-08 — this bridge authenticates with THIS run's credential.
  *
@@ -272,28 +272,20 @@ function resolveChatInput(params) {
   return typeof value === 'string' ? value : JSON.stringify(value ?? '')
 }
 
-async function resolveSessionId(params) {
-  const sessionIdFromArgsOrEnv =
-    params?.sessionId ||
-    params?.session_id ||
-    params?._meta?.sessionId ||
-    params?._meta?.session_id ||
-    process.env.BATSHIT_SESSION_ID ||
-    null
-	  if (sessionIdFromArgsOrEnv) return sessionIdFromArgsOrEnv
+function resolveSessionId() {
+  // BL-675: this is per-run launch context, not a model-selected chat. The route verifies it
+  // again against the run credential before it starts any Subagent or Worker.
+  const value = typeof process.env.BATSHIT_SESSION_ID === 'string'
+    ? process.env.BATSHIT_SESSION_ID.trim()
+    : ''
+  return value && !value.includes('${') ? value : null
+}
 
-	  try {
-	    const sessionIds = await redis.sMembers(`codex_sessions:${userId}:${agentId}`)
-	    if (sessionIds.length === 1) {
-	      return sessionIds[0]
-	    }
-	    if (sessionIds.length > 1) {
-	      return AMBIGUOUS_CODEX_SESSION
-	    }
-	    return null
-	  } catch (error) {
-	    return null
-	  }
+function resolveParentMessageId() {
+  const value = typeof process.env.BATSHIT_MESSAGE_ID === 'string'
+    ? process.env.BATSHIT_MESSAGE_ID.trim()
+    : ''
+  return value && !value.includes('${') ? value : null
 }
 
 /**
@@ -336,25 +328,21 @@ function extractErrorMessage(status, parsed) {
 
 async function callManagedSubagent(tool, params) {
   const chatInput = resolveChatInput(params)
-  const resolvedSessionId = await resolveSessionId(params)
-	  if (!resolvedSessionId) {
-	    return {
-	      error:
-	        'Managed Subagent call needs a Batshit session ID. Start the CLI Primary Agent from an active Batshit chat session.'
-	    }
-	  }
-	  if (resolvedSessionId === AMBIGUOUS_CODEX_SESSION) {
-	    return {
-	      error:
-	        'Managed Subagent call could not choose a Batshit session because multiple Codex chats for this agent are running. Batshit passes the session through BATSHIT_SESSION_ID for normal runs; if this keeps happening, stop the parallel Codex run and try again.'
-	    }
-	  }
+  const resolvedSessionId = resolveSessionId()
+  const parentMessageId = resolveParentMessageId()
+  if (!resolvedSessionId) {
+    return {
+      error:
+        'Managed Subagent call needs BATSHIT_SESSION_ID from the active Batshit run. Regenerate the managed profile if this persists.'
+    }
+  }
 
   const body = {
     // SA-117 DL-117-04/08: no `agentId`. The route binds the calling agent off the run
     // credential; a body id that differs from the bound one is refused 400 AGENT_MISMATCH.
     subagentId: tool.subagentId,
     sessionId: resolvedSessionId,
+    ...(parentMessageId ? { messageId: parentMessageId } : {}),
     chatInput,
     projectPath: resolveProjectPath(params),
     thread: resolveThreadMode(params)
@@ -413,24 +401,18 @@ async function callSubagent(tool, params) {
  * turn context the caps need.
  */
 async function callSpawnWorkers(params) {
-  const resolvedSessionId = await resolveSessionId(params)
+  const resolvedSessionId = resolveSessionId()
+  const parentMessageId = resolveParentMessageId()
   if (!resolvedSessionId) {
     return {
       error:
-        'Spawning workers needs a Batshit session ID. Start the CLI Primary Agent from an active Batshit chat session.'
+        'Spawning workers needs BATSHIT_SESSION_ID from the active Batshit run. Regenerate the managed profile if this persists.'
     }
   }
-  if (resolvedSessionId === AMBIGUOUS_CODEX_SESSION) {
-    return {
-      error:
-        'Spawning workers could not choose a Batshit session because multiple Codex chats for this agent are running. Stop the parallel run and try again.'
-    }
-  }
-
   const body = {
     // SA-117 DL-117-04/08: the calling agent is bound off the run credential.
     sessionId: resolvedSessionId,
-    messageId: process.env.BATSHIT_MESSAGE_ID || null,
+    ...(parentMessageId ? { messageId: parentMessageId } : {}),
     projectPath: resolveProjectPath(params),
     workers: Array.isArray(params?.workers) ? params.workers : []
   }
@@ -548,7 +530,9 @@ async function main() {
             required: ['chatInput']
           }
         }))
-        ]
+        ].map((tool) => ({ ...tool, _meta: {
+          ...tool._meta, 'anthropic/maxResultSizeChars': 100_000
+        } }))
       }
     } catch {
       console.error('[subagent-mcp] listTools failed')
@@ -556,7 +540,7 @@ async function main() {
     }
   })
 
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  async function callTool(request) {
     const name = request.params.name || ''
 
     if (name === CLI_WORKER_SPAWN_TOOL_NAME) {
@@ -604,6 +588,12 @@ async function main() {
     return {
       content: [{ type: 'text', text: typeof result.content === 'string' ? result.content : JSON.stringify(result.content, null, 2) }]
     }
+  }
+
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    return await guardCallToolContent(await callTool(request), {
+      fetchFn, baseUrl: batshitBaseUrl, runCredential, toolName: request.params.name || '', requireBudgetCheck: true
+    })
   })
 
   const transport = new StdioServerTransport()

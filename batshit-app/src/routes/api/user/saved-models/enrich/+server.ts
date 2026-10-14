@@ -14,6 +14,10 @@ import {
 import { resolvePresetMaxOutputTokenResolution } from '$lib/utils/modelOutputTokens'
 import { resolveCatalogIds } from '$lib/utils/modelIdResolver'
 import { resolveConnectionServiceFromId } from '$lib/utils/modelConnections'
+import {
+  resolveCatalogConnectionLimits,
+  resolveCatalogConnectionPricing
+} from '$lib/utils/catalogConnectionLimits'
 
 function toPositiveNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined
@@ -39,9 +43,10 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       )
     }
 
-    const vercelModel = await findVercelCatalogEntryById(vercelModelId)
+    const requestedConnectionId = typeof body.connectionId === 'string' ? body.connectionId.trim() : ''
+    const vercelModel = await findVercelCatalogEntryById(vercelModelId, requestedConnectionId || null)
     const selectedConnectionId = String(
-      body.connectionId || vercelModel?.connectionId || ''
+      requestedConnectionId || vercelModel?.connectionId || ''
     ).trim()
 
     let info: (ModelInfo & { pricing?: any; contextWindow?: number }) | VercelCatalogEntry | null =
@@ -109,21 +114,36 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
     const providerCapabilities = providerFeaturesToCapabilities(info.features)
     const capabilities = mergeCapabilities(providerCapabilities, enrichment?.capabilities)
+    // BL-68: a connection that joined a merged row through a reviewed identity
+    // rule has its own limits; neither the row's numbers (from another
+    // connection) nor Artificial Analysis's model-wide ones stand in for them.
+    const connectionLimits = vercelModel
+      ? resolveCatalogConnectionLimits(vercelModel, selectedConnectionId)
+      : null
     // BL-67: blank sends nothing. A row with no known window returns none, never 0.
-    const contextWindow = toPositiveNumber(
-      enrichment?.contextWindow ??
-        ('contextWindow' in info ? (info as any).contextWindow : undefined) ??
-        info.features.maxTokens
-    )
+    const contextWindow = connectionLimits?.perConnection
+      ? connectionLimits.contextWindow
+      : toPositiveNumber(
+          enrichment?.contextWindow ??
+            ('contextWindow' in info ? (info as any).contextWindow : undefined) ??
+            info.features.maxTokens
+        )
     const maxOutputResolution = resolvePresetMaxOutputTokenResolution({
-      maxOutputTokens:
-        enrichment?.maxOutputTokens ??
-        ('maxOutputTokens' in info ? (info as any).maxOutputTokens : undefined) ??
-        undefined,
+      maxOutputTokens: connectionLimits?.perConnection
+        ? connectionLimits.maxOutputTokens
+        : enrichment?.maxOutputTokens ??
+          ('maxOutputTokens' in info ? (info as any).maxOutputTokens : undefined) ??
+          undefined,
       contextWindow
     })
     const maxOutputTokens = maxOutputResolution.maxOutputTokens
     const compatibility = determineModelCompatibility(info.provider)
+    // BL-132: a connection whose own source lists a different price than the
+    // merged row (DeepInfra, Together) carries it on its variant; neither the
+    // row's price (another connection's) nor Artificial Analysis stands in for it.
+    const connectionPricing = vercelModel
+      ? resolveCatalogConnectionPricing(vercelModel, selectedConnectionId)
+      : null
     const fallbackPricing =
       'pricing' in info && info.pricing
         ? info.pricing
@@ -131,6 +151,29 @@ export const POST: RequestHandler = async ({ request, locals }) => {
             input: undefined,
             output: undefined,
             cachedInput: undefined
+          }
+    // Decision A (2026-09-25): a price the catalog lists wins; Artificial
+    // Analysis fills only a row that lists none.
+    const catalogListsPrice = [fallbackPricing.input, fallbackPricing.output, fallbackPricing.cachedInput].some(
+      (value) => value !== undefined && value !== null
+    )
+
+    const pricing = connectionPricing?.perConnection
+      ? {
+          input: connectionPricing.pricing?.input,
+          output: connectionPricing.pricing?.output,
+          cachedInput: connectionPricing.pricing?.cachedInput
+        }
+      : catalogListsPrice
+        ? {
+            input: fallbackPricing.input,
+            output: fallbackPricing.output,
+            cachedInput: fallbackPricing.cachedInput
+          }
+        : {
+            input: enrichment?.pricing?.input,
+            output: enrichment?.pricing?.output,
+            cachedInput: enrichment?.pricing?.cachedInput
           }
 
     const response = {
@@ -142,11 +185,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       contextWindow,
       // BL-67: an unknown price stays absent (the Token Panel then says Unknown); a
       // catalog price of 0 is a real zero and passes through.
-      pricing: {
-        input: enrichment?.pricing?.input ?? fallbackPricing.input,
-        output: enrichment?.pricing?.output ?? fallbackPricing.output,
-        cachedInput: enrichment?.pricing?.cachedInput ?? fallbackPricing.cachedInput
-      },
+      pricing,
       capabilities,
       compatibility,
       isVercelImport: Boolean(vercelModel && selectedConnectionId === 'vercel-gateway'),
@@ -163,6 +202,11 @@ export const POST: RequestHandler = async ({ request, locals }) => {
           contextWindow,
           capabilities: providerCapabilities
         }),
+        // BL-68: the saved baseline records the window this connection really has.
+        ...(connectionLimits?.perConnection ? { contextWindow } : {}),
+        // BL-132 / decision A: and the price this connection really charges, so
+        // Restore Defaults never brings back an Artificial Analysis price.
+        ...(connectionPricing?.perConnection || (enrichment?.pricing && catalogListsPrice) ? { pricing } : {}),
         maxOutputTokens,
         maxOutputTokensEstimated: maxOutputResolution.estimated,
         maxOutputTokensEstimateReason:

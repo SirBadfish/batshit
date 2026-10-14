@@ -20,10 +20,16 @@ const mocks = vi.hoisted(() => ({
 }))
 
 vi.mock('$lib/server/services/streamAbortRegistry', () => ({
-  getActiveStream: (...args: any[]) => mocks.getActiveStream(...args)
+  getActiveStream: (...args: any[]) => mocks.getActiveStream(...args),
+  // BL-601: the route asks for the running reply's Stop; `stop-signal.test.ts` pins it.
+  getRunningReplyStopSignal: () => undefined,
+  // BL-1321: the route now asks through the run credential; `stop-signal.test.ts` pins it.
+  getRunCredentialStopSignal: () => undefined
 }))
 
-vi.mock('$lib/server/services/nativeToolAuth', () => ({
+// BL-704: keep the real portable policy constants the route passes; only the resolver is faked.
+vi.mock('$lib/server/services/nativeToolAuth', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('$lib/server/services/nativeToolAuth')>()),
   resolveNativeToolUser: mocks.resolveNativeToolUser
 }))
 
@@ -275,5 +281,37 @@ describe('/api/controls/use — the click is the approval', () => {
     const payload = await response.json()
     expect(payload.error.message).toContain('direct chat')
     expect(payload.approvalRequest).toBeUndefined()
+  })
+
+  it('forwards the agent credential gateway ceiling separately from model-selected gateways', async () => {
+    mocks.resolveNativeToolUser.mockResolvedValue({
+      userId: 'user-1', auth: 'agent', agentId: 'agent-1',
+      mcpGatewayScope: ['gw_allowed']
+    })
+    const response = await POST({
+      request: request({
+        controlId: 'sys.mcp.dynamic.use', input: { toolName: 'lookup' },
+        selectedGateways: ['gw_other'], mcpGatewayScope: ['gw_other']
+      }),
+      locals: {}
+    } as any)
+    expect(response.status).toBe(200)
+    expect(mocks.useControl).toHaveBeenCalledWith(expect.objectContaining({
+      agentId: 'agent-1', mcpGatewayScope: ['gw_allowed'], selectedGateways: ['gw_other']
+    }))
+  })
+
+  it('fails closed on a legacy agent credential without a gateway snapshot', async () => {
+    mocks.resolveNativeToolUser.mockResolvedValue({ userId: 'user-1', auth: 'agent', agentId: 'agent-1' })
+    await POST({ request: request({ controlId: 'sys.mcp.dynamic.find' }), locals: {} } as any)
+    expect(mocks.useControl).toHaveBeenCalledWith(expect.objectContaining({ mcpGatewayScope: [] }))
+  })
+
+  it('does not turn a service caller body field into a vouched gateway ceiling', async () => {
+    await POST({
+      request: request({ controlId: 'sys.mcp.dynamic.use', agentId: 'agent-1', mcpGatewayScope: ['gw_other'] }),
+      locals: {}
+    } as any)
+    expect(mocks.useControl).toHaveBeenCalledWith(expect.not.objectContaining({ mcpGatewayScope: expect.anything() }))
   })
 })

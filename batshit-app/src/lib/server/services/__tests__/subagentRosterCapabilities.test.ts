@@ -101,6 +101,78 @@ describe('subagent roster capability fragment', () => {
     expect(fragment).not.toContain('Bash')
   })
 
+  // BL-878 (Josh, 2026-09-28): a CLI Subagent runs its commands with its own built-in tools, so its
+  // roster line must not name Bash (or Batshit's Web Search) from settings that do not govern it.
+  // The Bash and Web Search switches are off for a CLI Subagent on screen, but the shared resolver
+  // turns an absent value on, so the toggles read true for a CLI Subagent nobody touched.
+  describe('BL-878: a CLI Subagent line names its built-in tools, not Batshit Bash or Web Search', () => {
+    it.each([
+      ['on (the resolver default)', { bashEnabled: true, webSearchEnabled: true }],
+      ['off', { bashEnabled: false, webSearchEnabled: false }]
+    ])('prints built-in CLI tools first whatever the Bash and Web Search toggles say (%s)', (_name, toggles) => {
+      const fragment = buildSubagentRosterCapabilityFragment(
+        input({
+          scope: {
+            subagentType: 'cli',
+            nativeToolSettings: nativeToolSettings({
+              ...toggles,
+              dynamicMcpEnabled: true,
+              cliToolsEnabled: true,
+              artifactRuntimeEnabled: true,
+              agentBrowserEnabled: true
+            }),
+            resolvedGateways: ['gw_docker'],
+            resolvedCliToolIds: ['tool_a']
+          } as any,
+          gatewayNames: new Map([['gw_docker', 'Docker Catalog']])
+        })
+      )
+
+      expect(fragment).toContain(
+        'tools: built-in CLI tools, MCP (Docker Catalog), CLI tools (1), Artifacts, Agent Browser;'
+      )
+      expect(fragment).not.toContain('Bash')
+      expect(fragment).not.toContain('Web Search')
+    })
+
+    it('says built-in CLI tools even when no Batshit tool is on', () => {
+      const fragment = buildSubagentRosterCapabilityFragment(
+        input({ scope: { subagentType: 'cli', nativeToolSettings: nativeToolSettings({ bashEnabled: true }) } as any })
+      )
+
+      expect(fragment).toBe(
+        'CLI Subagent; model: not set here; tools: built-in CLI tools; skills: none; thread: none'
+      )
+    })
+
+    it('keeps the API Subagent line as it was, byte for byte', () => {
+      const line = (toggles: Record<string, boolean>) =>
+        buildSubagentRosterCapabilityFragment(
+          input({ scope: { subagentType: 'api', nativeToolSettings: nativeToolSettings(toggles) } as any })
+        )
+
+      expect(line({ bashEnabled: true, webSearchEnabled: true })).toBe(
+        'API Subagent; model: not set here; tools: Bash, Web Search; skills: none; thread: none'
+      )
+      expect(line({ bashEnabled: false, webSearchEnabled: false })).toBe(
+        'API Subagent; model: not set here; tools: none; skills: none; thread: none'
+      )
+    })
+
+    it('keeps the n8n Workflow Subagent line as it was, byte for byte', () => {
+      expect(
+        buildSubagentRosterCapabilityFragment(
+          input({
+            scope: {
+              subagentType: 'n8n-workflow',
+              nativeToolSettings: nativeToolSettings({ bashEnabled: true, webSearchEnabled: true })
+            } as any
+          })
+        )
+      ).toBe('n8n Workflow Subagent; model: not set here; tools: defined in n8n; skills: none; thread: none')
+    })
+  })
+
   it('states an unknown model instead of inventing a default', () => {
     expect(buildSubagentRosterCapabilityFragment(input())).toContain('model: not set here')
     expect(buildSubagentRosterCapabilityFragment(input({ model: 'gpt-5.6' }))).toContain(

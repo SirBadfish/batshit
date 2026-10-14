@@ -1,20 +1,27 @@
 /**
  * Universal Resolver for batshit-zip and batshit-clip references
- * 
- * Handles the new clean syntax:
+ *
+ * Reads the clean syntax:
  * - {{batshit-zip:id}} or {{batshit-zip:id:::content}}
  * - {{batshit-clip:id}} or {{batshit-clip:id:::description}}
- * 
- * Triple colons (:::) are used as separator because they're:
- * - Impossible to appear naturally in content
- * - Super visible and intentional
- * - Bulletproof for regex parsing
+ *
+ * Triple colons (:::) separate the id from the optional content.
+ *
+ * This is a looser reader than `zipReferenceSafety.ts` (the trust boundary): the compile uses it
+ * to ask whether an earlier message carries a reference at all, and the id may hold anything but
+ * `:`, line breaks and braces included. It is read by one scan (`createNextIndexFinder`), never
+ * a regex over the whole text: the pattern it replaced,
+ * `/\{\{(batshit-zip|batshit-clip):([^:]+?)(?::::([^}]+))?\}\}/g`, searched the rest of the
+ * text again from every opener, about 40 s of the one Node process for 20,000 openers in 1 MB
+ * whose content never closes, on every compile of that chat.
  */
 
-// Regex patterns for the new syntax with triple colons
-export const BATSHIT_ZIP_REGEX = /\{\{batshit-zip:([^:]+?)(?::::([^}]+))?\}\}/g;
-export const BATSHIT_CLIP_REGEX = /\{\{batshit-clip:([^:]+?)(?::::([^}]+))?\}\}/g;
-export const BATSHIT_UNIVERSAL_REGEX = /\{\{(batshit-zip|batshit-clip):([^:]+?)(?::::([^}]+))?\}\}/g;
+import { createNextIndexFinder } from '$lib/utils/braceScan'
+
+const REFERENCE_OPEN = '{{batshit-'
+const CONTENT_MARK = ':::'
+const COLON_CODE = 58 // `:`
+const CLOSE_BRACE_CODE = 125 // `}`
 
 /**
  * Create a new reference string from components
@@ -32,7 +39,13 @@ export function createReference(
 }
 
 /**
- * Extract all references from a text string
+ * Extract all references from a text string, in order. It finds exactly what the pattern above
+ * found (compared over 9,000 generated texts in `universalResolver.test.ts`):
+ * - after `{{batshit-zip:` or `{{batshit-clip:`, the id is at least one character, never `:`;
+ * - it ends at whichever comes first after its first character: a `}}` (a reference with no
+ *   content), or a `:`, which must start `:::` and one or more characters of content that end at
+ *   the first `}` after them, the first of `}}`;
+ * - anything else is not a reference, and the search resumes one character later.
  */
 export function extractAllReferences(text: string): Array<{
   fullMatch: string;
@@ -46,18 +59,55 @@ export function extractAllReferences(text: string): Array<{
     id: string;
     optionalContent?: string;
   }> = [];
-  
-  const matches = text.matchAll(BATSHIT_UNIVERSAL_REGEX);
-  for (const match of matches) {
-    const [fullMatch, fullTypeStr, id, optionalContent] = match;
-    const type = fullTypeStr.replace('batshit-', '') as 'zip' | 'clip';
+  if (!text.includes(REFERENCE_OPEN)) return references;
+
+  const nextColon = createNextIndexFinder(text, ':');
+  const nextPair = createNextIndexFinder(text, '}}');
+  const nextBrace = createNextIndexFinder(text, '}');
+  let from = 0;
+  for (;;) {
+    const start = text.indexOf(REFERENCE_OPEN, from);
+    if (start < 0) break;
+    const typeStart = start + REFERENCE_OPEN.length;
+    const type: 'zip' | 'clip' | null = text.startsWith('zip:', typeStart)
+      ? 'zip'
+      : text.startsWith('clip:', typeStart)
+        ? 'clip'
+        : null;
+    const idStart = type ? typeStart + type.length + 1 : -1;
+
+    let end = -1;
+    let id = '';
+    let optionalContent: string | undefined;
+    if (type && idStart < text.length && text.charCodeAt(idStart) !== COLON_CODE) {
+      const colonAt = nextColon(idStart + 1);
+      const pairAt = nextPair(idStart + 1);
+      if (pairAt < colonAt) {
+        id = text.slice(idStart, pairAt);
+        end = pairAt + 2;
+      } else if (colonAt < text.length && text.startsWith(CONTENT_MARK, colonAt)) {
+        const contentStart = colonAt + CONTENT_MARK.length;
+        const braceAt = nextBrace(contentStart);
+        if (braceAt > contentStart && text.charCodeAt(braceAt + 1) === CLOSE_BRACE_CODE) {
+          id = text.slice(idStart, colonAt);
+          optionalContent = text.slice(contentStart, braceAt);
+          end = braceAt + 2;
+        }
+      }
+    }
+    if (!type || end < 0) {
+      from = start + 1;
+      continue;
+    }
+
     references.push({
-      fullMatch,
+      fullMatch: text.slice(start, end),
       type,
       id,
       optionalContent: optionalContent || undefined
     });
+    from = end;
   }
-  
+
   return references;
 }

@@ -9,10 +9,57 @@ import {
   getActiveGroupAbort,
   getActiveSessionTurn,
   getActiveStream,
+  keepQueuedSessionTurns,
+  queuedSendNotices,
   stopSessionTurn
 } from '$lib/server/services/streamAbortRegistry'
 import { abortWokenTurnForInterrupt } from '$lib/server/services/agentWakeups'
-import { isTrustedInternalRequest } from '$lib/server/services/internalRequestAuth'
+import { QUEUED_SEND_FORWARD_LIMIT_MS } from '$lib/server/services/queuedSendRules'
+import {
+  internalServiceHeaders,
+  isTrustedInternalRequest
+} from '$lib/server/services/internalRequestAuth'
+
+/**
+ * BL-4 — tell every tab on the chat that its waiting sends will not be sent.
+ *
+ * Posted through `/api/sse` like the other chat events, so each tab turns its "Queued" bubble
+ * into the "Not sent — you stopped the reply" receipt at once, without waiting for the stopped
+ * reply to let go. A failed post only means the tabs learn it a little later, from the stopped
+ * reply's own end: it never fails the Stop.
+ *
+ * It goes out after each kept send's own "Queued" forward (BL-203): arriving first, it named a
+ * bubble no tab had yet, and the late "Queued" then showed a waiting bubble for a send the Stop
+ * had kept. Each forward has its own time limit and never rejects, and so does this post.
+ */
+async function announceKeptQueuedSends(
+  request: Request,
+  sessionId: string,
+  userMessageIds: string[],
+  queuedBubbles: Promise<unknown>[]
+) {
+  if (userMessageIds.length === 0) return
+  await Promise.allSettled(queuedBubbles)
+  try {
+    await fetch(new URL('/api/sse', request.url).toString(), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-internal-sse-forward': '1',
+        ...internalServiceHeaders()
+      },
+      body: JSON.stringify({ type: 'queued_send_dropped', sessionId, userMessageIds, reason: 'stopped' }),
+      // The page waits for this route's answer before it clears its Stop state, so this post has
+      // the same time limit as a queued send's own forwards (BL-204).
+      signal: AbortSignal.timeout(QUEUED_SEND_FORWARD_LIMIT_MS)
+    })
+  } catch (error) {
+    console.warn('[BL-4] Could not tell the tabs that the waiting sends were stopped:', {
+      sessionId,
+      error: error instanceof Error ? error.message : String(error)
+    })
+  }
+}
 
 export const POST: RequestHandler = async ({ request, locals }) => {
   // SA-113 AMD-113-02 — Batshit itself calls this route.
@@ -52,12 +99,28 @@ export const POST: RequestHandler = async ({ request, locals }) => {
   // signal that reaches a turn still in setup. No-op for ordinary browser turns.
   const abortedWokenTurn = abortWokenTurnForInterrupt(sessionId)
 
+  // BL-4: the chat's own Stop stops everything, a waiting message included (AMD-119-04). Every
+  // send waiting in the chat's line is kept, BEFORE the running turn is touched, so the lock it
+  // lets go of is handed on only to kept sends: each moves its saved message to the end of the
+  // chat, unanswered, in the order it was sent (`queuedSendKeeper.ts`). Never deleted. Only that
+  // Stop says so (`stopsWaitingSends`): a woken turn's time limit (Batshit's own call) and the DM
+  // drawer's Stop of a woken run end that run, and the sends waiting behind it then run.
+  const stopsWaitingSends = !internal && body?.stopsWaitingSends === true
+  const keptQueuedSendIds = stopsWaitingSends ? keepQueuedSessionTurns(sessionId, 'stopped') : []
+  // Beside the keep, while every kept send is still in the line (a handover takes it out).
+  const keptQueuedBubbles = queuedSendNotices(sessionId, keptQueuedSendIds)
+  const keptQueuedSends = keptQueuedSendIds.length
+  const answer = async (body: Record<string, unknown>) => {
+    await announceKeptQueuedSends(request, sessionId, keptQueuedSendIds, keptQueuedBubbles)
+    return json({ ...body, keptQueuedSends })
+  }
+
   const active = getActiveStream(sessionId)
   const activeGroup = getActiveGroupAbort(sessionId)
   const activeSessionTurn = getActiveSessionTurn(sessionId)
   if (!active && !activeGroup && !activeSessionTurn) {
-    return json({
-      success: abortedWokenTurn,
+    return answer({
+      success: abortedWokenTurn || keptQueuedSends > 0,
       reason: abortedWokenTurn ? 'wake_run_aborted' : 'no_active_stream',
       abortedWokenTurn
     })
@@ -72,7 +135,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     // lock when it is done; a stuck one loses it 5 s after this Stop (`stopSessionTurn`).
     if (!activeSessionTurn.runEnded) {
       stopSessionTurn(sessionId, 'user')
-      return json({
+      return answer({
         success: true,
         reason: abortedWokenTurn ? 'wake_run_aborted' : 'setup_stopped',
         abortedWokenTurn,
@@ -84,7 +147,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     }
     // The reply is over (its request is doing its after-reply work) or its request is stuck.
     clearSessionTurn(sessionId, requestedMessageId)
-    return json({
+    return answer({
       success: true,
       reason: abortedWokenTurn ? 'wake_run_aborted' : 'stale_turn_cleared',
       abortedWokenTurn,
@@ -98,8 +161,9 @@ export const POST: RequestHandler = async ({ request, locals }) => {
   const aborted = abortStream(sessionId, 'user')
   const abortedGroup = abortGroupChat(sessionId, 'user')
 
-  return json({
+  return answer({
     success: aborted.ok || abortedGroup.ok || abortedWokenTurn,
+    reason: aborted.ok || abortedGroup.ok ? 'aborted' : abortedWokenTurn ? 'wake_run_aborted' : 'no_active_stream',
     abortedWokenTurn,
     messageId: aborted.messageId ?? active?.messageId ?? requestedMessageId,
     requestedMessageId,

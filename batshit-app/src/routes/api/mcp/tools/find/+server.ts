@@ -15,7 +15,11 @@ import { mcpGatewayDiscovery } from '$lib/server/services/mcpGatewayDiscovery'
 import { resolveDynamicMcpGatewayScope } from '$lib/server/services/mcpSelectionResolver'
 import { redis } from '$lib/server/redis'
 import { resolveNativeToolUser } from '$lib/server/services/nativeToolAuth'
-import { bindActingAgentId } from '$lib/server/services/actingAgentIdentity'
+import {
+  bindActingAgentId,
+  refuseDelegatedRunOutsideList,
+  refusePortableSkillOutsideList
+} from '$lib/server/services/actingAgentIdentity'
 import {
   buildSchemaSummary,
   getSchemaHintText,
@@ -237,11 +241,23 @@ export const POST: RequestHandler = async ({ locals, request }) => {
       logger.debug(`[MCP Tools Find] Service auth for user ${userId}`)
     }
 
+    // This direct route does the work of the Fabric find control. Refuse a delegated run
+    // before opening any gateway, even when its model guesses a tool or gateway name.
+    const delegatedRefusal = refuseDelegatedRunOutsideList(auth, 'sys.mcp.dynamic.find')
+    if (delegatedRefusal) {
+      return json({ error: delegatedRefusal.message, code: delegatedRefusal.code }, { status: 403 })
+    }
+    // BL-687: a Portable Skill Token reaches gateways only when one of its families grants the
+    // find control, the rule `/api/controls/use` already keeps for the same work.
+    const portableRefusal = refusePortableSkillOutsideList(auth, 'sys.mcp.dynamic.find')
+    if (portableRefusal) {
+      return json({ error: portableRefusal.message, code: portableRefusal.code }, { status: 403 })
+    }
+
     // Clamp limit
     const effectiveLimit = toolFilter ? 1 : Math.min(Math.max(1, limit), 20)
 
-    // Dynamic MCP scope precedence:
-    // explicit selectedGateways -> agent defaults -> user-global enabled gateways.
+    // Caller selections only narrow the server-bound scope (or owned defaults).
     const selectedGateways = Array.isArray(body.selectedGateways)
       ? body.selectedGateways
       : Array.isArray(body.gatewayFilter)
@@ -257,6 +273,7 @@ export const POST: RequestHandler = async ({ locals, request }) => {
     const scopeResolution = await resolveDynamicMcpGatewayScope({
       userId,
       agentId: agentBinding.agentId ?? null,
+      ...(auth.auth === 'agent' ? { mcpGatewayScope: auth.mcpGatewayScope ?? [] } : {}),
       selectedGateways
     })
     const resolvedGateways = scopeResolution.resolvedGateways
@@ -273,7 +290,9 @@ export const POST: RequestHandler = async ({ locals, request }) => {
     const normalizedGroupFilters = groupFilters.map((value) => value.toLowerCase())
     const dcmDisplaySettings = await resolveAgentDcmDisplaySettings({
       agentId: agentBinding.agentId ?? null,
-      dcmDisplaySettings: body.dcmDisplaySettings
+      // A managed run's display policy is the stored agent setting. Model/helper JSON may
+      // narrow gateway scope, but cannot replace hidden group or tool preferences.
+      dcmDisplaySettings: auth.auth === 'agent' ? undefined : body.dcmDisplaySettings
     })
     const gatewayDefaults = await resolveGatewayDisplayDefaults(userId)
     const baseGroupGatewayKeysByName = new Map<string, Set<string>>()

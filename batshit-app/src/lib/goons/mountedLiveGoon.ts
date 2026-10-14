@@ -76,21 +76,27 @@ export type MountedLiveGoonLoadPlan = {
   mountedState: GoonMountedRuntimeState | null
 }
 
-export type MountedLiveGoonLoadResult = {
-  kind: 'vrm' | 'custom'
-  sceneSignature: string
-  baseLoopSignature: string
-  animationSignature: string
-  closetSignature: string
-  animationCatalog: Array<{ name: string; source: 'vrm' | 'goon' | 'vrma' }>
-  materialNames: string[]
-  appearanceDialsSignature: string
-  facialArtworkSignature: string
-  eyeAppearanceSignature: string
-  oralAppearanceSignature: string
-  viewFov: number
-  cameraMode: GoonCameraMode
-}
+export type MountedLiveGoonLoadResult =
+  | {
+      status: 'cancelled'
+      kind: 'vrm' | 'custom'
+    }
+  | {
+      status: 'loaded'
+      kind: 'vrm' | 'custom'
+      sceneSignature: string
+      baseLoopSignature: string
+      animationSignature: string
+      closetSignature: string
+      animationCatalog: Array<{ name: string; source: 'vrm' | 'goon' | 'vrma' }>
+      materialNames: string[]
+      appearanceDialsSignature: string
+      facialArtworkSignature: string
+      eyeAppearanceSignature: string
+      oralAppearanceSignature: string
+      viewFov: number
+      cameraMode: GoonCameraMode
+    }
 
 export type MountedLiveGoonClosetContext = Pick<
   MountedLiveGoonLoadPlan,
@@ -392,10 +398,17 @@ export function buildMountedLiveGoonLoadPlan(
   }
 }
 
-export async function loadMountedLiveGoon(engine: GoonEngine, plan: MountedLiveGoonLoadPlan) {
+export async function loadMountedLiveGoon(
+  engine: GoonEngine,
+  plan: MountedLiveGoonLoadPlan
+): Promise<MountedLiveGoonLoadResult> {
   await engine.init()
+  const avatar = await loadAvatarIntoEngine(engine, plan.goon, { role: 'mounted-live' })
+  if (avatar.role === 'cancelled') {
+    return { status: 'cancelled', kind: avatar.kind } satisfies MountedLiveGoonLoadResult
+  }
+  const { kind } = avatar
   engine.setCameraFov(plan.initialFov)
-  const { kind } = await loadAvatarIntoEngine(engine, plan.goon, { role: 'mounted-live' })
 
   if (plan.sceneMode === 'saved') {
     await applyGoonSceneDefinition(engine, plan.scene, plan.stagePostures)
@@ -419,6 +432,7 @@ export async function loadMountedLiveGoon(engine: GoonEngine, plan: MountedLiveG
   engine.setGoonVisible(true)
 
   return {
+    status: 'loaded',
     kind,
     sceneSignature: plan.sceneSignature,
     baseLoopSignature: plan.baseLoopSignature,

@@ -37,8 +37,6 @@ export interface MemoryProvenanceEntry {
   quote?: string
   source: 'agent' | 'user' | 'dreaming'
   note?: string
-  /** Set lazily when the source session no longer exists; recall says "original unavailable". */
-  source_deleted?: boolean
 }
 
 export interface MemoryRecord {

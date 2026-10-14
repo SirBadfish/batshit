@@ -32,9 +32,9 @@ const SUBAGENT_TOOL_PREFIX = 'subagent_'
  *   'mcp__'(5) + 'batshit_gateway_'(16) + segment + '__'(2) + 'subagent_'(9) + key <= 64
  *   => segment + key <= 32  =>  16 each.
  *
- * Names already inside their half are left EXACTLY as they were, so short agent/subagent
- * ids (`cody-subagents`, `researcher`) keep their current, readable names and no existing
- * profile churns.
+ * Names already inside their half are not shortened, so short agent/subagent ids keep
+ * readable names (`cody_subagents`, `researcher`). Since BL-154 a server name never
+ * carries a hyphen (`toCliShownMcpNameSegment`), because Codex shows one as `_`.
  */
 export const MCP_FULL_TOOL_NAME_LIMIT = 64
 export const CLI_SUBAGENT_SERVER_SEGMENT_MAX = 16
@@ -79,10 +79,30 @@ function sanitizeManagedGatewaySegment(value: string | null | undefined) {
 }
 
 /**
+ * BL-154 — the name both CLIs show. Codex shows the model every character of an MCP
+ * server name outside [A-Za-z0-9_] as `_` (the server `batshit_gateway_cody-subagents`
+ * reached the model as `mcp__batshit_gateway_cody_subagents`, measured in Codex's own
+ * request log), while Claude Code keeps a hyphen. A name made only of [A-Za-z0-9_], with no
+ * doubled or edge `_` (so `mcp__<server>__<tool>` still splits in one place), is the same
+ * string on both CLIs, so it is the one the profiles register, the DCM roster prints, and
+ * Claude's allow lists name.
+ */
+export function toCliShownMcpNameSegment(value: string): string {
+  return value
+    .replace(/[^A-Za-z0-9_]+/g, '_')
+    .replace(/_{2,}/g, '_')
+    .replace(/^_+|_+$/g, '')
+}
+
+/**
  * The MCP server name Batshit registers for one CLI primary's subagent bridge. Kept in
  * this module (rather than the profile managers' generic `buildManagedGatewayId`) so the
  * 64-character bound applies to THIS server only — every other managed gateway keeps its
  * existing name.
+ *
+ * The segment is shortened BEFORE it is made CLI-safe, so the hash of a long name is the
+ * one it always had: only a name that carried a hyphen (a name Codex was already showing
+ * differently from the roster) changes.
  */
 export function buildCliSubagentMcpServerName(
   agent: CliAgentToolNameRecord | null | undefined
@@ -91,11 +111,37 @@ export function buildCliSubagentMcpServerName(
   if (!agentId) return null
   const agentSlug = agent?.slug?.trim()
   const gatewaySource = agentSlug ? `${agentSlug}-subagents` : `${agentId}-subagents`
-  const segment = shortenNameSegment(
-    sanitizeManagedGatewaySegment(gatewaySource),
-    CLI_SUBAGENT_SERVER_SEGMENT_MAX
-  )
+  const segment =
+    toCliShownMcpNameSegment(
+      shortenNameSegment(
+        sanitizeManagedGatewaySegment(gatewaySource),
+        CLI_SUBAGENT_SERVER_SEGMENT_MAX
+      )
+    ) || 'gateway'
   return `${MANAGED_GATEWAY_PREFIX}${segment}`
+}
+
+/**
+ * BL-271 — whether `name` has a shape `buildCliSubagentMcpServerName` can produce for SOME
+ * agent. User gateways share the `batshit_gateway_` prefix (`buildManagedGatewayId`), so a
+ * gateway slug of this shape could become an agent's Subagent bridge name, now or when that
+ * agent is made later; the gateway service skips these slugs.
+ *
+ * The two shapes, both at most 16 characters after the prefix: a short agent name keeps
+ * `<name>_subagents` (or `subagents` alone when the name has no letter or digit); a longer one
+ * is `<head>_<6 hex>` (`shortenNameSegment`). Pinned against the builder by
+ * `mcpGatewaySubagentBridgeName.test.ts`.
+ */
+export function isCliSubagentBridgeServerName(name: string | null | undefined): boolean {
+  if (typeof name !== 'string' || !name.startsWith(MANAGED_GATEWAY_PREFIX)) return false
+  return isCliSubagentBridgeServerSegment(name.slice(MANAGED_GATEWAY_PREFIX.length))
+}
+
+/** The same test on the part after `batshit_gateway_` (a gateway slug is exactly that part). */
+export function isCliSubagentBridgeServerSegment(segment: string | null | undefined): boolean {
+  if (typeof segment !== 'string') return false
+  if (segment.length === 0 || segment.length > CLI_SUBAGENT_SERVER_SEGMENT_MAX) return false
+  return /^(?:[a-z0-9_]+_)?subagents$/.test(segment) || /^[a-z0-9_]+_[0-9a-f]{6}$/.test(segment)
 }
 
 /** The MCP tool name the bridge exposes for one subagent key. */
@@ -128,6 +174,15 @@ export type CliSubagentMcpToolReference = {
   fullToolName: string
 }
 
+/**
+ * The key one assigned subagent's tool is named after: its normalized id, the value the
+ * profile managers enable (`agent.assignedSubagents` holds ids) and the bridge advertises.
+ * A record without an id falls back to its slug.
+ */
+export function resolveCliSubagentToolKey(subagent: CliSubagentToolNameRecord): string {
+  return subagent.id ? normalizeSubagentSlugValue(subagent.id) : resolveSubagentSlug(subagent)
+}
+
 export function buildCliSubagentMcpToolReference(
   agent: CliAgentToolNameRecord | null | undefined,
   subagent: CliSubagentToolNameRecord | null | undefined
@@ -135,9 +190,7 @@ export function buildCliSubagentMcpToolReference(
   const serverName = buildCliSubagentMcpServerName(agent)
   if (!serverName || !subagent) return null
 
-  const toolKey = subagent.id
-    ? normalizeSubagentSlugValue(subagent.id)
-    : resolveSubagentSlug(subagent)
+  const toolKey = resolveCliSubagentToolKey(subagent)
   const toolId = buildCliSubagentMcpToolNameForKey(toolKey)
 
   return {
@@ -152,4 +205,34 @@ export function buildCliSubagentMcpToolName(
   subagent: CliSubagentToolNameRecord | null | undefined
 ) {
   return buildCliSubagentMcpToolReference(agent, subagent)?.fullToolName ?? null
+}
+
+export type CliSubagentToolCall = {
+  serverName: string
+  /** The subagent key the tool is named after, lowercased (`researcher`, or a shortened key). */
+  toolKey: string
+}
+
+const CLI_SUBAGENT_TOOL_KEY = /^[a-z0-9_-]+$/
+
+/**
+ * BL-272: the Subagent a CLI tool call names, read by the exact shape Batshit registers: the
+ * server is a managed gateway (`batshit_gateway_…`) and the tool is `subagent_<key>`, in the
+ * event adapters' `mcp.<server>.<tool>` form or Claude Code's own `mcp__<server>__<tool>`. Null
+ * for any other tool. The adapters used to take the first `subagent_` anywhere in the name, so
+ * an agent slugged `subagent`, whose bridge is `batshit_gateway_subagent_<hash>`, had the hash
+ * read as its Subagent, and its `spawn_workers` read as a Subagent call.
+ */
+export function parseCliSubagentToolName(toolName: string | null | undefined): CliSubagentToolCall | null {
+  const lower = typeof toolName === 'string' ? toolName.trim().toLowerCase() : ''
+  let parts: string[]
+  if (lower.startsWith('mcp__')) parts = lower.slice('mcp__'.length).split('__')
+  else if (lower.startsWith('mcp.')) parts = lower.slice('mcp.'.length).split('.')
+  else return null
+  if (parts.length !== 2) return null
+  const [serverName, tool] = parts
+  if (!serverName.startsWith(MANAGED_GATEWAY_PREFIX) || serverName.length === MANAGED_GATEWAY_PREFIX.length) return null
+  if (!tool.startsWith(SUBAGENT_TOOL_PREFIX)) return null
+  const toolKey = tool.slice(SUBAGENT_TOOL_PREFIX.length)
+  return CLI_SUBAGENT_TOOL_KEY.test(toolKey) ? { serverName, toolKey } : null
 }

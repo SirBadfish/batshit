@@ -1,3 +1,5 @@
+import { spawnOwnedCommandGroup } from './ownedCommandGroup'
+import { pinHostCommandOwner, type HostCommandOwner, type HostCommandPin } from './hostCommandOwnership'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { access, constants as fsConstants, stat } from 'node:fs/promises'
@@ -14,7 +16,13 @@ import {
   type ControlApprovalRequest
 } from '$lib/server/services/controlApprovals'
 import type { ControlActorType } from '$lib/server/services/fabricRegistry'
-import { endCommandProcess, trackCommandGroup } from '$lib/server/services/commandEnd'
+import { COMMAND_END_GRACE_MS, endCommandProcess } from '$lib/server/services/commandEnd'
+import { limitedOutput } from '$lib/server/services/commandOutputLimit'
+import {
+  attachCommandModelCapture,
+  createCommandModelCapture,
+  propagateCommandModelCapture
+} from '$lib/server/services/commandModelCapture'
 import { buildControlApprovalPauseGuidance } from '$lib/utils/controlApprovalPresentation'
 import {
   INFRA_API_KEY_SERVICES,
@@ -38,6 +46,7 @@ import type {
   CliToolValidationStatus
 } from '$lib/types/database'
 import { normalizeCliToolGridSettings } from '$lib/utils/toolGridCli'
+import { stripHostOperatorAuthorityFromChildEnv } from '$lib/server/services/cliChildEnv'
 
 export const CLI_TOOL_REGISTRY_SCHEMA_VERSION = 1 as const
 
@@ -212,7 +221,12 @@ export type CliToolExecutionParams = {
   toolId: string
   input?: Record<string, any> | null
   agentId?: string | null
+  /** Server-vouched physical owner; never accepted from the tool input or route body. */
+  processOwner?: HostCommandOwner
   sessionId?: string | null
+  /** Server-resolved run scope (BL-686). See `resolveCliToolSelectionScope`. */
+  cliToolScope?: string[] | null
+  /** The caller's list: a filter on the scope, never a replacement for it (BL-686). */
   selectedToolIds?: string[] | null
   /**
    * SA-116 DL-116-14 — **no longer read.**
@@ -297,6 +311,7 @@ export type CliToolExecutionResult =
         | 'UNAVAILABLE_IN_GROUP'
         | 'EXECUTION_FAILED'
         | 'OUTPUT_PARSE_FAILED'
+        | 'OWNER_UNAVAILABLE'
       error: string
       riskLevel?: CliToolRiskLevel
     }
@@ -317,6 +332,9 @@ export type CliToolValidationResult = {
 export type CliToolFindParams = {
   userId: string
   agentId?: string | null
+  /** Server-resolved run scope (BL-686). See `resolveCliToolSelectionScope`. */
+  cliToolScope?: string[] | null
+  /** The caller's list: a filter on the scope, never a replacement for it (BL-686). */
   selectedToolIds?: string[] | null
   query?: string
   limit?: number
@@ -986,26 +1004,53 @@ function searchScore(record: CliToolRecord, query: string): number {
   return score
 }
 
+function normalizeCliToolIdList(value: unknown[]): string[] {
+  return Array.from(
+    new Set(
+      value
+        .map((entry) => (typeof entry === 'string' ? entry.trim() : ''))
+        .filter((entry) => entry.length > 0)
+    )
+  )
+}
+
+/**
+ * The saved CLI tools one call may reach (BL-686, the rule BL-638 set for gateways).
+ *
+ * Two inputs, and they are not the same kind of thing:
+ *
+ * - `cliToolScope` is the server's answer for this run: the in-process turn's list, a managed
+ *   CLI run's credential, a Subagent's own saved list. When it is present it IS the scope, and
+ *   `null` or a malformed value is an empty one, so neither the caller's list nor the agent's
+ *   saved list can turn it back into permission.
+ * - `selectedToolIds` is the caller's list: a route body or a model's tool input. It only
+ *   NARROWS whatever scope resolves (`cliToolScope`, else the agent's saved list, else the
+ *   metadata list, else the user's Tool Grid list). A tool it names that the scope lacks is
+ *   dropped; `[]` means none. It used to replace the scope, so a managed run could name a tool
+ *   saved only for another agent and run it.
+ */
 export async function resolveCliToolSelectionScope(params: {
   userId: string
   agentId?: string | null
   agentMetadata?: Record<string, any> | null
+  cliToolScope?: string[] | null
   selectedToolIds?: string[] | null
 }): Promise<{
   toolIds: string[]
   source: 'selected' | 'agent' | 'user-global' | 'none'
 }> {
-  if (Array.isArray(params.selectedToolIds)) {
-    return {
-      toolIds: Array.from(
-        new Set(
-          params.selectedToolIds
-            .map((entry) => (typeof entry === 'string' ? entry.trim() : ''))
-            .filter((entry) => entry.length > 0)
-        )
-      ),
-      source: 'selected'
-    }
+  const requested = Array.isArray(params.selectedToolIds)
+    ? new Set(normalizeCliToolIdList(params.selectedToolIds))
+    : null
+  const narrow = (toolIds: string[]): string[] =>
+    requested ? toolIds.filter((toolId) => requested.has(toolId)) : toolIds
+
+  if (params.cliToolScope !== undefined) {
+    const bound = Array.isArray(params.cliToolScope) &&
+      params.cliToolScope.every((entry) => typeof entry === 'string')
+      ? normalizeCliToolIdList(params.cliToolScope)
+      : []
+    return { toolIds: narrow(bound), source: 'selected' }
   }
 
   if (params.agentId) {
@@ -1018,16 +1063,7 @@ export async function resolveCliToolSelectionScope(params: {
           : null
 
       if (Array.isArray(defaultTools)) {
-        return {
-          toolIds: Array.from(
-            new Set(
-              defaultTools
-                .map((entry: unknown) => (typeof entry === 'string' ? entry.trim() : ''))
-                .filter((entry: string) => entry.length > 0)
-            )
-          ),
-          source: 'agent'
-        }
+        return { toolIds: narrow(normalizeCliToolIdList(defaultTools)), source: 'agent' }
       }
     }
   }
@@ -1039,16 +1075,7 @@ export async function resolveCliToolSelectionScope(params: {
       : null
 
   if (Array.isArray(metadataDefaultTools)) {
-    return {
-      toolIds: Array.from(
-        new Set(
-          metadataDefaultTools
-            .map((entry: unknown) => (typeof entry === 'string' ? entry.trim() : ''))
-            .filter((entry: string) => entry.length > 0)
-        )
-      ),
-      source: 'agent'
-    }
+    return { toolIds: narrow(normalizeCliToolIdList(metadataDefaultTools)), source: 'agent' }
   }
 
   const userSettings = await redis.getUserSettings(params.userId).catch(() => null)
@@ -1058,7 +1085,7 @@ export async function resolveCliToolSelectionScope(params: {
 
   if (cliDefaults.discoverableToolIds.length > 0) {
     return {
-      toolIds: cliDefaults.discoverableToolIds,
+      toolIds: narrow(cliDefaults.discoverableToolIds),
       source: 'user-global'
     }
   }
@@ -1067,6 +1094,30 @@ export async function resolveCliToolSelectionScope(params: {
     toolIds: [],
     source: 'none'
   }
+}
+
+/**
+ * BL-686 — the saved CLI tools a managed run's credential carries, resolved the way the run's
+ * helper profile was: the list the run started with (the turn's list, or a Subagent's own list
+ * resolved by its runner), else the primary agent's saved list, else the user's Tool Grid list.
+ * A delegated run's id names no agent record, so it has only its runner's list, and none when
+ * the runner gave none. Both bridges mint this; the CLI tool routes and the dispatch read it.
+ */
+export async function resolveRunCredentialCliToolScope(run: {
+  userId?: string | null
+  agentId?: string | null
+  delegatedRun?: boolean | null
+  selectedCliToolIds?: string[] | null
+}): Promise<string[]> {
+  const userId = typeof run.userId === 'string' ? run.userId.trim() : ''
+  if (!userId) return []
+  if (run.delegatedRun === true && !Array.isArray(run.selectedCliToolIds)) return []
+  const scope = await resolveCliToolSelectionScope({
+    userId,
+    agentId: run.delegatedRun === true ? null : run.agentId ?? null,
+    cliToolScope: run.selectedCliToolIds ?? undefined
+  })
+  return scope.toolIds
 }
 
 export async function findCliTools(params: CliToolFindParams): Promise<{
@@ -1256,9 +1307,14 @@ function extractJsonCandidateFromText(text: string): string | null {
   return trimmed.slice(firstBrace).trim()
 }
 
-function parseCliToolOutput(record: CliToolRecord, stdout: string): { parsedOutput?: unknown } {
+function parseCliToolOutput(record: CliToolRecord, stdout: string, stdoutCut = false): { parsedOutput?: unknown } {
   if (record.parseMode === 'text') {
     return {}
+  }
+  if (stdoutCut) {
+    throw new Error(
+      `CLI tool stdout was cut at ${MAX_CLI_TOOL_OUTPUT_CHARS.toLocaleString('en-US')} characters; JSON output is incomplete.`
+    )
   }
 
   const candidate =
@@ -1286,6 +1342,31 @@ export type CliToolProcessRunParams = {
   env: Record<string, string>
   timeoutMs: number
   abortSignal?: AbortSignal | null
+  ownerPin?: HostCommandPin
+  sessionId?: string | null
+  messageId?: string | null
+}
+
+function pinCliToolOwner(params: Pick<CliToolExecutionParams, 'userId' | 'agentId' | 'actorType' | 'processOwner'>): HostCommandPin | undefined | null {
+  const agentId = typeof params.agentId === 'string' ? params.agentId.trim() : ''
+  const agentLane = params.actorType === 'agent' || params.actorType === 'in-process'
+  let owner: HostCommandOwner
+  if (params.processOwner) {
+    // Internal dispatch validates the context owner even for session/service callers.
+    // The public execute route only supplies this field from an agent run credential.
+    if (params.processOwner.userId !== params.userId ||
+      !['agent', 'subagent'].includes(params.processOwner.kind) || !params.processOwner.id) return null
+    owner = params.processOwner
+  } else if (agentLane && agentId.startsWith('subagent_cli')) {
+    // The virtual runtime id cannot stand in for the real Subagent or Worker owner.
+    return null
+  } else if (agentLane && agentId) {
+    owner = { userId: params.userId, kind: 'agent', id: agentId }
+  } else {
+    owner = { userId: params.userId, kind: 'host', id: 'administration' }
+  }
+  if (process.platform === 'win32') return undefined
+  return pinHostCommandOwner(owner)
 }
 
 export async function runCliProcess(params: CliToolProcessRunParams): Promise<{
@@ -1295,36 +1376,51 @@ export async function runCliProcess(params: CliToolProcessRunParams): Promise<{
   durationMs: number
   stopped: boolean
   timedOut: boolean
+  stdoutCut: boolean
 }> {
   const startedAt = Date.now()
   if (params.abortSignal?.aborted) {
-    return {
+    return attachCommandModelCapture({
       exitCode: null,
       stdout: '',
       stderr: 'The command was stopped.',
       durationMs: Date.now() - startedAt,
       stopped: true,
-      timedOut: false
-    }
+      timedOut: false,
+      stdoutCut: false
+    }, createCommandModelCapture().finish({ stopped: true }))
   }
   return await new Promise((resolve, reject) => {
     const ownGroup = process.platform !== 'win32'
-    const child = spawn(params.executable, params.args, {
+    const env = stripHostOperatorAuthorityFromChildEnv({ ...process.env, ...params.env })
+    const child = ownGroup
+      ? spawnOwnedCommandGroup(params.executable, params.args, {
+          cwd: params.cwd, env,
+          ownerPin: params.ownerPin,
+          sessionId: params.sessionId,
+          messageId: params.messageId
+        })
+      : spawn(params.executable, params.args, {
       cwd: params.cwd,
-      env: {
-        ...process.env,
-        ...params.env
-      },
+      env,
       stdio: ['ignore', 'pipe', 'pipe'],
       shell: false,
       detached: ownGroup
     })
-    if (ownGroup && child.pid) trackCommandGroup(child.pid)
 
-    let stdout = ''
-    let stderr = ''
+    const stdout = limitedOutput(MAX_CLI_TOOL_OUTPUT_CHARS)
+    const stderr = limitedOutput(MAX_CLI_TOOL_OUTPUT_CHARS)
+    const modelCapture = createCommandModelCapture()
     let settled = false
     let timeout: ReturnType<typeof setTimeout> | null = null
+    let drainTimeout: ReturnType<typeof setTimeout> | null = null
+    let termination: {
+      exitCode: null
+      stdout: string
+      stderr: string
+      stopped?: boolean
+      timedOut?: boolean
+    } | null = null
 
     const finish = (result: {
       exitCode: number | null
@@ -1332,27 +1428,54 @@ export async function runCliProcess(params: CliToolProcessRunParams): Promise<{
       stderr: string
       stopped?: boolean
       timedOut?: boolean
-    }) => {
+    }, signal?: string | null, outputIncomplete = false) => {
       if (settled) return
       settled = true
       if (timeout) clearTimeout(timeout)
+      if (drainTimeout) clearTimeout(drainTimeout)
       params.abortSignal?.removeEventListener('abort', onAbort)
-      resolve({
+      resolve(attachCommandModelCapture({
         ...result,
         durationMs: Date.now() - startedAt,
         stopped: result.stopped === true,
-        timedOut: result.timedOut === true
-      })
+        timedOut: result.timedOut === true,
+        stdoutCut: stdout.cut
+      }, modelCapture.finish({
+        exitCode: result.exitCode,
+        signal,
+        stopped: result.stopped,
+        timedOut: result.timedOut,
+        outputIncomplete
+      })))
+    }
+
+    const finishIncomplete = () => {
+      if (settled || !termination) return
+      const stdoutIncomplete = child.stdout !== null && !child.stdout.readableEnded
+      const stderrIncomplete = child.stderr !== null && !child.stderr.readableEnded
+      const outputIncomplete = stdoutIncomplete || stderrIncomplete
+      finish(outputIncomplete ? {
+        ...termination,
+        stderr: `${termination.stderr}\n[Command output capture incomplete: pipes did not close; any later output was not kept.]`
+      } : termination, null, outputIncomplete)
+      if (stdoutIncomplete) child.stdout?.destroy()
+      if (stderrIncomplete) child.stderr?.destroy()
     }
 
     const end = (reason: string, kind: 'stopped' | 'timedOut') => {
-      endCommandProcess(child, { ownGroup })
-      finish({
+      if (settled || termination) return
+      // Keep the existing model-visible Stop/timeout result, while allowing the private
+      // capture to consume bytes already in the child pipes before `close`.
+      termination = {
         exitCode: null,
-        stdout,
-        stderr: `${stderr}${stderr ? '\n' : ''}${reason}`,
+        stdout: stdout.text,
+        stderr: `${stderr.text}${stderr.text ? '\n' : ''}${reason}`,
         [kind]: true
-      })
+      }
+      if (timeout) clearTimeout(timeout)
+      endCommandProcess(child, { ownGroup })
+      // A descendant outside the ended group can inherit a pipe. Do not hold Stop forever.
+      drainTimeout = setTimeout(finishIncomplete, COMMAND_END_GRACE_MS + 600)
     }
     const onAbort = () => end('The command was stopped.', 'stopped')
 
@@ -1363,29 +1486,29 @@ export async function runCliProcess(params: CliToolProcessRunParams): Promise<{
     if (params.abortSignal?.aborted) onAbort()
 
     child.stdout?.on('data', (chunk) => {
-      stdout += chunk.toString()
-      if (stdout.length > MAX_CLI_TOOL_OUTPUT_CHARS) {
-        stdout = stdout.slice(0, MAX_CLI_TOOL_OUTPUT_CHARS)
-      }
+      modelCapture.appendStdout(chunk)
+      stdout.append(chunk.toString())
     })
     child.stderr?.on('data', (chunk) => {
-      stderr += chunk.toString()
-      if (stderr.length > MAX_CLI_TOOL_OUTPUT_CHARS) {
-        stderr = stderr.slice(0, MAX_CLI_TOOL_OUTPUT_CHARS)
-      }
+      modelCapture.appendStderr(chunk)
+      stderr.append(chunk.toString())
     })
     child.on('error', (error) => {
       if (settled) return
+      if (termination) {
+        finishIncomplete()
+        return
+      }
       if (timeout) clearTimeout(timeout)
       params.abortSignal?.removeEventListener('abort', onAbort)
       reject(error)
     })
-    child.on('close', (code) => {
-      finish({
+    child.on('close', (code, signal) => {
+      finish(termination ?? {
         exitCode: typeof code === 'number' ? code : null,
-        stdout,
-        stderr
-      })
+        stdout: stdout.text,
+        stderr: stderr.text
+      }, signal)
     })
   })
 }
@@ -1411,6 +1534,7 @@ export async function validateCliTool(
   toolId: string,
   options: { projectPath?: string | null; persist?: boolean } = {}
 ): Promise<CliToolValidationResult> {
+  const ownerPin = process.platform === 'win32' ? undefined : pinHostCommandOwner({ userId, kind: 'host', id: 'administration' })
   const record = await getCliTool(userId, toolId)
   if (!record) {
     throw new Error(`CLI tool "${toolId}" was not found`)
@@ -1432,7 +1556,8 @@ export async function validateCliTool(
       args,
       cwd: runtime.cwd,
       env: runtime.env,
-      timeoutMs: record.timeoutMs
+      timeoutMs: record.timeoutMs,
+      ownerPin
     })
     if (execution.exitCode !== 0) {
       result = {
@@ -1449,7 +1574,7 @@ export async function validateCliTool(
       }
     } else {
       try {
-        parseCliToolOutput(record, execution.stdout)
+        parseCliToolOutput(record, execution.stdout, execution.stdoutCut)
         result = {
           success: true,
           toolId: record.toolId,
@@ -1482,7 +1607,8 @@ export async function validateCliTool(
       args: record.helpCommand,
       cwd: runtime.cwd,
       env: runtime.env,
-      timeoutMs: Math.min(record.timeoutMs, 30_000)
+      timeoutMs: Math.min(record.timeoutMs, 30_000),
+      ownerPin
     })
     result = {
       success: execution.exitCode === 0,
@@ -1546,6 +1672,11 @@ export async function executeCliTool(
   params: CliToolExecutionParams,
   options: CliToolExecutionOptions = {}
 ): Promise<CliToolExecutionResult> {
+  const ownerPin = pinCliToolOwner(params)
+  if (ownerPin === null) return {
+    success: false, toolId: params.toolId, blocked: true, code: 'OWNER_UNAVAILABLE',
+    error: 'This delegated CLI command has no verified physical owner.'
+  }
   const { toolIds: selectedToolIds } = await resolveCliToolSelectionScope(params)
   const selectedSet = new Set(selectedToolIds)
   const record = await getCliTool(params.userId, params.toolId)
@@ -1680,7 +1811,10 @@ export async function executeCliTool(
       cwd: runtime.cwd,
       env: runtime.env,
       timeoutMs: record.timeoutMs,
-      abortSignal: options.abortSignal
+      abortSignal: options.abortSignal,
+      ownerPin,
+      sessionId: params.sessionId,
+      messageId: params.messageId
     })
     const auditId = crypto.randomUUID()
 
@@ -1707,7 +1841,7 @@ export async function executeCliTool(
         createdAt: new Date().toISOString(),
         error: execution.stderr.trim() || execution.stdout.trim() || 'CLI tool exited non-zero'
       })
-      return {
+      return propagateCommandModelCapture<CliToolExecutionResult>(execution, {
         success: false,
         toolId: record.toolId,
         title: record.title,
@@ -1726,12 +1860,12 @@ export async function executeCliTool(
         code: 'EXECUTION_FAILED',
         error: execution.stderr.trim() || execution.stdout.trim() || 'CLI tool exited non-zero',
         riskLevel: record.riskLevel
-      }
+      })
     }
 
     let parsedOutput: unknown
     try {
-      parsedOutput = parseCliToolOutput(record, execution.stdout).parsedOutput
+      parsedOutput = parseCliToolOutput(record, execution.stdout, execution.stdoutCut).parsedOutput
     } catch (error) {
       await recordCliToolAudit({
         id: auditId,
@@ -1753,7 +1887,7 @@ export async function executeCliTool(
         createdAt: new Date().toISOString(),
         error: error instanceof Error ? error.message : 'Output parse failed'
       })
-      return {
+      return propagateCommandModelCapture<CliToolExecutionResult>(execution, {
         success: false,
         toolId: record.toolId,
         title: record.title,
@@ -1770,7 +1904,7 @@ export async function executeCliTool(
         code: 'OUTPUT_PARSE_FAILED',
         error: error instanceof Error ? error.message : 'Output parse failed',
         riskLevel: record.riskLevel
-      }
+      })
     }
 
     await recordCliToolAudit({
@@ -1792,7 +1926,7 @@ export async function executeCliTool(
       durationMs: execution.durationMs,
       createdAt: new Date().toISOString()
     })
-    return {
+    return propagateCommandModelCapture<CliToolExecutionResult>(execution, {
       success: true,
       toolId: record.toolId,
       title: record.title,
@@ -1808,7 +1942,7 @@ export async function executeCliTool(
       durationMs: execution.durationMs,
       auditId,
       riskLevel: record.riskLevel
-    }
+    })
   } catch (error) {
     return {
       success: false,

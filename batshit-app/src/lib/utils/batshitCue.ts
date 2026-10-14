@@ -1,7 +1,8 @@
 import {
-  EMOTE_TAG_REGEX_SOURCE,
   GOON_STAGE_DIRECTION_REGEX_SOURCE,
-  controlTag
+  findControlBlocks,
+  stripEmoteTags,
+  type ControlBlock
 } from './controlTags'
 
 export type VisibleBatshitCueNote = {
@@ -15,10 +16,16 @@ export type BatshitCuePayload = {
   cues: string[]
 }
 
-const CUE_TAG = controlTag('cue').tag
-const CONTROL_TAG_REGEX = new RegExp(`<${CUE_TAG}\\b[^>]*>([\\s\\S]*?)<\\/${CUE_TAG}>`, 'gi')
-const EMOTE_TAG_REGEX = new RegExp(EMOTE_TAG_REGEX_SOURCE, 'gi')
 const GOON_STAGE_DIRECTION_REGEX = new RegExp(GOON_STAGE_DIRECTION_REGEX_SOURCE, 'gi')
+
+/**
+ * The complete Goon cue blocks of a text, as the registry's scanner reads them (BL-442): outside
+ * code, followed by a payload the cue parser reads, and closed. A cue shown as an example in code,
+ * or named in a sentence, sets no mood and stays in the text. One linear pass.
+ */
+export function findCueBlocks(content: string): ControlBlock[] {
+  return findControlBlocks(content, { final: true }).filter((block) => block.id === 'cue' && block.kind === 'paired')
+}
 
 function normalizeControlString(value: unknown): string | null {
   if (typeof value !== 'string') return null
@@ -170,19 +177,22 @@ export function extractVisibleBatshitCueState(content: string): {
   }
 
   const notes: VisibleBatshitCueNote[] = []
-  const cleanedContent = content
-    .replace(CONTROL_TAG_REGEX, (_match, rawPayload: string) => {
-      const mood = extractGoonMoodFromCuePayload(rawPayload)
-      if (mood) {
-        notes.push({
-          kind: 'mood',
-          label: `Mood: ${mood}`,
-          value: mood
-        })
-      }
-      return ''
-    })
-    .replace(EMOTE_TAG_REGEX, '')
+  const kept: string[] = []
+  let cursor = 0
+  for (const block of findCueBlocks(content)) {
+    kept.push(content.slice(cursor, block.start))
+    cursor = block.end
+    const mood = extractGoonMoodFromCuePayload(content.slice(block.bodyStart, block.bodyEnd))
+    if (mood) {
+      notes.push({
+        kind: 'mood',
+        label: `Mood: ${mood}`,
+        value: mood
+      })
+    }
+  }
+  kept.push(content.slice(cursor))
+  const cleanedContent = stripEmoteTags(kept.join(''))
     .replace(GOON_STAGE_DIRECTION_REGEX, '')
     .replace(/[ \t]+\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n')

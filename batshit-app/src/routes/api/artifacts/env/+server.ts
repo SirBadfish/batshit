@@ -7,6 +7,7 @@ import {
   requireArtifactRuntimeClaims,
   resolveArtifactRuntimeClaims
 } from '$lib/server/services/artifactRuntimeAuth'
+import { pausedPlanAddRefusal } from '$lib/server/services/pausedPlans'
 
 // SA-044: Secure API key retrieval for artifact iframes
 // Artifacts can request user API keys via window.batshit.env(keyName)
@@ -91,6 +92,15 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     // Block infrastructure keys
     if (BLOCKED_KEYS.has(normalizedKey)) {
       throw error(403, 'Key not accessible from artifacts')
+    }
+
+    // Plan pause: an artifact cannot get a paused plan's key from an artifact
+    // page, even when the artifact's own metadata names it, unless this
+    // copy's Dev switch allows paused plans (the same server rule
+    // ProviderManager.createForUser reads).
+    const pausedPlan = await pausedPlanAddRefusal(normalizedKey)
+    if (pausedPlan) {
+      return json({ value: null, error: pausedPlan.message }, { status: pausedPlan.status })
     }
 
     // Retrieve the decrypted key value

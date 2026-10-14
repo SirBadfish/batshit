@@ -11,6 +11,7 @@ import {
 } from "./toolRenderMap";
 import { detectToolSource } from "./toolSourceDetector";
 import { extractManagedPatchFromSources } from "./editDiff";
+import { countTextLines } from "./writePreview";
 import { logger } from '$lib/utils/logger'
 import type { IntermediateStep, ToolProvider, ToolSource } from './toolStepTypes'
 import { unwrapDynamicMcpUsePayload } from './toolPayloadUnwrap'
@@ -19,10 +20,12 @@ import {
   failedCommandExitCode,
   failedCommandOutput,
   joinListingSectionPath,
+  outputCutFields,
   shellActionCommand,
   shellCommandFailed,
   splitLsSections,
-  stripShellErrorLines
+  stripShellErrorLines,
+  withNativeBashOutputCut
 } from './toolActivityContract'
 import { estimateTokens } from './tokens'
 export type { IntermediateStep } from './toolStepTypes'
@@ -1307,25 +1310,14 @@ export function normalizeToolStep(step: IntermediateStep): IntermediateStep {
       clone.error || failureDetails.reason || failureDetails.error || toolFailureFallbackMessage(result);
   }
 
-  // Heuristic: if command tool actually represents a file op, remap before shaping
+  // A command whose RESULT is shaped like a file action (a list of files, a diff, content beside a
+  // path) is remapped before shaping. Its command TEXT is never read here (BL-233): every lane
+  // already classified the command once, with the shared mapper (`mapBashCommandToRendererTool`,
+  // the API lane in send-routed and the Codex and Claude adapters), and a step still named a
+  // command is one the mapper called a command. A second reading of the text disagreed with it:
+  // `npm test 2>&1 | tail -12 && node src/cli.js` was stored as a Read File of `src/cli.js`, and
+  // `cat notes.md; exit 3` as a read, while the Execution Viewer and Plan mode said Bash.
   if (canonical === "execute_command") {
-    const commandTextRaw =
-      (typeof args.command === "string" && args.command) ||
-      (typeof (result as any)?.command === "string" &&
-        (result as any).command) ||
-      "";
-    const commandText = commandTextRaw.toLowerCase();
-    const commandHead = commandTextRaw.split(/\r?\n/, 1)[0]?.trim().toLowerCase() || commandText;
-    const commandSegments = commandHead
-      .split(/&&|\|\|/)
-      .map((segment: string) => segment.trim())
-      .filter(Boolean);
-    const terminalCommandSegment =
-      commandSegments.length > 0 ? commandSegments[commandSegments.length - 1] : commandHead;
-    const firstToken = terminalCommandSegment.match(/^([a-z0-9_.-]+)/)?.[1] || "";
-    const startsWithListCommand =
-      firstToken === "ls" || firstToken === "find" || firstToken === "tree";
-
     const hasFiles =
       Array.isArray((result as any)?.files) ||
       Array.isArray((result as any)?.items) ||
@@ -1346,29 +1338,8 @@ export function normalizeToolStep(step: IntermediateStep): IntermediateStep {
     const hasPath =
       args.filePath || args.file_path || args.path || (result as any)?.filePath;
 
-    // Parse file path hints from command text (cat/sed/apply_patch/ls/find). A path is taken from
-    // the command as written, so it keeps its case; the command names and the patch header match
-    // in any case (bug sweep item 8: `/Users/Josh/Hello.md` was stored as `/users/josh/hello.md`).
-    const patchMatch = commandTextRaw.match(/update file:\s*([^\n\r]+)/i);
-    const sedCatMatch = commandTextRaw.match(
-      /\b(?:cat|sed|head|tail)[^\n\r]*?([\w./_-]+\.[\w]+)/i,
-    );
-    const lsMatch = commandText.match(/\bls\b[^|]*/);
-
-    if (patchMatch) {
-      canonical = "edit_file";
-      const fp = patchMatch[1]?.trim();
-      if (fp) {
-        args.filePath = args.filePath || fp;
-      }
-    } else if (startsWithListCommand || hasFiles || lsMatch) {
+    if (hasFiles) {
       canonical = "list_files";
-    } else if (sedCatMatch) {
-      canonical = "read_file";
-      const fp = sedCatMatch[1]?.trim();
-      if (fp) {
-        args.filePath = args.filePath || fp;
-      }
     } else if (hasDiff) {
       canonical = "edit_file";
     } else if (args.content && hasPath) {
@@ -1379,6 +1350,12 @@ export function normalizeToolStep(step: IntermediateStep): IntermediateStep {
   }
 
   clone.toolName = canonical;
+
+  // BL-166: a listing, search, or command whose API-lane run cut its output keeps saying so, the
+  // way BL-8 keeps Claude Code's cut: whole lines only, beside one `outputCut`.
+  if (canonical === "execute_command" || canonical === "list_files" || canonical === "search_files") {
+    result = withNativeBashOutputCut(result);
+  }
 
   switch (canonical) {
     case "read_file": {
@@ -1424,9 +1401,11 @@ export function normalizeToolStep(step: IntermediateStep): IntermediateStep {
             : JSON.stringify(content, null, 2),
         filePath,
         language,
+        // A final newline ends the last line; it does not start another (a one-line file read with
+        // `cat` was "2 lines" on the API and Codex lanes, found in BL-233's proof).
         lineCount:
           content && typeof content === "string"
-            ? content.split("\n").length
+            ? countTextLines(content)
             : undefined,
         ...(exitCode !== undefined ? { exitCode } : {}),
       };
@@ -1624,6 +1603,8 @@ export function normalizeToolStep(step: IntermediateStep): IntermediateStep {
           result?.mappedToolInput?.path ||
           ".",
         ...shellFailureResultFields(result, command, failed),
+        // BL-8: a listing its lane cut keeps saying so, or its count reads as the whole directory.
+        ...outputCutFields(result),
       };
       break;
     }
@@ -1653,6 +1634,7 @@ export function normalizeToolStep(step: IntermediateStep): IntermediateStep {
         ...(failureDetails?.errorCode ? { errorCode: failureDetails.errorCode } : {}),
         cwd: result?.cwd || args.cwd || args.directory || result?.directory,
         command: result?.command || args.command,
+        ...outputCutFields(result),
       };
       break;
     }
@@ -1689,6 +1671,12 @@ export function normalizeToolStep(step: IntermediateStep): IntermediateStep {
     default:
       // Leave unchanged
       clone.toolResult = result;
+  }
+
+  // Local shell commands can render as file actions. Keep their execution fact through every
+  // result rebuild, without guessing a shell for old records or managed in-process patches.
+  if (typeof result?.shell === 'string' && clone.toolResult && typeof clone.toolResult === 'object') {
+    clone.toolResult = { ...clone.toolResult, shell: result.shell };
   }
 
   return clone;

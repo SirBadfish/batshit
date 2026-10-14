@@ -42,7 +42,7 @@
   import { getUserSettings } from '$lib/stores/userSettings.svelte'
   import {
     QUICK_ACTION_EVENT,
-    quickActionDidText,
+    quickActionToastText,
     quickActionMarkOf,
     quickActionSettingsTabTarget,
     readQuickActionVerdict,
@@ -51,8 +51,18 @@
     type QuickActionMark,
     type QuickActionVerdict
   } from '$lib/utils/jevJuiceQuickActions'
+  import { executeVoiceQuickAction } from '$lib/appActions/voice/quickActionExecutor'
   import { getPlaybackState } from '$lib/stores/voicePlayback.svelte'
   import * as agentStore from '$lib/stores/agents.svelte'
+  import { chatBarWorkModeSave } from '$lib/utils/agentProviderSettings'
+  import { chatBarBlockSave } from '$lib/utils/chatBarBlockSave'
+  import { CLAUDE_THINKING_GROUP, CODEX_PERMISSION_GROUP } from '$lib/utils/agentBlockFieldSettings'
+  import {
+    CODEX_PERMISSION_PRESETS,
+    CODEX_SANDBOX_LABELS,
+    resolveCodexRunAccess
+  } from '$lib/utils/codexRunAccess'
+  import { createPendingSaves } from '$lib/utils/pendingSaves'
   import * as sessionStore from '$lib/stores/session.svelte'
   import * as projectStore from '$lib/stores/projects.svelte'
   import * as savedModelsStore from '$lib/stores/savedModels.svelte'
@@ -78,6 +88,8 @@
   import { cleanSpeechTranscript } from '$lib/utils/speechTranscript'
   import {
     createVoiceQuickActionCommitCoordinator,
+    createVoiceNoReplyCompletion,
+    createVoiceQueuedReplyWait,
     runVoiceQuickActionCommit,
     voiceQuickActionSnapshotMatches,
     type VoiceQuickActionCommitToken
@@ -150,7 +162,7 @@
   }
 
   let {
-    onSend = (message: string, metadata?: any) => {},
+    onSend = (message: string, metadata?: any, completion?: { onNoReplyCompleted?: () => void; onReplyAdmitted?: (kind: 'direct' | 'steer' | 'queued') => void; onSteerPrepared?: (identity: { steerId: string; sessionId: string; targetMessageId?: string }) => void }) => {},
     disabled = false,
     voiceMode = $bindable(false),
     onVoiceModeChange = (enabled: boolean) => {},
@@ -168,7 +180,7 @@
     steerReason = null,
     onQuickActionMessage = async (_content: string, _mark: QuickActionMark) => {}
   } = $props<{
-    onSend?: (message: string, metadata?: any) => boolean | void | Promise<boolean | void>
+    onSend?: (message: string, metadata?: any, completion?: { onNoReplyCompleted?: () => void; onReplyAdmitted?: (kind: 'direct' | 'steer' | 'queued') => void; onSteerPrepared?: (identity: { steerId: string; sessionId: string; targetMessageId?: string }) => void }) => boolean | void | Promise<boolean | void>
     disabled?: boolean
     voiceMode?: boolean
     onVoiceModeChange?: (enabled: boolean) => void
@@ -524,6 +536,8 @@
   function currentVoiceQuickActionContext() {
     return { sessionId: sessionId ?? null, agentId: currentAgent?.id ?? null }
   }
+
+  let voiceQueuedReplyWait: ReturnType<typeof createVoiceQueuedReplyWait> | null = null
 
   function invalidatePendingVoiceQuickActionCommit(context?: ReturnType<typeof currentVoiceQuickActionContext>) {
     const invalidated = context
@@ -1483,6 +1497,34 @@ $effect(() => {
   const activeCodexModeOption = $derived.by<(typeof CODEX_MODE_OPTIONS)[number]>(() => {
     return CODEX_MODE_OPTIONS.find((option) => option.value === codexPermissionActive) ?? CODEX_MODE_OPTIONS[0]
   })
+  /**
+   * BL-941: the Sandbox Level that a send from this chat bar runs with. The record is the upper
+   * bound: a send runs with the tighter of its mode's own level and the saved level (Agent
+   * Settings can save a tighter level by hand). The same function decides the run on the server,
+   * so the screen and the run agree. The saved level is read from where the mode above was read.
+   */
+  const codexSendSandbox = $derived.by(() => {
+    const block = currentAgent?.codex_settings
+    const modeFromBlock =
+      block?.permissionMode === 'chat' ||
+      block?.permissionMode === 'agent' ||
+      block?.permissionMode === 'agent_full'
+    const savedSandbox = modeFromBlock
+      ? block?.sandbox
+      : (activeModelProvider.settings as Record<string, unknown> | null)?.codex_sandbox ??
+        currentAgent?.provider_specific_settings?.codex_sandbox
+    return resolveCodexRunAccess({
+      recordMode: codexPermissionActive,
+      recordSandbox: savedSandbox,
+      sentMode: codexPermissionActive
+    }).sandbox
+  })
+  /** The level's words when a send runs with a level other than the mode's own (else null). */
+  const codexSendSandboxLabel = $derived(
+    codexSendSandbox !== CODEX_PERMISSION_PRESETS[codexPermissionActive].sandbox
+      ? CODEX_SANDBOX_LABELS[codexSendSandbox]
+      : null
+  )
   const claudePermissionActive = $derived.by<ClaudePermissionMode>(() => {
     const fromAgentSettings = currentAgent?.claude_settings?.permissionMode
     if (
@@ -2195,6 +2237,11 @@ $effect(() => {
       composerSessionId?: string | null
       /** A newer live transcript must survive acceptance of the older delayed turn. */
       mayResetComposer?: () => boolean
+      /** Local page completion, never message/provider metadata. */
+      onNoReplyCompleted?: () => void
+      /** The page chooses the local completion owner; never message/provider metadata. */
+      onReplyAdmitted?: (kind: 'direct' | 'steer' | 'queued') => void
+    onSteerPrepared?: (identity: { steerId: string; sessionId: string; targetMessageId?: string }) => void
     }
   ): Promise<boolean> {
     if (!rawText.trim() || disabled) return false
@@ -2323,6 +2370,11 @@ $effect(() => {
     const composerSessionId = hasCapturedComposerSession
       ? resolveSessionId(overrides?.composerSessionId) ?? slashInvocationSessionId
       : resolveSessionId(sessionId) ?? resolveSessionId(sessionStore.getCurrentSessionId())
+    // BL-941: a mode pick that has not landed yet goes first, so the mode read below is saved.
+    // The chat is taken above, so a chat opened during the wait does not get this message.
+    if (!(await modeSaves.settled(MODE_SAVE_WAIT_MS))) {
+      toast.warning('Your mode change is still saving, so this message may run with the mode the agent has saved.')
+    }
     const metadata: Record<string, any> = {
       stt: Boolean(messageIncludesStt),
       tts: Boolean(shouldSpeak),
@@ -2347,22 +2399,6 @@ $effect(() => {
        */
       onReplayAccepted: () =>
         clipsManager?.handleMessageAccepted?.({ waitForServer: false, clipIds: sentClipIds }),
-      /**
-       * AMD-119-05 — a browser-held queued message leaves the box the moment it is queued,
-       * the way a steer and a server-held one already do, and the bubble holds the words
-       * from then on.
-       *
-       * `resetComposer()` and NOT `handleAccepted`: the clips must stay exactly as they
-       * are. `clipsManager.handleMessageAccepted` unclips ONE-TIME clips, and a queued
-       * message has not been sent yet — its one-time clip still has to be attached when it
-       * finally goes, and has to survive a Stop that drops it.
-       *
-       * Nothing puts the words BACK. Josh, 2026-09-13: refilling the composer could erase
-       * paragraphs the user typed while waiting. The dropped bubble carries **Send now**
-       * and **Dismiss** instead, so the words are one click away without ever touching
-       * what is in the box.
-       */
-      onQueuedForLater: () => resetAcceptedComposer(),
       // SA-114 P3 (DL-114-01): present only when Cmd/Ctrl+Enter asked for the other mode.
       busySendModeOverride: overrides?.busySendModeOverride
     }
@@ -2379,7 +2415,11 @@ $effect(() => {
       metadata.projectRules = resolvedProjectRules
     }
     if (overrides?.beforeSend && !overrides.beforeSend()) return false
-    const sendAccepted = await Promise.resolve(onSend(finalMessage, metadata))
+    const sendAccepted = await Promise.resolve(onSend(finalMessage, metadata, {
+      onNoReplyCompleted: overrides?.onNoReplyCompleted,
+      onReplyAdmitted: overrides?.onReplyAdmitted,
+      onSteerPrepared: overrides?.onSteerPrepared
+    }))
     if (sendAccepted === false) {
       return false
     }
@@ -2977,6 +3017,53 @@ $effect(() => {
     }
   }
 
+  /**
+   * BL-941: the chat bar's own mode saves that have not landed yet. The page's copy of the agent
+   * takes a pick at once, and the server runs a send with the SAVED record as its upper bound, so
+   * a send made before a looser pick landed would run with the older record. A send waits for
+   * these first (`sendMessageWithText`) and then reads the mode, so it carries what was saved (a
+   * failed save puts the older mode back on the copy, and the send carries that). A save that
+   * never answers holds a send for `MODE_SAVE_WAIT_MS` at most, with a notice; the server still
+   * runs it with no more than the saved record allows.
+   */
+  const modeSaves = createPendingSaves()
+  const MODE_SAVE_WAIT_MS = 10_000
+  function trackModeSave<T>(save: Promise<T>): Promise<T> {
+    return modeSaves.track(save)
+  }
+
+  /**
+   * BL-941: the Codex menu names the saved Sandbox Level from the page's copy of the agent, and
+   * another window may have saved since (no event updates this copy). So opening the menu reads
+   * the record again and takes its Codex settings; a read that a mode pick overtook (or that ends
+   * while a pick is saving) changes nothing.
+   */
+  async function refreshCodexSettingsForMenu() {
+    const agentId = currentAgent?.id
+    if (!agentId || modeSaves.size > 0) return
+    const generation = modeSaves.generation
+    try {
+      const response = await fetch(`/api/agents/${agentId}`)
+      if (!response.ok) return
+      const fresh = (await response.json()) as agentStore.Agent
+      if (modeSaves.generation !== generation || modeSaves.size > 0) return
+      const copy = agentStore.getAgentById(agentId)
+      if (!copy) return
+      const freshProvider = (fresh.provider_specific_settings ?? {}) as Record<string, unknown>
+      const providerCodexKeys = Object.fromEntries(
+        ['codex_permission_mode', 'codex_sandbox', 'codex_approval']
+          .filter((key) => key in freshProvider)
+          .map((key) => [key, freshProvider[key]])
+      )
+      agentStore.updateAgent(agentId, {
+        codex_settings: fresh.codex_settings,
+        provider_specific_settings: { ...(copy.provider_specific_settings ?? {}), ...providerCodexKeys }
+      })
+    } catch (error) {
+      console.warn('[ChatInput] Could not read the agent again for the Codex menu', error)
+    }
+  }
+
   async function handleCodexModeSelect(mode: CodexPermissionMode) {
     if (!currentAgent) return
     const preset: { sandbox: CodexSandbox; approval: CodexApproval } =
@@ -2986,20 +3073,25 @@ $effect(() => {
           ? { sandbox: 'workspace-write', approval: 'on-request' }
           : { sandbox: 'read-only', approval: 'never' }
     try {
+      const viewedCodex = normalizeCodexSettings(currentAgent.codex_settings)
       const nextCodex: CodexAgentSettings = {
-        ...normalizeCodexSettings(currentAgent.codex_settings),
+        ...viewedCodex,
         permissionMode: mode,
         sandbox: preset.sandbox,
         approval: preset.approval
       }
-      const nextProviderSettings = {
-        ...(currentAgent.provider_specific_settings ?? {}),
-        codex_permission_mode: mode
-      }
-      await agentStore.updateAgentSettings(currentAgent.id, {
-        codex_settings: nextCodex,
-        provider_specific_settings: nextProviderSettings
-      })
+      // BL-833, BL-848: only its own keys. A Codex mode is one choice of three keys (the mode, its
+      // sandbox and its approval): all three always go out, so the record never holds a mix of this
+      // pick and another window's mode. The server writes the Codex settings key by key, so every
+      // other key stays, the model keys included.
+      await trackModeSave(
+        agentStore.updateAgentSettings(currentAgent.id, {
+          ...chatBarBlockSave('codex_settings', currentAgent.codex_settings, viewedCodex, nextCodex, {
+            group: CODEX_PERMISSION_GROUP
+          }),
+          provider_specific_settings: { codex_permission_mode: mode }
+        })
+      )
     } catch (error) {
       console.error('Failed to update Codex mode', error)
       toast.error('Could not save Codex mode')
@@ -3009,18 +3101,19 @@ $effect(() => {
   async function handleClaudeModeSelect(mode: ClaudePermissionMode) {
     if (!currentAgent) return
     try {
-      const nextClaude: ClaudeAgentSettings = {
-        ...normalizeClaudeSettings(currentAgent.claude_settings),
-        permissionMode: mode
-      }
-      const nextProviderSettings = {
-        ...(currentAgent.provider_specific_settings ?? {}),
-        claude_permission_mode: mode
-      }
-      await agentStore.updateAgentSettings(currentAgent.id, {
-        claude_settings: nextClaude,
-        provider_specific_settings: nextProviderSettings
-      })
+      const viewedClaude = normalizeClaudeSettings(currentAgent.claude_settings)
+      const nextClaude: ClaudeAgentSettings = { ...viewedClaude, permissionMode: mode }
+      // BL-833, BL-848: only its own key, always sent (a pick the copy already shows must still
+      // write it: the record may hold another mode); the server writes the Claude settings key by
+      // key, so every other key stays, the model keys included.
+      await trackModeSave(
+        agentStore.updateAgentSettings(currentAgent.id, {
+          ...chatBarBlockSave('claude_settings', currentAgent.claude_settings, viewedClaude, nextClaude, {
+            group: ['permissionMode']
+          }),
+          provider_specific_settings: { claude_permission_mode: mode }
+        })
+      )
     } catch (error) {
       console.error('Failed to update Claude mode', error)
       toast.error('Could not save Claude mode')
@@ -3032,20 +3125,25 @@ $effect(() => {
     try {
       const currentClaude = normalizeClaudeSettings(currentAgent.claude_settings)
       const enableThinking = mode === 'on'
-      const existingBudget =
-        typeof currentClaude.maxThinkingTokens === 'number' && currentClaude.maxThinkingTokens > 0
-          ? currentClaude.maxThinkingTokens
-          : CLAUDE_DEFAULT_MAX_THINKING_TOKENS
-
+      // On keeps the copy's own budget (or none), so the budget never differs from the copy and
+      // never goes out: it is not the chat bar's choice (only Agent Settings sets it), and a budget
+      // saved in another window stays. With thinking on and no budget saved, the server runs 1024
+      // (`claudeSettings.ts`), as the display does. Off removes the budget.
       const nextClaude: ClaudeAgentSettings = {
         ...currentClaude,
         alwaysThinkingEnabled: enableThinking,
-        maxThinkingTokens: enableThinking ? existingBudget : undefined
+        maxThinkingTokens: enableThinking ? currentClaude.maxThinkingTokens : undefined
       }
 
-      await agentStore.updateAgentSettings(currentAgent.id, {
-        claude_settings: nextClaude
-      })
+      // BL-848: the switch always goes out, even where the copy already shows it. Off is one choice
+      // of two keys: the budget always goes with it, as null (Off removes the budget). On sends the
+      // switch alone.
+      await agentStore.updateAgentSettings(
+        currentAgent.id,
+        chatBarBlockSave('claude_settings', currentAgent.claude_settings, currentClaude, nextClaude, {
+          group: enableThinking ? ['alwaysThinkingEnabled'] : CLAUDE_THINKING_GROUP
+        })
+      )
     } catch (error) {
       console.error('Failed to update Claude thinking mode', error)
       toast.error('Could not save Claude thinking mode')
@@ -3055,38 +3153,11 @@ $effect(() => {
   async function handleNativeBashModeSelect(mode: NativeBashAccessMode) {
     if (!currentAgent) return
     try {
-      const currentProviderSettings = currentAgent.provider_specific_settings ?? {}
-      const currentNativeTools =
-        currentProviderSettings.nativeTools &&
-        typeof currentProviderSettings.nativeTools === 'object' &&
-        !Array.isArray(currentProviderSettings.nativeTools)
-          ? currentProviderSettings.nativeTools
-          : {}
-      const existingBackend =
-        typeof currentNativeTools.executionBackend === 'string'
-          ? currentNativeTools.executionBackend
-          : null
-      const executionBackend =
-        mode === 'dangerous'
-          ? 'local'
-          : existingBackend && existingBackend !== 'local'
-            ? existingBackend
-            : 'apple_container'
-      const nextNativeTools = {
-        ...currentNativeTools,
-        bashAccessMode: mode,
-        executionBackend
-      } as Record<string, any>
-      // Remove legacy alias once access mode is explicitly chosen.
-      delete nextNativeTools.bashPolicyMode
-
-      const nextProviderSettings = {
-        ...currentProviderSettings,
-        nativeTools: nextNativeTools
-      }
-
+      // BL-833, BL-841: only the nativeTools fields this control changes (the mode, the command
+      // location it moves, the retired legacy alias); the server writes nativeTools field by
+      // field, so a never-allow list or web search choice saved elsewhere since stays.
       await agentStore.updateAgentSettings(currentAgent.id, {
-        provider_specific_settings: nextProviderSettings
+        provider_specific_settings: chatBarWorkModeSave(currentAgent.provider_specific_settings, mode)
       })
     } catch (error) {
       console.error('Failed to update bash mode', error)
@@ -3313,6 +3384,11 @@ $effect(() => {
    */
   async function commitVoiceModeTurn(finalMessage: string) {
     const pending = voiceQuickActionCommits.begin(currentVoiceQuickActionContext())
+    const replyWait = createVoiceQueuedReplyWait({
+      coordinator: voiceQuickActionCommits, token: pending, currentContext: currentVoiceQuickActionContext,
+      releaseWaiting: () => { waitingForAI = false }
+    })
+    voiceQueuedReplyWait = replyWait
     // P9b: with a wake word required (the default, "Yo"), a turn that does not start with it is
     // never judged: no Jev call, no wait. Jev sees the words after the wake word.
     const gate = quickActionsEnabled() ? resolveQuickActionWakeGate(finalMessage, quickActionVoiceModeSettings()) : null
@@ -3339,7 +3415,7 @@ $effect(() => {
         },
         applyAction: (verdict, mark) => {
           runQuickAction(verdict)
-          toast.info(`Quick action by Jev: ${quickActionDidText(mark)}`)
+          toast.info(quickActionToastText(mark))
         },
         persistOnly: async (mark) => {
           // A live-transcript lane may already have printed the user's NEXT words while Jev
@@ -3348,20 +3424,36 @@ $effect(() => {
           await onQuickActionMessage(finalMessage, mark)
           if (snapshotStillOwnsComposer()) message = ''
         },
-        send: (mark, beforeSend) => sendMessageWithText(finalMessage, {
-          stt: true,
-          tts: true,
-          quickAction: mark,
-          composerSessionId: pending.context.sessionId,
-          beforeSend,
-          mayResetComposer: snapshotStillOwnsComposer
-        }),
+        send: async (mark, beforeSend) => {
+          try {
+            const accepted = await sendMessageWithText(finalMessage, {
+              stt: true,
+              tts: true,
+              quickAction: mark,
+              composerSessionId: pending.context.sessionId,
+              beforeSend,
+              mayResetComposer: snapshotStillOwnsComposer,
+              onNoReplyCompleted: createVoiceNoReplyCompletion({
+                coordinator: voiceQuickActionCommits, token: pending, currentContext: currentVoiceQuickActionContext,
+                releaseWaiting: () => { waitingForAI = false }
+              }),
+              onReplyAdmitted: replyWait.onReplyAdmitted,
+              onSteerPrepared: replyWait.onSteerPrepared
+            })
+            if (accepted) replyWait.finishSend()
+            else replyWait.abandonSend()
+            return accepted
+          } catch (error) {
+            replyWait.abandonSend()
+            throw error
+          }
+        },
         releasePending: () => {
           waitingForAI = false
         }
       })
     } catch (error) {
-      console.error('[Jev Juice] could not commit the voice turn:', error)
+      console.error('[Judge Juice] could not commit the voice turn:', error)
     }
   }
 
@@ -3394,37 +3486,26 @@ $effect(() => {
       return readQuickActionVerdict(await response.json().catch(() => null))
     } catch (error) {
       if (!pending.signal.aborted) {
-        console.warn('[Jev Juice] quick-action check failed; the turn is sent as usual:', error)
+        console.warn('[Judge Juice] quick-action check failed; the turn is sent as usual:', error)
       }
       return null
     }
   }
 
-  /** Every action is one the user could click: the composer's own controls, or a window event the page answers. */
+  /** The fixed speech projection shares action names while retaining each current click owner. */
   function runQuickAction(verdict: QuickActionVerdict) {
-    switch (verdict.action) {
-      case 'stop':
-        voiceService.stopAll()
-        if (workBusy) void handleStopWorkClick()
-        return
-      case 'end_voice_mode':
-        endDirectVoiceMode({ notify: true, preservePendingCommit: true })
-        return
-      case 'show_execution_viewer':
-        onOpenExecutionViewer(sessionId)
-        return
-      case 'open_settings': {
-        const tab = quickActionSettingsTabTarget(verdict.tab)
+    executeVoiceQuickAction(verdict, {
+      stopPlayback: () => voiceService.stopAll(),
+      workBusy: () => workBusy,
+      requestWorkStop: () => { void handleStopWorkClick() },
+      endVoiceMode: options => endDirectVoiceMode(options),
+      openExecutionViewer: () => onOpenExecutionViewer(sessionId),
+      openSettings: selectedTab => {
+        const tab = quickActionSettingsTabTarget(selectedTab)
         window.dispatchEvent(new CustomEvent('batshit:open-settings', { detail: tab ? { tab } : {} }))
-        return
-      }
-      case 'open_goon_dock':
-      case 'close_goon_dock':
-        window.dispatchEvent(new CustomEvent(QUICK_ACTION_EVENT, { detail: { id: verdict.action } }))
-        return
-      default:
-        return
-    }
+      },
+      requestDock: id => window.dispatchEvent(new CustomEvent(QUICK_ACTION_EVENT, { detail: { id } }))
+    })
   }
 
   // Handle mic button (manual dictation STT)
@@ -3662,8 +3743,18 @@ $effect(() => {
     }
   })
   
+  // Exact server receipt/answer observations stay local to the captured Voice owner.
+  export function observeVoiceReply(observation: import('$lib/utils/voiceQuickActionCommit').VoiceReplyObservation) {
+    voiceQueuedReplyWait?.observeReply(observation)
+  }
+
+  export function voiceSteerTargetStopped(sessionId: string, messageId: string) {
+    voiceQueuedReplyWait?.onTargetStopped(sessionId, messageId)
+  }
+
   // Expose method to reset waiting state
   export function aiResponseReceived() {
+    if (voiceQueuedReplyWait?.holdGenericReplyCompletion()) return
     waitingForAI = false
   }
 </script>
@@ -4004,12 +4095,13 @@ $effect(() => {
             </DropdownMenu.Root>
           {/if}
           {#if isCodexMode3}
-            <DropdownMenu.Root>
+            <DropdownMenu.Root onOpenChange={(open) => { if (open) void refreshCodexSettingsForMenu() }}>
               <DropdownMenu.Trigger
                 class="chat-mode-selector-trigger mode-selector-trigger codex-mode-selector"
                 aria-label="Codex permission mode"
                 title="Codex permission mode"
                 data-ab-control="codex-permission-mode"
+                data-sandbox-level={codexSendSandbox}
               >
                 {@const TriggerIcon = activeCodexModeOption.icon}
                 <div class="mode-selector-inner">
@@ -4028,9 +4120,15 @@ $effect(() => {
                       class={getModeItemClass(option.value === codexPermissionActive)}
                     >
                       {@const OptionIcon = option.icon}
+                      {@const showsSavedLevel = option.value === codexPermissionActive && codexSendSandboxLabel !== null}
                       <OptionIcon class="chat-mode-menu-icon" />
-                      <div class="chat-mode-menu-copy">
+                      <!-- BL-941: the chosen mode's line names a saved Sandbox Level that is tighter than the
+                           mode's own (Josh: inside the menu, no more width in the chat bar). -->
+                      <div class="chat-mode-menu-copy" class:is-stacked={showsSavedLevel}>
                         <span class="chat-mode-menu-title">{option.menuLabel.split('(')[0]?.trim() || option.menuLabel}</span>
+                        {#if showsSavedLevel}
+                          <span class="chat-mode-menu-description" data-testid="codex-mode-sandbox-level">Sandbox Level from Agent Settings: {codexSendSandboxLabel}</span>
+                        {/if}
                       </div>
                     </DropdownMenu.RadioItem>
                   {/each}
@@ -4926,8 +5024,8 @@ $effect(() => {
     border-radius: 9999px;
     padding: 0;
     box-decoration-break: clone;
-    background: color-mix(in oklab, var(--bs-app-primary) 16%, transparent);
-    box-shadow: 0 0 0 3px color-mix(in oklab, var(--bs-app-primary) 16%, transparent);
+    background: var(--bs-app-primary-faint);
+    box-shadow: 0 0 0 3px var(--bs-app-primary-faint);
   }
 
   .mention-valid {

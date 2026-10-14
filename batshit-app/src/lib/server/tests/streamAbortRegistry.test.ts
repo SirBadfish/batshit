@@ -2,22 +2,30 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   __resetStreamAbortRegistryForTests,
+  __turnStartTraceCountForTests,
   abortStream,
   beginSessionDelete,
+  cancelQueuedSessionTurnsOfDeletedChat,
   clearGroupAbort,
   clearSessionTurn,
   clearStreamAbort,
   endSessionDelete,
   getActiveSessionTurn,
   getActiveStream,
+  getRunCredentialStopSignal,
+  getRunningReplyStopSignal,
   hasRunningRequest,
+  hasTurnStartedAfter,
   isSessionDeleting,
   isSessionTurnFinishing,
   isSessionTurnHeldByAnother,
+  lastTurnStartOf,
+  queueSessionTurn,
   registerGroupAbort,
   registerSessionTurn,
   registerStreamAbort,
   releaseSessionTurn,
+  RETIRED_REPLY_STOP_REASON,
   stopRunningRequests,
   stopSessionTurn
 } from '../services/streamAbortRegistry'
@@ -538,6 +546,152 @@ describe('streamAbortRegistry', () => {
       expect(second.entry.stop.signal.reason).toBe('session_deleted')
       expect(elsewhere.entry.stop.signal.aborted).toBe(false)
       expect(stopRunningRequests('session-9', 'session_deleted')).toBe(0)
+    })
+  })
+
+  /**
+   * BL-549 / BL-622: a background job in a chat (a nap, a Compact) reads the chat's last turn start
+   * when it begins and asks, before it writes, whether a turn started after it. A turn that started
+   * AND ended during the job leaves no lock and no running request, so the registry keeps the id of
+   * each chat's last turn: one entry per chat, and it leaves with the chat's delete. An id, not a
+   * clock, so a wall clock that steps back cannot hide a turn.
+   */
+  describe('the last turn start of each chat (lastTurnStartOf, hasTurnStartedAfter)', () => {
+    it('answers for a turn that started after the job began, also once that turn has ended', () => {
+      const seen = lastTurnStartOf('session-1')
+      expect(seen).toBe(0)
+      expect(hasTurnStartedAfter('session-1', seen)).toBe(false)
+
+      const turn = registerSessionTurn('session-1', 'single', 'msg-1')
+      if (!turn.ok) throw new Error('registration refused')
+      releaseSessionTurn('session-1', turn.entry.turnId)
+
+      expect(hasRunningRequest('session-1')).toBe(false)
+      expect(hasTurnStartedAfter('session-1', seen)).toBe(true)
+      // A job that began after that turn does not see it, nor does a job in another chat.
+      expect(hasTurnStartedAfter('session-1', lastTurnStartOf('session-1'))).toBe(false)
+      expect(hasTurnStartedAfter('session-2', lastTurnStartOf('session-2'))).toBe(false)
+    })
+
+    it('a turn already running when the job began is not a turn after it', () => {
+      const turn = registerSessionTurn('session-1', 'single', 'msg-1')
+      if (!turn.ok) throw new Error('registration refused')
+      const seen = lastTurnStartOf('session-1')
+
+      expect(seen).toBe(turn.entry.turnId)
+      expect(hasTurnStartedAfter('session-1', seen)).toBe(false)
+    })
+
+    it('does not use the clock: a wall clock that steps back still shows the turn', () => {
+      vi.useFakeTimers()
+      vi.setSystemTime(new Date('2026-09-27T12:00:00.000Z'))
+      const seen = lastTurnStartOf('session-1')
+      vi.setSystemTime(new Date('2026-09-27T11:00:00.000Z'))
+      registerSessionTurn('session-1', 'single', 'msg-1')
+
+      expect(hasTurnStartedAfter('session-1', seen)).toBe(true)
+    })
+
+    it('counts the turn of a send the chat\'s line handed the chat to', () => {
+      const first = registerSessionTurn('session-1', 'single', 'msg-1')
+      if (!first.ok) throw new Error('registration refused')
+      queueSessionTurn('session-1', { kind: 'single', messageId: 'msg-2', userMessageId: 'user-2' })
+      const seen = lastTurnStartOf('session-1')
+
+      releaseSessionTurn('session-1', first.entry.turnId)
+
+      expect(getActiveSessionTurn('session-1')?.messageId).toBe('msg-2')
+      expect(hasTurnStartedAfter('session-1', seen)).toBe(true)
+    })
+
+    it('keeps one entry per chat, and the entry leaves when the chat is deleted', () => {
+      const seen = lastTurnStartOf('session-1')
+      for (const messageId of ['msg-1', 'msg-2', 'msg-3']) {
+        const turn = registerSessionTurn('session-1', 'single', messageId)
+        if (!turn.ok) throw new Error('registration refused')
+        releaseSessionTurn('session-1', turn.entry.turnId)
+      }
+      const other = registerSessionTurn('session-2', 'single', 'msg-9')
+      if (!other.ok) throw new Error('registration refused')
+      expect(__turnStartTraceCountForTests()).toBe(2)
+
+      // A delete that is refused or fails leaves the chat, and its trace, in place.
+      expect(beginSessionDelete('session-1')).toBe(true)
+      endSessionDelete('session-1')
+      expect(hasTurnStartedAfter('session-1', seen)).toBe(true)
+
+      // A delete that swept the chat takes its trace with it.
+      expect(beginSessionDelete('session-1')).toBe(true)
+      cancelQueuedSessionTurnsOfDeletedChat('session-1')
+      endSessionDelete('session-1')
+      expect(lastTurnStartOf('session-1')).toBe(0)
+      expect(hasTurnStartedAfter('session-1', seen)).toBe(false)
+      expect(__turnStartTraceCountForTests()).toBe(1)
+      expect(lastTurnStartOf('session-2')).toBe(other.entry.turnId)
+    })
+
+    it('is emptied by the test reset', () => {
+      registerSessionTurn('session-1', 'single', 'msg-1')
+      __resetStreamAbortRegistryForTests()
+
+      expect(__turnStartTraceCountForTests()).toBe(0)
+      expect(lastTurnStartOf('session-1')).toBe(0)
+    })
+  })
+
+  describe('BL-1321: the Stop a run credential hears', () => {
+    it('gives a primary run its own reply’s Stop while that reply runs, and the stopped one after a Stop', () => {
+      const reply = new AbortController()
+      registerStreamAbort('session-1', 'reply-1', reply)
+
+      const signal = getRunCredentialStopSignal({ sessionId: ' session-1 ', messageId: 'reply-1' })
+      expect(signal).toBe(reply.signal)
+      expect(signal?.aborted).toBe(false)
+
+      abortStream('session-1', 'user')
+      expect(getRunCredentialStopSignal({ sessionId: 'session-1', messageId: 'reply-1' })?.aborted).toBe(true)
+    })
+
+    it('gives a retired primary run an already-aborted Stop, never a newer reply’s', () => {
+      const earlier = new AbortController()
+      registerStreamAbort('session-1', 'reply-earlier', earlier)
+      clearStreamAbort('session-1', 'reply-earlier')
+
+      // Its reply is gone and nothing runs: before BL-1321 the call had no Stop at all.
+      const gone = getRunCredentialStopSignal({ sessionId: 'session-1', messageId: 'reply-earlier' })
+      expect(gone?.aborted).toBe(true)
+      expect(gone?.reason).toBe(RETIRED_REPLY_STOP_REASON)
+
+      // A newer reply runs: before BL-1321 the call heard that reply's live Stop.
+      const newer = new AbortController()
+      registerStreamAbort('session-1', 'reply-newer', newer)
+      const replaced = getRunCredentialStopSignal({ sessionId: 'session-1', messageId: 'reply-earlier' })
+      expect(replaced).not.toBe(newer.signal)
+      expect(replaced?.aborted).toBe(true)
+      expect(replaced?.reason).toBe(RETIRED_REPLY_STOP_REASON)
+      expect(newer.signal.aborted).toBe(false)
+    })
+
+    it('keeps the chat’s running reply for a Subagent or Worker run and for a credential that names no reply', () => {
+      const parent = new AbortController()
+      registerStreamAbort('session-1', 'reply-parent', parent)
+
+      // A delegated credential names its own run id, never a Stop entry: it hears its parent.
+      expect(getRunCredentialStopSignal({ sessionId: 'session-1', messageId: 'subagent-s-1', delegated: true }))
+        .toBe(parent.signal)
+      expect(getRunCredentialStopSignal({ sessionId: 'session-1', messageId: '', delegated: false }))
+        .toBe(getRunningReplyStopSignal('session-1'))
+      expect(getRunCredentialStopSignal({ sessionId: 'session-1' })).toBe(parent.signal)
+
+      clearStreamAbort('session-1', 'reply-parent')
+      expect(getRunCredentialStopSignal({ sessionId: 'session-1', messageId: 'subagent-s-1', delegated: true }))
+        .toBeUndefined()
+    })
+
+    it('gives no Stop when the credential names no chat', () => {
+      registerStreamAbort('session-1', 'reply-1', new AbortController())
+      expect(getRunCredentialStopSignal({ sessionId: '', messageId: 'reply-1' })).toBeUndefined()
+      expect(getRunCredentialStopSignal({})).toBeUndefined()
     })
   })
 })

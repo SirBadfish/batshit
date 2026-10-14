@@ -1,3 +1,22 @@
+import { approvalSummaryIsPending } from './heldForApproval'
+
+export interface VoiceSteerIdentity {
+  steerId: string
+  sessionId: string
+  targetMessageId?: string
+}
+
+/** A server event or server-read record, never browser send metadata. */
+export interface VoiceReplyObservation {
+  sessionId: string
+  type: string
+  messageId?: string
+  steerId?: string
+  role?: string
+  status?: string
+  metadata?: Record<string, any>
+}
+
 export interface VoiceQuickActionCommitContext {
   sessionId: string | null
   agentId: string | null
@@ -59,11 +78,13 @@ export function createVoiceQuickActionCommitCoordinator(): VoiceQuickActionCommi
   let latestToken: VoiceQuickActionCommitToken | null = null
 
   const invalidate = () => {
+    // beforeSend retires the verdict token while its accepted send still owns Voice's
+    // wait. End must release that wait too; a second End owns nothing newer.
+    const ownedWait = latestToken?.generation === generation
     generation += 1
-    if (!active) return false
-    active.controller.abort()
+    active?.controller.abort()
     active = null
-    return true
+    return ownedWait
   }
 
   return {
@@ -151,5 +172,159 @@ export async function runVoiceQuickActionCommit<Verdict, Mark>(
     throw error
   } finally {
     if (options.coordinator.finish(options.token)) releasePending()
+  }
+}
+
+/** Complete only the captured spoken send; Voice End/restart retires even a same-chat token. */
+export function createVoiceNoReplyCompletion(options: {
+  coordinator: VoiceQuickActionCommitCoordinator
+  token: VoiceQuickActionCommitToken
+  currentContext: () => VoiceQuickActionCommitContext
+  releaseWaiting: () => void
+}): () => void {
+  return () => {
+    // beforeSend retires the active verdict token. Its generation still owns the send
+    // until Voice End/context change or a newer commit invalidates that authority.
+    if (options.coordinator.ownsLatestGeneration(options.token) &&
+      sameContext(options.token.context, options.currentContext())) options.releaseWaiting()
+  }
+}
+
+/** Generic reply completion cannot retire a spoken preparation or its queued send (BL-1291/1295). */
+export function createVoiceQueuedReplyWait(options: {
+  coordinator: VoiceQuickActionCommitCoordinator
+  token: VoiceQuickActionCommitToken
+  currentContext: () => VoiceQuickActionCommitContext
+  releaseWaiting: () => void
+}) {
+  let preparing = true
+  let queued = false
+  let inbox: { identity: VoiceSteerIdentity; receivingId: string | null; settled: boolean;
+    pausedVersion: number | null; latestVersion: number; receivingOwnsWords: boolean } | null = null
+  const retiredReceivingIds = new Set<string>()
+  const ownsWait = () => options.coordinator.ownsLatestGeneration(options.token) &&
+    sameContext(options.token.context, options.currentContext())
+
+  return {
+    holdGenericReplyCompletion() {
+      return ownsWait() && (preparing || queued || Boolean(inbox && !inbox.settled))
+    },
+    onSteerPrepared(identity: VoiceSteerIdentity) {
+      if (!ownsWait() || identity.sessionId !== options.token.context.sessionId) return
+      // Installed BEFORE POST: delivery, promotion and its terminal can race the 202.
+      retiredReceivingIds.clear()
+      inbox = { identity: { ...identity }, receivingId: null, settled: false, pausedVersion: null, latestVersion: 0, receivingOwnsWords: false }
+    },
+    onTargetStopped(sessionId: string, messageId: string) {
+      if (!ownsWait() || !inbox || inbox.settled || sessionId !== inbox.identity.sessionId) return
+      // A local, confirmed Stop owns only this exact receiving reply (or the target
+      // before delivery). It is also the fallback when the transient disposition was lost.
+      if (messageId !== (inbox.receivingId ?? inbox.identity.targetMessageId)) return
+      inbox.settled = true
+      options.releaseWaiting()
+    },
+    observeReply(observation: VoiceReplyObservation) {
+      if (!ownsWait() || !inbox || inbox.settled || observation.sessionId !== inbox.identity.sessionId) return
+      const metadata = observation.metadata ?? {}
+      const relation = metadata.steerPromoted
+      const matchesPromotion = Array.isArray(relation?.steerIds) && relation.steerIds.includes(inbox.identity.steerId)
+      const matchesDelivered = Array.isArray(metadata.steers) && metadata.steers.some(
+        (steer: any) => steer?.steerId === inbox!.identity.steerId && steer.source !== 'dm'
+      )
+      const release = () => {
+        inbox!.settled = true
+        options.releaseWaiting()
+      }
+      const bindReceiving = (messageId: string, ownsWords: boolean) => {
+        if (retiredReceivingIds.has(messageId)) return false
+        if (messageId !== inbox!.receivingId) {
+          const previous = inbox!.receivingId ?? inbox!.identity.targetMessageId
+          if (previous && previous !== messageId) retiredReceivingIds.add(previous)
+          inbox!.receivingId = messageId
+          inbox!.pausedVersion = null
+          inbox!.latestVersion = 0
+          inbox!.receivingOwnsWords = false
+        }
+        if (ownsWords) inbox!.receivingOwnsWords = true
+        return true
+      }
+      // Once an exact successor owns the answer, an older card's replay cannot
+      // reclaim it. In-place resumes retain the same id and use the version fence.
+      if (observation.messageId && retiredReceivingIds.has(observation.messageId)) return
+      if (matchesPromotion && (relation.disposition === 'unanswered' || metadata.approvalCardExpired === true)) {
+        release()
+        return
+      }
+      if (observation.type === 'steer_delivered' && observation.steerId === inbox.identity.steerId && observation.messageId) {
+        bindReceiving(observation.messageId, true)
+        return
+      }
+      if (matchesPromotion && relation.disposition === 'awaiting_approval' && metadata.waitsForApproval?.messageId) {
+        if (bindReceiving(metadata.waitsForApproval.messageId, false)) {
+          const pausedVersion = Number.isSafeInteger(relation.approvalResumeVersion) ? relation.approvalResumeVersion : inbox.latestVersion
+          if (pausedVersion >= inbox.latestVersion) {
+            inbox.pausedVersion = pausedVersion
+            inbox.latestVersion = pausedVersion
+          }
+        }
+      }
+      // A promoted USER record (including an approval hold) is not an answer.
+      if (observation.role === 'user' || observation.type === 'user_message' || observation.type === 'steer_promoted') return
+      if (observation.messageId && (matchesPromotion || matchesDelivered)) {
+        bindReceiving(observation.messageId, true)
+      }
+      if (!observation.messageId || observation.messageId !== inbox.receivingId) return
+      // waitsForApproval names the card, not a run that compiled these words. Its API
+      // in-place resume can finish before the held answer even starts. Only an actual
+      // delivered/promoted run, or the exact no-answer disposition above, owns completion.
+      if (!inbox.receivingOwnsWords) return
+      const version = Number.isSafeInteger(metadata.approvalResumeVersion) ? metadata.approvalResumeVersion :
+        Number.isSafeInteger(metadata.approvalResume?.version) ? metadata.approvalResume.version :
+        matchesPromotion && relation.disposition === 'awaiting_approval' && Number.isSafeInteger(relation.approvalResumeVersion)
+          ? relation.approvalResumeVersion : 0
+      if (version < inbox.latestVersion) return
+      inbox.latestVersion = version
+      if (matchesPromotion && relation.disposition === 'awaiting_approval' && Number.isSafeInteger(relation.approvalResumeVersion)) {
+        inbox.pausedVersion = relation.approvalResumeVersion
+      }
+      const failed = observation.type === 'error' || observation.status === 'error' ||
+        metadata.interrupted === true || metadata.response_failed === true
+      if (!failed && approvalSummaryIsPending(metadata.toolApprovals)) {
+        inbox.pausedVersion = version
+        return
+      }
+      if (!failed && version === 0 && Array.isArray(metadata.answeredApprovalIds) && metadata.answeredApprovalIds.length) {
+        inbox.pausedVersion ??= 0
+      }
+      const terminal = ['end', 'complete', 'error'].includes(observation.type) ||
+        (['record', 'complete_message'].includes(observation.type) && ['complete', 'error'].includes(observation.status ?? ''))
+      if (!terminal) return
+      // Answering a card clears its approvals BEFORE the resume starts. Neither that
+      // reload nor the pause's trailing complete is the answer. A newer resume version,
+      // or an exact terminal failure/disposition, must finish this receiving reply.
+      if (!failed && inbox.pausedVersion !== null && version <= inbox.pausedVersion) return
+      release()
+    },
+    onReplyAdmitted(kind: 'direct' | 'steer' | 'queued') {
+      if (!ownsWait() || !preparing) return
+      queued = kind === 'queued'
+      if (kind !== 'steer') inbox = null
+      preparing = false
+    },
+    finishSend() {
+      if (!ownsWait()) return
+      // A queued send's onSend promise waits for its OWN final turn outcome, not its
+      // early 202. A direct send keeps its own stream completion; an unrelated end
+      // held during preparation does not complete it. An inbox receipt is NOT a reply;
+      // exact delivery/promotion/terminal observations own that separate wait.
+      const release = queued
+      queued = preparing = false
+      if (release) options.releaseWaiting()
+    },
+    abandonSend() {
+      queued = preparing = false
+      inbox = null
+      // runVoiceQuickActionCommit's existing generation-owned refusal/error path releases.
+    }
   }
 }

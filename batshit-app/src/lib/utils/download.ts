@@ -1,4 +1,5 @@
 import { browser } from '$app/environment'
+import type { BackupPartialRequest } from '$lib/utils/backupPartialSummary'
 
 type ZeroNativeSaveFileOptions = {
   title?: string
@@ -11,7 +12,7 @@ type ZeroNativeApi = {
     saveFile?: (options?: ZeroNativeSaveFileOptions) => Promise<string | null>
   }
   downloads?: {
-    exportBackup?: (options: { includeSecrets: boolean }) => Promise<DownloadResult>
+    exportBackup?: (options: { includeSecrets: boolean; partial?: BackupPartialRequest }) => Promise<DownloadResult>
   }
 }
 
@@ -25,6 +26,13 @@ export type DownloadResult = {
   native: boolean
   canceled: boolean
   path?: string
+  /** Backup export only: the route's `X-Batshit-Backup-Not-Carried` value (BL-373/BL-369). */
+  notCarried?: string
+  /**
+   * Partial backup export only (BL-378 Phase 1b): the route's `X-Batshit-Backup-Missing-Uploads`
+   * value, as text. The panel reads it with the shared strict parser, never on trust.
+   */
+  missingUploads?: string
 }
 
 function sanitizeFilename(filename: string): string {
@@ -62,19 +70,26 @@ function resolveZeroNative(): ZeroNativeApi | null {
 }
 
 export async function exportBackupNatively(
-  includeSecrets: boolean
+  includeSecrets: boolean,
+  partial?: BackupPartialRequest
 ): Promise<DownloadResult | null> {
   const zero = resolveZeroNative()
   if (typeof zero?.downloads?.exportBackup !== 'function') return null
-  const result = await zero.downloads.exportBackup({ includeSecrets })
+  const result = await zero.downloads.exportBackup(partial ? { includeSecrets, partial } : { includeSecrets })
   if (
     !result ||
     typeof result.completed !== 'boolean' ||
     result.native !== true ||
     typeof result.canceled !== 'boolean' ||
-    (result.path !== undefined && typeof result.path !== 'string')
+    (result.path !== undefined && typeof result.path !== 'string') ||
+    (result.notCarried !== undefined && typeof result.notCarried !== 'string')
   ) {
     throw new Error('The Mac backup export returned an invalid result.')
+  }
+  // A finished download stays finished: a summary that is not text is only "unavailable" (the
+  // panel's parser says so), never a reason to call the written backup a failure.
+  if (result.missingUploads !== undefined && typeof result.missingUploads !== 'string') {
+    return { ...result, missingUploads: undefined }
   }
   return result
 }

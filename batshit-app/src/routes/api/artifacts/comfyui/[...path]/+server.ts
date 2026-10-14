@@ -2,6 +2,7 @@ import { json, type RequestHandler } from '@sveltejs/kit'
 import { apiFailure } from '$lib/server/services/apiResponses'
 import { env } from '$env/dynamic/private'
 import { resolveNativeToolUser } from '$lib/server/services/nativeToolAuth'
+import { refuseDelegatedRunOutsideList } from '$lib/server/services/actingAgentIdentity'
 import {
   buildRuntimeUrlAliasMap,
   isRuntimeUrlAliasKey,
@@ -13,6 +14,13 @@ import {
   requireArtifactRuntimeClaims,
   resolveArtifactRuntimeClaims
 } from '$lib/server/services/artifactRuntimeAuth'
+import {
+  buildForwardRequestHeaders,
+  buildTargetUrl,
+  isAllowedComfyPath,
+  normalizeWorkflowPath,
+  validateComfyPromptBody
+} from '$lib/server/artifacts/comfyuiProxyRules'
 
 const DEFAULT_PROXY_TIMEOUT_MS = 20_000
 const MIN_PROXY_TIMEOUT_MS = 1_000
@@ -38,21 +46,6 @@ type ProxyAttempt = {
   error?: string
 }
 
-type PromptValidationResult =
-  | { ok: true }
-  | {
-      ok: false
-      error: string
-      details: Record<string, unknown>
-    }
-
-const COMFY_PROMPT_HINTS = {
-  workflowFormatTool: 'Check the fabric:sys.comfyui.workflows output field: workflow_format',
-  apiShape: 'ComfyUI /prompt expects API prompt node-map shape: { "3": { class_type, inputs }, ... }',
-  uiShape:
-    'UI workflow graph shape (nodes/links/definitions) is for planning/analysis and must be converted/exported before submit.'
-} as const
-
 function clamp(value: number, min: number, max: number): number {
   if (!Number.isFinite(value)) return min
   if (value < min) return min
@@ -64,16 +57,6 @@ function parseTimeoutMs(rawValue: string | null): number {
   const parsed = Number(rawValue)
   if (!Number.isFinite(parsed)) return DEFAULT_PROXY_TIMEOUT_MS
   return clamp(Math.floor(parsed), MIN_PROXY_TIMEOUT_MS, MAX_PROXY_TIMEOUT_MS)
-}
-
-function normalizeWorkflowPath(rawPath: string | undefined): string {
-  const trimmed = (rawPath ?? '').trim()
-  if (!trimmed) return ''
-  return trimmed
-    .split('/')
-    .map((segment) => segment.trim())
-    .filter(Boolean)
-    .join('/')
 }
 
 function isPrivateIpv4(hostname: string): boolean {
@@ -238,50 +221,6 @@ function buildBaseUrlCandidates(rawBaseUrl: string | null): { baseUrls: string[]
   return { baseUrls: candidates }
 }
 
-function isAllowedComfyPath(pathname: string): boolean {
-  const normalized = pathname.trim().toLowerCase()
-  if (!normalized) return false
-
-  return (
-    normalized === 'prompt' ||
-    normalized === 'history' ||
-    normalized.startsWith('history/') ||
-    normalized === 'view' ||
-    normalized === 'object_info' ||
-    normalized === 'system_stats' ||
-    normalized === 'queue' ||
-    normalized === 'interrupt' ||
-    normalized === 'upload/image' ||
-    normalized === 'userdata' ||
-    normalized.startsWith('userdata/') ||
-    normalized === 'api/userdata' ||
-    normalized.startsWith('api/userdata/') ||
-    normalized.startsWith('models/')
-  )
-}
-
-function buildTargetUrl(baseUrl: string, requestPath: string, query: URLSearchParams): string {
-  const target = new URL(baseUrl)
-  const basePath = target.pathname.replace(/\/+$/, '')
-  const cleanPath = requestPath.replace(/^\/+/, '')
-  const combinedPath = `${basePath}/${cleanPath}`.replace(/\/{2,}/g, '/')
-  target.pathname = combinedPath.startsWith('/') ? combinedPath : `/${combinedPath}`
-  target.search = query.toString()
-  target.hash = ''
-  return target.toString()
-}
-
-function buildForwardRequestHeaders(request: Request): Headers {
-  const headers = new Headers()
-  const accept = request.headers.get('accept')
-  if (accept) headers.set('accept', accept)
-
-  const contentType = request.headers.get('content-type')
-  if (contentType) headers.set('content-type', contentType)
-
-  return headers
-}
-
 function buildForwardResponseHeaders(upstream: Response, resolvedBaseUrl: string): Headers {
   const headers = new Headers()
   for (const headerName of FORWARDED_RESPONSE_HEADERS) {
@@ -290,107 +229,6 @@ function buildForwardResponseHeaders(upstream: Response, resolvedBaseUrl: string
   }
   headers.set('x-batshit-comfyui-base-url', resolvedBaseUrl)
   return headers
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === 'object' && !Array.isArray(value)
-}
-
-function detectPromptShape(payload: unknown): 'api' | 'ui' | 'unknown' {
-  if (!isRecord(payload)) return 'unknown'
-
-  const maybeUi =
-    Array.isArray((payload as { nodes?: unknown }).nodes) &&
-    ('links' in payload || 'definitions' in payload || 'last_node_id' in payload || 'last_link_id' in payload)
-  if (maybeUi) return 'ui'
-
-  const entries = Object.values(payload)
-  const hasApiNode = entries.some((node) => {
-    if (!isRecord(node)) return false
-    return typeof node.class_type === 'string' && isRecord(node.inputs)
-  })
-
-  return hasApiNode ? 'api' : 'unknown'
-}
-
-function validateComfyPromptBody(rawBody: Buffer | undefined): PromptValidationResult {
-  if (!rawBody || rawBody.length === 0) {
-    return {
-      ok: false,
-      error: 'ComfyUI /prompt requires a JSON body with a prompt payload.',
-      details: {
-        reason: 'missing_body',
-        hints: [
-          COMFY_PROMPT_HINTS.workflowFormatTool,
-          COMFY_PROMPT_HINTS.apiShape
-        ]
-      }
-    }
-  }
-
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(rawBody.toString('utf8'))
-  } catch {
-    return {
-      ok: false,
-      error: 'ComfyUI /prompt payload must be valid JSON.',
-      details: {
-        reason: 'invalid_json',
-        hints: [COMFY_PROMPT_HINTS.apiShape]
-      }
-    }
-  }
-
-  if (!isRecord(parsed) || !('prompt' in parsed)) {
-    return {
-      ok: false,
-      error: 'ComfyUI /prompt payload must include a top-level "prompt" object.',
-      details: {
-        reason: 'missing_prompt_field',
-        hints: [COMFY_PROMPT_HINTS.apiShape]
-      }
-    }
-  }
-
-  const promptPayload = parsed.prompt
-  const promptShape = detectPromptShape(promptPayload)
-  if (promptShape === 'api') {
-    return { ok: true }
-  }
-
-  if (promptShape === 'ui') {
-    return {
-      ok: false,
-      error:
-        'ComfyUI /prompt requires API prompt-format payload. Received UI workflow graph format (nodes/links/definitions). Convert or export to API format before submit.',
-      details: {
-        reason: 'ui_workflow_not_prompt',
-        detectedPromptShape: promptShape,
-        expectedPromptShape: 'api',
-        hints: [
-          COMFY_PROMPT_HINTS.workflowFormatTool,
-          COMFY_PROMPT_HINTS.uiShape,
-          COMFY_PROMPT_HINTS.apiShape
-        ]
-      }
-    }
-  }
-
-  return {
-    ok: false,
-    error:
-      'ComfyUI /prompt requires API prompt-format payload where nodes are keyed objects containing { class_type, inputs }.',
-    details: {
-      reason: 'unknown_prompt_shape',
-      detectedPromptShape: promptShape,
-      expectedPromptShape: 'api',
-      hints: [
-        COMFY_PROMPT_HINTS.workflowFormatTool,
-        COMFY_PROMPT_HINTS.apiShape
-      ]
-    }
-  }
 }
 
 async function handleComfyUiProxy(request: Request, localsUserId: string | null, url: URL, path: string | undefined) {
@@ -407,6 +245,11 @@ async function handleComfyUiProxy(request: Request, localsUserId: string | null,
 
   if (!auth) {
     return apiFailure('Unauthorized', 401)
+  }
+
+  const delegatedRefusal = refuseDelegatedRunOutsideList(auth, null)
+  if (delegatedRefusal) {
+    return apiFailure(delegatedRefusal.message, 403, { code: delegatedRefusal.code })
   }
 
   const requestPath = normalizeWorkflowPath(path)

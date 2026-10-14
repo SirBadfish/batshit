@@ -19,7 +19,7 @@ import { access, mkdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
-import { resolveVoiceRuntimeLaunchOwner } from '$lib/server/services/voiceRuntimeLaunchRecords'
+import { resolveVoiceRuntimeLaunchOwner, withLocalRuntimeRecordLock } from '$lib/server/services/voiceRuntimeLaunchRecords'
 
 export const SBX_DAEMON_RECORD_NAME = '.batshit-sbx-daemon-launch.json'
 const SBX_DAEMON_STATE_DIR_ENV_VAR = 'BATSHIT_SBX_DAEMON_STATE_DIR'
@@ -92,11 +92,15 @@ export async function recordSbxDaemonStart(callStartedAt: number, callEndedAt: n
   await mkdir(stateDir, { recursive: true })
   const recordPath = path.join(stateDir, SBX_DAEMON_RECORD_NAME)
   const temp = path.join(stateDir, `${SBX_DAEMON_RECORD_NAME}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`)
-  try {
-    await writeFile(temp, `${JSON.stringify(record, null, 2)}\n`, 'utf8')
-    await rename(temp, recordPath)
-  } catch (error) {
-    await rm(temp, { force: true })
-    throw error
-  }
+  // Under the folder's record lock (the voice launch records' own), so a stopper never decides on
+  // one generation of this record and acts on another (BL-1257).
+  await withLocalRuntimeRecordLock(stateDir, async () => {
+    try {
+      await writeFile(temp, `${JSON.stringify(record, null, 2)}\n`, 'utf8')
+      await rename(temp, recordPath)
+    } catch (error) {
+      await rm(temp, { force: true })
+      throw error
+    }
+  })
 }

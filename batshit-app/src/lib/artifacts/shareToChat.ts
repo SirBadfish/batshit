@@ -30,8 +30,7 @@ window.batshit.shareToChat = async function(content, options = {}) {
       format: options.format || 'text',
       timestamp: new Date().toISOString(),
       sessionId: options.sessionId || window.batshit.sessionId || null,
-      includeInChat: options.includeInChat !== false,
-      initiator: options.initiator || 'user'
+      includeInChat: options.includeInChat !== false
     };
     
     // Send to parent window (Batshit main app)

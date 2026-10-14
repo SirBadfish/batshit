@@ -66,6 +66,16 @@ async function storedCard(): Promise<any> {
 const now = () => new Date('2026-09-18T18:00:00.000Z')
 
 describe('answerApprovalsOnce', () => {
+  it('refuses a changed ChatGPT provenance before recording or spending the approval', async () => {
+    await seedCard({ providerMessageSource: { connectionId: 'chatgpt-plan:fixture', planBinding: 'old-binding' } })
+    await expect(answerApprovalsOnce({ userId: USER, sessionId: SESSION, messageId: CARD, responses: [{ approvalId: 'aitxt-1', approved: true }], beforeRecord: stored => {
+      expect((stored.metadata as any).providerMessageSource.planBinding).toBe('old-binding')
+      throw new Error('Account changed')
+    } })).rejects.toThrow('Account changed')
+    const stored = await storedCard()
+    expect(stored.metadata[ANSWERED_APPROVAL_IDS_KEY]).toBeUndefined()
+    expect(stored.metadata.toolApprovals.approvals[0].status).toBe('pending')
+  })
   it('records the first click on the card before anything runs, and keeps the rest of the message', async () => {
     await seedCard()
 

@@ -1,11 +1,33 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { pruneForeignBcryptPrebuilds } from './prepare-package-resources.mjs';
+import { copyAppRuntimeScripts, pruneForeignBcryptPrebuilds } from './prepare-package-resources.mjs';
+
+test('Mac runtime assembly carries the standalone command guardian and anchored reader source', async () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const sourceApp = join(here, '..', '..', 'batshit-app');
+  const packageRoot = await mkdtemp(join(tmpdir(), 'batshit-guardian-package-'));
+  try {
+    const destinationApp = join(packageRoot, 'Contents', 'Resources', 'runtime', 'batshit-app');
+    await copyAppRuntimeScripts(sourceApp, destinationApp);
+    const sourceGuardian = join(sourceApp, 'scripts', 'command-group-guardian.mjs');
+    const packagedGuardian = join(destinationApp, 'scripts', 'command-group-guardian.mjs');
+    assert.equal((await stat(packagedGuardian)).isFile(), true);
+    assert.deepEqual(await readFile(packagedGuardian), await readFile(sourceGuardian));
+    for (const name of ['anchored-project-reader.c', 'build-anchored-project-reader.mjs']) {
+      const source = join(sourceApp, 'scripts', name);
+      const packaged = join(destinationApp, 'scripts', name);
+      assert.equal((await stat(packaged)).isFile(), true);
+      assert.deepEqual(await readFile(packaged), await readFile(source));
+    }
+  } finally {
+    await rm(packageRoot, { recursive: true, force: true });
+  }
+});
 
 test('Mac packaging keeps only the target bcrypt prebuild', async () => {
   const root = await mkdtemp(join(tmpdir(), 'batshit-bcrypt-prune-'));

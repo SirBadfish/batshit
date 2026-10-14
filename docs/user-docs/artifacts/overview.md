@@ -56,6 +56,7 @@ The Power Source describes what powers an Artifact, and whether an agent can run
 | ComfyUI | A panel for a ComfyUI-style service through Batshit's proxy. | No — current ComfyUI panels are user-run, not agent tools. |
 | HuggingFace | Embeds a HuggingFace Space. | No — user-only panel runtime. |
 | Gradio | Embeds a standalone Gradio app. | No — user-only panel runtime. |
+| Pinokio App | Runs an app installed in Pinokio (a ComfyUI, a Gradio app, or an app with its own API) through Batshit, and starts it when needed after you confirm. | Can be, if published with a valid runtime contract. See [Pinokio apps as Artifacts](pinokio.md). |
 | Static / No AI | A UI-only widget. | No — no AI completion path. |
 
 Don't force a panel runtime into an agent tool by changing its power source. If an agent needs to run the thing, build a backend-runnable Artifact or webhook path with typed fields.
@@ -71,6 +72,8 @@ The model is resolved from the Artifact's runtime contract: a request override i
 ## Artifact run logs
 
 When an Artifact calls Batshit's runtime, Batshit keeps a short-lived, scrubbed run log for about two weeks. Agents can inspect recent runs to see the related chat message, a short scrubbed prompt preview, the selected model, runtime path, output counts, and sanitized errors. For image generators, a run with zero generated files is treated as a failure to fix, even if the Artifact saved or published correctly.
+
+If a Built-in AI provider fails while streaming, text already shown can remain. The run is recorded as failed; partial text should not be treated as a completed result.
 
 These logs never store API keys, auth tokens, or raw image/audio bytes. Deleting an Artifact deletes its run logs immediately; editing, rolling back, or deleting Artifact versions does not.
 
@@ -88,6 +91,7 @@ ComfyUI-style Artifacts call ComfyUI-shaped endpoints through Batshit's same-ori
 - Real ComfyUI is a connect-existing runtime unless a future approved sidecar is documented.
 - Current ComfyUI panel Artifacts are user-run panels. They aren't agent runtime tools.
 - HuggingFace and Gradio embeds are user-only panel runtimes too.
+- A ComfyUI or Gradio app installed in **Pinokio** is different: as a **Pinokio App** Artifact, Batshit runs it on its server, so agents can use it. See [Pinokio apps as Artifacts](pinokio.md).
 
 ## Agent Use
 
@@ -111,7 +115,9 @@ File inputs are not normal Fabric fields. For file-heavy workflows, use Clips, u
 
 Artifacts can share output back into chat. Standard controls: Share to Chat, Save to Clip Vault, and Download.
 
-When an Artifact shares text, Batshit saves a visible user-role message. When it shares an image, Batshit stores it as a Clip — chat may show an optimized preview, while quick view, copied image URLs, and downloads use the original full-resolution image when Batshit has one. If the share targets the current chat, Batshit can trigger the assigned agent to respond. Agent-initiated image shares are handled carefully so the active turn doesn't accidentally start a second hidden follow-up turn.
+When an Artifact shares output, Batshit shows it in chat and identifies it to the agent as Artifact output, rather than your own words or instructions. When it shares an image, Batshit stores it as a Clip — chat may show an optimized preview, while quick view, copied image URLs, and downloads use the original full-resolution image when Batshit has one. If the share targets the current chat, Batshit can trigger the assigned agent to respond. Agent-initiated image shares are handled carefully so the active turn doesn't accidentally start a second hidden follow-up turn.
+
+Image shares can use image data or public HTTP(S) image URLs. URLs into your computer, local network, or private services are refused. Public URL downloads are limited to 10 MiB and 10 seconds, including redirects. Batshit keeps a local copy of the original image for later viewing.
 
 ## Artifact runtime safety
 
@@ -128,7 +134,19 @@ Don't import or publish untrusted Artifact code. An Artifact is still executable
 
 Batshit validates normal Artifact lifecycle writes. For backend-runnable Artifacts, the expected structure uses Batshit's Builder Kit and a Fabric runtime contract. This helps stop broken generated mini-apps from being saved as if they were ready.
 
+It also checks that every field has a name a screen reader can read: a label linked to the field, or an `aria-label`. A placeholder doesn't count. A save that adds a field without a name is refused. Fields an older Artifact already had are only reported, so it keeps saving. Builder Kit fields get their name from their `label`, and a Builder Kit slider shows its value.
+
 If you intentionally want a raw embed or static/manual Artifact, use the explicit settings path for that Artifact. Don't rely on accidental validation gaps.
+
+## When you and an agent edit the same Artifact
+
+**Settings → Artifacts** saves only what you change. Changing Placement or a switch never writes back the HTML, prompt, or fields the panel loaded, so an edit an agent made while Settings was open stays.
+
+The HTML editor saves on top of the version you opened. If an agent, or another window, saved a newer version while you were editing, Batshit refuses your save and names both versions. Your text stays in the editor. Copy it, close the editor, and Settings loads the newer version so you can make your change again.
+
+When an agent makes two edits to one Artifact at the same moment, both land, one after the other.
+
+An agent that saves the whole HTML (a rewrite, or a new version) names the version it read, the same way the editor does. If you saved a newer version after the agent read the Artifact, Batshit refuses the agent's save and keeps yours. The agent is told to load the Artifact again and redo its edit on your version. A small edit an agent sends as a patch is applied to the version saved now: if the lines it names still match, it lands on top of your save; if you changed those lines, Batshit refuses the patch and saves nothing.
 
 ## Backups don't include external runtimes
 
@@ -150,7 +168,9 @@ Back those up through their own tools if you need exact recovery.
 | Artifact generated text when you expected an image/file | Wrong model, unsupported output mode, missing saved provider key, or a non-file provider response. | Recent Artifact run logs for resolved model, transport, and output counts. |
 | ComfyUI Artifact works in browser but not from Docker | Wrong caller URL. | Use a container-reachable URL or the Batshit proxy. |
 | HuggingFace/Gradio embed isn't agent-usable | It's a user-only panel runtime. | Build a backend-runnable Artifact if agents need to call it. |
-| Save/update fails validation | Missing Builder Kit, Fabric fields, run-only contract, or a script syntax issue. | Run validation and fix the reported issue. |
+| Save/update fails validation | Missing Builder Kit, Fabric fields, run-only contract, a field with no name, or a script syntax issue. | Run validation and fix the reported issue. |
+| HTML save says an agent or another window saved a newer version | The Artifact changed after you opened the editor. | Copy your edit, close the editor, and make it again on the version Settings loads. |
+| An agent says its update was refused because the Artifact changed | You (or another agent) saved a newer version after it read the Artifact. Nothing was lost. | Ask the agent to load the Artifact again and redo its edit on the newer version. |
 
 ## Related docs
 

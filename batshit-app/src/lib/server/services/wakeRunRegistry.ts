@@ -55,6 +55,24 @@ export interface WakeRunEntry {
   userId: string
   origin: SessionOrigin
   startedAt: number
+  /**
+   * BL-703 — when the wake slot was RESERVED (`reserveWakeSlot`), not when the run was
+   * registered. `startedAt` is stamped 3-9s later, after the session/message setup awaits,
+   * so a schedule fire that lands in that gap saw no registry entry for the dmId yet and
+   * updated the note. The ending turn's three guards (`finishWokenTurn`) compare a fire's
+   * time against THIS field so that gap is covered too, the same as the gap after
+   * registration (BL-702). Optional because a handful of tests build a `WakeRunEntry`
+   * directly without going through `reserveWakeSlot`; those fall back to `startedAt`.
+   */
+  reservedAt?: number
+  /**
+   * The woken turn's own assistant message id, which the primitive generates before it posts
+   * (F-P1-1). BL-505: send-routed asks `isWokenTurnMessage` with a run's message id, because the
+   * chat can hold other runs while this entry exists: the user's own send that got the chat first
+   * (F-P1-4), and a steer the user typed during the woken reply, which the same request promotes
+   * into a new turn. Those are the user's messages; only this one is the woken turn.
+   */
+  assistantMessageId: string
   /** Aborts the internal `send-routed` request. Stop and the timeout both use it. */
   controller: AbortController
   /** The hard-stop timer, cleared on every terminal path. */
@@ -185,7 +203,7 @@ export function checkWakeCaps(agentId: string, now = Date.now()): WakeCapRefusal
 }
 
 export type WakeSlotReservation =
-  | { ok: true; reservationId: string }
+  | { ok: true; reservationId: string; reservedAt: number }
   | ({ ok: false } & WakeCapRefusal)
 
 /**
@@ -193,6 +211,10 @@ export type WakeSlotReservation =
  *
  * The caller must release on every refusal path that follows (`releaseWakeSlot`) and hand
  * the id to `registerWakeRun` on the accept path, which converts it into a real run.
+ *
+ * `reservedAt` (BL-703) is the moment this slot was taken, before the setup awaits that
+ * follow. The caller carries it into the registry entry so the ending-turn guards can catch
+ * a fire from that gap too, not only one from after `registerWakeRun`.
  */
 export function reserveWakeSlot(agentId: string, now = Date.now()): WakeSlotReservation {
   const refusal = checkWakeCaps(agentId, now)
@@ -201,7 +223,7 @@ export function reserveWakeSlot(agentId: string, now = Date.now()): WakeSlotRese
   reservationCounter += 1
   const reservationId = `wakeres_${now}_${reservationCounter}`
   reservations.set(reservationId, { agentId, at: now })
-  return { ok: true, reservationId }
+  return { ok: true, reservationId, reservedAt: now }
 }
 
 /** Give a reserved slot back. Idempotent, so a refusal path can call it unconditionally. */
@@ -240,6 +262,17 @@ export function hasActiveWakeRun(sessionId: string): boolean {
 
 export function getWakeRun(sessionId: string): WakeRunEntry | null {
   return runsBySession.get(sessionId) ?? null
+}
+
+/**
+ * BL-505: is the run writing `messageId` in this chat the woken turn itself? The server's answer,
+ * from what `requestAgentWakeup` registered; a run under any other id (the user's own send, a
+ * promoted steer) is a user's message. send-routed also requires the request to be the internal
+ * one, so a browser request that names this id is never the woken turn.
+ */
+export function isWokenTurnMessage(sessionId: string, messageId: string | null | undefined): boolean {
+  if (!messageId) return false
+  return runsBySession.get(sessionId)?.assistantMessageId === messageId
 }
 
 /**

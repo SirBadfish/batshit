@@ -18,7 +18,7 @@ describe('send-routed: an approval is answered once', () => {
   const register = source.indexOf('\n    const sessionTurnRegistration = registerSessionTurn(\n')
   const analyze = source.indexOf('const approvalState = analyzeApprovalState(approvalHistoryMessages)')
   const lateWarning = source.indexOf("'[Send-Routed] Late approval converted to deny due to timeout'")
-  const answer = source.indexOf('const approvalAnswer = await answerApprovalsOnce({')
+  const answer = source.indexOf('approvalAnswer = await answerApprovalsOnce({')
   const streamMetadata = source.indexOf('const metadataForStream =', answer)
 
   it('is called once, under the lock, after the three-minute sweep, before the run is built', () => {

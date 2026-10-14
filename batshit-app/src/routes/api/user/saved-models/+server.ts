@@ -1,3 +1,9 @@
+import { pausedPlanAddRefusal } from '$lib/server/services/pausedPlans'
+import { normaliseChatgptPlanPreset } from '$lib/server/services/chatgptPlanPreset'
+import { withChatgptPlanPublishedMetadata } from '$lib/data/chatgpt-plan-published-metadata'
+import { chatgptPlanAccounts } from '$lib/server/services/chatgptPlanHost'
+import { ChatgptPlanError } from '$lib/server/services/chatgptPlanVault'
+import { chatgptPlanAccountId, isChatgptPlanConnection } from '$lib/utils/chatgptPlanConnection'
 import { json } from '@sveltejs/kit'
 import type { RequestHandler } from './$types'
 import { redis } from '$lib/server/redis'
@@ -23,38 +29,23 @@ import { inferModelPurpose } from '$lib/utils/modelPurpose'
 import { resolveCatalogIds, resolveModelIds } from '$lib/utils/modelIdResolver'
 import { resolveSavedModelConnection } from '$lib/utils/modelConnections'
 import { LOCAL_AI_SERVER_IDS } from '$lib/data/localAiServers'
+import {
+  GATEWAY_UNLISTED_PRESET_REASON,
+  buildSavedModelCatalogLookup,
+  gatewayListsCatalogRow,
+  isGatewayCatalogPreset,
+  resolveCatalogConnectionId
+} from '$lib/server/services/savedModelCatalogMatch'
+import {
+  findModelPresetReferences,
+  formatModelPresetReferenceMessage
+} from '$lib/server/services/modelPresetReferences'
 
 class ModelPresetValidationError extends Error {
   constructor(message: string) {
     super(message)
     this.name = 'ModelPresetValidationError'
   }
-}
-
-async function findModelPresetAgentReferences(userId: string, modelId: string) {
-  const agents = await redis.getAgents(userId)
-  return agents
-    .flatMap((agent) => {
-      const references: Array<{ agentId: string; agentName: string; field: 'primary' | 'fallback' }> = []
-      const agentName = agent.displayName || (agent as Record<string, any>).name || agent.id
-      if (agent.primary_model_preset_id === modelId) {
-        references.push({ agentId: agent.id, agentName, field: 'primary' })
-      }
-      if (agent.fallback_model_preset_id === modelId) {
-        references.push({ agentId: agent.id, agentName, field: 'fallback' })
-      }
-      return references
-    })
-}
-
-function formatModelPresetReferenceMessage(
-  references: Array<{ agentName: string; field: 'primary' | 'fallback' }>
-) {
-  const names = references
-    .slice(0, 4)
-    .map((reference) => `${reference.agentName} (${reference.field})`)
-  const suffix = references.length > names.length ? ` and ${references.length - names.length} more` : ''
-  return `This model preset is still used by ${names.join(', ')}${suffix}. Choose a different model for those agents before deleting it.`
 }
 
 async function getProviderModel(
@@ -91,21 +82,12 @@ async function getProviderModel(
   )
 }
 
-function resolveConnectionId(connection: ModelConnectionInfo): string | null {
-  const explicit = connection.id?.trim()
-  if (explicit) return explicit
-  if (connection.type === 'vercel-gateway') return 'vercel-gateway'
-  if (connection.type === 'openrouter') return 'openrouter'
-  const service = connection.service?.trim()
-  return service ? `direct:${service}` : null
-}
-
 function resolveCatalogPresetIdentity(
   catalogEntry: Awaited<ReturnType<typeof findVercelCatalogEntryById>>,
   connection: ModelConnectionInfo
 ) {
   if (!catalogEntry) return null
-  const connectionId = resolveConnectionId(connection)
+  const connectionId = resolveCatalogConnectionId(connection)
   if (!connectionId) {
     throw new ModelPresetValidationError(
       'This catalog model is missing a provider connection. Select the connection again before saving.'
@@ -224,7 +206,7 @@ async function normaliseSavedModel(payload: SavedModel, manager: ProviderManager
   const requestedCatalogModelId =
     payload.catalogModelId?.trim() || payload.vercelSourceId?.trim() || undefined
   const catalogEntry = requestedCatalogModelId
-    ? await findVercelCatalogEntryById(requestedCatalogModelId)
+    ? await findVercelCatalogEntryById(requestedCatalogModelId, resolveCatalogConnectionId(resolvedConnection))
     : null
 
   if (requestedCatalogModelId && !catalogEntry) {
@@ -329,6 +311,8 @@ async function normaliseSavedModel(payload: SavedModel, manager: ProviderManager
     connection: resolvedConnection,
     imageTransport: normalizeImageTransport(payload.imageTransport)
   }
+  // BL-517: the list answer's availability mark is worked out on each load, never stored.
+  delete model.unavailableReason
 
   const providerModel: ModelInfo | null = await getProviderModel(
     manager,
@@ -419,12 +403,13 @@ function buildModelPresetId(options: {
   return namePart || identityPart
 }
 
-async function loadUserModelsWithPurge(userId: string, vercelIds: Set<string>) {
+/**
+ * The user's saved presets, newest first. BL-517: a read never deletes. A preset whose model a
+ * connection stopped listing stays stored (with its settings, and for the agents that name it);
+ * the GET marks it unavailable in its answer instead.
+ */
+async function loadUserModels(userId: string): Promise<SavedModel[]> {
   const modelIds = await redis.sMembers(`user:${userId}:models`)
-  if (!modelIds.length) {
-    return { models: [], purged: [] as { id: string; modelName: string }[] }
-  }
-
   const models: SavedModel[] = []
   for (const modelId of modelIds) {
     const record = (await redis.get(`model:${modelId}`)) as SavedModel | null
@@ -433,25 +418,13 @@ async function loadUserModelsWithPurge(userId: string, vercelIds: Set<string>) {
     }
   }
 
-  const purged: { id: string; modelName: string }[] = []
-  const filtered: SavedModel[] = []
-  for (const model of models) {
-    if (model.isVercelImport && model.vercelSourceId && !vercelIds.has(model.vercelSourceId)) {
-      await redis.del(`model:${model.id}`)
-      await redis.sRem(`user:${userId}:models`, model.id)
-      purged.push({ id: model.id, modelName: model.modelName })
-      continue
-    }
-    filtered.push(model)
-  }
-
-  filtered.sort(
+  models.sort(
     (a, b) =>
       new Date(b.createdAt || b.updatedAt || 0).getTime() -
       new Date(a.createdAt || a.updatedAt || 0).getTime()
   )
 
-  return { models: filtered, purged }
+  return models
 }
 
 function repairSavedModelIdentity(
@@ -461,26 +434,38 @@ function repairSavedModelIdentity(
   const connection = resolveSavedModelConnection(model)
   let changed = false
 
-  const connectionId = resolveConnectionId(connection)
+  const connectionId = resolveCatalogConnectionId(connection)
   const hasCatalogVariant = Boolean(
     connectionId && catalogEntry?.idVariants?.[connectionId]
   )
   if (catalogEntry && hasCatalogVariant) {
     const identity = resolveCatalogPresetIdentity(catalogEntry, connection)
     if (identity) {
+      // The saved baseline (what Restore Defaults returns to, and what the editor
+      // compares against to say "provider modified") recorded the old identity.
+      // A field it recorded as the old value moves with the repair in the same
+      // write; a field it recorded as something else is left alone (review
+      // finding 2: the MiMo Token Plan's `mimo` became `xiaomi` in BL-241).
+      const baseline = model.enrichment
+      const moveBaseline = (field: 'provider' | 'modelId' | 'identifier', from: string | undefined, to: string) => {
+        if (baseline && from !== undefined && baseline[field] === from) baseline[field] = to
+      }
       if (model.catalogModelId !== catalogEntry.id) {
         model.catalogModelId = catalogEntry.id
         changed = true
       }
       if (model.provider !== identity.developerId) {
+        moveBaseline('provider', model.provider, identity.developerId)
         model.provider = identity.developerId
         changed = true
       }
       if (model.modelId !== identity.modelId) {
+        moveBaseline('modelId', model.modelId, identity.modelId)
         model.modelId = identity.modelId
         changed = true
       }
       if (model.effectiveModelId !== identity.effectiveModelId) {
+        moveBaseline('identifier', model.effectiveModelId, identity.effectiveModelId)
         model.effectiveModelId = identity.effectiveModelId
         changed = true
       }
@@ -534,29 +519,23 @@ export const GET: RequestHandler = async ({ locals }) => {
 
   try {
     const catalog = await fetchVercelModelCatalog()
-    const vercelIds = new Set(
-      catalog.models.filter((entry) => entry.source === 'vercel').map((entry) => entry.id)
-    )
-    const { models, purged } = await loadUserModelsWithPurge(locals.user.id, vercelIds)
-
-    const catalogLookup = new Map<string, (typeof catalog.models)[number]>()
-    for (const entry of catalog.models) {
-      const id = entry.id?.toLowerCase()
-      if (id) catalogLookup.set(id, entry)
-      const canonicalId = entry.canonicalId?.toLowerCase()
-      if (canonicalId) catalogLookup.set(canonicalId, entry)
-      const providerKey = entry.provider && entry.name ? `${entry.provider}/${entry.name}`.toLowerCase() : null
-      if (providerKey) catalogLookup.set(providerKey, entry)
-    }
+    const models = await loadUserModels(locals.user.id)
+    // BL-68: a preset saved on a row that later merged into or was renamed to another still
+    // finds its model through its own connection's variant id.
+    const findCatalogRow = buildSavedModelCatalogLookup(catalog.models)
 
     let purposeBackfilledCount = 0
     let identityBackfilledCount = 0
+    const unlisted: { id: string; modelName: string }[] = []
+    const answered: SavedModel[] = []
     for (const model of models) {
-      const lookupKey =
-        model.catalogModelId?.toLowerCase() ||
-        model.vercelSourceId?.toLowerCase() ||
-        (model.provider && model.modelId ? `${model.provider}/${model.modelId}`.toLowerCase() : null)
-      const match = lookupKey ? catalogLookup.get(lookupKey) ?? null : null
+      if (isChatgptPlanConnection(model.connection?.id) || model.connection?.service === 'chatgpt-plan') {
+        const ready = chatgptPlanAccounts(locals.user.id).some(account => account.id === chatgptPlanAccountId(model.connection?.id) && account.state === 'ready')
+        const projected = withChatgptPlanPublishedMetadata(model)
+        answered.push(ready ? projected : { ...projected, unavailableReason: 'Reconnect this ChatGPT account in Settings → API Keys on this Mac.' })
+        continue
+      }
+      const match = findCatalogRow(model)
       const identityChanged = repairSavedModelIdentity(model, match)
       if (identityChanged) {
         identityBackfilledCount += 1
@@ -565,18 +544,27 @@ export const GET: RequestHandler = async ({ locals }) => {
       if (purposeChanged) {
         purposeBackfilledCount += 1
       }
-      if (identityChanged || purposeChanged) {
-        await redis.set(`model:${model.id}`, model)
+      // Written only while the preset still exists: a preset deleted since this load read it is
+      // not made again as a key no list names (review of BL-517), and it leaves the answer.
+      if ((identityChanged || purposeChanged) && !(await redis.json.setIfExists(`model:${model.id}`, '$', model))) {
+        continue
+      }
+      // BL-517: a gateway preset the gateway no longer lists stays; the answer (never the stored
+      // preset) says so, and the pickers show it as unavailable. The send says the same.
+      if (isGatewayCatalogPreset(model) && !gatewayListsCatalogRow(match)) {
+        unlisted.push({ id: model.id, modelName: model.modelName })
+        answered.push({ ...model, unavailableReason: GATEWAY_UNLISTED_PRESET_REASON })
+      } else {
+        answered.push(model)
       }
     }
 
     return json({
-      models,
+      models: answered,
       meta: {
-        purged,
+        unlisted,
         purposeBackfilledCount,
         identityBackfilledCount,
-        vercelCatalogCount: vercelIds.size,
         vercelCatalogFetchedAt: catalog.fetchedAt
       }
     })
@@ -588,7 +576,6 @@ export const GET: RequestHandler = async ({ locals }) => {
 
 export {
   normaliseSavedModel as _normaliseSavedModel,
-  loadUserModelsWithPurge as _loadUserModelsWithPurge,
   repairSavedModelPurpose as _repairSavedModelPurpose
 }
 
@@ -599,29 +586,64 @@ export const POST: RequestHandler = async ({ request, locals }) => {
   }
 
   try {
-    const providerManager = await ProviderManager.createForUser(locals.user.id)
     const payload = (await request.json()) as SavedModel
-    const model = await normaliseSavedModel(payload, providerManager)
+    // Plan pause: a model of a paused plan cannot be added or saved.
+    const paused = await pausedPlanAddRefusal(
+      payload?.connection?.service ?? payload?.connection?.id ?? null
+    )
+    if (paused) {
+      return json({ error: paused.message, code: 'paused_plan' }, { status: 409 })
+    }
+    // BL-516: a create sends no id (the id is built from the name, model, and connection); an
+    // update names its id. A create never replaces a saved preset, and an update never makes one.
+    const isUpdate = typeof payload?.id === 'string' && payload.id.trim().length > 0
+    const model = isChatgptPlanConnection(payload.connection?.id) || payload.connection?.service === 'chatgpt-plan'
+      ? await normaliseChatgptPlanPreset(payload, locals.user.id)
+      : await normaliseSavedModel(payload, await ProviderManager.createForUser(locals.user.id))
 
     const now = new Date().toISOString()
     model.createdAt = model.createdAt || now
     model.updatedAt = now
 
     const setKey = `user:${locals.user.id}:models`
-    const isOwned = await redis.sismember(setKey, model.id)
-    const exists = await redis.exists(`model:${model.id}`)
-    if (exists && !isOwned) {
-      return json(
-        { error: 'A model preset with that display name already exists. Choose a different display name.' },
-        { status: 400 }
-      )
-    }
+    const modelKey = `model:${model.id}`
+    const missing = json(
+      {
+        error: 'This model preset no longer exists. It may have been deleted in another window; reload Settings → Models.',
+        code: 'model_preset_missing'
+      },
+      { status: 404 }
+    )
 
-    await redis.set(`model:${model.id}`, model)
-    await redis.sAdd(setKey, model.id)
+    if (isUpdate) {
+      if (!(await redis.sismember(setKey, model.id))) {
+        return missing
+      }
+      // Written only while the preset is still there, so a delete that lands first wins.
+      if (!(await redis.json.setIfExists(modelKey, '$', model))) {
+        return missing
+      }
+    } else {
+      // Made in one step only while no preset has that id (`JSON.SET … NX`), so two creates of
+      // one id at the same moment cannot both write.
+      if (!(await redis.json.setIfAbsent(modelKey, '$', model))) {
+        const existing = (await redis.get(modelKey)) as SavedModel | null
+        const isOwned = await redis.sismember(setKey, model.id)
+        const existingName = isOwned && existing?.modelName?.trim() ? `: "${existing.modelName.trim()}"` : ''
+        return json(
+          {
+            error: `A model preset with that name already exists${existingName}. Choose a different display name.`,
+            code: 'model_preset_exists'
+          },
+          { status: 409 }
+        )
+      }
+      await redis.sAdd(setKey, model.id)
+    }
 
     return json({ success: true, model })
   } catch (error) {
+    if (error instanceof ChatgptPlanError) return json({ error: error.message, code: error.code }, { status: 409 })
     console.error('Failed to save model:', error)
     if (error instanceof ModelPresetValidationError) {
       return json({ error: error.message, code: 'invalid_model_identity' }, { status: 400 })
@@ -642,15 +664,14 @@ export const DELETE: RequestHandler = async ({ url, locals }) => {
   }
 
   try {
-    const agentReferences = await findModelPresetAgentReferences(locals.user.id, modelId)
-    if (agentReferences.length > 0) {
+    // BL-483: every place a preset id is stored, each named in the refusal.
+    const references = await findModelPresetReferences(locals.user.id, modelId)
+    if (references.length > 0) {
       return json(
         {
-          error: formatModelPresetReferenceMessage(agentReferences),
+          error: formatModelPresetReferenceMessage(references),
           code: 'model_preset_in_use',
-          dependencies: {
-            agents: agentReferences
-          }
+          dependencies: { references }
         },
         { status: 409 }
       )

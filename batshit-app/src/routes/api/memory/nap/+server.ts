@@ -66,7 +66,9 @@ export const POST: RequestHandler = async ({ request, locals, fetch: eventFetch 
 
   // DL-104-15: naps run between turns only. The registry covers every send-routed
   // lane; a live turn refuses the nap outright (the client retries at the next idle
-  // threshold check).
+  // threshold check). A turn that starts DURING the nap ends it early at its next writing
+  // step (BL-549 N1: `runFixedSessionNap` reads the chat's last turn start in this same
+  // synchronous step, before its first await).
   if (getActiveSessionTurn(sessionId)) {
     return json(
       {
@@ -96,8 +98,12 @@ export const POST: RequestHandler = async ({ request, locals, fetch: eventFetch 
         { status: 500 }
       )
     }
+    // BL-549 (N2): an early end answers 200 with `status: 'ended_early'` and `endedEarly`
+    // (`turn_started`: a message arrived, the finished steps stay; `chat_deleted`: nothing more
+    // was written, and `record` and `metadata` are null).
     return json({
       status: outcome.status,
+      ...(outcome.endedEarly ? { endedEarly: outcome.endedEarly } : {}),
       record: outcome.record,
       metadata: outcome.metadata,
       tokensBefore: outcome.tokensBefore,

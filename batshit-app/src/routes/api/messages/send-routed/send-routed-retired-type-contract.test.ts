@@ -75,10 +75,11 @@ describe('send-routed retired primary-agent type guard', () => {
 
   it('keeps exactly the two surviving accepted-send boundaries', () => {
     const clipConsumeSites = source.split(
-      'await consumePostCompileSessionClips(sessionId)',
+      'consumePostCompileSessionClips(sessionId',
     ).length - 1
 
-    // API/CLI single send + group send. The third (n8n) site retired with the lane.
+    // API/CLI single send + group send (spent once per round, when the round has ended, for the
+    // Clips its speakers compiled: BL-600). The third (n8n) site retired with the lane.
     expect(clipConsumeSites).toBe(2)
   })
 })

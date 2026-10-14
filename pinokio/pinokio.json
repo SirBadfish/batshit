@@ -1,0 +1,9 @@
+{
+  "title": "Batshit",
+  "description": "An alpha self-hosted AI workspace: API and CLI agents, tools, artifacts, voice, and local AI in one place. Runs on your own computer; your chats and keys stay there.",
+  "icon": "icon.png",
+  "links": [
+    { "title": "Batshit docs", "value": "https://docs.batshit.ai" },
+    { "title": "Source code", "value": "https://github.com/SirBadfish/batshit" }
+  ]
+}

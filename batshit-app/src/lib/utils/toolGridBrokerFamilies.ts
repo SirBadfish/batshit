@@ -34,6 +34,65 @@ import {
 export const FABRIC_TOOL_GRID_ID = '__fabric_controls__'
 export const FABRIC_TOOL_GRID_GROUP_NAME = 'Fabric Controls'
 
+/**
+ * SA-072 P2 step 0: the plain words the Fabric line in `tool_discovery` uses for each control
+ * family, so `- Fabric Controls (65 tools: agent DMs, artifacts, …, Pinokio, …)` tells an
+ * agent WHAT it can reach, not just how many. Without them a plain-words ask ("which apps do
+ * I have in Pinokio?") never triggers a search, because nothing in the index names Pinokio.
+ *
+ * Keyed by the family segment `fabricControlFamilyKey` derives from a control id. A family
+ * missing from this map still prints, as its raw segment, so a new family can never hide.
+ * Add a row when a family's raw segment reads wrong to a person.
+ */
+export const FABRIC_CONTROL_FAMILY_LABELS: Readonly<Record<string, string>> = {
+  ui: 'App Actions',
+  artifact: 'artifacts',
+  cli_tool: 'CLI tools',
+  comfyui: 'ComfyUI',
+  dm: 'agent DMs',
+  goon_scene: 'Goon scenes',
+  judge: 'Judge Juice',
+  mcp: 'MCP tools',
+  memory: 'memory',
+  model_catalog: 'model catalog',
+  pinokio: 'Pinokio',
+  runtime_addon: 'runtime add-ons',
+  schedule: 'schedules',
+  skill: 'skills',
+  voice: 'voice engines',
+  zip: 'zips'
+}
+
+/**
+ * The family segment of one Fabric control id: `sys.<family>.…` gives `<family>`, and any
+ * other id gives its first segment (the per-artifact `artifact.<id>.…` config controls land
+ * in `artifact`, beside `sys.artifact.*`).
+ */
+export function fabricControlFamilyKey(controlId: string): string {
+  const segments = controlId.trim().split('.')
+  if (segments[0] === 'sys' && segments[1]) return segments[1]
+  return segments[0] ?? ''
+}
+
+/**
+ * The distinct family words for a set of Fabric control ids, in a fixed order (plain
+ * lower-case comparison, never a locale, so the bytes are the same on every machine). The
+ * list changes only when the set of families changes.
+ */
+export function describeFabricControlFamilies(controlIds: Iterable<string>): string[] {
+  const labels = new Set<string>()
+  for (const controlId of controlIds) {
+    const key = fabricControlFamilyKey(controlId)
+    if (!key) continue
+    labels.add(FABRIC_CONTROL_FAMILY_LABELS[key] ?? key)
+  }
+  return Array.from(labels).sort((left, right) => {
+    const a = left.toLowerCase()
+    const b = right.toLowerCase()
+    return a < b ? -1 : a > b ? 1 : 0
+  })
+}
+
 export const ARTIFACT_TOOL_GRID_ID = '__artifact_runtime__'
 export const ARTIFACT_TOOL_GRID_GROUP_NAME = 'Artifact Tools'
 
@@ -51,9 +110,10 @@ interface BrokerFamilyToolGridDefinition {
   /**
    * The mode an untouched install resolves to.
    *
-   * Fabric ships ~44 controls in one group, which is over the DCM tool-name threshold on
+   * Fabric ships 60+ controls in one group, which is over the DCM tool-name threshold on
    * its own, so listing them is both noisy and pointless — the threshold would suppress
-   * the list anyway. `group-only` states that intent instead of leaving it to arithmetic.
+   * the list anyway. `group-only` states that intent instead of leaving it to arithmetic;
+   * the line still names the families (`describeFabricControlFamilies`).
    *
    * Artifacts are a small, user-created family where a schema hint is what buys the agent
    * a direct call instead of a search round trip, so hints are on by default.
@@ -87,7 +147,7 @@ export const BROKER_FAMILY_TOOL_GRID_DEFINITIONS: Record<
 export const FABRIC_TOOL_GRID_INFO_PARAGRAPHS = [
   "Fabric controls are Batshit's own built-in actions, such as publishing an artifact, registering a voice engine, or starting a runtime add-on.",
   'This row only changes how much of that list appears in the capability index the agent receives with each message. The agent can search for these controls and run them either way.',
-  'There are around forty of them, so Batshit shows the group and its count by default instead of naming every control. Choose a Tools option if you want the names or input hints in every message.'
+  'There are more than sixty of them, so by default Batshit shows the group, its count, and the kinds of control it holds (such as artifacts, memory, or Pinokio) instead of naming every control. Choose a Tools option if you want the names or input hints in every message.'
 ]
 
 export const ARTIFACT_TOOL_GRID_INFO_PARAGRAPHS = [

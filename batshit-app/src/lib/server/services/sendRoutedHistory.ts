@@ -1,4 +1,5 @@
 import { isSwallowedQuickActionTurn } from '$lib/utils/jevJuiceQuickActions'
+import type { CurrentMessageFrom } from '$lib/utils/compiledChatTags'
 
 type ChatHistoryMessage = Record<string, any>
 
@@ -103,4 +104,22 @@ export function prepareManagedHistoryMessages<T extends ChatHistoryMessage>({
   }
 
   return history
+}
+
+/**
+ * SA-128 (DP-1): who wrote the current message a send compiles. A woken turn (its DM, webhook,
+ * or schedule text), a group follow-up (Batshit's prompt about another agent's reply), and the
+ * artifact share follow-up are Batshit's words, so they compile as a `<note>`; every other send
+ * is the user's own message. `metadata.wake` marks the wake primitive's own POST, the one send
+ * that is not the user (send-routed reads it the same way for "needs you").
+ */
+export function resolveCurrentMessageFrom(options: {
+  metadata?: Record<string, any> | null
+  groupEventType?: 'user' | 'agent' | null
+}): CurrentMessageFrom {
+  if (options.groupEventType === 'agent') return 'batshit'
+  const metadata = options.metadata ?? {}
+  if (metadata.wake) return 'batshit'
+  if (metadata.source === 'artifact_share_auto_followup') return 'batshit'
+  return 'user'
 }

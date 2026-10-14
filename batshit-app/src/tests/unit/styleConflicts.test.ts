@@ -1,5 +1,5 @@
 /**
- * Contract test for the style-conflict check (scripts/check-style-conflicts.mjs).
+ * Contract test for the style-conflict check (build-scripts/check-style-conflicts.mjs).
  *
  * The check exists because Tailwind utilities resolve in a LATER cascade layer
  * than Batshit's own `@layer components` classes, so a utility silently beats a
@@ -16,7 +16,7 @@ import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 const appRoot = process.cwd()
-const scriptPath = path.join(appRoot, 'scripts', 'check-style-conflicts.mjs')
+const scriptPath = path.join(appRoot, 'build-scripts', 'check-style-conflicts.mjs')
 
 interface Finding {
   file: string

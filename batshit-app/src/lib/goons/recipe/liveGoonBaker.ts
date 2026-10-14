@@ -1890,7 +1890,7 @@ function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
   return true
 }
 
-function strictStoredZipEntries(packageBytes: Uint8Array): Map<string, Uint8Array> {
+export function strictStoredZipEntries(packageBytes: Uint8Array): Map<string, Uint8Array> {
   exactBytes(packageBytes, 'Live package bytes')
   if (packageBytes.byteLength < 22) fail('Live package is too small to be a ZIP')
   const view = new DataView(packageBytes.buffer, packageBytes.byteOffset, packageBytes.byteLength)

@@ -4,7 +4,9 @@ import {
   ARTIFACT_TOOL_GRID_GROUP_NAME,
   createDefaultArtifactToolGridSettings,
   createDefaultFabricToolGridSettings,
+  describeFabricControlFamilies,
   FABRIC_TOOL_GRID_GROUP_NAME,
+  fabricControlFamilyKey,
   normalizeArtifactToolGridSettings,
   normalizeFabricToolGridSettings
 } from '../toolGridBrokerFamilies'
@@ -60,5 +62,31 @@ describe('broker family Tool Grid settings', () => {
     expect(normalized.dcmDisplayDefaults.groups[ARTIFACT_TOOL_GRID_GROUP_NAME]).toBe(
       'group+tools+hints'
     )
+  })
+})
+
+/** SA-072 P2 step 0: the family words on the Fabric line of `tool_discovery`. */
+describe('Fabric control family words', () => {
+  it('reads the family from sys.<family>.* and from the first segment of any other id', () => {
+    expect(fabricControlFamilyKey('sys.pinokio.run')).toBe('pinokio')
+    expect(fabricControlFamilyKey('sys.voice.engine.register')).toBe('voice')
+    expect(fabricControlFamilyKey('artifact.art_1.field.model.set')).toBe('artifact')
+    expect(fabricControlFamilyKey(' sys.zip.fetch ')).toBe('zip')
+  })
+
+  it('names each family once, sorted without a locale, and never drops an unknown one', () => {
+    expect(
+      describeFabricControlFamilies([
+        'sys.voice.engine.enable',
+        'sys.pinokio.run',
+        'artifact.art_1.field.model.set',
+        'sys.artifact.create',
+        'sys.pinokio.status',
+        'sys.cli_tool.search',
+        'sys.dm.send',
+        'sys.zz_new_family.do'
+      ])
+    ).toEqual(['agent DMs', 'artifacts', 'CLI tools', 'Pinokio', 'voice engines', 'zz_new_family'])
+    expect(describeFabricControlFamilies([])).toEqual([])
   })
 })

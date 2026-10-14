@@ -31,7 +31,7 @@
 		}
 		
 		if (Array.isArray(result)) {
-			return `${result.length} items`
+			return `${result.length} ${result.length === 1 ? 'item' : 'items'}`
 		}
 		
 		if (typeof result === 'object') {

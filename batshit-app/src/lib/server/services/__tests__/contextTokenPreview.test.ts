@@ -4,6 +4,7 @@ import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const redisMock = vi.hoisted(() => ({
+  get: vi.fn(),
   getSessionMessages: vi.fn()
 }))
 
@@ -15,11 +16,17 @@ import {
   estimateCodexProjectInstructionChars,
   estimateCodexProjectInstructionTokens,
   resolveContextPreviewMessages,
+  resolveAgentBudgetSettings,
   resolveCodexProjectDocMaxBytes
 } from '$lib/server/services/contextTokenPreview'
 import { countTotalTokens } from '$lib/utils/tokenCounter'
 
 const tempDirs: string[] = []
+
+beforeEach(() => {
+  for (const key of ['CLAUDE_CODE_DISABLE_1M_CONTEXT', 'ANTHROPIC_BASE_URL',
+    'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY']) vi.stubEnv(key, '')
+})
 
 async function createTempProject() {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'batshit-context-preview-'))
@@ -28,6 +35,7 @@ async function createTempProject() {
 }
 
 afterEach(async () => {
+  vi.unstubAllEnvs()
   while (tempDirs.length > 0) {
     const dir = tempDirs.pop()
     if (dir) await rm(dir, { recursive: true, force: true })
@@ -93,6 +101,19 @@ describe('context preview message source', () => {
 })
 
 describe('context token preview', () => {
+  it('uses the chosen CLI model and the instance 1M cap for send preflight', async () => {
+    redisMock.get.mockResolvedValue(null)
+    const agent = {
+      primary_model_preset_id: null,
+      primary_model_provider: 'anthropic-claude-cli',
+      primary_model_name: 'claude-cli',
+      primary_model_connection: { type: 'direct', service: 'anthropic-claude-cli' },
+      claude_settings: { permissionMode: 'default', model: 'sonnet[1m]' }
+    }
+    expect((await resolveAgentBudgetSettings(agent)).contextLimit).toBe(1_000_000)
+    vi.stubEnv('CLAUDE_CODE_DISABLE_1M_CONTEXT', '1')
+    expect((await resolveAgentBudgetSettings(agent)).contextLimit).toBe(200_000)
+  })
   it('resolves Codex project_doc_max_bytes from custom config overrides', () => {
     expect(
       resolveCodexProjectDocMaxBytes({

@@ -1,9 +1,63 @@
-import { fireEvent, render, screen } from '@testing-library/svelte'
+import { fireEvent, render, screen, waitFor } from '@testing-library/svelte'
 import { describe, expect, it, vi } from 'vitest'
 
 import TokenPanel from './TokenPanel.svelte'
 
 describe('TokenPanel', () => {
+
+  it('associates the existing speed and KoboldCpp information triggers with their actual tooltip nodes', async () => {
+    ;(window as any).ResizeObserver ??= class ResizeObserver {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+    render(TokenPanel, { props: {
+      localProgramLabel: 'KoboldCpp', hasLatestResponse: true,
+      outputTokensPerSecond: 88.46, performanceSource: 'ai-sdk',
+      timeToFirstOutputMs: 234, responseTimeMs: 6800,
+    } })
+    for (const [label, text] of [
+      ['View speed stats for the latest response', 'Speed (latest response)'],
+      ['KoboldCpp performance information', 'KoboldCpp performance'],
+    ]) {
+      const trigger = screen.getByRole('button', { name: label })
+      await fireEvent.focus(trigger)
+      const title = await screen.findByText(text)
+      const content = title.closest('[data-slot="tooltip-content"]') as HTMLElement
+      await waitFor(() => {
+        expect(content.id).not.toBe('')
+        expect(content).toHaveAttribute('role', 'tooltip')
+        expect(trigger).toHaveAttribute('aria-describedby', content.id)
+        expect(document.getElementById(trigger.getAttribute('aria-describedby')!)).toBe(content)
+      })
+      await fireEvent.keyDown(content, { key: 'Escape' })
+      await waitFor(() => expect(title).not.toBeInTheDocument())
+      expect(trigger).not.toHaveAttribute('aria-describedby')
+      await fireEvent.blur(trigger)
+    }
+  })
+
+  it('shows used CLI tokens while the context limit is unknown', async () => {
+    ;(window as any).ResizeObserver ??= class ResizeObserver {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+    render(TokenPanel, {
+      props: {
+        currentTokens: 31_234, contextLimit: null, contextPercent: null,
+        contextUnknownHint: 'This CLI model has not reported a context limit.'
+      }
+    })
+    const trigger = screen.getByRole('button', { name: 'View context usage' })
+    expect(trigger).toHaveTextContent('31K')
+    expect(trigger).not.toHaveTextContent('%')
+    await fireEvent.pointerEnter(trigger)
+    await fireEvent.mouseEnter(trigger)
+    await fireEvent.focus(trigger)
+    expect(await screen.findByText('This CLI model has not reported a context limit.')).toBeInTheDocument()
+  })
+
   it('renders without requiring an external tooltip provider', () => {
     render(TokenPanel, {
       props: {
@@ -406,6 +460,91 @@ describe('TokenPanel', () => {
     expect(
       screen.getByRole('button', { name: 'View speed stats for the latest response' }),
     ).toHaveTextContent('8.5 t/s')
+  })
+
+  const koboldPerformanceNote = 'KoboldCpp doesn’t identify which reply its performance statistics belong to. Batshit shows measured reply speed when available.'
+
+  it('explains selected KoboldCpp native performance on hover without changing measured speed', async () => {
+    render(TokenPanel, { props: {
+      localProgramLabel: 'KoboldCpp', hasLatestResponse: true,
+      outputTokensPerSecond: 88.46, performanceSource: 'ai-sdk',
+    } })
+    expect(screen.getByRole('button', { name: 'View speed stats for the latest response' })).toHaveTextContent('88 t/s')
+    const info = screen.getByRole('button', { name: 'KoboldCpp performance information' })
+    expect(info).not.toHaveAttribute('title')
+    await fireEvent.pointerEnter(info, { pointerType: 'mouse' })
+    expect(await screen.findByText(koboldPerformanceNote)).toBeInTheDocument()
+    expect(info).toHaveAttribute('aria-expanded', 'true')
+    expect(screen.queryByText(/Showing Batshit-measured speed instead/)).not.toBeInTheDocument()
+  })
+
+  it('opens the KoboldCpp explanation with keyboard focus and dismisses it with Escape', async () => {
+    render(TokenPanel, { props: { localProgramLabel: 'KoboldCpp' } })
+    const info = screen.getByRole('button', { name: 'KoboldCpp performance information' })
+    await fireEvent.focus(info)
+    expect(await screen.findByText(koboldPerformanceNote)).toBeInTheDocument()
+    expect(info).toHaveAttribute('aria-describedby')
+    await fireEvent.keyDown(document, { key: 'Escape' })
+    expect(info).toHaveAttribute('aria-expanded', 'false')
+  })
+
+  it('toggles the KoboldCpp explanation by tap without hover or focus', async () => {
+    render(TokenPanel, { props: { localProgramLabel: 'KoboldCpp' } })
+    const info = screen.getByRole('button', { name: 'KoboldCpp performance information' })
+    await fireEvent.pointerDown(info, { pointerType: 'touch' })
+    await fireEvent.pointerUp(info, { pointerType: 'touch' })
+    await fireEvent.click(info)
+    expect(await screen.findByText(koboldPerformanceNote)).toBeInTheDocument()
+    expect(info).toHaveAttribute('aria-expanded', 'true')
+    await fireEvent.click(info)
+    expect(info).toHaveAttribute('aria-expanded', 'false')
+  })
+
+  it('opens on the browser touch pointerup-focus-click sequence and closes on a second activation', async () => {
+    ;(window as any).ResizeObserver ??= class ResizeObserver {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+    render(TokenPanel, { props: { localProgramLabel: 'KoboldCpp' } })
+    const info = screen.getByRole('button', { name: 'KoboldCpp performance information' })
+    // Chrome touch focuses after pointerup; that focus opens Bits UI before click.
+    await fireEvent.pointerDown(info)
+    await fireEvent.pointerUp(info)
+    await fireEvent.focus(info)
+    expect(info).toHaveAttribute('aria-expanded', 'true')
+    await fireEvent.click(info, { detail: 1 })
+    await waitFor(() => expect(info).toHaveAttribute('aria-expanded', 'true'))
+    expect(await screen.findByText(koboldPerformanceNote)).toBeInTheDocument()
+    await fireEvent.pointerDown(info)
+    await fireEvent.pointerUp(info)
+    await fireEvent.click(info, { detail: 1 })
+    await waitFor(() => expect(info).toHaveAttribute('aria-expanded', 'false'))
+    expect(screen.queryByText(koboldPerformanceNote)).not.toBeInTheDocument()
+  })
+
+  it.each([false, true])('preserves unknown speed and truthful copy with hasLatestResponse=%s', async hasLatestResponse => {
+    render(TokenPanel, { props: { localProgramLabel: 'KoboldCpp', hasLatestResponse } })
+    expect(screen.getByRole('button', { name: 'View speed stats for the latest response' })).toHaveTextContent('—')
+    await fireEvent.click(screen.getByRole('button', { name: 'KoboldCpp performance information' }))
+    expect(await screen.findByText(koboldPerformanceNote)).toBeInTheDocument()
+    expect(screen.queryByText(/output tokens per second/)).not.toBeInTheDocument()
+  })
+
+  it.each([null, 'Ollama', 'LM Studio'])('has no KoboldCpp information icon for %s', localProgramLabel => {
+    render(TokenPanel, { props: { localProgramLabel } })
+    expect(screen.queryByRole('button', { name: 'KoboldCpp performance information' })).not.toBeInTheDocument()
+  })
+
+  it('removes an open explanation when the selected program changes and keeps it closed on return', async () => {
+    const view = render(TokenPanel, { props: { localProgramLabel: 'KoboldCpp' } })
+    await fireEvent.click(screen.getByRole('button', { name: 'KoboldCpp performance information' }))
+    expect(await screen.findByText(koboldPerformanceNote)).toBeInTheDocument()
+    await view.rerender({ localProgramLabel: 'Ollama' })
+    expect(screen.queryByRole('button', { name: 'KoboldCpp performance information' })).not.toBeInTheDocument()
+    expect(screen.queryByText(koboldPerformanceNote)).not.toBeInTheDocument()
+    await view.rerender({ localProgramLabel: 'KoboldCpp' })
+    expect(screen.getByRole('button', { name: 'KoboldCpp performance information' })).toHaveAttribute('aria-expanded', 'false')
   })
 
   it.each([

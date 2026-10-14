@@ -128,6 +128,31 @@ export class ArtifactService {
     return response as ArtifactRow
   }
   
+  /**
+   * BL-544: turn ONE agent or Subagent on or off for one artifact (Settings > Agents > Access).
+   * The server adds or removes that id against the list as stored now; Agent Use and the
+   * all-agents switch stay as they are. Answers the artifact as stored.
+   */
+  async setArtifactAgentAccess(artifactId: string, agentId: string, enabled: boolean): Promise<ArtifactRow> {
+    const response = await this.apiCall(`/${encodeURIComponent(artifactId)}/agent-access`, {
+      method: 'PUT',
+      body: JSON.stringify({ agentId, enabled })
+    })
+
+    return response as ArtifactRow
+  }
+
+  // Restore an older version as the new current one (the server re-checks it like any save).
+  async restoreVersion(
+    artifactId: string,
+    targetVersion: number
+  ): Promise<{ success: boolean; newVersion: number; message?: string }> {
+    return await this.apiCall('/versions', {
+      method: 'PUT',
+      body: JSON.stringify({ artifactId, targetVersion })
+    })
+  }
+
   // Delete artifact
   async deleteArtifact(artifactId: string): Promise<void> {
     await this.apiCall(`/${artifactId}`, {

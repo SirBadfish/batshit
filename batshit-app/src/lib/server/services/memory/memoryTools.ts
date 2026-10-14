@@ -3,7 +3,8 @@
  *
  * One shared implementation behind BOTH agent-facing surfaces:
  *  - the Fabric `sys.memory.*` controls (fabricRegistry.ts handlers), and
- *  - the inline `<batshit-memory>` save route (`/api/memory/inline-saves`).
+ *  - the inline `<batshit-memory>` save, which the server's reply-end step processes
+ *    (`replyControlFinalize.ts`, SA-129 P2).
  *
  * The parity requirement (P3) is structural here: both surfaces call the same ops with
  * the same validated payload shape, so a tool save and an inline save produce identical
@@ -158,7 +159,7 @@ export interface MemorySummary {
   /** P4 1-hop link expansion: set when this row rode in via another result's [[links]]. */
   linked_from?: string
   /**
-   * SA-120 P4a: Jev Juice's 0-1 judgment that this memory bears on the query. Present only
+   * SA-120 P4a: Judge Juice's 0-1 judgment that this memory bears on the query. Present only
    * when the agent's rerank switch is on AND Jev answered; it is the provenance of the order.
    */
   jev_relevance?: number
@@ -440,11 +441,16 @@ function parseIsoToMs(value: unknown, field: string): number | undefined {
   const bare = BARE_DATE_PATTERN.exec(value.trim())
   if (bare) {
     const [, year, month, day] = bare
-    const localStart = new Date(Number(year), Number(month) - 1, Number(day)).getTime()
+    const localDay = new Date(Number(year), Number(month) - 1, Number(day))
+    const localStart = localDay.getTime()
     if (!Number.isFinite(localStart)) {
       throw new MemoryToolError(`"${field}" is not a valid timestamp: '${value}'.`)
     }
-    return field.endsWith('_to') ? localStart + 86_399_999 : localStart
+    // Use the next local midnight: days vary in length, and 23:59 can repeat (BL-788).
+    if (field.endsWith('_to')) {
+      return new Date(localDay.getFullYear(), localDay.getMonth(), localDay.getDate() + 1).getTime() - 1
+    }
+    return localStart
   }
   const parsed = new Date(value).getTime()
   if (!Number.isFinite(parsed)) {
@@ -633,14 +639,14 @@ export async function searchMemoriesOp(
         ranked = ranking.ranked
         jevRelevanceById = rerank.relevanceById
         rerankNote =
-          ' The order includes Jev Juice\'s judgment of how well each memory bears on your query (jev_relevance, 0 to 1, advisory).'
+          ' The order includes Judge Juice\'s judgment of how well each memory bears on your query (jev_relevance, 0 to 1, advisory).'
       } else if (rerank.record) {
         // A call that answered but left a memory unjudged is never partly trusted.
         const why =
           rerank.record.status === 'ok'
             ? 'an answer was missing.'
             : describeTypesafeReason(rerank.record.reason)
-        rerankNote = ` Jev Juice did not rerank this search (${why}); the order is the usual ranking.`
+        rerankNote = ` Judge Juice did not rerank this search (${why}); the order is the usual ranking.`
       }
       // Mid-run call: the row goes on the running assistant message's snapshot (DL-120-07).
       if (rerank.record) {
@@ -649,10 +655,10 @@ export async function searchMemoriesOp(
     } catch (error) {
       // `computeMemoryRerank` is written not to throw; this is the last net so a bug in the
       // lane can never fail a memory search. Loud, not silent: the usual ranking stands.
-      console.error('[Jev Juice] memory search rerank threw; the usual ranking stands:', error)
+      console.error('[Judge Juice] memory search rerank threw; the usual ranking stands:', error)
       ranked = usualRanking
       jevRelevanceById = null
-      rerankNote = ' Jev Juice did not rerank this search (it failed inside Batshit); the order is the usual ranking.'
+      rerankNote = ' Judge Juice did not rerank this search (it failed inside Batshit); the order is the usual ranking.'
     }
   }
 

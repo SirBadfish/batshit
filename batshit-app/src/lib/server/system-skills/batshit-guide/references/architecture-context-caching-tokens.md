@@ -6,7 +6,7 @@ Batshit is built so the stable parts of a conversation stay reusable, bulky outp
 
 Every model call re-sends context. The model has no memory between calls, so each turn ships the system prompt, the tools, and the conversation so far. Two things make that expensive:
 
-- **Metadata bloat.** Many chat apps wrap every message in hundreds of tokens of timestamps, IDs, and model config. Over a long conversation that's thousands of tokens of pure overhead nobody re-reads.
+- **Extras on every message.** Anything attached to a message is sent again on every later turn, so a small extra per message adds up over a long conversation.
 - **Dragging everything along.** Long logs, diffs, and tool results get carried through the whole conversation even when they're done being useful.
 
 There's a second, less obvious lever: **provider prompt caching rewards stable, repeated prefixes.** If the beginning of your request is identical to last time, a provider that supports caching can reuse that work cheaply. So the *order* of a request matters as much as its size — the more of the front that stays byte-for-byte stable, the more there is to reuse.
@@ -25,7 +25,7 @@ Putting the churn at the end means everything in front of it can stay reusable. 
 
 Before any provider caching enters the picture, Batshit already shrinks what it sends:
 
-- **Compact message storage.** Batshit doesn't wrap each message in metadata. A short message costs a few tokens, not a few hundred.
+- **Plain text, one simple tag per message.** Your conversation reaches the model as plain text, with each message inside its own tag: `<user>` for you, `<assistant>` for the agent's own earlier replies, `<agent name="…">` for any other agent in the chat, and `<note>` for Batshit's own entries, such as a summary of older messages or a DM that woke the agent. The first message of each day carries its date and time, and your newest message carries the current time. Batshit adds nothing else to the messages: no message IDs, session IDs, or model settings. If a message or a web page contains text that looks like one of these tags, Batshit disarms it (its `<` becomes `&lt;`), so it can't pretend to be you. The **Compiled Messages** section of the [Execution Viewer](../chat/execution-viewer.md) shows the result for recent runs.
 - **Zips.** Large tool output and long results are compressed to small references; the model only carries the full content when it's actually needed. See [Zips](../tools/zips.md).
 - **Clips.** Files and images are stored once and referenced, and images reach the model as structured image input — never as raw bytes pasted into prompt text. See [Clips](../clips/overview.md).
 - **Dynamic Tool Search.** Only a small, stable set of native tools is described in every request. Every other tool — MCP, CLI Tools, Artifacts, Fabric — is discovered on demand through a search-and-use contract, so thousands of tokens of tool schemas don't ride along on every message. See [Tools](../tools/overview.md).
@@ -37,7 +37,7 @@ These are why a Batshit request is already smaller and steadier before caching d
 Once the front of a request is genuinely stable, providers that support prompt caching can reuse it. Batshit makes `API` Primary Agent requests cache-friendly by default and adds the right provider-specific decoration at the transport edge — you don't hand-fill provider fields:
 
 - **OpenAI** caches automatically on recent models. Batshit attaches a stable cache key so repeated sends route to the same cached prefix.
-- **Anthropic** uses an explicit cache marker. Batshit places it on the stable system block, so the first eligible send writes the cache and later sends read it.
+- **Anthropic** uses an explicit cache marker. Batshit places it on the stable system block, so the first eligible send writes the cache and later sends read it. When one reply takes several tool steps, Batshit also turns on Anthropic's moving cache point from the second step on, so each step reads the step before it from the cache. API Subagents and Workers on their parent's model get it too.
 - **Gemini** caches implicitly on recent models once the stable prefix is large enough. Batshit keeps the prefix in the right order and reads the cache-hit counts back into its own usage numbers.
 - **OpenRouter** keeps a conversation on the same provider endpoint (sticky routing) and passes per-message cache markers where the underlying provider needs them.
 - **Vercel AI Gateway** can cache automatically; Batshit turns that on for gateway-routed models and leaves implicit-cache providers alone.

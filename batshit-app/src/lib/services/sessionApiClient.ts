@@ -48,16 +48,6 @@ export class SessionApiClient extends RedisStoreBase {
     })
   }
 
-  async touchSession(sessionId: string): Promise<void> {
-    try {
-      await this.updateSession(sessionId, {
-        last_modified_at: new Date().toISOString()
-      })
-    } catch (error) {
-      console.error('Failed to touch session:', error)
-    }
-  }
-
 }
 
 export const sessionApiClient = new SessionApiClient()

@@ -1,5 +1,5 @@
 /**
- * SA-120 Jev Juice — shared types for the TypeSafe System One (Jev) integration.
+ * SA-120 Judge Juice — shared types for the TypeSafe System One (Jev) integration.
  *
  * Jev is a non-generative cloud judgment model: code sends a `state` plus typed
  * questions and gets calibrated probabilities back. It never writes text and is
@@ -11,6 +11,10 @@
 
 /** The API-key service id under which the TypeSafe key is stored (`api_keys:{userId}:typesafe`). */
 export const TYPESAFE_KEY_SERVICE = 'typesafe' as const
+/** SA-120 P10a (DL-120-18): the Cloudflare API token a `cloudflare` judge sends (`api_keys:{userId}:cloudflare_workers_ai`). */
+export const CLOUDFLARE_WORKERS_AI_KEY_SERVICE = 'cloudflare_workers_ai' as const
+/** SA-120 P10a: the one key a `systemone_url` judge sends when its record says `sendsKey` (Liquid AI, for one). */
+export const SYSTEMONE_URL_KEY_SERVICE = 'systemone_url' as const
 
 export type TypesafeCallStatus = 'ok' | 'unavailable' | 'error'
 
@@ -24,6 +28,14 @@ export type TypesafeUnavailableReason =
   | 'rate_limited'
   | 'network'
   | 'aborted'
+  /** SA-120 P10a: the judge chosen for this feature is missing or not set up (no URL, no account, a deleted judge). */
+  | 'no_provider'
+  /**
+   * SA-120 P10a: the request does not fit the chosen judge's limits (questions, Choice options, or the input-token
+   * estimate), so Batshit sent nothing; or the judge itself said its input was cut (a 422 `STATE_TRUNCATED`).
+   * Batshit never truncates a request and never splits a Choice across requests.
+   */
+  | 'provider_limit'
 
 /**
  * The vendor answered, but not with an answer Batshit can use — or (`local_error`, SA-120
@@ -47,6 +59,17 @@ export interface TypesafeCallRecord {
   feature: string
   /** The model id the vendor reported, or the requested id when no answer came back. */
   model: string | null
+  /**
+   * SA-120 P10a (DL-120-18): the judge provider this call went to (or would have gone to). Absent on rows written
+   * before P10a, which were all TypeSafe, and on a denial that never found a provider (`no_provider`).
+   */
+  provider?: JudgeProviderRef
+  /**
+   * SA-120 P10a review round 1 (S5): on a `no_provider` denial, the judge id the feature's choice (or the default)
+   * named although no usable judge has it (a deleted judge, or the damaged-choice marker). The row then reads
+   * "No judge", never Jev.
+   */
+  chosenProviderId?: string
   latencyMs: number
   usage: TypesafeUsage | null
   deadlineHit: boolean
@@ -69,9 +92,11 @@ export interface TypesafeCallRecord {
  */
 export interface JevJuiceNote {
   feature: string
-  status: 'unavailable' | 'error'
-  reason: TypesafeCallReason
+  status: 'unavailable' | 'error' | 'not_applied'
+  reason: TypesafeCallReason | 'receipt_not_saved'
   at: string
+  /** SA-120 P10a: the judge the call went to, so the chip's tooltip names it. Absent on notes written before P10a (TypeSafe). */
+  provider?: JudgeProviderRef
 }
 
 /**
@@ -196,7 +221,7 @@ export interface UntrustedTextFinding {
 export interface UntrustedTextScreen {
   version: 1
   source: UntrustedTextSource
-  /** `skipped` means Jev Juice could not run (DL-120-02: said on screen, never hidden). */
+  /** `skipped` means Judge Juice could not run (DL-120-02: said on screen, never hidden). */
   status: 'flagged' | 'no_flag' | 'skipped'
   at: string
   /** `flagged` only: the questions at or over their floor, surest first. */
@@ -223,7 +248,71 @@ export interface JevJuiceMessageMetadata {
   zips?: JevJuiceZipChanges
 }
 
-/** Instance-level configuration stored at `batshit:typesafe_config` (the Settings → Admin → Jev Juice card). */
+/**
+ * SA-120 P10a (DL-120-18): the decision runtimes Judge Juice can ask. Only runtimes that already expose a
+ * Jev-compatible `POST /v1/systemone` join (Josh's "no hoops" rule); no loader or adapter is written for any other.
+ */
+export type JudgeProviderKind = 'typesafe' | 'ollama' | 'cloudflare' | 'systemone_url'
+
+/** Where a judge's request goes, for the "where your text goes" sentence. */
+export type JudgePrivacyClass = 'local' | 'lan' | 'cloud'
+
+/**
+ * One ADDED judge, stored in `batshit:typesafe_config.providers`. TypeSafe is not stored here: it is the one
+ * built-in judge (id `typesafe`), and its model is the record's own `modelId` (LS-048). No key is ever stored on
+ * this record: a key-bearing kind reads its key from `apiKeyService` per call.
+ */
+export interface JudgeProviderRecord {
+  /** Stable id the default and the per-feature choices point at. Never `typesafe`. */
+  id: string
+  kind: Exclude<JudgeProviderKind, 'typesafe'>
+  /** The user's name for it, shown in every list and in the Execution Viewer. */
+  label: string
+  /** `ollama` and `systemone_url`: the server's address; Batshit adds `/v1/systemone`. */
+  baseUrl?: string
+  /** `cloudflare`: the Cloudflare account id in the Workers AI path. */
+  accountId?: string
+  /** `ollama`: a tag that reports the `decision` capability; `cloudflare`: `clef` or `clef-flash`; `systemone_url`: as the server names it. */
+  modelId: string
+  /** `systemone_url` only: send the saved System One URL key as a bearer token (a hosted service such as Liquid AI). */
+  sendsKey?: boolean
+}
+
+/** A judge as the access rule sees it: the built-in TypeSafe judge or one added record. */
+export interface JudgeProvider {
+  id: string
+  kind: JudgeProviderKind
+  label: string
+  modelId: string
+  baseUrl?: string
+  accountId?: string
+  sendsKey?: boolean
+}
+
+/** What an Execution Viewer row and a note keep about the judge. */
+export interface JudgeProviderRef {
+  id: string
+  kind: JudgeProviderKind
+  label: string
+}
+
+/**
+ * The feature ids a judge can be chosen for, one per lane (the `TYPESAFE_FEATURES` ids minus the connection test).
+ * Kept here, not derived from the registry, so the browser card and the server validator share one list.
+ */
+export type JudgeLaneId =
+  | 'skill_tool_hints'
+  | 'judge_ask'
+  | 'group_speaker'
+  | 'memory_rerank'
+  | 'memory_recall'
+  | 'smart_zip'
+  | 'reply_check'
+  | 'style_coach'
+  | 'untrusted_text'
+  | 'quick_actions'
+
+/** Instance-level configuration stored at `batshit:typesafe_config` (the Settings → Admin → Judge Juice card). */
 export interface TypesafeConfig {
   /** The master switch. OFF means no feature calls TypeSafe, whatever its own switch says (DL-120-01/11). */
   enabled: boolean
@@ -239,11 +328,20 @@ export interface TypesafeConfig {
    */
   inChatWaitMs: number
   /**
-   * SA-120 P7: the feature switch **Screen Incoming Text** (on the Jev Juice card) (LS-057), default OFF. It
+   * SA-120 P7: the feature switch **Screen Incoming Text** (on the Judge Juice card) (LS-057), default OFF. It
    * lives here because the lane spans agent DMs, wake-up webhooks, and skill imports, and no
    * other record owns all three. THE reader is `resolveJevIncomingTextScreenEnabled`.
    */
   screenIncomingText: boolean
+  /**
+   * SA-120 P10a (DL-120-18): the judges the user ADDED (Ollama, Cloudflare Workers AI, any System One URL). Empty
+   * on every record written before P10a, which therefore reads exactly as before: TypeSafe only.
+   */
+  providers: JudgeProviderRecord[]
+  /** The judge every feature uses unless it has its own choice. `typesafe` by default (the shipped default). */
+  defaultProviderId: string
+  /** A feature's own judge, by feature id. Absent means the default. */
+  laneProviders: Partial<Record<JudgeLaneId, string>>
   updatedAt: string | null
 }
 

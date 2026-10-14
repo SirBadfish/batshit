@@ -106,7 +106,7 @@
   }
 
   .dm-inbox-trigger:hover {
-    background: color-mix(in oklab, var(--primary) 16%, transparent);
+    background: var(--bs-app-primary-faint);
   }
 
   .dm-inbox-trigger:focus-visible {
@@ -130,7 +130,7 @@
     justify-content: center;
     border: 1px solid var(--background);
     border-radius: 999px;
-    background: color-mix(in oklab, var(--primary) 82%, var(--foreground));
+    background: color-mix(in oklab, var(--primary-text) 82%, var(--foreground));
     padding: 0 3px;
     color: var(--background);
     font-size: 0.625rem;

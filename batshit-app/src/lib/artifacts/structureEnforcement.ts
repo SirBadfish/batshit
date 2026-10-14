@@ -6,6 +6,8 @@ export type ArtifactStructureIssueCode =
   | 'BUILDER_KIT_REQUIRED'
   | 'FABRIC_RUNTIME_REQUIRED'
   | 'FABRIC_BINDINGS_REQUIRED'
+  // Server-only (BL-89): artifactFieldNames.ts compares a save with the artifact's saved versions.
+  | 'FIELD_NAME_REQUIRED'
 
 export type ArtifactStructureValidationIssue = {
   code: ArtifactStructureIssueCode

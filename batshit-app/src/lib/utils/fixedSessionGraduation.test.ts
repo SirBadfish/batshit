@@ -3,6 +3,7 @@ import type { Message } from '$lib/stores/messages.svelte'
 import {
   applyFixedSessionGraduationToMessages,
   createFixedSessionGraduationSummaryMessage,
+  describeNapEndedEarly,
   getFixedSessionGraduationState,
   getFixedSessionNapRecords,
   getGraduatedMessageIds,
@@ -142,5 +143,26 @@ describe('fixedSessionGraduation (SA-104 P6)', () => {
         fixedSession: { naps: [{ id: 'n1', at: '2026-06-10T12:00:00.000Z', status: 'completed' }, 'junk'] }
       })
     ).toHaveLength(1)
+  })
+
+  describe('describeNapEndedEarly (BL-549 N6)', () => {
+    it('tells a pressed nap that stopped because a message arrived', () => {
+      expect(describeNapEndedEarly('manual', 'turn_started')).toBe(
+        'Nap stopped: you sent a message. It runs again after the reply.'
+      )
+    })
+
+    it('says nothing for a pressed nap that ended because the chat is gone', () => {
+      expect(describeNapEndedEarly('manual', 'chat_deleted')).toBeNull()
+    })
+
+    it('says nothing for the idle auto-nap, whatever the reason', () => {
+      expect(describeNapEndedEarly('threshold', 'turn_started')).toBeNull()
+      expect(describeNapEndedEarly('threshold', 'chat_deleted')).toBeNull()
+    })
+
+    it('says nothing when there is no ended-early reason', () => {
+      expect(describeNapEndedEarly('manual', undefined)).toBeNull()
+    })
   })
 })

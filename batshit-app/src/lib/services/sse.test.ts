@@ -168,4 +168,50 @@ describe('SSEService over the live hub', () => {
     last().status('open')
     expect(service.isConnected()).toBe(true)
   })
+
+  /**
+   * BL-382: the server replays only a chat's LIVE turn to a listener added again, and a finished
+   * turn's buffer goes 5 s after its `end`, so a tab that was away longer missed it. Every `open`
+   * after the first one means the server added this listener again, and the page re-reads the chat.
+   */
+  it('says "added again" once per return: not on the first open, once after a drop', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const service = new SSEService('session-1')
+    const onReconnect = vi.fn()
+    const connecting = service.connect(() => {}, () => {}, onReconnect)
+    last().status('open')
+    await connecting
+    expect(onReconnect).not.toHaveBeenCalled()
+
+    last().status('down')
+    expect(onReconnect).not.toHaveBeenCalled()
+    last().status('open')
+    expect(onReconnect).toHaveBeenCalledOnce()
+
+    last().status('down')
+    last().status('open')
+    expect(onReconnect).toHaveBeenCalledTimes(2)
+  })
+
+  it('says "added again" when the hub re-adds a silent tab (a second open with no down)', async () => {
+    const service = new SSEService('session-1')
+    const onReconnect = vi.fn()
+    const connecting = service.connect(() => {}, () => {}, onReconnect)
+    last().status('open')
+    await connecting
+    last().status('open')
+    expect(onReconnect).toHaveBeenCalledOnce()
+  })
+
+  it('never says it for a subscription it has let go of', async () => {
+    const service = new SSEService('session-1')
+    const onReconnect = vi.fn()
+    const connecting = service.connect(() => {}, () => {}, onReconnect)
+    const first = last()
+    first.status('open')
+    await connecting
+    service.disconnect()
+    first.status('open')
+    expect(onReconnect).not.toHaveBeenCalled()
+  })
 })

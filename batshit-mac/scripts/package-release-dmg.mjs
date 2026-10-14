@@ -4,6 +4,7 @@ import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { shouldIgnoreNonCodeSigningPath } from './managed-runtime-portability.mjs';
+import { releaseArtifactBaseName } from './release-artifact-name.mjs';
 
 import { sign } from '@electron/osx-sign';
 
@@ -11,7 +12,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const macRoot = resolve(__dirname, '..');
 const packageRoot = resolve(macRoot, 'electron-out', 'package');
 const defaultAppPath = join(packageRoot, 'Batshit.app');
-const defaultDmgPath = join(packageRoot, 'Batshit-0.1.0-macos-ReleaseSafe.dmg');
+const defaultDmgPath = join(packageRoot, `${releaseArtifactBaseName()}.dmg`);
 const defaultStagingRoot = join(packageRoot, 'release-dmg-staging');
 const entitlementsPath = join(macRoot, 'macos.entitlements');
 const childEntitlementsPath = join(macRoot, 'macos.child.entitlements');
@@ -23,8 +24,8 @@ function usage() {
 Create a signed, notarized Batshit DMG for public Mac distribution.
 
 Options:
-  --app <path>              Source .app bundle. Defaults to ReleaseSafe package output.
-  --out <path>              Output .dmg path. Defaults to ReleaseSafe package output.
+  --app <path>              Source .app bundle. Defaults to electron-out/package/Batshit.app.
+  --out <path>              Output .dmg path. Defaults to electron-out/package/Batshit-<version>-arm64.dmg.
   --identity <name>         Developer ID Application signing identity.
                             Defaults to BATSHIT_MAC_SIGN_IDENTITY or auto-detect.
   --notary-profile <name>   xcrun notarytool keychain profile.
@@ -198,7 +199,7 @@ async function signAppBundle(appPath, identity) {
     preAutoEntitlements: false,
     preEmbedProvisioningProfile: false,
     strictVerify: true,
-    version: '43.3.0',
+    version: '43.7.10',
     optionsForFile(filePath) {
       if (filePath === appPath || filePath === mainExecutable) {
         return { entitlements: entitlementsPath, hardenedRuntime: true };

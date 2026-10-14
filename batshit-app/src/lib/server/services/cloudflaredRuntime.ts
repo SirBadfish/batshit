@@ -1,9 +1,15 @@
 import { spawn, type ChildProcess } from 'node:child_process'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 
 export const CLOUDFLARED_ASSETS = {
+  'darwin-arm64': {
+    assetName: 'cloudflared-darwin-arm64.tgz',
+    binaryName: 'cloudflared',
+    archiveType: 'tgz',
+    sha256: '2aae4f69b0fc1c671b8353b4f594cbd902cd1e360c8eed2b8cad4602cb1546fb'
+  },
   'darwin-x64': {
     assetName: 'cloudflared-darwin-amd64.tgz',
     binaryName: 'cloudflared',
@@ -150,6 +156,24 @@ type InFlightTunnelStart = {
 // of each spawning their own cloudflared process and orphaning all but the
 // last one from the app's point of view.
 let inFlightTunnelStart: InFlightTunnelStart | null = null
+const runtimeMutations = new Set<string>()
+
+async function withCloudflaredRuntimeMutation<T>(operation: (installDir: string) => Promise<T>): Promise<T> {
+  const installDir = resolveCloudflaredInstallDir()
+  if (runtimeMutations.has(installDir)) {
+    throw new Error('Cloudflared installation or removal is already in progress. Wait for that operation to finish.')
+  }
+  runtimeMutations.add(installDir)
+  try {
+    const previousDir = `${installDir}.previous`
+    if (await exists(previousDir)) {
+      throw new Error(`Cloudflared recovery is required before another installation or removal. Previous installation retained at ${previousDir}.`)
+    }
+    return await operation(installDir)
+  } finally {
+    runtimeMutations.delete(installDir)
+  }
+}
 
 function appendWithLimit(current: string, chunk: string, maxChars: number) {
   if (!chunk) return { text: current, truncated: false }
@@ -269,9 +293,13 @@ function resolveManifestPath(installDir = resolveCloudflaredInstallDir()) {
   return path.join(installDir, 'manifest.json')
 }
 
-function resolveServerPlatform(): CloudflaredInstallPlatform {
-  if (process.platform === 'win32') return 'windows-x64'
-  if (process.platform === 'linux') return 'linux-x64'
+export function resolveCloudflaredInstallPlatform(
+  platform: NodeJS.Platform = process.platform,
+  architecture: string = process.arch
+): CloudflaredInstallPlatform {
+  if (platform === 'win32') return 'windows-x64'
+  if (platform === 'linux') return 'linux-x64'
+  if (architecture === 'arm64') return 'darwin-arm64'
   return 'darwin-x64'
 }
 
@@ -462,7 +490,8 @@ async function checkAvailability(): Promise<{
     }
   }
 
-  let lastError: string | null = null
+  let launchError: string | null = null
+  let missingError: string | null = null
 
   for (const command of candidates) {
     try {
@@ -480,21 +509,31 @@ async function checkAvailability(): Promise<{
           version: normalizeVersionText(versionRaw) ?? (versionRaw || 'unknown')
         }
       }
-      lastError = probe.stderr.trim() || `cloudflared exited with code ${probe.exitCode ?? 'unknown'}`
+      launchError ??= `Unable to run Cloudflared (${command}): ${probe.stderr.trim() || `cloudflared exited with code ${probe.exitCode ?? 'unknown'}`}`
     } catch (error) {
       const maybeError = error as NodeJS.ErrnoException
       if (maybeError?.code === 'ENOENT') {
-        lastError = `Command not found: ${command}`
+        missingError = `Command not found: ${command}`
         continue
       }
-      lastError = maybeError?.message || String(error)
+      launchError ??= formatCloudflaredLaunchError(command, error)
     }
   }
 
   return {
     available: false,
-    reason: `${lastError || 'cloudflared is unavailable.'} ${CLOUDFLARED_INSTALL_HELP}`
+    reason: `${launchError || missingError || 'cloudflared is unavailable.'} ${CLOUDFLARED_INSTALL_HELP}`
   }
+}
+
+function formatCloudflaredLaunchError(command: string, error: unknown): string {
+  const launchError = error as NodeJS.ErrnoException
+  // macOS EBADARCH is surfaced by Node as the otherwise opaque errno -86.
+  if (process.platform === 'darwin' && launchError?.errno === -86) {
+    const platform = process.arch === 'arm64' ? 'macOS (Apple Silicon/arm64)' : 'macOS (Intel/x64)'
+    return `Cloudflared (${command}) cannot run on this Mac: wrong CPU architecture. Select ${platform} in Admin and reinstall.`
+  }
+  return `Unable to run Cloudflared (${command}): ${launchError?.message || String(error)}`
 }
 
 function tunnelProcessAlive() {
@@ -642,7 +681,7 @@ export async function getCloudflaredRuntimeStatus(): Promise<CloudflaredRuntimeS
     managedInstallPresent: Boolean(managedBinaryPath),
     installCommand: 'Use the Admin installer',
     installHelp: CLOUDFLARED_INSTALL_HELP,
-    defaultPlatform: resolveServerPlatform(),
+    defaultPlatform: resolveCloudflaredInstallPlatform(),
     manifest: manifest ?? null,
     tunnel: getManagedTunnelStatus(),
     dockerSidecar: null
@@ -660,20 +699,27 @@ async function extractArchive(archivePath: string, destination: string) {
   }
 }
 
-async function resolveInstalledVersion(command: string): Promise<string | null> {
+async function verifyInstalledVersion(command: string): Promise<string> {
+  let probe: ProcessRunResult
   try {
-    const probe = await runProcess({
+    probe = await runProcess({
       command,
       args: ['--version'],
       timeoutMs: 5_000,
       maxOutputChars: 4_096
     })
-    if (probe.exitCode !== 0) return null
-    const raw = probe.stdout.trim() || probe.stderr.trim()
-    return normalizeVersionText(raw) ?? (raw || null)
-  } catch {
-    return null
+  } catch (error) {
+    throw new Error(formatCloudflaredLaunchError(command, error))
   }
+  if (probe.timedOut || probe.exitCode !== 0) {
+    throw new Error(`Cloudflared install verification failed: ${probe.timedOut ? 'version check timed out' : probe.stderr.trim() || `exited with code ${probe.exitCode ?? 'unknown'}`}`)
+  }
+  const raw = probe.stdout.trim() || probe.stderr.trim()
+  const version = raw.match(/cloudflared\s+version\s+([^\s]+)/i)?.[1]
+  if (version !== CLOUDFLARED_RELEASE_TAG) {
+    throw new Error(`Cloudflared install verification failed: expected version ${CLOUDFLARED_RELEASE_TAG}, got ${version || 'unrecognized version output'}.`)
+  }
+  return version
 }
 
 export async function installCloudflaredRuntime(platform: CloudflaredInstallPlatform): Promise<CloudflaredRuntimeStatus> {
@@ -681,18 +727,21 @@ export async function installCloudflaredRuntime(platform: CloudflaredInstallPlat
     return await getCloudflaredRuntimeStatus()
   }
 
-  const asset = CLOUDFLARED_ASSETS[platform]
-  if (!asset) {
+  if (!Object.hasOwn(CLOUDFLARED_ASSETS, platform)) {
     return {
       ...(await getCloudflaredRuntimeStatus()),
       installed: false,
       reason: 'Invalid cloudflared install platform.'
     }
   }
+  return await withCloudflaredRuntimeMutation((installDir) => installVerifiedCloudflaredRuntime(platform, installDir))
+}
 
-  const installDir = resolveCloudflaredInstallDir()
-  const stagingDir = `${installDir}.tmp-${Date.now()}`
-  await fs.rm(stagingDir, { recursive: true, force: true })
+async function installVerifiedCloudflaredRuntime(platform: CloudflaredInstallPlatform, installDir: string): Promise<CloudflaredRuntimeStatus> {
+  const asset = CLOUDFLARED_ASSETS[platform]
+  const stagingDir = `${installDir}.tmp-${randomUUID()}`
+  const previousDir = `${installDir}.previous`
+  let retainStagingForRecovery = false
   await fs.mkdir(stagingDir, { recursive: true })
 
   try {
@@ -717,7 +766,8 @@ export async function installCloudflaredRuntime(platform: CloudflaredInstallPlat
       }
     }
 
-    const targetPath = path.join(stagingDir, asset.assetName)
+    // Archives retain their release filename for extraction; raw assets are the executable itself.
+    const targetPath = path.join(stagingDir, asset.archiveType === 'tgz' ? asset.assetName : asset.binaryName)
     // The downloaded asset is verified against the pinned SHA-256 above before this private staging write.
     // codeql[js/http-to-file-access]
     await fs.writeFile(targetPath, data)
@@ -741,7 +791,7 @@ export async function installCloudflaredRuntime(platform: CloudflaredInstallPlat
     }
 
     const installedAt = new Date().toISOString()
-    const version = (await resolveInstalledVersion(binaryPath)) ?? CLOUDFLARED_RELEASE_TAG
+    const version = await verifyInstalledVersion(binaryPath)
     const manifest: CloudflaredManifest = {
       version,
       platform,
@@ -759,8 +809,35 @@ export async function installCloudflaredRuntime(platform: CloudflaredInstallPlat
     }
     await fs.writeFile(resolveManifestPath(stagingDir), JSON.stringify(manifest, null, 2))
 
-    await fs.rm(installDir, { recursive: true, force: true })
-    await fs.rename(stagingDir, installDir)
+    let movedPrevious = false
+    try {
+      await fs.rename(installDir, previousDir)
+      movedPrevious = true
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error
+    }
+
+    try {
+      await fs.rename(stagingDir, installDir)
+    } catch (publishError) {
+      if (movedPrevious) {
+        try {
+          await fs.rename(previousDir, installDir)
+        } catch (rollbackError) {
+          retainStagingForRecovery = true
+          throw new Error(`Cloudflared publication failed (${String(publishError)}) and restoring the previous installation failed (${String(rollbackError)}). Recovery required: previous installation retained at ${previousDir}; verified replacement retained at ${stagingDir}.`)
+        }
+      }
+      throw new Error(`Cloudflared publication failed: ${String(publishError)}. ${movedPrevious ? 'The previous installation was restored.' : 'No previous installation was changed.'}`)
+    }
+
+    if (movedPrevious) {
+      try {
+        await fs.rm(previousDir, { recursive: true, force: true })
+      } catch (error) {
+        throw new Error(`Cloudflared was installed, but removing the previous installation failed (${String(error)}). Previous files retained at ${previousDir}; recovery required before another installation or removal.`)
+      }
+    }
 
     const status = await getCloudflaredRuntimeStatus()
     return {
@@ -769,7 +846,9 @@ export async function installCloudflaredRuntime(platform: CloudflaredInstallPlat
       reason: status.installed ? null : status.reason
     }
   } finally {
-    await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => {})
+    if (!retainStagingForRecovery) {
+      await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => {})
+    }
   }
 }
 
@@ -793,32 +872,34 @@ export async function uninstallCloudflaredRuntime(): Promise<{
     }
   }
 
-  const managedBinaryBefore = await resolveManagedBinaryPath()
-  await stopManagedCloudflaredTunnel()
-  try {
-    await fs.rm(resolveCloudflaredInstallDir(), { recursive: true, force: true })
-  } catch {
-    // best effort
-  }
+  return await withCloudflaredRuntimeMutation(async (installDir) => {
+    const managedBinaryBefore = await resolveManagedBinaryPath()
+    await stopManagedCloudflaredTunnel()
+    try {
+      await fs.rm(installDir, { recursive: true, force: true })
+    } catch {
+      // best effort
+    }
 
-  const managedBinaryAfter = await resolveManagedBinaryPath()
-  const status = await getCloudflaredRuntimeStatus()
-  const removedManagedInstall = Boolean(managedBinaryBefore) && !managedBinaryAfter
-  const uninstalled = removedManagedInstall || !status.installed
-  const reason =
-    status.installed && removedManagedInstall
-      ? 'Batshit-managed Cloudflared was removed. A system-managed cloudflared is still available on PATH.'
-      : status.installed && !removedManagedInstall
-        ? 'Cloudflared is installed outside Batshit (system-managed). Admin uninstall only removes the Batshit-managed runtime.'
-        : null
-  return {
-    uninstalled,
-    supported: status.supported,
-    dockerUnsupported: status.dockerUnsupported,
-    removedManagedInstall,
-    reason,
-    status
-  }
+    const managedBinaryAfter = await resolveManagedBinaryPath()
+    const status = await getCloudflaredRuntimeStatus()
+    const removedManagedInstall = Boolean(managedBinaryBefore) && !managedBinaryAfter
+    const uninstalled = removedManagedInstall || !status.installed
+    const reason =
+      status.installed && removedManagedInstall
+        ? 'Batshit-managed Cloudflared was removed. A system-managed cloudflared is still available on PATH.'
+        : status.installed && !removedManagedInstall
+          ? 'Cloudflared is installed outside Batshit (system-managed). Admin uninstall only removes the Batshit-managed runtime.'
+          : null
+    return {
+      uninstalled,
+      supported: status.supported,
+      dockerUnsupported: status.dockerUnsupported,
+      removedManagedInstall,
+      reason,
+      status
+    }
+  })
 }
 
 export async function startManagedCloudflaredTunnel(options?: {

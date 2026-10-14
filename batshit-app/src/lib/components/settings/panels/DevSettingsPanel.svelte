@@ -4,6 +4,7 @@
   import { Button } from '$lib/components/ui/button'
   import { Badge } from '$lib/components/ui/badge'
   import * as Collapsible from '$lib/components/ui/collapsible'
+  import * as Switch from '$lib/components/ui/switch'
   import { Textarea } from '$lib/components/ui/textarea'
   import { toast } from '$lib/components/ui/sonner/settings-toast'
   import SystemPromptEditor from '$lib/components/settings/SystemPromptEditor.svelte'
@@ -23,6 +24,8 @@
   import type { CatalogSyncReportIndexEntry, CatalogSyncStoredReport } from '$lib/types/modelCatalogSyncReport'
   import type { CompatibilityMatrixSnapshot } from '$lib/types/compatibilityMatrix'
   import { copyTextToClipboard } from '$lib/utils/clipboard'
+  import { dispatchModelConnectionsUpdated } from '$lib/utils/liveSettingsEvents'
+  import { PAUSED_PLANS } from '$lib/data/pausedPlans'
 
   type CatalogReadinessPayload = {
     ready: boolean
@@ -125,7 +128,46 @@
   let matrixError = $state<string | null>(null)
 
 
+  // Plan pause (section 3a): "Use paused plans on this copy". The server owns
+  // the value; this card only shows it and asks the server to change it.
+  let usePausedPlans = $state<boolean | null>(null)
+  let pausedPlansSaving = $state(false)
+  let pausedPlansError = $state<string | null>(null)
+
+  async function loadPausedPlansSwitch() {
+    pausedPlansError = null
+    try {
+      const response = await fetch('/api/admin/paused-plans')
+      const payload = await response.json().catch(() => null)
+      if (!response.ok) throw new Error(payload?.error || 'Failed to load the paused plans switch')
+      usePausedPlans = payload?.usePausedPlans === true
+    } catch (error) {
+      pausedPlansError = error instanceof Error ? error.message : 'Failed to load the paused plans switch'
+    }
+  }
+
+  async function savePausedPlansSwitch(next: boolean) {
+    pausedPlansSaving = true
+    pausedPlansError = null
+    try {
+      const response = await fetch('/api/admin/paused-plans', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ usePausedPlans: next })
+      })
+      const payload = await response.json().catch(() => null)
+      if (!response.ok) throw new Error(payload?.error || 'Failed to save the paused plans switch')
+      usePausedPlans = payload?.usePausedPlans === true
+      dispatchModelConnectionsUpdated('paused-plans')
+    } catch (error) {
+      pausedPlansError = error instanceof Error ? error.message : 'Failed to save the paused plans switch'
+    } finally {
+      pausedPlansSaving = false
+    }
+  }
+
   onMount(async () => {
+    void loadPausedPlansSwitch()
     await loadSystemClips()
     if (isRegistryAdmin) {
       await loadCatalogReadiness()
@@ -518,6 +560,39 @@
 
 <div class="batshit-settings-surface">
 <div class="space-y-4">
+  <Card.Root class="batshit-settings-card batshit-settings-card-default">
+    <Card.Header>
+      <Card.Title class="flex items-center gap-2">
+        <Database class="h-4 w-4" />
+        Paused plans
+      </Card.Title>
+      <Card.Description>
+        {PAUSED_PLANS.map((plan) => plan.label).join(', ')} are paused on every copy of Batshit until
+        their seller lists Batshit. This copy can use them anyway. The seller's rule still applies to
+        your own plan account.
+      </Card.Description>
+    </Card.Header>
+    <Card.Content class="space-y-3">
+      <div class="batshit-settings-toggle-row">
+        <div class="batshit-settings-form-copy">
+          <p class="batshit-settings-form-label">Use paused plans on this copy</p>
+          <p class="batshit-settings-form-help">
+            Only this copy. A backup does not carry this switch to another copy.
+          </p>
+        </div>
+        <Switch.Root
+          checked={usePausedPlans === true}
+          disabled={usePausedPlans === null || pausedPlansSaving}
+          onCheckedChange={(checked) => savePausedPlansSwitch(checked)}
+          aria-label="Use paused plans on this copy"
+        />
+      </div>
+      {#if pausedPlansError}
+        <div class="text-sm text-destructive">{pausedPlansError}</div>
+      {/if}
+    </Card.Content>
+  </Card.Root>
+
   <Card.Root class="batshit-settings-card batshit-settings-card-default">
     <Card.Header>
       <Card.Title class="flex items-center gap-2">

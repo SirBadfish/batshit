@@ -51,6 +51,7 @@ import {
   type DmSteerFallback
 } from '$lib/utils/dmControl'
 import { normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
+import { describeDmFires } from '$lib/utils/dmRoster'
 import { SCHEDULE_TICK_MS, describeNextRun } from '$lib/utils/scheduleControl'
 import type { ScheduleRecord } from '$lib/types/schedule'
 import {
@@ -64,10 +65,12 @@ import {
 } from '$lib/types/dm'
 import {
   acknowledgeInfoDm,
+  buildDmNotFoundError,
   claimDm,
   closeDm,
   createDm,
   DmStoreError,
+  fileScheduleDm,
   getDm,
   linkResultDm,
   listInbox,
@@ -350,7 +353,7 @@ async function resolveRecipientState(
 }
 
 /* ------------------------------------------------------------------ *
- * SA-120 P7 — the Jev Juice incoming-text screen
+ * SA-120 P7 — the Judge Juice incoming-text screen
  * ------------------------------------------------------------------ */
 
 /**
@@ -363,7 +366,7 @@ async function resolveRecipientState(
  * makes a second call. Two kinds of text are NOT screened: a schedule's message, which the
  * user wrote, and the fixed "expired unclaimed" report, which Batshit wrote.
  *
- * With **Screen Incoming Text** (on the Jev Juice card) off this returns `null` having read one config
+ * With **Screen Incoming Text** (on the Judge Juice card) off this returns `null` having read one config
  * record and nothing else: no call, no stamp, a DM record byte-identical to today's.
  *
  * ADVISORY ONLY (DL-120-12). The return value is for evidence and for the badge. No caller may
@@ -399,7 +402,7 @@ export async function screenIncomingDms(
     }
     return screen
   } catch (error) {
-    console.warn('[Jev Juice] Could not screen or stamp an incoming DM; it is delivered unscreened:', error)
+    console.warn('[Judge Juice] Could not screen or stamp an incoming DM; it is delivered unscreened:', error)
     return null
   }
 }
@@ -981,7 +984,7 @@ async function resolveResultTarget(
 export async function listDmsOp(
   context: DmToolContext,
   input?: { include_done?: boolean }
-): Promise<{ open: DmSummary[]; total_open: number }> {
+): Promise<{ open: Array<DmSummary & { fired?: string }>; total_open: number }> {
   await requireDmEnabledAgent(context.userId, context.agentId)
   // Settle off the FULL reaped set, then narrow for the reply.
   //
@@ -994,7 +997,12 @@ export async function listDmsOp(
   const records =
     input?.include_done === true ? all : all.filter((record) => isOpenDmStatus(record.status))
   return {
-    open: records.map(toDmSummary),
+    // BL-401 S3: a schedule note that fired more than once also says so in words, in the same
+    // zone and phrase as its roster line; the three raw fields ride in the summary itself.
+    open: records.map((record) => {
+      const fired = describeDmFires(record)
+      return { ...toDmSummary(record), ...(fired ? { fired } : {}) }
+    }),
     total_open: records.filter((record) => record.status === 'new' || record.status === 'working')
       .length
   }
@@ -1008,7 +1016,13 @@ export async function readDmOp(
   await requireDmEnabledAgent(context.userId, context.agentId)
   const record = await runStore(async () => {
     const found = await getDm(input.dm_id)
-    if (!found || found.to !== context.agentId) {
+    // BL-40: "does not exist" and "is somebody else's" are two different answers, in that
+    // order, exactly as the store's own `requireOwnedDm` gives them to claim and close. Folding
+    // them told an agent holding a mistyped or invented id that it had a permissions problem.
+    // Telling them apart reveals nothing new: claim and close already answer both ways, and a
+    // DM id (`dm_<ms>_<6 hex>`) cannot be guessed, only already known.
+    if (!found) throw buildDmNotFoundError(input.dm_id)
+    if (found.to !== context.agentId) {
       throw new DmStoreError(
         `DM "${input.dm_id}" is not in your inbox.`,
         'not_recipient',
@@ -1106,6 +1120,18 @@ async function fireWakeCallback(
   return status
 }
 
+/**
+ * BL-401 S5 (review finding 1) — may this assignment's report skip the open-item cap?
+ *
+ * Only when it goes back to the agent that SENT the assignment: then the reports in one inbox
+ * are bounded by that agent's own assignments. `report_back_to` may name any DM-enabled agent,
+ * so without this check an agent could name a third agent on many assignments and every close
+ * or expiry would land in that agent's inbox with no limit.
+ */
+function reportsToItsOwnSender(record: DmRecord): boolean {
+  return record.from.kind === 'agent' && record.from.agentId === record.reportBackTo
+}
+
 async function reportBack(
   context: DmToolContext,
   agent: Record<string, any>,
@@ -1126,7 +1152,10 @@ async function reportBack(
       priority: record.priority,
       relatedDmId: record.id,
       deliver,
-      senderSessionId: context.sessionId ?? null
+      senderSessionId: context.sessionId ?? null,
+      // BL-401 S5: the one report of a closed assignment is never refused by a full inbox,
+      // but only when it goes back to the agent that sent the assignment.
+      assignmentReport: reportsToItsOwnSender(record)
     })
   } catch (error) {
     // The assignment IS closed; failing to deliver its result must be visible, not silent.
@@ -1203,7 +1232,10 @@ async function settleExpiredAssignments(
         subject: `Result: ${record.subject}`,
         body: `This assignment expired unclaimed on ${record.expiresAt}. Nobody picked it up.`,
         relatedDmId: record.id,
-        deliver: 'wait'
+        deliver: 'wait',
+        // BL-401 S5: this is the assignment's one report too, so a full inbox takes it when
+        // it goes back to the assignment's own sender.
+        assignmentReport: reportsToItsOwnSender(record)
       })
       await linkResultDm(record.id, created.id)
     } catch (error) {
@@ -1408,6 +1440,10 @@ export interface ScheduledDmResult {
  * just "May be woken" (AMD-113-05): a fire writes a DM, and an agent with DMs off has no
  * roster to see it in and no `sys.dm.*` tools to close it with.
  *
+ * **One unread note per schedule (BL-401).** A fire whose previous note is still unread
+ * updates that note and counts the fire on it, so `dmId` can be the same across fires: it
+ * names the note this fire wrote OR updated, and so does the schedule's `lastDmId`.
+ *
  * `chainDepth: 0` always. A clock starts a chain; it never continues one.
  */
 export async function deliverScheduledDm(
@@ -1435,8 +1471,10 @@ export async function deliverScheduledDm(
   }
 
   const now = options.now ?? new Date()
-  const record = await runStore(() =>
-    createDm({
+  // BL-401: a fire whose previous note is still unread updates that note instead of adding
+  // one (`fileScheduleDm`), so the rest of this function delivers whichever note it got.
+  const { record } = await runStore(() =>
+    fileScheduleDm({
       userId: schedule.userId,
       from: { kind: 'schedule', scheduleId: schedule.id, name: schedule.name },
       to: recipient.id,

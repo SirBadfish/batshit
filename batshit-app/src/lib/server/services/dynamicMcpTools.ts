@@ -141,6 +141,7 @@ async function loadGatewayToolsUncached(options: {
   userId: string
   agentId?: string | null
   agentMetadata?: Record<string, any> | null
+  mcpGatewayScope?: string[] | null
   selectedGateways?: string[]
   dcmDisplaySettings?: AgentDcmDisplaySettings | null
   projectPath?: string | null
@@ -148,7 +149,8 @@ async function loadGatewayToolsUncached(options: {
   const scopeResolution = await resolveDynamicMcpGatewayScope({
     userId: options.userId,
     agentId: options.agentId ?? null,
-    agentMetadata: options.agentMetadata ?? null,
+    agentMetadata: options.agentMetadata,
+    mcpGatewayScope: options.mcpGatewayScope,
     selectedGateways: normalizeStringArray(options.selectedGateways)
   })
 
@@ -201,6 +203,7 @@ export async function loadDynamicMcpGatewayTools(options: {
   userId: string
   agentId?: string | null
   agentMetadata?: Record<string, any> | null
+  mcpGatewayScope?: string[] | null
   selectedGateways?: string[]
   dcmDisplaySettings?: AgentDcmDisplaySettings | null
   projectPath?: string | null
@@ -210,7 +213,10 @@ export async function loadDynamicMcpGatewayTools(options: {
     ? JSON.stringify({
         userId: options.userId,
         agentId: options.agentId ?? null,
-        agentMetadata: options.agentMetadata ?? null,
+        // Undefined means an unscoped user-global caller; explicit null is a missing
+        // scoped actor and must not borrow that caller's cached discovery result.
+        agentMetadata: options.agentMetadata,
+        mcpGatewayScope: options.mcpGatewayScope,
         selectedGateways: normalizeStringArray(options.selectedGateways),
         dcmDisplaySettings: options.dcmDisplaySettings ?? null,
         projectPath: options.projectPath ?? null
@@ -240,6 +246,7 @@ export async function executeDynamicMcpFind(input: {
   userId: string
   agentId?: string | null
   agentMetadata?: Record<string, any> | null
+  mcpGatewayScope?: string[] | null
   query?: string
   tool?: string
   group?: string | string[]
@@ -265,7 +272,8 @@ export async function executeDynamicMcpFind(input: {
   const { tools, metadata } = await loadDynamicMcpGatewayTools({
     userId: input.userId,
     agentId: input.agentId ?? null,
-    agentMetadata: input.agentMetadata ?? null,
+    agentMetadata: input.agentMetadata,
+    mcpGatewayScope: input.mcpGatewayScope,
     selectedGateways: input.selectedGateways,
     dcmDisplaySettings: input.dcmDisplaySettings ?? null,
     projectPath: input.projectPath ?? null,
@@ -344,6 +352,7 @@ export async function executeDynamicMcpUse(input: {
   userId: string
   agentId?: string | null
   agentMetadata?: Record<string, any> | null
+  mcpGatewayScope?: string[] | null
   toolName: string
   params?: Record<string, any>
   selectedGateways?: string[]
@@ -351,6 +360,11 @@ export async function executeDynamicMcpUse(input: {
   projectPath?: string | null
   gatewayToolsCache?: GatewayToolsCache
   internalToolError?: string
+  /**
+   * BL-454: the reply's Stop. The gateway wrapper hands it to the MCP call and closes the
+   * client (and a STDIO gateway's process) on it; without it a stopped call ran to its timeout.
+   */
+  abortSignal?: AbortSignal | null
 }): Promise<Record<string, any>> {
   const toolName = input.toolName.trim()
   const params = input.params && typeof input.params === 'object' ? input.params : {}
@@ -367,7 +381,8 @@ export async function executeDynamicMcpUse(input: {
   const { tools, metadata } = await loadDynamicMcpGatewayTools({
     userId: input.userId,
     agentId: input.agentId ?? null,
-    agentMetadata: input.agentMetadata ?? null,
+    agentMetadata: input.agentMetadata,
+    mcpGatewayScope: input.mcpGatewayScope,
     selectedGateways: input.selectedGateways,
     dcmDisplaySettings: input.dcmDisplaySettings ?? null,
     projectPath: input.projectPath ?? null,
@@ -408,7 +423,8 @@ export async function executeDynamicMcpUse(input: {
     }
   }
 
-  const result = await execute(params)
+  // The AI SDK's tool-call options shape, so a wrapped gateway tool hears the Stop.
+  const result = await execute(params, { abortSignal: input.abortSignal ?? undefined })
   const meta = metadata.get(resolvedToolName)
 
   return {

@@ -3,6 +3,7 @@ import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { redis } from '$lib/server/redis'
 import { MAX_SCHEDULES_PER_AGENT } from '$lib/utils/scheduleControl'
 import { createSchedule, getSchedule } from '$lib/server/services/schedules/scheduleStore'
+import { getDm } from '$lib/server/services/dm/dmStore'
 
 /**
  * SA-115 P2 (DL-115-01, DL-115-07, DL-115-09) — the Schedules card's routes.
@@ -318,6 +319,92 @@ describe('POST /api/schedules/[id]/run-now', () => {
 
     await runNow(USER, record.id)
     expect((await getSchedule(record.id))?.missedRun).toBeNull()
+    expect(deliverScheduledDm).toHaveBeenCalledWith(
+      expect.objectContaining({ id: record.id }),
+      { trigger: 'run-now', now: expect.any(Date), dueAt: new Date('2026-09-01T14:00:00.000Z') }
+    )
+  })
+
+  it('files the missed slot’s due time in the actual note while preserving a paused schedule’s clock', async () => {
+    const real = await vi.importActual<typeof import('$lib/server/services/dm/dmTools')>(
+      '$lib/server/services/dm/dmTools'
+    )
+    deliverScheduledDm.mockImplementationOnce(real.deliverScheduledDm)
+    const record = await seedSchedule({ deliver: 'wait', enabled: false })
+    await redis.json.set(`schedule:${record.id}`, '$.missedRun', {
+      dueAt: '2026-09-01T14:00:00.000Z',
+      count: 3,
+      noticedAt: '2026-09-08T15:00:00.000Z'
+    } as never)
+
+    const payload = await (await runNow(USER, record.id)).json()
+
+    expect(payload.success).toBe(true)
+    expect(payload.outcome).toBe('waiting in inbox')
+    expect((await getDm(payload.dmId))?.body).toBe(
+      'Say good morning.\n\n(This run was due Tue, Sep 1, 9:00 AM CDT and is running late.)'
+    )
+    const stored = await getSchedule(record.id)
+    expect(stored?.missedRun).toBeNull()
+    expect(stored?.enabled).toBe(false)
+    expect(stored?.nextRunAt).toBe(record.nextRunAt)
+    expect(stored?.runCount).toBe(1)
+    expect(stored?.lastDmId).toBe(payload.dmId)
+    expect(deliverScheduledDm).toHaveBeenCalledTimes(1)
+  })
+
+  it('files an ordinary Run now note without inventing a late slot', async () => {
+    const real = await vi.importActual<typeof import('$lib/server/services/dm/dmTools')>(
+      '$lib/server/services/dm/dmTools'
+    )
+    deliverScheduledDm.mockImplementationOnce(real.deliverScheduledDm)
+    const record = await seedSchedule({ deliver: 'wait' })
+
+    const payload = await (await runNow(USER, record.id)).json()
+
+    expect(payload.success).toBe(true)
+    expect((await getDm(payload.dmId))?.body).toBe(record.message)
+    expect((await getSchedule(record.id))?.nextRunAt).toBe(record.nextRunAt)
+    expect(deliverScheduledDm).toHaveBeenCalledWith(
+      expect.objectContaining({ id: record.id }),
+      { trigger: 'run-now', now: expect.any(Date) }
+    )
+  })
+
+  it.each([
+    ['disabled', 'does not have Agent DMs turned on', 'Turn on Agent DMs for that agent in Agent Settings.'],
+    ['deleted', 'no longer exists', 'Delete this schedule, or point it at an agent that exists.']
+  ])('returns and records the real recovery hint for a %s agent', async (state, cause, hint) => {
+    const real = await vi.importActual<typeof import('$lib/server/services/dm/dmTools')>(
+      '$lib/server/services/dm/dmTools'
+    )
+    deliverScheduledDm.mockImplementationOnce(real.deliverScheduledDm)
+    const record = await seedSchedule({ deliver: 'wait' })
+    await redis.json.set(`schedule:${record.id}`, '$.missedRun', {
+      dueAt: '2026-09-01T14:00:00.000Z',
+      count: 1,
+      noticedAt: '2026-09-08T15:00:00.000Z'
+    } as never)
+    if (state === 'disabled') await redis.json.set(`agent:${COOPER}`, '$.dms_enabled', false as never)
+    else await redis.del(`agent:${COOPER}`)
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    const response = await runNow(USER, record.id)
+    const payload = await response.json()
+
+    expect(response.status).toBe(200)
+    expect(payload.success).toBe(false)
+    expect(payload.recorded).toBe(true)
+    expect(payload.error).toContain(cause)
+    expect(payload.error).toContain(hint)
+    expect(payload.hint).toBe(hint)
+    expect(payload.outcome).toBe(payload.error)
+    expect(payload.dmId).toBeUndefined()
+    const stored = await getSchedule(record.id)
+    expect(stored?.lastOutcome).toBe(payload.error)
+    expect(stored?.missedRun).toBeNull()
+    expect(stored?.nextRunAt).toBe(record.nextRunAt)
+    expect(stored?.runCount).toBe(1)
   })
 
   /**
@@ -396,6 +483,8 @@ describe('POST /api/schedules/[id]/run-now', () => {
     const payload = await response.json()
     expect(payload.success).toBe(false)
     expect(payload.error).toContain('no longer exists')
+    expect(payload.error).toBe('failed: that agent no longer exists')
+    expect(payload.hint).toBeUndefined()
 
     const stored = await getSchedule(record.id)
     expect(stored?.lastOutcome).toContain('failed:')

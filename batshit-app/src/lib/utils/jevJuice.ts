@@ -1,7 +1,7 @@
 /**
- * SA-120 Jev Juice — browser-safe feature registry and copy helpers.
+ * SA-120 Judge Juice — browser-safe feature registry and copy helpers.
  *
- * The product-facing name is **Jev Juice** (DL-120-13): two capitalized words,
+ * The product-facing name is **Judge Juice** (DL-120-13): two capitalized words,
  * always. Internal identifiers stay plain (`typesafe`). Feature ids are added here
  * by the packet that ships the feature; the Execution Viewer table and the inline
  * chat note read their labels from this one table so the wording stays consistent.
@@ -13,42 +13,49 @@ import type {
   JevJuicePostTurnFinding,
   JevJuicePostTurnLane,
   JevJuicePostTurnRecord,
+  JudgeProviderRef,
   TypesafeCallReason,
   TypesafeCallRecord,
   UntrustedTextFinding,
   UntrustedTextFindingId,
   UntrustedTextScreen
 } from '$lib/types/typesafe'
+import {
+  UNKNOWN_JUDGE_NAME,
+  judgeNameAtSentenceStart,
+  judgeNameOfCallRecord,
+  judgeServiceName
+} from '$lib/utils/judgeProviders'
 
-export const JEV_JUICE_NAME = 'Jev Juice'
+export const JEV_JUICE_NAME = 'Judge Juice'
 export const TYPESAFE_VENDOR_NAME = 'TypeSafe'
 
 export interface TypesafeFeatureDefinition {
   /** Short noun phrase used in the Execution Viewer and the inline note. */
   label: string
-  /** The per-feature switch wording, `Jev Juice: <what it does>` (DL-120-13), except on the Jev Juice card itself, where the card is the prefix. `null` for non-switch lanes. */
+  /** The per-feature switch wording, `Judge Juice: <what it does>` (DL-120-13), except on the Judge Juice card itself, where the card is the prefix. `null` for non-switch lanes. */
   switchLabel: string | null
 }
 
 export const TYPESAFE_FEATURES = {
-  /** The Settings → Admin → Jev Juice "Test" button: one fixed sample question. Not a feature switch. */
+  /** The Settings → Admin → Judge Juice "Test" button: one fixed sample question. Not a feature switch. */
   connection_test: { label: 'Connection test', switchLabel: null },
   /** SA-120 P1: skill and tool hints in the DCM tail plus the capability-gap chip (per-agent switch). */
-  skill_tool_hints: { label: 'Skill and tool hints', switchLabel: 'Jev Juice: Suggest Skills and Tools' },
+  skill_tool_hints: { label: 'Skill and tool hints', switchLabel: 'Judge Juice: Suggest Skills and Tools' },
   /** SA-120 P2: the agent-callable `sys.judge.ask` tool (per-agent switch). */
-  judge_ask: { label: 'Judgment tool (sys.judge.ask)', switchLabel: 'Jev Juice: Judgment Tool' },
+  judge_ask: { label: 'Judgment tool (sys.judge.ask)', switchLabel: 'Judge Juice: Judgment Tool' },
   /** SA-120 P3: group speaker selection and follow-up gating (the `smart` speaking preset on a group agent). */
-  group_speaker: { label: 'Group speaker', switchLabel: 'Jev Juice: Smart' },
+  group_speaker: { label: 'Group speaker', switchLabel: 'Judge Juice: Smart' },
   /** SA-120 P4a: a Jev relevance term in the agent's memory search ranking (per-agent switch). */
-  memory_rerank: { label: 'Memory search rerank', switchLabel: 'Jev Juice: Rerank Memory Search' },
+  memory_rerank: { label: 'Memory search rerank', switchLabel: 'Judge Juice: Rerank Memory Search' },
   /** SA-120 P4b: long-term memories that bear on the message join `Memory context:` without a trigger word (per-agent switch). */
-  memory_recall: { label: 'Memory recall', switchLabel: 'Jev Juice: Recall by Meaning' },
+  memory_recall: { label: 'Memory recall', switchLabel: 'Judge Juice: Recall by Meaning' },
   /** SA-120 P5: which zipped tool results a message needs, as DCM tail hints (ONE global switch on `global_zip_settings`). */
-  smart_zip: { label: 'Smart zip', switchLabel: 'Jev Juice: Smart Zip' },
+  smart_zip: { label: 'Smart zip', switchLabel: 'Judge Juice: Smart Zip' },
   /** SA-120 P6: after a reply, does it claim something the turn did not do? (per-agent switch) */
-  reply_check: { label: 'Reply check', switchLabel: 'Jev Juice: Check Replies' },
+  reply_check: { label: 'Reply check', switchLabel: 'Judge Juice: Check Replies' },
   /** SA-120 P6: after a reply, repeated openers, closers, phrases, and habits (per-agent switch). */
-  style_coach: { label: 'Style coach', switchLabel: 'Jev Juice: Style Coach' },
+  style_coach: { label: 'Style coach', switchLabel: 'Judge Juice: Style Coach' },
   /**
    * SA-120 P7: an advisory screen of text that did not come from the user: agent DMs, wake-up webhook
    * messages, and imported SKILL.md files (ONE instance switch on `batshit:typesafe_config`).
@@ -59,7 +66,7 @@ export const TYPESAFE_FEATURES = {
    * show or hide the Goon, open Settings, show the Execution Viewer) is carried out at once, without the
    * agent (ONE global switch on `voice_settings.voiceMode`).
    */
-  quick_actions: { label: 'Quick actions', switchLabel: 'Jev Juice: Quick Actions' }
+  quick_actions: { label: 'Quick actions', switchLabel: 'Judge Juice: Quick Actions' }
 } as const satisfies Record<string, TypesafeFeatureDefinition>
 
 export type TypesafeFeatureId = keyof typeof TYPESAFE_FEATURES
@@ -69,33 +76,44 @@ export function typesafeFeatureLabel(featureId: string): string {
   return definition?.label ?? featureId
 }
 
-/** Plain-language reason text shared by the Execution Viewer and the inline note. */
-export function describeTypesafeReason(reason: TypesafeCallReason | string | undefined): string {
+/**
+ * Plain-language reason text shared by the Execution Viewer and the inline note. SA-120 P10a: `judge` names who
+ * serves the call ("Ollama did not answer in time."); absent (every row and note written before P10a) means TypeSafe.
+ */
+export function describeTypesafeReason(
+  reason: TypesafeCallReason | string | undefined,
+  judge?: Pick<JudgeProviderRef, 'kind' | 'label'> | null
+): string {
+  const service = judge ? judgeServiceName(judge) : TYPESAFE_VENDOR_NAME
   switch (reason) {
     case 'master_off':
       return `${JEV_JUICE_NAME} is off in Settings → Admin.`
     case 'feature_off':
       return `This ${JEV_JUICE_NAME} feature is off.`
+    case 'no_provider':
+      return `The judge chosen for this feature is missing or not set up in Settings → Admin → ${JEV_JUICE_NAME}.`
     case 'no_key':
-      return `No ${TYPESAFE_VENDOR_NAME} key is saved.`
+      return `No ${service} key is saved.`
+    case 'provider_limit':
+      return `The request was too large for this judge (${service}), so Batshit did not send it.`
     case 'deadline':
-      return `${TYPESAFE_VENDOR_NAME} did not answer in time.`
+      return `${service} did not answer in time.`
     case 'timeout':
-      return `${TYPESAFE_VENDOR_NAME} did not answer before the timeout.`
+      return `${service} did not answer before the timeout.`
     case 'rate_limited':
-      return `${TYPESAFE_VENDOR_NAME} was busy (rate limited).`
+      return `${service} was busy (rate limited).`
     case 'network':
-      return `Batshit could not reach ${TYPESAFE_VENDOR_NAME}.`
+      return `Batshit could not reach ${service}.`
     case 'aborted':
       return 'The call was cancelled.'
     case 'unauthorized':
-      return `${TYPESAFE_VENDOR_NAME} rejected the key.`
+      return `${service} rejected the key.`
     case 'bad_request':
-      return `${TYPESAFE_VENDOR_NAME} rejected the request.`
+      return `${service} rejected the request.`
     case 'server_error':
-      return `${TYPESAFE_VENDOR_NAME} returned an error.`
+      return `${service} returned an error.`
     case 'malformed':
-      return `${TYPESAFE_VENDOR_NAME} sent an answer Batshit could not read.`
+      return `${service} sent an answer Batshit could not read.`
     case 'local_error':
       return 'Batshit could not prepare the request.'
     default:
@@ -103,8 +121,9 @@ export function describeTypesafeReason(reason: TypesafeCallReason | string | und
   }
 }
 
-/** Chip text: "Jev Juice: Memory recall skipped". */
+/** Chip text: "Judge Juice: Memory recall skipped". */
 export function jevJuiceNoteText(note: JevJuiceNote): string {
+  if (note.status === 'not_applied') return `${JEV_JUICE_NAME}: No-reply decision not applied`
   return `${JEV_JUICE_NAME}: ${typesafeFeatureLabel(note.feature)} skipped`
 }
 
@@ -113,14 +132,20 @@ const AFTER_REPLY_FEATURES = new Set<string>(['reply_check', 'style_coach'])
 
 /** Tooltip text: the reason plus the one promise that matters — the message still went out. */
 export function jevJuiceNoteDetail(note: JevJuiceNote): string {
+  if (note.status === 'not_applied' && note.reason === 'receipt_not_saved') {
+    // SA-120 P10a: a judge other than TypeSafe is "the judge" here (the note keeps no model id to name it by).
+    const who = note.provider && note.provider.kind !== 'typesafe' ? 'The judge' : 'Jev'
+    return `${who} answered, but Batshit could not save its no-reply receipt. The usual speaker rules were used.`
+  }
+  const reason = describeTypesafeReason(note.reason, note.provider)
   // SA-120 P7: the incoming-text screen never touches a send; what a miss means is "not screened".
   if (note.feature === 'untrusted_text') {
-    return `${describeTypesafeReason(note.reason)} This text was not screened.`
+    return `${reason} This text was not screened.`
   }
   if (AFTER_REPLY_FEATURES.has(note.feature)) {
-    return `${describeTypesafeReason(note.reason)} This reply was not checked.`
+    return `${reason} This reply was not checked.`
   }
-  return `${describeTypesafeReason(note.reason)} The message was sent without it.`
+  return `${reason} The message was sent without it.`
 }
 
 /** Reads `message.metadata.jevJuice.notes` defensively; older messages have none. */
@@ -133,7 +158,7 @@ export function readJevJuiceNotes(metadata: unknown): JevJuiceNote[] {
       Boolean(note) &&
       typeof note === 'object' &&
       typeof (note as JevJuiceNote).feature === 'string' &&
-      ((note as JevJuiceNote).status === 'unavailable' || (note as JevJuiceNote).status === 'error')
+      ((note as JevJuiceNote).status === 'unavailable' || (note as JevJuiceNote).status === 'error' || (note as JevJuiceNote).status === 'not_applied')
   )
 }
 
@@ -176,9 +201,12 @@ export function jevJuiceGapText(gap: JevJuiceGap): string {
   return `Might need ${gap.label} (off for ${gap.agentName})`
 }
 
-/** Tooltip text for the gap chip. */
+/**
+ * Tooltip text for the gap chip. SA-120 P10b: the gap is stored on the message without the judge that found it, so
+ * the sentence says "The judge" (right for every judge) instead of a name it cannot know.
+ */
 export function jevJuiceGapDetail(gap: JevJuiceGap): string {
-  return `Jev thinks this request needs ${gap.label}, which is turned off for ${gap.agentName}. The agent was told. Click to open the agent's settings.`
+  return `The judge thinks this request needs ${gap.label}, which is turned off for ${gap.agentName}. The agent was told. Click to open the agent's settings.`
 }
 
 // ---------------------------------------------------------------------------
@@ -329,15 +357,50 @@ export type UntrustedTextScreenView =
       harm: number | null
       clipped: boolean
       source: UntrustedTextScreen['source']
+      /** SA-120 P10b: the judge that flagged it, by name (`judgeNameOfCallRecord` of the screen's own row). */
+      judge: string
     }
-  | { status: 'skipped'; reason: TypesafeCallReason; source: UntrustedTextScreen['source'] }
+  | {
+      status: 'skipped'
+      reason: TypesafeCallReason
+      source: UntrustedTextScreen['source']
+      judge: string
+      /** The judge the skipped call would have gone to, so the quiet note names who was not reached. */
+      provider?: JudgeProviderRef
+    }
 
 export type UntrustedTextFlagView = Extract<UntrustedTextScreenView, { status: 'flagged' }>
 
+const MAX_JUDGE_NAME_CHARS = 80
+
+/** A view that crossed the wire (the brief route sends views) keeps the judge's name as plain text. */
+function readViewJudgeName(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value.trim().slice(0, MAX_JUDGE_NAME_CHARS) : null
+}
+
+function readViewProvider(value: unknown): JudgeProviderRef | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const ref = value as Partial<JudgeProviderRef>
+  if (typeof ref.id !== 'string' || typeof ref.label !== 'string') return undefined
+  if (ref.kind !== 'typesafe' && ref.kind !== 'ollama' && ref.kind !== 'cloudflare' && ref.kind !== 'systemone_url') return undefined
+  return { id: ref.id, kind: ref.kind, label: ref.label }
+}
+
+/**
+ * The judge's name for a stored screen or for a view of one (SA-120 P10b). A screen names the judge through its
+ * own evidence row; a view already carries the name. A screen with no readable row is "the judge", never a guess.
+ */
+export function untrustedTextScreenJudgeName(value: unknown): string {
+  if (!value || typeof value !== 'object') return UNKNOWN_JUDGE_NAME
+  const raw = value as { judge?: unknown; record?: unknown }
+  return readViewJudgeName(raw.judge) ?? judgeNameOfCallRecord(raw.record as TypesafeCallRecord | null | undefined)
+}
+
 export function readUntrustedTextScreen(value: unknown): UntrustedTextScreenView | null {
   if (!value || typeof value !== 'object') return null
-  const raw = value as Partial<UntrustedTextScreen>
+  const raw = value as Partial<UntrustedTextScreen> & { provider?: unknown }
   const source = raw.source === 'webhook' || raw.source === 'skill' ? raw.source : 'agent_dm'
+  const judge = untrustedTextScreenJudgeName(value)
   if (raw.status === 'flagged') {
     const findings = Array.isArray(raw.findings) ? raw.findings.filter(isUntrustedTextFinding) : []
     if (findings.length === 0) return null
@@ -347,25 +410,38 @@ export function readUntrustedTextScreen(value: unknown): UntrustedTextScreenView
       findings,
       harm: typeof raw.harm === 'number' && Number.isFinite(raw.harm) ? raw.harm : null,
       clipped: raw.clipped === true,
-      source
+      source,
+      judge
     }
   }
   if (raw.status === 'skipped') {
-    return { status: 'skipped', reason: (raw.reason ?? 'master_off') as TypesafeCallReason, source }
+    const provider = readViewProvider(raw.record?.provider) ?? readViewProvider(raw.provider)
+    return {
+      status: 'skipped',
+      reason: (raw.reason ?? 'master_off') as TypesafeCallReason,
+      source,
+      judge,
+      ...(provider ? { provider } : {})
+    }
   }
   return null
 }
 
 /**
- * The words the USER reads. Josh's review (2026-09-17) set every one of them: Jev is the model
- * that does things, Jev Juice is the feature, so a sentence about an action says "Jev". Each
- * finding is a CATEGORY with its confidence in parentheses, and the word "confidence" is never
- * dropped, even in a list, because a newcomer cannot know what a bare percentage means.
+ * The words the USER reads. Josh's review (2026-09-17) set every one of them: the model is the one
+ * that does things, Judge Juice is the feature, so a sentence about an action names the model.
+ * SA-120 P10b (DL-120-18): it names the model that actually judged ("Flagged by Clef Flash"), which
+ * is Jev only when TypeSafe judged. Each finding is a CATEGORY with its confidence in parentheses,
+ * and the word "confidence" is never dropped, even in a list, because a newcomer cannot know what
+ * a bare percentage means.
  */
-export const JEV_MODEL_NAME = 'Jev'
-export const UNTRUSTED_TEXT_BADGE_TEXT = `Flagged by ${JEV_MODEL_NAME}`
+export function untrustedTextBadgeText(judge: string): string {
+  return `Flagged by ${judge}`
+}
 /** The same words mid-sentence, for a tool card's subtitle ("to Cooper · woke a chat · flagged by Jev"). */
-export const UNTRUSTED_TEXT_INLINE_TEXT = `flagged by ${JEV_MODEL_NAME}`
+export function untrustedTextInlineText(judge: string): string {
+  return `flagged by ${judge}`
+}
 /** The notice card's title mark: the feature name, because it names WHICH feature raised the card. */
 export const UNTRUSTED_TEXT_NOTICE_TITLE = `${JEV_JUICE_NAME} flag`
 
@@ -407,7 +483,9 @@ export function untrustedTextHarmText(view: UntrustedTextFlagView): string {
 }
 
 /** The promise every flag carries: it is a guess, it may be wrong, and it blocked nothing. */
-export const UNTRUSTED_TEXT_ADVISORY_TEXT = `This is ${JEV_MODEL_NAME}'s best guess, and ${JEV_MODEL_NAME} can be wrong. Nothing was blocked; this flag is only to inform you.`
+export function untrustedTextAdvisoryText(judge: string): string {
+  return `This is ${judge}'s best guess, and ${judge} can be wrong. Nothing was blocked; this flag is only to inform you.`
+}
 /** The DM tool card's closing line: the reader saw the flag too. */
 export const UNTRUSTED_TEXT_DM_CARD_TOLD_TEXT = 'The agent that read this DM was told the same.'
 /** The drawer's closing line: the DM may not be read yet. */
@@ -419,7 +497,7 @@ export const UNTRUSTED_TEXT_CLIPPED_TEXT = 'Only the first part of the text was 
 
 /** Every line of a flag block, in order: categories, harm, the promise, the clipped note, then the surface's own closing line. */
 export function untrustedTextFlagLines(view: UntrustedTextFlagView, closing?: string | null): string[] {
-  const lines = [...untrustedTextCategoryLines(view), untrustedTextHarmText(view), UNTRUSTED_TEXT_ADVISORY_TEXT]
+  const lines = [...untrustedTextCategoryLines(view), untrustedTextHarmText(view), untrustedTextAdvisoryText(view.judge)]
   if (view.clipped) lines.push(UNTRUSTED_TEXT_CLIPPED_TEXT)
   if (closing) lines.push(closing)
   return lines
@@ -433,7 +511,9 @@ export function untrustedTextFlagDetail(view: UntrustedTextFlagView, closing?: s
 // --- The notice card above an approval card, in a chat a wake-up message started ---
 
 /** The notice card's first line. A DM that woke a chat is a wake-up message as much as a webhook's is. */
-export const UNTRUSTED_TEXT_NOTICE_LEAD = `${JEV_MODEL_NAME} flagged the wake-up message that started this chat.`
+export function untrustedTextNoticeLead(judge: string): string {
+  return `${judgeNameAtSentenceStart(judge)} flagged the wake-up message that started this chat.`
+}
 /** Shown only when an approval card sits under the notice. */
 export const UNTRUSTED_TEXT_APPROVAL_HINT = 'If an approval card follows, read the message before deciding to Approve or Deny.'
 export const UNTRUSTED_TEXT_SHOW_MESSAGE_TEXT = 'Show the message'
@@ -474,20 +554,33 @@ export function wakeOriginText(origin: WakeOrigin | null | undefined): string | 
 // --- The skill import box ---
 
 /** The import box's closing line: the skill is in the form and saving it is still the user's call. */
-export const UNTRUSTED_TEXT_IMPORT_ADVISORY_TEXT = `This is ${JEV_MODEL_NAME}'s best guess, and ${JEV_MODEL_NAME} can be wrong. Nothing was blocked: the skill is in the form, and saving it is still your call. Read SKILL.md first.`
+export function untrustedTextImportAdvisoryText(judge: string): string {
+  return `This is ${judge}'s best guess, and ${judge} can be wrong. Nothing was blocked: the skill is in the form, and saving it is still your call. Read SKILL.md first.`
+}
 /** The skill import dialog's one quiet line when the screen ran and raised nothing. Never a badge. */
-export const UNTRUSTED_TEXT_SKILL_NO_FLAG_TEXT = `${JEV_MODEL_NAME} read SKILL.md and raised no flag. That is not a safety check: still read the skill before you trust it.`
+export function untrustedTextSkillNoFlagText(judge: string): string {
+  return `${judgeNameAtSentenceStart(judge)} read SKILL.md and raised no flag. That is not a safety check: still read the skill before you trust it.`
+}
 
 /** The import box's lines: categories (skill names), harm, its own closing line. */
 export function untrustedTextImportLines(view: UntrustedTextFlagView): string[] {
-  const lines = [...untrustedTextCategoryLines(view), untrustedTextHarmText(view), UNTRUSTED_TEXT_IMPORT_ADVISORY_TEXT]
+  const lines = [...untrustedTextCategoryLines(view), untrustedTextHarmText(view), untrustedTextImportAdvisoryText(view.judge)]
   if (view.clipped) lines.push(UNTRUSTED_TEXT_CLIPPED_TEXT)
   return lines
 }
 
-/** The note a skipped screen shows: the same chip words every Jev Juice miss uses. */
+/**
+ * The note a skipped screen shows: the same chip words every Judge Juice miss uses. SA-120 P10b: it carries the
+ * judge the skipped call would have gone to, so the tooltip says who was not reached.
+ */
 export function untrustedTextSkippedNote(view: Extract<UntrustedTextScreenView, { status: 'skipped' }>): JevJuiceNote {
-  return { feature: 'untrusted_text', status: 'unavailable', reason: view.reason, at: '' }
+  return {
+    feature: 'untrusted_text',
+    status: 'unavailable',
+    reason: view.reason,
+    at: '',
+    ...(view.provider ? { provider: view.provider } : {})
+  }
 }
 
 /**

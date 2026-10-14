@@ -12,10 +12,12 @@ import {
 } from '$lib/server/constants/mode4Policy'
 
 function sanitizePermission(value: unknown): ClaudePermissionMode {
-  if (value === 'acceptEdits' || value === 'plan' || value === 'bypassPermissions') {
+  if (value === 'default' || value === 'acceptEdits' || value === 'plan' || value === 'bypassPermissions') {
     return value
   }
-  if (value === 'default' || value === 'chat') return 'acceptEdits'
+  // BL-959: Ask before edits runs as `default`, and so does the older value `chat` (the chat bar
+  // reads it so). A missing or unknown mode keeps `acceptEdits`, what Agent Settings shows for it.
+  if (value === 'chat') return 'default'
   if (value === 'agent') return 'acceptEdits'
   if (value === 'agent_full') return 'bypassPermissions'
   return 'acceptEdits'
@@ -245,18 +247,57 @@ function isAgentSettings(value: unknown): value is ClaudeAgentSettings {
   return Boolean(value && typeof value === 'object' && 'permissionMode' in (value as any))
 }
 
+/** BL-941: the order of a Claude run's mode, tightest first. */
+export const CLAUDE_PERMISSION_ORDER: readonly ClaudePermissionMode[] = ['plan', 'default', 'acceptEdits', 'bypassPermissions']
+
+/** The record's mode was tighter than the mode a send carried: both, for the reply's note. */
+export interface ClaudeModeLimit {
+  sentMode: ClaudePermissionMode
+  ranMode: ClaudePermissionMode
+}
+
+/**
+ * BL-941: the agent's record is the upper bound of a Claude run. A mode that a send carries (the
+ * chat bar's `metadata.claudePermissionMode`) can make the run tighter than the record, never
+ * looser: the mode is the tighter of the two; with no sent mode, the record's. It reads both itself
+ * (`sanitizePermission`), so they are compared as they run and the note names the mode that runs.
+ * An unknown value counts as `acceptEdits`: the old code gave an unknown SENT value that mode, and
+ * Agent Settings shows it for an unknown saved one; as the sent side it can only make a Bypass
+ * permissions record tighter. A missing (or null) sent mode is no sent mode.
+ */
+export function resolveClaudeRunMode(input: {
+  recordMode?: unknown
+  sentMode?: unknown
+}): { permissionMode: ClaudePermissionMode; modeLimitedByAgentSettings: ClaudeModeLimit | null } {
+  const recordMode = sanitizePermission(input.recordMode)
+  const sentMode =
+    input.sentMode === undefined || input.sentMode === null ? undefined : sanitizePermission(input.sentMode)
+  if (sentMode === undefined) return { permissionMode: recordMode, modeLimitedByAgentSettings: null }
+  const mode =
+    CLAUDE_PERMISSION_ORDER.indexOf(sentMode) <= CLAUDE_PERMISSION_ORDER.indexOf(recordMode) ? sentMode : recordMode
+  return {
+    permissionMode: mode,
+    modeLimitedByAgentSettings: mode !== sentMode ? { sentMode, ranMode: mode } : null
+  }
+}
+
+/** The runtime settings, and the reply's note when the record made the run tighter (BL-941). */
+export type ClaudeRunSettings = ClaudeRuntimeSettings & { modeLimitedByAgentSettings?: ClaudeModeLimit }
+
 export function buildClaudeRuntimeSettings(
   providerSettings?: Record<string, any> | ClaudeAgentSettings | null,
   overrides?: Partial<{ permissionMode: ClaudePermissionMode }>
-): ClaudeRuntimeSettings {
+): ClaudeRunSettings {
   const structuredSource = isAgentSettings(providerSettings) ? providerSettings : null
   const providerRecord = !structuredSource && providerSettings && typeof providerSettings === 'object'
     ? (providerSettings as Record<string, any>)
     : null
 
-  const permission = sanitizePermission(
-    overrides?.permissionMode ?? structuredSource?.permissionMode ?? providerRecord?.claude_permission_mode
-  )
+  const runMode = resolveClaudeRunMode({
+    recordMode: structuredSource?.permissionMode ?? providerRecord?.claude_permission_mode,
+    sentMode: overrides?.permissionMode
+  })
+  const permission = runMode.permissionMode
 
   const configScope =
     'managed'
@@ -317,7 +358,7 @@ export function buildClaudeRuntimeSettings(
       : []
   )
 
-  const settings: ClaudeRuntimeSettings = {
+  const settings: ClaudeRunSettings = {
     mode4Style: MODE4_STYLE_PRELAUNCH,
     permissionMode: permission,
     profileId:
@@ -358,6 +399,9 @@ export function buildClaudeRuntimeSettings(
       : sanitizedLegacyOverrides.overrides,
     workingDirectoryMode,
     customWorkingDirectory: undefined
+  }
+  if (runMode.modeLimitedByAgentSettings) {
+    settings.modeLimitedByAgentSettings = runMode.modeLimitedByAgentSettings
   }
 
   return settings

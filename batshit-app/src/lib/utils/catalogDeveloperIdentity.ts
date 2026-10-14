@@ -4,7 +4,11 @@ const CATALOG_DEVELOPER_ALIASES: Readonly<Record<string, string>> = Object.freez
   'z.ai': 'zai',
   'zai-org': 'zai',
   zai_coding: 'zai',
-  'zai-coding': 'zai'
+  'zai-coding': 'zai',
+  // BL-293: Moonshot's own /models owns every model as `moonshot`; the gateway,
+  // OpenRouter, Kimi Code and Hugging Face name the same maker `moonshotai`.
+  moonshot: 'moonshotai',
+  moonshotai: 'moonshotai'
 })
 
 /**

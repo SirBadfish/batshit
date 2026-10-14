@@ -91,12 +91,14 @@
 		failed
 			? {
 					'File Path': filePath,
+					...(tool.toolResult?.shell ? { Shell: tool.toolResult.shell } : {}),
 					...(failedExitCode !== undefined ? { 'Exit Code': failedExitCode } : {}),
 					'Result': 'Not written',
 					...(errorHeadline ? { 'Reason': errorHeadline } : {})
 				}
 			: {
 					'File Path': filePath,
+					...(tool.toolResult?.shell ? { Shell: tool.toolResult.shell } : {}),
 					'Lines Written': lineCount.toLocaleString(),
 					'Size': formatFileSize(fileSize),
 					'Language': language || 'Plain Text',
@@ -115,7 +117,7 @@
 <FullTool
 	icon={FileEdit}
 	title={rendererTitle}
-	subtitle={failed ? `${subtitleTarget} • not written` : `${subtitleTarget} • ${lineCount} lines written`}
+	subtitle={failed ? `${subtitleTarget} • not written` : `${subtitleTarget} • ${lineCount} ${lineCount === 1 ? 'line' : 'lines'} written`}
 	status={failed ? 'error' : 'success'}
 	{metadata}
 	duration={tool.metadata?.executionTime}

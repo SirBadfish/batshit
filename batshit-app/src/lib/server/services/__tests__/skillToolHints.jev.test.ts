@@ -49,6 +49,7 @@ import {
   decideSkillToolHints,
   type SkillToolHintRequest
 } from '../skillToolHints.jev'
+import { checkJudgeRequestFit, profileJudgeLimits } from '$lib/utils/judgeProviders'
 
 const SKILLS = [
   { invocation: '/vroid-dressup', skillId: 'vroid_dressup', description: 'Dress a VRoid Goon with XWear clothing' },
@@ -120,6 +121,33 @@ describe('buildSkillToolHintRequest', () => {
     const built = request({ tools: many })
     expect(Object.keys((built.questions.tool as any).criteria)).toHaveLength(240)
     expect(built.truncated.tools).toBe(true)
+  })
+
+  it('SA-120 P10a round 1, S4: a request at its maxima fits the TypeSafe judge and an Ollama judge refuses it', () => {
+    // Every list at its cap, long ids, descriptions past their clip, and gaps whose `what` rides the state in full.
+    const long = (prefix: string, i: number) => `${prefix}-${String(i).padStart(3, '0')}-${'x'.repeat(30)}`
+    const built = buildSkillToolHintRequest({
+      message: 'm'.repeat(5_000),
+      agentName: 'Cody',
+      skills: Array.from({ length: 300 }, (_, i) => ({ invocation: `/${long('skill', i)}`, skillId: long('skill', i), description: 'd'.repeat(400) })),
+      tools: Array.from({ length: 300 }, (_, i) => ({
+        ref: `mcp:${long('gateway', i)}/${long('tool', i)}`.slice(0, 80),
+        name: long('tool', i),
+        family: 'mcp' as const,
+        description: 't'.repeat(400),
+        hint: null,
+        enabled: true
+      })),
+      gaps: Array.from({ length: 80 }, (_, i) => ({ id: `cli:${long('gap', i)}`, kind: 'cli' as const, label: `Gap ${i}`, what: 'w'.repeat(300) }))
+    })
+    if (!built) throw new Error('expected a request')
+    const requestChars = JSON.stringify({ state: built.state, model: 'jev-1.13.0', questions: built.questions }).length
+    // The worst case the reviewer measured (110k-130k+ characters) is real: this one is well past 100,000.
+    expect(requestChars).toBeGreaterThan(100_000)
+    const jev = checkJudgeRequestFit(profileJudgeLimits({ kind: 'typesafe', modelId: 'jev-1.13.0' }), built.questions, requestChars)
+    expect(jev.fits).toBe(true)
+    const ollama = checkJudgeRequestFit(profileJudgeLimits({ kind: 'ollama', modelId: 'clef-flash' }), built.questions, requestChars)
+    expect(ollama).toMatchObject({ fits: false, detail: 'a Choice with 240 options; this judge takes at most 26' })
   })
 })
 
@@ -242,6 +270,41 @@ describe('buildCapabilityGapCatalog', () => {
       'gateway:gw_github'
     ])
     expect(gaps.find((gap) => gap.id === 'gateway:gw_github')?.what).toBe('tools such as create_issue, list_prs')
+  })
+
+  // BL-878 (Josh, 2026-09-28): a Codex or Claude agent has its own Bash, so a saved Bash value of
+  // `false` (an agent changed from API to CLI keeps it; nothing on screen can clear it) must not
+  // become "Off for this agent: Bash", which tells the agent to say so plainly instead of using
+  // its own shell. An API agent's real off switch still does.
+  it.each([
+    ['a CLI agent', { agentType: 'cli' }, false],
+    ['a Codex agent known only by its provider (a legacy record)', { primary_model_provider: 'codex-cli' }, false],
+    ['a Claude agent known only by its provider (a legacy record)', { primary_model_provider: 'claude-cli' }, false],
+    ['an API agent', { agentType: 'api' }, true]
+  ])('BL-878: %s and a Bash value of false', async (_name, agentFields, offered) => {
+    registries.listAllSlashCapabilities.mockResolvedValue([])
+    registries.listCliTools.mockResolvedValue([])
+    registries.gatewayList.mockResolvedValue([])
+    registries.resolveNativeToolSettings.mockReturnValueOnce({
+      webSearchEnabled: true,
+      bashEnabled: false,
+      agentBrowserEnabled: true,
+      dynamicMcpEnabled: true,
+      cliToolsEnabled: true,
+      artifactRuntimeEnabled: true,
+      batshitToolsEnabled: true,
+      fetchZipEnabled: true
+    })
+
+    const { gaps } = await buildCapabilityGapCatalog({
+      userId: 'josh',
+      agent: { ...agentFields, provider_specific_settings: { nativeTools: { bashEnabled: false } } },
+      enabledSkillInvocations: new Set(),
+      resolvedGatewayIds: null,
+      selectedCliToolIds: new Set()
+    })
+
+    expect(gaps.map((gap) => gap.id).includes('native:bash')).toBe(offered)
   })
 
   it('skips MCP sources entirely when Dynamic Tool Search is off for the agent, and reports a failed registry as partial', async () => {

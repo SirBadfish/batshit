@@ -1,0 +1,35 @@
+{
+  "error": {
+    "type": "prompt_outputs_failed_validation",
+    "message": "Prompt outputs failed validation",
+    "details": "",
+    "extra_info": {}
+  },
+  "node_errors": {
+    "4": {
+      "errors": [
+        {
+          "type": "value_not_in_list",
+          "message": "Value not in list",
+          "details": "ckpt_name: 'missing.safetensors' not in ['flux1-schnell-fp8.safetensors']",
+          "extra_info": {
+            "input_name": "ckpt_name",
+            "input_config": [
+              [
+                "flux1-schnell-fp8.safetensors"
+              ],
+              {
+                "tooltip": "The name of the checkpoint (model) to load."
+              }
+            ],
+            "received_value": "missing.safetensors"
+          }
+        }
+      ],
+      "dependent_outputs": [
+        "9"
+      ],
+      "class_type": "CheckpointLoaderSimple"
+    }
+  }
+}

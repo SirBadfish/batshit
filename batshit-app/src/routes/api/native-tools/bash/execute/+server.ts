@@ -1,6 +1,7 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
 import { apiFailure } from '$lib/server/services/apiResponses'
 import { resolveNativeToolUser } from '$lib/server/services/nativeToolAuth'
+import { refuseDelegatedRunOutsideList } from '$lib/server/services/actingAgentIdentity'
 import { nativeToolService } from '$lib/server/services/nativeTools'
 
 interface NativeBashExecuteRequest {
@@ -39,6 +40,21 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
     if (!auth) {
       return apiFailure('Unauthorized', 401)
+    }
+
+    const delegatedRefusal = refuseDelegatedRunOutsideList(auth, null)
+    if (delegatedRefusal) {
+      return apiFailure(delegatedRefusal.message, 403, { code: delegatedRefusal.code })
+    }
+    // This direct route is for authenticated server-side probes. Agent Bash runs through the
+    // native tool or managed helper dispatcher, which loads saved Agent Settings and owns the
+    // approval decision. The probe body's approval/access/backend fields cannot govern a run.
+    if (auth.auth === 'agent') {
+      return apiFailure(
+        'Agent runs must execute Bash through the managed native tool or helper dispatcher.',
+        403,
+        { code: 'DIRECT_BASH_NOT_ALLOWED' }
+      )
     }
 
     // Bridge defaults are stricter than Mode 3 direct native execution.

@@ -37,6 +37,21 @@ Common fixes:
 docker compose --env-file .env.docker up -d --build
 ```
 
+## Redis doesn't start
+
+Redis starts after a short setup step, `redis-init`, that prepares its data volume. When the volume holds only a Redis snapshot (`dump.rdb`) and no append-only file, `redis-init` first switches it to append-only persistence, once, and checks that every key made it across. It never changes the snapshot. Read both logs:
+
+```sh
+docker compose --env-file .env.docker logs redis-init
+docker compose --env-file .env.docker logs redis
+```
+
+- `Redis now uses append-only persistence` means the switch worked.
+- `Batshit's Redis is still running on this data` means an older Redis container was still up. Stop it with `docker compose --env-file .env.docker stop redis`, then start Batshit again with `./start-docker.sh`.
+- `holds a Redis snapshot (dump.rdb) but no append-only file yet` means Redis was started without `redis-init`, for example with `--no-deps`. Redis refuses, because it would load nothing from the snapshot and then overwrite it. Start Batshit with `./start-docker.sh` or `docker compose --env-file .env.docker up -d`, which run `redis-init` first.
+- `appendonlydir has no manifest` means the append-only folder is damaged, and Redis would ignore it and start with no data. Batshit leaves your data folder alone. Don't change anything in it yourself; open a GitHub issue ([Bug reports and diagnostics](bug-reports-and-diagnostics.md)) so the files can be recovered.
+- Every `redis-init` error ends with "Nothing was changed". For any other error, check free disk space (the switch writes a second copy of your data), then start again.
+
 ## Docker refuses placeholder secrets
 
 The production Docker runtime requires real, stable secrets. Open `.env.docker` and replace:
@@ -142,11 +157,24 @@ Docker Sandbox runs through Docker's `sbx` tool on your computer, so it needs th
 
 1. Install `sbx`: `winget install -h Docker.sbx` on Windows 11, or `brew install docker/tap/sbx` on a Mac.
 2. Run `sbx login` and sign in with your Docker account. A free account works.
-3. Run `sbx policy init balanced` to pick the default network rules.
+3. Run `sbx policy init balanced` to pick the default network rules. After a Mac restart, `sbx` may ask for its network rules again. Run the same command.
 
 The message names the step that's missing. After you do it, press Refresh on the Docker Sandbox Runtime card in Settings → Admin → Runtimes.
 
 Older setups used a `docker sandbox` command that came with Docker Desktop. Docker Desktop has removed it, so updating Docker Desktop alone doesn't give you Docker Sandbox. `sbx` is a separate install.
+
+## Docker Sandbox fails on a Windows socket
+
+If `sbx` reports `docker.sock` connection errors or cannot access `containerd.sock.ttrpc`, try launching it from normal Windows Terminal. On Windows 11 build 22631 with sbx v0.46.0, commands launched by the packaged Codex app used a redirected AppData folder and failed on these sockets. Resetting or reinstalling sbx in that context did not repair it. The same installed sbx worked when launched outside the packaged app.
+
+Open Windows Terminal, start the sandbox service, then run the Batshit launcher from your Batshit folder:
+
+```powershell
+sbx daemon start --detach
+node tools/docker/start-docker.mjs
+```
+
+Verify a real Docker Sandbox command in Batshit after startup; a setup/readiness message alone does not prove sandbox creation. If it still fails, [Docker's Windows socket issue #157](https://github.com/docker/sbx-releases/issues/157) includes similar symptoms, but this launch-context repair has only been measured on the configuration above. Preserve existing state before considering a reset. Batshit surfaces the command failure instead of silently changing execution backends.
 
 ## Bash runs, but it's not my host shell
 

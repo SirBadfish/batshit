@@ -53,10 +53,13 @@ import {
 } from '$lib/server/services/contextTokenPreview'
 import {
   buildDefaultSummaryGenerator,
+  createBackgroundJobLook,
+  ENDED_EARLY_MESSAGE_ARRIVED,
   graduateClosedEpisodesForSession,
   graduateRegularSessionTail,
   resolveMemorySummaryModelChoice,
   swapGraduationEvents,
+  type BackgroundJobEndedEarlyReason,
   type SummaryGenerator
 } from './memoryGraduation'
 import { closeEpisode, getOpenEpisode } from './memoryEpisodes'
@@ -64,13 +67,16 @@ import { foldAwarenessState } from './memoryRecall'
 import {
   createMemory,
   createMemorySegment,
+  deleteMemorySegment,
   fetchMemoriesByKeys,
   fetchMemorySegmentsByIds,
   listMemories,
   listMemorySegments,
   markExpiredDemotion,
+  standingMediaTotalIfRestored,
   supersedeMemory
 } from './memoryStore'
+import { MEMORY_STANDING_MEDIA_CAP } from './memoryMedia'
 import { createMemoryEmbedderAsync, type MemoryEmbedder } from './memoryEmbedder'
 import { getMemoryConfig, knnSearchMemories, requireReadyMemoryIndexes } from './memoryIndex'
 import {
@@ -551,6 +557,17 @@ export async function runDreamingPass(options: DreamingRunOptions): Promise<Drea
       ...(error ? { error } : {})
     })
   }
+  // BL-549 (N7): dreaming in one chat ended before its next write.
+  const actEndedEarly = (sessionId: string, reason: BackgroundJobEndedEarlyReason) => {
+    act(
+      'skip_session',
+      'skipped',
+      reason === 'turn_started'
+        ? `${ENDED_EARLY_MESSAGE_ARRIVED}: a turn started in this chat, so its dreaming stopped before the next write; what was already written stays, the rest waits for the next dream`
+        : 'ended early: the chat was deleted, so nothing more was written for it',
+      { sessionId }
+    )
+  }
   const flush = async () => {
     record.counts = countsFromActions(record.actions, modelCalls)
     await writeRun(record)
@@ -628,9 +645,17 @@ export async function runDreamingPass(options: DreamingRunOptions): Promise<Drea
         act('skip_session', 'skipped', 'live turn in progress — dreaming never touches an active session (DL-104-15)', { sessionId })
         continue
       }
+      // BL-549 (N7): read the chat's last turn start in the same synchronous step as the check
+      // above, then look again before each write in this chat (the nap's rule, N1/N2).
+      const look = createBackgroundJobLook(sessionId)
 
       try {
         const open = await getOpenEpisode(sessionId)
+        const stopBeforeClose = open ? await look() : null
+        if (stopBeforeClose) {
+          actEndedEarly(sessionId, stopBeforeClose)
+          continue
+        }
         if (open) {
           const idleGapMs = resolveMemoryIdleGapHours(options.agent) * 3_600_000
           const holdTs = open.hold_until ? new Date(open.hold_until).getTime() : Number.NaN
@@ -656,7 +681,7 @@ export async function runDreamingPass(options: DreamingRunOptions): Promise<Drea
         }
 
         const windowSettings = resolveMemoryWindowSettings(options.agent)
-        const budgetSettings = await resolveAgentBudgetSettings(options.agent)
+        const budgetSettings = await resolveAgentBudgetSettings(options.agent, sessionId)
         const window = resolveEffectiveMemoryWindow(windowSettings, budgetSettings.contextLimit)
         if (!window) {
           act(
@@ -687,7 +712,8 @@ export async function runDreamingPass(options: DreamingRunOptions): Promise<Drea
           generateSummary: generate,
           embedder,
           now,
-          maxEpisodes: DREAMING_MAX_EPISODES_PER_SESSION
+          maxEpisodes: DREAMING_MAX_EPISODES_PER_SESSION,
+          look
         })
         for (const entry of result.graduated) {
           act(
@@ -705,6 +731,7 @@ export async function runDreamingPass(options: DreamingRunOptions): Promise<Drea
             episodeId: skipped.episodeId
           })
         }
+        if (result.endedEarly) actEndedEarly(sessionId, result.endedEarly)
       } catch (error) {
         if (error instanceof DreamingModelBudgetExhausted) {
           act('graduate_episode', 'skipped', 'model-call budget reached — remaining episodes graduate on the next dream', { sessionId })
@@ -745,8 +772,12 @@ export async function runDreamingPass(options: DreamingRunOptions): Promise<Drea
             `idle regular session had ${outcome.messageCount} ungraduated messages past the watermark — its tail is now searchable memory (window untouched by design)`,
             { sessionId, segmentId: outcome.segmentId }
           )
+        } else if (outcome.status === 'chat_deleted') {
+          actEndedEarly(sessionId, 'chat_deleted')
         }
-        // not_idle / nothing_new / too_small stay quiet — no nightly no-op spam.
+        // not_idle / nothing_new / too_small / superseded stay quiet — no nightly no-op spam.
+        // `superseded` means another graduation of this same chat (a client-triggered call,
+        // most likely) already advanced the mark past this tail; nothing was missed.
       } catch (error) {
         if (error instanceof DreamingModelBudgetExhausted) {
           act('graduate_regular_tail', 'skipped', 'model-call budget reached — remaining sessions sweep on the next dream', { sessionId })
@@ -826,10 +857,46 @@ export async function runDreamingPass(options: DreamingRunOptions): Promise<Drea
     try {
       const memories = await listMemories(agentId)
       let demoted = 0
+      // BL-786: a record leaving Awareness keeps its images on recall (`markExpiredDemotion`);
+      // say so in the action, which is the change's record.
+      const recallOnlyNote = (before: MemoryRecord, after: MemoryRecord) => {
+        if (before.media_mode !== 'always' || after.media_mode !== 'on_recall') return null
+        const count = before.media?.length ?? 0
+        return {
+          why:
+            `; its ${count} image${count === 1 ? ' was' : 's were'} set to show every message, which only Awareness ` +
+            `can do, so ${count === 1 ? 'it now arrives' : 'they now arrive'} only when the memory is recalled (kept on the memory)`,
+          refs: { mediaMode: { from: 'always', to: 'on_recall' } }
+        }
+      }
       for (const memory of memories) {
         if (demoted >= DREAMING_MAX_EXPIRY_DEMOTIONS) break
         if (!memory.expires_ts || memory.expires_ts > now.getTime()) continue
-        if (memory.expired_demoted_to) continue
+        if (memory.expired_demoted_to) {
+          // BL-786: a record an older demotion moved out of Awareness still set to show its images
+          // every message (every save of it was refused). Settle it once, in place.
+          if (memory.lane === 'awareness' || memory.media_mode !== 'always') continue
+          try {
+            const settled = await markExpiredDemotion(agentId, memory.id, memory.lane)
+            demoted += 1
+            const note = recallOnlyNote(memory, settled)
+            act(
+              'expire_demote',
+              'done',
+              `expired ${memory.expires_at} — already demoted to ${memory.lane}` + (note?.why ?? ''),
+              { memoryId: memory.id, from: memory.lane, to: memory.lane, ...note?.refs }
+            )
+          } catch (error) {
+            act(
+              'expire_demote',
+              'failed',
+              'settling the images of an already-demoted memory failed; it keeps its current state',
+              { memoryId: memory.id },
+              error instanceof Error ? error.message : 'unknown error'
+            )
+          }
+          continue
+        }
         if (memory.is_superseded === 'y') continue
         const target: MemoryLane =
           memory.lane === 'awareness'
@@ -838,15 +905,17 @@ export async function runDreamingPass(options: DreamingRunOptions): Promise<Drea
               : 'ltm'
             : 'ltm'
         try {
-          await markExpiredDemotion(agentId, memory.id, target)
+          const demotedRecord = await markExpiredDemotion(agentId, memory.id, target)
           demoted += 1
+          const note = recallOnlyNote(memory, demotedRecord)
           act(
             'expire_demote',
             'done',
-            memory.lane === target
+            (memory.lane === target
               ? `expired ${memory.expires_at} — already ${target}; marked processed so it stays searchable and flagged expired`
-              : `expired ${memory.expires_at} — demoted ${memory.lane} → ${target} so it stops ${memory.lane === 'awareness' ? 'compiling into the system prompt' : 'auto-firing on triggers'} but stays searchable (never erased)`,
-            { memoryId: memory.id, from: memory.lane, to: target }
+              : `expired ${memory.expires_at} — demoted ${memory.lane} → ${target} so it stops ${memory.lane === 'awareness' ? 'compiling into the system prompt' : 'auto-firing on triggers'} but stays searchable (never erased)`) +
+              (note?.why ?? ''),
+            { memoryId: memory.id, from: memory.lane, to: target, ...note?.refs }
           )
         } catch (error) {
           act(
@@ -878,6 +947,31 @@ export async function runDreamingPass(options: DreamingRunOptions): Promise<Drea
         memory.updated_at = now.toISOString()
         await redis.json.set(memoryKey(agentId, memory.id), '$', memory as never)
       }
+      // BL-438: a record restored to current brings its always-on images back into the standing
+      // set, and past the cap every send of the agent fails at the compile. A repair cannot be
+      // refused (the record must become current), so an over-cap record comes back with its
+      // images on recall: kept on the memory, never dropped, and the action says so. `memories`
+      // holds the objects this loop mutates, so each check sees the repairs made before it.
+      const keepUnderStandingCap = (
+        memory: MemoryRecord
+      ): { why: string; refs: Record<string, unknown> } | null => {
+        const standingTotal = standingMediaTotalIfRestored(memories, memory, now.getTime())
+        if (standingTotal === null || standingTotal <= MEMORY_STANDING_MEDIA_CAP) return null
+        const imageCount = memory.media?.length ?? 0
+        memory.media_mode = 'on_recall'
+        return {
+          why:
+            `; its ${imageCount} image${imageCount === 1 ? ' was' : 's were'} set to show every message, but that would ` +
+            `make ${standingTotal} standing images, over the cap of ${MEMORY_STANDING_MEDIA_CAP}, so ` +
+            `${imageCount === 1 ? 'it now arrives' : 'they now arrive'} only when the memory is recalled ` +
+            '(kept on the memory; turn "Show this image every message" back on in the Memory panel once a slot is free)',
+          refs: {
+            mediaMode: { from: 'always', to: 'on_recall' },
+            standingImages: standingTotal,
+            cap: MEMORY_STANDING_MEDIA_CAP
+          }
+        }
+      }
       // The store's supersede/unsupersede own the happy paths; dreaming repairs the
       // broken shapes those functions refuse to touch (crashed half-writes, deletes).
       for (const memory of memories) {
@@ -887,13 +981,15 @@ export async function runDreamingPass(options: DreamingRunOptions): Promise<Drea
           if (!successor) {
             memory.superseded_by = null
             memory.is_superseded = 'n'
+            const capped = keepUnderStandingCap(memory)
             await write(memory)
             repairs += 1
             act(
               'supersession_repair',
               'done',
-              'superseded_by pointed at a memory that no longer exists (explicit delete) — restored this record to current',
-              { memoryId: memory.id }
+              'superseded_by pointed at a memory that no longer exists (explicit delete) — restored this record to current' +
+                (capped?.why ?? ''),
+              { memoryId: memory.id, ...capped?.refs }
             )
           } else {
             if (memory.is_superseded !== 'y') {
@@ -921,13 +1017,15 @@ export async function runDreamingPass(options: DreamingRunOptions): Promise<Drea
           }
         } else if (memory.is_superseded === 'y') {
           memory.is_superseded = 'n'
+          const capped = keepUnderStandingCap(memory)
           await write(memory)
           repairs += 1
           act(
             'supersession_repair',
             'done',
-            'flag mismatch: no superseded_by pointer but the superseded flag was on — restored to current (the pointer is the authority)',
-            { memoryId: memory.id }
+            'flag mismatch: no superseded_by pointer but the superseded flag was on — restored to current (the pointer is the authority)' +
+              (capped?.why ?? ''),
+            { memoryId: memory.id, ...capped?.refs }
           )
         }
 
@@ -1133,6 +1231,8 @@ export async function runDreamingPass(options: DreamingRunOptions): Promise<Drea
         act('skip_session', 'skipped', 'live turn in progress — era consolidation waits (DL-104-15)', { sessionId })
         continue
       }
+      // BL-549 (N7): the same look as phase 1, asked again after the era summary call.
+      const look = createBackgroundJobLook(sessionId)
       try {
         const fresh = await redis.getSession(sessionId)
         if (!fresh) continue
@@ -1149,7 +1249,7 @@ export async function runDreamingPass(options: DreamingRunOptions): Promise<Drea
         }
         if (batch.length < 2) continue
 
-        const budgetSettings = await resolveAgentBudgetSettings(options.agent)
+        const budgetSettings = await resolveAgentBudgetSettings(options.agent, sessionId)
         if (!budgetSettings.contextLimit) {
           act('era_consolidation', 'skipped', 'no model context limit resolvable — era summary budget cannot be computed', { sessionId })
           continue
@@ -1178,6 +1278,11 @@ export async function runDreamingPass(options: DreamingRunOptions): Promise<Drea
           ].join('\n'),
           budget.hardMaxTokens
         )
+        const stopAfterCall = await look()
+        if (stopAfterCall) {
+          actEndedEarly(sessionId, stopAfterCall)
+          continue
+        }
 
         const messageIds = Array.from(
           new Set(batch.flatMap((event) => event.sourceMessageIds))
@@ -1237,11 +1342,20 @@ export async function runDreamingPass(options: DreamingRunOptions): Promise<Drea
             { role: 'system', content: eraSegment.summary }
           ])
         }
-        await swapGraduationEvents(
+        const swapped = await swapGraduationEvents(
           sessionId,
           batch.map((event) => event.id),
           eraEvent
         )
+        if (swapped === 'chat_deleted') {
+          // BL-751: the chat went away between the era summary call above and this write's own
+          // embed call (inside `createMemorySegment`, before the swap). The era segment this pass
+          // just created was never wired into any window; remove it rather than leave it orphaned
+          // (a reused `existing` segment was already linked by an earlier pass and is left alone).
+          if (!existing) await deleteMemorySegment(agentId, eraSegment.id).catch(() => {})
+          actEndedEarly(sessionId, 'chat_deleted')
+          continue
+        }
         act(
           'era_consolidation',
           'done',

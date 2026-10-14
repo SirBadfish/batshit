@@ -29,7 +29,12 @@ import {
 import { createMemoryEmbedderAsync } from './memoryEmbedder'
 import { awarenessEntryLineHash, getMemoryFold } from './memoryRecall'
 import { refoldAwarenessAfterDelete, toMemorySummary, type MemorySummary } from './memoryTools'
-import type { MemoryLane, MemoryRecord, MemorySegmentRecord } from './memoryTypes'
+import type {
+  MemoryLane,
+  MemoryProvenanceEntry,
+  MemoryRecord,
+  MemorySegmentRecord
+} from './memoryTypes'
 import type { MemoryMediaMode, MemoryMediaRecord } from './memoryTypes'
 import {
   deleteMemoryMedia,
@@ -175,8 +180,51 @@ export async function searchManagedMemories(
   return { results: records.map(toMemorySummary) }
 }
 
+/** A provenance entry as the detail lane shows it. */
+export interface MemoryProvenanceView extends MemoryProvenanceEntry {
+  /** The entry's chat is gone. Worked out at each detail load, never stored (BL-447). */
+  source_deleted?: true
+}
+
+export type MemoryRecordDetailView = Omit<MemoryRecordView, 'provenance'> & {
+  provenance: MemoryProvenanceView[]
+}
+
+/**
+ * BL-447: mark each provenance entry whose chat no longer exists, so the panel can say
+ * "(original chat deleted)". Read-only: the chat-delete sweep writes nothing into memories,
+ * so the flag lives only in this answer. The EXISTS checks of the distinct chat ids go out
+ * together on one client (pipelined), not one round trip per entry.
+ */
+async function withDeletedChatMarks(
+  provenance: MemoryProvenanceEntry[] | undefined
+): Promise<MemoryProvenanceView[]> {
+  const entries = Array.isArray(provenance) ? provenance : []
+  const sessionIds = Array.from(
+    new Set(
+      entries
+        .map((entry) => entry.session_id)
+        .filter((id): id is string => typeof id === 'string' && id.length > 0)
+    )
+  )
+  const found =
+    sessionIds.length > 0
+      ? await redis.execute(async (client) =>
+          Promise.all(sessionIds.map((id) => client.exists(`session:${id}`)))
+        )
+      : []
+  const deleted = new Set(sessionIds.filter((_, index) => !found[index]))
+  return entries.map((entry) => {
+    const view: MemoryProvenanceView = { ...entry }
+    // Only this check decides: a value stored by anything else is not trusted.
+    delete view.source_deleted
+    if (deleted.has(entry.session_id)) view.source_deleted = true
+    return view
+  })
+}
+
 export interface MemoryManageDetail {
-  record: MemoryRecordView
+  record: MemoryRecordDetailView
   standingMediaCount: number
   chain: {
     predecessors: MemorySummary[]
@@ -207,7 +255,7 @@ export async function getManagedMemoryDetail(
     )
     .reduce((sum, entry) => sum + (entry.media?.length ?? 0), 0)
   return {
-    record: toRecordView(record),
+    record: { ...toRecordView(record), provenance: await withDeletedChatMarks(record.provenance) },
     standingMediaCount,
     chain: {
       predecessors: chain.predecessors.map(toMemorySummary),

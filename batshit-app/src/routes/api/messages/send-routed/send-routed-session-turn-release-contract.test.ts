@@ -40,7 +40,8 @@ describe('send-routed: the request releases only the turn it registered', () => 
 
   it('releases by its own registration, never by message id', () => {
     const tail = source.slice(outerFinally)
-    expect(tail).toContain('\n\t      releaseSessionTurn(sessionId, sessionTurnId)\n')
+    // BL-713: with how the request ended, for the chat's line (still by registration).
+    expect(tail).toContain('\n\t      releaseSessionTurn(sessionId, sessionTurnId, {\n')
     expect(source).not.toContain('clearSessionTurn(')
     expect(source.split('releaseSessionTurn(').length - 1).toBe(1)
   })

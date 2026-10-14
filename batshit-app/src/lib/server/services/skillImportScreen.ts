@@ -1,5 +1,5 @@
 /**
- * SA-120 P7 — the Jev Juice incoming-text screen, applied to a skill at import.
+ * SA-120 P7 — the Judge Juice incoming-text screen, applied to a skill at import.
  *
  * Both import doors call this AFTER `importSkillDefinition` has fetched and parsed the skill:
  * Settings → Skills & Commands (`POST /api/skills/import`, where the user then reads the
@@ -11,7 +11,7 @@
  * saved. Only SKILL.md is read, because that is the text an agent later takes as instructions;
  * bundled scripts and references are not screened, and the dialog's own warnings still say so.
  *
- * With **Screen Incoming Text** (on the Jev Juice card) off it returns `null`: no call, no field, today's
+ * With **Screen Incoming Text** (on the Judge Juice card) off it returns `null`: no call, no field, today's
  * response bytes.
  */
 
@@ -54,5 +54,5 @@ export async function screenImportedSkill(options: {
  */
 export function buildSkillScreenWarning(screen: UntrustedTextScreen | null | undefined): string | null {
   if (!screen || screen.status !== 'flagged' || screen.findings.length === 0) return null
-  return `Jev Juice flagged SKILL.md (an advisory guess; nothing was blocked): ${agentFindingList(screen)}. Read the skill before you trust it.`
+  return `Judge Juice flagged SKILL.md (an advisory guess; nothing was blocked): ${agentFindingList(screen)}. Read the skill before you trust it.`
 }

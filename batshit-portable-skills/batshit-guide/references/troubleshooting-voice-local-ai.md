@@ -169,7 +169,7 @@ n8n and Batshit may be calling different URLs or using different model/provider 
 
 ## Backup restore didn't restore voice or Local AI runtime
 
-Batshit backups can restore settings and references. They don't include Local AI model weights, the programs themselves, voice engine installs, local TTS/STT model files, or LiveKit servers/workers.
+Batshit backups can restore settings and references, and each clone voice's reference recording. They don't include Local AI model weights, the programs themselves, voice engine installs, local TTS/STT model files, or LiveKit servers/workers. In Docker, clone voice recordings live on the host computer and aren't in the backup yet.
 
 After restore: reinstall or restart the external runtime, reconnect the URL in Batshit, re-enter provider keys if the backup excluded secrets, run health checks, and run one real text/TTS/STT test before trusting the restored setup.
 

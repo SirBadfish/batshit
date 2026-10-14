@@ -19,6 +19,10 @@ vi.mock('$lib/services/zipping', () => ({
 import { compileForUserBatch, compileForAI } from './messageCompiler'
 import { api } from './api'
 import { zippingService } from '$lib/services/zipping'
+import { parseMessageContent } from '$lib/utils/messageFormatter'
+import type { TextRange } from '$lib/utils/hydratedTextRanges'
+import { decideReplyImageOrigins, emptyRunDelivery } from '$lib/server/services/imageAddressTurnRecord'
+import { buildMalformedCoolToolAiContent, buildCoolToolAiContentWithSources, estimateMalformedCoolToolAiTokens } from '$lib/utils/coolToolAiContent'
 
 const zipId = 'cool_tool_1779416324513_abcd1'
 const legacyZipId = 'cool_tool_1779416329822_legacy1'
@@ -28,6 +32,149 @@ const rawReadZipId = 'tool_raw_1779416340000_read1'
 const truncatedReadZipId = 'cool_tool_1779416341000_read1'
 const rawEditZipId = 'tool_raw_1779416342000_edit1'
 const truncatedEditZipId = 'cool_tool_1779416343000_edit1'
+
+describe('structural UI image hydration', () => {
+  it('keeps every observed short tool URL in the actual model prompt across long A/B/A references', async () => {
+    vi.mocked(zippingService.isUnzipped).mockReturnValue(true)
+    const a='cool_tool_1779416343000_aaaaaa'
+    const b='cool_tool_1779416343001_bbbbbb'
+    const urlA='https://unseen-a.example/image.png'
+    const urlB='https://seen-b.example/image.png'
+    const ref=(id:string)=>`{{batshit-zip:${id}:::${'description '.repeat(160)}}}`
+    const pieces:any[]=[]
+    const compiled=await compileForAI(`${ref(a)} between ${ref(b)} next ${ref(a)}`,0,1,{},
+      {id:'old',role:'assistant',metadata:{zipIds:[a,b]}},{},{
+        zipResolver:async(id)=>({id,type:'cool_tool',tokens:30,metadata:{operationKind:'read_file'},
+          content:JSON.stringify({toolName:'read_file',toolCallId:id,toolInput:{path:'/tmp/result'},toolResult:{content:id===a?urlA:urlB,lines:1}})}),
+        onDeliveredSource:(piece)=>pieces.push(piece)
+      })
+    expect(compiled).toContain(urlA)
+    expect(compiled).toContain(urlB)
+    expect(compiled).not.toContain('{{batshit-zip:')
+    for(const piece of pieces.filter((piece)=>piece.source==='tool_result')) expect(compiled).toContain(piece.text)
+    const record=decideReplyImageOrigins({messageId:'new',version:1,lane:'api',replyTexts:[`<img src="${urlA}">`],
+      compiled:{pieces:[{source:'agent_words',text:compiled,messageId:'old'},...pieces],nonTextInputs:0,unaccountedInputs:0},
+      addenda:[],run:{...emptyRunDelivery(false),observed:true},steers:[],storedRecords:{}})
+    expect(record.addresses[urlA].state).toBe('as_read')
+  })
+
+  it('keeps interleaved A/B/A references and raw-image neighbors at their actual positions', async () => {
+    const a = 'image_1779416343000_abcde1'
+    const b = 'image_1779416343001_abcdef22222'
+    const addressA = 'https://pictures.example.org/a.png'
+    const addressB = 'https://pictures.example.org/longer-b.png'
+    vi.mocked(api.getZips).mockResolvedValueOnce(new Map([
+      [a, { id:a,type:'image',content:addressA } as any], [b, { id:b,type:'image',content:addressB } as any]
+    ]))
+    let ranges: TextRange[] = []
+    const refA=`{{batshit-zip:${a}:::A}}`
+    const refB=`{{batshit-zip:${b}:::B with a longer description}}`
+    const raw=`<img src="${addressA}" data-zip-id="${a}" data-zip-type="image">`
+    const content=`Start ${raw} then ${refA} middle ${refB} next ${refA} finally ${raw} done`
+    const compiled=await compileForUserBatch(content, {trustedZipIds:new Set([a,b]),onHydratedRanges:(_text,value)=>{ranges=value}})
+    expect(compiled.startsWith(`Start ${raw} then `)).toBe(true)
+    expect(compiled.endsWith(`finally ${raw} done`)).toBe(true)
+    expect(compiled).not.toContain('{{batshit-zip:')
+    const images=parseMessageContent(compiled,'assistant',undefined,[],new Set([a,b]),ranges).filter((segment)=>segment.type==='image')
+    expect(images.map((segment)=>segment.src)).toEqual([addressA,addressA,addressB,addressA,addressA])
+    expect(images.map((segment)=>segment.hydratedContext)).toEqual([false,true,true,true,false])
+    expect(ranges.every((range)=>range.start>=0 && range.end>range.start && range.end<=compiled.length)).toBe(true)
+  })
+
+  it('hydrates repeated identical references at their actual positions with unchanged surrounding text', async () => {
+    const id = 'image_1779416343000_abcde1'
+    const address = 'https://pictures.example.org/a.png'
+    vi.mocked(api.getZips).mockResolvedValueOnce(new Map([[id, { id, type: 'image', content: address } as any]]))
+    let ranges: TextRange[] = []
+    const ref = `{{batshit-zip:${id}:::Image}}`
+    const text = await compileForUserBatch(`Before ${ref} between ${ref} after`, {
+      trustedZipIds: new Set([id]), onHydratedRanges: (_text, value) => { ranges = value }
+    })
+    expect(text).not.toContain('{{batshit-zip:')
+    const segments = parseMessageContent(text, 'assistant', undefined, [], new Set([id]), ranges)
+    expect(segments.filter((s) => s.type === 'image').map((s) => s.hydratedContext)).toEqual([true, true])
+    expect(segments.filter((s) => s.type === 'text').map((s) => s.content)).toEqual(['Before', 'between', 'after'])
+  })
+
+  it('exempts only the trusted replacement span, never the same raw tag or its attributes', async () => {
+    const id = 'image_1779416343000_abcde1'
+    const address = 'https://pictures.example.org/a.png'
+    vi.mocked(api.getZips).mockResolvedValueOnce(new Map([[id, { id, type: 'image', content: address } as any]]))
+    let ranges: TextRange[] = []
+    const raw = `<image src="${address}" data-zip-id="${id}" data-zip-type="image"></image>`
+    const text = await compileForUserBatch(`Before ${raw}\n{{batshit-zip:${id}:::Image}} after`, {
+      trustedZipIds: new Set([id]),
+      onHydratedRanges: (_text, value) => { ranges = value }
+    })
+    const images = parseMessageContent(text, 'assistant', undefined, [], new Set([id]), ranges).filter((s) => s.type === 'image')
+    expect(images.map((s) => s.src)).toEqual([address, address])
+    expect(images.map((s) => s.hydratedContext)).toEqual([false, true])
+  })
+
+  it('grants no hydration exemption to an untrusted reference', async () => {
+    const id = 'image_1779416343000_abcde1'
+    vi.mocked(api.getZips).mockResolvedValueOnce(new Map([[id, { id, type: 'image', content: 'https://pictures.example.org/a.png' } as any]]))
+    let ranges: TextRange[] = []
+    await compileForUserBatch(`{{batshit-zip:${id}}}`, { trustedZipIds: new Set(), onHydratedRanges: (_text, value) => { ranges = value } })
+    expect(ranges).toEqual([])
+  })
+})
+
+describe('malformed legacy Cool Tool sizing', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.mocked(zippingService.isUnzipped).mockReturnValue(false)
+    vi.mocked(zippingService.isRezipped).mockReturnValue(false)
+  })
+
+  it('uses the exact fallback sent to the model instead of inflated stored tokens', async () => {
+    const id = 'cool_tool_1779416344000_broken1'
+    const content = '{"incomplete":"</script> still open'
+    const zipResolver = vi.fn(async () => ({
+      id, type: 'cool_tool', content, tokens: 30000,
+      metadata: { toolName: 'read_file', operationKind: 'read_file' }
+    }))
+    const exposed: number[] = []
+    const compiled = await compileForAI(`{{batshit-zip:${id}:::broken read}}`, 4, 5,
+      { buffer_size_read_file: 2, zip_threshold_read_file: 0 }, undefined, {}, {
+        zipResolver,
+        onZipExposed: (entry) => exposed.push(entry.tokens)
+      })
+
+    expect(compiled).toBe(buildMalformedCoolToolAiContent(id, content))
+    expect(compiled).toContain('<\\/script>')
+    expect(exposed).toEqual([estimateMalformedCoolToolAiTokens(id, content)])
+    expect(exposed[0]).toBeLessThan(10000)
+  })
+
+  it('compresses a large malformed sidecar even when the main payload is small and parseable', async () => {
+    const id = 'cool_tool_1779416344000_main2'
+    const sidecarId = 'tool_raw_1779416344000_broken2'
+    const sidecarContent = '{"broken":"' + 'x'.repeat(40_000)
+    const main = {
+      id, type: 'cool_tool', tokens: 100,
+      content: JSON.stringify({
+        operationKind: 'read_file', rendererFamily: 'read_file',
+        toolResult: { content: '' }, rawSidecar: { zipId: sidecarId }
+      }),
+      metadata: { toolName: 'read_file', operationKind: 'read_file' }
+    }
+    const zipResolver = vi.fn(async (zipId: string) => zipId === id
+      ? main
+      : zipId === sidecarId
+        ? { id: sidecarId, type: 'tool_raw', content: sidecarContent, tokens: 100, metadata: {} }
+        : null)
+    const compressed: number[] = []
+    const compiled = await compileForAI(`{{batshit-zip:${id}:::broken read}}`, 4, 5,
+      { buffer_size_read_file: 2, zip_threshold_read_file: 0 }, undefined, {}, {
+        zipResolver,
+        onZipCompressed: (entry) => compressed.push(entry.tokens)
+      })
+
+    expect(compiled).toContain('large: hold it or fetch it')
+    expect(compressed).toEqual([estimateMalformedCoolToolAiTokens(id, sidecarContent)])
+  })
+})
 
 const payload = {
   toolName: 'batshit_server_read_file',
@@ -834,6 +981,29 @@ describe('messageCompiler – cool_tool inline payloads', () => {
     expect(healthy).not.toContain('cut short by an error')
   })
 
+  // BL-239: the stored message of an output-limit stop is advice for the user ("ask the agent to
+  // continue, or raise Max Tokens"); the model gets the plain fact, not that advice.
+  it('tells the model plainly when a reply stopped at the output limit', async () => {
+    const stopped = await compileForAI(
+      'I',
+      0,
+      1,
+      {},
+      {
+        metadata: {
+          response_failed: true,
+          failure_kind: 'output_limit',
+          error_message:
+            'The model reached its output limit of 65,536 tokens before this reply was finished. Ask the agent to continue, or raise Max Tokens in its model preset.'
+        }
+      },
+      {}
+    )
+    expect(stopped).toBe("I\n\n[This response stopped at the model's output limit before it was finished.]")
+    expect(stopped).not.toContain('Max Tokens')
+    expect(stopped).not.toContain('cut short by an error')
+  })
+
   it('includes saved reasoning in model history only when Preserve Reasoning is on', async () => {
     const message = {
       agent_id: 'agent-a',
@@ -979,10 +1149,11 @@ describe('messageCompiler – onZipCompressed (SA-120 P5)', () => {
         tokens: 900,
         operationKind: 'read_file',
         toolName: 'read_file',
-        forceCompress: false,
+        sizeGuard: null,
         rezipped: false,
         rezippedBy: null,
         groupUnshared: false,
+        deadCopy: null,
         messagesFromEnd: 4
       }
     ])
@@ -1012,6 +1183,46 @@ describe('messageCompiler – onZipCompressed (SA-120 P5)', () => {
     expect(result).toBe(marker)
     expect(exposed).toHaveLength(1)
     expect(compressed).toEqual([])
+  })
+
+  it('passes structural Cool Tool provenance for both inline and appended exposure without changing text', async () => {
+    const commandUrl = 'https://command.example/not-read.png'
+    const outputUrl = 'https://output.example/read.png'
+    const payload = {
+      toolName: 'bash', operationKind: 'bash',
+      toolArgs: { command: `echo ${commandUrl}` },
+      toolResult: { command: `echo ${commandUrl}`, stdout: outputUrl, stderr: '', exitCode: 0 }
+    }
+    const zipResolver = vi.fn(async (id: string) => ({
+      id,
+      type: 'cool_tool',
+      content: JSON.stringify(payload),
+      tokens: 80,
+      metadata: { operationKind: 'bash', toolName: 'bash', promptTokens: 80 }
+    }))
+    const expected = buildCoolToolAiContentWithSources(zipId, { content: JSON.stringify(payload) }, payload)
+    const marker = `{{batshit-zip:${zipId}}}`
+    const inlinePieces: any[] = []
+    const inline = await compileForAI(marker, 4, 5, {}, undefined, {}, {
+      zipResolver,
+      onDeliveredSource: (piece) => inlinePieces.push(piece)
+    })
+
+    expect(inline).toBe(expected.text)
+    expect(inlinePieces.map((piece) => piece.text).join('')).toBe(expected.text)
+    expect(inlinePieces.filter((piece) => piece.source === 'tool_result').map((piece) => piece.text).join('')).toContain(outputUrl)
+    expect(inlinePieces.filter((piece) => piece.source === 'tool_result').map((piece) => piece.text).join('')).not.toContain(commandUrl)
+
+    const appended: any[] = []
+    const appendedPrompt = await compileForAI(marker, 4, 5, {}, undefined, {}, {
+      zipResolver,
+      zipViewMode: 'appended',
+      onZipExposure: (exposure) => appended.push(exposure)
+    })
+    expect(appendedPrompt).toBe(marker)
+    expect(appended[0].expandedContent).toBe(expected.text)
+    expect(appended[0].expandedContentParts).toEqual(expected.parts)
+    expect(appended[0].expandedContentParts.map((piece: any) => piece.text).join('')).toBe(appended[0].expandedContent)
   })
 
   it('passes the stored description parts through as facts, with a missing part as an empty string', async () => {
@@ -1047,13 +1258,13 @@ describe('messageCompiler – onZipCompressed (SA-120 P5)', () => {
     vi.mocked(zippingService.isRezipped).mockReturnValue(true)
     const seen: any[] = []
     await compileForAI(`{{batshit-zip:${zipId}}}`, 4, 5, normalLane, undefined, {}, {
-      zipResolver: vi.fn(async (id: string) => readZip(id, { forceCompress: true })),
+      zipResolver: vi.fn(async (id: string) => readZip(id, { promptTokens: 25000, forceCompress: false })),
       onZipCompressed: (entry) => seen.push(entry)
     })
     expect(seen).toHaveLength(1)
     // No source was hydrated, so the rezip reads as the user's: the safe default for a
     // reader that must never override an explicit zip.
-    expect(seen[0]).toMatchObject({ rezipped: true, rezippedBy: 'user', forceCompress: true })
+    expect(seen[0]).toMatchObject({ rezipped: true, rezippedBy: 'user', sizeGuard: 'too_large' })
 
     vi.mocked(zippingService.getRezippedSource).mockReturnValue('inferred')
     seen.length = 0
@@ -1181,5 +1392,132 @@ describe('messageCompiler – onZipExposed (SA-120 P5)', () => {
     expect(noisy).toBe(quiet)
     expect(errorSpy).toHaveBeenCalledWith('[compileForAI] onZipExposed observer threw; ignored:', expect.any(Error))
     errorSpy.mockRestore()
+  })
+})
+
+describe('messageCompiler – dead copies and the compression hint (SA-129 P1)', () => {
+  const readPayload = JSON.stringify({
+    toolName: 'read_file',
+    operationKind: 'read_file',
+    toolArgs: { filePath: 'src/app.js', innerCommand: 'cat src/app.js' },
+    toolResult: { filePath: 'src/app.js', content: 'export const app = 1', lineCount: 1 }
+  })
+  const readZip = (id: string) => ({
+    id,
+    content: readPayload,
+    type: 'cool_tool',
+    tokens: 40,
+    description: 'read_file: src/app.js - 1 line',
+    metadata: { toolName: 'read_file', operationKind: 'read_file', promptTokens: 40 }
+  })
+  const lane = { buffer_size_read_file: 4, zip_threshold_read_file: 0 }
+  const marker = `{{batshit-zip:${zipId}:::read_file: src/app.js - 1 line}}`
+  const zipResolver = vi.fn(async (id: string) => readZip(id))
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.mocked(zippingService.isUnzipped).mockReturnValue(false)
+    vi.mocked(zippingService.isRezipped).mockReturnValue(false)
+    vi.mocked(zippingService.getUnzippedInfo).mockReturnValue(undefined)
+  })
+
+  it('an expanded read carries its compression hint after the transcript, and the last reply warns', async () => {
+    const early = await compileForAI(marker, 0, 5, lane, undefined, {}, { zipResolver, agentMessagesFromEnd: 1 })
+    expect(early).toContain('export const app = 1\n```\nCompresses 4 replies after it was read.')
+    const last = await compileForAI(marker, 0, 5, lane, undefined, {}, { zipResolver, agentMessagesFromEnd: 3 })
+    expect(last.endsWith('```\nCompresses after this reply. Note what you need or hold the file.')).toBe(true)
+  })
+
+  it('a dead copy compiles to its reference, which says why, and the observer is told', async () => {
+    const seen: any[] = []
+    const compiled = await compileForAI(marker, 0, 5, lane, undefined, {}, {
+      zipResolver,
+      agentMessagesFromEnd: 1,
+      deadCopies: new Map([[zipId, { reason: 'stale' as const, repliesUntilDead: 1 }]]),
+      onZipCompressed: (entry) => seen.push(entry)
+    })
+    expect(compiled).toBe(`{{batshit-zip:${zipId}:::read_file: src/app.js - 1 line - stale, edited since}}`)
+    expect(seen).toMatchObject([{ zipId, deadCopy: 'stale' }])
+  })
+
+  it('a dead copy that died after the buffer compressioned it keeps its plain reference', async () => {
+    const compiled = await compileForAI(marker, 0, 9, lane, undefined, {}, {
+      zipResolver,
+      agentMessagesFromEnd: 8,
+      deadCopies: new Map([[zipId, { reason: 'superseded' as const, repliesUntilDead: 6 }]])
+    })
+    expect(compiled).toBe(marker)
+  })
+
+  it("a user's unzip keeps a dead copy open; an agent's does not", async () => {
+    const deadCopies = new Map([[zipId, { reason: 'superseded' as const, repliesUntilDead: 0 }]])
+    vi.mocked(zippingService.isUnzipped).mockReturnValue(true)
+    vi.mocked(zippingService.getUnzippedInfo).mockReturnValue({ source: 'user' } as never)
+    const user = await compileForAI(marker, 0, 5, lane, undefined, {}, { zipResolver, deadCopies })
+    expect(user).toContain('export const app = 1')
+    // A held read says who holds it, never when it compresses (SA-129 P2).
+    expect(user).not.toContain('Compresses')
+    expect(user.endsWith('```\nHeld by the user: stays open until they release it.')).toBe(true)
+    vi.mocked(zippingService.getUnzippedInfo).mockReturnValue({ source: 'agent' } as never)
+    const agent = await compileForAI(marker, 0, 5, lane, undefined, {}, { zipResolver, deadCopies })
+    expect(agent).toBe(`{{batshit-zip:${zipId}:::read_file: src/app.js - 1 line - superseded by a later read}}`)
+  })
+
+  it("a group compile gives no compression hint to another agent's result", async () => {
+    const message = { agent_id: 'agent-b' }
+    const groupToolSharing = { currentAgentId: 'agent-a', sharedTools: ['read_file'] }
+    const other = await compileForAI(marker, 0, 5, lane, message, {}, { zipResolver, agentMessagesFromEnd: 0, groupToolSharing })
+    expect(other).toContain('export const app = 1')
+    expect(other).not.toContain('Compresses')
+    const own = await compileForAI(marker, 0, 5, lane, { agent_id: 'agent-a' }, {}, { zipResolver, agentMessagesFromEnd: 0, groupToolSharing })
+    expect(own).toContain('Compresses 4 replies after it was read.')
+  })
+
+  // SA-129 P2 (DL-03): a held read carries one steady line that says who holds it.
+  describe('the held lines (SA-129 P2)', () => {
+    const agent = { id: 'agent-a', ...lane }
+    const held = (info: Record<string, any>) => {
+      vi.mocked(zippingService.isUnzipped).mockReturnValue(true)
+      vi.mocked(zippingService.getUnzippedInfo).mockReturnValue({ zipId, sessionId: 's', unzippedAt: 1, ...info } as never)
+    }
+
+    it("an agent's hold reads Held by you to that agent, and stays open past its buffer", async () => {
+      held({ source: 'agent', permanent: true, path: 'src/app.js', agentId: 'agent-a' })
+      const compiled = await compileForAI(marker, 0, 9, agent, undefined, {}, { zipResolver, agentMessagesFromEnd: 8 })
+      expect(compiled.endsWith('```\nHeld by you: stays open until you release it.')).toBe(true)
+    })
+
+    it('another agent\'s hold (a chat that changed agents) says so', async () => {
+      held({ source: 'agent', permanent: true, path: 'src/app.js', agentId: 'agent-z' })
+      const compiled = await compileForAI(marker, 0, 5, agent, undefined, {}, { zipResolver, agentMessagesFromEnd: 1 })
+      expect(compiled.endsWith('```\nHeld by another agent: stays open until it is released.')).toBe(true)
+    })
+
+    it("a user's Hold for N messages says the length, which never changes while it lasts", async () => {
+      held({ source: 'user', permanent: false, duration: 10, messageCount: 2 })
+      const first = await compileForAI(marker, 0, 5, agent, undefined, {}, { zipResolver, agentMessagesFromEnd: 1 })
+      held({ source: 'user', permanent: false, duration: 10, messageCount: 7 })
+      const later = await compileForAI(marker, 0, 5, agent, undefined, {}, { zipResolver, agentMessagesFromEnd: 3 })
+      expect(first.endsWith('```\nHeld by the user for 10 messages.')).toBe(true)
+      expect(later).toBe(first)
+    })
+
+    it('a Judge Juice open gets no line (the DCM tells the agent)', async () => {
+      held({ source: 'inferred', permanent: false, duration: 2, messageCount: 0 })
+      const compiled = await compileForAI(marker, 0, 5, agent, undefined, {}, { zipResolver, agentMessagesFromEnd: 1 })
+      expect(compiled).toContain('export const app = 1\n```')
+      expect(compiled).not.toContain('Held by')
+      expect(compiled).not.toContain('Compresses')
+    })
+
+    it("an agent's hold on a copy it edited since compresses anyway (DL-01), with no line", async () => {
+      held({ source: 'agent', permanent: true, path: 'src/app.js', agentId: 'agent-a' })
+      const compiled = await compileForAI(marker, 0, 5, agent, undefined, {}, {
+        zipResolver,
+        agentMessagesFromEnd: 0,
+        deadCopies: new Map([[zipId, { reason: 'stale' as const, repliesUntilDead: 0 }]])
+      })
+      expect(compiled).toBe(`{{batshit-zip:${zipId}:::read_file: src/app.js - 1 line - stale, edited since}}`)
+    })
   })
 })

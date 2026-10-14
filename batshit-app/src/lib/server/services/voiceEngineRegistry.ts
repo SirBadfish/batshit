@@ -1,4 +1,4 @@
-import { rm, realpath, stat } from 'node:fs/promises'
+import { realpath } from 'node:fs/promises'
 import path from 'node:path'
 import { z } from 'zod'
 
@@ -14,12 +14,17 @@ import {
   normalizeApiKeyServiceName
 } from '$lib/services/apiKey.server'
 import { syncLocalRuntimeStopPreference } from '$lib/server/services/voiceRuntimeStopPreference'
+import { resolveRuntimeContext } from '$lib/server/services/runtimeContext'
 import {
   pruneLocalRuntimeLaunchRecords,
+  removeDeletedEngineFiles,
   stopDeletedEngineRuntimes
 } from '$lib/server/services/voiceRuntimeLaunchRecords'
 import { logger } from '$lib/utils/logger'
-import { hostOperatorCanStopVoiceRuntimes } from '$lib/server/services/voiceHostOperatorRuntime'
+import {
+  hostOperatorCanStopVoiceRuntimes,
+  registerHostVoiceRuntimeShutdown
+} from '$lib/server/services/voiceHostOperatorRuntime'
 import {
   normalizeAgentVoiceProfile,
   normalizeVoiceSettings,
@@ -310,15 +315,6 @@ const voiceEngineRecordSchema = z
     realtimeStt: voiceEngineRealtimeSttSchema.optional()
   })
   .strict()
-
-const voiceEngineRegistryStoreSchema = z
-  .object({
-    version: z.literal(VOICE_ENGINE_REGISTRY_SCHEMA_VERSION),
-    records: z.array(voiceEngineRecordSchema).default([])
-  })
-  .strict()
-
-type VoiceEngineRegistryStore = z.infer<typeof voiceEngineRegistryStoreSchema>
 
 export type VoiceEnginePublicUpdate = {
   id: string
@@ -983,44 +979,189 @@ function sanitizeVoiceSettingsForStorage(settingsValue: unknown): VoiceSettings 
   return rest
 }
 
-async function readVoiceEngineRegistryStore(userId: string): Promise<VoiceEngineRegistryStore> {
+// ---- Reading and writing the registry: never over what could not be read ---------------------
+//
+// The registry used to read a Redis error, or one record the strict schema refused (a field from
+// a newer Batshit, say), as an EMPTY registry, and the next save of any engine wrote that empty
+// list back: every other engine was gone, and the launch-record tidy that follows every save then
+// released their launch records. Now a failed read throws; a registry in a shape this Batshit
+// cannot read as a whole is never written over (a read for display sees no engines and a notice);
+// and one record it cannot read is kept, its raw value written back unchanged by every writer,
+// its id never given to another record, and named in the log and in the Engine Manager.
+
+/** One saved engine record Batshit could not read, kept and written back exactly as read. */
+type UnreadableVoiceEngineRecord = {
+  /** The id its raw value names, normalized, or null when it names none. */
+  id: string | null
+  /** Why it did not parse, in a few words. */
+  reason: string
+  /** Its raw value, written back unchanged. */
+  raw: unknown
+}
+
+/** What the Engine Manager and the voice pickers are told about a saved record, or list, they cannot show. */
+export type UnreadableVoiceEngineNotice = {
+  /** `list`: the saved engine list as a whole cannot be read. `record`: one saved engine cannot. */
+  scope: 'list' | 'record'
+  /** The engine id the record names, normalized, or null when it names none (always null for `list`). */
+  id: string | null
+  reason: string
+  /** For labels only (`record`): what its raw value says, where it says it plainly. */
+  name?: string
+  hidden?: boolean
+  supportsTts?: boolean
+  supportsStt?: boolean
+}
+
+/**
+ * A saved engine record, or the whole saved list, that Batshit cannot read: it will not edit, use,
+ * or delete it. Typed so a caller that only labels a reply's voice (the send path) can go on
+ * without the engine instead of failing the message.
+ */
+export class VoiceEngineRecordUnreadableError extends Error {
+  constructor(
+    readonly engineId: string,
+    message: string
+  ) {
+    super(message)
+    this.name = 'VoiceEngineRecordUnreadableError'
+  }
+}
+
+type LoadedVoiceEngineRegistry = {
+  records: VoiceEngineRecord[]
+  unreadable: UnreadableVoiceEngineRecord[]
+  /** Why the registry as a whole could not be read. Only a read for display gets this far. */
+  storeProblem: string | null
+}
+
+/** The registry as a whole is in a shape this Batshit cannot read: nothing may write over it. */
+class VoiceEngineRegistryUnreadableError extends Error {
+  constructor(
+    readonly key: string,
+    readonly why: string
+  ) {
+    super(`the voice engine registry ${key} does not parse: ${why}`)
+    this.name = 'VoiceEngineRegistryUnreadableError'
+  }
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function unreadableRecordId(raw: unknown): string | null {
+  if (!isPlainRecord(raw) || typeof raw.id !== 'string') return null
+  try {
+    return normalizeVoiceEngineId(raw.id)
+  } catch {
+    return null
+  }
+}
+
+function describeUnreadableRecord(error: z.ZodError): string {
+  const unknownFields = error.issues.flatMap((issue) =>
+    issue.code === 'unrecognized_keys' ? issue.keys.map((key) => [...issue.path, key].join('.')) : []
+  )
+  const parts = unknownFields.length ? [`has settings this Batshit does not know: ${unknownFields.join(', ')}`] : []
+  for (const issue of error.issues.filter((entry) => entry.code !== 'unrecognized_keys').slice(0, 2)) {
+    parts.push(`${issue.path.join('.') || 'the record'}: ${issue.message}`)
+  }
+  return parts.join('; ')
+}
+
+async function readVoiceEngineRegistryRaw(userId: string): Promise<{ key: string; raw: unknown }> {
   const key = buildVoiceEngineRegistryKey(userId)
   try {
-    const raw = await redis.execute(async (client) => {
-      return (await client.json.get(key)) as VoiceEngineRegistryStore | null
-    })
-
-    if (!raw) {
-      return {
-        version: VOICE_ENGINE_REGISTRY_SCHEMA_VERSION,
-        records: []
-      }
-    }
-
-    const parsed = voiceEngineRegistryStoreSchema.safeParse(raw)
-    if (!parsed.success) {
-      console.warn('[VoiceEngineRegistry] Invalid registry payload. Resetting store.', parsed.error.flatten())
-      return {
-        version: VOICE_ENGINE_REGISTRY_SCHEMA_VERSION,
-        records: []
-      }
-    }
-
-    return parsed.data
+    const raw = await redis.execute(async (client) => (await client.json.get(key)) as unknown)
+    return { key, raw }
   } catch (error) {
-    console.warn('[VoiceEngineRegistry] Failed to read registry store:', error)
-    return {
-      version: VOICE_ENGINE_REGISTRY_SCHEMA_VERSION,
-      records: []
-    }
+    throw new Error(
+      `Could not read the voice engine list (${key}): ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error }
+    )
+  }
+}
+
+function parseVoiceEngineRegistryStore(
+  key: string,
+  raw: unknown
+): Pick<LoadedVoiceEngineRegistry, 'records' | 'unreadable'> {
+  if (raw === null || raw === undefined) return { records: [], unreadable: [] }
+  if (!isPlainRecord(raw)) throw new VoiceEngineRegistryUnreadableError(key, 'it is not a list of engines')
+  const { version, records, ...rest } = raw
+  if (version !== VOICE_ENGINE_REGISTRY_SCHEMA_VERSION) {
+    throw new VoiceEngineRegistryUnreadableError(
+      key,
+      `it is format version ${JSON.stringify(version ?? null)}, and this Batshit reads version ${VOICE_ENGINE_REGISTRY_SCHEMA_VERSION}`
+    )
+  }
+  const unknownFields = Object.keys(rest)
+  if (unknownFields.length) {
+    throw new VoiceEngineRegistryUnreadableError(key, `it has fields this Batshit does not know: ${unknownFields.join(', ')}`)
+  }
+  if (records !== undefined && !Array.isArray(records)) {
+    throw new VoiceEngineRegistryUnreadableError(key, 'its records are not a list')
+  }
+  const readable: VoiceEngineRecord[] = []
+  const unreadable: UnreadableVoiceEngineRecord[] = []
+  for (const entry of (records ?? []) as unknown[]) {
+    const parsed = voiceEngineRecordSchema.safeParse(entry)
+    if (parsed.success) readable.push(parsed.data as VoiceEngineRecord)
+    else unreadable.push({ id: unreadableRecordId(entry), reason: describeUnreadableRecord(parsed.error), raw: entry })
+  }
+  return { records: readable, unreadable }
+}
+
+// Said once per process per problem, not on every read (voice playback reads the registry often).
+const reportedRegistryProblems = new Set<string>()
+
+function reportRegistryProblem(key: string, message: string) {
+  const signature = `${key}|${message}`
+  if (reportedRegistryProblems.has(signature)) return
+  reportedRegistryProblems.add(signature)
+  console.warn(`[VoiceEngineRegistry] ${key}: ${message}`)
+}
+
+function reportUnreadableRecords(key: string, unreadable: UnreadableVoiceEngineRecord[]) {
+  if (!unreadable.length) return
+  const named = unreadable.map((entry) => `${entry.id ?? '(no id)'} (${entry.reason})`).join('; ')
+  reportRegistryProblem(
+    key,
+    `${unreadable.length} saved engine record(s) cannot be read and are kept unchanged: ${named}`
+  )
+}
+
+/**
+ * Refuse to edit, use, or delete a record Batshit cannot read, or anything in a registry it cannot
+ * read as a whole. `null` ("not registered") would send a caller off to set the engine up again.
+ */
+function assertVoiceEngineRecordReadable(registry: LoadedVoiceEngineRegistry, engineId: string) {
+  if (registry.storeProblem) {
+    throw new VoiceEngineRecordUnreadableError(
+      engineId,
+      `The saved voice engine list can't be read (${registry.storeProblem}), so Batshit will not change it.`
+    )
+  }
+  const entry = registry.unreadable.find((candidate) => candidate.id === engineId)
+  if (entry) {
+    throw new VoiceEngineRecordUnreadableError(
+      engineId,
+      `The saved record for voice engine "${engineId}" can't be read (${entry.reason}), so Batshit keeps it unchanged and will not edit, use, or delete it.`
+    )
   }
 }
 
 async function writeVoiceEngineRegistryStore(
   userId: string,
-  store: VoiceEngineRegistryStore
+  registry: Pick<LoadedVoiceEngineRegistry, 'records' | 'unreadable'>
 ): Promise<void> {
   const key = buildVoiceEngineRegistryKey(userId)
+  const store = {
+    version: VOICE_ENGINE_REGISTRY_SCHEMA_VERSION,
+    // A record Batshit could not read goes back exactly as it was read.
+    records: [...registry.records, ...registry.unreadable.map((entry) => entry.raw)]
+  }
   await redis.execute(async (client) => {
     await client.json.set(key, '$', store as any)
   })
@@ -1029,10 +1170,27 @@ async function writeVoiceEngineRegistryStore(
   // engine, or its "keep running" would hold a shared runtime up with no switch left to change
   // it. Batshit is one user per instance, so this user's engines are the registry's engines.
   // Docker keeps no local records (the host operator does, and tidies its own at shutdown).
+  // Not while a record cannot be read: its engine may still use a launch record, and the tidy
+  // would read it as deleted and drop its attach records and its "keep running".
   if (!isContainerizedRuntime()) {
-    await pruneLocalRuntimeLaunchRecords(store.records).catch((error) =>
-      logger.warn('[voice-runtime] could not tidy launch records after a registry change', { error })
-    )
+    if (registry.unreadable.length > 0) {
+      logger.warn('[voice-runtime] did not tidy launch records after a registry change: a saved engine record cannot be read', {
+        engineIds: registry.unreadable.map((entry) => entry.id)
+      })
+    } else {
+      // LiveKit's runtimes are not voice engines but keep launch records too (BL-1300). Loaded at
+      // call time: the LiveKit module imports the engine setup, which imports this registry.
+      try {
+        const { resolveLiveKitRuntimeEngineRefs } = await import('$lib/server/services/liveKitSidecarRuntime')
+        const liveKit = await resolveLiveKitRuntimeEngineRefs(userId)
+        await pruneLocalRuntimeLaunchRecords([...registry.records, ...liveKit]).catch((error) =>
+          logger.warn('[voice-runtime] could not tidy launch records after a registry change', { error })
+        )
+      } catch (error) {
+        // Not without LiveKit's settings: the tidy would read LiveKit as gone and drop its records.
+        logger.warn('[voice-runtime] did not tidy launch records after a registry change: LiveKit settings could not be read', { error })
+      }
+    }
   }
 }
 
@@ -1386,7 +1544,7 @@ export type StopOnShutdownContext = {
  * recipe, so Batshit never started it and must not claim it can stop it. In
  * Docker the host runtime add-on operator starts host engines, and only an
  * operator that records them and publishes `/v1/voice-engines/stop` (protocol
- * revision 5) can stop them; with no operator, an older one, or one on Windows
+ * revision 5) can stop them; with no operator or an older one
  * the container cannot reach them — saying so is the whole point, rather than
  * showing a switch that silently does nothing.
  */
@@ -1409,6 +1567,48 @@ async function resolveStopOnShutdownContext(): Promise<StopOnShutdownContext> {
   return { hostOperatorCanStop: await hostOperatorCanStopVoiceRuntimes() }
 }
 
+/**
+ * Every voice engine on this instance, read for the Docker shutdown stop, where there is no
+ * request and so no user id. It reads the registry of each of the instance's users (`users:all`,
+ * written when a user is created and never restored from a backup, so a registry an old user id
+ * left behind is not read; Batshit is one user per instance). Unlike the registry's own reader it
+ * never answers "no engines" for a registry it could not read or parse. At shutdown an engine the
+ * list leaves out has no choice, which the host operator reads as "stop", so a failed read would
+ * stop engines set to keep running. It throws instead, and the shutdown then sends nothing (BL-19).
+ */
+export async function listVoiceEngineRecordsOfEveryUser(): Promise<VoiceEngineRecord[]> {
+  const userIds = await redis.execute(async (client) => client.sMembers('users:all'))
+  const records: VoiceEngineRecord[] = []
+  for (const userId of [...userIds].sort()) {
+    const { key, raw } = await readVoiceEngineRegistryRaw(userId)
+    // Throws for a registry it cannot read as a whole.
+    const parsed = parseVoiceEngineRegistryStore(key, raw)
+    // One record it cannot read is an engine it cannot name, and the operator would stop it.
+    if (parsed.unreadable.length > 0) {
+      throw new Error(
+        `the voice engine registry ${key} has ${parsed.unreadable.length} record(s) this Batshit cannot read (${parsed.unreadable
+          .map((entry) => entry.id ?? '(no id)')
+          .join(', ')}), and the host operator would read a missing engine as "stop"`
+      )
+    }
+    records.push(...parsed.records)
+  }
+  return records
+}
+
+/**
+ * Docker: when this container shuts down, the host operator stops the voice engines it started, as
+ * each engine's "Stop with Batshit" choice says. Registered when the server starts
+ * (`hooks.server.ts`), not at the first signed-in page load (BL-19): Docker restarts a container
+ * after a crash or a restart of the computer with nobody opening it, and that container would
+ * otherwise stop nothing an earlier one started. Outside Docker the launchers stop what they
+ * started, so nothing is registered.
+ */
+export function registerDockerVoiceEngineShutdown(): void {
+  if (!isContainerizedRuntime()) return
+  registerHostVoiceRuntimeShutdown(listVoiceEngineRecordsOfEveryUser)
+}
+
 function sanitizeVoiceEngineForClient(
   engine: VoiceEngineRecord,
   allRecords: VoiceEngineRecord[],
@@ -1429,7 +1629,10 @@ function sanitizeVoiceEngineForClient(
         installOwnership: engine.localRuntime.installOwnership,
         startup: engine.localRuntime.startup,
         canStopOnShutdown: stopAvailability.canStop,
-        stopOnShutdownUnavailableReason: stopAvailability.reason
+        stopOnShutdownUnavailableReason: stopAvailability.reason,
+        shutdownStopPolicy: stopAvailability.canStop
+          ? resolveRuntimeContext(process.env).localVoiceEngineStopPolicy
+          : undefined
       }
     : undefined
 
@@ -1461,8 +1664,10 @@ function sanitizeVoiceEngineForClient(
   }
 }
 
-async function migrateLegacyVoiceSettings(userId: string): Promise<VoiceEngineRegistryStore> {
-  const store = await readVoiceEngineRegistryStore(userId)
+async function migrateLegacyVoiceSettings(
+  userId: string,
+  registry: LoadedVoiceEngineRegistry
+): Promise<LoadedVoiceEngineRegistry> {
   const settings = await redis.getUserSettings(userId)
   const normalizedVoiceSettings = normalizeVoiceSettings(settings?.voice_settings)
   const legacyProviders = Array.isArray(normalizedVoiceSettings.byoProviders)
@@ -1470,14 +1675,23 @@ async function migrateLegacyVoiceSettings(userId: string): Promise<VoiceEngineRe
     : []
 
   if (legacyProviders.length === 0) {
-    return store
+    return registry
   }
 
-  const recordsById = new Map(store.records.map((record) => [record.id, record]))
+  // A legacy engine whose id a record Batshit cannot read holds is not merged into that record; it
+  // alone stays in the settings. Every other legacy engine moves to the registry and leaves the
+  // settings as usual, so deleting one later cannot bring it back from there.
+  const unreadableIds = new Set(registry.unreadable.map((entry) => entry.id).filter(Boolean))
+  const recordsById = new Map(registry.records.map((record) => [record.id, record]))
   let changed = false
+  const keptInSettings: typeof legacyProviders = []
 
   for (const provider of legacyProviders) {
     const engineId = normalizeVoiceEngineId(provider.id)
+    if (unreadableIds.has(engineId)) {
+      keptInSettings.push(provider)
+      continue
+    }
     const merged = mergeVoiceEnginePayload(engineId, provider, recordsById.get(engineId))
     const previous = recordsById.get(engineId)
     if (!previous || JSON.stringify(previous) !== JSON.stringify(merged)) {
@@ -1486,37 +1700,113 @@ async function migrateLegacyVoiceSettings(userId: string): Promise<VoiceEngineRe
     recordsById.set(engineId, merged)
   }
 
-  const nextStore: VoiceEngineRegistryStore = {
-    version: VOICE_ENGINE_REGISTRY_SCHEMA_VERSION,
+  const next: LoadedVoiceEngineRegistry = {
+    ...registry,
     records: Array.from(recordsById.values()).sort((left, right) => left.name.localeCompare(right.name))
   }
 
   if (changed) {
-    await writeVoiceEngineRegistryStore(userId, nextStore)
+    await writeVoiceEngineRegistryStore(userId, next)
   }
 
-  await redis.updateUserSettings(userId, {
-    voice_settings: sanitizeVoiceSettingsForStorage(settings?.voice_settings)
-  })
+  if (keptInSettings.length > 0) {
+    reportRegistryProblem(
+      buildVoiceEngineRegistryKey(userId),
+      'a legacy voice engine in the voice settings has the id of a saved record that cannot be read, so it stays in the settings'
+    )
+  }
+  if (keptInSettings.length < legacyProviders.length) {
+    await redis.updateUserSettings(userId, {
+      voice_settings: {
+        ...sanitizeVoiceSettingsForStorage(settings?.voice_settings),
+        ...(keptInSettings.length > 0 ? { byoProviders: keptInSettings } : {})
+      }
+    })
+  }
 
-  return nextStore
+  return next
 }
 
-async function loadRegistry(userId: string): Promise<VoiceEngineRegistryStore> {
-  return migrateLegacyVoiceSettings(userId)
+/**
+ * The registry, with the legacy settings migration applied. A failed read throws. For a
+ * `write`, a registry this Batshit cannot read as a whole throws too, so nothing is written over
+ * it; a `read` (display, and engines at run time) then sees no engines and the reason.
+ */
+async function loadRegistry(userId: string, use: 'read' | 'write'): Promise<LoadedVoiceEngineRegistry> {
+  const { key, raw } = await readVoiceEngineRegistryRaw(userId)
+  let parsed: Pick<LoadedVoiceEngineRegistry, 'records' | 'unreadable'>
+  try {
+    parsed = parseVoiceEngineRegistryStore(key, raw)
+  } catch (error) {
+    if (use === 'write' || !(error instanceof VoiceEngineRegistryUnreadableError)) throw error
+    reportRegistryProblem(key, `the saved engine list cannot be read and is kept unchanged: ${error.why}`)
+    // No migration either: it would write over the registry.
+    return { records: [], unreadable: [], storeProblem: error.why }
+  }
+  reportUnreadableRecords(key, parsed.unreadable)
+  return migrateLegacyVoiceSettings(userId, { ...parsed, storeProblem: null })
+}
+
+function sortVoiceEngineRecords(records: VoiceEngineRecord[]): VoiceEngineRecord[] {
+  return [...records].sort((left, right) => left.name.localeCompare(right.name))
+}
+
+function unreadableVoiceEngineNotices(registry: LoadedVoiceEngineRegistry): UnreadableVoiceEngineNotice[] {
+  return [
+    ...(registry.storeProblem ? [{ scope: 'list' as const, id: null, reason: registry.storeProblem }] : []),
+    ...registry.unreadable.map(({ id, reason, raw }): UnreadableVoiceEngineNotice => {
+      const notice: UnreadableVoiceEngineNotice = { scope: 'record', id, reason }
+      if (!isPlainRecord(raw)) return notice
+      // The defaults the Engine Manager applies to a record it can read.
+      if (typeof raw.name === 'string' && raw.name.trim()) notice.name = raw.name.trim()
+      if (isPlainRecord(raw.suite) && raw.suite.hidden === true) notice.hidden = true
+      notice.supportsTts = raw.supportsTts !== false
+      notice.supportsStt = raw.supportsStt === true
+      return notice
+    })
+  ]
 }
 
 export async function listVoiceEngineRecords(userId: string): Promise<VoiceEngineRecord[]> {
-  const store = await loadRegistry(userId)
-  return [...store.records].sort((left, right) => left.name.localeCompare(right.name))
+  return sortVoiceEngineRecords((await loadRegistry(userId, 'read')).records)
+}
+
+/**
+ * The engines, and whether every saved record could be read. A caller that decides what the
+ * registry no longer holds (the boot's launch-record tidy) must not act on an incomplete list.
+ */
+export async function listVoiceEngineRecordsForRuntime(
+  userId: string
+): Promise<{ records: VoiceEngineRecord[]; complete: boolean }> {
+  const registry = await loadRegistry(userId, 'read')
+  return {
+    records: sortVoiceEngineRecords(registry.records),
+    complete: !registry.storeProblem && registry.unreadable.length === 0
+  }
+}
+
+/** The Engine Manager's list: the engines it can show, and the saved records it cannot read. */
+export async function listVoiceEngineManagerView(
+  userId: string
+): Promise<{ engines: VoiceEngineClientSummary[]; unreadableEngines: UnreadableVoiceEngineNotice[] }> {
+  const registry = await loadRegistry(userId, 'read')
+  const records = sortVoiceEngineRecords(registry.records)
+  const stopContext = await resolveStopOnShutdownContext()
+  return {
+    engines: records
+      .filter((record) => !isVoiceEngineHidden(record))
+      .map((record) => sanitizeVoiceEngineForClient(record, records, stopContext)),
+    unreadableEngines: unreadableVoiceEngineNotices(registry)
+  }
+}
+
+/** The saved records the Engine Manager cannot show (for an answer that lists engines otherwise). */
+export async function listUnreadableVoiceEngines(userId: string): Promise<UnreadableVoiceEngineNotice[]> {
+  return unreadableVoiceEngineNotices(await loadRegistry(userId, 'read'))
 }
 
 export async function listVoiceEngineSummaries(userId: string): Promise<VoiceEngineClientSummary[]> {
-  const records = await listVoiceEngineRecords(userId)
-  const stopContext = await resolveStopOnShutdownContext()
-  return records
-    .filter((record) => !isVoiceEngineHidden(record))
-    .map((record) => sanitizeVoiceEngineForClient(record, records, stopContext))
+  return (await listVoiceEngineManagerView(userId)).engines
 }
 
 export async function getVoiceEngineRecord(
@@ -1524,8 +1814,9 @@ export async function getVoiceEngineRecord(
   engineId: string
 ): Promise<VoiceEngineRecord | null> {
   const normalized = normalizeVoiceEngineId(engineId)
-  const records = await listVoiceEngineRecords(userId)
-  return records.find((record) => record.id === normalized) ?? null
+  const registry = await loadRegistry(userId, 'read')
+  assertVoiceEngineRecordReadable(registry, normalized)
+  return registry.records.find((record) => record.id === normalized) ?? null
 }
 
 export async function getVoiceEngineRecordByProviderId(
@@ -1562,8 +1853,9 @@ export async function upsertVoiceEngineRecord(
 ): Promise<{ created: boolean; record: VoiceEngineRecord; summary: VoiceEngineClientSummary }> {
   const normalizedId = normalizeVoiceEngineId(engineId)
   assertVoiceEngineIdIsNotReserved(normalizedId)
-  const store = await loadRegistry(userId)
-  const records = [...store.records]
+  const registry = await loadRegistry(userId, 'write')
+  assertVoiceEngineRecordReadable(registry, normalizedId)
+  const records = [...registry.records]
   const existingIndex = records.findIndex((record) => record.id === normalizedId)
   const existing = existingIndex >= 0 ? records[existingIndex] : undefined
   const merged = mergeVoiceEnginePayload(normalizedId, payload, existing)
@@ -1574,20 +1866,13 @@ export async function upsertVoiceEngineRecord(
     records.push(merged)
   }
 
-  const nextStore: VoiceEngineRegistryStore = {
-    version: VOICE_ENGINE_REGISTRY_SCHEMA_VERSION,
-    records: records.sort((left, right) => left.name.localeCompare(right.name))
-  }
-  await writeVoiceEngineRegistryStore(userId, nextStore)
+  const next = { records: sortVoiceEngineRecords(records), unreadable: registry.unreadable }
+  await writeVoiceEngineRegistryStore(userId, next)
 
   return {
     created: existingIndex < 0,
     record: merged,
-    summary: sanitizeVoiceEngineForClient(
-      merged,
-      nextStore.records,
-      await resolveStopOnShutdownContext()
-    )
+    summary: sanitizeVoiceEngineForClient(merged, next.records, await resolveStopOnShutdownContext())
   }
 }
 
@@ -1604,12 +1889,22 @@ export async function applyVoiceEnginePublicUpdates(
   userId: string,
   updates: VoiceEnginePublicUpdate[]
 ): Promise<VoiceEngineClientSummary[]> {
-  const store = await loadRegistry(userId)
-  const recordsById = new Map(store.records.map((record) => [record.id, record]))
+  const registry = await loadRegistry(userId, 'write')
+  const unreadableIds = new Set(registry.unreadable.map((entry) => entry.id).filter(Boolean))
+  const recordsById = new Map(registry.records.map((record) => [record.id, record]))
   const touchedEngineIds = new Set<string>()
 
   for (const update of updates) {
     const engineId = normalizeVoiceEngineId(update.id)
+    // The Engine Manager never shows a record it cannot read, so an update for one is not the
+    // user's; it is kept unchanged like every other writer keeps it.
+    if (unreadableIds.has(engineId)) {
+      reportRegistryProblem(
+        buildVoiceEngineRegistryKey(userId),
+        `an update for voice engine "${engineId}", whose saved record cannot be read, was not applied`
+      )
+      continue
+    }
     const existing = recordsById.get(engineId)
     if (!existing) {
       continue
@@ -1628,11 +1923,8 @@ export async function applyVoiceEnginePublicUpdates(
     touchedEngineIds.add(engineId)
   }
 
-  const nextStore: VoiceEngineRegistryStore = {
-    version: VOICE_ENGINE_REGISTRY_SCHEMA_VERSION,
-    records: Array.from(recordsById.values()).sort((left, right) => left.name.localeCompare(right.name))
-  }
-  await writeVoiceEngineRegistryStore(userId, nextStore)
+  const next = { records: sortVoiceEngineRecords(Array.from(recordsById.values())), unreadable: registry.unreadable }
+  await writeVoiceEngineRegistryStore(userId, next)
 
   // The shutdown hooks read the on-disk launch record, never Redis, so the new
   // choice has to reach that file now. Saving is not the moment the engine
@@ -1651,9 +1943,9 @@ export async function applyVoiceEnginePublicUpdates(
   }
 
   const stopContext = await resolveStopOnShutdownContext()
-  return nextStore.records
+  return next.records
     .filter((record) => !isVoiceEngineHidden(record))
-    .map((record) => sanitizeVoiceEngineForClient(record, nextStore.records, stopContext))
+    .map((record) => sanitizeVoiceEngineForClient(record, next.records, stopContext))
 }
 
 export type DeleteVoiceEngineRecordOptions = {
@@ -1693,11 +1985,6 @@ function expandUserHomePath(targetPath: string): string {
   return targetPath
 }
 
-async function pathExists(targetPath: string): Promise<boolean> {
-  const details = await stat(targetPath).catch(() => null)
-  return Boolean(details)
-}
-
 async function canonicalPath(targetPath: string): Promise<string> {
   const resolved = path.resolve(expandUserHomePath(targetPath))
   return await realpath(resolved).catch(() => resolved)
@@ -1729,9 +2016,14 @@ async function deleteManagedLocalVoiceEngineFiles(
       const configuredResolved = path.resolve(expandUserHomePath(configuredInstallRoot))
       const configuredCanonical = await canonicalPath(configuredInstallRoot)
       if (configuredCanonical !== expectedCanonical) {
+        // Say where the files are and what to do (BL-176). In Docker this is an engine the host
+        // operator installed on the computer that runs Docker: the container cannot reach those
+        // files, and the operator has no call that deletes them.
         result.skipped.push({
           engineId: record.id,
-          reason: 'Saved install root does not match the Batshit-managed install root.'
+          reason: isContainerizedRuntime()
+            ? `"${record.name}" was installed on the computer that runs Docker, in ${configuredResolved}. Batshit in Docker cannot delete files there, so they were left in place. Delete that folder yourself once the engine has stopped.`
+            : `"${record.name}" keeps its files in ${configuredResolved}, not in Batshit's own install folder for it (${path.resolve(expectedInstallRoot)}), so Batshit left them in place. Delete that folder yourself if nothing else uses it.`
         })
         continue
       }
@@ -1751,6 +2043,20 @@ async function deleteManagedLocalVoiceEngineFiles(
       // runtime another engine still uses keeps running (that engine's record names it). If a
       // process could not be checked or stopped, keep the files and the record, and say so.
       const runtime = await stopDeletedEngineRuntimes(record.id, deletingEngineIds)
+      const stateRoot = resolveLocalVoiceRuntimeStateDir(record.id)
+      // A launch record that cannot be read may name a process running from these files: nothing
+      // was stopped, and the files and every record stay (BL-1268). The record is never removed
+      // while the engine it may name could still run.
+      if (runtime.unreadable.length > 0) {
+        const one = runtime.unreadable.length === 1
+        result.errors.push({
+          engineId: record.id,
+          message: `Batshit kept the local files of "${record.name}": ${runtime.unreadable
+            .map((entry) => entry.reason)
+            .join('; ')}, and ${one ? 'it' : 'they'} may name an engine still running from them. Once that engine has stopped (restarting the computer stops it), repair or remove ${one ? 'that file or folder' : 'those files or folders'}, then delete ${configuredResolved} and ${path.resolve(stateRoot)} yourself.`
+        })
+        continue
+      }
       if (runtime.notStopped.length > 0) {
         result.errors.push({
           engineId: record.id,
@@ -1761,15 +2067,31 @@ async function deleteManagedLocalVoiceEngineFiles(
         continue
       }
 
-      const stateRoot = resolveLocalVoiceRuntimeStateDir(record.id)
-      const installRootExists = await pathExists(configuredResolved)
-      const stateRootExists = await pathExists(stateRoot)
-
-      await rm(configuredResolved, { recursive: true, force: true })
-      await rm(stateRoot, { recursive: true, force: true })
-
-      if (installRootExists) result.deletedInstallRoots.push(configuredResolved)
-      if (stateRootExists) result.deletedStateRoots.push(path.resolve(stateRoot))
+      // The folders are shared by every Batshit on this computer that keeps the default ones
+      // (BL-1289): they go only when no record of another Batshit (or of unknown owner) is in the
+      // engine's state folder and no other engine's record names a launch of it that still runs,
+      // decided and done under that folder's record lock.
+      const files = await removeDeletedEngineFiles(record.id, configuredResolved)
+      if (!files.removed && files.unreadable.length > 0) {
+        const one = files.unreadable.length === 1
+        result.errors.push({
+          engineId: record.id,
+          message: `Batshit kept the local files of "${record.name}": ${files.unreadable.join('; ')}, and ${one ? 'it' : 'they'} may name an engine still running from them. Once that engine has stopped (restarting the computer stops it), repair or remove ${one ? 'that file or folder' : 'those files or folders'}, then delete ${configuredResolved} and ${path.resolve(stateRoot)} yourself.`
+        })
+        continue
+      }
+      if (!files.removed) {
+        // An error, not a skip: the Engine Manager always shows errors, also when another engine of
+        // the same delete was removed.
+        const one = files.sharedRecordPaths.length === 1
+        result.errors.push({
+          engineId: record.id,
+          message: `Batshit left the local files of "${record.name}" in place (${configuredResolved} and ${path.resolve(stateRoot)}): another Batshit on this computer (Batshit in Docker included), or another engine, may still use them. ${one ? 'This launch record shows it' : 'These launch records show it'}: ${files.sharedRecordPaths.join(', ')}. Delete those folders yourself once nothing else uses this engine.`
+        })
+        continue
+      }
+      if (files.installRootRemoved) result.deletedInstallRoots.push(configuredResolved)
+      if (files.stateRootRemoved) result.deletedStateRoots.push(path.resolve(stateRoot))
     } catch (error) {
       result.errors.push({
         engineId: record.id,
@@ -1797,13 +2119,14 @@ export async function deleteVoiceEngineRecord(
 }> {
   const normalizedId = normalizeVoiceEngineId(engineId)
   const providerId = `byo:${normalizedId}` as const
-  const store = await loadRegistry(userId)
-  const targetRecord = store.records.find((record) => record.id === normalizedId)
+  const registry = await loadRegistry(userId, 'write')
+  assertVoiceEngineRecordReadable(registry, normalizedId)
+  const targetRecord = registry.records.find((record) => record.id === normalizedId)
   const deleteIds = new Set<string>([normalizedId])
 
   if (targetRecord && !isVoiceEngineHidden(targetRecord)) {
     const suiteId = getVoiceEngineSuiteId(targetRecord)
-    for (const record of store.records) {
+    for (const record of registry.records) {
       if (record.id === normalizedId) continue
       if (getVoiceEngineSuiteId(record) !== suiteId) continue
       if (!isVoiceEngineHidden(record)) continue
@@ -1811,18 +2134,15 @@ export async function deleteVoiceEngineRecord(
     }
   }
 
-  const recordsToDelete = store.records.filter((record) => deleteIds.has(record.id))
+  const recordsToDelete = registry.records.filter((record) => deleteIds.has(record.id))
   const deletedProviderIds = Array.from(deleteIds).map((id) => `byo:${id}` as const)
   const deletedProviderIdSet = new Set<string>(deletedProviderIds)
-  const nextRecords = store.records.filter((record) => !deleteIds.has(record.id))
-  if (nextRecords.length === store.records.length) {
+  const nextRecords = registry.records.filter((record) => !deleteIds.has(record.id))
+  if (nextRecords.length === registry.records.length) {
     throw new Error(`Voice engine "${normalizedId}" is not registered.`)
   }
 
-  await writeVoiceEngineRegistryStore(userId, {
-    version: VOICE_ENGINE_REGISTRY_SCHEMA_VERSION,
-    records: nextRecords
-  })
+  await writeVoiceEngineRegistryStore(userId, { records: nextRecords, unreadable: registry.unreadable })
 
   const settings = await redis.getUserSettings(userId)
   const normalizedSettings = sanitizeVoiceSettingsForStorage(settings?.voice_settings)
@@ -2016,6 +2336,19 @@ export async function getVoiceEngineGuidanceForProviderId(
   userId: string,
   providerId: VoiceProviderId | string | null | undefined
 ): Promise<string[]> {
-  const summary = await getVoiceEngineSummaryByProviderId(userId, providerId)
-  return buildVoiceEngineGuidance(summary)
+  const normalizedProvider = normalizeVoiceProviderId(providerId)
+  if (!normalizedProvider?.startsWith('byo:')) return []
+  const engineId = normalizedProvider.replace(/^byo:/, '')
+  const registry = await loadRegistry(userId, 'read')
+  // Said, not thrown: this runs on the send path, and the engine's own use fails loudly.
+  if (registry.storeProblem || registry.unreadable.some((entry) => entry.id === engineId)) {
+    return [
+      `Voice engine: ${normalizedProvider}. Its saved settings cannot be read, so Batshit cannot use this engine until they are repaired.`
+    ]
+  }
+  const records = sortVoiceEngineRecords(registry.records)
+  const record = records.find((entry) => entry.id === engineId) ?? null
+  return buildVoiceEngineGuidance(
+    record ? sanitizeVoiceEngineForClient(record, records, await resolveStopOnShutdownContext()) : null
+  )
 }

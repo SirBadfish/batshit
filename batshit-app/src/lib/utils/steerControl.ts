@@ -48,9 +48,9 @@ export const STEER_DM_ALREADY_PENDING_REASON =
  * the send button was how "Send after reply" came to live behind a hover nobody used.
  *
  * Queue is not a new mechanism. It is the promotion SA-114 already built (DL-119-05, a
- * server-held steer) for a text-only message, and the browser wait DL-114-10 already had
- * (DL-119-06) for a message carrying files: one word for the user, two mechanisms
- * underneath, each already tested.
+ * server-held steer) for a text-only message, and the chat's line (BL-4) for anything else,
+ * a message carrying files included (BL-713; the page held those in the tab until then,
+ * DL-119-06): one word for the user, two server holders underneath, each already tested.
  *
  * A record written before this story still says `interrupt`. `resolveBusySendMode` reads it
  * as the default; nothing is written back until the user saves the panel themselves.
@@ -58,38 +58,21 @@ export const STEER_DM_ALREADY_PENDING_REASON =
 export type BusySendMode = 'steer' | 'queue'
 
 /**
- * DL-119-05, DL-119-06 — the promise a queued message makes, in one place.
+ * DL-119-05 — the promise a queued message makes, in one place.
  *
- * Queue has two mechanisms under it and the user is told the same thing by both. A
- * text-only message on a steerable turn is held by the SERVER (`deliver: 'end'`) and becomes
- * the next turn's user message; anything carrying files is held by the BROWSER and sent as
- * an ordinary message the moment the reply ends. The bubble, the badge and the toast all
- * read these constants, because SA-118's F-25 was exactly what happens when one behaviour
- * gets two wordings in two components.
+ * Queue has two holders on the SERVER and the user is told the same thing by both. A
+ * text-only message on a steerable turn is held by the steer inbox (`deliver: 'end'`) and
+ * becomes the next turn's user message; anything else (a Clip, an `@file`, a group chat, a
+ * lane that cannot take a steer) is saved and sent at once and waits in the chat's line
+ * (BL-4, BL-713), where it runs as itself when the reply ends. The bubble and the badge read
+ * this constant, because SA-118's F-25 was exactly what happens when one behaviour gets two
+ * wordings in two components.
  *
- * These replace `WAIT_SEND_SENTENCE` ("With files: waits for the reply to finish"), which
+ * It replaced `WAIT_SEND_SENTENCE` ("With files: waits for the reply to finish"), which
  * described the waiting rather than the sending and belonged to the retired third send
  * state.
  */
 export const QUEUED_AFTER_REPLY_SENTENCE = 'Queued — sends after this reply'
-export const QUEUED_WITH_FILES_SENTENCE = 'Queued — sends after this reply (with files)'
-
-/**
- * DL-119-06 — the honest refusal when a second message tries to queue in the browser.
- *
- * One client-held message per chat at a time: a second would race the first for the same
- * "the reply just ended" moment, and the loser sends into a live turn. The words stay in
- * the composer, which is the whole point of saying it out loud rather than dropping one.
- *
- * The files sentence is DL-119-06's own. The second exists because the same browser hold
- * also carries a TEXT-only message whenever the turn cannot take a steer (a group chat, an
- * unmanaged profile, a Codex exec lane) — telling that user "with files" would be a
- * sentence about a message they did not send (F-P2-2).
- */
-export const QUEUE_ONE_AT_A_TIME_SENTENCE =
-  'One queued message with files at a time — send it after this one'
-export const QUEUE_ONE_AT_A_TIME_TEXT_SENTENCE =
-  'One queued message at a time — send it after this one'
 
 /** Josh's call (2026-09-07, carried into DL-119-01): steer is the default; Queue is the other badge. */
 export const DEFAULT_BUSY_SEND_MODE: BusySendMode = 'steer'
@@ -212,9 +195,9 @@ export interface BusySendActions {
  * a clip is the case where "send it now" silently means "send it without the thing I
  * attached", so the safe key is the one that keeps everything together.
  *
- * Queue is enabled always. That is DL-119-05 and DL-119-06 together: a text-only message is
- * held by the server, anything else waits in the browser, and between them every message
- * has a way to be sent. "Nothing you typed is lost" rests on that being unconditional.
+ * Queue is enabled always. That is DL-119-05 and BL-713 together: a text-only message is
+ * held by the steer inbox, anything else waits in the chat's line, and between them every
+ * message has a way to be sent. "Nothing you typed is lost" rests on that being unconditional.
  */
 export function resolveBusySendActions(input: {
   mode: BusySendMode
@@ -390,6 +373,25 @@ export function readMessageSteers(message: unknown): DeliveredSteer[] {
 }
 
 /**
+ * Another agent's words, made unable to leave the DM bracket they are wrapped in (BL-466).
+ *
+ * A DM steer's text is the sender's subject and multi-line body (`buildSteeredDmContent`), and
+ * it used to be pasted in raw: a body that wrote `]`, a line break and
+ * `[The user said, mid-reply: ...]` closed the "not from the user" bracket and read as a real
+ * user steer, live on every lane and in every later compile. So square brackets (and the
+ * full-width ［ ］) become round ones and every run of line breaks (including U+2028, U+2029 and
+ * U+0085) becomes one space: the whole DM stays one bracketed line.
+ * Only DM text (and the sender's name) goes through this; a user steer is the user's own words.
+ */
+function containDmSteerText(text: string): string {
+  return text
+    .replace(/[[\uFF3B]/g, '(')
+    .replace(/[\]\uFF3D]/g, ')')
+    .replace(/\s*[\r\n\u2028\u2029\u0085]+\s*/g, ' ')
+    .trim()
+}
+
+/**
  * The AI view of one steer (DL-114-04, DL-118-07). A user steer reads as the user's own
  * words so the agent honours it; a DM steer is explicitly marked as NOT from the user,
  * because an agent's text must never be mistaken for an instruction from Josh.
@@ -409,8 +411,8 @@ export function readMessageSteers(message: unknown): DeliveredSteer[] {
 export function formatSteerForModel(steer: SteerEntry): string {
   const text = steer.text.trim()
   if (steer.source === 'dm') {
-    const from = (steer.label ?? '').trim() || 'another agent'
-    return `[Agent DM — from ${from}, not from the user, delivered mid-reply: ${text}]`
+    const from = containDmSteerText(steer.label ?? '') || 'another agent'
+    return `[Agent DM — from ${from}, not from the user, delivered mid-reply: ${containDmSteerText(text)}]`
   }
   return `[The user said, mid-reply: ${text}]`
 }
@@ -483,7 +485,8 @@ export function formatSteerForUser(steer: DeliveredSteer): string {
 export function expandSteerPlaceholders(
   content: string,
   steers: DeliveredSteer[],
-  format: (steer: DeliveredSteer) => string
+  format: (steer: DeliveredSteer) => string,
+  onReplacement?: (start: number, end: number, replacement: string, steer: DeliveredSteer | undefined, line: string) => void
 ): string {
   if (!content) return content
   const bySteerId = new Map(steers.map((steer) => [steer.steerId, steer]))
@@ -501,7 +504,9 @@ export function expandSteerPlaceholders(
       const followedByAnotherMarker = whole
         .slice(offset + match.length)
         .startsWith('{{batshit-steer:')
-      return followedByAnotherMarker ? `\n\n${line}` : `\n\n${line}\n\n`
+      const replacement = followedByAnotherMarker ? `\n\n${line}` : `\n\n${line}\n\n`
+      onReplacement?.(offset, offset + match.length, replacement, steer, line)
+      return replacement
     }
   )
   // A marker at the very start or end of the content would otherwise leave a leading or
@@ -663,8 +668,8 @@ export type SteerRefusalKind = 'already_finished' | 'queue' | 'refused'
  * Only two refusals may escalate. `reply_finished` means there is nothing to steer into
  * any more, so the words go out as an ordinary message. `not_steerable` means this agent
  * cannot be steered at all — and since DL-119-07 that answer is **queue**, not interrupt:
- * the words wait in the browser and go the moment the reply ends (DL-119-06), which is what
- * the user asked for rather than the stop they did not. EVERYTHING else — the cap
+ * the words are sent at once and wait in the chat's line until the reply ends (BL-713), which
+ * is what the user asked for rather than the stop they did not. EVERYTHING else — the cap
  * (`steer_inbox_full`), a waiting DM (`steer_dm_pending`), a bad request, a lost server — is
  * `refused`: the client shows the reason and stops. The reply keeps running, and the steers
  * it already accepted stay where they are. Collapsing those into "interrupt instead" is how
@@ -715,22 +720,21 @@ export interface InterruptionStamp {
  * `buildInterruptionAddendum` was still waiting to be given something. Stop, then Enter, is
  * now the whole gesture, so Stop's record is the only source (F-P2-7).
  *
- * Three things say no:
+ * Two things say no:
  *
  * - **No record.** Nothing was stopped, so there is nothing to say.
- * - **The browser was holding this message.** A steer and a server-held queue return long
- *   before the ordinary send path, but a BROWSER-held queue falls through into it — and
- *   what it waits for, "the reply ends", is exactly what a Stop makes happen. Stamping it
- *   would tell the model the user cut short a reply the user had chosen to wait behind.
  * - **The stopped reply is no longer the agent's last word.** A turn has landed since, so
  *   the note would name the wrong message.
+ *
+ * (A third, "the browser was holding this message", went with the page's own queue in
+ * BL-713: every send now posts at once, so the record it reads is the one pending when the
+ * user pressed Enter, as for any send.)
  *
  * A record missing either field is not completed from a default: a fabricated timestamp is
  * a worse answer than no note, and the one writer always sets both.
  */
 export function resolveStopInterruptionStamp(input: {
   record: StopInterruptionRecord | null | undefined
-  browserQueued: boolean
   latestAssistantMessageId: string | null | undefined
 }): InterruptionStamp | null {
   const messageId =
@@ -738,8 +742,6 @@ export function resolveStopInterruptionStamp(input: {
   const interruptedAt =
     typeof input.record?.interruptedAt === 'string' ? input.record.interruptedAt.trim() : ''
   if (!messageId || !interruptedAt) return null
-
-  if (input.browserQueued) return null
 
   const latest =
     typeof input.latestAssistantMessageId === 'string'
@@ -751,38 +753,6 @@ export function resolveStopInterruptionStamp(input: {
 }
 
 /* ------------------------------------------------------------------ *
- * SA-119 P3 (AMD-119-04) — what a browser-held queued message does when
- * its wait ends.
- * ------------------------------------------------------------------ */
-
-export type QueuedSendAfterWait = 'send' | 'dropped-by-stop' | 'still-running'
-
-/**
- * A browser-held queued message (DL-119-06) waits for the reply to END, and **a Stop is
- * one of the ways a reply ends** — so `replyEnded` alone cannot tell "the agent finished"
- * from "the user pressed Stop". Before AMD-119-04 the page read `replyEnded` and sent, so
- * a Stop dropped a SERVER-held queued message with a receipt (DL-119-05) and released a
- * browser-held one into the chat seconds later. Worse, the receipt was already on screen:
- * `settleSteerBubblesForMessage(..., { interrupted: true })` settles `waiting` bubbles too,
- * so the user was shown *Not sent — you stopped the reply* about a message that then sent.
- *
- * Josh's decision (2026-09-13): **Stop stops everything.** One button, one meaning.
- *
- * The order is the whole rule. `stoppedDuringWait` is read FIRST, because a Stop sets
- * `replyEnded` as surely as a finished answer does; reading `replyEnded` first would send
- * every stopped message. The caller must keep the bubble as the receipt in that case
- * rather than forgetting it.
- */
-export function resolveQueuedSendAfterWait(input: {
-  stoppedDuringWait: boolean
-  replyEnded: boolean
-}): QueuedSendAfterWait {
-  if (input.stoppedDuringWait) return 'dropped-by-stop'
-  if (!input.replyEnded) return 'still-running'
-  return 'send'
-}
-
-/* ------------------------------------------------------------------ *
  * SA-119 P3b review (F-P3b-2) — what a receipt's Send now may replay.
  * ------------------------------------------------------------------ */
 
@@ -790,18 +760,13 @@ export function resolveQueuedSendAfterWait(input: {
  * The keys of a send's metadata that belong to the composer that built it, and must never
  * ride a replay.
  *
- * `onAccepted` and `onQueuedForLater` are closures over the composer's LIVE text and clips
- * (`resetComposer()`, `clipsManager.handleMessageAccepted()`), so replaying them from a
- * receipt minutes later would wipe whatever the user has typed since and unclip whatever
+ * `onAccepted` is a closure over the composer's LIVE text and clips (`resetComposer()`,
+ * `clipsManager.handleMessageAccepted()`), so replaying it from a receipt minutes later would wipe whatever the user has typed since and unclip whatever
  * they have attached since — the exact loss Josh rejected a composer refill for
  * (AMD-119-05). `busySendModeOverride` was one badge click or one keypress; a replay is an
  * ordinary send and does whatever Enter would do now.
  */
-export const COMPOSER_BOUND_SEND_METADATA_KEYS = [
-  'onAccepted',
-  'onQueuedForLater',
-  'busySendModeOverride'
-] as const
+export const COMPOSER_BOUND_SEND_METADATA_KEYS = ['onAccepted', 'busySendModeOverride'] as const
 
 /**
  * The metadata a dropped bubble's **Send now** replays: the send's own facts (clip ids,
@@ -822,4 +787,94 @@ export function replayableSendMetadata(
   delete copy.onReplayAccepted
   if (typeof onReplayAccepted === 'function') copy.onAccepted = onReplayAccepted
   return copy
+}
+
+/**
+ * BL-4 — a send that met another turn and waits in the chat's line.
+ *
+ * The server holds it (`streamAbortRegistry.ts`) and tells every tab with `steer_queued`, which
+ * carries this notice: the id of the message the page saved (also the bubble's id), and the
+ * assistant id the send will reply under. Every tab takes that message out of its list and shows
+ * the Queue bubble instead, so the words show once, after everything else, until the send runs
+ * and the message comes back at the end of the chat. `null` for an ordinary steer or queued text.
+ */
+export function readQueuedSendNotice(
+  event: unknown
+): { userMessageId: string; assistantMessageId: string | null } | null {
+  if (!event || typeof event !== 'object') return null
+  const notice = (event as Record<string, unknown>).queuedSend
+  if (!notice || typeof notice !== 'object') return null
+  const { userMessageId, assistantMessageId } = notice as Record<string, unknown>
+  if (typeof userMessageId !== 'string' || !userMessageId.trim()) return null
+  return {
+    userMessageId: userMessageId.trim(),
+    assistantMessageId:
+      typeof assistantMessageId === 'string' && assistantMessageId.trim()
+        ? assistantMessageId.trim()
+        : null
+  }
+}
+
+/**
+ * BL-713 — the approval card a queued send's bubble waits for, from a `steer_queued` replay (a
+ * joining tab) or a `queued_send_hold` event (every tab, as the hold starts and ends). `null`
+ * when the line does not hold for a card.
+ */
+export function readHeldForApprovalCard(event: unknown): string | null {
+  if (!event || typeof event !== 'object') return null
+  const held = (event as Record<string, unknown>).heldForApprovalCard
+  if (!held || typeof held !== 'object') return null
+  const messageId = (held as Record<string, unknown>).messageId
+  return typeof messageId === 'string' && messageId.trim() ? messageId.trim() : null
+}
+
+/**
+ * A queued send's final answer that needs no toast: it was kept (Stop, shutdown: its receipt
+ * says "Not sent", and its words are in the chat) or its message was deleted while it waited.
+ */
+export function isQuietQueuedSendAnswer(code: unknown): boolean {
+  return code === 'queued_send_kept' || code === 'queued_send_missing'
+}
+
+/**
+ * A kept send's words come back into the chat at its end, unanswered. Its "Not sent" receipt then
+ * stays only in the tab that can Send it now (the tab that sent it holds the exact send); every
+ * other tab already shows the words in the chat, so a receipt there would show them twice.
+ */
+export function shouldClearKeptReceipt(input: {
+  bubbleState: string | undefined
+  canSendNow: boolean
+}): boolean {
+  return input.bubbleState === 'dropped' && !input.canSendNow
+}
+
+/**
+ * A Send now sends a kept message now. In the sending tab it becomes the chat's latest message,
+ * dated this send, so the reply placeholder the tab adds next (dated later by the same clock)
+ * sorts after it wherever the tab merges by time; send-routed dates the stored copy the same way
+ * when it moves it (`resentMessageCreatedAt`). A copy; nothing else about the message changes.
+ */
+export function restampResentMessage<T extends object>(message: T, sentAt: string): T {
+  return { ...message, created_at: sentAt, timestamp: sentAt }
+}
+
+/**
+ * The history a Send now of a message already in the chat carries: that message is the current
+ * turn, so it goes last, ahead of only the send's own reply placeholder (the server drops a
+ * trailing placeholder, then the current turn), wherever it sat before. Nothing else moves.
+ */
+export function placeUserMessageLast<T extends { id?: unknown }>(
+  messages: T[],
+  userMessageId: string,
+  placeholderId: string | null
+): T[] {
+  const named = messages.find((message) => message?.id === userMessageId)
+  if (!named) return messages
+  const placeholder = placeholderId
+    ? messages.find((message) => message?.id === placeholderId)
+    : undefined
+  const rest = messages.filter(
+    (message) => message !== named && (placeholder === undefined || message !== placeholder)
+  )
+  return placeholder ? [...rest, named, placeholder] : [...rest, named]
 }

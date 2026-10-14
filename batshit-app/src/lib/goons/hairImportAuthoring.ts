@@ -166,6 +166,7 @@ export type HairImportAuthoringProposal = {
   confidenceLabel: "high" | "medium" | "review-carefully";
   blockingReasons: [];
   summary: string[];
+  rootSelectionNotice?: string;
   clumps: Array<{
     id: string;
     meshNode: string;

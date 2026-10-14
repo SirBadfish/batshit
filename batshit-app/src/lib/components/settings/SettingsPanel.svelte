@@ -1,5 +1,11 @@
 <script lang="ts">
-import { onMount } from 'svelte'
+import { onMount, setContext, tick } from 'svelte'
+import { refuse, type SettingsTarget, type ToolsTab } from '$lib/appActions/catalog'
+import { registerSettingsFileShell } from '$lib/appActions/settingsFileOwners'
+import {
+  APP_ACTIONS_SETTINGS_DRAFT_SCOPE, appActionsHaveDrafts, registerSettingsAppActionOwner, registerAppActionDraft, retireAppActionNavigation,
+  type ActionContext, type ActionOutcome, type LazyPanelHandle
+} from '$lib/appActions/owners'
 import type { Component } from 'svelte'
 import {
   AudioLines,
@@ -57,7 +63,7 @@ type GoonsUnsavedState = {
 }
 
 type PendingSettingsAction =
-  | { type: 'switch-tab'; nextTab: string }
+  | { type: 'switch-tab'; nextTab: string; nextToolsTab?: ToolsTab }
   | { type: 'close-sheet' }
   | null
 
@@ -110,6 +116,130 @@ let isOverlayVisible = $state(false)
 let goonsUnsavedState = $state<GoonsUnsavedState | null>(null)
 let settingsUnsavedDialogOpen = $state(false)
 let pendingSettingsAction = $state<PendingSettingsAction>(null)
+let settingsForm = $state<HTMLFormElement | null>(null)
+let actionRouting = $state(false)
+let actionVisit = $state(false)
+const actionPanels = new Map<string, LazyPanelHandle>()
+setContext(APP_ACTIONS_SETTINGS_DRAFT_SCOPE, true)
+
+function settingsActionDirty() {
+  return Boolean(goonsUnsavedState) || [...actionPanels.values()].some(handle => {
+    const panel = handle.readAppActionState().panel
+    return typeof panel?.readAppActionState === 'function' && panel.readAppActionState().dirty
+  })
+}
+
+function checkSettingsAction(context: ActionContext) {
+  context.check()
+  if (settingsUnsavedDialogOpen || pendingSettingsAction) refuse('pending_human_action')
+  if (appActionsHaveDrafts()) refuse('unsaved_changes')
+}
+
+// Validate existence before opening/moving anything. These are existing session-authorized reads.
+async function validateActionEntity(target: SettingsTarget, context: ActionContext) {
+  const id = target.agentId ?? target.modelId ?? target.artifactId
+  if (!id) return
+  context.check()
+  const endpoint = target.agentId ? `/api/agents/${encodeURIComponent(id)}`
+    : target.artifactId ? `/api/artifacts/${encodeURIComponent(id)}` : '/api/user/saved-models'
+  const response = await fetch(endpoint, { cache: 'no-store', signal: context.signal })
+  context.check()
+  if (response.status === 404) refuse('missing_entity')
+  if (!response.ok) refuse('target_unavailable')
+  const payload = await response.json()
+  context.check()
+  const found = target.modelId
+    ? (Array.isArray(payload) ? payload : payload?.models)?.some((model: { id?: string }) => model.id === id)
+    : payload?.id === id
+  if (!found) refuse('missing_entity')
+}
+
+async function openSettingsAction(target: SettingsTarget, context: ActionContext): Promise<ActionOutcome> {
+  context.check()
+  if (!visibleTabs.some(tab => tab.value === target.tab)) refuse('target_unavailable')
+  const currentPanel = actionPanels.get(target.tab)?.readAppActionState()
+  const currentTarget = typeof currentPanel?.panel?.readAppActionState === 'function'
+    ? currentPanel.panel.readAppActionState() : undefined
+  const entityId = target.agentId ?? target.modelId ?? target.artifactId
+  const toolsTab = target.tab === 'tools' ? target.toolsTab ?? 'gateway-settings' : undefined
+  const matching = open && activeTab === target.tab &&
+    (!entityId || currentTarget?.entityId === entityId) && (!toolsTab || currentTarget?.toolsTab === toolsTab)
+  // A matching mounted view has no navigation or persistence effects, even with a retained draft.
+  if (!matching) checkSettingsAction(context)
+  await validateActionEntity(target, context)
+  context.check()
+  if (!matching) {
+    checkSettingsAction(context)
+    context.effect()
+    actionRouting = true
+    actionVisit = true
+    open = true
+    activeTab = target.tab
+    await tick()
+    actionRouting = false
+    context.report({ status: 'unknown_outcome', visible: 'applied', saved: 'not_requested' })
+  }
+  await context.wait(() => {
+    if (!open || activeTab !== target.tab) refuse('user_navigation')
+    if (!settingsForm?.isConnected) return undefined
+    if (target.tab === 'theme') return true
+    const lazy = actionPanels.get(target.tab)?.readAppActionState()
+    if (lazy?.error) refuse('panel_load_failed')
+    return lazy?.mounted ? true : undefined
+  })
+  context.check()
+  const panel = actionPanels.get(target.tab)?.readAppActionState().panel
+  if (entityId || toolsTab) {
+    if (typeof panel?.readAppActionState !== 'function' || !panel.selectAppActionTarget) refuse('unsupported_target')
+    await context.wait(() => {
+      const state = panel.readAppActionState()
+      if (state.error) refuse('panel_load_failed')
+      return !state.busy ? true : undefined
+    })
+    const state = panel.readAppActionState()
+    if ((entityId && state.entityId !== entityId) || (toolsTab && state.toolsTab !== toolsTab)) {
+      checkSettingsAction(context)
+      context.effect()
+      panel.selectAppActionTarget({ ...target, ...(toolsTab ? { toolsTab: toolsTab as SettingsTarget['toolsTab'] } : {}) }, context)
+    }
+    await context.wait(() => {
+      if (!open || activeTab !== target.tab) refuse('user_navigation')
+      const state = panel.readAppActionState()
+      if (state.error) refuse('panel_load_failed')
+      return !state.busy && (!entityId || state.entityId === entityId) &&
+        (!toolsTab || state.toolsTab === toolsTab) ? true : undefined
+    })
+  }
+  context.check()
+  return { status: matching ? 'no_op' : 'completed', visible: matching ? 'unchanged' : 'applied',
+    saved: 'not_requested', settings: target }
+}
+
+async function closeSettingsAction(context: ActionContext): Promise<ActionOutcome> {
+  context.check()
+  if (!open) return { status: 'no_op', visible: 'unchanged', saved: 'not_requested' }
+  checkSettingsAction(context)
+  context.effect()
+  open = false
+  await context.wait(() => !open && !settingsForm?.isConnected ? true : undefined)
+  return { status: 'completed', visible: 'applied', saved: 'not_requested' }
+}
+
+onMount(() => {
+  const remove = [
+    registerSettingsFileShell({ visible: () => open && Boolean(settingsForm?.isConnected), tab: () => activeTab,
+      panel: () => actionPanels.get(activeTab), pendingHumanAction: () => Boolean(settingsUnsavedDialogOpen || pendingSettingsAction) }),
+    registerAppActionDraft(() => open && settingsActionDirty()),
+    registerSettingsAppActionOwner({ observation: () => ({ open, tab: activeTab, devAvailable: isDevTabVisible,
+      toolsTab: activeTab === 'tools' ? actionPanels.get('tools')?.readAppActionState().panel?.readAppActionState?.().toolsTab ?? null : null,
+      dirty: settingsActionDirty(), pendingHumanAction: Boolean(pendingSettingsAction) }),
+      openAction: (args, context) => openSettingsAction(args as SettingsTarget, context),
+      closeAction: (_, context) => closeSettingsAction(context),
+      available: id => (id === 'settings.open' || open) && appActionsHaveDrafts() ? 'unsaved_changes' : 'available'
+    })
+  ]
+  return () => { for (const cleanup of remove) cleanup(); retireAppActionNavigation() }
+})
 
 function showOverlay() {
   isOverlayVisible = true
@@ -148,6 +278,7 @@ function runPendingSettingsAction() {
   clearPendingSettingsAction()
   if (!action) return
   if (action.type === 'switch-tab') {
+    if (action.nextToolsTab) activeToolsTab = action.nextToolsTab
     activeTab = action.nextTab
     return
   }
@@ -167,16 +298,22 @@ function discardGoonsChangesAndContinue() {
   runPendingSettingsAction()
 }
 
-function handleSettingsTabChange(nextTab: string) {
-  if (nextTab === activeTab) return
-  if (hasBlockingGoonsChanges()) {
-    queueSettingsAction({ type: 'switch-tab', nextTab })
+function handleSettingsTabChange(nextTab: string, nextToolsTab?: ToolsTab) {
+  if (nextTab === activeTab) {
+    if (nextToolsTab && !hasBlockingGoonsChanges()) activeToolsTab = nextToolsTab
     return
   }
+  retireAppActionNavigation()
+  if (hasBlockingGoonsChanges()) {
+    queueSettingsAction({ type: 'switch-tab', nextTab, nextToolsTab })
+    return
+  }
+  if (nextToolsTab) activeToolsTab = nextToolsTab
   activeTab = nextTab
 }
 
 function handleSettingsOpenChange(nextOpen: boolean) {
+  retireAppActionNavigation()
   if (nextOpen) {
     open = true
     return
@@ -218,7 +355,13 @@ type PlaceholderTabContent = {
 type TabContent = ComponentTabContent | PlaceholderTabContent
 
 function resolvePanelProps(content: ComponentTabContent) {
-  return content.props ? content.props() : {}
+  const props = content.props ? content.props() : {}
+  if (!actionVisit) return props
+  // A prior human launcher may have left a create/diagnostics target in the sidebar.
+  // P1 admits tab/entity/tools navigation only and never revives those targets.
+  return { ...props, initialAgentId: null, initialModelId: null, initialArtifactId: null,
+    initialSection: null, initialAction: null, initialSectionNonce: 0,
+    initialMode: 'list', initialModeNonce: 0 }
 }
 
 function resolveGoonsPanelProps(content: ComponentTabContent) {
@@ -453,8 +596,11 @@ $effect(() => {
     (open && !wasOpen) ||
     (open && (currentInitial !== lastInitialTab || currentInitialToolsTab !== lastInitialToolsTab))
   ) {
-    activeTab = currentInitial
-    activeToolsTab = currentInitialToolsTab
+    if (!actionRouting) {
+      actionVisit = false
+      retireAppActionNavigation()
+      handleSettingsTabChange(currentInitial, currentInitialToolsTab)
+    }
   }
 
   wasOpen = open
@@ -488,7 +634,7 @@ $effect(() => {
     <!-- Mobile close button (keep in corner for <768px) -->
     <button
       type="button"
-      class="batshit-settings-mobile-close md:hidden absolute right-4 top-4 inline-flex h-9 w-9 items-center justify-center focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+      class="batshit-settings-mobile-close md:hidden absolute right-4 top-4 inline-flex h-9 w-9 items-center justify-center focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
       aria-label="Close settings"
       onclick={() => handleSettingsOpenChange(false)}
     >
@@ -502,10 +648,11 @@ $effect(() => {
 
     <form
       id="batshit-settings-form"
+      bind:this={settingsForm}
       class="batshit-settings-form flex flex-col gap-0"
       onsubmit={(event) => event.preventDefault()}
     >
-      <Tabs.Root value={activeTab} onValueChange={handleSettingsTabChange} class="batshit-settings-tabs flex flex-col gap-0">
+      <Tabs.Root bind:value={() => activeTab, handleSettingsTabChange} class="batshit-settings-tabs flex flex-col gap-0">
       <!-- Mobile grid (below 768px) -->
       <h5 class="batshit-settings-mobile-title md:hidden text-center">SETTINGS</h5>
       <TabsPrimitive.List class="batshit-settings-mobile-grid relative z-[var(--z-surface)] p-2 grid w-full grid-cols-2 gap-2 sm:grid-cols-3 md:hidden">
@@ -514,7 +661,7 @@ $effect(() => {
             {#each section as tab}
               <TabsPrimitive.Trigger
                 value={tab.value}
-                class="batshit-settings-mobile-tab inline-flex w-full items-center gap-2 text-left focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+                class="batshit-settings-mobile-tab inline-flex w-full items-center gap-2 text-left focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
               >
                 <span class="batshit-settings-nav-icon inline-flex size-5 shrink-0 items-center justify-center" aria-hidden="true">
                   {#if tab.icon.type === 'lucide'}
@@ -553,7 +700,7 @@ $effect(() => {
                 {#each section as tab}
                   <TabsPrimitive.Trigger
                     value={tab.value}
-                    class="batshit-settings-rail-item inline-flex items-center justify-start gap-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+                    class="batshit-settings-rail-item inline-flex items-center justify-start gap-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
                   >
                     <span class="batshit-settings-nav-icon inline-flex size-5 items-center justify-center" aria-hidden="true">
                       {#if tab.icon.type === 'lucide'}
@@ -577,7 +724,7 @@ $effect(() => {
             <!-- Mid-breakpoint close button lives in the icon rail, pinned outside the scroll region so it's always visible -->
             <button
               type="button"
-              class="batshit-settings-nav-close mt-2 shrink-0 inline-flex items-center justify-center p-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+              class="batshit-settings-nav-close mt-2 shrink-0 inline-flex items-center justify-center p-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
               aria-label="Close settings"
               onclick={() => handleSettingsOpenChange(false)}
             >
@@ -595,7 +742,7 @@ $effect(() => {
               {#each section as tab}
                 <TabsPrimitive.Trigger
                   value={tab.value}
-                  class="batshit-settings-nav-item inline-flex w-full items-center justify-start gap-3 text-left focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+                  class="batshit-settings-nav-item inline-flex w-full items-center justify-start gap-3 text-left focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
                 >
                   <span>{tab.label}</span>
                 </TabsPrimitive.Trigger>
@@ -617,7 +764,7 @@ $effect(() => {
               {#each section as tab}
                 <TabsPrimitive.Trigger
                   value={tab.value}
-                  class="batshit-settings-nav-item inline-flex w-full items-center justify-start gap-3 text-left focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+                  class="batshit-settings-nav-item inline-flex w-full items-center justify-start gap-3 text-left focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
                 >
                   <span class="batshit-settings-nav-icon inline-flex size-5 items-center justify-center">
                     {#if tab.icon.type === 'lucide'}
@@ -640,7 +787,7 @@ $effect(() => {
           <div class="mt-4 shrink-0">
             <button
               type="button"
-              class="batshit-settings-nav-close w-full inline-flex items-center justify-center gap-2 px-3 py-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+              class="batshit-settings-nav-close w-full inline-flex items-center justify-center gap-2 px-3 py-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
               onclick={() => handleSettingsOpenChange(false)}
             >
               Close
@@ -665,6 +812,7 @@ $effect(() => {
                       loader={tab.content.loader}
                       active={open && activeTab === tab.value}
                       panelProps={resolveGoonsPanelProps(tab.content)}
+                      onAppActionHandle={(handle) => { if (handle) actionPanels.set(tab.value, handle); else actionPanels.delete(tab.value) }}
                     />
                   {/if}
                 {:else}
@@ -674,6 +822,7 @@ $effect(() => {
                       loader={tab.content.loader}
                       active={open && activeTab === tab.value}
                       panelProps={resolvePanelProps(tab.content)}
+                      onAppActionHandle={(handle) => { if (handle) actionPanels.set(tab.value, handle); else actionPanels.delete(tab.value) }}
                     />
                   </div>
                 {/if}
@@ -703,7 +852,18 @@ $effect(() => {
         }
       }}
     >
-      <Dialog.Content class="bs-unsaved-dialog-content">
+      <Dialog.Content
+        class="bs-unsaved-dialog-content"
+        onCloseAutoFocus={(event) => {
+          if (!open || settingsUnsavedDialogOpen || pendingSettingsAction || !settingsForm?.isConnected || !hasBlockingGoonsChanges()) return
+          const tab = Array.from(settingsForm.querySelectorAll<HTMLElement>('[role="tab"][data-value="3d-goons"][data-state="active"]'))
+            .find((candidate) => candidate.isConnected && candidate.getClientRects().length > 0 &&
+              getComputedStyle(candidate).visibility === 'visible' && getComputedStyle(candidate).pointerEvents !== 'none')
+          if (!tab) return
+          event.preventDefault()
+          tab.focus({ preventScroll: true })
+        }}
+      >
         <Dialog.Header>
           <Dialog.Title>Save 3D Goons changes first?</Dialog.Title>
           <Dialog.Description>

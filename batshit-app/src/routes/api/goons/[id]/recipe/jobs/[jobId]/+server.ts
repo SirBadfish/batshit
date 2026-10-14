@@ -4,6 +4,7 @@ import {
   discardRecipeJob,
   failRecipeJob,
   recoverInterruptedRecipeJob,
+  renewActiveRecipeJobLease,
   retryRecipeJob
 } from '$lib/server/services/goonRecipeLifecycleService.server'
 import { authenticatedRecipeOwner, recipeRouteError } from '$lib/server/services/goonRecipeRoute.server'
@@ -38,6 +39,7 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
     }
     if (body.action === 'retry') return json(await retryRecipeJob(input))
     if (body.action === 'discard') return json(await discardRecipeJob(input))
+    if (body.action === 'renew') return json(await renewActiveRecipeJobLease(input))
     if (body.action === 'advance') {
       return json(await advanceRecipeJobStage({ ...input, nextStatus: body.nextStatus }))
     }
@@ -49,7 +51,7 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
         reportRef: body.reportRef ?? null
       }))
     }
-    return json({ error: 'Recipe job action must be advance, fail, retry, or discard' }, { status: 400 })
+    return json({ error: 'Recipe job action must be advance, fail, renew, retry, or discard' }, { status: 400 })
   } catch (error) {
     return recipeRouteError(error)
   }

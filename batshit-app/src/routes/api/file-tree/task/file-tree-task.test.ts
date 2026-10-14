@@ -84,8 +84,13 @@ describe('/api/file-tree/task proxy', () => {
 
   it('fails loudly when the service token is missing', async () => {
     delete process.env.BATSHIT_TOKEN
-    await expect(POST(makeEvent({ toolName: 'read_file', input: {}, params: {} }))).rejects.toThrow(
+    await expect(POST(makeEvent({
+      toolName: 'read_file',
+      input: { filePath: 'fixture.txt' },
+      params: { projectPath: '/tmp/project' }
+    }))).rejects.toThrow(
       /BATSHIT_TOKEN/
     )
+    expect(fetchSpy).not.toHaveBeenCalled()
   })
 })

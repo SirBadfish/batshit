@@ -150,10 +150,96 @@ describe('a managed Claude Bash output too large to show (Bug C)', () => {
     const names = (stored.payload.toolResult.files as any[]).map((entry) => entry.name ?? entry.path ?? entry)
 
     expect(stored.payload.operationKind).toBe('list_files')
-    expect(stored.description).toBe('list_files: /tmp/tree - 447 entries')
+    expect(stored.payload.toolResult.totalItems).toBe(447)
     expect(names.every((name: string) => /^entry line \d{4} — ünïcödé ✓ (?:abcdefghij){3}$/.test(name))).toBe(true)
     expect(stored.content).not.toContain('persisted-output')
     expect(stored.content).not.toContain('Output cut here')
+  })
+})
+
+/**
+ * BL-8 (2026-09-22): a listing, a search, or a plain command Claude cut keeps only the whole lines
+ * Claude kept, so every count drawn from them was a lower bound that nothing marked: the live
+ * listing of 1,500 names was stored as `461 entries`. The cut now rides through both rebuilds
+ * (`normalizeToolStep`, then the lane summarizer) as `outputCut`, and the description, the AI view,
+ * and the card say "first".
+ */
+describe('an output Claude cut, on the lanes that count its lines (BL-8)', () => {
+  const CUT = { by: 'Claude Code', keptBytes: 29_948, totalBytes: 60_300 }
+  const CUT_SENTENCE = 'Claude Code cut this output: 29,948 of 60,300 bytes kept.'
+
+  it('stores a cut listing as its first entries, and says so', async () => {
+    const stored = await storeClaude(persistedBashEvents('ls -1 /tmp/tree', OUTPUT))
+
+    expect(stored.payload.toolResult.outputCut).toEqual(CUT)
+    expect(stored.description).toBe('list_files: /tmp/tree - first 447 entries')
+    expect(stored.aiView).toContain('Items: first 447 (the first 200 are listed)\n')
+    expect(stored.aiView).toContain(CUT_SENTENCE)
+  })
+
+  it('stores a cut search as its first matches, and says so', async () => {
+    const lines = `${rows(900)
+      .split('\n')
+      .map((row, index) => `/tmp/docs/big.txt:${index + 1}:${row}`)
+      .join('\n')}\n`
+    const stored = await storeClaude(persistedBashEvents('grep -rn entry /tmp/docs', lines))
+    const kept = Buffer.from(lines, 'utf8').subarray(0, 30_000).toString('utf8')
+    const wholeLines = kept.slice(0, kept.lastIndexOf('\n')).split('\n').length
+
+    expect(stored.payload.operationKind).toBe('search_files')
+    expect(stored.payload.toolResult.totalMatches).toBe(wholeLines)
+    expect(stored.payload.toolResult.outputCut).toMatchObject({ by: 'Claude Code', totalBytes: Buffer.byteLength(lines) })
+    expect(stored.description).toBe(`search_files: "entry" - first ${wholeLines} lines`)
+    // The AI view says it in words, as for a listing, never as the raw field (BL-8 review).
+    const keptBytes = stored.payload.toolResult.outputCut.keptBytes as number
+    expect(stored.aiView).toContain(`Matches: first ${wholeLines}\n`)
+    expect(stored.aiView).toContain(
+      `Claude Code cut this output: ${keptBytes.toLocaleString('en-US')} of ${Buffer.byteLength(lines).toLocaleString('en-US')} bytes kept.`
+    )
+    expect(stored.aiView).not.toContain('outputCut')
+  })
+
+  it('stores a cut plain command as its first lines, and says so', async () => {
+    const stored = await storeClaude(persistedBashEvents('node print-rows.js', OUTPUT))
+
+    expect(stored.payload.operationKind).toBe('bash')
+    expect(stored.payload.toolResult.outputCut).toEqual(CUT)
+    // BL-166: every whole line Claude kept (the listing's 447), never only the stored preview's.
+    expect((stored.payload.toolResult.stdout as string).split('\n').length).toBeLessThan(447)
+    expect(stored.description).toBe('bash: node print-rows.js - first 447 lines')
+    expect(stored.aiView).toContain(CUT_SENTENCE)
+  })
+
+  it('stores the same lanes exactly as before when Claude cut nothing', async () => {
+    const small = rows(30)
+    const plain = { stdout: small, stderr: '', interrupted: false, isImage: false, noOutputExpected: false }
+    const listing = await storeClaude(
+      claudeBashEvents({ id: 'toolu_small_ls', command: 'ls -1 /tmp/tree', isError: false, content: small, toolUseResult: plain })
+    )
+    const command = await storeClaude(
+      claudeBashEvents({ id: 'toolu_small_node', command: 'node print-rows.js', isError: false, content: small, toolUseResult: plain })
+    )
+    const matches = '/tmp/docs/a.txt:1:entry one\n/tmp/docs/a.txt:2:entry two\n'
+    const search = await storeClaude(
+      claudeBashEvents({
+        id: 'toolu_small_grep',
+        command: 'grep -rn entry /tmp/docs',
+        isError: false,
+        content: matches,
+        toolUseResult: { ...plain, stdout: matches }
+      })
+    )
+
+    expect(listing.content).not.toContain('outputCut')
+    expect(listing.description).toBe('list_files: /tmp/tree - 30 entries')
+    expect(listing.aiView).toContain('Items: 30\n')
+    expect(command.content).not.toContain('outputCut')
+    expect(command.description).toBe('bash: node print-rows.js - 30 lines')
+    expect(command.aiView).not.toContain('cut this output')
+    expect(search.content).not.toContain('outputCut')
+    expect(search.aiView).not.toContain('Matches: first')
+    expect(search.aiView).not.toContain('cut this output')
+    expect(search.aiView).toContain('Result:\n```json')
   })
 })
 
@@ -198,5 +284,42 @@ describe('a quoted sed script that only contains ` -i ` (Bug Q)', () => {
     expect(stored.payload.toolResult.content.trimEnd()).toBe(PRINTED)
     expect(stored.description).toMatch(/^read_file: \/tmp\/batshit-example\/notes\.md - \d+ lines$/)
     expect(stored.aiView).not.toContain('Diff unavailable')
+  })
+})
+
+// Found in BL-166's proof: over Claude Code's 64MB persist limit the notice has other words
+// ("Output exceeded the 64MB persist limit; only the first 64MB were saved to: <path>", Claude Code
+// 2.1.275), which the parser did not know, so the notice itself was stored and no cut was marked.
+describe('an output over Claude Code\'s 64MB persist limit', () => {
+  it('is stored as the whole lines Claude kept, marked as cut', async () => {
+    const lines = `${rows(900)
+      .split('\n')
+      .map((row, index) => `/tmp/docs/big.txt:${index + 1}:${row}`)
+      .join('\n')}\n`
+    const totalBytes = 93_642_796
+    const preview = lines.split('\n').slice(0, 30).join('\n')
+    const stored = await storeClaude(
+      claudeBashEvents({
+        id: 'toolu_over_64mb',
+        command: 'grep -rn entry /tmp/docs',
+        isError: false,
+        content: `<persisted-output>\nOutput exceeded the 64MB persist limit; only the first 64MB were saved to: ${NOTICE_PATH}\n\nPreview (first 2KB):\n${preview}\n...\n</persisted-output>`,
+        toolUseResult: {
+          stdout: Buffer.from(lines, 'utf8').subarray(0, 30_000).toString('utf8'),
+          stderr: '',
+          interrupted: false,
+          isImage: false,
+          noOutputExpected: false,
+          persistedOutputPath: NOTICE_PATH,
+          persistedOutputSize: totalBytes
+        }
+      })
+    )
+
+    expect(stored.payload.operationKind).toBe('search_files')
+    expect(stored.content).not.toContain('persisted-output')
+    expect(stored.content).not.toContain('persist limit')
+    expect(stored.payload.toolResult.outputCut).toMatchObject({ by: 'Claude Code', totalBytes })
+    expect(stored.description).toMatch(/^search_files: "entry" - first \d+ lines$/)
   })
 })

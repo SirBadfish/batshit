@@ -22,8 +22,13 @@
   import * as agentStore from '$lib/stores/agents.svelte'
   import { getUserSettings } from '$lib/stores/userSettings.svelte'
   import { normalizeId } from '$lib/utils/idNormalizer'
+  import { getDeadCopyReason, refreshDeadCopies } from '$lib/stores/zipDeadCopies.svelte'
+  import { describeHoldForUser, isUserHold } from '$lib/utils/zipHoldWords'
+  import type { DeadCopyReason } from '$lib/utils/zipDeadCopies'
   import { calculateAgentMessagesFromEndByIndex } from '$lib/utils/zipMessageAge'
   import { calculateZipActivation } from '$lib/utils/zipActivation'
+  import { toast } from 'svelte-sonner'
+  import type { ToolResultSizeGuard } from '$lib/utils/toolResultSizeGuard'
   import {
     buildZipStatusPresentation,
     resolveZipStateActors,
@@ -31,15 +36,18 @@
   } from '$lib/utils/zipStatusPresentation'
   import { normalizeCompactTool } from '$lib/utils/toolActivityContract'
   import {
+    countZipManagerHolds,
     getHiddenRawSidecarZipIds,
-    shouldShowZipManagerItem
+    shouldShowZipManagerItem,
+    ZIP_MANAGER_FILTERS,
+    zipManagerEmptyCopy,
+    type ZipManagerFilter
   } from '$lib/components/zips/zipManagerRows'
   import type { IconRef } from '$lib/icons/iconTypes'
   import { getProjectTreeIconRef } from '$lib/icons/fileTypeIcons'
   import FullTool from '$lib/components/renderers/tools/templates/FullTool.svelte'
   import ZipbatshitWrapper from '$lib/components/renderers/wrappers/ZipbatshitWrapper.svelte'
 
-  type ZipManagerFilter = 'unzipped' | 'zipped' | 'all'
   type ZipManagerSort = 'chat' | 'manual' | 'tokens' | 'newest'
   type ZipManagerToolStatus = 'loading' | 'success' | 'error' | 'info'
   type ZipManagerExpandedReason = 'buffer' | 'user' | 'agent' | 'inferred'
@@ -75,6 +83,10 @@
     agentControlled: boolean
     inferredControlled: boolean
     aboutToZip: boolean
+    /** SA-129 P2: "Held by you", "Held by you (3 messages left)", "Held by <agent>". */
+    holdLabel: string | null
+    deadCopyReason: DeadCopyReason | null
+    sizeGuard: ToolResultSizeGuard
     presentation: ZipStatusPresentation
     toolTitle: string
     toolSubtitle: string
@@ -90,7 +102,7 @@
   let isOpen = $state(false)
   let isLoading = $state(false)
   let loadError = $state<string | null>(null)
-  let filter = $state<ZipManagerFilter>('unzipped')
+  let filter = $state<ZipManagerFilter>('expanded')
   let sortMode = $state<ZipManagerSort>('chat')
 
   const sortOptions: { value: ZipManagerSort; label: string }[] = [
@@ -123,11 +135,16 @@
   )
   const unzippedRows = $derived(rows.filter((row) => row.isUnzippedNow))
   const zippedRows = $derived(rows.filter((row) => !row.isUnzippedNow))
+  const filterCounts = $derived<Record<ZipManagerFilter, number>>({
+    expanded: unzippedRows.length,
+    compressed: zippedRows.length,
+    all: rows.length
+  })
   const displayRows = $derived.by(() => {
     const sourceRows =
-      filter === 'unzipped'
+      filter === 'expanded'
         ? unzippedRows
-        : filter === 'zipped'
+        : filter === 'compressed'
           ? zippedRows
           : rows
 
@@ -147,10 +164,8 @@
         .filter(Boolean)
     ).size
   )
-  const permanentCount = $derived(unzippedRows.filter((row) => row.isPermanent).length)
-  const temporaryCount = $derived(
-    unzippedRows.filter((row) => row.presentation.duration === 'countdown').length
-  )
+  // BL-1485: "N held" counts every hold, with or without a countdown.
+  const heldCount = $derived(countZipManagerHolds(rows))
 
   let previousSessionId = $state<string | null | undefined>(undefined)
 
@@ -242,6 +257,7 @@
     try {
       await zippingService.ensureSessionLoaded(sessionId)
       syncUnzippedItems()
+      void refreshDeadCopies(sessionId)
       const response = await fetch(`/api/zips/list?sessionId=${encodeURIComponent(sessionId)}`, {
         headers: { 'x-internal-api-request': '1' }
       })
@@ -294,7 +310,10 @@
       row.tokens,
       'user'
     )
-    if (!ok) return
+    if (!ok) {
+      toast.error(zippingService.getLastUnzipError() ?? 'Could not hold this result.')
+      return
+    }
     const unzippedItem =
       zippingService.getUnzippedInfo(row.normalizedId) ??
       zippingService.getUnzippedInfo(row.id) ??
@@ -351,8 +370,8 @@
 
   async function clearAll() {
     const confirmed = await confirmDialog({
-      title: 'Zip all unzipped items?',
-      description: `This will compress ${unzippedRows.length} unzipped item(s) for this session.`,
+      title: 'Zip every expanded result?',
+      description: `This compresses ${unzippedRows.length} expanded result(s) in this chat.`,
       confirmLabel: 'Zip All'
     })
     if (!confirmed) return
@@ -513,6 +532,11 @@
       zippingService.getRezippedSource(zip.id) ||
       zippingService.getRezippedSource(normalizedId)
     const context = getMessageContext(zip)
+    const deadCopyReason = getDeadCopyReason(sessionId, normalizedId)
+    const holdLabel = describeHoldForUser(
+      unzippedItem,
+      unzippedItem?.agentId ? agentStore.getAgentById(unzippedItem.agentId)?.displayName ?? null : null
+    )
     const activation = calculateZipActivation({
       zipType: zip.type || 'all_other',
       messagesFromEnd: context.messagesFromEnd,
@@ -528,18 +552,24 @@
       toolName: zip.metadata?.toolName || zip.name,
       fallbackTokens: zip.tokens || 0,
       isUnzipped: Boolean(unzippedItem),
-      isRezipped
+      isInferredUnzipped: unzippedItem?.source === 'inferred',
+      isRezipped,
+      // SA-129 P2 (BL-333): the dead-copy facts the compile uses (a user hold keeps one open).
+      deadCopy: deadCopyReason ? { reason: deadCopyReason, repliesUntilDead: 0 } : null,
+      isUserUnzipped: isUserHold(unzippedItem)
     })
     const isManuallyUnzipped = Boolean(unzippedItem)
-    const isUnzippedNow = isManuallyUnzipped || !activation.shouldCompress
+    const deadCopyCompressed = Boolean(activation.deadCopy) && activation.shouldCompress
+    const isUnzippedNow = !activation.shouldCompress
     // SA-120 P5: the same reading of stored sources the chat badges use.
-    const actors = resolveZipStateActors(unzippedItem?.source, rezippedSource, isManuallyUnzipped)
-    const expandedReason = unzippedItem
+    const actors = resolveZipStateActors(unzippedItem?.source, rezippedSource, isManuallyUnzipped && isUnzippedNow)
+    const expandedReason = isManuallyUnzipped && isUnzippedNow
       ? actors.expandedReason
       : isUnzippedNow ? 'buffer' : undefined
     const remainingMessages = resolveRemainingMessages(unzippedItem, activation)
     const aboutToZip =
       isUnzippedNow &&
+      activation.sizeGuard === null &&
       !unzippedItem &&
       !isRezipped &&
       !activation.autoZip &&
@@ -558,7 +588,11 @@
       autoZip: activation.autoZip,
       agentControlled,
       inferredControlled,
-      aboutToZip
+      aboutToZip,
+      holdLabel,
+      deadCopyReason: deadCopyCompressed ? activation.deadCopy : null,
+      sizeGuard: activation.sizeGuard,
+      tokens: activation.tokens
     })
     const labelParts = splitZipDescription(zip.description || zip.name || zip.id)
     const toolPresentation = buildToolPresentation(zip, labelParts)
@@ -579,6 +613,9 @@
       agentControlled,
       inferredControlled,
       aboutToZip,
+      holdLabel,
+      deadCopyReason: deadCopyCompressed ? activation.deadCopy : null,
+      sizeGuard: activation.sizeGuard,
       presentation,
       ...toolPresentation
     }
@@ -859,11 +896,6 @@
     return `${Math.max(0, Math.round(tokens || 0)).toLocaleString()} tokens`
   }
 
-  function emptyCopy() {
-    if (filter === 'zipped') return 'No zipped items in this session yet.'
-    if (filter === 'all') return 'No zip items in this session yet.'
-    return 'Nothing is unzipped right now.'
-  }
 
   onMount(() => {
     syncUnzippedItems()
@@ -907,7 +939,7 @@
             class="zips-manager-clear-button"
             onclick={clearAll}
           >
-            Zip all unzipped
+            Zip all expanded
           </Button>
         {/if}
       </div>
@@ -915,16 +947,13 @@
       <div class="zips-manager-meta-row">
         <div class="zips-manager-stats" aria-label="Zip session stats">
           <div class="zips-manager-stat">
-            <span>{unzippedRows.length}</span> unzipped
+            <span>{unzippedRows.length}</span> expanded
           </div>
           <div class="zips-manager-stat">
             <span>{formatTokens(unzippedTokenTotal)}</span>
           </div>
           <div class="zips-manager-stat">
-            <span>{permanentCount}</span> always
-          </div>
-          <div class="zips-manager-stat">
-            <span>{temporaryCount}</span> countdown
+            <span>{heldCount}</span> held
           </div>
         </div>
 
@@ -951,36 +980,18 @@
       </div>
 
       <div class="zips-manager-filter" role="tablist" aria-label="Zip item filter">
-        <button
-          type="button"
-          role="tab"
-          class:active={filter === 'unzipped'}
-          aria-selected={filter === 'unzipped'}
-          onclick={() => filter = 'unzipped'}
-        >
-          <span>Unzipped</span>
-          <strong>{unzippedRows.length}</strong>
-        </button>
-        <button
-          type="button"
-          role="tab"
-          class:active={filter === 'zipped'}
-          aria-selected={filter === 'zipped'}
-          onclick={() => filter = 'zipped'}
-        >
-          <span>Zipped</span>
-          <strong>{zippedRows.length}</strong>
-        </button>
-        <button
-          type="button"
-          role="tab"
-          class:active={filter === 'all'}
-          aria-selected={filter === 'all'}
-          onclick={() => filter = 'all'}
-        >
-          <span>All</span>
-          <strong>{rows.length}</strong>
-        </button>
+        {#each ZIP_MANAGER_FILTERS as option (option.value)}
+          <button
+            type="button"
+            role="tab"
+            class:active={filter === option.value}
+            aria-selected={filter === option.value}
+            onclick={() => filter = option.value}
+          >
+            <span>{option.label}</span>
+            <strong>{filterCounts[option.value]}</strong>
+          </button>
+        {/each}
       </div>
     </div>
 
@@ -994,7 +1005,7 @@
       </div>
     {:else if displayRows.length === 0}
       <div class="zips-manager-empty">
-        <div class="zips-manager-empty-title">{emptyCopy()}</div>
+        <div class="zips-manager-empty-title">{zipManagerEmptyCopy(filter)}</div>
       </div>
     {:else}
       <div class="zips-manager-list">
@@ -1023,6 +1034,9 @@
                 autoZip={row.autoZip}
                 agentControlled={row.agentControlled}
                 inferredControlled={row.inferredControlled}
+                holdLabel={row.holdLabel}
+                deadCopyReason={row.deadCopyReason}
+                sizeGuard={row.sizeGuard}
                 manualZip={row.manualZip}
                 onToggleUnzip={(permanent: boolean) => handleUnzip(row, permanent)}
                 onZipNow={() => handleZip(row)}

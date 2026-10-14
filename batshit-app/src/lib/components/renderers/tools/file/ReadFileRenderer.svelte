@@ -92,6 +92,7 @@
 
 	// Build metadata
 	let metadata = $derived({
+		...(tool.toolResult?.shell ? { Shell: tool.toolResult.shell } : {}),
 		...(isSkillRead && skillName ? { 'Skill': skillName } : {}),
 		...(isSkillRead ? { 'Action': skillAction === 'invoke' ? 'Invoke' : 'Read' } : {}),
 		'File Path': filePath,
@@ -153,19 +154,10 @@
 			const nested = extractContent(result.result)
 			if (nested) return nested
 		}
-		if (typeof result.content === 'string') {
-			const trimmed = result.content.trim()
-			if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-				try {
-					const parsed = JSON.parse(trimmed)
-					const extracted = extractContent(parsed)
-					if (extracted) return extracted
-				} catch {
-					// Keep original content fallback below.
-				}
-			}
-			return result.content
-		}
+		// A read's content is the file's text, even when it starts with `{` or `[`: parsing it drew a
+		// one-line package.json as seven reformatted lines (BL-166 review). The shapers already
+		// unwrap transport wrappers before the zip is written.
+		if (typeof result.content === 'string') return result.content
 		if (result.fileContent) return result.fileContent
 		if (result.data) return result.data
 		if (result.blocked && typeof result.reason === 'string') return `Blocked: ${result.reason}`
@@ -195,7 +187,7 @@
 	icon={FileText}
 	iconRef={fileIconRef}
 	title={rendererTitle}
-	subtitle={isSkillRead && skillName ? `${skillName} • ${lineCount} lines` : `${subtitleTarget} • ${lineCount} lines`}
+	subtitle={`${isSkillRead && skillName ? skillName : subtitleTarget} • ${lineCount} ${lineCount === 1 ? 'line' : 'lines'}`}
 	{status}
 	{metadata}
 	duration={tool.metadata?.executionTime}

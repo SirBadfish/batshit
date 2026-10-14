@@ -221,7 +221,11 @@
         sceneMode: 'none',
         mountedState: value.mountedRuntimeState as GoonMountedRuntimeState | null
       })
-      await loadMountedLiveGoon(incoming, plan)
+      const loadResult = await loadMountedLiveGoon(incoming, plan)
+      if (loadResult.status === 'cancelled') {
+        incoming.dispose()
+        return
+      }
       if (generation !== loadGeneration) {
         incoming.dispose()
         return

@@ -1,5 +1,6 @@
+import { classifyToolResultSize, type ToolResultSizeGuard } from '$lib/utils/toolResultSizeGuard'
 /**
- * SA-120 P5 (design record B3) — Jev Juice smart zip.
+ * SA-120 P5 (design record B3) — Judge Juice smart zip.
  *
  * THE constants module for this feature (DL-120-03): the question, its criteria, both
  * floors, and every cap live here, so a reviewer reads the whole decision surface in one
@@ -7,7 +8,7 @@
  *
  * PRE-TURN (steps 1 and 2). Today an agent that wants an earlier tool result back has to
  * guess which compressed reference matters from its one-line description, and an unzip it
- * asks for only lands on the NEXT turn. With "Jev Juice: Smart Zip" ON, each accepted user
+ * asks for only lands on the NEXT turn. With "Judge Juice: Smart Zip" ON, each accepted user
  * turn on a PRIMARY API or managed CLI lane:
  *   1. the canonical compiler reports every zip it left compressed for this agent
  *      (`ZipCompression`) — the lane never re-derives zip activation;
@@ -152,7 +153,7 @@ export interface SmartZipCandidate {
   description: string
   tokens: number
   /** A safety row stays compressed even when unzipped, so its line says to fetch it instead. */
-  forceCompress: boolean
+  sizeGuard: ToolResultSizeGuard
   /** Whose hand-made rezip this is, if any. Only Jev's own (`inferred`) may be reopened by Jev. */
   rezippedBy: ZipCompression['rezippedBy']
 }
@@ -235,7 +236,7 @@ export function selectSmartZipCandidates(items: ZipCompression[]): {
       key: `z${index + 1}`,
       description: clip(item.description, SMART_ZIP_LIMITS.maxDescriptionChars),
       tokens: Number.isFinite(item.tokens) ? Math.max(0, Math.round(item.tokens)) : 0,
-      forceCompress: item.forceCompress === true,
+      sizeGuard: item.sizeGuard ?? classifyToolResultSize(item.tokens),
       // A rezip whose owner the compile did not load reads as the user's: never reopened.
       rezippedBy: item.rezipped ? (item.rezippedBy ?? 'user') : null
     }))
@@ -323,7 +324,7 @@ export function decideSmartZipOpens(likely: SmartZipHint[]): Pick<SmartZipDecisi
   let openedTokens = 0
   for (const hint of likely) {
     const { candidate } = hint
-    if (candidate.forceCompress) {
+    if (candidate.sizeGuard) {
       notOpened.push({ ...hint, reason: 'oversized' })
     } else if (candidate.rezippedBy !== null && candidate.rezippedBy !== 'inferred') {
       notOpened.push({ ...hint, reason: 'zipped_by_hand' })

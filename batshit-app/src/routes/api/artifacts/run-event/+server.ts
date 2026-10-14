@@ -1,11 +1,12 @@
 import { error, json, type RequestHandler } from '@sveltejs/kit'
-import { apiError } from '$lib/server/services/apiResponses'
+import { apiError, apiFailure } from '$lib/server/services/apiResponses'
 import {
   isOpaqueArtifactRuntimeRequest,
   requireArtifactRuntimeClaims,
   resolveArtifactRuntimeClaims
 } from '$lib/server/services/artifactRuntimeAuth'
 import { resolveNativeToolUser } from '$lib/server/services/nativeToolAuth'
+import { refuseDelegatedRunOutsideList } from '$lib/server/services/actingAgentIdentity'
 import { recordArtifactClientRunEvent } from '$lib/server/artifacts/artifactRunLogs'
 
 export const POST: RequestHandler = async ({ request, locals }) => {
@@ -40,6 +41,13 @@ export const POST: RequestHandler = async ({ request, locals }) => {
   const userId = auth?.userId
   if (!userId) {
     return apiError('Unauthorized', 401)
+  }
+
+  if (!runtimeClaims) {
+    const delegatedRefusal = refuseDelegatedRunOutsideList(auth, null)
+    if (delegatedRefusal) {
+      return apiFailure(delegatedRefusal.message, 403, { code: delegatedRefusal.code })
+    }
   }
 
   await recordArtifactClientRunEvent({

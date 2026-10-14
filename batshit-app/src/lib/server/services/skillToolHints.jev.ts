@@ -1,12 +1,12 @@
 /**
- * SA-120 P1 (design record B1 + B6) — Jev Juice skill and tool hints.
+ * SA-120 P1 (design record B1 + B6) — Judge Juice skill and tool hints.
  *
  * THE constants module for this feature (DL-120-03): every question, criterion,
  * threshold, and cap lives here, so a reviewer reads the whole decision surface in one
  * file. Thresholds change in code review, never in a prompt.
  *
  * What it does, per accepted user turn on a PRIMARY API or managed CLI lane whose agent
- * has "Jev Juice: Suggest Skills and Tools" ON:
+ * has "Judge Juice: Suggest Skills and Tools" ON:
  *   1. one Jev request with up to five parallel questions — an action gate, a Choice
  *      over the agent's enabled skills, a Choice over its discoverable typed refs, and
  *      a Choice plus a Noul over the capabilities it does NOT have;
@@ -28,6 +28,7 @@ import type { DynamicMcpDiscoverableRef } from './dynamicMcpIndex'
 import { listCliTools } from './cliToolRegistry'
 import { mcpGatewayService } from './mcpGatewayService'
 import { resolveNativeToolSettings } from './nativeTools'
+import { normalizePrimaryAgentType, primaryAgentAllowsNativeBash } from '$lib/utils/primaryAgentType'
 import { runTypesafeJudgment } from './typesafe/typesafeAvailability'
 import type {
   JevChoiceAnswer,
@@ -413,7 +414,14 @@ export async function buildCapabilityGapCatalog(
   const partial: string[] = []
 
   const native = resolveNativeToolSettings(input.agent?.provider_specific_settings ?? input.agent?.providerSpecificSettings ?? null)
+  // BL-878 (Josh, 2026-09-28): a Codex or Claude agent has its own Bash, and Batshit's Bash is not
+  // offered to it. A saved Bash value of `false` (an API agent changed to CLI keeps it, and the
+  // greyed-out switch cannot clear it) is not a missing capability there: "Off for this agent:
+  // Bash" would tell the agent to say so plainly instead of using its own shell. The DCM's Bash
+  // section already follows the same rule (`primaryAgentAllowsNativeBash`, API agents only).
+  const agentHasBatshitBash = primaryAgentAllowsNativeBash(normalizePrimaryAgentType(input.agent))
   for (const entry of NATIVE_CAPABILITY_GAPS) {
+    if (entry.id === 'native:bash' && !agentHasBatshitBash) continue
     if ((native as unknown as Record<string, unknown>)[entry.setting] === false) {
       gaps.push({ id: entry.id, kind: 'native', label: entry.label, what: entry.what })
     }
@@ -432,7 +440,7 @@ export async function buildCapabilityGapCatalog(
       })
     }
   } catch (error) {
-    console.warn('[Jev Juice] gap catalog: skills unavailable', error)
+    console.warn('[Judge Juice] gap catalog: skills unavailable', error)
     partial.push('skills')
   }
 
@@ -451,7 +459,7 @@ export async function buildCapabilityGapCatalog(
       })
     }
   } catch (error) {
-    console.warn('[Jev Juice] gap catalog: CLI tools unavailable', error)
+    console.warn('[Judge Juice] gap catalog: CLI tools unavailable', error)
     partial.push('cli')
   }
 
@@ -472,7 +480,7 @@ export async function buildCapabilityGapCatalog(
         })
       }
     } catch (error) {
-      console.warn('[Jev Juice] gap catalog: MCP sources unavailable', error)
+      console.warn('[Judge Juice] gap catalog: MCP sources unavailable', error)
       partial.push('gateways')
     }
   }

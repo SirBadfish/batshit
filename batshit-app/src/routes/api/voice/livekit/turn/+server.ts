@@ -10,6 +10,9 @@ import {
   abortStream
 } from '$lib/server/services/streamAbortRegistry'
 import { redis } from '$lib/server/redis'
+import { advanceZipCountdowns } from '$lib/server/services/zipHolds'
+import { wasMessageDeleted } from '$lib/server/services/deletedMessageRegistry'
+import { publishUserEvent } from '$lib/server/ssePublisher'
 import type { ChatMessage } from '$lib/types/database'
 import { generateMessageId } from '$lib/utils/messageId'
 
@@ -272,7 +275,38 @@ export const POST: RequestHandler = async ({ request, fetch: eventFetch }) => {
       status: 'complete'
     } as ChatMessage
 
-    await redis.saveMessage(message)
+    // BL-776: `saveMessage` puts a missing id back on the chat's list, so a late post of a
+    // message the user deleted would bring it back. Refused, and no tab is told.
+    if (wasMessageDeleted(sessionId, messageId)) {
+      return json(
+        { success: false, error: 'This message was deleted.', code: 'message_deleted', messageId },
+        { status: 409 }
+      )
+    }
+
+    // SA-129 P2b (BL-356, Faye 2026-09-27): a realtime voice turn counts toward every "Hold for
+    // N messages" like a typed one, one count for the user's words and one for the reply. These
+    // messages are saved here, never through send-routed, so this is their only count; a
+    // repeated post of a message already saved counts nothing.
+    const alreadySaved = await redis.exists(`message:${sessionId}:${messageId}`)
+    // BL-776: the server owns a reply's record, so a reply is written only when it is not stored
+    // yet. The user's own transcript is written again: the sidecar sends a longer one under the
+    // same id as the user keeps speaking.
+    if (!(alreadySaved && role === 'assistant')) {
+      await redis.saveMessage(message)
+    }
+    if (!alreadySaved) {
+      const countdown = await advanceZipCountdowns(sessionId)
+      if (countdown.counted.length > 0 || countdown.ended.length > 0) {
+        await publishUserEvent(userId, {
+          type: 'zip_state_changed',
+          sessionId,
+          source: 'countdown',
+          opened: [],
+          rezipped: []
+        })
+      }
+    }
     await forwardSse(eventFetch, request, sessionId, {
       type: role === 'assistant' ? 'complete_message' : 'user_message',
       message,

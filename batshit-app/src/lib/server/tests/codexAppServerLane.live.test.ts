@@ -3,7 +3,7 @@
  * with the operator's ChatGPT auth and spends a small amount of model usage.
  *
  * Skipped unless BATSHIT_LIVE_CODEX=1. Run explicitly:
- *   BATSHIT_LIVE_CODEX=1 npx vitest run src/lib/server/tests/codexAppServerLane.live.test.ts
+ *   BATSHIT_LIVE_CODEX=1 BATSHIT_CODEX_CLI_PATH=<candidate> BATSHIT_LIVE_CODEX_MODEL=gpt-6-sol npx vitest run src/lib/server/tests/codexAppServerLane.live.test.ts
  *
  * Uses an isolated CODEX_HOME under /tmp with a symlinked auth.json (the
  * managed-home pattern); never touches ~/.codex itself.
@@ -17,7 +17,7 @@ import { join } from 'node:path'
 import { startCodexAppServerRun } from '../services/codexAppServerLane'
 
 const LIVE = process.env.BATSHIT_LIVE_CODEX === '1'
-const MODEL = 'gpt-5.6-sol'
+const MODEL = process.env.BATSHIT_LIVE_CODEX_MODEL ?? 'gpt-5.6-sol'
 
 function setupLiveEnv() {
   const root = mkdtempSync(join(tmpdir(), 'batshit-appserver-lane-live-'))
@@ -45,8 +45,10 @@ describe.runIf(LIVE)('codex app-server lane (LIVE)', () => {
     { timeout: 120_000 },
     async () => {
       const { executable, env, root, workspace } = setupLiveEnv()
+      const reportedWindows: number[] = []
       const run = startCodexAppServerRun({
         executable,
+        onContextWindow: value => reportedWindows.push(value),
         env,
         cwd: workspace,
         threadParams: {
@@ -69,6 +71,8 @@ describe.runIf(LIVE)('codex app-server lane (LIVE)', () => {
       }
 
       const types = events.map((e) => e.type)
+      expect(reportedWindows.length).toBeGreaterThan(0)
+      expect(reportedWindows.every(value => Number.isFinite(value) && value > 0)).toBe(true)
       expect(types[0]).toBe('thread.started')
       expect(types).toContain('turn.started')
       expect(types).toContain('item.started')

@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it } from 'vitest'
 
 import {
+  applyQueuedSendHold,
   applySteerDelivered,
+  applySteerDropped,
   applySteerPromoted,
   applySteerQueued,
   clearDeliveredSteersForMessage,
@@ -10,15 +12,15 @@ import {
   clearDroppedSteersForSession,
   getPendingSteersForSession,
   getSteer,
+  getSteersAwaitingServerForMessage,
   getSteersForMessage,
   markSteerDropped,
   noteLocalSteer,
   steerBubbleStatusLabel
 } from './steerInbox.svelte'
-import {
-  QUEUED_AFTER_REPLY_SENTENCE,
-  QUEUED_WITH_FILES_SENTENCE
-} from '$lib/utils/steerControl'
+import { QUEUED_AFTER_REPLY_SENTENCE } from '$lib/utils/steerControl'
+import { unclosedReferenceReplies } from '$lib/test-utils/unclosedReferenceReplies'
+import { HELD_CARD_EXPIRED_SENTENCE, WAITS_FOR_APPROVAL_SENTENCE } from '$lib/utils/heldForApproval'
 
 /**
  * SA-114 P3 (DL-114-14) — the browser's view of a steer.
@@ -123,32 +125,9 @@ describe('steerInbox', () => {
     expect(steerBubbleStatusLabel(getSteer('steer_late')!)).toContain('Send it again')
   })
 
-  it('labels the waiting and queued states', () => {
-    noteLocalSteer({
-      steerId: 'steer_w',
-      sessionId: 's1',
-      messageId: 'm1',
-      text: 'w',
-      state: 'waiting',
-      withFiles: true
-    })
+  it('labels the queued state', () => {
     noteLocalSteer({ steerId: 'steer_q', sessionId: 's1', messageId: 'm1', text: 'q' })
-    expect(steerBubbleStatusLabel(getSteer('steer_w')!)).toBe(QUEUED_WITH_FILES_SENTENCE)
     expect(steerBubbleStatusLabel(getSteer('steer_q')!)).toContain('Queued')
-  })
-
-  it('never says "with files" about a text-only message the browser is holding (F-P2-2)', () => {
-    // A group chat, an unmanaged profile or a Codex exec lane cannot take a steer at all,
-    // so a plain typed message waits in the browser too (DL-119-06). Telling that user
-    // "(with files)" would describe a message they did not send.
-    noteLocalSteer({
-      steerId: 'steer_text_wait',
-      sessionId: 's1',
-      messageId: 'm1',
-      text: 'plain words',
-      state: 'waiting'
-    })
-    expect(steerBubbleStatusLabel(getSteer('steer_text_wait')!)).toBe(QUEUED_AFTER_REPLY_SENTENCE)
   })
 
   /**
@@ -248,8 +227,7 @@ describe('steerInbox', () => {
         sessionId: 's1',
         messageId: 'm1',
         text: 'this one carries a file.\n\n{{batshit-clip:clip_1789301213116_83c88e87_0:::sample.txt}}',
-        state: 'waiting',
-        withFiles: true
+        deliver: 'end'
       })
       expect(getSteer('steer_clip')?.text).toBe('this one carries a file.')
     })
@@ -260,8 +238,7 @@ describe('steerInbox', () => {
         sessionId: 's1',
         messageId: 'm1',
         text: 'read these\n\n{{batshit-clip:clip_1789301213116_83c88e87_0:::a.txt}}\n{{batshit-clip:clip_1789301213117_83c88e88_0:::b.txt}}',
-        state: 'waiting',
-        withFiles: true
+        deliver: 'end'
       })
       expect(getSteer('steer_clips')?.text).toBe('read these')
     })
@@ -273,8 +250,7 @@ describe('steerInbox', () => {
         sessionId: 's1',
         messageId: 'm1',
         text: '{{batshit-clip:clip_1789301213116_83c88e87_0:::sample.txt}}',
-        state: 'waiting',
-        withFiles: true
+        deliver: 'end'
       })
       expect(getSteer('steer_only')?.text).toBe('sample.txt')
     })
@@ -295,6 +271,16 @@ describe('steerInbox', () => {
         text: 'look at {{batshit-clip:...}} please'
       })
       expect(getSteer('steer_odd')?.text).toContain('{{batshit-clip:...}}')
+    })
+
+    it('reads 1 MB of 20,000 clip openers that never close in well under 200 ms', () => {
+      // The clip pattern the reference scan replaced cost (openers) x (text length) here.
+      for (const [shape, text] of Object.entries(unclosedReferenceReplies('clip'))) {
+        const started = performance.now()
+        noteLocalSteer({ steerId: 'steer_long', sessionId: 's1', messageId: 'm1', text })
+        expect(performance.now() - started, shape).toBeLessThan(200)
+        expect(getSteer('steer_long')?.text, shape).toBe(text.trim())
+      }
     })
 
     it('cleans the text the SSE event brings too, not only this tab’s own send', () => {
@@ -340,13 +326,6 @@ describe('steerInbox', () => {
     it('clears only dropped bubbles, and only in the session named', () => {
       noteLocalSteer({ steerId: 'steer_dropped', sessionId: 's1', messageId: 'm1', text: 'd' })
       noteLocalSteer({ steerId: 'steer_queued', sessionId: 's1', messageId: 'm1', text: 'q' })
-      noteLocalSteer({
-        steerId: 'steer_waiting',
-        sessionId: 's1',
-        messageId: 'm1',
-        text: 'w',
-        state: 'waiting'
-      })
       noteLocalSteer({ steerId: 'steer_delivered', sessionId: 's1', messageId: 'm1', text: 'v' })
       noteLocalSteer({ steerId: 'steer_other', sessionId: 's2', messageId: 'm2', text: 'o' })
 
@@ -358,7 +337,6 @@ describe('steerInbox', () => {
 
       expect(getSteer('steer_dropped')).toBeNull()
       expect(getSteer('steer_queued')?.state).toBe('queued')
-      expect(getSteer('steer_waiting')?.state).toBe('waiting')
       expect(getSteer('steer_delivered')?.state).toBe('delivered')
       // Another chat's receipt is not this send's business.
       expect(getSteer('steer_other')?.state).toBe('dropped')
@@ -447,53 +425,171 @@ describe('clearDroppedSteer (SA-119 P3b review, F-P3b-3)', () => {
 
   it('touches nothing that is not a dropped bubble', () => {
     noteLocalSteer({ steerId: 'steer_q', sessionId: 's1', messageId: 'm1', text: 'q' })
-    noteLocalSteer({ steerId: 'steer_w', sessionId: 's1', messageId: 'm1', text: 'w', state: 'waiting' })
     clearDroppedSteer('steer_q')
-    clearDroppedSteer('steer_w')
     clearDroppedSteer('')
     clearDroppedSteer('steer_missing')
     expect(getSteer('steer_q')?.state).toBe('queued')
-    expect(getSteer('steer_w')?.state).toBe('waiting')
   })
 })
 
 /**
- * SA-119 P3b review (Faye, F-P3b-4) — the wait that gives up on a reply still running.
- *
- * The browser-held queue waits fifteen minutes at most. Before P3b the words were still in
- * the composer when that ran out, so forgetting the bubble lost nothing; P3b cleared the
- * composer at queue time, and the same `forgetSteer` then lost the message outright while
- * the toast said it was "still here". The bubble is the receipt now, with its own reason.
+ * BL-4 — a send that met another turn waits in the chat's line, and every tab shows it as the
+ * Queue bubble. Its bubble id is the id of the message the page saved, and that same message can
+ * be queued again (Send now on its receipt), so a cleared id may come back for a NEWER queueing,
+ * never for a replay of the old one.
  */
-describe('the timed-out receipt (SA-119 P3b review, F-P3b-4)', () => {
-  afterEach(() => {
-    clearSteerInboxForTest()
+describe('a queued send (BL-4)', () => {
+  afterEach(() => clearSteerInboxForTest())
+
+  const queuedSend = (overrides: Record<string, any> = {}) => ({
+    sessionId: 's1',
+    messageId: 'reply-a',
+    steerId: 'msg-b',
+    text: 'SECOND',
+    deliver: 'end' as const,
+    at: '2026-09-22T12:00:00.000Z',
+    queuedSend: true,
+    ...overrides
   })
 
-  it('drops a waiting bubble as timed out, and says so without blaming a Stop', () => {
-    noteLocalSteer({
-      steerId: 'steer_w',
-      sessionId: 's1',
-      messageId: 'm1',
-      text: 'w',
-      state: 'waiting',
-      withFiles: true
-    })
-    markSteerDropped('steer_w', 'timed_out')
-    expect(getSteer('steer_w')?.state).toBe('dropped')
-    expect(getSteer('steer_w')?.dropReason).toBe('timed_out')
-    const label = steerBubbleStatusLabel(getSteer('steer_w')!)
-    expect(label).toContain('Not sent')
-    expect(label).toContain('ran too long')
-    expect(label).toContain('Send it again')
-    expect(label).not.toContain('you stopped')
-    expect(label).not.toContain('reply ended')
+  it('shows as the Queue bubble, filed under the reply it waits for', () => {
+    applySteerQueued(queuedSend())
+    const bubble = getSteer('msg-b')
+    expect(bubble).toMatchObject({ state: 'queued', deliver: 'end', messageId: 'reply-a', text: 'SECOND' })
+    expect(steerBubbleStatusLabel(bubble!)).toBe(QUEUED_AFTER_REPLY_SENTENCE)
   })
 
-  it('is still a dropped bubble to the session-wide clear (DL-118-08)', () => {
-    noteLocalSteer({ steerId: 'steer_w', sessionId: 's1', messageId: 'm1', text: 'w', state: 'waiting' })
-    markSteerDropped('steer_w', 'timed_out')
-    clearDroppedSteersForSession('s1')
-    expect(getSteer('steer_w')).toBeNull()
+  it('is filed under its own id when the reply it waits for has none yet (a group turn setting up)', () => {
+    applySteerQueued(queuedSend({ messageId: '' }))
+    expect(getSteer('msg-b')).toMatchObject({ state: 'queued', messageId: 'msg-b' })
+  })
+
+  it('becomes a receipt when the server says it will not be sent', () => {
+    applySteerQueued(queuedSend())
+    applySteerDropped({ steerIds: ['msg-b'], reason: 'stopped' })
+    expect(steerBubbleStatusLabel(getSteer('msg-b')!)).toBe('Not sent — you stopped the reply')
+
+    applySteerQueued(queuedSend({ steerId: 'msg-c' }))
+    applySteerDropped({ steerIds: ['msg-c'], reason: 'shutdown' })
+    expect(getSteer('msg-c')).toMatchObject({ state: 'dropped', dropReason: 'unanswered' })
+  })
+
+  it('comes back whenever the same message is queued again, whatever the two clocks say (review finding 4)', () => {
+    // A queued send's bubble never comes from the replay buffer (a joining tab gets it from the
+    // chat's line, only while it waits), so its event always means "waiting now". Send now can
+    // queue it again after its receipt was cleared, in this tab or another; a browser clock
+    // ahead of the server's must not hide it.
+    applySteerQueued(queuedSend({ at: '2020-01-01T00:00:00.000Z' }))
+    applySteerDropped({ steerIds: ['msg-b'], reason: 'stopped' })
+    clearDroppedSteer('msg-b')
+    applySteerQueued(queuedSend({ at: '2020-01-01T00:00:01.000Z' }))
+    expect(getSteer('msg-b')).toMatchObject({ state: 'queued' })
+  })
+
+  it('an ordinary steer id stays cleared whatever its timestamp says', () => {
+    applySteerQueued(queued())
+    markSteerDropped('steer_a')
+    clearDroppedSteer('steer_a')
+    applySteerQueued(queued({ at: new Date(Date.now() + 1000).toISOString() }))
+    expect(getSteer('steer_a')).toBeNull()
+  })
+
+  it('ignores a drop for a bubble this tab never saw', () => {
+    applySteerDropped({ steerIds: ['msg-unknown'], reason: 'stopped' })
+    expect(getSteer('msg-unknown')).toBeNull()
+  })
+})
+
+describe('the end-of-reply backstop settles only what the server holds (BL-455)', () => {
+  afterEach(() => clearSteerInboxForTest())
+
+  it('a server-held steer awaits the server; a send waiting in the chat\u2019s line does not (BL-713)', () => {
+    noteLocalSteer({ steerId: 'steer_server', sessionId: 's1', messageId: 'm1', text: 'held by the server', deliver: 'end' })
+    applySteerQueued({ steerId: 'steer_page', sessionId: 's1', messageId: 'm1', text: 'waits in the line', deliver: 'end', queuedSend: true })
+    noteLocalSteer({ steerId: 'steer_other', sessionId: 's1', messageId: 'm2', text: 'another reply' })
+    expect(getSteersAwaitingServerForMessage('s1', 'm1').map((entry) => entry.steerId)).toEqual(['steer_server'])
+  })
+
+  it('delivered, promoted, and dropped steers await nothing', () => {
+    noteLocalSteer({ steerId: 'steer_d', sessionId: 's1', messageId: 'm1', text: 'x' })
+    applySteerDelivered({ sessionId: 's1', messageId: 'm1', steerId: 'steer_d' })
+    noteLocalSteer({ steerId: 'steer_p', sessionId: 's1', messageId: 'm1', text: 'y' })
+    applySteerPromoted({ steerIds: ['steer_p'] })
+    noteLocalSteer({ steerId: 'steer_x', sessionId: 's1', messageId: 'm1', text: 'z' })
+    markSteerDropped('steer_x')
+    expect(getSteersAwaitingServerForMessage('s1', 'm1')).toEqual([])
+  })
+})
+
+
+/**
+ * BL-713 — a message that waits in the chat's line while the line holds for an approval card.
+ *
+ * The page keeps no queue of its own any more: a message with a Clip or an `@file` waits in the
+ * chat's line on the server, and every tab draws it as a queued send's bubble. When the reply it
+ * waits behind stops at an approval card, the line holds, and the bubble says so, with Send now,
+ * in BL-455's words. The server tells the tabs when a hold starts and ends (`queued_send_hold`),
+ * and a joining tab's replay carries it.
+ */
+describe('a queued send at an approval card (BL-713)', () => {
+  afterEach(() => clearSteerInboxForTest())
+
+  const queuedSend = (overrides: Record<string, any> = {}) => ({
+    sessionId: 's1',
+    messageId: 'reply-a',
+    steerId: 'msg-b',
+    text: 'summarise the file',
+    deliver: 'end' as const,
+    queuedSend: true,
+    ...overrides
+  })
+
+  it('a joining tab draws it as waiting for the card, from the replay', () => {
+    applySteerQueued(queuedSend({ messageId: '', heldForApprovalCard: 'reply-a' }))
+    const bubble = getSteer('msg-b')
+    expect(bubble).toMatchObject({ state: 'queued', queuedSend: true, heldForApprovalCard: 'reply-a' })
+    expect(steerBubbleStatusLabel(bubble!)).toBe(WAITS_FOR_APPROVAL_SENTENCE)
+  })
+
+  it('the hold starts and ends for every queued send of that chat, and nothing else', () => {
+    applySteerQueued(queuedSend())
+    applySteerQueued(queuedSend({ steerId: 'msg-c' }))
+    applySteerQueued(queuedSend({ steerId: 'msg-other', sessionId: 's2' }))
+    noteLocalSteer({ steerId: 'steer_text', sessionId: 's1', messageId: 'reply-a', text: 'held text', deliver: 'end' })
+
+    applyQueuedSendHold({ sessionId: 's1', heldForApprovalCard: 'reply-a' })
+    expect(steerBubbleStatusLabel(getSteer('msg-b')!)).toBe(WAITS_FOR_APPROVAL_SENTENCE)
+    expect(steerBubbleStatusLabel(getSteer('msg-c')!)).toBe(WAITS_FOR_APPROVAL_SENTENCE)
+    expect(steerBubbleStatusLabel(getSteer('msg-other')!)).toBe(QUEUED_AFTER_REPLY_SENTENCE)
+    // A server-held text Queue is BL-455's held message at a card, not this bubble.
+    expect(getSteer('steer_text')?.heldForApprovalCard ?? null).toBeNull()
+
+    applyQueuedSendHold({ sessionId: 's1', heldForApprovalCard: null })
+    expect(steerBubbleStatusLabel(getSteer('msg-b')!)).toBe(QUEUED_AFTER_REPLY_SENTENCE)
+    expect(getSteer('msg-b')?.heldForApprovalCard ?? null).toBeNull()
+  })
+
+  it('the page’s end-of-reply backstop never marks a queued send: the server settles it', () => {
+    // The line holds at a card for up to fifteen minutes with no reply running; the backstop
+    // would call it "Not sent — the reply ended before it could land" (BL-455's live find).
+    applySteerQueued(queuedSend())
+    noteLocalSteer({ steerId: 'steer_server', sessionId: 's1', messageId: 'reply-a', text: 'held text', deliver: 'end' })
+    expect(getSteersAwaitingServerForMessage('s1', 'reply-a').map((entry) => entry.steerId)).toEqual([
+      'steer_server'
+    ])
+  })
+
+  it('a kept send says why, in BL-455’s words', () => {
+    applySteerQueued(queuedSend())
+    applySteerQueued(queuedSend({ steerId: 'msg-c' }))
+    applyQueuedSendHold({ sessionId: 's1', heldForApprovalCard: 'reply-a' })
+    applySteerDropped({ steerIds: ['msg-b'], reason: 'approval_wait' })
+    applySteerDropped({ steerIds: ['msg-c'], reason: 'approval_expired' })
+    expect(getSteer('msg-b')).toMatchObject({ state: 'dropped', dropReason: 'approval_wait' })
+    expect(steerBubbleStatusLabel(getSteer('msg-b')!)).toBe(
+      'Not sent — the approval card is still waiting for your answer. Send it when you are ready.'
+    )
+    expect(getSteer('msg-c')).toMatchObject({ state: 'dropped', dropReason: 'approval_expired' })
+    expect(steerBubbleStatusLabel(getSteer('msg-c')!)).toBe(HELD_CARD_EXPIRED_SENTENCE)
   })
 })

@@ -1,5 +1,6 @@
 import type { Mesh, Object3D } from "three";
 import type { GoonEngine } from "$lib/goons/engine";
+import { parseSocketEyeContactSettings } from "$lib/goons/socketEyeContact";
 // Keep this core manifest/runtime module independent from the recipe barrel.
 // Worker entrypoints import Custom Avatar types, while the barrel also exports
 // both worker clients; importing the barrel here makes Vite discover each
@@ -905,70 +906,107 @@ export async function loadAvatarIntoEngine(
     );
   }
 
-  if (kind === "custom") {
-    const manifest = await loadCustomAvatarManifest(
-      resolveCustomManifestFile(goon),
-    );
-    const isLeanLive = manifest.liveBuild !== undefined && manifest.liveBuild !== null;
-    if (options.role === "recipe-source" && isLeanLive) {
-      throw new Error("Recipe editor resolved a Live package instead of Recipe Source.");
+  const goonLoadToken = engine.beginGoonLoad();
+  try {
+    if (kind === "custom") {
+      let manifest: GoonCustomAvatarManifest;
+      try {
+        manifest = await loadCustomAvatarManifest(resolveCustomManifestFile(goon));
+      } catch (error) {
+        if (!engine.isCurrentGoonLoad(goonLoadToken)) {
+          return { kind, manifest: null, role: "cancelled" as const };
+        }
+        throw error;
+      }
+      if (!engine.isCurrentGoonLoad(goonLoadToken)) {
+        return { kind, manifest: null, role: "cancelled" as const };
+      }
+      const isLeanLive = manifest.liveBuild !== undefined && manifest.liveBuild !== null;
+      if (options.role === "recipe-source" && isLeanLive) {
+        throw new Error("Recipe editor resolved a Live package instead of Recipe Source.");
+      }
+      if (options.role === "recipe-live-candidate" && !isLeanLive) {
+        throw new Error("Recipe candidate preview resolved an authoring package instead of lean Live.");
+      }
+      if (
+        options.role === "mounted-live" &&
+        isMountedRecipeLiveGoon(goon) &&
+        !isLeanLive
+      ) {
+        throw new Error("Mounted Recipe Goon resolved an authoring package instead of active Live.");
+      }
+      const socketEyeContactSettings = goon.defaults?.socketEyeContact
+        ? parseSocketEyeContactSettings(goon.defaults.socketEyeContact) : null;
+      const lipArtworkEnabled = goon.lipArtworkPresence
+        ? parseLipArtworkPresenceState(
+            parseLipArtworkDefinition(manifest.lipArtwork),
+            goon.lipArtworkPresence,
+          ).enabled
+        : true;
+      const nailSurfaceEnabled = goon.nailSurfacePresence
+        ? parseNailSurfacePresenceState(
+            parseNailSurfaceDefinition(manifest.nailSurface),
+            goon.nailSurfacePresence,
+          ).enabled
+        : true;
+      engine.setSocketEyeContactSettings(socketEyeContactSettings);
+      await engine.loadCustomGoon(avatarUrl, manifest, {
+        ...(!isLeanLive
+          ? { appearanceDialValues: goon.appearanceDials ?? null }
+          : {}),
+        facialArtworkState: goon.facialArtwork ?? null,
+        eyeAppearanceState: goon.eyeAppearance ?? null,
+        oralAppearanceState: goon.oralAppearance ?? null,
+        lipArtworkState: goon.lipArtwork ?? null,
+        lipArtworkEnabled,
+        nailSurfaceState: goon.nailSurface ?? null,
+        nailSurfaceEnabled,
+        skinAppearanceState: goon.skinAppearance ?? null,
+        skinMaterialArtworkState: goon.skinMaterialArtwork ?? null,
+      }, goonLoadToken);
+      if (!engine.isCurrentGoonLoad(goonLoadToken)) {
+        return { kind, manifest: null, role: "cancelled" as const };
+      }
+      return { kind, manifest, role: isLeanLive ? "live" as const : "source" as const };
     }
-    if (options.role === "recipe-live-candidate" && !isLeanLive) {
-      throw new Error("Recipe candidate preview resolved an authoring package instead of lean Live.");
-    }
-    if (
-      options.role === "mounted-live" &&
-      isMountedRecipeLiveGoon(goon) &&
-      !isLeanLive
-    ) {
-      throw new Error("Mounted Recipe Goon resolved an authoring package instead of active Live.");
-    }
-    engine.setSocketEyeContactSettings(goon.defaults?.socketEyeContact ?? null);
-    const lipArtworkEnabled = goon.lipArtworkPresence
-      ? parseLipArtworkPresenceState(
-          parseLipArtworkDefinition(manifest.lipArtwork),
-          goon.lipArtworkPresence,
-        ).enabled
-      : true;
-    const nailSurfaceEnabled = goon.nailSurfacePresence
-      ? parseNailSurfacePresenceState(
-          parseNailSurfaceDefinition(manifest.nailSurface),
-          goon.nailSurfacePresence,
-        ).enabled
-      : true;
-    await engine.loadCustomGoon(avatarUrl, manifest, {
-      ...(!isLeanLive
-        ? { appearanceDialValues: goon.appearanceDials ?? null }
-        : {}),
-      facialArtworkState: goon.facialArtwork ?? null,
-      eyeAppearanceState: goon.eyeAppearance ?? null,
-      oralAppearanceState: goon.oralAppearance ?? null,
-      lipArtworkState: goon.lipArtwork ?? null,
-      lipArtworkEnabled,
-      nailSurfaceState: goon.nailSurface ?? null,
-      nailSurfaceEnabled,
-      skinAppearanceState: goon.skinAppearance ?? null,
-      skinMaterialArtworkState: goon.skinMaterialArtwork ?? null,
-    });
-    return { kind, manifest, role: isLeanLive ? "live" as const : "source" as const };
-  }
 
-  if (sourceProfile === "guided-custom-vrm") {
-    const manifest = await loadCustomAvatarManifest(
-      resolveGuidedManifestFile(goon),
-    );
-    await engine.loadGoon(avatarUrl, manifest);
-    await engine.configureGuidedOutfitPieces(
-      goon.guidedAvatar?.outfitPieces ?? [],
-      goon.guidedAvatar?.pieceStates ?? {},
-      (goon.guidedAvatar?.dufOverlays ?? []).map((overlay) => ({
-        id: overlay.id,
-        file: overlay.file,
-      })),
-    );
-    return { kind, manifest, role: "vrm" as const };
-  }
+    if (sourceProfile === "guided-custom-vrm") {
+      let manifest: GoonCustomAvatarManifest;
+      try {
+        manifest = await loadCustomAvatarManifest(resolveGuidedManifestFile(goon));
+      } catch (error) {
+        if (!engine.isCurrentGoonLoad(goonLoadToken)) {
+          return { kind, manifest: null, role: "cancelled" as const };
+        }
+        throw error;
+      }
+      if (!engine.isCurrentGoonLoad(goonLoadToken)) {
+        return { kind, manifest: null, role: "cancelled" as const };
+      }
+      await engine.loadGoon(avatarUrl, manifest, goonLoadToken);
+      if (!engine.isCurrentGoonLoad(goonLoadToken)) {
+        return { kind, manifest: null, role: "cancelled" as const };
+      }
+      await engine.configureGuidedOutfitPieces(
+        goon.guidedAvatar?.outfitPieces ?? [],
+        goon.guidedAvatar?.pieceStates ?? {},
+        (goon.guidedAvatar?.dufOverlays ?? []).map((overlay) => ({
+          id: overlay.id,
+          file: overlay.file,
+        })),
+      );
+      if (!engine.isCurrentGoonLoad(goonLoadToken)) {
+        return { kind, manifest: null, role: "cancelled" as const };
+      }
+      return { kind, manifest, role: "vrm" as const };
+    }
 
-  await engine.loadGoon(avatarUrl, null);
-  return { kind, manifest: null, role: "vrm" as const };
+    await engine.loadGoon(avatarUrl, null, goonLoadToken);
+    if (!engine.isCurrentGoonLoad(goonLoadToken)) {
+      return { kind, manifest: null, role: "cancelled" as const };
+    }
+    return { kind, manifest: null, role: "vrm" as const };
+  } finally {
+    engine.finishGoonLoad(goonLoadToken);
+  }
 }

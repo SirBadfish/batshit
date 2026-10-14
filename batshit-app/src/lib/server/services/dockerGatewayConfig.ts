@@ -48,7 +48,9 @@ export const resolveDockerGatewayBaseUrl = (
   const containerized = runtimeEnv.BATSHIT_CONTAINERIZED === '1'
   const fallback =
     containerized ? DEFAULT_CONTAINER_GATEWAY_URL : DEFAULT_GATEWAY_URL
-  const portHost = containerized ? CONTAINER_HOST_GATEWAY : 'localhost'
+  // 127.0.0.1, not `localhost`: the Mac app's gateway listens on 127.0.0.1 only, and `localhost`
+  // resolves to ::1 first on a Mac. A URL the user wrote keeps its host.
+  const portHost = containerized ? CONTAINER_HOST_GATEWAY : '127.0.0.1'
 
   return normalizeBaseUrl(
     urlFromPort(runtimeEnv.DOCKER_MCP_GATEWAY_PORT, portHost) ||

@@ -22,6 +22,20 @@ function buildErrorMessage(base: string, stderrChunks: string[]): string {
   return `${base} (${stderr})`
 }
 
+/**
+ * BL-602: a start that timed out (or failed) has no client to close, so nothing closed its
+ * transport and the gateway's server process ran on. Closing the transport ends the process
+ * (stdin end, SIGTERM 2 s later, SIGKILL 2 s after that: the MCP SDK's own close), and a
+ * client that would have finished starting later finds its transport closed. The caller gets
+ * its error at once; the close runs on behind it. A second close of the same transport, after
+ * the client's own failed-start close, does nothing.
+ */
+function closeUnstartedTransport(transport: StdioClientTransport, gatewayName: string): void {
+  void transport.close().catch((closeError: unknown) => {
+    logger.warn(`[STDIO MCP] Could not close ${gatewayName} after a failed start`, closeError)
+  })
+}
+
 export class StdioMCPGatewayClient {
   private async createTransport(params: {
     gateway: MCPGateway
@@ -87,6 +101,8 @@ export class StdioMCPGatewayClient {
       if (typeof timeoutId !== 'undefined') clearTimeout(timeoutId)
       if (mcpClient) {
         await mcpClient.close().catch(() => undefined)
+      } else {
+        closeUnstartedTransport(transport, gateway.name)
       }
     }
   }
@@ -97,10 +113,13 @@ export class StdioMCPGatewayClient {
     projectPath?: string | null
   }): Promise<StdioMCPGatewayHealth> {
     let mcpClient: MCPClient | undefined
+    let transport: StdioClientTransport | undefined
     let timeoutId: ReturnType<typeof setTimeout> | undefined
 
     try {
-      const { transport, resolved } = await this.createTransport(params)
+      const created = await this.createTransport(params)
+      transport = created.transport
+      const { resolved } = created
       const timeout = new Promise<never>((_, reject) => {
         timeoutId = setTimeout(
           () => reject(new Error(`STDIO health check timed out after ${resolved.startupTimeoutMs}ms`)),
@@ -124,6 +143,8 @@ export class StdioMCPGatewayClient {
       if (typeof timeoutId !== 'undefined') clearTimeout(timeoutId)
       if (mcpClient) {
         await mcpClient.close().catch(() => undefined)
+      } else if (transport) {
+        closeUnstartedTransport(transport, params.gateway.name)
       }
     }
   }
@@ -153,6 +174,9 @@ export class StdioMCPGatewayClient {
         stderrChunks,
         toolCallTimeoutMs: resolved.toolCallTimeoutMs
       }
+    } catch (error) {
+      closeUnstartedTransport(transport, params.gateway.name)
+      throw error
     } finally {
       if (typeof timeoutId !== 'undefined') clearTimeout(timeoutId)
     }

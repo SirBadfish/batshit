@@ -31,7 +31,7 @@ The single-speaker queue is the heart of it:
 
 You steer who talks. By default, speaker selection is flexible — Batshit picks a reasonable next speaker — but when you name a specific agent, that agent is the one who answers. Speak policies let you tune how eager each agent is to jump in versus waiting until it's directly addressed.
 
-If you have [Jev Juice](../jev-juice/overview.md) set up, an agent can also use the **Jev Juice: Smart** preset: Batshit then asks a fast judgment model who is best placed to answer instead of picking at random, and skips follow-up turns from agents with nothing to add, which saves a model call each time. Naming an agent still wins, your messages are always answered, and the Execution Viewer shows who was picked and who was skipped.
+If you have [Judge Juice](../judge-juice/overview.md) set up, an agent can use **Judge Juice: Smart**. Batshit asks Jev who is best placed to reply and skips unnecessary follow-ups before they cost a model call. Smart agents can also skip a reply to your message when Jev clearly judges that no answer is needed. If all eligible agents are skipped, **Reply skipped by Jev** appears on your message with an explanation and an Execution Viewer entry; no agent runs. Naming any agent (including several) or using a driver still wins, and other presets keep their rules. Attachments, skills and other uninspected input prevent Judge Juice from skipping your turn; they do not guarantee an answer when no agent is eligible or a run fails. An uncertain or unavailable judgment uses the usual rules. If Batshit confirms the skip was refused, it follows the usual reply rules and says so. If it cannot confirm whether the skip was saved, the turn ends visibly without an agent run or automatic replay; the Execution Viewer shows what is known.
 
 ## Tool sharing
 
@@ -43,7 +43,7 @@ Both come from the same fact: agents in a Group speak one at a time, and the roo
 
 **Sending while the group is busy queues.** In a one-on-one chat you can [steer](../chat/overview.md#steer-or-queue-while-the-agent-is-busy) — your message lands inside the reply the agent is already writing. A Group can't do that, because agents there speak one at a time, so the **Steer** button is greyed out with the reason beside it and **Queue** is what you get: your message waits and goes the moment the reply ends. To stop a group reply instead, press **Stop**.
 
-**Risky actions can't be approved in a Group.** A [risky Fabric action](../fabric/overview.md#approving-a-risky-action) normally pauses and waits for your click on an **Approval required** card. In a Group, Batshit refuses it instead: *"Risky controls are not available in group chats. Ask the user in a direct chat with this agent."* A card raised here would be abandoned the moment the next agent starts speaking, and a half-answered approval is worse than a plain no. Open a direct chat with that agent, ask for the same thing, and approve it there.
+**Risky actions can't be approved in a Group.** A [risky Fabric action](../fabric/overview.md#approving-a-risky-action) normally pauses and waits for your click on an **Approval required** card. In a Group, Batshit refuses it instead: *"Risky controls are not available in group chats. Ask the user in a direct chat with this agent."* A card raised here would be abandoned the moment the next agent starts speaking, and a half-answered approval is worse than a plain no. Open a direct chat with that agent, ask for the same thing, and approve it there. The same goes for a shell command or a skill script that would need your approval: in a Group the agent is told it cannot run it here, and no card appears. A command on the agent's allow list still runs.
 
 ## Voice in a Group
 
@@ -65,13 +65,21 @@ The Goon changes when the active speaker changes; Batshit does not render the wh
 
 Get each agent working solo before grouping them. A Group can only be as healthy as its members: if one agent's model or tools are broken alone, it'll be broken in the Group too.
 
+## Changing or deleting a Group
+
+Group settings save automatically. Wait for the save to finish before deleting the Group; deletion refuses unsaved or pending changes. If Batshit reports that a change was not saved, check the saved values before trying again. A pending save stays with the Group you edited, even if you switch to another Group.
+
+When you upload a new avatar picture for a Group, clear it, or choose an icon, the old picture is deleted once the change saves. If the change can't save, the old picture stays, so the Group never points at a picture that is gone.
+
+Settings → Groups → the Group → delete. This removes the Group and its avatar pictures. Its chats stay, as ordinary chats. The pictures are stored by batshit-server, so Batshit checks that batshit-server is running before it deletes anything; if it is not, nothing is deleted and the error says so. Restart Batshit (in Docker, run `./start-docker.sh`) and try again.
+
 ## Common problems
 
 | Symptom | Likely cause | What to check |
 | --- | --- | --- |
 | An agent can't be added to a Group | The saved record is missing or uses a retired type. | Delete the retired record and create an `API` or `CLI` agent. |
 | The group feels stuck | Turns are sequential, so one agent's slow or stuck tool call holds the line. | Check that agent's model/provider and tools on their own. |
-| The wrong agent keeps answering | Speak policies, or you didn't name a specific agent. | Address an agent by name, adjust speak policies, or put the agents on **Jev Juice: Smart** so a judgment model picks. |
+| The wrong agent keeps answering | Speak policies, or you didn't name a specific agent. | Address an agent by name, adjust speak policies, or put the agents on **Judge Juice: Smart** so a judgment model picks. |
 | Agents ignore each other | Tool results aren't shared, so they're missing each other's context. | Turn on tool sharing for the results the group should see. |
 | No Goon appears | The current speaker has no ready Goon assigned, or the Dock/Desktop Mode is not active. | Assign a ready Goon to that agent and open the Goon Dock. |
 | The idle Goon is not the one you expected | The Group driver is the idle visual fallback when it is valid. | Check the Group driver and each agent's Goon assignment. |

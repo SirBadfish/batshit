@@ -17,7 +17,24 @@ const { writeErrorLog } = require('../utils/logSafety');
 const batshitzipService = require('../services/batshitZipService');
 const redisService = require('../services/redisService');
 const { persistFileBackedUpload } = require('../services/fileBackedUploadService');
+const { createSerialTransactionQueue } = require('../services/serialTransactionQueue');
+const { createGoonCustomAssetMaintenance } = require('../services/goonCustomAssetMaintenance');
+const {
+  isCustomRecipeAsset,
+  claimCustomRecipePublication,
+  releaseCustomRecipePublication,
+  reserveCustomRecipeDeletion,
+  beginCustomRecipeDeletion,
+  finishCustomRecipeDeletion
+} = require('../services/goonCustomAssetClaims');
+const {
+  parseAvatarOwnerDeleteRequest,
+  parseAvatarUploadOwner,
+  sweepOwnedAvatars
+} = require('../services/avatarOwnerSweep');
+const { nextAvatarTimestamp, withAvatarOwnerLock } = require('../services/avatarOwnerLock');
 const uploadManager = require('../services/uploadManager');
+const { admitHairImportUpload, assertHairCleanupContext, importedFileForJob, candidateIds, cleanupFileFromContext, materializeHairCleanupContext } = require('../services/hairImportFileAdmission');
 const { prepareFacialArtworkUpload } = require('../services/facialArtworkValidator');
 const { prepareLipArtworkUpload } = require('../services/lipArtworkValidator');
 const { prepareNailArtworkUpload } = require('../services/nailArtworkValidator');
@@ -28,6 +45,8 @@ const {
   hashFile,
   inspectAndExtractRecipeArchive
 } = require('../services/goonRecipeArchiveService');
+const { GOON_MANIFEST_MAX_BYTES, GOON_CUSTOM_MODEL_MAX_BYTES } = require('../services/goonPackageLimits.json');
+const { inspectGoonSceneVideo } = require('../services/goonSceneVideo');
 
 const router = express.Router();
 const execFileAsync = promisify(execFile);
@@ -43,6 +62,7 @@ const GOON_SKIN_SURFACE_UPLOAD_MAX_FILE_SIZE = 100 * MIB;
 const GOON_HAIR_ASSET_MAX_FILE_SIZE = 64 * MIB;
 const GOON_CLOTHING_ASSET_MAX_FILE_SIZE = 128 * MIB;
 const GOON_SCENE_UPLOAD_MAX_FILE_SIZE = 50 * MIB;
+const GOON_SKYBOX_UPLOAD_MAX_FILE_SIZE = 250 * MIB;
 const GOON_SCENE_MODEL_UPLOAD_MAX_FILE_SIZE = 200 * MIB;
 const GOON_ANIMATION_PREVIEW_MAX_FILE_SIZE = 40 * MIB;
 const GENERIC_UPLOAD_BLOCKED_ARCHIVE_EXTENSIONS = new Set(['.zip', '.bgoon', '.rar', '.7z', '.tar', '.gz', '.tgz']);
@@ -55,7 +75,40 @@ const GENERIC_UPLOAD_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp
 const GENERIC_UPLOAD_VIDEO_EXTENSIONS = new Set(['.mp4', '.webm', '.mov']);
 const GENERIC_UPLOAD_DOCUMENT_EXTENSIONS = new Set(['.pdf']);
 const GOON_ARCHIVE_MAX_ENTRIES = 16;
-const GOON_MANIFEST_MAX_BYTES = 2 * MIB;
+// Recipe uploads can share extracted model/manifest hashes even when their ZIPs differ.
+// Keep every metadata check, publication, and partial rollback in one process-local line.
+const recipePackagePublicationQueue = createSerialTransactionQueue();
+const customAssetMaintenance = createGoonCustomAssetMaintenance(() => redisService.client);
+const CUSTOM_ASSET_PERMIT = Symbol('custom Goon asset maintenance permit');
+
+function releaseCustomAssetPermit(req) {
+  req[CUSTOM_ASSET_PERMIT]?.();
+  req[CUSTOM_ASSET_PERMIT] = null;
+}
+
+function enterCustomAssetMaintenance(req, res, next) {
+  customAssetMaintenance.enter().then((release) => {
+    req[CUSTOM_ASSET_PERMIT] = release;
+    next();
+  }).catch((error) => sendUploadError(res, 'Custom Goon asset maintenance check failed', error));
+}
+
+function maybeEnterCustomAssetMaintenance(req, res, next) {
+  if (!isCustomRecipeAsset(req.body?.uploadType)) return next();
+  enterCustomAssetMaintenance(req, res, next);
+}
+
+function parseCustomPackageUpload(req, res, next) {
+  try {
+    goonCustomPackageUpload.single('file')(req, res, (error) => {
+      if (error) releaseCustomAssetPermit(req);
+      next(error);
+    });
+  } catch (error) {
+    releaseCustomAssetPermit(req);
+    next(error);
+  }
+}
 
 // Configure multer for memory storage instead of disk
 const storage = multer.memoryStorage();
@@ -80,7 +133,10 @@ fsSync.mkdirSync(goonDiskUploadTempDir, { recursive: true });
 
 const goonDiskStorage = multer.diskStorage({
   destination: (_req, _file, callback) => {
-    callback(null, goonDiskUploadTempDir);
+    // Restore replaces the uploads tree, including this temp directory. Create
+    // it for each disk upload, after custom-package maintenance admission.
+    fs.mkdir(goonDiskUploadTempDir, { recursive: true })
+      .then(() => callback(null, goonDiskUploadTempDir), callback);
   },
   filename: (_req, file, callback) => {
     const ext = path
@@ -151,6 +207,7 @@ const goonSceneUpload = multer({
     fileSize: GOON_SCENE_UPLOAD_MAX_FILE_SIZE // 50MB limit
   }
 });
+const goonSkyboxUpload = multer({ storage: goonDiskStorage, limits: { fileSize: GOON_SKYBOX_UPLOAD_MAX_FILE_SIZE } });
 
 // Goon scene room shells (GLB/GLTF)
 const goonSceneModelUpload = multer({
@@ -198,7 +255,7 @@ function resolveClipFileType(file, fileData) {
 }
 
 function resolveClipMimeType(file, fileData) {
-  if (!fileData.textContent) return file.mimetype;
+  if (!fileData.textContent) return fileData.mimetype;
   if (file.originalname.endsWith('.md')) return 'text/markdown';
   if (file.mimetype === 'application/octet-stream') return 'text/plain';
   return file.mimetype;
@@ -463,6 +520,7 @@ function getUploadLimitForPath(reqPath) {
     case '/upload/goon-lip-artwork':
       return GOON_IMAGE_UPLOAD_MAX_FILE_SIZE;
     case '/upload/goon-scene':
+      return GOON_SKYBOX_UPLOAD_MAX_FILE_SIZE;
     case '/upload/goon-room-texture':
       return GOON_SCENE_UPLOAD_MAX_FILE_SIZE;
     case '/upload/goon-room-shell':
@@ -864,29 +922,84 @@ async function storeFilesystemUploadAsset(
   };
 }
 
-async function deleteStoredUploadAsset(uploadType, filename) {
+async function deleteStoredUploadAsset(uploadType, filename, options = {}) {
   validateUploadType(uploadType);
   validateStoredFilename(filename);
 
   const redisKey = `upload:${uploadType}:${filename}`;
-  return deleteStoredUploadRecord(redisKey);
+  const canonicalOrphanPath = options.unlinkUnrecordedCanonical &&
+    ((uploadType === 'goon_custom_packages' && /^[0-9a-f]{64}\.bgoon$/.test(filename)) ||
+     (uploadType === 'goon_custom_models' && /^[0-9a-f]{64}\.glb$/.test(filename)) ||
+     (uploadType === 'goon_custom_manifests' && /^[0-9a-f]{64}\.json$/.test(filename)) ||
+     (uploadType === 'goon_hair_assets' && /^[A-Za-z0-9_-]+_[a-f0-9]{64}\.(glb|json|png)$/.test(filename)) ||
+     (uploadType === 'goon_hair_imports' && /^\d+_[a-f0-9-]{36}_[a-f0-9]{64}\.(obj|glb)$/.test(filename)))
+    ? resolveStoredUploadPath(uploadType, filename) : null;
+  return deleteStoredUploadRecord(redisKey, { ...options, canonicalOrphanPath });
 }
 
-async function deleteStoredUploadRecord(redisKey) {
-  const payload = await redisService.get(redisKey);
-  const filePath = payload ? resolveFileBackedPayloadPath(payload) : null;
+/**
+ * BL-144 (2026-09-25): an upload record read that THROWS. `redisService.get` answers null on
+ * a Redis error (and on its in-memory fallback), which a delete read as "no record": it
+ * deleted the key and kept the file, and nothing pointed at the file again. Here a failure
+ * stops the delete with nothing deleted, so a retry finds the same record.
+ */
+async function readUploadRecordForDelete(redisKey) {
+  if (!redisService.isConnected() || !redisService.client?.isOpen) {
+    throw new Error(`Upload storage unavailable: Redis is not connected, so ${redisKey} was not deleted.`);
+  }
+  const client = redisService.client;
+  const type = await client.type(redisKey);
+  if (type === 'none') return null;
+  if (type === 'ReJSON-RL') return client.json.get(redisKey);
+  if (type === 'string') {
+    // Older upload records were plain JSON strings; the read that served them parsed them.
+    const raw = await client.get(redisKey);
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return raw;
+    }
+  }
+  throw new Error(`${redisKey} is a Redis ${type}, not an upload record, so it was not deleted.`);
+}
+
+async function deleteStoredUploadRecord(redisKey, {
+  fileFirst = false,
+  canonicalOrphanPath = null,
+  requireCanonicalWhenUnrecorded = false,
+  requireFilePathWhenRecorded = false
+} = {}) {
+  const payload = await readUploadRecordForDelete(redisKey);
+  if (!payload && requireCanonicalWhenUnrecorded && !canonicalOrphanPath) {
+    throw new Error(`Unrecorded custom Goon asset ${redisKey} has no verified hash path for recovery.`);
+  }
+  const filePath = payload ? resolveFileBackedPayloadPath(payload) : canonicalOrphanPath;
+  if (payload && requireFilePathWhenRecorded && !filePath) {
+    throw new Error(`Recorded custom Goon asset ${redisKey} has no verified file path for deletion.`);
+  }
+  let removedFile = false;
+  const unlink = async () => {
+    try { await fs.unlink(filePath); return true; }
+    catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+  };
+  if (fileFirst && filePath) {
+    // Retain metadata until unlink has completed. A deleting marker survives an
+    // interrupted request, so replay can recover the exact restored file path.
+    removedFile = await unlink();
+  }
   const deleted = await redisService.client.del(redisKey);
   if (payload && deleted !== 1) {
     throw new Error(`Redis refused to delete upload metadata for ${redisKey}.`);
   }
 
-  if (filePath) {
+  if (!fileFirst && filePath) {
     await fs.rm(filePath, { force: true });
+    removedFile = true;
   }
   return {
     redisKey,
     existed: Boolean(payload),
-    deletedFile: Boolean(filePath)
+    deletedFile: removedFile
   };
 }
 
@@ -1163,6 +1276,7 @@ async function processAndStoreFile(file, compressionSettings = {}, uploadSetting
   const safeFilename = buildSafeUploadFilename(originalName, fallbackBase);
   
   let processedBuffer = file.buffer;
+  let processedMimeType = file.mimetype;
   let base64Content = null;
   let processedForAI = null;
   let textContent = null;
@@ -1242,7 +1356,9 @@ async function processAndStoreFile(file, compressionSettings = {}, uploadSetting
             .jpeg({ quality });
         }
         
-        processedBuffer = await pipeline.toBuffer();
+        const { data, info } = await pipeline.toBuffer({ resolveWithObject: true });
+        processedBuffer = data;
+        processedMimeType = `image/${info.format}`;
         
         logger.info('[Image Upload] Image processing complete');
         } else {
@@ -1250,9 +1366,7 @@ async function processAndStoreFile(file, compressionSettings = {}, uploadSetting
         }
         
         base64Content = processedBuffer.toString('base64');
-        // Determine the final mimetype based on what we output
-        const finalMimeType = (!forceJpeg && isPNG) ? 'image/png' : 'image/jpeg';
-        processedForAI = `data:${finalMimeType};base64,${base64Content}`;
+        processedForAI = `data:${processedMimeType};base64,${base64Content}`;
       }
     } catch (error) {
       writeErrorLog(logger, 'Error processing image', error);
@@ -1310,7 +1424,7 @@ async function processAndStoreFile(file, compressionSettings = {}, uploadSetting
 
   const metadata = {
     originalName,
-    mimetype: file.mimetype,
+    mimetype: processedMimeType,
     size: processedBuffer.length,
     originalSize: file.size,
     uploadType: uploadType,
@@ -1380,7 +1494,7 @@ async function processAndStoreFile(file, compressionSettings = {}, uploadSetting
     redisKey,
     filename: uploadResult.filename || fallbackStoredFilename,
     originalName,
-    mimetype: file.mimetype,
+    mimetype: processedMimeType,
     size: processedBuffer.length,
     base64: shouldIncludeBase64 ? base64Content : null,
     textContent: textContent,
@@ -1668,9 +1782,16 @@ router.post('/upload/avatar', avatarUploadRateLimit, upload.single('file'), asyn
       return res.status(400).json({ error: 'Avatar must be an image' });
     }
 
-    // Get entity type and ID from request body
-    const { entityType, entityId, oldAvatarUrl } = req.body;
-    
+    // BL-143: every picture is named after its owner (the only way a delete or tidy can find
+    // it again), so an upload without a valid owner is refused instead of stored ownerless.
+    let owner;
+    try {
+      owner = parseAvatarUploadOwner(req.body);
+    } catch (error) {
+      return res.status(400).json({ error: error.message });
+    }
+    const { entityType, entityId } = owner;
+
     // Process avatar: always resize to 256x256
     const avatarBuffer = await sharp(req.file.buffer)
       .resize(256, 256, { 
@@ -1679,64 +1800,28 @@ router.post('/upload/avatar', avatarUploadRateLimit, upload.single('file'), asyn
       })
       .jpeg({ quality: 90 })
       .toBuffer();
-    
-    const timestamp = Date.now();
-    
-    // Organize avatars by entity type
-    let avatarFilename;
-    let redisKey;
-    
-    if (entityType && entityId) {
-      // New organized structure: type_id_timestamp.jpg
-      avatarFilename = `${entityType}_${entityId}_${timestamp}.jpg`;
-      redisKey = `upload:avatars:${entityType}:${avatarFilename}`;
-    } else {
-      // Fallback to old structure for backward compatibility
-      avatarFilename = `avatar_${timestamp}.jpg`;
-      redisKey = `upload:avatars:${avatarFilename}`;
-    }
-    
-    // Delete old avatar if provided
-    if (oldAvatarUrl) {
-      try {
-        // Extract filename from old URL
-        const oldFilename = oldAvatarUrl.split('/').pop();
-        
-        // Try both old and new key patterns
-        const oldKeys = Array.from(new Set([
-          `upload:avatars:${oldFilename}`,
-          ...(entityType ? [`upload:avatars:${entityType}:${oldFilename}`] : []),
-          `upload:avatars:user:${oldFilename}`,
-          `upload:avatars:agent:${oldFilename}`,
-          `upload:avatars:subagent:${oldFilename}`,
-          `upload:avatars:group:${oldFilename}`
-        ]));
-        
-        for (const key of oldKeys) {
-          const exists = await redisService.client.exists(key);
-          if (exists) {
-            await deleteStoredUploadRecord(key);
-	            logger.info('Deleted old avatar');
-            break;
-          }
+
+    // No picture is deleted here (BL-281, 2026-09-27; agents and Subagents since BL-145): every
+    // Settings panel tidies after its save, so a save the form refuses never points at a
+    // picture its upload deleted. `oldAvatarUrl` is ignored.
+    // BL-288: the name and the store take the owner's turn, so a tidy of this owner never runs
+    // in between, and the name is later than the owner's previous upload.
+    const avatarFilename = await withAvatarOwnerLock(entityType, entityId, async () => {
+      // Named after its owner: `<type>_<id>_<timestamp>.jpg`.
+      const filename = `${entityType}_${entityId}_${nextAvatarTimestamp(entityType, entityId)}.jpg`;
+      await storeFilesystemUploadAsset(req, {
+        uploadType: 'avatars',
+        originalName: req.file.originalname,
+        filename,
+        mimetype: 'image/jpeg',
+        buffer: avatarBuffer,
+        redisKey: `upload:avatars:${entityType}:${filename}`,
+        metadata: {
+          entityType,
+          entityId
         }
-      } catch (cleanupError) {
-        writeErrorLog(logger, 'Failed to delete old avatar', cleanupError);
-        // Continue with upload even if cleanup fails
-      }
-    }
-    
-    await storeFilesystemUploadAsset(req, {
-      uploadType: 'avatars',
-      originalName: req.file.originalname,
-      filename: avatarFilename,
-      mimetype: 'image/jpeg',
-      buffer: avatarBuffer,
-      redisKey,
-      metadata: {
-        entityType: entityType || 'unknown',
-        entityId: entityId || 'unknown'
-      }
+      });
+      return filename;
     });
     
     // Construct the public URL - maintaining same URL structure for compatibility
@@ -1753,7 +1838,119 @@ router.post('/upload/avatar', avatarUploadRateLimit, upload.single('file'), asyn
   }
 });
 
-router.delete('/upload/asset', async (req, res) => {
+// Owner sweep (BL-41; Subagents and Groups BL-139/BL-140): deleting an agent, Subagent, or
+// Group removes every avatar picture the upload route above ever stored for it (see
+// `avatarOwnerSweep.js`). The app's delete routes call this server to server BEFORE they
+// delete the owner's record and keep the owner when this answers anything but 200, so every
+// refusal here is safe to retry. The owner's own pictures are found by name;
+// `legacyFilenames` (pre-2025-08-12 `avatar_<ts>.jpg` pictures, which name no owner) are
+// deleted as given: the service token is the trust boundary, and the app sends only a picture
+// the owner's record points at and no other record does. With `tidy: true` (BL-142) it is a
+// tidy of a living owner, the user included: every picture of the owner except the ones its
+// saved record shows (`keepFilenames`) and any that may still be on its way to a save (BL-288).
+router.delete('/upload/avatar', async (req, res) => {
+  let request;
+  try {
+    request = parseAvatarOwnerDeleteRequest(req.body);
+  } catch (error) {
+    return res.status(400).json({ error: error.message });
+  }
+  // Without Redis this server runs on its in-memory fallback, where a scan finds nothing:
+  // answering "deleted nothing" would let the agent go with its pictures still stored.
+  if (!redisService.isConnected() || !redisService.client?.isOpen) {
+    return res.status(503).json({
+      error: 'Upload storage unavailable: Redis is not connected, so no avatar was deleted.'
+    });
+  }
+  try {
+    // BL-288: the owner's turn, so no upload of this owner lands between the sweep's reads.
+    const result = await withAvatarOwnerLock(request.entityType, request.entityId, () =>
+      sweepOwnedAvatars({
+        client: redisService.client,
+        uploadRoot: config.uploadsDir,
+        ...request
+      })
+    );
+    logger.info(
+      `${request.tidy ? 'Tidied' : 'Deleted'} ${result.deletedRecords.length} avatar record(s) and ${result.deletedFiles.length} file(s) of ${request.entityType} ${request.entityId}${request.keepFilenames.length > 0 ? ` (kept ${request.keepFilenames.join(', ')})` : ''}`
+    );
+    return res.json({ success: true, ...result });
+  } catch (error) {
+    writeErrorLog(logger, 'Avatar delete error', error);
+    return res.status(500).json({ error: 'Avatar delete failed', details: error.message });
+  }
+});
+
+router.post('/upload/asset-maintenance/begin', async (req, res) => {
+  try {
+    const result = await customAssetMaintenance.begin(req.body?.token);
+    return res.json({ success: true, ...result });
+  } catch (error) {
+    writeErrorLog(logger, 'Custom Goon asset maintenance begin error', error);
+    return sendUploadError(res, 'Custom Goon asset maintenance begin failed', error);
+  }
+});
+
+router.post('/upload/asset-maintenance/end', async (req, res) => {
+  try {
+    const result = await customAssetMaintenance.end(req.body?.token);
+    return res.json({ success: true, ...result });
+  } catch (error) {
+    writeErrorLog(logger, 'Custom Goon asset maintenance end error', error);
+    return sendUploadError(res, 'Custom Goon asset maintenance end failed', error);
+  }
+});
+
+// This queue barrier runs after every previously admitted Hair publication.
+// It discovers only strictly bound creation receipts; origin is not ownership.
+router.post('/upload/asset-deletion/discover-hair-import', enterCustomAssetMaintenance, async (req, res) => {
+  try {
+    const files = await recipePackagePublicationQueue.run(async () => {
+      const job = await assertHairCleanupContext(redisService.client, req.body?.cleanupContext);
+      const ids = candidateIds(job);
+      const keys = await redisService.client.keys(`upload:goon_hair_assets:${ids.assetId}_${ids.revisionId}_*`);
+      if (keys.length > 4096) throw new Error('Hair cleanup discovery is too large; nothing was truncated.');
+      const found = [];
+      for (const key of keys.sort()) {
+        const filename = key.slice('upload:goon_hair_assets:'.length);
+        const record = await readUploadRecordForDelete(key);
+        const file = importedFileForJob(record, filename, job);
+        if (file) found.push(file);
+      }
+      await assertHairCleanupContext(redisService.client, req.body?.cleanupContext);
+      return found;
+    });
+    return res.json({ success: true, files });
+  } catch (error) {
+    return sendUploadError(res, 'Hair import cleanup discovery failed', error);
+  } finally { releaseCustomAssetPermit(req); }
+});
+
+router.post('/upload/asset-deletion/reserve', enterCustomAssetMaintenance, async (req, res) => {
+  try {
+    const uploadType = req.body?.uploadType;
+    const filename = req.body?.filename;
+    if (!isCustomRecipeAsset(uploadType)) {
+      return res.status(400).json({ error: 'Only immutable custom Goon assets can be reserved here.' });
+    }
+    validateStoredFilename(filename);
+    const result = await recipePackagePublicationQueue.run(() =>
+      reserveCustomRecipeDeletion(redisService.client, uploadType, filename)
+    );
+    return res.json({ success: true, ...result });
+  } catch (error) {
+    writeErrorLog(logger, 'Upload asset deletion reservation error', error);
+    return res.status(Number.isInteger(error?.statusCode) ? error.statusCode : 500).json({
+      error: 'Upload asset deletion reservation failed', details: error.message
+    });
+  } finally {
+    releaseCustomAssetPermit(req);
+  }
+});
+
+router.delete('/upload/asset', maybeEnterCustomAssetMaintenance, async (req, res) => {
+  let deletionNotStarted = true;
+  let fencedError = false;
   try {
     const uploadType = req.body?.uploadType;
     const filename = req.body?.filename;
@@ -1761,17 +1958,75 @@ router.delete('/upload/asset', async (req, res) => {
       return res.status(400).json({ error: 'uploadType and filename are required' });
     }
 
-    const result = await deleteStoredUploadAsset(uploadType, filename);
+    let result;
+    if (isCustomRecipeAsset(uploadType)) {
+      fencedError = true;
+      validateStoredFilename(filename);
+      const deletionToken = req.body?.deletionToken;
+      result = await recipePackagePublicationQueue.run(async () => {
+        let expectedFile = req.body?.expectedFile;
+        let atomicContext;
+        let legacyInline = false;
+        if (req.body?.cleanupContext) {
+          const matched = await materializeHairCleanupContext(redisService.client, req.body.cleanupContext);
+          atomicContext = matched.context;
+          expectedFile = cleanupFileFromContext(req.body.cleanupContext, matched.job, uploadType, filename);
+        }
+        if (uploadType === 'goon_hair_assets' || uploadType === 'goon_hair_imports') {
+          const record = await readUploadRecordForDelete(`upload:${uploadType}:${filename}`);
+          if (record) {
+            const filePath = resolveFileBackedPayloadPath(record);
+            legacyInline = typeof record.base64 === 'string' && record.base64.length > 0;
+            if (!filePath && !legacyInline) throw new Error('Hair upload has no verified file path or legacy inline bytes. Repair it before cleanup.');
+            if (record.uploadType !== undefined && record.uploadType !== uploadType) throw new Error('Hair upload namespace does not match its cleanup key.');
+            if (filePath && filePath !== resolveStoredUploadPath(uploadType, filename)) {
+              throw Object.assign(new Error('Hair upload ownership path changed. Repair it before cleanup.'), { statusCode: 409 });
+            }
+            if (expectedFile) {
+              let actualHash = record.sha256;
+              let actualBytes = record.size;
+              if (typeof record.base64 === 'string') {
+                const bytes = Buffer.from(record.base64, 'base64');
+                actualHash = crypto.createHash('sha256').update(bytes).digest('hex'); actualBytes = bytes.length;
+              }
+              if (expectedFile.ref !== `/uploads/${uploadType}/${filename}` || actualHash !== expectedFile.sha256 ||
+                  actualBytes !== expectedFile.bytes || (record.mimetype !== undefined && record.mimetype !== expectedFile.mimeType)) {
+                throw Object.assign(new Error('Hair upload no longer matches its exact cleanup receipt. Retry after repairing ownership.'), { statusCode: 409 });
+              }
+            }
+          }
+        }
+        // From here an uncertain response may have changed the durable token.
+        deletionNotStarted = false;
+        await beginCustomRecipeDeletion(redisService.client, uploadType, filename, deletionToken, atomicContext);
+        const deleted = await deleteStoredUploadAsset(uploadType, filename, {
+          fileFirst: true,
+          // A crashed hash publication can leave canonical bytes before its
+          // Redis metadata write. The marker/queue fence makes this path safe.
+          // Restored uploads with metadata always use their recorded path.
+          unlinkUnrecordedCanonical: true,
+          requireCanonicalWhenUnrecorded: true,
+          requireFilePathWhenRecorded: !legacyInline
+        });
+        await finishCustomRecipeDeletion(redisService.client, uploadType, filename, deletionToken);
+        return deleted;
+      });
+    } else {
+      result = await deleteStoredUploadAsset(uploadType, filename);
+    }
     return res.json({
       success: true,
       ...result
     });
   } catch (error) {
     writeErrorLog(logger, 'Upload asset delete error', error);
-    return res.status(500).json({
+    return res.status(Number.isInteger(error?.statusCode) ? error.statusCode : 500).json({
       error: 'Upload asset delete failed',
-      details: error.message
+      details: error.message,
+      ...(fencedError ? { deletionNotStarted: deletionNotStarted || error.deletionNotStarted === true } : {})
     });
+  } finally {
+    releaseCustomAssetPermit(req);
   }
 });
 
@@ -1821,8 +2076,7 @@ router.post('/upload/goon', goonVrmUpload.single('file'), async (req, res) => {
   }
 });
 
-router.post('/upload/goon-custom-package', goonCustomPackageUpload.single('file'), async (req, res) => {
-  const newlyStoredAssets = [];
+router.post('/upload/goon-custom-package', enterCustomAssetMaintenance, parseCustomPackageUpload, async (req, res) => {
   let extractedMembers = [];
   try {
     if (!req.file) {
@@ -1846,7 +2100,7 @@ router.post('/upload/goon-custom-package', goonCustomPackageUpload.single('file'
       archivePath,
       outputDir: goonDiskUploadTempDir,
       maxArchiveBytes: GOON_CUSTOM_PACKAGE_MAX_FILE_SIZE,
-      maxModelBytes: GOON_CUSTOM_PACKAGE_MAX_FILE_SIZE - GOON_MANIFEST_MAX_BYTES,
+      maxModelBytes: GOON_CUSTOM_MODEL_MAX_BYTES,
       maxManifestBytes: GOON_MANIFEST_MAX_BYTES,
       maxTotalUncompressedBytes: GOON_CUSTOM_PACKAGE_MAX_FILE_SIZE,
       maxExpansionRatio: 20
@@ -1863,185 +2117,226 @@ router.post('/upload/goon-custom-package', goonCustomPackageUpload.single('file'
     const modelFilename = `${modelMember.sha256}.glb`;
     const manifestFilename = `${manifestMember.sha256}.json`;
 
-    const storeImmutableAsset = async ({
-      uploadType,
-      filename,
-      expectedSha256,
-      expectedBytes,
-      originalAssetName,
-      mimetype,
-      operation
-    }) => {
-      const redisKey = `upload:${uploadType}:${filename}`;
-      const existing = await redisService.get(redisKey);
-      if (existing) {
-        const existingPath = resolveFileBackedPayloadPath(existing);
-        if (
-          existing.storage !== 'filesystem' ||
-          existing.sha256 !== expectedSha256 ||
-          existing.size !== expectedBytes ||
-          !existingPath
-        ) {
-          throw new Error(`Immutable Recipe asset metadata collision at ${redisKey}.`);
-        }
-        const storedHash = await hashFile(existingPath).catch(() => null);
-        if (
-          !storedHash ||
-          storedHash.sha256 !== expectedSha256 ||
-          storedHash.bytes !== expectedBytes
-        ) {
-          throw new Error(`Immutable Recipe asset bytes are corrupt at ${redisKey}.`);
-        }
-        return {
+    // Keep the transaction running to disk settlement even if the HTTP peer disconnects.
+    const response = await recipePackagePublicationQueue.run(async () => {
+      const claim = await claimCustomRecipePublication(redisService.client, [
+        { uploadType: 'goon_custom_packages', filename: packageFilename },
+        { uploadType: 'goon_custom_models', filename: modelFilename },
+        { uploadType: 'goon_custom_manifests', filename: manifestFilename }
+      ]);
+      const newlyStoredAssets = [];
+      let fullyPublished = false;
+      let integrityFailure = false;
+      try {
+        const storeImmutableAsset = async ({
+          uploadType,
           filename,
-          originalName: existing.originalName || originalAssetName,
-          url: buildRedisUploadUrl(req, uploadType, filename),
-          mimetype: existing.mimetype || mimetype,
-          size: existing.size,
-          uploadedAt: existing.uploadedAt,
-          redisKey,
-          storage: 'filesystem',
-          sha256: existing.sha256
-        };
-      }
-      const stored = await operation();
-      newlyStoredAssets.push({ uploadType, filename });
-      return stored;
-    };
-
-    const packageFile = await storeImmutableAsset({
-      uploadType: 'goon_custom_packages',
-      filename: packageFilename,
-      expectedSha256: extraction.archive.sha256,
-      expectedBytes: extraction.archive.bytes,
-      originalAssetName: originalName,
-      mimetype: req.file.mimetype || 'application/zip',
-      operation: () =>
-      storeFilesystemUploadAsset(req, {
-      uploadType: 'goon_custom_packages',
-      originalName,
-      filename: packageFilename,
-      mimetype: req.file.mimetype || 'application/zip',
-      sourceFile: req.file,
-      size: extraction.archive.bytes,
-      metadata: {
-        sha256: extraction.archive.sha256,
-        immutable: true,
-        recipeArchiveRole: 'archive'
-      }
-    })
-    });
-
-    const modelFile = await storeImmutableAsset({
-      uploadType: 'goon_custom_models',
-      filename: modelFilename,
-      expectedSha256: modelMember.sha256,
-      expectedBytes: modelMember.bytes,
-      originalAssetName: 'avatar.glb',
-      mimetype: 'model/gltf-binary',
-      operation: () =>
-      storeFilesystemUploadAsset(req, {
-      uploadType: 'goon_custom_models',
-      originalName: 'avatar.glb',
-      filename: modelFilename,
-      mimetype: 'model/gltf-binary',
-      sourceFile: {
-        filename: path.basename(modelMember.tempPath),
-        originalname: 'avatar.glb'
-      },
-      size: modelMember.bytes,
-      metadata: {
-        sha256: modelMember.sha256,
-        immutable: true,
-        recipeArchiveRole: 'model'
-      }
-    })
-    });
-
-    const manifestFile = await storeImmutableAsset({
-      uploadType: 'goon_custom_manifests',
-      filename: manifestFilename,
-      expectedSha256: manifestMember.sha256,
-      expectedBytes: manifestMember.bytes,
-      originalAssetName: 'avatar.json',
-      mimetype: 'application/json',
-      operation: () =>
-      storeFilesystemUploadAsset(req, {
-      uploadType: 'goon_custom_manifests',
-      originalName: 'avatar.json',
-      filename: manifestFilename,
-      mimetype: 'application/json',
-      sourceFile: {
-        filename: path.basename(manifestMember.tempPath),
-        originalname: 'avatar.json'
-      },
-      size: manifestMember.bytes,
-      metadata: {
-        sha256: manifestMember.sha256,
-        immutable: true,
-        recipeArchiveRole: 'manifest',
-        manifestSummary: summary
-      }
-    })
-    });
-
-    return res.json({
-      success: true,
-      files: {
-        package: packageFile,
-        model: modelFile,
-        manifest: manifestFile
-      },
-      manifestData: summary,
-      archiveExtraction: {
-        contract: extraction.contract,
-        extractor: extraction.extractor,
-        archive: {
-          ref: `/uploads/goon_custom_packages/${packageFilename}`,
-          sha256: extraction.archive.sha256,
-          bytes: extraction.archive.bytes
-        },
-        entryCount: extraction.entryCount,
-        totalUncompressedBytes: extraction.totalUncompressedBytes,
-        members: [
-          {
-            role: 'manifest',
-            path: manifestMember.path,
-            sha256: manifestMember.sha256,
-            bytes: manifestMember.bytes,
-            extracted: {
-              ref: `/uploads/goon_custom_manifests/${manifestFilename}`,
-              sha256: manifestMember.sha256,
-              bytes: manifestMember.bytes
+          expectedSha256,
+          expectedBytes,
+          originalAssetName,
+          mimetype,
+          operation
+        }) => {
+          const redisKey = `upload:${uploadType}:${filename}`;
+          const existing = await redisService.get(redisKey);
+          if (existing) {
+            const existingPath = resolveFileBackedPayloadPath(existing);
+            if (
+              existing.storage !== 'filesystem' ||
+              existing.sha256 !== expectedSha256 ||
+              existing.size !== expectedBytes ||
+              !existingPath
+            ) {
+              integrityFailure = true;
+              throw new Error(`Immutable Recipe asset metadata collision at ${redisKey}.`);
             }
-          },
-          {
-            role: 'model',
-            path: modelMember.path,
-            sha256: modelMember.sha256,
-            bytes: modelMember.bytes,
-            extracted: {
-              ref: `/uploads/goon_custom_models/${modelFilename}`,
-              sha256: modelMember.sha256,
-              bytes: modelMember.bytes
+            const storedHash = await hashFile(existingPath).catch(() => null);
+            if (
+              !storedHash ||
+              storedHash.sha256 !== expectedSha256 ||
+              storedHash.bytes !== expectedBytes
+            ) {
+              integrityFailure = true;
+              throw new Error(`Immutable Recipe asset bytes are corrupt at ${redisKey}.`);
             }
+            return {
+              filename,
+              originalName: existing.originalName || originalAssetName,
+              url: buildRedisUploadUrl(req, uploadType, filename),
+              mimetype: existing.mimetype || mimetype,
+              size: existing.size,
+              uploadedAt: existing.uploadedAt,
+              redisKey,
+              storage: 'filesystem',
+              sha256: existing.sha256
+            };
           }
-        ]
+          newlyStoredAssets.push({ uploadType, filename });
+          // The operation may fail after file publication but before Redis
+          // metadata. Rollback must own that canonical orphan too.
+          return operation();
+        };
+
+        const packageFile = await storeImmutableAsset({
+          uploadType: 'goon_custom_packages',
+          filename: packageFilename,
+          expectedSha256: extraction.archive.sha256,
+          expectedBytes: extraction.archive.bytes,
+          originalAssetName: originalName,
+          mimetype: req.file.mimetype || 'application/zip',
+          operation: () =>
+            storeFilesystemUploadAsset(req, {
+              uploadType: 'goon_custom_packages',
+              originalName,
+              filename: packageFilename,
+              mimetype: req.file.mimetype || 'application/zip',
+              sourceFile: req.file,
+              size: extraction.archive.bytes,
+              metadata: {
+                sha256: extraction.archive.sha256,
+                immutable: true,
+                recipeArchiveRole: 'archive'
+              }
+            })
+        });
+
+        const modelFile = await storeImmutableAsset({
+          uploadType: 'goon_custom_models',
+          filename: modelFilename,
+          expectedSha256: modelMember.sha256,
+          expectedBytes: modelMember.bytes,
+          originalAssetName: 'avatar.glb',
+          mimetype: 'model/gltf-binary',
+          operation: () =>
+            storeFilesystemUploadAsset(req, {
+              uploadType: 'goon_custom_models',
+              originalName: 'avatar.glb',
+              filename: modelFilename,
+              mimetype: 'model/gltf-binary',
+              sourceFile: {
+                filename: path.basename(modelMember.tempPath),
+                originalname: 'avatar.glb'
+              },
+              size: modelMember.bytes,
+              metadata: {
+                sha256: modelMember.sha256,
+                immutable: true,
+                recipeArchiveRole: 'model'
+              }
+            })
+        });
+
+        const manifestFile = await storeImmutableAsset({
+          uploadType: 'goon_custom_manifests',
+          filename: manifestFilename,
+          expectedSha256: manifestMember.sha256,
+          expectedBytes: manifestMember.bytes,
+          originalAssetName: 'avatar.json',
+          mimetype: 'application/json',
+          operation: () =>
+            storeFilesystemUploadAsset(req, {
+              uploadType: 'goon_custom_manifests',
+              originalName: 'avatar.json',
+              filename: manifestFilename,
+              mimetype: 'application/json',
+              sourceFile: {
+                filename: path.basename(manifestMember.tempPath),
+                originalname: 'avatar.json'
+              },
+              size: manifestMember.bytes,
+              metadata: {
+                sha256: manifestMember.sha256,
+                immutable: true,
+                recipeArchiveRole: 'manifest',
+                manifestSummary: summary
+              }
+            })
+        });
+
+        const result = {
+          success: true,
+          files: {
+            package: packageFile,
+            model: modelFile,
+            manifest: manifestFile
+          },
+          manifestData: summary,
+          archiveExtraction: {
+            contract: extraction.contract,
+            extractor: extraction.extractor,
+            archive: {
+              ref: `/uploads/goon_custom_packages/${packageFilename}`,
+              sha256: extraction.archive.sha256,
+              bytes: extraction.archive.bytes
+            },
+            entryCount: extraction.entryCount,
+            totalUncompressedBytes: extraction.totalUncompressedBytes,
+            members: [
+              {
+                role: 'manifest',
+                path: manifestMember.path,
+                sha256: manifestMember.sha256,
+                bytes: manifestMember.bytes,
+                extracted: {
+                  ref: `/uploads/goon_custom_manifests/${manifestFilename}`,
+                  sha256: manifestMember.sha256,
+                  bytes: manifestMember.bytes
+                }
+              },
+              {
+                role: 'model',
+                path: modelMember.path,
+                sha256: modelMember.sha256,
+                bytes: modelMember.bytes,
+                extracted: {
+                  ref: `/uploads/goon_custom_models/${modelFilename}`,
+                  sha256: modelMember.sha256,
+                  bytes: modelMember.bytes
+                }
+              }
+            ]
+          }
+        };
+        fullyPublished = true;
+        await releaseCustomRecipePublication(redisService.client, claim);
+        return result;
+      } catch (error) {
+        // An uncertain release must not roll back a complete publication: the
+        // marker may already be gone, letting the app acquire the same bytes.
+        if (fullyPublished) throw error;
+        let rollbackComplete = true;
+        for (const asset of newlyStoredAssets.reverse()) {
+          await deleteStoredUploadAsset(asset.uploadType, asset.filename, {
+            fileFirst: true,
+            unlinkUnrecordedCanonical: true,
+            requireCanonicalWhenUnrecorded: true,
+            requireFilePathWhenRecorded: true
+          }).catch((cleanupError) => {
+            rollbackComplete = false;
+            writeErrorLog(logger, 'Recipe package partial-write cleanup failed', cleanupError);
+          });
+        }
+        if (rollbackComplete && !integrityFailure) {
+          await releaseCustomRecipePublication(redisService.client, claim).catch((releaseError) => {
+            writeErrorLog(logger, 'Recipe package publication claim release failed', releaseError);
+          });
+        }
+        throw error;
       }
     });
+    return res.json(response);
   } catch (error) {
-    for (const asset of newlyStoredAssets.reverse()) {
-      await deleteStoredUploadAsset(asset.uploadType, asset.filename).catch((cleanupError) => {
-        writeErrorLog(logger, 'Recipe package partial-write cleanup failed', cleanupError);
-      });
-    }
     writeErrorLog(logger, 'Custom Goon package upload error', error);
     sendUploadError(res, 'Custom Goon package upload failed', error);
   } finally {
-    await cleanupTempUploadFile(req.file);
-    await Promise.all(
-      extractedMembers.map((member) => fs.rm(member.tempPath, { force: true }).catch(() => {}))
-    );
+    try {
+      await cleanupTempUploadFile(req.file);
+      await Promise.all(
+        extractedMembers.map((member) => fs.rm(member.tempPath, { force: true }).catch(() => {}))
+      );
+    } finally {
+      releaseCustomAssetPermit(req);
+    }
   }
 });
 
@@ -2258,6 +2553,7 @@ router.post('/upload/goon-facial-artwork', goonFacialArtworkUpload.single('file'
     const prepared = await prepareFacialArtworkUpload({
       buffer: req.file.buffer,
       role: req.body?.role,
+      packageDefinition: req.body?.packageDefinition,
       definitionSha256: req.body?.definitionSha256,
       templateId: req.body?.templateId,
       templateVersion: req.body?.templateVersion,
@@ -2468,7 +2764,27 @@ function validateHairAssetOwnerSegment(value, label) {
   return safe;
 }
 
-router.post('/upload/goon-hair-asset', goonHairAssetUpload.single('file'), async (req, res) => {
+// Optional importer authority is recorded at initial publication, before the job's next CAS.
+// It is an origin receipt, never permanent disposal authority after ownership transfer.
+function hairImportUploadReceipt(value, artifact, filename, size) {
+  if (value === undefined) return null;
+  let owner;
+  try { owner = JSON.parse(value); } catch { throw uploadValidationError('Hair import owner receipt is invalid.'); }
+  const validId = (id) => typeof id === 'string' && id.length <= 200 && /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(id);
+  if (!owner || owner.contract !== 'hair-import-upload/v1' ||
+      !validId(owner.userId) || !validId(owner.jobId) ||
+      Object.keys(owner).some((key) => !['contract', 'userId', 'jobId'].includes(key))) {
+    throw uploadValidationError('Hair import owner receipt is invalid.');
+  }
+  return { ...owner, ...artifact, filename, bytes: size };
+}
+
+router.post('/upload/goon-hair-asset', enterCustomAssetMaintenance, (req, res, next) => {
+  goonHairAssetUpload.single('file')(req, res, (error) => {
+    if (error) releaseCustomAssetPermit(req);
+    next(error);
+  });
+}, async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No Hair Asset artifact uploaded' });
     const role = typeof req.body?.role === 'string' ? req.body.role.trim() : '';
@@ -2477,7 +2793,14 @@ router.post('/upload/goon-hair-asset', goonHairAssetUpload.single('file'), async
     const spec = validateHairAssetArtifact(req.file, role);
     const sha256 = crypto.createHash('sha256').update(req.file.buffer).digest('hex');
     const filename = `${assetId}_${revisionId}_${sanitizeFilenameSegment(role, 'artifact')}_${sha256}${spec.ext}`;
-    const file = await storeFilesystemUploadAsset(req, {
+    const artifact = { assetId, revisionId, role, sha256 };
+    const importReceipt = hairImportUploadReceipt(req.body?.hairImportOwner, artifact, filename, req.file.buffer.length);
+    const file = await recipePackagePublicationQueue.run(async () => {
+      await admitHairImportUpload(redisService.client, importReceipt, req.body?.hairImportStateVersion);
+      const claim = await claimCustomRecipePublication(redisService.client, [{ uploadType: 'goon_hair_assets', filename }]);
+      // A failed/uncertain publication retains its marker. The same queued
+      // reservation endpoint can recover it after actual IO has settled.
+      const stored = await storeFilesystemUploadAsset(req, {
       uploadType: 'goon_hair_assets',
       originalName: req.file.originalname || filename,
       filename,
@@ -2485,17 +2808,29 @@ router.post('/upload/goon-hair-asset', goonHairAssetUpload.single('file'), async
       buffer: req.file.buffer,
       size: req.file.buffer.length,
       metadata: {
-        hairAssetArtifact: { assetId, revisionId, role, sha256 }
+        filename,
+        hairAssetArtifact: artifact,
+        ...(importReceipt ? { hairImportUpload: importReceipt } : {})
       }
+    });
+      await releaseCustomRecipePublication(redisService.client, claim);
+      return stored;
     });
     return res.json({ success: true, file, role });
   } catch (error) {
     writeErrorLog(logger, 'Goon Hair Asset artifact upload error', error);
     sendUploadError(res, 'Hair Asset artifact upload failed', error);
+  } finally {
+    releaseCustomAssetPermit(req);
   }
 });
 
-router.post('/upload/goon-hair-import-source', goonHairAssetUpload.single('file'), async (req, res) => {
+router.post('/upload/goon-hair-import-source', enterCustomAssetMaintenance, (req, res, next) => {
+  goonHairAssetUpload.single('file')(req, res, (error) => {
+    if (error) releaseCustomAssetPermit(req);
+    next(error);
+  });
+}, async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No Hair import source uploaded' });
     const originalName = req.file.originalname || 'hair.obj';
@@ -2512,20 +2847,25 @@ router.post('/upload/goon-hair-import-source', goonHairAssetUpload.single('file'
     }
     const sha256 = crypto.createHash('sha256').update(req.file.buffer).digest('hex');
     const filename = `${Date.now()}_${crypto.randomUUID()}_${sha256}${ext}`;
-    const file = await storeFilesystemUploadAsset(req, {
+    const file = await recipePackagePublicationQueue.run(async () => {
+      const claim = await claimCustomRecipePublication(redisService.client, [{ uploadType: 'goon_hair_imports', filename }]);
+      const stored = await storeFilesystemUploadAsset(req, {
       uploadType: 'goon_hair_imports',
       originalName,
       filename,
       mimetype: ext === '.glb' ? 'model/gltf-binary' : 'text/plain',
       buffer: req.file.buffer,
       size: req.file.buffer.length,
-      metadata: { hairImportSource: { sha256, stagedAt: new Date().toISOString() } }
+      metadata: { filename, hairImportSource: { sha256, stagedAt: new Date().toISOString() } }
+    });
+      await releaseCustomRecipePublication(redisService.client, claim);
+      return stored;
     });
     return res.json({ success: true, file });
   } catch (error) {
     writeErrorLog(logger, 'Goon Hair import source upload error', error);
     sendUploadError(res, 'Hair import source upload failed', error);
-  }
+  } finally { releaseCustomAssetPermit(req); }
 });
 
 const GOON_CLOTHING_ASSET_ROLES = new Map([
@@ -2656,8 +2996,8 @@ router.delete('/upload/goon-closet', async (req, res) => {
   }
 });
 
-// Goon scene upload endpoint (PNG/JPG only, no resizing)
-router.post('/upload/goon-scene', goonSceneUpload.single('file'), async (req, res) => {
+// Preserve original panorama media and generate a separate still thumbnail.
+router.post('/upload/goon-scene', goonSkyboxUpload.single('file'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No file uploaded' });
@@ -2670,9 +3010,16 @@ router.post('/upload/goon-scene', goonSceneUpload.single('file'), async (req, re
       (ext === '.jpg' || ext === '.jpeg') &&
       (req.file.mimetype === 'image/jpeg' || req.file.mimetype === 'image/jpg');
 
-    if (!isPng && !isJpeg) {
-      return res.status(400).json({ error: 'Scene images must be PNG or JPG.' });
+    const isVideo = ext === '.mp4' || ext === '.webm';
+    if (!isPng && !isJpeg && !isVideo) {
+      return res.status(400).json({ error: 'Skyboxes must be PNG, JPG, MP4 or WebM.' });
     }
+    if (!isVideo && req.file.size > GOON_SCENE_UPLOAD_MAX_FILE_SIZE) {
+      return res.status(400).json({ error: 'Panorama images may be up to 50 MB. Videos may be up to 250 MB.' });
+    }
+    const uploadPath = resolveMulterDiskUploadPath(req.file);
+    const videoInfo = isVideo ? await inspectGoonSceneVideo(uploadPath, ext) : null;
+    const mimeType = videoInfo?.mimeType || (isPng ? 'image/png' : 'image/jpeg');
 
     const safeBase = sanitizeFilenameSegment(path.basename(originalName, ext), 'scene').slice(0, 80) || 'scene';
 
@@ -2680,14 +3027,15 @@ router.post('/upload/goon-scene', goonSceneUpload.single('file'), async (req, re
     const normalizedExt = ext === '.jpeg' ? '.jpg' : ext;
     const filename = `${timestamp}_${safeBase}${normalizedExt}`;
     const thumbnailFilename = `${timestamp}_${safeBase}_thumb.jpg`;
-    const thumbnailBuffer = await buildGoonSceneThumbnail(req.file.buffer);
+    const thumbnailBuffer = videoInfo?.thumbnailBuffer || await buildGoonSceneThumbnail(uploadPath);
     const sceneFile = await storeFilesystemUploadAsset(req, {
       uploadType: 'goon_scenes',
       originalName,
       filename,
-      mimetype: req.file.mimetype || (isPng ? 'image/png' : 'image/jpeg'),
-      buffer: req.file.buffer,
-      size: req.file.size
+      mimetype: mimeType,
+      sourceFile: req.file,
+      size: req.file.size,
+      metadata: videoInfo ? { media: { width: videoInfo.width, height: videoInfo.height, duration: videoInfo.duration, fps: videoInfo.fps, codec: videoInfo.codec } } : undefined
     });
     const thumbnailFile = await storeFilesystemUploadAsset(req, {
       uploadType: 'goon_scene_thumbs',
@@ -2705,7 +3053,7 @@ router.post('/upload/goon-scene', goonSceneUpload.single('file'), async (req, re
         originalName,
         url: sceneFile.url,
         thumbnailUrl: thumbnailFile.url,
-        mimetype: req.file.mimetype || (isPng ? 'image/png' : 'image/jpeg'),
+        mimetype: mimeType,
         size: req.file.size,
         uploadedAt: sceneFile.uploadedAt,
         redisKey: sceneFile.redisKey
@@ -2713,7 +3061,9 @@ router.post('/upload/goon-scene', goonSceneUpload.single('file'), async (req, re
     });
   } catch (error) {
     writeErrorLog(logger, 'Goon scene upload error', error);
-    res.status(500).json({ error: 'Scene upload failed', details: error.message });
+    res.status(error.statusCode || 500).json({ error: 'Scene upload failed', details: error.message });
+  } finally {
+    await cleanupTempUploadFile(req.file);
   }
 });
 

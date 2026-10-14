@@ -1,0 +1,27 @@
+{
+  "case": "version-pinokiod",
+  "capturedAt": "2026-09-22T14:25:24.805Z",
+  "pinokio": {
+    "desktop": "8.2.0",
+    "pinokiod": "8.2.0",
+    "pterm": "0.0.25",
+    "script": "8.0.0"
+  },
+  "platform": "macOS 27.0 (26A428), Apple Silicon, Node 24.12.0 (Homebrew) running pterm through its shebang",
+  "sanitized": {
+    "/Users/tester": "the real home folder",
+    "192.168.1.10": "the real LAN address"
+  },
+  "argv": [
+    "pterm",
+    "version",
+    "pinokiod"
+  ],
+  "exitCode": 0,
+  "signal": null,
+  "timedOut": false,
+  "durationMs": 152,
+  "stdout": "pinokiod@8.2.0\n",
+  "stderr": "",
+  "note": "pterm version pinokiod: daemon version from GET /pinokio/version"
+}

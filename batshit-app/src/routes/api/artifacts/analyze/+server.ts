@@ -8,8 +8,9 @@
  */
 
 import { json, error, type RequestHandler } from '@sveltejs/kit'
-import { apiError } from '$lib/server/services/apiResponses'
+import { apiError, apiFailure } from '$lib/server/services/apiResponses'
 import { resolveNativeToolUser } from '$lib/server/services/nativeToolAuth'
+import { refuseDelegatedRunOutsideList } from '$lib/server/services/actingAgentIdentity'
 import { apiKeyService } from '$lib/services/apiKey.server'
 
 interface AnalysisResult {
@@ -311,6 +312,13 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
   if (!auth?.userId) {
     return apiError('Unauthorized', 401)
+  }
+  // BL-81 follow-up: a Subagent or Worker run's credential analyzes a URL (with the user's
+  // stored Hugging Face and GitHub keys) only when its list allows the control that does this
+  // work, which no delegated list holds: the Fabric control plane is primary-only (SA-064).
+  const delegatedRefusal = refuseDelegatedRunOutsideList(auth, 'sys.artifact.analyze_url')
+  if (delegatedRefusal) {
+    return apiFailure(delegatedRefusal.message, 403, { code: delegatedRefusal.code })
   }
 
   const { url, hfToken, githubToken } = body

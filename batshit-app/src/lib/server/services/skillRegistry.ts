@@ -1,12 +1,13 @@
+import { getBatshitHomeDir } from './batshitHome'
 import fs from 'node:fs/promises'
 import { existsSync } from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 
 import { redis } from '$lib/server/redis'
 import { mcpGatewayService } from '$lib/server/services/mcpGatewayService'
+import { SKILL_FILES_MISSING } from '$lib/server/services/skillFilesMissing'
 import type {
   MCPGateway,
   SkillBundleFile,
@@ -23,7 +24,7 @@ import {
   splitFrontmatter
 } from './skillFrontmatter'
 
-const SKILL_FILESYSTEM_ROOT = path.join(os.homedir(), '.batshit', 'skills')
+const SKILL_FILESYSTEM_ROOT = path.join(getBatshitHomeDir(), 'skills')
 const DEFAULT_SKILL_TEMPLATE = '# Skill\n\nAdd SKILL.md content for this skill.\n'
 const MAX_COMPATIBILITY_LENGTH = 500
 const MAX_DESCRIPTION_LENGTH = 1024
@@ -130,6 +131,29 @@ export interface UpsertSkillInput {
     bundleFiles?: SkillBundleFile[]
     isSystem?: boolean
     isActive?: boolean
+  }
+}
+
+/**
+ * BL-369: a user skill's text lives only in its folder under the skill root (Redis keeps
+ * metadata), so a missing folder is lost data, never a reason to write a blank placeholder
+ * over the skill. Thrown by `getSkill` and by a save that brings no text; nothing is written.
+ */
+export class SkillFilesMissingError extends Error {
+  readonly code = SKILL_FILES_MISSING
+  readonly skillId: string
+  readonly folder: string
+
+  constructor(skill: Pick<SkillRow, 'id' | 'name' | 'displayName'>) {
+    const folder = buildSkillDirectory(skill.id)
+    super(
+      `The files for skill "${skill.displayName || skill.name || skill.id}" are missing from ${folder}. ` +
+        'Batshit did not replace them with an empty skill. Restore them from a backup that carries skill files, ' +
+        'save the skill again with its text, or delete it.'
+    )
+    this.name = 'SkillFilesMissingError'
+    this.skillId = skill.id
+    this.folder = folder
   }
 }
 
@@ -791,7 +815,7 @@ function buildStoredSkillRecord(params: {
 
 async function ensureSkillFilesystemSnapshot(
   skill: SkillRow,
-  options?: { allowLegacyMaterialize?: boolean; allowCreateDefault?: boolean }
+  options?: { allowLegacyMaterialize?: boolean }
 ): Promise<SkillFilesystemSnapshot | null> {
   if (isRepoBackedSystemSkill(skill)) {
     const systemSkillDir = resolveSystemSkillSourceDir(skill)
@@ -813,13 +837,8 @@ async function ensureSkillFilesystemSnapshot(
     if (snapshot) return snapshot
   }
 
-  const allowCreateDefault = options?.allowCreateDefault === true
-  if (allowCreateDefault) {
-    const fallbackMarkdown = buildDefaultSkillMarkdown(skill.name, skill.description)
-    await writeSkillFilesystemContent(skill.id, fallbackMarkdown, [])
-    snapshot = await readSkillFilesystemSnapshot(skill.id)
-  }
-
+  // BL-369: no blank placeholder here. The callers decide: a user skill with no files is
+  // reported (`SkillFilesMissingError`), never rewritten to match an empty folder.
   return snapshot
 }
 
@@ -839,10 +858,14 @@ async function refreshSkillRecordFromFilesystem(
 ): Promise<SkillRow | null> {
   const now = options?.nowIso ?? new Date().toISOString()
   const snapshot = await ensureSkillFilesystemSnapshot(existing, {
-    allowLegacyMaterialize: options?.allowLegacyMaterialize,
-    allowCreateDefault: true
+    allowLegacyMaterialize: options?.allowLegacyMaterialize
   })
-  if (!snapshot) return null
+  if (!snapshot) {
+    // A built-in skill whose repo folder is gone reads as absent, as before. A user skill's
+    // folder holds its only copy of its text: say so, and write nothing (BL-369).
+    if (isRepoBackedSystemSkill(existing)) return null
+    throw new SkillFilesMissingError(existing)
+  }
 
   const nextStored = buildStoredSkillRecord({
     userId: existing.user_id,
@@ -940,12 +963,16 @@ export async function upsertSkill(input: UpsertSkillInput): Promise<SkillRow> {
 
   const existingSnapshot = existing
     ? await ensureSkillFilesystemSnapshot(existing, {
-        allowLegacyMaterialize: true,
-        allowCreateDefault: false
+        allowLegacyMaterialize: true
       })
     : null
 
   const markdownFromInput = typeof input.skill.markdown === 'string' ? input.skill.markdown : undefined
+  // BL-369: a save of an existing user skill whose files are missing must bring its text;
+  // otherwise it would write a blank placeholder over the skill.
+  if (existing && !existingSnapshot && markdownFromInput === undefined && !isRepoBackedSystemSkill(nextSkillShape)) {
+    throw new SkillFilesMissingError(existing)
+  }
   let markdownToWrite =
     markdownFromInput ??
     existingSnapshot?.markdown ??
@@ -965,8 +992,7 @@ export async function upsertSkill(input: UpsertSkillInput): Promise<SkillRow> {
   const snapshot =
     isRepoBackedSystemSkill(nextSkillShape)
       ? await ensureSkillFilesystemSnapshot(nextSkillShape as SkillRow, {
-          allowLegacyMaterialize: false,
-          allowCreateDefault: false
+          allowLegacyMaterialize: false
         })
       : (await writeSkillFilesystemContent(skillId, markdownToWrite, bundleFilesToWrite),
         await readSkillFilesystemSnapshot(skillId))

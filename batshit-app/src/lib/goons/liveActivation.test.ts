@@ -32,4 +32,14 @@ describe('GoonLiveActivationGate', () => {
     expect(gate.accept(newRevision)).toBe(true)
     expect(gate.isAccepted('goon::revision-new')).toBe(true)
   })
+
+  it('releases a cancelled activation without accepting or failing its key', () => {
+    const gate = new GoonLiveActivationGate()
+    const cancelled = gate.request('goon::revision-cancelled')!
+
+    expect(gate.cancel(cancelled)).toBe(true)
+    expect(gate.isAccepted(cancelled.key)).toBe(false)
+    expect(gate.getFailedKey()).toBe('')
+    expect(gate.request(cancelled.key)).not.toBeNull()
+  })
 })

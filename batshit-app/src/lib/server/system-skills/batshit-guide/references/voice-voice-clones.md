@@ -47,7 +47,7 @@ Practical care:
 
 - Only clone voices you have the right to use. Cloning someone without their clear consent can be harmful and, in some places, unlawful.
 - Keep reference clips and clone profiles private. Don't post them in bug reports, chat logs, public issues, or shared backups.
-- Remember that a With Secrets backup or an exposed local engine can carry voice data further than you intended.
+- Remember that every Batshit backup, not only a With Secrets backup, carries each clone voice's reference recording, and an exposed local engine can carry voice data further than you intended.
 - Delete clones and their reference samples when you no longer need them. Deleting a Batshit-managed BYO engine also removes the voice clone profiles and managed reference-audio created for it.
 
 For the broader trust model — backups, exposed local services, and what Batshit does and doesn't protect — see [Security and trust](../security/overview.md).

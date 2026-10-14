@@ -10,7 +10,7 @@ const source = readFileSync('src/routes/api/messages/send-routed/+server.ts', 'u
  * the memory commit at the accepted-send boundary — never a second call, never a commit
  * on a continuation or a group turn.
  */
-describe('send-routed Jev Juice memory recall contracts', () => {
+describe('send-routed Judge Juice memory recall contracts', () => {
   it('builds the recall turn before the compile and hands its provider to the compiler', () => {
     const streamStart = source.indexOf('async function handleBatshitAgentStream({')
     const collector = source.indexOf('const jevJuiceTurn = createJevJuiceTurnCollector()', streamStart)
@@ -35,7 +35,7 @@ describe('send-routed Jev Juice memory recall contracts', () => {
   })
 
   it('gives the memory commit the compile\'s own answer, inside the accepted-send gate', () => {
-    const consumeGate = source.indexOf('if (consumeSessionClips) {\n    await consumePostCompileSessionClips(sessionId)')
+    const consumeGate = source.indexOf('if (consumeSessionClips && !isApprovalResumeWithoutUserTurn) {\n')
     const userTurnGate = source.indexOf('if (messageForCompilation && !groupContext) {', consumeGate)
     const episodeUpkeep = source.indexOf('await ensureFixedSessionOpenEpisode({', userTurnGate)
     const commit = source.indexOf('memoryTurnCommit = await commitMemoryTurnState({', episodeUpkeep)

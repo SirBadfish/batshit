@@ -13,11 +13,17 @@ import { syncAgentClaudeProfiles } from '$lib/server/services/claudeProfileManag
 import { apiKeyService } from '$lib/services/apiKey.server'
 import { redis } from '$lib/server/redis'
 import {
+  assertDockerMcpProfileWritable,
+  DOCKER_PROFILE_FILE_NOT_FINISHED,
   getActiveDockerMcpProfile,
   normalizeDockerMcpProfile,
+  runDockerMcpProfileWrite,
   writeDockerMcpProfileEnv
 } from '$lib/server/services/dockerGatewayProfileConfig'
-import { decorateMcpGatewaysForRuntime } from '$lib/server/services/mcpGatewayRuntimePresentation'
+import {
+  presentMcpGatewaysForBrowser,
+  redactGatewaySecretsForBrowser
+} from '$lib/server/services/mcpGatewayRuntimePresentation'
 import type { MCPGateway } from '$lib/types/database'
 import { logger } from '$lib/utils/logger'
 
@@ -189,7 +195,7 @@ export const GET: RequestHandler = async ({ locals, url }) => {
         ? gateways
         : [...gateways, ...syntheticFiltered]
 
-    return json({ gateways: decorateMcpGatewaysForRuntime(merged) })
+    return json({ gateways: presentMcpGatewaysForBrowser(merged) })
   } catch (error) {
     console.error('[API] Error listing gateways:', error)
     return json(
@@ -197,6 +203,33 @@ export const GET: RequestHandler = async ({ locals, url }) => {
       { status: 500 }
     )
   }
+}
+
+/**
+ * BL-1407: the answer when the token store after a stored create did not confirm (it may have
+ * written the key). Same text in PUT /api/mcp/gateways/[id].
+ */
+const TOKEN_NOT_CONFIRMED =
+  'The gateway settings were saved, but Batshit could not confirm saving the n8n Instance MCP token. Save the token again, or save it in Settings → API Keys.'
+const AFTER_SAVE_NOT_FINISHED =
+  'The gateway settings were saved, but Batshit could not finish updating the agent profiles.'
+const AFTER_SAVE_ALSO_NOT_FINISHED = 'Batshit also could not finish updating the agent profiles.'
+
+/**
+ * BL-1410 / BL-1411: a 500 after the gateway record write was confirmed says so in fields, not
+ * only in its text: `gatewaySaved: true` and the id that write confirmed (the id `create` answered, never a later read). It vouches
+ * for the gateway record only; the token store, the profile file or a profile sync the error names
+ * may still be unknown. Never a 200, never retried.
+ */
+function savedButFailed(error: string, gatewayId: string) {
+  return json({ error, gatewaySaved: true, gatewayId }, { status: 500 })
+}
+
+/** A failure after the stored create: what was saved, and every step that did not finish. */
+function afterSaveError(notConfirmed: string[]) {
+  return notConfirmed.length === 0
+    ? AFTER_SAVE_NOT_FINISHED
+    : `${notConfirmed.join(' ')} ${AFTER_SAVE_ALSO_NOT_FINISHED}`
 }
 
 /**
@@ -208,6 +241,12 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     return json({ error: 'Unauthorized' }, { status: 401 })
   }
 
+  // BL-1407 / BL-1386: as in PUT, every check runs before the create, and the token store and the
+  // Docker profile file follow the stored create; after it, every failure is a 500 that says the
+  // settings were saved and names what could not be finished. Nothing written is undone.
+  let written = false
+  let createdId = ''
+  const notConfirmed: string[] = []
   try {
     const userId = locals.user.id
     const body = await request.json()
@@ -222,10 +261,13 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     }
 
     let metadata = body.metadata || {}
+    let sentToken = ''
+    let writeProfile = false
     if (body.type === 'n8n-instance-mcp') {
-      const authToken = typeof metadata?.authToken === 'string' ? metadata.authToken.trim() : ''
-      if (authToken) {
-        await apiKeyService.store('n8n_instance_mcp_token', authToken, userId)
+      sentToken = typeof metadata?.authToken === 'string' ? metadata.authToken.trim() : ''
+      // BL-1407: checked now (the "Invalid …" 400), stored only after the create.
+      if (sentToken) {
+        apiKeyService.buildStoredDocument('n8n_instance_mcp_token', sentToken)
       }
       if (metadata && typeof metadata === 'object') {
         const { authToken: _ignored, ...rest } = metadata
@@ -242,7 +284,9 @@ export const POST: RequestHandler = async ({ request, locals }) => {
             : getActiveDockerMcpProfile()
       const dockerProfile = normalizeDockerMcpProfile(rawProfile)
       if (hasProfile) {
-        await writeDockerMcpProfileEnv(dockerProfile)
+        // BL-1386: the containerized refusal before the create; the file is written after it.
+        assertDockerMcpProfileWritable()
+        writeProfile = true
       }
       metadata = {
         ...(metadata && typeof metadata === 'object' ? metadata : {}),
@@ -269,14 +313,48 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       updated_at: new Date().toISOString()
     }
 
-    await mcpGatewayService.create(userId, gateway)
+    createdId = (await mcpGatewayService.create(userId, gateway)).id
+    written = true
+
+    if (sentToken) {
+      // BL-1407: an explicit save, unconditional. A failure may still have written the key, so it
+      // is "not confirmed": never undone, never retried here.
+      try {
+        await apiKeyService.store('n8n_instance_mcp_token', sentToken, userId)
+      } catch (error) {
+        console.error('[API] n8n Instance MCP token store not confirmed after a stored gateway create', error)
+        notConfirmed.push(TOKEN_NOT_CONFIRMED)
+      }
+    }
+    if (writeProfile) {
+      // BL-1386: as in PUT, the profile as stored when this write runs, one write at a time; a
+      // failure may have written part or all of the file and is never undone or retried here.
+      try {
+        await runDockerMcpProfileWrite(async () => {
+          const stored = await mcpGatewayService.get(userId, createdId)
+          const storedProfile = stored?.type === 'docker-catalog' ? stored.metadata?.dockerProfile : undefined
+          if (typeof storedProfile === 'string') await writeDockerMcpProfileEnv(storedProfile)
+        })
+      } catch (error) {
+        console.error('[API] Docker MCP profile file not finished after a stored gateway create', error)
+        notConfirmed.push(DOCKER_PROFILE_FILE_NOT_FINISHED)
+      }
+    }
+
     await syncAgentCodexProfiles(userId)
     await syncAgentClaudeProfiles(userId)
 
-    return json({ gateway }, { status: 201 })
+    if (notConfirmed.length > 0) {
+      return savedButFailed(notConfirmed.join(' '), createdId)
+    }
+    return json({ gateway: redactGatewaySecretsForBrowser(gateway) }, { status: 201 })
   } catch (error) {
     console.error('[API] Error creating gateway:', error)
 
+    // The create is stored: neither "invalid" nor "already exists" is true.
+    if (written) {
+      return savedButFailed(afterSaveError(notConfirmed), createdId)
+    }
     // Handle validation errors
     if (error instanceof Error) {
       if (error.message.includes('Invalid') || error.message.includes('already exists')) {

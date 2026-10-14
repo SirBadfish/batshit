@@ -3,7 +3,16 @@
 // FormData/File implementations parse multipart correctly (jsdom's do not).
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-vi.mock('$lib/server/redis', () => ({ redis: {} }))
+// The avatar proxy checks the owner exists and is the user's own (BL-143).
+vi.mock('$lib/server/redis', () => ({
+  redis: {
+    json: {
+      get: vi.fn(async (key: string) =>
+        key === 'agent:agent-1' ? { id: 'agent-1', user_id: 'user-1' } : null
+      )
+    }
+  }
+}))
 
 const ENV_KEYS = [
   'BATSHIT_TOKEN',

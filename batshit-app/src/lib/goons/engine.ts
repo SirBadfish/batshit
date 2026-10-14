@@ -119,6 +119,7 @@ import {
   type GoonFramingPreset
 } from '$lib/goons/cameraNavigation'
 import { resolveGoonSkyboxTextureBudget } from '$lib/goons/skyboxQuality'
+import { isSkyboxVideo, loadSkyboxVideo, type SkyboxVideo } from '$lib/goons/skyboxVideo'
 import {
   type GoonFaceControl,
   type FaceControlMapping,
@@ -444,6 +445,7 @@ export type HairImportMotionPaintPick = HairImportMotionPaintTopologyMesh & {
 }
 
 export type GoonEngineOptions = {
+  onSceneError?: (message: string) => void
   quality?: GoonEngineQuality
   lipSyncEnabled?: boolean
   eyeContactMode?: GoonEyeContactMode
@@ -899,6 +901,11 @@ const AMBIENCE_PRESET_RUNTIME: Record<
   }
 }
 
+type CustomGoonLoadOwner = Readonly<{
+  token: number
+  root: THREE.Object3D
+}>
+
 export class GoonEngine implements GoonStageHost {
   private transparentTexture: THREE.DataTexture | null = null
   private goonVisible = true
@@ -906,6 +913,7 @@ export class GoonEngine implements GoonStageHost {
   private renderer?: WebGPURenderer
   private rendererSurfaceProfile: GoonRendererSurfaceProfile
   private initPromise: Promise<void> | null = null
+  private disposed = false
   private requiredMaxTextureArrayLayers = 0
   private activeMaxTextureArrayLayersRequirement = 0
   private sceneLightingInitialized = false
@@ -920,6 +928,10 @@ export class GoonEngine implements GoonStageHost {
   private groundedSkyboxCamera = new THREE.PerspectiveCamera(30, 1, 0.03, 200)
   private skyboxMesh: THREE.Mesh | null = null
   private skyboxTexture: THREE.Texture | null = null
+  private skyboxVideo: SkyboxVideo | null = null
+  private skyboxLoadAbort: AbortController | null = null
+  private skyboxMimeType: string | undefined
+  private onSceneError?: (message: string) => void
   private skyboxUrl: string | null = null
   private skyboxToken = 0
   private skyboxYaw = 0
@@ -1067,6 +1079,8 @@ export class GoonEngine implements GoonStageHost {
   private lastEyeLookDebugAt = 0
   private loadToken = 0
   private goonLoadToken = 0
+  private goonLoadPauseToken: number | null = null
+  private goonLoadShouldResume = false
   private deferredAnimationQueue: GoonFileRef[] = []
   private deferredAnimationUrls = new Set<string>()
   private deferredLoading = false
@@ -1342,6 +1356,7 @@ export class GoonEngine implements GoonStageHost {
   }
 
   constructor(container: HTMLElement, options: GoonEngineOptions = {}) {
+    this.onSceneError = options.onSceneError
     this.container = container
     this.quality = options.quality ?? 'auto'
     this.lipSyncEnabled = options.lipSyncEnabled ?? true
@@ -1810,10 +1825,16 @@ export class GoonEngine implements GoonStageHost {
     await this.init()
   }
 
+  private assertNotDisposed() {
+    if (this.disposed) throw new Error('Goon engine has been disposed.')
+  }
+
   async init() {
+    this.assertNotDisposed()
     if (this.renderer) return
     if (this.initPromise) {
       await this.initPromise
+      this.assertNotDisposed()
       return
     }
 
@@ -1830,8 +1851,10 @@ export class GoonEngine implements GoonStageHost {
       let renderer = createRenderer(this.forceWebGL2)
       try {
         await renderer.init()
+        this.assertNotDisposed()
       } catch (error) {
         renderer.dispose()
+        this.assertNotDisposed()
         if (
           shouldRetryGoonRendererWithWebGL2(this.forceWebGL2, this.requiredMaxTextureArrayLayers)
         ) {
@@ -1842,8 +1865,10 @@ export class GoonEngine implements GoonStageHost {
           renderer = createRenderer(true)
           try {
             await renderer.init()
+            this.assertNotDisposed()
           } catch (fallbackError) {
             renderer.dispose()
+            this.assertNotDisposed()
             const unsupported = this.buildUnsupportedRuntimeStatus(fallbackError)
             this.setRuntimeStatus(unsupported)
             throw new Error(unsupported.message ?? 'Goon rendering is unavailable.')
@@ -1854,6 +1879,7 @@ export class GoonEngine implements GoonStageHost {
           throw new Error(unsupported.message ?? 'Goon rendering is unavailable.')
         }
       }
+      this.assertNotDisposed()
       this.activeMaxTextureArrayLayersRequirement = this.requiredMaxTextureArrayLayers
       this.setRuntimeStatus(this.resolveRendererRuntime(renderer))
       renderer.setClearColor(0x000000, resolveGoonRendererClearAlpha(this.rendererSurfaceProfile))
@@ -1958,16 +1984,60 @@ export class GoonEngine implements GoonStageHost {
     }
   }
 
-  async loadGoon(url: string, guidedManifest: GoonCustomAvatarManifest | null = null) {
-    if (!this.renderer) {
-      await this.init()
+  beginGoonLoad(): number {
+    this.assertNotDisposed()
+    const token = ++this.goonLoadToken
+    if (this.goonLoadPauseToken !== null) this.goonLoadPauseToken = token
+    return token
+  }
+
+  isCurrentGoonLoad(token: number): boolean {
+    return !this.disposed && token === this.goonLoadToken
+  }
+
+  private pauseForGoonLoad(token: number) {
+    if (!this.isCurrentGoonLoad(token)) return false
+    if (this.goonLoadPauseToken === null) {
+      this.goonLoadShouldResume = !this.paused
+      if (this.goonLoadShouldResume) this.setPaused(true)
     }
-    const goonLoadToken = ++this.goonLoadToken
-    const shouldResumeAfterLoad = !this.paused
-    if (shouldResumeAfterLoad) {
-      this.setPaused(true)
-    }
+    this.goonLoadPauseToken = token
+    return true
+  }
+
+  finishGoonLoad(token: number): void {
+    if (!this.isCurrentGoonLoad(token) || this.goonLoadPauseToken !== token) return
+    const shouldResume = this.goonLoadShouldResume
+    this.goonLoadPauseToken = null
+    this.goonLoadShouldResume = false
+    if (shouldResume && !this.renderFailed && this.renderer) this.setPaused(false)
+  }
+
+  private invalidateGoonLoads(resume: boolean) {
+    this.goonLoadToken += 1
+    const shouldResume = resume && this.goonLoadShouldResume
+    this.goonLoadPauseToken = null
+    this.goonLoadShouldResume = false
+    if (shouldResume && !this.renderFailed && this.renderer) this.setPaused(false)
+  }
+
+  private isCurrentCustomGoonLoad(owner: CustomGoonLoadOwner) {
+    return this.isCurrentGoonLoad(owner.token) && this.customAvatarRoot === owner.root
+  }
+
+  private clearOwnedCustomGoonLoad(owner: CustomGoonLoadOwner) {
+    if (this.customAvatarRoot === owner.root) this.clearLoadedGoonState()
+  }
+
+  async loadGoon(url: string, guidedManifest: GoonCustomAvatarManifest | null = null, reservedGoonLoadToken?: number) {
+    this.assertNotDisposed()
+    const goonLoadToken = reservedGoonLoadToken ?? this.beginGoonLoad()
     try {
+      if (!this.renderer) {
+        await this.init()
+        if (!this.isCurrentGoonLoad(goonLoadToken)) return
+      }
+      if (!this.pauseForGoonLoad(goonLoadToken)) return
       this.loadToken += 1
       this.clearLoadedGoonState()
 
@@ -1979,7 +2049,7 @@ export class GoonEngine implements GoonStageHost {
         return new VRMLoaderPlugin(parser, { mtoonMaterialPlugin })
       })
       const gltf = await loader.loadAsync(url)
-      if (goonLoadToken !== this.goonLoadToken) {
+      if (!this.isCurrentGoonLoad(goonLoadToken)) {
         if (gltf?.scene) {
           this.disposeVrmScene(gltf.scene)
         }
@@ -2034,15 +2104,11 @@ export class GoonEngine implements GoonStageHost {
       }
 
       this.syncBaseLoopAnimation()
+    } catch (error) {
+      if (!this.isCurrentGoonLoad(goonLoadToken)) return
+      throw error
     } finally {
-      if (
-        shouldResumeAfterLoad &&
-        !this.renderFailed &&
-        this.renderer &&
-        goonLoadToken === this.goonLoadToken
-      ) {
-        this.setPaused(false)
-      }
+      this.finishGoonLoad(goonLoadToken)
     }
   }
 
@@ -2062,29 +2128,34 @@ export class GoonEngine implements GoonStageHost {
       skinAppearanceState?: SkinAppearanceStateV2 | unknown | null
       /** @deprecated Read-only migration input for pre-surface Recipe state. */
       skinMaterialArtworkState?: unknown
-    } = {}
+    } = {},
+    reservedGoonLoadToken?: number
   ) {
-    const socketEyePackage = parseFirstPartySocketEyePackage(manifest)
-    if (socketEyePackage) {
-      await this.ensureRendererTextureArrayLayers(
-        socketEyePackage.socketEyeSurface.rendering.requiredMaxTextureArrayLayers
-      )
-    }
-    if (!this.renderer) {
-      await this.init()
-    }
-    const goonLoadToken = ++this.goonLoadToken
-    const shouldResumeAfterLoad = !this.paused
-    if (shouldResumeAfterLoad) {
-      this.setPaused(true)
-    }
+    this.assertNotDisposed()
+    const goonLoadToken = reservedGoonLoadToken ?? this.beginGoonLoad()
+    if (!this.isCurrentGoonLoad(goonLoadToken)) return
+    let owner: CustomGoonLoadOwner | null = null
+    let clearedPreviousGoon = false
     try {
+      const socketEyePackage = parseFirstPartySocketEyePackage(manifest)
+      if (socketEyePackage) {
+        await this.ensureRendererTextureArrayLayers(
+          socketEyePackage.socketEyeSurface.rendering.requiredMaxTextureArrayLayers
+        )
+        if (!this.isCurrentGoonLoad(goonLoadToken)) return
+      }
+      if (!this.renderer) {
+        await this.init()
+        if (!this.isCurrentGoonLoad(goonLoadToken)) return
+      }
+      if (!this.pauseForGoonLoad(goonLoadToken)) return
       this.loadToken += 1
       this.clearLoadedGoonState()
+      clearedPreviousGoon = true
 
       const loader = new GLTFLoader()
       const gltf = await loader.loadAsync(url)
-      if (goonLoadToken !== this.goonLoadToken) {
+      if (!this.isCurrentGoonLoad(goonLoadToken)) {
         if (gltf?.scene) {
           this.disposeObject3D(gltf.scene)
         }
@@ -2104,6 +2175,7 @@ export class GoonEngine implements GoonStageHost {
       }
 
       this.customAvatarRoot = scene
+      owner = Object.freeze({ token: goonLoadToken, root: scene })
       this.syncLightingLane()
       this.customAvatarManifest = manifest
       this.disableAvatarMeshCulling(scene)
@@ -2127,6 +2199,10 @@ export class GoonEngine implements GoonStageHost {
       const appearanceDials = manifest.appearanceDials
       if (manifest.liveBuild !== undefined && manifest.liveBuild !== null) {
         await verifyGoonLiveManifest(parseGoonLiveManifestFromAvatarManifest(manifest))
+        if (!this.isCurrentCustomGoonLoad(owner)) {
+          this.clearOwnedCustomGoonLoad(owner)
+          return
+        }
         this.resetBodyDialsState()
         this.setupLiveJointCorrectives(manifest)
       } else if (appearanceDials !== undefined && appearanceDials !== null) {
@@ -2138,8 +2214,13 @@ export class GoonEngine implements GoonStageHost {
         this.setupSocketEyeAppearance(socketEyePackage, options.eyeAppearanceState ?? null)
         await this.setupFacialArtwork(
           socketEyePackage.facialArtwork,
-          options.facialArtworkState ?? null
+          options.facialArtworkState ?? null,
+          owner
         )
+        if (!this.isCurrentCustomGoonLoad(owner)) {
+          this.clearOwnedCustomGoonLoad(owner)
+          return
+        }
       } else {
         const facialArtworkCapability = classifyFacialArtworkPackageCapability(manifest)
         if (facialArtworkCapability.status === 'retired') {
@@ -2155,18 +2236,33 @@ export class GoonEngine implements GoonStageHost {
       await this.setupLipArtwork(
         manifest,
         options.lipArtworkState ?? null,
-        options.lipArtworkEnabled ?? true
+        options.lipArtworkEnabled ?? true,
+        owner
       )
+      if (!this.isCurrentCustomGoonLoad(owner)) {
+        this.clearOwnedCustomGoonLoad(owner)
+        return
+      }
       await this.setupNailSurface(
         manifest,
         options.nailSurfaceState ?? null,
-        options.nailSurfaceEnabled ?? true
+        options.nailSurfaceEnabled ?? true,
+        owner
       )
+      if (!this.isCurrentCustomGoonLoad(owner)) {
+        this.clearOwnedCustomGoonLoad(owner)
+        return
+      }
       await this.setupSkinAppearance(
         manifest,
         options.skinAppearanceState ?? null,
-        options.skinMaterialArtworkState ?? null
+        options.skinMaterialArtworkState ?? null,
+        owner
       )
+      if (!this.isCurrentCustomGoonLoad(owner)) {
+        this.clearOwnedCustomGoonLoad(owner)
+        return
+      }
       // Performance-rig/v2 depends on the socket-eye surface. Bind it only
       // after every appearance runtime has completed so a failed eye setup
       // cannot leave a half-active performance driver behind.
@@ -2191,23 +2287,19 @@ export class GoonEngine implements GoonStageHost {
     } catch (error) {
       // Loading is transactional. A failed package must not leave the render
       // loop holding a mixer, performance rig, or partially bound eye runtime.
-      if (goonLoadToken === this.goonLoadToken) {
-        this.clearLoadedGoonState()
+      if (!this.isCurrentGoonLoad(goonLoadToken)) {
+        if (owner) this.clearOwnedCustomGoonLoad(owner)
+        return
       }
+      if (clearedPreviousGoon) this.clearLoadedGoonState()
       throw error
     } finally {
-      if (
-        shouldResumeAfterLoad &&
-        !this.renderFailed &&
-        this.renderer &&
-        goonLoadToken === this.goonLoadToken
-      ) {
-        this.setPaused(false)
-      }
+      this.finishGoonLoad(goonLoadToken)
     }
   }
 
   unloadGoon() {
+    this.invalidateGoonLoads(true)
     this.loadToken += 1
     this.clearLoadedGoonState()
   }
@@ -2482,12 +2574,18 @@ export class GoonEngine implements GoonStageHost {
     pieceStates: Record<string, boolean> = {},
     dufOverlays: Array<{ id: string; file: GoonFileRef }> = []
   ) {
+    if (this.disposed) return
     this.clearGuidedOutfitRuntime()
     if (!this.vrm) return
+    const ownerVrm = this.vrm
+    const goonLoadToken = this.goonLoadToken
+    const ownerBonePairs = this.guidedDufOverlayBonePairs
+    const isCurrentOwner = () => this.isCurrentGoonLoad(goonLoadToken) &&
+      this.vrm === ownerVrm && this.guidedDufOverlayBonePairs === ownerBonePairs
 
     for (const piece of pieces) {
       if (piece.source === 'duf-overlay' && piece.overlayId) continue
-      const nodes = this.resolveGuidedRuntimeNodes(this.vrm.scene, piece.runtimeNodeNames)
+      const nodes = this.resolveGuidedRuntimeNodes(ownerVrm.scene, piece.runtimeNodeNames)
       if (nodes.length > 0) {
         this.guidedOutfitPieceNodes.set(piece.id, nodes)
       }
@@ -2502,17 +2600,27 @@ export class GoonEngine implements GoonStageHost {
     }
 
     for (const overlay of dufOverlays) {
+      if (!isCurrentOwner()) return
       const overlayPieces = overlayPiecesById.get(overlay.id) ?? []
       if (overlayPieces.length === 0) continue
-      await this.loadGuidedDufOverlay(overlay.file.url, overlayPieces)
+      try {
+        await this.loadGuidedDufOverlay(overlay.file.url, overlayPieces)
+      } catch (error) {
+        if (!isCurrentOwner()) return
+        throw error
+      }
+      if (!isCurrentOwner()) return
     }
 
+    if (!isCurrentOwner()) return
     for (const piece of pieces) {
+      if (!isCurrentOwner()) return
       const visible =
         piece.source === 'duf-overlay' ? true : (pieceStates[piece.id] ?? piece.defaultOn ?? true)
       this.setGuidedOutfitPieceVisible(piece.id, visible)
     }
 
+    if (!isCurrentOwner()) return
     this.collectMaterials()
   }
 
@@ -3883,6 +3991,12 @@ export class GoonEngine implements GoonStageHost {
 
   private async loadGuidedDufOverlay(url: string, pieces: GoonGuidedOutfitPiece[]) {
     if (!this.vrm || !url || pieces.length === 0) return
+    const ownerVrm = this.vrm
+    const goonLoadToken = this.goonLoadToken
+    const ownerBonePairs = this.guidedDufOverlayBonePairs
+    const isCurrentOwner = () => this.isCurrentGoonLoad(goonLoadToken) &&
+      this.vrm === ownerVrm && this.guidedDufOverlayBonePairs === ownerBonePairs
+    if (!isCurrentOwner()) return
     const loader = new GLTFLoader()
     loader.register((parser: any) => {
       const mtoonMaterialPlugin = new MToonMaterialLoaderPlugin(parser, {
@@ -3891,9 +4005,19 @@ export class GoonEngine implements GoonStageHost {
       return new VRMLoaderPlugin(parser, { mtoonMaterialPlugin })
     })
 
-    const gltf = await loader.loadAsync(url)
+    let gltf: Awaited<ReturnType<GLTFLoader['loadAsync']>>
+    try {
+      gltf = await loader.loadAsync(url)
+    } catch (error) {
+      if (!isCurrentOwner()) return
+      throw error
+    }
     const sourceScene = gltf.scene ?? gltf.scenes?.[0]
     if (!sourceScene) return
+    if (!isCurrentOwner()) {
+      this.disposeObject3D(sourceScene)
+      return
+    }
     this.disableAvatarMeshCulling(sourceScene)
 
     const overlayRoot = this.guidedDufOverlayRoot ?? new THREE.Group()
@@ -3901,7 +4025,7 @@ export class GoonEngine implements GoonStageHost {
     overlayRoot.visible = this.goonVisible
     if (!this.guidedDufOverlayRoot) {
       this.guidedDufOverlayRoot = overlayRoot
-      this.vrm.scene.add(overlayRoot)
+      ownerVrm.scene.add(overlayRoot)
     }
 
     const baseBones = this.buildBaseBoneNameMap()
@@ -3924,7 +4048,7 @@ export class GoonEngine implements GoonStageHost {
       if (node instanceof THREE.Bone) {
         const baseBone = baseBones.get(name)
         if (baseBone) {
-          this.guidedDufOverlayBonePairs.push({ baseBone, overlayBone: node })
+          ownerBonePairs.push({ baseBone, overlayBone: node })
         }
       }
     })
@@ -4108,7 +4232,7 @@ export class GoonEngine implements GoonStageHost {
       return
     }
     const applied = await runtime.apply(value)
-    if (applied) this.facialArtworkState = value
+    if (applied && this.facialArtworkRuntime === runtime) this.facialArtworkState = value
   }
 
   getEyeAppearanceDefinition() {
@@ -4229,7 +4353,7 @@ export class GoonEngine implements GoonStageHost {
       return
     }
     const applied = await runtime.apply(value)
-    if (applied) this.lipArtworkState = value
+    if (applied && this.lipArtworkRuntime === runtime) this.lipArtworkState = value
   }
 
   setLipArtworkEnabled(enabled: boolean) {
@@ -4244,7 +4368,8 @@ export class GoonEngine implements GoonStageHost {
   private async setupLipArtwork(
     manifest: GoonCustomAvatarManifest,
     initialState: LipArtworkStateV2 | null,
-    enabled: boolean
+    enabled: boolean,
+    owner: CustomGoonLoadOwner
   ) {
     const rawDefinition = manifest.lipArtwork
     if (rawDefinition === undefined || rawDefinition === null) {
@@ -4260,11 +4385,13 @@ export class GoonEngine implements GoonStageHost {
       throw new Error('lip-artwork/v2 requires a Recipe Source or verified Live Goon package.')
     }
     const definition = parseLipArtworkDefinition(rawDefinition)
-    const root = this.customAvatarRoot
-    if (!root) throw new Error('Custom avatar root is missing during Lip Artwork setup.')
-    const runtime = new LipArtworkEngineRuntime(root, definition)
+    const runtime = new LipArtworkEngineRuntime(owner.root, definition)
     try {
       await runtime.apply(initialState)
+      if (!this.isCurrentCustomGoonLoad(owner)) {
+        runtime.dispose()
+        return
+      }
       runtime.setEnabled(enabled)
     } catch (error) {
       runtime.dispose()
@@ -4286,7 +4413,7 @@ export class GoonEngine implements GoonStageHost {
       return
     }
     const applied = await runtime.apply(value)
-    if (applied) this.nailSurfaceState = value
+    if (applied && this.nailSurfaceRuntime === runtime) this.nailSurfaceState = value
   }
 
   setNailSurfaceEnabled(enabled: boolean) {
@@ -4301,7 +4428,8 @@ export class GoonEngine implements GoonStageHost {
   private async setupNailSurface(
     manifest: GoonCustomAvatarManifest,
     initialState: NailSurfaceStateV1 | null,
-    enabled: boolean
+    enabled: boolean,
+    owner: CustomGoonLoadOwner
   ) {
     const rawDefinition = manifest.nailSurface
     if (rawDefinition === undefined || rawDefinition === null) {
@@ -4317,11 +4445,13 @@ export class GoonEngine implements GoonStageHost {
       throw new Error('nail-surface/v1 requires a Recipe Source or verified Live Goon package.')
     }
     const definition = parseNailSurfaceDefinition(rawDefinition)
-    const root = this.customAvatarRoot
-    if (!root) throw new Error('Custom avatar root is missing during Nail Surface setup.')
-    const runtime = new NailSurfaceEngineRuntime(root, definition, initialState)
+    const runtime = new NailSurfaceEngineRuntime(owner.root, definition, initialState)
     try {
       await runtime.apply(initialState)
+      if (!this.isCurrentCustomGoonLoad(owner)) {
+        runtime.dispose()
+        return
+      }
       runtime.setEnabled(enabled)
     } catch (error) {
       runtime.dispose()
@@ -4352,7 +4482,7 @@ export class GoonEngine implements GoonStageHost {
       return
     }
     const applied = await runtime.apply(appearance, legacyArtwork)
-    if (applied) {
+    if (applied && this.skinAppearanceRuntime === runtime) {
       this.skinAppearanceState = appearance as SkinAppearanceStateV2 | null
       this.legacySkinMaterialArtworkState = legacyArtwork
     }
@@ -4366,7 +4496,8 @@ export class GoonEngine implements GoonStageHost {
   private async setupSkinAppearance(
     manifest: GoonCustomAvatarManifest,
     initialState: SkinAppearanceStateV2 | unknown | null,
-    initialMaterialArtwork: unknown
+    initialMaterialArtwork: unknown,
+    owner: CustomGoonLoadOwner
   ) {
     const rawDefinition = manifest.skinAppearance
     if (rawDefinition === undefined || rawDefinition === null) {
@@ -4389,12 +4520,9 @@ export class GoonEngine implements GoonStageHost {
         : await verifySkinArtworkProjectionDefinition(
             manifest.skinArtworkProjection
           )
-    const root = this.customAvatarRoot
-    if (!root) {
-      throw new Error('Custom avatar root is missing during Skin Appearance setup.')
-    }
+    if (!this.isCurrentCustomGoonLoad(owner)) return
     const runtime = new SkinAppearanceEngineRuntime(
-      root,
+      owner.root,
       definition,
       undefined,
       artworkProjection,
@@ -4404,6 +4532,10 @@ export class GoonEngine implements GoonStageHost {
     )
     try {
       await runtime.apply(initialState, initialMaterialArtwork)
+      if (!this.isCurrentCustomGoonLoad(owner)) {
+        runtime.dispose()
+        return
+      }
     } catch (error) {
       runtime.dispose()
       throw error
@@ -4416,18 +4548,26 @@ export class GoonEngine implements GoonStageHost {
 
   private async setupFacialArtwork(
     definition: FacialArtworkDefinition,
-    initialState: FacialArtworkState | null
+    initialState: FacialArtworkState | null,
+    owner: CustomGoonLoadOwner
   ) {
-    const root = this.customAvatarRoot
-    if (!root) throw new Error('Custom avatar root is missing during facial artwork setup.')
     const socketEyes = this.socketEyeSurfaceRuntime
     const eyeAppearance = this.eyeAppearanceRuntime
     if (!socketEyes || !eyeAppearance) {
       throw new Error('Facial Artwork v5 requires the active socket-eye runtime.')
     }
-    const runtime = new FacialArtworkEngineRuntime(root, definition, socketEyes, eyeAppearance)
+    const runtime = new FacialArtworkEngineRuntime(
+      owner.root,
+      definition,
+      socketEyes,
+      eyeAppearance
+    )
     try {
       await runtime.apply(initialState)
+      if (!this.isCurrentCustomGoonLoad(owner)) {
+        runtime.dispose()
+        return
+      }
     } catch (error) {
       runtime.dispose()
       throw error
@@ -6211,31 +6351,46 @@ export class GoonEngine implements GoonStageHost {
     }
   }
 
-  async setSkyboxBackground(url: string | null, options: { forceReload?: boolean } = {}) {
+  async setSkyboxBackground(url: string | null, options: { forceReload?: boolean; mimeType?: string } = {}) {
     if (!url) {
       this.skyboxToken += 1
       this.clearSkybox()
       return
     }
-    if (url === this.skyboxUrl && !options.forceReload) return
-
-    if (!this.renderer) {
-      await this.init()
-    }
+    if (url === this.skyboxUrl && options.mimeType === this.skyboxMimeType && !options.forceReload) return
 
     const token = ++this.skyboxToken
+    this.skyboxLoadAbort?.abort()
+    const abort = new AbortController()
+    this.skyboxLoadAbort = abort
     this.skyboxUrl = url
+    this.skyboxMimeType = options.mimeType
     this.syncSkyboxZoomFromCamera()
 
     try {
-      let texture: THREE.Texture = await this.textureLoader.loadAsync(url)
+      if (!this.renderer) await this.init()
+      if (token !== this.skyboxToken) return
+      const video = isSkyboxVideo(url, options.mimeType)
+        ? await loadSkyboxVideo(url, {
+            signal: abort.signal,
+            maxTextureSize: this.getRendererMaxTextureSize(),
+            paused: this.paused,
+            onError: (message) => {
+              if (token !== this.skyboxToken) return
+              this.clearSkybox()
+              this.onSceneError?.(message)
+            }
+          })
+        : null
+      let texture: THREE.Texture = video?.texture ?? await this.textureLoader.loadAsync(url)
       if (token !== this.skyboxToken) {
-        texture.dispose()
+        if (video) video.dispose()
+        else texture.dispose()
         return
       }
       texture.colorSpace = THREE.SRGBColorSpace
       const maxTextureSize = this.getRuntimeSkyboxTextureMaxSize()
-      if (maxTextureSize > 0) {
+      if (!video && maxTextureSize > 0) {
         texture = this.downsampleTextureForRuntime(texture, maxTextureSize, new Map())
       }
       this.ensureSkyboxMesh()
@@ -6243,7 +6398,10 @@ export class GoonEngine implements GoonStageHost {
       this.clearGroundedSkybox()
       const previousTexture = this.skyboxTexture
       material.map = null
-      previousTexture?.dispose()
+      if (this.skyboxVideo) this.skyboxVideo.dispose()
+      else previousTexture?.dispose()
+      this.skyboxVideo = video
+      video?.setPaused(this.paused)
       material.map = texture
       material.needsUpdate = true
       this.skyboxTexture = texture
@@ -6255,13 +6413,18 @@ export class GoonEngine implements GoonStageHost {
       console.warn('[GoonEngine] Failed to load skybox background:', error)
       if (token === this.skyboxToken) {
         this.clearSkybox()
+        this.onSceneError?.(error instanceof Error ? error.message : 'The panorama background could not be loaded.')
       }
     }
   }
 
   clearSkybox() {
+    this.skyboxToken += 1
+    this.skyboxLoadAbort?.abort()
+    this.skyboxLoadAbort = null
     this.skyboxActive = false
     this.skyboxUrl = null
+    this.skyboxMimeType = undefined
     this.clearGroundedSkybox()
     const texture = this.skyboxTexture
     this.skyboxTexture = null
@@ -6271,7 +6434,9 @@ export class GoonEngine implements GoonStageHost {
       material.needsUpdate = true
       this.skyboxMesh.visible = false
     }
-    texture?.dispose()
+    if (this.skyboxVideo) this.skyboxVideo.dispose()
+    else texture?.dispose()
+    this.skyboxVideo = null
     this.loadedSkyboxTextureMaxSize = 0
   }
 
@@ -7587,7 +7752,7 @@ export class GoonEngine implements GoonStageHost {
 
     const nextSkyboxMaxSize = this.getRuntimeSkyboxTextureMaxSize()
     if (this.skyboxUrl && this.skyboxTexture && previousSkyboxMaxSize !== nextSkyboxMaxSize) {
-      void this.setSkyboxBackground(this.skyboxUrl, { forceReload: true })
+      if (!this.skyboxVideo) void this.setSkyboxBackground(this.skyboxUrl, { forceReload: true, mimeType: this.skyboxMimeType })
     }
   }
 
@@ -7642,6 +7807,7 @@ export class GoonEngine implements GoonStageHost {
   setPaused(paused: boolean) {
     if (this.paused === paused) return
     this.paused = paused
+    this.skyboxVideo?.setPaused(paused)
     if (!this.renderer) return
 
     if (paused) {
@@ -9893,6 +10059,11 @@ export class GoonEngine implements GoonStageHost {
   }
 
   dispose() {
+    if (this.disposed) return
+    this.disposed = true
+    this.invalidateGoonLoads(false)
+    this.clearLoadedGoonState()
+    this.clearSkybox()
     this.loadToken += 1
     this.deferredLoadToken += 1
     const renderer = this.renderer
@@ -10003,10 +10174,6 @@ export class GoonEngine implements GoonStageHost {
       }
       this.skyboxMesh = null
     }
-    if (this.skyboxTexture) {
-      this.skyboxTexture.dispose()
-      this.skyboxTexture = null
-    }
     if (this.transparentTexture) {
       this.transparentTexture.dispose()
       this.transparentTexture = null
@@ -10098,6 +10265,7 @@ export class GoonEngine implements GoonStageHost {
     const now = performance.now()
     const hasExpressions = this.activeExpressions.length > 0
     const hasSceneAmbience = Boolean(this.sceneAmbienceRuntime)
+    const hasPlayingSkyboxVideo = this.skyboxActive && Boolean(this.skyboxVideo?.isPlaying())
     const hasSecondaryMotion =
       (Boolean(this.hairPreviewSecondaryMotionRuntime) &&
         !this.hairPreviewSecondaryMotionSuspended) ||
@@ -10106,6 +10274,7 @@ export class GoonEngine implements GoonStageHost {
       !this.speaking &&
       !hasExpressions &&
       !hasSceneAmbience &&
+      !hasPlayingSkyboxVideo &&
       !hasSecondaryMotion &&
       !this.baseLoopAction &&
       !this.animationOverrideActive &&

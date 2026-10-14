@@ -22,6 +22,10 @@ export type StreamEventType =
   | 'steer_queued'
   | 'steer_delivered'
   | 'steer_promoted'
+  // BL-759: a managed lane took back a segment of the reply (a Codex message that dropped and
+  // was started again), and `/api/sse` tells every tab the reply's text as it now reads.
+  | 'text_retract'
+  | 'content_reset'
   | 'file'           // SA-010: Generated file output (images, etc.)
   | 'audio'          // SA-011: Generated audio output (TTS/speech)
   | 'object_partial' // SA-011: Streaming structured object partial update
@@ -153,10 +157,41 @@ export class StreamEventAdapter {
     return event;
   }
 
-  async emitChunk(payload: { content: string } & Record<string, any>):
+  /**
+   * A text chunk. BL-759: `segmentId` names the vendor message the text belongs to (a managed
+   * lane's segment) and rides along, so a later `text_retract` can name it; no other field does.
+   */
+  async emitChunk(payload: { content: string; segmentId?: string | null } & Record<string, any>):
     Promise<CanonicalStreamEvent> {
     const event = this.buildEvent('chunk', {
-      content: payload.content
+      content: payload.content,
+      ...(typeof payload.segmentId === 'string' && payload.segmentId.length > 0
+        ? { segmentId: payload.segmentId }
+        : {})
+    });
+
+    await this.forwardEvent(event);
+    return event;
+  }
+
+  /** BL-759: a managed lane takes back every chunk of `segmentId` (never Batshit's own text). */
+  async emitTextRetract(payload: { segmentId: string; metadata?: Record<string, any> }):
+    Promise<CanonicalStreamEvent> {
+    const event = this.buildEvent('text_retract', {
+      segmentId: payload.segmentId,
+      ...(payload.metadata ? { metadata: payload.metadata } : {})
+    });
+
+    await this.forwardEvent(event);
+    return event;
+  }
+
+  /** BL-759: the reply's text so far, as it reads after a segment was taken back. */
+  async emitContentReset(payload: { content: string; metadata?: Record<string, any> }):
+    Promise<CanonicalStreamEvent> {
+    const event = this.buildEvent('content_reset', {
+      content: payload.content,
+      ...(payload.metadata ? { metadata: payload.metadata } : {})
     });
 
     await this.forwardEvent(event);
@@ -324,11 +359,25 @@ export class StreamEventAdapter {
     return event;
   }
 
+  /**
+   * The metadata an event of this stream carries: the stream's defaults, then `metadata`, then
+   * the voice facts. send-routed saves a reply's record with exactly what its `end` carries
+   * (BL-775), so it reads the composed metadata here before it saves.
+   */
+  composeEventMetadata(metadata: Record<string, any> | undefined): Record<string, any> {
+    return this.mergeMetadata(metadata) ?? {};
+  }
+
   async emitEnd(payload: {
     content: string;
     intermediateSteps?: any[];
     zipReferences?: ZipReference[];
     metadata?: Record<string, any>;
+    /**
+     * BL-775: the server already saved this exact reply (send-routed's finalize saves, then
+     * publishes `end`), so `/api/sse` hands it to the tabs as it is and rebuilds nothing.
+     */
+    savedRecord?: boolean;
   }): Promise<CanonicalStreamEvent> {
     this.finalContent = payload.content;
     this.lastIntermediateSteps = payload.intermediateSteps;
@@ -339,7 +388,8 @@ export class StreamEventAdapter {
       content: payload.content,
       intermediateSteps: payload.intermediateSteps,
       zipReferences: payload.zipReferences,
-      metadata: this.lastMetadata
+      metadata: this.lastMetadata,
+      ...(payload.savedRecord ? { savedRecord: true } : {})
     });
 
     await this.forwardEvent(event);

@@ -16,6 +16,11 @@
   import type { CatalogConnectionOption, CatalogModel } from '$lib/types/modelCatalog'
   import type { ModelCapabilities } from '$lib/types/savedModels'
   import type { ThemeMode } from '$lib/types/theme'
+  import {
+    resolveCatalogConnectionLimits,
+    resolveCatalogConnectionPricing
+  } from '$lib/utils/catalogConnectionLimits'
+  import { isFlatFeePlanConnection } from '$lib/utils/catalogPricing'
 
   interface Props {
     open?: boolean
@@ -65,6 +70,14 @@
     formatPrice,
     catalogFeaturesToCapabilities
   }: Props = $props()
+
+  /**
+   * Review finding 3 (BL-132): filtered to one connection, a row shows that
+   * connection's own price and window, as a preset for it would get them.
+   */
+  const viewerConnectionId = $derived(
+    catalogViewerConnection !== 'all' && catalogViewerConnection !== 'none' ? catalogViewerConnection : null
+  )
 
   function normalizeSelectValue(value: string | string[] | undefined, fallback = 'all') {
     return Array.isArray(value) ? value[0] ?? fallback : value ?? fallback
@@ -236,9 +249,14 @@
                 </td>
               </tr>
             {:else}
-              {#each catalogViewerRows as model (model.id)}
-                {@const inputPrice = formatPrice(model.pricing?.input)}
-                {@const outputPrice = formatPrice(model.pricing?.output)}
+              <!-- BL-241: a bare model id is not unique (Kimi K3 through Moonshot and
+                   through Qwen Cloud are both `kimi-k3`); /api/models makes canonicalId unique. -->
+              {#each catalogViewerRows as model (model.canonicalId ?? model.id)}
+                {@const rowPricing = resolveCatalogConnectionPricing(model, viewerConnectionId).pricing}
+                {@const rowContextWindow = resolveCatalogConnectionLimits(model, viewerConnectionId).contextWindow}
+                {@const inputPrice = formatPrice(rowPricing?.input)}
+                {@const outputPrice = formatPrice(rowPricing?.output)}
+                {@const rowIsFlatFeePlan = isFlatFeePlanConnection(viewerConnectionId)}
                 {@const rowCapabilities = catalogFeaturesToCapabilities(model.features ?? null)}
                 <tr class="batshit-settings-table-row">
                   <td class="batshit-settings-table-cell">
@@ -270,10 +288,10 @@
                       <span class="batshit-settings-form-label">—</span>
                     {/if}
                   </td>
-                  <td class="batshit-settings-table-cell">{inputPrice ? `$${inputPrice}/M` : '—'}</td>
-                  <td class="batshit-settings-table-cell">{outputPrice ? `$${outputPrice}/M` : '—'}</td>
+                  <td class="batshit-settings-table-cell">{rowIsFlatFeePlan ? 'Token plan' : inputPrice ? `$${inputPrice}/M` : '—'}</td>
+                  <td class="batshit-settings-table-cell">{rowIsFlatFeePlan ? 'Token plan' : outputPrice ? `$${outputPrice}/M` : '—'}</td>
                   <td class="batshit-settings-table-cell">
-                    {model.contextWindow ? `${model.contextWindow.toLocaleString()} tokens` : '—'}
+                    {rowContextWindow ? `${rowContextWindow.toLocaleString()} tokens` : '—'}
                   </td>
                   <td class="batshit-settings-table-cell">
                     {#if rowCapabilities}

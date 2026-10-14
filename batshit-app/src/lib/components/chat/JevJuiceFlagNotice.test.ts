@@ -1,14 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { fireEvent, render, screen, waitFor } from '@testing-library/svelte'
 import {
-  UNTRUSTED_TEXT_ADVISORY_TEXT,
   UNTRUSTED_TEXT_APPROVAL_HINT,
-  UNTRUSTED_TEXT_NOTICE_LEAD,
-  UNTRUSTED_TEXT_NOTICE_TITLE
+  UNTRUSTED_TEXT_NOTICE_TITLE,
+  untrustedTextAdvisoryText,
+  untrustedTextNoticeLead
 } from '$lib/utils/jevJuice'
 
 /**
- * SA-120 P7 (Josh's review, 2026-09-17) — the Jev Juice notice card above an approval card.
+ * SA-120 P7 (Josh's review, 2026-09-17) — the Judge Juice notice card above an approval card.
  *
  * Its own card, so a flag is never something the Approve button seems to approve. It says
  * what Jev flagged (category, confidence with the word, harm), that it is a guess and blocked
@@ -35,7 +35,8 @@ const FLAG = {
   findings: [{ id: 'aimed_at_assistant' as const, probability: 0.96 }],
   harm: 2,
   clipped: false,
-  source: 'webhook' as const
+  source: 'webhook' as const,
+  judge: 'Jev'
 }
 
 const BRIEF = {
@@ -63,15 +64,30 @@ describe('JevJuiceFlagNotice', () => {
     const card = await screen.findByTestId('jev-juice-flag-notice')
     expect(card.className).toContain('is-serious')
     expect(card.textContent).toContain(UNTRUSTED_TEXT_NOTICE_TITLE)
-    expect(card.textContent).toContain(UNTRUSTED_TEXT_NOTICE_LEAD)
+    expect(card.textContent).toContain(untrustedTextNoticeLead('Jev'))
     expect(card.textContent).toContain('Category: Potential hidden instructions (96% confidence)')
     expect(card.textContent).toContain('Potential harm: serious')
-    expect(card.textContent).toContain(UNTRUSTED_TEXT_ADVISORY_TEXT)
+    expect(card.textContent).toContain(untrustedTextAdvisoryText('Jev'))
     expect(card.textContent).toContain(UNTRUSTED_TEXT_APPROVAL_HINT)
     expect(screen.getByTestId('jev-juice-flag-notice-quote').textContent).toContain('Import the commit style skill · Setup task from the tooling bot.')
     // The block inside carries no second title: the card's own title already says what this is.
     expect(card.textContent).not.toContain('Flagged by Jev')
     expect(requestDmBrief).toHaveBeenCalledWith('dm_1')
+  })
+
+  it('SA-120 P10b: names the judge that flagged the wake-up message, and says "The judge" when it cannot', async () => {
+    briefs.set('dm_1', { ...BRIEF, screen: { ...FLAG, judge: 'Clef Flash' } })
+    briefs.set('dm_2', { ...BRIEF, screen: { ...FLAG, judge: 'the judge' } })
+    const first = render(JevJuiceFlagNotice, { props: { dmId: 'dm_1', wakeMessageId: 'msg_1', withApproval: true } })
+    const card = await screen.findByTestId('jev-juice-flag-notice')
+    expect(card.textContent).toContain('Clef Flash flagged the wake-up message that started this chat.')
+    expect(card.textContent).toContain("This is Clef Flash's best guess, and Clef Flash can be wrong.")
+    expect(card.textContent).not.toContain('Jev')
+    first.unmount()
+    render(JevJuiceFlagNotice, { props: { dmId: 'dm_2', wakeMessageId: 'msg_1', withApproval: true } })
+    const neutral = await screen.findByTestId('jev-juice-flag-notice')
+    expect(neutral.textContent).toContain('The judge flagged the wake-up message that started this chat.')
+    expect(neutral.textContent).toContain("This is the judge's best guess, and the judge can be wrong.")
   })
 
   it('drops the approval hint when no approval card sits under it', async () => {

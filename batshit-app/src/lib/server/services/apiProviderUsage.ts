@@ -394,23 +394,60 @@ export function normalizeProviderMetadataUsageInclusive(
     if (!hasCacheEvidence) continue
 
     if (isAnthropicExclusiveUsageShape(usageRecord)) {
-      const rawInput = coerceTokenCount(usageRecord.input_tokens) ?? 0
-      const cacheRead = normalized.cachedInputTokens ?? 0
-      const cacheWrite = normalized.cacheCreationInputTokens ?? 0
-      const inclusiveInput = rawInput + cacheRead + cacheWrite
-      const output = normalized.outputTokens
-      return buildUsageLike({
-        inputTokens: inclusiveInput,
-        outputTokens: output,
-        totalTokens:
-          typeof output === 'number' ? inclusiveInput + output : undefined,
-        reasoningTokens: normalized.reasoningTokens,
-        cachedInputTokens: normalized.cachedInputTokens,
-        cacheCreationInputTokens: normalized.cacheCreationInputTokens,
-      })
+      return inclusiveFromAnthropicExclusiveUsage(usageRecord, normalized)
     }
 
     return normalized
+  }
+
+  return null
+}
+
+/** Raw Anthropic accounting, made inclusive: fresh input + cache read + cache write. */
+function inclusiveFromAnthropicExclusiveUsage(
+  usageRecord: Record<string, any>,
+  normalized: NonNullable<ApiUsageLike>,
+): ApiUsageLike {
+  const rawInput = coerceTokenCount(usageRecord.input_tokens) ?? 0
+  const cacheRead = normalized.cachedInputTokens ?? 0
+  const cacheWrite = normalized.cacheCreationInputTokens ?? 0
+  const inclusiveInput = rawInput + cacheRead + cacheWrite
+  const output = normalized.outputTokens
+  return buildUsageLike({
+    inputTokens: inclusiveInput,
+    outputTokens: output,
+    totalTokens:
+      typeof output === 'number' ? inclusiveInput + output : undefined,
+    reasoningTokens: normalized.reasoningTokens,
+    cachedInputTokens: normalized.cachedInputTokens,
+    cacheCreationInputTokens: normalized.cacheCreationInputTokens,
+  })
+}
+
+/**
+ * BL-77: one model call's usage as Anthropic reports it, made inclusive — or null.
+ *
+ * Anthropic's raw usage (`providerMetadata.anthropic.usage`, snake_case) counts only the
+ * FRESH remainder in `input_tokens` and reports cache reads and writes beside it. Every other
+ * usage number Batshit keeps counts the whole prompt: the SDK's step and run usage, the
+ * Claude CLI lane, and every other provider. The Execution Viewer's per-call rows used to
+ * take the raw number, so a call's input shrank to its fresh remainder, and once the tool
+ * loop is cached that remainder is nearly zero while the Token Panel reads the largest
+ * call's input as the context size. Returns null unless an entry has exactly that raw
+ * exclusive shape, so no other lane's per-call numbers change.
+ */
+export function normalizeAnthropicExclusiveStepUsage(
+  providerMetadata: unknown,
+): ApiUsageLike {
+  const metadata = plainObject(providerMetadata)
+  if (!metadata) return null
+
+  for (const entryValue of Object.values(metadata)) {
+    const usageRecord = plainObject(plainObject(entryValue)?.usage)
+    if (!usageRecord || !isAnthropicExclusiveUsageShape(usageRecord)) continue
+    const normalized = normalizeUsageLike(usageRecord)
+    if (!normalized) continue
+    return inclusiveFromAnthropicExclusiveUsage(usageRecord, normalized)
   }
 
   return null

@@ -30,6 +30,7 @@ vi.mock('$lib/server/redis', () => ({
 }))
 
 import { SubagentBusyError } from '$lib/server/services/subagentThreads'
+import { SubagentDeletedError } from '$lib/server/services/subagentRunRegistry'
 
 let routeModule: typeof import('./+server')
 
@@ -54,6 +55,8 @@ describe('POST /api/subagents/managed-execute', () => {
       auth: 'agent',
       agentId: 'agent-1',
       sessionId: 'session-1',
+      messageId: 'parent-msg-7',
+      mcpGatewayScope: ['gw-1'],
       credentialId: 'arc_test',
     })
     mocks.redisGetSession.mockResolvedValue({
@@ -133,6 +136,7 @@ describe('POST /api/subagents/managed-execute', () => {
         agentId: 'agent-1',
         sessionId: 'session-1',
         messageId: 'parent-msg-7',
+        selectedGateways: ['gw-forged'],
         projectPath: '/workspace/project',
         workers: [{ task: 'Find the config file' }],
       }),
@@ -240,6 +244,19 @@ describe('POST /api/subagents/managed-execute', () => {
     expect(mocks.executeManagedSubagent.mock.calls[0]?.[0]).not.toHaveProperty(
       'callTimeoutMs',
     )
+  })
+
+  it('projects a returned Codex timeout observation without changing status or canonical usage', async () => {
+    const read = mocks.redisGet.getMockImplementation()!
+    mocks.redisGet.mockImplementation(async (key: string) => {
+      const record = await read(key)
+      return key === 'subagent:api-subagent' && record ? { ...record, subagentType: 'cli', primary_model_provider: 'openai-codex', primary_model_name: 'codex-cli' } : record
+    })
+    const observedUsage = { completeness: 'partial', parts: [{ source: 'codex-app-server-progress', counts: { outputTokens: 0, cacheCreationInputTokens: 3 } }] }
+    mocks.executeManagedSubagent.mockResolvedValueOnce({ output: 'Helper timed out', intermediateSteps: [], subagentType: 'cli', usage: null, observedUsage, modelId: 'gpt-5.4', provider: 'openai-codex', durationMs: 10_000, status: 'timed_out', thread: 'fresh' })
+    const response = await routeModule.POST({ request: buildRequest({ agentId: 'agent-1', subagentId: 'api-subagent', sessionId: 'session-1', chatInput: 'Work' }), locals: {} } as any)
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({ kind: 'subagent', status: 'timed_out', usage: null, observedUsage })
   })
 
   it('rejects untrusted internal calls before loading runtime state', async () => {
@@ -426,6 +443,29 @@ describe('POST /api/subagents/managed-execute', () => {
     })
   })
 
+  it('BL-661: maps a deleted Subagent to 410 subagent_deleted with the error message', async () => {
+    mocks.executeManagedSubagent.mockRejectedValueOnce(
+      new SubagentDeletedError('API Helper')
+    )
+
+    const response = await routeModule.POST({
+      request: buildRequest({
+        agentId: 'agent-1',
+        subagentId: 'api-subagent',
+        sessionId: 'session-1',
+        chatInput: 'hello',
+      }),
+      locals: {},
+    } as any)
+
+    expect(response.status).toBe(410)
+    const body = await response.json()
+    expect(body.error).toMatchObject({
+      code: 'subagent_deleted',
+      message: 'API Helper was deleted, so it does not run any more.',
+    })
+  })
+
   it('defaults thread control to fresh and reports what the thread did', async () => {
     // SA-111 P2 (DL-111-04): a CLI agent that says nothing gets Josh's chosen default.
     const response = await routeModule.POST({
@@ -588,5 +628,105 @@ describe('POST /api/subagents/managed-execute', () => {
     expect(mocks.executeManagedSubagent).toHaveBeenCalledWith(
       expect.objectContaining({ parentAgentId: 'agent-1' })
     )
+  })
+
+  for (const [kind, extra] of [
+    ['Subagent', { subagentId: 'api-subagent', chatInput: 'Inspect the repo' }],
+    ['Worker', { workers: [{ task: 'Inspect the repo' }] }],
+  ] as const) {
+    it(`BL-675: refuses a ${kind} call naming another chat owned by the same user`, async () => {
+      mocks.redisGetSession.mockResolvedValue({ id: 'session-other', user_id: 'user-1' })
+      const response = await routeModule.POST({
+        request: buildRequest({ ...extra, sessionId: 'session-other' }), locals: {},
+      } as any)
+      expect(response.status).toBe(400)
+      expect((await response.json()).error.code).toBe('session_mismatch')
+      expect(mocks.redisGetSession).not.toHaveBeenCalled()
+      expect(mocks.executeManagedSubagent).not.toHaveBeenCalled()
+      expect(mocks.spawnWorkers).not.toHaveBeenCalled()
+    })
+
+    it(`BL-675: refuses a ${kind} call naming another reply in the bound chat`, async () => {
+      const response = await routeModule.POST({
+        request: buildRequest({ ...extra, sessionId: 'session-1', messageId: 'another-reply' }),
+        locals: {},
+      } as any)
+      expect(response.status).toBe(400)
+      expect((await response.json()).error.code).toBe('message_mismatch')
+      expect(mocks.redisGetSession).not.toHaveBeenCalled()
+      expect(mocks.executeManagedSubagent).not.toHaveBeenCalled()
+      expect(mocks.spawnWorkers).not.toHaveBeenCalled()
+    })
+
+    for (const missing of ['sessionId', 'messageId'] as const) {
+      it(`BL-675: refuses a ${kind} call on a credential missing its bound ${missing}`, async () => {
+        mocks.resolveNativeToolUser.mockResolvedValue({
+          userId: 'user-1', auth: 'agent', agentId: 'agent-1',
+          sessionId: missing === 'sessionId' ? undefined : 'session-1',
+          messageId: missing === 'messageId' ? undefined : 'parent-msg-7',
+        })
+        const response = await routeModule.POST({
+          request: buildRequest({ ...extra, sessionId: 'session-1', messageId: 'parent-msg-7' }),
+          locals: {},
+        } as any)
+        expect(response.status).toBe(403)
+        expect((await response.json()).error.code).toBe('run_context_required')
+        expect(mocks.redisGetSession).not.toHaveBeenCalled()
+        expect(mocks.executeManagedSubagent).not.toHaveBeenCalled()
+        expect(mocks.spawnWorkers).not.toHaveBeenCalled()
+      })
+    }
+  }
+
+  it('uses the bound chat and reply when the Subagent body omits both', async () => {
+    const response = await routeModule.POST({
+      request: buildRequest({ subagentId: 'api-subagent', chatInput: 'Inspect the repo' }),
+      locals: {},
+    } as any)
+    expect(response.status).toBe(200)
+    expect(mocks.executeManagedSubagent).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: 'session-1', parentMessageId: 'parent-msg-7',
+    }))
+  })
+
+  it('keeps the n8n callback lane on its existing body chat and reply', async () => {
+    mocks.resolveNativeToolUser.mockResolvedValue({ userId: 'user-1', auth: 'n8n-callback' })
+    mocks.redisGetSession.mockResolvedValue({ id: 'session-2', user_id: 'user-1' })
+    const response = await routeModule.POST({
+      request: buildRequest({
+        agentId: 'agent-1', subagentId: 'api-subagent', chatInput: 'Inspect the repo',
+        sessionId: 'session-2', messageId: 'callback-reply'
+      }),
+      locals: {},
+    } as any)
+    expect(response.status).toBe(200)
+    expect(mocks.executeManagedSubagent).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: 'session-2', parentMessageId: 'callback-reply',
+    }))
+  })
+
+  it('Workers inherit only the credential gateway snapshot, including an empty legacy scope', async () => {
+    mocks.resolveNativeToolUser.mockResolvedValue({
+      userId: 'user-1', auth: 'agent', agentId: 'agent-1',
+      sessionId: 'session-1', messageId: 'parent-msg-7',
+    })
+    mocks.redisGet.mockImplementation(async (key: string) => key === 'agent:agent-1'
+      ? {
+          id: 'agent-1', user_id: 'user-1', agentType: 'cli',
+          primary_model_provider: 'codex', primary_model_name: 'gpt-5.6',
+          defaultMCPGateways: ['gw-stored'],
+        }
+      : null)
+    mocks.spawnWorkers.mockResolvedValue({ kind: 'workers', success: true, workers: [] })
+    const response = await routeModule.POST({
+      request: buildRequest({
+        workers: [{ task: 'Inspect the repo' }], selectedGateways: ['gw-forged']
+      }),
+      locals: {},
+    } as any)
+    expect(response.status).toBe(200)
+    expect(mocks.spawnWorkers).toHaveBeenCalledWith(expect.objectContaining({
+      parent: expect.objectContaining({ selectedGateways: [], defaultGateways: [] }),
+    }))
   })
 })

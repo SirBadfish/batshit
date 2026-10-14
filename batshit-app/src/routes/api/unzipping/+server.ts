@@ -1,7 +1,10 @@
 import { json } from '@sveltejs/kit'
 import type { RequestHandler } from './$types'
 import { redis } from '$lib/server/redis'
-import { requireOwnedSession, requireUser } from '$lib/server/services/routeSecurity'
+import { canAccessZipData, requireOwnedSession, requireUser } from '$lib/server/services/routeSecurity'
+import { withZipStateLock } from '$lib/server/services/zipStateLock'
+import { tooLargeCoolToolHoldTokens } from '$lib/server/services/toolResultHoldAdmission'
+import { resolveSessionZipForHold } from '$lib/server/services/resolveSessionZipForHold'
 import { isZipStateSource, type ZipStateSource } from '$lib/services/zipping'
 
 // GET: Get unzipped items for a session
@@ -60,33 +63,56 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     const sessionCheck = await requireOwnedSession(item.sessionId, user.value.id)
     if (!sessionCheck.ok) return sessionCheck.response
 
-    // SA-120 P5: the browser never CREATES an `inferred` unzip (the server writes those at
-    // the accepted-send boundary), but it does re-post one to persist its countdown. That
-    // must keep its source: coercing it to `user` would turn Batshit's weakest, temporary
-    // state into a user lock. Accepting the value from a browser widens nothing, because
-    // `inferred` locks nothing and both other sources overwrite it.
-    if (!isZipStateSource(item.source)) {
-      item.source = 'user'
-    }
+    // This route is the USER's doorway: a Hold or "Hold for N messages" from the chat or the
+    // Zip Manager. An agent's hold, the parked zip actions, a Judge Juice open, and every
+    // countdown are written by the server alone (SA-129 P2, SA-120 P5), so a browser can never
+    // write another source, name an agent, or attach a hold path.
+    delete item.path
+    delete item.agentId
+    item.source = 'user'
 
-    // Add to unzipped set
-    const unzippedKey = `unzipped:${item.sessionId}`
-    await redis.sAdd(unzippedKey, item.zipId)
+    // One writer at a time per chat (SA-129 P2b, BL-352): a reply end's hold move or countdown
+    // never lands between these writes, and never writes back over them.
+    const refusal = await withZipStateLock(item.sessionId, async () => {
+      const resolved = await resolveSessionZipForHold(item.sessionId, item.zipId)
+      if (resolved.status === 'missing') return json({ error: 'Zip not found; nothing was held.' }, { status: 404 })
+      if (resolved.status === 'ambiguous') return json({ error: 'Zip ID is ambiguous in this chat; nothing was held.' }, { status: 409 })
+      const { zipData } = resolved
+      if (!(await canAccessZipData(zipData, user.value.id))) {
+        return json({ error: 'Forbidden' }, { status: 403 })
+      }
+      // An older zip may identify its owner by userId alone. A known different chat is never
+      // eligible for this chat's Hold state, even when both chats have the same user.
+      const zipSessionId = zipData.metadata?.sessionId ?? zipData.metadata?.session_id ?? zipData.sessionId ?? zipData.session_id
+      if (typeof zipSessionId === 'string' && zipSessionId !== item.sessionId) {
+        return json({ error: 'Zip belongs to another session; nothing was held.' }, { status: 403 })
+      }
+      const tooLargeTokens = await tooLargeCoolToolHoldTokens(zipData)
+      if (tooLargeTokens !== null) {
+        return json({
+          error: `This result is about ${Math.ceil(tooLargeTokens).toLocaleString('en-US')} tokens and is too large to hold open. The agent must fetch it in parts.`
+        }, { status: 413 })
+      }
+      item.zipId = resolved.stateZipId
+      // Add to unzipped set
+      const unzippedKey = `unzipped:${item.sessionId}`
+      await redis.sAdd(unzippedKey, item.zipId)
 
-    // If it was manually rezipped before, clear that marker
-    const rezippedKey = `rezipped:${item.sessionId}`
-    await redis.sRem(rezippedKey, item.zipId)
-    await redis.del(`rezipped_item:${item.sessionId}:${item.zipId}`)
-    
-    // Store item metadata
-    const itemKey = `unzipped_item:${item.sessionId}:${item.zipId}`
-    await redis.set(itemKey, item)
-    
-    // Set expiry if not permanent
-    if (!item.permanent && item.duration) {
-      // For simplicity, we'll handle expiry through the service's incrementMessageCount
-      // In production, could use Redis TTL
-    }
+      // If it was manually rezipped before, clear that marker
+      const rezippedKey = `rezipped:${item.sessionId}`
+      await redis.sRem(rezippedKey, item.zipId)
+      await redis.del(`rezipped_item:${item.sessionId}:${item.zipId}`)
+
+      // Store item metadata
+      const itemKey = `unzipped_item:${item.sessionId}:${item.zipId}`
+      await redis.set(itemKey, item)
+      return null
+    })
+    if (refusal) return refusal
+
+
+    // A temporary hold counts down on the server: one count per accepted user message and per
+    // finished reply (`advanceZipCountdowns`, SA-129 P2).
 
     return json({ success: true })
   } catch (error) {

@@ -14,7 +14,7 @@ function errorMessage(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback
 }
 
-export const POST: RequestHandler = async ({ params, locals }) => {
+export const POST: RequestHandler = async ({ params, locals, url }) => {
   if (!locals.user) {
     return json({ success: false, error: 'Not authenticated' }, { status: 401 })
   }
@@ -28,7 +28,7 @@ export const POST: RequestHandler = async ({ params, locals }) => {
       userId: locals.user.id,
       tokenId
     })
-    const envTemplates = await ensurePortableSkillEnvTemplates()
+    const envTemplates = await ensurePortableSkillEnvTemplates(url.origin)
 
     return json({
       success: true,

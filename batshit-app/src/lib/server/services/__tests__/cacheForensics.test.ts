@@ -22,6 +22,7 @@ import {
 } from '$lib/server/services/cacheForensics/record'
 import type { CacheForensicsRecord } from '$lib/types/cacheForensics'
 import { buildInterruptedReasoningRecovery } from '$lib/utils/reasoningRecovery'
+import { compiledElement } from '$lib/utils/compiledChatTags'
 
 const TEST_KEY = Buffer.alloc(32, 7)
 const OTHER_KEY = Buffer.alloc(32, 9)
@@ -324,8 +325,11 @@ describe('cacheForensics history stability (SA-108)', () => {
     })
     expect(recovery).not.toBeNull()
 
-    const interruptedWithoutRecovery = 'A1: partial answer'
-    const interruptedWithRecovery = `${interruptedWithoutRecovery}\n\n${recovery?.renderedBlock}`
+    // SA-128: history segments are whole message elements; the recovery block rides inside
+    // the interrupted reply's element, exactly where the compiler appends it.
+    const reply = (text: string) => compiledElement('assistant', text)
+    const interruptedWithoutRecovery = reply('partial answer')
+    const interruptedWithRecovery = reply(`partial answer\n\n${recovery?.renderedBlock}`)
 
     const inserted = analyzeDivergence(
       history(['u1', interruptedWithRecovery], 'continue'),
@@ -337,17 +341,17 @@ describe('cacheForensics history stability (SA-108)', () => {
     })
 
     const retained = analyzeDivergence(
-      history(['u1', interruptedWithRecovery, 'u2', 'A1: failed retry'], 'continue again'),
+      history(['u1', interruptedWithRecovery, 'u2', reply('failed retry')], 'continue again'),
       history(['u1', interruptedWithRecovery], 'continue'),
     )
     expect(retained.historyStability).toMatchObject({ state: 'append-only' })
 
     const expired = analyzeDivergence(
       history(
-        ['u1', interruptedWithoutRecovery, 'u2', 'A1: failed retry', 'u3', 'A1: success'],
+        ['u1', interruptedWithoutRecovery, 'u2', reply('failed retry'), 'u3', reply('success')],
         'next task',
       ),
-      history(['u1', interruptedWithRecovery, 'u2', 'A1: failed retry'], 'continue again'),
+      history(['u1', interruptedWithRecovery, 'u2', reply('failed retry')], 'continue again'),
     )
     expect(expired.historyStability).toMatchObject({
       state: 'mutated',
@@ -360,16 +364,16 @@ describe('cacheForensics history stability (SA-108)', () => {
           'u1',
           interruptedWithoutRecovery,
           'u2',
-          'A1: failed retry',
+          reply('failed retry'),
           'u3',
-          'A1: success',
+          reply('success'),
           'u4',
-          'A1: ordinary next response',
+          reply('ordinary next response'),
         ],
         'keep going',
       ),
       history(
-        ['u1', interruptedWithoutRecovery, 'u2', 'A1: failed retry', 'u3', 'A1: success'],
+        ['u1', interruptedWithoutRecovery, 'u2', reply('failed retry'), 'u3', reply('success')],
         'next task',
       ),
     )
@@ -447,8 +451,9 @@ describe('cacheForensics record + baseline selection (P2)', () => {
     const record = capture()
     // Pinned deliberately: bumping the schema must be an explicit decision
     // (v2 = SA-108 compiled-user-message sub-segments + historyStability;
-    // v3 = DQ-D-028 Responses-shaped `body.input[]` sub-segmentation).
-    expect(record.schemaVersion).toBe(3)
+    // v3 = DQ-D-028 Responses-shaped `body.input[]` sub-segmentation;
+    // v4 = SA-128 tagged chat history).
+    expect(record.schemaVersion).toBe(4)
     expect(record.comparisonId).toMatch(HEX_64)
     expect(record.runId).toMatch(HEX_64)
     expect(record.runId).not.toContain('run-raw-id-1')

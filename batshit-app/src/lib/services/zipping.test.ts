@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { createZipStateView, zippingService, type UnzippedItem } from './zipping'
+import { countOneMoreMessage, createZipStateView, zippingService, type UnzippedItem } from './zipping'
 
 const jsonResponse = (payload: unknown, init?: ResponseInit) =>
   new Response(JSON.stringify(payload), {
@@ -47,6 +47,18 @@ describe('zippingService manual zip state', () => {
     expect(zippingService.getRezippedSource('zip-manual')).toBe('agent')
   })
 
+  it('exposes a rejected Hold reason and rolls back the optimistic state', async () => {
+    const refused = vi.fn(async () => jsonResponse({ error: 'This result is too large to hold open. Fetch it in parts.' }, { status: 413 })) as unknown as typeof fetch
+    const ok = await zippingService.unzip('zip_too_large', true, 10, undefined, undefined, 1, 'user', refused)
+    expect(ok).toBe(false)
+    expect(zippingService.isUnzipped('zip_too_large')).toBe(false)
+    expect(zippingService.getLastUnzipError()).toBe('This result is too large to hold open. Fetch it in parts.')
+
+    const accepted = vi.fn(async () => jsonResponse({ success: true })) as unknown as typeof fetch
+    expect(await zippingService.unzip('zip_small', true, 10, undefined, undefined, 1, 'user', accepted)).toBe(true)
+    expect(zippingService.getLastUnzipError()).toBeNull()
+  })
+
   it('persists zip-now and then clears it when returning to automatic', async () => {
     const calls: Array<{ url: string; init?: RequestInit }> = []
     const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -92,62 +104,6 @@ describe('zippingService manual zip state', () => {
     )).toBe(true)
   })
 
-  it('increments and persists temporary unzip message countdowns', async () => {
-    const calls: Array<{ url: string; init?: RequestInit }> = []
-    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      calls.push({ url: String(input), init })
-      return jsonResponse({ success: true })
-    }) as unknown as typeof fetch
-
-    await zippingService.setCurrentSession('session-007-countdown', storedStateFetcher([
-      {
-        zipId: 'zip-countdown',
-        sessionId: 'session-007-countdown',
-        permanent: false,
-        duration: 10,
-        messageCount: 4,
-        unzippedAt: 123,
-        source: 'user',
-      },
-    ]))
-
-    zippingService.incrementMessageCount('session-007-countdown', fetcher)
-
-    expect(zippingService.getUnzippedInfo('zip-countdown')?.messageCount).toBe(5)
-    const postCall = calls.find((call) =>
-      call.url === '/api/unzipping' &&
-      call.init?.method === 'POST'
-    )
-    expect(postCall).toBeTruthy()
-    expect(JSON.parse(String(postCall?.init?.body))).toMatchObject({
-      zipId: 'zip-countdown',
-      messageCount: 5,
-      duration: 10,
-      source: 'user',
-    })
-  })
-
-  it('does not burn countdowns for messages added to another session', async () => {
-    const fetcher = vi.fn(async () => jsonResponse({ success: true })) as unknown as typeof fetch
-
-    await zippingService.setCurrentSession('session-visible', storedStateFetcher([
-      {
-        zipId: 'zip-countdown',
-        sessionId: 'session-visible',
-        permanent: false,
-        duration: 10,
-        messageCount: 4,
-        unzippedAt: 123,
-        source: 'user',
-      },
-    ]))
-
-    zippingService.incrementMessageCount('session-background', fetcher)
-
-    expect(zippingService.getUnzippedInfo('zip-countdown')?.messageCount).toBe(4)
-    expect(fetcher).not.toHaveBeenCalled()
-  })
-
   it('keeps an inferred source on load, and re-reads the session from the server on demand (SA-120 P5)', async () => {
     let served = { unzipped: [] as unknown[], rezipped: [] as string[], rezippedSources: {} as Record<string, string> }
     const fetcher = vi.fn(async () => jsonResponse(served)) as unknown as typeof fetch
@@ -177,29 +133,6 @@ describe('zippingService manual zip state', () => {
     expect(fetcher).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ method: 'POST' }))
   })
 
-  it('burns an inferred unzip with the ordinary countdown and persists it with its source intact (SA-120 P5)', async () => {
-    const posted: any[] = []
-    const fetcher = vi.fn(async (_url: unknown, init?: RequestInit) => {
-      if (init?.method === 'POST') posted.push(JSON.parse(String(init.body)))
-      return jsonResponse({
-        unzipped: [
-          { zipId: 'zip-opened', sessionId: 'session-burn', permanent: false, duration: 2, messageCount: 0, unzippedAt: 1, source: 'inferred' }
-        ],
-        rezipped: [],
-        rezippedSources: {}
-      })
-    }) as unknown as typeof fetch
-    await zippingService.setCurrentSession('session-burn', fetcher)
-
-    zippingService.incrementMessageCount('session-burn', fetcher)
-    await Promise.resolve()
-    expect(zippingService.getUnzippedInfo('zip-opened')?.messageCount).toBe(1)
-    expect(posted).toEqual([expect.objectContaining({ zipId: 'zip-opened', messageCount: 1, source: 'inferred' })])
-
-    // The second message reaches the duration: it returns to automatic, like any timed unzip.
-    zippingService.incrementMessageCount('session-burn', fetcher)
-    expect(zippingService.isUnzipped('zip-opened')).toBe(false)
-  })
 })
 
 describe('createZipStateView (F-P5-11: one per server compile)', () => {
@@ -270,5 +203,46 @@ describe('createZipStateView (F-P5-11: one per server compile)', () => {
     // A caller that edits the list it was handed changes nothing inside the view.
     view.getAllUnzipped().pop()
     expect(view.getAllUnzipped()).toHaveLength(1)
+  })
+})
+
+// SA-129 P2 (DL-08): the countdown is the server's now; the tab never counts. This is the one rule
+// the server's `advanceZipCountdowns` and a new message's compile both read.
+describe('countOneMoreMessage', () => {
+  const item = (zipId: string, extra: Partial<UnzippedItem>): UnzippedItem => ({
+    zipId,
+    sessionId: 's',
+    permanent: false,
+    unzippedAt: 1,
+    ...extra
+  })
+
+  it('counts one message on every temporary hold and ends one whose count reaches its duration', () => {
+    const { kept, ended } = countOneMoreMessage([
+      item('fresh', { duration: 10, messageCount: 0, source: 'user' }),
+      item('last', { duration: 2, messageCount: 1, source: 'inferred' }),
+      item('forever', { permanent: true, source: 'agent', path: 'a.ts' })
+    ])
+    expect(kept.map((entry) => [entry.zipId, entry.messageCount])).toEqual([
+      ['fresh', 1],
+      ['forever', undefined]
+    ])
+    expect(ended).toMatchObject([{ zipId: 'last', messageCount: 2, source: 'inferred' }])
+  })
+
+  it('never counts a hold marked permanent, even one that also carries a duration (the compile reads this list unfiltered)', () => {
+    const { kept, ended } = countOneMoreMessage([item('odd', { permanent: true, duration: 1, messageCount: 0 })])
+    expect(ended).toEqual([])
+    expect(kept).toMatchObject([{ zipId: 'odd', messageCount: 0 }])
+  })
+
+  it('never changes the records it was handed', () => {
+    const records = [item('a', { duration: 3, messageCount: 1 })]
+    countOneMoreMessage(records)
+    expect(records[0].messageCount).toBe(1)
+  })
+
+  it('the tab has no countdown of its own any more', () => {
+    expect((zippingService as any).incrementMessageCount).toBeUndefined()
   })
 })

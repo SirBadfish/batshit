@@ -1,7 +1,15 @@
 import { z } from 'zod'
+import { APP_ACTIONS_VERSION, P1_APP_ACTION_DESCRIPTORS, parseActionRequest } from '$lib/appActions/catalog'
+import { executeAgentAppAction } from './appActions/runtime'
+import { SETTINGS_ACTION_DESCRIPTORS } from '$lib/appActions/settings/fields'
+import { SETTINGS_FABRIC_CONTROLS, parseSettingsAction, type SettingsActionId } from '$lib/appActions/settingsContract'
+import { executeAgentSettingsAction } from './appActions/settingsAdapter'
+import { settingsControlAdmission } from './appActions/settingsAdmission'
 import { redis } from '$lib/server/redis'
+import { fetchZipForModel, MAX_FETCH_ZIP_CHARS } from './fetchZipForModel'
 import { buildControlApprovalPauseGuidance } from '$lib/utils/controlApprovalPresentation'
 import { requireActingAgentIdentity } from '$lib/server/services/actingAgentIdentity'
+import { getOriginatingReplyStopSignal } from './streamAbortRegistry'
 import {
   DEFAULT_DYNAMIC_MCP_RESULTS,
   MAX_DYNAMIC_MCP_RESULTS,
@@ -9,7 +17,9 @@ import {
   executeDynamicMcpUse as executeSharedDynamicMcpUse
 } from './dynamicMcpTools'
 import { ArtifactsService, type ArtifactRecord } from '$lib/server/artifacts/artifactsService'
-import { isArtifactAgentUseEligible } from '$lib/artifacts/agentUseEligibility'
+import { hasNoBatshitCompletionRuntime, isArtifactAgentUseEligible } from '$lib/artifacts/agentUseEligibility'
+import { PINOKIO_FILE_FIELD_HINT, pinokioFileFieldIds } from '$lib/artifacts/pinokioArtifact'
+import { ARTIFACT_INVOKE_RESERVED_KEYS } from '$lib/artifacts/reservedFabricIds'
 import { importSkillDefinition, toImportErrorResponse, type SkillImportInput } from './skillImport'
 import { buildSkillScreenWarning, screenImportedSkill } from './skillImportScreen'
 import { buildUntrustedTextAdvisory } from './untrustedText.jev'
@@ -27,6 +37,18 @@ import {
 } from '$lib/server/services/cliToolRegistry'
 import { checkByoSpeechStatus } from '$lib/server/services/voiceService'
 import { completeLocalVoiceEngineSetup } from '$lib/server/services/voiceLocalEngineSetup'
+import {
+  PINOKIO_RUN_DEFAULT_WAIT_SECONDS,
+  PINOKIO_RUN_MAX_WAIT_SECONDS,
+  detectPinokio,
+  getPinokioAppLogs,
+  getPinokioAppStatus,
+  pinokioAppIdProblem,
+  searchPinokioApps,
+  startPinokioApp,
+  type PinokioOutcome
+} from '$lib/server/services/pinokioService'
+import { describePinokioAppApi, pinokioReadyUrlToBase } from '$lib/server/services/pinokioAppEndpoint'
 import {
   deleteVoiceEngineModel,
   downloadVoiceEngineModel,
@@ -116,6 +138,7 @@ import {
   canonicalizeCatalogDeveloperId,
   catalogDeveloperIdsMatch
 } from '$lib/utils/catalogDeveloperIdentity'
+import { resolveCatalogConnectionLimits } from '$lib/utils/catalogConnectionLimits'
 import { buildCompactEditPreview } from '$lib/utils/editDiff'
 import {
   getArtifactRunLog,
@@ -253,7 +276,17 @@ type ControlExecutionContext = {
   userId: string
   agentId?: string | null
   sessionId?: string | null
+  messageId?: string | null
+  actorType?: ControlActorType
+  /** Server-resolved run scope; never a control input. */
+  mcpGatewayScope?: string[] | null
   selectedGateways?: string[]
+  /**
+   * The running reply's Stop (BL-454 review). Server-owned: set only from
+   * `ControlUseOptions.abortSignal`, which in-process callers fill from the AI SDK or the
+   * helper dispatch; no request body or control input reaches it.
+   */
+  abortSignal?: AbortSignal
 }
 
 type ControlHandler = (
@@ -295,8 +328,7 @@ const MAX_DYNAMIC_RESULTS = MAX_DYNAMIC_MCP_RESULTS
 const DEFAULT_DYNAMIC_RESULTS = DEFAULT_DYNAMIC_MCP_RESULTS
 const MAX_CONTROL_RESULTS = 50
 const DEFAULT_CONTROL_RESULTS = 20
-const MAX_ZIP_CHARS = 250_000
-const DEFAULT_ZIP_CHARS = 16_000
+const MAX_ZIP_CHARS = MAX_FETCH_ZIP_CHARS
 const DEFAULT_MODEL_CATALOG_RESULTS = 8
 const MAX_MODEL_CATALOG_RESULTS = 25
 const DYNAMIC_ARTIFACT_CONTROL_PREFIX = 'artifact.'
@@ -304,7 +336,8 @@ const DYNAMIC_ARTIFACT_CONTROL_PREFIX = 'artifact.'
 const zipFetchInputSchema = z.object({
   zipId: z.string().trim().min(1),
   includeContent: z.boolean().optional(),
-  maxChars: z.number().int().min(64).max(MAX_ZIP_CHARS).optional()
+  maxChars: z.number().int().min(64).max(MAX_ZIP_CHARS).optional(),
+  offset: z.number().int().min(0).optional()
 })
 
 const dynamicFindInputSchema = z.object({
@@ -517,7 +550,7 @@ const artifactCreateInputSchema = z
     metadata: z.record(z.string(), z.any()).optional(),
     sessionId: z.string().trim().min(1).optional(),
     slug: z.string().trim().min(1).nullable().optional(),
-    brain_type: z.enum(['built_in', 'webhook', 'n8n_workflow', 'custom_webhook', 'none']).optional(),
+    brain_type: z.enum(['built_in', 'webhook', 'n8n_workflow', 'custom_webhook', 'pinokio_app', 'none']).optional(),
     ai_enabled: z.boolean().optional(),
     webhook_url: z.string().trim().min(1).nullable().optional(),
     model: z.string().trim().min(1).nullable().optional(),
@@ -559,6 +592,8 @@ const artifactUpdateInputSchema = z
   .object({
     artifactId: z.string().trim().min(1),
     content: z.string().optional(),
+    // BL-818: the artifact `version` the edit was made on (see `executeArtifactUpdate`).
+    expectedVersion: z.number().int().min(0).optional(),
     versionDescription: z.string().optional(),
     sessionId: z.string().trim().min(1).optional(),
     name: z.string().trim().min(1).optional(),
@@ -568,7 +603,7 @@ const artifactUpdateInputSchema = z
     tags: z.array(z.string()).optional(),
     metadata: z.record(z.string(), z.any()).optional(),
     mode: z.enum(['edit', 'published']).optional(),
-    brain_type: z.enum(['built_in', 'webhook', 'n8n_workflow', 'custom_webhook', 'none']).optional(),
+    brain_type: z.enum(['built_in', 'webhook', 'n8n_workflow', 'custom_webhook', 'pinokio_app', 'none']).optional(),
     ai_enabled: z.boolean().optional(),
     webhook_url: z.string().trim().min(1).nullable().optional(),
     model: z.string().trim().min(1).nullable().optional(),
@@ -618,6 +653,8 @@ const artifactAddVersionInputSchema = z
   .object({
     artifactId: z.string().trim().min(1),
     content: z.string().min(1),
+    // BL-818: the artifact `version` the content was edited on (see `executeArtifactAddVersion`).
+    expectedVersion: z.number().int().min(0).optional(),
     description: z.string().optional()
   })
   .passthrough()
@@ -641,7 +678,7 @@ const artifactSetWebhookInputSchema = z
     artifactId: z.string().trim().min(1),
     webhook_url: z.string().trim().min(1).nullable().optional(),
     ai_enabled: z.boolean().optional(),
-    brain_type: z.enum(['built_in', 'webhook', 'n8n_workflow', 'custom_webhook', 'none']).optional()
+    brain_type: z.enum(['built_in', 'webhook', 'n8n_workflow', 'custom_webhook', 'pinokio_app', 'none']).optional()
   })
   .passthrough()
 
@@ -755,6 +792,49 @@ const runtimeAddonListInputSchema = z
 const runtimeAddonByIdInputSchema = z
   .object({
     addonId: z.enum(RUNTIME_ADDON_IDS)
+  })
+  .passthrough()
+
+// SA-072 P1 (DL-08): an installed Pinokio app is named by its folder id. The rule refuses URLs,
+// pinokio:// refs, and id@host BEFORE the risk gate, so a call that could never run raises no card.
+const pinokioAppIdSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .superRefine((value, ctx) => {
+    const problem = pinokioAppIdProblem(value)
+    if (problem) ctx.addIssue({ code: z.ZodIssueCode.custom, message: problem })
+  })
+
+const pinokioStatusInputSchema = z.object({}).passthrough()
+
+const pinokioSearchInputSchema = z
+  .object({
+    query: z.string().trim().max(200).optional(),
+    limit: z.number().int().min(1).max(50).optional()
+  })
+  .passthrough()
+
+const pinokioAppStatusInputSchema = z
+  .object({
+    appId: pinokioAppIdSchema,
+    probe: z.boolean().optional(),
+    describeApi: z.boolean().optional()
+  })
+  .passthrough()
+
+const pinokioLogsInputSchema = z
+  .object({
+    appId: pinokioAppIdSchema,
+    tail: z.number().int().min(1).max(500).optional()
+  })
+  .passthrough()
+
+const pinokioRunInputSchema = z
+  .object({
+    appId: pinokioAppIdSchema,
+    alsoStarts: z.array(pinokioAppIdSchema).max(20).optional(),
+    waitSeconds: z.number().int().min(5).max(PINOKIO_RUN_MAX_WAIT_SECONDS).optional()
   })
   .passthrough()
 
@@ -879,8 +959,8 @@ const ARTIFACT_CONTROL_SEEDS: ArtifactControlSeed[] = [
   {
     controlId: 'sys.artifact.update',
     title: 'Artifact Update',
-    description: 'Update artifact metadata/content, including structured icon_ref when changing the artifact icon. For built-in AI artifacts, set model_config only with an exact manual modelId or a known existing preset; ask before substituting a fallback model.',
-    schemaHint: 'artifactId + content/metadata/mode/icon_ref/model_config manual modelId',
+    description: 'Update artifact metadata/content, including structured icon_ref when changing the artifact icon. Sending `content` replaces the whole page, so it must carry `expectedVersion`: the `version` of your last result that loaded the whole page or wrote your own whole content (sys.artifact.get with content, create, a content update, or add_version; your own write returns the next version to use), never an apply_patch, publish, zone, webhook, metadata, field, or rollback result, which shows the stored version of a page you may not have read in full (load the artifact again with sys.artifact.get before your next full-content write, update or add_version). If the artifact was saved after that (by the user or another agent), the update is refused and nothing is saved: load it again with sys.artifact.get, redo your edit on that content, and update with the `version` sys.artifact.get shows. An update without `content` needs no version. Existing Agent Use and agent access settings are user-owned; agents must ask the user to change them in Settings. For built-in AI artifacts, set model_config only with an exact manual modelId or a known existing preset; ask before substituting a fallback model.',
+    schemaHint: 'artifactId + content with expectedVersion (the version your last get (with content)/create/content update/add_version showed, never apply_patch)/metadata/mode/icon_ref/model_config manual modelId',
     riskLevel: 'safe',
     tags: ['artifact', 'update', 'builder'],
     inputSchema: artifactUpdateInputSchema,
@@ -889,6 +969,11 @@ const ARTIFACT_CONTROL_SEEDS: ArtifactControlSeed[] = [
       properties: {
         artifactId: { type: 'string' },
         content: { type: 'string' },
+        expectedVersion: {
+          type: 'integer',
+          minimum: 0,
+          description: 'Required with `content`: the artifact `version` shown by your last result that loaded the whole page or wrote your own whole content (sys.artifact.get with content, create, a content update, or add_version), never an apply_patch, publish, zone, webhook, metadata, field, or rollback result. A newer save makes the update refuse and saves nothing; load the artifact again and redo the edit.'
+        },
         versionDescription: { type: 'string' },
         mode: { type: 'string', enum: ['edit', 'published'] },
         icon_ref: {
@@ -901,14 +986,15 @@ const ARTIFACT_CONTROL_SEEDS: ArtifactControlSeed[] = [
           description: 'For built-in AI artifacts, use { "mode": "basic", "primary": { "source": "manual", "modelId": "<exact-current-provider-model-id>" } } unless the user explicitly named an existing saved preset.'
         }
       },
-      required: ['artifactId']
+      required: ['artifactId'],
+      dependentRequired: { content: ['expectedVersion'] }
     },
     handler: async (context, input) => await executeArtifactUpdate(context, input)
   },
   {
     controlId: 'sys.artifact.validate_structure',
     title: 'Artifact Validate Structure',
-    description: 'Preflight-check artifact structure before save or publish.',
+    description: 'Dry-run the save checks (Builder Kit, Fabric contract, field names, script syntax) without saving. Saves run the same checks and list what to fix, so use this only to test a risky edit.',
     schemaHint: 'artifactId/content + optional metadata/mode',
     riskLevel: 'safe',
     tags: ['artifact', 'validation', 'builder', 'fabric'],
@@ -966,8 +1052,8 @@ const ARTIFACT_CONTROL_SEEDS: ArtifactControlSeed[] = [
   {
     controlId: 'sys.artifact.add_version',
     title: 'Artifact Add Version',
-    description: 'Create a new saved artifact version.',
-    schemaHint: 'artifactId + version payload',
+    description: 'Save `content` as a new artifact version and make it the current page. It replaces the whole page, so it must carry `expectedVersion`: the `version` of your last result that loaded the whole page or wrote your own whole content (sys.artifact.get with content, create, a content update, or add_version), never an apply_patch, publish, zone, webhook, metadata, field, or rollback result, which shows the stored version of a page you may not have read in full (load the artifact again with sys.artifact.get before your next full-content write, update or add_version). If the artifact was saved after that (by the user or another agent), nothing is saved: load it again with sys.artifact.get, redo your edit on that content, and save again with the `version` sys.artifact.get shows.',
+    schemaHint: 'artifactId + content + expectedVersion (the version your last get (with content)/create/content update/add_version showed, never apply_patch), optional description',
     riskLevel: 'safe',
     tags: ['artifact', 'versioning'],
     inputSchema: artifactAddVersionInputSchema,
@@ -976,9 +1062,14 @@ const ARTIFACT_CONTROL_SEEDS: ArtifactControlSeed[] = [
       properties: {
         artifactId: { type: 'string' },
         content: { type: 'string' },
+        expectedVersion: {
+          type: 'integer',
+          minimum: 0,
+          description: 'Required: the artifact `version` shown by your last result that loaded the whole page or wrote your own whole content (sys.artifact.get with content, create, a content update, or add_version), never an apply_patch, publish, zone, webhook, metadata, field, or rollback result. A newer save makes the call refuse and saves nothing; load the artifact again and redo the edit.'
+        },
         description: { type: 'string' }
       },
-      required: ['artifactId', 'content']
+      required: ['artifactId', 'content', 'expectedVersion']
     },
     handler: async (context, input) => await executeArtifactAddVersion(context, input)
   },
@@ -1032,7 +1123,7 @@ const ARTIFACT_CONTROL_SEEDS: ArtifactControlSeed[] = [
         artifactId: { type: 'string' },
         webhook_url: { type: 'string' },
         ai_enabled: { type: 'boolean' },
-        brain_type: { type: 'string', enum: ['built_in', 'webhook', 'n8n_workflow', 'custom_webhook', 'none'] }
+        brain_type: { type: 'string', enum: ['built_in', 'webhook', 'n8n_workflow', 'custom_webhook', 'pinokio_app', 'none'] }
       },
       required: ['artifactId']
     },
@@ -1162,6 +1253,74 @@ async function executeRuntimeAddonControl(
   return {
     addon: result
   }
+}
+
+// ---------------------------------------------------------------------------
+// SA-072 P1: the Pinokio family (`sys.pinokio.*`, DL-08).
+//
+// Pinokio is optional (DL-01). A missing, closed, or too-old Pinokio is an answer, not a crash:
+// `status` reports it, and the other four return a readable failure (useControl's
+// CONTROL_EXECUTION_FAILED with the reason in `details`) without a stack or a retry.
+// Every call is audited like any control; `run` also logs its start and outcome.
+// ---------------------------------------------------------------------------
+
+function pinokioFailure(outcome: Extract<PinokioOutcome<unknown>, { ok: false }>) {
+  return {
+    success: false as const,
+    error: outcome.message,
+    kind: outcome.kind,
+    ...(outcome.reason ? { reason: outcome.reason } : {}),
+    ...(outcome.raw ? { raw: outcome.raw } : {})
+  }
+}
+
+async function executePinokioStatus() {
+  return { pinokio: await detectPinokio({ fresh: true }) }
+}
+
+async function executePinokioSearch(_context: ControlExecutionContext, input: Record<string, any>) {
+  const outcome = await searchPinokioApps({ query: input.query, limit: input.limit })
+  if (!outcome.ok) return pinokioFailure(outcome)
+  return {
+    ...outcome.value,
+    ...(outcome.value.skippedRemote > 0
+      ? {
+          note: `${outcome.value.skippedRemote} app(s) from another Pinokio machine were left out: Batshit drives only the Pinokio on this computer.`
+        }
+      : {})
+  }
+}
+
+async function executePinokioAppStatus(_context: ControlExecutionContext, input: Record<string, any>) {
+  const outcome = await getPinokioAppStatus({ appId: input.appId, probe: input.probe })
+  if (!outcome.ok) return pinokioFailure(outcome)
+  if (input.describeApi !== true) return { app: outcome.value }
+  // SA-072 P2: what the app's own API looks like, for writing a Pinokio app artifact's recipe.
+  const baseUrl = outcome.value.state === 'online' && outcome.value.probe !== false ? pinokioReadyUrlToBase(outcome.value.readyUrl) : null
+  if (!baseUrl) {
+    return {
+      app: outcome.value,
+      api: null,
+      apiNote: `${outcome.value.title} must be running (and answer at a local address) to describe its API. Start it with sys.pinokio.run.`
+    }
+  }
+  return { app: outcome.value, api: await describePinokioAppApi(baseUrl) }
+}
+
+async function executePinokioLogs(_context: ControlExecutionContext, input: Record<string, any>) {
+  const outcome = await getPinokioAppLogs({ appId: input.appId, tail: input.tail })
+  if (!outcome.ok) return pinokioFailure(outcome)
+  return { logs: outcome.value }
+}
+
+async function executePinokioRun(_context: ControlExecutionContext, input: Record<string, any>) {
+  const outcome = await startPinokioApp({
+    appId: input.appId,
+    alsoStarts: input.alsoStarts,
+    waitSeconds: input.waitSeconds
+  })
+  if (!outcome.ok) return pinokioFailure(outcome)
+  return { run: outcome.value }
 }
 
 // ---------------------------------------------------------------------------
@@ -1465,7 +1624,7 @@ const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
     executorType: 'internal_handler',
     title: 'Memory Recall',
     description:
-      'Read chosen memories in full: the complete content returns immediately in this tool result (which never enters chat history), and the same memories then ride your Memory context from the next message onward, lingering per the linger settings. Supported API models and Codex CLI receive recalled images during this same reply, either in the tool result or in a follow-up model input within this reply — look at them now. Claude CLI and other deferred images use the next-message REMEMBERED MEDIA path. Each row\'s media_note says which happened. Search hits alone are just references; recall is the read.',
+      'Read chosen memories in full: the complete content returns immediately in this tool result (which never enters chat history), and the same memories then ride your Memory context from the next message onward, lingering per the linger settings. Supported API models and Codex CLI receive recalled images during this same reply, either in the tool result or in a follow-up model input within this reply — look at them now. Claude CLI and other deferred images use the next-message remembered_media path. Each row\'s media_note says which happened. Search hits alone are just references; recall is the read.',
     inputSchema: memoryRecallControlSchema,
     inputSchemaJson: {
       type: 'object',
@@ -1682,7 +1841,7 @@ const DM_CONTROL_DEFINITIONS: ControlDefinition[] = [
     executorType: 'internal_handler',
     title: 'DM List',
     description:
-      'List the open DMs in your inbox as summary lines (no bodies), urgent first then oldest. The DMs roster in DYNAMIC INFO already shows these; use this to see past the roster cap or to include closed items.',
+      'List the open DMs in your inbox as summary lines (no bodies), urgent first then oldest. The DMs roster in dynamic_info already shows these; use this to see past the roster cap or to include closed items.',
     inputSchema: z.object({}).passthrough(),
     inputSchemaJson: {
       type: 'object',
@@ -1888,7 +2047,7 @@ const CADENCE_SCHEMA_JSON = {
 }
 
 // ---------------------------------------------------------------------------
-// SA-120 P2: the Jev Juice judgment tool (`sys.judge.ask`).
+// SA-120 P2: the Judge Juice judgment tool (`sys.judge.ask`).
 //
 // Gating copies `sys.dm.*`: `safe`, PRIMARY actors only, broker exposure per agent on
 // `jev_juice_judge_tool` through `resolveBrokerFabricAllowedControlIds`, explicit false at
@@ -1923,9 +2082,9 @@ const JUDGE_CONTROL_DEFINITIONS: ControlDefinition[] = [
     controlId: 'sys.judge.ask',
     sourceType: 'core',
     executorType: 'internal_handler',
-    title: 'Ask Jev Juice',
+    title: 'Ask Judge Juice',
     description:
-      'Hand a piece of text or JSON (state) and a map of typed questions to TypeSafe\'s Jev, a fast non-generative judgment model, and get calibrated probabilities back in about a quarter of a second: noul (is this true?), choice (which of these options?), score (where on these levels?). Every question is answered in parallel in one call, so ask everything at once. Jev cannot write text, run tools, or approve anything; you read the probabilities and decide. The state leaves the machine and goes to TypeSafe.',
+      'Hand a piece of text or JSON (state) and a map of typed questions to the judge your user chose for this tool (TypeSafe\'s Jev unless they picked another), a fast non-generative judgment model, and get calibrated probabilities back, typically in well under a second: noul (is this true?), choice (which of these options?), score (where on these levels?). Every question is answered in parallel in one call, so ask everything at once. The judge cannot write text, run tools, or approve anything; you read the probabilities and decide. The state goes to that judge, which may be a cloud service.',
     inputSchema: judgeAskControlSchema,
     inputSchemaJson: {
       type: 'object',
@@ -1936,9 +2095,9 @@ const JUDGE_CONTROL_DEFINITIONS: ControlDefinition[] = [
         questions: {
           type: 'object',
           description:
-            'Map of your own question ids to questions. Each is {"type":"noul","instructions":"…"} (optional criteria {true,false}), {"type":"choice","instructions":"…","criteria":{"option":"description",…}} (2-255 options; add other/none), or {"type":"score","instructions":"…","criteria":["low level","…","high level"]} (2-10 levels). Put the whole question in instructions; the id is never shown to the model. Point at parts of state with backticks.'
+            'Map of your own question ids to questions. Each is {"type":"noul","instructions":"…"} (optional criteria {true,false}), {"type":"choice","instructions":"…","criteria":{"option":"description",…}} (2-255 options, fewer for a smaller judge; add other/none), or {"type":"score","instructions":"…","criteria":["low level","…","high level"]} (2-10 levels). Put the whole question in instructions; the id is never shown to the model. Point at parts of state with backticks.'
         },
-        model: { type: 'string', description: 'Optional; must be the configured Jev model id (omit to use it). jev-latest is refused.' }
+        model: { type: 'string', description: 'Optional; must be the configured judge\'s model id (omit to use it). jev-latest is refused.' }
       },
       required: ['state', 'questions']
     },
@@ -2093,11 +2252,196 @@ const SCHEDULE_CONTROL_DEFINITIONS: ControlDefinition[] = [
   }
 ]
 
+const PINOKIO_APP_ID_PROPERTY = {
+  type: 'string',
+  description: 'The installed app folder id from sys.pinokio.search, for example comfy.git. Not a URL, a pinokio:// ref, or id@host.'
+} as const
+
+/**
+ * SA-072 P1 (DL-08): five controls, broad Batshit Tools scope (`sys.pinokio.*` in
+ * `BROKER_FABRIC_BATSHIT_TOOLS_CONTROL_IDS`), so Subagents and Workers never get them. They act for
+ * the USER (`actsAsAgent: false`): nothing here reads anything an agent owns. Only `run` changes
+ * anything, and it is `confirm`: the user's Approve click starts an app (DL-03).
+ */
+const PINOKIO_CONTROL_DEFINITIONS: ControlDefinition[] = [
+  {
+    controlId: 'sys.pinokio.status',
+    sourceType: 'core',
+    executorType: 'internal_handler',
+    title: 'Pinokio Status',
+    description:
+      'Report whether Pinokio, the optional local app launcher, is installed and running on this computer: its version (8.2.0 or newer is required), its home folder, and its pterm command. Pinokio is optional; when it is not detected, say so and carry on without it.',
+    inputSchema: pinokioStatusInputSchema,
+    inputSchemaJson: { type: 'object', properties: {} },
+    outputSchema: null,
+    schemaHint: 'no input',
+    riskLevel: 'safe',
+    actsAsAgent: false,
+    status: 'published',
+    tags: ['pinokio', 'local', 'apps', 'launcher', 'status'],
+    handler: async () => await executePinokioStatus()
+  },
+  {
+    controlId: 'sys.pinokio.search',
+    sourceType: 'core',
+    executorType: 'internal_handler',
+    title: 'Pinokio Search',
+    description:
+      'List the apps installed in Pinokio on this computer, optionally filtered by words (for example "comfyui" or "speech"). Returns each app\'s folder id (appId), title, and state (offline, starting, online) with its ready URL. Never installs or downloads anything.',
+    inputSchema: pinokioSearchInputSchema,
+    inputSchemaJson: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Optional words to match; leave out to list every installed app.' },
+        limit: { type: 'number', description: 'Optional, 1-50.' }
+      }
+    },
+    outputSchema: null,
+    schemaHint: 'optional query, optional limit (1-50)',
+    riskLevel: 'safe',
+    actsAsAgent: false,
+    status: 'published',
+    tags: ['pinokio', 'local', 'apps', 'launcher', 'search', 'installed'],
+    handler: async (context, input) => await executePinokioSearch(context, input)
+  },
+  {
+    controlId: 'sys.pinokio.app_status',
+    sourceType: 'core',
+    executorType: 'internal_handler',
+    title: 'Pinokio App Status',
+    description:
+      'Check one installed Pinokio app: offline, starting, or online; whether it answers at its ready URL (probe, on by default); and the URL to call it at. With describeApi: true, a running app also reports what its own API looks like (a Gradio app\'s endpoints and parameters, or that it is ComfyUI), for building a Pinokio app artifact.',
+    inputSchema: pinokioAppStatusInputSchema,
+    inputSchemaJson: {
+      type: 'object',
+      properties: {
+        appId: PINOKIO_APP_ID_PROPERTY,
+        probe: { type: 'boolean', description: 'Check that the app answers at its URL (default true).' },
+        describeApi: { type: 'boolean', description: 'Also describe the running app\'s own API (Gradio endpoints, or ComfyUI).' }
+      },
+      required: ['appId']
+    },
+    outputSchema: null,
+    schemaHint: 'appId (from sys.pinokio.search), optional probe, optional describeApi',
+    riskLevel: 'safe',
+    actsAsAgent: false,
+    status: 'published',
+    tags: ['pinokio', 'local', 'apps', 'status', 'ready'],
+    handler: async (context, input) => await executePinokioAppStatus(context, input)
+  },
+  {
+    controlId: 'sys.pinokio.logs',
+    sourceType: 'core',
+    executorType: 'internal_handler',
+    title: 'Pinokio Logs',
+    description:
+      'Read the last lines of one installed Pinokio app\'s launch log, for example to see why it did not start.',
+    inputSchema: pinokioLogsInputSchema,
+    inputSchemaJson: {
+      type: 'object',
+      properties: {
+        appId: PINOKIO_APP_ID_PROPERTY,
+        tail: { type: 'number', description: 'How many lines, 1-500 (default 50).' }
+      },
+      required: ['appId']
+    },
+    outputSchema: null,
+    schemaHint: 'appId (from sys.pinokio.search), optional tail (1-500)',
+    riskLevel: 'safe',
+    actsAsAgent: false,
+    status: 'published',
+    tags: ['pinokio', 'local', 'apps', 'logs'],
+    handler: async (context, input) => await executePinokioLogs(context, input)
+  },
+  {
+    controlId: 'sys.pinokio.run',
+    sourceType: 'core',
+    executorType: 'internal_handler',
+    title: 'Pinokio Run',
+    description: `Start one installed Pinokio app on this computer; the user approves every start. It waits up to ${PINOKIO_RUN_DEFAULT_WAIT_SECONDS} s (waitSeconds, 5-${PINOKIO_RUN_MAX_WAIT_SECONDS}) for the app to answer at its URL. An app still starting after that keeps starting in Pinokio: check it with sys.pinokio.app_status. An app that is already running is left alone. If the app's launcher also starts other apps (PINOKIO_SCRIPT_REQUIRES), name them in alsoStarts so the approval shows them. Never installs, downloads, stops, or deletes anything.`,
+    inputSchema: pinokioRunInputSchema,
+    inputSchemaJson: {
+      type: 'object',
+      properties: {
+        appId: PINOKIO_APP_ID_PROPERTY,
+        alsoStarts: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Only when the app requires other apps: every app folder id its start also starts.'
+        },
+        waitSeconds: { type: 'number', description: `Optional, 5-${PINOKIO_RUN_MAX_WAIT_SECONDS} (default ${PINOKIO_RUN_DEFAULT_WAIT_SECONDS}).` }
+      },
+      required: ['appId']
+    },
+    outputSchema: null,
+    schemaHint: `appId (from sys.pinokio.search); alsoStarts only when the app requires others; optional waitSeconds (5-${PINOKIO_RUN_MAX_WAIT_SECONDS})`,
+    riskLevel: 'confirm',
+    actsAsAgent: false,
+    status: 'published',
+    tags: ['pinokio', 'local', 'apps', 'launcher', 'start', 'run'],
+    handler: async (context, input) => await executePinokioRun(context, input)
+  }
+]
+
+// Five fixed safe capabilities. No actionId, actor, session or arbitrary-path wrapper.
+const APP_ACTION_CONTROL_DEFINITIONS: ControlDefinition[] = P1_APP_ACTION_DESCRIPTORS.map(action => {
+  const inputSchema = z.object({
+    requestId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/),
+    targetDocumentId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/).optional(),
+    args: z.record(z.string(), z.unknown()).superRefine((args, context) => {
+      try {
+        parseActionRequest({ requestId: 'validation', documentId: 'validation', documentEpoch: 'validation',
+          catalogVersion: APP_ACTIONS_VERSION, expectedSessionId: null, expiresAt: 1, actionId: action.id, args })
+      } catch { context.addIssue({ code: 'custom', message: 'Arguments do not match this App Action.' }) }
+    })
+  }).strict()
+  return {
+    controlId: `sys.ui.${action.id.replace('.', '_')}`, sourceType: 'core', executorType: 'internal_handler',
+    title: action.label, description: `${action.label} in the exact live main document showing this agent's bound session. ${action.id === 'settings.open' ? 'For tab=agents, pass args.agentId for the requested Primary Agent; your own settings means the acting Primary Agent ID. Omit args.agentId only for an intentional generic Agents view. A tab-only receipt does not identify the visible agent. ' : ''}Refuses no tab, ambiguity, drafts, Desktop mode and stale state. Outcomes distinguish visible and saved state; unknown outcomes must not be retried.`,
+    inputSchema, inputSchemaJson: { type: 'object', additionalProperties: false, required: ['requestId', 'args'], properties: {
+      requestId: { type: 'string', maxLength: 128, description: 'Unique request ID; identical retries retrieve the receipt and never repeat effects.' },
+      targetDocumentId: { type: 'string', maxLength: 128, description: 'Exact registrationId from an ambiguous_target documents entry; omit only for a unique eligible tab.' },
+      args: action.inputSchema
+    } }, outputSchema: null, schemaHint: action.id === 'settings.open'
+      ? 'requestId, args.tab; own/specific Agents require args.agentId=the requested Primary ID; omit only for generic Agents view. Optional targetDocumentId selects the window, not the agent.'
+      : 'requestId, args; optional targetDocumentId for exact targeting',
+    riskLevel: 'safe', actsAsAgent: true, status: 'published', tags: ['App Actions', 'ui', ...action.effects],
+    handler: (context, input) => executeAgentAppAction(context, { requestId: input.requestId, actionId: action.id,
+      args: input.args, ...(input.targetDocumentId ? { targetDocumentId: input.targetDocumentId } : {}) })
+  }
+})
+
+// Leaf schemas and fixed risk are consumed verbatim; normal Fabric scope, identity,
+// dry-run, consent and audit remain the only agent execution admission path.
+const SETTINGS_APP_ACTION_CONTROL_DEFINITIONS: ControlDefinition[] = SETTINGS_ACTION_DESCRIPTORS.map(action => {
+  const id = action.id as SettingsActionId
+  const controlId = SETTINGS_FABRIC_CONTROLS[id]
+  if (!controlId || action.owner !== 'server' || !action.callers.includes('agent') || !action.actsAsAgent) {
+    throw new Error('Unbound Settings App Action descriptor.')
+  }
+  return {
+    controlId, sourceType: 'core', executorType: 'internal_handler', title: action.label,
+    description: `${action.postcondition} ${action.undo} The acting agent is server-vouched and separate from subjectAgentId; own-agent actions refuse another subject. Saved/readback results do not prove a mounted panel refreshed.`,
+    inputSchema: z.record(z.string(), z.unknown()).superRefine((args, context) => {
+      try { parseSettingsAction(id, args) }
+      catch { context.addIssue({ code: 'custom', message: 'Arguments do not match this fixed Settings action.' }) }
+    }), inputSchemaJson: action.inputSchema, outputSchema: null,
+    schemaHint: id === 'settings.inspect' ? 'tab; subjectAgentId only for agents or memory'
+      : id.endsWith('.update') ? 'subjectAgentId, expectedRevision from read, exact changes'
+        : 'subjectAgentId: the acting Primary Agent only',
+    riskLevel: action.risk, actsAsAgent: true, status: 'published', tags: ['App Actions', 'ui', 'settings'],
+    handler: (context, input) => executeAgentSettingsAction(context, id, input)
+  }
+})
+
 const CONTROL_DEFINITIONS: ControlDefinition[] = [
+  ...APP_ACTION_CONTROL_DEFINITIONS,
+  ...SETTINGS_APP_ACTION_CONTROL_DEFINITIONS,
   ...MEMORY_CONTROL_DEFINITIONS,
   ...DM_CONTROL_DEFINITIONS,
   ...SCHEDULE_CONTROL_DEFINITIONS,
   ...JUDGE_CONTROL_DEFINITIONS,
+  ...PINOKIO_CONTROL_DEFINITIONS,
   {
     controlId: 'sys.model_catalog.search',
     sourceType: 'core',
@@ -2156,7 +2500,8 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
       properties: {
         zipId: { type: 'string' },
         includeContent: { type: 'boolean' },
-        maxChars: { type: 'integer', minimum: 64, maximum: MAX_ZIP_CHARS }
+        maxChars: { type: 'integer', minimum: 64, maximum: MAX_ZIP_CHARS },
+        offset: { type: 'integer', minimum: 0 }
       },
       required: ['zipId']
     },
@@ -2168,12 +2513,12 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
         content: { type: 'string' }
       }
     },
-    schemaHint: 'zipId (required), includeContent?, maxChars?',
+    schemaHint: 'zipId (required), includeContent?, maxChars?, offset?',
     riskLevel: 'safe',
     actsAsAgent: false,
     status: 'published',
     tags: ['zip', 'context', 'history'],
-    handler: async (context, input) => executeZipFetch(context.userId, input)
+    handler: async (context, input) => executeZipFetch(context, input)
   },
   {
     controlId: 'sys.goon_scene.creator_info',
@@ -2905,6 +3250,13 @@ export interface ControlFindOptions {
   includeDraft?: boolean
   limit?: number
   allowedControlIds?: string[]
+  /**
+   * BL-81 — the search comes from a Subagent or Worker run's credential. It then lists only
+   * `delegatedAllowedControlIds` (absent means nothing), so a delegated run is shown exactly
+   * what `useControl` will run for it, the way its DCM index already is.
+   */
+  delegatedRun?: boolean
+  delegatedAllowedControlIds?: string[] | null
 }
 
 export interface ControlFindResultItem {
@@ -2930,6 +3282,20 @@ export interface ControlFindResult {
 export interface ControlUseOptions {
   userId: string
   controlId: string
+  /**
+   * The running reply's Stop, for a control that runs something the Stop must end
+   * (`sys.mcp.dynamic.use`, BL-454 review). In-process callers only; never read from a body.
+   */
+  abortSignal?: AbortSignal
+  /**
+   * BL-1314 — on a request lane, the chat and the reply the caller's run credential was minted
+   * for. Only `/api/controls/use` sets it, from the credential (never the body). A Settings
+   * write from any lane but `in-process` is admitted only on the Stop of that exact reply, read
+   * at admission (`getOriginatingReplyStopSignal`), never on `abortSignal`: there that is the
+   * chat's running reply, which a still-valid credential of an earlier run would share with a
+   * newer reply, and which the route read before its own awaited work.
+   */
+  originatingReply?: { sessionId: string; messageId: string | null }
   agentId?: string
   sessionId?: string
   /**
@@ -2982,6 +3348,26 @@ export interface ControlUseOptions {
    * is a per-run runtime id rather than one of the user's agents.
    */
   delegatedRun?: boolean
+  /**
+   * BL-81 — what that delegated run may use: the control ids its DCM index offered it, off its
+   * credential (`resolveDelegatedRunAllowedControlIds`). **Read only beside `delegatedRun:
+   * true`**, and there a missing list is an empty one: a delegated call with no list is refused
+   * every control, so nothing can reach this function as a delegated run and fail open.
+   */
+  delegatedAllowedControlIds?: string[] | null
+  /**
+   * BL-81 — that delegated run's Subagent or Worker (the credential's `scopeAgentId`, BL-75),
+   * the id a control's agent ALLOWLIST is judged by (Settings -> Agents -> Access writes it
+   * there). **Honoured only beside `delegatedRun: true`**, so a stray value can never re-scope a
+   * primary's own call.
+   *
+   * It does not replace `agentId`. The identity gate, the risk gate, the handler and the audit's
+   * `agentId` keep the per-run id, because a Subagent's id can equal a primary's and a delegated
+   * run must never borrow that primary's inbox, consent or record.
+   */
+  scopeAgentId?: string | null
+  /** Server-resolved run scope; never a control input. */
+  mcpGatewayScope?: string[] | null
   selectedGateways?: string[]
   allowedControlIds?: string[]
 }
@@ -3066,6 +3452,7 @@ export type ControlUseErrorCode =
   | 'CONTROL_NOT_FOUND'
   | 'CONTROL_NOT_ALLOWED'
   | 'CONTROL_INPUT_INVALID'
+  | 'CONTROL_CANCELLATION_REQUIRED'
   | 'CONTROL_RISK_REQUIRES_APPROVAL'
   // SA-116 DL-116-10. `CONTROL_RISK_NEEDS_HUMAN_TURN` (SA-113 F-SEC-1) is RETIRED: a woken
   // turn now pauses for the same card as any other turn, so there is nothing left for the
@@ -3115,6 +3502,13 @@ type ControlAuditEntry = {
    * service lane, which after DL-117-05 can no longer act AS an agent at all).
    */
   agentId: string | null
+  /**
+   * BL-81 — on a delegated run, the Subagent or Worker whose artifact allowlists applied,
+   * beside the per-run id in `agentId` that its credential authenticated. `null` on every
+   * other call, where `agentId` alone governs. Once the run's credential is revoked this is the
+   * only record of which Subagent a delegated call was judged as.
+   */
+  scopeAgentId: string | null
   sessionId: string | null
   credentialId: string | null
   approval: ControlApprovalAudit | null
@@ -3248,61 +3642,28 @@ function normalizeEnabledAgentIdsForCommand(
   return fallback ? [fallback] : []
 }
 
-async function executeZipFetch(userId: string, input: Record<string, any>) {
-  const zipId = typeof input.zipId === 'string' ? input.zipId.trim() : ''
-  if (!zipId) {
+async function executeZipFetch(context: ControlExecutionContext, input: Record<string, any>) {
+  if (context.actorType !== 'agent' && context.actorType !== 'in-process') {
     return {
       found: false,
-      zipId: ''
+      zipId: typeof input.zipId === 'string' ? input.zipId : '',
+      reason: 'Fetch Zip requires a verified model run.',
+      code: 'MODEL_SCOPE_REQUIRED'
     }
   }
+  return fetchZipForModel(context, {
+    zipId: input.zipId,
+    includeContent: input.includeContent,
+    maxChars: input.maxChars,
+    offset: input.offset
+  })
+}
 
-  const zipData = await redis.getZip(zipId)
-  if (!zipData || typeof zipData !== 'object') {
-    return {
-      found: false,
-      zipId
-    }
-  }
-
-  const sessionId = (zipData as any)?.metadata?.sessionId || (zipData as any)?.metadata?.session_id || null
-  if (sessionId) {
-    const session = await redis.getSession(sessionId)
-    const owner = (session as any)?.user_id || (session as any)?.userId || null
-    if (owner && owner !== userId) {
-      return {
-        found: false,
-        zipId,
-        reason: 'Zip belongs to a different user.'
-      }
-    }
-  }
-
-  const fullContent = typeof (zipData as any).content === 'string' ? (zipData as any).content : ''
-  const includeContent = input.includeContent !== false
-  const maxChars = clampNumber(
-    typeof input.maxChars === 'number' ? input.maxChars : DEFAULT_ZIP_CHARS,
-    64,
-    MAX_ZIP_CHARS
-  )
-  const content = includeContent ? fullContent.slice(0, maxChars) : undefined
-
-  return {
-    found: true,
-    zipId: (zipData as any).id ?? zipId,
-    type: (zipData as any).type ?? 'unknown',
-    tokens: (zipData as any).tokens ?? null,
-    description: (zipData as any).description ?? null,
-    createdAt: (zipData as any).created_at ?? (zipData as any).createdAt ?? null,
-    metadata: (zipData as any).metadata ?? {},
-    ...(includeContent
-      ? {
-          content,
-          contentLength: fullContent.length,
-          contentTruncated: fullContent.length > maxChars
-        }
-      : {})
-  }
+function narrowMcpGatewayFilters(outer?: string[], inner?: string[]): string[] | undefined {
+  if (!outer) return inner
+  if (!inner) return outer
+  const allowed = new Set(outer)
+  return inner.filter((id) => allowed.has(id))
 }
 
 async function executeDynamicMcpFind(context: ControlExecutionContext, input: Record<string, any>) {
@@ -3314,7 +3675,8 @@ async function executeDynamicMcpFind(context: ControlExecutionContext, input: Re
     group: input.group,
     exact: input.exact === true,
     limit: typeof input.limit === 'number' ? input.limit : DEFAULT_DYNAMIC_RESULTS,
-    selectedGateways: normalizeStringArray(input.selectedGateways) ?? context.selectedGateways,
+    mcpGatewayScope: context.mcpGatewayScope,
+    selectedGateways: narrowMcpGatewayFilters(context.selectedGateways, normalizeStringArray(input.selectedGateways)),
     includeSchema: input.includeSchema === true,
     projectPath: typeof input.projectPath === 'string' ? input.projectPath : null
   })
@@ -3327,9 +3689,11 @@ async function executeDynamicMcpUse(context: ControlExecutionContext, input: Rec
     agentId: context.agentId ?? null,
     toolName,
     params: input.params && typeof input.params === 'object' ? input.params : {},
-    selectedGateways: normalizeStringArray(input.selectedGateways) ?? context.selectedGateways,
+    mcpGatewayScope: context.mcpGatewayScope,
+    selectedGateways: narrowMcpGatewayFilters(context.selectedGateways, normalizeStringArray(input.selectedGateways)),
     projectPath: typeof input.projectPath === 'string' ? input.projectPath : null,
-    internalToolError: `Tool "${toolName}" is internal-only and not callable via sys.mcp.dynamic.use.`
+    internalToolError: `Tool "${toolName}" is internal-only and not callable via sys.mcp.dynamic.use.`,
+    abortSignal: context.abortSignal ?? null
   })
 }
 
@@ -3865,10 +4229,58 @@ function serializeControlError(error: unknown): { message: string; status: numbe
 export const ARTIFACT_STRUCTURE_AGENT_NEXT_STEP =
   'Agent next step: load the Artifact Creator skill with `native_skill` (skillId `artifact_creator`) if it is listed in your skills, then rebuild the artifact with its Builder Kit and Fabric steps. If it is not listed, you cannot load it: ask the user to turn on Artifact Creator for you in Settings -> Agents -> Access (or for every agent in Settings -> Skills & Prompts). Suggest turning enforcement off only if the user asked for a raw, hand-written artifact.'
 
+// Review of BL-89: a save refused only for unnamed fields gets its own code and a step that fits
+// it. Loading the skill to "rebuild the artifact", or switching enforcement off, is not the fix
+// for a missing label.
+export const ARTIFACT_FIELD_NAME_AGENT_NEXT_STEP =
+  'Agent next step: add `label` or `aria-label` to the listed fields and save again.'
+
+const ARTIFACT_REFUSAL_AGENT_NEXT_STEPS = new Map<unknown, string>([
+  ['ARTIFACT_STRUCTURE_ENFORCED', ARTIFACT_STRUCTURE_AGENT_NEXT_STEP],
+  ['ARTIFACT_FIELD_NAME_REQUIRED', ARTIFACT_FIELD_NAME_AGENT_NEXT_STEP]
+])
+
+// BL-818: the service's own stale-version sentence speaks to the Settings panel's user ("this edit",
+// "load the current version") and names both version numbers. An agent needs the control that loads
+// the artifact and the field its next write must carry, and no number to copy: the stored version
+// would let it resend its OLD page unchanged. The words hold for every control that can meet the
+// conflict (`update`, `add_version`, and `apply_patch` or `rollback` in a cross-process race).
+const ARTIFACT_VERSION_CONFLICT_AGENT_MESSAGE =
+  'Not saved: this artifact changed after you read it, so saving your edit would have replaced a newer save (the user\'s, or another agent\'s). Agent next step: load the current artifact with `sys.artifact.get` (artifactId), redo your edit on that content, then save again; a write of `content` (`sys.artifact.update`, `sys.artifact.add_version`) must carry the `expectedVersion` (the `version`) that `sys.artifact.get` shows.'
+
+// BL-818: a whole-page write (`sys.artifact.update` with `content`, or `sys.artifact.add_version`)
+// sent without `expectedVersion`. It is refused before any read or write.
+function buildArtifactExpectedVersionRequiredMessage(controlId: 'sys.artifact.update' | 'sys.artifact.add_version'): string {
+  const isUpdate = controlId === 'sys.artifact.update'
+  return `Not saved: ${isUpdate ? '`sys.artifact.update` with `content`' : '`sys.artifact.add_version`'} replaces the whole page, so it must carry \`expectedVersion\`: the \`version\` of your last result that loaded the whole page or wrote your own whole content (\`sys.artifact.get\` with content, create, a content update, or add_version), never an apply_patch, publish, zone, webhook, metadata, field, or rollback result, which shows the stored version of a page you may not have read in full. That stops it from replacing a newer save by the user or another agent. If you have no such result, load the artifact with \`sys.artifact.get\` (artifactId), make your edit on that content, then send \`${controlId}\` again with your \`content\` and \`expectedVersion\`.${isUpdate ? ' An update without `content` needs no version.' : ''}`
+}
+
+// A refusal a handler returns as a result keeps its own status and code inside `details`; this picks
+// the control error code that says what kind of refusal it is (BL-829 access, BL-818 missing version).
+function controlErrorCodeForHandlerRefusal(controlId: string, code: unknown): ControlUseErrorCode {
+  if (controlId === 'sys.artifact.update' && code === 'ARTIFACT_ACCESS_USER_ONLY') return 'CONTROL_NOT_ALLOWED'
+  if (
+    (controlId === 'sys.artifact.update' || controlId === 'sys.artifact.add_version') &&
+    code === 'ARTIFACT_EXPECTED_VERSION_REQUIRED'
+  ) {
+    return 'CONTROL_INPUT_INVALID'
+  }
+  return 'CONTROL_EXECUTION_FAILED'
+}
+
 function toArtifactExecutionError(error: unknown) {
   const normalized = serializeControlError(error)
   const code = error && typeof error === 'object' ? (error as { code?: unknown }).code : undefined
-  if (code === 'ARTIFACT_STRUCTURE_ENFORCED') {
+  if (code === 'ARTIFACT_VERSION_CONFLICT') {
+    return {
+      success: false,
+      error: ARTIFACT_VERSION_CONFLICT_AGENT_MESSAGE,
+      status: normalized.status,
+      code
+    }
+  }
+  const nextStep = ARTIFACT_REFUSAL_AGENT_NEXT_STEPS.get(code)
+  if (nextStep) {
     const rawIssues = (error as { details?: { issues?: unknown } }).details?.issues
     const issues = Array.isArray(rawIssues)
       ? rawIssues
@@ -3877,7 +4289,7 @@ function toArtifactExecutionError(error: unknown) {
       : []
     return {
       success: false,
-      error: `${normalized.message}\n${ARTIFACT_STRUCTURE_AGENT_NEXT_STEP}`,
+      error: `${normalized.message}\n${nextStep}`,
       status: normalized.status,
       code,
       issues
@@ -4786,6 +5198,7 @@ function toModelCatalogResult(
   includePricing: boolean
 ): Record<string, any> {
   const selected = selectCatalogVariant(entry, requestedConnection)
+  const connectionLimits = resolveCatalogConnectionLimits(entry, selected.connectionId)
   const modelIdForArtifact =
     selected.variant?.effectiveId ||
     selected.variant?.modelId ||
@@ -4843,8 +5256,9 @@ function toModelCatalogResult(
     },
     tags: (entry.tags ?? []).slice(0, 12),
     features: entry.features ?? {},
-    contextWindow: entry.contextWindow ?? null,
-    maxOutputTokens: entry.maxOutputTokens ?? null,
+    // BL-68: the selected connection's own limits when it has them, else the row's.
+    contextWindow: connectionLimits.contextWindow ?? null,
+    maxOutputTokens: connectionLimits.maxOutputTokens ?? null,
     variants: catalogVariantEntries(entry).map(({ connectionId, variant }) => ({
       connectionId,
       developer: variant.developerId,
@@ -4951,6 +5365,7 @@ async function executeGoonSceneCreatorInfo(): Promise<Record<string, any>> {
       'Create copy-ready skybox prompts, negative prompts, texture notes, and Scene Editor import steps.',
       'Plan saved Ground Projection Line plus Uploaded GLB Room Shell scale, offset, Y rotation, and Align Floor/manual-Y confirmation.',
       'Plan one saved built-in Scene Atmosphere layer with a supported preset and placement.',
+      'Create image-first panoramas and muted looping MP4/WebM skyboxes using the optional animation reference and configurable light renderer.',
       'Use the bundled Qwen 360 ComfyUI workflow references and assets when ComfyUI is available.'
     ],
     limitations: [
@@ -4962,12 +5377,18 @@ async function executeGoonSceneCreatorInfo(): Promise<Record<string, any>> {
       'references/batshit-scene-spec.md',
       'references/skybox-generation.md',
       'references/qwen360-skybox-workflow.md',
+      'references/image-first-panorama.md',
+      'references/animated-panorama.md',
       'references/lofi-showcase-aesthetics.md'
     ],
     assets: [
       'assets/comfyui/qwen360-skybox-api-workflow.json',
       'assets/comfyui/qwen360-skybox-ui-workflow.json',
-      'assets/comfyui/qwen360-skybox-metadata.json'
+      'assets/comfyui/qwen360-skybox-metadata.json',
+      'assets/comfyui/night-city-full-reference-pano.api.json',
+      'assets/comfyui/night-city-seam-repair.api.json',
+      'assets/comfyui/night-city-8k-clean.api.json',
+      'assets/animation/animate-panorama.py'
     ]
   }
 }
@@ -5130,10 +5551,35 @@ async function executeArtifactUpdate(
   context: ControlExecutionContext,
   input: Record<string, any>
 ): Promise<Record<string, any>> {
+  // Access is owned by the user. Check presence before any read or partial save;
+  // false, null, and an empty allowlist are still access changes.
+  const changesAccess = ['agent_use_enabled', 'agent_access_scope', 'agent_allowlist'].some((key) =>
+    Object.prototype.hasOwnProperty.call(input, key)
+  )
+  if (changesAccess && context.actorType !== 'session' && context.actorType !== 'service') {
+    return {
+      success: false,
+      status: 403,
+      code: 'ARTIFACT_ACCESS_USER_ONLY',
+      error: 'Only the user can change artifact Agent Use or agent access. Ask the user to change these in Settings → Artifacts or Settings → Agents → Access. Nothing was saved.'
+    }
+  }
+  // BL-818: a full `content` replacement names the version it was made on, or the write could take
+  // back a newer save from the user (or another agent) without a word. Refused before any read or
+  // write. The stale case is refused by the service's own atomic check below, under the write lock.
+  if (typeof input.content === 'string' && input.expectedVersion === undefined) {
+    return {
+      success: false,
+      status: 400,
+      code: 'ARTIFACT_EXPECTED_VERSION_REQUIRED',
+      error: buildArtifactExpectedVersionRequiredMessage('sys.artifact.update')
+    }
+  }
   try {
     const artifactId = normalizeArtifactId(input.artifactId)
     const artifactsService = new ArtifactsService()
-    const { artifactId: _artifactId, userId: _ignoredUserId, ...updates } = input
+    // `expectedVersion` is the check's input, never a field of the record.
+    const { artifactId: _artifactId, userId: _ignoredUserId, expectedVersion, ...updates } = input
     const previousArtifact =
       typeof updates.content === 'string'
         ? await artifactsService.getOwned(artifactId, context.userId)
@@ -5141,7 +5587,10 @@ async function executeArtifactUpdate(
     const updatedFields = Object.entries(updates)
       .filter(([key, value]) => key !== 'sessionId' && key !== 'versionDescription' && value !== undefined)
       .map(([key]) => key)
-    const artifact = await artifactsService.update(artifactId, context.userId, updates)
+    const artifact =
+      expectedVersion === undefined
+        ? await artifactsService.update(artifactId, context.userId, updates)
+        : await artifactsService.update(artifactId, context.userId, updates, { expectedVersion })
     const diff =
       previousArtifact && previousArtifact.content !== artifact.content
         ? buildCompactEditPreview({
@@ -5268,6 +5717,17 @@ async function executeArtifactAddVersion(
   context: ControlExecutionContext,
   input: Record<string, any>
 ): Promise<Record<string, any>> {
+  // BL-818: this writes `content` as the whole page (it always needs content), so it names the
+  // version it was made on, like `sys.artifact.update` with `content`. Refused before any read or
+  // write; the stale case is refused by the service's atomic check under the write lock.
+  if (input.expectedVersion === undefined) {
+    return {
+      success: false,
+      status: 400,
+      code: 'ARTIFACT_EXPECTED_VERSION_REQUIRED',
+      error: buildArtifactExpectedVersionRequiredMessage('sys.artifact.add_version')
+    }
+  }
   try {
     const artifactId = normalizeArtifactId(input.artifactId)
     const content = typeof input.content === 'string' ? input.content : ''
@@ -5284,7 +5744,8 @@ async function executeArtifactAddVersion(
       artifactId,
       context.userId,
       content,
-      typeof input.description === 'string' ? input.description : undefined
+      typeof input.description === 'string' ? input.description : undefined,
+      { expectedVersion: input.expectedVersion }
     )
     return {
       success: true,
@@ -6099,6 +6560,12 @@ function buildArtifactDynamicRecords(artifact: ArtifactRecord): ControlRegistryR
     origin: 'system'
   })
 
+  // An artifact with no AI or webhook behind it (a static calculator) cannot be run by anyone but
+  // the user in its panel: /api/artifacts/complete refuses it. It keeps its settings controls, but
+  // it is never offered as a runnable tool (BL-77: a build once discovered its own static tool, ran
+  // it, got the 400, and switched agent use off, three wasted steps).
+  const runnable = !hasNoBatshitCompletionRuntime(artifact)
+
   const records: ControlRegistryRecord[] = [
     createRecord({
       suffix: 'field.model.set',
@@ -6186,7 +6653,7 @@ function buildArtifactDynamicRecords(artifact: ArtifactRecord): ControlRegistryR
       },
       handlerId: 'artifact.action.unpublish.run'
     }),
-    createRecord({
+    ...(!runnable ? [] : [createRecord({
       suffix: 'action.run.run',
       title: `${artifact.name}: run`,
       description: 'Execute this artifact with a prompt.',
@@ -6202,7 +6669,7 @@ function buildArtifactDynamicRecords(artifact: ArtifactRecord): ControlRegistryR
         additionalProperties: true
       },
       handlerId: 'artifact.action.run.run'
-    }),
+    })]),
     createRecord({
       suffix: 'action.publish_status.get',
       title: `${artifact.name}: publish status`,
@@ -6220,9 +6687,12 @@ function buildArtifactDynamicRecords(artifact: ArtifactRecord): ControlRegistryR
   // Per-artifact runtime capability:
   // - typed invoke when fabric_fields exist
   // - run-only invoke when metadata.run_only=true
-  if (artifact.mode === 'published' && artifact.slug && (hasTypedFields || runOnly)) {
+  if (runnable && artifact.mode === 'published' && artifact.slug && (hasTypedFields || runOnly)) {
     // Build input schema from fabric_fields
     const fieldProperties: Record<string, any> = {}
+    // SA-072 P2: a Pinokio app artifact's file fields take a Clip id, which is how an agent
+    // knows an attached picture; say so where the agent reads the field.
+    const fileFieldIds = pinokioFileFieldIds(artifact)
     for (const field of fabricFields) {
       if (!field.fabricId || typeof field.fabricId !== 'string') continue
       const prop: Record<string, any> = {}
@@ -6263,6 +6733,9 @@ function buildArtifactDynamicRecords(artifact: ArtifactRecord): ControlRegistryR
           break
       }
       if (field.label) prop.description = field.label
+      if (fileFieldIds.has(field.fabricId)) {
+        prop.description = `${field.label ? `${field.label}: ` : ''}${PINOKIO_FILE_FIELD_HINT}`
+      }
       fieldProperties[field.fabricId] = prop
     }
     // Always allow an optional prompt override unless the artifact already exposes
@@ -6283,7 +6756,7 @@ function buildArtifactDynamicRecords(artifact: ArtifactRecord): ControlRegistryR
       schemaHint: hasTypedFields
         ? fabricFields
             .filter((field: any) => typeof field?.fabricId === 'string' && field.fabricId.trim().length > 0)
-            .map((f: any) => `${f.fabricId} (${f.type})`)
+            .map((f: any) => (fileFieldIds.has(f.fabricId) ? `${f.fabricId} (${PINOKIO_FILE_FIELD_HINT})` : `${f.fabricId} (${f.type})`))
             .join(', ')
         : 'run-only trigger (no input fields)',
       riskLevel: 'safe',
@@ -6696,6 +7169,18 @@ async function executeDynamicArtifactRunAction(
 }
 
 // SA-042: Typed invoke handler — accepts typed field parameters and passes them to the completion endpoint
+/**
+ * How long an agent's `use.artifact` run may take. A Pinokio app runs a model on this computer
+ * (SA-072 P2): a local Flux image measured 60-125 s on an M-series Mac, over the 120 s cloud
+ * default, so its runs wait up to 10 minutes. The runner has its own 30-minute ceiling.
+ */
+const ARTIFACT_RUN_TIMEOUT_MS = 120_000
+const PINOKIO_APP_ARTIFACT_RUN_TIMEOUT_MS = 10 * 60_000
+
+export function resolveArtifactRunTimeoutMs(artifact: { brain_type?: unknown } | null | undefined): number {
+  return artifact?.brain_type === 'pinokio_app' ? PINOKIO_APP_ARTIFACT_RUN_TIMEOUT_MS : ARTIFACT_RUN_TIMEOUT_MS
+}
+
 async function executeDynamicArtifactTypedInvoke(
   context: ControlExecutionContext,
   artifactId: string,
@@ -6724,19 +7209,7 @@ async function executeDynamicArtifactTypedInvoke(
     }
 
     // Extract fields from input (everything except reserved control keys)
-    const reservedKeys = new Set([
-      'prompt',
-      'mode',
-      'context',
-      'sessionId',
-      'model',
-      'webhook_url',
-      'artifactId',
-      'shareToChat',
-      'share_to_chat',
-      'artifactName',
-      'artifact_name'
-    ])
+    const reservedKeys = new Set(['prompt', ...ARTIFACT_INVOKE_RESERVED_KEYS])
     const fieldIds = new Set(
       fabricFields
         .map((f: any) => (typeof f?.fabricId === 'string' ? f.fabricId.trim() : ''))
@@ -6798,7 +7271,7 @@ async function executeDynamicArtifactTypedInvoke(
         ...(typedPayload.aspectRatio ? { aspectRatio: typedPayload.aspectRatio } : {}),
         ...(typedPayload.providerOptions ? { providerOptions: typedPayload.providerOptions } : {})
       }),
-      signal: AbortSignal.timeout(120_000)
+      signal: AbortSignal.timeout(resolveArtifactRunTimeoutMs(artifact))
     })
 
     if (!response.ok) {
@@ -7196,9 +7669,18 @@ async function resolveVisibleControls(options: {
   runtimeMode?: ControlRuntimeMode | null
   includeDraft: boolean
   allowedControlIds?: string[]
+  /** BL-81: a delegated run's list (see `ControlFindOptions`); absent means nothing. */
+  delegatedAllowedControlIds?: string[] | null
+  delegatedRun?: boolean
 }): Promise<ControlDefinition[]> {
   const allowedIds = normalizeControlIdList(options.allowedControlIds)
   const allowedSet = Array.isArray(allowedIds) ? new Set(allowedIds) : null
+  const delegatedAllowed =
+    options.delegatedRun === true
+      ? Array.isArray(options.delegatedAllowedControlIds)
+        ? options.delegatedAllowedControlIds
+        : []
+      : null
   const controls = await loadControlDefinitionsForUser(options.userId)
 
   return controls.filter((definition) => {
@@ -7207,6 +7689,9 @@ async function resolveVisibleControls(options: {
       allowedSet &&
       !controlIdMatchesAllowedEntries(definition.controlId, Array.from(allowedSet))
     ) {
+      return false
+    }
+    if (delegatedAllowed && !controlIdMatchesAllowedEntries(definition.controlId, delegatedAllowed)) {
       return false
     }
     if (
@@ -7294,7 +7779,9 @@ export async function findControls(options: ControlFindOptions): Promise<Control
     agentId: options.agentId ?? null,
     runtimeMode: options.runtimeMode ?? null,
     includeDraft,
-    allowedControlIds: options.allowedControlIds
+    allowedControlIds: options.allowedControlIds,
+    delegatedRun: options.delegatedRun === true,
+    delegatedAllowedControlIds: options.delegatedAllowedControlIds
   }))
     .map((definition) => {
       if (sourceFilter && !sourceFilter.has(definition.sourceType)) return false
@@ -7481,6 +7968,21 @@ export async function useControl(options: ControlUseOptions): Promise<ControlUse
     options.input && typeof options.input === 'object' && !Array.isArray(options.input) ? options.input : {}
   const selectedGateways = normalizeStringArray(options.selectedGateways)
   const allowedControlIds = normalizeControlIdList(options.allowedControlIds)
+  /**
+   * BL-81 — two ids on a delegated run, each for its own consumers.
+   *
+   * `options.agentId` is who the lane vouched for; on a Subagent or Worker run it is the per-run
+   * runtime id. The identity gate, the risk gate, the handler and the audit's `agentId` read
+   * it. `scopeAgentId` (a delegated run only) is the Subagent whose artifact allowlists apply:
+   * the control's agent allowlist below and the short-alias lookup read it, via
+   * `allowlistAgentId`. For every other call the two are the same id.
+   */
+  const scopeAgentId =
+    options.delegatedRun === true && typeof options.scopeAgentId === 'string'
+      ? options.scopeAgentId.trim() || null
+      : null
+  const allowlistAgentId =
+    scopeAgentId ?? (typeof options.agentId === 'string' ? options.agentId.trim() || null : null)
   const controlDefinitions = await loadControlDefinitionsForUser(options.userId)
   let control =
     STATIC_CONTROL_MAP.get(requestedControlId) ||
@@ -7491,7 +7993,7 @@ export async function useControl(options: ControlUseOptions): Promise<ControlUse
           requestedControlId,
           inputPayload,
           controls: controlDefinitions,
-          agentId: options.agentId ?? null,
+          agentId: allowlistAgentId,
           runtimeMode: options.runtimeMode ?? null,
           allowedControlIds
         })
@@ -7517,6 +8019,7 @@ export async function useControl(options: ControlUseOptions): Promise<ControlUse
       userId: options.userId,
       actorType,
       agentId: typeof options.agentId === 'string' ? options.agentId.trim() || null : null,
+      scopeAgentId,
       sessionId: typeof options.sessionId === 'string' ? options.sessionId.trim() || null : null,
       credentialId:
         typeof options.credentialId === 'string' ? options.credentialId.trim() || null : null,
@@ -7588,7 +8091,8 @@ export async function useControl(options: ControlUseOptions): Promise<ControlUse
 
   if (
     !isControlVisibleForContext(control, {
-      agentId: options.agentId ?? null,
+      // BL-81: a delegated run's agent allowlists are judged by its Subagent (its scope id).
+      agentId: allowlistAgentId,
       runtimeMode: options.runtimeMode ?? null,
       forFind: false
     })
@@ -7636,6 +8140,44 @@ export async function useControl(options: ControlUseOptions): Promise<ControlUse
         control
       )
     }
+  }
+
+  /**
+   * BL-81 — a Subagent or Worker run uses exactly what its DCM index offered it, and nothing more.
+   *
+   * SA-064 keeps the Fabric control plane primary-only. The API lane enforces it by registering
+   * only those refs in its broker; the managed CLI helper serves every family on request, so
+   * until BL-81 a CLI Subagent could call any Fabric control here (`sys.skill.save` made a skill
+   * on for its runtime id: nobody). Its credential now carries the list its DCM offered it
+   * (`resolveDelegatedRunAllowedControlIds`: on a CLI lane, the published artifact tools allowed
+   * for it or nothing, because its CLI profile keeps Fetch Zip off; Fetch Zip reaches only an API
+   * Subagent whose toggle is on, through its broker), and every other control is refused with
+   * `CONTROL_NOT_ALLOWED`.
+   *
+   * **The order is pinned.** The identity gate above answers first, so an acting-agent control
+   * keeps its `AGENT_IDENTITY_REQUIRED` (SA-117 F-P2-1) whatever a list names. Everything below
+   * comes after: status, input validation, the dry run, the risk gate and the handler, so a
+   * control outside the list never raises an approval card and never runs. A delegated call
+   * with no list (a credential minted before BL-81) is allowed nothing.
+   */
+  if (
+    options.delegatedRun === true &&
+    !controlIdMatchesAllowedEntries(
+      control.controlId,
+      Array.isArray(options.delegatedAllowedControlIds) ? options.delegatedAllowedControlIds : []
+    )
+  ) {
+    return await finalize(
+      {
+        success: false,
+        controlId: effectiveControlId,
+        error: {
+          code: 'CONTROL_NOT_ALLOWED',
+          message: `Control "${effectiveControlId}" is not available to a Subagent or Worker run. A delegated run can use only the Batshit tools its own instructions list; ask the primary agent that started you to do this.`
+        }
+      },
+      control
+    )
   }
 
   if (control.status !== 'published') {
@@ -7699,6 +8241,44 @@ export async function useControl(options: ControlUseOptions): Promise<ControlUse
       },
       control
     )
+  }
+
+  // BL-1322 (with BL-1321): a primary managed run whose own reply has stopped, ended or been
+  // replaced does nothing. Its run credential's Stop is already aborted then (the routes read it
+  // with `getRunCredentialStopSignal`), and the call is refused here: after the identity gate,
+  // the allow lists, input validation and the dry run, and BEFORE the Settings choice and the
+  // risk gate, so no approval record or card is ever made for it and no handler runs. Stop means
+  // stop, for safe controls too. It sees only a Stop it is handed: `/api/controls/use` hands it;
+  // `/api/cli-tools/execute` and `/api/native-tools/dispatch` refuse such a call themselves
+  // first. Not this rule: a Subagent or Worker run (`delegatedRun`, whose
+  // Stop is its parent's), the API lane's in-process broker (its SDK never executes a stopped
+  // call), and the session, n8n, service and portable lanes, which keep what they had.
+  if (actorType === 'agent' && options.delegatedRun !== true && options.abortSignal?.aborted === true) {
+    return await finalize({
+      success: false,
+      controlId: effectiveControlId,
+      error: {
+        code: 'CONTROL_CANCELLATION_REQUIRED',
+        message: 'This reply has already stopped or ended, so nothing was done. Do not retry it.'
+      }
+    }, control)
+  }
+
+  // The two Settings writers must hear this reply's real Stop until Redis socket
+  // handoff. Reads and dry runs do not mutate and keep their normal admission behavior.
+  // BL-1314: only the API lane's in-process broker hands its own SDK turn signal as
+  // `abortSignal`. On every other lane that field is the chat's running reply (or, on the
+  // dispatch route's session and n8n lanes, the reply of a chat the body names), so a write
+  // there is admitted only on the Stop of the exact reply its run credential names, read now:
+  // a reply that ended after the route read its Stop (ended normally, so never aborted) is gone.
+  const settingsControl = (Object.values(SETTINGS_FABRIC_CONTROLS) as string[]).includes(effectiveControlId)
+  const settingsStop = !settingsControl || actorType === 'in-process'
+    ? options.abortSignal
+    : getOriginatingReplyStopSignal(options.originatingReply?.sessionId, options.originatingReply?.messageId)
+  const settingsRefusal = settingsControlAdmission({ controlId: effectiveControlId,
+    input: parsedInput.data, abortSignal: settingsStop })
+  if (settingsRefusal) {
+    return await finalize({ success: false, controlId: effectiveControlId, error: settingsRefusal }, control)
   }
 
   /* ---------------------------------------------------------------- *
@@ -7814,7 +8394,11 @@ export async function useControl(options: ControlUseOptions): Promise<ControlUse
         userId: options.userId,
         agentId: options.agentId ?? null,
         sessionId: options.sessionId ?? null,
-        selectedGateways: selectedGateways ?? undefined
+        messageId: options.messageId ?? null,
+        actorType,
+        mcpGatewayScope: options.actorType === 'agent' ? options.mcpGatewayScope ?? [] : options.mcpGatewayScope,
+        selectedGateways: selectedGateways ?? undefined,
+        abortSignal: options.abortSignal instanceof AbortSignal ? options.abortSignal : undefined
       },
       parsedInput.data as Record<string, any>
     )
@@ -7825,7 +8409,7 @@ export async function useControl(options: ControlUseOptions): Promise<ControlUse
           success: false,
           controlId: effectiveControlId,
           error: {
-            code: 'CONTROL_EXECUTION_FAILED',
+            code: controlErrorCodeForHandlerRefusal(effectiveControlId, result.code),
             message: result.error,
             details: result
           }

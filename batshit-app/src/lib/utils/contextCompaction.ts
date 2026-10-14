@@ -2,12 +2,70 @@ import type { Message } from '$lib/stores/messages.svelte'
 import { countMessageTokens } from '$lib/utils/tokenCounter'
 import type { ManualTrimProtections } from '$lib/utils/tokenPanel'
 import { isMessageProtectedFromManualTrim } from '$lib/utils/tokenPanel'
+import {
+  compiledConversation,
+  compiledElement,
+  resolveCompiledMessageElement,
+  type CompiledSpeakerView
+} from '$lib/utils/compiledChatTags'
 import { normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
+import { approvalSummaryIsPending } from '$lib/utils/heldForApproval'
 
 export const AUTO_COMPACT_SMART_TRIGGER_PERCENT = 0.15
 export const AUTO_COMPACT_MIN_TRIGGER_TOKENS = 30_000
 export const AUTO_COMPACT_MAX_TRIGGER_TOKENS = 80_000
+/**
+ * BL-106: the 30k floor was sized for big windows (the settings card shows
+ * "30k on a 200k model"). On a small window it asks for more free space than
+ * the window has left once Batshit's own prompt is in, so every turn read as
+ * "at the limit": a 16k KoboldCpp chat was compacted on open, 787 tokens into a
+ * 342-token summary, one model call to save about 445 tokens (2026-09-22). The
+ * floor never asks for more than this share of the window, which leaves every
+ * window of 120k and up exactly where it was.
+ */
+export const AUTO_COMPACT_SMALL_WINDOW_FLOOR_SHARE = 0.25
 export const AUTO_COMPACT_DEFAULT_KEEP_TAIL_MESSAGES = 0
+export const COMPACT_PENDING_APPROVAL_MESSAGE =
+  'Compact waits for the approval card in this chat to be resolved.'
+
+/**
+ * BL-711: replacing a waiting card with a summary hides its controls and unmounts its
+ * expiry handler. An elapsed clock alone is not settlement: leave the card mounted until
+ * its normal answer/expiry path records a resolved status. Cards an earlier Compact
+ * already hid cannot be answered here and must not block another Compact. Server callers
+ * use stored messages and events, never the browser's assertion that a card was answered.
+ */
+export function hasPendingCompactApproval(
+  messages: ReadonlyArray<{ id?: unknown; role?: unknown; metadata?: unknown }>,
+  events: ContextCompactionEvent[] = []
+): boolean {
+  const compacted = new Set(getCompactedMessageIds(events))
+  return messages.some((message) => {
+    if (typeof message.id === 'string' && compacted.has(message.id)) return false
+    if (message.role !== 'assistant' || !message.metadata || typeof message.metadata !== 'object') return false
+    const metadata = message.metadata as Record<string, unknown>
+    const summary = metadata.toolApprovals
+    if (!summary || typeof summary !== 'object') return false
+    const approvals = Array.isArray(summary)
+      ? summary
+      : (summary as Record<string, unknown>).approvals
+    if (!Array.isArray(approvals)) return false
+    const answered = new Set(
+      Array.isArray(metadata.answeredApprovalIds)
+        ? metadata.answeredApprovalIds
+            .filter((id): id is string => typeof id === 'string')
+            .map((id) => id.trim())
+            .filter(Boolean)
+        : []
+    )
+    // Keep the held-card receipt's status/submitted/legacy rule. The recorded answer list
+    // additionally wins over an older pending entry; Compact never writes a decision.
+    return approvalSummaryIsPending(approvals.filter((entry) =>
+      !entry || typeof entry !== 'object' ||
+      typeof entry.approvalId !== 'string' || !answered.has(entry.approvalId.trim())
+    ))
+  })
+}
 
 export type AutoCompactMode = 'off' | 'ask' | 'auto'
 export type AutoCompactAgentMode = 'inherit' | AutoCompactMode
@@ -147,10 +205,15 @@ export function getSmartAutoCompactTriggerTokens(contextLimit: number | null | u
       ? contextLimit
       : 0
   const smart = Math.round(limit * AUTO_COMPACT_SMART_TRIGGER_PERCENT)
-  return Math.max(
-    AUTO_COMPACT_MIN_TRIGGER_TOKENS,
-    Math.min(AUTO_COMPACT_MAX_TRIGGER_TOKENS, smart)
-  )
+  // An unknown window keeps the full floor rather than guessing a small one.
+  const floor =
+    limit > 0
+      ? Math.min(
+          AUTO_COMPACT_MIN_TRIGGER_TOKENS,
+          Math.round(limit * AUTO_COMPACT_SMALL_WINDOW_FLOOR_SHARE)
+        )
+      : AUTO_COMPACT_MIN_TRIGGER_TOKENS
+  return Math.max(floor, Math.min(AUTO_COMPACT_MAX_TRIGGER_TOKENS, smart))
 }
 
 export function normalizeGlobalAutoCompactSettings(
@@ -518,20 +581,30 @@ function formatToolResultsSummaryForCompact(message: Message): string {
   return lines.length ? `\nTool Results Summary:\n${lines.join('\n')}` : ''
 }
 
-export function buildCompactionTranscript(messages: Message[]): string {
-  return messages
-    .map((message, index) => {
+/**
+ * SA-128 (DL-11): the summarizer reads the old segment in the compiler's own tags, each
+ * message keeping its id and time as attributes because the summary may cite them. The human
+ * is `<user>` and Batshit's entries are `<note>`; content is disarmed like any compile.
+ *
+ * BL-224: with the compiler's speaker view too. `<assistant>` is only the agent the summary is
+ * for (`speakers.selfAgentId`); every other agent is `<agent name="…">`, or a switched or group
+ * chat's summary tells the agent "I said" what another agent said. The transcript is synchronous,
+ * so the caller passes the names in (`resolveCompiledSpeakerView`, server side).
+ */
+export function buildCompactionTranscript(messages: Message[], speakers: CompiledSpeakerView): string {
+  return compiledConversation(
+    messages.map((message) => {
       const timestamp = message.timestamp || message.created_at || 'unknown'
-      const role = message.role.toUpperCase()
+      const { tag, name } = resolveCompiledMessageElement(message, speakers)
       const content = message.content?.trim() || '[No content]'
       const toolSummary = formatToolResultsSummaryForCompact(message)
-      return [
-        `#${index + 1} ${role} | messageId=${message.id} | timestamp=${timestamp}`,
-        content,
-        toolSummary
-      ].filter(Boolean).join('\n')
+      return compiledElement(tag, [content, toolSummary].filter(Boolean).join('\n'), [
+        ['name', name],
+        ['id', message.id],
+        ['time', timestamp]
+      ])
     })
-    .join('\n\n---\n\n')
+  )
 }
 
 export function buildLiveProtectedItemsNote(params: {

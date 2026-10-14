@@ -11,7 +11,7 @@
   
   // Count lines for subtitle
   const lineCount = $derived(content ? content.split('\n').length : 0)
-  const subtitle = $derived(`${lineCount} lines`)
+  const subtitle = $derived(`${lineCount} ${lineCount === 1 ? 'line' : 'lines'}`)
   
   async function copyToClipboard() {
     try {

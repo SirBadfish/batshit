@@ -1,6 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { redis } from '../redis'
+import { createArtifactRuntimeToken } from '../services/artifactRuntimeAuth'
+import { resolveCompiledMessageElement } from '$lib/utils/compiledChatTags'
+import { env } from '$env/dynamic/private'
+import { createServer } from 'node:http'
+import * as artifactImageFetch from '../services/artifactShareImageFetch.server'
+import { mintRunCredential, AGENT_RUN_CREDENTIAL_HEADER } from '../services/agentRunCredentials'
 
 const publishMock = vi.fn()
 const fetchMock = vi.fn()
@@ -22,7 +28,8 @@ describe('POST /api/artifacts/share', () => {
     publishMock.mockClear()
     fetchMock.mockReset()
     // batshit-server uploads are service-token-gated; the share route attaches it.
-    vi.stubEnv('BATSHIT_TOKEN', 'artifacts-share-test-token')
+    vi.stubEnv('BATSHIT_TOKEN', 'test-acts-share-test-token')
+    env.BATSHIT_TOKEN = 'test-acts-share-test-token'
     fetchMock.mockResolvedValue(
       new Response(JSON.stringify({ success: true }), {
         status: 200,
@@ -47,6 +54,8 @@ describe('POST /api/artifacts/share', () => {
   })
 
   afterEach(() => {
+    vi.restoreAllMocks()
+    delete env.BATSHIT_TOKEN
     vi.unstubAllGlobals()
     vi.unstubAllEnvs()
   })
@@ -60,6 +69,26 @@ describe('POST /api/artifacts/share', () => {
     } as any)
 
     expect(response.status).toBe(401)
+  })
+
+  it('BL-506: refuses a real loopback image URL before any network request or persistence', async () => {
+    const { POST } = await import('../../../routes/api/artifacts/share/+server')
+    let hits = 0
+    const sink = createServer((_request, response) => { hits++; response.writeHead(404); response.end('private service') })
+    await new Promise<void>((resolve) => sink.listen(0, '127.0.0.1', resolve))
+    try {
+      const port = (sink.address() as { port: number }).port
+      await expect(POST({
+        request: buildRequest({ artifactId: 'art_share', content: `http://127.0.0.1:${port}/image`, format: 'image', includeInChat: false }),
+        locals: { user: { id: 'user_a' } }, fetch: fetchMock
+      } as any)).rejects.toMatchObject({ status: 400, body: { message: 'Unable to fetch shared image URL' } })
+      expect(hits).toBe(0)
+      expect(await redis.sMembers('user:user_a:clips')).toEqual([])
+      expect(publishMock).not.toHaveBeenCalled()
+    } finally {
+      sink.closeAllConnections()
+      await new Promise<void>((resolve) => sink.close(() => resolve()))
+    }
   })
 
   it('blocks access when user does not own unpublished artifact', async () => {
@@ -182,8 +211,12 @@ describe('POST /api/artifacts/share', () => {
     expect((message as any)?.content).not.toContain('data:image/')
   })
 
-  it('shares images without preview filler and preserves full-resolution source metadata', async () => {
+  it.each(['data', 'public-url'])('shares %s images with a local full-resolution original', async (source) => {
     const { POST } = await import('../../../routes/api/artifacts/share/+server')
+    const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII='
+    if (source === 'public-url') {
+      vi.spyOn(artifactImageFetch, 'fetchPublicArtifactImage').mockResolvedValue({ bytes: Buffer.from(png, 'base64'), contentType: 'image/png' })
+    }
     const clipId = 'clip_1779416324513_abcd1234'
     const previewUrl = 'http://localhost:5600/uploads/images/preview.jpg'
     const originalUrl = 'http://localhost:5600/uploads/images/original.png'
@@ -246,8 +279,7 @@ describe('POST /api/artifacts/share', () => {
     const response = await POST({
       request: buildRequest({
         artifactId: 'art_share',
-        content:
-          'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=',
+        content: source === 'data' ? `data:image/png;base64,${png}` : 'https://images.example.com/uploads/images/untrusted.png',
         format: 'image',
         sessionId: 'sess_1',
         initiator: 'agent'
@@ -282,7 +314,7 @@ describe('POST /api/artifacts/share', () => {
       cloudflared_target_url: 'http://127.0.0.1:5600'
     })
     expect(compressedUploadSettings).not.toHaveProperty('skip_clip_persistence')
-    expect(fetchMock).not.toHaveBeenCalled()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
 
     // Stored clip records keep canonical relative /uploads/... paths; browser-facing
     // reads resolve them against the current batshit-server base (clip-lifecycle contract).
@@ -355,17 +387,67 @@ describe('POST /api/artifacts/share', () => {
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
-  it('skips auto-followup for agent-initiated shares during an active agent turn', async () => {
+  it.each([undefined, 'user', 'agent'])('BL-472: runtime shares cannot claim initiator %s', async (initiator) => {
+    const { POST } = await import('../../../routes/api/artifacts/share/+server')
+    const token = await createArtifactRuntimeToken({ userId: 'user_a', artifactId: 'art_share', sessionId: 'sess_1' })
+    const request = buildRequest({ artifactId: 'art_share', content: 'artifact output', sessionId: 'sess_1', initiator })
+    request.headers.set('Origin', 'null')
+    request.headers.set('Authorization', `Bearer ${token}`)
+    const response = await POST({ request, locals: {}, fetch: fetchMock } as any)
+    const body = await response.json()
+    const message = await redis.json.get(`message:sess_1:${body.messageId}`) as any
+    expect(message.metadata.shareInitiator).toBe('artifact')
+    expect(resolveCompiledMessageElement(message, { selfAgentId: 'agent_1', agentNames: new Map() }).tag).toBe('note')
+    expect(body.followupTriggered).toBe(true)
+    const payload = JSON.parse(String(fetchMock.mock.calls[0][1].body))
+    expect(payload.metadata.shareInitiator).toBe('artifact')
+    expect(payload.content).toContain('Artifact "Sharer" shared output')
+    expect(payload.content).not.toContain('The user shared')
+  })
+
+  it('BL-472: session caller cannot turn a human share into an agent share', async () => {
+    const { POST } = await import('../../../routes/api/artifacts/share/+server')
+    const response = await POST({
+      request: buildRequest({ artifactId: 'art_share', content: 'human output', sessionId: 'sess_1', initiator: 'agent' }),
+      locals: { user: { id: 'user_a' } }, fetch: fetchMock
+    } as any)
+    const body = await response.json()
+    const message = await redis.json.get(`message:sess_1:${body.messageId}`) as any
+    expect(message.metadata.shareInitiator).toBe('user')
+    expect(resolveCompiledMessageElement(message, { selfAgentId: 'agent_1', agentNames: new Map() }).tag).toBe('user')
+    expect(body.followupTriggered).toBe(true)
+  })
+
+  it.each(['service', 'agent'])('BL-472: %s authentication cannot claim human speech', async (lane) => {
+    const { POST } = await import('../../../routes/api/artifacts/share/+server')
+    const request = buildRequest({ artifactId: 'art_share', content: 'machine output', sessionId: 'sess_1', initiator: 'user' })
+    if (lane === 'service') {
+      request.headers.set('x-batshit-token', 'test-acts-share-test-token')
+      request.headers.set('x-batshit-user-id', 'user_a')
+    } else {
+      await redis.set('agent:agent_1', { id: 'agent_1', user_id: 'user_a' })
+      const { token } = await mintRunCredential({ userId: 'user_a', agentId: 'agent_1', sessionId: 'sess_1', runtime: 'codex' })
+      request.headers.set(AGENT_RUN_CREDENTIAL_HEADER, token)
+    }
+    const response = await POST({ request, locals: {}, fetch: fetchMock } as any)
+    const body = await response.json()
+    const message = await redis.json.get(`message:sess_1:${body.messageId}`) as any
+    expect(message.metadata.shareInitiator).toBe(lane === 'agent' ? 'agent' : 'artifact')
+    expect(resolveCompiledMessageElement(message, { selfAgentId: 'agent_1', agentNames: new Map() }).tag).toBe('note')
+    expect(body.followupTriggered).toBe(lane !== 'agent')
+  })
+
+  it('skips auto-followup for trusted service agent shares during an active agent turn', async () => {
     const { POST } = await import('../../../routes/api/artifacts/share/+server')
 
     const response = await POST({
-      request: buildRequest({
+      request: new Request(buildRequest({
         artifactId: 'art_share',
         content: 'mirror this',
         sessionId: 'sess_1',
         initiator: 'agent'
-      }),
-      locals: { user: { id: 'user_a' } },
+      }), { headers: { 'x-batshit-token': 'test-acts-share-test-token', 'x-batshit-user-id': 'user_a' } }),
+      locals: {},
       fetch: fetchMock
     } as any)
     const body = await response.json()

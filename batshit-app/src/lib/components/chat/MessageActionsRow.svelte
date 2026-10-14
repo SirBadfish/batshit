@@ -6,6 +6,8 @@
     isAI: boolean
     isSpeaking: boolean
     tokens?: number | string | null
+    /** False while the reply is still running: a delete then would be undone (BL-381). */
+    canDelete?: boolean
     onPlayPause: () => void
     onCopyMarkdown: () => void
     onDelete: () => void
@@ -15,6 +17,7 @@
     isAI,
     isSpeaking,
     tokens = null,
+    canDelete = true,
     onPlayPause,
     onCopyMarkdown,
     onDelete
@@ -50,16 +53,18 @@
     <Copy class="message-action-icon" />
   </Button>
 
-  <Button
-    variant="ghost"
-    size="icon"
-    class="message-action-button is-danger"
-    onclick={onDelete}
-    aria-label="Delete message"
-    title="Delete"
-  >
-    <Trash2 class="message-action-icon" />
-  </Button>
+  {#if canDelete}
+    <Button
+      variant="ghost"
+      size="icon"
+      class="message-action-button is-danger"
+      onclick={onDelete}
+      aria-label="Delete message"
+      title="Delete"
+    >
+      <Trash2 class="message-action-icon" />
+    </Button>
+  {/if}
 
   {#if tokens}
     <span class="message-token-count">

@@ -729,41 +729,31 @@ describe('normalizeToolStep', () => {
     expect(normalized.toolResult.diff).toContain('+++ b/app.js')
   })
 
-  // Bug sweep item 8 (2026-09-18): the command-to-file remap lowercased the whole command before it
-  // took the path out, so a denied `cat /Users/Example/Hello.md; exit 3` was stored as a read of
-  // `/users/josh/hello.md`. It still matches the command name and the patch header in any case.
-  describe('a command remapped to a file action keeps its path as written (item 8)', () => {
+  // BL-233 (2026-09-25): a step still named a command is one the shared mapper called a command
+  // (every lane classifies a shell command once, with `mapBashCommandToRendererTool`). A second
+  // reading of the command text here disagreed with it and stored a test run as a Read File of the
+  // script it ran. Bug sweep item 8's paths (it kept their case) are commands by the mapper too.
+  describe('a command the mapper named a command stays a command (BL-233)', () => {
     it.each([
-      ['cat /Users/Example/Hello.md; exit 3', '/Users/Example/Hello.md'],
-      ['CAT /Users/Example/Hello.md; exit 3', '/Users/Example/Hello.md'],
-      ['cd /Users/Example && sed -n 1,5p Notes/Plan.MD; exit 3', 'Notes/Plan.MD']
-    ])('reads `%s` as a read of its own path', (command, filePath) => {
+      "cd /tmp/x && npm test 2>&1 | tail -12 && echo '--- CLI check ---' && node src/cli.js examples/meditate.json 2026-01-10",
+      'cat /Users/Example/Hello.md; exit 3',
+      'cd /Users/Example && sed -n 1,5p Notes/Plan.MD; exit 3',
+      'npm test -- --grep ls',
+      'git ls-files | wc -l',
+      "echo '*** Update File: /Users/Example/Notes.MD'"
+    ])('keeps `%s` a command with no file path', (command) => {
       const normalized = normalizeToolStep({
         type: 'tool',
         toolName: 'batshit_server_execute_command',
         toolArgs: { command },
-        toolResult: { stdout: '# Hello', exitCode: 3 }
+        toolResult: { stdout: '# Hello\n', exitCode: 0 }
       } as any)
 
-      expect(normalized.toolName).toBe('read_file')
-      expect(normalized.toolResult.filePath).toBe(filePath)
-      expect(normalized.toolArgs.filePath).toBe(filePath)
+      expect(normalized.toolName).toBe('execute_command')
+      expect(normalized.toolArgs).not.toHaveProperty('filePath')
+      expect(normalized.toolResult).not.toHaveProperty('filePath')
+      expect(normalized.toolResult.stdout).toBe('# Hello\n')
     })
-
-    it.each(['*** Update File: /Users/Example/Notes.MD', '*** UPDATE FILE: /Users/Example/Notes.MD'])(
-      'reads `%s` as an edit of its own path',
-      (header) => {
-        const normalized = normalizeToolStep({
-          type: 'tool',
-          toolName: 'execute_command',
-          toolArgs: { command: `apply_patch <<'PATCH'\n*** Begin Patch\n${header}\n@@\n-a\n+b\n*** End Patch\nPATCH` },
-          toolResult: { stdout: 'Done!', exitCode: 0 }
-        } as any)
-
-        expect(normalized.toolName).toBe('edit_file')
-        expect(normalized.toolResult.filePath).toBe('/Users/Example/Notes.MD')
-      }
-    )
   })
 
   // F-P6-5 follow-up item 6: `ls` of several directories heads each one with `<dir>:`.

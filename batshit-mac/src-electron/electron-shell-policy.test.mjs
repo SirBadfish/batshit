@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
-import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import {
   MAX_GOON_PACKAGE_READ_CHUNK_BYTES,
@@ -13,6 +15,7 @@ import {
   isExactDesktopControlsUrl,
   isExactDesktopGoonUrl,
   isSafeExternalUrl,
+  macShellFolderEnv,
   normalizeLoopbackOrigin,
   resolveCustomCssPath,
   resolveDesktopControlsUrl,
@@ -20,6 +23,7 @@ import {
   resolveDevToolsOptInPath,
   resolveDesktopGoonUrl,
   resolveBackupExportUrl,
+  resolveMacShellIdentity,
   resolveShellAssetPath,
   validateBackupExportOptions,
   validateElectronIpcSender,
@@ -116,6 +120,41 @@ test('backup export bridge accepts only its boolean option and exact local app r
     () => resolveBackupExportUrl('batshit-shell://app/index.html', origins, desktopUrl, controlsUrl),
     /local Batshit app origin/
   );
+});
+
+// BL-378 Phase 1b: the partial option is bounded here as the app route bounds it, and copied.
+test('backup export bridge accepts a bounded partial option and refuses every other shape', () => {
+  const entry = { key: 'upload:images:a.png', relativePath: 'images/a.png', fingerprint: 'a'.repeat(64) };
+  const input = { includeSecrets: false, partial: { acknowledged: [entry], confirmAllMissing: true } };
+  const options = validateBackupExportOptions(input);
+  assert.deepEqual(options, { includeSecrets: false, partial: { acknowledged: [entry], confirmAllMissing: true } });
+  input.partial.acknowledged[0] = { ...entry, key: 'upload:changed' };
+  assert.equal(options.partial.acknowledged[0].key, 'upload:images:a.png');
+  assert.deepEqual(validateBackupExportOptions({ partial: { acknowledged: [entry] } }), {
+    includeSecrets: false,
+    partial: { acknowledged: [entry] }
+  });
+  // 4,096 UTF-16 code units, as targetPath is measured here, though 12,288 bytes.
+  const cjk = '漢'.repeat(4096);
+  assert.equal(validateBackupExportOptions({ partial: { acknowledged: [{ ...entry, relativePath: cjk }] } }).partial.acknowledged[0].relativePath, cjk);
+
+  const refused = [
+    [null, /partial must be an object/],
+    [[entry], /partial must be an object/],
+    [{ acknowledged: [entry], skip: true }, /Unsupported backup export partial option: skip/],
+    [{ acknowledged: [entry], confirmAllMissing: false }, /confirmAllMissing may only be true/],
+    [{ acknowledged: [] }, /1 to 10000/],
+    [{ acknowledged: Array.from({ length: 10_001 }, () => entry) }, /1 to 10000/],
+    [{ acknowledged: ['upload:images:a.png'] }, /entries must be objects/],
+    [{ acknowledged: [{ ...entry, kind: 'missing' }] }, /exactly key, relativePath and fingerprint/],
+    [{ acknowledged: [{ ...entry, key: 'k'.repeat(4097) }] }, /partial key is invalid/],
+    [{ acknowledged: [{ ...entry, relativePath: 'images/a\0.png' }] }, /partial relativePath is invalid/],
+    [{ acknowledged: [{ ...entry, relativePath: `${cjk}漢` }] }, /partial relativePath is invalid/],
+    [{ acknowledged: [{ ...entry, fingerprint: 'A'.repeat(64) }] }, /fingerprint is invalid/]
+  ];
+  for (const [partial, message] of refused) {
+    assert.throws(() => validateBackupExportOptions({ includeSecrets: false, partial }), message);
+  }
 });
 
 test('Goon package picker accepts only bounded regular .bgoon and .zip files', () => {
@@ -349,4 +388,64 @@ test('the custom stylesheet sits beside the Mac data root and honours an explici
     resolveCustomCssPath({ BATSHIT_MAC_CUSTOM_CSS: '  /tmp/explicit.css  ' }, '/Users/tester'),
     '/tmp/explicit.css'
   );
+});
+
+
+// BL-72: a test package (rebuild-mac-app.sh --artifact-suffix) names itself "Batshit <Label>" and keeps
+// its data, logs, caches, Electron profile, and one-instance lock in "Batshit-<Label>" folders, even
+// when it is opened from Finder or the Dock without the lane launcher's environment.
+test('the real app and an unpackaged shell are "Batshit"; a test package is its own app', () => {
+  const real = { appName: 'Batshit', dataFolderName: 'Batshit', testPackage: false };
+  assert.deepEqual(resolveMacShellIdentity({ packaged: true, packagedName: 'Batshit' }), real);
+  assert.deepEqual(resolveMacShellIdentity({ packaged: false, packagedName: 'batshit-mac' }), real);
+  assert.deepEqual(resolveMacShellIdentity({ packaged: true, packagedName: 'Batshit FirstRunTest' }), {
+    appName: 'Batshit FirstRunTest',
+    dataFolderName: 'Batshit-FirstRunTest',
+    testPackage: true
+  });
+  // A packaged name that is neither is not guessed at: acting as the real app would share its data.
+  for (const name of ['batshit-electron-shell', 'Electron', 'Batshit ', 'Batshit ../x', 'Batshit Two Words', '']) {
+    assert.throws(() => resolveMacShellIdentity({ packaged: true, packagedName: name }), /neither Batshit nor a Batshit test package/, name);
+  }
+});
+
+test('a test package gets its own folders unless its launcher named them; the real app gets none', () => {
+  const home = '/Users/tester';
+  const lane = resolveMacShellIdentity({ packaged: true, packagedName: 'Batshit FirstRunTest' });
+  assert.deepEqual(macShellFolderEnv(lane, {}, home), {
+    BATSHIT_MAC_DATA_DIR: join(home, 'Library', 'Application Support', 'Batshit-FirstRunTest'),
+    BATSHIT_MAC_LOG_DIR: join(home, 'Library', 'Logs', 'Batshit-FirstRunTest'),
+    BATSHIT_MAC_CACHE_DIR: join(home, 'Library', 'Caches', 'Batshit-FirstRunTest')
+  });
+  // The lane launcher's own folders win.
+  assert.deepEqual(macShellFolderEnv(lane, { BATSHIT_MAC_DATA_DIR: '/lane/data' }, home), {
+    BATSHIT_MAC_LOG_DIR: join(home, 'Library', 'Logs', 'Batshit-FirstRunTest'),
+    BATSHIT_MAC_CACHE_DIR: join(home, 'Library', 'Caches', 'Batshit-FirstRunTest')
+  });
+  // Opened from Finder, its developer-tools marker and stylesheet sit in its own folder too.
+  const env = macShellFolderEnv(lane, {}, home);
+  assert.equal(resolveDevToolsOptInPath(env, home), join(home, 'Library', 'Application Support', 'Batshit-FirstRunTest', 'enable-devtools'));
+  assert.equal(resolveCustomCssPath(env, home), join(home, 'Library', 'Application Support', 'Batshit-FirstRunTest', 'custom.css'));
+
+  const real = resolveMacShellIdentity({ packaged: true, packagedName: 'Batshit' });
+  assert.deepEqual(macShellFolderEnv(real, {}, home), {});
+});
+
+test('the shell resolves who it is before anything reads the data folder, and names itself by it', () => {
+  const main = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'main.mjs'), 'utf8');
+  const identityAt = main.indexOf(
+    '\nconst shellIdentity = resolveMacShellIdentity({ packaged: app.isPackaged, packagedName: app.getName() });\n'
+  );
+  const envAt = main.indexOf('\nObject.assign(process.env, macShellFolderEnv(shellIdentity, process.env, homedir()));\n');
+  assert.ok(identityAt > 0 && envAt > identityAt);
+  for (const reader of [
+    '\nconst devToolsEnabled = resolveDevToolsEnabled(',
+    '\nconst customCssPath = resolveCustomCssPath(',
+    '\napp.setPath(\n  \'userData\','
+  ]) {
+    const at = main.indexOf(reader);
+    assert.ok(at > envAt, `${reader.trim()} comes after the folders are set`);
+  }
+  assert.ok(main.includes('\napp.setName(shellIdentity.appName);\n'));
+  assert.ok(!main.includes("app.setName('Batshit')"));
 });

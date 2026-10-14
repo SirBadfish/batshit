@@ -1,5 +1,6 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
 import {
+  GOON_UPLOAD_TYPES,
   auditGoonUploadAssets,
   cleanupOrphanGoonUploadAssets
 } from '$lib/server/services/goonAssetCleanupService'
@@ -31,7 +32,19 @@ export const POST: RequestHandler = async ({ locals, request }) => {
       return json({ error: 'confirmDeleteOrphans is required' }, { status: 400 })
     }
 
-    const cleanup = await cleanupOrphanGoonUploadAssets(admin.value.id)
+    const selectedAssets = body?.selectedAssets
+    if (!Array.isArray(selectedAssets) || selectedAssets.length === 0 || selectedAssets.length > 10_000 ||
+        !selectedAssets.every((value) => {
+          if (typeof value !== 'string') return false
+          const [uploadType, filename, extra] = value.split('/')
+          return (GOON_UPLOAD_TYPES as readonly string[]).includes(uploadType) &&
+            Boolean(filename) && filename.length <= 255 && !filename.includes('\\') &&
+            filename !== '.' && filename !== '..' && extra === undefined
+        })) {
+      return json({ error: 'Select the inspected cleanup candidates before confirming deletion' }, { status: 400 })
+    }
+
+    const cleanup = await cleanupOrphanGoonUploadAssets(admin.value.id, { selectedAssets })
     if (cleanup.failed.length > 0) {
       return json(
         {

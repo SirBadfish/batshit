@@ -6,6 +6,7 @@
 
 import { redis } from './redis'
 import type { RedisClientType } from 'redis'
+import { escapeRedisGlob } from '$lib/utils/redisGlob'
 
 export interface TempZipMetadata {
   sessionId: string
@@ -135,10 +136,13 @@ export class RedisStreamService {
    * Called on error or session end
    */
   async cleanupSessionTempStorage(sessionId: string, messageId?: string): Promise<void> {
-    // Pattern for all temp storage keys for this session
-    const pattern = messageId 
-      ? `zip_temp:${sessionId}:${messageId}:*`
-      : `zip_temp:${sessionId}:*`
+    // Pattern for all temp storage keys for this session. The ids are escaped (BL-603): KEYS
+    // reads `*`, `?`, `[`, `]`, and `\` as glob syntax, so a chat id `a*` would sweep the temp
+    // chunks of every chat whose id starts with `a`.
+    const sessionPattern = escapeRedisGlob(sessionId)
+    const pattern = messageId
+      ? `zip_temp:${sessionPattern}:${escapeRedisGlob(messageId)}:*`
+      : `zip_temp:${sessionPattern}:*`
     
     // Get all matching keys
     const keys = await this.redisService.keys(pattern)
@@ -154,7 +158,7 @@ export class RedisStreamService {
       await this.redisService.del(metaKey)
     } else {
       // Clean up all metadata for session
-      const metaPattern = `zip_temp_meta:${sessionId}:*`
+      const metaPattern = `zip_temp_meta:${sessionPattern}:*`
       const metaKeys = await this.redisService.keys(metaPattern)
       for (const key of metaKeys) {
         await this.redisService.del(key)

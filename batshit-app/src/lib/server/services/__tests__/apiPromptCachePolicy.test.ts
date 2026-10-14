@@ -189,7 +189,12 @@ describe('apiPromptCachePolicy', () => {
       type: 'ephemeral',
       ttl: '1h',
     })
-    expect((manual.messages[0] as any).providerOptions).toBeUndefined()
+    // BL-77: a preset's cache setting ADDS to the system cache point (on the preset's TTL)
+    // instead of replacing it; it used to leave the system prompt unmarked.
+    expect((manual.messages[0] as any).providerOptions?.anthropic?.cacheControl).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    })
   })
 
   it('adds a second Anthropic breakpoint to the last standing Awareness media part', () => {
@@ -202,9 +207,9 @@ describe('apiPromptCachePolicy', () => {
         {
           role: 'user',
           content: [
-            { type: 'text', text: '==== AWARENESS MEDIA (STANDING) ====\n- portrait.png — image' },
+            { type: 'text', text: '<awareness_media>\n- portrait.png — image\n</awareness_media>' },
             { type: 'image', image: 'data:image/png;base64,AAAA' },
-            { type: 'text', text: '==== CURRENT USER MESSAGE ====\n\nhello' }
+            { type: 'text', text: '<user time="9:00 AM">\nhello\n</user>' }
           ]
         }
       ] as any

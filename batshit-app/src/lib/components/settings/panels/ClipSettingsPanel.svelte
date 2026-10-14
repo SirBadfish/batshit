@@ -13,7 +13,7 @@
   import SettingsSaveStatus from '$lib/components/settings/SettingsSaveStatus.svelte'
   import { Image, Loader2, Paperclip, RefreshCw } from '@lucide/svelte'
   import { toast } from '$lib/components/ui/sonner/settings-toast'
-  import { setUserSettings } from '$lib/stores/userSettings.svelte'
+  import { confirmUserSettings as setUserSettings } from '$lib/stores/userSettings.svelte'
   import { BATSHIT_SERVER_URL } from '$lib/services/apiClient'
   import type { UserSettingsRow } from '$lib/types/database'
 
@@ -89,6 +89,15 @@
   let saveError = $state<string | null>(null)
   let activeSaveScope = $state<'image' | 'local' | null>(null)
   let isLoading = $state(true)
+  // BL-962: `clipSettings` holds saved values only after a real read of `/api/user/settings`
+  // succeeded. Until then it holds the page's older copy or the defaults, neither of which may
+  // ever be written back (the route replaces `ui_settings` and `upload_settings` whole), so the
+  // two cards that hold Clip values are not offered and the autosave refuses. The page's copy is
+  // the copy from when the page opened: it does not count as loaded, and it cannot tell "no
+  // record yet" from "the read failed".
+  let settingsLoaded = $state(false)
+  let loadError = $state<string | null>(null)
+  let settingsLoadBusy = $state(false)
   let cloudflaredStatus = $state<CloudflaredTunnelStatus | null>(null)
   let cloudflaredBusy = $state(false)
   let cloudflaredError = $state<string | null>(null)
@@ -131,7 +140,7 @@
         saveError = null
       })
 
-      if (updatedSettings) {
+      if (updatedSettings || result?.settings === null) {
         setUserSettings(updatedSettings)
       }
     } catch (error) {
@@ -170,7 +179,9 @@
   })
 
   $effect(() => {
-    if (isLoading) return
+    // BL-962: never a write built while no read of the saved settings succeeded. The controls
+    // are not offered then either; this line keeps the whole blocks from being sent if one ever is.
+    if (isLoading || !settingsLoaded) return
 
     const signature = makeSignature(clipSettings)
     if (signature === persistedSignature) {
@@ -208,6 +219,7 @@
   })
 
   async function loadSettings() {
+    settingsLoadBusy = true
     try {
       const response = await fetch('/api/user/settings')
       if (!response.ok) {
@@ -217,35 +229,49 @@
 
       const result = await response.json()
       const remoteSettings: UserSettingsRow | null = result?.settings ?? null
-      const initial = normaliseClipSettings(remoteSettings ?? data?.userSettings)
+      // A read that succeeded is the answer: `null` means "no record yet" (the route rethrows
+      // every Redis failure), and a new install opens on the defaults. The page's copy is never
+      // mixed in.
+      const initial = normaliseClipSettings(remoteSettings)
 
       untrack(() => {
         clipSettings = { ...initial }
         persistedSignature = makeSignature(initial)
         persistedImageSignature = makeImageSignature(initial)
         persistedTunnelSignature = makeTunnelSignature(initial)
+        settingsLoaded = true
+        // A successful (re)load clears the failure at once, in the same block that resets the
+        // signatures: the autosave effect returns at its signature guard and would never reach
+        // code that clears it (BL-487's follow-up).
+        loadError = null
         isLoading = false
         saveError = null
         activeSaveScope = null
       })
 
-      if (remoteSettings) {
+      if (remoteSettings || result?.settings === null) {
         setUserSettings(remoteSettings)
       }
     } catch (error) {
       console.error('Clip settings load failed:', error)
-      const fallback = normaliseClipSettings(data?.userSettings)
-
+      // Nothing is applied: the panel keeps its cards hidden and says so with a Retry.
       untrack(() => {
-        clipSettings = { ...fallback }
-        persistedSignature = makeSignature(fallback)
-        persistedImageSignature = makeImageSignature(fallback)
-        persistedTunnelSignature = makeTunnelSignature(fallback)
+        loadError = error instanceof Error ? error.message : 'Failed to load clip settings'
         isLoading = false
-        saveError = error instanceof Error ? error.message : 'Failed to load clip settings'
-        activeSaveScope = null
+      })
+    } finally {
+      untrack(() => {
+        settingsLoadBusy = false
       })
     }
+  }
+
+  // Retry does what opening does: the saved settings first, then the managed tunnel's status,
+  // which overlays the live tunnel URL and auto-start on the saved copy.
+  async function retryLoadSettings() {
+    if (settingsLoadBusy) return
+    await loadSettings()
+    if (settingsLoaded) await loadCloudflaredStatus()
   }
 
   function normaliseClipSettings(settings?: UserSettingsRow | null): ClipSettingsState {
@@ -529,6 +555,27 @@
         </SettingsInfoMenu>
       </div>
 
+      {#if !settingsLoaded}
+        <!-- BL-962: the cards that hold Clip values wait for a real read of the saved settings. -->
+        <div class="batshit-settings-inline-alert is-danger" data-testid="clip-settings-load-error">
+          <div class="flex items-center justify-between gap-2">
+            <span>
+              Clip settings could not load, so the Image Optimization and Tunnel Access cards are
+              hidden. Press Retry to load them.
+              {#if loadError}Details: {loadError}{/if}
+            </span>
+            <Button
+              variant="outline"
+              size="sm"
+              onclick={retryLoadSettings}
+              disabled={settingsLoadBusy}
+            >
+              <RefreshCw class={settingsLoadBusy ? 'h-3.5 w-3.5 animate-spin' : 'h-3.5 w-3.5'} />
+              Retry
+            </Button>
+          </div>
+        </div>
+      {:else}
       <SettingsAccordionCard name="clip-settings-cards" title="Image Optimization" icon={Image} open>
         {#snippet info()}
             <SettingsInfoMenu ariaLabel="About Image Optimization" contentClass="w-80">
@@ -876,6 +923,7 @@
             {/if}
             </div>
           </SettingsAccordionCard>
+      {/if}
     </div>
   </div>
 {/if}

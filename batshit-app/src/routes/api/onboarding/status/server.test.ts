@@ -7,11 +7,16 @@ const mocks = vi.hoisted(() => ({
   getAgents: vi.fn(),
   getUserSettings: vi.fn(),
   updateUserSettings: vi.fn(),
-  invalidateUserSettingsCache: vi.fn()
+  invalidateUserSettingsCache: vi.fn(),
+  pausedPlansAllowedOnThisCopy: vi.fn()
 }))
 
 vi.mock('$lib/server/services/providers', () => ({
   resolveProviderAccess: mocks.resolveProviderAccess
+}))
+
+vi.mock('$lib/server/services/pausedPlans', () => ({
+  pausedPlansAllowedOnThisCopy: mocks.pausedPlansAllowedOnThisCopy
 }))
 
 vi.mock('$lib/server/redis', () => ({
@@ -99,6 +104,7 @@ describe('/api/onboarding/status', () => {
       updated_at: '2026-06-22T00:00:01.000Z'
     }))
     mocks.resolveProviderAccess.mockResolvedValue(providerAccess())
+    mocks.pausedPlansAllowedOnThisCopy.mockResolvedValue(false)
     routeModule = await import('./+server')
   })
 
@@ -118,6 +124,23 @@ describe('/api/onboarding/status', () => {
     expect(payload.modelPresets.count).toBe(0)
     expect(payload.agents.count).toBe(0)
     expect(payload.onboarding.shouldShow).toBe(true)
+  })
+
+  it('does not count a paused plan key as ready unless the Dev switch allows it (FIX 7)', async () => {
+    mocks.resolveProviderAccess.mockResolvedValue(
+      providerAccess({ zai_coding: 'user', openai: 'user' })
+    )
+
+    const paused = await routeModule.GET({ locals: { user: { id: 'user-1' } } } as any)
+    const pausedPayload = await paused.json()
+    expect(pausedPayload.apiKeys.readyKeys.map((k: any) => k.id)).toEqual(['openai'])
+    expect(pausedPayload.apiKeys.readyCount).toBe(1)
+
+    mocks.pausedPlansAllowedOnThisCopy.mockResolvedValue(true)
+    const allowed = await routeModule.GET({ locals: { user: { id: 'user-1' } } } as any)
+    const allowedPayload = await allowed.json()
+    expect(allowedPayload.apiKeys.readyKeys.map((k: any) => k.id).sort()).toEqual(['openai', 'zai_coding'])
+    expect(allowedPayload.apiKeys.readyCount).toBe(2)
   })
 
   it('does not show onboarding for an already configured instance without a legacy finish marker', async () => {

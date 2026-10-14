@@ -1,8 +1,9 @@
+import { getBatshitHomeDir } from './batshitHome'
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
 import { promises as fs } from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
 import { redis } from '$lib/server/redis'
+import { buildPortableSkillEnvLines } from '$lib/utils/portableSkillEnv'
 import type {
   PortableSkillEnvTemplateInfo,
   PortableSkillFamilyId,
@@ -18,7 +19,92 @@ const MAX_LABEL_LENGTH = 80
 const EXECUTION_LOG_LIMIT = 200
 const TOKEN_PREFIX_LENGTH = 12
 const TOKEN_SUFFIX_LENGTH = 6
-const PORTABLE_SKILL_ENV_DIR = path.join(os.homedir(), '.batshit', 'portable-skills')
+const PORTABLE_SKILL_ENV_DIR = path.join(getBatshitHomeDir(), 'portable-skills')
+
+/**
+ * BL-787: update, rotate, and revoke each used to read the whole record and write it back at
+ * `$`. Two admin actions close together could undo each other -- an update inside a rotate's
+ * window wrote the old hash back (both secrets stopped working); a rotate that read before a
+ * revoke wrote `revokedAt: null` and a fresh hash index (the rotated secret worked after the
+ * revoke and was not listed); an update that read before a revoke reset `revokedAt`. BL-552's
+ * class, on the admin writers themselves.
+ *
+ * Fix: one atomic Lua script per writer. Each re-reads the record's OWN current state (never a
+ * value the caller read earlier) and refuses -- MISSING or REVOKED, never a partial write -- if
+ * the record is gone or already revoked; otherwise it writes only the fields it owns, by path,
+ * and keeps the hash index consistent with whatever `tokenHash` is actually stored at that
+ * instant (never a hash the caller computed from a stale read). Redis runs a script as one
+ * atomic step, so no other command can interleave between the check and the write.
+ */
+const UPDATE_PORTABLE_SKILL_TOKEN_SCRIPT = `
+-- BATSHIT_PORTABLE_SKILL_TOKEN_UPDATE_V1
+-- KEYS[1] = record key
+-- ARGV[1] = updatedAt; ARGV[2] = '1'/'0' set label; ARGV[3] = label JSON;
+-- ARGV[4] = '1'/'0' set families; ARGV[5] = families JSON array
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return 'MISSING'
+end
+if redis.call('JSON.TYPE', KEYS[1], '$.revokedAt')[1] ~= 'null' then
+  return 'REVOKED'
+end
+if ARGV[4] == '1' then
+  local families = cjson.decode(ARGV[5])
+  if #families == 0 then
+    return 'EMPTY_FAMILIES'
+  end
+  redis.call('JSON.SET', KEYS[1], '$.families', ARGV[5])
+end
+if ARGV[2] == '1' then
+  redis.call('JSON.SET', KEYS[1], '$.label', ARGV[3])
+end
+redis.call('JSON.SET', KEYS[1], '$.updatedAt', cjson.encode(ARGV[1]))
+return 'OK'
+`
+
+const ROTATE_PORTABLE_SKILL_TOKEN_SCRIPT = `
+-- BATSHIT_PORTABLE_SKILL_TOKEN_ROTATE_V1
+-- KEYS[1] = record key; KEYS[2] = new hash index key
+-- ARGV[1] = new tokenHash; ARGV[2] = new tokenPrefix; ARGV[3] = new tokenSuffix;
+-- ARGV[4] = updatedAt; ARGV[5] = userId; ARGV[6] = tokenId; ARGV[7] = hash index key prefix
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return 'MISSING'
+end
+if redis.call('JSON.TYPE', KEYS[1], '$.revokedAt')[1] ~= 'null' then
+  return 'REVOKED'
+end
+if redis.call('JSON.TYPE', KEYS[1], '$.tokenHash')[1] ~= 'string' then
+  return 'MALFORMED'
+end
+local oldHash = cjson.decode(redis.call('JSON.GET', KEYS[1], '$.tokenHash'))[1]
+redis.call('JSON.SET', KEYS[1], '$.tokenHash', cjson.encode(ARGV[1]))
+redis.call('JSON.SET', KEYS[1], '$.tokenPrefix', cjson.encode(ARGV[2]))
+redis.call('JSON.SET', KEYS[1], '$.tokenSuffix', cjson.encode(ARGV[3]))
+redis.call('JSON.SET', KEYS[1], '$.updatedAt', cjson.encode(ARGV[4]))
+redis.call('DEL', ARGV[7] .. oldHash)
+redis.call('JSON.SET', KEYS[2], '$', cjson.encode({userId=ARGV[5], tokenId=ARGV[6]}))
+return 'OK'
+`
+
+const REVOKE_PORTABLE_SKILL_TOKEN_SCRIPT = `
+-- BATSHIT_PORTABLE_SKILL_TOKEN_REVOKE_V1
+-- KEYS[1] = record key; KEYS[2] = user's token-set key
+-- ARGV[1] = revokedAt; ARGV[2] = tokenId; ARGV[3] = hash index key prefix
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return 'MISSING'
+end
+if redis.call('JSON.TYPE', KEYS[1], '$.revokedAt')[1] ~= 'null' then
+  return 'ALREADY_REVOKED'
+end
+if redis.call('JSON.TYPE', KEYS[1], '$.tokenHash')[1] ~= 'string' then
+  return 'MALFORMED'
+end
+local hash = cjson.decode(redis.call('JSON.GET', KEYS[1], '$.tokenHash'))[1]
+redis.call('JSON.SET', KEYS[1], '$.revokedAt', cjson.encode(ARGV[1]))
+redis.call('JSON.SET', KEYS[1], '$.updatedAt', cjson.encode(ARGV[1]))
+redis.call('DEL', ARGV[3] .. hash)
+redis.call('SREM', KEYS[2], ARGV[2])
+return 'OK'
+`
 
 export const PORTABLE_SKILL_TOKEN_HEADER = 'x-batshit-portable-token'
 
@@ -123,8 +209,13 @@ function buildTokenRecordKey(userId: string, tokenId: string) {
   return `portable_skill_token:${userId}:${tokenId}`
 }
 
+// BL-787: the rotate/revoke Lua scripts recompute this key from the record's OWN current
+// tokenHash (read fresh, inside the atomic script), never from a value the caller read earlier
+// -- so this prefix is the one piece they need passed in as an argument.
+const TOKEN_HASH_INDEX_KEY_PREFIX = 'portable_skill_token_hash:'
+
 function buildTokenHashIndexKey(tokenHash: string) {
-  return `portable_skill_token_hash:${tokenHash}`
+  return `${TOKEN_HASH_INDEX_KEY_PREFIX}${tokenHash}`
 }
 
 function buildExecutionLogKey(userId: string) {
@@ -135,15 +226,14 @@ function isContainerizedRuntime() {
   return process.env.BATSHIT_CONTAINERIZED === '1' || process.env.BATSHIT_RUNTIME_ENV === 'docker'
 }
 
-function buildPortableSkillEnvPlaceholder() {
+/** BL-341: `appOrigin` is the origin of the request that asked (the app's own address). */
+function buildPortableSkillEnvPlaceholder(appOrigin: string) {
   return [
     '# Batshit Portable Skill private token file',
     '# Keep this file on your machine. Do not put it inside a downloaded portable skill bundle.',
     '# Use one multi-scope token here for all Portable Skills, or create a per-skill',
     '# override file such as artifact-creator.env only when you want a narrower token.',
-    'BATSHIT_BASE_URL=http://127.0.0.1:5620',
-    'BATSHIT_PORTABLE_TOKEN=paste-your-portable-skill-token-here',
-    ''
+    buildPortableSkillEnvLines(appOrigin, 'paste-your-portable-skill-token-here')
   ].join('\n')
 }
 
@@ -210,16 +300,15 @@ export function getPortableSkillFamilyDefinitions(): PortableSkillTokenFamilyDef
   }))
 }
 
-export function buildPortableSkillEnvSnippet(token: string, baseUrl = 'http://127.0.0.1:5620') {
-  return [
-    'BATSHIT_BASE_URL=' + baseUrl,
-    'BATSHIT_PORTABLE_TOKEN=' + token,
-    ''
-  ].join('\n')
-}
-
-export async function ensurePortableSkillEnvTemplates(): Promise<PortableSkillEnvTemplateInfo[]> {
-  const placeholder = buildPortableSkillEnvPlaceholder()
+/**
+ * The env-file guidance the token routes return. `appOrigin` is the app's own address as the
+ * request reached it (`event.url.origin`); it fills `BATSHIT_BASE_URL` in the placeholder text and
+ * in a placeholder file created now (an existing file is never rewritten). BL-341.
+ */
+export async function ensurePortableSkillEnvTemplates(
+  appOrigin: string
+): Promise<PortableSkillEnvTemplateInfo[]> {
+  const placeholder = buildPortableSkillEnvPlaceholder(appOrigin)
   const writable = !isContainerizedRuntime()
 
   if (writable) {
@@ -371,66 +460,99 @@ export async function updatePortableSkillToken(options: {
   label?: unknown
   families?: unknown
 }): Promise<PortableSkillTokenSummary> {
-  const record = await readTokenRecord(options.userId, options.tokenId)
-  if (!record || record.revokedAt) {
-    throw Object.assign(new Error('Portable Skill Token not found.'), { status: 404 })
-  }
-
-  const nextFamilies =
-    options.families === undefined
-      ? record.families
-      : normalizePortableSkillFamilies(options.families)
-  if (nextFamilies.length === 0) {
+  const hasLabel = options.label !== undefined
+  const normalizedLabel = hasLabel ? normalizeLabel(options.label) : null
+  const hasFamilies = options.families !== undefined
+  const normalizedFamilies = hasFamilies ? normalizePortableSkillFamilies(options.families) : null
+  if (hasFamilies && (normalizedFamilies as PortableSkillFamilyId[]).length === 0) {
     throw Object.assign(new Error('Choose at least one Portable Skills capability family.'), {
       status: 400
     })
   }
 
-  const updated: PortableSkillTokenRecord = {
-    ...record,
-    label: options.label === undefined ? record.label : normalizeLabel(options.label),
-    families: nextFamilies,
-    updatedAt: nowIso()
+  const updatedAt = nowIso()
+  const recordKey = buildTokenRecordKey(options.userId, options.tokenId)
+
+  // BL-787: one atomic script -- see its definition for why. It refuses (MISSING/REVOKED)
+  // against the record's OWN current state, never a value read earlier, and writes only
+  // `label`/`families`/`updatedAt`, never touching `tokenHash` or `revokedAt`.
+  const answer = await redis.execute(async (client: any) =>
+    client.eval(UPDATE_PORTABLE_SKILL_TOKEN_SCRIPT, {
+      keys: [recordKey],
+      arguments: [
+        updatedAt,
+        hasLabel ? '1' : '0',
+        hasLabel ? JSON.stringify(normalizedLabel) : '',
+        hasFamilies ? '1' : '0',
+        hasFamilies ? JSON.stringify(normalizedFamilies) : ''
+      ]
+    })
+  )
+
+  if (answer === 'MISSING' || answer === 'REVOKED') {
+    throw Object.assign(new Error('Portable Skill Token not found.'), { status: 404 })
+  }
+  if (answer === 'EMPTY_FAMILIES') {
+    throw Object.assign(new Error('Choose at least one Portable Skills capability family.'), {
+      status: 400
+    })
+  }
+  if (answer !== 'OK') {
+    throw new Error(`Unexpected portable skill token update result: ${String(answer)}`)
   }
 
-  await redis.execute(async (client: any) => {
-    await client.json.set(buildTokenRecordKey(updated.userId, updated.id), '$', updated)
-  })
-
-  return summarizeRecord(updated)
+  const record = await readTokenRecord(options.userId, options.tokenId)
+  if (!record) {
+    throw Object.assign(new Error('Portable Skill Token not found.'), { status: 404 })
+  }
+  return summarizeRecord(record)
 }
 
 export async function rotatePortableSkillToken(options: {
   userId: string
   tokenId: string
 }): Promise<{ token: string; record: PortableSkillTokenSummary }> {
+  const secret = generateTokenSecret()
+  const tokenHash = hashToken(secret)
+  const updatedAt = nowIso()
+  const recordKey = buildTokenRecordKey(options.userId, options.tokenId)
+  const newHashIndexKey = buildTokenHashIndexKey(tokenHash)
+
+  // BL-787: one atomic script. It reads the record's CURRENT tokenHash itself (inside the
+  // script, not from an earlier JS-side read) to compute which old hash index to delete, so a
+  // rotate landing after another rotate always deletes the right one; it refuses outright if
+  // the record is gone or already revoked, so a rotate that raced a revoke can never bring a
+  // revoked token back to life.
+  const answer = await redis.execute(async (client: any) =>
+    client.eval(ROTATE_PORTABLE_SKILL_TOKEN_SCRIPT, {
+      keys: [recordKey, newHashIndexKey],
+      arguments: [
+        tokenHash,
+        secret.slice(0, TOKEN_PREFIX_LENGTH),
+        secret.slice(-TOKEN_SUFFIX_LENGTH),
+        updatedAt,
+        options.userId,
+        options.tokenId,
+        TOKEN_HASH_INDEX_KEY_PREFIX
+      ]
+    })
+  )
+
+  if (answer === 'MISSING' || answer === 'REVOKED') {
+    throw Object.assign(new Error('Portable Skill Token not found.'), { status: 404 })
+  }
+  if (answer !== 'OK') {
+    throw new Error(`Unexpected portable skill token rotate result: ${String(answer)}`)
+  }
+
   const record = await readTokenRecord(options.userId, options.tokenId)
-  if (!record || record.revokedAt) {
+  if (!record) {
     throw Object.assign(new Error('Portable Skill Token not found.'), { status: 404 })
   }
 
-  const secret = generateTokenSecret()
-  const tokenHash = hashToken(secret)
-  const updated: PortableSkillTokenRecord = {
-    ...record,
-    tokenHash,
-    tokenPrefix: secret.slice(0, TOKEN_PREFIX_LENGTH),
-    tokenSuffix: secret.slice(-TOKEN_SUFFIX_LENGTH),
-    updatedAt: nowIso()
-  }
-
-  await redis.execute(async (client: any) => {
-    await client.del(buildTokenHashIndexKey(record.tokenHash))
-    await client.json.set(buildTokenRecordKey(updated.userId, updated.id), '$', updated)
-    await client.json.set(buildTokenHashIndexKey(tokenHash), '$', {
-      userId: updated.userId,
-      tokenId: updated.id
-    })
-  })
-
   return {
     token: secret,
-    record: summarizeRecord(updated)
+    record: summarizeRecord(record)
   }
 }
 
@@ -438,25 +560,32 @@ export async function revokePortableSkillToken(options: {
   userId: string
   tokenId: string
 }): Promise<PortableSkillTokenSummary> {
-  const record = await readTokenRecord(options.userId, options.tokenId)
-  if (!record || record.revokedAt) {
+  const revokedAt = nowIso()
+  const recordKey = buildTokenRecordKey(options.userId, options.tokenId)
+  const setKey = buildTokenSetKey(options.userId)
+
+  // BL-787: one atomic script. It reads the record's CURRENT tokenHash itself, so it deletes
+  // whichever hash index is actually live at this instant (even if a rotate changed it after
+  // this call started), and refuses outright if the record is already gone or revoked.
+  const answer = await redis.execute(async (client: any) =>
+    client.eval(REVOKE_PORTABLE_SKILL_TOKEN_SCRIPT, {
+      keys: [recordKey, setKey],
+      arguments: [revokedAt, options.tokenId, TOKEN_HASH_INDEX_KEY_PREFIX]
+    })
+  )
+
+  if (answer === 'MISSING' || answer === 'ALREADY_REVOKED') {
     throw Object.assign(new Error('Portable Skill Token not found.'), { status: 404 })
   }
-
-  const revokedAt = nowIso()
-  const updated: PortableSkillTokenRecord = {
-    ...record,
-    revokedAt,
-    updatedAt: revokedAt
+  if (answer !== 'OK') {
+    throw new Error(`Unexpected portable skill token revoke result: ${String(answer)}`)
   }
 
-  await redis.execute(async (client: any) => {
-    await client.del(buildTokenHashIndexKey(record.tokenHash))
-    await client.json.set(buildTokenRecordKey(updated.userId, updated.id), '$', updated)
-    await client.sRem(buildTokenSetKey(updated.userId), updated.id)
-  })
-
-  return summarizeRecord(updated)
+  const record = await readTokenRecord(options.userId, options.tokenId)
+  if (!record) {
+    throw Object.assign(new Error('Portable Skill Token not found.'), { status: 404 })
+  }
+  return summarizeRecord(record)
 }
 
 export async function validatePortableSkillToken(secret: string | null): Promise<PortableSkillTokenValidation> {
@@ -503,13 +632,26 @@ export async function recordPortableSkillTokenControlExecution(options: {
   const usedAt = nowIso()
   await redis.execute(async (client: any) => {
     const recordKey = buildTokenRecordKey(options.userId, options.tokenId)
-    const record = await client.json.get(recordKey)
-    if (record && typeof record === 'object') {
-      await client.json.set(recordKey, '$', {
-        ...(record as PortableSkillTokenRecord),
-        lastUsedAt: usedAt,
-        updatedAt: usedAt
-      })
+    // BL-552: path-scoped writes only (precedent: `wakeHookStore.ts` `recordWakeHookUse`,
+    // lines 361-380). The old code read the whole record and wrote it back whole, which raced
+    // a rotate, a revoke, or a scope (`families`) edit landing between that read and this
+    // write: the stamp would silently overwrite the concurrent change with the stale read's
+    // other fields (the old token hash came back, a narrowed scope widened again, a revoked
+    // record lost its `revokedAt`). Setting ONLY the two fields this call owns cannot clobber
+    // a sibling field. A non-root `$.field` `JSON.SET` does NOT no-op against a key that does
+    // not exist -- RedisJSON REFUSES it (throws), so a record revoked/deleted before this stamp
+    // runs raises here, not recreates.
+    try {
+      await client.json.set(recordKey, '$.lastUsedAt', usedAt)
+      await client.json.set(recordKey, '$.updatedAt', usedAt)
+    } catch (error) {
+      // Only the expected race is silent: the record is gone (revoked/deleted) between
+      // validation and this stamp, same as the wake-hook precedent. A genuine failure while
+      // the record still exists (a dropped connection, a real Redis error) must still
+      // propagate, exactly like the old read-then-write code did (its `client.json.get` would
+      // throw on the same failure) -- a bare catch here would hide that too.
+      const stillExists = (await client.exists(recordKey)) > 0
+      if (stillExists) throw error
     }
 
     const logEntry = {

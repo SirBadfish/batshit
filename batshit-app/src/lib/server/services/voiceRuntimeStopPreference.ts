@@ -45,7 +45,16 @@ export async function syncLocalRuntimeStopPreference(
   try {
     // Under the engine folder's lock, so a toggle save racing a launch never writes the old
     // record back over the new one (review of 22aa935de).
-    ;({ changed, live } = await setLocalRuntimeStopChoice(engineId, stopOnShutdown))
+    let unreadable: string[] = []
+    ;({ changed, live, unreadable } = await setLocalRuntimeStopChoice(engineId, stopOnShutdown))
+    if (unreadable.length > 0) {
+      // Left as they are (BL-1268): the new choice did not reach them, and every stopper holds its
+      // stops while one cannot be read.
+      logger.warn('[voice-runtime] a launch record could not be read, so the new stop preference did not reach it', {
+        engineId,
+        unreadable
+      })
+    }
   } catch (error) {
     logger.warn('[voice-runtime] failed to update the saved stop preference', { engineId, error })
   }

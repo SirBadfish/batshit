@@ -42,7 +42,7 @@ These apply when Batshit runs through `Batshit.app` or directly from source on t
 | `PUBLIC_BATSHIT_SERVER_URL` | Mac app: `http://127.0.0.1:5600`; source checkout: `http://localhost:5610` | Browser-facing batshit-server URL saved/returned to users. |
 | `PUBLIC_BATSHIT_SERVER_API_URL` | Mac app: `http://127.0.0.1:5600/api/v1`; source checkout: `http://localhost:5610/api/v1` | Browser-facing batshit-server API root. |
 | `BATSHIT_ARTIFACT_COMPLETE_URL` | Mac app: `http://127.0.0.1:5620/api/artifacts/complete`; source checkout: `http://localhost:5621/api/artifacts/complete` | Server-to-app artifact completion callback. |
-| `BATSHIT_APP_VERSION` | `0.1.0-alpha.2` | Current installed Batshit version shown by the in-app update check. Normal users should not change this. |
+| `BATSHIT_APP_VERSION` | `0.1.0-alpha.3` | Current installed Batshit version shown by the in-app update check. Normal users should not change this. |
 | `BATSHIT_APP_CHANNEL` | `alpha` | Release channel label shown by the in-app update check. |
 | `BATSHIT_UPDATE_CHECK_DISABLED` | `0` | Set to `1` to disable in-app update checks for offline/private environments. |
 | `BATSHIT_UPDATE_FEED_URL` | blank | Optional custom release feed: a GitHub-style release list or one release. Blank uses Batshit's official GitHub release list, pre-releases included. |
@@ -75,6 +75,7 @@ These live in `.env.docker`.
 
 | Variable | Default example | Purpose |
 | --- | --- | --- |
+| `TZ` | blank; `./start-docker.sh` fills in your computer's time zone once | Your time zone, as an IANA name such as `Europe/Paris`. Agents are told the time in it, and a memory search by date counts its days. A zone already set is never changed. Left blank under raw Docker Compose, the containers run on UTC. |
 | `BATSHIT_DOCKER_BIND_HOST` | `127.0.0.1` | Host address Docker publishes ports on. The default keeps Batshit reachable only from the computer running Docker. `0.0.0.0` opts into LAN exposure — only on a trusted network. |
 | `BATSHIT_DOCKER_APP_PORT` | `5620` | Host/browser port for the Docker Batshit app. |
 | `BATSHIT_DOCKER_SERVER_PORT` | `5600` | Host/browser port for Docker batshit-server. |
@@ -87,7 +88,7 @@ These live in `.env.docker`.
 | `BATSHIT_SESSION_COOKIE_SECURE` | blank | Leave blank for automatic local HTTP vs HTTPS behavior. |
 | `BATSHIT_SESSION_COOKIE_NAME` | `batshit_session_docker` | Lets Docker stay logged in beside another local Batshit instance. |
 | `BODY_SIZE_LIMIT` | `1G` | SvelteKit incoming request body limit for ordinary app requests and trusted local imports. It is not a backup export or restore limit. |
-| `BATSHIT_APP_VERSION` | `0.1.0-alpha.2` | Current installed Batshit version shown by the in-app update check. |
+| `BATSHIT_APP_VERSION` | `0.1.0-alpha.3` | Current installed Batshit version shown by the in-app update check. |
 | `BATSHIT_APP_CHANNEL` | `alpha` | Release channel label shown by the in-app update check. |
 | `BATSHIT_UPDATE_CHECK_DISABLED` | `0` | Set to `1` to disable in-app update checks. |
 | `BATSHIT_UPDATE_FEED_URL` | blank | Optional custom release feed: a GitHub-style release list or one release. Blank uses Batshit's official GitHub release list, pre-releases included. |
@@ -142,6 +143,8 @@ Advanced tuning: `BATSHIT_CODEX_CONTEXT_GUARD_THRESHOLD` and `BATSHIT_CLAUDE_CON
 
 Raw Docker Compose can run without these values, but Docker Sandbox and Batshit-managed add-on start/stop buttons will show unavailable/manual setup states until the operator is configured.
 
+Each Docker Batshit tells the operator its name: `docker:` and its Docker Compose project name (`compose.yaml` sets `BATSHIT_VOICE_RUNTIME_OWNER` for you; it is not a setting). So when two Docker Batshits use the same operator, for example two projects started from one folder with `--project-name`, each one's shutdown stops only the voice engines it started.
+
 ## Docker MCP Gateway variables
 
 Docker MCP Gateway is optional and host-side.
@@ -170,8 +173,7 @@ When `DOCKER_MCP_GATEWAY_PORT` or `DOCKER_MCP_GATEWAY_URL` is set in `.env.docke
 | `N8N_EDITOR_BASE_URL` | `http://localhost:5678` | Browser/editor URL for optional Docker n8n profile. |
 | `WEBHOOK_URL` | `http://localhost:5678/` | Browser-facing webhook base for optional Docker n8n profile. |
 | `N8N_WEBHOOK_URL` | `http://localhost:5678/webhook` | Browser-facing webhook URL for optional Docker n8n profile. |
-| `GENERIC_TIMEZONE` | `America/New_York` | n8n timezone. |
-| `TZ` | `America/New_York` | Container timezone. |
+| `GENERIC_TIMEZONE` | blank; `./start-docker.sh` fills in your computer's time zone | Time zone n8n uses for its schedules. |
 
 When using `./start-docker.sh --profile n8n`, the launcher sets `N8N_API_URL=http://n8n:5678` if `.env.docker` still has a default host-managed n8n URL. If you use direct Compose with `--profile n8n`, set that value yourself. Keep the editor/webhook values browser-facing.
 
@@ -201,7 +203,7 @@ These can be env fallbacks, but Settings -> API Keys is preferred for normal use
 | `STEPFUN_API_KEY` / `STEP_API_KEY` / `STEPFUN_API_BASE_URL` | StepFun key and optional OpenAI-compatible base URL override. The same key also powers StepFun TTS. |
 | `OPENROUTER_API_KEY` | OpenRouter provider key. |
 | `AI_GATEWAY_API_KEY` | Vercel AI Gateway key. |
-| `TYPESAFE_API_KEY` | Optional TypeSafe key for [Jev Juice](../jev-juice/overview.md). Settings → API Keys is preferred; every Jev Juice feature stays off until you turn it on. |
+| `TYPESAFE_API_KEY` | Optional TypeSafe key for [Judge Juice](../judge-juice/overview.md). Settings → API Keys is preferred; every Judge Juice feature stays off until you turn it on. |
 | `DEEPSEEK_API_KEY` | DeepSeek provider key in app env examples. |
 | `ZAI_API_KEY` / `ZAI_API_BASE_URL` | Z.ai regular pay-as-you-go key and optional OpenAI-compatible base URL override. |
 | `ZAI_CODING_API_KEY` / `ZAI_CODING_API_BASE_URL` | Separate Z.ai Coding Plan key and optional coding-endpoint override. The regular key never activates this connection. |

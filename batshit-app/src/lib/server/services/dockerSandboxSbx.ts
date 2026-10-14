@@ -1,5 +1,9 @@
+import { getBatshitHomeDir, getDefaultBatshitHomeDir } from './batshitHome'
 import { createHash } from 'node:crypto'
+import { realpathSync } from 'node:fs'
+import path from 'node:path'
 import { SANDBOX_COMMAND_TAG_ENV, sandboxCommandEndArgv } from './commandEnd'
+import { batshitHomeSandboxMountPaths, sandboxProtectedHomeRoots, sandboxHomeMountIdentity, SANDBOX_BATSHIT_PROTECTED_DIRS, SANDBOX_MOUNT_VERSION } from './sandboxHomeMounts'
 
 /**
  * Docker Sandbox through Docker's standalone `sbx` CLI (Docker Sandboxes).
@@ -83,7 +87,8 @@ export function buildSbxSandboxName(options: {
       .slice(0, 20) || 'user'
   const sessionId = typeof options.sessionId === 'string' ? options.sessionId.trim() : ''
   const sessionSegment = sessionId ? `s${hashHex(sessionId, 8)}-` : ''
-  return `${SBX_SANDBOX_NAME_PREFIX}${userPart}-${sessionSegment}${hashHex(options.workspaceRoot, 10)}`
+  // A new name avoids reusing an existing sbx VM with the old broader mounts.
+  return `${SBX_SANDBOX_NAME_PREFIX}${userPart}-${sessionSegment}m${SANDBOX_MOUNT_VERSION}-${hashHex(`managed-mounts-v${SANDBOX_MOUNT_VERSION}:${options.workspaceRoot}${sandboxHomeMountIdentity()}`, 10)}`
 }
 
 export function isManagedSbxSandboxName(name: string) {
@@ -107,6 +112,21 @@ export function sbxCreateArgs(options: {
   workspaceRoot: string
   extraWorkspaces?: string[]
 }) {
+  const home = getBatshitHomeDir()
+  const isHome = (root: string) => path.basename(root) === '.batshit' || path.resolve(root) === home
+  const extraWorkspaces = (options.extraWorkspaces ?? []).flatMap((workspace) =>
+    isHome(workspace) ? batshitHomeSandboxMountPaths(workspace, path.resolve(workspace) === home ? getDefaultBatshitHomeDir() : workspace) : [workspace]
+  )
+  const protectedRoots = sandboxProtectedHomeRoots()
+  for (const workspace of options.extraWorkspaces ?? []) {
+    if (isHome(workspace)) protectedRoots.push(...SANDBOX_BATSHIT_PROTECTED_DIRS.map((name) => path.join(workspace, name)))
+    if (SANDBOX_BATSHIT_PROTECTED_DIRS.includes(path.basename(workspace)) && path.basename(path.dirname(workspace)) === '.batshit') protectedRoots.push(workspace)
+  }
+  for (const workspace of [options.workspaceRoot, ...extraWorkspaces]) {
+    if (protectedRoots.some((agents) => overlapsProtectedHome(workspace, agents))) {
+      throw new Error('Sandbox workspace exposes managed agent homes or protected runtime/Pinokio data.')
+    }
+  }
   return [
     'create',
     '--name',
@@ -115,8 +135,22 @@ export function sbxCreateArgs(options: {
     SBX_ALL_HOSTS,
     SBX_SANDBOX_KIT,
     options.workspaceRoot,
-    ...(options.extraWorkspaces ?? [])
+    ...extraWorkspaces
   ]
+}
+
+function overlapsProtectedHome(workspace: string, agents: string): boolean {
+  const flavor = /^[a-z]:[\\/]/i.test(workspace) ? path.win32 : path.posix
+  const canonical = (value: string) => {
+    try { return realpathSync.native(value) } catch { return flavor.resolve(value) }
+  }
+  const actualWorkspace = canonical(workspace)
+  const actualAgents = canonical(agents)
+  const inside = (target: string, root: string) => {
+    const relative = flavor.relative(root, target)
+    return relative === '' || (relative !== '..' && !relative.startsWith(`..${flavor.sep}`) && !flavor.isAbsolute(relative))
+  }
+  return inside(actualWorkspace, actualAgents) || inside(actualAgents, actualWorkspace)
 }
 
 export function sbxDenyAllNetworkArgs(sandboxName: string) {

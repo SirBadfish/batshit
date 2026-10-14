@@ -4,12 +4,10 @@ import { describe, expect, it, vi } from 'vitest'
 import { APPEARANCE_DIAL_VALUES_CONTRACT } from '../appearanceDials.contracts'
 import { parseAppearanceDialsManifest } from '../appearanceDials'
 import { createHairState } from '../hairAssets'
+import { createAnatomyFitState } from './anatomyFitContracts'
 import { hairFollowerDefinitionSha256 } from '../hairFollowers'
 import { createDefaultNailSurfaceState, parseNailSurfaceDefinition } from '../nailSurface'
-import {
-  HAIR_ROOT_WEIGHTED_MOTION_TAG,
-  secondaryMotionDefinitionSha256
-} from '../secondaryMotion'
+import { HAIR_ROOT_WEIGHTED_MOTION_TAG, secondaryMotionDefinitionSha256 } from '../secondaryMotion'
 import {
   createDefaultSkinAppearanceState,
   parseSkinAppearanceDefinition
@@ -64,7 +62,7 @@ import {
   HAIR_NEUTRAL_VALUE_PNG_FIXTURE
 } from './fixtures/hairAssetFixture'
 import { planAppearanceRecipeMigration } from './appearanceRecipeMigrationPlanner'
-
+import { RECIPE_ROLLBACK_PREVIEW_RESULT_CONTRACT } from './recipeRollbackPreviewResult'
 const hash = (character: string) => character.repeat(64)
 const bytes = (value: string) => new TextEncoder().encode(value)
 
@@ -251,8 +249,10 @@ function source(
         },
         identities: {
           contract: 'recipe-source/v1',
+          schemaVersion: 1,
           baseId: 'base_client',
           fitFamily: 'fit_client',
+          modelSha256,
           definitionSha256: hash('1'),
           neutralId: 'neutral_recipe_client',
           neutralRecipeSha256: hash('2'),
@@ -268,7 +268,10 @@ function source(
 }
 
 async function createFailureWorkflowHarness(
-  point: 'upload' | 'registration' | 'staging' | 'commit'
+  point: 'upload' | 'registration' | 'staging' | 'commit',
+  assetBase?: string,
+  assetUrl?: (ref: string) => string,
+  ordinary = false
 ) {
   const sourcePackage = bytes(`failure-source-package-${point}`)
   const sourceModel = bytes(`failure-source-model-${point}`)
@@ -278,7 +281,8 @@ async function createFailureWorkflowHarness(
   const liveManifest = bytes(`failure-live-manifest-${point}`)
   const recipeState = await buildRecipeStateSnapshot({
     goon: minimalGoon(),
-    appearanceDials: appearanceState()
+    appearanceDials: appearanceState(),
+    siblingStates: []
   })
   const buildReceipt = await liveReceipt(livePackage, liveModel, liveManifest, recipeState)
   const archiveReceipt = await storedArchive(livePackage, liveModel, liveManifest)
@@ -329,27 +333,30 @@ async function createFailureWorkflowHarness(
     retained: []
   }))
   const uploadCustomPackage = vi.fn(async () => upload)
+  const bake = vi.fn(
+    async (_input: unknown, _options: { signal?: AbortSignal }) =>
+      ({
+        contract: 'goon-live-bake-output/v1' as const,
+        packageBytes: livePackage,
+        modelBytes: liveModel,
+        manifestBytes: liveManifest,
+        receipt: buildReceipt,
+        manifest: {},
+        liveManifest: {},
+        audit: {}
+      }) as any
+  )
   const client = new RecipeWorkflowClient(minimalGoon().id, {
     fetchImpl: (async (input: RequestInfo | URL) => {
-      const body = sourceByRef.get(String(input))
+      const ref = String(input)
+      const body = sourceByRef.get(assetBase && ref.startsWith(`${assetBase}/`)
+        ? ref.slice(assetBase.length) : ref)
       return body
         ? new Response(body.slice().buffer, { status: 200 })
         : new Response('missing', { status: 404 })
     }) as typeof fetch,
-    assetUrl: (ref) => ref,
-    bake: vi.fn(
-      async () =>
-        ({
-          contract: 'goon-live-bake-output/v1' as const,
-          packageBytes: livePackage,
-          modelBytes: liveModel,
-          manifestBytes: liveManifest,
-          receipt: buildReceipt,
-          manifest: {},
-          liveManifest: {},
-          audit: {}
-        }) as any
-    ),
+    assetUrl: assetUrl ?? ((ref) => assetBase ? resolveRecipeAssetUrl(ref, assetBase) : ref),
+    bake,
     uploadCustomPackage,
     cleanupCustomPackage
   })
@@ -362,7 +369,8 @@ async function createFailureWorkflowHarness(
   const staged = {
     goon: minimalGoon(),
     owner: { writeVersion: 22 } as GoonRecipeV2,
-    job: { ...job, status: 'ready', stateVersion: 5 } as GoonRecipeJob
+    job: { ...job, status: 'ready', stateVersion: 5 } as GoonRecipeJob,
+    envelope: { live: await deriveRecipeAssetSetFromUpload(upload) }
   } as RecipeStageResponse
   const injectedError = new Error(`Injected ${point} failure.`)
   const register = vi.spyOn(client, 'registerCandidateAssets')
@@ -392,7 +400,9 @@ async function createFailureWorkflowHarness(
   const previewCandidate = vi.fn(async () => undefined)
 
   return {
-    client,
+    client, started, staged,
+    bake,
+    recipeSource,
     recipeState,
     archiveReceipt,
     cleanupCustomPackage,
@@ -446,6 +456,37 @@ describe('Recipe workflow browser client', () => {
       'http://127.0.0.1:5651/uploads/goon_custom_manifests/source.json'
     )
     expect(projected.customAvatar?.manifest?.url).toBe('/uploads/goon_custom_manifests/source.json')
+  })
+
+  it('resolves staged animation preloads even when the preview model is already resolved, preserving canonical Recipe data', () => {
+    const storedAnimation = {
+      url: '/uploads/goon_animations/dance.glb', filename: 'dance.glb', originalName: 'Dance.glb'
+    }
+    const externalAnimation = {
+      url: 'https://cdn.example/dance.glb', filename: 'external.glb'
+    }
+    const projected = minimalGoon({
+      customAvatar: {
+        model: { url: 'http://127.0.0.1:5691/uploads/goon_custom_models/live.glb', filename: 'live.glb' }
+      },
+      files: { animations: [storedAnimation, externalAnimation] }
+    })
+    // Identity-bound nested refs are canonical stored data, not browser assets.
+    const recipe = { authoringRevision: { source: { model: { ref: '/uploads/goon_custom_models/source.glb' } } } }
+    projected.recipe = recipe as GoonRecipeV2
+    const canonicalBefore = canonicalRecipeString(projected.recipe)
+
+    const resolved = resolveRecipePreviewGoonAssetUrls(projected, 'http://127.0.0.1:5691/')
+
+    expect(resolved.files.animations?.[0]).toEqual({
+      ...storedAnimation, url: 'http://127.0.0.1:5691/uploads/goon_animations/dance.glb'
+    })
+    expect(resolved.files.animations?.[1]).toBe(externalAnimation)
+    expect(projected.files.animations?.[0]).toBe(storedAnimation)
+    expect(storedAnimation.url).toBe('/uploads/goon_animations/dance.glb')
+    expect(resolved.recipe).toBe(projected.recipe)
+    expect(canonicalRecipeString(resolved.recipe)).toBe(canonicalBefore)
+    expect(resolveRecipePreviewGoonAssetUrls(resolved, 'http://127.0.0.1:5691/')).toBe(resolved)
   })
 
   it('refreshes the Goon after source upload so a runtime-only camera save cannot stale initial preparation', async () => {
@@ -716,6 +757,9 @@ describe('Recipe workflow browser client', () => {
     expect(first.siblings.find((entry) => entry.id === 'hairState')?.state).toMatchObject({
       motionSettings: { enabled: true, intensity: 1.1 }
     })
+    expect(first.siblings.find((entry) => entry.id === 'hairState')?.state).toMatchObject({
+      selected: { assetId: 'style-01', assetRevisionId: 'style-01-r1' }
+    })
     expect(first.stateSha256).toMatch(/^[a-f0-9]{64}$/)
   })
 
@@ -728,12 +772,7 @@ describe('Recipe workflow browser client', () => {
         id: 'anatomy-fit',
         contract: 'anatomy-fit-state/v2',
         definitionSha256,
-        state: {
-          contract: 'anatomy-fit-state/v2',
-          definitionSha256,
-          fits: [],
-          stateSha256: hash('e')
-        }
+        state: await createAnatomyFitState(definitionSha256, [])
       }
     })
     expect(fitted.siblings.map((entry) => entry.id)).toEqual(['anatomy-fit'])
@@ -793,7 +832,7 @@ describe('Recipe workflow browser client', () => {
           baseColor: '#2a1738',
           highlightColor: '#6f4a8e',
           motionSettings: { enabled: true, intensity: 1.1 }
-        }
+        },
       }),
       appearanceDials: fixture.sourceState.appearanceDials
     })
@@ -1046,9 +1085,15 @@ describe('Recipe workflow browser client', () => {
         ? new Response(body.slice().buffer, { status: 200 })
         : new Response('missing', { status: 404 })
     })
+    let releaseBake!: () => void
+    let bakeEntered!: () => void
+    const bakeGate = new Promise<void>((resolve) => { releaseBake = resolve })
+    const enteredBake = new Promise<void>((resolve) => { bakeEntered = resolve })
     const bake = vi.fn(
-      async (input) =>
-        ({
+      async (input, _options?: { signal?: AbortSignal }) => {
+        bakeEntered()
+        await bakeGate
+        return ({
           contract: 'goon-live-bake-output/v1' as const,
           packageBytes: livePackage,
           modelBytes: liveModel,
@@ -1058,6 +1103,7 @@ describe('Recipe workflow browser client', () => {
           liveManifest: {},
           audit: {}
         }) as any
+      }
     )
     const client = new RecipeWorkflowClient(minimalGoon().id, {
       fetchImpl: fetchImpl as typeof fetch,
@@ -1076,21 +1122,67 @@ describe('Recipe workflow browser client', () => {
       owner: { writeVersion: 13 } as GoonRecipeV2,
       job: { ...job, status: 'ready', stateVersion: 6 } as GoonRecipeJob
     } as RecipeStageResponse
-    const stage = vi.spyOn(client, 'stageCandidate').mockResolvedValue(staged)
-    const commit = vi.spyOn(client, 'commitJob').mockResolvedValue({} as RecipeCommitResponse)
-    const previewCandidate = vi.fn(async () => undefined)
-
-    const result = await client.buildUploadStageCommit({
-      start: {
-        kind: 'package-update',
-        request: {
-          expectedWriteVersion: 11,
-          idempotencyKey: 'client-key',
-          analysisId: 'analysis_client'
-        }
-      },
-      previewCandidate
+    let releaseStage!: () => void
+    let stageEntered!: () => void
+    const stageGate = new Promise<void>((resolve) => { releaseStage = resolve })
+    const enteredStage = new Promise<void>((resolve) => { stageEntered = resolve })
+    const stage = vi.spyOn(client, 'stageCandidate').mockImplementation(async () => {
+      stageEntered()
+      await stageGate
+      return staged
     })
+    let releaseCommit!: () => void
+    let commitEntered!: () => void
+    const commitGate = new Promise<void>((resolve) => { releaseCommit = resolve })
+    const enteredCommit = new Promise<void>((resolve) => { commitEntered = resolve })
+    const commit = vi.spyOn(client, 'commitJob').mockImplementation(async () => {
+      commitEntered()
+      await commitGate
+      return {} as RecipeCommitResponse
+    })
+    const renew = vi.spyOn(client, 'actOnJob').mockResolvedValue({} as RecipeJobActionResponse)
+    const previewCandidate = vi.fn(async () => undefined)
+    const buildController = new AbortController()
+
+    vi.useFakeTimers()
+    let result!: Awaited<ReturnType<typeof client.buildUploadStageCommit>>
+    try {
+      const workflow = client.buildUploadStageCommit({
+        start: {
+          kind: 'package-update',
+          request: {
+            expectedWriteVersion: 11,
+            idempotencyKey: 'client-key',
+            analysisId: 'analysis_client'
+          }
+        },
+        previewCandidate,
+        signal: buildController.signal
+      })
+      await enteredBake
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(renew).toHaveBeenCalledWith('job_client', {
+        action: 'renew', expectedWriteVersion: 11, expectedJobStateVersion: 4
+      }, { signal: expect.any(AbortSignal) })
+      releaseBake()
+      await enteredStage
+      await vi.advanceTimersByTimeAsync(15 * 60_000 + 1)
+      expect(bake.mock.calls[0]?.[1]?.signal?.aborted).toBe(false)
+      releaseStage()
+      await enteredCommit
+      await vi.advanceTimersByTimeAsync(15 * 60_000 + 1)
+      expect(bake.mock.calls[0]?.[1]?.signal?.aborted).toBe(false)
+      releaseCommit()
+      result = await workflow
+      expect(vi.getTimerCount()).toBe(0)
+      await vi.advanceTimersByTimeAsync(120_000)
+      expect(renew).toHaveBeenCalledTimes(1)
+    } finally {
+      releaseBake()
+      releaseStage()
+      releaseCommit()
+      vi.useRealTimers()
+    }
 
     const [bakeInput, bakeOptions] = bake.mock.calls[0]
     expect(bakeInput.state).toEqual(recipeState)
@@ -1108,7 +1200,7 @@ describe('Recipe workflow browser client', () => {
     expect(Array.from(bakeInput.hair.highlightMaskBytes)).toEqual(
       Array.from(HAIR_HIGHLIGHT_MASK_PNG_FIXTURE)
     )
-    expect(bakeOptions).toEqual({ signal: undefined, onProgress: undefined })
+    expect(bakeOptions).toEqual({ signal: expect.any(AbortSignal), onProgress: undefined })
     expect(register).toHaveBeenCalledWith('job_client', {
       expectedWriteVersion: 11,
       expectedJobStateVersion: 4,
@@ -1121,7 +1213,8 @@ describe('Recipe workflow browser client', () => {
         expectedJobStateVersion: 5,
         liveBuildReceipt: buildReceipt,
         live: result.live
-      })
+      }),
+      { signal: buildController.signal }
     )
     expect(register.mock.invocationCallOrder[0]).toBeLessThan(stage.mock.invocationCallOrder[0])
     expect(previewCandidate).toHaveBeenCalledWith(staged)
@@ -1143,7 +1236,8 @@ describe('Recipe workflow browser client', () => {
     const sourceManifest = bytes('source-manifest')
     const recipeState = await buildRecipeStateSnapshot({
       goon: minimalGoon(),
-      appearanceDials: appearanceState()
+      appearanceDials: appearanceState(),
+      siblingStates: []
     })
     const recipeSource = await source(sourcePackage, sourceModel, sourceManifest)
     const job = {
@@ -1220,7 +1314,8 @@ describe('Recipe workflow browser client', () => {
     const sourceManifest = bytes('source-manifest')
     const recipeState = await buildRecipeStateSnapshot({
       goon: minimalGoon(),
-      appearanceDials: appearanceState()
+      appearanceDials: appearanceState(),
+      siblingStates: []
     })
     const recipeSource = await source(sourcePackage, sourceModel, sourceManifest)
     const job = {
@@ -1289,7 +1384,8 @@ describe('Recipe workflow browser client', () => {
     const liveManifest = bytes('preview-live-manifest')
     const recipeState = await buildRecipeStateSnapshot({
       goon: minimalGoon(),
-      appearanceDials: appearanceState()
+      appearanceDials: appearanceState(),
+      siblingStates: []
     })
     const buildReceipt = await liveReceipt(livePackage, liveModel, liveManifest, recipeState)
     const archiveReceipt = await storedArchive(livePackage, liveModel, liveManifest)
@@ -1457,6 +1553,86 @@ describe('Recipe workflow browser client', () => {
     }
   )
 
+  it('registers a settled upload before honoring Cancel, then fails and cleans it up', async () => {
+    const harness = await createFailureWorkflowHarness('staging')
+    const originalUpload = harness.uploadCustomPackage.getMockImplementation()!
+    let releaseUpload!: () => void
+    let uploadEntered!: () => void
+    const uploadGate = new Promise<void>((resolve) => { releaseUpload = resolve })
+    const enteredUpload = new Promise<void>((resolve) => { uploadEntered = resolve })
+    harness.uploadCustomPackage.mockImplementation(async (...args) => {
+      uploadEntered()
+      await uploadGate
+      return originalUpload(...args)
+    })
+    const abort = new AbortController()
+    const workflow = harness.client.buildUploadStageCommit({
+      start: {
+        kind: 'bake',
+        request: { expectedWriteVersion: 20, idempotencyKey: 'cancel-upload', state: harness.recipeState }
+      },
+      signal: abort.signal,
+      previewCandidate: harness.previewCandidate
+    })
+    await enteredUpload
+    abort.abort()
+    releaseUpload()
+    await expect(workflow).rejects.toMatchObject({ name: 'AbortError' })
+    expect(harness.register).toHaveBeenCalledOnce()
+    expect(harness.stage).not.toHaveBeenCalled()
+    expect(harness.action).toHaveBeenCalledWith(
+      'job_staging_failure', expect.objectContaining({ action: 'fail', stage: 'packaging' })
+    )
+    expect(harness.cleanupCustomPackage).toHaveBeenCalledWith(
+      minimalGoon().id, harness.archiveReceipt
+    )
+    expect(harness.register.mock.invocationCallOrder[0]).toBeLessThan(
+      harness.action.mock.invocationCallOrder[0]
+    )
+  })
+
+  it('aborts a held Worker when lease renewal hangs and disposes every timer', async () => {
+    const harness = await createFailureWorkflowHarness('staging')
+    let enteredBake!: () => void
+    const bakeEntered = new Promise<void>((resolve) => { enteredBake = resolve })
+    harness.bake.mockImplementation(async (_input, options) => {
+      enteredBake()
+      return new Promise((_resolve, reject) => {
+        options.signal!.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true })
+      })
+    })
+    const renew = harness.action.mockImplementation(async (_jobId, action) => {
+      if (action.action === 'renew') return new Promise<RecipeJobActionResponse>(() => {})
+      return {} as RecipeJobActionResponse
+    })
+    vi.useFakeTimers()
+    try {
+      const workflow = harness.client.buildUploadStageCommit({
+        start: {
+          kind: 'bake',
+          request: { expectedWriteVersion: 20, idempotencyKey: 'hung-renew', state: harness.recipeState }
+        },
+        previewCandidate: harness.previewCandidate
+      })
+      const outcome = workflow.then(
+        () => null,
+        (error: unknown) => error
+      )
+      await bakeEntered
+      await vi.advanceTimersByTimeAsync(75_000)
+      expect(outcome).toBeDefined()
+      expect(await outcome).toMatchObject({ message: expect.stringContaining('Keeping the Goon update active took too long') })
+      const renewal = renew.mock.calls.find((call) => call[1].action === 'renew')
+      expect(renewal?.[2]?.signal?.aborted).toBe(true)
+      expect(harness.stage).not.toHaveBeenCalled()
+      expect(vi.getTimerCount()).toBe(0)
+      await vi.advanceTimersByTimeAsync(120_000)
+      expect(renew.mock.calls.filter((call) => call[1].action === 'renew')).toHaveLength(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('surfaces typed route errors with the server conflict code', async () => {
     const fetchImpl = vi.fn(
       async () =>
@@ -1486,5 +1662,34 @@ describe('Recipe workflow browser client', () => {
       '/api/goons/goon%2Fclient%20id/recipe/start',
       expect.objectContaining({ method: 'POST' })
     )
+  })
+
+  it('surfaces a rollback preview stream verification failure as a typed route error', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
+      contract: RECIPE_ROLLBACK_PREVIEW_RESULT_CONTRACT,
+      kind: 'error',
+      status: 409,
+      error: 'The previous Recipe revision is invalid.',
+      code: 'CORRUPT_REVISION'
+    })))
+    const client = new RecipeWorkflowClient(minimalGoon().id, { fetchImpl: fetchImpl as typeof fetch })
+
+    await expect(client.previewRollback()).rejects.toMatchObject({
+      status: 409,
+      code: 'CORRUPT_REVISION',
+      message: 'The previous Recipe revision is invalid.'
+    })
+    expect(fetchImpl).toHaveBeenCalledWith(
+      `/api/goons/${minimalGoon().id}/recipe/rollback`,
+      expect.objectContaining({ signal: undefined })
+    )
+  })
+
+  it('rejects an unversioned rollback preview response before interpreting its content', async () => {
+    const client = new RecipeWorkflowClient(minimalGoon().id, {
+      fetchImpl: vi.fn(async () => new Response(JSON.stringify({ kind: 'success', preview: {} }))) as typeof fetch
+    })
+
+    await expect(client.previewRollback()).rejects.toThrow('unsupported result contract')
   })
 })

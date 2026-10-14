@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   buildRealtimeSpeechChunkId,
+  findNextHiddenControlOpener,
   RealtimeSpeechCoordinator,
   type RealtimeSpeechMetadata
 } from '$lib/services/realtimeSpeechCoordinator'
@@ -458,6 +459,244 @@ describe('RealtimeSpeechCoordinator', () => {
       agentId: 'agent-1',
       messageId: 'message-1:realtime-tts:1',
       manual: true
+    })
+  })
+
+  describe('what counts as a control block (BL-442)', () => {
+    const spoken = () => speak.mock.calls.map((call) => call[0] as string).join(' ')
+
+    it('speaks the rest of a reply that names a tag in a sentence as it streams (R2, BL-473)', async () => {
+      coordinator.append('message-1', 'agent-1', { tts: true }, 'I write a <batshit-memory>')
+      coordinator.append('message-1', 'agent-1', { tts: true }, ' block when you ask me to remember something. Then')
+      // Spoken now, not held for a closing tag until the reply ends.
+      expect(spoken()).toContain('block when you ask me to remember something.')
+      await coordinator.finish('message-1', 'agent-1', { tts: true })
+      expect(spoken()).toContain('I write a')
+    })
+
+    it('speaks a lone < and a reply that ends in one (R4, R5, BL-477)', async () => {
+      coordinator.append('message-1', 'agent-1', { tts: true }, 'If the count is <')
+      coordinator.append('message-1', 'agent-1', { tts: true }, ' 5, retry the upload. And x < 5 and y > 3. The end <')
+      await coordinator.finish('message-1', 'agent-1', { tts: true })
+      expect(spoken()).toContain('If the count is < 5, retry the upload.')
+      expect(spoken()).toContain('x < 5 and y > 3.')
+      expect(spoken()).toContain('The end <')
+    })
+
+    it('reads a tag in code as code, never as a block that swallows the rest (R1)', async () => {
+      coordinator.append('message-1', 'agent-1', { tts: true }, 'Example:\n```\n<batshit-memory>{"lane":"ltm"')
+      coordinator.append('message-1', 'agent-1', { tts: true }, '}</batshit-memory>\n```\nThat is the syntax, and more words after.')
+      coordinator.append('message-1', 'agent-1', { tts: true }, ' Then `<batshit-tool-notes>{` is how notes start, and still more. Next')
+      // Spoken as it streams: the tag in inline code opened no block.
+      expect(spoken()).toContain('is how notes start, and still more.')
+      await coordinator.finish('message-1', 'agent-1', { tts: true })
+      expect(spoken()).toContain('That is the syntax, and more words after.')
+      expect(spoken()).toContain('is how notes start, and still more.')
+    })
+
+    it('speaks at the end what a tag in inline code held back when its closing backtick came later', async () => {
+      coordinator.append('message-1', 'agent-1', { tts: true }, 'Then `<batshit-tool-notes>{')
+      coordinator.append('message-1', 'agent-1', { tts: true }, '` is how notes start, and still more words.')
+      await coordinator.finish('message-1', 'agent-1', { tts: true })
+      expect(spoken()).toContain('is how notes start, and still more words.')
+    })
+
+    it('reads a chunk full of lone < in one pass', async () => {
+      const chunk = `${'a < b '.repeat(40_000)}> end. <batshit-memory>{"lane":"ltm","content":"canary fact"}</batshit-memory> Done.`
+      const started = performance.now()
+      coordinator.append('message-1', 'agent-1', { tts: true }, chunk)
+      expect(performance.now() - started).toBeLessThan(1_500)
+      await coordinator.finish('message-1', 'agent-1', { tts: true })
+      expect(spoken()).not.toContain('canary fact')
+    })
+
+    it('finds the opener after 300,000 lone < in one pass', () => {
+      // Without the remembered `>`, every `<` searched to the far `>` (grows with the square).
+      const text = `${'a < b '.repeat(300_000)}> end <batshit-memory>{"lane":"ltm"}</batshit-memory>`
+      const started = performance.now()
+      const opener = findNextHiddenControlOpener(text)
+      expect(performance.now() - started).toBeLessThan(1_000)
+      expect(opener).toMatchObject({ type: 'open', tagName: 'batshit-memory', index: text.indexOf('<batshit-memory>') })
+    })
+
+    it('at the end speaks a short held start and never part of a cut tag name (R4)', async () => {
+      coordinator.append('message-1', 'agent-1', { tts: true }, 'The first answer ends in <bat')
+      await coordinator.finish('message-1', 'agent-1', { tts: true })
+      expect(spoken()).toContain('The first answer ends in <bat')
+      speak.mockClear()
+      coordinator.append('message-2', 'agent-1', { tts: true }, 'The second answer was cut <batshit-tool-no')
+      await coordinator.finish('message-2', 'agent-1', { tts: true })
+      expect(spoken()).toContain('The second answer was cut')
+      expect(spoken()).not.toContain('batshit')
+    })
+
+    it('hides a real block that follows a block holding a lone backtick', async () => {
+      coordinator.append(
+        'message-1',
+        'agent-1',
+        { tts: true },
+        'Done. <batshit-tool-notes>{"notes":[{"toolName":"bash","summary":"no rule `all\'"}]}</batshit-tool-notes> '
+      )
+      coordinator.append(
+        'message-1',
+        'agent-1',
+        { tts: true },
+        '<batshit-cue>{"goon_mood":"canary"}</batshit-cue> and `make` later. More words here.'
+      )
+      await coordinator.finish('message-1', 'agent-1', { tts: true })
+      expect(spoken()).not.toContain('canary')
+      expect(dispatchGoonSpeechMessage.mock.calls.map((call) => call[2]).join(' ')).toContain('canary')
+    })
+
+    it('never fires a cue example in inline code whose closing backtick arrives in the next chunk (review)', async () => {
+      coordinator.append('message-1', 'agent-1', { tts: true }, 'To set a mood write `<batshit-cue>{"mood":"angry"}</batshit-cue>')
+      coordinator.append('message-1', 'agent-1', { tts: true }, '` and the face changes. That is all there is to it.')
+      await coordinator.finish('message-1', 'agent-1', { tts: true })
+      const dispatched = dispatchGoonSpeechMessage.mock.calls.map((call) => String(call[2]))
+      // A cue block handed to the Goon on its own (not inside the spoken text's inline code).
+      expect(dispatched.filter((content) => /(^|\n)<batshit-cue>/.test(content))).toEqual([])
+      expect(spoken()).toContain('To set a mood write')
+      expect(spoken()).toContain('<batshit-cue>{"mood":"angry"}</batshit-cue>')
+      expect(spoken()).toContain('and the face changes.')
+    })
+
+    it('still fires a real cue after an unmatched backtick once the paragraph ends', async () => {
+      coordinator.append('message-1', 'agent-1', { tts: true }, 'A lone ` here. <batshit-cue>{"goon_mood":"happy"}</batshit-cue>')
+      coordinator.append('message-1', 'agent-1', { tts: true }, ' Still talking.\n\nNew paragraph.')
+      // Decided when the paragraph ended, not held to the reply's end.
+      const beforeFinish = dispatchGoonSpeechMessage.mock.calls.map((call) => String(call[2])).join('\n')
+      expect(beforeFinish).toContain('<batshit-cue>{"goon_mood":"happy"}</batshit-cue>')
+      await coordinator.finish('message-1', 'agent-1', { tts: true })
+      expect(spoken()).not.toContain('goon_mood')
+    })
+
+    it('fires a real cue held for an open backtick when the reply ends without closing it', async () => {
+      coordinator.append('message-1', 'agent-1', { tts: true }, 'A lone ` here. <batshit-cue>{"goon_mood":"calm"}</batshit-cue> and the end.')
+      await coordinator.finish('message-1', 'agent-1', { tts: true })
+      const dispatched = dispatchGoonSpeechMessage.mock.calls.map((call) => String(call[2])).join('\n')
+      expect(dispatched).toContain('<batshit-cue>{"goon_mood":"calm"}</batshit-cue>')
+      expect(spoken()).not.toContain('goon_mood')
+      expect(spoken()).toContain('and the end.')
+    })
+
+    it('speaks a tag name followed by words as it streams, never holding it (R4 strict)', async () => {
+      coordinator.append('message-1', 'agent-1', { tts: true }, "Wrap it in a <batshit-memory tag and it's saved. ")
+      coordinator.append('message-1', 'agent-1', { tts: true }, 'Then the next sentence follows here.')
+      expect(spoken()).toContain("Wrap it in a <batshit-memory tag and it's saved.")
+      await coordinator.finish('message-1', 'agent-1', { tts: true })
+    })
+
+    describe('a closing tag split across chunks closes the block (BL-699)', () => {
+      const PAYLOADS: Record<string, string> = {
+        'batshit-zip-control': '{"unzip":["tool_result_1"]}',
+        'batshit-tool-notes': '{"notes":[{"toolName":"bash","summary":"secret note"}]}',
+        'batshit-memory': '{"lane":"ltm","content":"secret fact"}',
+        'batshit-cue': '{"mood":"happy"}',
+        'batshit-group': '{"mode":"responding"}',
+        // A plain tool-results section tag rides the same hold-back.
+        'tool-results': 'a summary never to speak'
+      }
+      const cases = Object.entries(PAYLOADS).flatMap(([tag, payload]) => {
+        const closing = `</${tag}>`
+        return Array.from({ length: closing.length - 1 }, (_, index) => [tag, index + 1, payload] as const)
+      })
+
+      it.each(cases)('<%s>, its closing tag split after %i characters', async (tag, split, payload) => {
+        const closing = `</${tag}>`
+        coordinator.append('message-1', 'agent-1', { tts: true }, `A first sentence. <${tag}>${payload}${closing.slice(0, split)}`)
+        coordinator.append('message-1', 'agent-1', { tts: true }, `${closing.slice(split)} And here are more words after it.`)
+        await coordinator.finish('message-1', 'agent-1', { tts: true })
+        expect(spoken()).toContain('And here are more words after it.')
+        expect(spoken()).not.toContain(payload)
+        if (tag === 'batshit-cue') {
+          expect(dispatchGoonSpeechMessage.mock.calls.map((call) => String(call[2])).join('\n')).toContain(`<${tag}>${payload}</${tag}>`)
+        }
+      })
+
+      it.each(cases)('<%s>, opened in an earlier chunk, its closing tag split after %i characters', async (tag, split, payload) => {
+        const closing = `</${tag}>`
+        coordinator.append('message-1', 'agent-1', { tts: true }, `A first sentence. <${tag}>${payload.slice(0, 3)}`)
+        coordinator.append('message-1', 'agent-1', { tts: true }, `${payload.slice(3)}${closing.slice(0, split)}`)
+        coordinator.append('message-1', 'agent-1', { tts: true }, `${closing.slice(split)} And here are more words after it.`)
+        await coordinator.finish('message-1', 'agent-1', { tts: true })
+        expect(spoken()).toContain('And here are more words after it.')
+        expect(spoken()).not.toContain(payload.slice(3))
+        if (tag === 'batshit-cue') {
+          expect(dispatchGoonSpeechMessage.mock.calls.map((call) => String(call[2])).join('\n')).toContain(`<${tag}>${payload}</${tag}>`)
+        }
+      })
+
+      it('holds only the start of a closing tag, so a long block with an early < streams in one pass', async () => {
+        // Holding any tail from the last `<` would carry "a < b ..." into every later chunk and
+        // search it again each time (grows with the square of the block's length).
+        const started = performance.now()
+        coordinator.append('message-1', 'agent-1', { tts: true }, 'Spoken. <batshit-memory>{"lane":"ltm","content":"a < b')
+        for (let chunk = 0; chunk < 20000; chunk += 1) {
+          coordinator.append('message-1', 'agent-1', { tts: true }, ' more payload words that go on and on and on')
+        }
+        coordinator.append('message-1', 'agent-1', { tts: true }, '"}</batshit-memory> Words after the block.')
+        await coordinator.finish('message-1', 'agent-1', { tts: true })
+        expect(performance.now() - started).toBeLessThan(1_500)
+        expect(spoken()).toContain('Words after the block.')
+        expect(spoken()).not.toContain('payload words')
+      })
+
+      it('the reviewer\'s input', async () => {
+        coordinator.append('message-1', 'agent-1', { tts: true }, 'A sentence. <batshit-cue>{"mood":"happy"}<')
+        coordinator.append('message-1', 'agent-1', { tts: true }, '/batshit-cue> And here are more words after it.')
+        await coordinator.finish('message-1', 'agent-1', { tts: true })
+        expect(spoken()).toContain('And here are more words after it.')
+        expect(dispatchGoonSpeechMessage.mock.calls.map((call) => String(call[2])).join('\n')).toContain('<batshit-cue>{"mood":"happy"}</batshit-cue>')
+      })
+
+      it('never speaks a partial closing tag of a block still open at the end', async () => {
+        coordinator.append('message-1', 'agent-1', { tts: true }, 'A sentence. <batshit-memory>{"lane":"ltm","content":"secret"}</batshit-mem')
+        await coordinator.finish('message-1', 'agent-1', { tts: true })
+        expect(spoken()).not.toContain('batshit')
+        expect(spoken()).not.toContain('secret')
+      })
+    })
+
+    it('still never speaks a real block next to them', async () => {
+      coordinator.append('message-1', 'agent-1', { tts: true }, 'Noted, x < 5. <batshit-memory>{"lane":"ltm","content":"canary fact"}')
+      coordinator.append('message-1', 'agent-1', { tts: true }, '</batshit-memory> Anything else?')
+      await coordinator.finish('message-1', 'agent-1', { tts: true })
+      expect(spoken()).not.toContain('canary fact')
+      expect(spoken()).toContain('Anything else?')
+    })
+  })
+
+  // BL-759: a managed lane took the end of the reply back (Codex retried a dropped answer). What
+  // was handed to the voice is spoken; what still waits in the buffer is the fragment's and goes.
+  describe('discardUnspoken (BL-759)', () => {
+    it('drops the words not yet handed to the voice and keeps speaking the new ones', async () => {
+      coordinator.append('message-1', 'agent-1', { tts: true }, 'First sentence is spoken. Half a sen')
+      expect(speak).toHaveBeenCalledTimes(1)
+
+      coordinator.discardUnspoken('message-1', 'First sentence is spoken. ')
+      vi.advanceTimersByTime(100)
+      coordinator.append('message-1', 'agent-1', { tts: true }, 'The retried answer. ')
+      await coordinator.finish('message-1', 'agent-1', { tts: true })
+
+      const spokenTexts = speak.mock.calls.map((call) => call[0])
+      expect(spokenTexts).toEqual(['First sentence is spoken.', 'The retried answer.'])
+      expect(spokenTexts.join(' ')).not.toContain('Half a sen')
+    })
+
+    it('keeps a finished message\'s last words waiting before the fragment, and drops only the fragment', async () => {
+      coordinator.append('message-1', 'agent-1', { tts: true }, 'Short tail')
+      coordinator.append('message-1', 'agent-1', { tts: true }, ' and a half sen')
+      expect(speak).not.toHaveBeenCalled()
+
+      coordinator.discardUnspoken('message-1', 'Short tail', ' and a half sen')
+      await coordinator.finish('message-1', 'agent-1', { tts: true })
+
+      expect(speak.mock.calls.map((call) => call[0])).toEqual(['Short tail'])
+    })
+
+    it('does nothing for a message it is not speaking', () => {
+      expect(() => coordinator.discardUnspoken('message-none', 'Anything.')).not.toThrow()
+      expect(coordinator.size).toBe(0)
     })
   })
 })

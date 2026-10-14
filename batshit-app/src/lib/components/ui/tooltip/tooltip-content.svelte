@@ -2,12 +2,16 @@
 	import { Tooltip as TooltipPrimitive } from "bits-ui";
 	import { cn } from "$lib/utils";
 
+	const uid = $props.id();
+
 	let {
 		ref = $bindable(null),
 		class: className,
 		sideOffset = 0,
 		side = "top",
 		children,
+		child: contentChild,
+		id = `bs-tooltip-${uid}`,
 		arrowClasses,
 		...restProps
 	}: TooltipPrimitive.ContentProps & {
@@ -18,6 +22,7 @@
 <TooltipPrimitive.Portal>
 	<TooltipPrimitive.Content
 		bind:ref
+		{id}
 		data-slot="tooltip-content"
 		{sideOffset}
 		{side}
@@ -27,21 +32,33 @@
 		)}
 		{...restProps}
 	>
-		{@render children?.()}
-		<TooltipPrimitive.Arrow>
-			{#snippet child({ props })}
-				<div
-					class={cn(
-						"bs-tooltip-arrow rotate-45",
-						"data-[side=top]:translate-x-1/2 data-[side=top]:translate-y-[calc(-50%_+_2px)]",
-						"data-[side=bottom]:-translate-y-[calc(-50%_+_1px)] data-[side=bottom]:translate-x-1/2",
-						"data-[side=right]:translate-x-[calc(50%_+_2px)] data-[side=right]:translate-y-1/2",
-						"data-[side=left]:translate-y-[calc(50%_-_3px)]",
-						arrowClasses
-					)}
-					{...props}
-				></div>
-			{/snippet}
-		</TooltipPrimitive.Arrow>
+		{#snippet child({ props, wrapperProps, open })}
+			{#if contentChild}
+				{@render contentChild({ props: { ...props, id, role: "tooltip" }, wrapperProps, open })}
+			{:else}
+				<div {...wrapperProps}>
+					<!-- Bits UI 2.17.2 consumes id in its floating path. Put identity
+					     and tooltip semantics on the node its attachment observes. -->
+					<div {...props} {id} role="tooltip">
+						{@render children?.()}
+						<TooltipPrimitive.Arrow>
+							{#snippet child({ props })}
+								<div
+									class={cn(
+										"bs-tooltip-arrow rotate-45",
+										"data-[side=top]:translate-x-1/2 data-[side=top]:translate-y-[calc(-50%_+_2px)]",
+										"data-[side=bottom]:-translate-y-[calc(-50%_+_1px)] data-[side=bottom]:translate-x-1/2",
+										"data-[side=right]:translate-x-[calc(50%_+_2px)] data-[side=right]:translate-y-1/2",
+										"data-[side=left]:translate-y-[calc(50%_-_3px)]",
+										arrowClasses
+									)}
+									{...props}
+								></div>
+							{/snippet}
+						</TooltipPrimitive.Arrow>
+					</div>
+				</div>
+			{/if}
+		{/snippet}
 	</TooltipPrimitive.Content>
 </TooltipPrimitive.Portal>

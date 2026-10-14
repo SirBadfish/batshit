@@ -4,9 +4,9 @@
  *
  * Batshit's `contextWindow` on a preset is never transmitted. It feeds the
  * prompt budget, the auto-compact trigger, the output reserve, and the Token
- * Panel. That part is correct — context length is a load-time property
- * everywhere. The problem is that Batshit's number and the program's number can
- * differ enormously, and nothing said so:
+ * Panel. Programs differ: some allocate context at load time, while Ollama
+ * can honor a context size on the request. Batshit must use the applicable
+ * request or loaded size instead of quietly assuming the preset ceiling:
  *
  *   - LM Studio held Josh's 27B at 208,384 under a 262,144 ceiling (live,
  *     2026-09-02). Batshit budgeted against 262,144.
@@ -24,6 +24,7 @@
  * a program that has just been stopped.
  */
 
+import { createHash } from 'node:crypto'
 import type { LocalContextReading } from '$lib/types/modelCatalog'
 import { resolveLocalAiRuntimeBaseUrl } from '$lib/server/services/localAiServers'
 import { logger } from '$lib/utils/logger'
@@ -34,6 +35,7 @@ const READING_TTL_MS = 30_000
 const PROBE_TIMEOUT_MS = 1_500
 
 type CacheEntry = {
+  checkedAt: number
   expiresAt: number
   readings: Map<string, LocalContextReading>
 }
@@ -54,11 +56,11 @@ function coerceFiniteNumber(value: unknown): number | null {
   return null
 }
 
-async function fetchJson(url: string): Promise<any | null> {
+async function fetchJson(url: string, apiKey?: string | null): Promise<any | null> {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS)
   try {
-    const response = await fetch(url, { signal: controller.signal })
+    const response = await fetch(url, { signal: controller.signal, headers: apiKey ? { authorization: `Bearer ${apiKey}` } : undefined })
     if (!response.ok) return null
     return await response.json().catch(() => null)
   } catch {
@@ -68,9 +70,9 @@ async function fetchJson(url: string): Promise<any | null> {
   }
 }
 
-async function readLmStudio(baseUrl: string): Promise<Map<string, LocalContextReading>> {
+async function readLmStudio(baseUrl: string, apiKey?: string | null): Promise<Map<string, LocalContextReading>> {
   const readings = new Map<string, LocalContextReading>()
-  const payload = await fetchJson(`${baseUrl}/api/v1/models`)
+  const payload = await fetchJson(`${baseUrl}/api/v1/models`, apiKey)
   const list = Array.isArray(payload?.models)
     ? payload.models
     : Array.isArray(payload?.data)
@@ -108,11 +110,11 @@ async function readLmStudio(baseUrl: string): Promise<Map<string, LocalContextRe
   return readings
 }
 
-async function readOllama(baseUrl: string): Promise<Map<string, LocalContextReading>> {
+async function readOllama(baseUrl: string, apiKey?: string | null): Promise<Map<string, LocalContextReading>> {
   const readings = new Map<string, LocalContextReading>()
   // `/api/ps` is the ONLY honest read of Ollama's effective context, and it
   // exists only while the model is loaded (verified live: llama3.2 at 131072).
-  const payload = await fetchJson(`${baseUrl}/api/ps`)
+  const payload = await fetchJson(`${baseUrl}/api/ps`, apiKey)
   const list = Array.isArray(payload?.models) ? payload.models : []
   for (const entry of list) {
     const name =
@@ -130,12 +132,98 @@ async function readOllama(baseUrl: string): Promise<Map<string, LocalContextRead
 }
 
 /**
+ * A reading keyed here applies to every model id a request could name. Used by
+ * a program that serves one model and answers every request with it.
+ */
+const ANY_MODEL = '*'
+
+/**
+ * The name KoboldCpp lists while no model is loaded (SA-124 P8 measured it).
+ * It is a placeholder, never a model that answers.
+ */
+const KOBOLDCPP_NO_MODEL = 'koboldcpp/inactive'
+
+/** What KoboldCpp says about the one model it serves. */
+export interface KoboldCppServing {
+  /** The size it runs that model at: what a prompt is really measured against. */
+  context: LocalContextReading | null
+  /**
+   * BL-104: the model KoboldCpp answers EVERY request with, exactly as
+   * `/v1/models` names it (`koboldcpp/<name>`), whatever `model` the request
+   * sends. Measured 2026-09-22: any model value got Qwen3.5-9B. Null when that
+   * is not known to be true.
+   */
+  servedModelId: string | null
+}
+
+/**
+ * BL-101 / SA-124 P4 / BL-104: what KoboldCpp serves, from its side doors.
+ *
+ * `/api/extra/true_max_context_length` is the size KoboldCpp was started, or
+ * last restarted, with: the number a prompt is really measured against. A
+ * request cannot enlarge this allocation. A request-specific smaller buffer
+ * does not change this allocated ceiling; a model switch can. One click in Batshit's model
+ * manager took it from 32768 to 12288 on 2026-09-22, while the preset still
+ * said 32768.
+ *
+ * KoboldCpp serves ONE model and answers every request with it, whatever id the
+ * request names, so both readings apply to any model id. The served model is
+ * the one `/v1/models` lists; the caller passes the ids it already fetched from
+ * there, so this adds no request. Three cases report nothing instead of a
+ * reading that may be wrong: router mode, which swaps models per request; no
+ * text model loaded at all; and a version door that does not answer.
+ */
+export async function readKoboldCppServing(
+  baseUrl: string,
+  listedModelIds: readonly string[],
+  apiKey?: string | null
+): Promise<KoboldCppServing> {
+  const [version, context] = await Promise.all([
+    fetchJson(`${baseUrl}/api/extra/version`, apiKey),
+    fetchJson(`${baseUrl}/api/extra/true_max_context_length`, apiKey)
+  ])
+  if (!version || version.router === true || version.llm === false) {
+    return { context: null, servedModelId: null }
+  }
+  const loaded = coerceFiniteNumber(context?.value)
+  const listed = listedModelIds.length === 1 ? listedModelIds[0] : null
+  return {
+    context:
+      loaded === null || loaded <= 0
+        ? null
+        : {
+            source: 'loaded',
+            loadedContextWindow: loaded,
+            maxContextWindow: null,
+            remainingTtlSeconds: null
+          },
+    servedModelId: listed && listed !== KOBOLDCPP_NO_MODEL ? listed : null
+  }
+}
+
+async function readKoboldCpp(baseUrl: string, apiKey?: string | null): Promise<Map<string, LocalContextReading>> {
+  const readings = new Map<string, LocalContextReading>()
+  // The send path needs only the size, which applies to any model id.
+  const { context } = await readKoboldCppServing(baseUrl, [], apiKey)
+  if (context) readings.set(ANY_MODEL, context)
+  return readings
+}
+
+/**
  * Which programs can answer "what is this model loaded with?" at all. A program
  * that is not here reports nothing, and the UI must say so rather than guess.
  */
-const CONTEXT_READERS: Record<string, (baseUrl: string) => Promise<Map<string, LocalContextReading>>> = {
+const CONTEXT_READERS: Record<string, (baseUrl: string, apiKey?: string | null) => Promise<Map<string, LocalContextReading>>> = {
   lmstudio: readLmStudio,
-  ollama: readOllama
+  ollama: readOllama,
+  koboldcpp: readKoboldCpp
+}
+
+function pickReading(
+  readings: Map<string, LocalContextReading>,
+  modelId: string
+): LocalContextReading | null {
+  return readings.get(modelId) ?? readings.get(ANY_MODEL) ?? null
 }
 
 export function localRuntimeReportsLoadedContext(providerId: string | null | undefined): boolean {
@@ -149,11 +237,17 @@ export function localRuntimeReportsLoadedContext(providerId: string | null | und
  * things, and the difference is the whole point: the first is "this program
  * never tells us", the second is "it would, once the model is loaded".
  */
-export async function readLocalRuntimeContext(args: {
+type LocalContextArgs = {
   providerId: string | null | undefined
   modelId: string | null | undefined
   baseUrl: string | null | undefined
-}): Promise<LocalContextReading | null> {
+  userId?: string
+  apiKey?: string | null
+}
+
+export async function readLocalRuntimeContextEvidence(args: LocalContextArgs): Promise<{
+  reading: LocalContextReading | null; checkedAt: number; expiresAt: number
+} | null> {
   const providerId = args.providerId?.trim().toLowerCase()
   const modelId = args.modelId?.trim()
   if (!providerId || !modelId) return null
@@ -165,32 +259,39 @@ export async function readLocalRuntimeContext(args: {
     .replace(/\/+$/, '')
   if (!resolvedBase) return null
 
-  const cacheKey = `${providerId}|${resolvedBase}`
+  const cacheKey = `${args.userId ?? ''}|${providerId}|${resolvedBase}|${createHash('sha256').update(args.apiKey ?? '').digest('hex')}`
   const now = Date.now()
   const cached = cache.get(cacheKey)
   if (cached && cached.expiresAt > now) {
-    return cached.readings.get(modelId) ?? null
+    return { reading: pickReading(cached.readings, modelId), checkedAt: cached.checkedAt, expiresAt: cached.expiresAt }
   }
 
   let readings: Map<string, LocalContextReading>
   try {
-    readings = await reader(resolvedBase)
+    readings = await reader(resolvedBase, args.apiKey)
   } catch (error) {
     logger.debug('[local-context] probe failed', { providerId, error })
     return null
   }
 
-  cache.set(cacheKey, { expiresAt: now + READING_TTL_MS, readings })
-  return readings.get(modelId) ?? null
+  const checkedAt = Date.now()
+  const entry = { checkedAt, expiresAt: checkedAt + READING_TTL_MS, readings }
+  cache.set(cacheKey, entry)
+  return { reading: pickReading(readings, modelId), checkedAt, expiresAt: entry.expiresAt }
+}
+
+export async function readLocalRuntimeContext(args: LocalContextArgs): Promise<LocalContextReading | null> {
+  return (await readLocalRuntimeContextEvidence(args))?.reading ?? null
 }
 
 /**
  * The number Batshit should budget against, and whether it disagrees with the
  * preset.
  *
- * Rule: when the program reports a loaded context, that wins — including when
- * it is LARGER than the preset, because the preset is the guess. When it does
- * not report, the preset stands and `source` says why.
+ * A reported or explicitly requested allocation bounds the prompt budget.
+ * A smaller positive preset is also a planning cap, without changing that
+ * allocation. A supported reader that cannot report keeps the limit unknown;
+ * programs without a reader can use a clearly labelled preset estimate.
  */
 export function resolveEffectiveContextLimit(args: {
   presetContextWindow: number | null | undefined
@@ -216,6 +317,9 @@ export function resolveEffectiveContextLimit(args: {
   /** True only when both numbers are known AND differ. */
   mismatch: boolean
 } {
+  const planningCap = typeof args.presetContextWindow === 'number' &&
+    Number.isFinite(args.presetContextWindow) && args.presetContextWindow > 0
+      ? args.presetContextWindow : null
   const requested =
     typeof args.requestedContextWindow === 'number' &&
     Number.isFinite(args.requestedContextWindow) &&
@@ -229,7 +333,7 @@ export function resolveEffectiveContextLimit(args: {
         ? args.reading.loadedContextWindow
         : null
     return {
-      contextLimit: requested,
+      contextLimit: planningCap !== null ? Math.min(planningCap, requested) : requested,
       source: 'requested',
       presetContextWindow:
         typeof args.presetContextWindow === 'number' && Number.isFinite(args.presetContextWindow)
@@ -252,7 +356,7 @@ export function resolveEffectiveContextLimit(args: {
 
   if (loaded !== null) {
     return {
-      contextLimit: loaded,
+      contextLimit: planningCap !== null ? Math.min(planningCap, loaded) : loaded,
       source: 'loaded',
       presetContextWindow: preset,
       loadedContextWindow: loaded,
@@ -261,7 +365,7 @@ export function resolveEffectiveContextLimit(args: {
   }
 
   return {
-    contextLimit: preset,
+    contextLimit: args.reading?.source === 'unknown-until-loaded' ? null : preset,
     source: args.reading?.source ?? 'preset',
     presetContextWindow: preset,
     loadedContextWindow: null,

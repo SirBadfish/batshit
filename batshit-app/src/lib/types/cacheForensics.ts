@@ -23,11 +23,16 @@
  * previously reported `historyStability: not-applicable` with a
  * `reusablePrefixBytes` frozen at the system item.
  *
+ * v4 (SA-128): the compiled message is tags now (`<conversation>` with one
+ * element per message, `<zip_index>`, then the new message and
+ * `<dynamic_info>`), so every history segment hashes new bytes. A v3 record is
+ * never a baseline for a v4 run.
+ *
  * Each bump changes the segment list shape, so records must never be compared
  * across versions — `isEligibleBaseline` already refuses that with a
  * plain-language reason.
  */
-export const CACHE_FORENSICS_SCHEMA_VERSION = 3
+export const CACHE_FORENSICS_SCHEMA_VERSION = 4
 
 export type CacheForensicsRuntime = 'vercel' | 'codex' | 'claude' | 'n8n'
 

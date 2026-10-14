@@ -997,6 +997,7 @@ describe('SA-117: the wake registry and the acting agent id', () => {
       userId: USER,
       origin: 'agent-dm' as any,
       startedAt: Date.now(),
+      assistantMessageId: 'msg-woken-turn',
       controller,
       timer
     })

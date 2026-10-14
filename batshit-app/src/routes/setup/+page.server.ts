@@ -20,10 +20,14 @@ export const load: PageServerLoad = async ({ locals }) => {
 export const actions = {
 	setup: async ({ request, cookies }) => {
 		const data = await request.formData()
-		const email = data.get('email') as string
-		const password = data.get('password') as string
-		const confirmPassword = data.get('confirmPassword') as string
-		const displayName = data.get('displayName') as string
+		const textField = (name: string) => {
+			const value = data.get(name)
+			return typeof value === 'string' ? value : ''
+		}
+		const email = textField('email')
+		const password = textField('password')
+		const confirmPassword = textField('confirmPassword')
+		const displayName = textField('displayName')
 
 		// Validation
 		if (!email || !password || !displayName) {
@@ -54,9 +58,9 @@ export const actions = {
 			// Create first user as admin
 			const result = await authService.createAdminUser(email, password, displayName)
 
-			// Check for collision error
+			// Service admission also refuses existing or incomplete account state.
 			if (!result.success || !result.user) {
-				return fail(400, {
+				return fail(result.status ?? 400, {
 					error: result.error || 'Failed to create user',
 					email,
 					displayName

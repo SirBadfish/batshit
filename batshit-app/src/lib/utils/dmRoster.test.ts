@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { buildDmRosterDcmLines } from './dmRoster'
+import { buildDmRosterDcmLines, describeDmFires } from './dmRoster'
 import { DM_ROSTER_MAX_LINES } from './dmControl'
 import type { DmRecord } from '$lib/types/dm'
 
@@ -170,5 +170,81 @@ describe('the cap', () => {
     )
     const result = buildDmRosterDcmLines({ records, now: NOW })
     expect(result.lines.at(-1)).not.toContain('More open')
+  })
+})
+
+/**
+ * BL-401 S3 — a schedule's one unread note says how often it fired, and its "new" mark
+ * follows the last fire. The zone is pinned here; production leaves it out and gets the
+ * runtime's own zone, like every other agent-facing time in the compile.
+ */
+describe('BL-401 — a schedule note that fired more than once', () => {
+  const CHICAGO = 'America/Chicago'
+  // 12:00Z on 2026-09-07 is 7:00 AM in Chicago; the fires below are 14:00Z (9:00 AM CDT)
+  // on the same Chicago day, so NOW is moved to the end of that day.
+  const LATE_NOW = Date.parse('2026-09-07T23:00:00.000Z')
+  const firstFire = '2026-09-07T14:00:00.000Z'
+  const lastFire = '2026-09-07T22:00:00.000Z'
+
+  function scheduleNote(overrides: Partial<DmRecord> = {}) {
+    return dm({
+      kind: 'info',
+      from: { kind: 'schedule', scheduleId: 'sch_q', name: 'Queue check' },
+      subject: 'Queue check',
+      createdAt: firstFire,
+      createdTs: Date.parse(firstFire),
+      fireCount: 14,
+      firstFiredAt: firstFire,
+      lastFiredAt: lastFire,
+      expiresAt: new Date(LATE_NOW + 7 * DAY).toISOString(),
+      ...overrides
+    })
+  }
+
+  it('prints the fire count and the first and last fire in the line', () => {
+    const result = buildDmRosterDcmLines({
+      records: [scheduleNote()],
+      now: LATE_NOW,
+      timeZone: CHICAGO
+    })
+    expect(result.lines[1]).toBe(
+      '- dm_1 ✅ info from Queue check: "Queue check" — new; ' +
+        'fired 14 times, first 9:00 AM, last 5:00 PM; expires in 7d'
+    )
+  })
+
+  it('names the day of a fire that was not today', () => {
+    expect(
+      describeDmFires(
+        { ...scheduleNote(), firstFiredAt: '2026-09-05T14:00:00.000Z' },
+        { now: LATE_NOW, timeZone: CHICAGO }
+      )
+    ).toBe('fired 14 times, first Sep 5 9:00 AM, last 5:00 PM')
+  })
+
+  it('says nothing for a note that fired once, so such a line is unchanged', () => {
+    expect(describeDmFires(dm(), { now: NOW })).toBeNull()
+    expect(describeDmFires(dm({ fireCount: 1 } as Partial<DmRecord>), { now: NOW })).toBeNull()
+  })
+
+  it('the ✅ follows the LAST fire, not the first', () => {
+    // The agent's previous turn was between the first and the last fire.
+    const previous = Date.parse('2026-09-07T18:00:00.000Z')
+    const again = buildDmRosterDcmLines({
+      records: [scheduleNote()],
+      previousUserMessageTs: previous,
+      now: LATE_NOW,
+      timeZone: CHICAGO
+    })
+    expect(again.lines[1]).toContain('✅')
+
+    // A previous turn after the last fire saw it already.
+    const seen = buildDmRosterDcmLines({
+      records: [scheduleNote()],
+      previousUserMessageTs: Date.parse('2026-09-07T22:30:00.000Z'),
+      now: LATE_NOW,
+      timeZone: CHICAGO
+    })
+    expect(seen.lines[1]).toContain('🟢')
   })
 })

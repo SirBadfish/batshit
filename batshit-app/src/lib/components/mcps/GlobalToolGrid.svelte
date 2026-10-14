@@ -39,7 +39,7 @@
   } from '@lucide/svelte'
   import { debounce } from '$lib/utils/debounce'
   import { GLOBAL_JEV_SMART_ZIP_FIELD, resolveJevSmartZipEnabled } from '$lib/utils/jevJuiceControl'
-  import { setUserSettings } from '$lib/stores/userSettings.svelte'
+  import { confirmUserSettings as setUserSettings } from '$lib/stores/userSettings.svelte'
   import {
     formatToolGridInheritedZipBehaviorLabel,
     formatToolGridZipBehaviorLabel,
@@ -223,10 +223,10 @@
   const TOOL_GRID_TABLE_CLASS = 'w-full min-w-[820px] table-fixed text-xs'
   const TOOL_GRID_FIRST_COLUMN_CLASS = 'w-[35%]'
   const TOOL_GRID_OTHER_COLUMN_CLASS = 'w-[13%]'
-  const DEFAULT_GLOBAL_ZIP_AGENT_CONTROL_ENABLED = true
   const DEFAULT_GLOBAL_ZIP_AI_VIEW_MODE = 'appended' as const
   const DEFAULT_GLOBAL_ZIP_TOOL_NOTES_ENABLED = true
   const GLOBAL_RESET_SAVE_KEY = '__global_tool_grid_reset__'
+  const ZIP_OFF_HELP = "Off keeps this tool's results open. The size guard still applies: a result over 25,000 tokens is never sent whole."
 
   const OTHER_ZIP_ROW_CONFIG: Record<OtherZipRowId, OtherZipRowConfig> =
     SHARED_NON_MCP_TOOL_GRID_CONFIG as Record<OtherZipRowId, OtherZipRowConfig>
@@ -237,6 +237,13 @@
   let loading = $state(false)
   let loadError = $state<string | null>(null)
   let gateways = $state<GatewayRow[]>([])
+
+  // BL-487: until a real load of `/api/user/settings` succeeds, the zip strip is showing
+  // empty defaults, not saved values. Every write through `saveUserToolGridDefaults` refuses
+  // while this is false, so a toggle made against a failed load can never overwrite a saved
+  // override with those empty defaults.
+  let zipSettingsLoaded = $state(false)
+  let zipLoadError = $state<string | null>(null)
   let cliToolCatalog = $state<CliToolCatalogRow[]>([])
 
   let saveStateByGateway = $state<Record<string, SaveState>>({})
@@ -255,10 +262,9 @@
   let globalArtifactToolGridSettings = $state(createDefaultArtifactToolGridSettings())
   let customToolSettings = $state<CustomToolSetting[]>([])
   let bulkZipDrafts = $state<Record<string, BulkZipDraft>>({})
-  let zipAgentControlEnabled = $state(false)
   let zipAiViewMode = $state<'inline' | 'appended'>('appended')
   let zipToolNotesEnabled = $state(true)
-  // SA-120 P5 (LS-054): "Jev Juice: Smart Zip", the one global switch. Absent means OFF.
+  // SA-120 P5 (LS-054): "Judge Juice: Smart Zip", the one global switch. Absent means OFF.
   let jevSmartZipEnabled = $state(false)
   let zipSaveState = $state<SaveState>('idle')
   let zipSaveError = $state<string | null>(null)
@@ -348,6 +354,8 @@
   async function loadZipSettings() {
     if (!userId) return
 
+    zipLoadError = null
+
     try {
       const response = await fetch('/api/user/settings')
       if (!response.ok) {
@@ -367,31 +375,29 @@
         settings?.global_tool_grid_settings?.artifact ?? null
       )
       const custom = normalizeCustomToolSettings(global.custom_tool_settings)
-      const legacyPermission =
-        global.zip_control_mode === 'agent'
-          ? true
-          : global.zip_control_mode === 'user'
-            ? false
-            : undefined
 
       globalZipSettingsRaw = global
       globalCliToolGridSettings = globalToolGridSettings
       globalFabricToolGridSettings = nextFabricToolGridSettings
       globalArtifactToolGridSettings = nextArtifactToolGridSettings
       customToolSettings = custom
-      zipAgentControlEnabled =
-        typeof global.zip_agent_control_enabled === 'boolean'
-          ? global.zip_agent_control_enabled
-          : legacyPermission ?? DEFAULT_GLOBAL_ZIP_AGENT_CONTROL_ENABLED
       zipAiViewMode = global.zip_ai_view_mode === 'inline' ? 'inline' : 'appended'
       zipToolNotesEnabled =
         typeof global.zip_tool_notes_enabled === 'boolean'
           ? global.zip_tool_notes_enabled
           : DEFAULT_GLOBAL_ZIP_TOOL_NOTES_ENABLED
       jevSmartZipEnabled = resolveJevSmartZipEnabled(global)
+      zipSettingsLoaded = true
+      // A successful (re)load clears any earlier "cannot be saved yet" refusal (BL-487):
+      // that message is now stale, and the values it warned about are gone.
+      if (zipSaveState === 'error') {
+        zipSaveState = 'idle'
+        zipSaveError = null
+      }
     } catch (error) {
       console.warn('[GlobalToolGrid] Failed loading zip defaults', error)
-      zipSaveError =
+      zipSettingsLoaded = false
+      zipLoadError =
         error instanceof Error ? error.message : 'Failed to load zip defaults'
     }
   }
@@ -585,15 +591,25 @@
   }
 
   function queueSaveZipSettings() {
+    // BL-487: refuse at once, with a visible error, instead of queuing a debounced write
+    // that would only fail (and briefly claim "saving") 450ms later.
+    if (!zipSettingsLoaded) {
+      clearZipResetTimer()
+      zipSaveState = 'error'
+      zipSaveError =
+        'Zip settings have not finished loading, so this change cannot be saved yet. Retry the load above.'
+      return
+    }
     zipSaveState = 'saving'
     zipSaveError = null
     clearZipResetTimer()
     debouncedSaveZipSettings()
   }
 
+  // The reset replaces the whole block, so it writes neither the parked experiment key (absent is
+  // OFF) nor the ignored legacy keys (BL-1484): a reset also sweeps those dead values.
   function createDefaultGlobalToolGridZipSettings(): GlobalZipSettings {
     return {
-      zip_agent_control_enabled: DEFAULT_GLOBAL_ZIP_AGENT_CONTROL_ENABLED,
       zip_ai_view_mode: DEFAULT_GLOBAL_ZIP_AI_VIEW_MODE,
       zip_tool_notes_enabled: DEFAULT_GLOBAL_ZIP_TOOL_NOTES_ENABLED
     }
@@ -607,6 +623,15 @@
     nextArtifactToolGridSettings: ReturnType<typeof createDefaultArtifactToolGridSettings> =
       globalArtifactToolGridSettings
   ): Promise<UserSettingsRow | null> {
+    // BL-487: this write replaces `global_zip_settings` and `global_tool_grid_settings`
+    // WHOLE (the route does not merge). Never send it while the load that seeded the current
+    // draft has not actually succeeded, or an empty/stale draft erases saved overrides.
+    if (!zipSettingsLoaded) {
+      throw new Error(
+        'Zip settings have not finished loading, so this change cannot be saved yet. Retry the load above.'
+      )
+    }
+
     const response = await fetch('/api/user/settings', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -637,11 +662,6 @@
     return payload?.settings ?? null
   }
 
-  function updateZipControlPermission(enabled: boolean) {
-    zipAgentControlEnabled = enabled
-    queueSaveZipSettings()
-  }
-
   function updateZipAiViewMode(mode: 'inline' | 'appended') {
     zipAiViewMode = mode
     queueSaveZipSettings()
@@ -661,9 +681,10 @@
     if (!userId) return
 
     try {
+      // The block is saved whole (BL-487), so every key this grid does not own rides through as
+      // stored: the parked experiment key and the ignored legacy zip control keys (BL-1484) too.
       const nextGlobalZipSettings: GlobalZipSettings = {
         ...globalZipSettingsRaw,
-        zip_agent_control_enabled: zipAgentControlEnabled,
         zip_ai_view_mode: zipAiViewMode,
         zip_tool_notes_enabled: zipToolNotesEnabled,
         custom_tool_settings: [...customToolSettings]
@@ -699,6 +720,24 @@
 
   async function resetGlobalToolGridDefaults() {
     if (!userId || globalResetBusy) return
+
+    // BL-487 follow-up: the Reset button is already disabled while unloaded, but this writes
+    // to EVERY gateway on the server (one PUT per row) before the guarded
+    // `saveUserToolGridDefaults` call at the end ever runs. Refusing only there let a Reset
+    // half-apply: every gateway reset for real on the server while the zip/tool-grid write
+    // refused, and the page kept showing the old (unloaded) gateway rows. Refuse the whole
+    // reset here, before any write, for the same reason the disabled button exists.
+    if (!zipSettingsLoaded) {
+      setGatewaySaveState(
+        GLOBAL_RESET_SAVE_KEY,
+        'error',
+        'Zip settings have not finished loading, so Reset cannot run yet. Retry the load above.'
+      )
+      zipSaveState = 'error'
+      zipSaveError =
+        'Zip settings have not finished loading, so Reset cannot run yet. Retry the load above.'
+      return
+    }
 
     globalResetBusy = true
     clearZipResetTimer()
@@ -746,7 +785,6 @@
       globalCliToolGridSettings = nextCliToolGridSettings
       customToolSettings = []
       bulkZipDrafts = {}
-      zipAgentControlEnabled = DEFAULT_GLOBAL_ZIP_AGENT_CONTROL_ENABLED
       zipAiViewMode = DEFAULT_GLOBAL_ZIP_AI_VIEW_MODE
       zipToolNotesEnabled = DEFAULT_GLOBAL_ZIP_TOOL_NOTES_ENABLED
       // The reset writes product defaults, and this switch's default is OFF (absent).
@@ -1704,12 +1742,22 @@
     </div>
   {/snippet}
 
+    {#if zipLoadError}
+      <div class="batshit-settings-inline-alert is-danger">
+        <div class="flex items-center justify-between gap-2">
+          <span>{zipLoadError}</span>
+          <Button variant="outline" size="sm" onclick={loadZipSettings}>
+            <RefreshCw class="h-3.5 w-3.5" />
+            Retry
+          </Button>
+        </div>
+      </div>
+    {/if}
+
     <GlobalZipControlStrip
-      {zipAgentControlEnabled}
       {zipAiViewMode}
       {zipToolNotesEnabled}
       {jevSmartZipEnabled}
-      onZipControlPermissionChange={updateZipControlPermission}
       onZipAiViewModeChange={updateZipAiViewMode}
       onZipToolNotesEnabledChange={updateZipToolNotesEnabled}
       onJevSmartZipEnabledChange={updateJevSmartZipEnabled}
@@ -1746,7 +1794,7 @@
               <th class="batshit-settings-table-head-cell">Display Detail</th>
               <th class="batshit-settings-table-head-cell">Zip Buffer</th>
               <th class="batshit-settings-table-head-cell">Zip Threshold</th>
-              <th class="batshit-settings-table-head-cell">Zip Behavior</th>
+              <th class="batshit-settings-table-head-cell" title={ZIP_OFF_HELP}>Zip Behavior</th>
             </tr>
           </thead>
           <tbody>
@@ -2100,7 +2148,7 @@
                                     <Select.Item value="off" label="Off">
                                       <span class="flex items-center gap-2">
                                         <Infinity class={`h-3.5 w-3.5 shrink-0 ${iconToneClass(false)}`} />
-                                        <span>Off</span>
+                                        <span title={ZIP_OFF_HELP}>Off</span>
                                       </span>
                                     </Select.Item>
                                   </Select.Content>
@@ -2506,7 +2554,7 @@
                                                   <Select.Item value="off" label="Off">
                                                     <span class="flex items-center gap-2">
                                                       <Infinity class={`h-3.5 w-3.5 shrink-0 ${iconToneClass(false)}`} />
-                                                      <span>Off</span>
+                                                      <span title={ZIP_OFF_HELP}>Off</span>
                                                     </span>
                                                   </Select.Item>
                                                 </Select.Content>
@@ -2558,7 +2606,7 @@
           variant="outline"
           size="sm"
           onclick={resetGlobalToolGridDefaults}
-          disabled={!userId || loading || globalResetBusy}
+          disabled={!userId || loading || globalResetBusy || !zipSettingsLoaded}
         >
           <RotateCcw aria-hidden="true" />
           Reset to defaults

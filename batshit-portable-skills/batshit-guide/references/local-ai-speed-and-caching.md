@@ -59,7 +59,7 @@ Open the Token Panel under the chat and hover the cache figure. What you see dep
 | llama.cpp, Docker Model Runner, oMLX | A cached-token count when the response includes one |
 | SGLang | A count when started with `--enable-cache-report` |
 | vLLM | A count on versions that support it, with `--enable-prompt-tokens-details` |
-| Ollama, LM Studio | Usually no cache count on the chat endpoint Batshit uses |
+| Ollama, LM Studio, KoboldCpp | Usually no cache count on the chat endpoint Batshit uses |
 
 Some programs simply don't put the number in their response. **Their caches still work** — Ollama went from 27 seconds to 0.05 seconds while reporting nothing at all. There is just no counter to read.
 
@@ -69,7 +69,9 @@ It won't show a zero the program never sent, or turn a fast answer into a cache 
 
 ## Watch the speed instead
 
-Next to the cache figure, the Token Panel shows **time to first output** — how long you waited before the model started writing — and **tokens per second** once it got going.
+When a reply includes timing and token counts, the Token Panel shows **time to first output** — how long you waited before the model started writing — and **tokens per second** once it got going.
+
+For KoboldCpp, these figures come from the timing and token counts saved with that chat reply. They are separate from KoboldCpp’s own global speed diagnostics. A stopped reply may have no timing or token count to read; missing means unknown, not zero. Very short replies are also poor speed comparisons.
 
 Compare time to first output on repeated messages to see whether performance improves. A faster repeat is useful evidence of speed, but cannot by itself prove a cache hit: scheduling, compilation, and other work also affect latency.
 

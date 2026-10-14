@@ -17,9 +17,9 @@
 	import { getJevJuiceDmScreen, requestDmBrief } from '$lib/stores/dmBriefs.svelte'
 	import {
 		UNTRUSTED_TEXT_DM_CARD_TOLD_TEXT,
-		UNTRUSTED_TEXT_INLINE_TEXT,
 		jevJuiceNoteDetail,
 		jevJuiceNoteText,
+		untrustedTextInlineText,
 		untrustedTextSkippedNote
 	} from '$lib/utils/jevJuice'
 
@@ -139,7 +139,7 @@
 	})
 
 	/**
-	 * SA-120 P7 — the Jev Juice flag on this DM, if it has one.
+	 * SA-120 P7 — the Judge Juice flag on this DM, if it has one.
 	 *
 	 * Asked by DM id from the screens store rather than read off the tool result, on purpose:
 	 * the result is what the AGENT reads, and only the agent that READS a flagged DM is told
@@ -157,7 +157,7 @@
 		requestDmBrief(screenDmId)
 	})
 	const screen = $derived(getJevJuiceDmScreen(screenDmId))
-	const flagSuffix = $derived(screen?.status === 'flagged' ? ` · ${UNTRUSTED_TEXT_INLINE_TEXT}` : '')
+	const flagSuffix = $derived(screen?.status === 'flagged' ? ` · ${untrustedTextInlineText(screen.judge)}` : '')
 
 	const openCount = $derived.by<number | null>(() => {
 		const value = (result as any)?.total_open

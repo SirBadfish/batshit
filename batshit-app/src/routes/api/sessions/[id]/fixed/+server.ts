@@ -6,8 +6,9 @@ import { buildFixedSessionMetadata, isFixedSession } from '$lib/utils/fixedSessi
 /**
  * SA-104 P5 — the ONE Infinite Session transition path (DL-104-12).
  *
- * `redis.updateSession` replaces `metadata` wholesale, so the transition merges
- * against the freshest stored record here, server-side. The choice is one-way:
+ * The transition writes only its own fields, by path (`redis.writeFixedSessionMark`:
+ * `metadata.fixedSession` and `locked`), so a block another writer adds meanwhile is
+ * kept (BL-735). The choice is one-way:
  * there is no DELETE/unset counterpart anywhere, and the generic session PUT
  * refuses to touch the stored block (`resolveFixedSessionMetadataUpdate`).
  */
@@ -54,14 +55,15 @@ export const POST: RequestHandler = async ({ params, locals }) => {
     )
   }
 
-  const nextMetadata = {
-    ...((session.metadata as Record<string, any> | undefined) ?? {}),
-    fixedSession: buildFixedSessionMetadata()
-  }
-
+  // BL-735: write only the two fields this route owns, at their own path — not a copy of the
+  // whole metadata block read above. A block another writer added while this route read the
+  // session and the message history (a Compact event, a graduation mark) must survive.
   // Auto-lock rides the existing 4-layer deletion guard (P0 §1.6). The user may
   // still deliberately unlock later — deletion must stay possible (DL-104-02).
-  await redis.updateSession(session.id, { metadata: nextMetadata, locked: true })
+  const written = await redis.writeFixedSessionMark(session.id, buildFixedSessionMetadata())
+  if (!written) {
+    return json({ error: 'Session not found' }, { status: 404 })
+  }
 
   const updated = await redis.getSession(session.id)
   return json({ success: true, session: updated })

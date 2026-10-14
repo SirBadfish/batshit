@@ -53,6 +53,14 @@ const mockRuntimeAddons = {
   prepareRuntimeAddon: vi.fn(),
   controlRuntimeAddon: vi.fn()
 }
+// SA-072 P1: the Pinokio service is stubbed here; its own suite runs it against the P0 fixtures.
+const mockPinokio = {
+  detectPinokio: vi.fn(),
+  searchPinokioApps: vi.fn(),
+  getPinokioAppStatus: vi.fn(),
+  getPinokioAppLogs: vi.fn(),
+  startPinokioApp: vi.fn()
+}
 const mockFetchVercelModelCatalog = vi.fn()
 const mockApiKeyRetrieve = vi.fn()
 const mockPrivateEnv = vi.hoisted(() => ({
@@ -192,6 +200,15 @@ vi.mock('$lib/server/services/runtimeAddons', () => ({
   getRuntimeAddonStatus: (...args: any[]) => mockRuntimeAddons.getRuntimeAddonStatus(...args),
   prepareRuntimeAddon: (...args: any[]) => mockRuntimeAddons.prepareRuntimeAddon(...args),
   controlRuntimeAddon: (...args: any[]) => mockRuntimeAddons.controlRuntimeAddon(...args)
+}))
+
+vi.mock('$lib/server/services/pinokioService', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  detectPinokio: (...args: any[]) => mockPinokio.detectPinokio(...args),
+  searchPinokioApps: (...args: any[]) => mockPinokio.searchPinokioApps(...args),
+  getPinokioAppStatus: (...args: any[]) => mockPinokio.getPinokioAppStatus(...args),
+  getPinokioAppLogs: (...args: any[]) => mockPinokio.getPinokioAppLogs(...args),
+  startPinokioApp: (...args: any[]) => mockPinokio.startPinokioApp(...args)
 }))
 
 // SA-113 F-SEC-1b: the gate dynamic-imports this to stamp the DM. Mocked so the test can
@@ -904,6 +921,135 @@ describe('controlRegistry artifact capability controls', () => {
     })
   })
 
+  describe('the Pinokio family (SA-072 P1, DL-08)', () => {
+    const NOT_RUNNING = {
+      ok: false,
+      kind: 'unavailable',
+      reason: 'not_running',
+      message: 'Pinokio is installed but not running. Open Pinokio, then try again.'
+    }
+
+    it('publishes five sys.pinokio.* controls that act for the user, with only run confirm-gated', async () => {
+      const { findControls, CORE_CONTROL_ACTING_AGENT_FLAGS } = await import('../services/fabricRegistry')
+      const result = await findControls({ query: 'sys.pinokio.', includeDraft: true, limit: 50 })
+      const pinokio = result.results.filter((item) => item.controlId.startsWith('sys.pinokio.'))
+      expect(pinokio.map((item) => item.controlId).sort()).toEqual([
+        'sys.pinokio.app_status',
+        'sys.pinokio.logs',
+        'sys.pinokio.run',
+        'sys.pinokio.search',
+        'sys.pinokio.status'
+      ])
+      const risk = Object.fromEntries(pinokio.map((item) => [item.controlId, item.riskLevel]))
+      expect(risk).toEqual({
+        'sys.pinokio.app_status': 'safe',
+        'sys.pinokio.logs': 'safe',
+        'sys.pinokio.run': 'confirm',
+        'sys.pinokio.search': 'safe',
+        'sys.pinokio.status': 'safe'
+      })
+      for (const item of pinokio) {
+        expect(CORE_CONTROL_ACTING_AGENT_FLAGS.find((entry) => entry.controlId === item.controlId)?.actsAsAgent).toBe(false)
+      }
+    })
+
+    it('status answers "not detected" as a result, not a failure (DL-01)', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+      mockPinokio.detectPinokio.mockResolvedValueOnce({
+        available: false,
+        reason: 'not_installed',
+        message: 'Pinokio not detected.',
+        version: null,
+        versionFloor: '8.2.0',
+        home: null,
+        ptermPath: null,
+        ptermVersion: null,
+        controlPlaneReachable: false
+      })
+      const result = await useControl({ userId: 'user-1', controlId: 'sys.pinokio.status', input: {} })
+      expect(result.success).toBe(true)
+      if (!result.success) return
+      expect((result.result as any).pinokio).toMatchObject({ available: false, message: 'Pinokio not detected.' })
+      expect(mockPinokio.detectPinokio).toHaveBeenCalledWith({ fresh: true })
+    })
+
+    it('the other controls fail readably when Pinokio is closed: the reason, no stack', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+      mockPinokio.searchPinokioApps.mockResolvedValueOnce(NOT_RUNNING)
+      const result = await useControl({ userId: 'user-1', controlId: 'sys.pinokio.search', input: { query: 'comfyui' } })
+      expect(result.success).toBe(false)
+      if (result.success) return
+      expect(result.error.code).toBe('CONTROL_EXECUTION_FAILED')
+      expect(result.error.message).toBe(NOT_RUNNING.message)
+      expect(result.error.details).toMatchObject({ kind: 'unavailable', reason: 'not_running' })
+    })
+
+    it('run pauses for the Approve click, and the click starts the app exactly once (DL-03)', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+      mockPinokio.startPinokioApp.mockResolvedValue({
+        ok: true,
+        value: { appId: 'comfy.git', title: 'Comfyui', alreadyRunning: false, ready: true, state: 'online', readyUrl: 'http://localhost:8188', alsoStarted: [], waitedMs: 13000, message: 'Comfyui is running in Pinokio and answered its probe.' }
+      })
+      const paused = await useControl({ userId: 'user-1', controlId: 'sys.pinokio.run', input: { appId: 'comfy.git' } })
+      expect(paused.success).toBe(false)
+      if (paused.success) return
+      expect(paused.error.code).toBe('CONTROL_RISK_REQUIRES_APPROVAL')
+      expect(mockPinokio.startPinokioApp).not.toHaveBeenCalled()
+
+      const approved = await useControlWithApproval({ userId: 'user-1', controlId: 'sys.pinokio.run', input: { appId: 'comfy.git' } })
+      expect(approved.success).toBe(true)
+      expect(mockPinokio.startPinokioApp).toHaveBeenCalledTimes(1)
+      expect(mockPinokio.startPinokioApp).toHaveBeenCalledWith({ appId: 'comfy.git', alsoStarts: undefined, waitSeconds: undefined })
+      if (!approved.success) return
+      expect((approved.result as any).run).toMatchObject({ ready: true, readyUrl: 'http://localhost:8188' })
+    })
+
+    it('app_status describes a running app\'s own API only when asked, and says why when it cannot (SA-072 P2)', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+      const online = { appId: 'comfy.git', title: 'Comfyui', state: 'online', running: true, ready: true, readyUrl: 'http://localhost:8188', probe: true, path: null, lastError: null }
+      mockPinokio.getPinokioAppStatus.mockResolvedValue({ ok: true, value: online })
+      const fetchMock = vi.fn(async (url: string) =>
+        String(url).endsWith('/system_stats') ? Response.json({ system: { comfyui_version: '0.37.0' } }) : new Response('', { status: 404 })
+      )
+      vi.stubGlobal('fetch', fetchMock)
+      try {
+        const plain = await useControl({ userId: 'user-1', controlId: 'sys.pinokio.app_status', input: { appId: 'comfy.git' } })
+        expect(plain.success && (plain.result as any).api).toBeUndefined()
+        expect(fetchMock).not.toHaveBeenCalled()
+
+        const described = await useControl({ userId: 'user-1', controlId: 'sys.pinokio.app_status', input: { appId: 'comfy.git', describeApi: true } })
+        expect(described.success).toBe(true)
+        if (!described.success) return
+        expect((described.result as any).api).toMatchObject({ kind: 'comfyui', comfyuiVersion: '0.37.0' })
+        expect(fetchMock.mock.calls.map((call) => String(call[0]))).toEqual(['http://127.0.0.1:8188/config', 'http://127.0.0.1:8188/system_stats'])
+
+        mockPinokio.getPinokioAppStatus.mockResolvedValue({ ok: true, value: { ...online, state: 'offline', running: false, ready: false, probe: false } })
+        const offline = await useControl({ userId: 'user-1', controlId: 'sys.pinokio.app_status', input: { appId: 'comfy.git', describeApi: true } })
+        expect(offline.success && (offline.result as any)).toMatchObject({ api: null, apiNote: expect.stringContaining('must be running') })
+      } finally {
+        vi.unstubAllGlobals()
+      }
+    })
+
+    it('gives a Pinokio app artifact run 10 minutes, and every other artifact the 120 s default (SA-072 P2)', async () => {
+      const { resolveArtifactRunTimeoutMs } = await import('../services/fabricRegistry')
+      expect(resolveArtifactRunTimeoutMs({ brain_type: 'pinokio_app' })).toBe(600_000)
+      expect(resolveArtifactRunTimeoutMs({ brain_type: 'built_in' })).toBe(120_000)
+      expect(resolveArtifactRunTimeoutMs(null)).toBe(120_000)
+    })
+
+    it('refuses a URL, a pinokio:// ref, or id@host as input, before any card (DL-07)', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+      for (const appId of ['https://github.com/x/y', 'pinokio://192.168.1.10:42000/api/comfy.git', 'comfy.git@peer', '../x']) {
+        const result = await useControl({ userId: 'user-1', controlId: 'sys.pinokio.run', input: { appId } })
+        expect(result.success).toBe(false)
+        if (result.success) continue
+        expect(result.error.code).toBe('CONTROL_INPUT_INVALID')
+      }
+      expect(mockPinokio.startPinokioApp).not.toHaveBeenCalled()
+    })
+  })
+
   it('confirm-gates sys.runtime_addon.start and executes through the approved operator path', async () => {
     const { useControl } = await import('../services/fabricRegistry')
 
@@ -1576,7 +1722,8 @@ describe('controlRegistry artifact capability controls', () => {
       'sys.artifact.update',
       {
         artifactId: 'artifact_123',
-        content: '<div>Updated</div>'
+        content: '<div>Updated</div>',
+        expectedVersion: 2
       }
     ],
     [
@@ -1830,6 +1977,68 @@ describe('controlRegistry artifact capability controls', () => {
     })
   })
 
+  it('reports a connection\'s own window, not the merged row\'s, for a reviewed-identity variant (BL-68)', async () => {
+    const sonnet45 = {
+      id: 'anthropic/claude-sonnet-4.5',
+      canonicalId: 'anthropic/claude-sonnet-4.5',
+      provider: 'anthropic',
+      upstreamProvider: 'vercel',
+      name: 'claude-sonnet-4.5',
+      displayName: 'Claude Sonnet 4.5',
+      tags: ['chat'],
+      features: { streaming: true, tools: true },
+      purpose: 'chat',
+      contextWindow: 1_000_000,
+      maxOutputTokens: 64_000,
+      idVariants: {
+        'vercel-gateway': {
+          developerId: 'anthropic',
+          modelId: 'claude-sonnet-4.5',
+          effectiveId: 'anthropic/claude-sonnet-4.5',
+          source: 'vercel'
+        },
+        'direct:anthropic': {
+          developerId: 'anthropic',
+          modelId: 'claude-sonnet-4-5-20250929',
+          effectiveId: 'claude-sonnet-4-5-20250929',
+          source: 'direct',
+          limits: { contextWindow: null, maxOutputTokens: null }
+        }
+      },
+      source: 'vercel',
+      transport: 'vercel-gateway',
+      connectionId: 'vercel-gateway',
+      availableConnections: ['vercel-gateway', 'direct:anthropic']
+    }
+    const { useControl } = await import('../services/fabricRegistry')
+
+    mockFetchVercelModelCatalog.mockResolvedValueOnce({ fetchedAt: '2026-09-22T00:00:00.000Z', models: [sonnet45] })
+    const direct = await useControl({
+      userId: 'user-1',
+      controlId: 'sys.model_catalog.search',
+      input: { provider: 'anthropic', modelId: 'claude-sonnet-4.5' }
+    })
+    mockFetchVercelModelCatalog.mockResolvedValueOnce({ fetchedAt: '2026-09-22T00:00:00.000Z', models: [sonnet45] })
+    const gateway = await useControl({
+      userId: 'user-1',
+      controlId: 'sys.model_catalog.search',
+      input: { provider: 'vercel-gateway', modelId: 'claude-sonnet-4.5' }
+    })
+
+    expect(direct.success && gateway.success).toBe(true)
+    if (!direct.success || !gateway.success) return
+    expect((direct.result as any).results[0]).toMatchObject({
+      modelIdForArtifact: 'claude-sonnet-4-5-20250929',
+      contextWindow: null,
+      maxOutputTokens: null
+    })
+    expect((gateway.result as any).results[0]).toMatchObject({
+      modelIdForArtifact: 'anthropic/claude-sonnet-4.5',
+      contextWindow: 1_000_000,
+      maxOutputTokens: 64_000
+    })
+  })
+
   it('executes sys.artifact.create via ArtifactsService (no legacy MCP adapter)', async () => {
     const { useControl } = await import('../services/fabricRegistry')
 
@@ -1883,6 +2092,34 @@ describe('controlRegistry artifact capability controls', () => {
     expect(ARTIFACT_STRUCTURE_AGENT_NEXT_STEP).toContain('`native_skill` (skillId `artifact_creator`)')
     expect(ARTIFACT_STRUCTURE_AGENT_NEXT_STEP).toContain('Settings -> Agents -> Access')
     expect(ARTIFACT_STRUCTURE_AGENT_NEXT_STEP).toContain('Settings -> Skills & Prompts')
+  })
+
+  it('gives a field-name refusal its own next step: name the fields, nothing about the skill or the toggle (BL-89 review)', async () => {
+    const issues = [{ code: 'FIELD_NAME_REQUIRED', message: 'Give every field a name a screen reader can read. These fields have none: line 12 `<input type="number" id="bill">`.' }]
+    mockArtifactService.create.mockRejectedValueOnce(
+      Object.assign(
+        new Error('Artifact save blocked: Give every field a name a screen reader can read. These fields have none: line 12 `<input type="number" id="bill">`.'),
+        { status: 400, code: 'ARTIFACT_FIELD_NAME_REQUIRED', details: { issues, unnamedFields: [{ element: '<input type="number" id="bill">', line: 12 }] } }
+      )
+    )
+
+    const { useControl, ARTIFACT_STRUCTURE_AGENT_NEXT_STEP, ARTIFACT_FIELD_NAME_AGENT_NEXT_STEP } = await import('../services/fabricRegistry')
+
+    const result = await useControl({
+      userId: 'user-1',
+      controlId: 'sys.artifact.create',
+      input: { name: 'Tip Calculator', type: 'html', content: '<input id="bill">' }
+    })
+
+    const payload = (result.success ? result.result : result) as any
+    const serialized = JSON.stringify(payload)
+    expect(ARTIFACT_FIELD_NAME_AGENT_NEXT_STEP).toBe('Agent next step: add `label` or `aria-label` to the listed fields and save again.')
+    expect(serialized).toContain(JSON.stringify(ARTIFACT_FIELD_NAME_AGENT_NEXT_STEP).slice(1, -1))
+    expect(serialized).not.toContain(JSON.stringify(ARTIFACT_STRUCTURE_AGENT_NEXT_STEP).slice(1, -1))
+    expect(serialized).toContain('ARTIFACT_FIELD_NAME_REQUIRED')
+    expect(serialized).toContain('FIELD_NAME_REQUIRED')
+    expect(serialized).toContain('<input type=\\"number\\" id=\\"bill\\">')
+    expect(serialized).not.toMatch(/toggle|artifact_creator/)
   })
 
   it('keeps ordinary artifact control errors unchanged (BL-69)', async () => {
@@ -2086,6 +2323,319 @@ describe('controlRegistry artifact capability controls', () => {
     })
   })
 
+  /**
+   * BL-81 — a delegated run may use exactly what its DCM index offers it, and nothing more.
+   *
+   * A Subagent or Worker run on a managed CLI lane reaches `useControl` on its own credential:
+   * `agentId` is the per-run runtime id it authenticated with, `scopeAgentId` the Subagent whose
+   * artifact allowlists apply, and `delegatedAllowedControlIds` the control ids its DCM index
+   * offered it (on a CLI lane, the published artifact tools allowed for it or nothing; this suite
+   * hands the gate lists by hand, Fetch Zip included, to test the gate itself). SA-064 keeps the Fabric
+   * control plane primary-only; this is where the CLI lane enforces it on the server.
+   */
+  it('refuses Fetch Zip on a service-token lane even when its body claims a chat', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+    const result = await useControl({
+      userId: 'user-1',
+      agentId: 'claimed-agent',
+      sessionId: 'session-1',
+      actorType: 'service',
+      controlId: 'sys.zip.fetch',
+      input: { zipId: 'zip_claimed' }
+    })
+    expect(result.success).toBe(true)
+    if (result.success) {
+      expect(result.result).toMatchObject({
+        found: false,
+        code: 'MODEL_SCOPE_REQUIRED'
+      })
+    }
+  })
+
+  describe('a delegated run uses exactly what its DCM offers it (BL-81)', () => {
+    const RUNTIME = 'subagent_cli_research_bot'
+    const SCOPE = 'research_bot'
+    const OFFERED = ['sys.zip.fetch', 'use.artifact.*']
+    const delegated = {
+      userId: 'user-1',
+      agentId: RUNTIME,
+      scopeAgentId: SCOPE,
+      delegatedRun: true,
+      delegatedAllowedControlIds: OFFERED,
+      actorType: 'agent' as const,
+      credentialId: 'arc_delegated'
+    }
+
+    /** A published, run-only artifact whose Agent Use list names `allowlist`. */
+    function runOnlyArtifact(allowlist: string[]) {
+      return {
+        id: 'artifact_scoped',
+        user_id: 'user-1',
+        name: 'Scoped Artifact',
+        slug: 'scoped-artifact',
+        mode: 'published',
+        zone: 'panel',
+        agent_use_enabled: true,
+        agent_allowlist: allowlist,
+        metadata: { run_only: true },
+        created_at: '2026-09-22T00:00:00.000Z',
+        updated_at: '2026-09-22T00:00:00.000Z'
+      }
+    }
+
+    function expectScopeRefusal(result: any, label: string) {
+      expect(result.success, label).toBe(false)
+      if (result.success) return
+      expect(result.error.code, label).toBe('CONTROL_NOT_ALLOWED')
+      expect(result.error.message, label).toContain('Subagent or Worker')
+    }
+
+    it('refuses sys.skill.save and sys.skill.import, and writes nothing', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+
+      const save = await useControl({
+        ...delegated,
+        controlId: 'sys.skill.save',
+        input: { commandName: 'probe-skill', skill: { markdown: '# Probe' } }
+      })
+      expectScopeRefusal(save, 'sys.skill.save')
+
+      const importResult = await useControl({
+        ...delegated,
+        controlId: 'sys.skill.import',
+        input: { source: 'https://github.com/example/skills', sourceType: 'github' }
+      })
+      expectScopeRefusal(importResult, 'sys.skill.import')
+
+      expect(mockUpsertSkill).not.toHaveBeenCalled()
+      expect(await mockRedisJsonGet('slash_command:user-1:probe_skill')).toBeNull()
+    })
+
+    it('answers an acting-agent control with AGENT_IDENTITY_REQUIRED first, whatever its list names', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+
+      // The order is pinned: the identity gate runs before the scope check, so this refusal
+      // survives even a list that (wrongly) names the family.
+      for (const list of [OFFERED, ['sys.dm.*', 'sys.memory.*', 'sys.schedule.*']]) {
+        for (const controlId of ['sys.dm.list', 'sys.memory.search', 'sys.schedule.list']) {
+          const result = await useControl({ ...delegated, delegatedAllowedControlIds: list, controlId, input: {} })
+          expect(result.success, controlId).toBe(false)
+          if (result.success) continue
+          expect(result.error.code, `${controlId} with ${list.join(',')}`).toBe('AGENT_IDENTITY_REQUIRED')
+        }
+      }
+    })
+
+    it('refuses above input validation, the dry run, the risk gate and the handler', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+
+      // A dry run of a control it may not use is not a validation success.
+      expectScopeRefusal(
+        await useControl({ ...delegated, controlId: 'sys.skill.save', dryRun: true, input: {} }),
+        'dry run'
+      )
+      // Invalid input is answered with the scope, not with a schema error.
+      expectScopeRefusal(await useControl({ ...delegated, controlId: 'sys.skill.save', input: {} }), 'bad input')
+
+      // A risky control never raises a card nobody could answer for it.
+      expectScopeRefusal(
+        await useControl({
+          ...delegated,
+          sessionId: 'session-1',
+          controlId: 'sys.cli_tool.test',
+          input: { toolId: 'repo_snapshot' }
+        }),
+        'risky'
+      )
+      expect(approvalRecordsWritten()).toEqual([])
+      expect(mockCliToolService.validateCliTool).not.toHaveBeenCalled()
+
+      // And no handler runs: Dynamic MCP would load an agent record for its gateway scope.
+      expectScopeRefusal(
+        await useControl({ ...delegated, controlId: 'sys.mcp.dynamic.find', input: { query: 'files' } }),
+        'handler'
+      )
+      expect(mockResolveDynamicMcpGatewayScope).not.toHaveBeenCalled()
+    })
+
+    it('runs Fetch Zip when its DCM offered it, and refuses it when it did not', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+
+      const offered = await useControl({ ...delegated, controlId: 'sys.zip.fetch', input: { zipId: 'zip_missing' } })
+      expect(offered.success).toBe(true)
+      if (offered.success) expect(offered.result).toMatchObject({ found: false, zipId: 'zip_missing' })
+
+      expectScopeRefusal(
+        await useControl({
+          ...delegated,
+          delegatedAllowedControlIds: ['use.artifact.*'],
+          controlId: 'sys.zip.fetch',
+          input: { zipId: 'zip_missing' }
+        }),
+        'toggle off'
+      )
+    })
+
+    it('allows nothing for a credential that names no list, as one minted before BL-81 does', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+
+      for (const list of [undefined, null, []]) {
+        expectScopeRefusal(
+          await useControl({
+            ...delegated,
+            delegatedAllowedControlIds: list as any,
+            controlId: 'sys.zip.fetch',
+            input: { zipId: 'zip_missing' }
+          }),
+          String(list)
+        )
+      }
+    })
+
+    it('runs an artifact allowlisted for its Subagent, judged by the scope id', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+      mockArtifactService.listByUser.mockResolvedValue([runOnlyArtifact([SCOPE])])
+
+      const scoped = await useControl({
+        ...delegated,
+        controlId: 'use.artifact.scoped-artifact',
+        dryRun: true,
+        input: {}
+      })
+      expect(scoped.success).toBe(true)
+
+      // The same run judged by its runtime id alone is outside the allowlist.
+      const unscoped = await useControl({
+        ...delegated,
+        scopeAgentId: undefined,
+        controlId: 'use.artifact.scoped-artifact',
+        dryRun: true,
+        input: {}
+      })
+      expect(unscoped.success).toBe(false)
+      if (unscoped.success) return
+      expect(unscoped.error.code).toBe('CONTROL_NOT_ALLOWED')
+      expect(unscoped.error.message).toContain('not available for the current agent scope')
+    })
+
+    it('refuses an artifact allowlisted only for a primary whose id differs from its scope', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+      mockArtifactService.listByUser.mockResolvedValue([runOnlyArtifact(['agent-cooper'])])
+
+      const result = await useControl({
+        ...delegated,
+        controlId: 'use.artifact.scoped-artifact',
+        dryRun: true,
+        input: {}
+      })
+      expect(result.success).toBe(false)
+      if (result.success) return
+      expect(result.error.code).toBe('CONTROL_NOT_ALLOWED')
+    })
+
+    it('resolves a short alias through the scope id, and then refuses it as outside the scope', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+      mockArtifactService.listByUser.mockResolvedValue([runOnlyArtifact([SCOPE])])
+
+      // Per-instance artifact controls belong to the Fabric family, so a delegated run may not
+      // use them; the alias still resolves by the scope id, so the answer says why.
+      const alias = await useControl({ ...delegated, controlId: 'action.run.run', dryRun: true, input: {} })
+      expect(alias.controlId).toBe('artifact.artifact_scoped.action.run.run')
+      expectScopeRefusal(alias, 'alias')
+
+      const unscoped = await useControl({
+        ...delegated,
+        scopeAgentId: undefined,
+        controlId: 'action.run.run',
+        dryRun: true,
+        input: {}
+      })
+      expect(unscoped.success).toBe(false)
+      if (unscoped.success) return
+      expect(unscoped.error.code).toBe('CONTROL_NOT_FOUND')
+    })
+
+    it('lists only what it may use', async () => {
+      const { findControls } = await import('../services/fabricRegistry')
+      mockArtifactService.listByUser.mockResolvedValue([runOnlyArtifact([SCOPE])])
+
+      const found = await findControls({
+        userId: 'user-1',
+        agentId: SCOPE,
+        delegatedRun: true,
+        delegatedAllowedControlIds: OFFERED,
+        includeDraft: true,
+        limit: 50
+      })
+      expect(found.results.map((row) => row.controlId).sort()).toEqual([
+        'sys.zip.fetch',
+        'use.artifact.scoped-artifact'
+      ])
+
+      const nothing = await findControls({ userId: 'user-1', agentId: SCOPE, delegatedRun: true, limit: 50 })
+      expect(nothing.results).toEqual([])
+    })
+
+    it('leaves a primary, the service token, a portable-skill token and a signed-in session as they were', async () => {
+      const { useControl, findControls } = await import('../services/fabricRegistry')
+
+      const callers = [
+        { actorType: 'agent' as const, agentId: 'agent_1', credentialId: 'arc_primary' },
+        { actorType: 'service' as const, agentId: 'agent_1' },
+        { actorType: 'session' as const, agentId: 'agent_1' },
+        { actorType: 'portable-skill' as const, allowRisky: true, allowedControlIds: ['sys.skill.save'] }
+      ]
+      for (const [index, caller] of callers.entries()) {
+        mockUpsertSkill.mockResolvedValueOnce({
+          id: `probe_${index}`,
+          name: `probe_${index}`,
+          displayName: `probe_${index}`,
+          description: '',
+          standards_status: 'valid',
+          trust_level: 'trusted',
+          dependencies: [],
+          metadata: {},
+          allowed_tools: []
+        })
+        const result = await useControl({
+          userId: 'user-1',
+          ...caller,
+          // A stray list without the delegated flag changes nothing.
+          delegatedAllowedControlIds: [],
+          controlId: 'sys.skill.save',
+          input: { commandName: `probe-${index}`, skill: { markdown: '# Probe' } }
+        })
+        expect(result.success, caller.actorType).toBe(true)
+      }
+
+      const found = await findControls({
+        userId: 'user-1',
+        agentId: 'agent_1',
+        delegatedAllowedControlIds: [],
+        query: 'sys.skill.save',
+        includeDraft: true,
+        limit: 50
+      })
+      expect(found.results.some((row) => row.controlId === 'sys.skill.save')).toBe(true)
+    })
+
+    it('audits the run that authenticated and the Subagent whose allowlist applied', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+      mockArtifactService.listByUser.mockResolvedValue([runOnlyArtifact([SCOPE])])
+
+      await useControl({ ...delegated, controlId: 'use.artifact.scoped-artifact', dryRun: true, input: {} })
+
+      expect(auditEntriesWritten().at(-1)).toMatchObject({
+        actorType: 'agent',
+        agentId: RUNTIME,
+        scopeAgentId: SCOPE,
+        credentialId: 'arc_delegated',
+        controlId: 'use.artifact.scoped-artifact',
+        success: true
+      })
+    })
+  })
+
   it('returns compact artifact summaries for lifecycle write controls', async () => {
     mockArtifactService.update.mockResolvedValueOnce({
       id: 'artifact_123',
@@ -2119,7 +2669,8 @@ describe('controlRegistry artifact capability controls', () => {
       controlId: 'sys.artifact.update',
       input: {
         artifactId: 'artifact_123',
-        content: '<div>Updated</div>'
+        content: '<div>Updated</div>',
+        expectedVersion: 2
       }
     })
 
@@ -2188,6 +2739,560 @@ describe('controlRegistry artifact capability controls', () => {
       kind: 'model_config',
       contentChanged: false,
       updatedFields: ['model_config']
+    })
+  })
+
+  describe('BL-829: artifact access belongs to the user', () => {
+    const accessRequests = [
+      ['turn Agent Use off', { agent_use_enabled: false }],
+      ['clear the selected agents', { agent_allowlist: [] }],
+      ['clear the selected agents with null', { agent_allowlist: null }],
+      ['open access to all agents', { agent_access_scope: 'all' }],
+      ['switch to selected agents', { agent_access_scope: 'selected' }]
+    ] as const
+    const nonUserLanes = ['agent', 'in-process', 'n8n-callback', 'portable-skill', 'unknown'] as const
+
+    it.each(accessRequests)('refuses an agent request to %s without saving any content', async (_label, access) => {
+      const { useControl } = await import('../services/fabricRegistry')
+
+      for (const actorType of nonUserLanes) {
+        const result = await useControl({
+          userId: 'user-1',
+          agentId: 'agent-1',
+          actorType,
+          controlId: 'sys.artifact.update',
+          input: { artifactId: 'artifact_123', content: '<div>unauthorized replacement</div>', ...access }
+        })
+
+        expect(result.success, `${actorType}: ${_label}`).toBe(false)
+        if (result.success) continue
+        expect(result.error.code).toBe('CONTROL_NOT_ALLOWED')
+        expect(result.error.details).toMatchObject({
+          success: false,
+          status: 403,
+          code: 'ARTIFACT_ACCESS_USER_ONLY'
+        })
+      }
+
+      expect(mockArtifactService.getOwned).not.toHaveBeenCalled()
+      expect(mockArtifactService.update).not.toHaveBeenCalled()
+    })
+
+    it.each(['session', 'service'] as const)('keeps %s access edits available with a claimed agent id', async (actorType) => {
+      const { useControl } = await import('../services/fabricRegistry')
+      mockArtifactService.update.mockResolvedValueOnce({
+        id: 'artifact_123',
+        name: 'Demo Artifact',
+        slug: 'demo-artifact',
+        type: 'html',
+        content: '<div>Existing</div>',
+        mode: 'edit',
+        zone: 'panel',
+        version: 1,
+        versions: [],
+        agent_access_scope: 'all',
+        updated_at: '2026-09-28T00:00:00.000Z'
+      })
+
+      const result = await useControl({
+        userId: 'user-1',
+        agentId: 'agent-1',
+        actorType,
+        controlId: 'sys.artifact.update',
+        input: { artifactId: 'artifact_123', agent_access_scope: 'all' }
+      })
+
+      expect(result.success).toBe(true)
+      expect(mockArtifactService.update).toHaveBeenCalledWith(
+        'artifact_123',
+        'user-1',
+        expect.objectContaining({ agent_access_scope: 'all' })
+      )
+    })
+
+    it('still lets a model replace content when no access field is present', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+      mockArtifactService.getOwned.mockResolvedValueOnce({ content: '<div>Before</div>' })
+      mockArtifactService.update.mockResolvedValueOnce({
+        id: 'artifact_123',
+        name: 'Demo Artifact',
+        slug: 'demo-artifact',
+        type: 'html',
+        content: '<div>After</div>',
+        mode: 'edit',
+        zone: 'panel',
+        version: 2,
+        versions: [],
+        updated_at: '2026-09-28T00:00:00.000Z'
+      })
+
+      const result = await useControl({
+        userId: 'user-1',
+        agentId: 'agent-1',
+        actorType: 'in-process',
+        controlId: 'sys.artifact.update',
+        input: { artifactId: 'artifact_123', content: '<div>After</div>', expectedVersion: 1 }
+      })
+
+      expect(result.success).toBe(true)
+      expect(mockArtifactService.update).toHaveBeenCalledWith(
+        'artifact_123',
+        'user-1',
+        expect.objectContaining({ content: '<div>After</div>' }),
+        { expectedVersion: 1 }
+      )
+    })
+  })
+
+  describe('BL-818: a whole-page write names the version it read', () => {
+    const everyLane = ['agent', 'in-process', 'n8n-callback', 'portable-skill', 'session', 'service'] as const
+    const staleConflict = () =>
+      Object.assign(
+        new Error(
+          'This artifact changed after this edit started: it is now at version 3, and the edit was made on version 2. Nothing was saved. Load the current version and make the edit again.'
+        ),
+        { status: 409, code: 'ARTIFACT_VERSION_CONFLICT', details: { storedVersion: 3, baseVersion: 2 } }
+      )
+
+    // The version comes from a result that loaded the WHOLE page or wrote the agent's OWN whole
+    // content (get with content, create, a content update, add_version), never from apply_patch (it
+    // applies to the stored text, so a user's save elsewhere can sit in its result) or from a write
+    // that read no page (publish, zone, webhook, metadata, field, rollback): those show the STORED
+    // version, and an agent that took it would send its older copy over a user's newer save and be
+    // accepted.
+    const expectVersionQualifier = (words: string) => {
+      expect(words).toContain('loaded the whole page or wrote your own whole content')
+      // A get WITHOUT content also returns the stored version, so "get" alone would let a stale page through.
+      expect(words).toContain('sys.artifact.get with content')
+      expect(words).toContain('add_version')
+      expect(words).toContain('never an apply_patch, publish, zone, webhook, metadata, field, or rollback result')
+      // apply_patch is in the "never" list and not in the list that counts.
+      expect(words).not.toMatch(/content update, (?:or )?apply_patch|apply_patch, or add_version/)
+      expect(words).not.toContain('loaded or wrote the content you edited')
+    }
+
+    // The two controls that write a whole page: each names the version it read.
+    const wholePageWrites = [
+      ['sys.artifact.update', 'update', { artifactId: 'artifact_123', content: '<div>replacement</div>' }],
+      ['sys.artifact.add_version', 'addVersion', { artifactId: 'artifact_123', content: '<div>replacement</div>' }]
+    ] as const
+
+    it.each(wholePageWrites)(
+      '%s refuses a write that names no version, before any read or write, on every lane',
+      async (controlId, serviceMethod, input) => {
+        const { useControl } = await import('../services/fabricRegistry')
+
+        for (const actorType of everyLane) {
+          const result = await useControl({
+            userId: 'user-1',
+            agentId: 'agent-1',
+            actorType,
+            controlId,
+            input
+          })
+
+          expect(result.success, actorType).toBe(false)
+          if (result.success) continue
+          // An input problem the caller can fix: the route answers 400, like the schema's own refusals.
+          expect(result.error.code, actorType).toBe('CONTROL_INPUT_INVALID')
+          expect(result.error.details, actorType).toMatchObject({
+            success: false,
+            status: 400,
+            code: 'ARTIFACT_EXPECTED_VERSION_REQUIRED'
+          })
+          // The words say what to send and how to get it, and name this control.
+          const words = result.error.message
+          expect(words, actorType).toContain(controlId)
+          expect(words, actorType).toContain('expectedVersion')
+          expect(words, actorType).toContain('sys.artifact.get')
+          // Which result counts: one that loaded the whole page or wrote the agent's own whole content.
+          expect(words, actorType).toContain('loaded the whole page or wrote your own whole content')
+          expect(words, actorType).toContain('add_version')
+          expect(words, actorType).toContain('never an apply_patch, publish, zone, webhook, metadata, field, or rollback result')
+          expect(words, actorType).not.toMatch(/content update, (?:or )?apply_patch|apply_patch, or add_version/)
+          expect(words, actorType).toContain('Not saved')
+          // No number to copy.
+          expect(words, actorType).not.toMatch(/\d/)
+          expect(words, actorType).not.toContain('current version')
+        }
+
+        expect(mockArtifactService.getOwned).not.toHaveBeenCalled()
+        expect(mockArtifactService[serviceMethod]).not.toHaveBeenCalled()
+      }
+    )
+
+    it('answers the access refusal first when an update carries an access field and no version', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+
+      const result = await useControl({
+        userId: 'user-1',
+        agentId: 'agent-1',
+        actorType: 'agent',
+        controlId: 'sys.artifact.update',
+        input: { artifactId: 'artifact_123', content: '<div>replacement</div>', agent_access_scope: 'all' }
+      })
+
+      expect(result.success).toBe(false)
+      if (result.success) return
+      expect(result.error.code).toBe('CONTROL_NOT_ALLOWED')
+      expect(result.error.details).toMatchObject({ status: 403, code: 'ARTIFACT_ACCESS_USER_ONLY' })
+      expect(mockArtifactService.getOwned).not.toHaveBeenCalled()
+      expect(mockArtifactService.update).not.toHaveBeenCalled()
+    })
+
+    it('answers the access refusal first when an update carries an access field and a stale version', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+      mockArtifactService.update.mockRejectedValue(staleConflict())
+
+      const result = await useControl({
+        userId: 'user-1',
+        agentId: 'agent-1',
+        actorType: 'agent',
+        controlId: 'sys.artifact.update',
+        input: {
+          artifactId: 'artifact_123',
+          content: '<div>replacement</div>',
+          expectedVersion: 2,
+          agent_use_enabled: false
+        }
+      })
+
+      expect(result.success).toBe(false)
+      if (result.success) return
+      expect(result.error.details).toMatchObject({ status: 403, code: 'ARTIFACT_ACCESS_USER_ONLY' })
+      expect(mockArtifactService.getOwned).not.toHaveBeenCalled()
+      expect(mockArtifactService.update).not.toHaveBeenCalled()
+    })
+
+    it('hands the version to the atomic check and never treats it as a field to save', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+      mockArtifactService.getOwned.mockResolvedValueOnce({ content: '<div>Before</div>' })
+      mockArtifactService.update.mockResolvedValueOnce({
+        id: 'artifact_123',
+        name: 'Demo Artifact',
+        slug: 'demo-artifact',
+        type: 'html',
+        content: '<div>After</div>',
+        mode: 'edit',
+        zone: 'panel',
+        version: 3,
+        versions: [],
+        updated_at: '2026-09-28T00:00:00.000Z'
+      })
+
+      const result = await useControl({
+        userId: 'user-1',
+        agentId: 'agent-1',
+        actorType: 'in-process',
+        controlId: 'sys.artifact.update',
+        input: {
+          artifactId: 'artifact_123',
+          content: '<div>After</div>',
+          versionDescription: 'Tidy',
+          expectedVersion: 2
+        }
+      })
+
+      expect(result.success).toBe(true)
+      if (!result.success) return
+      // Exactly the fields to save (no `expectedVersion`), and the version as the check option.
+      expect(mockArtifactService.update).toHaveBeenCalledWith(
+        'artifact_123',
+        'user-1',
+        { content: '<div>After</div>', versionDescription: 'Tidy' },
+        { expectedVersion: 2 }
+      )
+      expect((result.result as any).artifactUpdate.updatedFields).toEqual(['content'])
+      // The next update carries the version this result shows.
+      expect((result.result as any).artifact.version).toBe(3)
+    })
+
+    it('hands add_version its version as the check option too', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+      mockArtifactService.addVersion.mockResolvedValueOnce({
+        id: 'artifact_123',
+        name: 'Demo Artifact',
+        slug: 'demo-artifact',
+        type: 'html',
+        content: '<div>After</div>',
+        mode: 'edit',
+        zone: 'panel',
+        version: 3,
+        versions: [],
+        updated_at: '2026-09-28T00:00:00.000Z'
+      })
+
+      const result = await useControl({
+        userId: 'user-1',
+        agentId: 'agent-1',
+        actorType: 'in-process',
+        controlId: 'sys.artifact.add_version',
+        input: { artifactId: 'artifact_123', content: '<div>After</div>', description: 'Snapshot', expectedVersion: 2 }
+      })
+
+      expect(result.success).toBe(true)
+      if (!result.success) return
+      expect(mockArtifactService.addVersion).toHaveBeenCalledWith(
+        'artifact_123',
+        'user-1',
+        '<div>After</div>',
+        'Snapshot',
+        { expectedVersion: 2 }
+      )
+      expect((result.result as any).artifact.version).toBe(3)
+    })
+
+    it('needs no version for an update that sends no content', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+      mockArtifactService.update.mockResolvedValue({
+        id: 'artifact_123',
+        name: 'Demo Artifact',
+        slug: 'demo-artifact',
+        type: 'html',
+        content: '<div>Unchanged</div>',
+        mode: 'published',
+        zone: 'panel',
+        version: 2,
+        versions: [],
+        updated_at: '2026-09-28T00:00:00.000Z'
+      })
+
+      for (const input of [
+        { artifactId: 'artifact_123', mode: 'published' },
+        { artifactId: 'artifact_123', zone: 'header', metadata: { note: 'kept' } },
+        { artifactId: 'artifact_123', versionDescription: 'Only a note' }
+      ]) {
+        const result = await useControl({
+          userId: 'user-1',
+          agentId: 'agent-1',
+          actorType: 'in-process',
+          controlId: 'sys.artifact.update',
+          input
+        })
+        expect(result.success, JSON.stringify(input)).toBe(true)
+      }
+      // No check option is sent, so the write is the ordinary one.
+      expect(mockArtifactService.update).toHaveBeenNthCalledWith(1, 'artifact_123', 'user-1', { mode: 'published' })
+    })
+
+    it.each([
+      ['a string', '2'],
+      ['a fraction', 2.5],
+      ['a negative number', -1],
+      ['null', null]
+    ])('refuses %s as the version and saves nothing', async (_label, expectedVersion) => {
+      const { useControl } = await import('../services/fabricRegistry')
+
+      for (const [controlId, serviceMethod, input] of wholePageWrites) {
+        const result = await useControl({
+          userId: 'user-1',
+          agentId: 'agent-1',
+          actorType: 'in-process',
+          controlId,
+          input: { ...input, expectedVersion }
+        })
+
+        expect(result.success, controlId).toBe(false)
+        if (result.success) continue
+        expect(result.error.code, controlId).toBe('CONTROL_INPUT_INVALID')
+        expect((result.error.details as any).fieldErrors.expectedVersion?.length, controlId).toBeGreaterThan(0)
+        expect(mockArtifactService.getOwned).not.toHaveBeenCalled()
+        expect(mockArtifactService[serviceMethod]).not.toHaveBeenCalled()
+      }
+    })
+
+    const expectStaleWordsForAgent = (result: any) => {
+      expect(result.success).toBe(false)
+      // A conflict, not an input problem: the status stays 409 in the details.
+      expect(result.error.code).toBe('CONTROL_EXECUTION_FAILED')
+      expect(result.error.details).toMatchObject({ status: 409, code: 'ARTIFACT_VERSION_CONFLICT' })
+      const words = result.error.message as string
+      expect(words).toContain('Not saved')
+      expect(words).toContain('changed after you read it')
+      expect(words).toContain('sys.artifact.get')
+      expect(words).toContain('redo your edit on that content')
+      expect(words).toContain('expectedVersion')
+      // The agent gets no version number to send back: it must read the artifact to learn it,
+      // so a straight resend of its old page cannot succeed.
+      expect(words).not.toMatch(/\d/)
+      // Not the panel's words for the user, and true for every control that can meet the conflict.
+      expect(words).not.toContain('this edit started')
+      expect(words).not.toContain('full `content` update')
+    }
+
+    it.each(wholePageWrites)(
+      '%s: a stale-version refusal is worded for the agent, names the read control, and offers no number',
+      async (controlId, serviceMethod, input) => {
+        const { useControl } = await import('../services/fabricRegistry')
+        // Only `update` reads the artifact first (for its diff); a queued value nobody takes would
+        // leak into the next test's `getOwned`.
+        if (serviceMethod === 'update') mockArtifactService.getOwned.mockResolvedValueOnce({ content: '<div>Before</div>' })
+        mockArtifactService[serviceMethod].mockRejectedValueOnce(staleConflict())
+
+        const result = await useControl({
+          userId: 'user-1',
+          agentId: 'agent-1',
+          actorType: 'in-process',
+          controlId,
+          input: { ...input, expectedVersion: 2 }
+        })
+
+        expectStaleWordsForAgent(result)
+      }
+    )
+
+    it('words the same conflict the same way when it comes from apply_patch or rollback', async () => {
+      const patch = '*** Begin Patch\n*** Update File: artifact.html\n@@\n-<div>Hello</div>\n+<div>Patched</div>\n*** End Patch'
+      mockArtifactService.applyPatch.mockRejectedValueOnce(staleConflict())
+      expectStaleWordsForAgent(
+        await useControlWithApproval({
+          userId: 'user-1',
+          agentId: 'agent-1',
+          actorType: 'in-process',
+          controlId: 'sys.artifact.apply_patch',
+          input: { artifactId: 'artifact_123', patch }
+        })
+      )
+
+      mockArtifactService.rollbackToVersion.mockRejectedValueOnce(staleConflict())
+      expectStaleWordsForAgent(
+        await useControlWithApproval({
+          userId: 'user-1',
+          agentId: 'agent-1',
+          actorType: 'in-process',
+          controlId: 'sys.artifact.rollback',
+          input: { artifactId: 'artifact_123', targetVersion: 1 }
+        })
+      )
+    })
+
+    it('offers the version in the hint, the description, and the schema the model reads', async () => {
+      const { findControls } = await import('../services/fabricRegistry')
+      const result = await findControls({
+        query: 'sys.artifact.update',
+        includeDraft: true,
+        includeSchema: true,
+        limit: 50
+      })
+      const control = result.results.find((item) => item.controlId === 'sys.artifact.update')
+      expect(control).toBeTruthy()
+
+      // What the tool index and the DCM hint show, and the words a model reads on discovery.
+      expect(control!.schemaHint).toContain('expectedVersion')
+      expect(control!.schemaHint).toContain('never apply_patch')
+      expect(control!.schemaHint).toContain('get (with content)')
+      expect(control!.description).toContain('expectedVersion')
+      expect(control!.description).toContain('sys.artifact.get')
+      expectVersionQualifier(control!.description)
+      const schema = (control as any).inputSchema
+      expect(schema.properties.expectedVersion).toMatchObject({ type: 'integer', minimum: 0 })
+      expectVersionQualifier(schema.properties.expectedVersion.description)
+      // Required with `content` only: the rule is enforced by the handler, and `artifactId` stays the one required key.
+      expect(schema.required).toEqual(['artifactId'])
+      expect(schema.dependentRequired).toEqual({ content: ['expectedVersion'] })
+    })
+
+    it('offers add_version the same version in its hint, description, and schema', async () => {
+      const { findControls } = await import('../services/fabricRegistry')
+      const result = await findControls({
+        query: 'sys.artifact.add_version',
+        includeDraft: true,
+        includeSchema: true,
+        limit: 50
+      })
+      const control = result.results.find((item) => item.controlId === 'sys.artifact.add_version')
+      expect(control).toBeTruthy()
+
+      expect(control!.schemaHint).toContain('expectedVersion')
+      expect(control!.schemaHint).toContain('never apply_patch')
+      expect(control!.schemaHint).toContain('get (with content)')
+      expect(control!.description).toContain('expectedVersion')
+      expect(control!.description).toContain('sys.artifact.get')
+      expectVersionQualifier(control!.description)
+      const schema = (control as any).inputSchema
+      expect(schema.properties.expectedVersion).toMatchObject({ type: 'integer', minimum: 0 })
+      expectVersionQualifier(schema.properties.expectedVersion.description)
+      // It always writes `content`, so the version is always required.
+      expect(schema.required).toEqual(['artifactId', 'content', 'expectedVersion'])
+    })
+
+    it('keeps every other refusal of an update as it was', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+      mockArtifactService.update.mockRejectedValueOnce(
+        Object.assign(new Error('Artifact not found'), { status: 404 })
+      )
+
+      const result = await useControl({
+        userId: 'user-1',
+        agentId: 'agent-1',
+        actorType: 'in-process',
+        controlId: 'sys.artifact.update',
+        input: { artifactId: 'artifact_123', mode: 'edit' }
+      })
+
+      expect(result.success).toBe(false)
+      if (result.success) return
+      expect(result.error.message).toBe('Artifact not found')
+    })
+
+    it('shows the artifact version in the summary of every write an agent can build the next update on', async () => {
+      const stored = (version: number) => ({
+        id: 'artifact_123',
+        name: 'Demo Artifact',
+        slug: 'demo-artifact',
+        type: 'html',
+        content: '<div>Body</div>',
+        mode: 'edit',
+        zone: 'panel',
+        version,
+        versions: [],
+        updated_at: '2026-09-28T00:00:00.000Z'
+      })
+      mockArtifactService.create.mockResolvedValueOnce(stored(1))
+      mockArtifactService.applyPatch.mockResolvedValueOnce(stored(4))
+      mockArtifactService.update.mockResolvedValueOnce(stored(5)).mockResolvedValueOnce(stored(5))
+      mockArtifactService.addVersion.mockResolvedValueOnce(stored(6))
+      mockArtifactService.rollbackToVersion.mockResolvedValueOnce(stored(7))
+      mockArtifactService.getAccessible.mockResolvedValueOnce(stored(8))
+
+      // `rollback` is restricted, so it is approved the way a user's click would.
+      const shownVersion = async (controlId: string, input: Record<string, unknown>) => {
+        const result = await useControlWithApproval({
+          userId: 'user-1',
+          agentId: 'agent-1',
+          actorType: 'in-process',
+          controlId,
+          input
+        })
+        expect(result.success, controlId).toBe(true)
+        if (!result.success) return undefined
+        return (result.result as any).artifact?.version
+      }
+
+      expect(await shownVersion('sys.artifact.create', { name: 'Demo Artifact', content: '<div>Body</div>' })).toBe(1)
+      expect(
+        await shownVersion('sys.artifact.apply_patch', {
+          artifactId: 'artifact_123',
+          patch: '*** Begin Patch\n*** Update File: artifact.html\n@@\n-<div>Hello</div>\n+<div>Body</div>\n*** End Patch'
+        })
+      ).toBe(4)
+      expect(
+        await shownVersion('sys.artifact.update', {
+          artifactId: 'artifact_123',
+          content: '<div>Body</div>',
+          expectedVersion: 4
+        })
+      ).toBe(5)
+      expect(await shownVersion('sys.artifact.publish', { artifactId: 'artifact_123', publish: true })).toBe(5)
+      expect(
+        await shownVersion('sys.artifact.add_version', {
+          artifactId: 'artifact_123',
+          content: '<div>Body</div>',
+          expectedVersion: 5
+        })
+      ).toBe(6)
+      expect(await shownVersion('sys.artifact.rollback', { artifactId: 'artifact_123', targetVersion: 1 })).toBe(7)
+      expect(await shownVersion('sys.artifact.get', { artifactId: 'artifact_123' })).toBe(8)
     })
   })
 
@@ -2473,6 +3578,59 @@ describe('controlRegistry artifact capability controls', () => {
     expect(JSON.stringify(result.result)).not.toContain(imageDataUrl)
     expect(fetchMock).toHaveBeenCalledTimes(2)
   })
+
+  it.each(['artifact.artifact_123.action.run.run', 'use.artifact.demo-artifact'])(
+    'fails %s on a streamed error without auto-sharing previously delivered files',
+    async (controlId) => {
+      const typedArtifact = {
+        id: 'artifact_123',
+        user_id: 'user-1',
+        name: 'Demo Artifact',
+        slug: 'demo-artifact',
+        mode: 'published',
+        zone: 'panel',
+        agent_use_enabled: true,
+        agent_access_scope: 'all',
+        metadata: { fabric_fields: [{ fabricId: 'prompt', type: 'text', label: 'Prompt' }] },
+        created_at: '2026-02-22T00:00:00.000Z',
+        updated_at: '2026-02-22T00:00:00.000Z'
+      }
+      if (controlId === 'use.artifact.demo-artifact') {
+        mockArtifactService.listByUser.mockResolvedValueOnce([typedArtifact])
+        mockArtifactService.getAccessible.mockResolvedValueOnce(typedArtifact)
+      }
+      const reason = 'Provider disconnected after partial output'
+      const imageDataUrl = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB'
+      const ndjson = [
+        { type: 'chunk', content: 'Partial answer' },
+        { type: 'file', base64: imageDataUrl, mediaType: 'image/png', index: 0 },
+        { type: 'error', error: reason }
+      ].map((event) => JSON.stringify(event)).join('\n')
+      const fetchMock = vi.fn().mockResolvedValue(new Response(`${ndjson}\n`, { status: 200 }))
+      vi.stubGlobal('fetch', fetchMock)
+
+      const { useControl } = await import('../services/fabricRegistry')
+      const result = await useControl({
+        userId: 'user-1',
+        agentId: 'agent-1',
+        sessionId: 'sess_1',
+        controlId,
+        input: { prompt: 'Generate an image' },
+        actorType: 'session'
+      })
+
+      expect(result.success).toBe(false)
+      if (result.success) return
+      expect(result.error).toMatchObject({ code: 'CONTROL_EXECUTION_FAILED', message: reason })
+      expect(result).not.toHaveProperty('result')
+      expect(JSON.stringify(result)).not.toContain(imageDataUrl)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      expect(fetchMock).toHaveBeenCalledWith(
+        'http://localhost:5620/api/artifacts/complete',
+        expect.objectContaining({ method: 'POST' })
+      )
+    }
+  )
 
   it('captures typed artifact file events and auto-shares agent output to chat', async () => {
     const imageDataUrl = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB'
@@ -3014,6 +4172,47 @@ describe('controlRegistry artifact capability controls', () => {
     expect(result.results.some((entry) => entry.controlId === 'use.artifact.run-only-artifact')).toBe(true)
   })
 
+  it('tells an agent that a Pinokio app artifact\'s file field takes a Clip id (SA-072 P2)', async () => {
+    const { findControls } = await import('../services/fabricRegistry')
+
+    mockArtifactService.listByUser.mockResolvedValueOnce([
+      {
+        id: 'artifact_ocr',
+        user_id: 'user-1',
+        name: 'LightOn OCR',
+        slug: 'lighton_ocr',
+        mode: 'published',
+        zone: 'panel',
+        brain_type: 'pinokio_app',
+        ai_enabled: true,
+        agent_use_enabled: true,
+        agent_access_scope: 'all',
+        metadata: {
+          source_type: 'gradio',
+          runtime_manager: 'pinokio',
+          pinokio_app_id: 'LightOnOCR-2-1B-Pinokio.git',
+          fabric_fields: [
+            { fabricId: 'image', type: 'text', label: 'Image' },
+            { fabricId: 'model', type: 'text', label: 'Model' }
+          ],
+          pinokio_runtime: { api_name: '/process_input', inputs: [{ field: 'image', file: true }, { field: 'model' }], outputs: [1] }
+        },
+        created_at: '2026-09-25T00:00:00.000Z',
+        updated_at: '2026-09-25T00:00:00.000Z'
+      }
+    ])
+
+    const result = await findControls({ userId: 'user-1', agentId: 'agent-1', query: 'lighton ocr', sourceType: 'artifact', includeDraft: true, includeSchema: true, limit: 200 })
+    const control = result.results.find((entry) => entry.controlId === 'use.artifact.lighton_ocr')
+    expect(control?.schemaHint).toBe(
+      'image (a file: the Clip id from the Clips roster (clip_...), a public URL, or a data: URL), model (text)'
+    )
+    expect((control?.inputSchema as any)?.properties?.image?.description).toBe(
+      'Image: a file: the Clip id from the Clips roster (clip_...), a public URL, or a data: URL'
+    )
+    expect((control?.inputSchema as any)?.properties?.model?.description).toBe('Model')
+  })
+
   it('hides user-only HuggingFace embeds from artifact runtime tools even with stale agent-use settings', async () => {
     const { findControls } = await import('../services/fabricRegistry')
 
@@ -3088,6 +4287,119 @@ describe('controlRegistry artifact capability controls', () => {
 
     expect(result.results.some((entry) => entry.controlId === 'use.artifact.comfyui-panel')).toBe(false)
     expect(result.results.some((entry) => entry.controlId.startsWith('artifact.artifact_comfyui_panel.'))).toBe(false)
+  })
+
+  // BL-77 (new find 2): a static artifact has no AI or webhook behind it, so /api/artifacts/complete
+  // refuses it ("AI is disabled for this artifact", 400). Offering it as a runnable tool made an
+  // agent discover it, run it, fail, and switch agent use off: three wasted steps in a build.
+  it.each([
+    ['static artifact with Fabric fields', { brain_type: 'none', metadata: { source_type: 'static', fabric_fields: [{ fabricId: 'bill-amount', type: 'number', label: 'Bill Amount ($)' }] } }],
+    ['run-only static trigger', { brain_type: 'none', metadata: { source_type: 'static', run_only: true } }],
+    ['legacy record with AI switched off', { ai_enabled: false, metadata: { fabric_fields: [{ fabricId: 'bill-amount', type: 'number', label: 'Bill Amount ($)' }] } }]
+  ])('never offers a %s as a runnable tool', async (_label, shape) => {
+    const { findControls } = await import('../services/fabricRegistry')
+
+    mockArtifactService.listByUser.mockResolvedValueOnce([
+      {
+        id: 'artifact_tip',
+        user_id: 'user-1',
+        name: 'Tip Calculator',
+        slug: 'tip-calculator',
+        mode: 'published',
+        zone: 'panel',
+        agent_use_enabled: true,
+        agent_access_scope: 'all',
+        agent_allowlist: [],
+        created_at: '2026-02-22T00:00:00.000Z',
+        updated_at: '2026-02-22T00:00:00.000Z',
+        ...shape
+      }
+    ])
+
+    const result = await findControls({
+      userId: 'user-1',
+      agentId: 'agent-1',
+      query: 'tip calculator',
+      sourceType: 'artifact',
+      includeDraft: true,
+      limit: 200
+    })
+    const ids = result.results.map((entry) => entry.controlId)
+
+    expect(ids).not.toContain('use.artifact.tip-calculator')
+    expect(ids).not.toContain('artifact.artifact_tip.typed.invoke')
+    expect(ids).not.toContain('artifact.artifact_tip.action.run.run')
+    // Its settings controls stay: they change the artifact, they do not run it.
+    expect(ids).toContain('artifact.artifact_tip.field.details.get')
+  })
+
+  it('offers a legacy webhook record as a runnable tool, as the complete route runs it (BL-89 review)', async () => {
+    const { findControls } = await import('../services/fabricRegistry')
+
+    mockArtifactService.listByUser.mockResolvedValueOnce([
+      {
+        id: 'artifact_tip',
+        user_id: 'user-1',
+        name: 'Tip Calculator',
+        slug: 'tip-calculator',
+        mode: 'published',
+        zone: 'panel',
+        ai_enabled: false,
+        webhook_url: 'https://n8n.example/webhook/tip',
+        agent_use_enabled: true,
+        agent_access_scope: 'all',
+        agent_allowlist: [],
+        metadata: { fabric_fields: [{ fabricId: 'bill-amount', type: 'number', label: 'Bill Amount ($)' }] },
+        created_at: '2026-02-22T00:00:00.000Z',
+        updated_at: '2026-02-22T00:00:00.000Z'
+      }
+    ])
+
+    const result = await findControls({
+      userId: 'user-1',
+      agentId: 'agent-1',
+      query: 'tip calculator',
+      sourceType: 'artifact',
+      includeDraft: true,
+      limit: 200
+    })
+    const ids = result.results.map((entry) => entry.controlId)
+    expect(ids).toContain('artifact.artifact_tip.action.run.run')
+  })
+
+  it('still offers the same artifact as a runnable tool once it has built-in AI behind it', async () => {
+    const { findControls } = await import('../services/fabricRegistry')
+
+    mockArtifactService.listByUser.mockResolvedValueOnce([
+      {
+        id: 'artifact_tip',
+        user_id: 'user-1',
+        name: 'Tip Calculator',
+        slug: 'tip-calculator',
+        mode: 'published',
+        zone: 'panel',
+        brain_type: 'built_in',
+        agent_use_enabled: true,
+        agent_access_scope: 'all',
+        agent_allowlist: [],
+        metadata: { source_type: 'built_in', fabric_fields: [{ fabricId: 'bill-amount', type: 'number', label: 'Bill Amount ($)' }] },
+        created_at: '2026-02-22T00:00:00.000Z',
+        updated_at: '2026-02-22T00:00:00.000Z'
+      }
+    ])
+
+    const result = await findControls({
+      userId: 'user-1',
+      agentId: 'agent-1',
+      query: 'tip calculator',
+      sourceType: 'artifact',
+      includeDraft: true,
+      limit: 200
+    })
+    const ids = result.results.map((entry) => entry.controlId)
+
+    expect(ids).toContain('use.artifact.tip-calculator')
+    expect(ids).toContain('artifact.artifact_tip.action.run.run')
   })
 
   it('supports find->use parity for dynamic artifact control IDs', async () => {
@@ -4225,12 +5537,229 @@ describe('SA-117 DL-117-05: identity-bearing controls', () => {
    * `fabricRegistry.ts`, a thousand lines from the definitions it classified, so a new
    * `sys.<family>.*` whose handler read `context.agentId` as an identity was un-gated by
    * omission. The flag on `ControlDefinition` is required, so forgetting it is a type error
-   * — and this is the other half: the three families are the test's EXPECTATION, so adding
+   * — and this is the other half: the acting families are the test's EXPECTATION, so adding
    * a flag without a decision is as loud as losing one.
    */
-  const ACTING_AGENT_CONTROL_PREFIXES = ['sys.dm.', 'sys.memory.', 'sys.schedule.'] as const
+  const ACTING_AGENT_CONTROL_PREFIXES = ['sys.dm.', 'sys.memory.', 'sys.schedule.', 'sys.ui.'] as const
 
-  it('flags exactly the three acting-agent families across every code-defined control', async () => {
+  it('discovers exactly five fixed-safe App Actions with bounded exact schemas', async () => {
+    const { findControls } = await import('../services/fabricRegistry')
+    const found = await findControls({ userId: 'user-1', query: 'sys.ui.', allowedControlIds: [
+      'sys.ui.execution_open', 'sys.ui.goon_hide', 'sys.ui.goon_show', 'sys.ui.settings_close', 'sys.ui.settings_open'
+    ], includeSchema: true, limit: 5 })
+    expect(found.results.map(row => row.controlId).sort()).toEqual([
+      'sys.ui.execution_open', 'sys.ui.goon_hide', 'sys.ui.goon_show', 'sys.ui.settings_close', 'sys.ui.settings_open'
+    ])
+    expect(JSON.stringify(found).length).toBeLessThan(16_384)
+    for (const row of found.results) {
+      expect(row.riskLevel).toBe('safe')
+      expect(row.inputSchema?.additionalProperties).toBe(false)
+      expect(row.inputSchema?.required).toEqual(['requestId', 'args'])
+      expect(row.inputSchema?.properties.actionId).toBeUndefined()
+      expect(row.inputSchema?.properties.agentId).toBeUndefined()
+      expect(row.inputSchema?.properties.sessionId).toBeUndefined()
+    }
+  })
+
+  it('refuses service/unknown/delegated identities for remote App Actions before owner dispatch', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+    for (const options of [{ actorType: 'service' as const }, { actorType: 'unknown' as const }, { actorType: 'agent' as const, delegatedRun: true }]) {
+      const result = await useControl({ ...options, userId: 'user-1', agentId: 'agent-1', sessionId: 'session-1',
+        controlId: 'sys.ui.goon_show', input: { requestId: 'request', args: {} } })
+      expect(result.success).toBe(false)
+      if (!result.success) expect(result.error.code).toBe('AGENT_IDENTITY_REQUIRED')
+    }
+  })
+
+  it('validates the exact action before dry-run and cannot hide a settings writer in safe input', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+    const result = await useControl({ userId: 'user-1', agentId: 'agent-1', actorType: 'in-process',
+      controlId: 'sys.ui.settings_open', dryRun: true,
+      input: { requestId: 'request', args: { tab: 'agents', changes: { api_key: 'forged' } } } })
+    expect(result.success).toBe(false)
+    if (!result.success) expect(result.error.code).toBe('CONTROL_INPUT_INVALID')
+    const valid = await useControl({ userId: 'user-1', agentId: 'agent-1', actorType: 'in-process',
+      controlId: 'sys.ui.settings_open', dryRun: true, input: { requestId: 'request', args: { tab: 'agents' } } })
+    expect(valid.success).toBe(true)
+  })
+
+  it('keeps fixed Settings risks and validates changes before dry-run or consent', async () => {
+    const { findControls, useControl } = await import('../services/fabricRegistry')
+    const expectedRisks = [
+      ['sys.ui.settings_agent_identity_read', 'safe'], ['sys.ui.settings_agent_identity_update', 'safe'],
+      ['sys.ui.settings_agent_memory_read', 'safe'], ['sys.ui.settings_agent_memory_update', 'confirm']
+    ] as const
+    // Discovery searches text; its query is not a control-id prefix filter.
+    // Admit only the fixed settings operations whose risks this contract pins.
+    const found = await findControls({ userId: 'user-1', query: 'sys.ui.settings_agent_',
+      allowedControlIds: expectedRisks.map(([controlId]) => controlId), includeSchema: true, limit: expectedRisks.length })
+    expect(found.results.map(row => [row.controlId, row.riskLevel]).sort()).toEqual(expectedRisks)
+    expect(found.results.every(row => row.inputSchema?.additionalProperties === false)).toBe(true)
+    const common = { userId: 'user-1', agentId: 'agent-1', actorType: 'in-process' as const, controlId: 'sys.ui.settings_agent_memory_update', dryRun: true }
+    const invalid = await useControl({ ...common, input: { subjectAgentId: 'agent-1', expectedRevision: `sha256:${'a'.repeat(64)}`, changes: { onMyMind: 0, api_key: 'forged' }, risk: 'safe' } })
+    expect(invalid.success).toBe(false)
+    if (!invalid.success) expect(invalid.error.code).toBe('CONTROL_INPUT_INVALID')
+    const valid = await useControl({ ...common, input: { subjectAgentId: 'agent-1', expectedRevision: `sha256:${'a'.repeat(64)}`, changes: { onMyMind: 0 } } })
+    expect(valid.success).toBe(true)
+    if (valid.success) expect(valid.riskLevel).toBe('confirm')
+  })
+
+  it('refuses Settings writes without an active server-owned cancellation signal before consent', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+    for (const controlId of ['sys.ui.settings_agent_memory_update', 'sys.ui.settings_agent_identity_update']) {
+      const changes = controlId.includes('memory') ? { onMyMind: 0 } : { displayName: 'Primary' }
+      const result = await useControl({ userId: 'user-1', agentId: 'agent-1', actorType: 'in-process', controlId,
+        input: { subjectAgentId: 'agent-1', expectedRevision: `sha256:${'a'.repeat(64)}`, changes } })
+      expect(result.success).toBe(false)
+      if (!result.success) expect(result.error.code).toBe('CONTROL_CANCELLATION_REQUIRED')
+    }
+  })
+
+  it('BL-1314: on a request lane a live chat Stop alone does not admit a Settings write; only the exact reply does', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+    const registry = await import('../services/streamAbortRegistry')
+    const adapter = await import('../services/appActions/settingsAdapter')
+    // The owner is not under test here: a reached handler answers a fixture refusal.
+    const handler = vi.spyOn(adapter, 'executeAgentSettingsAction').mockResolvedValue({ status: 'blocked', reason: 'fixture_owner' })
+    const input = (controlId: string) => ({ subjectAgentId: 'agent-1', expectedRevision: `sha256:${'a'.repeat(64)}`,
+      changes: controlId.includes('memory') ? { onMyMind: 0 } : { displayName: 'Primary' } })
+    const identity = 'sys.ui.settings_agent_identity_update'
+    registry.__resetStreamAbortRegistryForTests()
+    try {
+      const live = new AbortController()
+      registry.registerStreamAbort('session-1', 'reply-newer', live)
+      for (const actorType of ['agent', 'session', 'n8n-callback'] as const) {
+        for (const controlId of ['sys.ui.settings_agent_memory_update', identity]) {
+          // `abortSignal` is the chat's running reply (the dispatch route's session and n8n lanes
+          // pick that chat from the body). With no originating reply, an earlier reply's id, or
+          // no reply id, the write is refused before the card and the owner.
+          for (const originatingReply of [undefined, { sessionId: 'session-1', messageId: 'reply-earlier' },
+            { sessionId: 'session-1', messageId: null }]) {
+            const label = `${actorType} ${controlId} ${JSON.stringify(originatingReply)}`
+            const result = await useControl({ userId: 'user-1', agentId: 'agent-1', sessionId: 'session-1', actorType,
+              controlId, abortSignal: live.signal, originatingReply, input: input(controlId) })
+            expect(result.success, label).toBe(false)
+            if (!result.success) expect(result.error.code, label).toBe('CONTROL_CANCELLATION_REQUIRED')
+          }
+        }
+      }
+      expect(handler).not.toHaveBeenCalled()
+
+      // The exact live reply admits the safe identity write: the handler runs.
+      const exact = { userId: 'user-1', agentId: 'agent-1', sessionId: 'session-1', actorType: 'agent' as const,
+        controlId: identity, abortSignal: live.signal, originatingReply: { sessionId: 'session-1', messageId: 'reply-newer' },
+        input: input(identity) }
+      expect(await useControl(exact)).toMatchObject({ success: true, result: { status: 'blocked', reason: 'fixture_owner' } })
+      expect(handler).toHaveBeenCalledTimes(1)
+
+      // Once that reply is stopped (or gone), the same call is refused.
+      registry.abortStream('session-1', 'user')
+      const stopped = await useControl(exact)
+      expect(stopped.success).toBe(false)
+      if (!stopped.success) expect(stopped.error.code).toBe('CONTROL_CANCELLATION_REQUIRED')
+      registry.clearStreamAbort('session-1', 'reply-newer')
+      const gone = await useControl({ ...exact, abortSignal: undefined })
+      expect(gone.success).toBe(false)
+      if (!gone.success) expect(gone.error.code).toBe('CONTROL_CANCELLATION_REQUIRED')
+      expect(handler).toHaveBeenCalledTimes(1)
+    } finally {
+      handler.mockRestore()
+      registry.__resetStreamAbortRegistryForTests()
+    }
+  })
+
+  describe('BL-1322: a primary managed run whose own reply has stopped does nothing', () => {
+    // The routes hand a primary agent-lane call its own reply's Stop (BL-1321), already aborted
+    // once that reply has stopped, ended or been replaced. `useControl` then refuses the call
+    // after validation and the dry run, before the Settings choice and the risk gate.
+    const addon = { controlId: 'sys.runtime_addon.start', input: { addonId: 'fbx2vrma' } }
+    const stopped = () => { const controller = new AbortController(); controller.abort('retired_reply'); return controller.signal }
+
+    async function spies() {
+      const approvals = await import('../services/controlApprovals')
+      const runtime = await import('../services/appActions/runtime')
+      return {
+        // The gate is not under test: a reached gate answers a fixture group refusal.
+        gate: vi.spyOn(approvals, 'decideRiskGate').mockResolvedValue({ kind: 'refuse-group', message: 'fixture gate' }),
+        handler: vi.spyOn(runtime, 'executeAgentAppAction').mockResolvedValue({ status: 'fixture_handler' } as any)
+      }
+    }
+
+    it('refuses a confirm control before the risk gate: no approval record, no card', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+      const { gate, handler } = await spies()
+      try {
+        const result = await useControl({ userId: 'user-1', agentId: 'agent-1', sessionId: 'session-1',
+          actorType: 'agent', abortSignal: stopped(), ...addon })
+        expect(result.success).toBe(false)
+        if (!result.success) expect(result.error.code).toBe('CONTROL_CANCELLATION_REQUIRED')
+        expect(gate).not.toHaveBeenCalled()
+      } finally { gate.mockRestore(); handler.mockRestore() }
+    })
+
+    it('refuses a safe control too: no handler runs for a stopped run', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+      const { gate, handler } = await spies()
+      try {
+        const result = await useControl({ userId: 'user-1', agentId: 'agent-1', sessionId: 'session-1',
+          actorType: 'agent', abortSignal: stopped(), controlId: 'sys.ui.execution_open',
+          input: { requestId: 'request-bl1322', args: {} } })
+        expect(result.success).toBe(false)
+        if (!result.success) expect(result.error.code).toBe('CONTROL_CANCELLATION_REQUIRED')
+        expect(handler).not.toHaveBeenCalled()
+
+        // The same call with a live Stop reaches its handler.
+        const live = await useControl({ userId: 'user-1', agentId: 'agent-1', sessionId: 'session-1',
+          actorType: 'agent', abortSignal: new AbortController().signal, controlId: 'sys.ui.execution_open',
+          input: { requestId: 'request-bl1322-live', args: {} } })
+        expect(live).toMatchObject({ success: true, result: { status: 'fixture_handler' } })
+        expect(handler).toHaveBeenCalledTimes(1)
+      } finally { gate.mockRestore(); handler.mockRestore() }
+    })
+
+    it('keeps validation, authorization and the dry run ahead of it', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+      const { gate, handler } = await spies()
+      try {
+        const invalid = await useControl({ userId: 'user-1', agentId: 'agent-1', actorType: 'agent',
+          abortSignal: stopped(), controlId: 'sys.runtime_addon.start', input: { addonId: 'not-an-addon' } })
+        expect(invalid.success).toBe(false)
+        if (!invalid.success) expect(invalid.error.code).toBe('CONTROL_INPUT_INVALID')
+
+        const dryRun = await useControl({ userId: 'user-1', agentId: 'agent-1', actorType: 'agent',
+          abortSignal: stopped(), dryRun: true, ...addon })
+        expect(dryRun).toMatchObject({ success: true, dryRun: true })
+        expect(gate).not.toHaveBeenCalled()
+      } finally { gate.mockRestore(); handler.mockRestore() }
+    })
+
+    it('exempts, by name, every caller that is not a primary managed run', async () => {
+      const { useControl } = await import('../services/fabricRegistry')
+      const { gate, handler } = await spies()
+      try {
+        const callers = [
+          { label: 'Subagent or Worker run', actorType: 'agent' as const, delegatedRun: true, scopeAgentId: 'worker_1',
+            delegatedAllowedControlIds: ['sys.runtime_addon.start'] },
+          { label: 'API in-process broker', actorType: 'in-process' as const },
+          { label: 'session', actorType: 'session' as const },
+          { label: 'n8n callback', actorType: 'n8n-callback' as const },
+          { label: 'service token', actorType: 'service' as const },
+          { label: 'Portable Skill Token', actorType: 'portable-skill' as const, allowRisky: true }
+        ]
+        for (const caller of callers) {
+          gate.mockClear()
+          const { label, ...lane } = caller
+          const result = await useControl({ userId: 'user-1', agentId: 'agent-1', sessionId: 'session-1',
+            abortSignal: stopped(), ...addon, ...lane })
+          // The guard let it through: the call reached its normal risk gate.
+          expect(gate, label).toHaveBeenCalledTimes(1)
+          if (!result.success) expect(result.error.code, label).not.toBe('CONTROL_CANCELLATION_REQUIRED')
+        }
+      } finally { gate.mockRestore(); handler.mockRestore() }
+    })
+  })
+
+  it('flags exactly the admitted acting-agent families across every code-defined control', async () => {
     const { CORE_CONTROL_ACTING_AGENT_FLAGS } = await import('../services/fabricRegistry')
 
     // Guards the guard: an empty or truncated readback would make the comparison below pass
@@ -4249,6 +5778,26 @@ describe('SA-117 DL-117-05: identity-bearing controls', () => {
     for (const prefix of ACTING_AGENT_CONTROL_PREFIXES) {
       expect(flagged.some((controlId) => controlId.startsWith(prefix)), prefix).toBe(true)
     }
+  })
+
+  it('gives every code-defined control family plain words for the tool index line (SA-072 P2 step 0)', async () => {
+    const { CORE_CONTROL_ACTING_AGENT_FLAGS } = await import('../services/fabricRegistry')
+    const { NATIVE_FABRIC_HELPER_CONTROL_META } = await import('../services/nativeFabricHelperCatalog')
+    const { FABRIC_CONTROL_FAMILY_LABELS, fabricControlFamilyKey } = await import(
+      '$lib/utils/toolGridBrokerFamilies'
+    )
+
+    // An unmapped family still prints (as its raw id segment), so this is not a visibility
+    // guard; it makes a new family choose the words an agent reads instead of `goon_scene`.
+    const families = new Set(
+      [
+        ...CORE_CONTROL_ACTING_AGENT_FLAGS.map((entry) => entry.controlId),
+        ...NATIVE_FABRIC_HELPER_CONTROL_META.map((meta) => meta.controlId)
+      ].map(fabricControlFamilyKey)
+    )
+    expect(families.has('pinokio')).toBe(true)
+    const unlabelled = [...families].filter((family) => !FABRIC_CONTROL_FAMILY_LABELS[family]).sort()
+    expect(unlabelled).toEqual([])
   })
 
   it('classifies the three families and nothing else as acting-as-agent', async () => {

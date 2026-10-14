@@ -50,6 +50,37 @@ function unescapeEntry(entry: string): string {
   )
 }
 
+/**
+ * BL-866: the choice a saved select value means for THIS model. A definition that names a
+ * `savedValueAliases` entry for the saved value gets the replacement; every other value comes
+ * back as it was saved. The Models panel shows this value and the mapper sends it.
+ */
+export function resolveSavedSelectValue(definition: ParameterDefinition, value: string): string {
+  return definition.savedValueAliases?.[value] ?? value
+}
+
+/**
+ * BL-866: a sentence for a saved select value that a definition with `onlyListedValues` does not
+ * offer (after its alias), or `null` when the value is offered, blank, or the definition does
+ * not ask for the check. The mapper refuses the send with this sentence (naming the model when
+ * it knows it); the Models panel shows it beside the field.
+ */
+export function describeUnlistedSelectValue(
+  definition: ParameterDefinition,
+  value: string,
+  modelId?: string | null
+): string | null {
+  if (!definition.onlyListedValues) return null
+  const saved = value.trim()
+  if (!saved.length) return null
+  const resolved = resolveSavedSelectValue(definition, saved)
+  const options = definition.options ?? []
+  if (options.some((option) => option.value === resolved)) return null
+  const choices = options.map((option) => option.label).join(' or ')
+  const target = modelId?.trim() ? modelId.trim() : 'this model'
+  return `${definition.label} "${saved}" is not available on ${target}. Choose ${choices}, or clear it.`
+}
+
 export function toInputValue(definition: ParameterDefinition, value?: ParameterValue): string {
   if (value === undefined || value === null) return ''
 
@@ -86,6 +117,9 @@ export function toInputValue(definition: ParameterDefinition, value?: ParameterV
       } catch {
         return ''
       }
+    case 'select':
+      // BL-866: what the picker shows for a saved choice this model replaces.
+      return typeof value === 'string' ? resolveSavedSelectValue(definition, value) : String(value)
     default:
       return typeof value === 'string' ? value : String(value)
   }

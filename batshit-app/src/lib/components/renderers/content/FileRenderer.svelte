@@ -256,12 +256,12 @@
   
   .file-renderer:hover {
     background: var(--muted-hover, var(--muted));
-    border-color: var(--primary);
+    border-color: var(--primary-text);
     cursor: pointer;
   }
 
   .file-renderer:focus-visible {
-    outline: 2px solid var(--primary);
+    outline: 2px solid var(--ring);
     outline-offset: 2px;
   }
   

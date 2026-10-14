@@ -1,5 +1,6 @@
 import type { ChatSession } from '$lib/stores/session.svelte'
 import { DatabaseService } from './databaseRedis.client'
+import { ApiCallError } from './redisCore'
 import * as sessionStore from '$lib/stores/session.svelte'
 import { logger } from '$lib/utils/logger'
 
@@ -193,6 +194,10 @@ export class SessionService {
       return true
     } catch (error) {
       console.error('Error updating session ID:', error)
+      // BL-605: a refusal from the create route (e.g. BL-541's glob-character check) carries
+      // the server's own reason in `error.message`. Rethrow it instead of collapsing to
+      // `false`, so the caller can show that reason rather than a vague generic toast.
+      if (error instanceof ApiCallError) throw error
       return false
     }
   }

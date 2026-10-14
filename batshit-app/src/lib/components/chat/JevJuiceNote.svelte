@@ -5,7 +5,7 @@
 
   /**
    * SA-120 P0 (DL-120-02, Josh's decision 1): the small inline note beside the memory
-   * chips when a Jev Juice lane could not run for this turn. The send already went out
+   * chips when a Judge Juice lane could not run for this turn. The send already went out
    * without it; this only says so. Never a pop-up, never a toast.
    */
   interface Props {

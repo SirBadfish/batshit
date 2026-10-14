@@ -7,6 +7,7 @@ import {
 } from '$lib/server/services/memory/memoryIndex'
 import {
   BUILTIN_EMBEDDING_MODELS,
+  assertPresetEmbeddingConnection,
   canonicalEmbeddingModelId,
   detectPresetEmbeddingDims,
   MEMORY_API_EMBEDDING_PROVIDERS,
@@ -111,6 +112,8 @@ export const PUT: RequestHandler = async ({ locals, request }) => {
           { status: 400 }
         )
       }
+      // Supplying dims skips the probe, so enforce the funding boundary here too.
+      assertPresetEmbeddingConnection(preset)
       const provider = String(preset.provider ?? '').trim().toLowerCase()
       const modelName = String(preset.effectiveModelId ?? preset.modelId ?? '').trim()
       if (!provider || !modelName) {

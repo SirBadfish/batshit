@@ -2,7 +2,7 @@
 import { ChevronDown, Settings, Plus, Edit, Bot } from '@lucide/svelte';
 import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
 import * as Avatar from '$lib/components/ui/avatar';
-import { onMount } from 'svelte';
+import { onMount, untrack } from 'svelte';
 import { toast } from 'svelte-sonner';
 import type { SavedModel } from '$lib/types/savedModels';
 import ModelProviderIcon from '$lib/components/models/ModelProviderIcon.svelte';
@@ -12,7 +12,8 @@ import SettingsPanel from '$lib/components/settings/SettingsPanel.svelte';
 import { getSavedModelBadgeProvider, resolveSavedModelConnection } from '$lib/utils/modelConnections';
 import type { CatalogConnectionOption } from '$lib/types/modelCatalog';
 import { getModelPresetAvailability } from '$lib/utils/modelPresetAvailability';
-import { isParameterSuppressedForModel } from '$lib/utils/parameterFilter';
+import { buildPickedPresetModelFields } from '$lib/utils/modelPresetPick';
+import { presetModelSettings } from '$lib/utils/agentProviderSettings';
 import { LIVE_SETTINGS_EVENTS } from '$lib/utils/liveSettingsEvents';
 import { isCliPrimaryAgentType, normalizePrimaryAgentType } from '$lib/utils/primaryAgentType';
 import type { PrimaryAgentType } from '$lib/utils/primaryAgentType';
@@ -83,10 +84,25 @@ async function loadConnectionOptions(options: { force?: boolean } = {}) {
 	}
 }
 
+// Once per mount. The load reads and writes the states its own fetch flips (loading, options,
+// error), so it runs untracked: a tracked call re-ran on a failed answer, forever (BL-977). A failed
+// load shows its error and does not retry by itself; the modelConnectionsUpdated handler below reloads.
 $effect(() => {
-	void loadConnectionOptions();
+	untrack(() => {
+		void loadConnectionOptions();
+	});
 });
-	
+
+// The user opening the menu while the last load failed asks once more (a retry the user drives, so
+// the menu recovers without a reload). The ONLY dependency is the menu's open state; the error the
+// load itself flips is read untracked, so the retry cannot re-run itself: one retry per open.
+$effect(() => {
+	if (!open) return;
+	untrack(() => {
+		if (connectionOptionsError) void loadConnectionOptions({ force: true });
+	});
+});
+
 function resolveActiveSavedModel(agent: agentStore.Agent | null, models: SavedModel[]) {
 	if (!agent) return null;
 
@@ -212,41 +228,12 @@ onMount(() => {
 		
 		if (selectedModel && currentAgent) {
 			try {
-				const suppressTemperature = isParameterSuppressedForModel('temperature', {
-					provider: selectedModel.provider,
-					modelId: selectedModel.modelId,
-					vercelId: selectedModel.catalogModelId ?? selectedModel.vercelSourceId
-				});
-				const suppressTopP = isParameterSuppressedForModel('topP', {
-					provider: selectedModel.provider,
-					modelId: selectedModel.modelId,
-					vercelId: selectedModel.catalogModelId ?? selectedModel.vercelSourceId
-				});
-				const suppressFrequencyPenalty = isParameterSuppressedForModel('frequencyPenalty', {
-					provider: selectedModel.provider,
-					modelId: selectedModel.modelId,
-					vercelId: selectedModel.catalogModelId ?? selectedModel.vercelSourceId
-				});
-				const suppressPresencePenalty = isParameterSuppressedForModel('presencePenalty', {
-					provider: selectedModel.provider,
-					modelId: selectedModel.modelId,
-					vercelId: selectedModel.catalogModelId ?? selectedModel.vercelSourceId
-				});
 				await agentStore.updateAgentSettings(currentAgent.id, {
-					primary_model_preset_id: selectedModel.id,
-					primary_model_name: selectedModel.effectiveModelId ?? selectedModel.modelId,
-					primary_model_provider: selectedModel.provider,
-					primary_model_temperature: suppressTemperature ? undefined : selectedModel.settings?.temperature,
-					primary_model_max_tokens: selectedModel.settings?.maxTokens,
-					primary_model_top_p: suppressTopP ? undefined : selectedModel.settings?.topP,
-					primary_model_frequency_penalty: suppressFrequencyPenalty
-						? undefined
-						: selectedModel.settings?.frequencyPenalty,
-					primary_model_presence_penalty: suppressPresencePenalty
-						? undefined
-						: selectedModel.settings?.presencePenalty,
+					// BL-515: a value the preset does not set is sent as null (stored as absent).
+					...buildPickedPresetModelFields(selectedModel),
 					primary_model_connection: resolveSavedModelConnection(selectedModel),
-					provider_specific_settings: selectedModel.settings ?? currentAgent.provider_specific_settings ?? undefined,
+					// BL-514: only the preset's model keys; the server keeps the agent's own keys.
+					provider_specific_settings: presetModelSettings(selectedModel.settings),
 					primary_model_capabilities: selectedModel.capabilities ?? currentAgent.primary_model_capabilities ?? null
 				});
 				if (setupWarningDescription) {
@@ -401,7 +388,7 @@ function handleEditClick(e: Event, presetId: string) {
 			{#each modelMenuItems as item (item.model.id)}
 					{@const model = item.model}
 					{@const availability = item.availability}
-					<div class="model-selector-menu-row flex items-center gap-2 {model.id === activeModel?.id ? 'border-l-2 border-r-2 border-primary pl-2 pr-2' : 'pl-3 pr-3'}">
+					<div class="model-selector-menu-row flex items-center gap-2 {model.id === activeModel?.id ? 'border-l-2 border-r-2 border-primary-text pl-2 pr-2' : 'pl-3 pr-3'}">
 						<DropdownMenu.Item
 							onSelect={() => handleSelectModel(model.id)}
 							class="model-selector-menu-item flex items-center gap-2 flex-1 text-sm"

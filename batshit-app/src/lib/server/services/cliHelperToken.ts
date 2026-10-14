@@ -26,7 +26,8 @@
 
 import {
   mintRunCredential,
-  type AgentRunCredentialRuntime
+  type AgentRunCredentialRuntime,
+  type AgentRunProcessOwner
 } from '$lib/server/services/agentRunCredentials'
 
 export type CliRunCredential = {
@@ -49,11 +50,26 @@ export async function mintCliRunCredential(options: {
    * credential is marked so it cannot act as an agent.
    */
   delegated?: boolean
+  processOwner?: AgentRunProcessOwner | null
+  commandParentAgentId?: string | null
+  delegatedBashEnabled?: boolean | null
   /**
    * BL-75 — the Subagent or Worker whose skill access governs a delegated run. Required when
    * `delegated`; see `mintRunCredential`.
    */
   scopeAgentId?: string | null
+  /**
+   * BL-81 — the control ids a delegated run's DCM index offered it. Required when `delegated`
+   * (an empty list is a real answer: nothing), refused on a primary run; see `mintRunCredential`.
+   */
+  allowedControlIds?: string[] | null
+  /** Server-resolved gateway selection for this run; `[]` disables all gateways. */
+  mcpGatewayScope?: string[] | null
+  /** BL-686: server-resolved saved CLI tools for this run; `[]` allows none. */
+  cliToolScope?: string[] | null
+  /** The managed profile's server-resolved Fetch Zip availability for this run. */
+  fetchZipAllowed?: boolean
+  codexToolOutputTokenLimit?: number | null
 }): Promise<CliRunCredential> {
   const minted = await mintRunCredential({
     userId: options.userId,
@@ -62,7 +78,15 @@ export async function mintCliRunCredential(options: {
     messageId: options.messageId ?? null,
     runtime: options.runtime,
     delegated: options.delegated === true,
-    scopeAgentId: options.scopeAgentId ?? null
+    processOwner: options.processOwner ?? null,
+    commandParentAgentId: options.commandParentAgentId ?? null,
+    delegatedBashEnabled: options.delegatedBashEnabled === true,
+    scopeAgentId: options.scopeAgentId ?? null,
+    allowedControlIds: options.allowedControlIds ?? null,
+    mcpGatewayScope: options.mcpGatewayScope ?? [],
+    cliToolScope: options.cliToolScope ?? [],
+    fetchZipAllowed: options.fetchZipAllowed === true,
+    codexToolOutputTokenLimit: options.codexToolOutputTokenLimit ?? null
   })
 
   return {

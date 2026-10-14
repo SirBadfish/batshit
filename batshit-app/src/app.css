@@ -16,6 +16,9 @@
   --color-popover-foreground: var(--popover-foreground);
   --color-primary: var(--primary);
   --color-primary-foreground: var(--primary-foreground);
+  /* `text-primary`, `border-primary`, and `fill-primary` are the dark fill and vanish on the
+     dark page; text, icons, and selected-state lines use the `*-primary-text` utilities. */
+  --color-primary-text: var(--primary-text);
   --color-secondary: var(--secondary);
   --color-secondary-foreground: var(--secondary-foreground);
   --color-muted: var(--muted);
@@ -149,15 +152,28 @@
     --bs-app-label: oklch(0.56 0.016 289.95);
     --bs-app-muted-text: oklch(0.49 0.014 289.95);
     --bs-app-faint-text: oklch(0.39 0.011 289.95);
-    --bs-app-primary: oklch(0.5 0.044 281);
-    --bs-app-primary-line: oklch(0.63 0.05 281.84);
-    --bs-app-primary-soft: oklch(0.5 0.044 281 / 0.34);
-    --bs-app-primary-faint: oklch(0.5 0.044 281 / 0.16);
+    /* The primary is a FILL: the dark indigo behind light text (primary buttons, the send
+       button, checked switches, selected chips). One primary everywhere since 2026-09-22;
+       Josh first set it for Settings alone on 2026-09-19. */
+    --bs-app-primary: oklch(0.33 0.07 274.7);
+    --bs-app-primary-line: oklch(0.38 0.07 273.01);
+    /* The primary drawn ON the dark page: text, icons, links, dots, selected-row lines, and
+       focus rings. The fill is too dark to read there (about 1.5:1), so this is its hue and
+       chroma at a readable lightness (about 7:1). It follows any change to the fill. */
+    --bs-app-primary-text: oklch(from var(--bs-app-primary) 0.74 c h);
+    /* See-through washes for hover and focus lines and selected highlights. They come from the
+       light tone, at the strength the washes had while the primary was a mid lavender. */
+    --bs-app-primary-soft: oklch(from var(--bs-app-primary-text) l c h / 0.18);
+    --bs-app-primary-faint: oklch(from var(--bs-app-primary-text) l c h / 0.09);
     --bs-app-primary-foreground: oklch(0.96 0.006 289.95);
     --bs-app-success: oklch(0.72 0.115 185);
     --bs-app-success-text: oklch(0.8 0.085 185);
     --bs-app-success-bg: oklch(0.19 0.07 185 / 0.26);
     --bs-app-success-line: oklch(0.68 0.1 185 / 0.26);
+    /* Josh requested a green Enabled badge; general success remains teal. */
+    --bs-app-enabled-text: oklch(0.8 0.085 145);
+    --bs-app-enabled-bg: oklch(0.19 0.07 145 / 0.26);
+    --bs-app-enabled-line: oklch(0.68 0.1 145 / 0.26);
     --app-header-height: 2.8125rem;
 
     /* Launch dark color assignments using the purple-black app canvas. */
@@ -171,6 +187,7 @@
     /* Primary color */
     --primary: var(--bs-app-primary);
     --primary-foreground: var(--bs-app-primary-foreground);
+    --primary-text: var(--bs-app-primary-text);
 
     /* Overlay */
     --overlay: oklch(0.05 0 0 / 0.8);
@@ -196,7 +213,7 @@
     /* Borders and inputs */
     --border: var(--bs-app-line);
     --input: var(--bs-app-field-line);
-    --ring: var(--bs-app-primary);
+    --ring: var(--bs-app-primary-text);
     --hr: var(--bs-app-inner-line);
 
     /* Other */
@@ -210,7 +227,7 @@
     --sidebar-accent: var(--bs-app-inset-surface-hover);
     --sidebar-accent-foreground: var(--bs-app-title);
     --sidebar-border: var(--bs-app-inner-line);
-    --sidebar-ring: var(--bs-app-primary);
+    --sidebar-ring: var(--bs-app-primary-text);
 
     /* Z-index scale */
     --z-canvas: 1;
@@ -699,7 +716,7 @@
   .bs-button-link {
     border-color: transparent;
     background: transparent;
-    color: var(--primary);
+    color: var(--primary-text);
     text-underline-offset: 4px;
   }
 
@@ -1087,12 +1104,12 @@
 
   .bs-select-item[data-highlighted],
   .bs-select-item:focus {
-    background: oklch(0.5 0.044 281 / 0.24);
+    background: var(--bs-app-primary-soft);
     color: oklch(0.9 0.008 289.95);
   }
 
   .bs-select-item[data-state='checked'] {
-    background: oklch(0.5 0.044 281 / 0.18);
+    background: var(--bs-app-primary-faint);
     color: oklch(0.9 0.008 289.95);
   }
 
@@ -1518,7 +1535,7 @@
     flex-grow: 1;
     overflow: visible;
     border-radius: 999px;
-    background: color-mix(in oklab, var(--primary) 20%, transparent);
+    background: color-mix(in oklab, var(--primary-text) 14%, transparent);
   }
 
   .bs-slider-range {
@@ -1526,7 +1543,7 @@
     position: absolute;
     inset-block: 0;
     border-radius: 999px;
-    background: var(--primary);
+    background: var(--primary-text);
   }
 
   .bs-slider-anchor {
@@ -1541,7 +1558,7 @@
 
   .bs-slider-thumb {
     display: block;
-    border: 1px solid color-mix(in oklab, var(--primary) 50%, transparent);
+    border: 1px solid color-mix(in oklab, var(--primary-text) 50%, transparent);
     background: var(--background);
     box-shadow: 0 1px 2px oklch(0 0 0 / 0.1);
     outline: none;
@@ -1585,14 +1602,14 @@
     height: 0.5rem;
     overflow: hidden;
     border-radius: 999px;
-    background: color-mix(in oklab, var(--primary) 20%, transparent);
+    background: color-mix(in oklab, var(--primary-text) 14%, transparent);
   }
 
   .bs-progress-bar {
     width: 100%;
     height: 100%;
     flex: 1;
-    background: var(--primary);
+    background: var(--primary-text);
     transition: transform 150ms ease-out;
   }
 
@@ -1874,7 +1891,7 @@
     width: 1rem;
     height: 1rem;
     flex-shrink: 0;
-    border: 1px solid var(--primary);
+    border: 1px solid var(--primary-text);
     border-radius: max(0px, calc(var(--radius) - 4px));
     box-shadow: 0 1px 2px oklch(0 0 0 / 0.12);
     cursor: pointer;
@@ -1901,7 +1918,7 @@
     height: 1rem;
     align-items: center;
     justify-content: center;
-    border: 1px solid var(--primary);
+    border: 1px solid var(--primary-text);
     border-radius: max(0px, calc(var(--radius) - 4px));
     background: var(--background);
     color: var(--foreground);
@@ -2126,11 +2143,13 @@
     --bs-settings-muted-text: oklch(0.47 0.05 279.75);
     --bs-settings-faint-text: oklch(0.38 0.02 289.35);
     --bs-settings-disabled-text: oklch(0.57 0.014 74);
-    --bs-settings-primary: oklch(0.33 0.07 274.7);
-    --bs-settings-primary-line: oklch(0.38 0.07 273.01);
-    --bs-settings-primary-soft: oklch(0.5 0.044 281 / 0.34);
-    --bs-settings-primary-faint: oklch(0.5 0.044 281 / 0.16);
-    --bs-settings-primary-foreground: oklch(0.96 0.006 289.95);
+    /* Settings wears the app-wide primary, so one value rules (Josh, 2026-09-22). */
+    --bs-settings-primary: var(--bs-app-primary);
+    --bs-settings-primary-line: var(--bs-app-primary-line);
+    --bs-settings-primary-text: var(--bs-app-primary-text);
+    --bs-settings-primary-soft: var(--bs-app-primary-soft);
+    --bs-settings-primary-faint: var(--bs-app-primary-faint);
+    --bs-settings-primary-foreground: var(--bs-app-primary-foreground);
     --bs-settings-danger: oklch(0.72 0.265 358);
     --bs-settings-danger-line: oklch(0.72 0.265 358 / 0.42);
     --bs-settings-danger-bg: oklch(0.17 0.075 358 / 0.38);
@@ -2161,7 +2180,7 @@
     --accent-foreground: var(--bs-settings-text);
     --border: var(--bs-settings-line);
     --input: var(--bs-settings-field-line);
-    --ring: var(--bs-settings-primary);
+    --ring: var(--bs-settings-primary-text);
 
     background: var(--bs-settings-canvas);
     border-color: var(--bs-settings-line);
@@ -2784,6 +2803,12 @@
     font-weight: 520;
     line-height: var(--bs-settings-status-badge-line-height);
     letter-spacing: 0;
+  }
+
+  .batshit-settings-status-badge.is-enabled {
+    border-color: var(--bs-app-enabled-line);
+    background: var(--bs-app-enabled-bg);
+    color: var(--bs-app-enabled-text);
   }
 
   .batshit-settings-status-badge.is-success {
@@ -4235,7 +4260,7 @@
   }
 
   .batshit-settings-choice-tile.is-selected {
-    border-color: var(--bs-settings-primary);
+    border-color: var(--bs-settings-primary-text);
     background: var(--bs-settings-primary-faint);
   }
 
@@ -4479,9 +4504,9 @@
   }
 
   .batshit-settings-option-card.is-selected {
-    border-color: color-mix(in oklab, var(--bs-settings-primary) 74%, var(--bs-settings-line-strong));
+    border-color: color-mix(in oklab, var(--bs-settings-primary-text) 74%, var(--bs-settings-line-strong));
     background: color-mix(in oklab, var(--bs-settings-primary) 36%, var(--bs-settings-icon-surface));
-    box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--bs-settings-primary) 34%, transparent);
+    box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--bs-settings-primary-text) 34%, transparent);
     color: var(--bs-settings-primary-foreground);
   }
 
@@ -4587,7 +4612,7 @@
   }
 
   .batshit-settings-range-input {
-    accent-color: var(--bs-settings-primary);
+    accent-color: var(--bs-settings-primary-text);
   }
 
   .batshit-settings-dropdown-trigger {
@@ -5292,7 +5317,35 @@
     border: 1px solid var(--bs-settings-line);
     border-radius: var(--bs-settings-radius-lg);
     background: var(--bs-settings-inset-surface);
+    padding: 0.75rem;
     box-shadow: none;
+  }
+
+  /* BL-1451: a subsection is one padded frame. Its direct children (title row, notes, rows, list) are spaced
+     0.75rem apart; `.is-compact` / `.is-spacious` keep their own padding and spacing, so they opt out of the
+     rhythm. The title row inside is flat (no second frame) and a list inside is a plain stack, so the frame
+     around them is the only border and each card keeps exactly one border of its own. A title row or group
+     OUTSIDE a subsection (display cards, LocalAI, Agent panels, Goons editors) keeps its framed look. */
+  .batshit-settings-subsection:not(.is-compact, .is-spacious) > * + * {
+    margin-top: 0.75rem;
+  }
+
+  .batshit-settings-subsection > .batshit-settings-action-row,
+  .batshit-settings-subsection > .batshit-settings-group {
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    padding: 0;
+    box-shadow: none;
+  }
+
+  /* The title row is as tall as its 2rem button, so a title with no button (Which Judge) centers on the same line. */
+  .batshit-settings-subsection > .batshit-settings-action-row {
+    min-height: 2rem;
+  }
+
+  .batshit-settings-subsection > .batshit-settings-group > * + * {
+    margin-top: 0.75rem;
   }
 
   .batshit-settings-sheet .batshit-settings-card-subtle-frame {
@@ -5575,7 +5628,7 @@
     color: oklch(0.82 0.055 68);
   }
 
-  /* A link inside help copy that opens another Settings tab (the Jev Juice card's missing-key
+  /* A link inside help copy that opens another Settings tab (the Judge Juice card's missing-key
      note). Text-styled, not a button face, so it reads as part of the sentence. */
   .batshit-settings-inline-link {
     padding: 0;

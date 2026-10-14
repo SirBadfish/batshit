@@ -24,20 +24,20 @@ describe('Recipe review external sibling contracts', () => {
           }
         },
         {
-          sourceStateId: 'clothingState',
-          targetStateId: 'clothingState',
+          sourceStateId: 'eyeAppearance',
+          targetStateId: 'eyeAppearance',
           validationSha256: hash('1'),
-          message: 'Clothing remains exactly compatible.',
+          message: 'Eye appearance remains exactly compatible.',
           targetState: {
-            id: 'clothingState',
-            contract: 'clothing-state/v1',
+            id: 'eyeAppearance',
+            contract: 'eye-appearance-state/v5',
             definitionSha256: hash('c'),
             stateSha256: hash('d'),
-            state: { schemaVersion: 'clothing-state/v1' }
+            state: { schemaVersion: 'eye-appearance-state/v5' }
           }
         },
       ]).map((input) => input.sourceStateId),
-    ).toEqual(['clothingState', 'hairState'])
+    ).toEqual(['eyeAppearance', 'hairState'])
   })
 
   it('rejects duplicate, unsorted, or identity-changing external bindings', () => {
@@ -75,16 +75,16 @@ describe('Recipe review external sibling contracts', () => {
           }
         },
         {
-          sourceStateId: 'clothingState',
-          targetStateId: 'clothingState',
+          sourceStateId: 'eyeAppearance',
+          targetStateId: 'eyeAppearance',
           validationSha256: hash('1'),
-          message: 'Clothing remains exactly compatible.',
+          message: 'Eye appearance remains exactly compatible.',
           targetState: {
-            id: 'clothingState',
-            contract: 'clothing-state/v1',
+            id: 'eyeAppearance',
+            contract: 'eye-appearance-state/v5',
             definitionSha256: hash('c'),
             stateSha256: hash('d'),
-            state: { schemaVersion: 'clothing-state/v1' }
+            state: { schemaVersion: 'eye-appearance-state/v5' }
           }
         },
       ]),

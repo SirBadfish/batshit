@@ -3,7 +3,11 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mockCreateMCPClient = vi.fn()
 const mockResolveStdioGatewayProcessConfig = vi.fn()
-const transportInstances: Array<{ config: Record<string, unknown>; stderr: PassThrough }> = []
+const transportInstances: Array<{
+  config: Record<string, unknown>
+  stderr: PassThrough
+  close: ReturnType<typeof vi.fn>
+}> = []
 
 vi.mock('@ai-sdk/mcp', () => ({
   createMCPClient: mockCreateMCPClient
@@ -12,11 +16,13 @@ vi.mock('@ai-sdk/mcp', () => ({
 vi.mock('@modelcontextprotocol/sdk/client/stdio.js', () => ({
   StdioClientTransport: class MockStdioClientTransport {
     stderr = new PassThrough()
+    // The real transport's close ends the server process (BL-602 closes it after a failed start).
+    close = vi.fn().mockResolvedValue(undefined)
     config: Record<string, unknown>
 
     constructor(config: Record<string, unknown>) {
       this.config = config
-      transportInstances.push({ config, stderr: this.stderr })
+      transportInstances.push({ config, stderr: this.stderr, close: this.close })
     }
   }
 }))
@@ -63,6 +69,8 @@ describe('stdioMCPGatewayClient', () => {
     })
 
     expect(tools.map((tool) => tool.name)).toEqual(['alpha', 'beta'])
+    // A started client closes its own transport; the transport is not closed a second time.
+    expect(transportInstances[0]?.close).not.toHaveBeenCalled()
     expect(transportInstances[0]?.config).toMatchObject({
       command: '/usr/bin/node',
       args: ['server.js'],
@@ -91,5 +99,7 @@ describe('stdioMCPGatewayClient', () => {
 
     expect(result.available).toBe(false)
     expect(result.error).toContain('spawn ENOENT')
+    // BL-602: no client started, so the transport itself is closed, which ends its process.
+    expect(transportInstances[0]?.close).toHaveBeenCalledTimes(1)
   })
 })

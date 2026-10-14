@@ -112,6 +112,41 @@ describe('/api/native-tools/dispatch', () => {
     })
   })
 
+  it('passes only the run credential gateway ceiling to the native dispatcher', async () => {
+    mocks.resolveNativeToolUser.mockResolvedValue({
+      userId: 'user-1', auth: 'agent', agentId: 'agent-1', sessionId: 'session-1',
+      mcpGatewayScope: ['gw_allowed']
+    })
+    mocks.dispatchNativeAutomationPackAction.mockResolvedValue({ success: true, data: {} })
+    const response = await POST({
+      request: request({
+        action: 'batshit_tool_search', input: { query: 'search', selectedGateways: ['gw_other'] },
+        mcpGatewayScope: ['gw_other'],
+        context: { session_id: 'session-1', agent_id: 'agent-1', mode: 'mode4', actor_type: 'primary' }
+      }),
+      locals: {}
+    } as any)
+    expect(response.status).toBe(200)
+    expect(mocks.dispatchNativeAutomationPackAction).toHaveBeenCalledWith(expect.objectContaining({
+      mcpGatewayScope: ['gw_allowed'], actorType: 'agent',
+      payloadInput: { query: 'search', selectedGateways: ['gw_other'] }
+    }))
+  })
+
+  it('sends no trusted gateway ceiling from a service-token caller', async () => {
+    mocks.dispatchNativeAutomationPackAction.mockResolvedValue({ success: true, data: {} })
+    await POST({
+      request: request({
+        action: 'batshit_tool_search', mcpGatewayScope: ['gw_other'],
+        context: { session_id: 'session-1', agent_id: 'agent-1', mode: 'mode4', actor_type: 'primary' }
+      }),
+      locals: {}
+    } as any)
+    expect(mocks.dispatchNativeAutomationPackAction).toHaveBeenCalledWith(
+      expect.not.objectContaining({ mcpGatewayScope: expect.anything() })
+    )
+  })
+
   it('passes explicit service-token projectPath into native automation dispatch', async () => {
     mocks.dispatchNativeAutomationPackAction.mockResolvedValue({
       success: true,
@@ -455,7 +490,9 @@ describe('/api/native-tools/dispatch', () => {
       expect.objectContaining({ actorType: 'service', delegatedRun: false })
     )
 
-    mocks.resolveNativeToolUser.mockResolvedValue({ ...agentLaneAuth, delegated: true })
+    mocks.resolveNativeToolUser.mockResolvedValue({ ...agentLaneAuth, delegated: true,
+      processOwner: { userId: 'user-1', kind: 'agent', id: 'agent-cooper' },
+      commandParentAgentId: 'agent-cooper' })
     await POST({
       request: request({
         action: 'batshit_tool_use',
@@ -467,6 +504,31 @@ describe('/api/native-tools/dispatch', () => {
     expect(mocks.dispatchNativeAutomationPackAction).toHaveBeenLastCalledWith(
       expect.objectContaining({ actorType: 'agent', delegatedRun: true })
     )
+  })
+
+  it('forwards only the credential owner and rejects delegated calls without one', async () => {
+    const owner = { userId: 'user-1', kind: 'subagent', id: 'stored-subagent' }
+    mocks.resolveNativeToolUser.mockResolvedValue({ ...agentLaneAuth,
+      agentId: 'subagent_cli_runtime', delegated: true, processOwner: owner,
+      commandParentAgentId: 'agent-cooper' })
+    mocks.dispatchNativeAutomationPackAction.mockResolvedValue({ success: true })
+    const body = { action: 'bash_execute', input: { command: 'echo hi' },
+      processOwner: { userId: 'user-1', kind: 'agent', id: 'agent-victim' },
+      context: { session_id: 'session-bound', mode: 'mode4', actor_type: 'primary' } }
+    const accepted = await POST({ request: request(body), locals: {} } as any)
+    expect(accepted.status).toBe(200)
+    expect(mocks.dispatchNativeAutomationPackAction).toHaveBeenCalledWith(
+      expect.objectContaining({ processOwner: owner,
+        context: expect.objectContaining({ actor_type: 'subagent', agent_id: owner.id,
+          parent_agent_id: 'agent-cooper' }) }))
+
+    mocks.dispatchNativeAutomationPackAction.mockClear()
+    mocks.resolveNativeToolUser.mockResolvedValue({ ...agentLaneAuth,
+      agentId: 'subagent_cli_runtime', delegated: true })
+    const refused = await POST({ request: request(body), locals: {} } as any)
+    expect(refused.status).toBe(400)
+    expect((await refused.json()).error.code).toBe('INVALID_CONTEXT')
+    expect(mocks.dispatchNativeAutomationPackAction).not.toHaveBeenCalled()
   })
 
   it('refuses a context agent id that differs, and dispatches nothing', async () => {
@@ -601,5 +663,88 @@ describe('/api/native-tools/dispatch', () => {
     for (const [input] of mocks.dispatchNativeAutomationPackAction.mock.calls) {
       expect(input.abortSignal).toBeUndefined()
     }
+  })
+
+  it('BL-1321: a primary credential hears only its own reply: live exact, retired already aborted', async () => {
+    const own = new AbortController()
+    registerStreamAbort('session-bound', 'message-1', own)
+    mocks.resolveNativeToolUser.mockResolvedValue({ ...agentLaneAuth, messageId: 'message-1' })
+    mocks.dispatchNativeAutomationPackAction.mockResolvedValue({ success: true })
+    const call = () => POST({
+      request: request({
+        action: 'batshit_tool_use',
+        input: { ref: 'mcp:slow_tool', input: {} },
+        context: { session_id: 'session-bound', mode: 'mode4', actor_type: 'primary' }
+      }),
+      locals: {}
+    } as any)
+
+    await call()
+    expect(mocks.dispatchNativeAutomationPackAction.mock.calls[0]?.[0]?.abortSignal).toBe(own.signal)
+
+    // A newer reply runs now. The earlier credential's call is retired (BL-1322): it is refused
+    // before the dispatcher, and it never hears, or ends, the newer reply's Stop.
+    const newer = new AbortController()
+    registerStreamAbort('session-bound', 'message-2', newer)
+    const response = await call()
+    expect(response.status).toBe(403)
+    expect(await response.json()).toMatchObject({ success: false, stopped: true,
+      error: { code: 'CONTROL_CANCELLATION_REQUIRED' } })
+    expect(mocks.dispatchNativeAutomationPackAction).toHaveBeenCalledTimes(1)
+    expect(newer.signal.aborted).toBe(false)
+
+    // Its own reply running again and then stopped: refused the same way.
+    registerStreamAbort('session-bound', 'message-1', own)
+    abortStream('session-bound', 'user')
+    expect((await call()).status).toBe(403)
+    expect(mocks.dispatchNativeAutomationPackAction).toHaveBeenCalledTimes(1)
+  })
+
+  it('BL-1322: a primary credential that names no reply keeps the chat lookup, and is refused once that reply has stopped', async () => {
+    registerStreamAbort('session-bound', 'message-1', new AbortController())
+    mocks.resolveNativeToolUser.mockResolvedValue(agentLaneAuth)
+    mocks.dispatchNativeAutomationPackAction.mockResolvedValue({ success: true })
+    const call = () => POST({
+      request: request({
+        action: 'batshit_tool_use',
+        input: { ref: 'cli:repo_snapshot', input: {} },
+        context: { session_id: 'session-bound', mode: 'mode4', actor_type: 'primary' }
+      }),
+      locals: {}
+    } as any)
+
+    expect((await call()).status).toBe(200)
+    abortStream('session-bound', 'user')
+    const response = await call()
+    expect(response.status).toBe(403)
+    expect((await response.json()).error.code).toBe('CONTROL_CANCELLATION_REQUIRED')
+    expect(mocks.dispatchNativeAutomationPackAction).toHaveBeenCalledTimes(1)
+  })
+
+  it('BL-1321/BL-1322: a Subagent or Worker credential keeps its parent’s running reply and is not refused', async () => {
+    const parent = new AbortController()
+    registerStreamAbort('session-bound', 'message-parent', parent)
+    mocks.resolveNativeToolUser.mockResolvedValue({ ...agentLaneAuth, agentId: 'subagent_cli_runtime',
+      messageId: 'subagent-helper-run', delegated: true,
+      processOwner: { userId: 'user-1', kind: 'subagent', id: 'stored-subagent' }, commandParentAgentId: 'agent-cooper' })
+    mocks.dispatchNativeAutomationPackAction.mockResolvedValue({ success: true })
+    const call = () => POST({
+      request: request({
+        action: 'bash_execute',
+        input: { command: 'sleep 30' },
+        context: { session_id: 'session-bound', mode: 'mode4', actor_type: 'primary' }
+      }),
+      locals: {}
+    } as any)
+
+    await call()
+    expect(mocks.dispatchNativeAutomationPackAction.mock.calls[0]?.[0]?.abortSignal).toBe(parent.signal)
+
+    // The parent's Stop is already pressed: the dispatcher still gets the call, with that Stop,
+    // and its own runner stops before anything starts (the route does not refuse delegated runs).
+    abortStream('session-bound', 'user')
+    expect((await call()).status).toBe(200)
+    expect(mocks.dispatchNativeAutomationPackAction).toHaveBeenCalledTimes(2)
+    expect(mocks.dispatchNativeAutomationPackAction.mock.calls[1]?.[0]?.abortSignal).toBe(parent.signal)
   })
 })

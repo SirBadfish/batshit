@@ -142,9 +142,13 @@ These are not current saved-scene features:
 
 - custom ambience sprites or multiple ambience layers;
 - animated props;
-- GIF or video textures;
+- GIFs or video textures on room surfaces/props (panorama video backgrounds are supported separately);
 - multi-Goon stage presentation;
 - physics or collision authoring;
 - automatic room generation from a skybox alone.
 
 You may suggest these as future polish ideas, but keep the scene plan grounded in the current product.
+
+## Video Backgrounds
+
+World Skybox also accepts muted looping 2:1 MP4/WebM videos, up to 250 MB, 8192x4096, two minutes and 60 fps. Videos retain their uploaded resolution and need a compatible browser decoder. For generation or troubleshooting only, read `animated-panorama.md`; still-only scene planning does not need the animation recipe.

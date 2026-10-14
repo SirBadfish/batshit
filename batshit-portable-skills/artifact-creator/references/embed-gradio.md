@@ -1,6 +1,8 @@
 # Embedding a Gradio App as an Artifact
 
-This is the simplest artifact you can build. A Gradio app embedded directly into Batshit — works great, takes about 10 lines of HTML.
+**Load when:** the user wants a standalone (non-HuggingFace) Gradio app embedded as it is. It is a user-only raw embed: no Builder Kit, no agent use, and structure enforcement must be off. An HF Space embed is in `brain-huggingface.md`.
+
+This is the simplest artifact you can build: about 10 lines of HTML.
 
 **Important:** this is a raw embed, not a Builder Kit + Fabric artifact. Batshit blocks that by default now, so the user must manually turn off **Enforce Batshit Artifact Structure** for this artifact in Settings -> Artifacts before the embed can save.
 

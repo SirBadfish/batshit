@@ -241,6 +241,27 @@ describe('toolActivityContract normalizers — pinned via resolveToolOperationKi
     )
   })
 
+  it('BL-5: treats the fixed helper server name exactly like the per-agent names it replaced', () => {
+    const wrappedEqualsBare = (wrapped: string, bare: string) => {
+      expect(resolveToolOperationKind({ toolName: wrapped })).toBe(
+        resolveToolOperationKind({ toolName: bare })
+      )
+    }
+    wrappedEqualsBare('mcp.batshit_helpers.batshit_server_bash_execute', 'batshit_server_bash_execute')
+    wrappedEqualsBare('mcp.batshit_helpers.batshit_server_fetch_zip', 'batshit_server_fetch_zip')
+    wrappedEqualsBare('mcp.batshit_helpers.batshit_tool_search', 'batshit_tool_search')
+    wrappedEqualsBare('mcp.batshit_helpers.batshit_server_cli_tool_use', 'batshit_server_cli_tool_use')
+    wrappedEqualsBare('mcp.batshit_helpers.native_skill', 'native_skill')
+    // The bash helper is its own kind, not a generic tool, under the new name.
+    expect(resolveToolOperationKind({ toolName: 'mcp.batshit_helpers.batshit_server_bash_execute' })).toBe(
+      'bash'
+    )
+    // Another managed server is never taken for the helper bridge.
+    expect(
+      resolveToolOperationKind({ toolName: 'mcp.batshit_gateway_cody-subagents.batshit_server_bash_execute' })
+    ).not.toBe('bash')
+  })
+
   it('lowercases the whole name before segment analysis (normalizeName contract)', () => {
     expect(
       resolveToolOperationKind({ toolName: 'MCP.Agent-123-Mode4-Controls.Batshit_Tool_Search' })

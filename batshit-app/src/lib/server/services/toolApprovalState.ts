@@ -45,6 +45,8 @@ export type ApprovalStateRecord = {
   expiresAt?: string
   expiresAtMs: number | null
   messageId?: string
+  /** How long this card waited before it expired (`approvalCardTimeoutSeconds`). */
+  timeoutSeconds: number
 }
 
 export type ApprovalStateSnapshot = {
@@ -98,6 +100,23 @@ export function extractApprovalToolName(entry: Record<string, any>): string | un
  * Only a control pause carries `control.lane`; a Bash approval has no `control` block and
  * therefore keeps the clock. `api` is the paused-SDK lane and keeps it too.
  */
+/**
+ * How long one card waits for an answer, in seconds: its own `timeoutSeconds` when it names one,
+ * else the span between its `requestedAt` and `expiresAt` (a Claude card: the permission helper's
+ * ten minutes, BL-496), else the default three minutes. The one owner of a card's limit. What
+ * the agent is told about an expired card reads this, never the default alone.
+ */
+export function approvalCardTimeoutSeconds(entry: Record<string, any> | null | undefined): number {
+  const own = Number((entry as any)?.timeoutSeconds)
+  if (Number.isFinite(own) && own > 0) return Math.round(own)
+  const requestedAtMs = parseApprovalTimestampMs((entry as any)?.requestedAt)
+  const expiresAtMs = parseApprovalTimestampMs((entry as any)?.expiresAt)
+  if (requestedAtMs !== null && expiresAtMs !== null && expiresAtMs > requestedAtMs) {
+    return Math.round((expiresAtMs - requestedAtMs) / 1000)
+  }
+  return TOOL_APPROVAL_TIMEOUT_SECONDS
+}
+
 export function approvalEntryExpires(entry: Record<string, any> | null | undefined): boolean {
   const lane = (entry as any)?.control?.lane
   if (typeof lane !== 'string' || lane.trim().length === 0) return true
@@ -255,11 +274,12 @@ export function analyzeApprovalState(
       const requestedAtMs = parseApprovalTimestampMs(entry.requestedAt)
       const fallbackRequestedAtMs = requestedAtMs ?? messageCreatedAtMs
       const explicitExpiresAtMs = parseApprovalTimestampMs(entry.expiresAt)
+      const timeoutSeconds = approvalCardTimeoutSeconds(entry)
       const expiresAtMs = !expires
         ? null
         : (explicitExpiresAtMs ??
           (fallbackRequestedAtMs !== null
-            ? fallbackRequestedAtMs + TOOL_APPROVAL_TIMEOUT_MS
+            ? fallbackRequestedAtMs + timeoutSeconds * 1000
             : null))
 
       const requestedAt =
@@ -286,7 +306,7 @@ export function analyzeApprovalState(
           approvalId,
           toolName: extractApprovalToolName(entry),
           expiredAt: nowIso,
-          timeoutSeconds: TOOL_APPROVAL_TIMEOUT_SECONDS,
+          timeoutSeconds,
           ...(typeof entry.control?.approvalId === 'string' &&
           entry.control.approvalId.trim().length > 0
             ? { controlApprovalId: entry.control.approvalId.trim() }
@@ -324,6 +344,7 @@ export function analyzeApprovalState(
         expiresAt,
         expiresAtMs,
         messageId: typeof message.id === 'string' ? message.id : undefined,
+        timeoutSeconds,
       })
     }
 
@@ -663,3 +684,66 @@ export function resolveApprovalSummarySource(
   if (entries.length === 0) return 'vercel'
   return entries.every((entry) => entry?.source === 'fabric') ? 'fabric' : 'vercel'
 }
+
+/** A card's wait in plain words: whole minutes when it is whole minutes, seconds otherwise. */
+export function describeApprovalTimeout(seconds: number): string {
+  if (seconds >= 60 && seconds % 60 === 0) {
+    const minutes = seconds / 60
+    return `${minutes} ${minutes === 1 ? 'minute' : 'minutes'}`
+  }
+  return `${seconds} ${seconds === 1 ? 'second' : 'seconds'}`
+}
+
+/**
+ * The system-prompt addendum for tool approvals that expired unanswered: what happened, and how
+ * to tell the user. It names each card's OWN wait (`timeoutSeconds`, `approvalCardTimeoutSeconds`),
+ * never the default alone: a card with its own time limit used to be described as "3 minutes".
+ */
+export function buildToolApprovalTimeoutAddendum(raw: unknown): string | null {
+  if (!Array.isArray(raw) || raw.length === 0) return null
+
+  const notices = raw
+    .filter((entry): entry is { approvalId: string; toolName?: string; timeoutSeconds?: number } => {
+      return Boolean(
+        entry &&
+        typeof entry === 'object' &&
+        typeof (entry as any).approvalId === 'string' &&
+        (entry as any).approvalId.trim().length > 0,
+      )
+    })
+    .map((entry) => {
+      const own = Number(entry.timeoutSeconds)
+      return {
+        approvalId: entry.approvalId.trim(),
+        toolName:
+          typeof entry.toolName === 'string' && entry.toolName.trim().length > 0
+            ? entry.toolName.trim()
+            : undefined,
+        wait: describeApprovalTimeout(Number.isFinite(own) && own > 0 ? Math.round(own) : TOOL_APPROVAL_TIMEOUT_SECONDS),
+      }
+    })
+
+  if (notices.length === 0) return null
+
+  const waits = new Set(notices.map((notice) => notice.wait))
+  const oneWait = waits.size === 1 ? notices[0].wait : null
+  const lines = [
+    '==== TOOL APPROVAL TIMEOUT ====',
+    oneWait
+      ? `One or more tool approvals expired after ${oneWait}, so those tool calls were not executed.`
+      : 'One or more tool approvals expired before they were answered, so those tool calls were not executed.',
+    'In your next reply, briefly explain the timeout and ask the user to tell you when to run the tool again.',
+    oneWait
+      ? `Suggested phrasing: "The tool I tried requires your approval, but the approval expired after ${oneWait}. Tell me when you are back and I will run it again."`
+      : 'Suggested phrasing: "The tool I tried requires your approval, but the approval expired. Tell me when you are back and I will run it again."',
+  ]
+
+  const sample = notices.slice(0, 3)
+  lines.push('Expired approvals:')
+  for (const entry of sample) {
+    lines.push(`- ${entry.toolName ?? `approval ${entry.approvalId}`} (expired after ${entry.wait})`)
+  }
+
+  return lines.join('\n')
+}
+

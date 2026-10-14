@@ -6,14 +6,19 @@ import { MAX_WAKE_CHAIN_DEPTH } from '$lib/utils/dmControl'
 import {
   __resetWakeRunRegistryForTests,
   getWakeAbortSignal,
-  hasActiveWakeRun
+  hasActiveWakeRun,
+  isWokenTurnMessage
 } from '$lib/server/services/wakeRunRegistry'
 import { getDm } from '$lib/server/services/dm/dmStore'
 import {
+  __resetStreamAbortRegistryForTests,
   clearSessionTurn,
-  registerSessionTurn
+  queueSessionTurn,
+  registerSessionTurn,
+  releaseSessionTurn
 } from '$lib/server/services/streamAbortRegistry'
 import {
+  __resetWakeFetchDispatcherForTests,
   abortWokenTurnForInterrupt,
   endWokenTurn,
   requestAgentWakeup,
@@ -31,6 +36,67 @@ import type { ChatSessionRow } from '$lib/types/database'
  * `fetch` is stubbed, so nothing here starts a real turn; the assertion is on the checks,
  * the session/message writes, and which request the primitive would have made.
  */
+
+/**
+ * BL-180: a woken turn's end writes the DM in steps (the outcome, then `needsUser` for a turn
+ * parked on an approval, then the acknowledgement of an info note), and the LAST thing
+ * `finishWokenTurn` does is publish the turn's final `session_run_status`. A test that waited
+ * only for the outcome could read the DM between two of those writes; it waits for that
+ * event instead. The publish itself still runs.
+ */
+const finishedRuns = vi.hoisted(() => [] as string[])
+const runningStatusPublishes = vi.hoisted(() => [] as string[])
+vi.mock('$lib/server/ssePublisher', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('$lib/server/ssePublisher')>()
+  return {
+    ...actual,
+    publishUserEvent: async (userId: string, event: Record<string, any>) => {
+      await actual.publishUserEvent(userId, event)
+      if (event?.type === 'session_run_status' && event.reason) finishedRuns.push(event.sessionId)
+      if (event?.type === 'session_run_status' && event.status === 'running') {
+        runningStatusPublishes.push(event.sessionId)
+      }
+    }
+  }
+})
+
+/**
+ * BL-398: the woken-turn POST (`send-routed`) gets its own undici dispatcher with header
+ * and body timeouts off, because send-routed only answers a wake once the whole turn ends
+ * and Node's default dispatcher gives up at 300s with no response headers. `fetch` is
+ * stubbed below, so this mock only lets the test see what agentWakeups constructed and
+ * handed to that stubbed fetch as `dispatcher` — nothing here opens a real connection.
+ */
+const undiciAgentCalls = vi.hoisted(() => [] as any[])
+// BL-398: a controllable one-shot throw, so a test can simulate a failed dispatcher build
+// (the equivalent of a rejected `import('undici')`) without breaking every other test that
+// resolves the dispatcher through this same mock.
+const undiciAgentFailNext = vi.hoisted(() => ({ count: 0 }))
+vi.mock('undici', () => {
+  class MockAgent {
+    opts: any
+    constructor(opts: any) {
+      if (undiciAgentFailNext.count > 0) {
+        undiciAgentFailNext.count -= 1
+        throw new Error('simulated undici Agent construction failure')
+      }
+      this.opts = opts
+      undiciAgentCalls.push(this)
+    }
+  }
+  return { Agent: MockAgent }
+})
+
+async function waitForWokenTurnToFinish(sessionId: string) {
+  await vi.waitFor(
+    () => {
+      if (!finishedRuns.includes(sessionId)) {
+        throw new Error(`the woken turn in ${sessionId} has not finished`)
+      }
+    },
+    { timeout: 4_000, interval: 10 }
+  )
+}
 
 useRedisTestServer()
 
@@ -110,6 +176,12 @@ let previousGatewayToken: string | undefined
 
 beforeEach(() => {
   fetchCalls.length = 0
+  finishedRuns.length = 0
+  runningStatusPublishes.length = 0
+  undiciAgentFailNext.count = 0
+  // Not reset: the wake dispatcher is a module-level singleton (one `Agent` for the
+  // process, built on first use), so it is constructed at most once across this file
+  // EXCEPT where a test explicitly calls `__resetWakeFetchDispatcherForTests`.
   holdSendRouted = null
   previousToken = envRecord.BATSHIT_TOKEN
   previousGatewayToken = envRecord.MCP_GATEWAY_AUTH_TOKEN
@@ -218,6 +290,25 @@ describe('refusals, in the locked order (DL-113-05)', () => {
     }
   })
 
+  it('refuses a chat whose line of sends waits, before it saves anything (BL-713 review)', async () => {
+    await seedAgent()
+    await seedSession('sess-line')
+    // A reply stopped at an approval card while a send waited: no turn holds the chat, the line holds.
+    const reply = registerSessionTurn('sess-line', 'single', 'msg-card')
+    if (!reply.ok) throw new Error('expected the reply to register')
+    queueSessionTurn('sess-line', { kind: 'single', messageId: 'msg-b-reply', userMessageId: 'msg-b' })
+    releaseSessionTurn('sess-line', reply.entry.turnId, { approvalCardMessageId: 'msg-card' })
+    try {
+      const result = await requestAgentWakeup(
+        baseInput({ target: { kind: 'session', sessionId: 'sess-line' } })
+      )
+      expect(result).toMatchObject({ ok: false, degraded: 'wait', code: 'agent_busy' })
+      expect(await redis.getMessages('sess-line')).toEqual([])
+    } finally {
+      __resetStreamAbortRegistryForTests()
+    }
+  })
+
   it('runs the caller-supplied guard LAST and reports its reason (P2 hook)', async () => {
     await seedAgent()
     const extraGuard = vi.fn(async () => ({
@@ -291,6 +382,126 @@ describe('accepting a wake-up (DL-113-05, DL-113-08)', () => {
     expect(body.metadata.wake).toMatchObject({ chainDepth: 1, dmId: 'dm_1' })
     expect(sendRouted!.init.headers['x-batshit-service-token']).toBe('test-service-token')
     expect(sendRouted!.init.signal).toBeDefined()
+  })
+
+  /**
+   * BL-398: send-routed can take past Node's global-fetch 300s headers timeout for
+   * ordinary CLI work, and the wake's own timer (not the dispatcher) is what bounds this
+   * call — so the dispatcher's own timeouts must be off, not merely long.
+   */
+  it('posts to send-routed with a dispatcher whose header/body timeouts are off', async () => {
+    await seedAgent()
+    const result = await requestAgentWakeup(baseInput())
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+
+    // The dispatcher is a module-level singleton (one `Agent` for the process), so it may
+    // already have been built by an earlier test in this file; either way, exactly one was
+    // ever constructed, and it carries these options.
+    expect(undiciAgentCalls.length).toBeGreaterThanOrEqual(1)
+    for (const call of undiciAgentCalls) {
+      expect(call.opts).toMatchObject({ headersTimeout: 0, bodyTimeout: 0 })
+    }
+
+    const sendRouted = fetchCalls.find((call) => call.url.includes('/api/messages/send-routed'))
+    expect(sendRouted).toBeDefined()
+    expect(undiciAgentCalls).toContainEqual(sendRouted!.init.dispatcher)
+
+    // Drains the turn's fire-and-forget completion before the next test runs — otherwise
+    // its straggling `redis.saveMessage` (recording the finished turn's status) can land
+    // during a LATER test's window and pollute a spy/call-count assertion there.
+    await waitForWokenTurnToFinish(result.sessionId)
+  })
+
+  /**
+   * BL-398: a failed dispatcher build must not register a run, publish `running`, or POST
+   * to send-routed — and must not poison every LATER wake either. One process-wide `Agent`
+   * cache that stayed rejected would fail every wake for the rest of the process from one
+   * transient failure.
+   */
+  it('refuses cleanly on a failed dispatcher build, and a later wake still succeeds', async () => {
+    __resetWakeFetchDispatcherForTests()
+    undiciAgentFailNext.count = 1
+    await seedAgent()
+
+    const failed = await requestAgentWakeup(baseInput())
+    expect(failed).toMatchObject({ ok: false, degraded: 'wait', code: 'wake_setup_failed' })
+    // Nothing was registered or announced as running for the failed attempt.
+    expect(runningStatusPublishes).toHaveLength(0)
+    expect(
+      fetchCalls.some((call) => call.url.includes('/api/messages/send-routed'))
+    ).toBe(false)
+
+    // The cache was not left rejected: a normal wake right after succeeds. (The stubbed
+    // fetch resolves at once with no `holdSendRouted`, so the run may already be finished
+    // by the time control returns here — `ok: true` plus a real dispatcher construction is
+    // the proof, not a still-running registry entry.)
+    const succeeded = await requestAgentWakeup(baseInput({ target: { kind: 'new-session' } }))
+    expect(succeeded.ok).toBe(true)
+    expect(undiciAgentCalls.length).toBeGreaterThanOrEqual(1)
+    if (succeeded.ok) {
+      await waitForWokenTurnToFinish(succeeded.sessionId)
+    }
+  })
+
+  /**
+   * BL-398: the dispatcher resolves right after the slot reservation — BEFORE the session
+   * is created, the wake user message is saved, or anything is broadcast. A failed build
+   * must leave no orphan user message and no session announced that nothing can ever post
+   * a reply into (a run that were registered/published but could never POST would sit in
+   * the sidebar as "running" forever).
+   */
+  it('resolves the dispatcher before creating a session, saving the wake message, or publishing anything', async () => {
+    __resetWakeFetchDispatcherForTests()
+    undiciAgentFailNext.count = 1
+    await seedAgent()
+
+    const sessionsBefore = await redis.getSessions(USER)
+    const result = await requestAgentWakeup(baseInput())
+    expect(result).toMatchObject({ ok: false, code: 'wake_setup_failed' })
+
+    // No orphan wake-up user message: a message lives only inside a session's own list
+    // (`messages:{sessionId}`), so "no new session for this wake" is the direct, complete
+    // proof that it wrote no message — there is nowhere such a message COULD live. (A raw
+    // `saveMessage` call-count spy was tried here first and is NOT used: other tests in
+    // this large suite leave their own wake turn's fire-and-forget completion unawaited,
+    // and a straggler `saveMessage` from one of THOSE can land during this test's window
+    // and inflate an unscoped call count — the session-existence check is immune to that,
+    // since a stray write targets a session id this test never created or held open.)
+    const sessionsAfter = await redis.getSessions(USER)
+    expect(sessionsAfter).toHaveLength(sessionsBefore.length)
+    // Nothing broadcast (the SSE forward and the send-routed POST both come later).
+    expect(fetchCalls).toHaveLength(0)
+    // Nothing registered or announced as running.
+    expect(runningStatusPublishes).toHaveLength(0)
+  })
+
+  /**
+   * BL-398: the send-routed response is never read on a normal completion (no code path
+   * needs its body — the turn's own record is Redis's), so leaving it unread would tie up
+   * the connection until GC. `response.body?.cancel()` is the fix; `bodyUsed` turning `true`
+   * is the structural, spec-defined proof that the body was actually consumed/canceled.
+   */
+  it('cancels the send-routed response body on a normal completion', async () => {
+    await seedAgent()
+    let sendRoutedResponse: Response | null = null
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: any, init?: any) => {
+        const url = String(input)
+        fetchCalls.push({ url, init })
+        const response = new Response(JSON.stringify({ success: true }), { status: 200 })
+        if (url.includes('/api/messages/send-routed')) sendRoutedResponse = response
+        return response
+      })
+    )
+
+    const result = await requestAgentWakeup(baseInput())
+    expect(result.ok).toBe(true)
+    if (result.ok) await waitForWokenTurnToFinish(result.sessionId)
+
+    expect(sendRoutedResponse).not.toBeNull()
+    expect(sendRoutedResponse!.bodyUsed).toBe(true)
   })
 
   /**
@@ -489,6 +700,20 @@ describe('F-P1-1: a woken turn owns its session-turn lock', () => {
     expect(body.messageId.length).toBeGreaterThan(0)
     expect(body.messageId).not.toBe(result.messageId)
   })
+
+  it('BL-505: registers that id as the woken turn, the one run in the chat that spends no Clip countdown', async () => {
+    await seedAgent()
+    holdSendRouted = new Promise<void>(() => {})
+    const result = await requestAgentWakeup(baseInput())
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+
+    const sendRouted = fetchCalls.find((call) => call.url.includes('/api/messages/send-routed'))
+    const body = JSON.parse(sendRouted!.init.body)
+    expect(isWokenTurnMessage(result.sessionId, body.messageId)).toBe(true)
+    // The DM's own user message is not the woken reply.
+    expect(isWokenTurnMessage(result.sessionId, result.messageId)).toBe(false)
+  })
 })
 
 describe('F-P1-3: the running slot is held from the moment the caps pass', () => {
@@ -576,14 +801,12 @@ describe('F-P1-4: a 409 from send-routed is `agent_busy`, not a failure', () => 
 
     const result = await requestAgentWakeup(baseInput())
     expect(result.ok).toBe(true)
+    if (!result.ok) throw new Error('the wake was refused')
 
     // The POST is fire-and-forget on purpose, and the stamp rides a dynamic import plus a
-    // Redis write behind it, so poll for the outcome rather than guessing a delay.
-    let dm = await getDm('dm_1')
-    for (let attempt = 0; attempt < 100 && !dm?.delivery?.outcome; attempt += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 10))
-      dm = await getDm('dm_1')
-    }
+    // Redis write behind it, so wait for the turn to finish rather than guessing a delay.
+    await waitForWokenTurnToFinish(result.sessionId)
+    const dm = await getDm('dm_1')
     expect(dm?.delivery).toMatchObject({
       requested: 'wake',
       actual: 'wait',
@@ -657,11 +880,7 @@ describe('F-P1-5: Stop and the hard timeout are told apart on the signal', () =>
     })
     release()
 
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      if ((await getDm('dm_1'))?.delivery?.outcome) break
-      await new Promise((resolve) => setTimeout(resolve, 10))
-    }
-
+    await waitForWokenTurnToFinish(started.sessionId)
     expect((await getDm('dm_1'))?.delivery?.outcome).toBe('timed_out')
   })
 })
@@ -707,12 +926,9 @@ describe('F-SEC-1b — a woken turn that ends stuck on the user says so', () => 
     // one does; only then does the primitive get to look at how it ended.
     await seedTail(result.sessionId)
     release()
-    // The POST is fire-and-forget, and the stamp rides a dynamic import plus a Redis write
-    // behind it, so poll for the outcome rather than guessing a delay (as F-P1-4 does).
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      if ((await getDm('dm_1'))?.delivery?.outcome) break
-      await new Promise((resolve) => setTimeout(resolve, 10))
-    }
+    // The POST is fire-and-forget, and the stamps ride a dynamic import plus Redis writes
+    // behind it. `needsUser` lands AFTER the outcome, so wait for the whole end (BL-180).
+    await waitForWokenTurnToFinish(result.sessionId)
     return result
   }
 
@@ -810,10 +1026,8 @@ describe('SA-115 F-P1-2 — a wake DELIVERS an info note, so the note stops bein
 
     await seedTail(result.sessionId)
     release()
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      if ((await getDm('dm_1'))?.delivery?.outcome) break
-      await new Promise((resolve) => setTimeout(resolve, 10))
-    }
+    // The acknowledgement and `needsUser` land AFTER the outcome (BL-180).
+    await waitForWokenTurnToFinish(result.sessionId)
     return result
   }
 
@@ -942,10 +1156,7 @@ describe('SA-115 F-P1-2 — a wake DELIVERS an info note, so the note stops bein
       userId: USER
     })
     release()
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      if ((await getDm('dm_1'))?.delivery?.outcome) break
-      await new Promise((resolve) => setTimeout(resolve, 10))
-    }
+    await waitForWokenTurnToFinish(result.sessionId)
 
     const dm = await getDm('dm_1')
     // A stopped turn may never have shown the agent the note at all.
