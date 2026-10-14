@@ -215,17 +215,10 @@ describe('mounted Live Goon loading', () => {
 
   it('does not publish scene, mood, camera, or animation state after avatar loading is cancelled', async () => {
     const { engine, calls } = createEngineHarness()
-    calls.loadCustomGoonPrepared.mockResolvedValue('cancelled')
-    const customGoon: GoonRecord = {
-      ...baseGoon,
-      kind: 'custom',
-      files: { animations: [] },
-      customAvatar: {
-        model: { url: '/goons/custom.glb', filename: 'custom.glb' },
-        manifest: { url: '/goons/avatar.json', filename: 'avatar.json' }
-      }
-    }
-    const plan = buildMountedLiveGoonLoadPlan(customGoon, {
+    calls.loadGoon.mockImplementation(async () => {
+      calls.isCurrentGoonLoad.mockReturnValue(false)
+    })
+    const plan = buildMountedLiveGoonLoadPlan(baseGoon, {
       goonsSettings,
       animationFiles,
       sceneMode: 'saved'
@@ -233,7 +226,7 @@ describe('mounted Live Goon loading', () => {
 
     const result = await loadMountedLiveGoon(engine, plan)
 
-    expect(result).toEqual({ status: 'cancelled', kind: 'custom' })
+    expect(result).toEqual({ status: 'cancelled', kind: 'vrm' })
     expect(calls.setCameraFov).not.toHaveBeenCalled()
     expect(calls.setPostureDefinitions).not.toHaveBeenCalled()
     expect(calls.setGroundProjectionLine).not.toHaveBeenCalled()
