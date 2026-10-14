@@ -27,73 +27,40 @@ function getSettingsSaveError(payload: any, response: Response) {
 }
 
 function getConfirmedSettings(payload: any): UserSettingsPayload | null {
-  return payload?.settings ?? payload?.userSettings ?? null
-}
-
-function getConfirmedGoonsSettings(payload: any): GoonsSettings | null {
-  return getConfirmedSettings(payload)?.goons_settings ?? null
+  if (!payload || !Object.hasOwn(payload, 'settings')) {
+    throw new Error('Settings response did not include user settings')
+  }
+  const settings = payload.settings
+  if (settings === null) return null
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
+    throw new Error('Settings response did not include a valid user settings record')
+  }
+  return settings
 }
 
 export async function refreshUserSettingsRequest(fetcher: Fetcher): Promise<UserSettingsPayload> {
   const response = await fetcher('/api/user/settings', { cache: 'no-store' })
   const payload = await parseSettingsResponse(response)
-
-  if (!response.ok || payload?.success === false) {
-    throw getSettingsSaveError(payload, response)
-  }
-
-  const settings = getConfirmedSettings(payload)
-  if (!settings) {
-    throw new Error('Settings response did not include user settings')
-  }
-
-  return settings
+  if (!response.ok || payload?.success === false) throw getSettingsSaveError(payload, response)
+  // A successful explicit null is a new install. An omitted/malformed envelope is a failure.
+  return getConfirmedSettings(payload) ?? {}
 }
 
-export async function persistGoonsSettingsRequest(
-  fetcher: Fetcher,
-  nextSettings: GoonsSettings
-): Promise<GoonsSettings> {
-  const response = await fetcher('/api/user/settings', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ goons_settings: nextSettings })
-  })
-
-  const payload = await parseSettingsResponse(response)
-
-  if (!response.ok || payload?.success === false) {
-    throw getSettingsSaveError(payload, response)
-  }
-
-  const goonsSettings = getConfirmedGoonsSettings(payload)
-  if (!goonsSettings) {
-    throw new Error('Settings save response did not include Goon settings')
-  }
-
-  return goonsSettings
-}
-
+/** Patch only the writer's owned keys; return the whole authoritative server answer. */
 export async function persistGoonsSettingsPatchRequest(
   fetcher: Fetcher,
   patch: Partial<GoonsSettings>
-): Promise<GoonsSettings> {
+): Promise<UserSettingsPayload> {
   const response = await fetcher('/api/user/settings', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ goons_settings_patch: patch })
   })
-
   const payload = await parseSettingsResponse(response)
-
-  if (!response.ok || payload?.success === false) {
-    throw getSettingsSaveError(payload, response)
-  }
-
-  const goonsSettings = getConfirmedGoonsSettings(payload)
-  if (!goonsSettings) {
+  if (!response.ok || payload?.success === false) throw getSettingsSaveError(payload, response)
+  const settings = getConfirmedSettings(payload)
+  if (!settings?.goons_settings || typeof settings.goons_settings !== 'object' || Array.isArray(settings.goons_settings)) {
     throw new Error('Settings save response did not include Goon settings')
   }
-
-  return goonsSettings
+  return settings
 }

@@ -215,14 +215,19 @@ describe('SA-102 per-runtime local parameter schemas', () => {
  * was and was not measured.
  */
 describe('SA-102 the two new local programs', () => {
-  it('registers SGLang and oMLX, both disabled by default and connect-only', () => {
+  it('registers SGLang and oMLX, both disabled by default', () => {
     for (const id of ['sglang', 'omlx']) {
       const definition = LOCAL_AI_SERVER_DEFINITIONS.find((entry) => entry.id === id)
       expect(definition, id).toBeDefined()
       expect(definition?.enabledByDefault, `${id} must not enable itself`).toBe(false)
-      expect(definition?.supports.management, `${id} is connect-only`).toBe(false)
       expect(definition?.supports.promptCacheReporting, `${id} reports cache`).toBe('reports')
     }
+    // SGLang loads one model per process from a launch flag; oMLX has a real
+    // load/unload API that SA-124 P8 drives (BL-105).
+    const management = (id: string) =>
+      LOCAL_AI_SERVER_DEFINITIONS.find((entry) => entry.id === id)?.supports.management
+    expect(management('sglang'), 'sglang is connect-only').toBe(false)
+    expect(management('omlx'), 'omlx is managed').toBe(true)
   })
 
   it('does not move any existing program default base URL', () => {
@@ -427,14 +432,12 @@ describe('SA-124 P1 KoboldCpp roleplay samplers', () => {
     }
   })
 
-  it('does not offer the four that measured as dead or unprovable', () => {
+  it('does not offer the two that measured as dead', () => {
     // adaptive_decay moved nothing at 0.99 vs 0.01 over 160 tokens.
     // max_context_length: the server kept 32768 after requests asked for 4096
     //   and 8192; the launch flag wins.
-    // thinking budget / reasoning effort: unprovable on a model that cannot
-    //   think, so not offered until measured on one that can.
     const names = new Set(kobold().map((d) => d.name))
-    for (const absent of ['adaptiveDecay', 'maxContextLength', 'thinkingBudgetTokens', 'koboldReasoningEffort']) {
+    for (const absent of ['adaptiveDecay', 'maxContextLength']) {
       expect(names.has(absent), absent).toBe(false)
     }
   })
@@ -455,7 +458,88 @@ describe('SA-124 P1 KoboldCpp roleplay samplers', () => {
 
   it('lands the whole set under KoboldCpp Options, not Common', () => {
     const provider = kobold().filter((d) => d.section === 'provider')
-    expect(provider.length).toBe(26)
+    expect(provider.length).toBe(27)
     expect(kobold().filter((d) => d.section === 'core').length).toBe(9)
+    expect(kobold().filter((d) => d.section === 'reasoning').length).toBe(2)
+  })
+})
+
+/**
+ * Measured 2026-09-22 on Qwen3.5-9B under KoboldCpp 1.121 (--jinja), pinned
+ * seed, max_tokens 400. Thinking tokens: baseline 359; budget 0/30/120 ->
+ * 15/43/134; effort none/minimal/low/medium/high -> 15/54/113/214/313; effort
+ * xhigh -> 359 (no limit); effort low + budget 5 -> 113. Full table above
+ * koboldReasoningEffort in parameter-schemas.ts.
+ */
+describe('SA-124 KoboldCpp thinking controls', () => {
+  const kobold = (capabilities?: Record<string, boolean>) =>
+    filterParameters({ provider: 'koboldcpp', modelId: 'm', capabilities: capabilities as any })
+  const find = (name: string) => kobold().find((d) => d.name === name)
+
+  it('routes Thinking effort through the SDK-owned option key', () => {
+    // A snake_case `reasoning_effort` would be erased by @ai-sdk/openai-compatible.
+    expect(find('localReasoningEffort')?.providerOptionKey).toBe('koboldcpp.reasoningEffort')
+  })
+
+  it('offers only the effort values KoboldCpp turns into a limit', () => {
+    // `xhigh` measured byte-identical to sending nothing: KoboldCpp treats an
+    // unknown value as "no limit", so offering it would be a dead option.
+    expect(find('localReasoningEffort')?.options?.map((o) => o.value)).toEqual([
+      'none',
+      'minimal',
+      'low',
+      'medium',
+      'high'
+    ])
+  })
+
+  it('offers the thinking budget as a whole number of tokens, zero allowed', () => {
+    const budget = find('thinkingBudgetTokens')
+    expect(budget?.providerOptionKey).toBe('koboldcpp.thinking_budget_tokens')
+    expect(budget?.inputType).toBe('integer')
+    // 0 is real (it skips thinking), so the floor is 0, not 1.
+    expect(budget?.min).toBe(0)
+  })
+
+  it('sends nothing until the user picks a value', () => {
+    // DL-102-01: blank means "do not send".
+    for (const name of ['localReasoningEffort', 'thinkingBudgetTokens', 'chatTemplateKwargs']) {
+      expect(find(name)?.defaultValue, name).toBeUndefined()
+    }
+  })
+
+  it('offers chat template options, which is how thinking is switched on or off', () => {
+    const kwargs = find('chatTemplateKwargs')
+    expect(kwargs?.providerOptionKey).toBe('koboldcpp.chat_template_kwargs')
+    expect(kwargs?.inputType).toBe('json')
+    // KoboldCpp reads the field only in --jinja mode; the field must say so.
+    expect(kwargs?.description).toContain('--jinja')
+  })
+
+  it('is not gated on the Reasoning capability, unlike Ollama', () => {
+    // On a model that cannot think both limits are silent no-ops (measured on
+    // llama3.2), where Ollama's `think: true` fails the whole send.
+    for (const capabilities of [undefined, { reasoning: false }, { reasoning: true }]) {
+      const names = new Set(kobold(capabilities).map((d) => d.name))
+      expect(names.has('localReasoningEffort'), JSON.stringify(capabilities)).toBe(true)
+      expect(names.has('thinkingBudgetTokens'), JSON.stringify(capabilities)).toBe(true)
+    }
+  })
+
+  it('puts all three on the wire through the mapper', () => {
+    const runtime = buildRuntimeModelSettings({
+      provider: 'koboldcpp',
+      modelId: 'koboldcpp/Qwen3.5-9B-Q4_K_M',
+      settings: {
+        localReasoningEffort: 'low',
+        thinkingBudgetTokens: 0,
+        chatTemplateKwargs: { enable_thinking: true }
+      }
+    })
+    expect(runtime.providerOptions.koboldcpp).toEqual({
+      reasoningEffort: 'low',
+      thinking_budget_tokens: 0,
+      chat_template_kwargs: { enable_thinking: true }
+    })
   })
 })

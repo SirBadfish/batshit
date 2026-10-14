@@ -2,10 +2,10 @@ import { json } from '@sveltejs/kit'
 import { apiFailure } from '$lib/server/services/apiResponses'
 import type { RequestHandler } from './$types'
 import {
-  deleteLocalAiServer,
   listLocalAiServers,
   saveLocalAiServers
 } from '$lib/server/services/localAiServers'
+import { deleteLocalAiServer } from '$lib/server/services/localAiServerDeletion'
 import type { LocalAiServerUpdate, LocalAiServerId } from '$lib/types/localAi'
 
 export const GET: RequestHandler = async ({ locals }) => {

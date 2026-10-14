@@ -8,17 +8,18 @@ Think of an Artifact as a small app with a clear job: a dashboard, prompt form, 
 
 The Power Source decides how an Artifact runs — and whether an agent can run it.
 
-| Power source | What it means | Agent-runnable at launch? |
+| Power source | What it means | Agent-runnable? |
 | --- | --- | --- |
 | Built-in AI | Batshit calls the selected model through the direct `API` path. | Yes, when published with a Fabric field or run-only contract. |
 | n8n Workflow | Batshit calls a saved n8n webhook. | Yes, when built as a backend-runnable Artifact. |
 | Custom Webhook | Batshit calls a custom webhook you provide. | Yes, when the webhook Artifact has the required contract. |
+| Pinokio App | Batshit calls the HTTP API of an app installed in Pinokio. | Yes, when published with a valid app recipe and typed fields or a run-only contract. |
 | Static / No AI | A local UI only. | No — agent-runnable tools need a backend power source. |
 | ComfyUI | User-run panel through Batshit's ComfyUI proxy. | No for current panel artifacts. |
 | HuggingFace | Embedded HuggingFace/Gradio-style UI. | No for current embeds. |
 | Gradio | Embedded standalone Gradio UI. | No for current embeds. |
 
-Static / No AI, ComfyUI, HuggingFace, and Gradio panels are still useful to you — they just aren't published as agent tools unless Batshit has a backend runtime path (Built-in AI, n8n Workflow, or Custom Webhook).
+Static / No AI, ComfyUI, HuggingFace, and Gradio panels are still useful to you — they just aren't published as agent tools unless Batshit has a backend runtime path (Built-in AI, n8n Workflow, Custom Webhook, or Pinokio App). [Pinokio App artifacts](pinokio.md) can run supported ComfyUI, Gradio, and custom API apps through that backend path.
 
 ## Create or edit an Artifact
 
@@ -64,7 +65,7 @@ Typed Fabric fields are form fields the agent can set safely:
 - number
 - prompt pair
 
-File inputs are not agent-settable Fabric fields at launch. For generated-image Artifacts, builders can still expose source or reference images to agents using text fields that accept an image URL or data URI. When the Artifact uses an image-capable Built-in AI model, Batshit maps common field names like `source-image-1-url`, `image-count`, `aspect-ratio`, and `resolution` into the structured image request instead of treating them as prompt text. User-operated image Artifacts can also offer Clip Vault source picking: Batshit lists image clips as metadata first, then resolves the selected clip into a tunnel/public URL when one's available, falling back to stored image data with size limits so very large local images fail clearly instead of silently breaking the request.
+Agents pass file references through typed fields; they do not operate a browser file picker. A Pinokio Gradio recipe can mark an input as a file and accept an attached Clip ID, a public URL, or a data URL. For generated-image Artifacts, builders can expose source or reference images through text fields that accept an image URL or data URI. When the Artifact uses an image-capable Built-in AI model, Batshit maps common field names like `source-image-1-url`, `image-count`, `aspect-ratio`, and `resolution` into the structured image request instead of treating them as prompt text. User-operated image Artifacts can also offer Clip Vault source picking: Batshit lists image clips as metadata first, then resolves the selected clip into a tunnel/public URL when one's available, falling back to stored image data with size limits so very large local images fail clearly instead of silently breaking the request.
 
 ## Enable Agent Use
 
@@ -78,6 +79,10 @@ File inputs are not agent-settable Fabric fields at launch. For generated-image 
 8. Ask the allowed agent to find and run it.
 
 Here's one that's easy to fuck up: if Agent Use is on but you chose **selected agents** and assigned none, *no agent can see it*. An empty allowlist in selected-agents mode means invisible, not "everyone." Either assign agents or switch to all-agents.
+
+Turning Agent Use off hides the Artifact from every agent but keeps your agent choices. Turn it back on and the same agents can use it again.
+
+You control these access settings. An agent can edit an existing Artifact’s content, but it cannot switch Agent Use on or off or change which agents have access. Make those changes in Settings → Artifacts or Settings → Agents → Access. If an agent includes an access change with a content edit, Batshit refuses the entire update and saves neither change.
 
 ## How agents find Artifacts
 

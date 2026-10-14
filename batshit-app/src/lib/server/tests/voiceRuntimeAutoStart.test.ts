@@ -5,15 +5,22 @@ import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promis
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest'
 
 const mockListVoiceEngineRecords = vi.fn()
+// Whether the registry read every saved record (a record Batshit cannot read makes it incomplete).
+const mockRegistryComplete = vi.fn(() => true)
 const mockUpsertVoiceEngineRecord = vi.fn()
 const mockInspectByoSpeechRuntimeForRecord = vi.fn()
 const mockStartLocalVoiceRuntime = vi.fn()
 const mockStartHostVoiceRuntimeViaOperator = vi.fn()
 const mockRegisterHostVoiceRuntimeShutdown = vi.fn()
 const mockAutoStartLiveKitSidecarRuntime = vi.fn()
+const mockResolveLiveKitRuntimeEngineRefs = vi.fn()
 
 vi.mock('$lib/server/services/voiceEngineRegistry', () => ({
   listVoiceEngineRecords: (...args: any[]) => mockListVoiceEngineRecords(...args),
+  listVoiceEngineRecordsForRuntime: async (...args: any[]) => ({
+    records: await mockListVoiceEngineRecords(...args),
+    complete: mockRegistryComplete()
+  }),
   upsertVoiceEngineRecord: (...args: any[]) => mockUpsertVoiceEngineRecord(...args)
 }))
 
@@ -40,7 +47,8 @@ vi.mock('$lib/server/services/voiceHostOperatorRuntime', () => ({
 }))
 
 vi.mock('$lib/server/services/liveKitSidecarRuntime', () => ({
-  autoStartLiveKitSidecarRuntime: (...args: any[]) => mockAutoStartLiveKitSidecarRuntime(...args)
+  autoStartLiveKitSidecarRuntime: (...args: any[]) => mockAutoStartLiveKitSidecarRuntime(...args),
+  resolveLiveKitRuntimeEngineRefs: (...args: any[]) => mockResolveLiveKitRuntimeEngineRefs(...args)
 }))
 
 describe('voiceRuntimeAutoStart', () => {
@@ -55,6 +63,7 @@ describe('voiceRuntimeAutoStart', () => {
     vi.clearAllMocks()
     vi.resetModules()
     mockAutoStartLiveKitSidecarRuntime.mockResolvedValue(null)
+    mockResolveLiveKitRuntimeEngineRefs.mockResolvedValue([])
     tempRoot = await mkdtemp(path.join(os.tmpdir(), 'batshit-voice-runtime-auto-start-'))
     runtimeStateRoot = path.join(tempRoot, 'runtime-state')
     originalManagedInstallsRoot = process.env.BATSHIT_MANAGED_INSTALLS_ROOT
@@ -335,23 +344,20 @@ describe('voiceRuntimeAutoStart', () => {
     expect(mockStartLocalVoiceRuntime).not.toHaveBeenCalled()
     expect(mockStartHostVoiceRuntimeViaOperator).toHaveBeenCalledWith(
       expect.objectContaining({
-        engineId: 'kokoro',
-        installRoot: '/Users/example/.batshit/installs/kokoro',
-        launch: expect.objectContaining({
-          command: '~/.batshit/tools/mlx-audio/.venv/bin/mlx_audio.server'
+        id: 'kokoro',
+        localRuntime: expect.objectContaining({
+          installRoot: '/Users/example/.batshit/installs/kokoro',
+          launch: expect.objectContaining({
+            command: '~/.batshit/tools/mlx-audio/.venv/bin/mlx_audio.server'
+          })
         }),
-        // The operator records the listener it serves and the choice (absent means stop).
-        endpoint: 'http://127.0.0.1:8010',
-        stopOnShutdown: true
+        baseUrl: 'http://127.0.0.1:8010'
       })
     )
-    // The operator started it, so the operator stops it when this container shuts down; the
-    // shutdown reads the user's engines then, so a toggle made since boot is honored.
-    expect(mockRegisterHostVoiceRuntimeShutdown).toHaveBeenCalledTimes(1)
-    const listEngines = mockRegisterHostVoiceRuntimeShutdown.mock.calls[0][0]
-    mockListVoiceEngineRecords.mockClear()
-    await listEngines()
-    expect(mockListVoiceEngineRecords).toHaveBeenCalledWith('user-1')
+    // The operator started it, so the operator stops it when this container shuts down. That
+    // stop is registered when the server starts (BL-19), never here: a registration here would
+    // replace the server-start one, which reads every engine strictly at shutdown.
+    expect(mockRegisterHostVoiceRuntimeShutdown).not.toHaveBeenCalled()
     expect(report.results).toEqual([
       expect.objectContaining({
         engineId: 'kokoro',
@@ -386,6 +392,52 @@ describe('voiceRuntimeAutoStart', () => {
         pid: 6262
       })
     ])
+  })
+
+  // BL-1300: LiveKit is not a voice engine, so the boot tidy needs LiveKit's runtimes in use, or
+  // it reads LiveKit as deleted and releases its "keep running".
+  describe('the boot tidy and LiveKit (BL-1300)', () => {
+    const LIVEKIT_SERVER = { id: 'livekit-server', baseUrl: 'http://127.0.0.1:7880', localRuntime: { launch: { command: '/x/livekit-server' } } }
+
+    async function liveKitKeep() {
+      const { writeLocalRuntimeLaunchRecord } = await import('../services/voiceRuntimeLaunchRecords')
+      await writeLocalRuntimeLaunchRecord({ engineId: 'livekit-server', pid: process.pid, command: '/x/livekit-server', endpoint: 'http://127.0.0.1:7880', stopOnShutdown: false })
+    }
+    const liveKitChoice = async () =>
+      JSON.parse(await readFile(path.join(runtimeStateRoot, 'livekit-server', '.batshit-local-runtime-launch.json'), 'utf8')).stopOnShutdown
+
+    it('keeps its keep-running choice while LiveKit is in use', async () => {
+      mockListVoiceEngineRecords.mockResolvedValue([])
+      mockResolveLiveKitRuntimeEngineRefs.mockResolvedValue([LIVEKIT_SERVER])
+      await liveKitKeep()
+      const { ensureVoiceRuntimesAutoStarted } = await import('../services/voiceRuntimeAutoStart')
+
+      await ensureVoiceRuntimesAutoStarted('user-1')
+
+      expect(mockResolveLiveKitRuntimeEngineRefs).toHaveBeenCalledWith('user-1')
+      expect(await liveKitChoice()).toBe(false)
+    })
+
+    it('releases it as for any deleted engine when LiveKit is not configured', async () => {
+      mockListVoiceEngineRecords.mockResolvedValue([])
+      await liveKitKeep()
+      const { ensureVoiceRuntimesAutoStarted } = await import('../services/voiceRuntimeAutoStart')
+
+      await ensureVoiceRuntimesAutoStarted('user-1')
+
+      expect(await liveKitChoice()).toBeUndefined()
+    })
+
+    it("skips the tidy when LiveKit's settings cannot be read, so nothing is released", async () => {
+      mockListVoiceEngineRecords.mockResolvedValue([])
+      mockResolveLiveKitRuntimeEngineRefs.mockRejectedValue(new Error('redis down'))
+      await liveKitKeep()
+      const { ensureVoiceRuntimesAutoStarted } = await import('../services/voiceRuntimeAutoStart')
+
+      await ensureVoiceRuntimesAutoStarted('user-1')
+
+      expect(await liveKitChoice()).toBe(false)
+    })
   })
 
   it('hands each engine its own Stop with Batshit choice at launch', async () => {
@@ -538,6 +590,24 @@ describe('voiceRuntimeAutoStart', () => {
       expect(
         JSON.parse(await readFile(path.join(runtimeStateRoot, 'kokoro', '.batshit-local-runtime-launch.json'), 'utf8'))
       ).toMatchObject({ startedBy: 'chatterbox-turbo', stopOnShutdown: true })
+    })
+
+    it('while a saved engine record cannot be read, the boot tidies no launch records', async () => {
+      await writeStarterRecord('http://127.0.0.1:8012')
+      const { attachLocalRuntimeLaunchRecord } = await import('../services/voiceRuntimeLaunchRecords')
+      // qwen3-tts shares the runtime and keeps it running, but its saved record is one this
+      // Batshit cannot read (a newer one wrote it), so it is missing from the list below. The
+      // tidy would read it as deleted and drop its choice; the runtime would then stop at quit.
+      await attachLocalRuntimeLaunchRecord({ engineId: 'qwen3-tts', endpoint: 'http://127.0.0.1:8012', stopOnShutdown: false })
+      mockListVoiceEngineRecords.mockResolvedValue([kokoroOn(8012, { stopOnShutdown: true })])
+      mockRegistryComplete.mockReturnValueOnce(false)
+
+      const { ensureVoiceRuntimesAutoStarted } = await import('../services/voiceRuntimeAutoStart')
+      await ensureVoiceRuntimesAutoStarted('user-1')
+
+      expect(
+        JSON.parse(await readFile(path.join(runtimeStateRoot, 'qwen3-tts', '.batshit-local-runtime-launch.json'), 'utf8'))
+      ).toMatchObject({ startedBy: 'chatterbox-turbo', stopOnShutdown: false })
     })
 
     it('records nothing for a runtime no Batshit launch serves', async () => {

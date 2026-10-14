@@ -22,9 +22,11 @@ Diagnostics is the safe support-bundle export for bug reports. It previews exact
 
 ## Runtime status and installers
 
-The Admin area includes a `Runtimes` section that reports the health of optional runtimes Batshit can use, and offers install or repair actions where they apply. It covers status for the n8n runtime, Agent Browser, Cloudflared, Apple Container on Mac, the Docker Sandbox, the FBX-to-VRMA converter, and Batshit's optional NVIDIA Audio2Face bridge. Audio2Face status distinguishes the bridge process from the separately installed NVIDIA NIM so a running bridge is never mistaken for inference readiness.
+The Admin area includes a `Runtimes` section that reports the health of optional runtimes Batshit can use, and offers install or repair actions where they apply. It covers status for the n8n runtime, Pinokio, Agent Browser, Cloudflared, Apple Container on Mac, the Docker Sandbox, the FBX-to-VRMA converter, and Batshit's optional NVIDIA Audio2Face bridge. The Pinokio row only reports whether Pinokio 8.2.0 or newer is installed and running on this computer; Pinokio is optional, and Batshit works the same without it. Audio2Face status distinguishes the bridge process from the separately installed NVIDIA NIM so a running bridge is never mistaken for inference readiness.
 
 The behavior is honest about each environment. For example, the n8n runtime entry is status-only — it checks whether your n8n URL and API key are reachable and reports readiness, rather than pretending Batshit can launch n8n for you. In Docker, runtimes like Agent Browser and Cloudflared appear as sidecar states (active or stopped) and defer start/stop to the approved host operator, instead of offering native installs that wouldn't fit the container. When a runtime isn't available, Batshit shows that clearly rather than hiding it.
+
+On Mac, the Cloudflared installer selects Apple Silicon/arm64 or Intel/x64 to match the app's native architecture. If an existing Cloudflared cannot run because it uses the wrong architecture, the status explains that failure and names the matching platform to select before installing again. Batshit checks the download and the new program's version before replacing the existing installation. If moving the replacement into place fails, Batshit restores the previous files. If that recovery also fails, Batshit keeps both copies, reports their locations, and requires recovery before another install or removal.
 
 ## Instance-wide defaults
 
@@ -37,14 +39,16 @@ A wake-up is a chat Batshit starts on its own, with nobody typing — one agent 
 Three things live here:
 
 - **Allow Wake-ups** — the master switch for this Batshit. Off means nothing can start a chat on its own; every wake-up waits in the recipient's inbox instead, with the reason recorded. Each agent also has its own "May be woken" switch in Agent Settings.
-- **Schedules** — Batshit's own clock: a saved cadence, time zone, and message per agent, fired as a DM at the time you set. Each row can be run once now, paused, or deleted; there is no edit, so changing a schedule means replacing it. A run Batshit slept through is not asked about here — that question arrives as a dialog in the chat window the next time you open Batshit. Full detail in [Agent DMs and wake-ups](../primary-agents/agent-dms-and-wake-ups.md).
+- **Schedules** — Batshit's own clock: a saved cadence, time zone, and message per agent, fired as a DM at the time you set. Each row can be edited, run once now, paused, or deleted. **Edit** changes its name, timing, time zone, message, kind, and delivery; moving it to another agent requires a new schedule. A run Batshit slept through is not asked about here — that question arrives as a dialog in the chat window the next time you open Batshit. Full detail in [Agent DMs and wake-ups](../primary-agents/agent-dms-and-wake-ups.md).
 - **Wake-up Webhooks** — one URL and one token per hook, for n8n or any other outside program. Create a hook, pick the agent it writes to, and copy the token **once**: Batshit stores only a fingerprint of it and cannot show it again. Rows show each hook's agent, delivery default, last use, and count, and you can pause a hook, rotate its token, or revoke it.
 
 A hook's recipient needs **Agent DMs** on, not only "May be woken" — a call writes a real DM record, and an agent with DMs off would have no inbox to see it in.
 
 ## Cleanup utilities
 
-Admin also holds cleanup tools, including Goon Asset Cleanup, which inspects uploaded Goon files that aren't referenced by any current Goon, Motion Vault, Closet, or Scene, and lets you remove orphaned files deliberately. This is handy when backups or storage have grown large because of unused Goon assets.
+**Goon Asset Cleanup** inspects uploaded Goon files and shows each orphan under **Files and Reasons**. An orphan has no current saved reference; that does not prove it was removed intentionally. **Clean Orphans** asks for confirmation, rechecks the inspected eligible files, and removes only those still unreferenced. It also lets you explicitly resume interrupted custom Goon cleanup.
+
+Scene skyboxes, thumbnails, room shells, room textures and props with unknown reference history are **Preserved**, even after cleanup. A failed or partial settings write can erase a Scene reference while leaving its file. The audit has no earlier settings snapshot, so it cannot determine when or why the reference disappeared or safely recreate the Scene. If a Scene is missing, keep its files and review a known backup before using the separate restore workflow. Inspect never changes files or settings.
 
 ## In this section
 

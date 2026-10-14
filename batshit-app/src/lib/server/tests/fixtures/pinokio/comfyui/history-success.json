@@ -1,0 +1,148 @@
+{
+  "b84029e0-5809-4cf1-8aad-9a0ec29cb4e4": {
+    "prompt": [
+      0,
+      "b84029e0-5809-4cf1-8aad-9a0ec29cb4e4",
+      {
+        "4": {
+          "class_type": "CheckpointLoaderSimple",
+          "inputs": {
+            "ckpt_name": "flux1-schnell-fp8.safetensors"
+          }
+        },
+        "6": {
+          "class_type": "CLIPTextEncode",
+          "inputs": {
+            "text": "a small purple bat reading a book, soft light",
+            "clip": [
+              "4",
+              1
+            ]
+          }
+        },
+        "7": {
+          "class_type": "CLIPTextEncode",
+          "inputs": {
+            "text": "",
+            "clip": [
+              "4",
+              1
+            ]
+          }
+        },
+        "5": {
+          "class_type": "EmptySD3LatentImage",
+          "inputs": {
+            "width": 512,
+            "height": 512,
+            "batch_size": 1
+          }
+        },
+        "3": {
+          "class_type": "KSampler",
+          "inputs": {
+            "seed": 42,
+            "steps": 4,
+            "cfg": 1.0,
+            "sampler_name": "euler",
+            "scheduler": "simple",
+            "denoise": 1.0,
+            "model": [
+              "4",
+              0
+            ],
+            "positive": [
+              "6",
+              0
+            ],
+            "negative": [
+              "7",
+              0
+            ],
+            "latent_image": [
+              "5",
+              0
+            ]
+          }
+        },
+        "8": {
+          "class_type": "VAEDecode",
+          "inputs": {
+            "samples": [
+              "3",
+              0
+            ],
+            "vae": [
+              "4",
+              2
+            ]
+          }
+        },
+        "9": {
+          "class_type": "SaveImage",
+          "inputs": {
+            "filename_prefix": "batshit_p2_probe",
+            "images": [
+              "8",
+              0
+            ]
+          }
+        }
+      },
+      {
+        "client_id": "batshit-p2-probe",
+        "create_time": 1790368166919
+      },
+      [
+        "9"
+      ]
+    ],
+    "outputs": {
+      "9": {
+        "images": [
+          {
+            "filename": "batshit_p2_probe_00001_.png",
+            "subfolder": "",
+            "type": "output"
+          }
+        ]
+      }
+    },
+    "status": {
+      "status_str": "success",
+      "completed": true,
+      "messages": [
+        [
+          "execution_start",
+          {
+            "prompt_id": "b84029e0-5809-4cf1-8aad-9a0ec29cb4e4",
+            "timestamp": 1790368166920
+          }
+        ],
+        [
+          "execution_cached",
+          {
+            "nodes": [],
+            "prompt_id": "b84029e0-5809-4cf1-8aad-9a0ec29cb4e4",
+            "timestamp": 1790368166922
+          }
+        ],
+        [
+          "execution_success",
+          {
+            "prompt_id": "b84029e0-5809-4cf1-8aad-9a0ec29cb4e4",
+            "timestamp": 1790368232753
+          }
+        ]
+      ]
+    },
+    "meta": {
+      "9": {
+        "node_id": "9",
+        "display_node": "9",
+        "parent_node": null,
+        "real_node_id": "9"
+      }
+    }
+  }
+}

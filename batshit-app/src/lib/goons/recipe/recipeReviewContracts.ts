@@ -31,7 +31,8 @@ import { canonicalRecipeString, requireLowercaseSha256 } from './recipeCanonical
 import { type RecipeMigrationReport, type RecipeSiblingSurface } from './updateContracts'
 
 export const RECIPE_UPDATE_ANALYSIS_CONTEXT_CONTRACT = 'recipe-update-analysis-context/v3' as const
-export const RECIPE_REVIEWED_STATE_CONTRACT = 'recipe-reviewed-state/v1' as const
+import { RECIPE_REVIEWED_STATE_CONTRACT } from './contractIds'
+export { RECIPE_REVIEWED_STATE_CONTRACT } from './contractIds'
 
 export const RECIPE_REVIEW_OPERATIONS = ['first-bake', 'rebake', 'package-update'] as const
 

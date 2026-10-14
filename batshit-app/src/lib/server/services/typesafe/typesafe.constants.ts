@@ -1,5 +1,5 @@
 /**
- * SA-120 Jev Juice — the constants every TypeSafe lane shares (DL-120-03/05/08).
+ * SA-120 Judge Juice — the constants every TypeSafe lane shares (DL-120-03/05/08).
  *
  * Feature modules (`<feature>.jev.ts`) hold their own questions, criteria, and
  * thresholds; this file holds only the transport and instance-wide values.
@@ -8,7 +8,7 @@
 export const TYPESAFE_BASE_URL = 'https://api.typesafe.ai'
 export const TYPESAFE_SYSTEM_ONE_PATH = '/v1/systemone'
 
-/** Redis key for the instance-level config record (Settings → Admin → Jev Juice). Backup group: `settings`. */
+/** Redis key for the instance-level config record (Settings → Admin → Judge Juice). Backup group: `settings`. */
 export const TYPESAFE_CONFIG_KEY = 'batshit:typesafe_config'
 
 /** Env fallback for the key, read only when no user key is saved (same rule as every provider key). */
@@ -31,7 +31,7 @@ export const TYPESAFE_ATTEMPT_TIMEOUT_MAX_MS = 30_000
  * The In-Chat Wait Limit (DL-120-05, AMD-120-02, DL-120-16): the total budget for a Jev call
  * the send path waits on (the compile lanes: P1 hints, P3 group speaker, P4 recall by meaning,
  * P5 smart zip). A miss omits the section and the send proceeds. It is a user setting on the
- * Jev Juice card (`batshit:typesafe_config.inChatWaitMs`, LS-059) read per call through
+ * Judge Juice card (`batshit:typesafe_config.inChatWaitMs`, LS-059) read per call through
  * `runTypesafeJudgment` with `lane: 'in_chat'`; this is only its default and its bounds.
  *
  * Why 750 by default. Measured in-app 2026-09-16: a one-question call is 158-176 ms warm and

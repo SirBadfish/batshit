@@ -2,7 +2,8 @@ import { redis } from '$lib/server/redis'
 import type { ChatMemoryRow } from '$lib/types/database'
 import {
   collectTrustedZipIdsFromMetadata,
-  extractTrustedZipIdsFromContent
+  extractTrustedZipIdsFromContent,
+  scanZipReferences
 } from '$lib/utils/zipReferenceSafety'
 
 type ZipReference = {
@@ -13,15 +14,10 @@ type ZipReference = {
 function extractZipReferences(content: string): ZipReference[] {
   if (!content || !content.includes('{{batshit-zip:')) return []
 
-  const refs: ZipReference[] = []
-  const regex = /\{\{batshit-zip:([^:}\s]+)(?::::[^}]*)?\}\}/g
-  let match: RegExpExecArray | null = null
-  while ((match = regex.exec(content)) !== null) {
-    if (match[1] && match[0]) {
-      refs.push({ id: match[1], reference: match[0] })
-    }
-  }
-  return refs
+  return scanZipReferences(content).map((reference) => ({
+    id: reference.id,
+    reference: reference.match
+  }))
 }
 
 function readString(value: unknown): string | null {

@@ -2,6 +2,7 @@
   import { Infinity, Clock, Hand, Lock, Sparkles, Zap } from '@lucide/svelte'
   import BatshitIcon from '$lib/components/icons/BatshitIcon.svelte'
   import { buildZipStatusPresentation } from '$lib/utils/zipStatusPresentation'
+  import type { ToolResultSizeGuard } from '$lib/utils/toolResultSizeGuard'
 
   let {
     isZipped = false,
@@ -17,6 +18,10 @@
     aboutToZip = false,
     remainingMessages = undefined,
     autoZip = false,
+    holdLabel = null,
+    deadCopyReason = null,
+    heldDeadCopy = false,
+    sizeGuard = null,
     name = '',
     description = '',
     // Visual indicator settings
@@ -44,11 +49,21 @@
     isPermanent?: boolean
     manualZip?: boolean
     agentControlled?: boolean
-    /** SA-120 P5: Jev Juice opened it, or zipped it after a reply (`source: 'inferred'`). */
+    /** SA-120 P5: Judge Juice opened it, or zipped it after a reply (`source: 'inferred'`). */
     inferredControlled?: boolean
     aboutToZip?: boolean
     remainingMessages?: number | null
     autoZip?: boolean
+    /** SA-129 P2 (D1): who holds it, in the user's words ("Held by you", "Held by Opie"). */
+    holdLabel?: string | null
+    /** SA-129 P2 (BL-333): the prompt compresses this read as a dead copy, and why. */
+    deadCopyReason?: 'superseded' | 'stale' | null
+    /**
+     * SA-129 P2b (BL-358): a hold that is not the user's sits on this dead copy, which the prompt
+     * compresses anyway. The user can still Release it here, as in the Zip Manager.
+     */
+    heldDeadCopy?: boolean
+    sizeGuard?: ToolResultSizeGuard
     name?: string
     description?: string
     // Visual indicator settings
@@ -74,14 +89,20 @@
   const isExpanded = $derived.by(
     () => !isZipped && (isUnzipped || Boolean(expandedReason))
   )
+  // The user may hold anything that is not already the user's hold: a compressed result, one the
+  // buffer keeps open, and one an agent or Judge Juice holds (the user wins, SA-129 DL-02).
   const canManualUnzip = $derived.by(
-    () => isZipped || (!isUnzipped && expandedReason === 'buffer')
+    () =>
+      sizeGuard !== 'too_large' &&
+      (isZipped ||
+        (!isUnzipped && expandedReason === 'buffer') ||
+        (isUnzipped && (expandedReason === 'agent' || expandedReason === 'inferred')))
   )
   const canZipNow = $derived.by(
     () => Boolean(onZipNow) && Boolean(zipId) && !isZipped
   )
   const canReturnAutomatic = $derived.by(
-    () => Boolean(onReturnAutomatic) && Boolean(zipId) && (isUnzipped || manualZip)
+    () => Boolean(onReturnAutomatic) && Boolean(zipId) && (isUnzipped || manualZip || heldDeadCopy)
   )
   const canShowManualControls = $derived.by(
     () => canManualUnzip || canZipNow || canReturnAutomatic
@@ -119,7 +140,11 @@
       autoZip,
       agentControlled,
       inferredControlled,
-      aboutToZip
+      aboutToZip,
+      holdLabel,
+      deadCopyReason,
+      sizeGuard,
+      tokens
     })
   )
 
@@ -185,7 +210,7 @@
 <div
   class="batshit-zip-wrapper"
   class:zipped={isZipped}
-  class:unzipped={isUnzipped}
+  class:unzipped={isUnzipped && !isZipped}
   class:manual-zipped={manualZip}
   class:expanded={isExpanded}
   class:about-to-zip={aboutToZip}
@@ -197,7 +222,7 @@
   class:has-token-count={hasTokenCount}
   class:tool-header-expanded={toolHeaderExpanded}
   role={isZipped ? "region" : "none"}
-  aria-label={isZipped ? "Zipped content" : undefined}
+  aria-label={isZipped ? "Compressed content" : undefined}
   data-zip-id={zipId || undefined}
   style={`--zip-badge-token-text-width: ${tokenBadgeTextWidth};`}
   use:toolHeaderExpansionObserver
@@ -225,8 +250,8 @@
             <button
               class="unzip-button unzip"
               onclick={handleUnzip10Click}
-              aria-label="Unzip for 10 messages"
-              title="Unzip for 10 messages"
+              aria-label="Hold for 10 messages"
+              title="Hold for 10 messages"
             >
               <BatshitIcon id="unzip" class="h-3 w-3" />
               <span class="unzip-label">10</span>
@@ -234,8 +259,8 @@
             <button
               class="unzip-button unzip"
               onclick={handleUnzipPermanentClick}
-              aria-label="Unzip indefinitely"
-              title="Unzip indefinitely"
+              aria-label="Hold"
+              title="Hold: keep it open until you release it"
             >
               <BatshitIcon id="unzip" class="h-3 w-3" />
               <Infinity class="h-2.5 w-2.5" />
@@ -255,8 +280,8 @@
             <button
               class="unzip-button automatic"
               onclick={handleReturnAutomaticClick}
-              aria-label="Return to automatic"
-              title="Return to automatic"
+              aria-label="Release"
+              title="Release: back to the automatic rules"
             >
               <Clock class="h-3 w-3" />
             </button>
@@ -274,12 +299,12 @@
           {:else}
             <BatshitIcon id="unzip" class="h-4 w-4" />
             {#if statusPresentation.actor === 'user'}
-              <Hand class="status-modifier-icon user-zip-control-icon" size={11} strokeWidth={2.2} aria-label="User zip control" />
+              <Hand class="status-modifier-icon user-zip-control-icon" size={11} strokeWidth={2.2} aria-label="Held by you" />
             {:else if statusPresentation.actor === 'agent'}
-              <Sparkles class="status-modifier-icon agent-zip-control-icon" size={10} strokeWidth={2.4} aria-label="Agent zip control" />
+              <Sparkles class="status-modifier-icon agent-zip-control-icon" size={10} strokeWidth={2.4} aria-label="Held by an agent" />
             {:else if statusPresentation.actor === 'inferred'}
-              <!-- The Jev Juice mark (the same icon as its Settings card and its chat note). -->
-              <Zap class="status-modifier-icon inferred-zip-control-icon" size={10} strokeWidth={2.4} aria-label="Unzipped by Jev" />
+              <!-- The Judge Juice mark (the same icon as its Settings card and its chat note). -->
+              <Zap class="status-modifier-icon inferred-zip-control-icon" size={10} strokeWidth={2.4} aria-label="Held by the judge" />
             {/if}
             {#if isPermanent}
               <Infinity class="h-2.5 w-2.5 ml-0.5 opacity-80" />

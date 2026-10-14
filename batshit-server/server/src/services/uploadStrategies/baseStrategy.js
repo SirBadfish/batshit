@@ -44,15 +44,8 @@ class BaseUploadStrategy {
     return false;
   }
 
-  /**
-   * Clean up or delete a file (optional)
-   * @param {string} identifier - File identifier (URL, key, etc.)
-   * @returns {Promise<boolean>} True if deleted
-   */
-  async delete(identifier) {
-    // Optional - not all storage backends support deletion
-    return false;
-  }
+  // No delete (BL-282): a placeholder that answered `false` was a silent no-op waiting for a
+  // caller. Upload deletes go through `deleteStoredUploadRecord` in `upload-redis.js`.
 }
 
 module.exports = BaseUploadStrategy;

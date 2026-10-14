@@ -1,3 +1,4 @@
+import { getBatshitHomeDir } from './batshitHome'
 import { readFileSync, existsSync, readdirSync, rmSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -192,8 +193,7 @@ function readSystemSkillContent(skillId: string): {
 }
 
 function resolveUserSkillDir(skillId: string): string {
-  const home = process.env.HOME || process.env.USERPROFILE || '~'
-  return join(home, '.batshit', 'skills', skillId)
+  return join(getBatshitHomeDir(), 'skills', skillId)
 }
 
 function cleanupLegacyUserSkillDirs(skillIds: string[]): void {

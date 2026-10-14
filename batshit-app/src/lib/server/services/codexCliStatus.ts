@@ -1,5 +1,6 @@
 import { promisify } from 'node:util'
 import { execFile } from 'node:child_process'
+import { stripHostOperatorAuthorityFromChildEnv } from './cliChildEnv'
 import { accessSync, constants, readdirSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -128,7 +129,7 @@ function buildCodexExecEnv(codexHome?: string | null): NodeJS.ProcessEnv {
   if (trimmedHome) {
     execEnv.CODEX_HOME = trimmedHome
   }
-  return execEnv
+  return stripHostOperatorAuthorityFromChildEnv(execEnv)
 }
 
 /**
@@ -182,7 +183,13 @@ export function getCodexCliExecutableCandidates(home = os.homedir()): string[] {
     joinHomePath(home, '.local', 'bin', 'codex'),
     joinHomePath(home, '.volta', 'bin', 'codex'),
     ...getNvmCodexCandidates(home),
-    '/Applications/Codex.app/Contents/Resources/codex'
+    // BL-155: the Codex desktop app ships as `ChatGPT.app` (bundle id `com.openai.codex`), the
+    // last resort after every CLI install. BL-590: it keeps its Codex in `codex-cli/bin`, the
+    // entrypoint its `codex-cli/codex-package.json` names (a launcher for `CodexCLI.app`;
+    // codex-cli 0.162.0-alpha.17.2 in ChatGPT.app 26.1007.21159, measured 2026-10-10). The
+    // flat `Contents/Resources/codex` and the older `Codex.app` are gone, and the app updates
+    // itself.
+    '/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex'
   ]
 
   return Array.from(new Set(candidates))

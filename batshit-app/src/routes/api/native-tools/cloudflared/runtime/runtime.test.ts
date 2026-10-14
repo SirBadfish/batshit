@@ -75,6 +75,27 @@ describe('/api/native-tools/cloudflared/runtime', () => {
     restoreContainerizedEnv()
   })
 
+  it.each(['__proto__', 'constructor', 'toString', 'darwin-invalid', null])('refuses invalid platform %s', async (platform) => {
+    const response = await POST({
+      ...authedEvent,
+      request: requestJson({ platform })
+    } as any)
+
+    expect(response.status).toBe(400)
+    await expect(response.json()).resolves.toMatchObject({ error: 'Invalid platform.' })
+  })
+
+  it('admits the Apple-silicon platform without running a native installer in Docker', async () => {
+    process.env.BATSHIT_CONTAINERIZED = '1'
+    const response = await POST({
+      ...authedEvent,
+      request: requestJson({ platform: 'darwin-arm64' })
+    } as any)
+
+    expect(response.status).toBe(503)
+    await expect(response.json()).resolves.toMatchObject({ supportLevel: 'docker-sidecar' })
+  })
+
   it('reports Cloudflared as a stopped Docker sidecar in containerized Batshit', async () => {
     process.env.BATSHIT_CONTAINERIZED = '1'
     delete process.env.BATSHIT_CLOUDFLARED_TARGET_URL

@@ -6,37 +6,52 @@ Local AI is connect-first. Batshit doesn't bundle these programs or any model we
 
 ## Supported programs
 
-| Program | Default URL | OpenAI-compatible path | What Batshit can do |
+| Program | Default URL | API path | What Batshit can do |
 | --- | --- | --- | --- |
-| Ollama | `http://localhost:11434` | `/v1` | List, pull, and delete models |
+| Ollama | `http://localhost:11434` | `/v1` (model discovery; chat uses native `/api/chat`) | List, pull, and delete models |
 | Docker Model Runner | `http://localhost:12434` | `/engines/llama.cpp/v1` | List, create, and delete models |
-| LM Studio | `http://localhost:1234` | `/v1` | Connect existing |
-| llama.cpp | `http://localhost:8080` | `/v1` | Connect existing |
+| LM Studio | `http://localhost:1234` | `/v1` | Load and unload models |
+| llama.cpp | `http://localhost:8080` | `/v1` | Load/unload models when its server is in router mode; otherwise connect existing |
 | vLLM | `http://localhost:8000` | `/v1` | Connect existing |
 | SGLang | `http://localhost:30000` | `/v1` | Connect existing |
-| oMLX | `http://localhost:8000` | `/v1` | Connect existing |
-| KoboldCpp | `http://localhost:5001` | `/v1` | Connect existing |
+| oMLX | `http://localhost:8000` | `/v1` | Load and unload models |
+| KoboldCpp | `http://localhost:5001` | `/v1` | Switch models (restarts KoboldCpp) |
 
-Connect existing means Batshit checks health and lists models, but you start, stop, update, and download models in that program's own app or command line.
+Connect existing means Batshit checks the connection and lists models, while you start the program and manage its models in that program's app or command line. Some programs also expose specific model controls in Batshit, but each is available only when that installation provides the required API and access.
 
 Ollama and Docker Model Runner are enabled by default. The rest you turn on when you have them.
 
-**Batshit can load and unload models for five of these programs.** Ollama, Docker Model Runner,
-KoboldCpp, LM Studio and oMLX each have a Models card in Settings, Local AI. The other three,
-llama.cpp, vLLM and SGLang, run one model per program start: you pick it on the command line, and
-nothing can change it while they run. Batshit shows you what they have loaded instead.
+**Batshit offers model controls for six programs, with conditions.** Ollama, Docker Model Runner,
+KoboldCpp, LM Studio and oMLX have their program-specific Models cards in Settings → Local AI.
+llama.cpp also has Load/Unload controls when its server reports router mode. A single-model
+llama.cpp server, vLLM and SGLang remain connect-only in Batshit; Batshit lists their models but
+does not present whole-engine memory controls as per-model unload.
+
+llama.cpp router Load and Unload wait for the program to confirm the change; startup failures remain visible with Retry. If its idle-sleep setting releases the model's memory, the card shows **Sleeping · chat wakes it**, rather than Loaded. A new chat wakes that child automatically; Unload stops it.
 
 **Batshit asks the program, it does not read your folders.** That is on purpose. If Batshit listed
 the model files on your disk, it would show you models for programs that cannot load them, and every
 one of those would be a dead entry.
 
-Two things to know:
+Things to know:
 
-- **KoboldCpp restarts itself to change models.** It goes quiet for a few seconds. That is normal.
-  KoboldCpp also needs to be started with `--admin` and `--admindir` pointing at your models folder,
-  or it cannot switch at all. Batshit tells you if you forgot.
-- **LM Studio downloads are done in LM Studio.** Batshit can load and unload, but LM Studio has no
-  way to start a download from outside, so there is no download button here.
+- **KoboldCpp restarts itself to change models.** It goes quiet for a few seconds, and Batshit
+  waits for it. Model switching requires KoboldCpp's admin mode, an accessible authorized model
+  list, and the control entries it provides. Chat and the running-model/context readout work without
+  admin model-management access. Batshit tells you when switching is unavailable.
+- **A .gguf file loads with KoboldCpp's default settings**, not the ones you started it with. A
+  bigger context size, `--jinja`, or `--enableguidance` is dropped. To keep yours, save them as a
+  `.kcpps` settings file in the same folder (KoboldCpp's launcher does this with Save Config) and
+  pick it under **Settings for Model Files**. Create nonsecret configs before entering credentials: Save Config can store passwords in plain text. **Restore Startup Model** goes back to the model and
+  settings KoboldCpp was started with. The card always says what KoboldCpp is running right now.
+- **KoboldCpp model and context changes** offer **Model**, **Context Tokens** and **Apply and Restart** on explicitly enrolled same-machine Mac installations. Remote, Docker and unenrolled connections use operator-prepared **Saved KoboldCpp Settings**, whose expected fields only verify the result. Wait for all chats in every client to finish; leave KoboldCpp and its Terminal running. See [Changing the loaded model or context](model-settings.md#changing-koboldcpps-loaded-model-or-context).
+- **LM Studio downloads are done in LM Studio.** Newer LM Studio versions have a native download
+  API, but Batshit's card manages loading and unloading only. Unload targets the loaded instance,
+  which can be different from the model's ID.
+
+- **oMLX model controls need admin access.** An inference API key alone does not grant access to
+  oMLX's admin model list or unload action. If its admin list is protected, set up access in oMLX;
+  Batshit keeps chat separate from model management.
 
 **KoboldCpp is the newest.** It is one downloaded program file, it runs GGUF models, and it is what
 most of the roleplay community uses. Point Batshit at `http://localhost:5001` after you start it.
@@ -57,6 +72,20 @@ lies.
 **KoboldCpp cannot tell Batshit about its prompt cache.** Its replies carry no cache numbers, so the
 Token Panel says the count is unknown rather than showing you a zero nobody measured. Its cache still
 works; Batshit just cannot see it. Watch the speed numbers instead.
+
+**KoboldCpp does tell Batshit its real context size.** Batshit plans within that allocation and any smaller positive **Context window** saved in your preset. If your
+preset says 32,768 but KoboldCpp is running at 12,288, the preset editor says so, and Batshit keeps
+your conversation inside the 12,288 KoboldCpp really has. A smaller preset limit stays a smaller planning budget; it does not resize KoboldCpp.
+
+Changing the preset cannot increase KoboldCpp's loaded ceiling. To raise it, restart KoboldCpp with
+a larger **Context Size** (`--contextsize`) setting, use the enrolled Local AI context editor, or apply a native saved settings file containing that allocation. Batshit does not send KoboldCpp's
+`max_context_length` request extension from a preset.
+
+**KoboldCpp answers every preset with the one model it has loaded**, whatever model the preset names.
+After you switch KoboldCpp to another model, a preset saved for the old one still works, but the
+replies come from the new one. The preset editor tells you, under Model ID: "KoboldCpp is serving
+Llama-3.2-3B-Instruct-Q4_K_M, not the model above." The chat bar and the Token Panel still show the
+preset's own name, so check the preset after a switch.
 
 **SGLang and oMLX are new.** [Their setup page](sglang-and-omlx.md) covers both, including the fact that oMLX and vLLM share port 8000 by default.
 
@@ -106,7 +135,13 @@ Batshit rewrites common loopback URLs for server-side Docker calls, but it's sti
 
 Local models appear in Batshit's Model Catalog and preset pickers once the program is enabled and reachable. For local presets:
 
-- **Settings start collapsed and blank.** Blank means Batshit sends nothing and your program decides. Fill a field in and it wins for that message. [Full explanation.](model-settings.md)
+A disabled program can still show installed model files in Local AI. The Model Catalog explains that it must be enabled before those models appear in preset pickers.
+
+When a program reports its running context, Batshit uses that window to choose a safe **Max Output Tokens** estimate, leaving room for your prompt. A running window of 16,384 tokens gives an estimated output of 8,192. If LM Studio, Ollama, or KoboldCpp cannot report a loaded window, Batshit shows the context limit as unknown rather than using the model's published ceiling or the preset. Programs without a loaded-context reader can use a positive preset only as a labeled estimate. A valid smaller output value you chose is preserved. Context and output edits stay as drafts while you type; leaving the field or pressing Enter formats and validates the completed value before autosave. Invalid token counts stay visible with an explanation. Unsaved drafts remain available when you close and reopen Models within the same app session; failed saves offer Retry Save.
+
+KoboldCpp's Models card shows the loaded model and running context even without admin model-management access. You can chat with that loaded model; the admin notice concerns optional model switching in Batshit.
+
+- **Settings start collapsed and blank.** Most blank fields let your program decide; a value you enter wins for that message. Ollama's Thinking is an exception: **Default (off)** requests thinking off unless Custom Parameters override it. Choose `true` to request thinking. [Full explanation.](model-settings.md)
 - Tools default off unless you enable tool support for that preset.
 - Local model IDs are preserved exactly as the program reports them.
 - Vision support depends on the model and program, not just on Batshit.
@@ -123,6 +158,10 @@ Batshit supports two image transport styles for local programs:
 - **Force URL**: Batshit rewrites image references to URLs the program can fetch.
 
 Automatic is the default, because some local vision programs — especially LM Studio setups — reject HTTP image URLs and expect image data in the request itself.
+
+**Ollama vision models require Automatic.** Ollama's native chat API takes image data,
+so Force URL is refused with guidance to change the preset or Local AI setting.
+Batshit does not download the URL or retry with another transport behind the scenes.
 
 Force URL is useful when your program must fetch images itself. In that case, set the image base URL to something the program can reach. For Docker Batshit, that often needs to point at batshit-server from the program's point of view:
 
@@ -150,7 +189,7 @@ http://host.docker.internal:11434
 
 After Batshit can list models, create a preset using an Ollama model ID such as `llama3.2:latest`.
 
-Two things about Ollama are worth knowing before you go far: its OpenAI-compatible endpoint accepts a much smaller set of settings than the other programs, and **it silently shortens conversations that outgrow its context size**. Both are covered, with the fix, in [Getting your local model settings right](model-settings.md#ollama-is-the-odd-one-out).
+Batshit uses Ollama's native API, including its sampler controls and a real **Context size** setting. Ollama still **silently shortens conversations that outgrow that context size**. Set it to fit your model and hardware; see [Getting your local model settings right](model-settings.md#ollama-used-to-be-the-odd-one-out) for the controls and context guidance.
 
 ## Docker Model Runner notes
 
@@ -204,6 +243,8 @@ LM Studio adds its own instruction paragraph to the front of every prompt it rec
 
 ## llama.cpp, vLLM, and SGLang notes
 
+llama.cpp keeps its **Detected Models** list in single-model mode. In router mode, Load and Unload wait for the program to confirm the model state; a failed start stays visible with its error. If a model-list read fails, use **Retry**. Changing a saved connection refreshes the card and discards the old connection’s pending result.
+
 These three are connect-existing. Batshit expects an OpenAI-compatible API and doesn't manage their process, model files, or GPU settings. Their settings are launch flags you chose when you started the server.
 
 Make sure the program's `/models` endpoint works before debugging Batshit, then save the base URL and path in **Settings → Local AI**.
@@ -220,7 +261,7 @@ n8n Workflow Subagents use whatever model/provider nodes you configure in n8n �
 
 Batshit backups save your Local AI settings and model preset references. They do **not** include model weights, the programs themselves, Docker Model Runner storage, or program logs and caches.
 
-After a restore, reconnect or reinstall the program, refresh models, and reselect presets if a model ID changed.
+After a restore, reconnect or reinstall the program, refresh models, and reselect presets if a model ID changed. Enroll managed KoboldCpp context editing again; removing and re-adding the connection cannot reactivate its previous local grant.
 
 ## Practical test
 

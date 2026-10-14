@@ -41,8 +41,10 @@ button:hover:not(:disabled) {
   border-color: oklch(0.41 0.035 282);
 }
 
+/* The app's primary family, copied because this boot window loads before the app's CSS:
+   --bs-app-primary, -line, and -text in batshit-app/src/app.css (one primary, 2026-09-22). */
 button:focus-visible {
-  outline: 2px solid oklch(0.63 0.05 281.84);
+  outline: 2px solid oklch(0.74 0.07 274.7);
   outline-offset: 2px;
 }
 
@@ -53,8 +55,8 @@ button:disabled {
 }
 
 button.primary {
-  border-color: oklch(0.63 0.05 281.84);
-  background: oklch(0.48 0.05 278.79);
+  border-color: oklch(0.38 0.07 273.01);
+  background: oklch(0.33 0.07 274.7);
 }
 
 button.quiet {

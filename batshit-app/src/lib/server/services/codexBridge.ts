@@ -1,4 +1,6 @@
-import { spawn } from "node:child_process";
+import { pinHostCommandOwner, prepareHostCommand, validateHostCommandOwner, type HostCommandLease, type HostCommandOwner } from './hostCommandOwnership';
+import { withManagedProfileRunWrite, isManagedProfileRunRefusal } from './agentProfileFolderGate';
+import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import readline from "node:readline";
 import os from "node:os";
@@ -6,10 +8,18 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import { env } from "$env/dynamic/private";
 import { logger } from "$lib/utils/logger";
-import type { ThreadEvent } from "$lib/types/codexProtocol";
+import type { ThreadEvent, Usage } from "$lib/types/codexProtocol";
 import type { NativeModeRequest } from "./vercelBrain";
 import { detectCodexCliStatus, resolveCodexCliExecutable } from "./codexCliStatus";
+import {
+  assertCliModelStillOffered,
+  explainCodexVersionRefusal,
+  warnIfCliOlderThanPinned,
+} from "./cliModelAvailability";
 import { CodexEventAdapter } from "./codexEventAdapter";
+import { CodexReplyBaseline } from "./codexReplyBaseline";
+import { CodexRunProcesses } from "./codexRunProcesses";
+import { recordCodexCleanupWarning } from "./codexCleanupWarnings";
 import { redis } from "$lib/server/redis";
 import {
   buildCodexRuntimeSettings,
@@ -23,6 +33,8 @@ import type {
 } from "$lib/types/codex";
 import {
   ensureManagedCodexHome,
+  readManagedCodexHelperLaunchOverrides,
+  readManagedCodexToolOutputTokenLimit,
   DOCKER_AUTH_ENV_VAR,
   N8N_INSTANCE_MCP_TOKEN_ENV,
   buildAgentProfileId,
@@ -35,13 +47,30 @@ import {
   resolveManagedStdioEnvironmentValues,
 } from "$lib/server/services/mcpGatewayStdio";
 import { mintCliRunCredential } from "$lib/server/services/cliHelperToken";
-import { applyCliRunCredentialToChildEnv } from "$lib/server/services/cliChildEnv";
+import { resolveNativeToolSettings } from "$lib/server/services/nativeTools";
+import { resolveRunCredentialCliToolScope } from "$lib/server/services/cliToolRegistry";
+import {
+  resolveManagedCliFetchZipAllowed,
+} from "$lib/server/services/mode4InternalTools";
+import { applyCliRunCredentialToChildEnv, stripHostOperatorAuthorityFromChildEnv } from "$lib/server/services/cliChildEnv";
 import { revokeRunCredential } from "$lib/server/services/agentRunCredentials";
 import {
   startCodexAppServerRun,
   type CodexSteerResult,
   type CodexAppServerThreadParams,
 } from "$lib/server/services/codexAppServerLane";
+import {
+  acquireCodexHomeStart,
+  createCodexHomeStartStoppedError,
+  isCodexHomeStartStopped,
+} from "$lib/server/services/codexHomeStartGate";
+import {
+  assertBatshitManagedCodexHome,
+  assertManagedCodexProfileId,
+  ensureManagedCodexFallbackHome,
+  isManagedCodexHomeRefusal,
+} from "$lib/server/services/codexManagedHome";
+import { SegmentedText } from "$lib/utils/segmentedText";
 
 type CodexRunTransport = "app-server" | "exec";
 
@@ -117,6 +146,10 @@ export function getDefaultCodexWorkingDirectory(home = os.homedir()) {
 }
 
 interface CodexRunOptions {
+  onContextWindow?: (contextWindow: number) => void;
+  hostCommandLease?: HostCommandLease;
+  profileOwner?: HostCommandOwner;
+  cleanupMessageId?: string | null;
   model?: string | null;
   permissionMode?: CodexPermissionMode;
   sandboxMode: "read-only" | "workspace-write" | "danger-full-access";
@@ -149,6 +182,8 @@ interface CodexRunOptions {
   reasoningSummary?: CodexRuntimeSettings["reasoningSummary"];
   modelSupportsReasoningSummaries?: CodexRuntimeSettings["modelSupportsReasoningSummaries"];
   signal?: AbortSignal;
+  onProcessCleanupFailure?: (error: Error) => void | Promise<void>;
+  onProcessesExited?: () => void | Promise<void>;
   unifiedExec: boolean;
   imagePaths?: string[];
   sessionId?: string | null;
@@ -165,6 +200,7 @@ interface CodexRunner {
   transport: CodexRunTransport;
   events: AsyncGenerator<ThreadEvent>;
   cleanup?: () => void | Promise<void>;
+  getObservedUsage?: () => Partial<Usage> | null;
   /**
    * SA-114 P2 (DL-114-06) — present only on the app-server lane.
    *
@@ -174,6 +210,13 @@ interface CodexRunner {
    * the user can even try.
    */
   steer?: (payload: { steerIds: string[]; text: string }) => Promise<CodexSteerResult>;
+  /** BL-268: the Codex this run started (its reported version and how it was found). */
+  cli?: { version?: string | null; source?: string | null };
+  /**
+   * BL-287: the Codex process, on both lanes. The stream ends when Batshit sends it SIGTERM,
+   * not when it has exited; the Subagent runner waits for the exit (`subagentRunSettle.ts`).
+   */
+  process?: ChildProcess;
 }
 
 function mapCodexRuntimeTransport(transport: CodexRunTransport) {
@@ -188,6 +231,16 @@ export interface CodexHiddenTextRequest {
   providerSettings?: Record<string, any> | null;
   codexSettings?: CodexRuntimeSettings | null;
   timeoutMs?: number;
+  abortSignal?: AbortSignal;
+}
+
+/** Hidden summaries never return partial text after a Stop, even if the lane ends normally. */
+function throwIfHiddenTextAborted(signal?: AbortSignal, timeoutError?: Error): void {
+  if (!signal?.aborted) return;
+  if (timeoutError && signal.reason === timeoutError) throw timeoutError;
+  const error = new Error("Codex compact worker stopped.", { cause: signal.reason });
+  error.name = "AbortError";
+  throw error;
 }
 
 export interface CodexHiddenTextResult {
@@ -427,6 +480,27 @@ export function buildCodexCliArgs(
   if (nativeSkillDisableOverride) {
     args.push("--config", nativeSkillDisableOverride)
   }
+  // BL-7: a Batshit-managed Codex home never installs Codex's bundled skills. Codex installs
+  // them by deleting `CODEX_HOME/skills/.system` and writing it again, unguarded, so runs of
+  // one agent that start together (two chats, the compact worker beside a turn, two Batshit
+  // processes) race there: `Directory not empty (os error 66)`, and a home can keep a partial
+  // set under a marker that says it is current. Batshit already disables each of those skills
+  // by path from the second run on; this turns the bundled set off at the source, so nothing
+  // is installed and a first run no longer sees them either. Only for a MANAGED home: the
+  // user's own `~/.codex` (no managed home) belongs to their Codex app, and codex-cli 0.139.0
+  // answers this switch by deleting that folder.
+  if (options.managedConfigHome) {
+    args.push("--config", CODEX_BUNDLED_SKILLS_OFF_OVERRIDE)
+  }
+  // BL-161: with its `plugins` feature on (the default), Codex syncs OpenAI's curated plugin
+  // repository into `CODEX_HOME/.tmp/plugins` at startup, so every managed home kept its own
+  // 88 MB copy (90,184 KB within 6 s of `initialize` on a fresh home, codex-cli 0.139.0; the
+  // same gate in 0.155.1's source). Batshit owns the managed tool surface, so a managed home
+  // runs without plugins, unless the agent turned the feature on itself: its `[features]
+  // plugins = true` is in its config, and this switch would silently override it.
+  if (options.managedConfigHome && !enablesCodexFeature(options, "plugins")) {
+    args.push("--config", CODEX_PLUGINS_OFF_OVERRIDE)
+  }
 
   if (options.permissionMode === "agent_full") {
     args.push("--dangerously-bypass-approvals-and-sandbox")
@@ -493,8 +567,67 @@ export function redactCodexCliArgsForLog(args: string[]) {
   return redacted
 }
 
+type CodexSessionFallback = { userId: string; agentId: string; sessionId: string };
+
+/**
+ * BL-162: what one run set up before its Codex process exists, released exactly once: by the
+ * reply's stream when it ends, or by `streamNativeMode` when the start fails and no stream
+ * will ever run its cleanup. Before, that failure left the image temp folder on disk and the
+ * chat in `codex_sessions:<user>:<agent>` for its hour, where the Subagent bridge's fallback
+ * then saw two sessions and refused as ambiguous.
+ */
+class CodexRunSetup {
+  private imageCleanup: (() => Promise<void>) | null = null;
+  private baseline: Promise<CodexReplyBaseline> | null = null;
+  private released = false;
+
+  constructor(
+    private readonly sessionFallback: CodexSessionFallback | null,
+    private readonly reportBaselineCleanupFailure: (error: unknown) => Promise<void>,
+  ) {}
+
+  keepImageCleanup(cleanup: () => Promise<void>) {
+    this.imageCleanup = cleanup;
+  }
+
+  keepBaseline(baseline: Promise<CodexReplyBaseline>) {
+    this.baseline = baseline;
+    // Setup proceeds concurrently; attach a handler immediately while preserving the rejection.
+    void baseline.catch(() => {});
+  }
+
+  async release(includeBaseline = true) {
+    // Process exit can precede the last event read-back; retain the baseline until stream cleanup.
+    if (includeBaseline && this.baseline) {
+      const baseline = this.baseline;
+      this.baseline = null;
+      try { await (await baseline).dispose(); }
+      catch (error) {
+        console.error("[CodexBridge] Baseline cleanup could not be verified", error);
+        await this.reportBaselineCleanupFailure(error).catch(reportError =>
+          console.error("[CodexBridge] Failed to persist baseline cleanup warning", reportError));
+      }
+    }
+    if (this.released) return;
+    this.released = true;
+    await this.imageCleanup?.();
+    const fallback = this.sessionFallback;
+    if (!fallback) return;
+    try {
+      await redis.execute(async (client) => {
+        await client.sRem(
+          `codex_sessions:${fallback.userId}:${fallback.agentId}`,
+          fallback.sessionId,
+        );
+      });
+    } catch (error) {
+      console.warn("[CodexBridge] Failed to clear codex session mapping", error);
+    }
+  }
+}
+
 export class CodexBridge {
-  async streamNativeMode(request: NativeModeRequest) {
+  async streamNativeMode(request: NativeModeRequest, preparedLease?: HostCommandLease) {
     if (env.BATSHIT_CODEX_PROVIDER_ENABLED === "false") {
       throw new Error(PROVIDER_DISABLED_ERROR);
     }
@@ -503,7 +636,54 @@ export class CodexBridge {
       throw new Error("No messages provided to Codex runtime");
     }
 
-    const codexSessionFallback =
+    const codexSettings: CodexRuntimeSettings =
+      request.codexSettings ??
+      buildCodexRuntimeSettings(request.providerSettings ?? null);
+    // BL-156: the same id the profile sync and the compact worker build for this agent
+    // (lowercased, every character outside [a-z0-9_-] as `_`), so the run uses the agent's own
+    // home; `batshit_agent_${agentId}` was refused for a capital and named a second home for
+    // any other outside character.
+    const profileId =
+      codexSettings.profileId ??
+      (request.agentId ? buildAgentProfileId(request.agentId) : null);
+    const configScope = codexSettings.configScope ?? "managed";
+    // BL-7 review: a managed run's profile id becomes its home folder
+    // (`~/.batshit/agents/<profile id>/.codex`) and can come from stored settings, so it is
+    // refused here, before anything is written or started for this run. A stored `../..`
+    // made that folder the user's own `~/.codex`.
+    if (configScope === "managed" && profileId !== null) {
+      assertManagedCodexProfileId(profileId);
+    }
+    if (request.delegatedRun && !request.processOwner) {
+      throw new Error("A delegated Codex run needs its server-owned process owner.");
+    }
+    if (request.processOwner && request.processOwner.userId !== request.userId) {
+      throw new Error("Codex process ownership must match the requesting user.");
+    }
+    const hostCommandPin = process.platform === 'win32' ? undefined : pinHostCommandOwner(
+      request.processOwner ?? {
+        userId: request.userId || 'host',
+        kind: request.agentId ? 'agent' : 'host',
+        id: request.agentId || 'unassigned-codex',
+      }, configScope === 'managed' ? profileId : null,
+    );
+    if (preparedLease && (!hostCommandPin || preparedLease.record.kind !== 'codex' ||
+        preparedLease.pin.profileId !== hostCommandPin.profileId ||
+        preparedLease.pin.owner.userId !== hostCommandPin.owner.userId ||
+        preparedLease.pin.owner.kind !== hostCommandPin.owner.kind ||
+        preparedLease.pin.owner.id !== hostCommandPin.owner.id)) {
+      throw new Error('The prepared Codex admission does not match this run owner and profile.');
+    }
+    // BL-158: a saved model Batshit's Codex list no longer offers stops the run here, before
+    // anything of it is set up, with a message naming whose setting it is; Codex answered it
+    // with a raw 400 on every run. A model id Batshit never listed passes.
+    await assertCliModelStillOffered(
+      "codex",
+      codexSettings.model?.trim() || this.normalizeModelId(request.model),
+      request,
+    );
+
+    const codexSessionFallback: CodexSessionFallback | null =
       request.sessionId && request.userId && request.agentId
         ? {
             userId: request.userId,
@@ -529,7 +709,68 @@ export class CodexBridge {
       }
     }
 
+    // BL-162: what this run sets up before any Codex process exists (the session entry above,
+    // the image folder `prepareImages` makes) is released by the reply's stream when it ends,
+    // or here when the start fails, which never reaches a stream: a missing Codex, a refused
+    // home, an agent that no longer exists. A Stop at the start gate is not a failure; it ends
+    // through its own stream like every other Stop.
+    const runSetup = new CodexRunSetup(codexSessionFallback, async () => {
+      const messageId = request.delegatedRun ? request.processCleanupMessageId : request.messageId;
+      if (request.userId && request.sessionId && messageId) {
+        await recordCodexCleanupWarning({ userId: request.userId, sessionId: request.sessionId, messageId });
+      }
+    });
+    let hostCommandLease: HostCommandLease | undefined = preparedLease;
+    try {
+      if (hostCommandPin && !hostCommandLease) hostCommandLease = await prepareHostCommand(hostCommandPin, {
+        kind: 'codex', program: 'codex', sessionId: request.sessionId,
+        messageId: request.delegatedRun ? request.processCleanupMessageId : request.messageId,
+      });
+      if (hostCommandLease) await validateHostCommandOwner(hostCommandLease.pin.owner);
+      return await this.startNativeRun(request, {
+        codexSettings,
+        profileId,
+        configScope,
+        runSetup,
+        hostCommandLease,
+      });
+    } catch (error) {
+      hostCommandLease?.abortBeforeSpawn();
+      await runSetup.release();
+      throw error;
+    }
+  }
+
+  private async startNativeRun(
+    request: NativeModeRequest,
+    {
+      codexSettings,
+      profileId,
+      configScope,
+      runSetup,
+      hostCommandLease,
+    }: {
+      codexSettings: CodexRuntimeSettings;
+      profileId: string | null;
+      configScope: NonNullable<CodexRuntimeSettings["configScope"]>;
+      runSetup: CodexRunSetup;
+      hostCommandLease?: HostCommandLease;
+    },
+  ) {
     const requestStart = Date.now();
+    // BL-9: this reply's git baseline (which files already had changes, and a copy of each),
+    // read before Codex starts so no command of the reply can land first. Started here to run
+    // beside the rest of the setup; awaited before the credential mint, because nothing awaited
+    // may sit between the mint and the spawn. Ordinary read failure yields an unavailable diff;
+    // unverified reader cleanup rejects setup and records the run cleanup warning.
+    const replyProjectPath =
+      typeof request.projectPath === "string" ? request.projectPath : null;
+    const replyBaselineTaken = CodexReplyBaseline.take({
+      projectPath: replyProjectPath,
+      // A Stop during the baseline ends it at once; the start gate then ends the reply as a Stop.
+      signal: request.abortSignal ?? null,
+    });
+    runSetup.keepBaseline(replyBaselineTaken);
     const promptPackage = buildCodexPromptPackageFromMessages({
       messages: request.messages,
       images: request.images,
@@ -537,11 +778,9 @@ export class CodexBridge {
     const prompt = promptPackage.prompt;
     const { paths: imagePaths, cleanup: imageCleanup } =
       await this.prepareImages(request.images);
+    runSetup.keepImageCleanup(imageCleanup);
     const permissions = await this.loadAgentPermissions(request.agentId);
     const baseSandbox = this.resolveSandboxMode(permissions);
-    const codexSettings: CodexRuntimeSettings =
-      request.codexSettings ??
-      buildCodexRuntimeSettings(request.providerSettings ?? null);
     const sandboxMode = baseSandbox
       ? this.clampSandbox(codexSettings.sandbox, baseSandbox)
       : codexSettings.sandbox;
@@ -557,11 +796,6 @@ export class CodexBridge {
       codexSettings.model && codexSettings.model.trim().length
         ? codexSettings.model.trim()
         : normalizedModelId;
-    const profileId =
-      codexSettings.profileId ??
-      (request.agentId ? `batshit_agent_${request.agentId}` : null);
-
-    const configScope = codexSettings.configScope ?? "managed";
     const managedStdioEnv =
       configScope === "managed" && request.userId
         ? await this.resolveManagedStdioEnv(
@@ -595,9 +829,13 @@ export class CodexBridge {
         managedConfigHome = await ensureManagedCodexHome({
           userId: request.userId,
           profileId,
+          owner: request.processOwner ?? { userId: request.userId, kind: 'agent', id: request.agentId || '' },
           historyPersistence: codexSettings.historyPersistence,
         });
       } catch (error) {
+        // BL-7 review: a refused home fails the run; only a home that merely could not be
+        // prepared goes on to the managed fallback in `createRunner`.
+        if (isManagedCodexHomeRefusal(error) || isManagedProfileRunRefusal(error)) throw error;
         console.error(
           "[CodexBridge] Failed to prepare managed Codex config",
           error,
@@ -611,6 +849,7 @@ export class CodexBridge {
             workingDirectory,
           })
         : [];
+    const replyBaseline = await replyBaselineTaken;
 
     /**
      * SA-117 DL-117-06 — mint this run's credential.
@@ -629,6 +868,11 @@ export class CodexBridge {
      * user, and this deliberately does not catch it: a run whose identity does not add up
      * must not start.
      */
+    // Snapshot the limit the managed profile actually gives this run. Null stays unknown;
+    // helpers use a conservatively measured page, never a larger vendor setting.
+    const codexToolOutputTokenLimit = managedConfigHome
+      ? await readManagedCodexToolOutputTokenLimit(managedConfigHome)
+      : null;
     const runCredential =
       request.userId && request.agentId && request.sessionId
         ? await mintCliRunCredential({
@@ -637,10 +881,26 @@ export class CodexBridge {
             sessionId: request.sessionId,
             messageId: request.messageId ?? null,
             runtime: "codex",
+            codexToolOutputTokenLimit,
             delegated: request.delegatedRun === true,
+            processOwner: request.processOwner,
+            commandParentAgentId: request.commandParentAgentId ?? null,
+            delegatedBashEnabled: request.delegatedRun === true &&
+              resolveNativeToolSettings(request.providerSettings ?? null).bashEnabled,
             // BL-75: a delegated run's credential names the Subagent or Worker whose skill
             // access governs its `native_skill` loads.
             scopeAgentId: request.scopeAgentId ?? null,
+            // BL-81: and the control ids its DCM index offered it, the only ones the control
+            // routes will answer it with. The mint refuses a delegated run without them.
+            allowedControlIds: request.delegatedAllowedControlIds ?? null,
+            mcpGatewayScope: request.selectedGateways ?? [],
+            // BL-686: the saved CLI tools this run's helper may find and run, resolved the
+            // way its profile was (a delegated run: its runner's list only).
+            cliToolScope: await resolveRunCredentialCliToolScope(request),
+            fetchZipAllowed: resolveManagedCliFetchZipAllowed(request.providerSettings, {
+              configScope,
+              delegatedRun: request.delegatedRun,
+            }),
           })
         : null;
     if (!runCredential) {
@@ -676,7 +936,15 @@ export class CodexBridge {
     // throw above this line has no credential to leak; a throw below it is revoked in the
     // catch. Do not insert an awaited call between here and `createRunner`.
     const runOptions: CodexRunOptions = {
+      hostCommandLease,
+      profileOwner: request.processOwner ?? { userId: request.userId || '', kind: 'agent', id: request.agentId || '' },
       model: resolvedModel,
+      onContextWindow: request.onCliContext
+        ? (contextWindow) => request.onCliContext?.({
+            runtime: 'codex', model: resolvedModel ?? 'default', contextWindow, evidence: 'runtime'
+          })
+        : undefined,
+      cleanupMessageId: request.delegatedRun ? request.processCleanupMessageId : request.messageId,
       permissionMode: codexSettings.permissionMode,
       sandboxMode,
       workingDirectory,
@@ -709,6 +977,19 @@ export class CodexBridge {
       reasoningSummary: codexSettings.reasoningSummary,
       modelSupportsReasoningSummaries: codexSettings.modelSupportsReasoningSummaries,
       signal: request.abortSignal,
+      onProcessesExited: () => runSetup.release(false),
+      onProcessCleanupFailure: async (error) => {
+        console.error("[CodexBridge] Run process cleanup could not be verified; unverified processes were not signalled", {
+          sessionId: request.sessionId,
+          runMessageId: request.messageId,
+          profileId,
+          error,
+        });
+        const messageId = request.delegatedRun ? request.processCleanupMessageId : request.messageId;
+        if (request.userId && request.sessionId && messageId) {
+          await recordCodexCleanupWarning({ userId: request.userId, sessionId: request.sessionId, messageId });
+        }
+      },
       sessionId: request.sessionId ?? null,
       messageId: request.messageId ?? null,
       promptCacheKey:
@@ -743,24 +1024,39 @@ export class CodexBridge {
       runner = await this.createRunner(prompt, runOptions);
     } catch (error) {
       await revokeRunCredentialOnce();
-      throw error;
+      hostCommandLease?.abortBeforeSpawn();
+      // BL-7 review: a Stop that ended this run while it waited at the start gate (no Codex
+      // process exists) ends the reply the way every other Stop does, through its stream,
+      // so send-routed records an interrupted turn. Thrown from here it was a failed send
+      // (500 "Failed to send message", no reply stored), measured live on the dev lane.
+      if (!isCodexHomeStartStopped(error)) throw error;
+      runner = {
+        transport: resolveCodexTransportLane(runOptions, process.env),
+        events: (async function* (): AsyncGenerator<ThreadEvent> {
+          throw error;
+        })(),
+      };
     }
 
     const adapter = new CodexEventAdapter({
       request,
       transport: "cli",
+      replyBaseline,
+      getObservedUsage: runner.getObservedUsage,
       onFinish: request.onFinish
-        ? async ({ text, steps, totalUsage, reasoning }) => {
+        ? async ({ text, steps, totalUsage, reasoning, observedUsage }) => {
             await request.onFinish!({
               text,
               steps,
               totalUsage,
               usage: totalUsage,
               reasoning,
+              ...(observedUsage ? { observedUsage } : {}),
             });
           }
         : undefined,
     });
+    request.registerObservedUsageSource?.(() => adapter.takeObservedUsage());
 
     const stream = adapter.stream(runner.events);
     let firstChunkLogged = false;
@@ -772,20 +1068,20 @@ export class CodexBridge {
         // SA-117 DL-117-06: run end is credential end, on every exit — a finished stream, a
         // Stop (the iterator's `return`), a timeout, or a thrown error. `wrapStream` funnels
         // all four through here exactly once.
+        // Stop finalizes the reply without waiting for bounded OS cleanup. The run's
+        // controller reports a late failure through its server-owned warning record;
+        // Subagent deletion separately awaits that controller in its run settlement.
+        const completion = (async () => {
+          try { await runner.cleanup?.(); }
+          finally { await runSetup.release(); }
+        })();
+        void completion.catch((error) => console.error("[CodexBridge] Process cleanup incomplete", error));
         await revokeRunCredentialOnce();
-        if (runner.cleanup) await runner.cleanup();
-        await imageCleanup();
-        if (codexSessionFallback) {
-          try {
-            await redis.execute(async (client) => {
-              const setKey = `codex_sessions:${codexSessionFallback.userId}:${codexSessionFallback.agentId}`;
-              await client.sRem(setKey, codexSessionFallback.sessionId);
-            });
-          } catch (error) {
-            console.warn("[CodexBridge] Failed to clear codex session mapping", error);
-          }
-        }
+        if (!request.abortSignal?.aborted) await completion;
       },
+      // BL-268: Codex refuses a model its version cannot run with a raw 400; the error then
+      // says which Codex Batshit ran and how to get the one Batshit installs.
+      explainError: (error) => explainCodexVersionRefusal(error, runner.cli),
       onFirstChunk: () => {
         if (firstChunkLogged) return;
         firstChunkLogged = true;
@@ -809,6 +1105,8 @@ export class CodexBridge {
       __steer: runner.steer ?? null,
       __steerLane: runner.steer ? ("codex" as const) : null,
       __transport: runner.transport,
+      // BL-287: the Codex process (none when the start was stopped before it spawned).
+      __cliProcess: runner.process ?? null,
       __detectToolSource: adapter.getToolMetadataResolver(),
       __rawEvents: adapter.getRawEvents?.(),
       __runtimeInfo: {
@@ -826,6 +1124,21 @@ export class CodexBridge {
   }
 
   async generateHiddenText(request: CodexHiddenTextRequest): Promise<CodexHiddenTextResult> {
+    throwIfHiddenTextAborted(request.abortSignal);
+    const pin = process.platform === 'win32' ? undefined : pinHostCommandOwner({
+      userId: request.userId, kind: request.agentId ? 'agent' : 'host', id: request.agentId || 'compact-worker',
+    }, request.agentId ? buildAgentProfileId(request.agentId) : null);
+    const lease = pin ? await prepareHostCommand(pin, { kind: 'codex', program: 'codex' }) : undefined;
+    try {
+      throwIfHiddenTextAborted(request.abortSignal);
+      if (lease) await validateHostCommandOwner(lease.pin.owner);
+      return await this.generateHiddenTextRun(request, lease);
+    }
+    catch (error) { lease?.abortBeforeSpawn(); throw error; }
+  }
+
+  private async generateHiddenTextRun(request: CodexHiddenTextRequest, hostCommandLease?: HostCommandLease): Promise<CodexHiddenTextResult> {
+    throwIfHiddenTextAborted(request.abortSignal);
     if (env.BATSHIT_CODEX_PROVIDER_ENABLED === "false") {
       throw new Error(PROVIDER_DISABLED_ERROR);
     }
@@ -845,6 +1158,9 @@ export class CodexBridge {
     if (!resolvedModel) {
       throw new Error("Codex compact worker is missing a Codex model selection.");
     }
+    // BL-158: the same stop for the hidden compact worker, which runs the agent's own model.
+    await assertCliModelStillOffered("codex", resolvedModel, { agentId: request.agentId ?? null });
+    throwIfHiddenTextAborted(request.abortSignal);
 
     const profileId = request.agentId ? buildAgentProfileId(request.agentId) : null;
     let managedConfigHome: string | null = null;
@@ -853,9 +1169,12 @@ export class CodexBridge {
         managedConfigHome = await ensureManagedCodexHome({
           userId: request.userId,
           profileId,
+          owner: { userId: request.userId, kind: 'agent', id: request.agentId! },
           historyPersistence: "none",
         });
       } catch (error) {
+        // BL-7 review: a refused home fails the worker loudly.
+        if (isManagedCodexHomeRefusal(error) || isManagedProfileRunRefusal(error)) throw error;
         console.warn("[CodexBridge] Failed to prepare compact worker Codex home", {
           profileId,
           error,
@@ -863,10 +1182,17 @@ export class CodexBridge {
       }
     }
 
+    throwIfHiddenTextAborted(request.abortSignal);
     const abortController = new AbortController();
     const timeoutMs = Math.max(30_000, Math.min(request.timeoutMs ?? 180_000, 600_000));
-    const timeout = setTimeout(() => abortController.abort(), timeoutMs);
+    const timeoutError = new Error(`Codex compact worker timed out after ${Math.round(timeoutMs / 1000)} seconds.`);
+    const timeout = setTimeout(() => abortController.abort(timeoutError), timeoutMs);
+    // Use the same composition as API summaries; the first abort retains its own reason.
+    const signal = request.abortSignal
+      ? AbortSignal.any([request.abortSignal, abortController.signal])
+      : abortController.signal;
     const runOptions: CodexRunOptions = {
+      hostCommandLease,
       model: resolvedModel,
       permissionMode: "chat",
       sandboxMode: "read-only",
@@ -892,7 +1218,7 @@ export class CodexBridge {
       unifiedExec: baseSettings.unifiedExec,
       permissionOverridden: true,
       reasoningEffort: baseSettings.reasoningEffort,
-      signal: abortController.signal,
+      signal,
       sessionId: null,
       imagePaths: [],
       nativeSkillDisablePaths: [],
@@ -902,7 +1228,8 @@ export class CodexBridge {
     };
 
     let runner: CodexRunner | null = null;
-    let streamedText = "";
+    // BL-759: pieces by segment, so a message Codex dropped and started again is taken back.
+    const streamedText = new SegmentedText();
     let finishText = "";
     let usage: Record<string, any> | undefined;
 
@@ -922,6 +1249,7 @@ export class CodexBridge {
       const adapter = new CodexEventAdapter({
         request: adapterRequest,
         transport: "cli",
+        getObservedUsage: runner.getObservedUsage,
         onFinish: ({ text, totalUsage }) => {
           finishText = text;
           usage = totalUsage;
@@ -930,15 +1258,16 @@ export class CodexBridge {
 
       for await (const chunk of adapter.stream(runner.events)) {
         if (chunk.type === "text-delta") {
-          streamedText += chunk.text;
+          streamedText.append(chunk.text, chunk.segmentId);
+        } else if (chunk.type === "text-retract") {
+          streamedText.retract(chunk.segmentId);
         } else if (chunk.type === "finish") {
           usage = chunk.totalUsage ?? chunk.usage ?? usage;
         }
       }
+      throwIfHiddenTextAborted(signal, timeoutError);
     } catch (error) {
-      if (abortController.signal.aborted) {
-        throw new Error(`Codex compact worker timed out after ${Math.round(timeoutMs / 1000)} seconds.`);
-      }
+      throwIfHiddenTextAborted(signal, timeoutError);
       throw error;
     } finally {
       clearTimeout(timeout);
@@ -947,7 +1276,9 @@ export class CodexBridge {
       }
     }
 
-    const text = (finishText || streamedText).trim();
+    // Cleanup is awaited once. A Stop during that wait still invalidates the finished answer.
+    throwIfHiddenTextAborted(signal, timeoutError);
+    const text = (finishText || streamedText.toString()).trim();
     if (!text) {
       throw new Error("Codex compact worker returned an empty summary.");
     }
@@ -1174,36 +1505,25 @@ export class CodexBridge {
     options: CodexRunOptions,
   ): Promise<CodexRunner> {
     // Managed runs must always have a CODEX_HOME so per-agent config stays deterministic.
+    // BL-7 review: the fallback is a managed home too (both lanes check it before they
+    // start), and a run that cannot have one fails here. Before, a folder that could not be
+    // made let the run start with no CODEX_HOME of its own, which is the user's `~/.codex`.
     if (options.configScope === "managed" && !options.managedConfigHome) {
-      const fallbackProfile = options.profileName || "batshit_agent_default";
-      const fallbackHome = path.join(
-        os.homedir(),
-        ".batshit",
-        "agents",
-        fallbackProfile,
-        ".codex",
+      const profileId = options.profileName || "batshit_agent_default";
+      options.managedConfigHome = await withManagedProfileRunWrite(
+        options.profileOwner ?? { userId: '', kind: 'host', id: '' },
+        profileId,
+        () => ensureManagedCodexFallbackHome(profileId),
       );
-      try {
-        await fs.mkdir(fallbackHome, { recursive: true });
-        options.managedConfigHome = fallbackHome;
-      } catch (error) {
-        console.warn(
-          "[CodexBridge] Failed to create fallback managed Codex home",
-          {
-            fallbackHome,
-            error,
-          },
-        );
-      }
     }
 
     if (resolveCodexTransportLane(options, process.env) === "app-server") {
       const appServerRunner = await this.runViaAppServer(prompt, options);
-      return this.wrapRunnerCleanup(appServerRunner);
+      return appServerRunner;
     }
 
     const cliRunner = await this.runViaCli(prompt, options);
-    return this.wrapRunnerCleanup(cliRunner);
+    return cliRunner;
   }
 
   private buildCodexChildEnv(options: CodexRunOptions): NodeJS.ProcessEnv {
@@ -1240,7 +1560,26 @@ export class CodexBridge {
     for (const [key, value] of Object.entries(options.managedStdioEnv ?? {})) {
       childEnv[key] = value;
     }
-    return childEnv;
+    return stripHostOperatorAuthorityFromChildEnv(childEnv);
+  }
+
+  private async prepareHostLease(options: CodexRunOptions, executable: string): Promise<HostCommandLease | undefined> {
+    if (process.platform === 'win32') return undefined; // Windows ownership is Corey's separate packet.
+    const lease = options.hostCommandLease;
+    if (!lease) throw new Error('Codex run has no prepared host ownership.');
+    try {
+      await validateHostCommandOwner(lease.pin.owner);
+      if (options.agentRunToken) {
+        const { validateRunCredential } = await import('./agentRunCredentials');
+        const credential = await validateRunCredential(options.agentRunToken);
+        if (!credential.valid) throw new Error('The Codex run credential is no longer valid.');
+      }
+      if (options.signal?.aborted) throw createCodexHomeStartStoppedError(options.signal);
+      return lease;
+    } catch (error) {
+      lease.abortBeforeSpawn(); // No spawn has occurred; this is a verified admission abort.
+      throw error;
+    }
   }
 
   private async runViaAppServer(
@@ -1252,6 +1591,7 @@ export class CodexBridge {
         "Codex app-server run refused: Batshit's compiled developer instructions are empty.",
       );
     }
+    await this.assertRunHomeIsManaged(options);
     const status = await detectCodexCliStatus({
       codexHome: options.managedConfigHome,
     });
@@ -1276,6 +1616,8 @@ export class CodexBridge {
     const codexExecutable =
       status.executable || resolveCodexCliExecutable(childEnv);
     const threadParams = buildCodexAppServerThreadParams(options);
+    // BL-268: a Codex older than the one Batshit installs may refuse newer models on the list.
+    warnIfCliOlderThanPinned("codex", { ...status, executable: codexExecutable });
 
     logger.debug(
       "[CodexBridge AppServer] Launching codex app-server",
@@ -1288,44 +1630,84 @@ export class CodexBridge {
       }),
     );
 
-    const run = startCodexAppServerRun({
-      executable: codexExecutable,
-      spawnArgs,
-      env: childEnv,
-      cwd: options.workingDirectory,
-      threadParams,
-      prompt,
-      imagePaths: options.imagePaths ?? [],
-      signal: options.signal,
-    });
+    // BL-7: one Codex start at a time in this agent's managed home (see codexHomeStartGate).
+    // A Stop while this start waits its turn ends the wait at once (BL-7 review).
+    const releaseStart = options.managedConfigHome
+      ? await acquireCodexHomeStart(options.managedConfigHome, { signal: options.signal })
+      : null;
+    // A Stop that landed as the turn was handed over: let the gate go, spawn nothing.
+    if (releaseStart && options.signal?.aborted) {
+      releaseStart();
+      throw createCodexHomeStartStoppedError(options.signal);
+    }
+    let run: ReturnType<typeof startCodexAppServerRun>;
+    try {
+      spawnArgs.push(...(await this.readHelperLaunchArgs(options)));
+      const hostCommandLease = await this.prepareHostLease(options, codexExecutable);
+      run = startCodexAppServerRun({
+        hostCommandLease,
+        executable: codexExecutable,
+        spawnArgs,
+        env: childEnv,
+        cwd: options.workingDirectory,
+        threadParams,
+        prompt,
+        imagePaths: options.imagePaths ?? [],
+        signal: options.signal,
+        onProcessCleanupFailure: options.onProcessCleanupFailure,
+        onProcessesExited: options.onProcessesExited,
+        onContextWindow: options.onContextWindow,
+        ...(releaseStart ? { onStartupSettled: releaseStart } : {}),
+      });
+    } catch (error) {
+      releaseStart?.();
+      throw error;
+    }
 
     return {
       transport: "app-server",
       events: run.events,
       cleanup: run.cleanup,
+      getObservedUsage: run.getObservedUsage,
       steer: run.steer,
+      process: run.process,
+      cli: { version: status.version ?? null, source: status.source ?? null },
     };
   }
 
-  private wrapRunnerCleanup(runner: CodexRunner): CodexRunner {
-    if (!runner.cleanup) return runner;
+  /**
+   * BL-7 review: a run's `managedConfigHome` becomes the child's CODEX_HOME and gets the
+   * bundled-skills switch (codex-cli 0.139.0 answers it by deleting
+   * `CODEX_HOME/skills/.system`), so both lanes check it before anything runs Codex in it,
+   * the login-status probe included. A home that is not Batshit-managed fails the run.
+   */
+  private async assertRunHomeIsManaged(options: CodexRunOptions) {
+    if (options.managedConfigHome) {
+      await assertBatshitManagedCodexHome(options.managedConfigHome);
+    }
+  }
 
-    return {
-      ...runner,
-      cleanup: async () => {
-        try {
-          await runner.cleanup?.();
-        } catch (error) {
-          console.warn("[CodexBridge] Runner cleanup error", error);
-        }
-      },
-    };
+  /**
+   * BL-152: `--config mcp_servers.<id>.args=[…]` pairs that launch the home's helper servers with
+   * this process's script folder and app URL. The shared `config.toml` names both by reference,
+   * because every Batshit on the Mac rewrites it. Read HERE, after the home is final (managed or
+   * the fallback after a failed sync) and after the start gate, right before the spawn, from the
+   * bytes Codex is about to read: an override for a server those bytes lack makes Codex refuse
+   * to start, so the window left is this read to Codex's own config load (its process start).
+   * A config Batshit cannot read fails the run instead of launching a literal reference. A run
+   * that ignores the config (`--ignore-user-config`, the compact worker) has no helpers.
+   */
+  private async readHelperLaunchArgs(options: CodexRunOptions): Promise<string[]> {
+    if (!options.managedConfigHome || options.ignoreUserConfig) return [];
+    const overrides = await readManagedCodexHelperLaunchOverrides(options.managedConfigHome);
+    return overrides.flatMap((override) => ["--config", override]);
   }
 
   private async runViaCli(
     prompt: string,
     options: CodexRunOptions,
   ): Promise<CodexRunner> {
+    await this.assertRunHomeIsManaged(options);
     const status = await detectCodexCliStatus({
       codexHome: options.managedConfigHome,
     });
@@ -1351,22 +1733,76 @@ export class CodexBridge {
     const childEnv = this.buildCodexChildEnv(options);
 
     const codexExecutable = status.executable || resolveCodexCliExecutable(childEnv);
+    // BL-268: a Codex older than the one Batshit installs may refuse newer models on the list.
+    warnIfCliOlderThanPinned("codex", { ...status, executable: codexExecutable });
     logger.debug("[CodexBridge CLI] Executing codex", JSON.stringify({
       executable: codexExecutable,
       version: status.version ?? null,
       args: redactCodexCliArgsForLog(args),
     }));
 
-    const child = spawn(codexExecutable, args, {
-      cwd: options.workingDirectory,
-      env: childEnv,
-      signal: options.signal,
-    });
-    if (child.stdin) {
-      child.stdin.write(`${prompt}\n`);
-      child.stdin.end();
+    // BL-7: one Codex start at a time in this agent's managed home (see codexHomeStartGate).
+    // `codex exec` prints nothing until it has set its home up and started the thread, so
+    // its first line is the end of its start; a spawn failure or an exit ends it too.
+    // A Stop while this start waits its turn ends the wait at once (BL-7 review).
+    const releaseStart = options.managedConfigHome
+      ? await acquireCodexHomeStart(options.managedConfigHome, { signal: options.signal })
+      : null;
+    // A Stop that landed as the turn was handed over: let the gate go, spawn nothing.
+    if (releaseStart && options.signal?.aborted) {
+      releaseStart();
+      throw createCodexHomeStartStoppedError(options.signal);
     }
-
+    try {
+      args.push(...(await this.readHelperLaunchArgs(options)));
+    } catch (error) {
+      releaseStart?.();
+      throw error;
+    }
+    let hostCommandLease: HostCommandLease | undefined;
+    try { hostCommandLease = await this.prepareHostLease(options, codexExecutable); }
+    catch (error) { releaseStart?.(); throw error; }
+    hostCommandLease?.markSpawnAttempt();
+    const child = (() => {
+      try {
+        return spawn(codexExecutable, args, {
+          cwd: options.workingDirectory,
+          env: childEnv,
+          // Capture descendants before any abort signal can kill the npm wrapper.
+          detached: process.platform !== "win32",
+        });
+      } catch (error) {
+        releaseStart?.();
+        hostCommandLease?.complete();
+        throw error;
+      }
+    })();
+    const processes = new CodexRunProcesses(child, {
+      onFailure: async error => {
+        try { hostCommandLease?.unresolved(); } finally { await options.onProcessCleanupFailure?.(error); }
+      },
+      onExit: options.onProcessesExited,
+      onCapture: rows => hostCommandLease?.observe(rows),
+      onVerifiedExit: () => hostCommandLease?.complete(),
+    });
+    hostCommandLease?.onCleanup(async () => {
+      await processes.prepareStop();
+      await processes.retryEnd();
+    });
+    const stopProcesses = () => {
+      // end() observes a failed preparation too, so it reports an incomplete cleanup.
+      void processes.prepareStop().catch(() => {});
+      void processes.end().catch((error) => {
+        console.error("[CodexBridge CLI] Process cleanup incomplete", error);
+      });
+    };
+    if (options.signal?.aborted) stopProcesses();
+    else options.signal?.addEventListener("abort", stopProcesses, { once: true });
+    if (releaseStart) {
+      child.stdout?.once("data", releaseStart);
+      child.once("close", releaseStart);
+      child.once("error", releaseStart);
+    }
     const rl = readline.createInterface({
       input: child.stdout,
       crlfDelay: Infinity,
@@ -1398,18 +1834,35 @@ export class CodexBridge {
       console.error("[CodexBridge CLI] Spawn error", error);
     });
 
+    const startup = (async () => {
+      await processes.ready;
+      if (!options.signal?.aborted && child.stdin) {
+        child.stdin.write(`${prompt}\n`);
+        child.stdin.end();
+      }
+    })();
+    void startup.catch(() => {});
+
     const cleanup = async () => {
       rl.close();
+      options.signal?.removeEventListener("abort", stopProcesses);
       child.removeAllListeners();
-      if (!child.killed) {
-        child.kill();
+      // BL-7: the listener above went with the rest; the start gate still frees on exit.
+      if (releaseStart) {
+        if (child.exitCode !== null || child.signalCode !== null) releaseStart();
+        else child.once("close", releaseStart);
       }
+      await processes.end();
     };
 
     return {
       transport: "exec",
-      events,
+      // Return the process before startup can fail, so a Subagent retains ownership
+      // even when the first process inspection or stdin write fails.
+      events: (async function* () { await startup; yield* events; })(),
       cleanup,
+      process: child,
+      cli: { version: status.version ?? null, source: status.source ?? null },
     };
   }
 
@@ -1469,7 +1922,11 @@ export class CodexBridge {
     getStderr: () => string,
     abortSignal?: AbortSignal,
   ): AsyncGenerator<ThreadEvent> {
+    const abortError = () => Object.assign(new Error("Codex run aborted by user"), { name: "AbortError" });
+    const closeOnAbort = () => rl.close();
+    abortSignal?.addEventListener("abort", closeOnAbort, { once: true });
     try {
+      if (abortSignal?.aborted) throw abortError();
       for await (const line of rl) {
         if (!line) continue;
         try {
@@ -1479,8 +1936,16 @@ export class CodexBridge {
           console.error("[CodexBridge CLI] Failed to parse event line", error);
         }
       }
+      if (abortSignal?.aborted) throw abortError();
       await new Promise<void>((resolve, reject) => {
-        child.once("close", (code, signal) => {
+        const finish = (error?: Error) => {
+          child.removeListener("close", onClose);
+          abortSignal?.removeEventListener("abort", onAbort);
+          if (error) reject(error);
+          else resolve();
+        };
+        const onAbort = () => finish(abortError());
+        const onClose = (code: number | null, signal: NodeJS.Signals | null) => {
           const aborted =
             abortSignal?.aborted === true ||
             signal === "SIGTERM" ||
@@ -1489,18 +1954,25 @@ export class CodexBridge {
             code === 137;
 
           if (code === 0 || aborted) {
-            resolve();
+            finish();
             return;
           }
 
-          reject(
+          finish(
             new Error(
               `Codex CLI exited with code ${code ?? -1}: ${getStderr()?.trim() || "No stderr output"}`,
             ),
           );
-        });
+        };
+        if (abortSignal?.aborted) onAbort();
+        else if (child.exitCode !== null || child.signalCode !== null) onClose(child.exitCode, child.signalCode);
+        else {
+          child.once("close", onClose);
+          abortSignal?.addEventListener("abort", onAbort, { once: true });
+        }
       });
     } finally {
+      abortSignal?.removeEventListener("abort", closeOnAbort);
       rl.close();
     }
   }
@@ -1513,9 +1985,11 @@ export class CodexBridge {
       adapter: CodexEventAdapter;
       cleanup?: (() => void | Promise<void>) | undefined;
       onFirstChunk?: () => void;
+      /** BL-268: turns a raw Codex error into one that says what to do, or returns it as is. */
+      explainError?: (error: unknown) => unknown;
     },
   ) {
-    const { onAbort, abortSignal, adapter, cleanup, onFirstChunk } = context;
+    const { onAbort, abortSignal, adapter, cleanup, onFirstChunk, explainError } = context;
 
     if (abortSignal && onAbort) {
       abortSignal.addEventListener(
@@ -1557,7 +2031,7 @@ export class CodexBridge {
               result = await iterator.next();
             } catch (error) {
               await runCleanup();
-              throw error;
+              throw explainError ? explainError(error) : error;
             }
             if (!firstChunkEmitted && !result.done && onFirstChunk) {
               firstChunkEmitted = true;
@@ -1576,14 +2050,23 @@ export class CodexBridge {
             return result;
           },
           return: async () => {
-            await runCleanup();
-            return iterator.return
-              ? iterator.return(undefined)
-              : Promise.resolve({ done: true, value: undefined });
+            try {
+              await runCleanup();
+              return iterator.return
+                ? await iterator.return(undefined)
+                : { done: true, value: undefined };
+            } finally {
+              await adapter.finalize();
+            }
           },
           throw: async (err?: any) => {
-            await runCleanup();
-            return iterator.throw ? iterator.throw(err) : Promise.reject(err);
+            try {
+              await runCleanup();
+              if (iterator.throw) return await iterator.throw(err);
+              throw err;
+            } finally {
+              await adapter.finalize();
+            }
           },
         };
       },
@@ -1643,6 +2126,16 @@ function normalizeConfigOverrideValue(raw: string | null | undefined): string {
 
   // fallback: quote the value so paths like /Users/foo/bar.toml parse correctly
   return JSON.stringify(trimmed);
+}
+
+/** BL-7: Codex's own switch for its bundled skills (`[skills.bundled] enabled`). */
+export const CODEX_BUNDLED_SKILLS_OFF_OVERRIDE = "skills.bundled.enabled=false";
+
+/** BL-161: Codex's own switch for its plugins, which gates the curated plugin repo sync. */
+export const CODEX_PLUGINS_OFF_OVERRIDE = "features.plugins=false";
+
+function enablesCodexFeature(options: CodexRunOptions, feature: string) {
+  return (options.enableFeatures ?? []).some((name) => name?.trim() === feature);
 }
 
 export function buildCodexNativeSkillDisableOverride(paths: string[]) {

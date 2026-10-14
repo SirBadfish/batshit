@@ -91,7 +91,7 @@ describe('POST /api/sessions', () => {
 })
 
 describe('PUT /api/sessions/[id]', () => {
-  it('re-attaches a stored origin when a read-spread-write payload omits it', async () => {
+  it('keeps a stored origin when a read-spread-write payload omits it', async () => {
     const response = (await (updateSession as any)(
       cookieEvent({ metadata: { agent_id: 'agent-faye', last_agent_id: 'agent-faye' } }, {
         id: 'sess-woken'
@@ -101,7 +101,10 @@ describe('PUT /api/sessions/[id]', () => {
     expect(response.status).toBe(200)
     const stored = await redis.getSession('sess-woken')
     expect(resolveSessionOrigin(stored)).toMatchObject({ kind: 'dm', label: 'Cooper' })
-    expect((stored?.metadata as any)?.agent_id).toBe('agent-faye')
+    // BL-690: the generic update writes only the chat's group from a metadata payload; the rest
+    // of the stored block stays as it is.
+    expect((stored?.metadata as any)?.agent_id).toBe('agent-cooper')
+    expect((stored?.metadata as any)?.last_agent_id).toBeUndefined()
   })
 
   it('refuses to change a stored origin', async () => {

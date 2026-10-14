@@ -1,5 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { realpathSync } from 'node:fs';
 import { cp, lstat, mkdir, readFile, readlink, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -29,7 +30,6 @@ const lipArtworkSource = join(appSource, 'static', 'goons', 'lip-artwork', 'v2')
 const nailSurfaceSource = join(appSource, 'static', 'goons', 'nail-surface', 'v1');
 const skinAppearanceSource = join(appSource, 'static', 'goons', 'skin-appearance', 'v1');
 const hairCatalogSource = join(repoRoot, ...HAIR_CATALOG_PACKAGE_CONTRACT.runtimeRoot.split('/'));
-const clothingCatalogSource = join(appSource, 'static', 'goon-assets', 'clothing', 'v1');
 const appDest = join(runtimePath, 'batshit-app');
 const serverDest = join(runtimePath, 'batshit-server', 'server');
 const liveKitSidecarDest = join(runtimePath, 'tools', 'livekit-agent-sidecar');
@@ -39,7 +39,6 @@ const lipArtworkDest = join(runtimePath, 'assets', 'goons', 'lip-artwork', 'v2')
 const nailSurfaceDest = join(runtimePath, 'assets', 'goons', 'nail-surface', 'v1');
 const skinAppearanceDest = join(runtimePath, 'assets', 'goons', 'skin-appearance', 'v1');
 const hairCatalogDest = join(runtimePath, ...HAIR_CATALOG_PACKAGE_CONTRACT.runtimeRoot.split('/'));
-const clothingCatalogDest = join(appDest, 'static', 'goon-assets', 'clothing', 'v1');
 const nodeRuntimeDest = join(runtimePath, 'vendor', 'node');
 const redisRuntimeDest = join(runtimePath, 'vendor', 'redis');
 const ffmpegRuntimeDest = join(runtimePath, 'vendor', 'ffmpeg');
@@ -113,6 +112,11 @@ async function copyRequired(source, dest, { dereference = true } = {}) {
       return true;
     }
   });
+}
+
+/** Keep the app's standalone runtime scripts beside its built Node server. */
+export async function copyAppRuntimeScripts(sourceAppRoot, destAppRoot) {
+  await copyRequired(join(sourceAppRoot, 'scripts'), join(destAppRoot, 'scripts'));
 }
 
 async function copyRequiredFile(source, dest) {
@@ -237,31 +241,6 @@ async function copyHairCatalogAssets() {
     contract: HAIR_CATALOG_PACKAGE_CONTRACT.contract,
     root: HAIR_CATALOG_PACKAGE_CONTRACT.runtimeRoot,
     definition: HAIR_CATALOG_PACKAGE_CONTRACT.definition,
-    files
-  };
-}
-
-async function copyClothingCatalogAssets() {
-  await copyRequired(clothingCatalogSource, clothingCatalogDest);
-  const files = await inventoryFiles(clothingCatalogSource);
-  const catalog = files.find((entry) => entry.path === 'catalog.json');
-  if (!catalog) {
-    throw new Error(
-      'Clothing Asset package input is incomplete: expected the clothing-catalog/v1 catalog.'
-    );
-  }
-  const parsed = JSON.parse(await readFile(join(clothingCatalogSource, 'catalog.json'), 'utf8'));
-  if (
-    parsed?.schemaVersion !== 'clothing-catalog/v1' ||
-    !Array.isArray(parsed?.assets) ||
-    Object.keys(parsed).sort().join(',') !== 'assets,schemaVersion'
-  ) {
-    throw new Error('Clothing Asset package input contains an invalid clothing-catalog/v1 catalog.');
-  }
-  return {
-    contract: 'clothing-catalog/v1',
-    root: 'batshit-app/static/goon-assets/clothing/v1',
-    definition: 'catalog.json',
     files
   };
 }
@@ -585,6 +564,10 @@ async function main() {
     join(macRoot, 'scripts', 'sbx-daemon-stop.mjs'),
     join(resourcesPath, 'scripts', 'sbx-daemon-stop.mjs')
   );
+  await cp(
+    join(macRoot, 'scripts', 'apple-container-system-stop.mjs'),
+    join(resourcesPath, 'scripts', 'apple-container-system-stop.mjs')
+  );
   await copyRequiredFile(thirdPartyNoticesSource, join(resourcesPath, 'THIRD_PARTY_NOTICES.md'));
 
   await rm(runtimePath, { recursive: true, force: true });
@@ -593,7 +576,14 @@ async function main() {
 
   await copyRequired(join(appSource, 'build'), join(appDest, 'build'));
   await copyRequired(join(appSource, 'node_modules'), join(appDest, 'node_modules'));
-  await copyRequired(join(appSource, 'scripts'), join(appDest, 'scripts'));
+  await copyAppRuntimeScripts(appSource, appDest);
+  // The native reader is compiled for the package architecture before codesign runs.
+  // A developer's generated binary is never the package authority.
+  runChecked(process.execPath, [
+    join(appDest, 'scripts', 'build-anchored-project-reader.mjs'),
+    '--output', join(appDest, 'scripts', 'anchored-project-reader'),
+    '--target-arch', process.arch
+  ]);
   await cp(join(appSource, 'package.json'), join(appDest, 'package.json'));
   if (await exists(join(appSource, 'package-lock.json'))) {
     await cp(join(appSource, 'package-lock.json'), join(appDest, 'package-lock.json'));
@@ -628,7 +618,6 @@ async function main() {
   const nailSurfaceAssets = await copyNailSurfaceAssets();
   const skinAppearanceAssets = await copySkinAppearanceAssets();
   const hairCatalogAssets = await copyHairCatalogAssets();
-  const clothingCatalogAssets = await copyClothingCatalogAssets();
   await copyLiveKitSidecarSourcePackage();
   const managedRuntimeEntries = await Promise.all([
     copyManagedNodeRuntime(),
@@ -647,13 +636,21 @@ async function main() {
         server: 'batshit-server/server/src plus runtime node_modules',
         n8n: 'not bundled',
         liveKitSidecar: 'tools/livekit-agent-sidecar source package for native runtime install',
+        anchoredProjectReader: {
+          contract: 'bl320/1',
+          source: 'batshit-app/scripts/anchored-project-reader.c',
+          sourceSha256: await sha256File(join(appDest, 'scripts', 'anchored-project-reader.c')),
+          executable: 'batshit-app/scripts/anchored-project-reader',
+          platform: 'darwin',
+          architecture: process.arch,
+          minimumMacosVersion: MAC_RUNTIME_MINIMUM_VERSION
+        },
         assets: {
           facialArtwork: facialArtworkAssets,
           lipArtwork: lipArtworkAssets,
           nailSurface: nailSurfaceAssets,
           skinAppearance: skinAppearanceAssets,
-          hairCatalog: hairCatalogAssets,
-          clothingCatalog: clothingCatalogAssets
+          hairCatalog: hairCatalogAssets
         },
         managedRuntimes
       },
@@ -680,7 +677,17 @@ async function main() {
 
 }
 
-const invokedPath = process.argv[1] ? resolve(process.argv[1]) : '';
-if (invokedPath === fileURLToPath(import.meta.url)) {
+// Run only when started directly, not when imported. Node gives this module its REAL path, so the
+// start path is compared as a real path too: a start through a link (or macOS's /var, a link to
+// /private/var) used to exit 0 having done nothing (BL-148).
+function startedDirectly() {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+if (startedDirectly()) {
   await main();
 }

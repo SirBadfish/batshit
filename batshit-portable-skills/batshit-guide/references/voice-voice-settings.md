@@ -28,7 +28,7 @@ Global Voice Settings separates the lanes so they're easy to audit:
 - **Transcribe** — composer dictation and uploaded-audio transcription.
 - **Voice Mode Input** — Mic STT or Text Input for the ChatBar Voice button.
 - **Turn Mode** — Auto Listen or Manual Turn when Direct Voice Mode uses recorded-turn STT.
-- **Jev Juice: Quick Actions** — off by default. With it on, a spoken turn that starts with the wake word and asks Batshit itself for something small ("Yo, stop", "Yo, hang up", "Yo, open the dock", "Yo, open the voice settings") is done at once, without the agent. **Require Wake Word** and **Wake Word** ("Yo" by default) sit under it. See [Jev Juice](../jev-juice/overview.md#quick-actions-from-speech-one-switch-in-voice-settings).
+- **Judge Juice: Quick Actions** — off by default. With it on, a spoken turn that starts with the wake word and asks Batshit itself for something small ("Yo, stop", "Yo, hang up", "Yo, open the dock", "Yo, open the voice settings") is done at once, without the agent. **Require Wake Word** and **Wake Word** ("Yo" by default) sit under it. See [Judge Juice](../judge-juice/overview.md#quick-actions-from-speech-one-switch-in-voice-settings).
 - **Voice Mode STT** — the listener used by the ChatBar Voice button.
 - **Reply Voice** — the TTS provider used for spoken assistant replies.
 - **Runtime** — Direct Voice Mode or LiveKit Bridge.
@@ -73,7 +73,7 @@ Fish realtime TTS needs a Fish API key and a selected Fish voice in Voice Settin
 
 Inworld realtime TTS needs an Inworld API key and a selected Inworld voice in Voice Settings. Batshit calls Inworld's realtime TTS endpoint directly and keeps ownership of chat context, tools, Zips, message storage, and playback events. When 3D Goon Lip Sync is set to Rhubarb WASM / the Premium viseme lane, Batshit keeps Inworld's OVR-style phoneme/viseme detail through playback and adapts it to the active Goon's authored mouth profile instead of flattening it early or waiting for Rhubarb WASM analysis.
 
-MiniMax, MiMo, Alibaba Cloud, and StepFun reuse their pay-as-you-go saved API key for direct model presets and speech. MiniMax Token Plan and MiMo Token Plan are separate key rows; eligible MiniMax/MiMo speech prefers subscription quota when the plan key is present. Inworld, Cartesia, Async, and Azure Speech are TTS-only rows in Settings -> API Keys; Inworld is TTS-only but supports Batshit-owned direct realtime TTS, while Cartesia, Async, and Azure Speech remain batch TTS lanes in Batshit until direct streaming adapters land. Azure's current Batshit lane is REST batch TTS and regional voice listing; provider viseme/lip-sync events need a future Azure Speech SDK bridge.
+MiniMax, MiMo, Alibaba Cloud, and StepFun reuse their pay-as-you-go saved API key for direct model presets and speech. MiniMax Token Plan and MiMo Token Plan are separate key rows; eligible MiniMax/MiMo speech prefers subscription quota when the plan key is present. The MiMo Token Plan is paused for now (see [API keys and models](../providers/api-keys-and-models.md#paused-plans)): while its key is saved, MiMo speech says so instead of switching to the pay-as-you-go key. Inworld, Cartesia, Async, and Azure Speech are TTS-only rows in Settings -> API Keys; Inworld is TTS-only but supports Batshit-owned direct realtime TTS, while Cartesia, Async, and Azure Speech remain batch TTS lanes in Batshit until direct streaming adapters land. Azure's current Batshit lane is REST batch TTS and regional voice listing; provider viseme/lip-sync events need a future Azure Speech SDK bridge.
 
 ## STT: transcribing audio
 
@@ -96,6 +96,10 @@ MiMo V2.5 ASR is available in the same recorded/uploaded lane. Batshit converts 
 - Mistral Voxtral STT is available for recorded/uploaded-audio transcription. Voxtral realtime transcription is tracked as a future live bridge, but it is not selectable as a working realtime Voice Mode lane yet.
 
 Voice Mode never silently borrows the normal Transcribe STT provider. If the selected realtime lane isn't ready, Batshit fails clearly or falls back only to the explicit browser lane.
+
+## Saved choices and lip sync
+
+Voice Settings waits for your saved settings to load. If they cannot be read, use **Retry** before editing. The Goon Dock's **Lip Sync Lab** follows the same rule and saves the global mode and analyzer while keeping the independent blend and other Voice choices. Voice Settings saves lip-sync fields only when you change them; after a save, untouched lip-sync controls follow the saved answer while your later edits stay in the form.
 
 ## Voice Mode button states
 
@@ -149,6 +153,8 @@ Recommended flow:
 7. Run one real synthesis or transcription test.
 8. Enable the engine only after the test passes.
 
+If Installed Engine Controls says a saved engine can't be read, its saved settings are in a form this Batshit doesn't know, usually because a newer Batshit saved them (after going back to an older version, or restoring a backup from a newer one). Batshit keeps that engine's settings exactly as they are and won't edit, use, or delete it. Your other engines and your chats work as usual. The voice pickers still list that engine, marked "Saved settings can't be read", and speaking with it shows an error. In Docker, while an engine can't be read, Batshit stops none of your engines when it shuts down, so an engine set to Stop with Batshit keeps running until you stop it. If a newer Batshit saved it, updating Batshit makes it readable again.
+
 For Mac app or source-checkout Batshit, local engines can usually use normal `localhost` URLs. For Docker Batshit, server-side TTS and uploaded-audio STT usually need `http://host.docker.internal:<port>`, while browser-direct realtime STT usually needs a browser-reachable WebSocket like `ws://localhost:<port>`. LiveKit bridge-mode STT starts from the LiveKit sidecar, so the same host service is reached through `host.docker.internal` for that path.
 
 ### Start with Batshit and Stop with Batshit
@@ -160,17 +166,19 @@ Each local engine Batshit can launch has two switches in Settings → Voice → 
 
 Batshit only ever stops the process it started. It records the process it launched and when, and before stopping anything it checks that the running process is still that one, so an engine you started yourself is never touched. A crash or a force quit cannot stop anything, so an engine can survive that way whatever the switch says.
 
+If one of those launch records cannot be read (it is damaged, or Batshit has no permission to read it), Batshit stops no engine on that quit and changes no record, because the damaged one might hold an engine's **Stop with Batshit** off. The log names the file. Once the engines have stopped (restarting the computer stops them), fix or remove that file; the next quit then works as usual. Starting an engine whose launch record cannot be read fails too, and says which file.
+
 On macOS 27 and later, an engine left running with **Stop with Batshit** off shows as a light gray dot under Batshit's Dock icon after you quit ("Running in Background"), because Batshit started it. That is expected; the dot goes away when the engine stops.
 
 Some engines share one running program. Several MLX engines, for example, can run on the same shared `mlx_audio.server` on one port. Batshit stops a shared program only if every engine that uses it has **Stop with Batshit** on; if any one of them has it off, the program keeps running for all of them.
 
 Engines you added with **Connect Existing** have no **Stop with Batshit** switch, because Batshit never started them. Their info menu says so.
 
-In Docker, Batshit starts and stops host engines through its helper program on your computer (the host operator that `./start-docker.sh` starts). When the Docker app shuts down, the helper stops the engines whose switch is on. The switch appears once `./start-docker.sh` has updated that helper; until then, and on Windows, where stopping is not available yet, it stays hidden and the info menu says why.
+In Docker, Batshit starts and stops host engines through its helper program on your computer (the host operator that `./start-docker.sh` starts). When the Docker app shuts down, the helper stops the engines whose switch is on. This works on macOS and Windows with the current helper. The switch appears once `./start-docker.sh` has updated that helper; until then, it stays hidden and the info menu says why. On Windows, a launcher that exits before the helper identifies its children can leave an engine running. When it detects that uncertainty, the helper reports an incomplete stop and keeps the launch record. If it could not identify any process when the engine started, it leaves a running engine alone and tells you why; once that engine is gone, it removes the record. If the helper cannot read the Windows process list while applying engine choices, it stops no engines and reports an error. A child that detached before it was observed may still need to be stopped manually.
 
 Batshit-managed local engines should keep their own files under `~/.batshit/installs/<engine-id>/`. For Hugging Face-backed engines, Batshit uses a per-engine cache such as `~/.batshit/installs/<engine-id>/hf-home` by default, so deleting that managed engine's local files can remove its downloaded weights too. Reusing an existing shared Hugging Face cache is allowed, but it should be an explicit choice because Batshit will not own or delete that shared folder automatically.
 
-When you delete an engine with **Delete local files too**, Batshit first stops the engine if it started it and it is still running, unless another engine still uses the same running program. If Batshit cannot stop it, it keeps the engine's files and tells you why, so the engine is never left running from a deleted folder.
+When you delete an engine with **Delete local files too**, Batshit first stops the engine if it started it and it is still running, unless another engine still uses the same running program. In that case, and when another Batshit on this computer (Batshit in Docker included) has also run that engine, Batshit leaves the engine's files in place and tells you which folders it left. It never stops what another Batshit started. If Batshit cannot stop it, or cannot read a launch record that might belong to it, it keeps the engine's files and tells you why, so the engine is never left running from a deleted folder. In Docker, an engine installed on the computer that runs Docker keeps its files on that computer, where Batshit in Docker cannot delete them: Batshit tells you which folder it left, so you can delete it yourself once the engine has stopped.
 
 ## Docker voice boundary
 
@@ -179,6 +187,8 @@ Cloud voice providers work from Docker with saved keys. Docker Batshit does not 
 - connect to an already-running engine
 - start a saved Batshit-managed host-native runtime through the authenticated host operator when that record already exists
 - use a specifically approved Docker sidecar/profile when one exists
+
+Start Docker with `./start-docker.sh` after updating to prepare the host voice helper. Host engine starts use the engine's saved launch recipe. A direct Docker Compose start still works, but starting a host voice engine reports a setup error if the launcher's private voice key is missing.
 
 Voice engines are a connect-existing runtime family in the Docker add-on catalog. Start/stop refuses generic voice-engine containers until a specific engine sidecar has pinned versions, volumes, health checks, secrets, restart behavior, backup boundaries, and real TTS/STT proof.
 
@@ -198,7 +208,7 @@ Native Mac/Linux users can install the local LiveKit runtime from:
 Settings → Voice → Voice Engines → Voice Runtimes → LiveKit → Install
 ```
 
-The install button downloads the LiveKit Server version tested with your Batshit build, installs the matching Batshit sidecar under the managed runtime folder, saves local Voice Runtime credentials when needed, and starts both services. If a later Batshit build carries a newer tested runtime, this row shows **Update available** and changes the action to **Update & Restart**. **Start with Batshit** also refreshes stale Batshit-managed sidecar code before auto-start; it does not chase untested upstream releases on its own. The LiveKit row has its own **Stop with Batshit** switch, on by default, which stops the managed LiveKit server and sidecar when Batshit shuts down. Turn it off to leave both running. In Docker the LiveKit add-on owns its own lifecycle, so that switch does not apply.
+The install button downloads the LiveKit Server version tested with your Batshit build, installs the matching Batshit sidecar under the managed runtime folder, saves local Voice Runtime credentials when needed, and starts both services. If a later Batshit build carries a newer tested runtime, this row shows **Update available** and changes the action to **Update & Restart**. Batshit restarts only the LiveKit server and sidecar it started itself: if another Batshit on this computer started the running one, or also uses it, or you started it yourself, the row shows why it did not restart, and it keeps running. **Start with Batshit** also refreshes stale Batshit-managed sidecar code before auto-start; it does not chase untested upstream releases on its own. The LiveKit row has its own **Stop with Batshit** switch, on by default, which stops the managed LiveKit server and sidecar when Batshit shuts down. Turn it off to leave both running. A change applies to a LiveKit that is already running; if it cannot reach it, the row says so until LiveKit restarts. If another Batshit on this computer already runs the LiveKit server, this Batshit uses that server and keeps its own Stop with Batshit choice for it. The LiveKit agent serves the Batshit that started it. If another Batshit’s agent is running here, or Batshit cannot tell whether it is its own, the row tells you what to stop or check first. If this Batshit's own agent was started by an older Batshit version, the row asks you to press Start once, which restarts it. Before starting a voice session, Batshit checks that its own LiveKit agent is running here and refuses if it cannot confirm that. If that Batshit restarts LiveKit, the row tells you to start LiveKit here again so the choice is kept. If an older Batshit started that LiveKit, the row asks you to update that Batshit and restart LiveKit there first. In Docker the LiveKit add-on owns its own lifecycle, so that switch does not apply.
 
 Docker users can start the local LiveKit add-on with:
 

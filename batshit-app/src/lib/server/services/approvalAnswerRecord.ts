@@ -32,6 +32,10 @@ export async function answerApprovalsOnce(options: {
   /** The answers as the resumed run receives them (a late Approve is already a denial). */
   responses: ReadonlyArray<{ approvalId?: unknown; approved?: unknown }>
   now?: () => Date
+  /** Server-owned provenance check, run on this exact stored record before any write. */
+  beforeRecord?: (record: { metadata?: unknown }) => Promise<void> | void
+  /** Own the asynchronous persistence against account invalidation. */
+  mutate?: (write: () => Promise<void>) => Promise<void>
 }): Promise<ApprovalAnswerOutcome> {
   const messageId = typeof options.messageId === 'string' ? options.messageId.trim() : ''
   if (!messageId || options.responses.length === 0) return { ok: true, recorded: false }
@@ -46,6 +50,7 @@ export async function answerApprovalsOnce(options: {
   }
   // No card message: the resume has nothing to continue either, and fails on its own terms.
   if (!stored || typeof stored !== 'object') return { ok: true, recorded: false }
+  await options.beforeRecord?.(stored)
 
   const metadata =
     stored.metadata && typeof stored.metadata === 'object'
@@ -60,7 +65,7 @@ export async function answerApprovalsOnce(options: {
   }
 
   const decidedAt = (options.now?.() ?? new Date()).toISOString()
-  try {
+  const write = async () => {
     // `updateMessage` REPLACES metadata, so the whole stored metadata goes back with the record
     // added (the same read-then-merge `settleControlApprovalCard` does).
     await redis.updateMessage(
@@ -69,6 +74,10 @@ export async function answerApprovalsOnce(options: {
       { metadata: recordApprovalAnswers(metadata, options.responses, decidedAt) },
       options.userId
     )
+  }
+  try {
+    if (options.mutate) await options.mutate(write)
+    else await write()
   } catch (error) {
     return { ok: false, reason: 'record_failed', error }
   }

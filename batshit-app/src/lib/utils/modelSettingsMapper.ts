@@ -6,12 +6,20 @@ import {
 import type { ModelCapabilities, ModelConnectionInfo, ModelPurpose } from '$lib/types/savedModels'
 import {
   ALL_DEFINED_PARAMETER_NAMES,
+  type ParameterDefinition,
   type ParameterValue
 } from '$lib/data/parameter-schemas'
+import { describeUnlistedSelectValue, resolveSavedSelectValue } from '$lib/utils/parameterValueAdapter'
 import {
   DEFAULT_MODEL_MAX_OUTPUT_TOKENS,
   normalizeRuntimeMaxOutputTokens
 } from '$lib/utils/modelOutputTokens'
+
+import {
+  AnthropicThinkingRefusedError,
+  refuseAnthropicThinkingTheModelRejects,
+  sendsAnthropicOptions
+} from '$lib/utils/anthropicThinkingGuard'
 
 export type StandardKey = keyof RuntimeModelStandardSettings
 
@@ -51,10 +59,41 @@ export function resolveProviderOptionsSegment(provider: string): string {
  * "bashAccessMode":"plan"}` in the chat-completions body.
  */
 const INTERNAL_SETTING_PREFIXES = ['codex_', 'claude_', 'batshit_'] as const
-const INTERNAL_SETTING_NAMES: ReadonlySet<string> = new Set(['nativeTools'])
+/**
+ * BL-515: also the agent-owned keys a preset never holds, which is why they survive when an
+ * agent's runtime settings are rebuilt from the preset it names (`mergePresetRuntimeSettings`):
+ * the native-tool block and its legacy alias (`batshitNativeTools`), and the legacy top-level
+ * native-tool keys `resolveNativeToolSettings` and `resolveBrokerToolToggles` still read (every
+ * `native<Name>` key, plus the unprefixed names below). Dropping one would quietly turn a tool
+ * setting such as `bashEnabled: false` back to its default.
+ */
+const INTERNAL_SETTING_NAMES: ReadonlySet<string> = new Set([
+  'nativeTools',
+  'batshitNativeTools',
+  'bashEnabled',
+  'bashPolicyMode',
+  'bashExecutionBackend',
+  'bashAgentApprovalCardsEnabled',
+  'bashApprovalCardsEnabled',
+  'webSearchEnabled',
+  'agentBrowserEnabled',
+  'agentBrowserLiveViewEnabled',
+  'fetchZipEnabled',
+  'dynamicMcpEnabled',
+  'cliToolsEnabled',
+  'artifactRuntimeEnabled',
+  'batshitToolsEnabled'
+])
+const LEGACY_NATIVE_SETTING_PATTERN = /^native[A-Z]/
 
-function isInternalRuntimeSetting(key: string): boolean {
+/**
+ * Batshit's own runtime configuration in an agent's `provider_specific_settings`: never a model
+ * parameter, never sent to a provider, and kept from the agent when its settings come from a
+ * preset (BL-515).
+ */
+export function isAgentRuntimeSettingKey(key: string): boolean {
   if (INTERNAL_SETTING_NAMES.has(key)) return true
+  if (LEGACY_NATIVE_SETTING_PATTERN.test(key)) return true
   return INTERNAL_SETTING_PREFIXES.some((prefix) => key.startsWith(prefix))
 }
 
@@ -120,7 +159,13 @@ export function buildRuntimeModelSettings({
     const value = settings?.[definition.name]
     if (value === undefined || value === null) continue
 
-    if (applySpecialProviderMapping(definition.name, value, providerOptions, parameterProvider)) {
+    if (
+      applySpecialProviderMapping(definition.name, value, providerOptions, parameterProvider, {
+        definition,
+        modelId,
+        connection
+      })
+    ) {
       continue
     }
 
@@ -139,7 +184,7 @@ export function buildRuntimeModelSettings({
       if (knownKeys.has(key)) continue
       if (value === undefined || value === null) continue
       // SA-102 P2: Batshit's own runtime configuration is not a model parameter.
-      if (isInternalRuntimeSetting(key)) continue
+      if (isAgentRuntimeSettingKey(key)) continue
       // SA-102 P2: a parameter Batshit defines but did NOT offer for this model
       // was excluded on purpose. Only genuine user-authored Custom Parameters
       // reach the passthrough below.
@@ -197,6 +242,10 @@ export function buildRuntimeModelSettings({
     connection,
     contextWindow
   })
+
+  // A thinking setting the AI SDK would rewrite for this model without a word is refused here,
+  // with a sentence that says what to change (`anthropicThinkingGuard.ts`).
+  refuseAnthropicThinkingTheModelRejects({ provider, modelId, vercelId, connection, providerOptions })
 
   return {
     standard,
@@ -388,7 +437,12 @@ function applySpecialProviderMapping(
   name: string,
   value: ParameterValue,
   providerOptions: Record<string, Record<string, any>>,
-  provider?: string | null
+  provider?: string | null,
+  model?: {
+    definition: ParameterDefinition
+    modelId?: string | null
+    connection?: ModelConnectionInfo | null
+  }
 ) {
   const normalizedProvider = provider?.toLowerCase() ?? ''
   switch (name) {
@@ -418,7 +472,10 @@ function applySpecialProviderMapping(
       if (!providerOptions.anthropic.thinking) {
         providerOptions.anthropic.thinking = {}
       }
-      providerOptions.anthropic.thinking.type = value
+      providerOptions.anthropic.thinking.type =
+        typeof value === 'string' && model
+          ? resolveThinkingModeForModel(value, model.definition, model.modelId, model.connection)
+          : value
       return true
     }
     case 'thinkingBudget': {
@@ -438,4 +495,29 @@ function applySpecialProviderMapping(
     default:
       return false
   }
+}
+
+/**
+ * BL-866: the `thinking.type` a saved Thinking mode becomes for this model. The definition the
+ * model's filter picked decides: a saved choice it replaces (Sonnet 5.5's Disabled becomes
+ * `between_tools`) is sent as the replacement, and a choice it does not offer is refused, on a
+ * lane that sends `providerOptions.anthropic` (the Thinking guard's own lane check: OpenRouter and
+ * a direct connection to another service never send it, so nothing there can fail and nothing is
+ * refused). A definition with neither rule sends the saved value, as it always has.
+ */
+function resolveThinkingModeForModel(
+  value: string,
+  definition: ParameterDefinition,
+  modelId?: string | null,
+  connection?: ModelConnectionInfo | null
+): string {
+  const unlisted = sendsAnthropicOptions(connection)
+    ? describeUnlistedSelectValue(definition, value, modelId)
+    : null
+  if (unlisted) {
+    throw new AnthropicThinkingRefusedError(
+      `${unlisted} Open Settings → Models, edit this model preset, and change it. Batshit does not send a value the model refuses, and does not change it for you.`
+    )
+  }
+  return resolveSavedSelectValue(definition, value)
 }

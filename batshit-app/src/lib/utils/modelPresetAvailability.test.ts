@@ -1,5 +1,6 @@
+import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
-import { getModelPresetAvailability } from './modelPresetAvailability'
+import { getModelPresetAvailability, presetAvailabilityKeepsSelection } from './modelPresetAvailability'
 import type { CatalogConnectionOption } from '$lib/types/modelCatalog'
 import type { SavedModel } from '$lib/types/savedModels'
 
@@ -133,5 +134,77 @@ describe('getModelPresetAvailability', () => {
       disabledBecause: 'locked',
       reason: 'Add an OpenAI API key.'
     })
+  })
+})
+
+describe('BL-517: a preset whose connection no longer lists its model', () => {
+  const unlisted = preset({
+    modelName: 'Old GPT',
+    modelId: 'gpt-4.1-old',
+    connection: { type: 'vercel-gateway', service: 'vercel' },
+    isVercelImport: true,
+    unavailableReason: 'Vercel AI Gateway no longer lists this model'
+  })
+
+  it('is unavailable with the reason the list load gave, in the pickers existing unavailable state', () => {
+    const availability = getModelPresetAvailability({ model: unlisted, agentType: 'api', connectionOptions: null })
+    expect(availability).toMatchObject({
+      disabled: true,
+      disabledBecause: 'unlisted',
+      reason: 'Vercel AI Gateway no longer lists this model'
+    })
+  })
+
+  it('still reads as the wrong type first on a CLI agent', () => {
+    const availability = getModelPresetAvailability({ model: unlisted, agentType: 'cli', connectionOptions: null })
+    expect(availability.disabledBecause).toBe('incompatible')
+  })
+
+  it('keeps an agent\'s saved selection (never cleared by opening Settings), like a locked connection', () => {
+    const unlistedAvailability = getModelPresetAvailability({ model: unlisted, agentType: 'api', connectionOptions: null })
+    expect(presetAvailabilityKeepsSelection(unlistedAvailability)).toBe(true)
+    expect(
+      presetAvailabilityKeepsSelection({ disabled: true, disabledBecause: 'locked', reason: 'Missing API key', connectionOption: null })
+    ).toBe(true)
+    expect(
+      presetAvailabilityKeepsSelection(getModelPresetAvailability({ model: unlisted, agentType: 'cli', connectionOptions: null }))
+    ).toBe(false)
+    expect(
+      presetAvailabilityKeepsSelection(
+        getModelPresetAvailability({ model: preset({ purpose: 'visual', modelId: 'gpt-image-2' }), agentType: 'api', connectionOptions: null })
+      )
+    ).toBe(false)
+    expect(
+      presetAvailabilityKeepsSelection(getModelPresetAvailability({ model: preset({ modelId: 'gpt-5.5' }), agentType: 'api', connectionOptions: null }))
+    ).toBe(true)
+  })
+})
+
+describe('BL-517: Agent Settings keeps an unlisted preset selected when it opens', () => {
+  const panel = readFileSync('src/lib/components/settings/panels/AgentSettingsPanel.svelte', 'utf8')
+
+  it('the primary and Subagent selection updates show a selection only when the shared rule says so', () => {
+    // Pinned from the line start, so a `false &&` or a return to the old `!== "locked"` test breaks it.
+    // BL-514: the primary's selection is display only; the form keeps the saved model (and
+    // opening saves nothing), so both of its selection updates ask the shared rule.
+    expect(panel).toContain(
+      '\n    return presetAvailabilityKeepsSelection(\n      getModelPresetAvailability({\n        model,\n        agentType: basicForm.agentType,'
+    )
+    expect(panel).toContain('\n    selectedModelId = match && agentPresetShowsAsSelected(match) ? match.id : null;\n')
+    expect(panel).toContain('\n    const nextId = match && agentPresetShowsAsSelected(match) ? match.id : null;\n')
+    // BL-834: the Subagent's selection is display only too. Its sync used to clear the Subagent's
+    // model when the preset could not be selected, and the autosave then saved the empty model.
+    expect(panel).toContain(
+      '\n    return presetAvailabilityKeepsSelection(\n      getModelPresetAvailability({\n        model,\n        agentType: getSubagentToolHostScope(subagentForm.subagentType),'
+    )
+    expect(panel).toContain('\n    selectedSubagentModelId = match && subagentPresetShowsAsSelected(match) ? match.id : null;\n')
+    expect(panel).toContain('\n    const nextId = match && subagentPresetShowsAsSelected(match) ? match.id : null;\n')
+    const subagentSync = panel.slice(
+      panel.indexOf('  function syncSelectedModelFromSubagent() {'),
+      panel.indexOf('  function subagentPresetShowsAsSelected(')
+    )
+    expect(subagentSync).toContain('selectedSubagentModelId = match && subagentPresetShowsAsSelected(match)')
+    expect(subagentSync).not.toContain('clearSubagentModelSelection')
+    expect(panel).not.toContain('availability.disabledBecause !== "locked"')
   })
 })

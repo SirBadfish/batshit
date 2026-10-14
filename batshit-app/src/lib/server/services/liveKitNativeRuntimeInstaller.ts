@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process'
+import { stripHostOperatorAuthorityFromChildEnv } from './cliChildEnv'
 import { createHash, randomBytes } from 'node:crypto'
 import {
   chmod,
@@ -17,10 +18,10 @@ import { promisify } from 'node:util'
 
 import { apiKeyService } from '$lib/services/apiKey.server'
 import {
-  resolveLocalVoiceRuntimeLaunchRecordPath,
   resolveManagedInstallsRoot,
   startLocalVoiceRuntime
 } from '$lib/server/services/voiceLocalEngineSetup'
+import { stopSolelyOwnedLaunchForRestart } from '$lib/server/services/voiceRuntimeLaunchRecords'
 
 const execFileAsync = promisify(execFile)
 
@@ -48,6 +49,9 @@ const LIVEKIT_REDIS_ENV_TO_UNSET = [
   'REDIS_TLS',
   'REDIS_DB'
 ]
+// The server's own environment drops an inherited LIVEKIT_CONFIG too: LiveKit prefers a key_file
+// from it over the keys Batshit passes (BL-1332).
+const LIVEKIT_SERVER_ENV_TO_UNSET = [...LIVEKIT_REDIS_ENV_TO_UNSET, 'LIVEKIT_CONFIG']
 
 export type LiveKitNativeInstallManifest = {
   kind: 'livekit-server' | 'livekit-sidecar'
@@ -592,11 +596,11 @@ export async function installLiveKitSidecarPackage(): Promise<void> {
     await execFileAsync(process.execPath, [npmCliPath, 'ci'], {
       cwd: stagingRoot,
       timeout: NPM_INSTALL_TIMEOUT_MS,
-      env: {
+      env: stripHostOperatorAuthorityFromChildEnv({
         ...process.env,
         NODE_OPTIONS: '--no-warnings',
         NODE_NO_WARNINGS: '1'
-      }
+      })
     })
 
     const installedAt = new Date().toISOString()
@@ -819,32 +823,38 @@ export async function startNativeLiveKitServerRuntime(options: {
     }
 
     if (options.forceRestart) {
-      const launchRecord = await readJsonFile<{
-        engineId?: string
-        pid?: number
-        command?: string
-      }>(resolveLocalVoiceRuntimeLaunchRecordPath(LIVEKIT_NATIVE_SERVER_ENGINE_ID))
-      const recordedPid = launchRecord?.pid
-      const recordedCommand = cleanString(launchRecord?.command)
-      const commandWithinManagedRoot = recordedCommand
-        ? !path.relative(resolveNativeLiveKitServerInstallRoot(), path.resolve(recordedCommand)).startsWith('..')
-        : false
-      if (
-        launchRecord?.engineId !== LIVEKIT_NATIVE_SERVER_ENGINE_ID ||
-        !recordedPid ||
-        !owner.pids.includes(recordedPid) ||
-        !commandWithinManagedRoot
-      ) {
+      const notStarted = new Error(
+        `LiveKit is already listening on port ${port}, but Batshit did not start that process. Stop the external LiveKit server before applying the managed runtime update.`
+      )
+      // Only a LiveKit server this Batshit alone started (BL-1296): the install folder is shared by
+      // every Batshit on this computer, so the listening process can be another Batshit's, which
+      // a restart here would take down under it.
+      const restart = await stopSolelyOwnedLaunchForRestart(LIVEKIT_NATIVE_SERVER_ENGINE_ID, owner.pids, async (record) => {
+        const recordedCommand = cleanString(record.command)
+        const commandWithinManagedRoot = recordedCommand
+          ? !path.relative(resolveNativeLiveKitServerInstallRoot(), path.resolve(recordedCommand)).startsWith('..')
+          : false
+        if (!commandWithinManagedRoot) throw notStarted
+        try {
+          process.kill(record.pid as number, 'SIGTERM')
+        } catch (error) {
+          const code = typeof error === 'object' && error && 'code' in error ? error.code : null
+          if (code !== 'ESRCH') throw error
+        }
+      })
+      if (!restart.stopped) {
+        if (restart.refusal === 'not-started') throw notStarted
+        if (restart.refusal === 'shared') {
+          throw new Error(
+            `Batshit did not restart the LiveKit server on port ${port}: another Batshit on this computer, or another engine, also uses it (process ${restart.pid}; ${restart.recordPaths.join(', ')}). Restart it from the Batshit that started it, or once nothing else uses it.`
+          )
+        }
+        if (restart.refusal === 'unverified') {
+          throw new Error(`Batshit did not restart the LiveKit server on port ${port}: ${restart.reason}. Make sure nothing else uses that port, then try again.`)
+        }
         throw new Error(
-          `LiveKit is already listening on port ${port}, but Batshit did not start that process. Stop the external LiveKit server before applying the managed runtime update.`
+          `Batshit did not restart the LiveKit server on port ${port}: ${restart.reasons.join('; ')}, and Batshit cannot tell whether that record names this server. Repair or remove it, then try again.`
         )
-      }
-
-      try {
-        process.kill(recordedPid, 'SIGTERM')
-      } catch (error) {
-        const code = typeof error === 'object' && error && 'code' in error ? error.code : null
-        if (code !== 'ESRCH') throw error
       }
 
       const stopDeadline = Date.now() + 5_000
@@ -885,6 +895,8 @@ export async function startNativeLiveKitServerRuntime(options: {
     installRoot: status.serverInstallRoot,
     installOwnership: 'batshit-managed',
     stopOnShutdown: options.stopOnShutdown,
+    // Recorded so another Batshit that finds it running can record its use of it (BL-1298).
+    endpoint: url,
     launch: {
       command: status.serverBinaryPath,
       args: [
@@ -896,11 +908,13 @@ export async function startNativeLiveKitServerRuntime(options: {
         '--rtc.tcp_port',
         String(rtcTcpPort),
         '--udp-port',
-        String(rtcUdpPort),
-        '--keys',
-        `${options.apiKey}: ${options.apiSecret}`
+        String(rtcUdpPort)
       ],
-      unsetEnv: LIVEKIT_REDIS_ENV_TO_UNSET
+      // The keys go in the server's environment, never on its command line, which every local user
+      // can read, nor in its launch record, which stores the args (BL-1332). LiveKit reads
+      // LIVEKIT_KEYS exactly as `--keys`, and `--dev` adds its demo key only when no key is set.
+      env: { LIVEKIT_KEYS: `${options.apiKey}: ${options.apiSecret}` },
+      unsetEnv: LIVEKIT_SERVER_ENV_TO_UNSET
     }
   })
 

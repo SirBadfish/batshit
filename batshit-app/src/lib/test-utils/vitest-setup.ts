@@ -7,6 +7,14 @@ import {
   neutralizeAllZipReferenceSyntax,
   neutralizeUntrustedClipReferenceSyntax
 } from '$lib/utils/zipReferenceSafety'
+// BL-4: the fake's message-list readers skip a waiting send's message exactly as the real ones
+// do (the same leaf, the same positional filter), so no suite on this lane can pass on a fake
+// that shows it.
+import { filterQueuedSendMessageIds } from '$lib/server/services/queuedSendHiddenIds'
+import { unclaimedZipsMadeByMessage, zipClaimsOfMessage, zipsOwnedOnlyByMessage } from '$lib/utils/messageDeletionZips'
+import { withZipStateLock } from '$lib/server/services/zipStateLock'
+import { MessageStillRunningError } from '$lib/server/messageStillRunningError'
+import { assertBrowserMessageMutation, preserveServerSteerMetadata, type BrowserMessageMutationPolicy } from '$lib/server/browserMessageMutation'
 
 // Svelte Testing Library owns component cleanup. This earlier-registered global
 // hook runs after its per-file hook and lets Bits UI finish a delayed body unlock
@@ -151,6 +159,17 @@ vi.mock('$lib/server/redis', async () => {
 
   const readJsonPath = (value: any, path: string) => {
     if (path === '$') return [clone(value)]
+    // RedisJSON indexed projections preserve missing-field holes by path, not by
+    // compacting several wildcard result arrays and pairing unrelated records.
+    const indexed = /^\$\[(\d+)\]\.(.+)$/.exec(path)
+    if (indexed) {
+      let current = value?.[Number(indexed[1])]
+      for (const part of indexed[2].split('.')) {
+        if (current == null || typeof current !== 'object' || !(part in current)) return []
+        current = current[part]
+      }
+      return [clone(current)]
+    }
     if (!path.startsWith('$.')) return null
 
     const parts = path
@@ -194,11 +213,52 @@ vi.mock('$lib/server/redis', async () => {
     return { parent: current, key: parts[parts.length - 1] }
   }
 
+  // BL-1371: the facade's raw compare-and-set (`getRaw`, `setIfUnchanged`, `delIfUnchanged`).
+  // Their own bounded paths (`$` and `$.<field>[<n>]` only); `readJsonPath` and
+  // `resolveJsonWriteTarget` above stay as they are for every other operation.
+  const { createJsonCompareAndWriteTwins } = await import('$lib/test-utils/redisJsonCompareAndWriteTwin')
+  const jsonCompareAndWrite = createJsonCompareAndWriteTwins({
+    read: (key) => {
+      const entry = redisStore.get(key)
+      if (!entry) return undefined
+      if (entry.type !== 'json') throw new Error('WRONGTYPE Operation against a key holding the wrong kind of value')
+      return entry.value
+    },
+    write: (key, document) => {
+      redisStore.set(key, { type: 'json', value: clone(document) })
+    },
+    remove: (key) => {
+      redisStore.delete(key)
+      expireStore.delete(key)
+    }
+  })
+
+  // BL-1397: the n8n Instance token's two guarded writes over the same documents (bounded paths).
+  const { createN8nCredentialScriptTwins } = await import('$lib/test-utils/n8nCredentialScriptsTwin')
+  const n8nCredentialScripts = createN8nCredentialScriptTwins({
+    read: (key) => {
+      const entry = redisStore.get(key)
+      if (!entry) return undefined
+      if (entry.type !== 'json') throw new Error('WRONGTYPE Operation against a key holding the wrong kind of value')
+      return entry.value
+    },
+    write: (key, document) => {
+      redisStore.set(key, { type: 'json', value: clone(document) })
+    },
+    remove: (key) => {
+      redisStore.delete(key)
+      expireStore.delete(key)
+    }
+  })
+
   const redisJsonMock = {
-    get: vi.fn(async (key: string, options?: { path?: string }) => {
+    get: vi.fn(async (key: string, options?: { path?: string | string[] }) => {
       const entry = redisStore.get(key)
       if (!entry) return null
       if (entry.type === 'json') {
+        if (Array.isArray(options?.path)) {
+          return Object.fromEntries(options.path.map(path => [path, readJsonPath(entry.value, path)]))
+        }
         if (options?.path) return readJsonPath(entry.value, options.path)
         return clone(entry.value)
       }
@@ -221,6 +281,38 @@ vi.mock('$lib/server/redis', async () => {
       target.parent[target.key] = clone(value)
       return 'OK'
     }),
+    // BL-753: `JSON.SET … XX`, the real one's twin: nothing is written when the key is gone.
+    setIfExists: vi.fn(async (key: string, path: string, value: any) => {
+      const entry = redisStore.get(key)
+      if (!entry || entry.type !== 'json') return false
+      if (!path || path === '$') {
+        redisStore.set(key, { type: 'json', value: clone(value) })
+        return true
+      }
+      const target = resolveJsonWriteTarget(entry.value, path)
+      if (!target || !(target.key in target.parent)) return false
+      target.parent[target.key] = clone(value)
+      return true
+    }),
+    // BL-516: `JSON.SET … NX`, the real one's twin: nothing is written when the key (or path) exists.
+    setIfAbsent: vi.fn(async (key: string, path: string, value: any) => {
+      const entry = redisStore.get(key)
+      if (!path || path === '$') {
+        if (entry) return false
+        redisStore.set(key, { type: 'json', value: clone(value) })
+        return true
+      }
+      if (!entry || entry.type !== 'json') return false
+      const target = resolveJsonWriteTarget(entry.value, path)
+      if (!target || target.key in target.parent) return false
+      target.parent[target.key] = clone(value)
+      return true
+    }),
+    getRaw: vi.fn(jsonCompareAndWrite.getRaw),
+    setIfUnchanged: vi.fn(jsonCompareAndWrite.setIfUnchanged),
+    delIfUnchanged: vi.fn(jsonCompareAndWrite.delIfUnchanged),
+    moveLegacyN8nToken: vi.fn(n8nCredentialScripts.moveLegacyN8nToken),
+    deleteN8nToken: vi.fn(n8nCredentialScripts.deleteN8nToken),
     numIncrBy: vi.fn(async (key: string, path: string, by: number) => {
       const entry = redisStore.get(key)
       if (!entry || entry.type !== 'json') {
@@ -279,19 +371,78 @@ vi.mock('$lib/server/redis', async () => {
 
       return clone(agentData)
     }),
-    updateAgent: vi.fn(async (id: string, updates: any) => {
+    // BL-768: the real one runs `planAgentRecordUpdate`'s by-path writes in a Lua script. This twin
+    // builds the SAME script arguments (`agentUpdateScriptArguments`) and applies them by their
+    // path strings, read as RedisJSON reads them (`test-utils/agentUpdateScriptTwin.ts`, review
+    // item 3). Same order as the real one: a refused save throws before anything (a 400), a gone
+    // agent throws "Agent not found" and is not recreated, a key of another type throws RedisJSON's
+    // wrong-type error.
+    // BL-1294: a save of the memory settings (`options.expectedMemory`) is compared with the stored
+    // ones first, by the real `agentMemoryBaseMatches`, and its guard goes to the twin.
+    updateAgent: vi.fn(async (id: string, updates: any, options?: { expectedMemory?: Record<string, unknown> }) => {
+      const {
+        AGENT_MEMORY_SOURCE_PATHS,
+        AgentMemorySettingsConflictError,
+        agentMemoryBaseMatches,
+        planAgentRecordUpdate,
+        agentUpdateScriptArguments
+      } = await import('$lib/server/agentRecordUpdate')
+      const { REDISJSON_WRONG_TYPE_MESSAGE, agentTypeSnapshotOf, runAgentUpdateScriptTwin } = await import(
+        '$lib/test-utils/agentUpdateScriptTwin'
+      )
+      const plan = planAgentRecordUpdate({ updates: clone(updates ?? {}), now: new Date().toISOString() })
       const existingEntry = redisStore.get(`agent:${id}`)
-      if (!existingEntry || existingEntry.type !== 'json') {
-        throw new Error('Agent not found')
+      if (!existingEntry) throw new Error('Agent not found')
+      if (existingEntry.type !== 'json') throw new Error(REDISJSON_WRONG_TYPE_MESSAGE)
+      const guardsMemory = options?.expectedMemory !== undefined
+      if (guardsMemory && !agentMemoryBaseMatches(existingEntry.value, options!.expectedMemory)) {
+        throw new AgentMemorySettingsConflictError()
       }
-
-      const updated = {
-        ...clone(existingEntry.value),
-        ...clone(updates),
-        updated_at: new Date().toISOString()
-      }
-
-      redisStore.set(`agent:${id}`, { type: 'json', value: clone(updated) })
+      const { answer, record } = runAgentUpdateScriptTwin(
+        existingEntry.value,
+        agentUpdateScriptArguments(
+          plan,
+          agentTypeSnapshotOf(existingEntry.value),
+          guardsMemory ? agentTypeSnapshotOf(existingEntry.value, AGENT_MEMORY_SOURCE_PATHS) : null
+        )
+      )
+      // One step here, so the type fields cannot change between the read and the script.
+      if (answer !== 'OK') throw new Error(`The update of agent ${id} answered ${answer}.`)
+      redisStore.set(`agent:${id}`, { type: 'json', value: record })
+    }),
+    // BL-914: the Subagent's twin of the above. The real one plans `planSubagentRecordUpdate`'s
+    // by-path writes and runs them in `UPDATE_SUBAGENT_FIELDS_SCRIPT`; this twin makes the SAME
+    // script argument and applies it by its path strings. A refused save throws before anything
+    // (a 400), a gone Subagent answers `false` and is not recreated, a key of another type throws
+    // RedisJSON's wrong-type error.
+    updateSubagent: vi.fn(async (id: string, writes: any) => {
+      const { serializeAgentRecordPlan } = await import('$lib/server/agentRecordUpdate')
+      const { planSubagentRecordUpdate } = await import('$lib/server/subagentRecordUpdate')
+      const { REDISJSON_WRONG_TYPE_MESSAGE, runSubagentUpdateScriptTwin } = await import(
+        '$lib/test-utils/agentUpdateScriptTwin'
+      )
+      const plan = planSubagentRecordUpdate({ writes: clone(writes ?? {}), now: new Date().toISOString() })
+      const existingEntry = redisStore.get(`subagent:${id}`)
+      if (!existingEntry) return false
+      if (existingEntry.type !== 'json') throw new Error(REDISJSON_WRONG_TYPE_MESSAGE)
+      const { record } = runSubagentUpdateScriptTwin(existingEntry.value, [serializeAgentRecordPlan(plan.ops)])
+      redisStore.set(`subagent:${id}`, { type: 'json', value: record })
+      return true
+    }),
+    // BL-770: twins of the `/fix` route's two helpers (the real ones read TYPE, and replace a string
+    // record only while it is still the same string, in one Lua step).
+    readAgentRecordStorage: vi.fn(async (id: string) => {
+      const entry = redisStore.get(`agent:${id}`)
+      if (!entry) return { type: 'none' }
+      if (entry.type === 'json') return { type: 'json', record: clone(entry.value) }
+      if (entry.type === 'string') return { type: 'string', raw: entry.value }
+      return { type: 'other' }
+    }),
+    replaceStringAgentRecord: vi.fn(async (id: string, raw: string, record: any) => {
+      const entry = redisStore.get(`agent:${id}`)
+      if (!entry || entry.type !== 'string' || entry.value !== raw) return false
+      redisStore.set(`agent:${id}`, { type: 'json', value: clone(record) })
+      return true
     }),
     getAgents: vi.fn(async (userId: string) => {
       const agentIds = Array.from(ensureSet(`user:${userId}:agents`).values())
@@ -326,14 +477,23 @@ vi.mock('$lib/server/redis', async () => {
       redisStore.set(`user:${userId}:settings`, { type: 'json', value: clone(merged) })
       return clone(merged)
     }),
-    saveMessage: vi.fn(async (message: any) => {
+    saveMessage: vi.fn(async (message: any, options: { browserMutation?: BrowserMessageMutationPolicy } = {}) => {
       if (!message?.session_id || !message?.id) return null
       const messageRecord = {
         ...clone(message),
         created_at: message.created_at || new Date().toISOString()
       }
       const key = `message:${message.session_id}:${message.id}`
-      await redisJsonMock.set(key, '$', messageRecord)
+      if (options.browserMutation) {
+        const current = redisStore.get(key)?.value
+        assertBrowserMessageMutation(options.browserMutation, redisStore.get(`session:${message.session_id}`)?.value, current, messageRecord)
+        messageRecord.metadata = preserveServerSteerMetadata({ ...current?.metadata, ...messageRecord.metadata }, current?.metadata)
+        if (current?.created_at) messageRecord.created_at = current.created_at
+        // No await between the current identity/markers read and the fake's atomic write.
+        redisStore.set(key, { type: 'json', value: clone(messageRecord) })
+      } else {
+        await redisJsonMock.set(key, '$', messageRecord)
+      }
       const existingMessages = await redisMock.lRange(`messages:${message.session_id}`, 0, -1)
       if (!existingMessages.includes(message.id)) {
         await redisMock.rPush(`messages:${message.session_id}`, message.id)
@@ -359,21 +519,286 @@ vi.mock('$lib/server/redis', async () => {
         return dateB - dateA
       })
     }),
-    // SA-113 P1: the generic session PUT (which re-attaches a stored `metadata.origin`)
-    // needs the real client's top-level merge, including the wholesale metadata replace
-    // that the re-attach resolver exists to defend against.
-    updateSession: vi.fn(async (id: string, updates: any) => {
+    // BL-734: the real one is a Lua script; this twin keeps its contract: only the named top-level
+    // fields are written (`undefined` skipped, `null` kept, a `metadata` replaces that one block),
+    // then the stamp; a chat that is gone throws and is not recreated.
+    updateSession: vi.fn(async (id: string, updates: Record<string, unknown>) => {
       const entry = redisStore.get(`session:${id}`)
+      for (const name of Object.keys(updates)) {
+        if (!/^[a-z_]+$/.test(name)) throw new Error(`Not a chat field name: ${name}`)
+      }
       if (!entry || entry.type !== 'json') {
         throw new Error('Session not found')
       }
-      const updated = {
-        ...clone(entry.value),
-        ...clone(updates),
-        last_modified_at: new Date().toISOString()
+      const session = clone(entry.value)
+      for (const [name, value] of Object.entries(updates)) {
+        if (value !== undefined) session[name] = clone(value)
       }
-      redisStore.set(`session:${id}`, { type: 'json', value: clone(updated) })
+      session.last_modified_at = new Date().toISOString()
+      redisStore.set(`session:${id}`, { type: 'json', value: clone(session) })
     }),
+    // BL-690: the real one is a Lua script; this twin keeps its contract: only the named fields
+    // and the group are written, every other field and metadata block stays.
+    updateSessionFields: vi.fn(
+      async (id: string, fields: Record<string, unknown>, groupChat: Record<string, unknown> | null | undefined) => {
+        const entry = redisStore.get(`session:${id}`)
+        if (!entry || entry.type !== 'json') return false
+        const session = clone(entry.value)
+        for (const [name, value] of Object.entries(fields)) session[name] = clone(value ?? null)
+        if (groupChat !== undefined) {
+          const metadata =
+            session.metadata && typeof session.metadata === 'object' && !Array.isArray(session.metadata)
+              ? session.metadata
+              : {}
+          if (groupChat === null) delete metadata.group_chat
+          else metadata.group_chat = clone(groupChat)
+          session.metadata = metadata
+        }
+        session.last_modified_at = new Date().toISOString()
+        redisStore.set(`session:${id}`, { type: 'json', value: clone(session) })
+        return true
+      }
+    ),
+    // BL-723: the real one is a Lua script; this twin keeps its contract: only the mark is
+    // written, the segment id joins the stored list (the last 100 kept), every other block stays.
+    // BL-737: a compare-and-set on `expectedLastGraduatedMessageId` (the id this graduation read
+    // as its starting mark, `null` for "read none") against the mark's CURRENT stored id — not an
+    // ordering check on any timestamp. A mismatch answers `superseded` and writes nothing.
+    writeRegularGraduationMark: vi.fn(
+      async (
+        id: string,
+        mark: {
+          lastGraduatedMessageId: string
+          lastGraduatedAt: string
+          segmentId: string
+        },
+        expectedLastGraduatedMessageId: string | null
+      ) => {
+        const entry = redisStore.get(`session:${id}`)
+        if (!entry || entry.type !== 'json') return 'missing'
+        const session = clone(entry.value)
+        const metadata =
+          session.metadata && typeof session.metadata === 'object' && !Array.isArray(session.metadata)
+            ? session.metadata
+            : {}
+        const stored = metadata.memoryGraduation
+        const hasMark = Boolean(stored) && typeof stored === 'object' && !Array.isArray(stored)
+        // BL-737 review: an empty-string stored id is "no mark" too, the same sentinel as null.
+        const storedId =
+          hasMark && typeof stored.lastGraduatedMessageId === 'string' && stored.lastGraduatedMessageId !== ''
+            ? stored.lastGraduatedMessageId
+            : null
+        if (storedId !== expectedLastGraduatedMessageId) {
+          // BL-737 review: the winner already reused THIS call's own segment id — its
+          // segmentIds already lists it — so the caller must not delete it.
+          const storedSegmentIds =
+            hasMark && Array.isArray(stored.segmentIds) ? stored.segmentIds : []
+          if (storedSegmentIds.includes(mark.segmentId)) {
+            return 'superseded_linked'
+          }
+          return 'superseded'
+        }
+        if (!hasMark) {
+          metadata.memoryGraduation = {
+            version: 1,
+            lastGraduatedMessageId: mark.lastGraduatedMessageId,
+            lastGraduatedAt: mark.lastGraduatedAt,
+            segmentIds: [mark.segmentId]
+          }
+        } else {
+          stored.version = 1
+          stored.lastGraduatedMessageId = mark.lastGraduatedMessageId
+          stored.lastGraduatedAt = mark.lastGraduatedAt
+          stored.segmentIds = Array.isArray(stored.segmentIds)
+            ? [...stored.segmentIds, mark.segmentId].slice(-100)
+            : [mark.segmentId]
+        }
+        session.metadata = metadata
+        session.last_modified_at = new Date().toISOString()
+        redisStore.set(`session:${id}`, { type: 'json', value: clone(session) })
+        return 'ok'
+      }
+    ),
+    // BL-736: the real one is a Lua script; this twin keeps its contract: the removal happens
+    // only while the chat's LIVE `metadata.group_chat.group_id` still names this Group.
+    clearGroupChatIfMatches: vi.fn(async (id: string, groupId: string) => {
+      const entry = redisStore.get(`session:${id}`)
+      if (!entry || entry.type !== 'json') return false
+      const session = clone(entry.value)
+      const metadata =
+        session.metadata && typeof session.metadata === 'object' && !Array.isArray(session.metadata)
+          ? session.metadata
+          : {}
+      if (!metadata.group_chat || metadata.group_chat.group_id !== groupId) return false
+      delete metadata.group_chat
+      session.metadata = metadata
+      session.last_modified_at = new Date().toISOString()
+      redisStore.set(`session:${id}`, { type: 'json', value: clone(session) })
+      return true
+    }),
+    // BL-474 step 2: the real one is a Lua script; this twin keeps its contract: the chat and its
+    // owner, a decided record only for this chat's own assistant reply, never over a newer version,
+    // and a pending write never over a decided record of the same version.
+    writeImageOriginRecord: vi.fn(
+      async (input: {
+        userId: string
+        sessionId: string
+        messageId: string
+        version: number
+        state: 'pending' | 'decided'
+        record: Record<string, unknown>
+      }) => {
+        if (
+          !input.record ||
+          typeof input.record !== 'object' ||
+          Array.isArray(input.record) ||
+          input.record.messageId !== input.messageId ||
+          input.record.state !== input.state ||
+          input.record.version !== input.version
+        ) {
+          throw new Error('Image origin record does not match write arguments.')
+        }
+        const session = redisStore.get(`session:${input.sessionId}`)
+        if (!session) return 'missing_chat'
+        if (session.type !== 'json' || session.value?.user_id !== input.userId) return 'not_owner'
+        if (input.state === 'decided') {
+          const reply = redisStore.get(`message:${input.sessionId}:${input.messageId}`)
+          if (!reply) return 'missing_reply'
+          const value = reply.type === 'json' ? reply.value : null
+          if (
+            value?.role !== 'assistant' ||
+            value?.session_id !== input.sessionId ||
+            value?.id !== input.messageId ||
+            value?.user_id !== input.userId
+          ) return 'not_reply'
+        }
+        const itemKey = `image_origin:${input.sessionId}:${input.messageId}`
+        const previous = redisStore.get(itemKey)
+        if (previous && previous.type !== 'json') throw new Error('Image origin record has the wrong type')
+        const stored = previous?.value
+        if (typeof stored?.version === 'number') {
+          if (stored.version > input.version) return 'older'
+          if (stored.version === input.version && input.state === 'pending' && stored.state === 'decided') return 'kept'
+        }
+        redisStore.set(itemKey, { type: 'json', value: clone(input.record) })
+        await redisMock.sAdd(`image_origins:${input.sessionId}`, input.messageId)
+        return 'ok'
+      }
+    ),
+    // BL-735: the real one is a Lua script; this twin keeps its contract: only `metadata.fixedSession`
+    // and `locked` are written, every other field and metadata block stays.
+    writeFixedSessionMark: vi.fn(async (id: string, fixedSession: Record<string, unknown>) => {
+      const entry = redisStore.get(`session:${id}`)
+      if (!entry || entry.type !== 'json') return false
+      const session = clone(entry.value)
+      const metadata =
+        session.metadata && typeof session.metadata === 'object' && !Array.isArray(session.metadata)
+          ? session.metadata
+          : {}
+      metadata.fixedSession = clone(fixedSession)
+      session.metadata = metadata
+      session.locked = true
+      session.last_modified_at = new Date().toISOString()
+      redisStore.set(`session:${id}`, { type: 'json', value: clone(session) })
+      return true
+    }),
+    // BL-622: the real one is a Lua script (one step inside Redis); this twin keeps its contract:
+    // refuse unless the last countable Compact event is the one read, then add the event at its
+    // own path and leave every other metadata field as it is stored now.
+    appendContextCompactionEvent: vi.fn(
+      async (id: string, event: Record<string, unknown>, expectedLastEventId: string | null) => {
+        const entry = redisStore.get(`session:${id}`)
+        if (!entry || entry.type !== 'json') return { ok: false, reason: 'missing' }
+        const session = clone(entry.value)
+        const metadata =
+          session.metadata && typeof session.metadata === 'object' && !Array.isArray(session.metadata)
+            ? session.metadata
+            : {}
+        const block = metadata.contextCompaction
+        const events: any[] | null = Array.isArray(block?.events) ? block.events : null
+        const counted = (events ?? []).filter(
+          (candidate: any) =>
+            candidate &&
+            typeof candidate === 'object' &&
+            typeof candidate.id === 'string' &&
+            typeof candidate.createdAt === 'string' &&
+            typeof candidate.summary === 'string' &&
+            Array.isArray(candidate.sourceMessageIds)
+        )
+        const lastEventId = counted.length > 0 ? counted[counted.length - 1].id : ''
+        if (lastEventId !== (expectedLastEventId ?? '')) {
+          return { ok: false, reason: 'changed', lastEventId: lastEventId || null }
+        }
+        metadata.contextCompaction = events
+          ? { ...block, events: [...events, clone(event)] }
+          : { version: 1, events: [clone(event)] }
+        session.metadata = metadata
+        session.last_modified_at = new Date().toISOString()
+        redisStore.set(`session:${id}`, { type: 'json', value: clone(session) })
+        return { ok: true, contextCompaction: clone(metadata.contextCompaction) }
+      }
+    ),
+    // BL-549 (N4): the real ones are Lua scripts; these twins keep their contracts: only the
+    // named list in `metadata.fixedSession` changes, as stored now; every other block stays.
+    appendFixedSessionGraduationEvent: vi.fn(async (id: string, event: Record<string, unknown>) => {
+      const entry = redisStore.get(`session:${id}`)
+      if (!entry || entry.type !== 'json') return 'missing'
+      const session = clone(entry.value)
+      if (session.metadata?.fixedSession?.enabled !== true) return 'not_fixed'
+      const fixed = session.metadata.fixedSession
+      if (Array.isArray(fixed.graduation?.events)) fixed.graduation.events.push(clone(event))
+      else fixed.graduation = { version: 1, events: [clone(event)] }
+      session.last_modified_at = new Date().toISOString()
+      redisStore.set(`session:${id}`, { type: 'json', value: clone(session) })
+      return 'ok'
+    }),
+    swapFixedSessionGraduationEvents: vi.fn(
+      async (id: string, removeEventIds: string[], eraEvent: Record<string, unknown>) => {
+        if (removeEventIds.length === 0) {
+          throw new Error('swapFixedSessionGraduationEvents requires at least one event id to replace.')
+        }
+        const entry = redisStore.get(`session:${id}`)
+        if (!entry || entry.type !== 'json') return { ok: false, reason: 'missing' }
+        const session = clone(entry.value)
+        if (session.metadata?.fixedSession?.enabled !== true) return { ok: false, reason: 'not_fixed' }
+        const fixed = session.metadata.fixedSession
+        const events: any[] = Array.isArray(fixed.graduation?.events) ? fixed.graduation.events : []
+        const present = new Set(
+          events.filter((event) => event && typeof event.id === 'string').map((event) => event.id)
+        )
+        const missing = removeEventIds.filter((eventId) => !present.has(eventId))
+        if (missing.length > 0) return { ok: false, reason: 'changed', missing }
+        const remove = new Set(removeEventIds)
+        const firstIndex = events.findIndex((event) => event && remove.has(event.id))
+        const kept = events.filter((event) => !(event && remove.has(event.id)))
+        kept.splice(firstIndex, 0, clone(eraEvent))
+        fixed.graduation.events = kept
+        session.last_modified_at = new Date().toISOString()
+        redisStore.set(`session:${id}`, { type: 'json', value: clone(session) })
+        return { ok: true }
+      }
+    ),
+    appendFixedSessionNapRecord: vi.fn(
+      async (id: string, record: Record<string, unknown>, limit = 20) => {
+        const entry = redisStore.get(`session:${id}`)
+        if (!entry || entry.type !== 'json') return null
+        const session = clone(entry.value)
+        const metadata =
+          session.metadata && typeof session.metadata === 'object' && !Array.isArray(session.metadata)
+            ? session.metadata
+            : {}
+        const fixed =
+          metadata.fixedSession && typeof metadata.fixedSession === 'object' && !Array.isArray(metadata.fixedSession)
+            ? metadata.fixedSession
+            : {}
+        fixed.naps = (Array.isArray(fixed.naps) ? [...fixed.naps, clone(record)] : [clone(record)]).slice(-limit)
+        metadata.fixedSession = fixed
+        session.metadata = metadata
+        session.last_modified_at = new Date().toISOString()
+        redisStore.set(`session:${id}`, { type: 'json', value: clone(session) })
+        return clone(metadata)
+      }
+    ),
     getSession: vi.fn(async (sessionId: string) => {
       const entry = redisStore.get(`session:${sessionId}`)
       if (!entry || entry.type !== 'json') return null
@@ -385,7 +810,10 @@ vi.mock('$lib/server/redis', async () => {
     // the right end of the chat, and in production they looked at the wrong one. The fake
     // now lies about nothing: `getMessages` is head-first, `getRecentMessages` is the tail.
     getMessages: vi.fn(async (sessionId: string, limit = 100) => {
-      const messageIds = await redisMock.lRange(`messages:${sessionId}`, 0, limit - 1)
+      const messageIds = filterQueuedSendMessageIds(
+        sessionId,
+        await redisMock.lRange(`messages:${sessionId}`, 0, limit - 1)
+      )
       const messages = await Promise.all(
         messageIds.map((messageId) => redisJsonMock.get(`message:${sessionId}:${messageId}`))
       )
@@ -394,7 +822,10 @@ vi.mock('$lib/server/redis', async () => {
     }),
     getRecentMessages: vi.fn(async (sessionId: string, limit = 100) => {
       if (!Number.isFinite(limit) || limit <= 0) return []
-      const messageIds = await redisMock.lRange(`messages:${sessionId}`, -limit, -1)
+      const messageIds = filterQueuedSendMessageIds(
+        sessionId,
+        await redisMock.lRange(`messages:${sessionId}`, -limit, -1)
+      )
       const messages = await Promise.all(
         messageIds.map((messageId) => redisJsonMock.get(`message:${sessionId}:${messageId}`))
       )
@@ -402,18 +833,41 @@ vi.mock('$lib/server/redis', async () => {
       return messages.filter(Boolean)
     }),
     getAllMessages: vi.fn(async (sessionId: string) => {
-      const messageIds = await redisMock.lRange(`messages:${sessionId}`, 0, -1)
+      const messageIds = filterQueuedSendMessageIds(
+        sessionId,
+        await redisMock.lRange(`messages:${sessionId}`, 0, -1)
+      )
       const messages = await Promise.all(
         messageIds.map((messageId) => redisJsonMock.get(`message:${sessionId}:${messageId}`))
       )
       return messages.filter(Boolean)
     }),
+    // BL-4: the real `moveMessageToEnd` — the list move, and `created_at` set to now (or to
+    // the time a resent message's tab sent it). BL-195: the real one is one Lua script, so
+    // this one never awaits between its check and its writes: nothing can land in between.
+    moveMessageToEnd: vi.fn(
+      async (sessionId: string, messageId: string, options: { createdAt?: string | null } = {}) => {
+      if (!sessionId || !messageId) return null
+      const messageKey = `message:${sessionId}:${messageId}`
+      const entry = redisStore.get(messageKey)
+      if (!redisStore.has(`session:${sessionId}`) || !entry) return null
+      if (entry.type !== 'json') throw new Error(`WRONGTYPE ${messageKey} is not a JSON record`)
+      const createdAt = options.createdAt ?? new Date().toISOString()
+      if (entry.value && typeof entry.value === 'object') entry.value.created_at = createdAt
+      const list = ensureList(`messages:${sessionId}`)
+      const kept = list.filter((id) => id !== messageId)
+      list.splice(0, list.length, ...kept, messageId)
+      return clone(entry.value)
+      }
+    ),
     getSessionMessages: vi.fn(async (sessionId: string) =>
       redisMock.getRecentMessages(sessionId, 1000)
     ),
     getAllSessionMessages: vi.fn(async (sessionId: string) =>
       redisMock.getAllMessages(sessionId)
     ),
+    // SA-129 P2: the real `getZip` reads the JSON record at `zip:{id}` with the exact id.
+    getZip: vi.fn(async (zipId: string) => redisJsonMock.get(`zip:${zipId}`)),
     /**
      * SA-116 P3: the fake had NO `updateMessage`, so every caller of it threw
      * "is not a function" — and a caller that (correctly) catches its own persistence
@@ -429,7 +883,8 @@ vi.mock('$lib/server/redis', async () => {
       messageId: string,
       sessionId: string,
       updates: Record<string, any>,
-      userId: string
+      userId: string,
+      options: { browserMutation?: BrowserMessageMutationPolicy } = {}
     ) => {
       const session = await redisJsonMock.get(`session:${sessionId}`)
       if (!session) throw new Error('Session not found')
@@ -470,18 +925,104 @@ vi.mock('$lib/server/redis', async () => {
       // The real client also calls `touchSession` here. This fake models no session
       // touching anywhere (its `saveMessage` does not either), so `last_modified_at` is
       // not a thing any test on this lane may assert about a message write.
-      await redisJsonMock.set(key, '$', updated)
+      if (options.browserMutation) {
+        const current = redisStore.get(key)?.value
+        assertBrowserMessageMutation(options.browserMutation, redisStore.get(`session:${sessionId}`)?.value, current, updated)
+        updated.metadata = preserveServerSteerMetadata(updated.metadata, current?.metadata)
+        if (current?.created_at) updated.created_at = current.created_at
+        redisStore.set(key, { type: 'json', value: clone(updated) })
+      } else {
+        await redisJsonMock.set(key, '$', updated)
+      }
     }),
-    deleteMessage: vi.fn(async (messageId: string, sessionId: string, userId: string) => {
+    deleteMessage: vi.fn(async (
+      messageId: string,
+      sessionId: string,
+      userId: string,
+      options: { stillRunning?: () => boolean } = {}
+    ) => {
       const session = await redisJsonMock.get(`session:${sessionId}`)
       if (!session) throw new Error('Session not found')
       if ((session as any).user_id !== userId) {
         throw new Error('Unauthorized: Session does not belong to user')
       }
 
-      await redisMock.del(`message:${sessionId}:${messageId}`)
-      await redisMock.lRem(`messages:${sessionId}`, 0, messageId)
+      // BL-390 / BL-381: the real delete (`redis.deleteMessage`) decides under the chat's zip state
+      // lock which zips go with the message, refuses a damaged other message, and asks the route's
+      // running check again right before it writes; the same rules apply here over the fake.
+      await withZipStateLock(sessionId, async () => {
+        const message = (await redisJsonMock.get(`message:${sessionId}:${messageId}`)) as any
+        const zipSetKey = `session:${sessionId}:zips`
+        const candidates = [...new Set([...(await redisMock.sMembers(zipSetKey)), ...zipClaimsOfMessage(message)])]
+        const zips = []
+        for (const zipId of candidates) {
+          const zip = (await redisJsonMock.get(`zip:${zipId}`)) as any
+          zips.push({ zipId, messageId: zip?.metadata?.messageId, sessionId: zip?.metadata?.sessionId })
+        }
+        const otherMessages: unknown[] = []
+        const otherMessageIds: string[] = []
+        for (const id of await redisMock.lrange(`messages:${sessionId}`, 0, -1)) {
+          if (id === messageId) continue
+          otherMessageIds.push(id)
+          const key = `message:${sessionId}:${id}`
+          const other = await redisJsonMock.get(key)
+          if (other == null && redisStore.has(key)) {
+            throw new Error('Another message of this chat could not be read, so nothing was deleted.')
+          }
+          otherMessages.push(other)
+        }
+        const zipIdsToDelete = zipsOwnedOnlyByMessage({
+          messageId,
+          sessionId,
+          zips,
+          message,
+          otherMessageIds,
+          otherMessages
+        })
+        if (options.stillRunning?.()) throw new MessageStillRunningError()
+        for (const zipId of zipIdsToDelete) {
+          await redisMock.del(`zip:${zipId}`)
+          await redisMock.sRem(zipSetKey, zipId)
+          await redisMock.del(`unzipped_item:${sessionId}:${zipId}`)
+          await redisMock.sRem(`unzipped:${sessionId}`, zipId)
+          await redisMock.del(`rezipped_item:${sessionId}:${zipId}`)
+          await redisMock.sRem(`rezipped:${sessionId}`, zipId)
+        }
+        await redisMock.del(`message:${sessionId}:${messageId}`)
+        await redisMock.lRem(`messages:${sessionId}`, 0, messageId)
+      })
       await redisMock.del(`session:${sessionId}:messages`)
+    }),
+    // BL-775: the real `redis.removeUnclaimedZipsMadeByMessage`, same rules over the fake.
+    removeUnclaimedZipsMadeByMessage: vi.fn(async (sessionId: string, messageId: string, zipIds: string[]) => {
+      const candidates = [...new Set(zipIds.filter((id) => typeof id === 'string' && id.length > 0))].sort()
+      if (!sessionId || !messageId || candidates.length === 0) return []
+      const chatMessages: unknown[] = []
+      for (const id of await redisMock.lrange(`messages:${sessionId}`, 0, -1)) {
+        const key = `message:${sessionId}:${id}`
+        const message = await redisJsonMock.get(key)
+        if (message == null && redisStore.has(key)) {
+          throw new Error('A message of this chat could not be read, so no zip was removed.')
+        }
+        chatMessages.push(message)
+      }
+      return withZipStateLock(sessionId, async () => {
+        const zips = []
+        for (const zipId of candidates) {
+          const zip = (await redisJsonMock.get(`zip:${zipId}`)) as any
+          zips.push({ zipId, messageId: zip?.metadata?.messageId, sessionId: zip?.metadata?.sessionId })
+        }
+        const removable = unclaimedZipsMadeByMessage({ messageId, sessionId, zips, chatMessages })
+        for (const zipId of removable) {
+          await redisMock.del(`zip:${zipId}`)
+          await redisMock.sRem(`session:${sessionId}:zips`, zipId)
+          await redisMock.del(`unzipped_item:${sessionId}:${zipId}`)
+          await redisMock.sRem(`unzipped:${sessionId}`, zipId)
+          await redisMock.del(`rezipped_item:${sessionId}:${zipId}`)
+          await redisMock.sRem(`rezipped:${sessionId}`, zipId)
+        }
+        return removable
+      })
     }),
     get: vi.fn(async (key: string) => {
       const entry = redisStore.get(key)
@@ -637,6 +1178,15 @@ vi.mock('$lib/server/redis', async () => {
             queue.push(() => redisMock.del(key))
             return multiApi
           },
+          // BL-537: a zip state Release and Hold are one MULTI each (`zipHolds.ts`).
+          sAdd: (key: string, ...members: any[]) => {
+            queue.push(() => redisMock.sAdd(key, ...members))
+            return multiApi
+          },
+          sRem: (key: string, ...members: any[]) => {
+            queue.push(() => redisMock.sRem(key, ...members))
+            return multiApi
+          },
           json: {
             set: (key: string, path: string, value: any) => {
               queue.push(() => redisJsonMock.set(key, path, value))
@@ -682,9 +1232,23 @@ vi.mock('$lib/server/redis', async () => {
         lRange: vi.fn(async (key: string, start: number, stop: number) =>
           redisMock.lRange(key, start, stop)
         ),
+        // LPOS with RANK: a negative rank counts matches from the tail (BL-4's resend check).
+        lPos: vi.fn(async (key: string, element: any, options: { RANK?: number } = {}) => {
+          const list: string[] = await redisMock.lRange(key, 0, -1)
+          const rank = options?.RANK ?? 1
+          const indexes = list.map((_, index) => index)
+          let seen = 0
+          for (const index of rank < 0 ? indexes.reverse() : indexes) {
+            if (list[index] === String(element) && ++seen === Math.abs(rank)) return index
+          }
+          return null
+        }),
         rPush: vi.fn(async (key: string, value: any) => redisMock.rPush(key, value)),
         sAdd: vi.fn(async (key: string, ...members: any[]) => redisMock.sAdd(key, ...members)),
         sMembers: vi.fn(async (key: string) => redisMock.sMembers(key)),
+        sIsMember: vi.fn(async (key: string, member: string) =>
+          (await redisMock.sMembers(key)).includes(member)
+        ),
         sRem: vi.fn(async (key: string, ...members: any[]) => redisMock.sRem(key, ...members)),
         zAdd: vi.fn(async (key: string, entries: any) => redisMock.zAdd(key, entries)),
         zRange: vi.fn(async (key: string, start: number, stop: number) =>
@@ -695,6 +1259,119 @@ vi.mock('$lib/server/redis', async () => {
           redisMock.zRangeWithScores(key, start, stop)
         ),
         zCard: vi.fn(async (key: string) => redisMock.zCard(key)),
+        // Most fake-Redis suites predate EVAL and check `if (client.eval)` to decide whether
+        // this environment supports Lua scripts at all, falling back to their own no-EVAL path
+        // when it is absent. `eval` must stay undefined by default -- BL-787 review (2026-09-28)
+        // found that making it unconditionally defined broke 15 tests across 4 unrelated
+        // repository suites (hairImportJobRepository.server, hairAssetRepository.server,
+        // clothingAssetRepository, hairImportLifecycle.server): about ten repositories reached
+        // this SAME fake with THEIR OWN scripts, which fell through every branch here into "This
+        // Redis fake does not implement that Lua script" instead of their intended no-EVAL path.
+        // Both script families stay opt-in, each behind its own flag: the retained-output script
+        // (`VITEST_FAKE_RETAINED_OUTPUT_EVAL`) and BL-787's three Portable Skill Token scripts
+        // (`VITEST_FAKE_PORTABLE_SKILL_TOKEN_EVAL`, stubbed only in
+        // nativeToolAuth.portable.test.ts, the one fake-lane suite that reaches them).
+        ...(process.env.VITEST_FAKE_RETAINED_OUTPUT_EVAL === 'true' ||
+        process.env.VITEST_FAKE_PORTABLE_SKILL_TOKEN_EVAL === 'true'
+          ? { eval: vi.fn(async (script: string, options: { keys?: string[]; arguments?: string[] } = {}) => {
+          if (
+            process.env.VITEST_FAKE_RETAINED_OUTPUT_EVAL === 'true' &&
+            script.includes('BATSHIT_RETAINED_OUTPUT_PUBLICATION_V2')
+          ) {
+            const [indexKey, zipKey] = options.keys ?? []
+            const [zipId, zipJson] = options.arguments ?? []
+            if (!indexKey || !zipKey || !zipId || !zipJson) {
+              throw new Error('Retained output publication needs two keys and two arguments.')
+            }
+            const index = redisStore.get(indexKey)
+            if (index && index.type !== 'set') throw new Error('Retained output index has the wrong Redis type.')
+            if (redisStore.has(zipKey)) throw new Error('Retained output zip id already exists.')
+            const parsed = JSON.parse(zipJson)
+            const members = index ? index.value as Set<string> : new Set<string>()
+            members.add(zipId)
+            redisStore.set(indexKey, { type: 'set', value: members })
+            redisStore.set(zipKey, { type: 'json', value: clone(parsed) })
+            return 1
+          }
+
+          // BL-787: JS twins of the three atomic Portable Skill Token scripts. Each reads the
+          // record's CURRENT state from this same fake store (never a value a caller captured
+          // earlier) and refuses on a missing/revoked record, exactly like the real scripts.
+          // Review round 2: as strict as the Lua. `JSON.TYPE $.revokedAt` on a MISSING path
+          // returns nil, and `nil ~= 'null'` is true in Lua, so a record with no revokedAt
+          // field at all fails closed (REVOKED), the same as an actually-revoked one -- only a
+          // JSON `null` value reads as "not revoked". A tokenHash that is not a string is a
+          // malformed record: error, never delete a `${prefix}undefined` nonsense key.
+          const isRevoked = (record: any) => record?.revokedAt !== null
+          const getJson = (key: string) => {
+            const entry = redisStore.get(key)
+            return entry && entry.type === 'json' ? entry.value : null
+          }
+          const setJson = (key: string, value: any) => redisStore.set(key, { type: 'json', value: clone(value) })
+
+          if (
+            process.env.VITEST_FAKE_PORTABLE_SKILL_TOKEN_EVAL === 'true' &&
+            script.includes('BATSHIT_PORTABLE_SKILL_TOKEN_UPDATE_V1')
+          ) {
+            const [recordKey] = options.keys ?? []
+            const [updatedAt, hasLabelFlag, labelJson, hasFamiliesFlag, familiesJson] = options.arguments ?? []
+            const existing = getJson(recordKey)
+            if (!existing) return 'MISSING'
+            if (isRevoked(existing)) return 'REVOKED'
+            const next = { ...existing }
+            if (hasFamiliesFlag === '1') {
+              const families = JSON.parse(familiesJson)
+              if (families.length === 0) return 'EMPTY_FAMILIES'
+              next.families = families
+            }
+            if (hasLabelFlag === '1') next.label = JSON.parse(labelJson)
+            next.updatedAt = updatedAt
+            setJson(recordKey, next)
+            return 'OK'
+          }
+
+          if (
+            process.env.VITEST_FAKE_PORTABLE_SKILL_TOKEN_EVAL === 'true' &&
+            script.includes('BATSHIT_PORTABLE_SKILL_TOKEN_ROTATE_V1')
+          ) {
+            const [recordKey, newHashIndexKey] = options.keys ?? []
+            const [newTokenHash, tokenPrefix, tokenSuffix, updatedAt, userId, tokenId, hashPrefix] =
+              options.arguments ?? []
+            const existing = getJson(recordKey)
+            if (!existing) return 'MISSING'
+            if (isRevoked(existing)) return 'REVOKED'
+            if (typeof existing.tokenHash !== 'string') {
+              return 'MALFORMED'
+            }
+            const oldHash = existing.tokenHash
+            setJson(recordKey, { ...existing, tokenHash: newTokenHash, tokenPrefix, tokenSuffix, updatedAt })
+            redisStore.delete(`${hashPrefix}${oldHash}`)
+            setJson(newHashIndexKey, { userId, tokenId })
+            return 'OK'
+          }
+
+          if (
+            process.env.VITEST_FAKE_PORTABLE_SKILL_TOKEN_EVAL === 'true' &&
+            script.includes('BATSHIT_PORTABLE_SKILL_TOKEN_REVOKE_V1')
+          ) {
+            const [recordKey, setKey] = options.keys ?? []
+            const [revokedAt, tokenId, hashPrefix] = options.arguments ?? []
+            const existing = getJson(recordKey)
+            if (!existing) return 'MISSING'
+            if (isRevoked(existing)) return 'ALREADY_REVOKED'
+            if (typeof existing.tokenHash !== 'string') {
+              return 'MALFORMED'
+            }
+            const hash = existing.tokenHash
+            setJson(recordKey, { ...existing, revokedAt, updatedAt: revokedAt })
+            redisStore.delete(`${hashPrefix}${hash}`)
+            await redisMock.sRem(setKey, tokenId)
+            return 'OK'
+          }
+
+          throw new Error(`This Redis fake does not implement that Lua script: ${script.slice(0, 80)}`)
+        }) }
+          : {}),
         json: redisJsonMock,
         multi: vi.fn(() => createMulti())
       }

@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ChatMemoryRow } from '$lib/types/database'
+import { unclosedReferenceReplies } from '$lib/test-utils/unclosedReferenceReplies'
 
 const mockRedis = {
   getZips: vi.fn()
@@ -154,5 +155,19 @@ describe('enrichMessagesWithTrustedZipMetadata', () => {
 
     expect(mockRedis.getZips).not.toHaveBeenCalled()
     expect(message.metadata).toBeUndefined()
+  })
+
+  it('reads 1 MB of 20,000 zip openers that never close in well under 200 ms', async () => {
+    // The zip pattern the reference scan replaced cost (openers) x (text length), twice per
+    // message here (the trusted-id pass and this module's own reference pass).
+    const { enrichMessagesWithTrustedZipMetadata } = await import('../messageZipTrust')
+    for (const [shape, content] of Object.entries(unclosedReferenceReplies('zip'))) {
+      const started = performance.now()
+      const [message] = await enrichMessagesWithTrustedZipMetadata([buildMessage({ content })], 'user-1')
+      expect(performance.now() - started, shape).toBeLessThan(200)
+      expect(message.content, shape).toBe(content)
+      expect(message.metadata, shape).toBeUndefined()
+    }
+    expect(mockRedis.getZips).not.toHaveBeenCalled()
   })
 })

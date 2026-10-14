@@ -1,6 +1,9 @@
 <script lang="ts">
-import { onMount, untrack } from 'svelte'
-import { debounce } from '$lib/utils/debounce'
+  import { refuse, type SettingsTarget } from '$lib/appActions/catalog'
+  import { appActionsHaveDrafts, type ActionContext } from '$lib/appActions/owners'
+
+import { onDestroy, onMount, untrack } from 'svelte'
+import { createModelPresetAutosave, getModelPresetDrafts, runModelPresetSave, waitForModelPresetSaves } from '../models/modelPresetAutosave'
 import * as Card from '$lib/components/ui/card'
 import { Input } from '$lib/components/ui/input'
 import * as Label from '$lib/components/ui/label'
@@ -39,7 +42,13 @@ import {
   isParameterSuppressedForModel,
   resolveParameterProvider
 } from '$lib/utils/parameterFilter'
-import { formatDefaultInput, fromInputValue, toInputValue } from '$lib/utils/parameterValueAdapter'
+import {
+  describeUnlistedSelectValue,
+  formatDefaultInput,
+  fromInputValue,
+  resolveSavedSelectValue,
+  toInputValue
+} from '$lib/utils/parameterValueAdapter'
 import ModelProviderIcon from '$lib/components/models/ModelProviderIcon.svelte'
   import type {
     SavedModel,
@@ -51,6 +60,8 @@ import ModelProviderIcon from '$lib/components/models/ModelProviderIcon.svelte'
     ModelPurpose
   } from '$lib/types/savedModels'
 import type { ParameterDefinition, ParameterValue } from '$lib/data/parameter-schemas'
+import { getParameterSchema } from '$lib/data/parameter-schemas'
+import { acknowledgeOllamaPresetCapabilities, projectOllamaPresetCapabilities } from '$lib/utils/ollamaModelCapabilities'
 import { LOCAL_AI_SERVER_DEFINITIONS } from '$lib/data/localAiServers'
 import { isTieredPricing } from '$lib/types/savedModels'
 import { determineModelCompatibility, isN8NSupported } from '$lib/data/model-compatibility-registry'
@@ -68,6 +79,7 @@ import {
 } from '$lib/utils/modelConnections'
 import {
   buildConnectionScopedCatalogModels,
+  findConnectionScopedCatalogPreset,
   resolveConnectionScopedCatalogModel,
   type ConnectionScopedCatalogModel
 } from '$lib/utils/catalogConnectionScope'
@@ -105,7 +117,20 @@ import {
   buildPresetPricingFromForm,
   parsePresetContextWindow
 } from '$lib/components/settings/models/modelPresetPayload'
+import {
+  describeLocalContextNote,
+  describeServedModelNote,
+  findServingModel,
+  localModelName
+} from '$lib/components/settings/models/localProgramNotes'
+import {
+  resolveCatalogConnectionLimits,
+  resolveCatalogConnectionPricing
+} from '$lib/utils/catalogConnectionLimits'
+import { isFlatFeePlanConnection } from '$lib/utils/catalogPricing'
+import { isChatgptPlanConnection, CHATGPT_PLAN_PARAMETERS } from '$lib/utils/chatgptPlanConnection'
 import { themeStore } from '$lib/stores/theme'
+import { LIVE_SETTINGS_EVENTS } from '$lib/utils/liveSettingsEvents'
 	import * as savedModelsStore from '$lib/stores/savedModels.svelte'
 import * as compatibilityMatrixStore from '$lib/stores/compatibilityMatrix.svelte'
 import {
@@ -372,7 +397,7 @@ const LOCAL_PROVIDER_LABELS = new Map<string, string>(
   LOCAL_AI_SERVER_DEFINITIONS.map((definition) => [definition.id, definition.label])
 )
 
-function resolveLocalProviderId(form: ModelFormState): string | null {
+function resolveLocalProviderId(form: Pick<ModelFormState, 'connectionService' | 'provider'>): string | null {
   const connectionService = form.connectionService?.trim().toLowerCase() ?? ''
   if (connectionService && LOCAL_PROVIDER_LABELS.has(connectionService)) return connectionService
   const provider = form.provider?.trim().toLowerCase() ?? ''
@@ -573,11 +598,17 @@ function allowModelForConnection(model: CatalogModel, connection: CatalogConnect
   let lastSyncedConnectionSignature: string | null = null
   let isEnriching = $state(false)
   let enrichmentWarning = $state<string | null>(null)
-  let purgeNotice = $state<{ count: number; names: string[] } | null>(null)
+  /** BL-517: presets whose model the AI Gateway no longer lists (kept, never deleted by a load). */
+  let unlistedNotice = $state<{ count: number; names: string[] } | null>(null)
 
   let selectedModelId = $state<string | null>(null)
   let editingForm = $state<ModelFormState>({ ...EMPTY_FORM })
   let formPersistedSignature = $state<string | null>(null)
+  let numericDraftActive = $state(false)
+  let formSelection = 0
+  let panelDisposed = false
+  const presetDrafts = getModelPresetDrafts<ModelFormState, ReturnType<typeof createDefaultCodexOptions>, SavedModel>()
+  let creationContinuation: { selection: number; draft: ReturnType<typeof capturePresetDraft> | null } | null = null
   let creatingNew = $state(false)
   let suppressDraftAutoCreate = $state(false)
   let lastDraftCreateAttemptSignature = $state<string | null>(null)
@@ -662,7 +693,7 @@ let lastInvalidModelSignature = $state<string | null>(null)
     const modelId = editingForm.modelId?.trim() ?? ''
     const sourceId = editingForm.catalogModelId?.trim() || editingForm.vercelSourceId?.trim() || ''
     if (!provider && !modelId && !sourceId) return
-    const signature = `${sourceId}|${provider}|${modelId}`
+    const signature = `${selectedConnectionId}|${sourceId}|${provider}|${modelId}`
     if (signature === lastAutomaticCatalogSyncSignature) return
     lastAutomaticCatalogSyncSignature = signature
     syncCatalogSelectionFromEditingForm()
@@ -803,40 +834,59 @@ let lastInvalidModelSignature = $state<string | null>(null)
   const localProviderId = $derived.by(() => resolveLocalProviderId(editingForm))
 
   /**
-   * SA-102 P4 (DL-102-04): what the local program says it is ACTUALLY running
-   * this model with, next to the ceiling the preset stores.
-   *
-   * Three states, all of them said out loud: a real loaded number, "not loaded
-   * yet" for a program that would tell us once it is, and nothing at all for a
-   * program that never reports. Batshit never quietly presents the ceiling as
-   * the truth — Josh's own 27B loads at 208,384 under a 262,144 ceiling.
+   * BL-104: the model a local program answers EVERY request with, whatever the
+   * preset names. KoboldCpp serves one model, so after a switch a preset saved
+   * for another model still runs, on this one, and the editor says so.
    */
-  const localContextStatus = $derived.by(() => {
-    const program = localProgramLabel
-    const reading = selectedCatalogEntry?.model?.localContext
-    if (!program || !reading) return null
+  /** BL-68: the window the catalog lists for the selected connection, not always the row's. */
+  const selectedCatalogContextWindow = $derived.by(() =>
+    selectedCatalogModel
+      ? resolveCatalogConnectionLimits(selectedCatalogModel, selectedConnectionId).contextWindow
+      : undefined
+  )
+  /** BL-132: likewise the price the catalog lists for the selected connection. */
+  const selectedCatalogPricing = $derived.by(() =>
+    selectedCatalogModel
+      ? resolveCatalogConnectionPricing(selectedCatalogModel, selectedConnectionId).pricing
+      : undefined
+  )
+  /** BL-658 / BL-296: a flat-fee plan connection bills a monthly fee, not this per-token price. */
+  const selectedConnectionIsFlatFeePlan = $derived.by(() => isFlatFeePlanConnection(selectedConnectionId))
+  const localServingModel = $derived.by(() => findServingModel(catalogModels, localProviderId))
+  const effectiveFormCapabilities = $derived.by(() => getFormCapabilities(editingForm))
+  const localServedModelNote = $derived.by(() =>
+    describeServedModelNote({
+      programId: localProviderId,
+      programLabel: localProgramLabel,
+      presetModelId: editingForm.modelId,
+      serving: localServingModel
+    })
+  )
 
-    const preset = parseFormattedInteger(editingForm.contextWindow) || null
-    if (reading.source === 'loaded' && typeof reading.loadedContextWindow === 'number') {
-      const loaded = reading.loadedContextWindow
-      return {
-        tone: preset && preset !== loaded ? 'is-warning' : '',
-        text:
-          preset && preset !== loaded
-            ? `${program} is running this model at ${loaded.toLocaleString()} tokens, not the ${preset.toLocaleString()} above. Batshit plans against ${loaded.toLocaleString()}.`
-            : `${program} is running this model at ${loaded.toLocaleString()} tokens.`,
-        ttl:
-          typeof reading.remainingTtlSeconds === 'number'
-            ? `${program} unloads it in about ${Math.max(1, Math.round(reading.remainingTtlSeconds / 60))} minutes, after which this becomes unknown again.`
-            : null
-      }
-    }
-    return {
-      tone: '',
-      text: `${program} can tell Batshit the real size, but only while the model is loaded. Load it and reopen this to see the number.`,
-      ttl: null
-    }
-  })
+  /**
+   * SA-102 P4 (DL-102-04): what the local program says it is ACTUALLY running
+   * this model with, next to the ceiling the preset stores. Josh's own 27B
+   * loads at 208,384 under a 262,144 ceiling.
+   *
+   * BL-104: a program that serves one model to every request reports that
+   * model's size for any preset, which is how the send path already budgets.
+   * Its reading wins over whichever catalog row the browser shows, and a preset
+   * saved for another model still gets it, naming the model that really runs.
+   */
+  const localContextStatus = $derived.by(() =>
+    describeLocalContextNote({
+      programId: localProviderId,
+      programLabel: localProgramLabel,
+      reading: localServingModel?.localContext ?? selectedCatalogEntry?.model?.localContext,
+      presetContextWindow: parseFormattedInteger(editingForm.contextWindow) || null,
+      requestedContextWindow: localProviderId === 'ollama'
+        ? parseFormattedInteger(editingForm.parameterValues.ollamaNumCtx ?? '') || null : null,
+      runningModelName:
+        localServedModelNote && localProviderId && localServingModel
+          ? localModelName(localProviderId, localServingModel.name)
+          : null
+    })
+  )
 
   /** SA-102 P4 (DL-102-11): open-ended text, never a two-value enum. */
   const localModelFormat = $derived.by(() => {
@@ -1028,11 +1078,11 @@ let lastInvalidModelSignature = $state<string | null>(null)
       provider,
       modelId,
       vercelId,
-      capabilities: editingForm.capabilities ?? null,
+      capabilities: effectiveFormCapabilities,
       connection: editingForm.connectionType ?? undefined,
       purpose: activePresetRole,
       matrixEntries
-    })
+    }).filter(definition => !isChatgptPlanConnection(editingForm.connectionId) || CHATGPT_PLAN_PARAMETERS.has(definition.name))
   })
 
   const PARAMETER_SECTION_ORDER = {
@@ -1588,11 +1638,30 @@ let lastInvalidModelSignature = $state<string | null>(null)
     await refreshN8nParameterCompatibilityOnOpen()
   })
 
+  /**
+   * BL-134 (LS-007, LS-011): a saved key, a custom provider, a Local AI save, or
+   * a model switch on a Local AI model card changes what this tab's catalog
+   * says (connection states, local program rows, KoboldCpp's served model), so
+   * an open tab reloads it, the same load its Refresh button runs.
+   */
+  onMount(() => {
+    const handleModelConnectionsUpdated = () => {
+      void loadCatalog()
+    }
+    window.addEventListener(LIVE_SETTINGS_EVENTS.modelConnectionsUpdated, handleModelConnectionsUpdated)
+    return () => {
+      window.removeEventListener(LIVE_SETTINGS_EVENTS.modelConnectionsUpdated, handleModelConnectionsUpdated)
+    }
+  })
+
   async function loadModels() {
     isLoading = true
     listError = null
 
     try {
+      // A reopened editor must read after its predecessor's completed saves settle.
+      await waitForModelPresetSaves()
+      if (panelDisposed) return
       const response = await fetch('/api/user/saved-models')
       if (!response.ok) {
         const message = await extractError(response, 'Failed to load models')
@@ -1603,13 +1672,13 @@ let lastInvalidModelSignature = $state<string | null>(null)
       models = loaded ?? []
       savedModelsStore.setSavedModels(models)
 
-      const purged = Array.isArray(result)
+      const unlisted: Array<{ modelName: string }> = Array.isArray(result)
         ? []
-        : result?.meta?.purged ?? []
-      purgeNotice = purged.length
+        : result?.meta?.unlisted ?? []
+      unlistedNotice = unlisted.length
         ? {
-            count: purged.length,
-            names: purged.map((entry: { modelName: string }) => entry.modelName)
+            count: unlisted.length,
+            names: unlisted.map((entry) => entry.modelName)
           }
         : null
 
@@ -1633,18 +1702,31 @@ let lastInvalidModelSignature = $state<string | null>(null)
     }
   }
 
+  /** BL-134: only the newest catalog load may apply its answer; an older one is stale. */
+  let catalogLoadSequence = 0
+  /**
+   * BL-295: a Refresh (`?refresh=1`, which re-reads the registry) has not
+   * answered yet. A load that replaces it (a connection change) refreshes too,
+   * or the Refresh's answer is dropped for the cached catalog it was replacing.
+   */
+  let catalogRefreshPending = false
+
   async function loadCatalog(forceRefresh = false) {
+    const sequence = ++catalogLoadSequence
+    const refresh = forceRefresh || catalogRefreshPending
+    catalogRefreshPending = refresh
     catalogLoading = true
     catalogError = null
 
     try {
-      const endpoint = forceRefresh ? '/api/models?refresh=1' : '/api/models'
+      const endpoint = refresh ? '/api/models?refresh=1' : '/api/models'
       const response = await fetch(endpoint)
       if (!response.ok) {
         const message = await extractError(response, 'Failed to load model catalog')
         throw new Error(message)
       }
       const payload = await response.json()
+      if (sequence !== catalogLoadSequence) return
       const models = payload?.data?.models ?? []
       const connections = payload?.data?.connections ?? []
       catalogModels = models
@@ -1654,10 +1736,14 @@ let lastInvalidModelSignature = $state<string | null>(null)
       }
 
     } catch (error) {
+      if (sequence !== catalogLoadSequence) return
       console.error('Failed to load catalog:', error)
       catalogError = error instanceof Error ? error.message : 'Failed to load catalog'
     } finally {
-      catalogLoading = false
+      if (sequence === catalogLoadSequence) {
+        catalogLoading = false
+        catalogRefreshPending = false
+      }
     }
   }
 
@@ -1676,18 +1762,45 @@ let lastInvalidModelSignature = $state<string | null>(null)
     return true
   }
 
+  function capturePresetDraft() {
+    return {
+      form: $state.snapshot(editingForm), codex: $state.snapshot(codexOptions),
+      signature: makeFormSignature(editingForm), persistedSignature: formPersistedSignature,
+      error: saveError, failedSignature: saveError ? lastInvalidModelSignature : null, numericDraft: numericDraftActive,
+      payload: !numericDraftActive && canCreate && !validateModelForm(editingForm) ? buildModelPayload(editingForm) : null
+    }
+  }
+
+  function retainCurrentPresetDraft() {
+    if (creatingNew && saveState === 'saving' && creationContinuation?.selection === formSelection) {
+      creationContinuation.draft = capturePresetDraft()
+    }
+    if (creatingNew && saveError) presetDrafts.set(CREATE_SENTINEL, capturePresetDraft())
+    if (!selectedModelId || creatingNew) return
+    if (makeFormSignature(editingForm) !== formPersistedSignature || presetAutosave.hasWork(selectedModelId)) {
+      presetDrafts.set(selectedModelId, capturePresetDraft())
+    } else {
+      presetDrafts.delete(selectedModelId)
+    }
+  }
+
   function selectModel(model: SavedModel) {
+    retainCurrentPresetDraft()
+    formSelection += 1
+    numericDraftActive = false
     creatingNew = false
     suppressDraftAutoCreate = false
     lastDraftCreateAttemptSignature = null
     selectedModelId = model.id
-    editingForm = normaliseModel(model)
-    codexOptions = normaliseCodexOptions(model.settings ?? null)
-    formPersistedSignature = makeFormSignature(editingForm)
+    const retained = presetDrafts.get(model.id)
+    numericDraftActive = retained?.numericDraft ?? false
+    editingForm = retained?.form ?? normaliseModel(model)
+    codexOptions = retained?.codex ?? normaliseCodexOptions(model.settings ?? null)
+    formPersistedSignature = retained?.persistedSignature ?? makeFormSignature(editingForm)
     formValidationError = null
-    lastInvalidModelSignature = null
-    saveState = 'idle'
-    saveError = null
+    lastInvalidModelSignature = retained?.failedSignature ?? null
+    saveState = presetAutosave.hasWork(model.id) ? 'saving' : 'idle'
+    saveError = retained?.error ?? null
     enrichmentWarning = null
     catalogSelectionDirty = false
     lastAutomaticCatalogSyncSignature = ''
@@ -1706,6 +1819,9 @@ let lastInvalidModelSignature = $state<string | null>(null)
   }
 
   function showCatalogLanding() {
+    retainCurrentPresetDraft()
+    formSelection += 1
+    numericDraftActive = false
     creatingNew = false
     suppressDraftAutoCreate = false
     lastDraftCreateAttemptSignature = null
@@ -1728,10 +1844,25 @@ let lastInvalidModelSignature = $state<string | null>(null)
 
   function startCreate() {
     showCatalogLanding()
+    // An explicit new catalog/manual choice replaces the recoverable failed create draft.
+    presetDrafts.delete(CREATE_SENTINEL)
     creatingNew = true
   }
 
   function selectFirstModelOrShowCatalogLanding() {
+    const failedCreate = presetDrafts.get(CREATE_SENTINEL)
+    if (failedCreate) {
+      showCatalogLanding()
+      creatingNew = true
+      editingForm = failedCreate.form
+      codexOptions = failedCreate.codex
+      numericDraftActive = failedCreate.numericDraft
+      lastDraftCreateAttemptSignature = failedCreate.signature
+      saveError = failedCreate.error
+      selectedConnectionId = editingForm.connectionId
+      syncCatalogSelectionFromEditingForm()
+      return
+    }
     if (models.length > 0) {
       selectModel(models[0])
       return
@@ -1774,12 +1905,34 @@ let lastInvalidModelSignature = $state<string | null>(null)
     }
   })
 
-  const debouncedSave = debounce(async (payload: SavedModel) => {
+  const presetAutosave = createModelPresetAutosave({
+    delay: SAVE_DEBOUNCE_MS,
+    settled: () => untrack(() => {
+      if (selectedModelId && presetAutosave.hasWork(selectedModelId)) saveState = 'saving'
+    }),
+    save: persistPresetDraft
+  })
+
+  async function persistPresetDraft(draft: { id: string; payload: SavedModel; signature: string; persistedSignature?: string | null; selection: number }) {
+    const isCurrent = () => !panelDisposed && selectedModelId === draft.id
     try {
+      const submittedForm = JSON.parse(draft.signature) as ModelFormState
+      const previous = savedModelsStore.getSavedModels().find(model => model.id === draft.id)
+      if (previous) {
+        // A successor may have been queued before an earlier save confirmed
+        // its inferred flags. Preserve those flags only when the captured
+        // baseline did not already hold an explicit choice being replaced.
+        const baseline = JSON.parse(draft.persistedSignature ?? draft.signature) as ModelFormState
+        const capabilities = acknowledgeOllamaPresetCapabilities(draft.payload, formCapabilitySubject(baseline), previous, previous)
+        if (capabilities !== (draft.payload.capabilities ?? null)) {
+          draft.payload = { ...draft.payload, capabilities: capabilities ?? undefined }
+          draft.signature = withSignatureCapabilities(draft.signature, capabilities)
+        }
+      }
       const response = await fetch('/api/user/saved-models', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+        body: JSON.stringify(draft.payload)
       })
 
       if (!response.ok) {
@@ -1789,41 +1942,116 @@ let lastInvalidModelSignature = $state<string | null>(null)
 
       const result = await response.json()
       const updated: SavedModel | null = result?.model ?? null
+      if (!updated || updated.id !== draft.id) throw new Error('The model save returned no matching preset.')
 
-      if (updated) {
+      if (updated && !panelDisposed) {
         models = models.map((model) => (model.id === updated.id ? updated : model))
-        editingForm = normaliseModel(updated)
-        selectedModelId = updated.id
-        formPersistedSignature = makeFormSignature(editingForm)
-        savedModelsStore.upsertSavedModel(updated)
       }
+      savedModelsStore.upsertSavedModel(updated)
 
       untrack(() => {
+        const submittedCapabilities = acknowledgeOllamaPresetCapabilities(
+          formCapabilitySubject(submittedForm), formCapabilitySubject(submittedForm), draft.payload, updated
+        )
+        const acknowledgedSignature = withSignatureCapabilities(draft.signature, submittedCapabilities)
+        const retained = presetDrafts.get(draft.id)
+        if (retained) {
+          retained.form = acknowledgeOllamaForm(retained.form, submittedForm, draft.payload, updated)
+          retained.signature = withSignatureCapabilities(retained.signature, retained.form.capabilities)
+          if (retained.payload) {
+            const capabilities = acknowledgeOllamaPresetCapabilities(retained.payload, formCapabilitySubject(submittedForm), draft.payload, updated)
+            retained.payload = { ...retained.payload, capabilities: capabilities ?? undefined }
+          }
+          retained.persistedSignature = acknowledgedSignature
+          retained.error = null
+          retained.failedSignature = null
+          if (retained.signature === acknowledgedSignature) presetDrafts.delete(draft.id)
+        }
+        if (!isCurrent()) return
+        // Acknowledge only the submitted draft. Later edits stay in the form.
+        editingForm = acknowledgeOllamaForm(editingForm, submittedForm, draft.payload, updated)
+        formPersistedSignature = acknowledgedSignature
         lastInvalidModelSignature = null
-        formValidationError = null
-        saveState = 'saved'
+        const matchesSubmittedDraft = makeFormSignature(editingForm) === acknowledgedSignature
+        if (matchesSubmittedDraft) formValidationError = null
+        saveState = matchesSubmittedDraft ? 'saved' : 'idle'
         saveError = null
       })
     } catch (error) {
       console.error('Model save failed:', error)
+      if (!isCurrent()) toast.error(`Could not save model preset "${draft.payload.modelName}": ${error instanceof Error ? error.message : 'Failed to save model'}`)
       untrack(() => {
+        const retained = presetDrafts.get(draft.id)
+        if (retained) {
+          retained.error = error instanceof Error ? error.message : 'Failed to save model'
+          retained.failedSignature = draft.signature
+        }
+        if (!isCurrent()) return
+        lastInvalidModelSignature = draft.signature
         saveState = 'idle'
         saveError = error instanceof Error ? error.message : 'Failed to save model'
       })
     } finally {
       setTimeout(() => {
         untrack(() => {
-          if (saveState === 'saved') {
+          if (isCurrent() && saveState === 'saved') {
             saveState = 'idle'
           }
         })
       }, 2000)
     }
-  }, SAVE_DEBOUNCE_MS)
+  }
+
+  onDestroy(() => {
+    retainCurrentPresetDraft()
+    panelDisposed = true
+    presetAutosave.dispose()
+  })
+
+  function beginNumericDraft() {
+    numericDraftActive = true
+    formValidationError = null
+    if (selectedModelId) presetAutosave.cancelPending(selectedModelId)
+    if (selectedModelId && !presetAutosave.hasWork(selectedModelId)) saveState = 'idle'
+  }
+
+  function finishNumericDraft() {
+    for (const [label, raw] of [
+      ['Context Window', editingForm.contextWindow],
+      ['Max Output Tokens', getParameterValue('maxTokens')]
+    ]) {
+      const text = raw.trim()
+      if (!text) continue
+      const value = Number(text.replace(/,/g, ''))
+      if (!/^(?:\d+|\d{1,3}(?:,\d{3})+)$/.test(text) || !Number.isSafeInteger(value) || value <= 0) {
+        formValidationError = `${label} must be a positive whole number, or blank${label === 'Context Window' ? ' for unknown context' : ' for a safe estimate'}.`
+        numericDraftActive = true
+        saveState = 'idle'
+        return
+      }
+    }
+    formValidationError = null
+    formatField('contextWindow', formatGroupedIntegerDisplay)
+    applySafeMaxOutputToEditingForm(getParameterValue('maxTokens'))
+    numericDraftActive = false
+  }
+
+  function commitNumericDraftOnEnter(event: KeyboardEvent) {
+    if (event.key !== 'Enter') return
+    event.preventDefault()
+    finishNumericDraft()
+  }
 
 $effect(() => {
-  if (!isExistingModel) return
+  if (!isExistingModel || numericDraftActive) return
   const signature = makeFormSignature(editingForm)
+  if (signature === formPersistedSignature && selectedModelId) {
+    untrack(() => {
+      presetAutosave.cancelPending(selectedModelId!)
+      if (!presetAutosave.hasWork(selectedModelId!)) saveState = 'idle'
+    })
+    return
+  }
   if (
     !formPersistedSignature ||
     signature === formPersistedSignature ||
@@ -1850,16 +2078,28 @@ $effect(() => {
   saveError = null
 
   const payload = buildModelPayload(editingForm)
+  if (!isChatgptPlanConnection(editingForm.connectionId) &&
+    payload.settings?.maxTokens !== parseFormattedInteger(editingForm.parameterValues.maxTokens ?? '')) {
+    // Normalize a completed dirty form before acknowledging it, never a focused numeric draft.
+    untrack(() => applySafeMaxOutputToEditingForm(editingForm.parameterValues.maxTokens))
+    return
+  }
   if (!payload.id && selectedModelId) {
       payload.id = selectedModelId
     }
 
-    debouncedSave(payload)
+    untrack(() => presetAutosave.schedule({
+      id: payload.id,
+      payload,
+      signature,
+      persistedSignature: formPersistedSignature,
+      selection: formSelection
+    }))
   })
 
   $effect(() => {
     if (!creatingNew) return
-    if (suppressDraftAutoCreate || saveState === 'saving') return
+    if (suppressDraftAutoCreate || saveState === 'saving' || numericDraftActive) return
 
     const signature = makeFormSignature(editingForm)
     if (!canCreate || signature === lastDraftCreateAttemptSignature) {
@@ -1905,9 +2145,15 @@ $effect(() => {
     }
     saveState = 'saving'
     saveError = null
+    const selection = formSelection
+    const signature = makeFormSignature(editingForm)
+    const isCurrent = () => !panelDisposed && selection === formSelection
+    const continuation = { selection, draft: null as ReturnType<typeof capturePresetDraft> | null }
+    creationContinuation = continuation
 
     try {
       const payload = buildModelPayload(editingForm)
+      await runModelPresetSave(async () => {
       const response = await fetch('/api/user/saved-models', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1921,22 +2167,73 @@ $effect(() => {
 
       const result = await response.json()
       const created: SavedModel | null = result?.model ?? null
+      if (!created?.id) throw new Error('The model create returned no saved preset.')
 
       if (created) {
-        models = [created, ...models.filter((model) => model.id !== created.id)]
-        selectModel(created)
+        if (!panelDisposed) models = [created, ...models.filter((model) => model.id !== created.id)]
         savedModelsStore.upsertSavedModel(created)
+        presetDrafts.delete(CREATE_SENTINEL)
+        const submittedForm = JSON.parse(signature) as ModelFormState
+        const submittedCapabilities = acknowledgeOllamaPresetCapabilities(
+          formCapabilitySubject(submittedForm), formCapabilitySubject(submittedForm), payload, created
+        )
+        const acknowledgedSignature = withSignatureCapabilities(signature, submittedCapabilities)
+        if (continuation.draft && continuation.draft.signature !== signature) {
+          const retained = continuation.draft
+          const retainedForm = acknowledgeOllamaForm(retained.form, submittedForm, payload, created)
+          const retainedSignature = withSignatureCapabilities(retained.signature, retainedForm.capabilities)
+          const retainedPayload = retained.payload ? {
+            ...retained.payload,
+            capabilities: acknowledgeOllamaPresetCapabilities(retained.payload, formCapabilitySubject(submittedForm), payload, created) ?? undefined
+          } : null
+          presetDrafts.set(created.id, {
+            ...retained,
+            form: { ...retainedForm, id: created.id },
+            payload: retainedPayload,
+            signature: JSON.stringify({ ...JSON.parse(retainedSignature), id: created.id }),
+            persistedSignature: JSON.stringify({ ...JSON.parse(acknowledgedSignature), id: created.id })
+          })
+          if (!isCurrent() && !retained.numericDraft && retainedPayload) {
+            // This completed successor stays inside the admitted create, before remount reads.
+            await persistPresetDraft({
+              id: created.id,
+              payload: { ...retainedPayload, id: created.id },
+              signature: JSON.stringify({ ...JSON.parse(retainedSignature), id: created.id }),
+              persistedSignature: JSON.stringify({ ...JSON.parse(acknowledgedSignature), id: created.id }),
+              selection
+            })
+          }
+        }
+        if (isCurrent()) {
+          if (makeFormSignature(editingForm) === signature) {
+            selectModel(created)
+          } else {
+            // The create acknowledgement gives this draft its id, without undoing later typing.
+            editingForm = { ...acknowledgeOllamaForm(editingForm, submittedForm, payload, created), id: created.id }
+            selectedModelId = created.id
+            creatingNew = false
+            formPersistedSignature = JSON.stringify({ ...JSON.parse(acknowledgedSignature), id: created.id })
+          }
+        }
         toast.success(options?.successMessage ?? 'Model preset created')
-      } else {
-        toast.success(options?.successMessage ?? 'Model preset created')
-        await loadModels()
       }
+      })
     } catch (error) {
       console.error('Model creation failed:', error)
-      saveError = error instanceof Error ? error.message : 'Failed to create model'
-      toast.error(saveError)
+      const message = error instanceof Error ? error.message : 'Failed to create model'
+      const failedDraft = isCurrent() ? capturePresetDraft() : continuation.draft
+      if (failedDraft) presetDrafts.set(CREATE_SENTINEL, {
+        ...failedDraft, error: message, failedSignature: failedDraft.signature
+      })
+      if (isCurrent()) {
+        saveError = message
+        lastDraftCreateAttemptSignature = makeFormSignature(editingForm)
+        toast.error(saveError)
+      } else {
+        toast.error(`Could not create model preset: ${message}`)
+      }
     } finally {
-      saveState = 'idle'
+      if (isCurrent()) saveState = 'idle'
     }
   }
 
@@ -2082,9 +2379,11 @@ $effect(() => {
         throw new Error(message)
       }
 
-      models = models.filter((model) => model.id !== selectedModelId)
-      savedModelsStore.removeSavedModel(selectedModelId)
+      const deletedId = selectedModelId
+      models = models.filter((model) => model.id !== deletedId)
+      savedModelsStore.removeSavedModel(deletedId)
       selectFirstModelOrShowCatalogLanding()
+      presetDrafts.delete(deletedId)
       toast.success('Model deleted')
     } catch (error) {
       console.error('Model deletion failed:', error)
@@ -2136,10 +2435,18 @@ $effect(() => {
   }
 
   /**
-   * SA-102 P1 (DL-102-16): a blank local field must never imply a value. It says
-   * which program decides instead, by name.
+   * DL-102-16 names the local program that decides a blank field. Ollama
+   * Thinking instead names the adapter's off default (BL-1261).
+   * Cloud presets keep their wording.
    */
+  function blankChoiceLabel(definition: ParameterDefinition, cloudLabel: string): string {
+    return localProgramLabel ? resolveParameterPlaceholder(definition) : cloudLabel
+  }
+
   function resolveParameterPlaceholder(definition: ParameterDefinition): string {
+    if (localProviderId === 'ollama' && definition.name === 'ollamaThink') {
+      return 'Default (off)'
+    }
     if (localProgramLabel) {
       return `Not sent, ${localProgramLabel} decides`
     }
@@ -2165,6 +2472,20 @@ $effect(() => {
 
   function showResponseFormatWarning(definition: ParameterDefinition) {
     return isResponseFormatParameter(definition) && getParameterValue(definition.name).trim().length > 0
+  }
+
+  /**
+   * BL-866: a saved choice the model does not offer (Claude Sonnet 5.5 has no Enabled) is shown
+   * as it was saved, with the sentence a send would be refused with, so nothing is swapped
+   * behind the user's back.
+   */
+  function getUnlistedChoiceNotice(definition: ParameterDefinition) {
+    if (definition.inputType !== 'select') return null
+    return describeUnlistedSelectValue(
+      definition,
+      getParameterValue(definition.name),
+      editingForm.modelId || selectedCatalogEntry?.modelId || null
+    )
   }
 
   function addCustomParamRow() {
@@ -2252,15 +2573,7 @@ $effect(() => {
 
   function buildParameterValueMap(model: SavedModel): Record<string, string> {
     if (!model.settings) return {}
-    const definitions = filterParameters({
-      provider: resolveParameterProvider(model.provider, model.connection),
-      modelId: model.modelId,
-      vercelId: model.catalogModelId ?? model.vercelSourceId ?? undefined,
-      capabilities: model.capabilities ?? null,
-      connection: model.connection?.type ?? undefined,
-      purpose: resolvePresetType(model),
-      matrixEntries
-    })
+    const definitions = getHydrationParameterDefinitions(model)
     const mapped: Record<string, string> = {}
     for (const definition of definitions) {
       if (model.settings[definition.name] === undefined) continue
@@ -2273,20 +2586,85 @@ $effect(() => {
     return mapped
   }
 
-  function resolveSafeFormMaxOutputTokens(maxOutputTokens: string | number | null | undefined, contextWindow: unknown) {
+  function getFormCapabilities(form: ModelFormState) {
+    return projectOllamaPresetCapabilities(formCapabilitySubject(form), catalogModels)
+  }
+
+  function formCapabilitySubject(form: ModelFormState) {
+    return {
+      provider: form.provider,
+      modelId: form.modelId,
+      effectiveModelId: form.effectiveModelId,
+      capabilities: form.capabilities,
+      connection: {
+        id: form.connectionId ?? undefined,
+        type: form.connectionType ?? 'direct',
+        service: form.connectionService ?? undefined
+      }
+    }
+  }
+
+  function acknowledgeOllamaForm(form: ModelFormState, original: ModelFormState, submitted: SavedModel, confirmed: SavedModel): ModelFormState {
+    const capabilities = acknowledgeOllamaPresetCapabilities(formCapabilitySubject(form), formCapabilitySubject(original), submitted, confirmed)
+    return capabilities === form.capabilities ? form : { ...form, capabilities }
+  }
+
+  function withSignatureCapabilities(signature: string, capabilities: ModelCapabilities | null): string {
+    const snapshot = JSON.parse(signature)
+    if (JSON.stringify(snapshot.capabilities ?? null) === JSON.stringify(capabilities)) return signature
+    return JSON.stringify({ ...snapshot, capabilities })
+  }
+
+  function getHydrationParameterDefinitions(model: SavedModel): ParameterDefinition[] {
+    const definitions = filterParameters({
+      provider: resolveParameterProvider(model.provider, model.connection),
+      modelId: model.modelId,
+      vercelId: model.catalogModelId ?? model.vercelSourceId ?? undefined,
+      capabilities: projectOllamaPresetCapabilities(model, catalogModels),
+      connection: model.connection?.type ?? undefined,
+      purpose: resolvePresetType(model),
+      matrixEntries
+    }).filter(definition => !isChatgptPlanConnection(model.connection?.id) || CHATGPT_PLAN_PARAMETERS.has(definition.name))
+    // Preserve an already saved Thinking value even if optional metadata has
+    // not arrived. Hydrating a known field does not advertise its capability.
+    if (model.connection?.type === 'direct' && model.connection.service === 'ollama' &&
+        model.settings?.ollamaThink !== undefined && !definitions.some(definition => definition.name === 'ollamaThink')) {
+      const thinking = getParameterSchema('ollama').base.find(definition => definition.name === 'ollamaThink')
+      if (thinking) definitions.push(thinking)
+    }
+    return definitions
+  }
+
+  function getFormLoadedContext(form: Pick<ModelFormState, 'provider' | 'connectionService' | 'connectionId' | 'catalogModelId' | 'modelId'>) {
+    const program = resolveLocalProviderId(form)
+    if (!program || form.connectionId !== `direct:${program}`) return undefined
+    const serving = findServingModel(catalogModels, program)
+    const connection = connectionOptions.find(option => option.id === form.connectionId) ?? null
+    const matched = serving ?? findConnectionScopedCatalogPreset(catalogModels, connection, {
+      provider: form.provider,
+      modelId: form.modelId,
+      targetId: form.catalogModelId
+    })
+    return matched?.localContext?.source === 'loaded' ? matched.localContext.loadedContextWindow : undefined
+  }
+
+  function resolveSafeFormMaxOutputTokens(maxOutputTokens: string | number | null | undefined, contextWindow: unknown, loadedContextWindow?: unknown) {
     return resolvePresetMaxOutputTokens({
       maxOutputTokens,
-      contextWindow
+      contextWindow,
+      loadedContextWindow
     })
   }
 
   function resolveSafeFormMaxOutputTokenResolution(
     maxOutputTokens: string | number | null | undefined,
-    contextWindow: unknown
+    contextWindow: unknown,
+    loadedContextWindow?: unknown
   ) {
     return resolvePresetMaxOutputTokenResolution({
       maxOutputTokens,
-      contextWindow
+      contextWindow,
+      loadedContextWindow
     })
   }
 
@@ -2325,8 +2703,9 @@ $effect(() => {
   }
 
   function applySafeMaxOutputToEditingForm(rawMaxOutputTokens: string | number | null | undefined) {
+    if (isChatgptPlanConnection(editingForm.connectionId)) return
     const contextWindow = parseFormattedInteger(editingForm.contextWindow) || 0
-    const resolution = resolveSafeFormMaxOutputTokenResolution(rawMaxOutputTokens, contextWindow)
+    const resolution = resolveSafeFormMaxOutputTokenResolution(rawMaxOutputTokens, contextWindow, getFormLoadedContext(editingForm))
 
     editingForm = {
       ...editingForm,
@@ -2341,15 +2720,7 @@ $effect(() => {
   function buildCustomParameterRows(model: SavedModel): CustomParamRow[] {
     if (!model.settings) return []
     const parameterProvider = resolveParameterProvider(model.provider, model.connection)
-    const definitions = filterParameters({
-      provider: parameterProvider,
-      modelId: model.modelId,
-      vercelId: model.catalogModelId ?? model.vercelSourceId ?? undefined,
-      capabilities: model.capabilities ?? null,
-      connection: model.connection?.type ?? undefined,
-      purpose: resolvePresetType(model),
-      matrixEntries
-    })
+    const definitions = getHydrationParameterDefinitions(model)
     const known = new Set(definitions.map((definition) => definition.name))
     const rows: CustomParamRow[] = []
 
@@ -2399,7 +2770,8 @@ $effect(() => {
 
     const contextWindow = model.contextWindow ?? 0
     const maxOutputResolution = resolveSafeFormMaxOutputTokenResolution(model.settings?.maxTokens ?? null, contextWindow)
-    const parameterValues = ensureSafeMaxOutputValue(buildParameterValueMap(model), contextWindow)
+    const plan = isChatgptPlanConnection(model.connection?.id)
+    const parameterValues = plan ? buildParameterValueMap(model) : ensureSafeMaxOutputValue(buildParameterValueMap(model), contextWindow)
     const enrichment = withAppliedBaselineFields(model.enrichment ?? null, {
       modelName: model.modelName,
       modelId: model.modelId,
@@ -2415,7 +2787,9 @@ $effect(() => {
       capabilities: model.capabilities ?? null,
       vercelSourceId: model.vercelSourceId ?? null
     })
-    const resolvedEnrichment = withMaxOutputResolution(enrichment, maxOutputResolution)
+    // The plan has no output-token setting; an estimate-only snapshot would
+    // falsely mark every missing identity baseline as Modified (BL-1067).
+    const resolvedEnrichment = plan ? enrichment : withMaxOutputResolution(enrichment, maxOutputResolution)
 
     return {
       id: model.id ?? null,
@@ -2505,14 +2879,22 @@ $effect(() => {
       ),
       modelId: form.modelId || selectedCatalogEntry?.modelId || undefined,
       vercelId: form.catalogModelId || form.vercelSourceId || selectedCatalogModel?.id || undefined,
-      capabilities: form.capabilities ?? null,
+      capabilities: getFormCapabilities(form),
       connection: form.connectionType ?? undefined,
       purpose: activePresetRole,
       matrixEntries
     })
 
     const settings: Record<string, ParameterValue> = {}
+    // A restriction or metadata outage may hide Thinking; retain its saved
+    // value on unrelated edits without changing whether runtime may send it.
+    if (form.connectionType === 'direct' && form.connectionService === 'ollama' &&
+        form.parameterValues.ollamaThink !== undefined && !definitions.some(definition => definition.name === 'ollamaThink')) {
+      const thinking = getParameterSchema('ollama').base.find(definition => definition.name === 'ollamaThink')
+      if (thinking) definitions.push(thinking)
+    }
     for (const definition of definitions) {
+      if (isChatgptPlanConnection(form.connectionId) && !CHATGPT_PLAN_PARAMETERS.has(definition.name)) continue
       const raw = form.parameterValues[definition.name]
       if (raw === undefined || raw.trim().length === 0) {
         continue
@@ -2590,9 +2972,9 @@ $effect(() => {
     // stays absent so the Token Panel says Unknown instead of an exact $0.00.
     const pricing = buildPresetPricingFromForm(form)
     const contextWindow = parsePresetContextWindow(form.contextWindow)
-    const maxOutputResolution = resolveSafeFormMaxOutputTokenResolution(form.parameterValues.maxTokens ?? null, contextWindow)
+    const maxOutputResolution = resolveSafeFormMaxOutputTokenResolution(form.parameterValues.maxTokens ?? null, contextWindow, getFormLoadedContext(form))
     const settings = buildParameterSettings(form)
-    settings.maxTokens = maxOutputResolution.maxOutputTokens
+    if (!isChatgptPlanConnection(form.connectionId)) settings.maxTokens = maxOutputResolution.maxOutputTokens
     const customSettings = buildCustomSettings(form)
     const includeCodexSettings = isCodexForm(form)
     const codexSettings = includeCodexSettings ? buildCodexSettingsPayload(codexOptions) : {}
@@ -2623,14 +3005,14 @@ $effect(() => {
       ...(contextWindow !== undefined ? { contextWindow } : {}),
       pricing,
       settings: mergedSettings,
-      capabilities: form.capabilities ?? undefined,
+      capabilities: getFormCapabilities(form) ?? undefined,
       voiceSession: voiceSession ?? undefined,
       compatibility: form.compatibility ?? undefined,
       imageTransport: form.imageTransport !== 'auto' ? form.imageTransport : undefined,
       isVercelImport: form.isVercelImport,
       vercelSourceId: form.vercelSourceId ?? undefined,
       vercelDisplayName: form.vercelDisplayName ?? undefined,
-      enrichment: withMaxOutputResolution(form.enrichment ?? {
+      enrichment: isChatgptPlanConnection(form.connectionId) ? undefined : withMaxOutputResolution(form.enrichment ?? {
         source: 'provider-manager',
         fetchedAt: now
       }, maxOutputResolution),
@@ -2789,10 +3171,6 @@ $effect(() => {
     }
   }
 
-  function normalizeCatalogIdentifier(value?: string | null) {
-    return value?.toLowerCase().trim() ?? ''
-  }
-
   function getNewPresetActionLabel() {
     if (manualEntryConnectionActive || connectionNeedsManualModel) {
       return 'Start Manual Preset'
@@ -2802,7 +3180,7 @@ $effect(() => {
 
   function getOverwriteConfirmationMessage() {
     return [
-      'This updates the basic model info, connection details, compatibility badges, pricing, context window, and Max Output Tokens.',
+      'This updates the basic model info, connection details, supported features, compatibility badges, pricing, context window, and Max Output Tokens.',
       'Your other model parameters, custom parameters, and image transport setting will stay exactly as they are.'
     ].join('\n')
   }
@@ -2841,26 +3219,11 @@ $effect(() => {
       return
     }
 
-    const normalizedTarget = normalizeCatalogIdentifier(targetId)
-    const match =
-      catalogModels.find(
-        (model) =>
-          normalizeCatalogIdentifier(model.id) === normalizedTarget ||
-          normalizeCatalogIdentifier(model.canonicalId) === normalizedTarget ||
-          Object.values(model.idVariants ?? {}).some(
-            (variant) => normalizeCatalogIdentifier(variant.effectiveId) === normalizedTarget
-          )
-      ) ??
-      catalogModels.find(
-        (model) =>
-          canonicalizeCatalogDeveloperId(model.provider) ===
-            canonicalizeCatalogDeveloperId(editingForm.provider) && model.name === editingForm.modelId
-      ) ??
-      catalogModels.find((model) =>
-        Object.values(model.idVariants ?? {}).some(
-          (variant) => variant.developerId === editingForm.provider && variant.modelId === editingForm.modelId
-        )
-      )
+    const match = findConnectionScopedCatalogPreset(catalogModels, selectedConnection, {
+      targetId,
+      provider: editingForm.provider,
+      modelId: editingForm.modelId
+    })
 
     if (match) {
       const scopedMatch = resolveConnectionScopedCatalogModel(match, selectedConnection)
@@ -2947,14 +3310,20 @@ $effect(() => {
     const baselineProvider = resolvedIds.developerId
     const hostedCatalogIdentity = !['local', 'n8n-only', 'codex', 'claude-cli'].includes(model.source ?? '')
     const isGatewaySelection = selectedConnection?.transport === 'vercel-gateway'
-    const rawMaxOutputTokens = toCatalogNumber(model.maxOutputTokens)
-    const pricingInput = toCatalogNumber(model.pricing?.input)
-    const pricingOutput = toCatalogNumber(model.pricing?.output)
-    const pricingCached = toCatalogNumber(model.pricing?.cachedInput)
-    const rawContext = toCatalogNumber(model.contextWindow)
-    // BL-67: a catalog window of 0 (or less) is not a window; it is unknown.
-    const contextWindow = rawContext !== undefined && rawContext > 0 ? Math.round(rawContext) : undefined
-    const maxOutputResolution = resolveSafeFormMaxOutputTokenResolution(rawMaxOutputTokens, contextWindow)
+    // BL-68: the chosen connection's own limits when its variant carries them.
+    // BL-67: a window of 0 (or less) is not a window; it is unknown.
+    const connectionLimits = resolveCatalogConnectionLimits(model, baselineConnectionId)
+    const rawMaxOutputTokens = connectionLimits.maxOutputTokens
+    const plan = isChatgptPlanConnection(baselineConnectionId)
+    // BL-132: and the chosen connection's own price when its variant carries one.
+    const connectionPricing = resolveCatalogConnectionPricing(model, baselineConnectionId).pricing
+    const pricingInput = toCatalogNumber(connectionPricing?.input)
+    const pricingOutput = toCatalogNumber(connectionPricing?.output)
+    const pricingCached = toCatalogNumber(connectionPricing?.cachedInput)
+    const contextWindow =
+      connectionLimits.contextWindow !== undefined ? Math.round(connectionLimits.contextWindow) : undefined
+    const maxOutputResolution = resolveSafeFormMaxOutputTokenResolution(rawMaxOutputTokens, contextWindow,
+      model.source === 'local' && model.localContext?.source === 'loaded' ? model.localContext.loadedContextWindow : undefined)
     const baselineMaxOutputTokens = maxOutputResolution.maxOutputTokens
     const capabilities = catalogFeaturesToCapabilities(model.features ?? null)
     const compatibility = determineModelCompatibility(
@@ -2967,15 +3336,15 @@ $effect(() => {
     if (pricingCached !== undefined) pricing.cachedInput = pricingCached
 
     const warnings: string[] = []
-    if (Object.keys(pricing).length === 0) {
+    if (!plan && Object.keys(pricing).length === 0) {
       warnings.push('Pricing not provided in catalog entry.')
     }
-    if (contextWindow === undefined) {
+    if (!plan && contextWindow === undefined) {
       warnings.push('Context window missing from catalog entry.')
     }
-    if (rawMaxOutputTokens === undefined) {
+    if (!plan && rawMaxOutputTokens === undefined) {
       warnings.push(`Max Output Tokens missing from catalog entry; using ${baselineMaxOutputTokens.toLocaleString()}.`)
-    } else if (baselineMaxOutputTokens !== Math.floor(rawMaxOutputTokens)) {
+    } else if (!plan && rawMaxOutputTokens !== undefined && baselineMaxOutputTokens !== Math.floor(rawMaxOutputTokens)) {
       warnings.push(`Catalog Max Output Tokens looked unsafe; using ${baselineMaxOutputTokens.toLocaleString()}.`)
     }
     if (!capabilities) {
@@ -2987,10 +3356,11 @@ $effect(() => {
       fetchedAt: new Date().toISOString(),
       modelName: baselineModelName,
       modelId: baselineModelId,
-      maxOutputTokens: baselineMaxOutputTokens,
-      maxOutputTokensEstimated: maxOutputResolution.estimated,
-      maxOutputTokensEstimateReason:
-        maxOutputResolution.reason === 'provided' ? undefined : maxOutputResolution.reason,
+      ...(!plan ? {
+        maxOutputTokens: baselineMaxOutputTokens,
+        maxOutputTokensEstimated: maxOutputResolution.estimated,
+        maxOutputTokensEstimateReason: maxOutputResolution.reason === 'provided' ? undefined : maxOutputResolution.reason
+      } : {}),
       contextWindow,
       pricing: Object.keys(pricing).length ? pricing : undefined,
       capabilities: capabilities ?? undefined,
@@ -3020,7 +3390,7 @@ $effect(() => {
       isVercelImport: isGatewaySelection,
       vercelSourceId: isGatewaySelection ? model.id : undefined,
       vercelDisplayName: model.displayName,
-      settings: {
+      settings: plan ? undefined : {
         maxTokens: baselineMaxOutputTokens
       },
       enrichment
@@ -3410,6 +3780,24 @@ $effect(() => {
       return fallback
     }
   }
+
+  export function readAppActionState() {
+    return {
+      entityId: selectedModelId,
+      busy: isLoading || saveState === 'saving' || deleteBusy,
+      dirty: creatingNew || (formPersistedSignature !== null && makeFormSignature(editingForm) !== formPersistedSignature),
+      error: listError
+    }
+  }
+  export function selectAppActionTarget(target: SettingsTarget, context: ActionContext) {
+    context.check()
+    if (appActionsHaveDrafts()) refuse('unsaved_changes')
+    const model = models.find(model => model.id === target.modelId)
+    if (!model) refuse('missing_entity')
+    if (readAppActionState().busy) refuse('busy')
+    selectModel(model)
+  }
+
 </script>
 
 <div class="space-y-4">
@@ -3426,14 +3814,16 @@ $effect(() => {
   </div>
 
   <div class="batshit-settings-surface space-y-4">
-    {#if purgeNotice}
+    {#if unlistedNotice}
       <div class="batshit-settings-inline-alert is-warning">
-        Removed {purgeNotice.count} deprecated model{purgeNotice.count === 1 ? '' : 's'} from your presets.
-        {#if purgeNotice.names.length}
+        {unlistedNotice.count === 1
+          ? '1 preset uses a model Vercel AI Gateway no longer lists. Agents that use it cannot send until you pick another model for them.'
+          : `${unlistedNotice.count} presets use models Vercel AI Gateway no longer lists. Agents that use them cannot send until you pick another model for them.`}
+        {#if unlistedNotice.names.length}
           <span class="batshit-settings-caption ml-1">
-            {purgeNotice.names.slice(0, 3).join(', ')}
-            {#if purgeNotice.names.length > 3}
-              &nbsp;+{purgeNotice.names.length - 3} more
+            {unlistedNotice.names.slice(0, 3).join(', ')}
+            {#if unlistedNotice.names.length > 3}
+              &nbsp;+{unlistedNotice.names.length - 3} more
             {/if}
           </span>
         {/if}
@@ -3690,6 +4080,11 @@ $effect(() => {
             </Select.Root>
           </div>
         </div>
+        {#if selectedConnection?.status === 'locked' && selectedConnection.service && LOCAL_PROVIDER_LABELS.has(selectedConnection.service)}
+          <div class="batshit-settings-inline-alert is-warning" role="status">
+            {selectedConnection.label} is disabled. Enable it in Settings → Local AI to discover its models.
+          </div>
+        {/if}
         {#if manualEntryConnectionActive}
           <div class="batshit-settings-note is-dashed">
             <p>No catalog available yet. Choose a connection, then copy its provider defaults into the preset and enter the developer and model ID manually below.</p>
@@ -3749,22 +4144,37 @@ $effect(() => {
                       </p>
                     {/if}
                   </div>
-                  {#if selectedCatalogModel.pricing}
+                  {#if selectedConnectionIsFlatFeePlan}
                     <p class="flex flex-wrap gap-3">
-                      {#if selectedCatalogModel.pricing.input !== undefined}
-                        <span>Input ${formatPrice(selectedCatalogModel.pricing.input)}/M</span>
+                      <span>Token plan</span>
+                    </p>
+                  {:else if selectedCatalogPricing}
+                    <p class="flex flex-wrap gap-3">
+                      {#if selectedCatalogPricing.input !== undefined}
+                        <span>Input ${formatPrice(selectedCatalogPricing.input)}/M</span>
                       {/if}
-                      {#if selectedCatalogModel.pricing.output !== undefined}
-                        <span>Output ${formatPrice(selectedCatalogModel.pricing.output)}/M</span>
+                      {#if selectedCatalogPricing.output !== undefined}
+                        <span>Output ${formatPrice(selectedCatalogPricing.output)}/M</span>
                       {/if}
-                      {#if selectedCatalogModel.pricing.cachedInput !== undefined}
-                        <span>Cached ${formatPrice(selectedCatalogModel.pricing.cachedInput)}/M</span>
+                      {#if selectedCatalogPricing.cachedInput !== undefined}
+                        <span>Cached ${formatPrice(selectedCatalogPricing.cachedInput)}/M</span>
                       {/if}
                     </p>
                   {/if}
-                  {#if selectedCatalogModel.contextWindow}
+                  {#if selectedCatalogContextWindow}
                     <p>
-                      Context: {selectedCatalogModel.contextWindow.toLocaleString()} tokens
+                      Context: {selectedCatalogContextWindow.toLocaleString()} tokens
+                    </p>
+                  {/if}
+                  {#if selectedCatalogModel.publishedMetadata}
+                    <p>
+                      Published model context: {selectedCatalogModel.publishedMetadata.contextWindow.toLocaleString()} tokens.
+                      Published max output: {selectedCatalogModel.publishedMetadata.maxOutputTokens.toLocaleString()} tokens.
+                    </p>
+                    <p>
+                      ChatGPT account context and output limits are unknown. Published limits do not set this preset's budget.
+                      <a href={selectedCatalogModel.publishedMetadata.sourceUrl} target="_blank" rel="noopener noreferrer">OpenAI model documentation</a>
+                      (verified {selectedCatalogModel.publishedMetadata.verifiedAt}).
                     </p>
                   {/if}
                   {#if selectedConnection}
@@ -3988,13 +4398,20 @@ $effect(() => {
 	            </SettingsInfoMenu>
             {/snippet}
             {#snippet actions()}
-	            {#if !creatingNew && selectedModelId}
-	              <SettingsSaveStatus
+	            {#if (!creatingNew && selectedModelId) || saveError}
+              <SettingsSaveStatus
 	                state={saveError ? 'error' : saveState}
 	                error={saveError}
 	                savedLabel="Model Saved"
 	                sticky={false}
-	              />
+              />
+              {#if saveError}
+                <Button variant="outline" size="sm" disabled={numericDraftActive || saveState === 'saving'} onclick={() => {
+                  lastInvalidModelSignature = null
+                  lastDraftCreateAttemptSignature = null
+                  saveError = null
+                }}>Retry Save</Button>
+              {/if}
 	            {/if}
             {/snippet}
 		          <div class="batshit-settings-form-stack">
@@ -4129,6 +4546,11 @@ $effect(() => {
 		                  class="batshit-model-id"
 		                  oninput={(event) => updateField('modelId', (event.target as HTMLInputElement).value)}
 		                />
+		                {#if localServedModelNote}
+		                  <p class={`batshit-settings-form-meta ${localServedModelNote.tone}`}>
+		                    {localServedModelNote.text}
+		                  </p>
+		                {/if}
 		              </div>
 		            </div>
 
@@ -4238,7 +4660,7 @@ $effect(() => {
                   </div>
                 {/if}
 
-		            {#if editingForm.capabilities}
+		            {#if effectiveFormCapabilities}
 		              <div class="batshit-settings-form-row is-tall">
 		                <div class="batshit-settings-form-copy">
 		                  <div class="batshit-settings-form-label-line">
@@ -4254,10 +4676,13 @@ $effect(() => {
 		                <div class="batshit-settings-form-control">
 		                  <div class="batshit-settings-form-meta">
 		                    {#each CAPABILITY_LABELS as capability}
-		                      {#if editingForm.capabilities[capability.key]}
+		                      {#if effectiveFormCapabilities[capability.key]}
 		                        <Badge variant="outline">{capability.label}</Badge>
 		                      {/if}
 		                    {/each}
+                        {#if isChatgptPlanConnection(editingForm.connectionId) && editingForm.capabilities?.vision === false}
+                          <p>Image input is disabled for this preset. Overwrite Selected Preset reapplies the catalog's supported features.</p>
+                        {/if}
 		                  </div>
 		                </div>
 		              </div>
@@ -4290,6 +4715,9 @@ $effect(() => {
 		              </div>
 		            {/if}
 
+		            {#if isChatgptPlanConnection(editingForm.connectionId)}
+                <p class="batshit-settings-note">ChatGPT plan inference has no API token price. Manage plan usage in ChatGPT; quota percentages and resets are not reported here.</p>
+              {:else}
 		            <div class="batshit-settings-form-row is-tall">
 		              <div class="batshit-settings-form-copy">
 		                <div class="batshit-settings-form-label-line">
@@ -4457,6 +4885,7 @@ $effect(() => {
 	                />
 	              </div>
 	            </div>
+	            {/if}
 
 	            <div class="batshit-settings-form-row">
 	              <div class="batshit-settings-form-copy">
@@ -4467,6 +4896,9 @@ $effect(() => {
                   {/if}
 	                  <SettingsInfoMenu ariaLabel="About Context Window">
 	                    <p>Total tokens supported by this model. Leave blank when you want Batshit to treat it as unknown.</p>
+                      {#if isChatgptPlanConnection(editingForm.connectionId)}
+                        <p>The published model ceiling does not establish this ChatGPT account's effective context budget. Leave blank unless you have verified that budget.</p>
+                      {/if}
 	                  </SettingsInfoMenu>
 	                </div>
 	              </div>
@@ -4475,12 +4907,14 @@ $effect(() => {
 	                  type="text"
                     inputmode="numeric"
 	                  value={editingForm.contextWindow}
-	                  placeholder="200,000"
-	                  oninput={(event) => updateField('contextWindow', (event.target as HTMLInputElement).value)}
-                    onblur={() => {
-                      formatField('contextWindow', formatGroupedIntegerDisplay)
-                      applySafeMaxOutputToEditingForm(getParameterValue('maxTokens'))
+	                  placeholder={isChatgptPlanConnection(editingForm.connectionId) ? 'Unknown' : '200,000'}
+                    onfocus={beginNumericDraft}
+                    onkeydown={commitNumericDraftOnEnter}
+	                  oninput={(event) => {
+                      beginNumericDraft()
+                      updateField('contextWindow', (event.target as HTMLInputElement).value)
                     }}
+                    onblur={finishNumericDraft}
 	                />
 	                {#if localContextStatus}
 	                  <p class={`batshit-settings-form-meta ${localContextStatus.tone}`}>
@@ -4552,10 +4986,16 @@ $effect(() => {
 	                <Input
 	                  type="text"
                     inputmode="numeric"
-	                  value={getParameterValue('maxTokens')}
-	                  placeholder="4,000"
-	                  oninput={(event) => updateParameterValue('maxTokens', (event.target as HTMLInputElement).value)}
-                    onblur={() => applySafeMaxOutputToEditingForm(getParameterValue('maxTokens'))}
+	                  value={isChatgptPlanConnection(editingForm.connectionId) ? '' : getParameterValue('maxTokens')}
+                    disabled={isChatgptPlanConnection(editingForm.connectionId)}
+	                  placeholder={isChatgptPlanConnection(editingForm.connectionId) ? 'Managed by ChatGPT' : '4,000'}
+                    onfocus={beginNumericDraft}
+                    onkeydown={commitNumericDraftOnEnter}
+	                  oninput={(event) => {
+                      beginNumericDraft()
+                      updateParameterValue('maxTokens', (event.target as HTMLInputElement).value)
+                    }}
+                    onblur={finishNumericDraft}
 	                />
 	              </div>
 	            </div>
@@ -4705,7 +5145,9 @@ $effect(() => {
 		                        <span class="batshit-settings-inline-strong"> OpenAI Options</span> when they apply.
 		                      </p>
 		                      <p class="mt-2">
-		                        {localProgramLabel
+		                        {localProviderId === 'ollama'
+                          ? 'Every field here is optional. Blank fields let Ollama decide, except Thinking: Batshit requests it off by default. Choose true to request thinking. Custom Parameters can override that choice. Values you enter apply to this request only.'
+                          : localProgramLabel
                           ? `Every field here is optional. Leave a field blank and ${localProgramLabel} decides that value, using its own per-model setting. Fill a field in and this preset wins for that value, on this request only.`
                           : 'Leave any field blank to use the provider default instead.'}
 		                      </p>
@@ -4777,6 +5219,7 @@ $effect(() => {
                                 matrixEntries
                               })}
                               {@const responseFormatWarningVisible = showResponseFormatWarning(parameter)}
+                              {@const unlistedChoiceNotice = getUnlistedChoiceNotice(parameter)}
 	                              <div class="batshit-settings-form-row">
                                 <div class="batshit-settings-form-copy">
                                   <div class="batshit-settings-form-label-line">
@@ -4807,6 +5250,15 @@ $effect(() => {
                                         </p>
                                       </SettingsInfoMenu>
                                     {/if}
+                                    {#if unlistedChoiceNotice}
+                                      <SettingsInfoMenu
+                                        ariaLabel={`${parameter.label} not available`}
+                                        tone="amber"
+                                        contentClass="w-80"
+                                      >
+                                        <p>{unlistedChoiceNotice}</p>
+                                      </SettingsInfoMenu>
+                                    {/if}
                                   </div>
                                 </div>
                                 <div class="batshit-settings-form-control">
@@ -4827,20 +5279,22 @@ $effect(() => {
                                             {#if getParameterValue(parameter.name)}
                                               {getParameterValue(parameter.name)}
                                             {:else}
-                                              Select option
+                                              {blankChoiceLabel(parameter, 'Select option')}
                                             {/if}
                                           </span>
                                         </Select.Trigger>
                                         <Select.Content>
-                                          <Select.Item value="">Use provider default</Select.Item>
+                                          <Select.Item value="">{blankChoiceLabel(parameter, 'Use provider default')}</Select.Item>
                                           <Select.Item value="true">true</Select.Item>
                                           <Select.Item value="false">false</Select.Item>
                                         </Select.Content>
                                       </Select.Root>
                                     {:else if parameter.inputType === 'select'}
+                                      <!-- BL-866: a saved choice this model replaces shows as its replacement, also after a model change -->
+                                      {@const shownChoice = resolveSavedSelectValue(parameter, getParameterValue(parameter.name) || '')}
                                       <Select.Root
                                         type="single"
-                                        value={(getParameterValue(parameter.name) || '') as unknown as string}
+                                        value={shownChoice as unknown as string}
                                         onValueChange={(value) =>
                                           updateParameterValue(
                                             parameter.name,
@@ -4850,11 +5304,11 @@ $effect(() => {
                                       >
                                         <Select.Trigger>
                                           <span>
-                                            {#if getParameterValue(parameter.name)}
-                                              {parameter.options?.find((option) => option.value === getParameterValue(parameter.name))?.label ??
-                                                getParameterValue(parameter.name)}
+                                            {#if shownChoice}
+                                              {parameter.options?.find((option) => option.value === shownChoice)?.label ??
+                                                shownChoice}
                                             {:else}
-                                              Select option
+                                              {blankChoiceLabel(parameter, 'Select option')}
                                             {/if}
                                           </span>
                                         </Select.Trigger>
@@ -4869,7 +5323,7 @@ $effect(() => {
                                             does nothing.
                                           -->
                                           {#if !(parameter.options ?? []).some((option) => option.value === '')}
-                                            <Select.Item value="">Use provider default</Select.Item>
+                                            <Select.Item value="">{blankChoiceLabel(parameter, 'Use provider default')}</Select.Item>
                                           {/if}
                                           {#each parameter.options ?? [] as option (option.value)}
                                             <Select.Item value={option.value}>{option.label}</Select.Item>

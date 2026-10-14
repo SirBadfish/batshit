@@ -330,4 +330,48 @@ describe('ChatMessage: what an approval click leaves on the card', () => {
     await waitFor(() => expect((screen.getByRole('button', { name: 'Approve' }) as HTMLButtonElement).disabled).toBe(false))
     expect(storedApprovals()[0]).toMatchObject({ status: 'pending', submitted: false })
   })
+
+  /**
+   * BL-496 (A5, A6): a Claude card's clock is its permission helper's wait. When it runs out the
+   * card says nobody answered, and the page sends nothing: the helper ends the card itself, and
+   * send-routed never answers a Claude card (it used to be sent there as a Deny).
+   */
+  it('a Claude card past its own time says nobody answered and sends nothing', async () => {
+    const asked = Date.now() - 11 * 60_000
+    seed(
+      [
+        bashApproval('claude-1', 'git push', {
+          source: 'claude',
+          requestedAt: new Date(asked).toISOString(),
+          expiresAt: new Date(asked + 10 * 60_000).toISOString()
+        })
+      ],
+      'claude'
+    )
+    mount()
+
+    await screen.findByText('Expired: nobody answered')
+    expect(storedApprovals()[0]).toMatchObject({ status: 'expired', expiryReason: 'unanswered' })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('a Claude card still inside its ten minutes keeps its buttons past three', async () => {
+    const asked = Date.now() - 4 * 60_000
+    seed(
+      [
+        bashApproval('claude-2', 'git push', {
+          source: 'claude',
+          requestedAt: new Date(asked).toISOString(),
+          expiresAt: new Date(asked + 10 * 60_000).toISOString()
+        })
+      ],
+      'claude'
+    )
+    mount()
+
+    expect(await screen.findByRole('button', { name: 'Approve' })).toBeTruthy()
+    expect(storedApprovals()[0]).toMatchObject({ status: 'pending' })
+  })
 })
+

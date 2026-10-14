@@ -38,6 +38,14 @@ export interface ToolApprovalEntry {
   requestedAt?: string
   expiresAt?: string
   expiredAt?: string
+  /**
+   * BL-496: why a Claude card ended with no answer. `unanswered`: nobody answered before the
+   * permission helper's wait ran out; `run_ended`: the reply ended (a Stop, a failure) while
+   * the card waited; `wait_failed`: Batshit could not read the answer (a Redis failure).
+   * Absent on every other card.
+   */
+  expiryReason?: 'unanswered' | 'run_ended' | 'wait_failed'
+  decidedAt?: string
   toolName?: string
   toolCall?: Record<string, any>
   input?: any

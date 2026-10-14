@@ -1,5 +1,5 @@
 /**
- * SA-120 P6 — what the Jev Juice after-reply check noticed, as the chat page sees it.
+ * SA-120 P6 — what the Judge Juice after-reply check noticed, as the chat page sees it.
  *
  * Small on purpose: a map of records by message id, a refresh, and a forget. The SERVER owns
  * the records (`postTurnCheckState.ts` is their only writer) and they are deliberately NOT part
@@ -59,13 +59,13 @@ export async function refreshJevJuicePostTurnRecords(
     const response = await fetcher(`/api/jev-juice/post-turn?sessionId=${encodeURIComponent(session)}`)
     if (!response.ok) {
       // A chat that was just deleted answers 404; nothing to draw, nothing to report.
-      if (response.status !== 404) console.warn('[Jev Juice] Could not read after-reply notes:', response.status)
+      if (response.status !== 404) console.warn('[Judge Juice] Could not read after-reply notes:', response.status)
       return
     }
     const payload = await response.json().catch(() => null)
     applyJevJuicePostTurnRecords(session, payload?.records)
   } catch (error) {
-    console.warn('[Jev Juice] Could not read after-reply notes:', error)
+    console.warn('[Judge Juice] Could not read after-reply notes:', error)
   }
 }
 

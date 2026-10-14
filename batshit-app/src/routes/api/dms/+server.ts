@@ -92,7 +92,11 @@ function toRow(record: DmRecord) {
     resultDmId: record.resultDmId ?? null,
     callbackStatus: record.callbackStatus ?? null,
     hasResult: typeof record.result === 'string' && record.result.length > 0,
-    // SA-120 P7: what the Jev Juice incoming-text screen said, for the row's advisory badge.
+    // BL-401: a schedule note that fired more than once counts its fires on one row.
+    fireCount: record.fireCount ?? null,
+    firstFiredAt: record.firstFiredAt ?? null,
+    lastFiredAt: record.lastFiredAt ?? null,
+    // SA-120 P7: what the Judge Juice incoming-text screen said, for the row's advisory badge.
     // Display only; this route decides nothing from it.
     screen: record.screen ?? null,
     // A row is "live" only while the wake registry still owns that session's turn, which

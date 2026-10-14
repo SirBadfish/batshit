@@ -1,6 +1,7 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
 import { apiFailure } from '$lib/server/services/apiResponses'
 import { resolveNativeToolUser } from '$lib/server/services/nativeToolAuth'
+import { refuseDelegatedRunOutsideList } from '$lib/server/services/actingAgentIdentity'
 import { nativeToolService } from '$lib/server/services/nativeTools'
 
 interface NativeWebSearchRequest {
@@ -35,6 +36,11 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
     if (!auth) {
       return apiFailure('Unauthorized', 401)
+    }
+
+    const delegatedRefusal = refuseDelegatedRunOutsideList(auth, null)
+    if (delegatedRefusal) {
+      return apiFailure(delegatedRefusal.message, 403, { code: delegatedRefusal.code })
     }
 
     const result = await nativeToolService.nativeWebSearch({

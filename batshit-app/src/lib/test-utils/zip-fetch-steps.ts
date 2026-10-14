@@ -9,9 +9,16 @@
  * zip's stored JSON body — which is itself a normalized tool payload.
  */
 
+import { CLI_HELPER_MCP_SERVER_NAME } from '$lib/utils/cliHelperToolNames'
+
 export const FETCHED_ZIP_ID = 'cool_tool_1789624908784_kd008'
 export const FETCHED_ZIP_DESCRIPTION = 'bash: git log --oneline -5 - error - 11 lines'
-export const MANAGED_HELPER_SERVER = 'batshit_gateway_example-mode4-controls'
+/**
+ * BL-5: the helper server's one name, which both CLI lanes report today. The captures carried
+ * the per-agent name of their day; `cli-helper-steps.ts` builds these steps under that kind of
+ * name too, to pin that stored chats still resolve the same.
+ */
+export const MANAGED_HELPER_SERVER = CLI_HELPER_MCP_SERVER_NAME
 
 /** A cool_tool zip body exactly as `coolToolZipAdapter` stores it (here, a bash call). */
 export function storedBashToolPayload(): Record<string, any> {
@@ -169,11 +176,11 @@ export function directHelperZipFetchOutput(): Record<string, any> {
  * Managed Codex lane, direct helper: Codex wraps every helper call's arguments in
  * `{ arguments }` and its result in an MCP text envelope; send-routed adds `input`.
  */
-export function codexDirectZipFetchStep(): Record<string, any> {
+export function codexDirectZipFetchStep(server = MANAGED_HELPER_SERVER): Record<string, any> {
   const args = { arguments: { zipId: FETCHED_ZIP_ID, includeContent: true, maxChars: 20000 } }
   return {
-    toolName: `mcp.${MANAGED_HELPER_SERVER}.batshit_server_fetch_zip`,
-    originalToolName: `mcp.${MANAGED_HELPER_SERVER}.batshit_server_fetch_zip`,
+    toolName: `mcp.${server}.batshit_server_fetch_zip`,
+    originalToolName: `mcp.${server}.batshit_server_fetch_zip`,
     toolInput: args,
     toolArgs: args,
     toolResult: {
@@ -185,7 +192,7 @@ export function codexDirectZipFetchStep(): Record<string, any> {
     timestamp: 1789624876250,
     toolProvider: 'mcp',
     toolSource: 'mcp-gateway',
-    mcpServerName: MANAGED_HELPER_SERVER,
+    mcpServerName: server,
     success: true
   }
 }
@@ -194,11 +201,11 @@ export function codexDirectZipFetchStep(): Record<string, any> {
  * Managed Claude lane, direct helper: Claude's `tool_use_result` is a one-item text array,
  * which send-routed's `normalizeToolResult` parses into the helper's object (plus `input`).
  */
-export function claudeDirectZipFetchStep(): Record<string, any> {
+export function claudeDirectZipFetchStep(server = MANAGED_HELPER_SERVER): Record<string, any> {
   const args = { zipId: FETCHED_ZIP_ID, includeContent: true }
   return {
-    toolName: `mcp.${MANAGED_HELPER_SERVER}.batshit_server_fetch_zip`,
-    originalToolName: `mcp.${MANAGED_HELPER_SERVER}.batshit_server_fetch_zip`,
+    toolName: `mcp.${server}.batshit_server_fetch_zip`,
+    originalToolName: `mcp.${server}.batshit_server_fetch_zip`,
     toolInput: args,
     toolArgs: args,
     toolResult: { ...directHelperZipFetchOutput(), input: args },
@@ -206,7 +213,7 @@ export function claudeDirectZipFetchStep(): Record<string, any> {
     timestamp: 1789624876250,
     toolProvider: 'mcp',
     toolSource: 'mcp-gateway',
-    mcpServerName: MANAGED_HELPER_SERVER,
+    mcpServerName: server,
     success: true
   }
 }
@@ -216,11 +223,14 @@ export function claudeDirectZipFetchStep(): Record<string, any> {
  * `/api/controls/use`, so the control's result stays nested under `result`, and the helper
  * stamps the presentation on top. Pass the helper's real MCP text (see the black-box test).
  */
-export function codexBrokeredZipFetchStep(helperText: string): Record<string, any> {
+export function codexBrokeredZipFetchStep(
+  helperText: string,
+  server = MANAGED_HELPER_SERVER
+): Record<string, any> {
   const args = { arguments: { ref: 'fabric:sys.zip.fetch', input: { zipId: FETCHED_ZIP_ID } } }
   return {
-    toolName: `mcp.${MANAGED_HELPER_SERVER}.batshit_tool_use`,
-    originalToolName: `mcp.${MANAGED_HELPER_SERVER}.batshit_tool_use`,
+    toolName: `mcp.${server}.batshit_tool_use`,
+    originalToolName: `mcp.${server}.batshit_tool_use`,
     toolInput: args,
     toolArgs: args,
     toolResult: {
@@ -232,16 +242,19 @@ export function codexBrokeredZipFetchStep(helperText: string): Record<string, an
     timestamp: 1789624876250,
     toolProvider: 'mcp',
     toolSource: 'mcp-gateway',
-    mcpServerName: MANAGED_HELPER_SERVER,
+    mcpServerName: server,
     success: true
   }
 }
 
-export function claudeBrokeredZipFetchStep(helperText: string): Record<string, any> {
+export function claudeBrokeredZipFetchStep(
+  helperText: string,
+  server = MANAGED_HELPER_SERVER
+): Record<string, any> {
   const args = { ref: 'fabric:sys.zip.fetch', zipId: FETCHED_ZIP_ID }
   return {
-    toolName: `mcp.${MANAGED_HELPER_SERVER}.batshit_tool_use`,
-    originalToolName: `mcp.${MANAGED_HELPER_SERVER}.batshit_tool_use`,
+    toolName: `mcp.${server}.batshit_tool_use`,
+    originalToolName: `mcp.${server}.batshit_tool_use`,
     toolInput: args,
     toolArgs: args,
     toolResult: { ...JSON.parse(helperText), input: args },
@@ -249,7 +262,7 @@ export function claudeBrokeredZipFetchStep(helperText: string): Record<string, a
     timestamp: 1789624876250,
     toolProvider: 'mcp',
     toolSource: 'mcp-gateway',
-    mcpServerName: MANAGED_HELPER_SERVER,
+    mcpServerName: server,
     success: true
   }
 }

@@ -30,7 +30,6 @@ const sdkRoot = path.join(__dirname, '..', 'node_modules', '@modelcontextprotoco
 const { Server } = require(path.join(sdkRoot, 'server', 'index.js'))
 const { StdioServerTransport } = require(path.join(sdkRoot, 'server', 'stdio.js'))
 const { CallToolRequestSchema, ListToolsRequestSchema } = require(path.join(sdkRoot, 'types.js'))
-const fetchFn = globalThis.fetch || require('node-fetch')
 const {
   normalizeCliRuntime,
   isRecallPayloadWithMedia,
@@ -40,6 +39,21 @@ const {
 // F-P7-10: one shutdown rule for every stdio bridge, so a helper can never outlive the
 // managed CLI run that spawned it.
 const { installStdioLifecycle } = require(path.join(__dirname, 'lib', 'mcp-stdio-lifecycle.cjs'))
+// BL-318: a control call waits as long as its own run limit allows (an artifact run up to the
+// longest artifact limit), not a flat 60 s.
+const {
+  CLI_HELPER_HTTP_TIMEOUT_MS,
+  resolveControlUseWaitMs
+} = require(path.join(__dirname, 'lib', 'cli-helper-waits.cjs'))
+// BL-318 review: not Node's built-in fetch, whose undici Agent cuts a response that takes more
+// than 300 s, so a 10-minute artifact run ended at 5:00 whatever the wait above said.
+const { createHelperFetch } = require(path.join(__dirname, 'lib', 'cli-helper-http.cjs'))
+const fetchFn = createHelperFetch(CLI_HELPER_HTTP_TIMEOUT_MS)
+const {
+  guardCallToolContent, withCommandModelCapture, unwrapCommandModelCaptureResponse,
+  observeTrustedToolResponseHeaders, readCurrentToolTextBudget, readCurrentToolPageKind
+} = require(path.join(__dirname, 'lib', 'cli-tool-result-guard.cjs'))
+const { fitToolPagePayload } = require(path.join(__dirname, 'lib', 'cli-tool-page-budget.cjs'))
 
 const TOOL_NAMES = {
   fetchZip: 'batshit_server_fetch_zip',
@@ -69,7 +83,8 @@ const TOOL_DEFINITIONS = [
       type: 'object',
       properties: {
         zipId: { type: 'string', description: 'Zip id, e.g. zip:abc123' },
-        maxChars: { type: 'number', description: 'Optional max returned content length' },
+        maxChars: { type: 'integer', minimum: 64, maximum: 250000, description: 'Maximum characters in this page (default 16000)' },
+        offset: { type: 'integer', minimum: 0, description: 'Start character for the next page (default 0)' },
         includeContent: { type: 'boolean', description: 'Include full content preview (default true)' }
       },
       required: ['zipId']
@@ -122,11 +137,14 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: TOOL_NAMES.bashExecute,
-    // The Stop sentence is a copy of `NATIVE_BASH_STOP_GUIDANCE` (nativeTools.ts); a test holds
-    // them to one text. The dispatch hands this command the Stop of the running reply.
+    // The apply_patch and Stop sentences are copies of `NATIVE_BASH_APPLY_PATCH_GUIDANCE` and
+    // `NATIVE_BASH_STOP_GUIDANCE` (nativeTools.ts); a test holds them to one text. The dispatch
+    // hands this command the Stop of the running reply, and applies a managed apply_patch itself.
     description:
       'Run a Batshit-managed bash command through the current agent Bash settings/sandbox. Prefer this over raw CLI shell/read/list/search tools when the result may need same-turn Batshit zip-control or Batshit Read/List/Search/Edit/Bash rendering. ' +
-      'A Stop or a timeout ends the command and everything it started. To leave a program running, start it in the background with its output sent to a file (`cmd > log 2>&1 &`) and let the command finish; it then runs until Batshit quits (in a sandbox, at most until this reply ends).',
+      "apply_patch is built into this tool, not a program on the PATH, so there is no need to check for it. Send it as the whole command, optionally after `cd <folder> &&`: `apply_patch <<'PATCH'`, the patch from `*** Begin Patch` to `*** End Patch`, then `PATCH`. Run anything else, such as tests, in a separate call. A patch may be 200,000 characters long; other commands 4,000. " +
+      'Local commands use system zsh when installed, otherwise bash; the result records the selected shell. Use common shell syntax until the result identifies it. ' +
+      "A Stop or a timeout ends programs still in the command's managed group. A program that leaves that group or creates a new session can survive cleanup. To leave a program running, start it in the background with its output sent to a file (`cmd > log 2>&1 &`) and let the command finish; programs remaining in the managed group are ended when Batshit quits (in a sandbox, at most until this reply ends).",
     inputSchema: {
       type: 'object',
       properties: {
@@ -152,7 +170,7 @@ const TOOL_DEFINITIONS = [
         exact: { type: 'boolean' },
         limit: { type: 'number' },
         includeSchema: { type: 'boolean' },
-        selectedGateways: { type: 'array', items: { type: 'string' } }
+        selectedGateways: { type: 'array', items: { type: 'string' }, description: 'Optional filter within this run’s allowed gateways. Cannot add access; [] selects none.' }
       }
     }
   },
@@ -164,7 +182,7 @@ const TOOL_DEFINITIONS = [
       properties: {
         toolName: { type: 'string' },
         params: { type: 'object', additionalProperties: true },
-        selectedGateways: { type: 'array', items: { type: 'string' } }
+        selectedGateways: { type: 'array', items: { type: 'string' }, description: 'Optional filter within this run’s allowed gateways. Cannot add access; [] selects none.' }
       },
       required: ['toolName']
     }
@@ -231,7 +249,11 @@ const TOOL_DEFINITIONS = [
         skillId: { type: 'string', description: 'The skill id to operate on.' },
         action: { type: 'string', enum: ['invoke', 'list', 'read'] },
         path: { type: 'string', description: 'Reference path to read, such as references/guide.md or SKILL.md.' },
-        maxChars: { type: 'number', description: 'Optional max returned content length for read actions.' }
+        maxChars: { type: 'number', description: 'Optional max returned content length for read actions.' },
+        offset: {
+          type: 'number',
+          description: 'read: the character to start from (default 0). A partial read names the next offset.'
+        }
       },
       required: ['skillId']
     }
@@ -316,7 +338,7 @@ const TOOL_DEFINITIONS = [
           description:
             'Ignored (SA-116). A confirm/restricted control pauses for the user Approve click; this flag unlocks nothing.'
         },
-        selectedGateways: { type: 'array', items: { type: 'string' } }
+        selectedGateways: { type: 'array', items: { type: 'string' }, description: 'Optional filter within this run’s allowed gateways. Cannot add access; [] selects none.' }
       },
       required: ['controlId']
     }
@@ -489,6 +511,7 @@ async function postJson(endpointPath, payload, timeoutMs = 60000) {
       signal: controller.signal
     })
 
+    observeTrustedToolResponseHeaders(response, endpointPath)
     const text = await response.text()
     let body
     try {
@@ -500,7 +523,7 @@ async function postJson(endpointPath, payload, timeoutMs = 60000) {
     return {
       ok: response.ok,
       status: response.status,
-      body
+      body: unwrapCommandModelCaptureResponse(response, body)
     }
   } catch (error) {
     return {
@@ -550,6 +573,9 @@ function formatFetchZipResult(responseBody, inputZipId) {
     zipId: result.zipId || inputZipId || '',
     truncated: result.contentTruncated === true,
     totalLength: typeof result.contentLength === 'number' ? result.contentLength : undefined,
+    offset: typeof result.offset === 'number' ? result.offset : undefined,
+    nextOffset: typeof result.nextOffset === 'number' ? result.nextOffset : null,
+    readMore: typeof result.readMore === 'string' ? result.readMore : undefined,
     content: typeof result.content === 'string' ? result.content : undefined,
     metadata
   }
@@ -625,7 +651,7 @@ async function callControlUse(rawArgs) {
     ...(Array.isArray(allowedControlIds) ? { allowedControlIds } : {})
   }
 
-  const response = await postJson('/api/controls/use', payload, 60000)
+  const response = await postJson('/api/controls/use', payload, resolveControlUseWaitMs(payload.controlId))
   return response.body
 }
 
@@ -794,6 +820,7 @@ async function callFetchZip(rawArgs) {
       zipId,
       ...(typeof args.maxChars === 'number' ? { maxChars: args.maxChars } : {}),
       ...(typeof args.max_chars === 'number' ? { maxChars: args.max_chars } : {}),
+      ...('offset' in args ? { offset: args.offset } : {}),
       ...(typeof args.includeContent === 'boolean' ? { includeContent: args.includeContent } : {})
     },
     dryRun: args.dryRun === true || args.dry_run === true
@@ -1125,7 +1152,9 @@ async function callSkillRuntime(rawArgs) {
     ...(typeof args.skillId === 'string' ? { skillId: args.skillId } : {}),
     ...(typeof args.action === 'string' ? { action: args.action } : {}),
     ...(typeof args.path === 'string' ? { path: args.path } : {}),
-    ...(typeof args.maxChars === 'number' ? { maxChars: args.maxChars } : {})
+    ...(typeof args.maxChars === 'number' ? { maxChars: args.maxChars } : {}),
+    // Find 1: sent as given, so the server refuses a malformed offset instead of reading from 0.
+    ...(args.offset !== undefined ? { offset: args.offset } : {})
   }
 
   const response = await postJson('/api/skills/runtime', payload, 30000)
@@ -1207,9 +1236,14 @@ async function main() {
     }
   )
 
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOL_DEFINITIONS }))
+  // Batshit already bounds final text to 100k; keep Claude from hiding its cut notice in a file.
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: TOOL_DEFINITIONS.map((tool) => ({ ...tool, _meta: {
+      ...tool._meta, 'anthropic/maxResultSizeChars': 100_000
+    } }))
+  }))
 
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  server.setRequestHandler(CallToolRequestSchema, async (request) => withCommandModelCapture(async () => {
     const name = request?.params?.name || ''
     const args = request?.params?.arguments || {}
     const delivery = await deliverRecalledImages(await executeTool(name, args))
@@ -1217,8 +1251,13 @@ async function main() {
     // `buildCallToolContent` never sets `structuredContent` — Codex drops
     // `content[]` when it is present (openai/codex#10334), which would delete
     // both the JSON text and the images.
-    return buildCallToolContent(delivery.payload, delivery.images)
-  })
+    return await guardCallToolContent(buildCallToolContent(
+      fitToolPagePayload(delivery.payload, readCurrentToolPageKind(), readCurrentToolTextBudget()),
+      delivery.images
+    ), {
+      fetchFn, baseUrl: batshitBaseUrl, runCredential, toolName: name, runtime: cliRuntime
+    })
+  }))
 
   const transport = new StdioServerTransport()
   await server.connect(transport)

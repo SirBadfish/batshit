@@ -127,6 +127,7 @@ describe('the wake registry is the first source, not the request body', () => {
       userId,
       origin: { kind: 'dm', dmId: 'dm_1', from: 'agent-faye' } as any,
       startedAt: Date.now(),
+      assistantMessageId: 'msg-woken-turn',
       controller: new AbortController(),
       timer: setTimeout(() => {}, 60_000)
     })

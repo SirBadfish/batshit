@@ -219,6 +219,7 @@ Current runtime control grammar:
 - emoji mappings still trigger enabled emotes
 - `<batshit-cue>` blocks may appear inline wherever the mood/cue should happen; they do not need to be first in the reply.
 - Never output the Goon cue JSON by itself. If you use cue JSON, it must be wrapped in `<batshit-cue>` and `</batshit-cue>` so Batshit can hide the raw syntax and route it to the avatar.
+- Write the cue block itself as plain text in your reply, without the backticks shown around it above. To show a tag as an example, put it in a code block. A tag in a code block does nothing.
 - Group chat does not support Goon mood/cue controls. Do not use `<batshit-cue>`, one-shot motion tags, or Goon emote markup in group chat.
 
 TTS boundary:

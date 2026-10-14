@@ -1,0 +1,110 @@
+{
+  "1": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "night-city-upscale-4k-input.png"
+    }
+  },
+  "2": {
+    "class_type": "ImageCrop",
+    "inputs": {
+      "image": [
+        "1",
+        0
+      ],
+      "width": 128,
+      "height": 2048,
+      "x": 3968,
+      "y": 0
+    }
+  },
+  "3": {
+    "class_type": "ImageCrop",
+    "inputs": {
+      "image": [
+        "1",
+        0
+      ],
+      "width": 128,
+      "height": 2048,
+      "x": 0,
+      "y": 0
+    }
+  },
+  "4": {
+    "class_type": "ImageStitch",
+    "inputs": {
+      "image1": [
+        "2",
+        0
+      ],
+      "image2": [
+        "1",
+        0
+      ],
+      "direction": "right",
+      "match_image_size": false,
+      "spacing_width": 0,
+      "spacing_color": "black"
+    }
+  },
+  "5": {
+    "class_type": "ImageStitch",
+    "inputs": {
+      "image1": [
+        "4",
+        0
+      ],
+      "image2": [
+        "3",
+        0
+      ],
+      "direction": "right",
+      "match_image_size": false,
+      "spacing_width": 0,
+      "spacing_color": "black"
+    }
+  },
+  "6": {
+    "class_type": "UpscaleModelLoader",
+    "inputs": {
+      "model_name": "RealESRGAN_x2plus.pth"
+    }
+  },
+  "7": {
+    "class_type": "ImageUpscaleWithModel",
+    "inputs": {
+      "upscale_model": [
+        "6",
+        0
+      ],
+      "image": [
+        "5",
+        0
+      ]
+    }
+  },
+  "8": {
+    "class_type": "ImageCrop",
+    "inputs": {
+      "image": [
+        "7",
+        0
+      ],
+      "width": 8192,
+      "height": 4096,
+      "x": 256,
+      "y": 0
+    }
+  },
+  "9": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": [
+        "8",
+        0
+      ],
+      "filename_prefix": "h3-equi360/night-city-8k-clean"
+    }
+  }
+}

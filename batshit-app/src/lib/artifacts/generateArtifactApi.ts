@@ -15,6 +15,7 @@
  */
 
 import { generateNdjsonConsumerScript } from '$lib/utils/ndjsonConsumer';
+import { generatePinokioRuntimeApi } from '$lib/artifacts/pinokioArtifactRuntime';
 import { SHARE_TO_CHAT_API } from './shareToChat';
 
 export interface ArtifactApiConfig {
@@ -57,8 +58,11 @@ export const BATSHIT_THEME_CSS = `
   :root {
     color-scheme: dark;
 
-    /* Batshit launch-dark app palette */
-    --batshit-bg: oklch(0.11 0.02 276);
+    /* Batshit launch-dark app palette. The surfaces an artifact paints (the canvas, cards, raised
+       and inset surfaces, fields) carry the app's own values, pinned by the artifactThemeAppTokens
+       suite; the canvas is the app canvas (--bs-app-canvas), so a body painted with it matches
+       the panel around it (BL-172). */
+    --batshit-bg: oklch(0.1656 0.0127 277.51);
     --batshit-surface: oklch(0.108 0.014 278);
     --batshit-surface-elevated: oklch(0.16 0.024 281);
     --batshit-surface-inset: color-mix(
@@ -71,11 +75,29 @@ export const BATSHIT_THEME_CSS = `
     --batshit-text-secondary: oklch(0.56 0.016 289.95);
     --batshit-muted: oklch(0.49 0.014 289.95);
     --batshit-faint: oklch(0.39 0.011 289.95);
-    --batshit-accent: oklch(0.5 0.044 281);
-    --batshit-accent-hover: oklch(0.56 0.05 281.84);
-    --batshit-accent-foreground: oklch(0.96 0.006 289.95);
-    --batshit-accent-soft: oklch(0.5 0.044 281 / 0.34);
-    --batshit-accent-faint: oklch(0.5 0.044 281 / 0.16);
+
+    /* The app's primary, split the way app.css splits it (Fill and Mark). Artifacts run in their
+       own document and cannot read the app's variables, so these carry the same values; the
+       artifactThemeAppTokens suite fails when they drift from app.css. */
+    --batshit-primary: oklch(0.33 0.07 274.7); /* the fill: only ever behind light text */
+    --batshit-primary-line: oklch(0.38 0.07 273.01); /* the fill's rim */
+    --batshit-primary-foreground: oklch(0.96 0.006 289.95); /* text on the fill */
+    --batshit-primary-hover: color-mix(in oklab, var(--batshit-primary) 90%, transparent);
+    /* The mark: text, icons, lines, slider fills, spinners, and focus rings drawn on the page. */
+    --batshit-primary-text: oklch(from var(--batshit-primary) 0.74 c h);
+    --batshit-primary-soft: oklch(from var(--batshit-primary-text) l c h / 0.18);
+    --batshit-primary-faint: oklch(from var(--batshit-primary-text) l c h / 0.09);
+    --batshit-ring: var(--batshit-primary-text);
+
+    /* The older accent names. Saved artifacts draw text, borders, and spinners with them, and
+       their accent-coloured buttons are repainted by the button rule below, so they carry the
+       mark. Text on the light accent is dark, as on the app's DM badge. */
+    --batshit-accent: var(--batshit-primary-text);
+    --batshit-accent-hover: oklch(from var(--batshit-accent) calc(l + 0.06) c h);
+    --batshit-accent-foreground: oklch(0.1656 0.0127 277.51);
+    --batshit-accent-soft: var(--batshit-primary-soft);
+    --batshit-accent-faint: var(--batshit-primary-faint);
+
     --batshit-success: oklch(0.72 0.115 185);
     --batshit-danger: oklch(0.64 0.275 358);
     --batshit-warning: oklch(0.75 0.13 85);
@@ -87,18 +109,15 @@ export const BATSHIT_THEME_CSS = `
     --batshit-field-hover: oklch(0.56 0.044 281 / 0.3);
     --batshit-field-border: oklch(0.74 0.03 282 / 0.3);
     --batshit-field-border-hover: oklch(0.78 0.034 282 / 0.46);
-    --batshit-field-focus-ring: oklch(0.56 0.05 281 / 0.34);
+    /* A wash of the mark at the strength the old lavender ring had. */
+    --batshit-field-focus-ring: var(--batshit-primary-soft);
     --batshit-select-arrow: oklch(0.78 0.028 289.95);
+    /* Tinted surfaces mix the fill into a surface, so they stay on the fill. */
     --batshit-control-surface: color-mix(
       in oklab,
       var(--batshit-surface-elevated) 72%,
       var(--batshit-primary) 28%
     );
-
-    /* Semantic aliases */
-    --batshit-primary: var(--batshit-accent);
-    --batshit-primary-hover: var(--batshit-accent-hover);
-    --batshit-primary-foreground: var(--batshit-accent-foreground);
 
     /* Spacing */
     --batshit-radius-sm: 4px;
@@ -177,7 +196,7 @@ export const BATSHIT_THEME_CSS = `
   }
 
   html body :is(input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not([type="button"]):not([type="submit"]):not([type="reset"]):not([type="hidden"]):not([type="image"]):not([type="color"]), textarea, select):not(.batshit-unstyled):not([data-batshit-unstyled="true"]):focus {
-    border-color: var(--batshit-accent-hover) !important;
+    border-color: var(--batshit-ring) !important;
     background-color: var(--batshit-field-hover) !important;
     box-shadow: 0 0 0 2px var(--batshit-field-focus-ring) !important;
   }
@@ -189,7 +208,7 @@ export const BATSHIT_THEME_CSS = `
 
   html body :is(button, input[type="button"], input[type="submit"], input[type="reset"]):not(.batshit-unstyled):not([data-batshit-unstyled="true"]) {
     min-height: 36px !important;
-    border: 1px solid color-mix(in oklab, var(--batshit-primary) 30%, var(--batshit-border)) !important;
+    border: 1px solid color-mix(in oklab, var(--batshit-primary-text) 30%, var(--batshit-border)) !important;
     border-radius: var(--batshit-radius) !important;
     background-color: color-mix(in oklab, var(--batshit-surface-elevated) 86%, var(--batshit-primary) 14%) !important;
     color: var(--batshit-text-strong) !important;
@@ -205,9 +224,9 @@ export const BATSHIT_THEME_CSS = `
   }
 
   html body :is(button, input[type="button"], input[type="submit"], input[type="reset"]):not(.batshit-unstyled):not([data-batshit-unstyled="true"]):hover {
-    border-color: var(--batshit-primary-hover) !important;
+    border-color: var(--batshit-primary-text) !important;
     background-color: color-mix(in oklab, var(--batshit-primary) 24%, var(--batshit-surface-elevated)) !important;
-    box-shadow: 0 0 0 1px color-mix(in oklab, var(--batshit-primary) 18%, transparent) !important;
+    box-shadow: 0 0 0 1px var(--batshit-primary-soft) !important;
   }
 
   html body :is(button, input[type="button"], input[type="submit"], input[type="reset"]):not(.batshit-unstyled):not([data-batshit-unstyled="true"]):focus-visible {
@@ -276,7 +295,8 @@ export function generateArtifactApiScript(config: ArtifactApiConfig): string {
     '/api/artifacts/run-event',
     '/api/artifacts/share',
     '/api/artifacts/storage',
-    '/api/artifacts/comfyui/'
+    '/api/artifacts/comfyui/',
+    '/api/artifacts/pinokio/'
   ];
 
   function batshitUrlForFetch(input) {
@@ -306,7 +326,9 @@ export function generateArtifactApiScript(config: ArtifactApiConfig): string {
 	    const target = batshitUrlForFetch(input);
 	    if (!target) return false;
 	    const pageOrigin = new URL(window.location.href).origin;
-	    return target.origin === pageOrigin && target.pathname === '/api/artifacts/comfyui/view';
+	    if (target.origin !== pageOrigin) return false;
+	    // SA-072 P2: a Pinokio app's media (ComfyUI /view, Gradio file=…) comes through its proxy.
+	    return target.pathname === '/api/artifacts/comfyui/view' || (target.pathname.startsWith('/api/artifacts/pinokio/') && (target.pathname.slice(-5) === '/view' || target.pathname.indexOf('file=') !== -1));
 	  }
 
 	  window.batshit._fetch = function(input, init) {
@@ -451,7 +473,6 @@ export function generateArtifactApiScript(config: ArtifactApiConfig): string {
 
   // SA-042: Fabric Field Registry — tracks all fabricId-enabled primitives
   window.batshit._fabricFields = [];
-  window.batshit._fabricSetters = {};
 
   /**
    * Call the artifact completion endpoint
@@ -535,6 +556,8 @@ export function generateArtifactApiScript(config: ArtifactApiConfig): string {
       }
     }
 
+    // SA-072 P2: a Pinokio app that is not running becomes "Start with Pinokio", not an error.
+    let pinokioOffline = null;
     let result;
     try {
       result = await consumeNdjson(res, {
@@ -551,12 +574,30 @@ export function generateArtifactApiScript(config: ArtifactApiConfig): string {
         onToolCall: function(call, evt) { return callRunHook('onToolCall', options.onToolCall, [call, evt]); },
         onToolResult: function(resultPayload, evt) { return callRunHook('onToolResult', options.onToolResult, [resultPayload, evt]); },
         onEnd: function(evt) { return callRunHook('onEnd', options.onEnd, [evt]); },
-        onError: function(error, evt) { return callRunHook('onError', options.onError, [error, evt]); },
+        onError: function(error, evt) {
+          if (!options._pinokioRetried && window.batshit.pinokio && window.batshit.pinokio.isOffline(evt)) {
+            pinokioOffline = { error: error, evt: evt };
+            return undefined;
+          }
+          return callRunHook('onError', options.onError, [error, evt]);
+        },
         onEvent: function(evt) { return callRunHook('onEvent', options.onEvent, [evt]); }
       });
     } catch (consumeError) {
       reportClientRunEvent('consumer_error', consumeError && consumeError.message ? consumeError.message : 'Artifact stream consumer failed', null);
       throw consumeError;
+    }
+
+    if (pinokioOffline) {
+      const started = await window.batshit.pinokio.offerStart(pinokioOffline.evt.metadata || {});
+      if (started) {
+        try {
+          return await callCompletion(prompt, Object.assign({}, options, { _pinokioRetried: true }));
+        } finally {
+          window.batshit.pinokio.afterRun();
+        }
+      }
+      callRunHook('onError', options.onError, [pinokioOffline.error, pinokioOffline.evt]);
     }
 
     return {
@@ -579,6 +620,7 @@ export function generateArtifactApiScript(config: ArtifactApiConfig): string {
   ${features.audio ? generateSpeechApi() : ''}
   ${features.streaming ? generateObjectStreamApi() : ''}
   ${generateBuilderKitApi()}
+  ${generatePinokioRuntimeApi()}
 
   // Metadata helper
   window.batshit.getMetadata = function() {
@@ -957,32 +999,34 @@ function generateBuilderKitApi(): string {
       const style = document.createElement('style');
       style.id = STYLE_ID;
       style.textContent = [
-        '.batshit-builder-root{display:grid;gap:14px;padding:15px;border:1px solid color-mix(in oklab,var(--batshit-primary) 22%,var(--batshit-border));border-radius:var(--batshit-radius-lg);background:linear-gradient(180deg,color-mix(in oklab,var(--batshit-surface-elevated) 86%,var(--batshit-primary) 14%),color-mix(in oklab,var(--batshit-surface) 92%,var(--batshit-primary) 8%));box-shadow:0 10px 26px oklch(0 0 0 / .2);max-width:100%;overflow:hidden;}',
+        '.batshit-builder-root{display:grid;gap:14px;padding:15px;border:1px solid color-mix(in oklab,var(--batshit-primary-text) 22%,var(--batshit-border));border-radius:var(--batshit-radius-lg);background:linear-gradient(180deg,color-mix(in oklab,var(--batshit-surface-elevated) 86%,var(--batshit-primary) 14%),color-mix(in oklab,var(--batshit-surface) 92%,var(--batshit-primary) 8%));box-shadow:0 10px 26px oklch(0 0 0 / .2);max-width:100%;overflow:hidden;}',
         '.batshit-builder-surface{border-color:var(--batshit-border-subtle);background:color-mix(in oklab,var(--batshit-surface) 86%,var(--batshit-primary) 14%);}',
         '.batshit-builder-field{display:grid;gap:7px;max-width:100%;}',
         '.batshit-builder-label{font:600 12px/1.25 var(--batshit-font);color:var(--batshit-text-strong);letter-spacing:0;}',
         '.batshit-builder-hint{font:400 11px/1.35 var(--batshit-font);color:var(--batshit-muted);}',
-        '.batshit-builder-input,.batshit-builder-textarea,.batshit-builder-select,.batshit-builder-number,.batshit-builder-slider{width:100%;max-width:100%;box-sizing:border-box;border:1px solid var(--batshit-field-border);border-radius:var(--batshit-radius);background-color:var(--batshit-field);color:var(--batshit-text);padding:10px 12px;font:450 13px/1.4 var(--batshit-font);letter-spacing:0;outline:none;accent-color:var(--batshit-primary);transition:border-color .15s ease,box-shadow .15s ease,background-color .15s ease;}',
+        '.batshit-builder-label-row{display:flex;align-items:baseline;justify-content:space-between;gap:8px;}',
+        '.batshit-builder-value{font:600 12px/1.25 var(--batshit-font);color:var(--batshit-text-strong);font-variant-numeric:tabular-nums;}',
+        '.batshit-builder-input,.batshit-builder-textarea,.batshit-builder-select,.batshit-builder-number,.batshit-builder-slider{width:100%;max-width:100%;box-sizing:border-box;border:1px solid var(--batshit-field-border);border-radius:var(--batshit-radius);background-color:var(--batshit-field);color:var(--batshit-text);padding:10px 12px;font:450 13px/1.4 var(--batshit-font);letter-spacing:0;outline:none;accent-color:var(--batshit-primary-text);transition:border-color .15s ease,box-shadow .15s ease,background-color .15s ease;}',
         '.batshit-builder-input,.batshit-builder-select,.batshit-builder-number{min-height:40px;}',
         '.batshit-builder-select{-webkit-appearance:none;appearance:none;padding-right:38px;color-scheme:dark;background-image:linear-gradient(45deg,transparent 50%,var(--batshit-select-arrow) 50%),linear-gradient(135deg,var(--batshit-select-arrow) 50%,transparent 50%);background-position:calc(100% - 18px) 50%,calc(100% - 13px) 50%;background-size:5px 5px,5px 5px;background-repeat:no-repeat;}',
         '.batshit-builder-select[multiple]{min-height:96px;padding-right:12px;background-image:none;}',
         '.batshit-builder-select option,.batshit-builder-select optgroup{min-height:32px;padding:8px 12px;background:oklch(0.14 0.018 281);color:var(--batshit-text);}',
         '.batshit-builder-select option:checked{background:color-mix(in oklab,var(--batshit-primary) 45%,oklch(0.14 0.018 281));color:var(--batshit-text-strong);}',
         '.batshit-builder-input:hover,.batshit-builder-textarea:hover,.batshit-builder-select:hover,.batshit-builder-number:hover,.batshit-builder-slider:hover{border-color:var(--batshit-field-border-hover);background:var(--batshit-field-hover);}',
-        '.batshit-builder-input:focus,.batshit-builder-textarea:focus,.batshit-builder-select:focus,.batshit-builder-number:focus,.batshit-builder-slider:focus{border-color:var(--batshit-primary-hover);box-shadow:0 0 0 2px var(--batshit-field-focus-ring);background:var(--batshit-field-hover);}',
+        '.batshit-builder-input:focus,.batshit-builder-textarea:focus,.batshit-builder-select:focus,.batshit-builder-number:focus,.batshit-builder-slider:focus{border-color:var(--batshit-ring);box-shadow:0 0 0 2px var(--batshit-field-focus-ring);background:var(--batshit-field-hover);}',
         '.batshit-builder-textarea{min-height:96px;resize:vertical;}',
         '.batshit-builder-checkbox-row{display:flex;align-items:center;gap:8px;font:500 12px/1.3 var(--batshit-font);color:var(--batshit-text);}',
-        '.batshit-builder-checkbox-row input{accent-color:var(--batshit-primary);}',
+        '.batshit-builder-checkbox-row input{accent-color:var(--batshit-primary-text);}',
         '.batshit-builder-radio-group{display:grid;gap:8px;padding:8px;border:1px dashed var(--batshit-border-subtle);border-radius:var(--batshit-radius);}',
-        '.batshit-builder-radio-group input{accent-color:var(--batshit-primary);}',
+        '.batshit-builder-radio-group input{accent-color:var(--batshit-primary-text);}',
         '.batshit-builder-inline{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}',
-        '.batshit-builder-button{min-height:34px;border:1px solid color-mix(in oklab,var(--batshit-primary) 30%,var(--batshit-border));background:color-mix(in oklab,var(--batshit-surface-elevated) 86%,var(--batshit-primary) 14%);color:var(--batshit-text-strong);border-radius:var(--batshit-radius);padding:0 13px;font:650 12px/1 var(--batshit-font);cursor:pointer;transition:background-color .12s ease,border-color .12s ease,box-shadow .12s ease,color .12s ease;}',
-        '.batshit-builder-button:hover{border-color:var(--batshit-primary-hover);background:color-mix(in oklab,var(--batshit-primary) 24%,var(--batshit-surface-elevated));box-shadow:0 0 0 1px color-mix(in oklab,var(--batshit-primary) 18%, transparent);}',
+        '.batshit-builder-button{min-height:34px;border:1px solid color-mix(in oklab,var(--batshit-primary-text) 30%,var(--batshit-border));background:color-mix(in oklab,var(--batshit-surface-elevated) 86%,var(--batshit-primary) 14%);color:var(--batshit-text-strong);border-radius:var(--batshit-radius);padding:0 13px;font:650 12px/1 var(--batshit-font);cursor:pointer;transition:background-color .12s ease,border-color .12s ease,box-shadow .12s ease,color .12s ease;}',
+        '.batshit-builder-button:hover{border-color:var(--batshit-primary-text);background:color-mix(in oklab,var(--batshit-primary) 24%,var(--batshit-surface-elevated));box-shadow:0 0 0 1px var(--batshit-primary-soft);}',
         '.batshit-builder-button:disabled{opacity:.6;cursor:not-allowed;transform:none;}',
         '.batshit-builder-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:10px 0 0;}',
-        '.batshit-builder-action-button--share,.batshit-builder-action-button--save,.batshit-builder-action-button--download{border-color:color-mix(in oklab,var(--batshit-primary) 34%, var(--batshit-border));background:color-mix(in oklab,var(--batshit-surface-elevated) 90%,var(--batshit-primary) 10%);}',
+        '.batshit-builder-action-button--share,.batshit-builder-action-button--save,.batshit-builder-action-button--download{border-color:color-mix(in oklab,var(--batshit-primary-text) 34%, var(--batshit-border));background:color-mix(in oklab,var(--batshit-surface-elevated) 90%,var(--batshit-primary) 10%);}',
         '.batshit-builder-drop-zone{display:grid;place-items:center;text-align:center;padding:18px;border:1px dashed var(--batshit-field-border);border-radius:var(--batshit-radius);background:var(--batshit-field);color:var(--batshit-muted);transition:border-color .15s ease, background-color .15s ease;min-height:90px;}',
-        '.batshit-builder-drop-zone.is-drag-over{border-color:var(--batshit-primary-hover);background:var(--batshit-accent-faint);color:var(--batshit-text);}',
+        '.batshit-builder-drop-zone.is-drag-over{border-color:var(--batshit-primary-text);background:var(--batshit-primary-faint);color:var(--batshit-text);}',
         '.batshit-builder-output{max-width:100%;overflow:auto;border:1px solid var(--batshit-border-subtle);border-radius:var(--batshit-radius);background:var(--batshit-field);padding:10px;color:var(--batshit-text);font:500 13px/1.45 var(--batshit-font);}',
         '.batshit-builder-output pre{margin:0;white-space:pre-wrap;word-break:break-word;font:500 12px/1.45 var(--batshit-font-mono);}',
         '.batshit-builder-status{display:grid;gap:4px;padding:10px;border-radius:var(--batshit-radius);border:1px solid var(--batshit-border-subtle);}',
@@ -1017,20 +1061,57 @@ function generateBuilderKitApi(): string {
       if (typeof callback === 'function') callback(value, event);
     }
 
+    // uploadButton and dropFile hand the chosen files to onFiles, the name builder-kit-api.md
+    // documents (an agent that followed it got a drop zone that did nothing); onChange still works.
+    // The chosen files are copied with Array.from: input.files is a FileList, not an array, and
+    // toArray turned it into [] (a file picked with the picker never reached the artifact).
+    function fileCallback(options) {
+      return typeof options.onFiles === 'function' ? options.onFiles : options.onChange;
+    }
+
+    // BL-89: a label names its control only when the two are linked. Each field control keeps the
+    // artifact's own id or gets a generated one, and its visible label points at it; a field with no
+    // visible label is named by the ariaLabel option instead.
+    let generatedIdCount = 0;
+    function ensureElementId(element, prefix) {
+      if (element.id) return element.id;
+      let candidate = '';
+      do {
+        generatedIdCount += 1;
+        candidate = prefix + '-' + generatedIdCount;
+      } while (document.getElementById(candidate));
+      element.id = candidate;
+      return candidate;
+    }
+
     function createFieldShell(options = {}) {
       ensureStyles();
       const root = document.createElement('div');
       root.className = FIELD_CLASS;
       const labelText = trimString(options.label);
+      let label = null;
       if (labelText) {
-        const label = document.createElement('label');
+        label = document.createElement('label');
         label.className = 'batshit-builder-label';
         label.textContent = labelText;
         root.appendChild(label);
       }
       const hintText = trimString(options.hint);
+      const ariaLabel = trimString(options.ariaLabel);
       return {
         root,
+        label,
+        bindControl(control) {
+          if (label) label.htmlFor = ensureElementId(control, 'batshit-field');
+          else if (ariaLabel) control.setAttribute('aria-label', ariaLabel);
+          return control;
+        },
+        bindGroup(group, role) {
+          group.setAttribute('role', role);
+          if (label) group.setAttribute('aria-labelledby', ensureElementId(label, 'batshit-field-label'));
+          else if (ariaLabel) group.setAttribute('aria-label', ariaLabel);
+          return group;
+        },
         addHint() {
           if (!hintText) return;
           const hint = document.createElement('div');
@@ -1055,6 +1136,11 @@ function generateBuilderKitApi(): string {
       const input = document.createElement('input');
       input.type = type;
       input.className = type === 'range' ? 'batshit-builder-slider' : type === 'number' ? 'batshit-builder-number' : 'batshit-builder-input';
+      // The range and step first: a range input clamps and snaps its value to the bounds it has
+      // when the value is set, so a value set earlier was bent to the default 0-100, step 1.
+      if (options.min !== undefined) input.min = String(options.min);
+      if (options.max !== undefined) input.max = String(options.max);
+      if (options.step !== undefined) input.step = String(options.step);
       const value = options.value ?? options.defaultValue ?? '';
       if (type === 'checkbox') {
         input.checked = asBoolean(value, false);
@@ -1062,28 +1148,48 @@ function generateBuilderKitApi(): string {
         input.value = String(value);
       }
       if (options.placeholder) input.placeholder = asString(options.placeholder);
-      if (options.min !== undefined) input.min = String(options.min);
-      if (options.max !== undefined) input.max = String(options.max);
-      if (options.step !== undefined) input.step = String(options.step);
       if (options.disabled === true) input.disabled = true;
       if (options.name) input.name = asString(options.name);
       if (options.id) input.id = asString(options.id);
+      shell.bindControl(input);
+      // BL-89: a slider shows its current value, so a person can set an exact number.
+      let valueOutput = null;
+      if (type === 'range') {
+        valueOutput = document.createElement('output');
+        valueOutput.className = 'batshit-builder-value';
+        valueOutput.setAttribute('for', ensureElementId(input, 'batshit-field'));
+        // For the eye only: the slider reports its own value, and a second live region would
+        // repeat every change to a screen reader.
+        valueOutput.setAttribute('aria-hidden', 'true');
+        if (shell.label) {
+          const labelRow = document.createElement('div');
+          labelRow.className = 'batshit-builder-label-row';
+          shell.root.insertBefore(labelRow, shell.label);
+          labelRow.appendChild(shell.label);
+          labelRow.appendChild(valueOutput);
+        }
+      }
+      const valueSuffix = asString(options.valueSuffix);
+      function showValue() {
+        if (!valueOutput) return;
+        valueOutput.textContent = input.value + valueSuffix;
+        // Say the value with its unit ("15%"), the way the readout shows it.
+        if (valueSuffix) input.setAttribute('aria-valuetext', input.value + valueSuffix);
+      }
       if (options.fabricId) {
         input.dataset.fabricId = asString(options.fabricId);
         registerFabricField(options.fabricId, type === 'range' ? 'slider' : type, trimString(options.label), {
           min: options.min, max: options.max, step: options.step
         });
-        registerFabricSetter(options.fabricId, function(val) {
-          if (type === 'checkbox') { input.checked = asBoolean(val, false); }
-          else { input.value = String(val); }
-          emitChange(options.onChange, type === 'checkbox' ? input.checked : input.value, null);
-        });
       }
       input.addEventListener('input', (event) => {
+        showValue();
         const next = type === 'checkbox' ? input.checked : input.value;
         emitChange(options.onChange, next, event);
       });
       shell.root.appendChild(input);
+      if (valueOutput && !shell.label) shell.root.appendChild(valueOutput);
+      showValue();
       shell.addHint();
       return asBuilderComponent(shell.root, { input });
     }
@@ -1115,22 +1221,9 @@ function generateBuilderKitApi(): string {
       });
     }
 
-    function registerFabricSetter(fabricId, setter) {
-      if (!fabricId || typeof fabricId !== 'string') return;
-      window.batshit._fabricSetters[fabricId.trim()] = setter;
-    }
-
-    // SA-042: Listen for batshit:set-fields messages from parent (agent field injection)
-    window.addEventListener('message', function(event) {
-      if (!event.data || event.data.type !== 'batshit:set-fields') return;
-      var fields = event.data.fields;
-      if (!fields || typeof fields !== 'object') return;
-      var keys = Object.keys(fields);
-      for (var i = 0; i < keys.length; i++) {
-        var setter = window.batshit._fabricSetters[keys[i]];
-        if (typeof setter === 'function') setter(fields[keys[i]]);
-      }
-    });
+    // BL-175: there is no listener for a parent message that fills fields. Nothing in Batshit
+    // ever sent one: an agent's run of a published artifact happens on the server with the values
+    // it sends, and never fills the fields of a panel the user has open.
 
     // SA-042: Public API to read registered fabric fields
     window.batshit.getFabricFields = function() {
@@ -1156,17 +1249,18 @@ function generateBuilderKitApi(): string {
         const shell = createFieldShell(options);
         const textarea = document.createElement('textarea');
         textarea.className = 'batshit-builder-textarea';
+        if (options.id) textarea.id = asString(options.id);
+        shell.bindControl(textarea);
         textarea.value = asString(options.value ?? options.defaultValue ?? '');
+        // BL-171: rows is the documented height in lines; the kit used to ignore it.
+        const rows = typeof options.rows === 'number' ? options.rows : typeof options.rows === 'string' && options.rows.trim() ? Number(options.rows) : NaN;
+        if (Number.isInteger(rows) && rows > 0) textarea.rows = rows;
         if (options.placeholder) textarea.placeholder = asString(options.placeholder);
         if (options.disabled === true) textarea.disabled = true;
         textarea.addEventListener('input', (event) => emitChange(options.onChange, textarea.value, event));
         if (options.fabricId) {
           textarea.dataset.fabricId = asString(options.fabricId);
           registerFabricField(options.fabricId, 'textarea', trimString(options.label));
-          registerFabricSetter(options.fabricId, function(val) {
-            textarea.value = asString(val);
-            emitChange(options.onChange, textarea.value, null);
-          });
         }
         shell.root.appendChild(textarea);
         shell.addHint();
@@ -1176,6 +1270,8 @@ function generateBuilderKitApi(): string {
         const shell = createFieldShell(options);
         const select = document.createElement('select');
         select.className = 'batshit-builder-select';
+        if (options.id) select.id = asString(options.id);
+        shell.bindControl(select);
         const rows = normalizeOptions(options);
         for (const row of rows) {
           const option = document.createElement('option');
@@ -1190,10 +1286,6 @@ function generateBuilderKitApi(): string {
           select.dataset.fabricId = asString(options.fabricId);
           var optionValues = normalizeOptions(options).map(function(r) { return r.value; });
           registerFabricField(options.fabricId, 'select', trimString(options.label), { fieldOptions: optionValues });
-          registerFabricSetter(options.fabricId, function(val) {
-            select.value = String(val);
-            emitChange(options.onChange, select.value, null);
-          });
         }
         shell.root.appendChild(select);
         shell.addHint();
@@ -1204,6 +1296,8 @@ function generateBuilderKitApi(): string {
         const select = document.createElement('select');
         select.className = 'batshit-builder-select';
         select.multiple = true;
+        if (options.id) select.id = asString(options.id);
+        shell.bindControl(select);
         const rows = normalizeOptions(options);
         for (const row of rows) {
           const option = document.createElement('option');
@@ -1211,7 +1305,8 @@ function generateBuilderKitApi(): string {
           option.textContent = row.label;
           select.appendChild(option);
         }
-        const selectedValues = new Set(toArray(options.value ?? options.defaultValue).map((entry) => String(entry)));
+        // BL-171: values is the documented name; value (the name the kit reads) wins when both are given.
+        const selectedValues = new Set(toArray(options.value ?? options.defaultValue ?? options.values).map((entry) => String(entry)));
         Array.from(select.options).forEach((option) => {
           option.selected = selectedValues.has(option.value);
         });
@@ -1223,13 +1318,6 @@ function generateBuilderKitApi(): string {
           select.dataset.fabricId = asString(options.fabricId);
           var optionValues = normalizeOptions(options).map(function(r) { return r.value; });
           registerFabricField(options.fabricId, 'multiselect', trimString(options.label), { fieldOptions: optionValues });
-          registerFabricSetter(options.fabricId, function(val) {
-            var vals = toArray(val).map(function(v) { return String(v); });
-            var valSet = new Set(vals);
-            Array.from(select.options).forEach(function(opt) { opt.selected = valSet.has(opt.value); });
-            var selected = Array.from(select.selectedOptions).map(function(opt) { return opt.value; });
-            emitChange(options.onChange, selected, null);
-          });
         }
         shell.root.appendChild(select);
         shell.addHint();
@@ -1241,15 +1329,13 @@ function generateBuilderKitApi(): string {
         row.className = 'batshit-builder-checkbox-row';
         const input = document.createElement('input');
         input.type = 'checkbox';
-        input.checked = asBoolean(options.value ?? options.defaultValue, false);
+        if (options.id) input.id = asString(options.id);
+        // BL-171: checked is the documented name; value (the name the kit reads) wins when both are given.
+        input.checked = asBoolean(options.value ?? options.defaultValue ?? options.checked, false);
         input.addEventListener('change', (event) => emitChange(options.onChange, input.checked, event));
         if (options.fabricId) {
           input.dataset.fabricId = asString(options.fabricId);
           registerFabricField(options.fabricId, 'checkbox', trimString(options.label || options.text));
-          registerFabricSetter(options.fabricId, function(val) {
-            input.checked = asBoolean(val, false);
-            emitChange(options.onChange, input.checked, null);
-          });
         }
         row.appendChild(input);
         const text = document.createElement('span');
@@ -1266,6 +1352,8 @@ function generateBuilderKitApi(): string {
         const shell = createFieldShell(options);
         const group = document.createElement('div');
         group.className = 'batshit-builder-radio-group';
+        if (options.id) group.id = asString(options.id);
+        shell.bindGroup(group, 'radiogroup');
         const name = asString(options.name || options.id || ('radio-' + Math.random().toString(36).slice(2)));
         const selected = options.value ?? options.defaultValue;
         const rows = normalizeOptions(options);
@@ -1290,13 +1378,6 @@ function generateBuilderKitApi(): string {
           group.dataset.fabricId = asString(options.fabricId);
           var optionValues = normalizeOptions(options).map(function(r) { return r.value; });
           registerFabricField(options.fabricId, 'radio', trimString(options.label), { fieldOptions: optionValues });
-          registerFabricSetter(options.fabricId, function(val) {
-            var radios = group.querySelectorAll('input[type=radio]');
-            for (var i = 0; i < radios.length; i++) {
-              radios[i].checked = radios[i].value === String(val);
-              if (radios[i].checked) emitChange(options.onChange, radios[i].value, null);
-            }
-          });
         }
         shell.root.appendChild(group);
         shell.addHint();
@@ -1313,6 +1394,8 @@ function generateBuilderKitApi(): string {
         const root = document.createElement('div');
         root.className = 'batshit-builder-root';
         root.style.padding = '10px';
+        if (options.id) root.id = asString(options.id);
+        shell.bindGroup(root, 'group');
         const primary = this.textarea({
           label: asString(options.promptLabel || 'Prompt'),
           value: asString(options.prompt || options.value || '')
@@ -1328,15 +1411,6 @@ function generateBuilderKitApi(): string {
         if (options.fabricId) {
           root.dataset.fabricId = asString(options.fabricId);
           registerFabricField(options.fabricId, 'promptPair', trimString(options.label));
-          registerFabricSetter(options.fabricId, function(val) {
-            if (typeof val === 'object' && val !== null) {
-              if (val.prompt !== undefined) primary.input.value = asString(val.prompt);
-              if (val.negativePrompt !== undefined) secondary.input.value = asString(val.negativePrompt);
-            } else {
-              primary.input.value = asString(val);
-            }
-            emitChange(options.onChange, { prompt: primary.input.value, negativePrompt: secondary.input.value }, null);
-          });
         }
         root.appendChild(primary.shell);
         root.appendChild(secondary.shell);
@@ -1358,7 +1432,7 @@ function generateBuilderKitApi(): string {
         button.className = 'batshit-builder-button';
         button.textContent = asString(options.buttonText || 'Upload File');
         button.addEventListener('click', () => input.click());
-        input.addEventListener('change', (event) => emitChange(options.onChange, toArray(input.files), event));
+        input.addEventListener('change', (event) => emitChange(fileCallback(options), Array.from(input.files || []), event));
         row.appendChild(button);
         row.appendChild(input);
         shell.root.appendChild(row);
@@ -1389,9 +1463,9 @@ function generateBuilderKitApi(): string {
           event.preventDefault();
           dropZone.classList.remove('is-drag-over');
           const files = event.dataTransfer ? Array.from(event.dataTransfer.files || []) : [];
-          emitChange(options.onChange, files, event);
+          emitChange(fileCallback(options), files, event);
         });
-        input.addEventListener('change', (event) => emitChange(options.onChange, toArray(input.files), event));
+        input.addEventListener('change', (event) => emitChange(fileCallback(options), Array.from(input.files || []), event));
 
         shell.root.appendChild(dropZone);
         if (options.showUploadButton === true) {
@@ -1399,7 +1473,7 @@ function generateBuilderKitApi(): string {
             buttonText: options.buttonText || 'Choose file',
             accept: options.accept,
             multiple: options.multiple,
-            onChange: options.onChange
+            onFiles: fileCallback(options)
           });
           shell.root.appendChild(buttonRow.shell);
         } else {
@@ -1442,10 +1516,10 @@ function generateBuilderKitApi(): string {
         let element;
         if (type === 'video') {
           element = document.createElement('video');
-          element.controls = true;
+          element.controls = options.controls !== false;
         } else if (type === 'audio') {
           element = document.createElement('audio');
-          element.controls = true;
+          element.controls = options.controls !== false;
         } else {
           element = document.createElement('img');
           element.alt = asString(options.alt || 'artifact output');
@@ -1461,7 +1535,8 @@ function generateBuilderKitApi(): string {
         wrapper.className = SURFACE_CLASS + ' batshit-builder-output';
         const table = document.createElement('table');
         table.className = 'batshit-builder-table';
-        const columns = toArray(options.columns).map((entry) => String(entry));
+        // BL-171: headers is the documented name; columns (the name the kit reads) wins when both are given.
+        const columns = toArray(options.columns !== undefined ? options.columns : options.headers).map((entry) => String(entry));
         const normalizedRows = toArray(rows).map((row) => row && typeof row === 'object' ? row : {});
         const keys = columns.length > 0 ? columns : Array.from(new Set(normalizedRows.flatMap((row) => Object.keys(row))));
         const thead = document.createElement('thead');
@@ -1492,7 +1567,8 @@ function generateBuilderKitApi(): string {
         ensureStyles();
         const card = document.createElement('div');
         card.className = SURFACE_CLASS + ' batshit-builder-status';
-        card.dataset.kind = asString(options.kind || 'info');
+        // BL-171: status is the documented name; kind (the name the kit reads) wins when both are given.
+        card.dataset.kind = asString(options.kind || options.status || 'info');
         const title = document.createElement('div');
         title.className = 'batshit-builder-label';
         title.textContent = asString(options.title || 'Status');
@@ -1839,7 +1915,6 @@ function generateBuilderKitApi(): string {
         const getShareOptions = (includeInChat) => {
           const base = asObject(options.shareOptions) ? { ...options.shareOptions } : {};
           if (!base.type) base.type = 'data';
-          if (!base.initiator) base.initiator = trimString(options.initiator || 'user');
           base.includeInChat = includeInChat;
           return base;
         };

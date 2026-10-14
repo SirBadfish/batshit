@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { prepareManagedHistoryMessages } from '../sendRoutedHistory'
+import { prepareManagedHistoryMessages, resolveCurrentMessageFrom } from '../sendRoutedHistory'
 
 describe('prepareManagedHistoryMessages', () => {
   it('removes the current user turn after the API/CLI waiting placeholder', () => {
@@ -120,5 +120,21 @@ describe('prepareManagedHistoryMessages', () => {
     })
 
     expect(history.map((message) => message.id)).toEqual(['assistant-previous'])
+  })
+})
+
+describe('resolveCurrentMessageFrom (SA-128 DP-1)', () => {
+  it('names Batshit for a woken turn, a group follow-up, and the artifact share follow-up', () => {
+    expect(resolveCurrentMessageFrom({ metadata: { wake: { chainDepth: 1, dmId: 'dm_1' } } })).toBe('batshit')
+    expect(resolveCurrentMessageFrom({ metadata: {}, groupEventType: 'agent' })).toBe('batshit')
+    expect(resolveCurrentMessageFrom({ metadata: { source: 'artifact_share_auto_followup' } })).toBe('batshit')
+  })
+
+  it('names the user for every other send, including the first event of a group turn', () => {
+    expect(resolveCurrentMessageFrom({ metadata: null })).toBe('user')
+    expect(resolveCurrentMessageFrom({ metadata: { projectPath: '/x' } })).toBe('user')
+    expect(resolveCurrentMessageFrom({ metadata: {}, groupEventType: 'user' })).toBe('user')
+    // An approval click is the user's own act, whatever Batshit wrote around it (DL-116-08).
+    expect(resolveCurrentMessageFrom({ metadata: { approvalResume: { approvalIds: ['a'] } } })).toBe('user')
   })
 })

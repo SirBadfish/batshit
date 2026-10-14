@@ -3,8 +3,11 @@ import {
   buildClaudeLlmCapture,
   buildCodexLlmCapture,
   buildVercelLlmCapture,
+  reportedUsageConfidence,
   sanitizeRuntimeEventLogForCapture,
 } from '../executionViewerLlmCapture'
+import { summarizeContextUsage } from '$lib/utils/tokenPanel'
+import type { ExecutionSnapshot } from '$lib/types/executionViewer'
 
 describe('executionViewerLlmCapture redaction', () => {
   it('redacts data image URLs in Vercel capture payloads', () => {
@@ -249,6 +252,37 @@ describe('executionViewerLlmCapture redaction', () => {
     )
   })
 
+  /**
+   * BL-503 / BL-1361: the CLI lanes' finish callback also runs for a run that failed, was stopped,
+   * or was ended by the context guard, and such a run's CLI reported no usage. Its counts are
+   * unknown (`value: null`), never `exact` and never zero; a run whose CLI reported them is exact.
+   */
+  it.each([
+    ['claude', (totalUsage: any) => buildClaudeLlmCapture({ prompt: 'p', tools: null, toolMetadata: null, totalUsage })],
+    ['codex', (totalUsage: any) => buildCodexLlmCapture({ prompt: 'p', tools: null, toolMetadata: null, totalUsage })],
+  ] as const)('labels %s CLI usage exact only when the CLI reported it', (_lane, build) => {
+    for (const missing of [null, undefined, {}]) {
+      const capture = build(missing)
+      for (const usage of [capture.llmCalls[0]!.usage, capture.llmSummary.totalUsage]) {
+        for (const stat of [usage.inputTokens, usage.outputTokens, usage.totalTokens]) {
+          expect(stat).toMatchObject({ value: null, confidence: 'estimated' })
+        }
+      }
+    }
+
+    const reported = build({ inputTokens: 9, outputTokens: 4, totalTokens: 13 })
+    expect(reported.llmCalls[0]!.usage.totalTokens).toMatchObject({ value: 13, confidence: 'exact' })
+    expect(reported.llmSummary.totalUsage.inputTokens).toMatchObject({ value: 9, confidence: 'exact' })
+  })
+
+  it('treats a reported zero as reported, and nothing reported as unknown', () => {
+    expect(reportedUsageConfidence({ inputTokens: 0 })).toBe('exact')
+    expect(reportedUsageConfidence({ outputTokens: 12 })).toBe('exact')
+    expect(reportedUsageConfidence({})).toBe('estimated')
+    expect(reportedUsageConfidence(null)).toBe('estimated')
+    expect(reportedUsageConfidence(undefined)).toBe('estimated')
+  })
+
   it('preserves Claude cache-read and cache-creation breakdown while showing total processed input', () => {
     const capture = buildClaudeLlmCapture({
       prompt: 'Reply with the cached total.',
@@ -469,5 +503,147 @@ describe('sanitizeRuntimeEventLogForCapture (SA-105 P3)', () => {
     expect(serialized).not.toContain(rawBase64)
     expect(serialized).toContain('[redacted image/png data URL')
     expect(serialized).toContain('[redacted base64 payload')
+  })
+})
+
+/**
+ * BL-77: once the tool loop is cached, most of each Anthropic call is READ from or WRITTEN to
+ * the cache. Anthropic's raw per-call usage (`providerMetadata.anthropic.usage`) counts only
+ * the fresh remainder in `input_tokens`, and that raw number used to override the SDK's
+ * whole-prompt count on every call row. The Token Panel meter reads the largest call's input
+ * as the context size, so it would have shown a few hundred tokens for a 30,000-token prompt.
+ * Shapes below are the real ones from the 2026-09-22 baseline run.
+ */
+describe('BL-77 per-call input counts the whole prompt on Anthropic accounting', () => {
+  const anthropicStep = (fresh: number, read: number, written: number, output: number) => ({
+    usage: {
+      inputTokens: fresh + read + written,
+      inputTokenDetails: { noCacheTokens: fresh, cacheReadTokens: read, cacheWriteTokens: written },
+      outputTokens: output,
+      outputTokenDetails: { textTokens: output, reasoningTokens: 0 },
+      totalTokens: fresh + read + written + output,
+    },
+    providerMetadata: {
+      anthropic: {
+        usage: {
+          input_tokens: fresh,
+          cache_creation_input_tokens: written,
+          cache_read_input_tokens: read,
+          output_tokens: output,
+        },
+      },
+    },
+  })
+
+  it('reports fresh + cache read + cache write as the call input, with the cache split beside it', () => {
+    const capture = buildVercelLlmCapture({
+      steps: [anthropicStep(12551, 9852, 0, 248)],
+      totalUsage: null,
+      finalText: 'done',
+    })
+
+    const usage = capture.llmCalls[0]!.usage
+    expect(usage.inputTokens.value).toBe(22403)
+    expect(usage.cachedInputTokens?.value).toBe(9852)
+    expect(usage.cacheCreationInputTokens?.value).toBe(0)
+    expect(usage.outputTokens.value).toBe(248)
+    expect(usage.totalTokens.value).toBe(22651)
+  })
+
+  it('does the same when only the raw provider metadata reports usage', () => {
+    const step = anthropicStep(2, 22403, 9439, 1543)
+    const capture = buildVercelLlmCapture({
+      steps: [{ providerMetadata: step.providerMetadata }],
+      totalUsage: null,
+      finalText: 'done',
+    })
+
+    const usage = capture.llmCalls[0]!.usage
+    expect(usage.inputTokens.value).toBe(31844)
+    expect(usage.cachedInputTokens?.value).toBe(22403)
+    expect(usage.cacheCreationInputTokens?.value).toBe(9439)
+    expect(usage.totalTokens.value).toBe(31844 + 1543)
+  })
+
+  it('does the same for a Vercel AI Gateway Claude call, whose own step usage is exclusive too', () => {
+    // SA-107's live gateway shape: the SDK usage keeps the fresh remainder as its input and
+    // reports the cache beside it, and the raw Anthropic usage rides providerMetadata.
+    const capture = buildVercelLlmCapture({
+      steps: [
+        {
+          usage: {
+            inputTokens: 3,
+            inputTokenDetails: { cacheReadTokens: 5117, cacheWriteTokens: 13996 },
+            outputTokens: 553,
+          },
+          providerMetadata: {
+            gateway: { routing: { finalProvider: 'anthropic' } },
+            anthropic: {
+              usage: {
+                input_tokens: 3,
+                output_tokens: 553,
+                cache_read_input_tokens: 5117,
+                cache_creation_input_tokens: 13996,
+              },
+            },
+          },
+        },
+      ],
+      totalUsage: null,
+      finalText: 'done',
+    })
+
+    const usage = capture.llmCalls[0]!.usage
+    expect(usage.inputTokens.value).toBe(3 + 5117 + 13996)
+    expect(usage.cachedInputTokens?.value).toBe(5117)
+    expect(usage.cacheCreationInputTokens?.value).toBe(13996)
+  })
+
+  it('keeps the Token Panel meter on the largest whole prompt once the tool loop is cached', () => {
+    // A cached three-step loop: step one reads the system prompt, steps two and three read the
+    // previous step and write only what it added, so their fresh remainder is tiny.
+    const capture = buildVercelLlmCapture({
+      steps: [
+        anthropicStep(1390, 9852, 0, 102),
+        anthropicStep(2, 9852, 12549, 248),
+        anthropicStep(2, 22403, 9439, 1543),
+      ],
+      totalUsage: {
+        inputTokens: 11242 + 22403 + 31844,
+        inputTokenDetails: { noCacheTokens: 1394, cacheReadTokens: 42107, cacheWriteTokens: 21988 },
+        outputTokens: 1893,
+        totalTokens: 11242 + 22403 + 31844 + 1893,
+      } as any,
+      finalText: 'done',
+    })
+    const snapshot = {
+      id: 'snap-bl77',
+      sessionId: 'sess-bl77',
+      userId: 'user-1',
+      agentId: 'agent-1',
+      agentName: 'Probe',
+      createdAt: '2026-09-22T12:00:00.000Z',
+      structuredInput: {},
+      runtime: {
+        runtimeId: 'vercel',
+        providerId: 'anthropic',
+        connectionId: 'direct:anthropic',
+        modelName: 'claude-sonnet-5',
+        transport: 'vercel-sdk',
+        status: 'succeeded',
+      },
+      llmSummary: capture.llmSummary,
+      llmCalls: capture.llmCalls,
+    } as unknown as ExecutionSnapshot
+
+    const summary = summarizeContextUsage({
+      messages: [],
+      snapshots: [snapshot],
+      activeModel: null,
+      agent: null,
+    })
+
+    expect(summary.displayTokens).toBe(31844)
+    expect(summary.label).toBe('32K peak call')
   })
 })

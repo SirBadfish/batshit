@@ -218,6 +218,8 @@ type ApiShellOptions = {
    * copies.
    */
   snapshots?: { before: string; after: string }
+  /** The run's own flag: a stream passed its limit and was cut (`stdout`/`stderr` show how). */
+  truncated?: boolean
 }
 
 /**
@@ -254,7 +256,7 @@ export function apiNativeBashResult(options: ApiShellOptions): Record<string, an
     signal: null,
     timedOut: false,
     durationMs: 104,
-    truncated: false,
+    truncated: options.truncated === true,
     policyMode: 'workspace',
     accessMode: 'agent',
     backend: 'apple_container',

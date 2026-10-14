@@ -19,6 +19,18 @@ let store = $state<SubagentStore>({
 // Base API URL for direct Redis API
 const API_BASE = '/api/subagents'
 
+/**
+ * The server's own reason for a refusal, when it gave one. A delete that could not reach
+ * batshit-server (2026-09-25, BL-139), a name another agent already uses (BL-187), or a save
+ * the server refused (BL-286) says what to do; the bare status text ("Service Unavailable")
+ * did not.
+ */
+async function describeRefusal(response: Response, action: string, subject = 'subagent') {
+  const payload = await response.json().catch(() => null)
+  const reason = typeof payload?.error === 'string' && payload.error.trim() ? payload.error.trim() : response.statusText
+  return `Failed to ${action} ${subject}: ${reason}`
+}
+
 export function createSubagentStore() {
   return {
     get subagents() { return store.subagents },
@@ -27,6 +39,12 @@ export function createSubagentStore() {
     
     init(userId: string) {
       store.userId = userId
+    },
+
+    /** A successful authenticated GET updates the same cache that section reads observe. */
+    acceptServerRecord(record: SubagentRow) {
+      if (record.user_id !== store.userId) throw new Error('Subagent settings belong to another user')
+      store.subagents = store.subagents.map(existing => existing.id === record.id ? record : existing)
     },
     
     async load() {
@@ -42,7 +60,7 @@ export function createSubagentStore() {
           const data = await response.json()
           store.subagents = data.subagents || []
         } else {
-          store.error = `Failed to load subagents: ${response.statusText}`
+          store.error = await describeRefusal(response, 'load', 'subagents')
           store.subagents = []
         }
       } catch (err) {
@@ -100,7 +118,7 @@ export function createSubagentStore() {
           
           return newSubagent
         } else {
-          const errorMsg = `Failed to create subagent: ${response.statusText}`
+          const errorMsg = await describeRefusal(response, 'create')
           store.error = errorMsg
           throw new Error(errorMsg)
         }
@@ -152,7 +170,9 @@ export function createSubagentStore() {
             sa.id === id ? updatedSubagent : sa
           )
         } else {
-          const errorMsg = `Failed to update subagent: ${response.statusText}`
+          // BL-286: the server's reason (an override it refused, a required webhook URL), which
+          // the Subagent panel's save error shows, not the bare status text.
+          const errorMsg = await describeRefusal(response, 'update')
           store.error = errorMsg
           throw new Error(errorMsg)
         }
@@ -171,9 +191,11 @@ export function createSubagentStore() {
         })
         
         if (response.ok) {
+          const payload = await response.json().catch(() => null)
           store.subagents = store.subagents.filter(sa => sa.id !== id)
+          return typeof payload?.notice === 'string' ? payload.notice : null
         } else {
-          const errorMsg = `Failed to delete subagent: ${response.statusText}`
+          const errorMsg = await describeRefusal(response, 'delete')
           store.error = errorMsg
           throw new Error(errorMsg)
         }
@@ -217,7 +239,7 @@ export function createSubagentStore() {
         })
         
         if (!response.ok) {
-          const errorMsg = `Failed to update agent subagents: ${response.statusText}`
+          const errorMsg = await describeRefusal(response, 'update', 'agent subagents')
           store.error = errorMsg
           throw new Error(errorMsg)
         }

@@ -18,6 +18,8 @@ Batshit has three Subagent types:
 
 Each n8n Workflow, API, and CLI Subagent can be assigned to either live Primary Agent type.
 
+A CLI Subagent has its own Codex or Claude mode in Agent Settings. Codex shows its saved Sandbox Level, or the mode's own level when none was saved. **Agent (full access)** disables the level control and keeps any tighter level saved in an older record; pick **Agent** to adjust it. Claude offers **Plan**, **Ask before edits**, **Edit automatically**, and **Bypass permissions**. CLI Subagents have no approval cards: a request that needs permission fails instead of waiting for a user.
+
 ## When to use a Subagent
 
 Use a Subagent when a recurring piece of work deserves its own instructions, model, tools, or personality. Good fits:
@@ -68,7 +70,7 @@ Each Subagent has its own Tool Grid. Depending on type and configuration, Subage
 
 Broad Batshit control-plane tools stay Primary Agent territory. Subagents can use published Artifact runtime tools, but they do not get broad Fabric controls for changing the whole app.
 
-Fetch Zip is Primary-only. If a Subagent needs context from a large prior result, have the Primary Agent fetch or summarize it first.
+Fetch Zip reaches a Subagent only on the API lane, when its Fetch Zip toggle is on. CLI and n8n Workflow Subagents never get it, so have the Primary Agent fetch or summarize the zip first.
 
 ## Start fresh or continue a conversation
 
@@ -81,7 +83,7 @@ The Primary Agent can ask to **resume** when a follow-up depends on the Subagent
 - Each Subagent has one thread per chat. A new chat starts separately; Group Chat members who share a Subagent also share its thread.
 - Calls to the same Subagent wait for each other, so they cannot overwrite the same conversation. Different Subagents can work at the same time.
 
-The tool argument is `thread: "fresh"` or `thread: "resume"`; normally your Primary Agent chooses it from your request. n8n Workflow Subagents need the current official template, or the matching [thread-key setup](../user-templates/batshit-official-n8n-workflow-templates/README.md#conversation-threads), to honor this choice.
+The tool argument is `thread: "fresh"` or `thread: "resume"`; normally your Primary Agent chooses it from your request. n8n Workflow Subagents need the current official template, or the matching [thread-key setup](../resources/n8n-workflow-templates.md#conversation-threads), to honor this choice.
 
 ## Workers
 
@@ -100,11 +102,11 @@ Workers cannot use broad app-management or memory tools, call Subagents, or star
 
 Batshit allows **three Workers in one call, three running at once, and nine Worker runs during one Primary Agent turn**. Going over a limit returns a clear refusal. The Workers card shows each helper's status, duration, reported usage, and result. Workers operate within the speaking agent's turn in Group Chat.
 
-Claude Code can also run its own native helpers. These are labeled **Claude Code Helper**; Batshit's Worker limits and thread controls do not govern them.
+Claude Code can also run its own native helpers. These are labeled **Claude Code Helper**; Batshit's Worker limits and thread controls do not govern them. The card shows the helper's answer; the helper's own steps are not shown as separate cards. If a helper starts one of your Batshit Subagents or Workers, that run still counts in the reply's spend.
 
 ## Time limits and cost
 
-API and n8n Workflow Subagents default to three minutes per call; CLI Subagents default to five minutes. Set **Call Timeout** in the Subagent's Agent Settings to override its default with 10–600 seconds, or leave it blank to use the default. Workers default to three minutes; a copy of a specialist honors that specialist's explicit timeout override. A timeout is shown as a timed-out result, not a completed task.
+API and n8n Workflow Subagents default to three minutes per call; CLI Subagents default to five minutes. Set **Call Timeout** in the Subagent's Agent Settings to override its default with 10–600 seconds, or leave it blank to use the default. Workers default to three minutes; a copy of a specialist honors that specialist's explicit timeout override. A timeout is shown as a timed-out result, not a completed task. Pressing **Stop** on your agent's reply ends its Subagent and Worker runs too, on API and CLI agents alike, instead of leaving them to run until their time limit.
 
 Call Timeout covers the call itself, not time spent waiting for a turn. Batshit runs one call per Subagent at a time so its thread stays intact, so if your agent calls the same Subagent twice at once, the second call waits for the first to finish and can take up to about twice its Call Timeout overall. Batshit says so in the result when that happens, so a long call is never unexplained. Use Workers for work that should genuinely run at the same time — they do not wait in line.
 
@@ -161,7 +163,7 @@ Docker note: CLI Subagents need the CLI authenticated in the Docker app containe
 2. Pick `n8n Workflow`, `API`, or `CLI`.
 3. Give it a short, specific description; the Primary Agent uses this to decide when to call it.
 4. Add the Subagent's system prompt.
-5. Choose model/runtime settings.
+5. Choose a saved model and its runtime settings. An API Subagent runs through that saved model's connection (for example Google directly, or OpenRouter), the same way a Primary Agent does. If the model field says to pick the model again, pick it once; until then that Subagent refuses to run rather than guess a connection.
 6. Configure its Tool Grid.
 7. Assign it to one or more `API` or `CLI` Primary Agents.
 8. Send a test request that clearly asks for that specialist.
@@ -171,6 +173,24 @@ Good descriptions are specific:
 - "Reviews TypeScript and Svelte changes for bugs, regressions, missing tests, and launch-readiness risk."
 - "Summarizes long n8n workflows and explains each branch in plain English."
 - "Drafts user-facing documentation in warm, non-technical language."
+
+A Subagent can't use a name that a Primary Agent already uses, and a new Primary Agent can't use a Subagent's name. Skill and artifact access lists name agents and Subagents the same way, so two of them with one name would share that access. Pick another name if Batshit says the name is taken.
+
+## Saving Agent Settings
+
+Agent Settings saves changes automatically. While a save for the shown agent is still on its way, its controls are temporarily read-only. You can select another agent while it finishes. A draft waiting to save, or a field that needs correcting, stays editable.
+
+If changing **Assigned Subagents** fails, the error beside that card shows Batshit's reason when one is available.
+
+After 30 seconds without an answer, Settings shows a notice with **Retry**. Retry reads the saved record; it does not cancel the original save. Your draft stays visible, and choices that save several related values or a whole list wait for a successful read and for that agent’s pending writes to settle. If the read fails, use Retry; Settings keeps your draft.
+
+## Changing or deleting a Subagent
+
+When you upload a new avatar picture, clear it, or choose an icon, the old picture is deleted once the change saves. If the change can't save (for example the name is empty), the old picture stays, so the Subagent never points at a picture that is gone.
+
+Settings → Agents → the Subagent → delete. This removes the Subagent and everything that is only its own: its settings, its avatar pictures, and, for a `CLI Subagent`, its folder of managed CLI settings under `~/.batshit/agents/` (that folder also holds the CLI's own log of the Subagent's prompts). It also drops the Subagent from every Primary Agent it was assigned to, from skill or artifact lists that named it, and erases its thread in each of your chats. If a reply is using the Subagent when you delete it, Batshit stops that call first and waits for it to end before deleting anything. If it has not ended within 30 seconds, nothing is deleted and the error asks you to retry. If Batshit cannot verify command cleanup, it keeps the Subagent and its CLI folder. This safeguard also applies after an app restart: host-side records can block deletion while a recorded program still runs or cannot be checked. The error names a recorded live program so you can end it yourself and retry, or restart the computer and retry. When Batshit verifies that only the recorded programs ended, it may still warn that other commands from the old run could remain.
+
+The avatar pictures are stored by batshit-server, so Batshit checks that batshit-server is running before it deletes anything. If it is not running, nothing is deleted and the error says so. Restart Batshit (in Docker, run `./start-docker.sh`) and delete the Subagent again.
 
 ## Common problems
 

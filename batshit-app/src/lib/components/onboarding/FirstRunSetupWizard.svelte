@@ -6,7 +6,7 @@
   import { toast } from 'svelte-sonner'
   import * as agentStore from '$lib/stores/agents.svelte'
   import * as savedModelsStore from '$lib/stores/savedModels.svelte'
-  import { setUserSettings } from '$lib/stores/userSettings.svelte'
+  import { confirmUserSettings as setUserSettings } from '$lib/stores/userSettings.svelte'
   import { LIVE_SETTINGS_EVENTS } from '$lib/utils/liveSettingsEvents'
 
   type SetupStepId = 'api-keys' | 'models' | 'agents'
@@ -153,7 +153,7 @@
         throw new Error(payload?.error || 'Failed to update setup status')
       }
 
-      if (payload?.settings) {
+      if (payload && Object.hasOwn(payload, 'settings')) {
         setUserSettings(payload.settings)
       }
       if (payload?.status) {
@@ -449,7 +449,7 @@
     display: inline-flex;
     align-items: center;
     gap: 0.25rem;
-    color: var(--bs-app-primary);
+    color: var(--bs-app-primary-text);
     font-weight: 650;
     text-decoration: none;
   }
@@ -478,7 +478,7 @@
   }
 
   article.active {
-    background: color-mix(in oklab, var(--bs-app-primary) 8%, transparent);
+    background: var(--bs-app-primary-faint);
   }
 
   article.complete {
@@ -516,7 +516,7 @@
     place-items: center;
     border: 1px solid var(--bs-app-shell-line);
     border-radius: 8px;
-    color: var(--bs-app-primary);
+    color: var(--bs-app-primary-text);
     background: var(--bs-app-inset-surface);
   }
 

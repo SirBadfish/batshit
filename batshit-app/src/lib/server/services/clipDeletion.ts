@@ -20,6 +20,9 @@ export interface ClipDeletionResult {
 async function deleteUploadReferences(clip: ClipRow) {
   const locator = resolveClipUploadLocator(clip)
   if (locator) {
+    // These are borrowed Hair resources. Removing a Clip releases its own
+    // record/session links; Hair lifecycle/library/Admin owns file disposal.
+    if (locator.uploadType === 'goon_hair_assets' || locator.uploadType === 'goon_hair_imports') return
     await deleteUploadAsset(locator.uploadType, locator.filename)
     return
   }

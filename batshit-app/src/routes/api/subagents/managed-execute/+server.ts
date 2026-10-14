@@ -19,9 +19,12 @@ import {
   isSubagentBusyError,
   normalizeSubagentThreadMode,
 } from '$lib/server/services/subagentThreads'
+import { isSubagentDeletedError } from '$lib/server/services/subagentRunRegistry'
 import { spawnWorkers } from '$lib/server/services/workerRunner'
 import { resolveWorkersEnabled } from '$lib/utils/delegationCapabilities'
 import { resolveCliSubagentRuntime } from '$lib/server/services/cliSubagentModelResolution'
+import { boundRunCredential } from '$lib/server/services/actingAgentIdentity'
+import { getRunCredentialStopSignal } from '$lib/server/services/streamAbortRegistry'
 
 type ManagedExecuteBody = {
   agentId?: unknown
@@ -129,6 +132,14 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     return jsonError(400, 'missing_user', 'Managed subagent execution requires a caller identity.')
   }
 
+  // BL-675: delegation changes chat-owned state and Worker budgets. A managed run's
+  // credential, not its tool arguments, must identify both the chat and parent reply.
+  const boundSession = auth.auth === 'agent' ? readString(auth.sessionId) : ''
+  const boundMessage = auth.auth === 'agent' ? readString(auth.messageId) : ''
+  if (auth.auth === 'agent' && (!boundSession || !boundMessage)) {
+    return jsonError(403, 'run_context_required', 'Managed execution needs a run credential bound to a chat and reply.')
+  }
+
   let body: ManagedExecuteBody
   try {
     body = await request.json()
@@ -144,10 +155,18 @@ export const POST: RequestHandler = async ({ request, locals }) => {
   }
   const agentId = agentBinding.agentId ?? ''
   const subagentId = readString(body.subagentId)
-  const sessionId = readString(body.sessionId)
+  if (auth.auth === 'agent' && Object.prototype.hasOwnProperty.call(body, 'sessionId') &&
+    readString(body.sessionId) !== boundSession) {
+    return jsonError(400, 'session_mismatch', 'The requested chat differs from this run credential.')
+  }
+  if (auth.auth === 'agent' && Object.prototype.hasOwnProperty.call(body, 'messageId') &&
+    readString(body.messageId) !== boundMessage) {
+    return jsonError(400, 'message_mismatch', 'The requested reply differs from this run credential.')
+  }
+  const sessionId = auth.auth === 'agent' ? boundSession : readString(body.sessionId)
   const chatInput = typeof body.chatInput === 'string' ? body.chatInput : ''
   const projectPath = readString(body.projectPath) || null
-  const parentMessageId = readString(body.messageId) || null
+  const parentMessageId = auth.auth === 'agent' ? boundMessage : readString(body.messageId) || null
   const thread = normalizeSubagentThreadMode(body.thread)
   // SA-111 P4: one route, two modes. Worker mode is chosen by the presence of `workers`,
   // never by a caller-supplied discriminator, so a malformed subagent call can never be
@@ -231,17 +250,18 @@ export const POST: RequestHandler = async ({ request, locals }) => {
         lane: 'cli',
         cliModelFields,
         providerSettings: agentRecord.provider_specific_settings ?? null,
-        // The parent's scope as this lane knows it: a CLI primary's own runtime profile is
-        // built from these same stored defaults, so a worker inherits exactly what its
-        // parent has rather than the wider user-global set.
-        selectedGateways: normalizeIdList(agentRecord.defaultMCPGateways ?? agentRecord.default_mcp_gateways),
+        // The Worker inherits the actual parent run, including a human chat-bar override.
+        // Missing/old credential scope means none, never current saved defaults or body input.
+        selectedGateways: auth.mcpGatewayScope ?? [],
         toolSelections: normalizeIdList(
           agentRecord.defaultMCPToolSelections ?? agentRecord.default_mcp_tool_selections
         ),
         selectedCliToolIds: normalizeIdList(agentRecord.defaultTools ?? agentRecord.default_tools),
-        defaultGateways: normalizeIdList(agentRecord.defaultMCPGateways ?? agentRecord.default_mcp_gateways),
+        defaultGateways: auth.mcpGatewayScope ?? [],
         dcmDisplaySettings: agentRecord.dcmDisplaySettings ?? agentRecord.dcm_display_settings ?? null,
         assignedSubagents: getAssignedSubagentIds(agentRecord),
+        // BL-578: the parent reply's Stop ends its Workers (see the Subagent call below).
+        abortSignal: getRunCredentialStopSignal(boundRunCredential(auth)),
       },
       workers: body.workers,
     })
@@ -288,6 +308,13 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       parentMessageId,
       projectPath,
       thread,
+      // BL-578: the Stop of the reply that made this call, so a Stop of the CLI Primary ends
+      // its Subagent run instead of leaving it to its time limit. The request cannot carry it
+      // (SvelteKit aborts `request.signal` only before the body is read), so it comes from the run
+      // credential, never a chat the body names. BL-1321: this route takes only primary runs, so
+      // it is that run's own reply's Stop, already aborted once that reply has ended or been
+      // replaced; then the Subagent or Workers never start (BL-287).
+      abortSignal: getRunCredentialStopSignal(boundRunCredential(auth)),
     })
 
     return json({
@@ -299,6 +326,8 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       subagentId,
       subagentName: subagent.displayName || subagent.id,
       usage: result.usage,
+      ...(result.observedUsage ? { observedUsage: result.observedUsage } : {}),
+      ...(result.observedUsageUnavailable ? { observedUsageUnavailable: result.observedUsageUnavailable } : {}),
       modelId: result.modelId,
       provider: result.provider,
       durationMs: result.durationMs,
@@ -329,6 +358,13 @@ export const POST: RequestHandler = async ({ request, locals }) => {
         thread: null,
         toolSource: toolSourceFor(subagentType),
       })
+    }
+
+    // BL-661: a Subagent deleted mid-call (or already gone when the run tried to start) is
+    // a specific, expected outcome — 410 with its own code, not the generic 500 every other
+    // thrown error gets, so the CLI helper can say plainly that the Subagent is gone.
+    if (isSubagentDeletedError(error)) {
+      return jsonError(410, error.code, error.message)
     }
 
     const message = error instanceof Error ? error.message : String(error)

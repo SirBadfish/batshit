@@ -107,6 +107,17 @@ describe('MissedSchedulesDialog — Run now reports a failed record (F-P1-2)', (
     expect(toast.warning).not.toHaveBeenCalled()
   })
 
+  it('shows the route’s failure and recovery guidance when answering a missed run', async () => {
+    const error = 'failed: Cooper does not have Agent DMs turned on, so it would never see this. Turn on Agent DMs for that agent in Agent Settings.'
+    mockFetch({ success: false, error, outcome: error, recorded: true })
+
+    await pressRunNow()
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith(error))
+    expect(toast.success).not.toHaveBeenCalled()
+    expect(toast.warning).not.toHaveBeenCalled()
+  })
+
   it('says nothing extra on Skip, which records nothing to fail at', async () => {
     mockFetch({ success: true })
 

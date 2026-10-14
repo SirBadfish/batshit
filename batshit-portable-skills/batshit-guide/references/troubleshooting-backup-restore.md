@@ -11,9 +11,10 @@ Normal Batshit backups include Batshit-owned records and uploaded files, such as
 - settings
 - agents, subagents, groups, and assignments
 - sessions, folders, messages, zips, clips, and Execution Viewer snapshots
-- model presets, custom providers, local provider records, MCP gateways, CLI tools, skills, and prompts
+- model presets, custom providers, local provider records, MCP gateways, CLI tools, slash commands, and prompts
+- your own skills with their files, and each clone voice's reference recording
 - artifacts and artifact runtime storage
-- Goons, Motion Vault, Closet, scenes, custom icons, and uploaded assets
+- Goons, the Motion Vault list, Closet, scenes, custom icons, and uploaded assets
 - voice profiles and voice engine registry references
 - agent memory
 - agent DMs, wake-up webhooks, and schedules
@@ -30,9 +31,9 @@ Use each external tool's own backup/export process for those.
 
 Check that you're signed in as Admin, the app can reach Redis, batshit-server upload storage is reachable, the browser didn't block the download, and there's enough disk space.
 
-In the Mac app, the Save dialog opens before export starts. Choose a destination and leave the app running while Batshit streams the archive there. Active Goons, retained source packages and Recipe revisions, Motion Vault clips, Closet textures, Hair assets, scenes, Clips, and other uploads can make a valid backup several gigabytes. Before exporting, you can use Settings → Admin → Goon Asset Cleanup to inspect and delete orphaned Goon upload records/files.
+In the Mac app, the Save dialog opens before export starts. Choose a destination and leave the app running while Batshit streams the archive there. Active Goons, retained source packages and Recipe revisions, Motion Vault clips, Closet textures, Hair assets, scenes, Clips, and other uploads can make a valid backup several gigabytes. Before exporting, use Settings → Admin → Goon Asset Cleanup to inspect eligible orphans, read **Files and Reasons**, and explicitly confirm cleanup. Referenced files and unknown Scene files marked **Preserved** stay in storage.
 
-If the Mac app reports that the backup's `Content-length` exceeds `1073741824` bytes, that build is using the old blob re-upload path. Update or rebuild the Mac app; increasing `BODY_SIZE_LIMIT` is not the export fix.
+If the Mac app reports that the backup's `Content-length` exceeds `1073741824` bytes (1 GiB), update the Mac app, or rebuild it if you build your own copy. Increasing `BODY_SIZE_LIMIT` does not fix this backup-export error.
 
 ## Should I use With Secrets?
 
@@ -59,6 +60,7 @@ Preflight checks the bundle before Batshit mutates data. Common causes:
 - file paths inside the zip are unsafe
 - the backup was created by a future Batshit version this install doesn't understand
 - uploaded file assets referenced by records are missing
+- a saved Goon Recipe has missing build-review records or inconsistent saved-state hashes
 
 Fix: try the original backup file again, re-download or re-export if it may be incomplete, update Batshit before restoring if it's from a newer version, and use a complete backup bundle if the error mentions missing files. Don't bypass preflight.
 
@@ -77,6 +79,8 @@ Before replacing data:
 ## Restore completed but provider keys are missing
 
 If you restored a normal backup, secrets were excluded by design. Re-enter them: open Settings → API Keys, re-enter provider API keys, re-enter n8n API/MCP tokens if needed, re-enter tunnel/runtime tokens if needed, and test one small provider call. This is safer than accidentally putting keys into every backup.
+
+A custom provider's Extra Header values are left out too, because a header such as `Authorization` often carries a key. The header names come back with the value `null`. Open Settings → API Keys → Custom OpenAI-Compatible, enter the provider's API key, and replace each `null` with the header's value. Inspect lists these headers before the restore.
 
 ## With Secrets restore still has broken keys
 
@@ -109,6 +113,19 @@ Make sure the real files are mounted there.
 
 Backups restore Batshit settings/references — they don't install external runtimes. Reinstall or restart the Local AI or voice runtime, reconnect the base URL in Batshit, re-enter secrets if needed, run health checks, and run one real model/voice test. For Docker, host-local runtimes usually need `host.docker.internal` URLs.
 
+## A skill or clone voice came back without its files
+
+Inspect lists every skill folder and clone voice recording a backup doesn't carry, with the reason:
+
+- The folder or recording was missing when the backup was made, or Batshit couldn't read it.
+- A file in the folder changed while the backup was being made.
+- The folder is, or holds, a symbolic link. Batshit never follows one.
+- A file is over 100 MiB, or the folder is over 500 MiB or 2,000 files.
+- The backup came from Docker, where clone voice recordings live on the host computer and Batshit can't read them yet.
+- The backup is from an older Batshit that didn't save skill files or voice recordings.
+
+The skill or voice still comes back with its settings. Add the skill's files again (or import the skill again), or record the voice sample again in Voice Studio. A skill whose files are missing says so when it's used; Batshit never replaces it with an empty skill.
+
 ## Goon assets are missing or broken
 
 Backups include active Batshit-owned Goon upload assets, but broken imports can still happen if the backup zip is incomplete, files were already missing before export, restore failed partway and rolled back, or the browser is trying to load an old source-instance URL.
@@ -123,11 +140,15 @@ Wait if progress is still active, check the preflight disk row, and check app lo
 
 If Batshit says restore is waiting for active work, stop the current chat send or other long-running task and retry. No restore data has been changed at that point.
 
+If restore reports unfinished Goon asset cleanup or upload, let the current Goon operation finish, run **Settings → Admin → Goon Asset Cleanup**, then retry restore. Cleanup safely resumes interrupted file work. Do not delete upload files or clear Redis records by hand.
+
+If startup says an interrupted restore needs manual recovery, keep its upload and backup-staging folders intact and seek support with the exact error. Batshit stops when it cannot verify the original files or recovery records; deleting those records can destroy the information needed to recover. This can also happen with an unfinished restore from an older build. Older backup ZIP files remain supported separately.
+
 ## Backup file is too large
 
 Common size sources: active Advanced/Blender Goons, Motion Vault previews, Closet textures, scene skyboxes/room shells/props, many image/file Clips, and large artifact assets.
 
-Use Settings → Admin → Goon Asset Cleanup to remove orphaned Goon upload records/files before export. Also remove unneeded old sessions, clips, and artifacts from inside Batshit when appropriate. Don't manually delete upload files from disk behind Batshit's back unless you're intentionally repairing a broken instance and understand the references.
+Use Settings → Admin → Goon Asset Cleanup to inspect and remove eligible orphaned Goon uploads before export. Scene files with unknown reference history are preserved: a failed or partial settings write could have erased their saved reference, and the audit cannot date that loss or recreate the Scene safely. If a Scene disappeared, keep its files and review a known backup before the separate restore workflow. Also remove unneeded old sessions, clips, and artifacts from inside Batshit when appropriate. Don't manually delete upload files from disk behind Batshit's back unless you're intentionally repairing a broken instance and understand the references.
 
 ## Docker restore staging fails
 

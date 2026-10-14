@@ -38,6 +38,7 @@
  */
 
 import type { NativeToolAuthMethod } from '$lib/server/services/nativeToolAuth'
+import { isControlIdAllowedByList } from '$lib/utils/brokerAvailability'
 
 /**
  * Lanes as `useControl` sees them: every auth method, plus `in-process` for the callers that
@@ -56,6 +57,14 @@ export type ActingAgentAuth = {
   auth: ActingAgentLane
   agentId?: string | null
   sessionId?: string | null
+  /** The reply a run credential was minted for (BL-1321). See `boundRunCredential`. */
+  messageId?: string | null
+  /** A Subagent or Worker run's credential (SA-117 F-P2-1). */
+  delegated?: boolean | null
+  /** That run's Subagent or Worker, whose access lists govern it (BL-75). See `boundScopeAgentId`. */
+  scopeAgentId?: string | null
+  /** What that run may use through the control routes (BL-81). See `boundDelegatedAllowedControlIds`. */
+  delegatedAllowedControlIds?: string[] | null
 }
 
 export type ActingAgentBinding =
@@ -76,6 +85,48 @@ export function boundAgentId(auth: ActingAgentAuth | null | undefined): string {
 export function boundSessionId(auth: ActingAgentAuth | null | undefined): string {
   if (!auth || auth.auth !== 'agent') return ''
   return trimmed(auth.sessionId)
+}
+
+/**
+ * BL-1321 — the run a helper call belongs to, read only off the minted run credential: its chat,
+ * its reply, and whether it is a Subagent or Worker run. Empty on every lane but `agent`, so no
+ * body field can name a run. `getRunCredentialStopSignal` turns it into the Stop the call hears.
+ */
+export function boundRunCredential(auth: ActingAgentAuth | null | undefined): {
+  sessionId: string
+  messageId: string
+  delegated: boolean
+} {
+  if (!auth || auth.auth !== 'agent') return { sessionId: '', messageId: '', delegated: false }
+  return { sessionId: trimmed(auth.sessionId), messageId: trimmed(auth.messageId), delegated: auth.delegated === true }
+}
+
+/**
+ * BL-81 — the Subagent or Worker whose artifact ALLOWLISTS apply to a delegated run's call, or
+ * `''`.
+ *
+ * A Subagent or Worker run's credential names two ids, and they answer different questions.
+ * `agentId` (`boundAgentId`) is the per-run runtime id, `subagent_cli_<slug>`: it says WHO
+ * authenticated, and no agent record, inbox, allowlist or approval names it. `scopeAgentId` is
+ * the Subagent's record id, a `base` Worker's base id, or a built-in Worker's `worker_…` id
+ * (BL-75): the id Settings -> Agents -> Access writes into an artifact's agent allowlist, and the
+ * id the run's own DCM lists its artifact tools for.
+ *
+ * So this is not a rebinding: only a control's agent allowlist (and the short-alias lookup that
+ * applies it) reads it, on `/api/controls/use` and `/api/controls/find`. WHICH controls a
+ * delegated run may use at all is a separate answer, `boundDelegatedAllowedControlIds`. The
+ * identity gate, the risk gate, the handler, the audit's `agentId` and the step label keep
+ * `boundAgentId`: a Subagent's id can equal a primary's (both are `sanitizeId(displayName)`,
+ * checked for collisions only in their own key space), and a delegated run must never borrow
+ * that primary's record, consent or inbox.
+ *
+ * `''` for a primary run (its own agent governs), for a delegated credential minted before
+ * BL-75 (no scope: the per-run id, which no allowlist names, fails closed), and on every lane
+ * but `agent`.
+ */
+export function boundScopeAgentId(auth: ActingAgentAuth | null | undefined): string {
+  if (!auth || auth.auth !== 'agent' || auth.delegated !== true) return ''
+  return trimmed(auth.scopeAgentId)
 }
 
 /**
@@ -123,6 +174,101 @@ export function bindActingSessionId(
   const bound = boundSessionId(auth)
   if (bound) return bound
   return trimmed(claimed) || undefined
+}
+
+/**
+ * BL-81 — what a delegated run may use through the control routes, or `undefined`.
+ *
+ * On the `agent` lane with a delegated credential: the control ids its DCM index offered it,
+ * minted onto the credential by the runner, and `[]` when the credential carries none (one
+ * minted before BL-81), so a delegated call can never look like a primary's here and fail open.
+ * `undefined` for a primary run and on every other lane, where the caller's own settings and
+ * the route's existing rules govern, unchanged.
+ */
+export function boundDelegatedAllowedControlIds(
+  auth: ActingAgentAuth | null | undefined
+): string[] | undefined {
+  if (!auth || auth.auth !== 'agent' || auth.delegated !== true) return undefined
+  return Array.isArray(auth.delegatedAllowedControlIds) ? auth.delegatedAllowedControlIds : []
+}
+
+export const DELEGATED_RUN_NOT_ALLOWED_ERROR_CODE = 'CONTROL_NOT_ALLOWED'
+
+/**
+ * BL-81 follow-up — a delegated run's credential on a route OUTSIDE the two control routes.
+ *
+ * A managed CLI Subagent or Worker run's credential sits in its child process environment
+ * (`BATSHIT_AGENT_TOKEN`), so the model's own shell can present it to any route that takes a
+ * run credential, not only the routes its helper calls. BL-81 held that credential to its list
+ * on `/api/controls/find` and `/api/controls/use`; a route that does the same work directly has
+ * to hold it to the same list, or it serves the run as the full user.
+ *
+ * `controlId` names the control whose work the route does (`/api/native-tools/fetch-zip` is
+ * `sys.zip.fetch`): the call goes on exactly when the run's list allows that control. `null`
+ * is a route whose work no delegated list holds (artifact share and complete: a delegated run
+ * reaches those only through `use.artifact.*` on `/api/controls/use`, whose handler makes that
+ * HTTP hop with the instance token, never with this credential), so a delegated credential is
+ * refused there outright.
+ *
+ * Returns the refusal, or `null` to go on. Always `null` for a primary run and on every lane
+ * but `agent` (an artifact runtime token included), so those callers keep their answers.
+ * `auth` is whatever the route authenticated with, which on the artifact routes may be an
+ * artifact runtime token's claims rather than `resolveNativeToolUser`'s answer.
+ */
+export function refuseDelegatedRunOutsideList(
+  auth: unknown,
+  controlId: string | null
+): { code: typeof DELEGATED_RUN_NOT_ALLOWED_ERROR_CODE; message: string } | null {
+  if (!auth || typeof auth !== 'object') return null
+  const lane = auth as { auth?: unknown; delegated?: unknown; delegatedAllowedControlIds?: unknown }
+  if (lane.auth !== 'agent' || lane.delegated !== true) return null
+  const list = Array.isArray(lane.delegatedAllowedControlIds)
+    ? lane.delegatedAllowedControlIds.filter((entry): entry is string => typeof entry === 'string')
+    : []
+  if (controlId && isControlIdAllowedByList(controlId, list)) return null
+  return {
+    code: DELEGATED_RUN_NOT_ALLOWED_ERROR_CODE,
+    message:
+      'A Subagent or Worker run cannot use this route: it may use only the Batshit tools its ' +
+      'own instructions list, through its tool helper. Ask the primary agent that started you ' +
+      'to do this.'
+  }
+}
+
+export const PORTABLE_SKILL_NOT_ALLOWED_ERROR_CODE = 'CONTROL_NOT_ALLOWED'
+
+/**
+ * BL-687 — a Portable Skill Token on a route that does a control's work directly.
+ *
+ * A Portable Skill Token is scoped to the families the user granted when minting it, and
+ * `/api/controls/use` answers it only for the controls those families hold. A route that does
+ * the same work as a control (`/api/mcp/tools/find` is `sys.mcp.dynamic.find`) holds the token
+ * to the same list, or the token reaches that work through the side door. No family holds a
+ * dynamic MCP control today, so both MCP routes refuse every Portable Skill Token until one does.
+ *
+ * Since BL-704 the resolver itself refuses the token on every route but the two control routes
+ * (default-deny admission), so this check is no longer reachable from the MCP routes. It stays
+ * as defense in depth: a route that is ever reviewed into the portable lane keeps the rule.
+ *
+ * Returns the refusal, or `null` to go on. Always `null` on every lane but `portable-skill`.
+ */
+export function refusePortableSkillOutsideList(
+  auth: unknown,
+  controlId: string
+): { code: typeof PORTABLE_SKILL_NOT_ALLOWED_ERROR_CODE; message: string } | null {
+  if (!auth || typeof auth !== 'object') return null
+  const lane = auth as { auth?: unknown; portableSkillAllowedControlIds?: unknown }
+  if (lane.auth !== 'portable-skill') return null
+  const list = Array.isArray(lane.portableSkillAllowedControlIds)
+    ? lane.portableSkillAllowedControlIds.filter((entry): entry is string => typeof entry === 'string')
+    : []
+  if (isControlIdAllowedByList(controlId, list)) return null
+  return {
+    code: PORTABLE_SKILL_NOT_ALLOWED_ERROR_CODE,
+    message:
+      `A Portable Skill Token cannot use this route: no Portable Skill family grants "${controlId}". ` +
+      'Use a Batshit agent for MCP tools, or the Batshit tools your token\'s families list.'
+  }
 }
 
 export type DispatchContextBinding =

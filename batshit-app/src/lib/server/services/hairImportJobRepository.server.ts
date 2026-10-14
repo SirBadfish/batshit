@@ -1,6 +1,9 @@
 import { randomUUID } from 'node:crypto'
 
 import { redis } from '$lib/server/redis'
+import { collectCustomGoonUploadKeys, CUSTOM_GOON_UPLOAD_GUARD_LUA } from './goonCustomAssetOwnership.server'
+import { sameHairCleanupFile, isHairCleanupFile, type HairCleanupContext } from './hairCleanupContext'
+import type { HairImportOwnedFile } from './hairCleanupContext'
 import type { HairRefitTransformV1 } from '$lib/goons/hairAssets'
 
 export const HAIR_IMPORT_JOB_CONTRACT = 'hair-import-job/v4' as const
@@ -25,14 +28,7 @@ const HAIR_IMPORT_JOB_STATUSES: readonly HairImportJobStatus[] = [
   'cancelled'
 ]
 
-export type HairImportOwnedFile = {
-  uploadType: 'goon_hair_imports' | 'goon_hair_assets'
-  filename: string
-  ref: string
-  sha256: string
-  bytes: number
-  mimeType: string
-}
+export type { HairImportOwnedFile } from './hairCleanupContext'
 
 export type HairImportTarget =
   | { kind: 'new' }
@@ -77,6 +73,7 @@ export type HairImportDiscardableJob = Pick<
   'jobId' | 'userId' | 'cleanupFiles'
 > & {
   reason: 'expired' | 'obsolete'
+  observedRaw: string
 }
 
 export class HairImportJobError extends Error {
@@ -96,7 +93,22 @@ export class HairImportJobError extends Error {
   }
 }
 
+/** Cleanup tuples are bookkeeping, not reference acquisition. Cancelled jobs
+ * retain their borrowed source but cannot republish an owned candidate. */
+export function hairImportJobLiveUploadKeys(job: HairImportJob, creation = false): string[] {
+  const keys = collectCustomGoonUploadKeys(job.status === 'cancelled'
+    ? (job.target.kind === 'refit' ? [job.target.refitSource] : [])
+    : [job.source, job.target, job.candidate, job.proposal, job.draft, ...(creation ? job.cleanupFiles : [])])
+  // The immutable raw source is consumed before final commit. Updating cleanup
+  // bookkeeping must not reacquire those bytes; new source ownership is guarded
+  // at job creation, and replace cannot change its source identity.
+  return creation ? keys : keys.filter((key) => job.source.uploadType !== 'goon_hair_imports' ||
+    key !== `upload:goon_hair_imports:${job.source.filename}`)
+}
+
 const CREATE_JOB_SCRIPT = `
+${CUSTOM_GOON_UPLOAD_GUARD_LUA}
+if not customGoonUploadsAvailable(ARGV[3]) then return 'ASSET_UNAVAILABLE' end
 if redis.call('EXISTS', KEYS[1]) == 1 then
   return 'EXISTS'
 end
@@ -110,19 +122,49 @@ return 'CREATED'
 `
 
 const REPLACE_JOB_SCRIPT = `
+${CUSTOM_GOON_UPLOAD_GUARD_LUA}
 local current = redis.call('JSON.GET', KEYS[1])
 if not current then return 'NOT_FOUND' end
 local decoded = cjson.decode(current)
 if decoded.userId ~= ARGV[1] then return 'FORBIDDEN' end
 if tonumber(decoded.stateVersion) ~= tonumber(ARGV[2]) then return 'WRITE_CONFLICT' end
+local next = cjson.decode(ARGV[3])
+if decoded.status == 'cancelled' and next.status ~= 'cancelled' then return 'WRITE_CONFLICT' end
+if not next.source or next.source.ref ~= decoded.source.ref then return 'WRITE_CONFLICT' end
+if not customGoonUploadsAvailable(ARGV[4]) then return 'ASSET_UNAVAILABLE' end
 redis.call('JSON.SET', KEYS[1], '$', ARGV[3])
 return 'UPDATED'
 `
 
 const DELETE_JOB_SCRIPT = `
+local current = redis.call('JSON.GET', KEYS[1])
+if not current then return 'NOT_FOUND' end
+if ARGV[2] ~= '' then
+  if current ~= ARGV[2] then return 'WRITE_CONFLICT' end
+else
+  local decoded = cjson.decode(current)
+  if decoded.stateVersion ~= tonumber(ARGV[3]) then return 'WRITE_CONFLICT' end
+end
 local removed = redis.call('DEL', KEYS[1])
 redis.call('SREM', KEYS[2], ARGV[1])
-return removed
+return 'DELETED'
+`
+
+const RETIRE_JOB_SCRIPT = `
+local current = redis.call('JSON.GET', KEYS[1])
+if not current then return 'NOT_FOUND' end
+if ARGV[1] ~= '' then
+  if current ~= ARGV[1] then return 'WRITE_CONFLICT' end
+else
+  local decoded = cjson.decode(current)
+  if decoded.stateVersion ~= tonumber(ARGV[2]) or decoded.status == 'complete' then return 'WRITE_CONFLICT' end
+end
+local decoded = cjson.decode(current)
+if decoded.status == 'complete' then return 'WRITE_CONFLICT' end
+-- Partial RedisJSON writes preserve every other raw number/array and legacy field.
+redis.call('JSON.SET', KEYS[1], '.status', '"cancelled"')
+if decoded.contract == 'hair-import-job/v4' then redis.call('JSON.NUMINCRBY', KEYS[1], '.stateVersion', 1) end
+return redis.call('JSON.GET', KEYS[1])
 `
 
 export function hairImportJobRedisKey(userId: string, jobId: string) {
@@ -156,6 +198,7 @@ function assertJobShape(value: unknown): HairImportJob {
     typeof job.jobId !== 'string' ||
     typeof job.userId !== 'string' ||
     typeof job.goonId !== 'string' ||
+    !isHairCleanupFile(job.source) || job.source.bytes < 1 ||
     !job.target ||
     (job.target.kind !== 'new' && job.target.kind !== 'refit') ||
     !job.startingTransform ||
@@ -164,8 +207,9 @@ function assertJobShape(value: unknown): HairImportJob {
       job.calibration === null ||
       (typeof job.calibration === 'object' && !Array.isArray(job.calibration))
     ) ||
-    !Number.isSafeInteger(job.stateVersion) ||
-    !Array.isArray(job.cleanupFiles)
+    !Number.isSafeInteger(job.stateVersion) || job.stateVersion < 1 ||
+    !HAIR_IMPORT_JOB_STATUSES.includes(job.status) ||
+    !Array.isArray(job.cleanupFiles) || !job.cleanupFiles.every(isHairCleanupFile)
   ) {
     throw new HairImportJobError('INVALID_STATE', 'Stored Hair import job is malformed.', 500)
   }
@@ -173,37 +217,15 @@ function assertJobShape(value: unknown): HairImportJob {
 }
 
 function assertCleanupFileShape(value: unknown): HairImportOwnedFile {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new HairImportJobError('INVALID_STATE', 'Stored Hair import cleanup file is malformed.', 500)
-  }
-  const file = value as HairImportOwnedFile
-  const validUploadType =
-    file.uploadType === 'goon_hair_imports' || file.uploadType === 'goon_hair_assets'
-  const validFilename =
-    typeof file.filename === 'string' &&
-    file.filename.length > 0 &&
-    !file.filename.includes('/') &&
-    !file.filename.includes('\\')
-  if (
-    !validUploadType ||
-    !validFilename ||
-    file.ref !== `/uploads/${file.uploadType}/${file.filename}` ||
-    typeof file.sha256 !== 'string' ||
-    !/^[a-f0-9]{64}$/.test(file.sha256) ||
-    !Number.isSafeInteger(file.bytes) ||
-    file.bytes < 0 ||
-    typeof file.mimeType !== 'string' ||
-    file.mimeType.length === 0
-  ) {
-    throw new HairImportJobError('INVALID_STATE', 'Stored Hair import cleanup file is malformed.', 500)
-  }
-  return file
+  if (!isHairCleanupFile(value)) throw new HairImportJobError('INVALID_STATE', 'Stored Hair import cleanup file is malformed.', 500)
+  return value
 }
 
 function obsoleteCleanupJob(
   value: unknown,
   expectedUserId: string,
-  expectedJobId: string
+  expectedJobId: string,
+  observedRaw: string
 ): HairImportDiscardableJob {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new HairImportJobError('INVALID_STATE', 'Stored Hair import job is malformed.', 500)
@@ -236,7 +258,8 @@ function obsoleteCleanupJob(
     jobId: expectedJobId,
     userId: expectedUserId,
     cleanupFiles: job.cleanupFiles.map(assertCleanupFileShape),
-    reason: 'obsolete'
+    reason: 'obsolete',
+    observedRaw
   }
 }
 
@@ -299,8 +322,9 @@ export async function createHairImportJob(input: {
     if (typeof client.eval === 'function') {
       const result = await client.eval(CREATE_JOB_SCRIPT, {
         keys: [hairImportJobRedisKey(input.userId, jobId), hairImportJobIndexKey(input.userId)],
-        arguments: [JSON.stringify(job), jobId]
+        arguments: [JSON.stringify(job), jobId, JSON.stringify(hairImportJobLiveUploadKeys(job, true))]
       })
+      if (result === 'ASSET_UNAVAILABLE') throw new HairImportJobError('WRITE_CONFLICT', 'Hair files are unavailable or being deleted. Retry after cleanup finishes.', 409)
       if (result !== 'CREATED') {
         throw new HairImportJobError('WRITE_CONFLICT', 'Hair import job id already exists.', 409)
       }
@@ -323,6 +347,7 @@ async function loadHairImportJob(userId: string, jobId: string) {
   const job = assertJobShape(value)
   if (job.userId !== userId)
     throw new HairImportJobError('FORBIDDEN', 'Hair import job belongs to another user.', 403)
+  if (job.jobId !== jobId) throw new HairImportJobError('INVALID_STATE', 'Stored Hair import job does not match its owner key.', 500)
   return job
 }
 
@@ -357,17 +382,18 @@ export async function replaceHairImportJob(
     if (typeof client.eval === 'function') {
       return client.eval(REPLACE_JOB_SCRIPT, {
         keys: [hairImportJobRedisKey(current.userId, current.jobId)],
-        arguments: [current.userId, String(current.stateVersion), JSON.stringify(next)]
+        arguments: [current.userId, String(current.stateVersion), JSON.stringify(next), JSON.stringify(hairImportJobLiveUploadKeys(next))]
       })
     }
     const stored = assertJobShape(
       await client.json.get(hairImportJobRedisKey(current.userId, current.jobId))
     )
     if (stored.userId !== current.userId) return 'FORBIDDEN'
-    if (stored.stateVersion !== current.stateVersion) return 'WRITE_CONFLICT'
+    if (stored.stateVersion !== current.stateVersion || (stored.status === 'cancelled' && next.status !== 'cancelled')) return 'WRITE_CONFLICT'
     await client.json.set(hairImportJobRedisKey(current.userId, current.jobId), '$', next)
     return 'UPDATED'
   })
+  if (result === 'ASSET_UNAVAILABLE') throw new HairImportJobError('WRITE_CONFLICT', 'Hair files are unavailable or being deleted. Retry after cleanup finishes.', 409)
   if (result === 'UPDATED') return next
   if (result === 'NOT_FOUND')
     throw new HairImportJobError('NOT_FOUND', 'Hair import job was not found.', 404)
@@ -380,14 +406,103 @@ export async function replaceHairImportJob(
   )
 }
 
-export async function deleteHairImportJobRecord(userId: string, jobId: string) {
+export function hairImportCleanupContext(job: HairImportJob, files: readonly HairImportOwnedFile[],
+  mode: HairCleanupContext['mode'] = job.status === 'cancelled' ? 'retired' : 'subset'): HairCleanupContext {
+  if (files.some((file) => !job.cleanupFiles.some((owned) => sameHairCleanupFile(file, owned)))) {
+    throw new HairImportJobError('INVALID_STATE', 'Hair cleanup subset is not owned by the observed job.', 409)
+  }
+  return { jobKey: hairImportJobRedisKey(job.userId, job.jobId), stateVersion: job.stateVersion, files, mode }
+}
+
+export async function retireHairImportJob(current: HairImportJob): Promise<HairImportJob> {
+  if (current.status === 'complete') throw new HairImportJobError('INVALID_STATE', 'Completed Hair imports cannot be discarded.', 409)
+  if (current.status === 'cancelled') return current
+  return redis.execute(async (client: any) => {
+    if (typeof client.eval === 'function') {
+      const result = await client.eval(RETIRE_JOB_SCRIPT, { keys: [hairImportJobRedisKey(current.userId, current.jobId)],
+        arguments: ['', String(current.stateVersion)] })
+      if (typeof result !== 'string' || !result.startsWith('{')) throw new HairImportJobError('WRITE_CONFLICT', 'Hair import changed. Reload before cleanup.', 409)
+      return assertJobShape(JSON.parse(result))
+    }
+    // The existing isolated default fake has no EVAL; production never uses it.
+    const stored = assertJobShape(await client.json.get(hairImportJobRedisKey(current.userId, current.jobId)))
+    if (stored.stateVersion !== current.stateVersion) throw new HairImportJobError('WRITE_CONFLICT', 'Hair import changed. Reload before cleanup.', 409)
+    const next = { ...stored, status: 'cancelled' as const, stateVersion: stored.stateVersion + 1 }
+    await client.json.set(hairImportJobRedisKey(current.userId, current.jobId), '$', next)
+    return next
+  })
+}
+
+export async function retireDiscardableHairImportJob(job: HairImportDiscardableJob): Promise<HairCleanupContext> {
+  return redis.execute(async (client: any) => {
+    const key = hairImportJobRedisKey(job.userId, job.jobId)
+    let raw: string
+    if (typeof client.eval === 'function') {
+      raw = await client.eval(RETIRE_JOB_SCRIPT, { keys: [key], arguments: [job.observedRaw, ''] })
+      if (typeof raw !== 'string' || !raw.startsWith('{')) throw new HairImportJobError('WRITE_CONFLICT', 'Hair import changed. Retry pruning.', 409)
+    } else {
+      const value = await client.json.get(key)
+      if (JSON.stringify(value) !== job.observedRaw) throw new HairImportJobError('WRITE_CONFLICT', 'Hair import changed. Retry pruning.', 409)
+      const next = { ...value, status: 'cancelled', ...(value.contract === HAIR_IMPORT_JOB_CONTRACT ? { stateVersion: value.stateVersion + 1 } : {}) }
+      await client.json.set(key, '$', next)
+      raw = JSON.stringify(next)
+    }
+    const retired = JSON.parse(raw)
+    return retired.contract === HAIR_IMPORT_JOB_CONTRACT
+      ? { jobKey: key, stateVersion: retired.stateVersion, files: job.cleanupFiles, mode: 'retired' }
+      : { jobKey: key, expectedRaw: raw, files: job.cleanupFiles, mode: 'retired' }
+  })
+}
+
+/** Track a discovered exact subset without rewriting any candidate numbers or
+ * arrays. Used only after retirement, with the same observed-record CAS. */
+export async function trackRetiredHairCleanupFiles(context: HairCleanupContext, files: readonly HairImportOwnedFile[]): Promise<HairCleanupContext> {
+  files.forEach(assertCleanupFileShape)
+  if (context.mode !== 'retired') throw new HairImportJobError('INVALID_STATE', 'Hair cleanup owner was not retired.', 409)
+  return redis.execute(async (client: any) => {
+    const script = `
+local raw = redis.call('JSON.GET', KEYS[1])
+if not raw then return 'NOT_FOUND' end
+local job = cjson.decode(raw)
+if job.status ~= 'cancelled' then return 'WRITE_CONFLICT' end
+if ARGV[1] ~= '' then
+  if raw ~= ARGV[1] then return 'WRITE_CONFLICT' end
+elseif job.stateVersion ~= tonumber(ARGV[2]) then return 'WRITE_CONFLICT' end
+redis.call('JSON.SET', KEYS[1], '.cleanupFiles', ARGV[3])
+if job.contract == 'hair-import-job/v4' then redis.call('JSON.NUMINCRBY', KEYS[1], '.stateVersion', 1) end
+return redis.call('JSON.GET', KEYS[1])
+`
+    let raw: string
+    if (typeof client.eval === 'function') {
+      raw = await client.eval(script, { keys: [context.jobKey], arguments: [context.expectedRaw ?? '', String(context.stateVersion ?? ''), JSON.stringify(files)] })
+      if (typeof raw !== 'string' || !raw.startsWith('{')) throw new HairImportJobError('WRITE_CONFLICT', 'Hair cleanup owner changed.', 409)
+    } else {
+      const job = await client.json.get(context.jobKey)
+      if (context.expectedRaw ? JSON.stringify(job) !== context.expectedRaw : job.stateVersion !== context.stateVersion) throw new HairImportJobError('WRITE_CONFLICT', 'Hair cleanup owner changed.', 409)
+      const next = { ...job, cleanupFiles: files, ...(job.contract === HAIR_IMPORT_JOB_CONTRACT ? { stateVersion: job.stateVersion + 1 } : {}) }
+      await client.json.set(context.jobKey, '$', next)
+      raw = JSON.stringify(next)
+    }
+    const tracked = JSON.parse(raw)
+    return tracked.contract === HAIR_IMPORT_JOB_CONTRACT
+      ? { jobKey: context.jobKey, stateVersion: tracked.stateVersion, files, mode: 'retired' }
+      : { jobKey: context.jobKey, expectedRaw: raw, files, mode: 'retired' }
+  })
+}
+
+export async function deleteHairImportJobRecord(userId: string, jobId: string, context: HairCleanupContext) {
   await redis.execute(async (client: any) => {
     if (typeof client.eval === 'function') {
-      await client.eval(DELETE_JOB_SCRIPT, {
+      const result = await client.eval(DELETE_JOB_SCRIPT, {
         keys: [hairImportJobRedisKey(userId, jobId), hairImportJobIndexKey(userId)],
-        arguments: [jobId]
+        arguments: [jobId, context.expectedRaw ?? '', String(context.stateVersion ?? '')]
       })
+      if (result !== 'DELETED') throw new HairImportJobError('WRITE_CONFLICT', 'Hair import changed before cleanup finished. Retry from its current state.', 409)
       return
+    }
+    const stored = await client.json.get(hairImportJobRedisKey(userId, jobId))
+    if (!stored || (context.expectedRaw ? JSON.stringify(stored) !== context.expectedRaw : stored.stateVersion !== context.stateVersion)) {
+      throw new HairImportJobError('WRITE_CONFLICT', 'Hair import changed before cleanup finished.', 409)
     }
     await client.del(hairImportJobRedisKey(userId, jobId))
     await client.sRem(hairImportJobIndexKey(userId), jobId)
@@ -401,7 +516,10 @@ export async function listDiscardableHairImportJobs(userId: string, now = new Da
     )
     const discardable: HairImportDiscardableJob[] = []
     for (const jobId of jobIds) {
-      const value = await client.json.get(hairImportJobRedisKey(userId, jobId))
+      const key = hairImportJobRedisKey(userId, jobId)
+      const observedRaw = typeof client.sendCommand === 'function'
+        ? await client.sendCommand(['JSON.GET', key]) : JSON.stringify(await client.json.get(key))
+      const value = observedRaw ? JSON.parse(observedRaw) : null
       if (!value) {
         await client.sRem(hairImportJobIndexKey(userId), jobId)
         continue
@@ -411,7 +529,7 @@ export async function listDiscardableHairImportJobs(userId: string, now = new Da
           ? (value as Record<string, unknown>).contract
           : null
       if (contract !== HAIR_IMPORT_JOB_CONTRACT) {
-        discardable.push(obsoleteCleanupJob(value, userId, jobId))
+        discardable.push(obsoleteCleanupJob(value, userId, jobId, observedRaw))
         continue
       }
       const job = assertJobShape(value)
@@ -427,7 +545,8 @@ export async function listDiscardableHairImportJobs(userId: string, now = new Da
           jobId: job.jobId,
           userId: job.userId,
           cleanupFiles: job.cleanupFiles,
-          reason: 'expired'
+          reason: 'expired',
+          observedRaw
         })
       }
     }

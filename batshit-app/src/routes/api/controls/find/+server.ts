@@ -7,8 +7,15 @@ import {
   type ControlRiskLevel,
   type ControlSourceType
 } from '$lib/server/services/fabricRegistry'
-import { resolveNativeToolUser } from '$lib/server/services/nativeToolAuth'
-import { bindActingAgentId } from '$lib/server/services/actingAgentIdentity'
+import {
+  PORTABLE_SKILL_SCOPED_DISCOVERY,
+  resolveNativeToolUser
+} from '$lib/server/services/nativeToolAuth'
+import {
+  bindActingAgentId,
+  boundDelegatedAllowedControlIds,
+  boundScopeAgentId
+} from '$lib/server/services/actingAgentIdentity'
 
 type FindControlsRequest = {
   userId?: string
@@ -63,7 +70,10 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     const auth = await resolveNativeToolUser({
       request,
       localsUserId: locals.user?.id ?? null,
-      claimedUserId: body.userId ?? null
+      claimedUserId: body.userId ?? null,
+      // BL-704: one of the two routes that admit a Portable Skill Token. Discovery shows only
+      // the token's family controls (`allowedControlIds` below comes off the token, never the body).
+      portableSkillPolicy: PORTABLE_SKILL_SCOPED_DISCOVERY
     })
 
     if (!auth) {
@@ -78,9 +88,17 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       )
     }
 
+    // BL-81: a Subagent or Worker run is shown exactly what `/api/controls/use` will run for it:
+    // only the controls its credential carries (the ones its DCM offered it; none for a
+    // credential minted before BL-81), with agent allowlists judged by its scope id, the id
+    // that route judges them by. `boundScopeAgentId` and `boundDelegatedAllowedControlIds` have
+    // the reasons; both are empty on every other call, which keeps its existing answer.
+    const visibleForAgentId = boundScopeAgentId(auth) || agentBinding.agentId
+    const delegatedAllowedControlIds = boundDelegatedAllowedControlIds(auth)
+
     if (auth.auth === 'portable-skill') {
       const portableResult = await findControls({
-        ...toFindOptions(body, auth.userId, agentBinding.agentId),
+        ...toFindOptions(body, auth.userId, visibleForAgentId),
         allowedControlIds: auth.portableSkillAllowedControlIds
       })
       return json({
@@ -91,7 +109,10 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       })
     }
 
-    const result = await findControls(toFindOptions(body, auth.userId, agentBinding.agentId))
+    const result = await findControls({
+      ...toFindOptions(body, auth.userId, visibleForAgentId),
+      ...(delegatedAllowedControlIds ? { delegatedRun: true, delegatedAllowedControlIds } : {})
+    })
     return json({
       success: true,
       auth: auth.auth,

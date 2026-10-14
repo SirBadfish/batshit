@@ -4,7 +4,7 @@
  * Agents get exactly three things about clips, and nothing else:
  *
  *   1. CONTENT — every currently-attached clip arrives structurally with the
- *      send (text inlined under `CLIPPED ITEMS (USER UPLOADS)`, images as real
+ *      send (text inlined in `<clipped_items>`, images as real
  *      image parts). A placeholder next to content that already arrived is
  *      redundant bookkeeping, so attached clips compile to NO history marker
  *      at all (DL-109-02).
@@ -25,10 +25,7 @@
  * path, in the provider adapter, and under unit tests without Redis.
  */
 
-import {
-  BATSHIT_CLIP_REFERENCE_REGEX,
-  BATSHIT_LEGACY_CLIP_REFERENCE_REGEX
-} from './zipReferenceSafety'
+import { replaceClipReferences, replaceLegacyClipReferences } from './zipReferenceSafety'
 
 /** Used when a departed clip has no recoverable filename — loud, never silent. */
 export const CLIP_LOG_UNNAMED_LABEL = 'unnamed clip'
@@ -62,8 +59,22 @@ function readLegacyClipName(fullMatch: string): string {
  * Deterministic by construction: the same stored content always compiles to
  * the same bytes, which is what the SA-108 `historyStability` verdict reads.
  */
-function tidyAfterRemoval(content: string): string {
-  return content.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
+function tidyAfterRemoval(content: string, report?: (start:number,end:number,replacement:string)=>void): string {
+  const replace=(text:string,pattern:RegExp,replacement:string)=>{
+    let shift=0
+    return text.replace(pattern,(match:string,offset:number)=>{
+      report?.(offset+shift,offset+shift+match.length,replacement)
+      shift+=replacement.length-match.length
+      return replacement
+    })
+  }
+  let next=replace(content,/[ \t]+\n/g,'\n')
+  next=replace(next,/\n{3,}/g,'\n\n')
+  const leading=next.length-next.trimStart().length
+  if(leading) {report?.(0,leading,'');next=next.slice(leading)}
+  const trailing=next.length-next.trimEnd().length
+  if(trailing) {report?.(next.length-trailing,next.length,'');next=next.slice(0,next.length-trailing)}
+  return next
 }
 
 /**
@@ -81,7 +92,7 @@ function tidyAfterRemoval(content: string): string {
 export function compileClipReferencesForAiView(
   content: string,
   activeClipIds: Set<string> | null | undefined,
-  options: { clipNames?: Map<string, string> | null } = {}
+  options: { clipNames?: Map<string, string> | null; onReplace?: (start:number,end:number,replacement:string)=>void } = {}
 ): string {
   if (!content || !content.includes('{{batshit-clip')) return content
 
@@ -92,26 +103,35 @@ export function compileClipReferencesForAiView(
   const resolveName = (clipId: string, inlineName: string) =>
     inlineName || normalizeName(names?.get(clipId))
 
-  let next = content.replace(
-    new RegExp(BATSHIT_LEGACY_CLIP_REFERENCE_REGEX.source, 'g'),
-    (fullMatch, clipId: string) => {
-      const id = normalizeName(clipId)
-      if (isAttached(id)) return ''
-      return formatClipLog(resolveName(id, readLegacyClipName(fullMatch)))
-    }
-  )
+  const report=(start:number,end:number,replacement:string)=>{
+    try {options.onReplace?.(start,end,replacement)}
+    catch(error) {console.error('[Clip AI view] Read-only replacement observer failed:',error)}
+  }
+  let cursor=0,shift=0
+  let next = replaceLegacyClipReferences(content, (fullMatch, clipId) => {
+    const id = normalizeName(clipId)
+    const replacement=isAttached(id)?'':formatClipLog(resolveName(id,readLegacyClipName(fullMatch)))
+    const index=content.indexOf(fullMatch,cursor)
+    cursor=index+fullMatch.length
+    report(index+shift,index+shift+fullMatch.length,replacement)
+    shift+=replacement.length-fullMatch.length
+    return replacement
+  })
 
-  next = next.replace(
-    new RegExp(BATSHIT_CLIP_REFERENCE_REGEX.source, 'g'),
-    (_fullMatch, clipId: string, description: string | undefined) => {
-      const id = normalizeName(clipId)
-      if (isAttached(id)) return ''
-      return formatClipLog(resolveName(id, normalizeName(description)))
-    }
-  )
+  const beforeModern=next
+  cursor=0;shift=0
+  next = replaceClipReferences(next, (fullMatch, clipId, description) => {
+    const id = normalizeName(clipId)
+    const replacement=isAttached(id)?'':formatClipLog(resolveName(id,normalizeName(description)))
+    const index=beforeModern.indexOf(fullMatch,cursor)
+    cursor=index+fullMatch.length
+    report(index+shift,index+shift+fullMatch.length,replacement)
+    shift+=replacement.length-fullMatch.length
+    return replacement
+  })
 
   if (next === content) return content
-  return tidyAfterRemoval(next)
+  return tidyAfterRemoval(next,report)
 }
 
 export interface ClipRosterEntryInput {

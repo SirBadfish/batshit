@@ -11,6 +11,10 @@ import {
   GoonRecipeDuplicationError
 } from '$lib/server/services/goonRecipeDuplicationService.server'
 import { GoonRecipeLifecycleError } from '$lib/server/services/goonRecipeLifecycleService.server'
+import {
+  createOwnedGoonForClient,
+  GoonMutationError
+} from '$lib/server/services/goonMutationRepository.server'
 
 function generateGoonId() {
   return `goon_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
@@ -73,9 +77,7 @@ export const POST: RequestHandler = async ({ params, locals }) => {
         delete clone.customAvatar.pending
       }
 
-      await client.json.set(`goon:${newGoonId}`, '$', clone as any)
-      await client.sAdd(`user:${locals.user!.id}:goons`, newGoonId)
-      return clone
+      return createOwnedGoonForClient({ client, userId: locals.user!.id, goon: clone })
     })
 
     if (!result) {
@@ -84,7 +86,8 @@ export const POST: RequestHandler = async ({ params, locals }) => {
 
     return json({ goon: resolveUploadUrlsForBrowserInPayload(result) })
   } catch (error) {
-    if (error instanceof GoonRecipeDuplicationError || error instanceof GoonRecipeLifecycleError) {
+    if (error instanceof GoonRecipeDuplicationError ||
+        error instanceof GoonRecipeLifecycleError || error instanceof GoonMutationError) {
       return json({ error: error.message }, { status: error.status })
     }
     console.error('Error duplicating goon:', error)

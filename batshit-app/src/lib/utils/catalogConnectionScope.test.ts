@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import type { CatalogConnectionOption, CatalogModel } from '$lib/types/modelCatalog'
 import {
   buildConnectionScopedCatalogModels,
+  findConnectionScopedCatalogPreset,
   resolveConnectionScopedCatalogModel
 } from './catalogConnectionScope'
 
@@ -30,6 +31,21 @@ const baseModel = (overrides: Partial<CatalogModel> = {}): CatalogModel => ({
 })
 
 describe('catalogConnectionScope', () => {
+  it('selects only the exact account before matching a paid same-slug row or another account (BL-1067)', () => {
+    const row = (connectionId: string) => baseModel({
+      id: `${connectionId}/gpt-6-astra`, canonicalId: `${connectionId}/gpt-6-astra`,
+      provider: 'openai', name: 'gpt-6-astra', connectionId, availableConnections: [connectionId],
+      idVariants: { [connectionId]: { developerId: 'openai', modelId: 'gpt-6-astra', effectiveId: 'gpt-6-astra', source: 'direct' } }
+    })
+    const rows = [row('direct:openai'), row('chatgpt-plan:account-a'), row('chatgpt-plan:account-b')]
+    const connection = baseConnection({ id: 'chatgpt-plan:account-b', service: 'chatgpt-plan', providers: ['openai'] })
+    const preset = { targetId: rows[0].id, provider: 'openai', modelId: 'gpt-6-astra' }
+    expect(findConnectionScopedCatalogPreset(rows, connection, preset)).toBe(rows[2])
+    expect(findConnectionScopedCatalogPreset(rows, { ...connection, id: 'direct:openai' }, preset)).toBe(rows[0])
+    expect(findConnectionScopedCatalogPreset(rows.slice(0, 2), connection, preset)).toBeUndefined()
+    expect(findConnectionScopedCatalogPreset(rows, null, preset)).toBeUndefined()
+    expect(findConnectionScopedCatalogPreset(rows, connection, { ...preset, modelId: 'GPT-6-Astra' })).toBeUndefined()
+  })
   it('resolves the selected connection variant instead of the shared base row identity', () => {
     const scoped = resolveConnectionScopedCatalogModel(
       baseModel({

@@ -164,4 +164,41 @@ describe('/api/cli-runtimes', () => {
       operation: { phase: 'downloading' },
     })
   })
+
+  // BL-268: the found CLI's own version, and whether it is older than the version Batshit
+  // installs, so Agent Settings can say that newer models may be refused.
+  it('reports the found CLI version and whether it is older than the pinned one', async () => {
+    const { mkdtemp, writeFile, chmod, rm } = await import('node:fs/promises')
+    const os = await import('node:os')
+    const path = await import('node:path')
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'zccli-bl268-'))
+    try {
+      const oldCodex = path.join(dir, 'codex')
+      await writeFile(oldCodex, '#!/bin/sh\necho "codex-cli 0.139.0"\n')
+      await chmod(oldCodex, 0o755)
+      const newClaude = path.join(dir, 'claude')
+      await writeFile(newClaude, '#!/bin/sh\necho "2.1.280 (Claude Code)"\n')
+      await chmod(newClaude, 0o755)
+      mocks.getStatus.mockImplementation(async (runtime: string) => ({
+        ...status,
+        pinnedVersion: runtime === 'codex' ? '0.155.1' : '2.1.185'
+      }))
+      mocks.resolveCodex.mockReturnValue({ executable: oldCodex, source: 'path' })
+      mocks.resolveClaude.mockReturnValue({ executable: newClaude, source: 'well-known' })
+
+      const response = await GET({ locals: locals(false) } as any)
+      const body = await response.json()
+      expect(body.runtimes.codex.resolution).toMatchObject({
+        version: 'codex-cli 0.139.0',
+        olderThanPinned: true
+      })
+      expect(body.runtimes.claude.resolution).toMatchObject({
+        version: '2.1.280 (Claude Code)',
+        olderThanPinned: false
+      })
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
 })
+

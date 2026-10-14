@@ -178,7 +178,7 @@ async function updateFolder(
 
 async function deleteFolder(
   folderId: string,
-  options: { deleteSessions?: boolean } = {}
+  options: { deleteSessions?: false } | { deleteSessions: true; expectedChatIds: string[] } = {}
 ): Promise<DeleteFolderResult> {
   try {
     const folder = state.folders.find(f => f.id === folderId)
@@ -188,8 +188,16 @@ async function deleteFolder(
     }
     
     const params = options.deleteSessions ? '?deleteSessions=true' : ''
+    // BL-388: Delete Folder + Sessions names the chats its dialog showed; the server deletes
+    // nothing when the folder holds anything else by then (409).
     const response = await fetch(`/api/folders/${folderId}${params}`, {
-      method: 'DELETE'
+      method: 'DELETE',
+      ...(options.deleteSessions
+        ? {
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ expectedChatIds: options.expectedChatIds })
+          }
+        : {})
     })
     
     if (!response.ok) {
@@ -207,6 +215,44 @@ async function deleteFolder(
     state.error = error instanceof Error ? error.message : 'Failed to delete folder'
     console.error('Error deleting folder:', error)
     return { success: false, error: state.error }
+  }
+}
+
+export type FolderChatForDelete = {
+  id: string
+  name: string
+  archived: boolean
+  locked: boolean
+}
+
+export type FolderChatsForDeleteResult =
+  | { success: true; chats: FolderChatForDelete[] }
+  | { success: false; error: string }
+
+/**
+ * Every chat "Delete Folder + Sessions" would delete, archived chats included, read from the
+ * server (BL-388). The page's own list holds only what the sidebar shows, so it cannot count
+ * them. A failed read is returned as a failure: the caller must not offer the delete.
+ */
+async function loadFolderChatsForDelete(folderId: string): Promise<FolderChatsForDeleteResult> {
+  try {
+    const response = await fetch(`/api/folders/${encodeURIComponent(folderId)}/sessions`)
+    const payload = await response.json().catch(() => null)
+    if (!response.ok) {
+      return {
+        success: false,
+        error: payload?.error || `The server answered ${response.status} ${response.statusText}`.trim()
+      }
+    }
+    if (!payload || !Array.isArray(payload.chats)) {
+      return { success: false, error: 'The server did not send the list of chats' }
+    }
+    return { success: true, chats: payload.chats as FolderChatForDelete[] }
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Could not reach the server'
+    }
   }
 }
 
@@ -308,6 +354,7 @@ export const foldersStore = {
   renameFolder,
   updateFolder,
   deleteFolder,
+  loadFolderChatsForDelete,
   moveSessionsToFolder,
   toggleFolderExpanded,
   setDefaultFolder,

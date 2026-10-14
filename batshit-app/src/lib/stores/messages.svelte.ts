@@ -1,5 +1,4 @@
 // Messages store using Svelte 5 runes
-import { zippingService } from '$lib/services/zipping'
 
 export interface Message {
   id: string
@@ -329,9 +328,9 @@ export function addMessage(message: Partial<Message> & { content: string; role: 
   } else {
     messages = nextMessages
   }
-
-  // Increment message counts for temporary pins
-  zippingService.incrementMessageCount(targetSessionId)
+  // SA-129 P2 (DL-08): the countdown of a "Hold for N messages" is the server's now (one count
+  // per accepted user message and per finished reply, open chat or not); this store no longer
+  // counts. The tab re-reads zip state when the server says it changed (`zip_state_changed`).
 }
 
 export function updateMessage(id: string, updates: Partial<Message>, sessionId?: string | null) {

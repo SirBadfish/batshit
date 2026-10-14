@@ -7,17 +7,40 @@ Batshit has an Admin backup and restore system for Batshit-owned data. Use it be
 A Batshit backup is a structured `.zip` file created by the app. It is not a raw Redis dump. It can include:
 
 - User settings and Admin settings
-- Core prompt edits
+- Core prompt edits, and which core prompts are still Batshit defaults (so a newer Batshit can update those)
 - Agents, Subagents, Groups, assignments, and model presets
 - Sessions, folders, messages, zips, clips, and Execution Viewer records
 - Agent memories, graduated history, and memory-owned photos
 - Agent DMs, wake-up webhooks, and schedules
-- MCP gateways, CLI tools, slash commands, skill metadata, and related settings
+- MCP gateways, CLI tools, slash commands, and related settings
+- Your own skills, with their files (`SKILL.md`, scripts, references, and assets)
 - Artifacts and artifact ordering/runtime data
-- Goons, custom icons, voice profiles, and voice engine registry references
+- Goons, the Motion Vault, custom icons, voice profiles, the reference recording of each clone voice, and voice engine registry references
 - Batshit-owned uploaded files under the upload store
 
-The export includes a `manifest.json`, Redis record entries, and uploaded file assets.
+The export includes a `manifest.json`, Redis record entries, uploaded file assets, and the skill and voice files described below.
+
+### Skill files and clone voice recordings
+
+Some of your data lives in folders on the computer rather than in Batshit's database: each of your own skills in `~/.batshit/skills/`, and each clone voice's reference recording in `~/.batshit/voice-profiles/`. A backup carries those folders too, so a restore onto another computer brings back your skills' text and your clone voices' recordings. Built-in skills aren't in the backup; they come with Batshit.
+
+A backup only carries a folder it can copy whole and safely:
+
+- Batshit never follows a shortcut (a symbolic link). A skill folder that is a link, or holds one, stays out of the backup.
+- A single file can be at most 100 MiB, and one folder at most 500 MiB and 2,000 files.
+- A folder that is missing when you export, or a clone voice whose recording is gone, can't be carried.
+
+When a folder can't be carried, the backup still finishes. The export message names the folders it left out, and Inspect has the complete list, with the reason for each, before a restore. The skill or voice itself still comes back, with its settings but without those files.
+
+Restore replaces only the skill and voice folders that the backup carries. Other folders in `~/.batshit/skills` stay as they are, because another Batshit on the same computer may use them.
+
+If one of those folders is already on this computer, Inspect names it before you restore. Batshit doesn't delete the copy it replaces: it keeps it in a `.replaced-…` folder next to the others, for example `~/.batshit/skills/.replaced-20260927T142436Z-1a2b3c4d/`, and the restore message says where. Delete that folder yourself once you don't need it.
+
+If another Batshit changes one of those folders while the restore is running, the restore stops before it changes anything and asks you to try again.
+
+Every backup carries clone voice recordings, not only With Secrets backups. A voice sample is sensitive personal data, so keep your backup files private.
+
+In Docker, a clone voice's recording lives on the host computer, where the Docker Batshit can't read or write it yet. A Docker backup lists each clone voice as left out, and a restore into Docker brings clone voices back without their recording. Record or upload each sample again in Voice Studio. Skills work fully in Docker.
 
 ## What backups don't include
 
@@ -35,6 +58,7 @@ Batshit backups don't silently copy external systems. They do not include:
 - ComfyUI or other external runtime data
 - Project source files on disk
 - Docker volumes outside the Batshit-owned app export
+- ChatGPT plan logins, OAuth tokens and host registration, including in **With Secrets** exports. Model presets travel, but their account selectors grant no access on another instance. Sign in there and select that Mac's account connection.
 - The one-run credentials Batshit mints for a Codex or Claude run
 
 Back up those systems with their own tools.
@@ -51,7 +75,7 @@ Use normal Export Backup for most situations.
 4. In the Mac app, choose the destination when the Save dialog opens. Batshit then streams the backup directly to that file.
 5. Store the `.zip` somewhere safe.
 
-Normal backups exclude saved provider keys, tokens, and other secrets. After restoring a normal backup, re-enter missing provider keys and reconnect external services as needed.
+Normal backups exclude saved provider keys, tokens, and other secrets. That includes the values of a custom provider's Extra Headers: a header such as `Authorization` often carries a key, so a normal backup keeps each header's name and leaves its value out. Only a few headers that never carry a key keep their values: `Accept`, `Accept-Language`, `Content-Type`, `User-Agent`, `HTTP-Referer`, `X-Title`, `anthropic-version`, `anthropic-beta`, and `OpenAI-Beta`. After restoring a normal backup, re-enter missing provider keys and reconnect external services as needed. Inspect names every custom provider header whose value you need to enter again.
 
 ## Export with secrets
 
@@ -116,13 +140,17 @@ Check these after every restore:
 - Do Local AI and voice runtimes need restarting or reconnecting?
 - In Docker, are optional profiles and sidecars running if you need them?
 
-If you restored without secrets, re-enter API keys in Settings → API Keys.
+If you restored without secrets, re-enter API keys in Settings → API Keys. For a custom provider, open Settings → API Keys → Custom OpenAI-Compatible, enter its API key, and replace each Extra Header that shows `null` with its value.
+
+If Inspect said a backup is from a Batshit that didn't save skill files or clone voice recordings, those skills and voices came back with their settings only. If their folders aren't already on this computer, a skill says its files are missing when it's used, and a clone voice has no recording. Add them again, or delete them.
+
+If Inspect said some core prompts "will show as customized", the backup came from a Batshit that didn't record which prompts were its defaults. Batshit keeps that text, because it may be your edit. If you never edited one of them, open Settings → Admin → Core System Prompts and click its Reset.
 
 ## Docker notes
 
 Docker Batshit stores core runtime state in Docker volumes, but the app backup is still the normal user-level recovery path for Batshit-owned data.
 
-Use app backups for moving Batshit-owned data between instances, before upgrades, before risky settings changes, and to recover from bad app-level config. Use Docker volume backups or snapshots only when you want exact full-instance rollback, including volume state outside the app backup.
+Use app backups for moving Batshit-owned data between instances, before upgrades, before risky settings changes, and to recover from bad app-level config. Use Docker volume backups or snapshots only when you want exact full-instance rollback, including volume state outside the app backup. Stop Batshit first (`docker compose --env-file .env.docker stop`): Redis keeps its data in an append-only file that it rewrites now and then, and a copy taken during a rewrite may not load.
 
 Docker restores rewrite some host-only Project paths to `/workspace` so containerized Batshit can see them. The backup does not copy the project source tree itself — mount or copy project files into the Docker workspace separately.
 
@@ -172,7 +200,7 @@ Mac app/source-checkout repair and Docker use different file paths. Docker users
 
 ### Backup file is huge
 
-Large source packages and Live Goons can each contribute hundreds of megabytes. Retained Goon Recipe revisions, Hair assets, Motion Vault assets, Closet items, scenes, Clips, and other uploaded files can also make backups large. That size is expected when the data is active. Use Settings → Admin → Goon Asset Cleanup to inspect orphaned Goon upload records before export; it does not delete referenced assets just to make a backup smaller.
+Large source packages and Live Goons can each contribute hundreds of megabytes. Retained Goon Recipe revisions, Hair assets, Motion Vault assets, Closet items, scenes, Clips, and other uploaded files can also make backups large. That size is expected when the data is active. Use Settings → Admin → Goon Asset Cleanup to inspect eligible orphaned Goon uploads before export. Read **Files and Reasons** before confirming cleanup. Referenced assets and Scene files marked **Preserved** stay in storage and in the backup; the audit cannot prove that an unknown Scene reference was removed intentionally.
 
 ## Related docs
 

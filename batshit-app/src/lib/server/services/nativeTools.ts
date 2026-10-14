@@ -1,3 +1,6 @@
+import { getBatshitHomeDir } from './batshitHome'
+import { spawnOwnedCommandGroup } from './ownedCommandGroup'
+import { pinHostCommandOwner, type HostCommandOwner, type HostCommandPin } from './hostCommandOwnership'
 import { tool } from 'ai'
 import { load as loadHtml } from 'cheerio'
 import { spawn } from 'node:child_process'
@@ -12,6 +15,7 @@ import type { AgentDcmDisplaySettings, MCPToolSelections } from '$lib/types/data
 import type { ToolApprovalMode } from '$lib/types/tool-approvals'
 import { buildControlApprovalPauseGuidance } from '$lib/utils/controlApprovalPresentation'
 import { redis } from '$lib/server/redis'
+import { fetchZipForModel, MAX_FETCH_ZIP_CHARS } from './fetchZipForModel'
 import {
   getInternalBatshitServerUrl,
   getInternalBatshitServerAuthHeaders
@@ -28,10 +32,17 @@ import {
   commandEditsInPlace,
   extractInPlaceEditTargetPaths,
   mapBashCommandToRendererTool,
-  summarizeShellSimpleCommands
+  summarizeShellSimpleCommands,
+  splitShellCommandSegments,
+  shellHeredocMarker
 } from './bashCommandMapper'
 import { buildSnapshotEditPreview, extractManagedPatchFromSource } from '$lib/utils/editDiff'
 import { resolveDefaultNativeExecutionBackend } from './nativeExecutionDefaults'
+import { resolveLocalCommandShell } from './localCommandShell'
+import { stripHostOperatorAuthorityFromChildEnv, stripNativeCommandAuthorityFromChildEnv } from './cliChildEnv'
+import { limitedOutput } from './commandOutputLimit'
+import { createCommandModelCapture, attachCommandModelCapture, propagateCommandModelCapture, MAX_COMMAND_MODEL_CAPTURE_CHARS } from './commandModelCapture'
+import { formatBashResultForModel, isBashResultForModel } from './bashResultModelText'
 import {
   BROKER_FABRIC_FETCH_ZIP_CONTROL_ID,
   BROKER_TOOL_FAMILIES,
@@ -53,6 +64,7 @@ import {
   type ControlActorType,
   type ControlUseErrorCode
 } from './fabricRegistry'
+import { settingsControlAdmission } from './appActions/settingsAdmission'
 import {
   hasScopedRiskWindow,
   type ControlApprovalGrant,
@@ -83,7 +95,14 @@ import {
   resolveSkillRuntimeForTool,
   type SkillRuntimeActor
 } from './skillRuntimeToolService'
+import {
+  normalizeSkillReadOffset,
+  partialSkillReadFields,
+  skillReadNoteLine,
+  skillReadOffsetPastEndError
+} from './skillReadWindow'
 import { resolveSkillAccessForActor } from './slashCommandCapabilities'
+import { CLI_LANE_GETS_BATSHIT_BASH } from './mode4InternalTools'
 import {
   resolveScreenshotUploadModelUrl,
   resolveUploadConfigForScreenshot
@@ -128,7 +147,6 @@ import {
   SANDBOX_COMMAND_END_TIMEOUT_MS,
   endCommandProcess,
   newSandboxCommandTag,
-  trackCommandGroup
 } from './commandEnd'
 import { bytesToBlob } from '$lib/utils/binary'
 import {
@@ -137,6 +155,7 @@ import {
   applyManagedPatchHunks,
   extractManagedApplyPatchDocument,
   isManagedApplyPatchCommand,
+  parseManagedApplyPatchCommand,
   parseManagedApplyPatchDocument,
   type ManagedApplyPatchOperation
 } from './managedApplyPatch'
@@ -249,9 +268,16 @@ type BatshitToolUseResponse = Record<string, any> & {
 }
 
 export interface NativeToolContext {
+  /** Originating API reply Stop, forwarded by the brain; not model or request data. */
+  abortSignal?: AbortSignal
+  /** Physical command owner, separate from the parent audit/approval identity. */
+  processOwner?: HostCommandOwner
+  /** Delegated record's own Bash grant, independent of merged model-preset settings. */
+  delegatedBashEnabled?: boolean
   userId: string
   agentId?: string | null
   sessionId?: string
+  messageId?: string
   selectedGateways?: string[]
   toolSelections?: MCPToolSelections
   selectedCliToolIds?: string[]
@@ -319,6 +345,9 @@ export interface NativeToolContext {
    * `subagentRunner.ts` for an API Subagent or Worker run (whose `agentId` is the PARENT's) to
    * the id its `skills_commands` list was built for. Absent on a primary turn, where the turn's
    * own `agentId` governs.
+   *
+   * BL-186 — the same id judges the run's artifact allowlists (the broker's search and use), the
+   * id its DCM index lists them by, as a CLI run's credential does (BL-81).
    */
   scopeAgentId?: string | null
   workers?: {
@@ -510,8 +539,7 @@ const MAX_SEARCH_RESULTS = 10
 const DEFAULT_SEARCH_RESULTS = 5
 const MAX_DYNAMIC_RESULTS = MAX_DYNAMIC_MCP_RESULTS
 const DEFAULT_DYNAMIC_RESULTS = DEFAULT_DYNAMIC_MCP_RESULTS
-const MAX_ZIP_CHARS = 250_000
-const DEFAULT_ZIP_CHARS = 16_000
+const MAX_ZIP_CHARS = MAX_FETCH_ZIP_CHARS
 const MAX_SKILL_REFERENCE_CHARS = 50_000
 const DEFAULT_SKILL_REFERENCE_CHARS = 12_000
 const MAX_SKILL_SCRIPT_CHARS = 30_000
@@ -538,7 +566,8 @@ const ZIP_FETCH_INPUT_SCHEMA_JSON = {
   properties: {
     zipId: { type: 'string' },
     includeContent: { type: 'boolean' },
-    maxChars: { type: 'integer', minimum: 64, maximum: MAX_ZIP_CHARS }
+    maxChars: { type: 'integer', minimum: 64, maximum: MAX_ZIP_CHARS },
+    offset: { type: 'integer', minimum: 0 }
   },
   required: ['zipId']
 }
@@ -604,6 +633,12 @@ const AGENT_BROWSER_DOCKER_SIDECAR_DEFAULT_URL = 'http://agent-browser:8091'
  * `SIDECAR_REVISION`, 2026-09-18). An older sidecar reports none.
  */
 const AGENT_BROWSER_SIDECAR_STOP_REVISION = 2
+const AGENT_BROWSER_SIDECAR_CAPTURE_REVISION = 4
+
+/** Does a Docker sidecar reporting this `sidecarRevision` end a run on a Stop? One rule for the run and Admin. */
+function agentBrowserSidecarHearsStop(revision: number | null | undefined): boolean {
+  return (revision ?? 0) >= AGENT_BROWSER_SIDECAR_STOP_REVISION
+}
 const DOCKER_AGENT_BROWSER_UNSUPPORTED_REASON =
   'Docker Agent Browser sidecar is not running yet. Start it from Batshit when the host operator is configured, or run the agent-browser Compose profile from the host.'
 const DOCKER_AGENT_BROWSER_INSTALL_HELP =
@@ -1350,6 +1385,8 @@ function buildCompactJsonSchemaHint(inputSchema: unknown): string | undefined {
  */
 const BATSHIT_BROKER_PLUMBING_KEYS = [
   'selectedGateways',
+  'mcpGatewayScope',
+  'mcp_gateway_scope',
   'selected_gateways',
   'selectedToolIds',
   'selected_tool_ids',
@@ -1375,9 +1412,18 @@ const BATSHIT_BROKER_PLUMBING_KEYS = [
   // too — leaving them out of this list shipped `actorType` into every MCP tool's input.
   'actorType',
   'delegatedRun',
+  'processOwner',
+  // BL-186: a delegated run's scope id is server-set plumbing too, never a control's payload.
+  'scopeAgentId',
+  'controlScopeAgentId',
   // SA-116 P2: server-set plumbing, never part of a control's payload. Missing this
   // shipped `approvalGrant: null` into every artifact control's input.
-  'approvalGrant'
+  'approvalGrant',
+  // BL-1290: the reply's message id is server-set on the API lane (the zip checkpoint reads it
+  // from the broker input, never the payload). Missing this put it into every broker payload, so
+  // strict controls (Settings, App Actions) refused every API call. A model's top-level
+  // `messageId` drops with the rest of the plumbing; a field nested under `input` is the model's.
+  'messageId'
 ] as const
 
 const BATSHIT_BROKER_PLUMBING_KEY_SET = new Set<string>(BATSHIT_BROKER_PLUMBING_KEYS)
@@ -2372,7 +2418,7 @@ const PROTECTED_SYSTEM_SKILL_PATH_SEGMENTS = [
 ]
 
 function getSystemSkillRuntimeRoot(): string {
-  return path.join(os.homedir(), '.batshit', 'skills')
+  return path.join(getBatshitHomeDir(), 'skills')
 }
 
 function normalizeSystemSkillRuntimeId(value: string): string {
@@ -2816,7 +2862,7 @@ function getPolicyInspectionCommand(command: string): string {
   if (!trimmed) return ''
 
   // Heredoc bodies can contain semicolons or shell-like symbols that are not command chaining.
-  if (/<<-?\s*['"]?[A-Za-z_][A-Za-z0-9_]*['"]?/.test(trimmed)) {
+  if (shellHeredocMarker(trimmed.split(/\r?\n/, 1)[0] ?? '')) {
     return trimmed.split(/\r?\n/, 1)[0]?.trim() ?? trimmed
   }
 
@@ -2837,8 +2883,7 @@ function getPolicyInspectionCommandLines(command: string): string[] {
     }
 
     lines.push(trimmed)
-    const markerMatch = trimmed.match(/<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?/)
-    if (markerMatch?.[1]) heredocMarker = markerMatch[1]
+    heredocMarker = shellHeredocMarker(trimmed)
   }
 
   return lines
@@ -3072,9 +3117,34 @@ function getSedPolicyViolation(tokens: string[]): string | null {
     : null
 }
 
+function hasZshFileSubstitution(command: string): boolean {
+  // zsh's =(...) executes a command and substitutes a temporary filename. Unlike $(),
+  // it is literal inside either quote type; preserve those harmless argument strings.
+  let quote: string | null = null
+  let ansiQuote = false
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index]
+    if (quote) {
+      if (char === '\\' && (quote === '"' || ansiQuote)) index += 1
+      else if (char === quote) quote = null
+      continue
+    }
+    if (char === '\\') { index += 1; continue }
+    if (char === '$' && command[index + 1] === "'") {
+      quote = "'"
+      ansiQuote = true
+      index += 1
+      continue
+    }
+    if (char === "'" || char === '"') { quote = char; ansiQuote = false; continue }
+    if (char === '=' && command[index + 1] === '(') return true
+  }
+  return false
+}
+
 function getReadOnlyShellSideEffectViolation(command: string): string | null {
   for (const commandLine of getPolicyInspectionCommandLines(command)) {
-    if (/\$\(|`|[<>]\(/.test(commandLine)) {
+    if (/\$\(|`|[<>]\(/.test(commandLine) || hasZshFileSubstitution(commandLine)) {
       return 'Plan mode blocks shell and process substitutions because they can execute hidden commands.'
     }
 
@@ -3329,16 +3399,42 @@ async function executeManagedApplyPatch(options: {
   }
 }
 
+// Rendering may unwrap shells for readable cards. Authorization always inspects the raw envelope.
+function getPlanModeRawEnvelopeViolation(command: string): string | null {
+  const operations = getPolicyInspectionCommandLines(command).flatMap(summarizeShellSimpleCommands)
+  for (const operation of operations) {
+    const program = operation.program ?? ''
+    const executable = operation.commandWord ?? ''
+    if (executable.includes('/') && !/^\/(?:usr\/)?bin\/[^/]+$/.test(executable)) {
+      return 'Plan mode cannot trust a workspace executable with an inspection command name.'
+    }
+    const directInspection = ['pwd', 'ls', 'find', 'tree', 'cat', 'sed', 'head', 'tail', 'rg',
+      'grep', 'diff', 'wc', 'stat', 'file', 'echo', 'printf', 'which', 'whereis', 'git', 'touch'].includes(program)
+    const inPlaceEditor = (program === 'gsed' || /^perl(?:\d+(?:\.\d+)*)?$/.test(program)) && commandEditsInPlace(command)
+    if (!directInspection && !inPlaceEditor) {
+      return 'Plan mode requires a direct inspection command or Markdown editor; shell and process wrappers are blocked.'
+    }
+    for (const target of operation.outputRedirectTargets) {
+      if (target === '/dev/null' || (target !== null && /^(?:&(?:\d+|-)|\/dev\/fd\/\d+)$/.test(target))) continue
+      if (!target || operation.dynamic || !isMarkdownPath(target)) {
+        return 'Plan mode requires every output file to be a literal Markdown path.'
+      }
+    }
+  }
+  return null
+}
+
 function isPlanModeAllowedCommand(command: string): boolean {
   const trimmed = command.trim()
   if (!trimmed) return false
 
   const commandForPolicy = getPolicyInspectionCommand(trimmed)
 
-  if (/[;&]|&&|\|\|/.test(commandForPolicy)) return false
+  if (splitShellCommandSegments(commandForPolicy).length > 1) return false
   if (getPolicyInspectionCommandLines(trimmed).length > 1) return false
 
   if (isManagedApplyPatchCommand(trimmed)) return true
+  if (getPlanModeRawEnvelopeViolation(trimmed)) return false
   if (getPlanModeInPlaceEditViolation(trimmed)) return false
 
   const mapping = mapBashCommandToRendererTool(trimmed)
@@ -3942,7 +4038,7 @@ function evaluateBashPolicy(
     return {
       success: false,
       blocked: true,
-      reason: `Command is too long (${trimmed.length} characters; limit ${commandLengthLimit}). For large file writes or edits, send a managed apply_patch command (heredoc with "*** Begin Patch" / "*** End Patch"), which allows up to ${MAX_MANAGED_APPLY_PATCH_COMMAND_CHARS} characters. Otherwise split the work into smaller commands.`
+      reason: `Command is too long (${trimmed.length} characters; limit ${commandLengthLimit}). For large file writes or edits, send a managed apply_patch command as the whole command, optionally after \`cd <folder> &&\` (a heredoc with "*** Begin Patch" / "*** End Patch"), which allows up to ${MAX_MANAGED_APPLY_PATCH_COMMAND_CHARS} characters. Otherwise split the work into smaller commands.`
     }
   }
 
@@ -3973,7 +4069,7 @@ function evaluateBashPolicy(
     const commandForPolicy = getPolicyInspectionCommand(trimmed)
     const commandLinesForPolicy = getPolicyInspectionCommandLines(trimmed)
 
-    if (/[;&]|&&|\|\|/.test(commandForPolicy)) {
+    if (splitShellCommandSegments(commandForPolicy).length > 1) {
       return {
         success: false,
         blocked: true,
@@ -4030,13 +4126,6 @@ function evaluateBashPolicy(
   }
 
   return { success: true }
-}
-
-function appendWithLimit(current: string, chunk: string, limit: number): { text: string; truncated: boolean } {
-  if (!chunk) return { text: current, truncated: false }
-  const combined = current + chunk
-  if (combined.length <= limit) return { text: combined, truncated: false }
-  return { text: combined.slice(0, limit), truncated: true }
 }
 
 async function getSafeRealPath(targetPath: string): Promise<string | null> {
@@ -4167,8 +4256,63 @@ async function resolveBashWorkingDirectory(options: {
   return { cwd: realCwd }
 }
 
+/**
+ * The folder a managed patch runs in after `cd <folder>` (BL-244): the folder is resolved against
+ * the command's own working folder the way a shell would, then through the same realpath and
+ * workspace-root check as a requested cwd, and it must exist as a folder.
+ */
+async function resolveManagedApplyPatchFolder(options: {
+  cdPath: string
+  cwd: string
+  workspaceRoot: string
+}): Promise<
+  { cwd: string } | { blocked: boolean; errorCode: 'POLICY_BLOCKED' | 'INVALID_INPUT'; reason: string }
+> {
+  // BL-254: `resolveBashWorkingDirectory` trims what it is given, so a folder named with a space at
+  // either end would resolve to its trimmed sibling. The parser refuses such names; so does this.
+  if (!options.cdPath || options.cdPath !== options.cdPath.trim()) {
+    return {
+      blocked: false,
+      errorCode: 'INVALID_INPUT',
+      reason: `The folder in \`cd ${options.cdPath}\` has spaces at one end, so the patch was not applied.`
+    }
+  }
+  const target = path.resolve(options.cwd, options.cdPath)
+  // Cooper's second review: resolving can bring such a space to the end of the path (`app /` and
+  // `app /.` both resolve to `…/app `), and the trim below would then land in the sibling `app`.
+  if (target !== target.trim()) {
+    return {
+      blocked: false,
+      errorCode: 'INVALID_INPUT',
+      reason: `The folder in \`cd ${options.cdPath}\` has spaces at one end, so the patch was not applied.`
+    }
+  }
+  const resolution = await resolveBashWorkingDirectory({
+    requestedCwd: target,
+    workspaceRoot: options.workspaceRoot
+  })
+  if ('blocked' in resolution) {
+    return {
+      blocked: true,
+      errorCode: 'POLICY_BLOCKED',
+      reason: `The folder in \`cd ${options.cdPath}\` is outside the workspace, so the patch was not applied. ${resolution.reason}`
+    }
+  }
+  const folder = await stat(resolution.cwd).catch(() => null)
+  if (!folder?.isDirectory()) {
+    return {
+      blocked: false,
+      errorCode: 'INVALID_INPUT',
+      reason: `The folder in \`cd ${options.cdPath}\` does not exist (${resolution.cwd}), so the patch was not applied.`
+    }
+  }
+  return { cwd: resolution.cwd }
+}
+
 type CommandRunResult = {
   command: string
+  /** The system shell actually selected for a local command; absent for non-shell runners. */
+  shell?: string
   stdout: string
   stderr: string
   exitCode: number | null
@@ -4188,14 +4332,28 @@ const STOPPED_COMMAND_REASON = 'The command was stopped.'
 
 /**
  * What a bash tool tells the model about a Stop and a timeout (Agent Docs, 2026-09-18): both end
- * the command and everything it started (`commandEnd.ts`), and how to leave a program running.
+ * the command's managed group (`commandEnd.ts`), and how to leave a program running.
  * Every reply removes the chat's sandboxes when it ends, which is the sandbox limit. The API
  * lane's `native_bash_execute` and the managed CLI helper's `batshit_server_bash_execute`
  * (`scripts/mode4-controls-mcp.cjs`, which holds a copy of this exact text) both say it; a test
  * holds the copy to this constant.
  */
 export const NATIVE_BASH_STOP_GUIDANCE =
-  'A Stop or a timeout ends the command and everything it started. To leave a program running, start it in the background with its output sent to a file (`cmd > log 2>&1 &`) and let the command finish; it then runs until Batshit quits (in a sandbox, at most until this reply ends).'
+  "A Stop or a timeout ends programs still in the command's managed group. A program that leaves that group or creates a new session can survive cleanup. To leave a program running, start it in the background with its output sent to a file (`cmd > log 2>&1 &`) and let the command finish; programs remaining in the managed group are ended when Batshit quits (in a sandbox, at most until this reply ends)."
+
+/**
+ * What a bash tool tells the model about the managed `apply_patch` (BL-244, 2026-09-25): it is
+ * built in, so a `which` probe finds nothing and must not be the model's test, and it must be
+ * the whole command (`parseManagedApplyPatchCommand`). In SA-126 B0 agents probed for it 37 times
+ * in 32 chats and lost 39 patches to `cd <folder> && apply_patch` before that form was accepted.
+ * The API lane's `native_bash_execute` and the managed CLI helper's `batshit_server_bash_execute`
+ * (`scripts/mode4-controls-mcp.cjs`, which holds a copy of this exact text) both say it.
+ */
+export const NATIVE_BASH_APPLY_PATCH_GUIDANCE =
+  "apply_patch is built into this tool, not a program on the PATH, so there is no need to check for it. Send it as the whole command, optionally after `cd <folder> &&`: `apply_patch <<'PATCH'`, the patch from `*** Begin Patch` to `*** End Patch`, then `PATCH`. Run anything else, such as tests, in a separate call. A patch may be 200,000 characters long; other commands 4,000."
+
+export const NATIVE_BASH_SHELL_GUIDANCE =
+  'Local commands use system zsh when installed, otherwise bash; the result records the selected shell. Use common shell syntax until the result identifies it. '
 
 /** A command a Stop reached before it started: it never ran. */
 function stoppedBeforeStartRun(command: string): CommandRunResult {
@@ -4219,17 +4377,27 @@ async function runProcessCommand(options: {
   timeoutMs: number
   maxOutputChars: number
   env?: Record<string, string>
+  /** Only the server-owned sbx adapter retains its existing host launch environment. */
+  trustedHostAdapter?: boolean
   abortSignal?: AbortSignal
   /**
    * The local shell (2026-09-18): the command leads its own process group, so a Stop or timeout
    * ends everything it started (`commandEnd.ts`).
    */
+  captureModelOutput?: boolean
   ownProcessGroup?: boolean
+  ownerPin?: HostCommandPin
+  sessionId?: string | null
+  messageId?: string | null
   /** A sandbox command: what a Stop or timeout also ends inside the sandbox (`commandEnd.ts`). */
   endInside?: () => Promise<void>
 }): Promise<CommandRunResult> {
   const start = Date.now()
   const envOverrides = options.env ?? {}
+  const childEnv = { ...process.env, ...envOverrides }
+  const finalEnv = options.trustedHostAdapter
+    ? stripHostOperatorAuthorityFromChildEnv(childEnv)
+    : stripNativeCommandAuthorityFromChildEnv(childEnv)
   const commandText = `${options.command} ${options.args.join(' ')}`.trim()
   const abortSignal = options.abortSignal
 
@@ -4237,20 +4405,24 @@ async function runProcessCommand(options: {
 
   return await new Promise((resolve, reject) => {
     const ownGroup = options.ownProcessGroup === true && process.platform !== 'win32'
-    const child = spawn(options.command, options.args, {
+    const child = ownGroup
+      ? spawnOwnedCommandGroup(options.command, options.args, {
+          cwd: options.cwd, env: finalEnv,
+          ownerPin: options.ownerPin,
+          sessionId: options.sessionId,
+          messageId: options.messageId
+        })
+      : spawn(options.command, options.args, {
       cwd: options.cwd,
-      env: {
-        ...process.env,
-        ...envOverrides
-      },
+      env: finalEnv,
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: ownGroup
     })
-    if (ownGroup && child.pid) trackCommandGroup(child.pid)
 
-    let stdout = ''
-    let stderr = ''
-    let truncated = false
+    const modelCapture = options.captureModelOutput ? createCommandModelCapture() : null
+    const stdout = limitedOutput(options.maxOutputChars)
+    const stderr = limitedOutput(options.maxOutputChars)
+    let outputIncomplete = false
     let timedOut = false
     let stopped = false
     let settled = false
@@ -4258,17 +4430,8 @@ async function runProcessCommand(options: {
     let endedInside = true
     let closed: { exitCode: number | null; signal: NodeJS.Signals | null } | null = null
 
-    child.stdout.on('data', (chunk) => {
-      const next = appendWithLimit(stdout, String(chunk), options.maxOutputChars)
-      stdout = next.text
-      if (next.truncated) truncated = true
-    })
-
-    child.stderr.on('data', (chunk) => {
-      const next = appendWithLimit(stderr, String(chunk), options.maxOutputChars)
-      stderr = next.text
-      if (next.truncated) truncated = true
-    })
+    child.stdout.on('data', (chunk) => { stdout.append(String(chunk)); modelCapture?.appendStdout(chunk) })
+    child.stderr.on('data', (chunk) => { stderr.append(String(chunk)); modelCapture?.appendStderr(chunk) })
 
     // The run is over once its output has closed and, for a Stop or timeout, once what it
     // started inside its sandbox has been ended too.
@@ -4277,17 +4440,18 @@ async function runProcessCommand(options: {
       settled = true
       clearTimeout(timer)
       abortSignal?.removeEventListener('abort', onAbort)
-      resolve({
+      const result: CommandRunResult = {
         command: commandText,
-        stdout,
-        stderr,
+        stdout: stdout.text,
+        stderr: `${outputIncomplete ? '[Remaining command pipe output was not kept after the command ended.]\n' : ''}${stderr.text}`,
         exitCode: closed.exitCode,
         signal: closed.signal,
         timedOut,
         durationMs: Date.now() - start,
-        truncated,
+        truncated: stdout.cut || stderr.cut || outputIncomplete,
         ...(stopped ? { stopped: true } : {})
-      })
+      }
+      resolve(modelCapture ? attachCommandModelCapture(result, modelCapture.finish({ ...result, outputIncomplete })) : result)
     }
 
     // A Stop and a timeout end a command the same way (2026-09-18, `commandEnd.ts`): SIGTERM and
@@ -4301,6 +4465,7 @@ async function runProcessCommand(options: {
       endCommandProcess(child, {
         ownGroup,
         afterKill: () => {
+          outputIncomplete = !child.stdout.readableEnded || !child.stderr.readableEnded
           child.stdout.destroy()
           child.stderr.destroy()
         }
@@ -4330,6 +4495,7 @@ async function runProcessCommand(options: {
       end()
     }
     abortSignal?.addEventListener('abort', onAbort, { once: true })
+    if (abortSignal?.aborted) onAbort()
 
     child.on('error', (error) => {
       if (settled) return
@@ -4373,6 +4539,21 @@ async function fetchDockerSandboxOperatorJson<TPayload = Record<string, any>>(
   else callerSignal?.addEventListener('abort', forwardCallerAbort, { once: true })
 
   try {
+    // BL-368: an updated app may meet an operator left running by an older
+    // checkout, including when Compose was started without our launcher.
+    const health = await fetch(`${config.url}/health`, {
+      headers: { accept: 'application/json', authorization: `Bearer ${config.token}` },
+      signal: controller.signal
+    })
+    const healthPayload = await health.json().catch(() => null)
+    if (!health.ok || !Number.isInteger(healthPayload?.sandboxRevision) || healthPayload.sandboxRevision < 12) {
+      return {
+        ok: false,
+        statusCode: health.status,
+        payload: null,
+        reason: 'Docker Sandbox operator must be updated to revision 12 or later. Run start-docker again to update its sandbox protection and output limits.'
+      }
+    }
     const response = await fetch(`${config.url}${pathname}`, {
       ...init,
       headers: {
@@ -4424,7 +4605,7 @@ function normalizeOperatorCommandRun(input: Record<string, any> | null | undefin
   const run = input && typeof input === 'object' ? input : {}
   return {
     command: typeof run.command === 'string' ? run.command : 'Docker Sandbox operator execute',
-    stdout: typeof run.stdout === 'string' ? run.stdout : '',
+    stdout: `${run.truncated === true ? '[The Docker host operator cut this command output. The rest was not kept. Run the command again for a smaller part.]\n' : ''}${typeof run.stdout === 'string' ? run.stdout : ''}`,
     stderr: typeof run.stderr === 'string' ? run.stderr : '',
     exitCode: typeof run.exitCode === 'number' ? run.exitCode : null,
     signal: typeof run.signal === 'string' ? (run.signal as NodeJS.Signals) : null,
@@ -4626,6 +4807,7 @@ async function runSbx(
     timeoutMs: number
     maxOutputChars?: number
     abortSignal?: AbortSignal
+    captureModelOutput?: boolean
     endInside?: () => Promise<void>
   }
 ): Promise<CommandRunResult> {
@@ -4646,16 +4828,19 @@ async function runSbxCommand(
     timeoutMs: number
     maxOutputChars?: number
     abortSignal?: AbortSignal
+    captureModelOutput?: boolean
     endInside?: () => Promise<void>
   }
 ): Promise<CommandRunResult> {
   return await runProcessCommand({
     command: SBX_COMMAND,
+    trustedHostAdapter: true,
     args,
     cwd: process.cwd(),
     timeoutMs: options.timeoutMs,
     maxOutputChars: options.maxOutputChars ?? DOCKER_SANDBOX_STATUS_MAX_OUTPUT_CHARS,
     abortSignal: options.abortSignal,
+    captureModelOutput: options.captureModelOutput,
     endInside: options.endInside
   }).catch((error) => {
     const maybeError = error as NodeJS.ErrnoException
@@ -5201,23 +5386,34 @@ export async function recoverAppleContainerSandboxBackend(options: {
 
 async function runBashCommand(options: {
   command: string
+  shell?: string
   cwd: string
   timeoutMs: number
   maxOutputChars?: number
   env?: Record<string, string>
   abortSignal?: AbortSignal
+  ownerPin?: HostCommandPin
+  sessionId?: string | null
+  messageId?: string | null
 }): Promise<CommandRunResult> {
   const maxOutputChars = options.maxOutputChars ?? MAX_BASH_OUTPUT_CHARS
-  return await runProcessCommand({
-    command: '/bin/zsh',
+  if (options.abortSignal?.aborted) return stoppedBeforeStartRun(options.command)
+  const shell = options.shell ?? await resolveLocalCommandShell()
+  const run = await runProcessCommand({
+    command: shell,
     args: ['-lc', options.command],
     cwd: options.cwd,
     timeoutMs: options.timeoutMs,
     maxOutputChars,
     env: options.env,
     abortSignal: options.abortSignal,
-    ownProcessGroup: true
+    ownProcessGroup: true,
+    ownerPin: options.ownerPin,
+    sessionId: options.sessionId,
+    messageId: options.messageId,
+    captureModelOutput: true
   })
+  return propagateCommandModelCapture(run, { ...run, shell })
 }
 
 async function runDockerSandboxCommand(options: {
@@ -5277,6 +5473,7 @@ async function runDockerSandboxCommand(options: {
         timeoutMs: options.timeoutMs,
         maxOutputChars: options.maxOutputChars ?? MAX_BASH_OUTPUT_CHARS,
         abortSignal: options.abortSignal,
+        captureModelOutput: true,
         endInside: () => endDockerSandboxCommand(sandboxName, tag)
       }
     )
@@ -5350,32 +5547,24 @@ async function runAgentBrowserCli(
   return await new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd: request.cwd ?? process.cwd(),
-      env: {
+      env: stripNativeCommandAuthorityFromChildEnv({
         ...process.env,
         ...(request.env ?? {})
-      },
+      }),
       stdio: ['ignore', 'pipe', 'pipe']
     })
 
-    let stdout = ''
-    let stderr = ''
-    let truncated = false
+    const modelCapture = createCommandModelCapture()
+    const stdout = limitedOutput(maxOutputChars)
+    const stderr = limitedOutput(maxOutputChars)
+    let outputIncomplete = false
     let timedOut = false
     let stopped = false
     let ending = false
     let settled = false
 
-    child.stdout.on('data', (chunk) => {
-      const next = appendWithLimit(stdout, String(chunk), maxOutputChars)
-      stdout = next.text
-      if (next.truncated) truncated = true
-    })
-
-    child.stderr.on('data', (chunk) => {
-      const next = appendWithLimit(stderr, String(chunk), maxOutputChars)
-      stderr = next.text
-      if (next.truncated) truncated = true
-    })
+    child.stdout.on('data', (chunk) => { stdout.append(String(chunk)); modelCapture.appendStdout(chunk) })
+    child.stderr.on('data', (chunk) => { stderr.append(String(chunk)); modelCapture.appendStderr(chunk) })
 
     // A Stop and the timeout end the call the same way (`commandEnd.ts`): SIGTERM, then SIGKILL
     // 400 ms later, to the CLI process ALONE. The daemon the CLI starts once is long-lived by
@@ -5387,6 +5576,7 @@ async function runAgentBrowserCli(
       endCommandProcess(child, {
         ownGroup: false,
         afterKill: () => {
+          outputIncomplete = !child.stdout.readableEnded || !child.stderr.readableEnded
           child.stdout.destroy()
           child.stderr.destroy()
         }
@@ -5421,18 +5611,19 @@ async function runAgentBrowserCli(
     child.on('close', (exitCode, signal) => {
       if (settled) return
       finish()
-      resolve({
+      const result: AgentBrowserCliRunResult = {
         command,
         args,
-        stdout,
-        stderr,
+        stdout: stdout.text,
+        stderr: `${outputIncomplete ? '[Remaining command pipe output was not kept after the command ended.]\n' : ''}${stderr.text}`,
         exitCode,
         signal,
         timedOut,
         durationMs: Date.now() - start,
-        truncated,
+        truncated: stdout.cut || stderr.cut || outputIncomplete,
         ...(stopped ? { stopped: true } : {})
-      })
+      }
+      resolve(attachCommandModelCapture(result, modelCapture.finish({ ...result, outputIncomplete })))
     })
   })
 }
@@ -5623,8 +5814,19 @@ function normalizeAgentBrowserSidecarRun(
   payload: Record<string, any> | null,
   fallbackArgs: string[]
 ): AgentBrowserCliRunResult {
+  if (!Number.isSafeInteger(payload?.sidecarRevision) ||
+    payload!.sidecarRevision < AGENT_BROWSER_SIDECAR_CAPTURE_REVISION) {
+    throw new Error('Docker Agent Browser sidecar cannot retain full command output. Rebuild the agent-browser sidecar before running this command.')
+  }
+  const capture = payload?.modelCapture
+  if (!capture || typeof capture.text !== 'string' ||
+    capture.text.length > MAX_COMMAND_MODEL_CAPTURE_CHARS ||
+    !Number.isSafeInteger(capture.originalTextChars) ||
+    capture.originalTextChars < capture.text.length) {
+    throw new Error('Docker Agent Browser sidecar returned an invalid command-output capture. Rebuild the agent-browser sidecar and try again.')
+  }
   const run = payload?.run && typeof payload.run === 'object' ? payload.run : payload
-  return {
+  const normalized: AgentBrowserCliRunResult = {
     command: typeof run?.command === 'string' ? run.command : 'agent-browser',
     args: Array.isArray(run?.args) ? run.args.map((entry: unknown) => String(entry)) : fallbackArgs,
     stdout: typeof run?.stdout === 'string' ? run.stdout : '',
@@ -5635,6 +5837,10 @@ function normalizeAgentBrowserSidecarRun(
     durationMs: typeof run?.durationMs === 'number' ? run.durationMs : 0,
     truncated: run?.truncated === true
   }
+  return attachCommandModelCapture(normalized, {
+    text: capture.text,
+    originalTextChars: capture.originalTextChars
+  })
 }
 
 async function fetchAgentBrowserSidecarHealth(): Promise<{
@@ -5824,9 +6030,18 @@ export async function getAgentBrowserRuntimeStatus(): Promise<{
   packageTarballUrl: string
   packageIntegrity: string
   runtimeMatchesTestedVersion: boolean | null
+  /** The running Docker sidecar's `sidecarRevision`; null when it reported none, or outside Docker. */
+  sidecarRevision: number | null
+  /**
+   * Docker only: does the running sidecar end a command on a Stop (revision 2 or later)? An older
+   * one is never handed a Stop, so a Stop waits for its command (BL-16); Admin says so. Null when
+   * no Docker sidecar is running.
+   */
+  sidecarHearsStop: boolean | null
 }> {
   const availability = await checkAgentBrowserAvailability()
   const normalizedVersion = normalizeAgentBrowserVersion(availability.version)
+  const runningDockerSidecar = availability.supportLevel === 'docker-sidecar' && availability.available
   const runtimeMatchesTestedVersion =
     availability.available && normalizedVersion
       ? normalizedVersion === AGENT_BROWSER_TESTED_VERSION
@@ -5854,7 +6069,9 @@ export async function getAgentBrowserRuntimeStatus(): Promise<{
     packageSpec: AGENT_BROWSER_TESTED_PACKAGE_SPEC,
     packageTarballUrl: AGENT_BROWSER_TESTED_TARBALL_URL,
     packageIntegrity: AGENT_BROWSER_TESTED_INTEGRITY,
-    runtimeMatchesTestedVersion
+    runtimeMatchesTestedVersion,
+    sidecarRevision: runningDockerSidecar ? (availability.sidecarRevision ?? null) : null,
+    sidecarHearsStop: runningDockerSidecar ? agentBrowserSidecarHearsStop(availability.sidecarRevision) : null
   }
 }
 
@@ -6400,56 +6617,24 @@ export function __setAgentBrowserCliRunnerForTests(
 
 async function nativeFetchZip(input: {
   userId: string
+  agentId?: string | null
+  sessionId?: string | null
+  messageId?: string | null
+  actorType?: ControlActorType
   zipId: string
   includeContent?: boolean
   maxChars?: number
+  offset?: number
 }): Promise<Record<string, any>> {
-  const zipData = await redis.getZip(input.zipId)
-  if (!zipData || typeof zipData !== 'object') {
+  if (input.actorType !== 'agent' && input.actorType !== 'in-process') {
     return {
       found: false,
-      zipId: input.zipId
+      zipId: input.zipId,
+      reason: 'Fetch Zip requires a verified model run.',
+      code: 'MODEL_SCOPE_REQUIRED'
     }
   }
-
-  const sessionId =
-    (zipData as any)?.metadata?.sessionId ||
-    (zipData as any)?.metadata?.session_id ||
-    null
-
-  if (sessionId) {
-    const session = await redis.getSession(sessionId)
-    const owner = (session as any)?.user_id || (session as any)?.userId || null
-    if (owner && owner !== input.userId) {
-      return {
-        found: false,
-        zipId: input.zipId,
-        reason: 'Zip belongs to a different user.'
-      }
-    }
-  }
-
-  const fullContent = typeof (zipData as any).content === 'string' ? (zipData as any).content : ''
-  const includeContent = input.includeContent !== false
-  const maxChars = clamp(input.maxChars ?? DEFAULT_ZIP_CHARS, 64, MAX_ZIP_CHARS)
-  const content = includeContent ? fullContent.slice(0, maxChars) : undefined
-
-  return {
-    found: true,
-    zipId: (zipData as any).id ?? input.zipId,
-    type: (zipData as any).type ?? 'unknown',
-    tokens: (zipData as any).tokens ?? null,
-    description: (zipData as any).description ?? null,
-    createdAt: (zipData as any).created_at ?? (zipData as any).createdAt ?? null,
-    metadata: (zipData as any).metadata ?? {},
-    ...(includeContent
-      ? {
-          content,
-          contentLength: fullContent.length,
-          contentTruncated: fullContent.length > maxChars
-        }
-      : {})
-  }
+  return fetchZipForModel(input, input)
 }
 
 async function nativeDynamicMcpFind(input: {
@@ -6461,6 +6646,7 @@ async function nativeDynamicMcpFind(input: {
   group?: string | string[]
   exact?: boolean
   limit?: number
+  mcpGatewayScope?: string[] | null
   selectedGateways?: string[]
   includeSchema?: boolean
   dcmDisplaySettings?: import('$lib/types/database').AgentDcmDisplaySettings | null
@@ -6477,6 +6663,7 @@ async function nativeDynamicMcpFind(input: {
     exact: input.exact,
     limit: input.limit,
     selectedGateways: input.selectedGateways,
+    mcpGatewayScope: input.mcpGatewayScope,
     includeSchema: input.includeSchema,
     dcmDisplaySettings: input.dcmDisplaySettings ?? null,
     projectPath: input.projectPath ?? null,
@@ -6490,10 +6677,13 @@ async function nativeDynamicMcpUse(input: {
   agentMetadata?: Record<string, any> | null
   toolName: string
   params?: Record<string, any>
+  mcpGatewayScope?: string[] | null
   selectedGateways?: string[]
   dcmDisplaySettings?: import('$lib/types/database').AgentDcmDisplaySettings | null
   projectPath?: string | null
   gatewayToolsCache?: GatewayToolsCache
+  /** BL-454: the reply's Stop, handed to the gateway call so it ends the remote call or STDIO process. */
+  abortSignal?: AbortSignal | null
 }): Promise<Record<string, any>> {
   return executeSharedDynamicMcpUse({
     userId: input.userId,
@@ -6502,10 +6692,12 @@ async function nativeDynamicMcpUse(input: {
     toolName: input.toolName,
     params: input.params,
     selectedGateways: input.selectedGateways,
+    mcpGatewayScope: input.mcpGatewayScope,
     dcmDisplaySettings: input.dcmDisplaySettings ?? null,
     projectPath: input.projectPath ?? null,
     gatewayToolsCache: input.gatewayToolsCache,
-    internalToolError: `Tool "${input.toolName.trim()}" is internal-only and not callable through Batshit Tool Use.`
+    internalToolError: `Tool "${input.toolName.trim()}" is internal-only and not callable through Batshit Tool Use.`,
+    abortSignal: input.abortSignal ?? null
   })
 }
 
@@ -6520,7 +6712,9 @@ async function nativeCliToolFind(input: {
   return await findCliTools({
     userId: input.userId,
     agentId: input.agentId ?? null,
-    selectedToolIds: input.selectedCliToolIds,
+    // Every caller hands over a list the server resolved (BL-686): the in-process turn's, or
+    // the dispatch's `resolveDispatchCliToolScope`. Absent reads the agent's saved list.
+    cliToolScope: input.selectedCliToolIds,
     query: input.query,
     limit: input.limit,
     includeSchema: input.includeSchema
@@ -6528,6 +6722,8 @@ async function nativeCliToolFind(input: {
 }
 
 async function nativeCliToolUse(input: {
+  /** Server-owned identity; never accepted from model input. */
+  processOwner?: HostCommandOwner
   userId: string
   agentId?: string | null
   sessionId?: string
@@ -6550,11 +6746,13 @@ async function nativeCliToolUse(input: {
 
   return await executeCliTool({
     userId: input.userId,
+    processOwner: input.processOwner,
     agentId: input.agentId ?? null,
     sessionId: input.sessionId,
     toolId,
     input: cliInput,
-    selectedToolIds: input.selectedCliToolIds,
+    // A server-resolved list, as in `nativeCliToolFind` (BL-686).
+    cliToolScope: input.selectedCliToolIds,
     allowRisky: input.allowRisky === true,
     approval: input.approval ?? null,
     projectPath: input.projectPath ?? null,
@@ -6821,6 +7019,10 @@ function resolveBrokerPresentation(
 
 async function executeNativeFabricHelperControl(input: {
   userId: string
+  agentId?: string | null
+  sessionId?: string | null
+  messageId?: string | null
+  actorType?: ControlActorType
   controlId: string
   payload: Record<string, any>
   backend: NativeExecutionBackend
@@ -6828,9 +7030,14 @@ async function executeNativeFabricHelperControl(input: {
   if (input.controlId === FABRIC_FETCH_ZIP_CONTROL_ID) {
     return await nativeFetchZip({
       userId: input.userId,
+      agentId: input.agentId,
+      sessionId: input.sessionId,
+      messageId: input.messageId,
+      actorType: input.actorType,
       zipId: typeof input.payload.zipId === 'string' ? input.payload.zipId : '',
       includeContent: input.payload.includeContent,
-      maxChars: typeof input.payload.maxChars === 'number' ? input.payload.maxChars : undefined
+      maxChars: input.payload.maxChars,
+      offset: input.payload.offset
     })
   }
 
@@ -6890,7 +7097,10 @@ function mapAgentBrowserSearchResult(
 async function nativeBatshitToolSearch(input: BatshitToolSearchInput & {
   userId: string
   agentId?: string | null
+  /** BL-186 — a delegated run's own id: the artifact family's allowlists are judged by it. */
+  controlScopeAgentId?: string | null
   agentMetadata?: Record<string, any> | null
+  mcpGatewayScope?: string[] | null
   selectedGateways?: string[]
   selectedCliToolIds?: string[]
   dcmDisplaySettings?: AgentDcmDisplaySettings | null
@@ -6925,6 +7135,7 @@ async function nativeBatshitToolSearch(input: BatshitToolSearchInput & {
         limit: normalizedLimit,
         includeSchema,
         selectedGateways: input.selectedGateways,
+        mcpGatewayScope: input.mcpGatewayScope,
         dcmDisplaySettings: input.dcmDisplaySettings ?? null,
         projectPath: input.projectPath ?? null,
         gatewayToolsCache: input.gatewayToolsCache
@@ -6953,7 +7164,7 @@ async function nativeBatshitToolSearch(input: BatshitToolSearchInput & {
     if (family === 'artifact') {
       const found = await findControls({
         userId: input.userId,
-        agentId: input.agentId ?? undefined,
+        agentId: input.controlScopeAgentId ?? input.agentId ?? undefined,
         query,
         runtimeMode: input.runtimeMode,
         includeSchema,
@@ -7026,10 +7237,14 @@ async function nativeBatshitToolSearch(input: BatshitToolSearchInput & {
 }
 
 async function nativeBatshitToolUse(input: BatshitToolUseInput & {
+  /** Server-owned identity; never accepted from model input. */
+  processOwner?: HostCommandOwner
   userId: string
   agentId?: string | null
+  messageId?: string | null
   agentMetadata?: Record<string, any> | null
   sessionId?: string
+  mcpGatewayScope?: string[] | null
   selectedGateways?: string[]
   selectedCliToolIds?: string[]
   dcmDisplaySettings?: AgentDcmDisplaySettings | null
@@ -7057,6 +7272,8 @@ async function nativeBatshitToolUse(input: BatshitToolUseInput & {
   actorType: ControlActorType
   /** SA-117 F-P2-1 — the call arrived on a Subagent or Worker run's credential. */
   delegatedRun?: boolean
+  /** BL-186 — that run's own id (the credential's `scopeAgentId`), whose allowlists apply. */
+  scopeAgentId?: string | null
   /**
    * The server-owned Stop of the reply this call belongs to. Agent Browser and saved CLI
    * runners receive it separately from model-supplied tool input and approval authority.
@@ -7092,13 +7309,16 @@ async function nativeBatshitToolUse(input: BatshitToolUseInput & {
       toolName: parsed.target,
       params: payload,
       selectedGateways: input.selectedGateways,
+      mcpGatewayScope: input.mcpGatewayScope,
       dcmDisplaySettings: input.dcmDisplaySettings ?? null,
       projectPath: input.projectPath ?? null,
-      gatewayToolsCache: input.gatewayToolsCache
+      gatewayToolsCache: input.gatewayToolsCache,
+      abortSignal: input.abortSignal
     })
   } else if (parsed.family === 'cli') {
     routed = await nativeCliToolUse({
       userId: input.userId,
+      processOwner: input.processOwner,
       agentId: input.agentId ?? null,
       sessionId: input.sessionId,
       toolId: parsed.target,
@@ -7137,6 +7357,10 @@ async function nativeBatshitToolUse(input: BatshitToolUseInput & {
       parsed.family === 'fabric' && isControlIdAllowedByList(parsed.target, allowedControlIds)
         ? await executeNativeFabricHelperControl({
             userId: input.userId,
+            agentId: input.agentId,
+            sessionId: input.sessionId,
+            messageId: input.messageId,
+            actorType: input.actorType,
             controlId: parsed.target,
             payload,
             backend: input.executionBackend ?? getDefaultNativeExecutionBackend()
@@ -7165,8 +7389,13 @@ async function nativeBatshitToolUse(input: BatshitToolUseInput & {
             approval: input.approvalGrant ?? undefined,
             actorType: input.actorType,
             delegatedRun: input.delegatedRun === true,
+            scopeAgentId: input.scopeAgentId ?? null,
             selectedGateways: input.selectedGateways,
-            allowedControlIds
+            mcpGatewayScope: input.mcpGatewayScope,
+            allowedControlIds,
+            // BL-454 review: `sys.mcp.dynamic.use` hands it to the gateway call. Only a real
+            // signal counts, because the model's input is spread into this call.
+            abortSignal: input.abortSignal instanceof AbortSignal ? input.abortSignal : undefined
           })
     }
   } else {
@@ -7182,14 +7411,14 @@ async function nativeBatshitToolUse(input: BatshitToolUseInput & {
     })
   }
 
-  return {
+  return propagateCommandModelCapture(routed, {
     ...(routed ?? {}),
     ref: input.ref,
     family: parsed.family,
     target: parsed.target,
     operationKind,
     rendererFamily
-  }
+  })
 }
 
 function formatBatshitToolSearchModelOutput() {
@@ -7286,7 +7515,11 @@ function formatBrokerFetchZipModelValue(output: Record<string, any>): string | n
       ? [`description: ${payload.description.trim()}`]
       : []),
     ...(typeof payload.tokens === 'number' ? [`tokens: ${payload.tokens}`] : []),
-    ...(payload.contentTruncated === true ? ['content_truncated: true'] : [])
+    ...(typeof payload.offset === 'number' ? [`offset: ${payload.offset}`] : []),
+    ...(typeof payload.contentLength === 'number' ? [`total_length: ${payload.contentLength}`] : []),
+    ...(payload.contentTruncated === true ? ['content_truncated: true'] : []),
+    ...(typeof payload.nextOffset === 'number' ? [`next_offset: ${payload.nextOffset}`] : []),
+    ...(typeof payload.readMore === 'string' ? [`read_more: ${payload.readMore}`] : [])
   ]
 
   if (typeof payload.content === 'string') {
@@ -8777,7 +9010,11 @@ async function nativeComfyUiObjectInfo(input: {
 
 async function nativeBashExecute(input: {
   userId?: string
+  agentId?: string | null
+  /** Trusted server context only; never read from command text or model input. */
+  processOwner?: HostCommandOwner
   sessionId?: string
+  messageId?: string | null
   projectPath?: string | null
   command: string
   cwd?: string | null
@@ -8806,6 +9043,12 @@ async function nativeBashExecute(input: {
    */
   abortSignal?: AbortSignal | null
 }): Promise<Record<string, any>> {
+  const agentId = typeof input.agentId === 'string' ? input.agentId.trim() : ''
+  const ownerPin = process.platform === 'win32' ? undefined : pinHostCommandOwner(input.processOwner ?? (
+    input.userId && agentId && !agentId.startsWith('subagent_cli')
+      ? { userId: input.userId, kind: 'agent', id: agentId }
+      : { userId: input.userId || 'host', kind: 'host', id: 'administration' }
+  ))
   const command = input.command?.trim() || ''
   const abortSignal = input.abortSignal ?? undefined
   const accessMode =
@@ -9046,9 +9289,29 @@ async function nativeBashExecute(input: {
     workspaceRoot: workspaceResolution.workspaceRoot
   })
 
-  const managedPatchCommand = isManagedApplyPatchCommand(command)
-  if (managedPatchCommand) {
-    const managedPatchDocument = extractManagedApplyPatchDocument(command)
+  const managedPatch = parseManagedApplyPatchCommand(command)
+  if (managedPatch.kind !== 'none') {
+    // BL-252: a command that runs apply_patch in any other shape (a test after the patch, input
+    // piped into it, a `cd` Batshit cannot follow) is refused before anything runs. No part of a
+    // command that names apply_patch ever reaches a shell; before, the other lines were dropped
+    // while the result said the command succeeded.
+    if (managedPatch.kind === 'refused') {
+      return {
+        success: false,
+        blocked: false,
+        errorCode: 'INVALID_INPUT',
+        reason: managedPatch.reason,
+        error: managedPatch.reason,
+        command,
+        policyMode,
+        accessMode,
+        backend: effectiveBackend,
+        backendLabel: NATIVE_EXECUTION_BACKEND_LABELS[effectiveBackend],
+        cwd: cwdResolution.cwd,
+        workspaceRoot: workspaceResolution.workspaceRoot
+      }
+    }
+    const managedPatchDocument = managedPatch.document
     if (!managedPatchDocument) {
       return {
         success: false,
@@ -9068,6 +9331,35 @@ async function nativeBashExecute(input: {
       }
     }
 
+    // BL-244: a `cd <folder>` before the patch is followed, so relative patch paths resolve in that
+    // folder. It must exist and resolve (symlinks followed) inside the workspace root; every patch
+    // target is still checked on its own in `executeManagedApplyPatch`.
+    let patchCwd = cwdResolution.cwd
+    if (managedPatch.cdPath !== null) {
+      const folder = await resolveManagedApplyPatchFolder({
+        cdPath: managedPatch.cdPath,
+        cwd: cwdResolution.cwd,
+        workspaceRoot: workspaceResolution.workspaceRoot
+      })
+      if ('reason' in folder) {
+        return {
+          success: false,
+          blocked: folder.blocked,
+          errorCode: folder.errorCode,
+          reason: folder.reason,
+          error: folder.reason,
+          command,
+          policyMode,
+          accessMode,
+          backend: effectiveBackend,
+          backendLabel: NATIVE_EXECUTION_BACKEND_LABELS[effectiveBackend],
+          cwd: cwdResolution.cwd,
+          workspaceRoot: workspaceResolution.workspaceRoot
+        }
+      }
+      patchCwd = folder.cwd
+    }
+
     const parsedPatch = parseManagedApplyPatchDocument(managedPatchDocument)
     if (!parsedPatch.success) {
       const reason = parsedPatch.message || 'Invalid apply_patch payload.'
@@ -9082,7 +9374,7 @@ async function nativeBashExecute(input: {
         accessMode,
         backend: effectiveBackend,
         backendLabel: NATIVE_EXECUTION_BACKEND_LABELS[effectiveBackend],
-        cwd: cwdResolution.cwd,
+        cwd: patchCwd,
         workspaceRoot: workspaceResolution.workspaceRoot
       }
     }
@@ -9104,7 +9396,7 @@ async function nativeBashExecute(input: {
           accessMode,
           backend: effectiveBackend,
           backendLabel: NATIVE_EXECUTION_BACKEND_LABELS[effectiveBackend],
-          cwd: cwdResolution.cwd,
+          cwd: patchCwd,
           workspaceRoot: workspaceResolution.workspaceRoot
         }
       }
@@ -9112,7 +9404,7 @@ async function nativeBashExecute(input: {
 
     const protectedSystemSkillReason = getProtectedSystemSkillWriteViolationReason({
       command,
-      cwd: cwdResolution.cwd,
+      cwd: patchCwd,
       touchedPaths: parsedPatch.touchedPaths,
       workspaceRoot: workspaceResolution.workspaceRoot
     })
@@ -9127,14 +9419,14 @@ async function nativeBashExecute(input: {
         accessMode,
         backend: effectiveBackend,
         backendLabel: NATIVE_EXECUTION_BACKEND_LABELS[effectiveBackend],
-        cwd: cwdResolution.cwd,
+        cwd: patchCwd,
         workspaceRoot: workspaceResolution.workspaceRoot
       }
     }
 
     const protectedBatshitRepoReason = getProtectedBatshitRepoWriteViolationReason({
       command,
-      cwd: cwdResolution.cwd,
+      cwd: patchCwd,
       touchedPaths: parsedPatch.touchedPaths,
       workspaceRoot: workspaceResolution.workspaceRoot
     })
@@ -9149,7 +9441,7 @@ async function nativeBashExecute(input: {
         accessMode,
         backend: effectiveBackend,
         backendLabel: NATIVE_EXECUTION_BACKEND_LABELS[effectiveBackend],
-        cwd: cwdResolution.cwd,
+        cwd: patchCwd,
         workspaceRoot: workspaceResolution.workspaceRoot
       }
     }
@@ -9158,7 +9450,7 @@ async function nativeBashExecute(input: {
     try {
       const execution = await executeManagedApplyPatch({
         operations: parsedPatch.operations,
-        cwd: cwdResolution.cwd,
+        cwd: patchCwd,
         workspaceRoot: workspaceResolution.workspaceRoot
       })
       const mapping = mapBashCommandToRendererTool(command)
@@ -9178,7 +9470,7 @@ async function nativeBashExecute(input: {
         accessMode,
         backend: effectiveBackend,
         backendLabel: NATIVE_EXECUTION_BACKEND_LABELS[effectiveBackend],
-        cwd: cwdResolution.cwd,
+        cwd: patchCwd,
         workspaceRoot: workspaceResolution.workspaceRoot,
         mappedToolName: mapping.toolName,
         mappedToolInput: {
@@ -9209,7 +9501,7 @@ async function nativeBashExecute(input: {
         accessMode,
         backend: effectiveBackend,
         backendLabel: NATIVE_EXECUTION_BACKEND_LABELS[effectiveBackend],
-        cwd: cwdResolution.cwd,
+        cwd: patchCwd,
         workspaceRoot: workspaceResolution.workspaceRoot
       }
     }
@@ -9257,6 +9549,9 @@ async function nativeBashExecute(input: {
     }
   }
 
+  // Resolve on the machine executing the command, once for this call (including any browser
+  // recovery commands). A command failure never selects another shell and repeats side effects.
+  let localShell: string | undefined
   const executeWithBackend = async (
     commandValue: string
   ): Promise<
@@ -9319,15 +9614,28 @@ async function nativeBashExecute(input: {
       }
     }
 
-    const run = await runBashCommand({
-      command: commandValue,
-      cwd: cwdResolution.cwd,
-      timeoutMs: effectiveTimeoutMs,
-      maxOutputChars,
-      env: commandEnv,
-      abortSignal
-    })
-    return { ok: true, run }
+    try {
+      localShell ??= await resolveLocalCommandShell()
+      const run = await runBashCommand({
+        command: commandValue,
+        shell: localShell,
+        cwd: cwdResolution.cwd,
+        timeoutMs: effectiveTimeoutMs,
+        maxOutputChars,
+        env: commandEnv,
+        abortSignal,
+        ownerPin,
+        sessionId: input.sessionId,
+        messageId: input.messageId
+      })
+      return { ok: true, run }
+    } catch (error) {
+      return {
+        ok: false,
+        code: 'BACKEND_UNAVAILABLE',
+        reason: `Local command could not start${localShell ? ` with ${localShell}` : ''}: ${error instanceof Error ? error.message : String(error)}`
+      }
+    }
   }
 
   let sandboxName: string | null = null
@@ -9505,10 +9813,11 @@ async function nativeBashExecute(input: {
     }
   }
 
-  return {
+  return propagateCommandModelCapture(run, {
     success: run.exitCode === 0 && run.timedOut === false && !run.stopped,
     blocked: false,
     command: run.command,
+    ...(run.shell ? { shell: run.shell } : {}),
     stdout: run.stdout,
     stderr: run.stderr,
     exitCode: run.exitCode,
@@ -9532,7 +9841,7 @@ async function nativeBashExecute(input: {
     ...(commandToRun !== command ? { requestedCommand: command } : {}),
     ...(agentBrowserMetadata ? { agentBrowser: agentBrowserMetadata } : {}),
     ...(modelImageUrl ? { modelImageUrl } : {})
-  }
+  })
 }
 
 async function nativeAgentBrowserFind(input: {
@@ -9695,9 +10004,16 @@ async function nativeAgentBrowserUse(input: {
 
   const params = input.params && typeof input.params === 'object' ? input.params : {}
   const dockerSidecar = availability.supportLevel === 'docker-sidecar'
+  if (dockerSidecar && (availability.sidecarRevision ?? 0) < AGENT_BROWSER_SIDECAR_CAPTURE_REVISION) {
+    return {
+      success: false,
+      toolName: command.id,
+      supportLevel: 'docker-sidecar',
+      error: 'Docker Agent Browser sidecar is too old to retain full command output. Rebuild the agent-browser sidecar before running commands.'
+    }
+  }
   // The Docker sidecar hears a Stop from its revision 2 on; an older one is not handed one mid-run.
-  const sidecarHearsStop =
-    dockerSidecar && (availability.sidecarRevision ?? 0) >= AGENT_BROWSER_SIDECAR_STOP_REVISION
+  const sidecarHearsStop = dockerSidecar && agentBrowserSidecarHearsStop(availability.sidecarRevision)
   const requestedRuntimeMode =
     normalizeAgentBrowserRuntimeMode(params.runtimeMode) ??
     input.settings?.runtimeMode ??
@@ -10081,7 +10397,7 @@ async function nativeAgentBrowserUse(input: {
     }
   }
 
-  return {
+  return propagateCommandModelCapture(run, {
     success: successFromPayload && run.timedOut === false,
     ...(stopped ? { stopped: true, reason: STOPPED_COMMAND_REASON } : {}),
     toolName: command.id,
@@ -10128,7 +10444,7 @@ async function nativeAgentBrowserUse(input: {
       stdout: run.stdout,
       stderr: run.stderr
     }
-  }
+  })
 }
 
 const NATIVE_AUTOMATION_ACTION_SCHEMA = z.enum(NATIVE_AUTOMATION_ACTIONS)
@@ -10200,6 +10516,7 @@ const NATIVE_AUTOMATION_INPUT_SCHEMAS = {
     path: z.string().trim().optional(),
     args: z.array(z.string()).max(MAX_SKILL_SCRIPT_ARGS).optional(),
     maxChars: z.number().int().min(64).max(MAX_SKILL_REFERENCE_CHARS).optional(),
+    offset: z.number().int().min(0).optional(),
     cwd: z.string().trim().optional(),
     timeoutMs: z.number().int().min(MIN_BASH_TIMEOUT_MS).max(MAX_BASH_TIMEOUT_MS).optional(),
     maxOutputChars: z.number().int().min(1_000).max(MAX_BASH_OUTPUT_CHARS).optional()
@@ -10309,7 +10626,7 @@ function resolveBatshitToolBrokerFamiliesForAutomation(
   ) {
     if (!families.includes('fabric')) families.push('fabric')
   }
-  // SA-120 P2: the Jev Juice judgment tool opens `fabric` under the same conditions.
+  // SA-120 P2: the Judge Juice judgment tool opens `fabric` under the same conditions.
   if (
     settings.batshitToolsEnabled &&
     context.actor_type === 'primary' &&
@@ -10585,6 +10902,14 @@ function normalizeNativeSkillAutomationInput(input: unknown): unknown {
     argumentsValueInput?.max_chars
   ])
 
+  const offset = firstFiniteNumber([
+    source.offset,
+    nestedInput?.offset,
+    argumentsInput?.offset,
+    valueInput?.offset,
+    argumentsValueInput?.offset
+  ])
+
   const cwd = firstNonEmptyString([
     source.cwd,
     nestedInput?.cwd,
@@ -10639,6 +10964,7 @@ function normalizeNativeSkillAutomationInput(input: unknown): unknown {
     ...(path ? { path } : {}),
     ...(args ? { args } : {}),
     ...(maxChars !== undefined ? { maxChars } : {}),
+    ...(offset !== undefined ? { offset } : {}),
     ...(cwd ? { cwd } : {}),
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     ...(maxOutputChars !== undefined ? { maxOutputChars } : {})
@@ -10924,6 +11250,7 @@ export function mapControlUseErrorToNativeAutomationErrorCode(
     case 'CONTROL_NOT_EXECUTABLE':
       return 'INVALID_INPUT'
     case 'CONTROL_NOT_ALLOWED':
+    case 'CONTROL_CANCELLATION_REQUIRED':
     // Same reason as the HTTP status mapping: a pause and a group refusal are policy, and
     // `BACKEND_UNAVAILABLE` reads to the model as "the server is down, try again".
     // SA-116 retired `CONTROL_RISK_NEEDS_HUMAN_TURN` and kept the rule for both successors.
@@ -11033,7 +11360,55 @@ function evaluateNonInteractiveAutomationBashPolicy(options: {
   }
 }
 
+/**
+ * BL-878 — what the dispatch tells a Codex or Claude agent whose call it refuses. Two doors start
+ * a process under Batshit's rules, and the managed CLI lane is offered neither (the named rule is
+ * `CLI_LANE_GETS_BATSHIT_BASH`, in `mode4InternalTools.ts`): each sentence names the cause and the
+ * next step. The Bash sentence is also pinned by the helper's own end-to-end proofs.
+ */
+export const CLI_LANE_BASH_REFUSAL_MESSAGE =
+  "Batshit's Bash helper is not offered to Codex and Claude agents. Use your own shell tool."
+export const CLI_LANE_SKILL_SCRIPT_REFUSAL_MESSAGE =
+  'Batshit does not run skill scripts for Codex and Claude agents. Read the skill with native_skill (invoke or read), then run its script with your own shell tool.'
+
+/**
+ * BL-686 — the saved CLI tools one dispatch call may reach, resolved once at the door.
+ *
+ * The scope is the server's: a managed run's credential list on the `agent` lane (`[]` when an
+ * old credential carries none), a Subagent actor's own saved list, or the governing agent's
+ * saved list (then the user's Tool Grid list). The payload's `selectedToolIds` only narrows it.
+ * The broker and the CLI helpers below take the answer as a bound list, never the model's.
+ */
+async function resolveDispatchCliToolScope(
+  input: { userId: string; actorType?: ControlActorType; cliToolScope?: string[] | null },
+  context: { actor_type?: unknown },
+  options: {
+    governingAgentId?: string | null
+    subagentRecord?: Record<string, any> | null
+    selectedToolIds?: string[]
+  }
+): Promise<{ toolIds: string[] }> {
+  return await resolveCliToolSelectionScope({
+    userId: input.userId,
+    ...(context.actor_type === 'subagent'
+      ? { agentMetadata: options.subagentRecord ?? null }
+      : { agentId: options.governingAgentId || null }),
+    ...(input.actorType === 'agent'
+      ? { cliToolScope: input.cliToolScope ?? [] }
+      : input.cliToolScope !== undefined
+        ? { cliToolScope: input.cliToolScope }
+        : {}),
+    selectedToolIds: options.selectedToolIds
+  })
+}
+
 export async function dispatchNativeAutomationPackAction(input: {
+  /** Authenticated run owner; never read from payloadInput or context. */
+  processOwner?: HostCommandOwner
+  /** Server-vouched run snapshot; never read from payloadInput/context. */
+  mcpGatewayScope?: string[] | null
+  /** Server-vouched saved CLI tool list of a managed run (BL-686); never read from the payload. */
+  cliToolScope?: string[] | null
   userId: string
   action: unknown
   payloadInput: unknown
@@ -11047,6 +11422,8 @@ export async function dispatchNativeAutomationPackAction(input: {
    */
   actorType?: ControlActorType
   delegatedRun?: boolean
+  /** Delegated run's own Bash toggle from its authenticated credential. */
+  delegatedBashEnabled?: boolean
   /**
    * BL-75 — the run credential's `scopeAgentId` on the `agent` lane: the Subagent or Worker
    * whose skill access governs a delegated run's `native_skill`. Absent on every other lane.
@@ -11102,6 +11479,22 @@ export async function dispatchNativeAutomationPackAction(input: {
   }
   const context = parsedContext.value
 
+  // BL-878 (Josh, 2026-09-28): the managed CLI lane has its own Bash, so Batshit's is refused for
+  // it, before any settings read that could grant it. The lane is the run credential's: `input
+  // .actorType` is `auth.auth` from the route, and only `CodexBridge` and `ClaudeBridge` mint an
+  // agent-lane credential. `context.mode` and every other body field are claims, never the test.
+  // Session and service callers, the n8n Workflow Subagent automation pack, and the API lane's own
+  // tool are not on this lane and are not changed.
+  if (action === 'bash_execute' && input.actorType === 'agent' && !CLI_LANE_GETS_BATSHIT_BASH) {
+    return buildNativeAutomationResult({
+      success: false,
+      action,
+      backend: getDefaultNativeExecutionBackend(),
+      context,
+      error: { code: 'ACTION_DISABLED', message: CLI_LANE_BASH_REFUSAL_MESSAGE }
+    })
+  }
+
   const governingAgentId =
     context.actor_type === 'subagent' ? context.parent_agent_id || '' : context.agent_id
   const agentRecord = (await redis.get(`agent:${governingAgentId}`)) as
@@ -11147,7 +11540,30 @@ export async function dispatchNativeAutomationPackAction(input: {
     }
   }
 
+  if ((input.delegatedRun === true && !input.processOwner) ||
+    (input.processOwner && (input.processOwner.userId !== input.userId || input.processOwner.kind === 'host'))) {
+    return buildNativeAutomationResult({
+      success: false,
+      action,
+      backend: getDefaultNativeExecutionBackend(),
+      context,
+      error: { code: 'INVALID_CONTEXT', message: 'The command run has no verified process owner. Start a new run and retry.' }
+    })
+  }
+  const processOwner: HostCommandOwner = input.processOwner ?? (
+    context.actor_type === 'subagent' && subagentRecord?.user_id === input.userId
+      ? { userId: input.userId, kind: 'subagent', id: context.agent_id }
+      : { userId: input.userId, kind: 'agent', id: governingAgentId }
+  )
+
   const nativeSettings = resolveNativeToolSettings(effectiveProviderSettings)
+  if (input.delegatedRun === true) {
+    // A parent's settings provide execution context, never a grant for delegated Bash.
+    // The own-run snapshot and parent toggle must both allow it; older records deny it.
+    nativeSettings.bashEnabled = nativeSettings.bashEnabled &&
+      input.delegatedBashEnabled === true &&
+      resolveNativeToolSettings(primaryProviderSettings).bashEnabled
+  }
   const backend = nativeSettings.executionBackend
 
   if (!resolveNativeAutomationToggleState(action, nativeSettings)) {
@@ -11178,6 +11594,49 @@ export async function dispatchNativeAutomationPackAction(input: {
     })
   }
 
+  // BL-878: a skill `script_run` starts a process under Batshit's rules, the second door, so the
+  // agent lane is refused here too, before any skill runtime, cache, or process work (Cooper's
+  // condition). It reads the action AS PARSED: `parseNativeAutomationInput` has already folded the
+  // wrapped forms (`input`, `arguments`, `value`, a JSON text) and the aliases (`run`,
+  // `run_script`, `script-run`, in any case) into `script_run` through `normalizeNativeSkillToolAction`,
+  // which is also what `executeNativeSkillToolAction` acts on. There is no second parser here.
+  if (
+    action === 'native_skill' &&
+    input.actorType === 'agent' &&
+    !CLI_LANE_GETS_BATSHIT_BASH &&
+    normalizeNativeSkillToolAction(parsedInput.value.action) === 'script_run'
+  ) {
+    return buildNativeAutomationResult({
+      success: false,
+      action,
+      backend,
+      context,
+      error: { code: 'ACTION_DISABLED', message: CLI_LANE_SKILL_SCRIPT_REFUSAL_MESSAGE }
+    })
+  }
+
+  // BL-933: managed CLI credentials must use the existing Fabric consent path. This
+  // legacy automation action has no verified approval-card/resume context. Keep its
+  // toggle and input checks above, and its session/service/n8n contract unchanged.
+  // actorType is supplied by authentication; payload approval flags cannot grant this.
+  if (
+    input.actorType === 'agent' &&
+    (action === 'runtime_addon_start' || action === 'runtime_addon_stop')
+  ) {
+    const controlRef = `fabric:sys.runtime_addon.${action === 'runtime_addon_start' ? 'start' : 'stop'}`
+    return buildNativeAutomationResult({
+      success: false,
+      action,
+      backend,
+      context,
+      error: {
+        code: 'ACTION_DISABLED',
+        message: `Managed CLI runs cannot ${action === 'runtime_addon_start' ? 'start' : 'stop'} runtime add-ons directly. A Primary Agent must request ${controlRef} through Batshit Tools and wait for the user's approval.`,
+        details: { controlRef }
+      }
+    })
+  }
+
   const resolvedProjectPath =
     (typeof input.projectPath === 'string' && input.projectPath.trim().length > 0
       ? input.projectPath.trim()
@@ -11185,22 +11644,20 @@ export async function dispatchNativeAutomationPackAction(input: {
     (await resolveSessionProjectPath(context.session_id))
 
   if (action === 'batshit_tool_search' || action === 'batshit_tool_use') {
-    const subagentGatewayScope =
-      context.actor_type === 'subagent'
-        ? await resolveDynamicMcpGatewayScope({
-            userId: input.userId,
-            agentMetadata: subagentRecord ?? null,
-            selectedGateways: parsedInput.value.selectedGateways
-          })
-        : null
-    const subagentCliScope =
-      context.actor_type === 'subagent'
-        ? await resolveCliToolSelectionScope({
-            userId: input.userId,
-            agentMetadata: subagentRecord ?? null,
-            selectedToolIds: parsedInput.value.selectedToolIds
-          })
-        : null
+    const brokerGatewayScope = await resolveDynamicMcpGatewayScope({
+      userId: input.userId,
+      agentId: context.actor_type === 'subagent' ? undefined : governingAgentId,
+      agentMetadata: context.actor_type === 'subagent' ? subagentRecord ?? null : undefined,
+      mcpGatewayScope: input.actorType === 'agent' ? input.mcpGatewayScope ?? [] : input.mcpGatewayScope,
+      selectedGateways: parsedInput.value.selectedGateways
+    })
+    // BL-686: the model's `selectedToolIds` only narrows the governing agent's (or the
+    // Subagent's) saved list, or a managed run's credential list; it never replaces it.
+    const brokerCliScope = await resolveDispatchCliToolScope(input, context, {
+      governingAgentId,
+      subagentRecord,
+      selectedToolIds: parsedInput.value.selectedToolIds
+    })
     // SA-104 P3: per-agent memory enablement, PRIMARY actors only. Subagents never get
     // memory refs — subagent memory access is a deferred product decision and memory is
     // PA-owned state (see BROKER_FABRIC_MEMORY_CONTROL_IDS).
@@ -11211,7 +11668,7 @@ export async function dispatchNativeAutomationPackAction(input: {
       context.actor_type === 'primary' && resolveAgentDmsEnabled(agentRecord)
     // SA-115 P2: the schedule family, on the same per-agent switch as DMs.
     const brokerScheduleControlsEnabled = brokerDmControlsEnabled
-    // SA-120 P2: the Jev Juice judgment tool, on its own per-agent switch.
+    // SA-120 P2: the Judge Juice judgment tool, on its own per-agent switch.
     const brokerJudgeControlsEnabled =
       context.actor_type === 'primary' && resolveAgentJevJudgeToolEnabled(agentRecord)
     const brokerAllowedFamilies = resolveBatshitToolBrokerFamiliesForAutomation(nativeSettings, context, {
@@ -11242,14 +11699,8 @@ export async function dispatchNativeAutomationPackAction(input: {
         judgeControlsEnabled: brokerJudgeControlsEnabled
       })
     )
-    const brokerSelectedGateways =
-      context.actor_type === 'subagent'
-        ? subagentGatewayScope?.resolvedGateways
-        : parsedInput.value.selectedGateways
-    const brokerSelectedCliToolIds =
-      context.actor_type === 'subagent'
-        ? subagentCliScope?.toolIds
-        : parsedInput.value.selectedToolIds
+    const brokerSelectedGateways = brokerGatewayScope.resolvedGateways
+    const brokerSelectedCliToolIds = brokerCliScope.toolIds
     const brokerDcmDisplaySettings =
       context.actor_type === 'subagent'
         ? ((subagentRecord?.dcmDisplaySettings ??
@@ -11263,6 +11714,7 @@ export async function dispatchNativeAutomationPackAction(input: {
         userId: input.userId,
         agentId: context.actor_type === 'subagent' ? context.agent_id : governingAgentId || null,
         agentMetadata: context.actor_type === 'subagent' ? subagentRecord ?? null : null,
+        mcpGatewayScope: brokerSelectedGateways,
         selectedGateways: brokerSelectedGateways,
         selectedCliToolIds: brokerSelectedCliToolIds,
         dcmDisplaySettings: brokerDcmDisplaySettings,
@@ -11295,9 +11747,12 @@ export async function dispatchNativeAutomationPackAction(input: {
         userId: input.userId,
         actorType: input.actorType ?? 'unknown',
         delegatedRun: input.delegatedRun === true,
+        processOwner,
+        scopeAgentId: input.scopeAgentId ?? null,
         agentId: context.actor_type === 'subagent' ? context.agent_id : governingAgentId || null,
         agentMetadata: context.actor_type === 'subagent' ? subagentRecord ?? null : null,
         sessionId: context.session_id,
+        mcpGatewayScope: brokerSelectedGateways,
         selectedGateways: brokerSelectedGateways,
         selectedCliToolIds: brokerSelectedCliToolIds,
         dcmDisplaySettings: brokerDcmDisplaySettings,
@@ -11410,6 +11865,7 @@ export async function dispatchNativeAutomationPackAction(input: {
 
     const result = await nativeBashExecute({
       userId: input.userId,
+      processOwner,
       sessionId: context.session_id,
       projectPath: resolvedProjectPath,
       command: parsedInput.value.command,
@@ -11441,11 +11897,11 @@ export async function dispatchNativeAutomationPackAction(input: {
           action,
           backend,
           context,
-          data: {
+          data: propagateCommandModelCapture(result, {
             ...result,
             failureMessage: summarizeNativeBashExecutionFailure(result),
             policyProfile
-          }
+          })
         })
       }
 
@@ -11489,32 +11945,26 @@ export async function dispatchNativeAutomationPackAction(input: {
       action,
       backend,
       context,
-      data: {
+      data: propagateCommandModelCapture(result, {
         ...result,
         policyProfile
-      }
+      })
     })
   }
 
   if (action === 'cli_tool_find') {
-    const subagentCliScope =
-      context.actor_type === 'subagent'
-        ? await resolveCliToolSelectionScope({
-            userId: input.userId,
-            agentMetadata: subagentRecord ?? null,
-            selectedToolIds: parsedInput.value.selectedToolIds
-          })
-        : null
+    const cliScope = await resolveDispatchCliToolScope(input, context, {
+      governingAgentId,
+      subagentRecord,
+      selectedToolIds: parsedInput.value.selectedToolIds
+    })
     const result = await nativeCliToolFind({
       userId: input.userId,
       agentId: context.actor_type === 'subagent' ? null : governingAgentId || null,
       query: parsedInput.value.query,
       limit: parsedInput.value.limit,
       includeSchema: parsedInput.value.includeSchema,
-      selectedCliToolIds:
-        context.actor_type === 'subagent'
-          ? subagentCliScope?.toolIds
-          : parsedInput.value.selectedToolIds
+      selectedCliToolIds: cliScope.toolIds
     })
     return buildNativeAutomationResult({
       success: true,
@@ -11526,16 +11976,14 @@ export async function dispatchNativeAutomationPackAction(input: {
   }
 
   if (action === 'cli_tool_use') {
-    const subagentCliScope =
-      context.actor_type === 'subagent'
-        ? await resolveCliToolSelectionScope({
-            userId: input.userId,
-            agentMetadata: subagentRecord ?? null,
-            selectedToolIds: parsedInput.value.selectedToolIds
-          })
-        : null
+    const cliScope = await resolveDispatchCliToolScope(input, context, {
+      governingAgentId,
+      subagentRecord,
+      selectedToolIds: parsedInput.value.selectedToolIds
+    })
     const result = await nativeCliToolUse({
       userId: input.userId,
+      processOwner,
       actorType: input.actorType ?? 'unknown',
       agentId: context.actor_type === 'subagent' ? context.agent_id : governingAgentId || null,
       sessionId: context.session_id,
@@ -11544,10 +11992,7 @@ export async function dispatchNativeAutomationPackAction(input: {
       allowRisky: parsedInput.value.allowRisky,
       abortSignal,
       projectPath: resolvedProjectPath,
-      selectedCliToolIds:
-        context.actor_type === 'subagent'
-          ? subagentCliScope?.toolIds
-          : parsedInput.value.selectedToolIds
+      selectedCliToolIds: cliScope.toolIds
     })
     // Stop and timeout are command outcomes, as they are for native Bash, not backend failures.
     if (result.success === false && result.stopped !== true && result.timedOut !== true) {
@@ -11698,6 +12143,7 @@ export async function dispatchNativeAutomationPackAction(input: {
       runtimeMode: context.mode,
       actorType: input.actorType ?? 'unknown',
       delegatedRun: input.delegatedRun === true,
+      scopeAgentId: input.scopeAgentId ?? null,
       allowedControlIds: Array.from(ARTIFACT_RUNTIME_ALLOWED_CONTROL_IDS)
     })
 
@@ -11855,6 +12301,7 @@ export async function dispatchNativeAutomationPackAction(input: {
     }
     const result = await executeNativeSkillToolAction({
       userId: input.userId,
+      processOwner,
       actor: skillActor.actor,
       settings: nativeSettings,
       sessionId: context.session_id,
@@ -11865,6 +12312,7 @@ export async function dispatchNativeAutomationPackAction(input: {
       path: parsedInput.value.path,
       args: parsedInput.value.args,
       maxChars: parsedInput.value.maxChars,
+      offset: parsedInput.value.offset,
       cwd: parsedInput.value.cwd,
       timeoutMs: parsedInput.value.timeoutMs,
       maxOutputChars: parsedInput.value.maxOutputChars,
@@ -11993,9 +12441,9 @@ function resolveDispatchSkillActor(args: {
     }
   }
   if (args.lane === 'n8n-callback' && args.contextActorType !== 'subagent') {
-    // n8n is never a Primary Agent type, and its callback token binds the PARENT agent, so a
-    // primary-shaped context here would load the parent's skills. A Workflow Subagent names
-    // itself (`actor_type: 'subagent'`), and its own list governs.
+    // n8n is never a Primary Agent type. BL-78 binds the workflow identity in the callback
+    // token and validates dispatch fields; skill access still requires a subagent actor,
+    // so primary-shaped callbacks cannot load the parent's skills.
     return {
       ok: false,
       message:
@@ -12028,10 +12476,13 @@ function resolveInProcessSkillActor(context: NativeToolContext): SkillRuntimeAct
 
 async function executeNativeSkillToolAction(input: {
   userId: string
+  processOwner?: HostCommandOwner
   settings: ResolvedNativeToolSettings
   sessionId?: string
   projectPath?: string | null
   bashApprovalRequestsEnabled: boolean
+  /** BL-410: a group member run, where a script that is not allow-listed gets the group reason. */
+  groupMemberRun?: boolean
   skillId: string
   /**
    * BL-75: whose skill access decides this load. Required, so every caller names one; see
@@ -12042,6 +12493,8 @@ async function executeNativeSkillToolAction(input: {
   path?: string
   args?: unknown
   maxChars?: number
+  /** `read` and `script_read`: where the window starts, in characters (find 1). */
+  offset?: number
   cwd?: string
   timeoutMs?: number
   maxOutputChars?: number
@@ -12057,7 +12510,8 @@ async function executeNativeSkillToolAction(input: {
       actor: input.actor,
       action,
       path: input.path,
-      maxChars: input.maxChars
+      maxChars: input.maxChars,
+      ...(input.offset !== undefined ? { offset: input.offset } : {})
     })
     if (result.success === true && (action === 'invoke' || action === 'read')) {
       return {
@@ -12129,7 +12583,15 @@ async function executeNativeSkillToolAction(input: {
       64,
       MAX_SKILL_SCRIPT_CHARS
     )
-    const decoded = readSkillBundleFileText(file, maxChars)
+    const offset = normalizeSkillReadOffset(input.offset)
+    if (!offset.ok) {
+      return { success: false, action, error: offset.error, availableScripts: scriptPaths }
+    }
+    const decoded = readSkillBundleFileText(file, maxChars, offset.offset)
+    const pastEnd = skillReadOffsetPastEndError(offset.offset, decoded.originalChars, file.path)
+    if (pastEnd) {
+      return { success: false, action, error: pastEnd, availableScripts: scriptPaths }
+    }
     return {
       success: true,
       action,
@@ -12141,7 +12603,15 @@ async function executeNativeSkillToolAction(input: {
       originalChars: decoded.originalChars,
       returnedChars: decoded.content.length,
       operationKind: 'skill_read',
-      rendererFamily: 'skill_read'
+      rendererFamily: 'skill_read',
+      ...partialSkillReadFields({
+        skillId: skill.id,
+        action: 'script_read',
+        path: file.path,
+        offset: decoded.offset,
+        returnedChars: decoded.content.length,
+        originalChars: decoded.originalChars
+      })
     }
   }
 
@@ -12178,8 +12648,9 @@ async function executeNativeSkillToolAction(input: {
       action,
       blocked: true,
       errorCode: 'POLICY_BLOCKED',
-      error:
-        'Blocked by Agent mode policy. Add this command to the allow list, switch Approval Policy to On Failure, or switch to Dangerous mode.',
+      error: input.groupMemberRun
+        ? GROUP_APPROVAL_UNAVAILABLE_REASON
+        : 'Blocked by Agent mode policy. Add this command to the allow list, switch Approval Policy to On Failure, or switch to Dangerous mode.',
       command,
       policyMode: input.settings.bashPolicyMode,
       accessMode: input.settings.bashAccessMode
@@ -12188,6 +12659,7 @@ async function executeNativeSkillToolAction(input: {
 
   const execution = await nativeBashExecute({
     userId: input.userId,
+    processOwner: input.processOwner,
     sessionId: input.sessionId,
     projectPath: input.projectPath ?? null,
     command,
@@ -12239,6 +12711,8 @@ const NATIVE_FABRIC_USE_PASSTHROUGH_BLOCKLIST = new Set<string>([
   'allowRisky',
   'allow_risky',
   'selectedGateways',
+  'mcpGatewayScope',
+  'mcp_gateway_scope',
   'selected_gateways',
   'gatewayToolsCache'
 ])
@@ -12319,6 +12793,11 @@ function readBrokerRefInput(raw: unknown): {
 export async function resolveBrokerRiskApprovalTarget(options: {
   userId: string
   agentId?: string | null
+  /**
+   * BL-186 review — a delegated run's own id. The risk profile judges the artifact allowlist
+   * (visibility and the `use.artifact.*` alias) by it, as `useControl` does; absent, `agentId`.
+   */
+  controlScopeAgentId?: string | null
   /** The model's raw `native_batshit_tool_use` input: `{ ref, input, dryRun, … }`. */
   input: unknown
   /** Absent means "do not narrow" — the persist path trusts the pause the policy already made. */
@@ -12403,7 +12882,7 @@ export async function resolveBrokerRiskApprovalTarget(options: {
 
   const profile = await resolveControlRiskProfile({
     userId: options.userId,
-    agentId: options.agentId ?? null,
+    agentId: options.controlScopeAgentId ?? options.agentId ?? null,
     runtimeMode: 'mode3',
     controlId: parsed.target,
     input: normalized,
@@ -12436,12 +12915,28 @@ export async function resolveBrokerRiskApprovalTarget(options: {
 export async function needsBrokerRiskApproval(options: {
   userId: string
   agentId?: string | null
+  /** BL-186 review — a delegated run's own id, for the risk profile only (see the target). */
+  controlScopeAgentId?: string | null
   sessionId?: string | null
   input: unknown
   allowedFamilies?: BatshitToolFamily[] | null
   fabricAllowedControlIds?: string[] | null
   selectedCliToolIds?: string[] | null
+  /** API approval callbacks omit SDK abortSignal; use this exact server-owned run. */
+  abortSignal?: AbortSignal
 }): Promise<boolean> {
+  const settingsRefused = () => {
+    const input = readBrokerRefInput(options.input)
+    if (!input) return false
+    let ref: ReturnType<typeof parseBatshitToolRef>
+    try { ref = parseBatshitToolRef(input.ref) } catch { return false }
+    if (ref.family !== 'fabric') return false
+    return Boolean(settingsControlAdmission({ controlId: ref.target, input: input.payload,
+      dryRun: input.dryRun, abortSignal: options.abortSignal }))
+  }
+  // A refused Settings call reaches execute for its typed refusal, never a
+  // consent card. This does not treat it as an approved/safe mutation.
+  if (settingsRefused()) return false
   let target: BrokerRiskApprovalTarget | null = null
   try {
     target = await resolveBrokerRiskApprovalTarget(options)
@@ -12449,8 +12944,11 @@ export async function needsBrokerRiskApproval(options: {
     // Fail closed: an unresolvable risk question pauses. `execute` then answers whatever it
     // was going to answer anyway, and the worst case is a card for a call that fails.
     console.warn('[NativeTools] Risk-approval policy could not resolve the ref:', error)
+    if (settingsRefused()) return false
     return true
   }
+  // Profile/window reads await: Stop can retire the exact run during them.
+  if (settingsRefused()) return false
   if (!target) return false
   if (!target.scopeKey) return true
 
@@ -12462,6 +12960,7 @@ export async function needsBrokerRiskApproval(options: {
     userId: options.userId,
     agentId: options.agentId ?? null
   })
+  if (settingsRefused()) return false
   if (woken.woken) return true
 
   const covered = await hasScopedRiskWindow({
@@ -12470,8 +12969,18 @@ export async function needsBrokerRiskApproval(options: {
     agentId: options.agentId ?? null,
     scopeKey: target.scopeKey
   })
-  return !covered
+  return settingsRefused() ? false : !covered
 }
+
+/**
+ * BL-410 — the one wording for a Bash command or skill script that would need an approval card
+ * in a group chat. A group member run raises no card (the group runner never resumes one, and a
+ * click would start a new round), so the command is refused and the agent is told what the user
+ * can do instead, like a risky control's group refusal (DL-116-10).
+ */
+export const GROUP_APPROVAL_UNAVAILABLE_REASON =
+  'Not run: this command needs the user\'s approval, and approval cards are not available in group chats. ' +
+  'Tell the user they can run it in a one-agent chat with this agent, or add the command to the allow list in Agent Settings.'
 
 export type NativeToolApprovalPolicy = (
   input: unknown
@@ -12479,6 +12988,8 @@ export type NativeToolApprovalPolicy = (
 
 export interface Mode3NativeToolSet {
   tools: Record<string, any>
+  /** The final server-resolved broker scope for this turn, before any model output is cut. */
+  fetchZipAvailable: boolean
   /**
    * AI SDK 7 call-level tool approval policies keyed by registered tool name.
    * Passed to streamText/generateText as `toolApproval` (the v6 tool-level
@@ -12489,11 +13000,23 @@ export interface Mode3NativeToolSet {
 
 export async function buildMode3NativeTools(context: NativeToolContext): Promise<Mode3NativeToolSet> {
   const settings = resolveNativeToolSettings(context.providerSettings)
-  const selectedGateways = normalizeStringArray(context.selectedGateways)
+  if (context.processOwner || normalizeOptionalString(context.scopeAgentId)) {
+    // API Subagents and Workers keep the parent as their audit identity. Their own
+    // saved Bash grant and the parent's restriction must both allow commands; a
+    // model preset, missing grant or missing parent record cannot supply authority.
+    const parentId = normalizeOptionalString(context.agentId)
+    const parentRecord = parentId ? await redis.get(`agent:${parentId}`) as Record<string, any> | null : null
+    settings.bashEnabled = settings.bashEnabled && !!context.processOwner &&
+      context.delegatedBashEnabled === true &&
+      parentRecord?.user_id === context.userId &&
+      resolveNativeToolSettings(parentRecord.provider_specific_settings ?? null).bashEnabled
+  }
+  const selectedGateways = normalizeStringArray(context.selectedGateways) ?? []
   const cliToolScope = await resolveCliToolSelectionScope({
     userId: context.userId,
     agentId: context.agentId ?? null,
-    selectedToolIds: normalizeStringArray(context.selectedCliToolIds)
+    // The in-process turn's server-resolved list (BL-686); absent reads the agent's saved list.
+    cliToolScope: normalizeStringArray(context.selectedCliToolIds)
   })
   const selectedCliToolIds = cliToolScope.toolIds
 
@@ -12501,6 +13024,9 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
   const toolApprovals: Record<string, NativeToolApprovalPolicy> = {}
   const resolvedSessionId = normalizeOptionalString(context.sessionId)
   const resolvedAgentId = normalizeOptionalString(context.agentId)
+  // BL-186: set only on an API Subagent or Worker run, whose `agentId` is the PARENT's. Its
+  // artifact allowlists are judged by this id, the one its DCM index lists them by.
+  const delegatedScopeAgentId = normalizeOptionalString(context.scopeAgentId)
   const gatewayToolsCache: GatewayToolsCache = new Map()
 
   /* ---------------------------------------------------------------- *
@@ -12547,9 +13073,12 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
   const executeBrokerScopedControlUse = async (
     input: ControlUseInput,
     wrapperAllowedControlIds: string[],
-    approval?: ControlApprovalGrant | null
+    approval?: ControlApprovalGrant | null,
+    abortSignal?: AbortSignal,
+    gatewayFilter?: string[]
   ) => {
     return await useControl({
+      abortSignal,
       userId: context.userId,
       agentId: context.agentId ?? undefined,
       sessionId: context.sessionId,
@@ -12561,12 +13090,26 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
       dryRun: input.dryRun,
       allowRisky: input.allowRisky,
       approval: approval ?? undefined,
-      selectedGateways,
-      allowedControlIds: wrapperAllowedControlIds
+      mcpGatewayScope: selectedGateways,
+      selectedGateways: gatewayFilter,
+      allowedControlIds: wrapperAllowedControlIds,
+      // BL-186: a delegated run is judged as its Subagent or Worker and may use exactly what this
+      // broker offers it. `agentId` stays the parent for the identity gate, approvals and audit.
+      ...(delegatedScopeAgentId
+        ? {
+            delegatedRun: true,
+            scopeAgentId: delegatedScopeAgentId,
+            delegatedAllowedControlIds: wrapperAllowedControlIds
+          }
+        : {})
     })
   }
 
+  // BL-410: a group member run raises no approval card (see `GROUP_APPROVAL_UNAVAILABLE_REASON`),
+  // so Agent mode there is policy-only: an allow-listed command runs, anything else is refused.
+  const groupMemberRun = context.groupMemberRun === true
   const bashApprovalRequestsEnabled =
+    !groupMemberRun &&
     settings.bashAccessMode === 'agent' &&
     (context.toolApprovalMode
       ? context.toolApprovalMode === 'all'
@@ -12587,8 +13130,10 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
     return access.ok
   }
 
-  toolApprovals.native_skill = async (input) =>
-    (await nativeSkillNeedsApproval(input)) ? 'user-approval' : undefined
+  if (!groupMemberRun) {
+    toolApprovals.native_skill = async (input) =>
+      (await nativeSkillNeedsApproval(input)) ? 'user-approval' : undefined
+  }
 
   tools.native_skill = tool({
     description:
@@ -12599,6 +13144,12 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
       path: z.string().optional(),
       args: z.array(z.string()).max(MAX_SKILL_SCRIPT_ARGS).optional(),
       maxChars: z.number().int().min(64).max(MAX_SKILL_SCRIPT_CHARS).optional(),
+      offset: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe('read and script_read: the character to start from (default 0). A partial read names the next offset.'),
       cwd: z.string().optional(),
       timeoutMs: z.number().int().min(MIN_BASH_TIMEOUT_MS).max(MAX_BASH_TIMEOUT_MS).optional(),
       maxOutputChars: z.number().int().min(1_000).max(MAX_BASH_OUTPUT_CHARS).optional()
@@ -12606,16 +13157,21 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
     execute: async (input, options) =>
       executeNativeSkillToolAction({
         userId: context.userId,
+        processOwner: context.processOwner ?? (context.agentId
+          ? { userId: context.userId, kind: 'agent', id: context.agentId }
+          : { userId: context.userId, kind: 'host', id: 'administration' }),
         actor: resolveInProcessSkillActor(context),
         settings,
         sessionId: context.sessionId,
         projectPath: context.projectPath ?? null,
         bashApprovalRequestsEnabled,
+        groupMemberRun,
         skillId: input.skillId,
         action: input.action ?? 'invoke',
         path: input.path,
         args: input.args,
         maxChars: input.maxChars,
+        offset: input.offset,
         cwd: input.cwd,
         timeoutMs: input.timeoutMs,
         maxOutputChars: input.maxOutputChars,
@@ -12676,13 +13232,12 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
         if ((output as any).action === 'read') {
           const pathLabel = typeof (output as any).path === 'string' ? (output as any).path : 'reference'
           const content = typeof (output as any).content === 'string' ? (output as any).content : ''
-          const truncated = (output as any).contentTruncated === true
           return {
             type: 'text',
             value: [
               `==== SKILL REFERENCE (${pathLabel}) ====`,
               content,
-              truncated ? '[truncated]' : '',
+              skillReadNoteLine(output as Record<string, unknown>),
               '==== END SKILL REFERENCE ===='
             ]
               .filter((line) => line !== '')
@@ -12703,13 +13258,12 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
         if ((output as any).action === 'script_read') {
           const pathLabel = typeof (output as any).path === 'string' ? (output as any).path : 'script'
           const content = typeof (output as any).content === 'string' ? (output as any).content : ''
-          const truncated = (output as any).contentTruncated === true
           return {
             type: 'text',
             value: [
               `==== SKILL SCRIPT (${pathLabel}) ====`,
               content,
-              truncated ? '[truncated]' : '',
+              skillReadNoteLine(output as Record<string, unknown>),
               '==== END SKILL SCRIPT ===='
             ]
               .filter((line) => line !== '')
@@ -12784,7 +13338,7 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
   const dmControlsEnabled = context.dmControlsEnabled === true
   // SA-115 P2: and the schedule family, on the same per-agent switch.
   const scheduleControlsEnabled = context.scheduleControlsEnabled === true
-  // SA-120 P2: and the Jev Juice judgment tool, on its own per-agent switch.
+  // SA-120 P2: and the Judge Juice judgment tool, on its own per-agent switch.
   const judgeControlsEnabled = context.judgeControlsEnabled === true
 
   // SA-096: shared with the compile path's broker-guidance gate so registered tools and
@@ -12812,6 +13366,8 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
       judgeControlsEnabled
     })
   )
+  const fetchZipAvailable = apiBrokerAllowedFamilies.includes('fabric') &&
+    apiBrokerFabricAllowedControlIds.has(FABRIC_FETCH_ZIP_CONTROL_ID)
 
   if (apiBrokerAllowedFamilies.length > 0) {
     tools.native_batshit_tool_search = tool({
@@ -12823,7 +13379,9 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
           ...withoutBrokerPlumbing(input),
           userId: context.userId,
           agentId: context.agentId ?? null,
-          selectedGateways,
+          controlScopeAgentId: delegatedScopeAgentId,
+          mcpGatewayScope: selectedGateways,
+          selectedGateways: normalizeStringArray(input.selectedGateways),
           selectedCliToolIds,
           dcmDisplaySettings: context.dcmDisplaySettings ?? null,
           projectPath: context.projectPath ?? null,
@@ -12853,7 +13411,9 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
         (await needsBrokerRiskApproval({
           userId: context.userId,
           agentId: context.agentId ?? null,
+          controlScopeAgentId: delegatedScopeAgentId,
           sessionId: context.sessionId ?? null,
+          abortSignal: context.abortSignal,
           input,
           allowedFamilies: apiBrokerAllowedFamilies,
           fabricAllowedControlIds: Array.from(apiBrokerFabricAllowedControlIds),
@@ -12900,9 +13460,12 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
           ...withoutBrokerPlumbing(input),
           userId: context.userId,
           actorType: 'in-process',
+          processOwner: context.processOwner,
           agentId: context.agentId ?? null,
           sessionId: context.sessionId,
-          selectedGateways,
+          messageId: context.messageId,
+          mcpGatewayScope: selectedGateways,
+          selectedGateways: normalizeStringArray(input.selectedGateways),
           selectedCliToolIds,
           dcmDisplaySettings: context.dcmDisplaySettings ?? null,
           projectPath: context.projectPath ?? null,
@@ -12914,7 +13477,7 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
           approvalGrant: grant,
           abortSignal: options?.abortSignal,
           executeControlUse: (controlInput, allowedControlIds) =>
-            executeBrokerScopedControlUse(controlInput, allowedControlIds, grant)
+            executeBrokerScopedControlUse(controlInput, allowedControlIds, grant, options?.abortSignal, normalizeStringArray(input.selectedGateways))
         })
       },
       toModelOutput: formatBatshitToolUseModelOutput(context)
@@ -13066,9 +13629,13 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
 
     tools.native_bash_execute = tool({
       // Agent Docs (2026-09-18): the model is told what a Stop and a timeout end (`commandEnd.ts`)
-      // and how to leave a program running. Every API agent pays for these words on every turn.
+      // and how to leave a program running; since BL-244 (2026-09-25) also how to send the managed
+      // apply_patch. Every API agent pays for these words on every turn.
       description:
         'Execute bash commands using Agent Settings access mode (Plan, Agent, Dangerous) with policy guards and renderer mapping. ' +
+        NATIVE_BASH_APPLY_PATCH_GUIDANCE +
+        ' ' +
+        NATIVE_BASH_SHELL_GUIDANCE +
         NATIVE_BASH_STOP_GUIDANCE,
       inputSchema: z.object({
         command: z.string().min(1),
@@ -13089,8 +13656,9 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
           return {
             success: false,
             blocked: true,
-            reason:
-              'Blocked by Agent mode policy. Add this command to the allow list, switch Approval Policy to On Failure, or switch to Dangerous mode.',
+            reason: groupMemberRun
+              ? GROUP_APPROVAL_UNAVAILABLE_REASON
+              : 'Blocked by Agent mode policy. Add this command to the allow list, switch Approval Policy to On Failure, or switch to Dangerous mode.',
             command,
             policyMode: settings.bashPolicyMode,
             accessMode: settings.bashAccessMode
@@ -13099,7 +13667,10 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
 
         return nativeBashExecute({
           userId: context.userId,
+          processOwner: context.processOwner,
+          agentId: context.agentId,
           sessionId: context.sessionId,
+          messageId: context.messageId,
           projectPath: context.projectPath ?? null,
           command: input.command,
           cwd: input.cwd,
@@ -13145,6 +13716,14 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
           }
         }
 
+        // BL-1483: a lean text, not the pretty-printed result object. The stored result is unchanged.
+        if (isBashResultForModel(output)) {
+          return {
+            type: 'text',
+            value: formatBashResultForModel(output)
+          }
+        }
+
         return {
           type: 'json',
           value: output ?? null
@@ -13153,7 +13732,7 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
     })
   }
 
-  return { tools, toolApprovals }
+  return { tools, toolApprovals, fetchZipAvailable }
 }
 
 export const nativeToolService = {

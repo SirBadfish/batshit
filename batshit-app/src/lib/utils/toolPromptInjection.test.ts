@@ -8,7 +8,8 @@ import {
   buildSubagentGuidancePromptBlock,
   buildToolGuidanceZipPromptBlock,
   buildDmGuidancePromptBlock,
-  buildJevJuiceGuidancePromptBlock
+  buildJevJuiceGuidancePromptBlock,
+  CONTROL_TAG_EXAMPLE_SENTENCE
 } from './toolPromptInjection'
 import { formatSteerForModel, STEER_WRAPPER_GUIDANCE_EXAMPLES } from './steerControl'
 import {
@@ -56,8 +57,7 @@ describe('buildToolGuidanceZipPromptBlock', () => {
   it('teaches one-based current tool result aliases when agent control is enabled', () => {
     const prompt = buildToolGuidanceZipPromptBlock({ zipControlPermission: 'agent' })
 
-    expect(prompt).toContain('Treat natural-language requests as zip-control requests')
-    expect(prompt).toContain('the user does not need to mention Batshit zip control')
+    expect(prompt).toContain('The user does not need to mention Batshit zip control')
     expect(prompt).toContain('use `tool_result_N`')
     expect(prompt).toContain('Never use `tool_result_0`')
     expect(prompt).toContain('"unzip":["tool_result_1","tool_result_3"],"zip":["zipId"]')
@@ -81,7 +81,6 @@ describe('buildToolGuidanceZipPromptBlock', () => {
 
     expect(prompt).toContain('use `tool_result_N`')
     expect(prompt).toContain('Never use `tool_result_0`')
-    expect(prompt).toContain('Treat natural-language requests as zip-control requests')
     expect(prompt).toContain('not private reasoning and not a place for private instructions')
     expect(prompt).toContain('Tool Results Summary notes are user-visible')
     expect(prompt).toContain('raw XML/JSON syntax is stripped')
@@ -90,12 +89,44 @@ describe('buildToolGuidanceZipPromptBlock', () => {
     expect(prompt).not.toContain('Use `zipId` for every zip-control action.')
   })
 
-  it('keeps natural unzip requests explicit when zip control is user-only', () => {
+  // BL-360 (SA-129 DL-06): with the parked permission ON the prompt no longer teaches `unzip` for
+  // "keep this file open" beside the Hold section; a file is held, `unzip` is for anything else,
+  // and the user wins both ways. The packaged prompt and the code fallback say the same.
+  it('the parked enabled prompt turns "keep this file open" into a hold, both copies (BL-360)', () => {
+    const fallback = buildToolGuidanceZipPromptBlock({ zipControlPermission: 'agent' })
+    const packaged = readFileSync(
+      resolve(process.cwd(), '../docs/batshit_System_Prompts/batshit_tool_prompt_zip_control_enabled.md'),
+      'utf8'
+    )
+    for (const prompt of [fallback, packaged]) {
+      expect(prompt).toContain('Treat natural-language requests such as "keep this file open," "keep this unzipped," "leave this tool output available," or "pin this context" as hold requests: hold a file you read by its path')
+      expect(prompt).toContain('use the `unzip` control only for a result that is not a file you read')
+      expect(prompt).toContain('The user wins: do not zip what the user holds, and do not unzip what the user zipped by hand. Batshit refuses both and tells you why.')
+      expect(prompt).not.toContain('Treat natural-language requests as zip-control requests')
+      expect(prompt).not.toContain('unzip these memory files')
+      expect(prompt).not.toContain('Do not zip user-locked items.')
+    }
+  })
+
+  it('turns natural "keep this open" requests into holds when zip control is user-only (SA-129 P2)', () => {
     const prompt = buildToolGuidanceZipPromptBlock({ zipControlPermission: 'user' })
 
-    expect(prompt).toContain('Treat natural-language requests such as "keep this unzipped"')
-    expect(prompt).toContain('Because zip control is disabled for you here')
+    expect(prompt).toContain('Treat natural-language requests such as "keep this file open" or "keep this unzipped" as hold requests')
     expect(prompt).toContain('Do NOT include unzip/zip actions')
+    expect(prompt).toContain('{"hold":["src/app.ts"],"release":["docs/old-spec.md"]}')
+  })
+
+  it('teaches hold and release to every agent, with Tool Notes on or off and either permission (DL-02)', () => {
+    for (const zipControlPermission of ['user', 'agent'] as const) {
+      for (const toolNotesEnabled of [true, false]) {
+        const prompt = buildToolGuidanceZipPromptBlock({ zipControlPermission, toolNotesEnabled })
+        expect(prompt).toContain('Hold and release:')
+        expect(prompt).toContain('name its path in `hold` in your Tool Notes block, and in `release` when you are done with it')
+        expect(prompt).toContain('if the user already holds a file, leave it alone')
+        // The same promise as the packaged prompts (SA-129 P2b, BL-359): the user wins both ways.
+        expect(prompt).toContain('only the user releases what the user holds, and the user can release yours.')
+      }
+    }
   })
 
   it('keeps the packaged zip-disabled Admin reset prompt aligned with user-only zip control', () => {
@@ -107,8 +138,8 @@ describe('buildToolGuidanceZipPromptBlock', () => {
       'utf8'
     )
 
-    expect(prompt).toContain('Treat natural-language requests such as "keep this unzipped"')
-    expect(prompt).toContain('Because zip control is disabled for you here')
+    expect(prompt).toContain('Treat natural-language requests such as "keep this file open" or "keep this unzipped" as hold requests')
+    expect(prompt).toContain('## Hold and Release')
     expect(prompt).toContain('Do NOT include unzip/zip action arrays')
     expect(prompt).toContain('not private reasoning and not a place for private instructions')
     expect(prompt).toContain('Tool Results Summary notes are user-visible')
@@ -171,7 +202,9 @@ describe('buildToolGuidanceZipPromptBlock', () => {
     // The fuller treatment lives in the tool + zip block, which always ships for API agents.
     expect(prompt).not.toContain('POLICY_BLOCKED')
     expect(prompt).not.toContain('native_bash')
-    expect(prompt).toContain('==== DYNAMIC INFO ====')
+    // SA-128 (DL-12): the base prompt says how the tagged chat reads.
+    expect(prompt).toContain('`<dynamic_info>` (the DCM) is Batshit\'s live context for this turn')
+    expect(prompt).toContain('`<assistant>` is you')
 
     for (const toolPrompt of [
       'batshit_tool_prompt_zip_control_enabled.md',
@@ -373,7 +406,7 @@ describe('buildToolGuidanceZipPromptBlock', () => {
     for (const prompt of [packaged, fallback]) {
       // What a subagent is, and that the roster is the authority on who exists.
       expect(prompt).toContain('Named specialists the user configured for you')
-      expect(prompt).toContain('roster in DYNAMIC INFO is the authority')
+      expect(prompt).toContain('roster in `<dynamic_info>` is the authority')
       expect(prompt).toContain('Never delegate to a name that is not on the roster')
       // When to delegate versus do it yourself, and that results cost tokens.
       expect(prompt).toContain('Do it yourself when you already have the tools and context')
@@ -467,7 +500,7 @@ describe('buildToolGuidanceZipPromptBlock', () => {
       expect(prompt).toContain('media_note')
       expect(prompt).toContain('during this same reply')
       expect(prompt).toContain('in the tool result or in a follow-up model input within this reply')
-      expect(prompt).toContain('Claude CLI and other deferred images use the next-message REMEMBERED MEDIA path')
+      expect(prompt).toContain('Claude CLI and other deferred images use the next-message `<remembered_media>` path')
       // The retired claim must not survive in either place.
       expect(prompt).not.toContain('images cannot ride a tool result')
     }
@@ -494,7 +527,7 @@ describe('buildToolGuidanceZipPromptBlock', () => {
       expect(prompt).toContain('nothing is lost and nothing retries')
       expect(prompt).toContain('sys.dm.agents')
       // The roster is the authority, and closed items leave it.
-      expect(prompt).toContain('roster in DYNAMIC INFO is the authority')
+      expect(prompt).toContain('roster in `<dynamic_info>` is the authority')
       expect(prompt).toContain('OPEN items only')
       expect(prompt).toContain('stops costing you tokens')
       // One assignment at a time, and closing needs a real result.
@@ -542,6 +575,10 @@ describe('buildToolGuidanceZipPromptBlock', () => {
       expect(prompt).toContain('never a message from the user')
       // The broadcast sentence had to change with it: `to: "all"` refuses anything but wait.
       expect(prompt).toContain('never wakes or steers anybody')
+      // BL-401: a schedule's fires count on its one unread note, and the roster line says
+      // so. The agent is told what the phrase means where it reads about the roster.
+      expect(prompt).toContain('A schedule keeps one unread note; a new fire updates it')
+      expect(prompt).toContain('`fired 3 times, first 9:00 AM, last 5:00 PM`')
 
       // SA-115 P2 (DL-115-10): every `sys.schedule.*` control AND its required fields.
       // `tool_discovery` prints a Fabric COUNT and never a schema, so a control named here
@@ -589,13 +626,18 @@ describe('buildToolGuidanceZipPromptBlock', () => {
     // was already sitting two words under the old cap — which is the same trade every raise
     // above made. A delivery mode this block does not name is a delivery mode no agent will
     // ever use, and one named without its field is a guaranteed first-call failure.
+    //
+    // Raised from 660 to 680 for BL-401, deliberately and once: a schedule now keeps one
+    // unread note that each fire updates, and the roster line gained the phrase that says so
+    // (`fired 3 times, first 9:00 AM, last 5:00 PM`). Twenty words tell the agent that one row
+    // stands for many fires; the code fallback was nine words under the old cap.
     for (const prompt of [readPackaged('batshit_dm_guidance.md'), buildDmGuidancePromptBlock()]) {
       const words = prompt.trim().split(/\s+/).length
-      expect(words).toBeLessThan(660)
+      expect(words).toBeLessThan(680)
     }
   })
 
-  it('SA-120 P2: the Jev Juice guidance teaches the exact sys.judge.ask shape on both surfaces', () => {
+  it('SA-120 P2: the Judge Juice guidance teaches the exact sys.judge.ask shape on both surfaces', () => {
     // Packaged default and code fallback are one product surface (the DM block's rule):
     // whichever one an instance uses, the agent is taught the same call. `tool_discovery`
     // prints a Fabric COUNT and never a schema, so a control named here without its
@@ -613,9 +655,16 @@ describe('buildToolGuidanceZipPromptBlock', () => {
       expect(prompt).toContain('"type":"choice"')
       expect(prompt).toContain('"type":"score"')
       expect(prompt).toContain('"probabilities":{…},"confidence"')
-      expect(prompt).toContain('the id is never shown to Jev')
+      expect(prompt).toContain('the id is never shown to the judge')
       // The limits, restated from JUDGE_ASK_LIMITS (judgeAsk.jev.test.ts ties the numbers).
+      // SA-120 P10b: they are the most a call may carry; a smaller judge takes fewer Choice options and less state
+      // (every profile allows 64 questions), and an over-limit request is refused as too large, with the limit named
+      // (the agent sees "too large for this judge", never the internal reason word).
       expect(prompt).toContain('2 to 255 options')
+      expect(prompt).toContain('a smaller judge may take fewer')
+      expect(prompt).toContain('a smaller judge takes fewer Choice options and less state')
+      expect(prompt).toContain('refused as too large for this judge, with the limit named')
+      expect(prompt).not.toContain('provider_limit')
       expect(prompt).toContain('2 to 10 levels, low to high')
       expect(prompt).toContain('Up to 64 questions per call')
       expect(prompt).toContain('under about 30k tokens')
@@ -627,10 +676,15 @@ describe('buildToolGuidanceZipPromptBlock', () => {
       // What Jev cannot do, and the privacy sentence (DL-120-01: text leaves the machine).
       expect(prompt).toContain('no memory of earlier calls')
       expect(prompt).toContain('never runs a tool')
-      expect(prompt).toContain('Jev cannot write')
+      expect(prompt).toContain('The judge cannot write')
       expect(prompt).toContain('cannot approve a risky control')
       expect(prompt).toContain("never counts as the user's")
-      expect(prompt).toContain('leaves this computer and goes to TypeSafe')
+      // SA-120 P10b: the block names the judge the user chose (TypeSafe's Jev only as the default), not TypeSafe.
+      expect(prompt).toContain("the judge your user chose for this tool (TypeSafe's Jev unless they picked another)")
+      expect(prompt).toContain('goes to that judge, which may be a cloud service')
+      expect(prompt).not.toContain('goes to TypeSafe,')
+      expect(prompt).not.toContain('Jev cannot')
+      expect(prompt).not.toContain('Jev sees')
       // A refusal is a reason to fix the request, never a retry loop.
       expect(prompt).toContain('Do not loop on it')
       // DL-120-07: every call is visible.
@@ -640,7 +694,7 @@ describe('buildToolGuidanceZipPromptBlock', () => {
     }
   })
 
-  it('SA-120 P2: the Jev Juice guidance stays inside its token budget on both surfaces', () => {
+  it('SA-120 P2: the Judge Juice guidance stays inside its token budget on both surfaces', () => {
     // One control, three question shapes with a copyable example each, five rules, and
     // the "cannot" paragraph. Sized for the block that exists, with a little room; the
     // guard is here so it cannot quietly grow into a second memory prompt.
@@ -665,5 +719,35 @@ describe('buildToolGuidanceZipPromptBlock', () => {
       expect(prompt).toContain('The Dynamic Tool Search/Use pair itself: call it directly')
       expect(prompt).toMatch(/exact typed ref[\s\S]+prior search is not required/)
     }
+  })
+})
+
+describe('BL-442: every block-teaching prompt says what a code block does', () => {
+  it('the packaged zip prompts, the memory prompt, and their code fallbacks carry the one sentence', () => {
+    for (const file of [
+      'batshit_tool_prompt_zip_control_enabled.md',
+      'batshit_tool_prompt_zip_control_disabled.md',
+      'batshit_tool_prompt_memory.md'
+    ]) {
+      expect({ file, has: readPackaged(file).includes(CONTROL_TAG_EXAMPLE_SENTENCE) }).toEqual({ file, has: true })
+    }
+    expect(buildToolGuidanceZipPromptBlock({ zipControlPermission: 'agent' })).toContain(CONTROL_TAG_EXAMPLE_SENTENCE)
+    expect(buildToolGuidanceZipPromptBlock({ zipControlPermission: 'user', toolNotesEnabled: false })).toContain(CONTROL_TAG_EXAMPLE_SENTENCE)
+    expect(buildMemoryPromptBlock()).toContain(CONTROL_TAG_EXAMPLE_SENTENCE)
+    expect(CONTROL_TAG_EXAMPLE_SENTENCE).toBe(
+      'To show a tag as an example, put it in a code block. A tag in a code block does nothing.'
+    )
+  })
+
+  it('every Agent Doc that shows a control block inside code also says to write the block as plain text', () => {
+    // The memory prompt shows its save block in a fenced code block; the Goon Guide clip shows the
+    // cue block in inline code. A copy with the code around it would do nothing (BL-442 R1).
+    expect(readPackaged('batshit_tool_prompt_memory.md')).toContain(
+      `Write the block itself as plain text, without the code block around it. ${CONTROL_TAG_EXAMPLE_SENTENCE}`
+    )
+    const goonGuide = readFileSync(resolve(process.cwd(), '../docs/batshit_System_Clips/goon-guide.md'), 'utf8')
+    expect(goonGuide).toContain(
+      `Write the cue block itself as plain text in your reply, without the backticks shown around it above. ${CONTROL_TAG_EXAMPLE_SENTENCE}`
+    )
   })
 })

@@ -209,8 +209,8 @@
   }
 
   :global(.widget-placement-radio[data-state="checked"] + .widget-placement-option) {
-    border-color: var(--primary);
-    background: oklch(from var(--primary) l c h / 0.05);
+    border-color: var(--primary-text);
+    background: var(--bs-app-primary-faint);
   }
 
   .widget-placement-icon-slot {

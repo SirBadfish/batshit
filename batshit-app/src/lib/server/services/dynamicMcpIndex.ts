@@ -48,6 +48,7 @@ import {
   ARTIFACT_TOOL_GRID_ID,
   FABRIC_TOOL_GRID_GROUP_NAME,
   FABRIC_TOOL_GRID_ID,
+  describeFabricControlFamilies,
   normalizeArtifactToolGridSettings,
   normalizeFabricToolGridSettings
 } from '$lib/utils/toolGridBrokerFamilies'
@@ -100,13 +101,19 @@ export interface DynamicMcpIndexGroup {
   tools?: DynamicMcpIndexTool[]
   /** Rendered once under the group. Used for family-level rules that are not per-tool. */
   note?: string | null
+  /**
+   * SA-072 P2 step 0: the plain words for the families this group's counted entries belong
+   * to, printed inside the group line (`- Fabric Controls (65 tools: agent DMs, …)`). Only
+   * the Fabric group sets it.
+   */
+  families?: string[]
 }
 
 export type DynamicMcpDiscoverableFamily = 'mcp' | 'cli' | 'fabric' | 'artifact'
 
 /**
  * SA-120 P1: one discoverable capability the agent can reach through the broker, in
- * the exact typed-ref form `tool_use` accepts. This is the list the Jev Juice skill and
+ * the exact typed-ref form `tool_use` accepts. This is the list the Judge Juice skill and
  * tool hint judges over, so it follows the SAME visibility and allowlist rules the DCM
  * text and `_find` follow: a hidden tool is not here, and a family the broker would
  * refuse on this runtime is not here. Unlike the rendered text, it is not collapsed by
@@ -276,9 +283,10 @@ function extractSchema(tool: any): any {
   return tool.inputSchema?.jsonSchema || tool.inputSchema || tool.parameters || tool.schema || null
 }
 
-function formatGroupLine(name: string, count: number): string {
+function formatGroupLine(name: string, count: number, families?: string[]): string {
   const label = count === 1 ? 'tool' : 'tools'
-  return `- ${name} (${count} ${label})`
+  const familyText = families && families.length > 0 ? `: ${families.join(', ')}` : ''
+  return `- ${name} (${count} ${label}${familyText})`
 }
 
 /**
@@ -298,7 +306,7 @@ function buildDcmText(groups: DynamicMcpIndexGroup[]): string {
       Array.isArray(group.tools) &&
       group.tools.length > 0
     ) {
-      body.push(`${formatGroupLine(group.name, group.toolCount)}:`)
+      body.push(`${formatGroupLine(group.name, group.toolCount, group.families)}:`)
       for (const tool of group.tools) {
         const hint =
           tool.visibility === 'name+hint' && tool.schemaHint
@@ -307,7 +315,7 @@ function buildDcmText(groups: DynamicMcpIndexGroup[]): string {
         body.push(`  - ${tool.name}${hint}`)
       }
     } else {
-      body.push(formatGroupLine(group.name, group.toolCount))
+      body.push(formatGroupLine(group.name, group.toolCount, group.families))
     }
 
     if (group.note) {
@@ -388,6 +396,8 @@ function buildBrokerFamilyGroup(input: {
   agentSettings: AgentDcmDisplaySettings
   entries: BrokerFamilyEntry[]
   note?: string | null
+  /** SA-072 P2 step 0: derives the group line's family words from the COUNTED entries. */
+  describeFamilies?: (countedNames: string[]) => string[]
 }): WorkingGroup | null {
   if (input.entries.length === 0) return null
 
@@ -412,6 +422,7 @@ function buildBrokerFamilyGroup(input: {
     forceToolList: isExplicitAgentToolListMode(agentGroupMode),
     note: input.note ?? null
   }
+  const countedNames: string[] = []
 
   for (const entry of input.entries) {
     const toolVisibility = resolveEffectiveToolVisibility({
@@ -426,6 +437,7 @@ function buildBrokerFamilyGroup(input: {
     if (toolVisibility === 'hidden') continue
 
     group.toolCount += 1
+    countedNames.push(entry.name)
 
     if (groupVisibility === 'group+tools') {
       group.tools = group.tools || []
@@ -438,6 +450,11 @@ function buildBrokerFamilyGroup(input: {
   }
 
   if (group.toolCount === 0) return null
+  // Only families with a control this agent can actually see: a hidden control never names
+  // its family, and a Subagent with no Pinokio controls never reads "Pinokio".
+  if (input.describeFamilies) {
+    group.families = input.describeFamilies(countedNames)
+  }
   return group
 }
 
@@ -545,7 +562,7 @@ async function resolveIndexJudgeControlsEnabled(
     const agent = (await redis.get(`agent:${agentId}`)) as Record<string, unknown> | null
     return resolveAgentJevJudgeToolEnabled(agent)
   } catch (error) {
-    console.warn('[Dynamic MCP DCM] Failed to resolve Jev Juice judgment-tool enablement:', error)
+    console.warn('[Dynamic MCP DCM] Failed to resolve Judge Juice judgment-tool enablement:', error)
     return false
   }
 }
@@ -625,7 +642,8 @@ export async function buildDynamicMcpIndex(
   const cliScope = await resolveCliToolSelectionScope({
     userId,
     agentId: options.agentId ?? null,
-    selectedToolIds: options.selectedCliToolIds
+    // The index's caller resolved this list on the server (BL-686); absent reads the agent's.
+    cliToolScope: options.selectedCliToolIds ?? undefined
   })
   const selectedCliToolIds = new Set(cliScope.toolIds)
   const cliToolsEnabled = options.cliToolsEnabled !== false
@@ -942,7 +960,8 @@ export async function buildDynamicMcpIndex(
       groupName: FABRIC_TOOL_GRID_GROUP_NAME,
       gatewayDefaults: fabricToolGridSettings.dcmDisplayDefaults,
       agentSettings: dcmDisplaySettings,
-      entries
+      entries,
+      describeFamilies: describeFabricControlFamilies
     })
     if (fabricGroup) {
       dcmToolCount += fabricGroup.toolCount
@@ -1004,7 +1023,7 @@ export async function buildDynamicMcpIndex(
       gatewayDefaults: artifactToolGridSettings.dcmDisplayDefaults,
       agentSettings: dcmDisplaySettings,
       entries,
-      note: 'artifact_hint: run these with the exact artifact:use.artifact.{slug} ref and structured field input. User-only panel artifacts such as Gradio/HuggingFace embeds and ComfyUI panel artifacts are not agent-runnable; tell the user instead of changing an artifact brain type or power source.'
+      note: 'artifact_hint: run these with the exact artifact:use.artifact.{slug} ref and structured field input. User-only artifacts (Static / No AI tools, Gradio/HuggingFace embeds, ComfyUI panel artifacts) are not agent-runnable; tell the user instead of changing an artifact brain type or power source.'
     })
     if (artifactGroup) {
       dcmToolCount += artifactGroup.toolCount
@@ -1041,6 +1060,7 @@ export async function buildDynamicMcpIndex(
       visibility: group.visibility,
       tools: group.tools,
       note: group.note ?? null,
+      ...(group.families ? { families: group.families } : {}),
       forceToolList: group.forceToolList
     }))
 

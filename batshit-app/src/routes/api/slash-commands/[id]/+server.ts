@@ -7,6 +7,7 @@ import {
   normalizeSkillId,
   upsertSkill
 } from '$lib/server/services/skillRegistry'
+import { isSkillFilesMissingError } from '$lib/server/services/skillFilesMissing'
 import {
   DEFAULT_PROMPT_ICON_REF,
   DEFAULT_SKILL_ICON_REF
@@ -15,6 +16,7 @@ import { parseIconRef, type IconRef } from '$lib/icons/iconTypes'
 import { normalizeOptionalIconRef } from '$lib/icons/iconLegacy'
 import type { SlashCommandRow } from '$lib/types/database'
 import { sanitizeId } from '$lib/utils/idSanitizer'
+import { writeSlashCommandRecord } from '$lib/server/services/agentAccessLists'
 
 function normalizeInvocation(value: string) {
   const trimmed = value.trim()
@@ -230,8 +232,13 @@ export const GET: RequestHandler = async ({ params, locals }) => {
           JSON.stringify(comparableSkillCommandMetadata(synchronized))
         ) {
           synchronized.updated_at = new Date().toISOString()
-          await redis.json.set(key, '$', synchronized)
-          command = synchronized
+          // BL-544: a metadata refresh never changes who may use the skill. The per-agent list is
+          // kept as stored at the write, not the copy read before the skill files were read.
+          const storedCommand = await writeSlashCommandRecord(key, synchronized, { keepAgentAccess: true })
+          if (!storedCommand) {
+            return json({ error: 'Slash command not found' }, { status: 404 })
+          }
+          command = storedCommand
         }
       }
     }
@@ -613,14 +620,29 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
       updated_at: now
     }
 
-    await redis.json.set(commandKey, '$', updatedCommand)
+    // BL-544: the per-agent list is written only when this request sends one. Otherwise it stays
+    // as stored at the moment of the write: Settings > Agents > Access may have turned an agent
+    // on or off after this record was read (the skill files were written in between).
+    const storedCommand = await writeSlashCommandRecord(commandKey, updatedCommand, {
+      keepAgentAccess: updates.enabled_agent_ids === undefined
+    })
+    if (!storedCommand) {
+      return json(
+        { error: 'Slash command not found: it was deleted while this change was saved.' },
+        { status: 404 }
+      )
+    }
 
-    if (command.skill_id && command.skill_id !== updatedCommand.skill_id) {
+    if (command.skill_id && command.skill_id !== storedCommand.skill_id) {
       await deleteSkillIfOrphaned(locals.user.id, command.skill_id, command.id)
     }
 
-    return json({ slashCommand: updatedCommand })
+    return json({ slashCommand: storedCommand })
   } catch (error) {
+    // BL-369: a user skill whose files are missing is named, never a generic 500.
+    if (isSkillFilesMissingError(error)) {
+      return json({ error: error.message, code: error.code }, { status: 409 })
+    }
     console.error('Error updating slash command:', error)
     if (error && typeof error === 'object' && 'status' in error && (error as any).status === 400) {
       return json({ error: error instanceof Error ? error.message : 'Invalid slash command update' }, { status: 400 })

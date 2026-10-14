@@ -33,6 +33,24 @@ Batshit encrypts saved API keys and custom provider secrets with `ENCRYPTION_KEY
 
 Don't rotate `ENCRYPTION_KEY` casually. If it changes, saved encrypted keys may need to be re-entered.
 
+## Connect a ChatGPT plan in the Mac app
+
+You can use your ChatGPT plan with an ordinary **API** agent in the local Batshit Mac app. OpenAI decides which models and limits your account can use. This connection currently requires the Mac app; Docker support is not available yet.
+
+1. Open **Settings → API Keys → ChatGPT Plan**.
+2. Choose **Continue with ChatGPT** and finish sign-in and consent in your browser. If no browser opens, use **Open ChatGPT Sign-In**.
+3. Wait for your account to say **Connected**. Signing in without granting plan use cannot run models.
+4. Open **Settings → Models**, select **ChatGPT Plan** for that account and choose a model from its list. Save the preset.
+5. Choose that preset for an **API** agent and chat normally.
+
+Normal conversation history, memory context and Batshit's permitted tools follow the same API-agent path. API Subagents and Workers can use a plan preset within their own permissions. Plain Compact can use it too. Memory's background summary features, artifacts, embeddings, voice/media and n8n need a separate supported connection.
+
+Image-capable models can inspect image Clips. In Models, **View Details** separates verified published model properties from your account's unknown effective limits; it includes the official source and verification date. **Refresh** fetches the account's current choices, while published metadata is audited through Batshit's daily catalog maintenance. See [ChatGPT plan catalog details](model-catalog.md#chatgpt-plan-models) for context and capability guidance.
+
+**Total Cost** becomes **ChatGPT Plan** with [Manage ChatGPT Usage](https://chatgpt.com/settings/usage). Context token counts, context-window percentage, cache/speed displays, Trim and Compact remain. Batshit has no supported subscription percentage or reset-time feed; check ChatGPT's usage page. If a request reaches a plan limit, Batshit shows the failure and usage link. It never switches to a paid API key automatically.
+
+Use **Disconnect** here to remove local access. If OpenAI revocation cannot be confirmed, Batshit says so; manage its connection in ChatGPT settings. A restored model preset does not carry the login, even in a With Secrets backup. Sign in and select the new account connection on the target Mac. OpenAI API keys and Codex CLI login remain separate connections.
+
 ## Add a provider key
 
 1. Open Settings → API Keys.
@@ -95,14 +113,26 @@ Kimi, MiniMax, and MiMo also have separate subscription connections:
 
 These rows do not replace or overwrite **Moonshot AI**, **MiniMax**, or **MiMo** pay-as-you-go keys. When both a pay-as-you-go and subscription speech key are saved for MiniMax or MiMo, Batshit prefers the subscription quota for eligible speech.
 
+### Paused plans
+
+Some sellers allow their flat-fee plans only inside tools they list, and they do not list Batshit yet. Batshit has paused these plans:
+
+- **Z.ai Coding Plan** (use **Z.ai** pay-as-you-go instead)
+- **Qwen Token Plan** from Alibaba Cloud (use **Qwen Cloud** pay-as-you-go instead)
+- **MiMo Token Plan** from Xiaomi (use **MiMo** pay-as-you-go instead)
+
+A paused plan is switched off, not deleted. You cannot add its key or a new model for it, and a saved model of that plan does not run: the chat or the MiMo voice shows why and does not move to another connection on its own. Your saved key stays where it was, and the plan's row in **Settings -> API Keys** says it is paused. Once Batshit has asked a seller for approval, the row shows the date. A plan comes back when its seller says yes. Kimi Code and the MiniMax Token Plan are not paused.
+
+Every call Batshit makes to a model seller names Batshit in its `User-Agent` header, for example `Batshit/0.1.0-alpha.2 (+https://batshit.ai)`, so a seller can see which calls come from Batshit.
+
 ## Create a saved model preset
 
 1. Open Settings → Models.
 2. In **Browse Model Catalog**, pick the **Provider**: the key you added shows as `<Name> (Direct)`, for example `Anthropic (Direct)`; Vercel AI Gateway, OpenRouter, and Local AI programs have their own entries.
 3. Pick the **Developer** (the company that made the model), then pick a **Model**. Batshit never picks the model for you: the list holds every model that provider serves, older ones included, so choose a current one on purpose (for example Claude Sonnet 5, or a current GPT chat model).
-4. Choose **Use to Create New Preset**. You should see **Model preset created**, and the preset appears under **Saved Models**.
+4. Choose **Use to Create New Preset**. You should see **Model preset created**, and the preset appears under **Saved Models**. If you already made a preset from that model with the same name, Batshit says a preset with that name already exists and saves nothing; change the display name to keep both.
 5. Check the details it filled in: tools, image support, reasoning, context window, and pricing. Change anything provider-specific there; it saves by itself.
-   If the catalog does not list a price or a context window for that model, the field stays blank. The chat then shows its running cost or context use as **Unknown** instead of guessing; type the price or window in to get a real number. A price of `0` is kept as free. Local AI programs, Codex CLI, and Claude Code CLI are always priced at `0` per token, because they run on your own computer or on a plan you already pay for.
+   If the catalog does not list a price or a context window for that API model, the field stays blank. The chat then shows its running cost or context use as **Unknown** instead of guessing; type the price or window in to get a real number. A price of `0` is kept as free. Codex and Claude Code CLI agents use their selected CLI model's known window or a matching CLI-reported window instead of the generic CLI preset's blank value. An unknown CLI limit leaves the percentage blank while retaining the used-token count. Local AI programs, Codex CLI, and Claude Code CLI are always priced at `0` per token, because they run on your own computer or on a plan you already pay for.
 
 The model list only shows models that run on the provider you picked. A model that only Vercel AI Gateway or OpenRouter serves appears under those providers, not under the direct one. For a model the catalog doesn't cover, providers like Alibaba Cloud, StepFun, and your custom OpenAI-compatible providers use manual entry instead.
 
@@ -119,6 +149,8 @@ Saved presets make agent setup easier: agents pick a preset instead of repeating
 ## Prompt caching on API agents
 
 For `API` Primary Agents, Batshit automatically uses provider-side prompt/input caching options where they are supported. OpenAI gets a Batshit-generated cache key, Anthropic gets cache control, OpenRouter gets sticky session routing plus usage reporting, Vercel AI Gateway gets automatic caching, direct Gemini relies on Google's implicit prompt caching, and both Qwen Cloud connections use the official Alibaba provider's cache support. Advanced provider settings can still override supported provider options, but normal users should not need to configure prompt caching by hand.
+
+ChatGPT Plan uses only the plan's supported inference options; Batshit does not apply paid OpenAI cache options to that connection.
 
 Cache hits depend on provider rules. Very short prompts may not be eligible, cache entries can expire, and some providers only report cache evidence after a repeated eligible request. Batshit does not use Google's explicit cached-content resources for normal direct Gemini API-agent sends because Google does not allow that cache option to be combined with the live system/tool fields Batshit agents normally use. Image Clips are sent as structured image inputs rather than prompt text, but multimodal turns can still change how a provider applies prompt caching. Some implicit-cache providers may miss, restart, or report smaller cache reads after image turns even when Batshit reuses the same Clip URL or provider file URI. Check the Execution Viewer if you want to see whether a run reported cached input or cache-write tokens.
 

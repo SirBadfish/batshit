@@ -1,0 +1,72 @@
+{
+  "gpt-6-astra": {
+    "modelId": "gpt-6-astra",
+    "sourceUrl": "https://developers.openai.com/api/docs/models/gpt-6-astra",
+    "verifiedAt": "2026-10-01",
+    "contextWindow": 1050000,
+    "maxOutputTokens": 128000,
+    "inputModalities": [
+      "text",
+      "image"
+    ],
+    "outputModalities": [
+      "text"
+    ]
+  },
+  "gpt-5.6-sol": {
+    "modelId": "gpt-5.6-sol",
+    "sourceUrl": "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
+    "verifiedAt": "2026-10-01",
+    "contextWindow": 1050000,
+    "maxOutputTokens": 128000,
+    "inputModalities": [
+      "text",
+      "image"
+    ],
+    "outputModalities": [
+      "text"
+    ]
+  },
+  "gpt-5.6-terra": {
+    "modelId": "gpt-5.6-terra",
+    "sourceUrl": "https://developers.openai.com/api/docs/models/gpt-5.6-terra",
+    "verifiedAt": "2026-10-01",
+    "contextWindow": 1050000,
+    "maxOutputTokens": 128000,
+    "inputModalities": [
+      "text",
+      "image"
+    ],
+    "outputModalities": [
+      "text"
+    ]
+  },
+  "gpt-5.6-luna": {
+    "modelId": "gpt-5.6-luna",
+    "sourceUrl": "https://developers.openai.com/api/docs/models/gpt-5.6-luna",
+    "verifiedAt": "2026-10-01",
+    "contextWindow": 1050000,
+    "maxOutputTokens": 128000,
+    "inputModalities": [
+      "text",
+      "image"
+    ],
+    "outputModalities": [
+      "text"
+    ]
+  },
+  "gpt-5.5": {
+    "modelId": "gpt-5.5",
+    "sourceUrl": "https://developers.openai.com/api/docs/models/gpt-5.5",
+    "verifiedAt": "2026-10-01",
+    "contextWindow": 1050000,
+    "maxOutputTokens": 128000,
+    "inputModalities": [
+      "text",
+      "image"
+    ],
+    "outputModalities": [
+      "text"
+    ]
+  }
+}

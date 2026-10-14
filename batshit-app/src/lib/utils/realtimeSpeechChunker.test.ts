@@ -32,6 +32,12 @@ describe('splitRealtimeSpeechBuffer', () => {
     expect(result.remainder).toBe('')
   })
 
+  it('flushes past a lone < in a sentence instead of holding speech to the reply end (BL-477)', () => {
+    const result = splitRealtimeSpeechBuffer('If the count is < 5, retry the upload. Then it goes on')
+    expect(result.chunks).toEqual(['If the count is < 5, retry the upload.'])
+    expect(result.remainder).toBe('Then it goes on')
+  })
+
   it('does not flush across incomplete control markup', () => {
     const result = splitRealtimeSpeechBuffer('Visible text is ready. <batshit-cue')
 

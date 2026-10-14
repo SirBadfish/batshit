@@ -49,11 +49,12 @@ A message that is in between — sent, but not yet part of anything — draws it
 | It says | It means |
 |---|---|
 | *Queued for the agent's next step* | You steered. Batshit has your message and is holding it for the next tool call to finish. On a Codex or Claude agent this can sit for several seconds — that's normal, not a failure. |
-| *Queued — sends after this reply* | You queued. It goes as your next message the moment the reply ends. |
-| *Queued — sends after this reply (with files)* | Same promise, and your attachment goes with it. |
+| *Queued — sends after this reply* | You queued. It goes as your next message the moment the reply ends, attachment and all. |
+| *Waits for your answer to the approval card.* | You queued it, and the reply then stopped at an approval card. It goes after your answer (see [When the reply stops at an approval card](#when-the-reply-stops-at-an-approval-card)). **Send now** sends it without waiting. |
 | *Not sent — you stopped the reply* | You pressed Stop, and Stop means stop: your message was not passed on and no new turn started. This covers a queued message too. |
 | *Not sent — the reply ended before it could land. Send it again.* | The rare backstop: the chat went quiet with your message still waiting, so Batshit never placed it anywhere rather than guess. |
-| *Not sent — the reply ran too long to wait for. Send it again when it ends.* | A message your browser was holding (one with a file, or a chat that cannot take a steer) waits for the reply to end, but not forever. After a very long reply it gives up, and the receipt keeps your message: press **Send now** when the reply ends. |
+| *Not sent — the approval card is still waiting for your answer. Send it when you are ready.* | A queued message waited 15 minutes for your answer to an approval card and stopped waiting. Your message is at the end of the chat, unanswered. |
+| *Not sent — the approval card expired* | The card expired before you answered it, so your queued message was not sent. It is at the end of the chat, unanswered. |
 
 Either way the bubble goes grey and **keeps your words on screen**, so a message that wasn't sent is still there. It is never quietly turned into a message you didn't mean to send.
 
@@ -63,13 +64,32 @@ A bubble disappears the moment your message has a real home. If the agent read i
 
 A **grey "not sent" bubble** has no home to go to, so it stays until you are done with it: it clears the next time you send in that chat, and it clears when you leave the chat. Pressing **Send now** or **Dismiss** on one receipt leaves the others alone. A bubble for a reply that is still running stays put — leaving and coming back does not throw away the only sign that your message is still waiting.
 
+### When the reply stops at an approval card
+
+A reply that stops to ask for your **Approve** has not ended: it is waiting for you. So is anything you typed while it ran. A steer that did not reach the agent before the card, and every queued message, becomes one message from you at the end of the chat, marked *Waits for your answer to the approval card.* The agent does not answer it yet, so it never works on your words beside a card you have not answered.
+
+In a one-agent chat, Compact waits for a visible approval card too, so the card's buttons and your waiting message stay visible. Auto Compact can run again once the card is answered or its expiry is recorded and the chat is idle.
+
+- **Press Approve or Deny.** The reply carries on. When it finishes, the agent answers your message straight away, in its next reply, whether or not a Batshit tab is open. If the reply stops at another card, your message keeps waiting for that one too.
+- **Press Send now** under the message if you do not want to wait. It goes as an ordinary message, and the card stays as it is.
+- **Send a new message instead**, and the agent reads both, in order. The waiting one does not need a reply of its own.
+- **Press Stop** on the reply that carries on after your click, and Stop means stop: your message is not sent. It says *Not sent — you stopped the reply*, with **Send now**. If that reply fails instead, your message says *Not sent — the reply ended before it could land. Send it again.*, with **Send now**.
+
+Nothing runs while you are away: your words wait with the card. A card raised by an API agent expires after three minutes. When a chat tab shows an expired card, Batshit closes it as a Deny and the reply says the action did not run.
+
+A card raised by a **Claude Code agent** waits ten minutes, whether or not a Batshit tab shows the chat. Close the tab, reload it, or open the chat later from another tab, and the card is there, with its buttons, until its ten minutes are up. If nobody answers in time, the card says *Expired: nobody answered*, the action does not run, and the agent is told why, so its reply can say what it needed. A card whose reply was stopped before anyone answered says *Expired: the reply ended*, and one whose answer Batshit could not read says *Ended: the answer could not be read* (the action did not run; ask again). Only your own click lets the agent answer your waiting message, so an expired card does not: your message says *Not sent — the approval card expired*, and **Send now** sends it.
+
+A queued message with a file (or one in a group chat, or on an agent that cannot take a steer) waits for the same click. It shows *Waits for your answer to the approval card.* in every tab, and goes after the reply that carries on, whether or not a Batshit tab is open. **Send now** under it sends it without waiting, and so does sending a new message: both go, in the order you sent them. If you still have not answered the card after 15 minutes, it stops waiting: your message moves to the end of the chat, unanswered, and the tab you sent it from shows *Not sent — the approval card is still waiting for your answer. Send it when you are ready.*, with **Send now**. Words you typed or steered while the reply ran keep waiting for the card: they still say *Waits for your answer to the approval card.*, and your answer sends them. The message that stopped waiting goes when you press its **Send now**. If the card expires first, your queued message says *Not sent — the approval card expired* instead.
+
 ### The limits
 
-**Nothing you type is lost.** A steer the agent never got to — a plain text answer, or one that's already wrapping up — is sent as your next message the moment the reply ends, the same as a queued one. Queued text messages are held **on the server**, so they still arrive even if you close the tab.
+**Nothing you type is lost.** A steer the agent never got to — a plain text answer, or one that's already wrapping up — is sent as your next message the moment the reply ends, the same as a queued one. If the reply stopped at an approval card, it waits for your click first (above). Queued messages are held **on the server**, so they still arrive even if you reload the page or close the tab.
 
-**One queued message with files at a time.** A message with an attachment waits in your browser rather than on the server, and only one can wait per chat. A second is refused with *"One queued message with files at a time — send it after this one"*, and your words stay in the box. (A queued message with files does not survive a browser reload — a text-only one does.)
+**Messages with files wait in line.** A queued message with a Clip or an `@file` (and any queued message in a group chat, or on an agent that cannot take a steer) is saved the moment you send it and waits on the server for the reply to end. It shows as *Queued — sends after this reply* in every tab and window, and it goes with its attachment and its files, with or without a tab open. Five can wait like this in one chat; a sixth is refused, and its words land at the end of the chat, unanswered.
 
 **Five at a time, per reply.** Steered and server-queued messages share one allowance of five per reply. The sixth is refused with *"5 messages are already waiting for this reply (Batshit holds 5). Wait for the reply to finish."* A message the agent has already read frees its slot, so a long tool-heavy reply never locks you out.
+
+**A message from another tab waits its turn.** A reply can start in one tab or window while you type in another, and for its first moments the other tab cannot know it is running. A message you send from that tab is not refused: Batshit holds it and sends it the moment the chat is free. Until then every tab shows it as *Queued — sends after this reply*, and it appears in the chat after that reply, where a new message would. Five can wait like this at a time; a sixth is refused, and its words land at the end of the chat, unanswered. **Stop** stops these too: none of them is sent, each one moves to the end of the chat, unanswered, and the tab you sent it from shows *Not sent — you stopped the reply* with **Send now**.
 
 **When Batshit says no.** If it refuses without the reply ending — the cap above, an agent DM already waiting, or a moment when it can't reach the server — you get a one-line note saying why. The reply keeps running, nothing is interrupted, and nothing is sent. Your words stay in the box.
 
@@ -85,6 +105,7 @@ A few things you'll notice that aren't in ordinary chat apps:
 
 - **Tool cards.** When an agent runs a tool — a file read, a command, a web search, an n8n workflow — the result renders as a card inline, not as a wall of raw text.
 - **Zip badges.** Large output (long logs, big tool results, generated images) gets compressed into a Zip so it doesn't flood the chat or burn context. The full content stays one click away. This is a Batshit-original idea — the concept is explained in [Zips and context](../tools/zips.md), and the chat-side controls are in the [Zip Manager](zip-manager.md) section.
+- **Outside pictures wait for your click.** A picture in an assistant reply that comes from another website shows as a box naming the website; nothing is fetched until you click **Load picture**. Batshit may explain whether it saw the exact address in information it could account as read. A matching address still needs your click and does not prove the agent chose it safely. A reply still being written, a failed record read or write, or a record that does not match the exact reply stays in “Checking where this address came from” with no Load action. Batshit blocks an address when only its start was read, when an unread address may contain chat text, or when a complete API record shows it was not read. An exact address that was read but may contain chat text gets a warning and a smaller Load action. Managed Codex and Claude replies can remain unknown because Batshit cannot see all vendor context or truncation, though partial evidence can still block an address. If Batshit cannot tell and the reply is not pending, it shows a warning and a smaller Load action. Older replies and direct LiveKit voice replies have no address record; after Batshit reads the chat's records, they appear as unknown with a warning and a smaller Load action. These labels apply to pictures in assistant reply text. Tool-card and expanded Zip/Clip pictures follow the source rules: a Clip Batshit supplies for the message shows at once, even when its URL uses a tunnel; uploads served from Batshit's own address also show at once, while other tunnel or website pictures wait for your click (including Agent Browser screenshots). An outside request can send its address to that website, including data in its path or query. A click loads only that address in that message and browser tab; a reload or another tab asks again.
 - **A Tool Results Summary.** After tool calls, an agent can leave a short, always-visible note so the useful facts survive even after a big result is zipped.
 
 Batshit can also run more than one chat at once — a long task in one session keeps going while you work in another. The [Sessions sidebar](sessions-sidebar.md) shows a status label on any background chat that's still running.
@@ -105,14 +126,16 @@ If an agent ever does something you didn't expect — ignores a file, says it ca
 
 ## The Token Panel: your context meter
 
-Every model has a context window — a hard limit on how much conversation and tool output it can "hold in mind" at once. Most chat apps hide how full it's getting until something breaks. Batshit puts it right under the composer in the **Token Panel**.
+Every model has a context window — a hard limit on how much conversation and tool output it can "hold in mind" at once. Batshit shows how full it's getting right under the composer, in the **Token Panel**, so you see trouble before something breaks.
 
 The Token Panel shows:
 
 - **A context meter** — a ring that fills up as the window fills, with the percent used. It shifts color as you approach the limit (calm when there's plenty of room, a warning tone in the high range, and a clear danger state near full), so you can see trouble coming.
-- **A running cost indicator** for the chat.
+- For Codex and Claude Code agents, the meter uses the chosen CLI model's known window, then the window reported by a matching run when available. A Codex agent with custom CLI overrides outside the numeric context settings does not reuse a saved runtime report on later views, but live previews still update its count and limit. Changing its model or settings invalidates an older preview. Claude's configured context cap applies before the first preview. If the limit is unknown, it still shows the tokens used but leaves the percentage blank and explains why.
+- **A running cost indicator** for the chat. Tokens the provider read from its cache cost the cached price. Tokens it wrote to its cache can cost more than plain input: on Claude models a write costs 1.25 times the input price for Anthropic's 5-minute cache and 2 times for its 1-hour cache, and the running cost counts them that way. When Batshit does not know a provider's cache-write price, the running cost is marked as an estimate.
 - **Tokens used and remaining**, on hover.
 - **A cache readout** — how much of the latest response's input the provider read from its prompt cache, as a percent (cached input is billed far cheaper on most providers). Hover for the token math, tokens newly written to cache, and the whole chat's overall rate across every response that reported cache data.
+- If Batshit cannot read a saved CLI context report, the send can continue, but the context limit and percentage stay unknown. The Token Panel details explain the failure while the used-token count remains visible. A newer successful check or matching runtime report clears the warning.
 - **A speed readout** — output tokens per second for the latest response. Hover for time to first output and total model time. API agents show the AI SDK's own measurements; managed Codex and Claude CLI agents show timings Batshit measured live (first output includes CLI startup time).
 
 Both readouts are honest by design: they only ever show numbers the provider or runtime actually reported or Batshit actually measured. When a lane doesn't report a metric, you see a dash — never a guess.

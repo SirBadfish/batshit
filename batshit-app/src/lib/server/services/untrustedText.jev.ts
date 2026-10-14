@@ -1,5 +1,5 @@
 /**
- * SA-120 P7 (design record F1) — Jev Juice incoming-text screen.
+ * SA-120 P7 (design record F1) — Judge Juice incoming-text screen.
  *
  * THE constants module for this feature (DL-120-03): every question, its criteria, every
  * floor, and every cap live here, so a reviewer reads the whole decision surface in one
@@ -7,7 +7,7 @@
  *
  * What it does. Three kinds of text reach an agent from somewhere other than the user: a DM
  * from another agent (a `result` included), a wake-up webhook's message, and the SKILL.md of
- * a skill being imported. With the ONE switch **Screen Incoming Text** (on the Jev Juice card) ON
+ * a skill being imported. With the ONE switch **Screen Incoming Text** (on the Judge Juice card) ON
  * (`batshit:typesafe_config.screenIncomingText`, LS-057), Batshit shows each such text to Jev
  * ONCE, when it arrives, and asks three yes-or-no questions plus one harm Score:
  *
@@ -45,7 +45,7 @@
  * Not a compile lane: the text is screened where it enters (a tool call, the webhook route,
  * the import route), so the budget is `deadlineMs` below, not the user's In-Chat Wait Limit.
  * Jev unavailable, slow, or unkeyed: a `skipped` result with the reason, shown as the quiet
- * Jev Juice note on the DM or in the import dialog, and an Execution Viewer row; never an LLM
+ * Judge Juice note on the DM or in the import dialog, and an Execution Viewer row; never an LLM
  * stand-in (DL-120-02). The switch OFF: no call, no record, and nothing stored anywhere.
  *
  * What leaves the machine when ON: the subject and text of each agent DM and wake-up webhook
@@ -54,6 +54,7 @@
  */
 
 import type {
+  JudgeProviderRef,
   TypesafeCallRecord,
   UntrustedTextFinding,
   UntrustedTextFindingId,
@@ -61,6 +62,7 @@ import type {
   UntrustedTextSource
 } from '$lib/types/typesafe'
 import { resolveJevIncomingTextScreenEnabled } from '$lib/utils/jevJuiceControl'
+import { judgeProviderRef, resolveJudgeProviderForLane } from '$lib/utils/judgeProviders'
 import { runTypesafeJudgment } from './typesafe/typesafeAvailability'
 import type {
   JevNoulAnswer,
@@ -379,11 +381,18 @@ export interface ScreenUntrustedTextOptions extends UntrustedTextInput {
  */
 export async function screenUntrustedText(options: ScreenUntrustedTextOptions): Promise<UntrustedTextScreen | null> {
   const now = options.now ?? (() => new Date())
-  let requestedModel = ''
+  let requestedModel: string | null = null
+  let provider: JudgeProviderRef | undefined
+  let chosenProviderId: string | undefined
   let questionCount = 0
   try {
     const config = await getTypesafeConfig()
-    requestedModel = config.modelId
+    // SA-120 P10a: the judge this lane asks, so even a local error's row names it.
+    const routed = resolveJudgeProviderForLane(config, UNTRUSTED_TEXT_FEATURE_ID)
+    const judge = routed.provider
+    requestedModel = judge?.modelId ?? null
+    provider = judge ? judgeProviderRef(judge) : undefined
+    chosenProviderId = judge ? undefined : routed.providerId
     if (!resolveJevIncomingTextScreenEnabled(config)) return null
     if (typeof options.text !== 'string' || !options.text.trim()) return null
 
@@ -427,10 +436,12 @@ export async function screenUntrustedText(options: ScreenUntrustedTextOptions): 
       record
     }
   } catch (error) {
-    console.error('[Jev Juice] the incoming-text screen failed before it could answer:', error)
+    console.error('[Judge Juice] the incoming-text screen failed before it could answer:', error)
     const record = createTypesafeCallRecord({
       featureId: UNTRUSTED_TEXT_FEATURE_ID,
       requestedModel,
+      provider,
+      chosenProviderId,
       questionCount,
       outcome: null,
       decision: `${SOURCE_WORDS[options.source]}: not screened (Batshit could not prepare the request); nothing blocked`,

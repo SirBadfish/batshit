@@ -16,6 +16,7 @@ const mockGetVoiceProfiles = vi.fn()
 const mockGetVoiceProfile = vi.fn()
 const mockCreateVoiceProfile = vi.fn()
 const mockDeleteVoiceProfile = vi.fn()
+const mockResolveLiveKitRuntimeEngineRefs = vi.fn(async (_userId: string): Promise<unknown[]> => [])
 const mockRedisExecute = vi.fn(async (operation: any) =>
   operation({
     json: {
@@ -24,6 +25,11 @@ const mockRedisExecute = vi.fn(async (operation: any) =>
     }
   })
 )
+
+// The registry's launch-record tidy also takes LiveKit's runtimes in use (BL-1300).
+vi.mock('$lib/server/services/liveKitSidecarRuntime', () => ({
+  resolveLiveKitRuntimeEngineRefs: (userId: string) => mockResolveLiveKitRuntimeEngineRefs(userId)
+}))
 
 vi.mock('$lib/server/redis', () => ({
   redis: {
@@ -40,7 +46,16 @@ vi.mock('$lib/server/redis', () => ({
 }))
 
 describe('voiceEngineRegistry', () => {
+  // "Delete local files too" reads the Docker host operator's records (BL-1292): never the real
+  // folder under ~/.batshit. A test that needs one points this at its own.
+  const originalOperatorRoot = process.env.BATSHIT_RUNTIME_ADDON_OPERATOR_STATE_DIR
+  afterEach(() => {
+    if (originalOperatorRoot === undefined) delete process.env.BATSHIT_RUNTIME_ADDON_OPERATOR_STATE_DIR
+    else process.env.BATSHIT_RUNTIME_ADDON_OPERATOR_STATE_DIR = originalOperatorRoot
+  })
+
   beforeEach(() => {
+    process.env.BATSHIT_RUNTIME_ADDON_OPERATOR_STATE_DIR = path.join(os.tmpdir(), `batshit-test-no-operator-${process.pid}`)
     vi.clearAllMocks()
     mockGetAgents.mockResolvedValue([])
     mockUpdateAgent.mockResolvedValue(undefined)
@@ -796,6 +811,209 @@ describe('voiceEngineRegistry', () => {
     }
   })
 
+  describe('"Delete local files too" for files Batshit cannot delete (BL-176)', () => {
+    const saved = {
+      installs: process.env.BATSHIT_MANAGED_INSTALLS_ROOT,
+      state: process.env.BATSHIT_VOICE_RUNTIME_STATE_ROOT,
+      containerized: process.env.BATSHIT_CONTAINERIZED
+    }
+    let tempRoot: string
+
+    beforeEach(async () => {
+      tempRoot = await mkdtemp(path.join(os.tmpdir(), 'batshit-voice-engine-foreign-root-'))
+      process.env.BATSHIT_MANAGED_INSTALLS_ROOT = path.join(tempRoot, 'managed-installs')
+      process.env.BATSHIT_VOICE_RUNTIME_STATE_ROOT = path.join(tempRoot, 'runtime')
+      const jsonStore = new Map<string, any>()
+      mockRedisJsonGet.mockImplementation(async (key: string) => jsonStore.get(key) ?? null)
+      mockRedisJsonSet.mockImplementation(async (key: string, _path: string, value: any) => {
+        jsonStore.set(key, value)
+        return 'OK'
+      })
+      mockGetUserSettings.mockResolvedValue({
+        id: 'settings_user-1',
+        user_id: 'user-1',
+        voice_settings: { schemaVersion: 2 }
+      })
+    })
+
+    afterEach(async () => {
+      for (const [key, value] of [
+        ['BATSHIT_MANAGED_INSTALLS_ROOT', saved.installs],
+        ['BATSHIT_VOICE_RUNTIME_STATE_ROOT', saved.state],
+        ['BATSHIT_CONTAINERIZED', saved.containerized]
+      ] as const) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+      await rm(tempRoot, { recursive: true, force: true })
+    })
+
+    async function deleteEngineInstalledAt(installRoot: string) {
+      await mkdir(path.join(installRoot, 'models'), { recursive: true })
+      const { deleteVoiceEngineRecord, upsertVoiceEngineRecord } = await import('../services/voiceEngineRegistry')
+      await upsertVoiceEngineRecord('user-1', 'kokoro-host', {
+        name: 'Kokoro Host',
+        baseUrl: 'http://localhost:9998',
+        localRuntime: {
+          installRoot,
+          installOwnership: 'batshit-managed',
+          launch: { command: path.join(installRoot, 'server.py'), cwd: installRoot }
+        }
+      })
+      return deleteVoiceEngineRecord('user-1', 'kokoro-host', { deleteLocalFiles: true })
+    }
+
+    it('in Docker, says the files are on the computer that runs Docker, where they are, and what to do', async () => {
+      process.env.BATSHIT_CONTAINERIZED = '1'
+      // Installed by the host operator: a host path the container cannot reach.
+      const hostInstallRoot = path.join(tempRoot, 'host-home', '.batshit', 'installs', 'kokoro-host')
+      const deleted = await deleteEngineInstalledAt(hostInstallRoot)
+
+      expect(deleted.localFiles.deleted).toBe(false)
+      expect(deleted.localFiles.errors).toEqual([])
+      expect(deleted.localFiles.skipped).toHaveLength(1)
+      const reason = deleted.localFiles.skipped[0].reason
+      expect(reason).toContain('"Kokoro Host"')
+      expect(reason).toContain('the computer that runs Docker')
+      expect(reason).toContain(hostInstallRoot)
+      expect(reason).toMatch(/Delete that folder yourself/)
+      expect(reason).not.toMatch(/does not match/)
+      // Nothing was deleted.
+      expect((await stat(hostInstallRoot)).isDirectory()).toBe(true)
+    })
+
+    it('outside Docker, names the saved folder and the managed one, and what to do', async () => {
+      delete process.env.BATSHIT_CONTAINERIZED
+      const elsewhere = path.join(tempRoot, 'somewhere-else', 'kokoro-host')
+      const deleted = await deleteEngineInstalledAt(elsewhere)
+
+      expect(deleted.localFiles.deleted).toBe(false)
+      const reason = deleted.localFiles.skipped[0].reason
+      expect(reason).toContain('"Kokoro Host"')
+      expect(reason).toContain(elsewhere)
+      expect(reason).toContain(path.join(tempRoot, 'managed-installs', 'kokoro-host'))
+      expect(reason).toMatch(/Delete that folder yourself/)
+      expect(reason).not.toContain('Docker')
+      expect((await stat(elsewhere)).isDirectory()).toBe(true)
+    })
+
+    // BL-1289: the install and state folders are shared by every Batshit on the computer that keeps
+    // the default ones. Deleting this Batshit's engine never stops another Batshit's launch of the
+    // same engine id and never removes its records or its files.
+    it("never stops another Batshit's launch of the same engine, nor removes its records or the shared files", async () => {
+      delete process.env.BATSHIT_CONTAINERIZED
+      const installRoot = path.join(tempRoot, 'managed-installs', 'kokoro-host')
+      const theirs = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', tempRoot], { detached: true, stdio: 'ignore' })
+      await new Promise((resolve) => theirs.once('spawn', resolve))
+      try {
+        const stateDir = path.join(tempRoot, 'runtime', 'kokoro-host')
+        await mkdir(stateDir, { recursive: true })
+        const recordPath = path.join(stateDir, '.batshit-local-runtime-launch.json')
+        const record = JSON.stringify({
+          engineId: 'kokoro-host',
+          pid: theirs.pid,
+          command: process.execPath,
+          args: ['-e', 'setInterval(() => {}, 1000)', tempRoot],
+          launchedAt: new Date().toISOString(),
+          registry: 'redis-0000000000000000',
+          stopOnShutdown: false
+        })
+        await writeFile(recordPath, record)
+
+        const deleted = await deleteEngineInstalledAt(installRoot)
+
+        expect(deleted.localFiles.deleted).toBe(false)
+        expect(deleted.localFiles.skipped).toEqual([])
+        // An error, so the Engine Manager always shows it.
+        expect(deleted.localFiles.errors).toHaveLength(1)
+        expect(deleted.localFiles.errors[0].message).toContain('another Batshit on this computer (Batshit in Docker included), or another engine, may still use them')
+        expect(deleted.localFiles.errors[0].message).toContain(installRoot)
+        expect(deleted.localFiles.errors[0].message).toContain(recordPath)
+        // Their process runs, their record keeps its bytes, and the shared install folder stays.
+        expect(() => process.kill(theirs.pid as number, 0)).not.toThrow()
+        expect(await readFile(recordPath, 'utf8')).toBe(record)
+        expect((await stat(installRoot)).isDirectory()).toBe(true)
+      } finally {
+        try {
+          process.kill(-(theirs.pid as number), 'SIGKILL')
+        } catch {}
+      }
+    })
+
+    // An attach record lives in the folder of the engine that attaches. A runtime another engine
+    // still uses runs from these files, so they stay, whichever Batshit that engine is in (this
+    // Batshit's own case, with a real attach, is "a runtime another engine still uses" below).
+    it("keeps the files of a runtime an engine of another Batshit still uses through its attach record", async () => {
+      delete process.env.BATSHIT_CONTAINERIZED
+      const installRoot = path.join(tempRoot, 'managed-installs', 'kokoro-host')
+      const { writeLocalRuntimeLaunchRecord } = await import('../services/voiceRuntimeLaunchRecords')
+      const runtime = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', tempRoot], { detached: true, stdio: 'ignore' })
+      await new Promise((resolve) => runtime.once('spawn', resolve))
+      try {
+        const launch = { engineId: 'kokoro-host', pid: runtime.pid as number, command: process.execPath, args: ['-e', 'setInterval(() => {}, 1000)', tempRoot], launchedAt: new Date().toISOString() }
+        await writeLocalRuntimeLaunchRecord(launch)
+        const ownPath = path.join(tempRoot, 'runtime', 'kokoro-host', '.batshit-local-runtime-launch.json')
+        const own = await readFile(ownPath, 'utf8')
+        const attachPath = path.join(tempRoot, 'runtime', 'whisper', '.batshit-local-runtime-launch.json')
+        await mkdir(path.dirname(attachPath), { recursive: true })
+        const attach = JSON.stringify({ ...launch, engineId: 'whisper', startedBy: 'kokoro-host', registry: 'redis-0000000000000000', stopOnShutdown: false })
+        await writeFile(attachPath, attach)
+
+        const deleted = await deleteEngineInstalledAt(installRoot)
+
+        expect(deleted.localFiles.deleted).toBe(false)
+        expect(deleted.localFiles.errors).toHaveLength(1)
+        expect(deleted.localFiles.errors[0].message).toContain(attachPath)
+        expect(() => process.kill(runtime.pid as number, 0)).not.toThrow()
+        expect(await readFile(ownPath, 'utf8')).toBe(own)
+        expect(await readFile(attachPath, 'utf8')).toBe(attach)
+        expect((await stat(path.join(installRoot, 'models'))).isDirectory()).toBe(true)
+      } finally {
+        try {
+          process.kill(-(runtime.pid as number), 'SIGKILL')
+        } catch {}
+      }
+    })
+
+    it('keeps the files while the Docker host operator runs that engine, and says so (BL-1292)', async () => {
+      delete process.env.BATSHIT_CONTAINERIZED
+      const installRoot = path.join(tempRoot, 'managed-installs', 'kokoro-host')
+      process.env.BATSHIT_RUNTIME_ADDON_OPERATOR_STATE_DIR = path.join(tempRoot, 'operator')
+      const operatorPath = path.join(tempRoot, 'operator', 'kokoro-host', '.batshit-local-runtime-launch.json')
+      await mkdir(path.dirname(operatorPath), { recursive: true })
+      const operatorRecord = JSON.stringify({ engineId: 'kokoro-host', pid: process.pid, command: path.join(installRoot, 'server.py'), launchedBy: 'batshit-docker' })
+      await writeFile(operatorPath, operatorRecord)
+
+      const deleted = await deleteEngineInstalledAt(installRoot)
+
+      expect(deleted.localFiles.deleted).toBe(false)
+      expect(deleted.localFiles.errors).toHaveLength(1)
+      expect(deleted.localFiles.errors[0].message).toContain('Batshit in Docker included')
+      expect(deleted.localFiles.errors[0].message).toContain(operatorPath)
+      expect(await readFile(operatorPath, 'utf8')).toBe(operatorRecord)
+      expect((await stat(path.join(installRoot, 'models'))).isDirectory()).toBe(true)
+    })
+
+    it('with only its own records there, removes the install and state folders as before', async () => {
+      delete process.env.BATSHIT_CONTAINERIZED
+      const installRoot = path.join(tempRoot, 'managed-installs', 'kokoro-host')
+      const { writeLocalRuntimeLaunchRecord } = await import('../services/voiceRuntimeLaunchRecords')
+      // A launch of this Batshit whose process is gone.
+      const gone = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' })
+      await new Promise((resolve) => gone.once('exit', resolve))
+      await writeLocalRuntimeLaunchRecord({ engineId: 'kokoro-host', pid: gone.pid as number, command: '/bin/x' })
+      const stateDir = path.join(tempRoot, 'runtime', 'kokoro-host')
+
+      const deleted = await deleteEngineInstalledAt(installRoot)
+
+      expect(deleted.localFiles.skipped).toEqual([])
+      expect(deleted.localFiles.deletedInstallRoots).toEqual([installRoot])
+      expect(deleted.localFiles.deletedStateRoots).toEqual([path.resolve(stateDir)])
+      await expect(stat(installRoot)).rejects.toMatchObject({ code: 'ENOENT' })
+      await expect(stat(stateDir)).rejects.toMatchObject({ code: 'ENOENT' })
+    })
+  })
+
   it('hides hidden suite members from public summaries while aggregating suite capabilities', async () => {
     const jsonStore = new Map<string, any>()
     let storedVoiceSettings: Record<string, any> | undefined
@@ -1008,6 +1226,32 @@ describe('voiceEngineRegistry', () => {
       }
     }
 
+    // BL-1300: LiveKit is not a voice engine. The tidy after every engine save released LiveKit's
+    // "keep running", because it read LiveKit as deleted.
+    it("keeps LiveKit's keep-running through an engine save while LiveKit is in use, and skips the tidy when its settings cannot be read", async () => {
+      useStore()
+      const { writeLocalRuntimeLaunchRecord } = await import('../services/voiceRuntimeLaunchRecords')
+      await writeLocalRuntimeLaunchRecord({ engineId: 'livekit-server', pid: process.pid, command: '/x/livekit-server', endpoint: 'http://127.0.0.1:7880', stopOnShutdown: false })
+      const choice = async () =>
+        JSON.parse(await readFile(path.join(stateRoot, 'livekit-server', '.batshit-local-runtime-launch.json'), 'utf8')).stopOnShutdown
+      const registry = await import('../services/voiceEngineRegistry')
+
+      mockResolveLiveKitRuntimeEngineRefs.mockResolvedValueOnce([
+        { id: 'livekit-server', baseUrl: 'http://127.0.0.1:7880', localRuntime: { launch: { command: '/x/livekit-server' } } }
+      ])
+      await registry.upsertVoiceEngineRecord('user-1', 'whisper-cpp', LAUNCHABLE)
+      expect(mockResolveLiveKitRuntimeEngineRefs).toHaveBeenCalledWith('user-1')
+      expect(await choice()).toBe(false)
+
+      mockResolveLiveKitRuntimeEngineRefs.mockRejectedValueOnce(new Error('redis down'))
+      await registry.upsertVoiceEngineRecord('user-1', 'whisper-cpp', { ...LAUNCHABLE, name: 'Whisper' })
+      expect(await choice()).toBe(false)
+
+      // Not configured: LiveKit's launch follows the tidy as any deleted engine's does.
+      await registry.upsertVoiceEngineRecord('user-1', 'whisper-cpp', { ...LAUNCHABLE, name: 'Whisper.cpp' })
+      expect(await choice()).toBeUndefined()
+    })
+
     it('offers the toggle only for an engine Batshit can honestly stop', async () => {
       useStore()
       const { listVoiceEngineSummaries, upsertVoiceEngineRecord } = await import(
@@ -1048,6 +1292,38 @@ describe('voiceEngineRegistry', () => {
       const summary = (await listVoiceEngineSummaries('user-1'))[0]
       expect(summary.localRuntime?.canStopOnShutdown).toBe(false)
       expect(summary.localRuntime?.stopOnShutdownUnavailableReason).toBe('docker')
+    })
+
+    it('projects the Windows guest policy only for stoppable engines and never saves over an OFF choice', async () => {
+      const runtimeContext = await import('../services/runtimeContext')
+      const context = runtimeContext.resolveRuntimeContext({
+        BATSHIT_RUNTIME_OWNER: 'pinokio',
+        BATSHIT_PINOKIO_HOST: 'windows-wsl',
+        BATSHIT_PINOKIO_ENGINE_STOP_POLICY: 'all-owned'
+      }, 'linux')
+      const capability = vi.spyOn(runtimeContext, 'resolveRuntimeContext').mockReturnValue(context)
+      try {
+        useStore()
+        const registry = await import('../services/voiceEngineRegistry')
+        await registry.upsertVoiceEngineRecord('user-1', 'whisper-cpp', {
+          ...LAUNCHABLE,
+          localRuntime: { ...LAUNCHABLE.localRuntime, startup: { stopOnShutdown: false } }
+        })
+        await registry.upsertVoiceEngineRecord('user-1', 'connected-tts', {
+          name: 'Connected TTS', baseUrl: 'http://127.0.0.1:9100',
+          localRuntime: { installOwnership: 'user-managed' }
+        })
+        const byId = Object.fromEntries((await registry.listVoiceEngineSummaries('user-1')).map((summary) => [summary.id, summary]))
+        expect(byId['whisper-cpp'].localRuntime).toMatchObject({
+          canStopOnShutdown: true, shutdownStopPolicy: 'all-owned', startup: { stopOnShutdown: false }
+        })
+        expect(byId['connected-tts'].localRuntime).toMatchObject({ canStopOnShutdown: false })
+        expect(byId['connected-tts'].localRuntime?.shutdownStopPolicy).toBeUndefined()
+        expect((await registry.getVoiceEngineRecordByProviderId('user-1', 'byo:whisper-cpp'))?.localRuntime?.startup?.stopOnShutdown).toBe(false)
+        expect((await registry.getVoiceEngineRecordByProviderId('user-1', 'byo:whisper-cpp'))?.localRuntime).not.toHaveProperty('shutdownStopPolicy')
+      } finally {
+        capability.mockRestore()
+      }
     })
 
     describe('in Docker, with a host operator', () => {
@@ -1180,6 +1456,25 @@ describe('voiceEngineRegistry', () => {
         await registry.upsertVoiceEngineRecord('user-1', 'kokoro', { name: 'Kokoro (renamed)' })
         expect(await kokoroRecordExists()).toBe(true)
       })
+
+      it('while its saved record cannot be read, no save tidies it away or releases its keep-running choice', async () => {
+        const registry = await sharedRuntime()
+        // A newer Batshit wrote kokoro's record with a field this one does not know. Its engine
+        // may still use the shared runtime, so the tidy cannot know its record is stale.
+        const stored = await mockRedisJsonGet('voice_engine_registry:user-1')
+        stored.records.find((record: { id: string }) => record.id === 'kokoro').futureOption = true
+
+        await registry.upsertVoiceEngineRecord('user-1', 'chatterbox-turbo', { name: 'Chatterbox (renamed)' })
+
+        expect(await kokoroRecordExists()).toBe(true)
+        expect(
+          JSON.parse(await readFile(path.join(stateRoot, 'kokoro', '.batshit-local-runtime-launch.json'), 'utf8'))
+            .stopOnShutdown
+        ).toBe(false)
+        expect(
+          (await mockRedisJsonGet('voice_engine_registry:user-1')).records.map((record: { id: string }) => record.id).sort()
+        ).toEqual(['chatterbox-turbo', 'kokoro'])
+      })
     })
 
     describe('"Delete local files too" stops the engine first', () => {
@@ -1271,9 +1566,9 @@ describe('voiceEngineRegistry', () => {
         await expect(stat(path.join(stateRoot, 'solo-engine'))).rejects.toMatchObject({ code: 'ENOENT' })
       })
 
-      it('a runtime another engine still uses keeps running, and stays recorded', async () => {
+      it('a runtime another engine still uses keeps running, stays recorded, and keeps the files it runs from (BL-1289)', async () => {
         useStore()
-        const { pid } = await launchedEngine('starter-engine', 8202)
+        const { pid, installRoot } = await launchedEngine('starter-engine', 8202)
         const registry = await import('../services/voiceEngineRegistry')
         await registry.upsertVoiceEngineRecord('user-1', 'sharing-engine', {
           ...LAUNCHABLE,
@@ -1288,10 +1583,21 @@ describe('voiceEngineRegistry', () => {
         const deleted = await registry.deleteVoiceEngineRecord('user-1', 'starter-engine', { deleteLocalFiles: true })
 
         expect(alive(pid)).toBe(true)
-        expect(deleted.localFiles.errors).toEqual([])
+        expect(deleted.localFiles.deleted).toBe(false)
+        expect(deleted.localFiles.errors).toEqual([
+          expect.objectContaining({
+            engineId: 'starter-engine',
+            message: expect.stringContaining(path.join(stateRoot, 'sharing-engine', '.batshit-local-runtime-launch.json'))
+          })
+        ])
+        expect((await stat(installRoot)).isDirectory()).toBe(true)
         expect(
           JSON.parse(await readFile(path.join(stateRoot, 'sharing-engine', '.batshit-local-runtime-launch.json'), 'utf8'))
         ).toMatchObject({ pid, startedBy: 'starter-engine' })
+        // The starter's own record stays, so its shutdown choice still counts.
+        expect(
+          JSON.parse(await readFile(path.join(stateRoot, 'starter-engine', '.batshit-local-runtime-launch.json'), 'utf8')).pid
+        ).toBe(pid)
       })
 
       it('an engine that cannot be checked or stopped keeps its files and record, and says so', async () => {
@@ -1314,6 +1620,32 @@ describe('voiceEngineRegistry', () => {
         expect((await stat(installRoot)).isDirectory()).toBe(true)
         expect(
           JSON.parse(await readFile(path.join(stateRoot, 'stuck-engine', '.batshit-local-runtime-launch.json'), 'utf8')).pid
+        ).toBe(pid)
+      })
+
+      it('a launch record that cannot be read keeps the engine, its files and every record, and says what to do (BL-1268)', async () => {
+        useStore()
+        const { pid, installRoot } = await launchedEngine('garbled-engine', 8204)
+        // An earlier launch's record, moved aside and now malformed: it may name a copy still
+        // running from these files, so nothing is stopped and nothing is deleted.
+        const aside = path.join(stateRoot, 'garbled-engine', '.batshit-local-runtime-launch.4242.json')
+        await writeFile(aside, '{ "pid": 4242, "stopOnShutdown": fal')
+        const { deleteVoiceEngineRecord } = await import('../services/voiceEngineRegistry')
+
+        const deleted = await deleteVoiceEngineRecord('user-1', 'garbled-engine', { deleteLocalFiles: true })
+
+        await new Promise((resolve) => setTimeout(resolve, 300))
+        expect(alive(pid)).toBe(true)
+        expect(deleted.localFiles.deleted).toBe(false)
+        expect(deleted.localFiles.errors).toHaveLength(1)
+        const { message } = deleted.localFiles.errors[0]
+        expect(message).toMatch(/^Batshit kept the local files of "garbled-engine": the launch record .*\.4242\.json is not valid JSON, and it may name an engine still running from them\. Once that engine has stopped \(restarting the computer stops it\), repair or remove that file or folder, then delete /)
+        expect(message).toContain(`delete ${installRoot} and ${path.join(stateRoot, 'garbled-engine')} yourself.`)
+        expect(message).not.toMatch(/is still running and could not be stopped/)
+        expect((await stat(installRoot)).isDirectory()).toBe(true)
+        expect(await readFile(aside, 'utf8')).toBe('{ "pid": 4242, "stopOnShutdown": fal')
+        expect(
+          JSON.parse(await readFile(path.join(stateRoot, 'garbled-engine', '.batshit-local-runtime-launch.json'), 'utf8')).pid
         ).toBe(pid)
       })
     })
@@ -1361,12 +1693,13 @@ describe('voiceEngineRegistry', () => {
 
       await upsertVoiceEngineRecord('user-1', 'whisper-cpp', LAUNCHABLE)
 
-      // A record from an earlier launch, written before the user chose.
+      // A record from an earlier launch by this Batshit (its registry), written before the user chose.
+      const { resolveVoiceRuntimeRegistryIdentity } = await import('../services/voiceRuntimeLaunchRecords')
       const recordPath = resolveLocalVoiceRuntimeLaunchRecordPath('whisper-cpp')
       await mkdir(path.dirname(recordPath), { recursive: true })
       await writeFile(
         recordPath,
-        JSON.stringify({ engineId: 'whisper-cpp', pid: 4242, stopOnShutdown: true })
+        JSON.stringify({ engineId: 'whisper-cpp', pid: 4242, stopOnShutdown: true, registry: await resolveVoiceRuntimeRegistryIdentity() })
       )
 
       await applyVoiceEnginePublicUpdates('user-1', [
@@ -1385,6 +1718,34 @@ describe('voiceEngineRegistry', () => {
         { id: 'whisper-cpp', localRuntime: { startup: { stopOnShutdown: true } } }
       ])
       expect(JSON.parse(await readFile(recordPath, 'utf8')).stopOnShutdown).toBe(true)
+    })
+
+    // BL-1286: the choice updater runs after ANY update of an engine with a launch recipe, so an
+    // unrelated save here must never write this Batshit's choice into another Batshit's record.
+    it("an unrelated update leaves another Batshit's keep-running record of the same engine unchanged", async () => {
+      useStore()
+      const { applyVoiceEnginePublicUpdates, upsertVoiceEngineRecord } = await import(
+        '../services/voiceEngineRegistry'
+      )
+      const { resolveLocalVoiceRuntimeLaunchRecordPath } = await import(
+        '../services/voiceLocalRuntimePaths'
+      )
+      await upsertVoiceEngineRecord('user-1', 'whisper-cpp', LAUNCHABLE)
+
+      // Another Batshit (another registry) launched its whisper-cpp, which runs, and keeps it running.
+      const recordPath = resolveLocalVoiceRuntimeLaunchRecordPath('whisper-cpp')
+      await mkdir(path.dirname(recordPath), { recursive: true })
+      const theirs = JSON.stringify({
+        engineId: 'whisper-cpp',
+        pid: process.pid,
+        stopOnShutdown: false,
+        registry: 'redis-0000000000000000'
+      })
+      await writeFile(recordPath, theirs)
+
+      await applyVoiceEnginePublicUpdates('user-1', [{ id: 'whisper-cpp', enabled: false }])
+
+      expect(await readFile(recordPath, 'utf8')).toBe(theirs)
     })
 
     it('saving an unrelated field leaves an untouched engine stopping on shutdown', async () => {
@@ -1412,6 +1773,298 @@ describe('voiceEngineRegistry', () => {
         { id: 'whisper-cpp', localRuntime: { startup: { stopOnShutdown: false } } }
       ])
       expect(updated[0].localRuntime?.startup?.stopOnShutdown).toBe(false)
+    })
+  })
+
+  // A registry Batshit cannot fully read must never be written over. Before, a Redis error, or one
+  // record the strict schema refused (a field from a newer Batshit, say), read as an EMPTY
+  // registry, and the next save of any engine wrote that empty list back: every other engine was
+  // gone, and the launch-record tidy that follows every save then released their launch records.
+  describe('a registry Batshit cannot fully read is never written over', () => {
+    const KEY = 'voice_engine_registry:user-1'
+    const engineRecord = (id: string, name: string, port: number) => ({
+      id,
+      name,
+      enabled: true,
+      baseUrl: `http://127.0.0.1:${port}`,
+      requestFormat: 'openai-compatible',
+      ttsPath: '/v1/audio/speech'
+    })
+    // Written by a newer Batshit: a field this one does not know, which the strict schema refuses.
+    const FROM_NEWER = {
+      id: 'dots-tts-mf',
+      name: 'Dots TTS',
+      enabled: true,
+      baseUrl: 'http://127.0.0.1:8122',
+      requestFormat: 'openai-compatible',
+      futureOption: { lanes: ['a', 'b'] }
+    }
+
+    function seed(records: unknown[], envelope: Record<string, unknown> = {}) {
+      const jsonStore = new Map<string, any>()
+      jsonStore.set(KEY, { version: 1, records, ...envelope })
+      mockRedisJsonGet.mockImplementation(async (key: string) => jsonStore.get(key) ?? null)
+      // Stored as JSON, as RedisJSON would: nothing the writer holds on to changes it later.
+      mockRedisJsonSet.mockImplementation(async (key: string, _path: string, value: any) => {
+        jsonStore.set(key, JSON.parse(JSON.stringify(value)))
+        return 'OK'
+      })
+      mockGetUserSettings.mockResolvedValue({ id: 'settings_user-1', user_id: 'user-1', voice_settings: {} })
+      mockUpdateUserSettings.mockResolvedValue({ id: 'settings_user-1', user_id: 'user-1' })
+      return jsonStore
+    }
+    const savedIds = (jsonStore: Map<string, any>) =>
+      (jsonStore.get(KEY).records as Array<{ id: string }>).map((record) => record.id).sort()
+    const savedRecord = (jsonStore: Map<string, any>, id: string) =>
+      (jsonStore.get(KEY).records as Array<{ id: string }>).find((record) => record.id === id)
+
+    it('a Redis error throws, and nothing is written', async () => {
+      const jsonStore = seed([engineRecord('kokoro', 'Kokoro', 8010)])
+      const registry = await import('../services/voiceEngineRegistry')
+
+      mockRedisJsonGet.mockRejectedValueOnce(new Error('connection lost'))
+      await expect(
+        registry.upsertVoiceEngineRecord('user-1', 'whisper-cpp', engineRecord('whisper-cpp', 'Whisper', 8077))
+      ).rejects.toThrow(/connection lost/)
+      expect(mockRedisJsonSet).not.toHaveBeenCalled()
+      expect(savedIds(jsonStore)).toEqual(['kokoro'])
+
+      // A read for display throws too: an empty list would say there are no engines.
+      mockRedisJsonGet.mockRejectedValueOnce(new Error('connection lost'))
+      await expect(registry.listVoiceEngineSummaries('user-1')).rejects.toThrow(/connection lost/)
+    })
+
+    it('one unreadable record among good ones survives saving another engine, untouched', async () => {
+      const jsonStore = seed([engineRecord('kokoro', 'Kokoro', 8010), FROM_NEWER, engineRecord('whisper-cpp', 'Whisper', 8077)])
+      const registry = await import('../services/voiceEngineRegistry')
+
+      await registry.upsertVoiceEngineRecord('user-1', 'qwen3-tts', engineRecord('qwen3-tts', 'Qwen', 8012))
+
+      expect(savedIds(jsonStore)).toEqual(['dots-tts-mf', 'kokoro', 'qwen3-tts', 'whisper-cpp'])
+      expect(savedRecord(jsonStore, 'dots-tts-mf')).toEqual(FROM_NEWER)
+    })
+
+    it('every other writer keeps it too: the Engine Manager save and deleting another engine', async () => {
+      const jsonStore = seed([engineRecord('kokoro', 'Kokoro', 8010), FROM_NEWER, engineRecord('whisper-cpp', 'Whisper', 8077)])
+      const registry = await import('../services/voiceEngineRegistry')
+
+      await registry.applyVoiceEnginePublicUpdates('user-1', [{ id: 'kokoro', enabled: false }])
+      expect(savedIds(jsonStore)).toEqual(['dots-tts-mf', 'kokoro', 'whisper-cpp'])
+      expect(savedRecord(jsonStore, 'kokoro')).toMatchObject({ enabled: false })
+
+      await registry.deleteVoiceEngineRecord('user-1', 'whisper-cpp')
+      expect(savedIds(jsonStore)).toEqual(['dots-tts-mf', 'kokoro'])
+      expect(savedRecord(jsonStore, 'dots-tts-mf')).toEqual(FROM_NEWER)
+    })
+
+    it('the engine it cannot read is never edited, deleted, or reported as missing', async () => {
+      const jsonStore = seed([engineRecord('kokoro', 'Kokoro', 8010), FROM_NEWER])
+      const registry = await import('../services/voiceEngineRegistry')
+
+      await expect(registry.upsertVoiceEngineRecord('user-1', 'dots-tts-mf', { enabled: false })).rejects.toThrow(
+        /can.t be read/
+      )
+      await expect(registry.deleteVoiceEngineRecord('user-1', 'dots-tts-mf')).rejects.toThrow(/can.t be read/)
+      // Not `null` ("not registered"), which would send a caller off to set it up again.
+      await expect(registry.getVoiceEngineRecord('user-1', 'dots-tts-mf')).rejects.toThrow(/can.t be read/)
+      expect(mockRedisJsonSet).not.toHaveBeenCalled()
+      expect(savedRecord(jsonStore, 'dots-tts-mf')).toEqual(FROM_NEWER)
+    })
+
+    it('the Engine Manager lists the good engines, names the one it cannot read, and the log says so once', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      // Its own id: the log remembers a problem it has told for the life of the process.
+      seed([engineRecord('kokoro', 'Kokoro', 8010), { ...FROM_NEWER, id: 'dots-tts-once' }])
+      const registry = await import('../services/voiceEngineRegistry')
+
+      const view = await registry.listVoiceEngineManagerView('user-1')
+      await registry.listVoiceEngineManagerView('user-1')
+
+      expect(view.engines.map((engine) => engine.id)).toEqual(['kokoro'])
+      expect(view.unreadableEngines).toEqual([
+        {
+          scope: 'record',
+          id: 'dots-tts-once',
+          reason: expect.stringContaining('futureOption'),
+          name: 'Dots TTS',
+          supportsTts: true,
+          supportsStt: false
+        }
+      ])
+      expect(warn.mock.calls.filter((call) => String(call[0]).includes('dots-tts-once'))).toHaveLength(1)
+      warn.mockRestore()
+    })
+
+    it('a registry in another format is never written over, and reads as no engines plus a notice', async () => {
+      const jsonStore = seed([engineRecord('kokoro', 'Kokoro', 8010)], { version: 2 })
+      const registry = await import('../services/voiceEngineRegistry')
+
+      await expect(
+        registry.upsertVoiceEngineRecord('user-1', 'whisper-cpp', engineRecord('whisper-cpp', 'Whisper', 8077))
+      ).rejects.toThrow(/does not parse/)
+      expect(mockRedisJsonSet).not.toHaveBeenCalled()
+      expect(jsonStore.get(KEY)).toEqual({ version: 2, records: [engineRecord('kokoro', 'Kokoro', 8010)] })
+
+      const view = await registry.listVoiceEngineManagerView('user-1')
+      expect(view.engines).toEqual([])
+      expect(view.unreadableEngines).toEqual([{ scope: 'list', id: null, reason: expect.stringContaining('version') }])
+    })
+
+    it('a legacy engine whose id an unreadable record holds alone stays in the settings; the rest move, and nothing is dropped', async () => {
+      const jsonStore = seed([engineRecord('kokoro', 'Kokoro', 8010), FROM_NEWER])
+      let storedVoiceSettings: Record<string, any> = {
+        schemaVersion: 2,
+        byoProviders: [
+          { id: 'dots-tts-mf', name: 'Dots (legacy)', baseUrl: 'http://localhost:7777', ttsPath: '/tts' },
+          { id: 'legacy-two', name: 'Legacy Two', baseUrl: 'http://localhost:7778', ttsPath: '/tts' }
+        ]
+      }
+      mockGetUserSettings.mockImplementation(async () => ({
+        id: 'settings_user-1',
+        user_id: 'user-1',
+        voice_settings: storedVoiceSettings
+      }))
+      mockUpdateUserSettings.mockImplementation(async (_userId: string, updates: Record<string, any>) => {
+        storedVoiceSettings = updates.voice_settings
+        return { id: 'settings_user-1', user_id: 'user-1', voice_settings: storedVoiceSettings }
+      })
+      const registry = await import('../services/voiceEngineRegistry')
+
+      await registry.listVoiceEngineSummaries('user-1')
+
+      expect(savedIds(jsonStore)).toEqual(['dots-tts-mf', 'kokoro', 'legacy-two'])
+      expect(savedRecord(jsonStore, 'dots-tts-mf')).toEqual(FROM_NEWER)
+      // Only the one it could not merge. The one that moved is gone from the settings, so
+      // deleting it later cannot bring it back from there.
+      expect(storedVoiceSettings.byoProviders?.map((provider: { id: string }) => provider.id)).toEqual(['dots-tts-mf'])
+    })
+
+    it('a chat send whose chosen voice engine cannot be read still goes through; using the engine is refused plainly', async () => {
+      const jsonStore = seed([engineRecord('kokoro', 'Kokoro', 8010), FROM_NEWER])
+      const registry = await import('../services/voiceEngineRegistry')
+      const { resolveVoiceConfigForMetadata } = await import('../services/voiceService')
+      const userSettings = {
+        id: 'settings_user-1',
+        user_id: 'user-1',
+        voice_settings: { schemaVersion: 2, tts: { providerId: 'byo:dots-tts-mf', voiceId: 'alice' } }
+      } as any
+
+      // Every send runs this, voice on or off (send-routed, and the managed CLI voice block).
+      await expect(resolveVoiceConfigForMetadata({ userSettings, agent: null, metadata: {} })).resolves.toMatchObject({
+        provider: 'byo:dots-tts-mf',
+        voiceId: 'alice'
+      })
+      // Speaking with it is what fails, with the typed error.
+      await expect(registry.getVoiceEngineRecordByProviderId('user-1', 'byo:dots-tts-mf')).rejects.toBeInstanceOf(
+        registry.VoiceEngineRecordUnreadableError
+      )
+
+      // The whole list unreadable: the same.
+      jsonStore.set(KEY, { version: 2, records: [FROM_NEWER] })
+      await expect(resolveVoiceConfigForMetadata({ userSettings, agent: null, metadata: {} })).resolves.toMatchObject({
+        provider: 'byo:dots-tts-mf'
+      })
+
+      // A failed Redis read is not an engine it cannot read: it still throws.
+      mockRedisJsonGet.mockRejectedValueOnce(new Error('connection lost'))
+      await expect(resolveVoiceConfigForMetadata({ userSettings, agent: null, metadata: {} })).rejects.toThrow(
+        /connection lost/
+      )
+      expect(mockRedisJsonSet).not.toHaveBeenCalled()
+    })
+
+    it('the voice guidance says an engine it cannot read cannot be used, and does not throw', async () => {
+      const jsonStore = seed([engineRecord('kokoro', 'Kokoro', 8010), FROM_NEWER])
+      const registry = await import('../services/voiceEngineRegistry')
+
+      expect(await registry.getVoiceEngineGuidanceForProviderId('user-1', 'byo:dots-tts-mf')).toEqual([
+        expect.stringMatching(/byo:dots-tts-mf.*saved settings cannot be read/)
+      ])
+      expect((await registry.getVoiceEngineGuidanceForProviderId('user-1', 'byo:kokoro'))[0]).toBe(
+        'Voice engine: Kokoro (byo:kokoro)'
+      )
+
+      jsonStore.set(KEY, { version: 2, records: [engineRecord('kokoro', 'Kokoro', 8010)] })
+      expect(await registry.getVoiceEngineGuidanceForProviderId('user-1', 'byo:kokoro')).toEqual([
+        expect.stringMatching(/saved settings cannot be read/)
+      ])
+    })
+
+    it('run time learns whether every saved record was read', async () => {
+      const jsonStore = seed([engineRecord('kokoro', 'Kokoro', 8010)])
+      const registry = await import('../services/voiceEngineRegistry')
+
+      expect(await registry.listVoiceEngineRecordsForRuntime('user-1')).toMatchObject({ complete: true })
+
+      jsonStore.set(KEY, { version: 1, records: [engineRecord('kokoro', 'Kokoro', 8010), FROM_NEWER] })
+      const oneUnreadable = await registry.listVoiceEngineRecordsForRuntime('user-1')
+      expect(oneUnreadable.complete).toBe(false)
+      expect(oneUnreadable.records.map((record) => record.id)).toEqual(['kokoro'])
+
+      jsonStore.set(KEY, { version: 2, records: [engineRecord('kokoro', 'Kokoro', 8010)] })
+      expect(await registry.listVoiceEngineRecordsForRuntime('user-1')).toEqual({ records: [], complete: false })
+    })
+
+    it.each([
+      ['fields this Batshit does not know', { version: 1, records: [], futureIndex: { a: 1 } }, /does not know: futureIndex/],
+      ['records that are not a list', { version: 1, records: { kokoro: {} } }, /not a list/],
+      ['no format version', { records: [] }, /format version null/],
+      ['a value that is not an object', ['kokoro'], /not a list of engines/]
+    ])('a saved list with %s is never written over', async (_label, stored, why) => {
+      const jsonStore = seed([])
+      jsonStore.set(KEY, stored)
+      const registry = await import('../services/voiceEngineRegistry')
+
+      await expect(
+        registry.upsertVoiceEngineRecord('user-1', 'whisper-cpp', engineRecord('whisper-cpp', 'Whisper', 8077))
+      ).rejects.toThrow(why)
+      await expect(registry.applyVoiceEnginePublicUpdates('user-1', [])).rejects.toThrow(why)
+      await expect(registry.deleteVoiceEngineRecord('user-1', 'whisper-cpp')).rejects.toThrow(why)
+      expect(mockRedisJsonSet).not.toHaveBeenCalled()
+      expect(jsonStore.get(KEY)).toEqual(stored)
+
+      const view = await registry.listVoiceEngineManagerView('user-1')
+      expect(view.engines).toEqual([])
+      expect(view.unreadableEngines).toEqual([{ scope: 'list', id: null, reason: expect.stringMatching(why) }])
+    })
+
+    it('a saved list it cannot read as a whole runs no legacy migration', async () => {
+      const jsonStore = seed([engineRecord('kokoro', 'Kokoro', 8010)], { version: 2 })
+      mockGetUserSettings.mockResolvedValue({
+        id: 'settings_user-1',
+        user_id: 'user-1',
+        voice_settings: {
+          schemaVersion: 2,
+          byoProviders: [{ id: 'legacy-two', name: 'Legacy Two', baseUrl: 'http://localhost:7778', ttsPath: '/tts' }]
+        }
+      })
+      const registry = await import('../services/voiceEngineRegistry')
+
+      await registry.listVoiceEngineManagerView('user-1')
+
+      expect(mockRedisJsonSet).not.toHaveBeenCalled()
+      expect(mockUpdateUserSettings).not.toHaveBeenCalled()
+      expect(jsonStore.get(KEY)).toEqual({ version: 2, records: [engineRecord('kokoro', 'Kokoro', 8010)] })
+    })
+
+    it('a record with no usable id is one record it cannot read, not the whole list, and is kept', async () => {
+      const NO_ID = { name: 'Nameless', baseUrl: 'http://127.0.0.1:8130', requestFormat: 'openai-compatible' }
+      const HIDDEN_LANE = { ...FROM_NEWER, id: 'qwen3-tts-clone', suite: { id: 'qwen3-tts', role: 'clone', hidden: true } }
+      const jsonStore = seed([engineRecord('kokoro', 'Kokoro', 8010), NO_ID, HIDDEN_LANE])
+      const registry = await import('../services/voiceEngineRegistry')
+
+      const view = await registry.listVoiceEngineManagerView('user-1')
+      expect(view.engines.map((engine) => engine.id)).toEqual(['kokoro'])
+      expect(view.unreadableEngines).toEqual([
+        expect.objectContaining({ scope: 'record', id: null, name: 'Nameless', reason: expect.stringContaining('id') }),
+        expect.objectContaining({ scope: 'record', id: 'qwen3-tts-clone', hidden: true })
+      ])
+
+      await registry.upsertVoiceEngineRecord('user-1', 'qwen3-tts', engineRecord('qwen3-tts', 'Qwen', 8012))
+      const saved = jsonStore.get(KEY).records as unknown[]
+      expect(saved).toHaveLength(4)
+      expect(saved).toContainEqual(NO_ID)
+      expect(saved).toContainEqual(HIDDEN_LANE)
     })
   })
 })

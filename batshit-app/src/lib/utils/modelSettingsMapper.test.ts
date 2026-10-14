@@ -433,3 +433,30 @@ describe('SA-102 local providerOptions segment', () => {
     expect(runtime.providerOptions.lmstudio).toEqual({ min_p: 0.05, top_k: 20 })
   })
 })
+
+describe('BL-515: Batshit\'s own keys never reach a provider, legacy ones included', () => {
+  it('keeps the native-tool block, its legacy alias and legacy top-level tool keys out of the request', () => {
+    const runtime = buildRuntimeModelSettings({
+      provider: 'vllm',
+      modelId: 'ssmod-probe',
+      connection: { type: 'direct', service: 'vllm' },
+      settings: {
+        temperature: 0.4,
+        userKnob: 3,
+        nativeTools: { bashAccessMode: 'plan' },
+        batshitNativeTools: { bashEnabled: false },
+        bashEnabled: false,
+        nativeWebSearchProvider: 'exa',
+        codex_permission_mode: 'chat',
+        claude_permission_mode: 'plan',
+        batshit_tool_search: true
+      }
+    })
+    expect(runtime.standard.temperature).toBe(0.4)
+    const sent = JSON.stringify(runtime.providerOptions)
+    expect(sent).toContain('userKnob')
+    for (const key of ['nativeTools', 'batshitNativeTools', 'bashEnabled', 'nativeWebSearchProvider', 'codex_permission_mode', 'claude_permission_mode', 'batshit_tool_search']) {
+      expect(sent).not.toContain(key)
+    }
+  })
+})

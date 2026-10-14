@@ -6,6 +6,7 @@ import {
   GOON_RECIPE_OWNER_V2_CONTRACT,
   GOON_RECIPE_REVISION_ENVELOPE_CONTRACT,
   GOON_RECIPE_STATE_CONTRACT,
+  GOON_RECIPE_REVISION_CONTRACT,
   GOON_RECIPE_JOB_CONTRACT,
   RECIPE_ARCHIVE_CONTAINMENT_RECEIPT_CONTRACT,
   RECIPE_MIGRATION_PLAN_CONTRACT,
@@ -18,6 +19,10 @@ import {
   createAnatomyFitState,
   createGoonRecipeDocument,
   createRecipeMigrationPlan,
+  createRecipeRevisionEnvelope,
+  recipeAuthoringRevisionSha256,
+  recipeRevisionBundleSha256,
+  verifyGoonRecipeV2,
   verifyRecipeStateSnapshot
 } from '$lib/goons/recipe'
 import type { GoonRecord } from '$lib/types/goons'
@@ -28,7 +33,10 @@ import {
   discardRecipeAnalysisRecords,
   getGoonRecipeDocument,
   getOwnedRecipeGoon,
-  putGoonRecipeDocument
+  putGoonRecipeDocument,
+  putRecipeRevisionEnvelope,
+  getRecipeRevisionEnvelope,
+  renewRecipeJobLease
 } from '../goonRecipeRepository.server'
 
 const REAL_REDIS_LANE = process.env.VITEST_USE_REAL_REDIS === 'true'
@@ -120,10 +128,30 @@ function goon(name = 'Recipe CAS Goon', writeVersion = 1): GoonRecord {
   }
 }
 
+function sphericalEyelid(
+  method: 'original' | 'spherical',
+  outwardMM: number
+): NonNullable<GoonRecord['sphericalEyelid']> {
+  const side = {
+    fit: {
+      translationMM: [outwardMM, 0, 0] as [number, number, number],
+      rotationDegreesXYZ: [0, 0, 0] as [number, number, number]
+    },
+    opening: { width: 1.04, height: 0.92, slantDegrees: 2, cornerRise: 0.03 },
+    roundingRadiusMM: 0.42
+  }
+  return {
+    contract: 'spherical-eyelid-state/v1',
+    definitionSha256: sha('f'),
+    method,
+    spherical: { left: structuredClone(side), right: structuredClone(side) }
+  }
+}
+
 async function storageStableAnatomyFitSnapshot() {
   const fitInput = await createAnatomyFitInput({
-    solverVersion: 'eye-socket-fit/neutral-relative/v3',
-    domain: 'eye-socket-left',
+    solverVersion: 'oral-cavity-anatomy-fit/v2',
+    domain: 'oral-cavity',
     source: {
       modelSha256: sha('3'),
       appearanceDefinitionSha256: sha('6'),
@@ -138,17 +166,7 @@ async function storageStableAnatomyFitSnapshot() {
     relevantInputs: [
       { id: 'eye_size', value: 0.9963701302315507 }
     ],
-    parameters: [
-      {
-        id: 'sclera-scale',
-        lower: 0.88,
-        upper: 1.12,
-        neutral: 1,
-        regularizationWeight: 0.5,
-        initialStep: 0.04,
-        minimumStep: 0.005
-      }
-    ]
+    parameters: []
   })
   const fitResult = await createAnatomyFitResult({
     solverVersion: fitInput.solverVersion,
@@ -162,17 +180,15 @@ async function storageStableAnatomyFitSnapshot() {
       tolerance: 0.00025,
       reason: 'objective-tolerance'
     },
-    resolvedParameters: [
-      { id: 'sclera-scale', value: 0.9722222222222207, lower: 0.88, upper: 1.12, neutral: 1 }
-    ],
+    resolvedParameters: [],
     nodeTransforms: [
       {
-        nodeId: 'eye-l-sclera',
+        nodeId: 'lower-gums',
         rootDeltaMatrix: [
-          -0.11218153564400829, 0, 0, 0,
-          0, 1, 0, 0,
-          0, 0, 1, 0,
-          3.3040728006091187, 0, 0, 1
+          1, 0, 0, 0,
+          1.34743637836628e-12, 1, 0, 0,
+          0, 1.88737329204147e-15, 1, 0,
+          -1.52736168765123e-12, 0, 0, 1
         ]
       }
     ],
@@ -399,7 +415,7 @@ async function storageStableMigrationPlanDocument() {
 describe('Goon Recipe repository', () => {
   useRedisTestServer()
 
-  it('round-trips owned Recipe Goons and content-addressed documents', async () => {
+  it.runIf(REAL_REDIS_LANE)('round-trips owned Recipe Goons and content-addressed documents', async () => {
     await redis.json.set(`goon:${GOON_ID}`, '$', goon())
     await expect(getOwnedRecipeGoon(USER_ID, GOON_ID)).resolves.toMatchObject({
       id: GOON_ID,
@@ -459,6 +475,32 @@ describe('Goon Recipe repository', () => {
     expect(stored.name).toBe('Recipe CAS Goon')
   })
 
+  it.runIf(REAL_REDIS_LANE)('rejects a new custom asset ref before changing owner or immutable record', async () => {
+    await redis.json.set(`goon:${GOON_ID}`, '$', goon())
+    const uploadKey = 'upload:goon_custom_packages:shared.bgoon'
+    const markerKey = 'goon_asset_delete:goon_custom_packages:shared.bgoon'
+    const recordKey = `goon_recipe_document:${USER_ID}:${GOON_ID}:${sha('e')}`
+    await redis.json.set(uploadKey, '$', { filename: 'shared.bgoon' })
+    await redis.execute((client) => client.set(markerKey, JSON.stringify({
+      contract: 'goon-asset-deletion/v1', phase: 'publishing'
+    })))
+    const next = {
+      ...goon('Guarded', 2),
+      recipe: { ...recipeOwner(2), activeRevision: documentRef('f') },
+      updated_at: '2026-07-17T00:00:01.000Z'
+    }
+    const record = { payload: { ref: '/uploads/goon_custom_packages/shared.bgoon' } }
+    await expect(compareAndSwapRecipeState({
+      userId: USER_ID,
+      goonId: GOON_ID,
+      expectedWriteVersion: 1,
+      nextGoon: next,
+      records: [{ key: recordKey, value: record }]
+    })).rejects.toMatchObject({ code: 'ASSET_UNAVAILABLE', status: 409 })
+    expect(await redis.json.get(recordKey)).toBeNull()
+    expect((await redis.json.get(`goon:${GOON_ID}`) as GoonRecord).recipe?.writeVersion).toBe(1)
+  })
+
   it.runIf(REAL_REDIS_LANE)('preserves unrelated Goon fields changed after a Recipe snapshot', async () => {
     await redis.json.set(`goon:${GOON_ID}`, '$', goon())
     const staleNext = {
@@ -492,6 +534,7 @@ describe('Goon Recipe repository', () => {
       nailSurface: { marker: 'old' },
       skinAppearance: { marker: 'old' },
       hairState: { marker: 'old' },
+      sphericalEyelid: sphericalEyelid('original', 2.25),
       recipeFitReceipts: [{ receiptId: 'old-fit' }]
     })
     const next = {
@@ -504,6 +547,7 @@ describe('Goon Recipe repository', () => {
       nailSurface: { marker: 'new' },
       skinAppearance: { marker: 'new' },
       hairState: { marker: 'new' },
+      sphericalEyelid: sphericalEyelid('spherical', 2.5),
       recipeFitReceipts: [{ receiptId: 'new-fit', status: 'stale' }],
       updated_at: '2026-07-17T00:00:01.000Z'
     } as unknown as GoonRecord
@@ -523,8 +567,52 @@ describe('Goon Recipe repository', () => {
       nailSurface: { marker: 'new' },
       skinAppearance: { marker: 'new' },
       hairState: { marker: 'new' },
+      sphericalEyelid: sphericalEyelid('spherical', 2.5),
       recipeFitReceipts: [{ receiptId: 'new-fit', status: 'stale' }]
     })
+  })
+
+  it.runIf(REAL_REDIS_LANE)('atomically sets, clears, and restores the spherical sibling projection', async () => {
+    const original = sphericalEyelid('original', 2.25)
+    await redis.json.set(`goon:${GOON_ID}`, '$', {
+      ...goon(),
+      sphericalEyelid: original
+    })
+
+    const updated = await compareAndSwapRecipeState({
+      userId: USER_ID,
+      goonId: GOON_ID,
+      expectedWriteVersion: 1,
+      nextGoon: {
+        ...goon('Spherical Revision', 2),
+        sphericalEyelid: sphericalEyelid('spherical', 2.5),
+        updated_at: '2026-07-17T00:00:01.000Z'
+      }
+    })
+    expect(updated.sphericalEyelid).toEqual(sphericalEyelid('spherical', 2.5))
+
+    const cleared = await compareAndSwapRecipeState({
+      userId: USER_ID,
+      goonId: GOON_ID,
+      expectedWriteVersion: 2,
+      nextGoon: {
+        ...goon('Original Without Sibling', 3),
+        updated_at: '2026-07-17T00:00:02.000Z'
+      }
+    })
+    expect(cleared).not.toHaveProperty('sphericalEyelid')
+
+    const restored = await compareAndSwapRecipeState({
+      userId: USER_ID,
+      goonId: GOON_ID,
+      expectedWriteVersion: 3,
+      nextGoon: {
+        ...goon('Rolled Back Revision', 4),
+        sphericalEyelid: original,
+        updated_at: '2026-07-17T00:00:03.000Z'
+      }
+    })
+    expect(restored.sphericalEyelid).toEqual(original)
   })
 
   it.runIf(REAL_REDIS_LANE)('preserves Anatomy Fit hashes through a nested RedisJSON round trip', async () => {
@@ -533,12 +621,17 @@ describe('Goon Recipe repository', () => {
       ...goon(),
       recipe: {
         ...recipeOwner(),
+        liveStatus: 'needs_bake',
+        activeRevision: null,
         authoringRevision: {
           ...recipeOwner().authoringRevision,
           state: snapshot
         }
       }
     } as GoonRecord
+    storedInput.recipe!.authoringRevision.revisionSha256 = await recipeAuthoringRevisionSha256(
+      storedInput.recipe!.authoringRevision
+    )
 
     await redis.json.set(`goon:${GOON_ID}`, '$', storedInput)
     const stored = await getOwnedRecipeGoon(USER_ID, GOON_ID)
@@ -546,6 +639,49 @@ describe('Goon Recipe repository', () => {
     await expect(
       verifyRecipeStateSnapshot(stored.recipe!.authoringRevision.state)
     ).resolves.toEqual(snapshot)
+    await expect(verifyGoonRecipeV2(stored.recipe)).resolves.toEqual(storedInput.recipe)
+
+    const reviewDocument = await createGoonRecipeDocument({
+      userId: USER_ID, goonId: GOON_ID,
+      content: {
+        contract: 'recipe-reviewed-state/v1', reviewId: 'first-bake-review',
+        operation: 'first-bake', analysisId: null, planSha256: null,
+        containmentReceiptSha256: sha('5'), state: snapshot,
+        adjustedControlIds: [], confirmedControlIds: [], cleanResetConfirmed: false
+      }
+    })
+    await putGoonRecipeDocument(reviewDocument)
+    await expect(getGoonRecipeDocument(USER_ID, GOON_ID, reviewDocument.sha256)).resolves.toEqual(reviewDocument)
+    // An idempotent retry must compare verified canonical content, including
+    // all original hashes; raw RedisJSON decimal formatting is not a collision.
+    await expect(putGoonRecipeDocument(reviewDocument)).resolves.toMatchObject({ document: reviewDocument })
+
+    const revision = {
+      ...storedInput.recipe!.authoringRevision,
+      contract: GOON_RECIPE_REVISION_CONTRACT,
+      liveBuildReceipt: { contract: 'goon-live-build/v1', ref: 'live-receipt', sha256: sha('a') }
+    }
+    revision.revisionSha256 = await recipeRevisionBundleSha256(revision)
+    const envelope = await createRecipeRevisionEnvelope({
+      contract: GOON_RECIPE_REVISION_ENVELOPE_CONTRACT,
+      revision,
+      sourceContainmentReceipt: storedInput.recipe!.authoringSourceContainmentReceipt,
+      live: {
+        package: { ref: '/uploads/goon_custom_packages/live.bgoon', sha256: sha('b'), bytes: 300 },
+        model: { ref: '/uploads/goon_custom_models/live.glb', sha256: sha('c'), bytes: 200 },
+        manifest: { ref: '/uploads/goon_custom_manifests/live.json', sha256: sha('d'), bytes: 100 }
+      }
+    })
+    for (const [uploadType, filename] of [
+      ['goon_custom_packages', 'live.bgoon'],
+      ['goon_custom_models', 'live.glb'],
+      ['goon_custom_manifests', 'live.json']
+    ]) {
+      await redis.json.set(`upload:${uploadType}:${filename}`, '$', { filename })
+    }
+    await putRecipeRevisionEnvelope(USER_ID, GOON_ID, envelope)
+    await expect(getRecipeRevisionEnvelope(USER_ID, GOON_ID, revision.revisionId)).resolves.toEqual(envelope)
+    await expect(putRecipeRevisionEnvelope(USER_ID, GOON_ID, envelope)).resolves.toMatchObject({ envelope })
   })
 
   it.runIf(REAL_REDIS_LANE)('preserves migration-plan proof hashes through RedisJSON', async () => {
@@ -654,6 +790,238 @@ describe('Goon Recipe repository', () => {
     ])
     expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1)
     expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1)
+  })
+
+  it.runIf(REAL_REDIS_LANE)('renews only the current pending job lease without advancing versions or replacing sibling state', async () => {
+    const baseMs = Date.now()
+    const timestamp = (offsetMs: number) => new Date(baseMs + offsetMs).toISOString()
+    const owner = {
+      ...goonWithPendingJob(1, 2),
+      name: 'Concurrent unrelated name',
+      sphericalEyelid: sphericalEyelid('spherical', 2.5)
+    }
+    const job = {
+      ...bakingJob(1, 2),
+      lease: { ownerId: 'worker-1', expiresAt: timestamp(5 * 60_000) }
+    }
+    const jobKey = `goon_recipe_job:${USER_ID}:${GOON_ID}:job-1`
+    await redis.json.set(`goon:${GOON_ID}`, '$', owner)
+    await redis.json.set(jobKey, '$', job)
+
+    const result = await renewRecipeJobLease({
+      userId: USER_ID,
+      goonId: GOON_ID,
+      jobId: 'job-1',
+      expectedWriteVersion: 2,
+      expectedJobStateVersion: 1,
+      expectedStatus: 'baking',
+      expectedLeaseOwnerId: 'worker-1',
+      expectedLeaseExpiresAt: job.lease.expiresAt,
+      now: new Date(baseMs + 60_000),
+      expiresAt: timestamp(10 * 60_000)
+    })
+
+    expect(result.goon).toEqual(owner)
+    expect(result.job).toEqual({
+      ...job,
+      lease: { ...job.lease, expiresAt: timestamp(10 * 60_000) }
+    })
+    await expect(redis.json.get(`goon:${GOON_ID}`)).resolves.toEqual(owner)
+    await expect(redis.json.get(jobKey)).resolves.toEqual(result.job)
+
+    const attempt = {
+      userId: USER_ID,
+      goonId: GOON_ID,
+      jobId: 'job-1',
+      expectedWriteVersion: 2,
+      expectedJobStateVersion: 1,
+      expectedStatus: 'baking' as const,
+      expectedLeaseOwnerId: 'worker-1',
+      expectedLeaseExpiresAt: result.job.lease!.expiresAt,
+      now: new Date(baseMs + 2 * 60_000),
+      expiresAt: timestamp(15 * 60_000)
+    }
+    for (const stale of [
+      { expectedWriteVersion: 1 },
+      { expectedJobStateVersion: 2 },
+      { expectedStatus: 'packaging' as const },
+      { expectedLeaseOwnerId: 'worker-2' },
+      { expectedLeaseExpiresAt: timestamp(9 * 60_000) },
+      { jobId: 'replaced-job' },
+      { expiresAt: timestamp(9 * 60_000) },
+      { now: new Date(baseMs + 10 * 60_000) }
+    ]) {
+      await expect(renewRecipeJobLease({ ...attempt, ...stale })).rejects.toMatchObject({
+        code: 'WRITE_CONFLICT', status: 409
+      })
+      await expect(redis.json.get(jobKey)).resolves.toEqual(result.job)
+      await expect(redis.json.get(`goon:${GOON_ID}`)).resolves.toEqual(owner)
+    }
+
+    for (const terminalStatus of ['ready', 'failed', 'committed'] as const) {
+      await expect(renewRecipeJobLease({ ...attempt, expectedStatus: terminalStatus })).rejects.toMatchObject({
+        code: 'CORRUPT_RECORD', status: 500
+      })
+    }
+    await expect(renewRecipeJobLease({ ...attempt, userId: 'another-user' })).rejects.toMatchObject({
+      code: 'FORBIDDEN', status: 403
+    })
+    await redis.json.set(`goon:${GOON_ID}`, '$.recipe.pendingJob', null)
+    await expect(renewRecipeJobLease(attempt)).rejects.toMatchObject({
+      code: 'WRITE_CONFLICT', status: 409
+    })
+    await redis.json.set(`goon:${GOON_ID}`, '$', owner)
+
+    await redis.json.set(jobKey, '$.status', 'failed')
+    await expect(renewRecipeJobLease(attempt)).rejects.toMatchObject({
+      code: 'WRITE_CONFLICT', status: 409
+    })
+    await expect(redis.json.get(jobKey)).resolves.toMatchObject({
+      status: 'failed', lease: { expiresAt: timestamp(10 * 60_000) }
+    })
+    await redis.json.set(jobKey, '$', { ...job, lease: { ...job.lease, expiresAt: timestamp(60_000) } })
+    await expect(renewRecipeJobLease({ ...attempt, expectedLeaseExpiresAt: timestamp(60_000) })).rejects.toMatchObject({
+      code: 'WRITE_CONFLICT', status: 409
+    })
+    await expect(redis.json.get(jobKey)).resolves.toMatchObject({
+      status: 'baking', lease: { expiresAt: timestamp(60_000) }
+    })
+  })
+
+  it.runIf(REAL_REDIS_LANE)('keeps same-version concurrent lease renewals monotonic', async () => {
+    const baseMs = Date.now()
+    const timestamp = (offsetMs: number) => new Date(baseMs + offsetMs).toISOString()
+    const owner = goonWithPendingJob(1, 2)
+    const jobKey = `goon_recipe_job:${USER_ID}:${GOON_ID}:job-1`
+    await redis.json.set(`goon:${GOON_ID}`, '$', owner)
+    await redis.json.set(jobKey, '$', {
+      ...bakingJob(1, 2),
+      lease: { ownerId: 'worker-1', expiresAt: timestamp(5 * 60_000) }
+    })
+    const input = {
+      userId: USER_ID,
+      goonId: GOON_ID,
+      jobId: 'job-1',
+      expectedWriteVersion: 2,
+      expectedJobStateVersion: 1,
+      expectedStatus: 'baking' as const,
+      expectedLeaseOwnerId: 'worker-1',
+      expectedLeaseExpiresAt: timestamp(5 * 60_000),
+      now: new Date(baseMs + 60_000)
+    }
+    const results = await Promise.allSettled([
+      renewRecipeJobLease({ ...input, expiresAt: timestamp(11 * 60_000) }),
+      renewRecipeJobLease({ ...input, expiresAt: timestamp(12 * 60_000) })
+    ])
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1)
+    const currentJob = await redis.json.get(jobKey) as ReturnType<typeof bakingJob>
+    if (currentJob.lease!.expiresAt !== timestamp(12 * 60_000)) {
+      await renewRecipeJobLease({
+        ...input,
+        expectedLeaseExpiresAt: currentJob.lease!.expiresAt,
+        expiresAt: timestamp(12 * 60_000)
+      })
+    }
+    await expect(redis.json.get(jobKey)).resolves.toMatchObject({
+      stateVersion: 1,
+      lease: { ownerId: 'worker-1', expiresAt: timestamp(12 * 60_000) }
+    })
+    await expect(redis.json.get(`goon:${GOON_ID}`)).resolves.toEqual(owner)
+  })
+
+  it.runIf(REAL_REDIS_LANE)('refuses renewal when Redis time passed expiry after the service clock snapshot', async () => {
+    const owner = goonWithPendingJob(1, 2)
+    const jobKey = `goon_recipe_job:${USER_ID}:${GOON_ID}:job-1`
+    const baseMs = Date.now()
+    const job = {
+      ...bakingJob(1, 2),
+      lease: { ownerId: 'worker-1', expiresAt: new Date(baseMs - 1_000).toISOString() }
+    }
+    await redis.json.set(`goon:${GOON_ID}`, '$', owner)
+    await redis.json.set(jobKey, '$', job)
+
+    // The service's captured time predates expiry. Only Redis TIME can reject
+    // this queued renewal at the atomic write boundary.
+    await expect(renewRecipeJobLease({
+      userId: USER_ID,
+      goonId: GOON_ID,
+      jobId: 'job-1',
+      expectedWriteVersion: 2,
+      expectedJobStateVersion: 1,
+      expectedStatus: 'baking',
+      expectedLeaseOwnerId: 'worker-1',
+      expectedLeaseExpiresAt: job.lease.expiresAt,
+      now: new Date(baseMs - 2_000),
+      expiresAt: new Date(baseMs + 60_000).toISOString()
+    })).rejects.toMatchObject({ code: 'WRITE_CONFLICT', status: 409 })
+    await expect(redis.json.get(`goon:${GOON_ID}`)).resolves.toEqual(owner)
+    await expect(redis.json.get(jobKey)).resolves.toEqual(job)
+  })
+
+  it.runIf(REAL_REDIS_LANE)('guards final job CAS with the exact lease and Redis write-time clock', async () => {
+    const live = {
+      package: { ref: '/uploads/goon_custom_packages/ready.bgoon', sha256: sha('a'), bytes: 3 },
+      model: { ref: '/uploads/goon_custom_models/ready.glb', sha256: sha('b'), bytes: 2 },
+      manifest: { ref: '/uploads/goon_custom_manifests/ready.json', sha256: sha('c'), bytes: 1 }
+    }
+    const nextJob = {
+      ...bakingJob(1, 2),
+      status: 'ready' as const,
+      stateVersion: 2,
+      targetWriteVersion: 3,
+      stagedLive: live,
+      candidateRevision: documentRef('f'),
+      lease: null,
+      updatedAt: '2026-07-17T00:00:02.000Z'
+    }
+    const nextGoon = goonWithPendingJob(2, 3)
+    nextGoon.recipe = {
+      ...nextGoon.recipe!,
+      pendingJob: { ...nextGoon.recipe!.pendingJob!, status: 'ready' }
+    }
+    const currentOwner = goonWithPendingJob(1, 2)
+    const jobKey = `goon_recipe_job:${USER_ID}:${GOON_ID}:job-1`
+    const recordKey = `goon_recipe_document:${USER_ID}:${GOON_ID}:${sha('f')}`
+    for (const key of [
+      'upload:goon_custom_packages:ready.bgoon',
+      'upload:goon_custom_models:ready.glb',
+      'upload:goon_custom_manifests:ready.json'
+    ]) await redis.json.set(key, '$', { filename: key.slice(key.lastIndexOf(':') + 1) })
+    const transition = (expectedLease: { ownerId: string; expiresAt: string }) =>
+      compareAndSwapRecipeJobState({
+        userId: USER_ID,
+        goonId: GOON_ID,
+        expectedWriteVersion: 2,
+        expectedJobStateVersion: 1,
+        nextGoon,
+        nextJob,
+        expectedLease,
+        records: [{ key: recordKey, value: { contract: 'recipe-job-report/v1' } }]
+      })
+
+    const expiredLease = {
+      ownerId: 'worker-1', expiresAt: new Date(Date.now() - 1_000).toISOString()
+    }
+    await redis.json.set(`goon:${GOON_ID}`, '$', currentOwner)
+    await redis.json.set(jobKey, '$', { ...bakingJob(1, 2), lease: expiredLease })
+    await expect(transition(expiredLease)).rejects.toMatchObject({ code: 'WRITE_CONFLICT', status: 409 })
+    await expect(redis.json.get(`goon:${GOON_ID}`)).resolves.toEqual(currentOwner)
+    await expect(redis.json.get(jobKey)).resolves.toMatchObject({ stateVersion: 1, lease: expiredLease })
+    await expect(redis.json.get(recordKey)).resolves.toBeNull()
+
+    const liveLease = {
+      ownerId: 'worker-1', expiresAt: new Date(Date.now() + 60_000).toISOString()
+    }
+    await redis.json.set(jobKey, '$', { ...bakingJob(1, 2), lease: liveLease })
+    await expect(transition({ ...liveLease, ownerId: 'other-worker' })).rejects.toMatchObject({
+      code: 'WRITE_CONFLICT', status: 409
+    })
+    await expect(redis.json.get(recordKey)).resolves.toBeNull()
+    await expect(transition(liveLease)).resolves.toMatchObject({
+      recipe: { writeVersion: 3, pendingJob: { status: 'ready' } }
+    })
+    await expect(redis.json.get(jobKey)).resolves.toMatchObject({ status: 'ready', lease: null })
+    await expect(redis.json.get(recordKey)).resolves.toEqual({ contract: 'recipe-job-report/v1' })
   })
 
   it.runIf(REAL_REDIS_LANE)('atomically discards analysis only when pendingJob is JSON null', async () => {

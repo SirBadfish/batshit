@@ -69,10 +69,19 @@ import {
   buildSubagentThreadKey,
   releaseSubagentRunLock,
 } from '../subagentThreads'
-import { executeManagedSubagent } from '../subagentRunner'
+import { executeManagedSubagent as runManagedSubagent } from '../subagentRunner'
+import { StreamStoppedError } from '../streamStop'
 
 const subagentRedis = createSubagentRedisMock()
 threadRunnerMocks.redisStore.current = subagentRedis
+
+// BL-287: the runner refuses a Subagent whose record is gone (a turn that loaded it before its
+// delete), so each call stores the record it runs first, as a real Subagent's is.
+async function executeManagedSubagent(params: Parameters<typeof runManagedSubagent>[0]) {
+  const id = typeof params.subagent?.id === 'string' ? params.subagent.id.trim() : ''
+  if (id && params.delegationKind !== 'worker') subagentRedis.seed(`subagent:${id}`, params.subagent)
+  return runManagedSubagent(params)
+}
 
 function apiSubagent(id = 'api-helper') {
   return {
@@ -82,6 +91,9 @@ function apiSubagent(id = 'api-helper') {
     subagentType: 'api' as const,
     primary_model_provider: 'openai',
     primary_model_name: 'gpt-5.4',
+    // BL-266: an own model names its preset, which carries the connection.
+    primary_model_preset_id: 'preset-gpt-54',
+    primary_model_connection: { id: 'direct:openai', type: 'direct', service: 'openai' },
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   }
@@ -113,6 +125,12 @@ beforeEach(() => {
   vi.clearAllMocks()
   subagentRedis.clear()
   subagentRedis.seed('batshit:sub_system_prompt', '# Base subagent prompt')
+  subagentRedis.seed('model:preset-gpt-54', {
+    id: 'preset-gpt-54',
+    provider: 'openai',
+    modelId: 'gpt-5.4',
+    connection: { id: 'direct:openai', type: 'direct', service: 'openai' },
+  })
   threadRunnerMocks.redisGetUserSettings.mockResolvedValue(null)
   threadRunnerMocks.buildManagedSubagentDynamicInfo.mockResolvedValue('')
   threadRunnerMocks.resolveManagedSubagentScope.mockImplementation(async () => ({
@@ -143,7 +161,28 @@ describe('the skill scope of an API Subagent run (BL-75)', () => {
 
     expect(threadRunnerMocks.processNativeMode.mock.calls[0]?.[0]).toMatchObject({
       agentId: 'primary-agent',
+      processOwner: { userId: 'USER-1', kind: 'subagent', id: 'api-helper' },
       scopeAgentId: 'api-helper',
+    })
+  })
+
+  it('keeps a Worker on the parent physical owner without changing its audit identity', async () => {
+    await run({ delegationKind: 'worker' })
+    expect(threadRunnerMocks.processNativeMode.mock.calls[0]?.[0]).toMatchObject({
+      agentId: 'primary-agent',
+      processOwner: { userId: 'USER-1', kind: 'agent', id: 'primary-agent' },
+    })
+  })
+
+  it('takes the API Bash grant from the actual delegated record, even if a preset enables Bash', async () => {
+    subagentRedis.seed('model:preset-gpt-54', {
+      id: 'preset-gpt-54', provider: 'openai', modelId: 'gpt-5.4',
+      connection: { id: 'direct:openai', type: 'direct', service: 'openai' },
+      settings: { nativeTools: { bashEnabled: true } },
+    })
+    await run({ subagent: { ...apiSubagent(), provider_specific_settings: { nativeTools: { bashEnabled: false } } } })
+    expect(threadRunnerMocks.processNativeMode.mock.calls[0]?.[0]).toMatchObject({
+      delegatedBashEnabled: false,
     })
   })
 
@@ -153,6 +192,54 @@ describe('the skill scope of an API Subagent run (BL-75)', () => {
     expect(threadRunnerMocks.processNativeMode).not.toHaveBeenCalled()
     expect(result.status).toBe('failed')
     expect(result.output).toContain('no subagent id')
+  })
+})
+
+describe('the connection an API Subagent runs through (BL-266)', () => {
+  it('runs its own model through the connection its preset names, never by name through the AI Gateway', async () => {
+    await run({ parentConnection: { id: 'direct:anthropic', type: 'direct', service: 'anthropic' } })
+
+    expect(threadRunnerMocks.processNativeMode.mock.calls[0]?.[0]).toMatchObject({
+      model: 'gpt-5.4',
+      connection: { id: 'direct:openai', type: 'direct', service: 'openai' },
+    })
+  })
+
+  it('refuses an own model saved without a preset, before it touches the thread', async () => {
+    subagentRedis.seed(THREAD_KEY, { messages: [{ role: 'user', content: 'kept' }] })
+    const legacy = { ...apiSubagent(), primary_model_preset_id: undefined, primary_model_connection: undefined }
+    const result = await run({ subagent: legacy, thread: 'fresh' })
+
+    expect(threadRunnerMocks.processNativeMode).not.toHaveBeenCalled()
+    expect(result.status).toBe('failed')
+    expect(result.output).toContain('pick its model again')
+    expect(await subagentRedis.redis.get(THREAD_KEY)).not.toBeNull()
+  })
+})
+
+describe('a model setting the model refuses (the AI SDK set of 2026-09-29)', () => {
+  it('comes back as a failed run the parent can read, before it touches the thread', async () => {
+    subagentRedis.seed(THREAD_KEY, { messages: [{ role: 'user', content: 'kept' }] })
+    subagentRedis.seed('model:preset-opus-55-off', {
+      id: 'preset-opus-55-off',
+      provider: 'anthropic',
+      modelId: 'claude-opus-5-5',
+      connection: { id: 'direct:anthropic', type: 'direct', service: 'anthropic' },
+      settings: { thinkingMode: 'disabled' },
+    })
+    const opus = {
+      ...apiSubagent(),
+      primary_model_provider: 'anthropic',
+      primary_model_name: 'claude-opus-5-5',
+      primary_model_preset_id: 'preset-opus-55-off',
+      primary_model_connection: { id: 'direct:anthropic', type: 'direct', service: 'anthropic' },
+    }
+    const result = await run({ subagent: opus, thread: 'fresh' })
+
+    expect(threadRunnerMocks.processNativeMode).not.toHaveBeenCalled()
+    expect(result.status).toBe('failed')
+    expect(result.output).toContain('Claude Opus 5.5 always thinks')
+    expect(await subagentRedis.redis.get(THREAD_KEY)).not.toBeNull()
   })
 })
 
@@ -363,5 +450,46 @@ describe('same-subagent serialization (DL-111-05, closes F7)', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+})
+
+// Plumbing only: the brain is mocked, so these pass without the BL-449/BL-452 fixes. The fixes
+// themselves are proven in vercelBrain.delegatedRunEnd.test.ts and vercelBrain.mode3.test.ts.
+describe("the runner's Stop and failure plumbing on the API lane", () => {
+  it("runner plumbing: the parent's Stop aborts the signal it hands the brain, and a Stop commits no thread", async () => {
+    let signal: AbortSignal | null = null
+    let markStarted: () => void = () => {}
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve
+    })
+    threadRunnerMocks.processNativeMode.mockImplementationOnce(
+      ({ abortSignal }: { abortSignal: AbortSignal }) => {
+        signal = abortSignal
+        markStarted()
+        return new Promise((_resolve, reject) => {
+          abortSignal.addEventListener('abort', () => reject(new StreamStoppedError()))
+        })
+      },
+    )
+    const parent = new AbortController()
+
+    const pending = run({ abortSignal: parent.signal })
+    pending.catch(() => undefined)
+    await started
+    parent.abort()
+
+    await expect(pending).rejects.toThrow('cancelled')
+    expect(signal?.aborted).toBe(true)
+    expect(subagentRedis.snapshot()[THREAD_KEY]).toBeUndefined()
+  })
+
+  it("runner plumbing: a brain that throws becomes a failed result carrying the error's message", async () => {
+    threadRunnerMocks.processNativeMode.mockRejectedValueOnce(new Error('Overloaded'))
+
+    await expect(run()).resolves.toMatchObject({
+      status: 'failed',
+      output: 'API Helper failed: Overloaded',
+    })
+    expect(subagentRedis.snapshot()[THREAD_KEY]).toBeUndefined()
   })
 })

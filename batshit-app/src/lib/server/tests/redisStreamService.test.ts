@@ -12,6 +12,8 @@ import { RedisStreamService } from '../redisStreamService'
 
 useRedisTestServer()
 
+const REAL_REDIS_LANE = process.env.VITEST_USE_REAL_REDIS === 'true'
+
 describe('RedisStreamService', () => {
   let service: RedisStreamService
   const sessionId = 'session123'
@@ -148,6 +150,54 @@ describe('RedisStreamService', () => {
       expect(tempKeys).toHaveLength(0)
       expect(metaKeys).toHaveLength(0)
     })
+
+    /**
+     * BL-603: the cleanup builds KEYS patterns from the chat id (and the message id). Redis
+     * reads `*`, `?`, `[`, `]`, and `\` in a pattern as glob syntax, so cleaning up a chat whose
+     * id was `a*` swept the temp chunks of every chat whose id starts with `a`. Real Redis only:
+     * the fake's pattern matcher is not Redis's.
+     */
+    const seedTemp = async (session: string, message: string) => {
+      const storageKey = service.createTempStorageKey(session, message, 'terminal', 1)
+      await service.startZipBlock({
+        sessionId: session,
+        messageId: message,
+        type: 'terminal',
+        index: 1,
+        startedAt: new Date().toISOString()
+      })
+      await service.appendChunk(storageKey, `chunk of ${session}/${message}`)
+      return [storageKey, service.createTempMetadataKey(session, message)]
+    }
+
+    for (const [glob, other] of [
+      ['*', 'bc'],
+      ['?', 'b'],
+      ['[b]', 'b'],
+      ['\\', '']
+    ] as const) {
+      it.runIf(REAL_REDIS_LANE)(`cleaning up chat "a${glob}" leaves chat "a${other}"'s temp keys (BL-603)`, async () => {
+        const stamp = `bl603-${randomUUID()}-`
+        const cleaned = await seedTemp(`${stamp}a${glob}`, 'message-1')
+        const kept = await seedTemp(`${stamp}a${other}`, 'message-1')
+
+        await service.cleanupSessionTempStorage(`${stamp}a${glob}`)
+
+        for (const key of kept) expect(await redis.exists(key), key).toBe(true)
+        for (const key of cleaned) expect(await redis.exists(key), key).toBe(false)
+      })
+
+      it.runIf(REAL_REDIS_LANE)(`cleaning up message "m${glob}" leaves message "m${other}"'s temp keys (BL-603)`, async () => {
+        const session = `bl603-${randomUUID()}`
+        const cleaned = await seedTemp(session, `m${glob}`)
+        const kept = await seedTemp(session, `m${other}`)
+
+        await service.cleanupSessionTempStorage(session, `m${glob}`)
+
+        for (const key of kept) expect(await redis.exists(key), key).toBe(true)
+        for (const key of cleaned) expect(await redis.exists(key), key).toBe(false)
+      })
+    }
 
     it('tracks concurrent blocks with incremental indices', async () => {
       const session = `session-concurrent-${randomUUID()}`

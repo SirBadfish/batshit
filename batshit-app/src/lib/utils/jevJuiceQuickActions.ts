@@ -13,13 +13,13 @@
  * catalog, so the id, the label, and the tell line can never drift.
  */
 
-import { JEV_MODEL_NAME } from './jevJuice'
+import { UNKNOWN_JUDGE_NAME, judgeNameAtSentenceStart } from './judgeProviders'
 
 export const QUICK_ACTION_FEATURE_ID = 'quick_actions' as const
 
 /** The switch: `voice_settings.voiceMode.jevJuiceQuickActions` (LS-060). Absent means OFF. */
 export const VOICE_JEV_QUICK_ACTIONS_FIELD = 'jevJuiceQuickActions' as const
-export const VOICE_JEV_QUICK_ACTIONS_LABEL = 'Jev Juice: Quick Actions'
+export const VOICE_JEV_QUICK_ACTIONS_LABEL = 'Judge Juice: Quick Actions'
 
 /** THE rule for "may a spoken turn run a quick action?" Reads the normalized Voice Mode block or the raw record. */
 export function resolveJevQuickActionsEnabled(voiceModeSettings: unknown): boolean {
@@ -322,9 +322,17 @@ export function quickActionConfidenceText(confidence: number): string {
   return `${Math.max(0, Math.min(100, Math.round(confidence * 100)))}% confidence`
 }
 
-/** The chip under the user's bubble: "Quick action by Jev: opened the Goon Dock (94% confidence)". */
+/**
+ * The chip under the user's bubble: "Quick action by the judge: opened the Goon Dock (94% confidence)". SA-120 P10b:
+ * the mark is stored on the user's message and keeps no judge, so the sentence says "the judge", right for every judge.
+ */
 export function quickActionMarkText(mark: QuickActionMark): string {
-  return `Quick action by ${JEV_MODEL_NAME}: ${quickActionDidText(mark)} (${quickActionConfidenceText(mark.confidence)})`
+  return `Quick action by ${UNKNOWN_JUDGE_NAME}: ${quickActionDidText(mark)} (${quickActionConfidenceText(mark.confidence)})`
+}
+
+/** The toast a quick action shows when it runs: the chip's words without the confidence. */
+export function quickActionToastText(mark: Pick<QuickActionMark, 'id' | 'tab'>): string {
+  return `Quick action by ${UNKNOWN_JUDGE_NAME}: ${quickActionDidText(mark)}`
 }
 
 /** The chip's second line: who got the turn. */
@@ -332,7 +340,7 @@ export function quickActionRoutingText(mark: QuickActionMark, agentName: string)
   return mark.onlyThis ? `Nothing was sent to ${agentName}.` : `The rest went to ${agentName}.`
 }
 
-export const QUICK_ACTION_MARK_DETAIL_TEXT = `${JEV_MODEL_NAME} judged what you said and Batshit acted on it without your agent. ${JEV_MODEL_NAME} can be wrong; every quick action is one click to undo.`
+export const QUICK_ACTION_MARK_DETAIL_TEXT = `${judgeNameAtSentenceStart(UNKNOWN_JUDGE_NAME)} read what you said and Batshit acted on it without your agent. ${judgeNameAtSentenceStart(UNKNOWN_JUDGE_NAME)} can be wrong; every quick action is one click to undo.`
 
 /**
  * The line the agent reads in its next turn (DL-120-15: the agent is told; design record rule 4).
@@ -341,7 +349,7 @@ export const QUICK_ACTION_MARK_DETAIL_TEXT = `${JEV_MODEL_NAME} judged what you 
 export function quickActionTellLine(mark: Pick<QuickActionMark, 'id' | 'tab' | 'onlyThis'>, said: string): string {
   const did = quickActionDidText(mark)
   const quote = said.trim().replace(/\s+/g, ' ').slice(0, 160)
-  const who = `a quick action by ${JEV_MODEL_NAME}, not you`
+  const who = "a quick action by Batshit's judgment model, not you"
   return mark.onlyThis
     ? `The user said "${quote}" and Batshit ${did} for them (${who}); that turn never reached you.`
     : `In this message the user also asked Batshit to act, and Batshit ${did} (${who}) before you read it.`

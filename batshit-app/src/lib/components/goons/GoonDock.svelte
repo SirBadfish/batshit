@@ -93,7 +93,17 @@
   import { voiceService } from '$lib/services/voice'
   import { updateGoon as updateGoonRecord } from '$lib/services/goons'
   import { getGoons } from '$lib/stores/goons.svelte'
-  import { getUserSettings, setUserSettings } from '$lib/stores/userSettings.svelte'
+  import {
+    getUserSettings,
+    getUserSettingsReadState,
+    confirmUserSettings as setUserSettings,
+    failUserSettingsRead
+  } from '$lib/stores/userSettings.svelte'
+  import {
+    persistVoiceSettingsPatchRequest,
+    requireConfirmedVoiceSettings
+  } from '$lib/services/voiceSettingsPersistence'
+  import { refreshUserSettingsRequest } from '$lib/services/goonsSettingsPersistence'
   import * as agentStore from '$lib/stores/agents.svelte'
   import { toast } from 'svelte-sonner'
   import type { GoonLipSyncMode, GoonLipSyncPremiumAnalyzerId } from '$lib/types/voice'
@@ -103,7 +113,6 @@
     GoonLipSyncPlaybackMetrics,
     GoonLipSyncTimeline
   } from '$lib/utils/goonLipSync'
-  import { normalizeVoiceSettings } from '$lib/utils/voiceSchema'
   import {
     GoonLiveActivationGate,
     type GoonLiveActivationTicket
@@ -251,6 +260,8 @@
     DEFAULT_PREMIUM_GOON_LIP_SYNC_ANALYZER
   )
   let lipSyncLabSaving = $state(false)
+  let lipSyncLabRefreshing = $state(false)
+  const lipSyncLabSettingsConfirmed = $derived(getUserSettingsReadState() === 'confirmed')
   let lipSyncLabError = $state<string | null>(null)
   let lipSyncLabLastMetrics = $state<GoonLipSyncPlaybackMetrics | null>(null)
   let lipSyncLabHistory = $state<GoonLipSyncPlaybackMetrics[]>([])
@@ -883,6 +894,7 @@
     dispatchGoonsSettingsAction('batshit:goons-edit', { goonId })
   }
 
+
   function resolveDockEmotePreviewDuration(definition?: GoonCueDefinition | null) {
     if (definition?.steps?.length) {
       return definition.steps.reduce(
@@ -1127,6 +1139,7 @@
     let incomingEngine: GoonEngine
     try {
       incomingEngine = new EngineCtor(targetEl, {
+        onSceneError: (message) => toast.error(message),
         quality: resolvedQuality,
         lipSyncEnabled,
         eyeContactMode: resolveGoonEyeContactMode(nextGoon, goonsSettings),
@@ -1168,6 +1181,15 @@
         mountedState
       })
       const loadResult = await loadMountedLiveGoon(incomingEngine, loadPlan)
+      if (loadResult.status === 'cancelled') {
+        disposeLoadingEngine(incomingEngine)
+        if (token === swapToken && liveActivationGate.cancel(activation)) {
+          swapActive = false
+          swapReady = false
+        }
+        releaseHandoffMountedStateClaim(claimedHandoffMountedState)
+        return
+      }
       incomingSceneSignature = loadResult.sceneSignature
       incomingBaseLoopSignature = loadResult.baseLoopSignature
       incomingAnimationSignature = loadResult.animationSignature
@@ -2050,6 +2072,7 @@
     if (!primaryViewportEl) return
     const EngineCtor = await getGoonEngineCtor()
     const mountedEngine = new EngineCtor(primaryViewportEl, {
+        onSceneError: (message) => toast.error(message),
       quality: resolvedQuality,
       lipSyncEnabled,
       eyeContactMode: currentEyeContactMode,
@@ -2436,15 +2459,11 @@
     nextMode: GoonLipSyncMode,
     nextAnalyzer: GoonLipSyncPremiumAnalyzerId = lipSyncLabAnalyzer
   ) {
-    const currentUserSettings = getUserSettings()
-    const normalizedVoiceSettings = normalizeVoiceSettings(currentUserSettings?.voice_settings)
-    const voiceSettings = {
-      ...normalizedVoiceSettings,
-      goonLipSync: {
-        ...normalizedVoiceSettings.goonLipSync,
-        mode: nextMode,
-        analyzerId: nextAnalyzer
-      }
+    try {
+      requireConfirmedVoiceSettings()
+    } catch (error) {
+      lipSyncLabError = error instanceof Error ? error.message : 'Voice settings have not loaded.'
+      return
     }
 
     lipSyncLabMode = nextMode
@@ -2453,26 +2472,10 @@
     lipSyncLabError = null
 
     try {
-      const response = await fetch('/api/user/settings', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          voice_settings: voiceSettings
-        })
+      const updated = await persistVoiceSettingsPatchRequest(fetch, {
+        goonLipSync: { mode: nextMode, analyzerId: nextAnalyzer }
       })
-
-      if (!response.ok) {
-        const payload = await response.json().catch(() => null)
-        throw new Error(payload?.error || 'Failed to save lip sync settings.')
-      }
-
-      const payload = await response.json().catch(() => null)
-      const updated = payload?.settings ?? payload?.userSettings ?? null
-      if (updated) {
-        setUserSettings(updated)
-      }
+      setUserSettings(updated)
 
     } catch (error) {
       lipSyncLabMode = lipSyncMode
@@ -2481,6 +2484,19 @@
       toast.error(lipSyncLabError)
     } finally {
       lipSyncLabSaving = false
+    }
+  }
+
+  async function retryLipSyncLabSettings() {
+    lipSyncLabRefreshing = true
+    lipSyncLabError = null
+    try {
+      setUserSettings(await refreshUserSettingsRequest(fetch))
+    } catch (error) {
+      failUserSettingsRead(error)
+      lipSyncLabError = error instanceof Error ? error.message : 'Voice settings could not load.'
+    } finally {
+      lipSyncLabRefreshing = false
     }
   }
 
@@ -2566,6 +2582,12 @@
                       This edits the same saved Voice setting as the full Settings panel.
                     </p>
                   </div>
+                  {#if !lipSyncLabSettingsConfirmed}
+                    <p class="goon-lip-sync-lab-copy">Voice settings have not loaded. Press Retry before changing lip sync.</p>
+                    <Button size="sm" variant="outline" disabled={lipSyncLabRefreshing} onclick={retryLipSyncLabSettings}>
+                      {lipSyncLabRefreshing ? 'Loading…' : 'Retry'}
+                    </Button>
+                  {:else}
                   <div class="goon-lip-sync-lab-grid is-two">
                     {#each [
                       { value: 'amplitude', label: 'Shitty but Fast' },
@@ -2599,6 +2621,7 @@
                         {/each}
                       </div>
                     </div>
+                  {/if}
                   {/if}
                   {#if lipSyncLabSaving}
                     <p class="goon-lip-sync-lab-copy">Saving global lip sync setting…</p>

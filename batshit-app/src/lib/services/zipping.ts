@@ -4,7 +4,7 @@ import { logger } from '$lib/utils/logger'
 
 /**
  * Who changed a zip's state. `user` locks (an agent may not zip it), `agent` is zip
- * control, and `inferred` (SA-120 P5) is Batshit acting on a Jev Juice judgment: the
+ * control, and `inferred` (SA-120 P5) is Batshit acting on a Judge Juice judgment: the
  * weakest of the three. It never locks anything, either of the others overwrites it, and
  * the browser never creates it; only the server writes it at the accepted-send boundary.
  */
@@ -25,6 +25,14 @@ export interface UnzippedItem {
   description?: string
   tokens?: number
   source?: ZipStateSource
+  /**
+   * SA-129 P2 (DL-02): an agent's hold names the FILE it holds (the dead-copy ledger's key: a
+   * project path, or `skill:<id>:<path>`). The server moves the hold to the newest whole read of
+   * that file at every reply end, so it follows the file. Absent on every other record.
+   */
+  path?: string
+  /** SA-129 P2: which agent holds it (a `source: 'agent'` hold), so every surface can name it. */
+  agentId?: string
 }
 
 /**
@@ -73,8 +81,35 @@ export function createZipStateView(
   })
 }
 
-/** What the browser itself may write. `inferred` state is server-written and only read here. */
-type ZipControlSource = 'user' | 'agent'
+/**
+ * SA-129 P2 (DL-08): the countdown of a "Hold for N messages" (and of Judge Juice's temporary
+ * opens) after ONE more message in the chat. A permanent item is unchanged; a temporary one counts
+ * one message and ends when its count reaches its duration (it then returns to the automatic
+ * rules). The server burns the countdown (`advanceZipCountdowns`, once per accepted user message
+ * and once per finished reply); a compile for a new user message reads the state as it will be
+ * once that message counts, which is what the chat page's count used to give it.
+ */
+export function countOneMoreMessage(items: UnzippedItem[]): { kept: UnzippedItem[]; ended: UnzippedItem[] } {
+  const kept: UnzippedItem[] = []
+  const ended: UnzippedItem[] = []
+  for (const item of items) {
+    if (item.permanent || typeof item.duration !== 'number') {
+      kept.push(item)
+      continue
+    }
+    const messageCount = (item.messageCount || 0) + 1
+    if (messageCount >= item.duration) ended.push({ ...item, messageCount })
+    else kept.push({ ...item, messageCount })
+  }
+  return { kept, ended }
+}
+
+/**
+ * What the browser itself may write: the user's own state. `agent` state (holds, the parked zip
+ * actions) and `inferred` state are written only by the server at a reply end or an accepted send
+ * (SA-129 P2, SA-120 P5), and are only read here.
+ */
+type ZipControlSource = 'user'
 
 class ZippingService implements ZipStateView {
   private apiUrl = '/api/unzipping' // Now using Vite API endpoint
@@ -82,6 +117,11 @@ class ZippingService implements ZipStateView {
   private sessionUnzipped: Map<string, UnzippedItem> = new Map() // Memory cache only
   private sessionRezipped: Set<string> = new Set()
   private sessionRezippedSources: Map<string, ZipStateSource> = new Map()
+  private lastUnzipError: string | null = null
+
+  getLastUnzipError(): string | null {
+    return this.lastUnzipError
+  }
 
   private notifyStateChanged() {
     if (typeof window === 'undefined') return
@@ -110,31 +150,10 @@ class ZippingService implements ZipStateView {
     return null
   }
 
-  private async persistUnzippedItem(item: UnzippedItem, fetcher?: typeof fetch) {
-    const fetchImpl = this.resolveFetch(fetcher)
-    if (!fetchImpl) return
-
-    try {
-      const response = await fetchImpl(this.apiUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-internal-api-request': '1'
-        },
-        body: JSON.stringify({ ...item })
-      })
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`)
-      }
-    } catch (error) {
-      console.error('[Unzipping] Failed to persist unzipped item countdown:', error)
-    }
-  }
-  
   async setCurrentSession(sessionId: string, fetcher?: typeof fetch) {
     if (this.currentSessionId !== sessionId) {
       this.currentSessionId = sessionId
+      this.lastUnzipError = null
       this.sessionUnzipped.clear()
       this.sessionRezipped.clear()
       this.sessionRezippedSources.clear()
@@ -196,15 +215,18 @@ class ZippingService implements ZipStateView {
     name?: string,
     description?: string,
     tokens?: number,
-    source: 'user' | 'agent' = 'user',
+    source: ZipControlSource = 'user',
     fetcher?: typeof fetch
   ) {
+    this.lastUnzipError = null
     if (!this.currentSessionId) {
+      this.lastUnzipError = 'No current chat is selected.'
       console.error('[Unzipping] No current session')
       return false
     }
     const fetchImpl = this.resolveFetch(fetcher)
     if (!fetchImpl) {
+      this.lastUnzipError = 'The Hold request could not be sent.'
       console.error('[Unzipping] No fetch implementation available for unzip')
       return false
     }
@@ -240,12 +262,15 @@ class ZippingService implements ZipStateView {
       })
       
       if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`)
+        const body = await response.json().catch(() => null)
+        const reason = typeof body?.error === 'string' && body.error.trim() ? body.error.trim() : `HTTP ${response.status}`
+        throw new Error(reason)
       }
       
       logger.debug(`[Unzipping] Unzipped ${zipId} via API`)
       return true
     } catch (error) {
+      this.lastUnzipError = error instanceof Error ? error.message : String(error)
       console.error('[Unzipping] Failed to save unzipped item to API:', error)
       this.sessionUnzipped.delete(zipId) // Rollback on error
       this.notifyStateChanged()
@@ -391,34 +416,6 @@ class ZippingService implements ZipStateView {
   getTotalTokens(): number {
     return Array.from(this.sessionUnzipped.values())
       .reduce((sum, item) => sum + (item.tokens || 0), 0)
-  }
-  
-  incrementMessageCount(sessionId?: string | null, fetcher?: typeof fetch) {
-    if (sessionId && sessionId !== this.currentSessionId) return
-
-    // Update message counts and check for expiry
-    const itemsToRezip: string[] = []
-    const itemsToPersist: UnzippedItem[] = []
-    
-    this.sessionUnzipped.forEach((item, zipId) => {
-      if (!item.permanent && item.duration !== undefined) {
-        item.messageCount = (item.messageCount || 0) + 1
-        if (item.messageCount >= item.duration) {
-          itemsToRezip.push(zipId)
-        } else {
-          itemsToPersist.push({ ...item })
-        }
-      }
-    })
-    
-    // Timed unzips expire back to automatic policy rather than creating a manual zip override.
-    itemsToRezip.forEach(zipId => this.returnToAutomatic(zipId))
-    if (itemsToPersist.length > 0) {
-      this.notifyStateChanged()
-      itemsToPersist.forEach(item => {
-        void this.persistUnzippedItem(item, fetcher)
-      })
-    }
   }
   
   clear() {

@@ -1,0 +1,28 @@
+{
+  "case": "status-online-probe",
+  "capturedAt": "2026-09-22T14:27:38.629Z",
+  "pinokio": {
+    "desktop": "8.2.0",
+    "pinokiod": "8.2.0",
+    "pterm": "0.0.25",
+    "script": "8.0.0"
+  },
+  "platform": "macOS 27.0 (26A428), Apple Silicon, Node 24.12.0 (Homebrew) running pterm through its shebang",
+  "sanitized": {
+    "/Users/tester": "the real home folder",
+    "192.168.1.10": "the real LAN address"
+  },
+  "argv": [
+    "pterm",
+    "status",
+    "comfy.git",
+    "--probe"
+  ],
+  "exitCode": 0,
+  "signal": null,
+  "timedOut": false,
+  "durationMs": 166,
+  "stdout": "{\n  \"app_id\": \"comfy.git\",\n  \"name\": \"comfy.git\",\n  \"title\": \"Comfyui\",\n  \"description\": \"The most powerful and modular diffusion model GUI, api and backend with a graph/nodes interface. https://github.com/comfyanonymous/ComfyUI\",\n  \"icon\": \"/asset/api/comfy.git/icon.jpeg\",\n  \"path\": \"/Users/tester/pinokio/api/comfy.git\",\n  \"install_script\": \"install.js\",\n  \"start_script\": \"start.js\",\n  \"default_target\": \"http://localhost:8188\",\n  \"default_script\": null,\n  \"running\": true,\n  \"ready\": true,\n  \"ready_url\": \"http://localhost:8188\",\n  \"external_ready_urls\": [],\n  \"state\": \"online\",\n  \"running_scripts\": [\n    \"start.js\"\n  ],\n  \"ready_script\": \"start.js\",\n  \"local_entries\": [\n    {\n      \"script\": \"start.js\",\n      \"local\": {\n        \"url\": \"http://localhost:8188\"\n      }\n    }\n  ],\n  \"probe\": true,\n  \"last_error\": null,\n  \"preference\": {\n    \"starred\": false,\n    \"starred_at\": null,\n    \"protection_enabled\": false,\n    \"last_launch_at\": \"2026-09-22T14:27:25.624Z\",\n    \"last_launch_source\": \"pterm\",\n    \"launch_count_total\": 4,\n    \"launch_count_pterm\": 1,\n    \"launch_count_ui\": 3,\n    \"launch_count_unknown\": 0\n  },\n  \"source\": {\n    \"host\": \"192.168.1.10\",\n    \"name\": \"p25\",\n    \"local\": true\n  },\n  \"ref\": \"pinokio://192.168.1.10:42000/api/comfy.git\"\n}\n",
+  "stderr": "",
+  "note": "status <app_id> --probe after state online: probe true, ready_url set. Capture note: first --probe after state=online ready=true (12995 ms)"
+}

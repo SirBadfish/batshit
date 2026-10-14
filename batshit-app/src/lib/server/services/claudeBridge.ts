@@ -1,10 +1,11 @@
-import { spawn } from 'node:child_process'
+import { spawn, type ChildProcess } from 'node:child_process'
 import readline from 'node:readline'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import os from 'node:os'
 import { env } from '$env/dynamic/private'
 import { logger } from '$lib/utils/logger'
+import { claudeContextCappedByEnvironment, matchingCliContextReport, type CliContextSelection } from '$lib/utils/cliContextWindow'
 import type { NativeModeRequest } from '$lib/server/services/vercelBrain'
 import { detectClaudeCliStatus, resolveClaudeCliExecutable } from '$lib/server/services/claudeCliStatus'
 import { ClaudeEventAdapter } from '$lib/server/services/claudeEventAdapter'
@@ -16,13 +17,15 @@ import {
 } from '$lib/server/services/claudeContextGuard'
 import { buildCodexPromptFromMessages } from '$lib/server/services/codexBridge'
 import { redis } from '$lib/server/redis'
+import { ManagedProfileRunRefusedError, isManagedProfileRunRefusal } from './agentProfileFolderGate'
 import { buildClaudeRuntimeSettings } from '$lib/server/services/claudeSettings'
 import { mcpGatewayService } from '$lib/server/services/mcpGatewayService'
 import {
   syncAgentClaudeProfiles,
-  getManagedClaudePaths,
+  ensureManagedClaudeHome,
+  assertManagedClaudeProfileId,
   buildClaudeProfileId,
-  collectManagedClaudeGatewayHeaderEnv,
+  buildUsersClaudePlansDenyRules,
   CLAUDE_APPROVAL_TOOL_NAME
 } from '$lib/server/services/claudeProfileManager'
 import { buildManagedGatewayId } from '$lib/server/services/codexProfileManager'
@@ -32,19 +35,33 @@ import type { ClaudePermissionMode } from '$lib/types/claude'
 import { resolveRuntimeModelSelection } from '$lib/utils/modelPresetRuntime'
 import {
   MODE4_INTERNAL_HELPER_TOOL_NAMES,
+  MODE4_INTERNAL_FETCH_ZIP_TOOL_NAMES,
+  resolveManagedCliFetchZipAllowed,
   resolveEnabledMode4InternalHelperTools,
   isMode4InternalHelperTool,
-  buildMode4InternalHelpersGatewayId,
-  buildMode4InternalHelpersGatewaySlug
+  buildCliHelperMcpToolName
 } from '$lib/server/services/mode4InternalTools'
 import { resolveNativeToolSettings } from '$lib/server/services/nativeTools'
-import { resolveCliToolSelectionScope } from '$lib/server/services/cliToolRegistry'
+import {
+  resolveCliToolSelectionScope,
+  resolveRunCredentialCliToolScope
+} from '$lib/server/services/cliToolRegistry'
 import {
   isStdioGateway,
   resolveManagedStdioEnvironmentValues
 } from '$lib/server/services/mcpGatewayStdio'
 import { mintCliRunCredential } from '$lib/server/services/cliHelperToken'
-import { applyCliRunCredentialToChildEnv } from '$lib/server/services/cliChildEnv'
+import { waitForSseExternalSubscriber } from '$lib/server/sseExternalSubscriber'
+import { endClaudeApprovalRunForReply } from '$lib/server/services/claudeApprovalEvents'
+
+/** BL-496: how long a run with approvals waits for the server's Redis subscriber to listen. */
+const APPROVAL_SUBSCRIBER_WAIT_MS = 10_000
+import { applyCliRunCredentialToChildEnv, stripHostOperatorAuthorityFromChildEnv } from '$lib/server/services/cliChildEnv'
+import {
+  cliHelperLaunchEnv,
+  resolveCliHelperLaunchValues,
+  type CliHelperLaunchValues
+} from '$lib/server/services/cliHelperLaunch'
 import { revokeRunCredential } from '$lib/server/services/agentRunCredentials'
 import { getDockerGatewayAuthToken } from '$lib/server/services/dockerGatewayConfig'
 import {
@@ -53,11 +70,13 @@ import {
   resolveClaudeRunAsIdentity,
   resolveClaudeRuntimeUid
 } from '$lib/server/services/claudeRuntimeUser'
+import { buildSubagentSlugCollisionError } from '$lib/utils/subagentSlug'
+import { assertCliModelStillOffered, warnIfCliOlderThanPinned } from '$lib/server/services/cliModelAvailability'
 import {
-  buildSubagentSlugCollisionError,
-  normalizeSubagentSlugValue,
-  resolveSubagentSlug
-} from '$lib/utils/subagentSlug'
+  buildCliSubagentMcpToolReference,
+  buildCliWorkerSpawnToolReference,
+  resolveCliSubagentToolKey
+} from '$lib/utils/cliSubagentToolNames'
 
 type ClaudeTransport = 'cli'
 
@@ -120,6 +139,11 @@ interface ClaudeRunner {
    * (`--replay-user-messages`), and that echo is the delivery signal (AMD-114-01).
    */
   steer?: (payload: { steerIds: string[]; text: string }) => Promise<boolean>
+  /**
+   * BL-287: the Claude process. A caller that must outlast it (a Subagent delete, which
+   * removes the folder it writes into) waits for its exit (`subagentRunSettle.ts`).
+   */
+  process?: ChildProcess
 }
 
 const PROVIDER_DISABLED_ERROR =
@@ -185,15 +209,29 @@ export function redactClaudeCliArgsForLog(args: string[]) {
 export function buildClaudeRunChildEnv(
   options: Pick<ClaudeRunOptions, 'agentRunToken' | 'dockerAuthToken'>,
   baseEnv: NodeJS.ProcessEnv = process.env,
-  identity = resolveClaudeRunAsIdentity(baseEnv)
+  identity = resolveClaudeRunAsIdentity(baseEnv),
+  helperLaunch: CliHelperLaunchValues = resolveCliHelperLaunchValues()
 ): NodeJS.ProcessEnv {
   const envVars = buildClaudeChildEnv(baseEnv, identity)
   applyCliRunCredentialToChildEnv(envVars, {
     agentRunToken: options.agentRunToken,
     dockerAuthToken: options.dockerAuthToken ?? null
   })
+  // BL-152: the shared managed mcp.json names each helper's script folder and URL by
+  // reference, and Claude Code expands them from this environment, so this run launches its
+  // own process's helpers whichever Batshit wrote the file last.
+  Object.assign(envVars, cliHelperLaunchEnv(helperLaunch))
   return envVars
 }
+
+/**
+ * BL-270: what a managed Plan-mode run is told about its plan. Claude Code writes a plan file in
+ * Plan mode, into the user's own `~/.claude/plans`; managed runs are denied that folder
+ * (`buildUsersClaudePlansDenyRules`), so the plan belongs in the reply.
+ */
+export const CLAUDE_MANAGED_PLAN_MODE_NOTE =
+  'Plan mode in Batshit: Batshit keeps your plan in the chat, so write the whole plan in your ' +
+  'reply. Do not save a plan file; the plans folder is closed to this run.'
 
 export class ClaudeBridge {
   async streamNativeMode(request: NativeModeRequest) {
@@ -205,6 +243,39 @@ export class ClaudeBridge {
       throw new Error('No messages provided to Claude CLI runtime')
     }
 
+    if (request.delegatedRun && !request.processOwner) {
+      throw new ManagedProfileRunRefusedError('A delegated Claude run requires its stored process owner before profile setup.')
+    }
+    if (request.processOwner && request.processOwner.userId !== request.userId) {
+      throw new ManagedProfileRunRefusedError('The Claude process owner does not match this user.')
+    }
+    const profileOwner = request.processOwner ?? {
+      userId: request.userId || '', kind: 'agent' as const, id: request.agentId || ''
+    }
+
+    const claudeSettings = request.claudeSettings
+      ? buildClaudeRuntimeSettings(request.claudeSettings)
+      : buildClaudeRuntimeSettings(request.providerSettings ?? null)
+    const configScope = claudeSettings.configScope ?? 'managed'
+    const profileId =
+      claudeSettings.profileId ??
+      (request.agentId ? buildClaudeProfileId(request.agentId) : null)
+    // BL-7 review: a managed run's profile id becomes its home folder and can come from a
+    // stored `claude_profile_id`, so it is refused here, before any file is written for this
+    // run. A stored `../..` pointed `--settings`, `--mcp-config` and `--plugin-dir` into the
+    // user's own `~/.claude`.
+    if (configScope === 'managed' && profileId) {
+      assertManagedClaudeProfileId(profileId)
+    }
+    // BL-158: a saved model Batshit's Claude list no longer offers stops the run here, before
+    // anything of it is set up, with a message naming whose setting it is. A model id Batshit
+    // never listed passes.
+    await assertCliModelStillOffered(
+      'claude',
+      this.resolveCliModel(request.model, claudeSettings.model),
+      request
+    )
+
     const requestStart = Date.now()
     const prompt = buildCodexPromptFromMessages({
       messages: request.messages,
@@ -215,19 +286,12 @@ export class ClaudeBridge {
 
     const agentRecord = await this.loadAgentRecord(request.agentId)
     const permissions = this.resolveAgentPermissions(agentRecord)
-    const claudeSettings = request.claudeSettings
-      ? buildClaudeRuntimeSettings(request.claudeSettings)
-      : buildClaudeRuntimeSettings(request.providerSettings ?? null)
     const resolvedModel = this.resolveCliModel(request.model, claudeSettings.model)
     const workingDirectory = await this.resolveWorkingDirectory({
       userId: request.userId,
       projectPath: request.projectPath ?? null,
       claudeSettings
     })
-    const configScope = claudeSettings.configScope ?? 'managed'
-    const profileId =
-      claudeSettings.profileId ??
-      (request.agentId ? buildClaudeProfileId(request.agentId) : null)
     const sharedToolApprovalMode = request.toolApprovalMode === 'all' ? 'all' : 'off'
 
     // Managed mcp.json references gateway auth headers as ${BATSHIT_MCP_HEADER_*} placeholders;
@@ -235,14 +299,11 @@ export class ClaudeBridge {
     let gatewayHeaderEnv: Record<string, string> = {}
     if (configScope === 'managed' && request.userId && profileId) {
       try {
-        gatewayHeaderEnv = await syncAgentClaudeProfiles(request.userId)
+        gatewayHeaderEnv = await syncAgentClaudeProfiles(request.userId, profileId)
       } catch (error) {
-        console.warn('[ClaudeBridge] Failed to sync managed Claude profiles', error)
-        try {
-          gatewayHeaderEnv = await collectManagedClaudeGatewayHeaderEnv(request.userId)
-        } catch (headerEnvError) {
-          console.warn('[ClaudeBridge] Failed to resolve managed gateway header env after sync failure', headerEnvError)
-        }
+        // A run must not continue with an older config when its required sync failed.
+        if (isManagedProfileRunRefusal(error)) throw error
+        throw new ManagedProfileRunRefusedError('The managed Claude profile could not be synced for this run.', { cause: error })
       }
     }
 
@@ -275,6 +336,11 @@ export class ClaudeBridge {
       (approvalMode === 'default' || approvalMode === 'acceptEdits')
 
     const disallowedTools = new Set<string>(claudeSettings.disallowedTools ?? [])
+    if (configScope === 'managed') {
+      // Keep the native permission callback unavailable to model selection while
+      // still allowing Claude Code to invoke it host-side when a prompt is needed.
+      disallowedTools.add(CLAUDE_APPROVAL_TOOL_NAME)
+    }
     if (permissions.allowFileEdits === false) {
       disallowedTools.add('Write')
       disallowedTools.add('Edit')
@@ -288,13 +354,19 @@ export class ClaudeBridge {
     let mcpConfigPath: string | null = null
     let pluginDirs: string[] | undefined
     if (configScope === 'managed' && profileId) {
-      const paths = getManagedClaudePaths(profileId)
+      // BL-7 review: the flags come only from a home that exists and passed the managed-home
+      // check (a folder symlinked out of the agents folder is refused here, loudly).
+      const paths = await ensureManagedClaudeHome(profileId, profileOwner)
       settingsPath = paths.settingsPath
       mcpConfigPath = paths.mcpPath
       pluginDirs = [paths.pluginsDir]
     }
 
     if (configScope === 'managed') {
+      // BL-270: a managed run never writes its Plan-mode plan into the user's own plans folder.
+      for (const rule of buildUsersClaudePlansDenyRules()) {
+        disallowedTools.add(rule)
+      }
       const mcpDisallowed = await this.resolveManagedMcpToolDenyList({
         userId: request.userId,
         gatewayToolMap: request.gatewayToolMap ?? null
@@ -328,7 +400,6 @@ export class ClaudeBridge {
       const internalMode4Tools = await this.resolveMode4InternalControlAllowTools({
         userId: request.userId ?? null,
         agentId: request.agentId ?? null,
-        agentSlug: request.agentSlug ?? null,
         providerSettings: request.providerSettings ?? null,
         selectedCliToolIds: request.selectedCliToolIds ?? null
       })
@@ -337,6 +408,19 @@ export class ClaudeBridge {
       }
       if (subagentMcpTools.length > 0) {
         allowedMcpTools = Array.from(new Set([...allowedMcpTools, ...subagentMcpTools]))
+      }
+      // BL-267: the profile registers `spawn_workers` on the same bridge for a Workers-on
+      // primary (`resolveWorkersEnabled`, the value send-routed passes as `workersEnabled`;
+      // a delegated run never has it), so it is pre-allowed under the name the profile
+      // registers. Outside the list, Claude refused a Worker call with approvals off.
+      // Never in Plan mode: a Worker can change files, and `--allowedTools` would pre-allow it
+      // there too; Plan mode's own allow list stays the Subagent tools.
+      const workerTool =
+        request.workersEnabled === true && permissionMode !== 'plan' && request.agentId
+          ? buildCliWorkerSpawnToolReference({ id: request.agentId, slug: request.agentSlug ?? null })
+          : null
+      if (workerTool) {
+        allowedMcpTools = Array.from(new Set([...allowedMcpTools, workerTool.fullToolName]))
       }
       for (const toolName of internalMode4Tools.disallowTools) {
         disallowedTools.add(toolName)
@@ -371,8 +455,22 @@ export class ClaudeBridge {
 
     const contextGuard = await this.resolveContextGuardConfig({
       agent: agentRecord,
-      model: resolvedModel
+      model: resolvedModel,
+      selection: request.cliContextSelection
     })
+    contextGuard.onReport = request.onCliContext
+
+    // BL-496 (A2): the permission helper publishes its card on the chat's Redis channel, and
+    // only the server's subscriber hears it. That subscriber used to start with the first
+    // browser connection, so a woken or unwatched run could ask for approval with nobody,
+    // not even the server, listening. It must listen before the run can ask. Above the mint:
+    // nothing awaited may sit between the mint and the spawn's `try` (F-P2-6).
+    if (wantsPermissionPrompt && !(await waitForSseExternalSubscriber(APPROVAL_SUBSCRIBER_WAIT_MS))) {
+      throw new Error(
+        'Batshit could not start listening for approval cards, so this Claude run, which asks ' +
+          'you before some tools, was not started. Check that Redis is running, then send again.'
+      )
+    }
 
     /**
      * SA-117 DL-117-06 — mint this run's credential, where the instance token used to be
@@ -388,9 +486,25 @@ export class ClaudeBridge {
             messageId: request.messageId ?? null,
             runtime: 'claude',
             delegated: request.delegatedRun === true,
+            processOwner: request.processOwner ?? null,
+            commandParentAgentId: request.commandParentAgentId ?? null,
+            delegatedBashEnabled: request.delegatedRun === true &&
+              resolveNativeToolSettings(request.providerSettings ?? null).bashEnabled,
             // BL-75: a delegated run's credential names the Subagent or Worker whose skill
             // access governs its `native_skill` loads.
-            scopeAgentId: request.scopeAgentId ?? null
+            scopeAgentId: request.scopeAgentId ?? null,
+            // BL-81: and the control ids its DCM index offered it, the only ones the control
+            // routes will answer it with. The mint refuses a delegated run without them.
+            allowedControlIds: request.delegatedAllowedControlIds ?? null,
+            mcpGatewayScope: request.selectedGateways ?? [],
+            // BL-686: see `codexBridge.ts`; the same list the helper profile was built from.
+            cliToolScope: await resolveRunCredentialCliToolScope(request),
+            fetchZipAllowed: resolveManagedCliFetchZipAllowed(request.providerSettings, {
+              configScope,
+              delegatedRun: request.delegatedRun
+            }) &&
+              allowedMcpTools.includes(buildCliHelperMcpToolName(MODE4_INTERNAL_FETCH_ZIP_TOOL_NAMES[0])) &&
+              !disallowedTools.has(buildCliHelperMcpToolName(MODE4_INTERNAL_FETCH_ZIP_TOOL_NAMES[0]))
           })
         : null
     if (!runCredential) {
@@ -495,8 +609,16 @@ export class ClaudeBridge {
       cleanup: async () => {
         // SA-117 DL-117-06: run end is credential end, on every exit — a finished stream, a
         // Stop (the iterator's `return`), a timeout, or a thrown error.
-        await revokeRunCredentialOnce()
-        if (runner.cleanup) await runner.cleanup()
+        try {
+          await revokeRunCredentialOnce()
+          if (runner.cleanup) await runner.cleanup()
+        } finally {
+          // BL-496: a card still waiting ends with its run (its helper is gone), and every
+          // "needs you" mark this run's cards set is taken back, even when cleanup threw.
+          if (wantsPermissionPrompt && request.sessionId && request.messageId) {
+            await endClaudeApprovalRunForReply(request.sessionId, request.messageId)
+          }
+        }
       },
       onFirstChunk: () => {
         if (firstChunkLogged) return
@@ -519,8 +641,12 @@ export class ClaudeBridge {
       __steer: runner.steer ?? null,
       __steerLane: runner.steer ? ('claude' as const) : null,
       __transport: runner.transport,
+      // BL-287: the Claude process, so the Subagent runner can wait for its exit.
+      __cliProcess: runner.process ?? null,
       __detectToolSource: adapter.getToolMetadataResolver(),
       __rawEvents: adapter.getRawEvents(),
+      // BL-1362: accounting only (send-routed's `delegated` summary); filled as the run streams.
+      __helperDelegatedSteps: adapter.getHelperDelegatedSteps(),
       __runtimeInfo: {
         runtimeId: 'claude',
         providerId: 'anthropic-claude-cli',
@@ -560,9 +686,11 @@ export class ClaudeBridge {
   private async resolveContextGuardConfig(params: {
     agent: Record<string, any> | null
     model: string | null
-  }): Promise<ClaudeContextGuardConfig | null> {
+    selection?: CliContextSelection
+  }): Promise<ClaudeContextGuardConfig> {
     const threshold = resolveClaudeContextGuardThreshold()
-    if (threshold === null) return null
+    const selection = params.selection?.model === params.model ? params.selection : null
+    const disableClaude1M = claudeContextCappedByEnvironment(params.model)
 
     let presetContextWindow: number | null = null
     const presetId =
@@ -570,7 +698,9 @@ export class ClaudeBridge {
       params.agent.primary_model_preset_id.trim().length > 0
         ? params.agent.primary_model_preset_id.trim()
         : null
-    if (presetId) {
+    if (selection) {
+      presetContextWindow = selection.presetContextWindow
+    } else if (presetId) {
       try {
         const preset = (await redis.get(`model:${presetId}`)) as SavedModel | null
         const selection = resolveRuntimeModelSelection({
@@ -582,12 +712,21 @@ export class ClaudeBridge {
       }
     }
 
+    const matched = selection ? matchingCliContextReport(selection.priorReport, selection.settingsKey) : null
+    const reported = matched?.runtime === 'claude' && matched.model === (params.model ?? 'default') &&
+      Boolean(matched.disableClaude1M) === disableClaude1M ? matched : null
     return {
       contextWindow: resolveClaudeContextWindow({
         presetContextWindow,
-        model: params.model
+        model: params.model,
+        disableClaude1M,
+        reported
       }),
-      threshold
+      threshold,
+      model: params.model,
+      presetContextWindow,
+      disableClaude1M,
+      reported
     }
   }
 
@@ -599,6 +738,13 @@ export class ClaudeBridge {
     return this.sanitizeToolName(name.trim())
   }
 
+  /**
+   * The full names of this primary's Subagent tools, for `--allowedTools` and the Plan-mode
+   * allow list. BL-153: they come from the same `cliSubagentToolNames.ts` rule the Claude
+   * profile registers the bridge under and the DCM roster prints (bounded server segment
+   * and tool key), never from `buildManagedGatewayId`. A name the profile does not register
+   * allows nothing, so a Subagent was denied in Plan mode and asked for approval elsewhere.
+   */
   private resolveSubagentPlanAllowTools(params: {
     agentId?: string | null
     agentSlug?: string | null
@@ -607,46 +753,37 @@ export class ClaudeBridge {
     const agentId = typeof params.agentId === 'string' ? params.agentId.trim() : ''
     if (!agentId) return []
 
-    const slugSource =
-      typeof params.agentSlug === 'string' && params.agentSlug.trim().length > 0
-        ? params.agentSlug.trim()
-        : agentId
-    const managedId = buildManagedGatewayId(
-      `${agentId}-subagents`,
-      `${slugSource}-subagents`
-    )
-
     const candidates = Array.isArray(params.assignedSubagents) ? params.assignedSubagents : []
     if (candidates.length === 0) return []
 
+    const agent = { id: agentId, slug: params.agentSlug ?? null }
     const usedKeys = new Map<string, string>()
     const toolNames: string[] = []
 
-    const addSubagentTool = (key: string, label: string) => {
+    for (const entry of candidates) {
+      const subagent =
+        typeof entry === 'string' && entry.trim().length > 0
+          ? { id: entry }
+          : entry && typeof entry === 'object'
+            ? entry
+            : null
+      if (!subagent) continue
+
+      const key = resolveCliSubagentToolKey(subagent)
+      const label =
+        typeof subagent.id === 'string' && subagent.id.trim()
+          ? subagent.id.trim()
+          : typeof subagent.displayName === 'string' && subagent.displayName.trim()
+            ? subagent.displayName.trim()
+            : key
       const existing = usedKeys.get(key)
       if (existing) {
         throw buildSubagentSlugCollisionError(key, existing, label)
       }
       usedKeys.set(key, label)
-      toolNames.push(`mcp__${managedId}__subagent_${key}`)
-    }
 
-    for (const entry of candidates) {
-      if (typeof entry === 'string' && entry.trim().length > 0) {
-        addSubagentTool(normalizeSubagentSlugValue(entry), entry)
-        continue
-      }
-
-      if (entry && typeof entry === 'object') {
-        const key = resolveSubagentSlug(entry)
-        const label =
-          typeof (entry as any).id === 'string' && (entry as any).id.trim()
-            ? (entry as any).id.trim()
-            : typeof (entry as any).displayName === 'string' && (entry as any).displayName.trim()
-              ? (entry as any).displayName.trim()
-              : key
-        addSubagentTool(key, label)
-      }
+      const reference = buildCliSubagentMcpToolReference(agent, subagent)
+      if (reference) toolNames.push(reference.fullToolName)
     }
 
     return toolNames.sort()
@@ -655,7 +792,6 @@ export class ClaudeBridge {
   private async resolveMode4InternalControlAllowTools(params: {
     userId?: string | null
     agentId?: string | null
-    agentSlug?: string | null
     providerSettings?: Record<string, any> | null
     selectedCliToolIds?: string[] | null
   }) {
@@ -667,27 +803,22 @@ export class ClaudeBridge {
       }
     }
 
-    const slugSource =
-      typeof params.agentSlug === 'string' && params.agentSlug.trim().length > 0
-        ? params.agentSlug.trim()
-        : agentId
-    const managedId = buildManagedGatewayId(
-      buildMode4InternalHelpersGatewayId(agentId),
-      buildMode4InternalHelpersGatewaySlug(slugSource)
-    )
-
     const nativeToolSettings = resolveNativeToolSettings(params.providerSettings ?? null)
     const cliToolScope = await resolveCliToolSelectionScope({
       userId: params.userId ?? '',
       agentId,
-      selectedToolIds: params.selectedCliToolIds ?? undefined
+      // The run's server-resolved list (BL-686); absent reads the agent's saved list.
+      cliToolScope: params.selectedCliToolIds ?? undefined
     })
     const hasCliTools = cliToolScope.toolIds.length > 0
     const enabledHelperTools = resolveEnabledMode4InternalHelperTools(nativeToolSettings, {
       hasCliTools
     })
     const enabledSet = new Set(enabledHelperTools)
-    const toManagedToolName = (toolName: string) => `mcp__${managedId}__${toolName}`
+    // BL-5: the same fixed server name both profile managers register the helper bridge under.
+    // A deny list naming any other server would deny nothing, and Claude would gain the
+    // retained helpers (`cliHelperServerParity.test.ts`).
+    const toManagedToolName = (toolName: string) => buildCliHelperMcpToolName(toolName)
 
     return {
       allowTools: enabledHelperTools.map(toManagedToolName),
@@ -825,15 +956,20 @@ export class ClaudeBridge {
   }
 
   private buildCliAllowedTools(
-    options: Pick<ClaudeRunOptions, 'allowedTools' | 'allowedMcpTools' | 'planAllowedTools'>
+    options: Pick<ClaudeRunOptions, 'permissionMode' | 'allowedTools' | 'allowedMcpTools' | 'planAllowedTools'>
   ) {
-    return Array.from(
-      new Set(
-        [
+    // Plan only pre-allows the server-resolved assigned Subagents. Ordinary user
+    // and managed MCP allows would otherwise bypass Plan's permission boundary.
+    const tools = options.permissionMode === 'plan'
+      ? options.planAllowedTools ?? []
+      : [
           ...(options.allowedTools ?? []),
           ...(options.allowedMcpTools ?? []),
           ...(options.planAllowedTools ?? [])
         ]
+    return Array.from(
+      new Set(
+        tools
           .map((tool) => tool.trim())
           .filter((tool) => tool.length > 0)
       )
@@ -930,6 +1066,8 @@ export class ClaudeBridge {
           'Claude Code CLI is not installed or not authenticated. Install it and run `claude auth login`.'
       )
     }
+    // BL-268: a Claude Code older than the one Batshit installs may refuse newer models.
+    warnIfCliOlderThanPinned('claude', status)
 
     const args = [
       '--print',
@@ -943,6 +1081,15 @@ export class ClaudeBridge {
       // acceptance — which is the only honest moment to call a steer delivered.
       '--replay-user-messages'
     ]
+
+    // BL-389: Batshit owns the chat, so a managed turn (a primary's, a Subagent's, or a
+    // Worker's) never lets Claude Code save its own session copy. Without this flag every turn
+    // wrote a `.jsonl` of the whole compiled prompt (system prompt plus the conversation) into
+    // the user's own `~/.claude/projects/<cwd>/`, where deleting the chat or the agent never
+    // reached it. Batshit never resumes a Claude session. `--print` only, which every run is.
+    if (options.configScope === 'managed') {
+      args.push('--no-session-persistence')
+    }
 
     if (options.model && !options.model.includes('claude-cli')) {
       args.push('--model', options.model)
@@ -977,12 +1124,27 @@ export class ClaudeBridge {
       args.push('--allowedTools', list.join(','))
     }
 
-    if (options.systemPromptMode === 'append' && options.systemPrompt) {
-      args.push('--append-system-prompt', options.systemPrompt)
-    } else if (options.systemPromptMode === 'replace' && options.systemPrompt) {
+    // BL-270: a managed Plan-mode run may not write its plan file (the user's plans folder is
+    // denied), so it is told to keep the whole plan in its reply, which Batshit keeps. Without
+    // the note the model asked the user to allow the write instead (measured on 2.1.280).
+    const planNote =
+      options.configScope === 'managed' && options.permissionMode === 'plan'
+        ? CLAUDE_MANAGED_PLAN_MODE_NOTE
+        : null
+    const appendedPrompt = [
+      options.systemPromptMode === 'append' ? options.systemPrompt : null,
+      planNote
+    ]
+      .filter((part): part is string => typeof part === 'string' && part.trim().length > 0)
+      .join('\n\n')
+    if (options.systemPromptMode === 'replace' && options.systemPrompt) {
       args.push('--system-prompt', options.systemPrompt)
     } else if (options.systemPromptMode === 'replace_file' && options.systemPromptFile) {
       args.push('--system-prompt-file', options.systemPromptFile)
+    }
+    // Claude Code combines an append flag with either replacement flag (CLI reference).
+    if (appendedPrompt) {
+      args.push('--append-system-prompt', appendedPrompt)
     }
 
     if (options.chromeEnabled === true) {
@@ -991,7 +1153,16 @@ export class ClaudeBridge {
       args.push('--no-chrome')
     }
 
-    if (options.settingSources && options.settingSources.length > 0) {
+    // BL-498: an empty array is the "no sources" case (project instructions off), not "omit
+    // the flag". Omitting `--setting-sources` does not mean "load nothing" to Claude Code —
+    // it means "load the default sources" (user, project, AND local), so a managed run with
+    // project instructions off used to fall through to the user's own `~/.claude/settings.json`
+    // (hooks, plugins, allow rules, user CLAUDE.md). The verified fix, read from the installed
+    // Claude Code CLI's own bundled source (`Fmo`, its `--setting-sources` parser): an explicit
+    // empty string is a valid value and means "no sources" — the exact value Claude Code's own
+    // `--restricted` startup path passes internally. So the flag is always passed with an
+    // explicit value whenever the caller set one, never left out to fall back to CLI defaults.
+    if (options.settingSources !== undefined) {
       args.push('--setting-sources', options.settingSources.join(','))
     }
 
@@ -1021,12 +1192,6 @@ export class ClaudeBridge {
     const childProcessOptions = buildClaudeChildProcessOptions(runAsIdentity)
     if (typeof options.maxThinkingTokens === 'number' && options.maxThinkingTokens > 0) {
       envVars.MAX_THINKING_TOKENS = String(options.maxThinkingTokens)
-    }
-    if (options.sessionId) {
-      envVars.BATSHIT_SESSION_ID = options.sessionId
-    }
-    if (options.messageId) {
-      envVars.BATSHIT_MESSAGE_ID = options.messageId
     }
     if (options.userId) {
       envVars.BATSHIT_USER_ID = options.userId
@@ -1061,6 +1226,17 @@ export class ClaudeBridge {
     for (const [key, value] of Object.entries(options.managedStdioEnv ?? {})) {
       envVars[key] = value
     }
+    // These identify this run's approval context and must never come from the
+    // parent process or a managed gateway's environment.
+    delete envVars.BATSHIT_SESSION_ID
+    delete envVars.BATSHIT_MESSAGE_ID
+    if (options.sessionId) {
+      envVars.BATSHIT_SESSION_ID = options.sessionId
+    }
+    if (options.messageId) {
+      envVars.BATSHIT_MESSAGE_ID = options.messageId
+    }
+    stripHostOperatorAuthorityFromChildEnv(envVars)
 
     const claudeExecutable = status.executable || resolveClaudeCliExecutable(envVars)
     logger.debug('[ClaudeBridge CLI] Executing claude', JSON.stringify({
@@ -1150,8 +1326,7 @@ export class ClaudeBridge {
     }
     const events = guard
       ? applyClaudeContextGuard(baseEvents, {
-          contextWindow: guard.contextWindow,
-          threshold: guard.threshold,
+          ...guard,
           onTrip: (stopMessage) => {
             console.warn('[ClaudeBridge CLI] Context guard stopping Claude run', { stopMessage })
             rl.close()
@@ -1200,7 +1375,8 @@ export class ClaudeBridge {
       transport: 'cli',
       events,
       cleanup,
-      steer
+      steer,
+      process: child
     }
   }
 
@@ -1286,6 +1462,12 @@ export class ClaudeBridge {
     const matchSteerEcho = (event: any): string[] | null => {
       if (steersAwaitingEcho.length === 0) return null
       if (event?.type !== 'user') return null
+      // BL-1366: a defensive closure. The echo of a stdin line is the main thread's (2.1.296
+      // writes it with `parent_tool_use_id: null`), while Claude Code's own helper model's
+      // messages carry the Agent call's id (BL-501). Without this, a helper's text-only user
+      // message whose words equalled a pending steer would be taken as its echo. No vendor path
+      // that sends such a message is known; this only keeps the two apart, like the adapter.
+      if (event?.parent_tool_use_id) return null
       const content = event?.message?.content
       if (!Array.isArray(content)) return null
       // A tool result is also a `user` event. Only a replayed steer is text-only.

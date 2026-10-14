@@ -11,9 +11,11 @@ const mockDeleteVoiceProfile = vi.fn()
 const mockGetVoiceEngineRecordByProviderId = vi.fn()
 const mockListVoiceEngineRecords = vi.fn()
 const mockListVoiceEngineSummaries = vi.fn()
+const mockListUnreadableVoiceEngines = vi.fn()
 const mockFetch = vi.fn()
 const mockRetrieveApiKey = vi.fn()
 const mockSaveHostVoiceReferenceAudioViaOperator = vi.fn()
+const mockPausedPlansAllowed = vi.fn(async () => false)
 
 vi.mock('$lib/server/redis', () => ({
   redis: {
@@ -30,9 +32,19 @@ vi.mock('$lib/server/services/voiceEngineRegistry', () => ({
     mockGetVoiceEngineRecordByProviderId(...args),
   listVoiceEngineRecords: (...args: any[]) => mockListVoiceEngineRecords(...args),
   listVoiceEngineSummaries: (...args: any[]) => mockListVoiceEngineSummaries(...args),
+  listVoiceEngineManagerView: async (...args: any[]) => ({
+    engines: await mockListVoiceEngineSummaries(...args),
+    unreadableEngines: await mockListUnreadableVoiceEngines(...args)
+  }),
+  VoiceEngineRecordUnreadableError: class VoiceEngineRecordUnreadableError extends Error {},
   getVoiceEngineSuiteId: (record: any) => record?.suite?.id ?? record?.id,
   getVoiceEngineSuiteRole: (record: any) => record?.suite?.role ?? 'primary',
   isVoiceEngineHidden: (record: any) => record?.suite?.hidden === true
+}))
+
+vi.mock('$lib/server/services/pausedPlans', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('$lib/server/services/pausedPlans')>()),
+  pausedPlansAllowedOnThisCopy: () => mockPausedPlansAllowed()
 }))
 
 vi.mock('$lib/services/apiKey.server', () => ({
@@ -62,7 +74,9 @@ describe('voiceService engine defaults', () => {
     mockDeleteVoiceProfile.mockResolvedValue(undefined)
     mockListVoiceEngineRecords.mockResolvedValue([])
     mockListVoiceEngineSummaries.mockResolvedValue([])
+    mockListUnreadableVoiceEngines.mockResolvedValue([])
     mockSaveHostVoiceReferenceAudioViaOperator.mockReset()
+    mockPausedPlansAllowed.mockResolvedValue(false)
     mockGetUserSettings.mockResolvedValue({
       user_id: 'user-1',
       voice_settings: {
@@ -417,7 +431,8 @@ describe('voiceService engine defaults', () => {
     expect(Array.from(result.audio)).toEqual([9, 10, 11])
   })
 
-  it('uses the separate MiMo Token Plan endpoint and key for speech when configured', async () => {
+  it('uses the separate MiMo Token Plan endpoint and key for speech on a Dev copy that allows paused plans', async () => {
+    mockPausedPlansAllowed.mockResolvedValue(true)
     mockRetrieveApiKey.mockImplementation(async (service: string) => {
       if (service === 'mimo_token_plan') return 'tp-mimo-plan-test'
       if (service === 'mimo') return 'mimo-paygo-test'
@@ -447,7 +462,8 @@ describe('voiceService engine defaults', () => {
     })
   })
 
-  it('transcribes recorded audio through MiMo V2.5 ASR and the Token Plan', async () => {
+  it('transcribes recorded audio through MiMo V2.5 ASR and the Token Plan on a Dev copy that allows paused plans', async () => {
+    mockPausedPlansAllowed.mockResolvedValue(true)
     mockRetrieveApiKey.mockImplementation(async (service: string) =>
       service === 'mimo_token_plan' ? 'tp-mimo-plan-test' : null
     )
@@ -483,6 +499,53 @@ describe('voiceService engine defaults', () => {
     })
     expect(body.messages[0].content[0].input_audio.data).toMatch(/^data:audio\/wav;base64,/)
     expect(result).toEqual({ text: 'Good morning from MiMo.', language: 'en' })
+  })
+
+  it('plan pause: a saved MiMo Token Plan key fails MiMo speech with the plan sentence, no switch to pay-as-you-go', async () => {
+    mockRetrieveApiKey.mockImplementation(async (service: string) => {
+      if (service === 'mimo_token_plan') return 'tp-mimo-plan-test'
+      if (service === 'mimo') return 'mimo-paygo-test'
+      return null
+    })
+    const sentence =
+      'MiMo Token Plan is paused: Xiaomi MiMo does not list Batshit as an allowed tool yet. ' +
+      "Xiaomi MiMo's normal pay-as-you-go connection (MiMo) works."
+    const { synthesizeSpeech, transcribeAudio, buildVoiceProviderSummary } = await import(
+      '../services/voiceService'
+    )
+    await expect(
+      synthesizeSpeech({ text: 'hi', provider: 'mimo', model: 'mimo-v2.5-tts', userId: 'user-1' })
+    ).rejects.toThrow(sentence)
+    await expect(
+      transcribeAudio({
+        audio: createTinyWav(),
+        provider: 'mimo',
+        model: 'mimo-v2.5-asr',
+        contentType: 'audio/wav',
+        userId: 'user-1'
+      })
+    ).rejects.toThrow(sentence)
+    expect(mockFetch).not.toHaveBeenCalled()
+
+    const summary = await buildVoiceProviderSummary('user-1')
+    expect(summary.find((entry) => entry.id === 'mimo')).toMatchObject({ ready: false, statusHint: sentence })
+  })
+
+  it('plan pause: MiMo pay-as-you-go speech is not paused', async () => {
+    mockRetrieveApiKey.mockImplementation(async (service: string) =>
+      service === 'mimo' ? 'mimo-paygo-test' : null
+    )
+    mockFetch.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [{ message: { audio: { data: Buffer.from([9, 10]).toString('base64') } } }]
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      )
+    )
+    const { synthesizeSpeech } = await import('../services/voiceService')
+    await synthesizeSpeech({ text: 'hi', provider: 'mimo', model: 'mimo-v2.5-tts', userId: 'user-1' })
+    expect(mockFetch.mock.calls[0][0]).toBe('https://api.xiaomimimo.com/v1/chat/completions')
   })
 
   it('synthesizes speech through Azure Speech REST TTS', async () => {
@@ -1060,6 +1123,33 @@ describe('voiceService engine defaults', () => {
       ready: true,
       statusHint: undefined
     })
+  })
+
+  it('keeps a saved engine it cannot read in the voice pickers, not ready, instead of dropping it', async () => {
+    mockListUnreadableVoiceEngines.mockResolvedValue([
+      { scope: 'record', id: 'dots-tts-mf', reason: 'has settings this Batshit does not know: futureOption', name: 'Dots TTS', supportsTts: true, supportsStt: false },
+      { scope: 'record', id: 'whisper-next', reason: 'x', supportsTts: false, supportsStt: true },
+      // Not pickable: a suite's hidden lane, a record with no usable id, and the whole list.
+      { scope: 'record', id: 'qwen3-tts-clone', reason: 'x', hidden: true, supportsTts: true, supportsStt: false },
+      { scope: 'record', id: null, reason: 'id: Invalid input', supportsTts: true, supportsStt: false },
+      { scope: 'list', id: null, reason: 'it is format version 2' }
+    ])
+
+    const { buildVoiceProviderSummary } = await import('../services/voiceService')
+    const result = await buildVoiceProviderSummary('user-1')
+    const byo = result.filter((entry) => entry.type === 'byo')
+
+    expect(byo.map((entry) => entry.id)).toEqual(['byo:dots-tts-mf', 'byo:whisper-next'])
+    expect(byo[0]).toMatchObject({
+      label: 'Dots TTS',
+      ready: false,
+      statusHint: "Saved settings can't be read",
+      supports: { tts: true, stt: false, listVoices: false }
+    })
+    // No name in the record: its id is the label.
+    expect(byo[1]).toMatchObject({ label: 'whisper-next', ready: false, supports: { tts: false, stt: true } })
+    // Nothing tried to reach an engine it cannot read.
+    expect(mockFetch).not.toHaveBeenCalled()
   })
 
   it('marks Fish and Inworld as built-in direct realtime TTS providers in provider summaries', async () => {
@@ -3225,5 +3315,31 @@ describe('voiceService engine defaults', () => {
       mediaType: 'audio/wav'
     })
     expect(Array.from(result.audio)).toEqual([1, 2, 3, 4])
+  })
+
+  it('BL-684: OpenAI speech and transcription clients carry Batshit\'s own User-Agent', async () => {
+    mockRetrieveApiKey.mockImplementation(async (service: string) =>
+      service === 'openai' ? 'sk-zcpause-openai-1234567890' : null
+    )
+    const { createOpenAI } = await import('@ai-sdk/openai')
+    const { BATSHIT_USER_AGENT } = await import('../services/providers/batshitIdentity')
+    const { synthesizeSpeech, transcribeAudio } = await import('../services/voiceService')
+    vi.mocked(createOpenAI).mockClear()
+
+    await synthesizeSpeech({ userId: 'user-1', provider: 'openai', text: 'hi', model: 'gpt-4o-mini-tts' } as any)
+      .catch(() => undefined)
+    await transcribeAudio({
+      audio: new Uint8Array([1, 2, 3]),
+      provider: 'openai',
+      userId: 'user-1',
+      model: 'gpt-4o-transcribe',
+      contentType: 'audio/wav'
+    }).catch(() => undefined)
+
+    const calls = vi.mocked(createOpenAI).mock.calls
+    expect(calls.length).toBe(2)
+    for (const [options] of calls) {
+      expect(options).toMatchObject({ headers: { 'User-Agent': BATSHIT_USER_AGENT } })
+    }
   })
 })

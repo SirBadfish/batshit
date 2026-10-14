@@ -1,6 +1,6 @@
 /**
  * SA-120 P7 — a chat page's short read of a DM, by DM id: who wrote it, its subject and the
- * start of its body, and what the Jev Juice incoming-text screen said about it.
+ * start of its body, and what the Judge Juice incoming-text screen said about it.
  *
  * Three surfaces ask: the Agent DM tool card (by the `dm_id` in its own result), and, in a
  * chat a wake-up message started, the origin line on an approval card and the notice card

@@ -47,6 +47,23 @@ describe('approval continuation stream', () => {
     expect(saved.metadata.toolApprovals.approvals[0].approvalId).toBe('second')
   })
 
+  it("carries the first part's reply-end record in the start, so the live end and the saved message keep the same notes (SA-129 P2b)", () => {
+    const withControl = {
+      ...prior,
+      metadata: {
+        ...prior.metadata,
+        zipControl: { unzip: [], zip: [], toolResultsSummary: [{ toolName: 'read_file', summary: 'a' }] },
+        memorySaves: [{ id: 'mem_1' }],
+        controlErrors: [{ tag: 'batshit-tool-notes', error: 'x', at: '2026-09-27T00:00:00.000Z' }],
+        zipHolds: { held: [{ path: 'a.ts', zipId: 'zip_a' }] }
+      }
+    }
+    const resume = createApprovalResumeStart(withControl, 100)
+    for (const key of ['zipControl', 'memorySaves', 'controlErrors', 'zipHolds']) {
+      expect(resume.prior.metadata[key]).toEqual((withControl.metadata as any)[key])
+    }
+  })
+
   it('rejects missing or malformed start envelopes', () => {
     for (const value of [undefined, {}, { approvalResume: true }, { approvalResume: { version: NaN, prior } }, { approvalResume: { version: 10 } }]) {
       expect(readApprovalResumeStart(value)).toBeNull()

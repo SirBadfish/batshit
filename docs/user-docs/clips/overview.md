@@ -31,7 +31,16 @@ If a Clip works in your browser but fails for an agent or Artifact, the current 
 
 If the selected model has Vision turned off, Batshit treats it as text-only and blocks image Clips before sending. Image transport settings fix the URL shape; they can't make a text-only model understand images.
 
+## Upload and attachment status
+
+If your saved Clip settings cannot be loaded, no upload starts. Saving a file in the Vault and attaching it to the current chat are separate steps: a later batch failure does not undo an earlier saved file or confirmed attachment.
+
+If attachment status is uncertain, **Refresh Clips** checks what is currently attached without uploading or attaching again. An earlier request may still finish after that check. The warning can remain even when the Clip appears, and further attachment changes or deletion may be held while that request is unconfirmed. Do not repeat an upload or attach to clear the warning, or assume reloading cancels the earlier request. Check the Vault and current chat; keep any continuing error for diagnosis.
+
 ## Image Clips
+
+A picture Batshit supplies as a Clip for the message shows at once, even when its URL uses a tunnel. A Batshit upload served from its own address also shows at once; other pictures served through your tunnel or another website wait for your click. A picture in an agent's reply that comes from another website shows as a box and loads only when you click **Load picture** (see [Security](../security/overview.md)).
+
 
 Images are sent as structured image inputs, never as raw base64 text inside the prompt — raw image text explodes token usage and makes conversations unreadable. Depending on the provider or runtime, Batshit uses a fetchable URL, a local data URL, or a provider-specific upload path.
 

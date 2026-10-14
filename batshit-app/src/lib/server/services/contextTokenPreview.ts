@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 import { redis } from '$lib/server/redis'
 import { executionViewerService } from '$lib/server/services/executionViewerService'
+import { readCliContextReport } from '$lib/server/services/cliContextReportLookup'
 import { DatabaseService } from '$lib/services/databaseRedis.server'
 import type { Message } from '$lib/stores/messages.svelte'
 import type { ExecutionSnapshot } from '$lib/types/executionViewer'
@@ -36,7 +37,14 @@ import {
   resolveBudgetOutputReserve,
   type PromptBudgetReport
 } from '$lib/server/services/contextBudgetPreflight'
-import { resolveRuntimeModelSelection } from '$lib/utils/modelPresetRuntime'
+import { resolveApiContextBudget } from './localApiContextBudget'
+import { buildRuntimeModelSettings } from '$lib/utils/modelSettingsMapper'
+import { resolveAgentModelFallbacks, resolveRuntimeModelSelection } from '$lib/utils/modelPresetRuntime'
+import {
+  claudeContextCappedByEnvironment, cliContextSettingsKey,
+  matchingCliContextReport,
+  resolveEffectiveAgentCliModel, resolveCliContextWindow
+} from '$lib/utils/cliContextWindow'
 import type { SavedModel } from '$lib/types/savedModels'
 
 export type AgentRow = Record<string, any>
@@ -154,7 +162,7 @@ async function loadProtectedUnzippedZipIds(sessionId: string): Promise<string[]>
 
   for (const zipId of ids ?? []) {
     if (typeof zipId !== 'string' || !zipId.trim()) continue
-    // SA-120 P5: a result Jev Juice opened (source `inferred`) is Batshit's guess, not a pin,
+    // SA-120 P5: a result Judge Juice opened (source `inferred`) is Batshit's guess, not a pin,
     // so it never shields a message from Manual Trim, Compact, or a nap. A record that
     // cannot be read keeps protecting, as every unzip always has.
     const item = await redis.get(`unzipped_item:${sessionId}:${zipId.trim()}`).catch(() => null)
@@ -407,7 +415,7 @@ async function loadPrimarySavedModel(agent: AgentRow): Promise<SavedModel | null
   return model && typeof model === 'object' ? model as SavedModel : null
 }
 
-export async function resolveAgentBudgetSettings(agent: AgentRow) {
+export async function resolveAgentBudgetSettings(agent: AgentRow, sessionId?: string, userId = agent.user_id as string) {
   const preset = await loadPrimarySavedModel(agent)
   const selection = resolveRuntimeModelSelection({
     preset,
@@ -418,15 +426,51 @@ export async function resolveAgentBudgetSettings(agent: AgentRow) {
     capabilities: preset?.capabilities ?? agent.primary_model_capabilities ?? null,
     settings: (preset?.settings ?? agent.provider_specific_settings ?? null) as Record<string, any> | null
   })
-  const explicitMaxTokens =
-    typeof selection.settings?.maxTokens === 'number'
-      ? selection.settings.maxTokens
-      : typeof agent.primary_model_max_tokens === 'number'
-        ? agent.primary_model_max_tokens
-        : null
+  const runtimeSettings = buildRuntimeModelSettings({
+    ...selection, settings: selection.settings,
+    fallbacks: resolveAgentModelFallbacks({ preset, agent })
+  })
+  const explicitMaxTokens = runtimeSettings.standard.maxTokens ?? null
+  const apiContext = await resolveApiContextBudget({
+    userId, providerId: selection.provider, modelId: selection.modelId,
+    presetContextWindow: selection.contextWindow,
+    requestedContextWindow: selection.provider === 'ollama'
+      ? runtimeSettings.providerOptions?.ollama?.options?.num_ctx ?? null : null
+  })
+
+  const service = selection.connection?.service ?? preset?.connection?.service ??
+    agent.primary_model_connection?.service ?? agent.primary_model_provider
+  const cliRuntime = service === 'openai-codex' || service === 'codex'
+    ? 'codex' : service === 'anthropic-claude-cli' || service === 'claude-cli'
+      ? 'claude' : null
+  const cliModel = cliRuntime
+    ? resolveEffectiveAgentCliModel(cliRuntime, agent, selection.settings, selection.modelId) : null
+  const claudeCap = cliRuntime === 'claude' ? claudeContextCappedByEnvironment(cliModel) : false
+  const contextLookup = cliRuntime && sessionId
+    ? await readCliContextReport(sessionId, agent.id, cliRuntime)
+    : { report: null, warning: null, checkedAt: undefined }
+  const savedReport = contextLookup.report
+  const matchedReport = cliRuntime ? matchingCliContextReport(savedReport,
+    cliContextSettingsKey(cliRuntime, agent, selection.contextWindow,
+      selection.settings, selection.modelId)) : null
+  const matchingReport = matchedReport &&
+    (cliRuntime !== 'claude' || Boolean(matchedReport.disableClaude1M) === claudeCap)
+      ? matchedReport : null
+  const contextLimit = contextLookup.warning ? null : cliRuntime
+    ? resolveCliContextWindow({
+        runtime: cliRuntime,
+        model: cliModel,
+        presetContextWindow: selection.contextWindow,
+        reported: matchingReport,
+        disableClaude1M: claudeCap
+      }).contextWindow
+    : apiContext.contextLimit
 
   return {
-    contextLimit: selection.contextWindow ?? null,
+    contextLimit,
+    localContext: apiContext.evidence,
+    contextWindowWarning: contextLookup.warning,
+    contextWindowCheckedAt: contextLookup.checkedAt,
     maxOutputTokens: explicitMaxTokens,
     reasoningModel: Boolean(selection.capabilities?.reasoning)
   }
@@ -488,7 +532,7 @@ export async function estimateCompiledBudget(params: {
     wrapperOverheadTokens: params.wrapperOverheadTokens
   })
   const [budgetSettings, codexProjectInstructionChars] = await Promise.all([
-    resolveAgentBudgetSettings(params.agent),
+    resolveAgentBudgetSettings(params.agent, params.sessionId, params.userId),
     params.runtimeFlavor === 'codex'
       ? estimateCodexProjectInstructionChars({
           agent: params.agent,
@@ -521,6 +565,9 @@ export async function estimateCompiledBudget(params: {
     autoCompactTriggerTokens,
     extraRuntimeInputChars: codexProjectInstructionChars
   })
+  budget.localContext = budgetSettings.localContext
+  budget.contextWindowWarning = budgetSettings.contextWindowWarning
+  budget.contextWindowCheckedAt = budgetSettings.contextWindowCheckedAt
 
   return {
     tokens: budget.estimatedRuntimeTokens,

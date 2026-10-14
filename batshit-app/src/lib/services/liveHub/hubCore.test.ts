@@ -434,6 +434,13 @@ describe('HubCore', () => {
     streams[1].connect('hub-2')
     await settle()
     expect(patches[0].change).toEqual({ hubId: 'hub-2', add: [sessionSub('b', 'chat-2')], remove: [] })
+    // BL-382: the tab that spoke again hears `open` a second time (no `down` reached it while it
+    // was silent). `SSEService` reads every `open` after the first as "added again; reload".
+    await acceptOldest()
+    expect(tabB.statuses().map((message) => [message.id, message.status])).toEqual([
+      ['b', 'open'],
+      ['b', 'open']
+    ])
   })
 
   it('ignores a malformed subscription instead of sending it to the server', async () => {

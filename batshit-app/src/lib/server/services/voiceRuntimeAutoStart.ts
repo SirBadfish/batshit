@@ -6,7 +6,7 @@ import type {
   VoiceEngineRecord
 } from '$lib/types/voice'
 import {
-  listVoiceEngineRecords,
+  listVoiceEngineRecordsForRuntime,
   upsertVoiceEngineRecord
 } from '$lib/server/services/voiceEngineRegistry'
 import { shouldStopVoiceRuntimeOnShutdown } from '$lib/utils/voiceSchema'
@@ -18,16 +18,13 @@ import {
   resolveLocalVoiceRuntimeLogPath,
   resolveManagedInstallsRoot
 } from '$lib/server/services/voiceLocalRuntimePaths'
-import {
-  registerHostVoiceRuntimeShutdown,
-  startHostVoiceRuntimeViaOperator
-} from '$lib/server/services/voiceHostOperatorRuntime'
+import { startHostVoiceRuntimeViaOperator } from '$lib/server/services/voiceHostOperatorRuntime'
 import {
   attachLocalRuntimeLaunchRecord,
   pruneLocalRuntimeLaunchRecords
 } from '$lib/server/services/voiceRuntimeLaunchRecords'
 import { logger } from '$lib/utils/logger'
-import { autoStartLiveKitSidecarRuntime } from '$lib/server/services/liveKitSidecarRuntime'
+import { autoStartLiveKitSidecarRuntime, resolveLiveKitRuntimeEngineRefs } from '$lib/server/services/liveKitSidecarRuntime'
 
 const AUTO_START_RECENT_WINDOW_MS = 15_000
 const AUTO_START_READY_TIMEOUT_MS = 45_000
@@ -198,13 +195,12 @@ async function recordSharedRuntimeChoices(records: VoiceEngineRecord[]) {
 
 async function autoStartVoiceRuntimes(userId: string): Promise<VoiceRuntimeAutoStartReport> {
   const results: VoiceRuntimeAutoStartResult[] = []
-  const records = await listVoiceEngineRecords(userId)
+  // `complete` is false while a saved engine record cannot be read (it is kept unchanged).
+  const { records, complete } = await listVoiceEngineRecordsForRuntime(userId)
   // Docker: the host operator started these engines, so it is what stops them when this
-  // container shuts down. Registered on every boot, not only when this boot started
-  // something, because an engine a previous container started may still be running.
-  if (isContainerizedRuntime()) {
-    registerHostVoiceRuntimeShutdown(() => listVoiceEngineRecords(userId))
-  }
+  // container shuts down. That stop is registered when the server starts
+  // (`registerDockerVoiceEngineShutdown`, BL-19), not here: a container nobody opened after a
+  // crash or a restart never runs this pass, and a registration here would replace that one.
 
   for (const rawRecord of records) {
     const providerId = buildProviderId(rawRecord.id)
@@ -264,14 +260,7 @@ async function autoStartVoiceRuntimes(userId: string): Promise<VoiceRuntimeAutoS
 
     try {
       const started = isContainerizedRuntime()
-        ? await startHostVoiceRuntimeViaOperator({
-            engineId: record.id,
-            installRoot: localRuntime.installRoot,
-            installOwnership: localRuntime.installOwnership,
-            launch: localRuntime.launch,
-            endpoint: record.baseUrl,
-            stopOnShutdown: shouldStopVoiceRuntimeOnShutdown(localRuntime.startup)
-          })
+        ? await startHostVoiceRuntimeViaOperator(record)
         : await startLocalVoiceRuntime({
             userId,
             engineId: record.id,
@@ -308,10 +297,23 @@ async function autoStartVoiceRuntimes(userId: string): Promise<VoiceRuntimeAutoS
   // when the container shuts down, from the choices the app sends then. Natively, first drop
   // this registry's attach records that no longer match an engine (deleted, moved to another
   // endpoint, or changed while this Batshit was not running), then record the current ones.
+  // Not while a saved record cannot be read: its engine is missing from `records`, and the tidy
+  // would read it as deleted and drop its attach records and its "keep running".
   if (!isContainerizedRuntime()) {
-    await pruneLocalRuntimeLaunchRecords(records).catch((error) => {
-      logger.warn('[voice-runtime] could not tidy launch records at boot', { error })
-    })
+    if (complete) {
+      // LiveKit's runtimes keep launch records too (BL-1300); not without its settings.
+      const liveKit = await resolveLiveKitRuntimeEngineRefs(userId).catch((error) => {
+        logger.warn('[voice-runtime] did not tidy launch records at boot: LiveKit settings could not be read', { error })
+        return null
+      })
+      if (liveKit) {
+        await pruneLocalRuntimeLaunchRecords([...records, ...liveKit]).catch((error) => {
+          logger.warn('[voice-runtime] could not tidy launch records at boot', { error })
+        })
+      }
+    } else {
+      logger.warn('[voice-runtime] did not tidy launch records at boot: a saved engine record cannot be read')
+    }
     await recordSharedRuntimeChoices(records)
   }
 

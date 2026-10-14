@@ -1,6 +1,6 @@
 # Artifact Templates Gallery
 
-Starter templates and the design patterns they demonstrate. Use these as references when building new artifacts.
+**Load when:** you want a proven code pattern for a piece of an artifact: streaming output, passing context to the AI, the action bar, file upload with preview, a webhook call, saved state, or status feedback. The page skeleton itself is in `brain-general.md`.
 
 ## Template Index
 
@@ -93,7 +93,7 @@ Render the fixed action bar (`Share to Chat`, `Save to Clip Vault`, `Download`):
 const actions = window.batshit.builder.action.standardControls({
   storageKey: 'lastResult',
   title: 'Tool Result',
-  shareOptions: { type: 'data', format: 'markdown', initiator: 'user' },
+  shareOptions: { type: 'data', format: 'markdown' },
   onStatus: (message) => showStatus(message)
 });
 window.batshit.builder.mount(document.getElementById('actions'), actions);
@@ -109,7 +109,7 @@ window.batshit.builder.mount(document.getElementById('actions'), actions);
 
 Used by: Image Tool
 
-Handle file uploads with drag-and-drop and preview grid:
+For a custom preview grid, handle drag-and-drop yourself (Builder Kit's `dropFile()` / `uploadButton()` cover the simple case):
 
 ```javascript
 let uploadedFiles = [];
@@ -220,10 +220,10 @@ With CSS:
 When building any artifact, verify:
 
 - [ ] Uses `--batshit-*` CSS variables with fallbacks (not hardcoded colors)
-- [ ] Reset applied: `* { box-sizing: border-box; margin: 0; padding: 0; }`
+- [ ] Reset applied: `* { box-sizing: border-box; }`
 - [ ] Body uses `var(--batshit-font)`, `var(--batshit-bg)`, `var(--batshit-text)`
 - [ ] Buttons have `:hover` and `:disabled` states
-- [ ] Inputs have `:focus` states with accent border
+- [ ] Fields come from Builder Kit (they bring their own focus ring and names)
 - [ ] Loading/streaming states are visually distinct
 - [ ] Error states are clearly communicated
 - [ ] Layout is appropriate for the target zone

@@ -18,7 +18,9 @@ const FLAGGED = {
   at: '2026-09-17T09:30:00.000Z',
   findings: [{ id: 'override', probability: 0.98 }],
   severity: 'serious',
-  harm: 2
+  harm: 2,
+  // What the brief route sends: the view carries the judge's name (SA-120 P10b).
+  judge: 'Clef Flash'
 }
 
 const BRIEF = {
@@ -64,7 +66,8 @@ describe('dmBriefs store', () => {
         findings: [{ id: 'override', probability: 0.98 }],
         harm: 2,
         clipped: false,
-        source: 'agent_dm'
+        source: 'agent_dm',
+        judge: 'Clef Flash'
       }
     })
     expect(getJevJuiceDmScreen('dm_one')?.status).toBe('flagged')

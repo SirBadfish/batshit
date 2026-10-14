@@ -44,6 +44,10 @@ afterEach(async () => {
 })
 
 describe('resolveManagedCliTarget', () => {
+  it('pins the tested current model runtimes exactly', () => {
+    expect(MANAGED_CLI_PINNED_VERSIONS).toEqual({ codex: '0.160.0', claude: '2.1.296' })
+  })
+
   it('maps codex platform keys onto npm alias versions and vendor triples', () => {
     const version = MANAGED_CLI_PINNED_VERSIONS.codex
 

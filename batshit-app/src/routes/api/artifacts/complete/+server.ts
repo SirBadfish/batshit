@@ -1,5 +1,5 @@
 import { error, type RequestHandler } from '@sveltejs/kit'
-import { apiError } from '$lib/server/services/apiResponses'
+import { apiError, apiFailure } from '$lib/server/services/apiResponses'
 import { logger } from '$lib/utils/logger'
 import { StreamEventAdapter } from '$lib/server/services/streamEventAdapter'
 import { redis } from '$lib/server/redis'
@@ -7,6 +7,7 @@ import { generateMessageId } from '$lib/utils/messageId'
 import { VercelAIBrain } from '$lib/server/services/vercelBrain'
 import { ProviderManager } from '$lib/server/services/providers'
 import { resolveNativeToolUser } from '$lib/server/services/nativeToolAuth'
+import { refuseDelegatedRunOutsideList } from '$lib/server/services/actingAgentIdentity'
 import { env } from '$env/dynamic/private'
 import { apiKeyService } from '$lib/services/apiKey.server'
 // SA-011 Phase 1: Image generation support
@@ -40,6 +41,8 @@ import {
   recordArtifactRunEvent,
   startArtifactRunLog
 } from '$lib/server/artifacts/artifactRunLogs'
+import { PINOKIO_APP_BRAIN_TYPE, readPinokioArtifactBinding } from '$lib/artifacts/pinokioArtifact'
+import { PinokioAppRunError, runPinokioAppArtifact } from '$lib/server/services/pinokioAppRunner'
 
 
 const RATE_LIMIT_WINDOW_SECONDS = 60
@@ -905,19 +908,48 @@ async function resolveModelForRole({
   }
 }
 
-function validatePayloadSize(body: CompletionRequestBody) {
+function isDataUrlValue(value: unknown): value is string {
+  return typeof value === 'string' && value.startsWith('data:')
+}
+
+/**
+ * SA-072 P2: a Pinokio app artifact's file fields (a picture dropped on its panel) arrive as
+ * `data:` URLs in `fields` / `context`, and its runner uploads them to the app instead of
+ * putting them in a prompt. Only that transport counts them against the image budget; every
+ * other artifact keeps the plain text limit, where such a value is refused as before.
+ */
+function redactDataUrlFieldValues(value: unknown): { value: unknown; chars: number } {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return { value, chars: 0 }
+  let chars = 0
+  const redacted: Record<string, unknown> = {}
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (isDataUrlValue(entry)) {
+      chars += entry.length
+      redacted[key] = `[data url ${entry.length} chars]`
+    } else {
+      redacted[key] = entry
+    }
+  }
+  return { value: redacted, chars }
+}
+
+function validatePayloadSize(body: CompletionRequestBody, options: { dataUrlFieldValues?: boolean } = {}) {
   const imagePayloadChars = Array.isArray(body.images)
     ? body.images.reduce((total, image) => {
         const data = typeof image?.data === 'string' ? image.data : ''
         return total + data.length
       }, 0)
     : 0
-  if (imagePayloadChars > MAX_IMAGE_INPUT_PAYLOAD_CHARS) {
+  const fieldFiles = options.dataUrlFieldValues ? redactDataUrlFieldValues(body.fields) : { value: body.fields, chars: 0 }
+  const contextFiles = options.dataUrlFieldValues ? redactDataUrlFieldValues(body.context) : { value: body.context, chars: 0 }
+  if (imagePayloadChars + fieldFiles.chars + contextFiles.chars > MAX_IMAGE_INPUT_PAYLOAD_CHARS) {
     throw error(413, 'Artifact image input payload too large')
   }
 
   const bodyForTextLimit = {
     ...body,
+    fields: fieldFiles.value,
+    context: contextFiles.value,
     images: Array.isArray(body.images)
       ? body.images.map((image) => ({
           ...image,
@@ -1210,6 +1242,8 @@ async function streamViaMode3({
   for await (const rawChunk of result.stream as any) {
     const chunkType = String(rawChunk?.type || '')
     switch (chunkType) {
+      case 'error':
+        throw rawChunk.error ?? new Error('Artifact completion failed')
       case 'text-delta': {
         const textChunk = rawChunk.text || ''
         if (textChunk) {
@@ -1880,6 +1914,110 @@ async function generateViaObjectStream({
   await writer.close()
 }
 
+async function streamViaPinokioApp(input: {
+  artifact: any
+  artifactId: string
+  userId: string
+  runId: string
+  messageId: string
+  fields: Record<string, any> | null
+  context: unknown
+  streamAdapter: StreamEventAdapter
+  writer: WritableStreamDefaultWriter<Uint8Array>
+  stream: TransformStream
+}): Promise<Response> {
+  const { artifact, artifactId, userId, runId, messageId, streamAdapter, writer } = input
+  const binding = readPinokioArtifactBinding(artifact)
+  if (!binding) {
+    const message =
+      'This artifact has brain_type "pinokio_app" but no Pinokio app binding (metadata.runtime_manager "pinokio", metadata.pinokio_app_id, and a source_type of comfyui, gradio, or custom).'
+    await finishArtifactRunLog({ userId, artifactId, runId, status: 'error', errorMessage: message, source: 'pinokio_binding' })
+    throw error(400, message)
+  }
+  await markArtifactRunPrepared({
+    userId,
+    artifactId,
+    runId,
+    role: 'primary',
+    configuredSource: null,
+    resolvedModel: null,
+    requestModel: null,
+    connectionService: 'pinokio',
+    chosenTransport: 'pinokio-app'
+  })
+  // The panel sends its form as `context`; an agent's typed call sends `fields`. Fields win.
+  const values: Record<string, unknown> = {
+    ...(input.context && typeof input.context === 'object' && !Array.isArray(input.context) ? (input.context as Record<string, unknown>) : {}),
+    ...(input.fields ?? {})
+  }
+
+  ;(async () => {
+    let finalStatus: 'success' | 'error' = 'success'
+    let finalError: string | null = null
+    let finalException: unknown = null
+    try {
+      await streamAdapter.emitStart({
+        messageId,
+        metadata: { transport: 'pinokio-app', runId, runtimeManager: 'pinokio', appId: binding.appId }
+      })
+      const result = await runPinokioAppArtifact(
+        { artifactId, binding, metadata: artifact.metadata ?? {}, values, userId },
+        {
+          chunk: async (text) => {
+            await streamAdapter.emitChunk({ content: text })
+          },
+          file: async (file, index) => {
+            await streamAdapter.emitFile({ base64: file.base64, mediaType: file.mediaType, index, metadata: file.metadata })
+          }
+        }
+      )
+      await streamAdapter.emitFinish({})
+      await streamAdapter.emitEnd({ content: result.text, zipReferences: [], metadata: result.metadata })
+      await streamAdapter.emitComplete()
+      await writer.close()
+    } catch (err) {
+      finalStatus = 'error'
+      finalException = err
+      finalError = artifactErrorMessage(err)
+      if (isArtifactStreamWriteError(err)) {
+        console.warn('[Artifacts] Pinokio app artifact stream closed before result delivery:', artifactErrorLogValue(err))
+      } else {
+        // `code` lets the panel's Builder Kit turn `app_offline` into a "Start with Pinokio" button.
+        await streamAdapter
+          .emitError({
+            error: finalError,
+            metadata: err instanceof PinokioAppRunError ? { code: err.code, ...err.details } : undefined
+          })
+          .catch((emitErr) => {
+            console.error('[Artifacts] Failed to emit Pinokio app artifact error event:', artifactErrorLogValue(emitErr))
+          })
+      }
+      await writer.close().catch(() => {})
+    } finally {
+      await finishArtifactRunLog({
+        userId,
+        artifactId,
+        runId,
+        status: finalStatus,
+        errorMessage: finalError,
+        error: finalException,
+        source: isArtifactStreamWriteError(finalException) ? 'client_disconnect' : 'pinokio_app'
+      }).catch((logErr) => console.error('[Artifacts] Failed to finish Pinokio app artifact run log:', logErr))
+    }
+  })().catch((taskErr) => {
+    console.error('[Artifacts] Pinokio app artifact background task failed after safeguards:', taskErr)
+  })
+
+  return new Response(input.stream.readable, {
+    status: 200,
+    headers: {
+      'Content-Type': 'application/x-ndjson',
+      'Cache-Control': 'no-store',
+      'X-Accel-Buffering': 'no'
+    }
+  })
+}
+
 export const POST: RequestHandler = async ({ request, locals, fetch }) => {
   const body = (await request.json()) as CompletionRequestBody
   const { artifactId, context = null, mode = 'complete', webhookUrl, sessionId: providedSessionId, model } = body
@@ -1915,14 +2053,23 @@ export const POST: RequestHandler = async ({ request, locals, fetch }) => {
   if (!userId) {
     return apiError('Unauthorized', 401)
   }
+  // BL-81 follow-up: no Subagent or Worker run completes an artifact on its own credential.
+  // Its allowed artifact tools (`use.artifact.*` on `/api/controls/use`) run through their
+  // handler, which calls this route with the instance token.
+  const delegatedRefusal = refuseDelegatedRunOutsideList(auth, null)
+  if (delegatedRefusal) {
+    return apiFailure(delegatedRefusal.message, 403, { code: delegatedRefusal.code })
+  }
 
-  validatePayloadSize(body)
+  validatePayloadSize(body, { dataUrlFieldValues: true })
   await enforceRateLimit(userId, artifactId)
 
   const artifact = await loadArtifact(artifactId)
-  const brainType: 'built_in' | 'webhook' | 'n8n_workflow' | 'custom_webhook' | 'none' =
+  const brainType: 'built_in' | 'webhook' | 'n8n_workflow' | 'custom_webhook' | 'pinokio_app' | 'none' =
     artifact.brain_type ||
     (artifact.webhook_url ? 'webhook' : artifact.ai_enabled === false ? 'none' : 'built_in')
+  const runsPinokioApp = brainType === PINOKIO_APP_BRAIN_TYPE
+  if (!runsPinokioApp) validatePayloadSize(body)
   const configuredWebhookUrl = typeof artifact.webhook_url === 'string' ? artifact.webhook_url.trim() : ''
   const requestedWebhookUrl = typeof webhookUrl === 'string' ? webhookUrl.trim() : ''
 
@@ -1947,7 +2094,7 @@ export const POST: RequestHandler = async ({ request, locals, fetch }) => {
 
   // SA-042: Inject fabric field values into prompt context when present (skip for passthrough —
   // fields go directly to the webhook body, not into the prompt)
-  if (!webhookPassthrough && fields && Object.keys(fields).length > 0) {
+  if (!webhookPassthrough && !runsPinokioApp && fields && Object.keys(fields).length > 0) {
     const fieldLines = Object.entries(fields).map(([key, value]) => `- ${key}: ${JSON.stringify(value)}`).join('\n')
     prompt = `[Pre-filled field values]\n${fieldLines}\n\n${prompt}`
   }
@@ -2009,6 +2156,12 @@ export const POST: RequestHandler = async ({ request, locals, fetch }) => {
   })
 
   streamAdapter.setMessageId(messageId)
+
+  // SA-072 P2: a Pinokio app artifact runs its app's own API through the saved recipe; no model.
+  if (runsPinokioApp) {
+    return streamViaPinokioApp({ artifact, artifactId, userId, runId, messageId, fields, context, streamAdapter, writer, stream })
+  }
+
   const systemPrompt = buildSystemPrompt(artifact, await redis.get('batshit:artifacts_system_prompt') as string | null)
   const modelConfig = normalizeArtifactModelConfig(artifact.model_config ?? null, artifact.model ?? null)
   const role = resolveArtifactRoleForMode(mode)

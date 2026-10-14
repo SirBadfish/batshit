@@ -3,6 +3,12 @@ import { RECIPE_MIGRATION_REPORT_CONTRACT } from "./contractIds";
 import { GOON_LIVE_BUILD_CONTRACT } from "./liveBuildContracts";
 import { RECIPE_SOURCE_CONTRACT } from "./packageMetadata";
 import {
+  anatomyFitRecipeSibling,
+  createAnatomyFitInput,
+  createAnatomyFitResult,
+  createAnatomyFitState,
+} from "./anatomyFitContracts";
+import {
   GOON_RECIPE_AUTHORING_REVISION_CONTRACT,
   GOON_RECIPE_CONTRACT,
   GOON_RECIPE_REVISION_CONTRACT,
@@ -15,6 +21,9 @@ import {
   recipeSiblingStateSha256,
   recipeStateSnapshotSha256,
   verifyGoonRecipe,
+  verifyRecipeAuthoringRevision,
+  verifyRecipeRevisionBundle,
+  verifyRecipeStateSnapshot,
 } from "./recipeContracts";
 
 const sha = (character: string) => character.repeat(64);
@@ -345,6 +354,19 @@ describe("goon-recipe/v1 contracts", () => {
     );
   });
 
+  it.each([
+    ["sphericalEyelid", "spherical-eyelid-state/v1"],
+    ["clothingState", "clothing-state/v1"],
+    ["anatomyPresence", "anatomy-presence-state/v1"],
+  ])("refuses held sibling %s without adapting its stored state", (id, contract) => {
+    const recipe = validRecipe() as any;
+    const sibling = recipe.authoringRevision.state.siblings[0];
+    sibling.id = id;
+    sibling.contract = contract;
+    sibling.state.schemaVersion = contract;
+    expect(() => parseGoonRecipe(recipe)).toThrow(/unsupported in this public release/);
+  });
+
   it("retains successful revisions relative to the active revision, not pending authoring work", () => {
     const parsed = parseGoonRecipe(pendingRecipe());
     expect(parsed.authoringRevision.recipeRevision).toBe(3);
@@ -498,5 +520,64 @@ describe("goon-recipe/v1 contracts", () => {
     expect(() => parseGoonRecipe(owner)).toThrow(
       /accessor properties are not supported/,
     );
+  });
+
+  it("restores declared Anatomy Fit precision before every enclosing hash without changing its hashes", async () => {
+    const successful = parseRecipeRevisionBundle(revision(1));
+    const fitInput = await createAnatomyFitInput({
+      solverVersion: "oral-cavity-anatomy-fit/v2", domain: "oral-cavity",
+      source: {
+        modelSha256: sha("a"), appearanceDefinitionSha256: sha("b"),
+        topologySha256: sha("c"), positionsSha256: sha("d"), positionsScalarCount: 9,
+        physicalEvaluationSha256: sha("e"), physicalEvaluationScalarCount: 16,
+        landmarkSetSha256: sha("f"), landmarkSampleCount: 3,
+      },
+      relevantInputs: [{ id: "hero_head", value: 0 }], parameters: [],
+    });
+    const fitResult = await createAnatomyFitResult({
+      solverVersion: fitInput.solverVersion, domain: fitInput.domain,
+      inputSha256: fitInput.inputSha256, status: "converged",
+      convergence: { converged: true, iterations: 0, objective: 0, tolerance: 0, reason: "closed-form" },
+      resolvedParameters: [], followerMorphCoefficients: [], metrics: [], diagnostics: [],
+      nodeTransforms: [{ nodeId: "lower-gums", rootDeltaMatrix: [
+        1, 0, 0, 0, 1.34743637836628e-12, 1, 0, 0,
+        0, 0, 1, 0, -1.52736168765123e-12, 0, 0, 1,
+      ] }],
+    });
+    successful.state.siblings = [await anatomyFitRecipeSibling(await createAnatomyFitState(sha("b"), [{ input: fitInput, result: fitResult }]))];
+    successful.state.stateSha256 = await recipeStateSnapshotSha256(successful.state);
+    successful.revisionSha256 = await recipeRevisionBundleSha256(successful);
+    const { liveBuildReceipt: _receipt, ...content } = successful;
+    const authoring = { ...content, contract: GOON_RECIPE_AUTHORING_REVISION_CONTRACT };
+    authoring.revisionSha256 = await recipeAuthoringRevisionSha256(authoring);
+
+    // Exact adjacent doubles observed after a RedisJSON read of the oral fit.
+    const reopened = structuredClone(successful);
+    const fit = reopened.state.siblings[0].state as any;
+    fit.fits[0].result.nodeTransforms[0].rootDeltaMatrix[4] = 1.3474363783662799e-12;
+    fit.fits[0].result.nodeTransforms[0].rootDeltaMatrix[12] = -1.5273616876512299e-12;
+    expect(await recipeSiblingStateSha256(fit)).not.toBe(reopened.state.siblings[0].stateSha256);
+    await expect(verifyRecipeStateSnapshot(reopened.state)).resolves.toEqual(successful.state);
+    await expect(verifyRecipeRevisionBundle(reopened)).resolves.toEqual(successful);
+    await expect(verifyRecipeAuthoringRevision({ ...authoring, state: reopened.state })).resolves.toEqual(authoring);
+
+    fit.fits[0].result.nodeTransforms[0].rootDeltaMatrix[12] = 0.001;
+    await expect(verifyRecipeStateSnapshot(reopened.state)).rejects.toThrow(/resultSha256/);
+    fit.fits[0].result.nodeTransforms[0].rootDeltaMatrix[12] = -1.5273616876512299e-12;
+    fit.fits[0].result.nodeTransforms[0].unexpected = true;
+    await expect(verifyRecipeStateSnapshot(reopened.state)).rejects.toThrow(/exactly/);
+  });
+
+  it("keeps unknown sibling numeric content exact and rejects adjacent-double edits", async () => {
+    const state = parseRecipeRevisionBundle(revision(1)).state;
+    state.siblings = [{
+      id: "future-fit", contract: "future-fit-state/v1", definitionSha256: sha("a"),
+      stateSha256: sha("0"), state: { contract: "future-fit-state/v1", coefficient: 1.34743637836628e-12 },
+    }];
+    state.siblings[0].stateSha256 = await recipeSiblingStateSha256(state.siblings[0].state);
+    state.stateSha256 = await recipeStateSnapshotSha256(state);
+    await expect(verifyRecipeStateSnapshot(state)).resolves.toEqual(state);
+    state.siblings[0].state.coefficient = 1.3474363783662799e-12;
+    await expect(verifyRecipeStateSnapshot(state)).rejects.toThrow(/sibling future-fit state hash mismatch/);
   });
 });

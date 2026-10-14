@@ -103,9 +103,11 @@ Portable Skill Tokens are the standing approval for the granted family. Do not a
 - Author local draft files only in the outside-agent workspace or another user-approved working folder.
 - Keep API keys and provider secrets in Batshit server-side settings or Artifact configuration. Do not paste secrets into artifact HTML, chat text, or downloaded bundles.
 - For built-in AI artifacts, use `sys.model_catalog.search` and store the exact returned artifact model config when the model is known. Never silently choose a fallback model.
-- For every normal artifact save, run `sys.artifact.validate_structure` before `create`, `update`, `apply_patch`, or `publish`.
+- Saves (`create`, `update`, `apply_patch`, `publish`) run the Builder Kit, Fabric, and field-name checks themselves and refuse with a list of what to fix: fix those and send the save again. `sys.artifact.validate_structure` gives the same verdict without saving, for a dry run of a risky edit.
 - Respect the Builder Kit plus Fabric contract: use `window.batshit.builder.*`, declare `metadata.fabric_fields`, or set `metadata.run_only=true` for trigger-only artifacts.
+- Give every field a visible `label` (the Builder Kit links it to the control so a screen reader can name it; `ariaLabel` only for a field that shows no label). A save refuses a new field without a name.
 - For `sys.artifact.apply_patch`, send one managed patch string against `artifact.html`. Do not send unified diff headers or JSON patch objects.
+- A `sys.artifact.update` with `content`, or a `sys.artifact.add_version`, replaces the whole page, so it must carry `expectedVersion`: the `version` of your last result that loaded the whole page or wrote your own whole content (a `get` with content, `create`, a `content` update, or `add_version`), never an apply_patch, publish, zone, webhook, metadata, field, or rollback result: those show the stored version of a page you may not have read in full (a patch applies to the stored text, so a user's save elsewhere can sit in it), so `get` the artifact again before your next full-content write. If the user or another agent saved a newer version, the update is refused and nothing is saved: `get` the artifact again, redo your edit on that content, and send the new version. A `sys.artifact.update` without `content` needs no version.
 - For Docker Batshit, resolve URLs by caller. Host services normally need app-container URLs such as `host.docker.internal`; browser/iframe URLs may still be `localhost`.
 
 ## Workflow
@@ -113,20 +115,17 @@ Portable Skill Tokens are the standing approval for the granted family. Do not a
 Follow this order:
 
 1. Understand what the user wants and whether this is a new artifact or an edit.
-2. If editing, call `sys.artifact.list`, then `sys.artifact.get` with `includeContent: true`.
-3. Pick the build path and load the right references before coding:
-   - general native artifact: `references/brain-general.md` and `references/builder-kit-api.md`
-   - ComfyUI artifact: `references/brain-comfyui.md` and `references/builder-kit-api.md`
-   - n8n workflow artifact: `references/brain-n8n.md` and `references/builder-kit-api.md`
+2. If editing, call `sys.artifact.list`, then `sys.artifact.get`, and read `references/editing.md`.
+3. Load the references the build needs before coding. Each opens with a "Load when" line; read only what applies:
+   - native artifact (static, Built-in AI, or a webhook UI): `references/brain-general.md` and `references/builder-kit-api.md`, plus `references/ai-capabilities.md` and `references/ai-models.md` for Built-in AI
+   - ComfyUI workflow: `references/brain-comfyui.md`, then `references/comfyui-build.md`
+   - n8n workflow: `references/brain-n8n.md`
    - HuggingFace path: `references/brain-huggingface.md`
    - standalone Gradio embed: `references/embed-gradio.md`
-4. Load `references/fabric-and-agent-use.md` before publishing any agent-usable artifact.
-5. Author or patch the artifact locally.
-6. Run `sys.artifact.validate_structure`.
-7. Create or update through `sys.artifact.create`, `sys.artifact.update`, or `sys.artifact.apply_patch`.
-8. Publish/place through `sys.artifact.publish` or `sys.artifact.set_zone` when the user wants it usable now.
-9. If the artifact runs AI or a webhook, run it once when practical and inspect `sys.artifact.run_logs.list` / `sys.artifact.run_logs.get`.
-10. Report exactly what changed and where the user can find it.
+4. Author or patch the artifact locally.
+5. Create it with one `sys.artifact.create` that carries everything (`metadata`, `brain_type`, `zone`, `icon_ref`, `model_config` and `system_prompt` for Built-in AI, and `mode: "published"` when it should be usable now), or change it with `sys.artifact.update` (with `expectedVersion` when it sends `content`) / `sys.artifact.apply_patch`. A refused save lists what to fix.
+6. If the artifact runs AI or a webhook, run it once when practical and inspect `sys.artifact.run_logs.list` / `sys.artifact.run_logs.get`. `references/fabric-and-agent-use.md` covers agent access and failed runs.
+7. Report exactly what changed and where the user can find it.
 
 ## Available Controls
 
@@ -148,19 +147,27 @@ Follow this order:
 - `sys.artifact.run_logs.get`
 - `sys.model_catalog.search`
 
-## Mandatory References
+## References
 
-Always read the build-path references named in the workflow before writing artifact HTML. Read optional layout examples only when they help:
+Read the build-path references named in the workflow before writing artifact HTML; each reference's first lines say when to load it:
 
-- `references/builder-kit-api.md`
-- `references/brain-general.md`
+- `references/ai-capabilities.md`
+- `references/ai-models.md`
 - `references/brain-comfyui.md`
+- `references/brain-general.md`
 - `references/brain-huggingface.md`
 - `references/brain-n8n.md`
+- `references/builder-kit-api.md`
+- `references/comfyui-build.md`
+- `references/comfyui-reference.md`
+- `references/editing.md`
 - `references/embed-gradio.md`
 - `references/fabric-and-agent-use.md`
-- `references/zone-patterns.md`
+- `references/n8n-troubleshooting.md`
+- `references/runtime-api.md`
+- `references/runtime-location.md`
 - `references/templates-gallery.md`
+- `references/zone-patterns.md`
 
 ## Completion Report
 
@@ -170,9 +177,9 @@ End with:
 - new vs updated
 - artifact power source
 - zone and published status
-- validation result
+- save result (and any refusal you fixed)
 - model or runtime URL truth when relevant
 - run-log evidence when relevant
 - anything the user must still do
 
-Do not call the artifact done if structure validation failed or if the intended runtime cannot be reached.
+Do not call the artifact done if the save was refused or the intended runtime cannot be reached.

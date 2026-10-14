@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { dispatchModelConnectionsUpdated } from '$lib/utils/liveSettingsEvents'
   import { onMount } from 'svelte';
   import { ollamaModels, type OllamaModel } from '$lib/services/ollamaModels';
   import { Button } from '$lib/components/ui/button';
@@ -36,6 +37,7 @@
   async function loadModels() {
     try {
       models = await ollamaModels.getInstalledModels(baseUrl);
+      dispatchModelConnectionsUpdated('local-ai');
     } catch (error) {
       toast.error('Failed to load Ollama models');
     }

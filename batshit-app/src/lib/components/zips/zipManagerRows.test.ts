@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  countZipManagerHolds,
   getHiddenRawSidecarZipIds,
-  shouldShowZipManagerItem
+  shouldShowZipManagerItem,
+  ZIP_MANAGER_FILTERS,
+  zipManagerEmptyCopy
 } from './zipManagerRows'
 
 describe('Zip Manager row visibility', () => {
@@ -79,5 +82,36 @@ describe('Zip Manager row visibility', () => {
 
     expect(shouldShowZipManagerItem(zips[1], hiddenIds)).toBe(false)
     expect(shouldShowZipManagerItem(zips[2], hiddenIds)).toBe(true)
+  })
+})
+
+// BL-1485 (SA-129 D1, DL-07): one vocabulary. The state is compressed or expanded; Hold, Hold for
+// N messages and Release are the actions; "zip" stays the verb.
+describe('Zip Manager words (BL-1485)', () => {
+  it('filters read Expanded, Compressed, All', () => {
+    expect(ZIP_MANAGER_FILTERS.map((filter) => filter.label)).toEqual(['Expanded', 'Compressed', 'All'])
+  })
+
+  it('every empty state says compressed or expanded, never unzipped or zipped', () => {
+    const copies = ZIP_MANAGER_FILTERS.map((filter) => zipManagerEmptyCopy(filter.value))
+    expect(copies).toEqual([
+      'Nothing is expanded right now.',
+      'No compressed results in this chat yet.',
+      'No zips in this chat yet.'
+    ])
+    for (const copy of copies) expect(copy).not.toMatch(/unzipped|zipped|items/)
+  })
+
+  it('"N held" counts every hold, with or without a countdown, whoever holds it', () => {
+    const rows = [
+      { isManuallyUnzipped: true }, // Hold (you)
+      { isManuallyUnzipped: true }, // Hold for 10 messages (you)
+      { isManuallyUnzipped: true }, // an agent's hold on a dead copy the prompt compresses
+      { isManuallyUnzipped: true }, // a Judge Juice open, two messages
+      { isManuallyUnzipped: false }, // open by the buffer
+      { isManuallyUnzipped: false } // compressed
+    ]
+    expect(countZipManagerHolds(rows)).toBe(4)
+    expect(countZipManagerHolds([])).toBe(0)
   })
 })

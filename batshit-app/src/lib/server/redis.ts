@@ -2,6 +2,24 @@
 // Replaces batshit-server proxy with direct Redis 8 JSON support
 
 import { logger } from '$lib/utils/logger'
+import { escapeRedisGlob } from '$lib/utils/redisGlob'
+import { replaceBracedTokens } from '$lib/utils/braceScan'
+import {
+  firstJsonPathMatch,
+  unclaimedZipsMadeByMessage,
+  zipClaimsOfMessage,
+  zipsOwnedOnlyByMessage
+} from '$lib/utils/messageDeletionZips'
+import { MessageStillRunningError } from '$lib/server/messageStillRunningError'
+import { BrowserMessageMutationError, type BrowserMessageMutationPolicy } from '$lib/server/browserMessageMutation'
+import { withZipStateLock } from '$lib/server/services/zipStateLock'
+import {
+  FOLDER_CHANGED_CODE,
+  FOLDER_CHANGED_MESSAGE,
+  sameFolderChatIds,
+  selectFolderChats
+} from '$lib/server/services/folderChatsForDelete'
+import type { FixedSessionMetadata } from '$lib/utils/fixedSession'
 import { createClient, type RedisClientType } from 'redis'
 import type { 
   ChatSessionRow, 
@@ -28,17 +46,682 @@ import {
   shouldShowReasoningByDefaultForPrimaryAgent
 } from '$lib/utils/primaryAgentType'
 import {
+  AGENT_MEMORY_SOURCE_PATHS,
+  AGENT_TYPE_SOURCE_PATHS,
+  AgentMemorySettingsConflictError,
+  AgentUpdateConflictError,
+  agentMemoryBaseMatches,
+  agentMemoryFieldsFromAnswers,
+  agentUpdateScriptArguments,
+  planAgentRecordUpdate,
+  serializeAgentRecordPlan,
+  type AgentUpdateOptions
+} from '$lib/server/agentRecordUpdate'
+import { planSubagentRecordUpdate } from '$lib/server/subagentRecordUpdate'
+import {
   collectTrustedClipIdsFromMetadata,
+  scanDeletionSweepZipReferences,
   neutralizeAllZipReferenceSyntax,
   neutralizeUntrustedClipReferenceSyntax
 } from '$lib/utils/zipReferenceSafety'
 import { getRuntimeEnv } from '$lib/server/services/runtimeEnv'
 import { resolveRedisConnectionUrl } from '$lib/server/redisConnection'
 import {
+  JSON_COMPARE_AND_WRITE_SCRIPT,
+  jsonTextOf,
+  readJsonCompareAndWriteAnswer
+} from '$lib/server/redisJsonCompareAndWrite'
+import {
+  DELETE_N8N_TOKEN_SCRIPT,
+  MOVE_LEGACY_N8N_TOKEN_SCRIPT,
+  readLegacyN8nTokenMoveAnswer,
+  readN8nTokenDeleteAnswer,
+  type LegacyN8nTokenMoveAnswer,
+  type N8nTokenDeleteAnswer
+} from '$lib/server/n8nCredentialScripts'
+import {
   normalizeUploadUrlsForStorageInPayload,
   resolveUploadUrlsForBrowserInPayload
 } from '$lib/server/services/batshitServerUrls'
 import { keepAnsweredApprovals } from '$lib/server/services/toolApprovalState'
+// BL-4: a leaf with no imports of its own, so the approval gates' import walk through this
+// facade gains that one file and nothing behind it (`jevNeverApproves.pinning.test.ts`).
+import { filterQueuedSendMessageIds } from '$lib/server/services/queuedSendHiddenIds'
+import {
+  collectGoonGuardedReferences,
+  CUSTOM_GOON_UPLOAD_GUARD_LUA
+} from '$lib/server/services/goonCustomAssetOwnership.server'
+
+const STORE_SETTINGS_WITH_CUSTOM_GOON_REFS_SCRIPT = `${CUSTOM_GOON_UPLOAD_GUARD_LUA}
+if not customGoonUploadsAvailable(ARGV[2]) then
+  return 'ASSET_UNAVAILABLE'
+end
+redis.call('JSON.SET', KEYS[1], '$', ARGV[1])
+return 'STORED'
+`
+
+/**
+ * BL-195: `saveMessage`'s write. The save reads the stored record first (to keep what the
+ * server already wrote), then writes the whole record; a move that lands between the two
+ * (`MOVE_MESSAGE_TO_END_SCRIPT`) dated the message now, and the save's write put the old date
+ * back. This keeps the date stored at the moment of the write, so a message keeps its first
+ * `created_at` unless a move changes it. KEYS: the message record. ARGV: the record as JSON,
+ * then the `created_at` the save read.
+ */
+const SAVE_MESSAGE_KEEPING_CREATED_AT_SCRIPT = `
+-- BL-1302: only the authenticated browser routes supply ARGV[3]/KEYS[2]. Internal
+-- promotion, approval, reply and restore writers retain their normal trusted semantics.
+local browser = ARGV[3] and ARGV[3] ~= ''
+local protectedKeys = {steerPromoted = true, waitsForApproval = true, approvalCardExpired = true}
+local preservedMetadata = {}
+-- RedisJSON quoted names escape ONLY quotes/backslashes (agentRecordOpPath's
+-- measured contract). cjson.encode adds invalid slash/control-character escapes.
+local function quotedPathName(name)
+  local escaped = string.gsub(name, string.char(92), string.char(92, 92))
+  escaped = string.gsub(escaped, string.char(34), string.char(92, 34))
+  return '["' .. escaped .. '"]'
+end
+if browser then
+  local policy = cjson.decode(ARGV[3])
+  if redis.call('EXISTS', KEYS[2]) == 0 then return 'MISSING_SESSION' end
+  if redis.call('JSON.TYPE', KEYS[2], '$')[1] ~= 'object' then return 'FORBIDDEN' end
+  local session = cjson.decode(redis.call('JSON.GET', KEYS[2]))
+  if session.user_id ~= policy.userId then return 'FORBIDDEN' end
+  local exists = redis.call('EXISTS', KEYS[1]) == 1
+  if exists ~= policy.expectedExists then
+    if exists then return 'CHANGED_MESSAGE' else return 'MISSING_MESSAGE' end
+  end
+  local incoming = cjson.decode(ARGV[1])
+  local function owned(record)
+    return record.id == policy.messageId and record.session_id == policy.sessionId
+      and record.user_id == policy.userId and record.role == 'user'
+  end
+  if not owned(incoming) then return 'FORBIDDEN' end
+  if exists then
+    if redis.call('JSON.TYPE', KEYS[1], '$')[1] ~= 'object' then return 'FORBIDDEN' end
+    local current = cjson.decode(redis.call('JSON.GET', KEYS[1]))
+    if not owned(current) then return 'FORBIDDEN' end
+    -- JSONPath returns [] for absent markers. Legacy JSON.GET paths throw when absent.
+    -- POST merges CURRENT unprovided siblings; PUT replaces ordinary metadata. In both,
+    -- the protected three always belong to the stored record, never the browser payload.
+    if redis.call('JSON.TYPE', KEYS[1], '$.metadata')[1] == 'object' then
+      local incomingKeys = {}
+      if policy.mergeMetadataKeys then
+        for _, key in ipairs(policy.mergeMetadataKeys) do incomingKeys[key] = true end
+      end
+      for key, _ in pairs(current.metadata) do
+        if protectedKeys[key] or (policy.mergeMetadataKeys and not incomingKeys[key]) then
+          local path = '$["metadata"]' .. quotedPathName(key)
+          local raw = redis.call('JSON.GET', KEYS[1], path)
+          preservedMetadata[path] = string.sub(raw, 2, -2)
+        end
+      end
+    end
+  end
+end
+local stored = nil
+if redis.call('EXISTS', KEYS[1]) == 1 then
+  stored = cjson.decode(redis.call('JSON.GET', KEYS[1], '$.created_at'))[1]
+end
+redis.call('JSON.SET', KEYS[1], '$', ARGV[1])
+if browser then
+  if redis.call('JSON.TYPE', KEYS[1], '$.metadata')[1] ~= 'object' then
+    redis.call('JSON.SET', KEYS[1], '$.metadata', '{}')
+  end
+  for key, _ in pairs(protectedKeys) do
+    redis.call('JSON.DEL', KEYS[1], '$.metadata.' .. key)
+  end
+  for path, raw in pairs(preservedMetadata) do
+    redis.call('JSON.SET', KEYS[1], path, raw)
+  end
+end
+if type(stored) == 'string' and stored ~= '' and stored ~= ARGV[2] then
+  redis.call('JSON.SET', KEYS[1], '$.created_at', cjson.encode(stored))
+end
+return 'OK'
+`
+
+/**
+ * BL-195: `moveMessageToEnd` in one step on the server, so nothing lands between its check and
+ * its write. A message or chat that is gone answers nil and nothing changes; before this, a
+ * message deleted between the read and the MULTI left its id on the list with no record. The
+ * date is written first, so a record of the wrong type fails before the list is touched.
+ * KEYS: the session, the message record, the chat's message list. ARGV: the message id, then
+ * the new `created_at` as JSON. Answers the moved record as JSON.
+ */
+const MOVE_MESSAGE_TO_END_SCRIPT = `
+if redis.call('EXISTS', KEYS[1]) == 0 or redis.call('EXISTS', KEYS[2]) == 0 then
+  return false
+end
+redis.call('JSON.SET', KEYS[2], '$.created_at', ARGV[2])
+redis.call('LREM', KEYS[3], 0, ARGV[1])
+redis.call('RPUSH', KEYS[3], ARGV[1])
+return redis.call('JSON.GET', KEYS[2])
+`
+
+/**
+ * BL-622 (C1, C2): a Compact adds its one event to the chat's record at its own path, only while
+ * the chat's last event is still the one the Compact read before its summary call. The block a
+ * Compact read is never written back: that erased whatever another writer put into the chat's
+ * metadata during the summary call. KEYS: the chat record. ARGV: the event as JSON, the last
+ * event id the Compact read (`''` for none), a new `contextCompaction` block holding only this
+ * event as JSON, and `last_modified_at` as JSON. The last event is the last one the readers count
+ * (`getContextCompactionState`: an object with a string `id`, `createdAt` and `summary`, and a
+ * `sourceMessageIds` list, asked of JSON.TYPE because Lua reads a JSON list and a JSON object as
+ * the same table). Answers `MISSING`, `CHANGED:<last id>`, or the stored block as JSON.
+ */
+const APPEND_CONTEXT_COMPACTION_EVENT_SCRIPT = `
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return 'MISSING'
+end
+local eventsType = redis.call('JSON.TYPE', KEYS[1], '$.metadata.contextCompaction.events')[1]
+local lastId = ''
+if eventsType == 'array' then
+  local events = cjson.decode(redis.call('JSON.GET', KEYS[1], '$.metadata.contextCompaction.events'))[1]
+  for index = #events, 1, -1 do
+    local event = events[index]
+    if type(event) == 'table' and type(event.id) == 'string' and type(event.createdAt) == 'string'
+      and type(event.summary) == 'string'
+      and redis.call('JSON.TYPE', KEYS[1], '$.metadata.contextCompaction.events[' .. (index - 1) .. '].sourceMessageIds')[1] == 'array' then
+      lastId = event.id
+      break
+    end
+  end
+end
+if lastId ~= ARGV[2] then
+  return 'CHANGED:' .. lastId
+end
+if eventsType == 'array' then
+  redis.call('JSON.ARRAPPEND', KEYS[1], '$.metadata.contextCompaction.events', ARGV[1])
+else
+  if redis.call('JSON.TYPE', KEYS[1], '$.metadata')[1] ~= 'object' then
+    redis.call('JSON.SET', KEYS[1], '$.metadata', '{}')
+  end
+  redis.call('JSON.SET', KEYS[1], '$.metadata.contextCompaction', ARGV[3])
+end
+redis.call('JSON.SET', KEYS[1], '$.last_modified_at', ARGV[4])
+return redis.call('JSON.GET', KEYS[1], '$.metadata.contextCompaction')
+`
+
+/**
+ * BL-690: the generic update of a chat writes only the fields a browser may change, each by path,
+ * in one step inside Redis. KEYS: the chat record. ARGV[1]: `last_modified_at` as JSON. ARGV[2]:
+ * `keep`, `remove`, or the chat's new `metadata.group_chat` as JSON. ARGV[3..]: pairs of a
+ * top-level field name (the route's allow list) and its value as JSON. Answers `MISSING` or `OK`.
+ * `updateSession` runs it too, with `keep` and its caller's fields (BL-734).
+ */
+const UPDATE_SESSION_FIELDS_SCRIPT = `
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return 'MISSING'
+end
+for index = 3, #ARGV, 2 do
+  redis.call('JSON.SET', KEYS[1], '$.' .. ARGV[index], ARGV[index + 1])
+end
+if ARGV[2] ~= 'keep' then
+  if redis.call('JSON.TYPE', KEYS[1], '$.metadata')[1] ~= 'object' then
+    redis.call('JSON.SET', KEYS[1], '$.metadata', '{}')
+  end
+  if ARGV[2] == 'remove' then
+    redis.call('JSON.DEL', KEYS[1], '$.metadata.group_chat')
+  else
+    redis.call('JSON.SET', KEYS[1], '$.metadata.group_chat', ARGV[2])
+  end
+end
+redis.call('JSON.SET', KEYS[1], '$.last_modified_at', ARGV[1])
+return 'OK'
+`
+
+/**
+ * The ops loop `UPDATE_AGENT_FIELDS_SCRIPT` and `UPDATE_SUBAGENT_FIELDS_SCRIPT` share (BL-914):
+ * ARGV[1] is the plan's ops as JSON, entries `['ensure', path]` (make the path an object when it is
+ * not one), `['set', path, valueAsJson]`, `['del', path]`, and `['delnull', path]` (remove the
+ * path only while it holds null), run in order. The default lane's twin is `applyRecordOpsTwin`
+ * (`test-utils/agentUpdateScriptTwin.ts`).
+ */
+const APPLY_RECORD_OPS_LUA = `for _, entry in ipairs(cjson.decode(ARGV[1])) do
+  local kind = entry[1]
+  local path = entry[2]
+  if kind == 'ensure' then
+    if redis.call('JSON.TYPE', KEYS[1], path)[1] ~= 'object' then
+      redis.call('JSON.SET', KEYS[1], path, '{}')
+    end
+  elseif kind == 'set' then
+    redis.call('JSON.SET', KEYS[1], path, entry[3])
+  elseif kind == 'del' then
+    redis.call('JSON.DEL', KEYS[1], path)
+  elseif kind == 'delnull' then
+    if redis.call('JSON.TYPE', KEYS[1], path)[1] == 'null' then
+      redis.call('JSON.DEL', KEYS[1], path)
+    end
+  end
+end`
+
+/**
+ * BL-768: an agent update's by-path writes, in one step inside Redis. KEYS: the agent record.
+ * ARGV (`agentUpdateScriptArguments` in `agentRecordUpdate.ts`): [1] the ops as JSON, entries
+ * `['ensure', path]` (make the path an object when it is not one), `['set', path, valueAsJson]`,
+ * `['del', path]`, and `['delnull', path]` (remove the path only while it holds null); [2] the
+ * `agentType` rule, `set`, `auto` or `derive`; [3] the type to write, as JSON; [4] the caller's read
+ * of the type fields: each path's own `JSON.GET` answer, joined by line breaks (one `JSON.GET` of
+ * many paths answers them in a random order, measured on Redis 8.10.1); [5] the memory guard, `''`
+ * or JSON `{ paths, snapshot }` (BL-1294); [6..] the type paths.
+ *
+ * The memory guard is checked first: a save of the memory settings writes only while each memory
+ * path still answers what the caller read when it compared the save's base (`expectedMemory`),
+ * else it answers `MEMORY_CHANGED`. `agentType` (review of wave 2, item 1) is decided HERE, from the
+ * record as it is now: `set` writes it; `auto` leaves a canonical stored type alone (a type worked
+ * out from an earlier read wrote an old type back over a change made since); a legacy or
+ * non-canonical stored type, and `derive`, write the worked-out type only while the type fields
+ * still read as ARGV[4], else answer `TYPE_CHANGED`. Every read comes before the first write, so
+ * `MISSING`, `MEMORY_CHANGED` and `TYPE_CHANGED` write nothing, and a key that is not JSON fails on
+ * its first command. Answers `MISSING`, `MEMORY_CHANGED`, `TYPE_CHANGED` or `OK`.
+ */
+const UPDATE_AGENT_FIELDS_SCRIPT = `
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return 'MISSING'
+end
+if ARGV[5] ~= '' then
+  local guard = cjson.decode(ARGV[5])
+  local memory = {}
+  for _, path in ipairs(guard.paths) do
+    memory[#memory + 1] = redis.call('JSON.GET', KEYS[1], path)
+  end
+  if table.concat(memory, string.char(10)) ~= guard.snapshot then
+    return 'MEMORY_CHANGED'
+  end
+end
+local writeType = ARGV[2] == 'set'
+if not writeType then
+  local stored = cjson.decode(redis.call('JSON.GET', KEYS[1], '$.agentType'))[1]
+  if ARGV[2] == 'derive' or not (stored == 'api' or stored == 'cli' or stored == 'n8n') then
+    local fields = {}
+    for index = 6, #ARGV do
+      fields[#fields + 1] = redis.call('JSON.GET', KEYS[1], ARGV[index])
+    end
+    if table.concat(fields, string.char(10)) ~= ARGV[4] then
+      return 'TYPE_CHANGED'
+    end
+    writeType = true
+  end
+end
+if writeType then
+  redis.call('JSON.SET', KEYS[1], '$.agentType', ARGV[3])
+end
+${APPLY_RECORD_OPS_LUA}
+return 'OK'
+`
+
+/** How many times `updateAgent` works a changing type out again before it gives up (writing nothing). */
+const AGENT_UPDATE_TYPE_TRIES = 3
+
+/**
+ * BL-914: a Subagent update's by-path writes, in one step inside Redis. KEYS: the Subagent record.
+ * ARGV[1]: the plan's ops as JSON (`planSubagentRecordUpdate`, `serializeAgentRecordPlan`), run by
+ * `APPLY_RECORD_OPS_LUA`. There is no type rule: the type fields are written only as ops, when the
+ * request names them. The existence check comes before the first write, so `MISSING` writes
+ * nothing and a Subagent deleted meanwhile is not made again; a key that is not JSON fails on its
+ * first command. Answers `MISSING` or `OK`.
+ */
+const UPDATE_SUBAGENT_FIELDS_SCRIPT = `
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return 'MISSING'
+end
+${APPLY_RECORD_OPS_LUA}
+return 'OK'
+`
+
+/**
+ * BL-770 (`GET /api/agents/[id]/fix`): an agent record stored as a JSON STRING becomes a RedisJSON
+ * record, only while it is still the same string. A string key cannot take a JSON write, so the
+ * key is removed and written again, in one step inside Redis. KEYS: the agent record. ARGV[1]: the
+ * string the route read. ARGV[2]: the record as JSON. Answers `CHANGED` (nothing written) or `OK`.
+ */
+const REPLACE_STRING_AGENT_RECORD_SCRIPT = `
+if redis.call('TYPE', KEYS[1])['ok'] ~= 'string' or redis.call('GET', KEYS[1]) ~= ARGV[1] then
+  return 'CHANGED'
+end
+redis.call('DEL', KEYS[1])
+redis.call('JSON.SET', KEYS[1], '$', ARGV[2])
+return 'OK'
+`
+
+/**
+ * BL-723: a regular chat's graduation mark (`metadata.memoryGraduation`) is written at its own
+ * path, in one step inside Redis. The graduation used to read the chat and write that copy's
+ * whole metadata back, erasing a Compact event or any other block written in between. The new
+ * segment id is added to the list as stored now (the last 100 kept), never to a list read
+ * earlier. BL-737: the write is a COMPARE-AND-SET on `lastGraduatedMessageId`, the id this
+ * graduation read at its OWN start (`tailStart` above is really keyed on that id's position in
+ * the message list, never on any message's timestamp) — ARGV[5], empty when the graduation read
+ * no mark at all. It writes only while the stored `lastGraduatedMessageId` still equals ARGV[5];
+ * anything else (another graduation's write landed first, or a mark now exists that didn't before)
+ * answers `SUPERSEDED` and changes nothing. This settles two graduations racing each other (an
+ * idle timer and a session-close, say): both read the same old id, the first write's CAS matches
+ * and wins, the second's CAS no longer matches and it answers `SUPERSEDED` — and never gets stuck
+ * the way a "moves forward only" ordering check did (BL-737's own bug): a graduation that reads a
+ * mark whose message was since deleted just reads the CURRENT stored id and its CAS matches. KEYS:
+ * the chat record. ARGV[1]: `last_modified_at` as JSON. ARGV[2]: the last graduated message id as
+ * JSON. ARGV[3]: the graduation time as JSON. ARGV[4]: the segment id as JSON. ARGV[5]: the id
+ * this graduation read as its starting mark, a bare string (empty string means "no mark read").
+ * A STORED `lastGraduatedMessageId` that is itself an empty string reads as "no mark" too — the
+ * same sentinel, not a real id to CAS against — so a mark that was ever written with one never
+ * gets stuck permanently answering `SUPERSEDED` against every future "no mark read" caller.
+ * ARGV[6]: a whole new mark holding only this segment as JSON (for a chat with no mark object
+ * yet). Answers `MISSING` (chat gone), `SUPERSEDED`, `SUPERSEDED_LINKED`, or `OK`. BL-737 review:
+ * a CAS loser whose own segment (ARGV[4]) is ALREADY in the stored, winning mark's `segmentIds` —
+ * the winner reused it — answers `SUPERSEDED_LINKED` instead of plain `SUPERSEDED`, so the caller
+ * knows not to delete a segment the winner just linked in.
+ */
+const WRITE_REGULAR_GRADUATION_MARK_SCRIPT = `
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return 'MISSING'
+end
+if redis.call('JSON.TYPE', KEYS[1], '$.metadata')[1] ~= 'object' then
+  redis.call('JSON.SET', KEYS[1], '$.metadata', '{}')
+end
+local hasMark = redis.call('JSON.TYPE', KEYS[1], '$.metadata.memoryGraduation')[1] == 'object'
+local storedId = false
+if hasMark and redis.call('JSON.TYPE', KEYS[1], '$.metadata.memoryGraduation.lastGraduatedMessageId')[1] == 'string' then
+  local decodedStoredId = cjson.decode(redis.call('JSON.GET', KEYS[1], '$.metadata.memoryGraduation.lastGraduatedMessageId'))[1]
+  if decodedStoredId ~= '' then
+    storedId = decodedStoredId
+  end
+end
+local function supersededAnswer()
+  if hasMark and redis.call('JSON.TYPE', KEYS[1], '$.metadata.memoryGraduation.segmentIds')[1] == 'array' then
+    local storedSegmentIds = cjson.decode(redis.call('JSON.GET', KEYS[1], '$.metadata.memoryGraduation.segmentIds'))[1]
+    local thisSegmentId = cjson.decode(ARGV[4])
+    for _, storedSegmentId in ipairs(storedSegmentIds) do
+      if storedSegmentId == thisSegmentId then
+        return 'SUPERSEDED_LINKED'
+      end
+    end
+  end
+  return 'SUPERSEDED'
+end
+local expected = ARGV[5]
+if expected == '' then
+  if storedId ~= false then
+    return supersededAnswer()
+  end
+elseif storedId ~= expected then
+  return supersededAnswer()
+end
+if not hasMark then
+  redis.call('JSON.SET', KEYS[1], '$.metadata.memoryGraduation', ARGV[6])
+  redis.call('JSON.SET', KEYS[1], '$.last_modified_at', ARGV[1])
+  return 'OK'
+end
+redis.call('JSON.SET', KEYS[1], '$.metadata.memoryGraduation.version', '1')
+redis.call('JSON.SET', KEYS[1], '$.metadata.memoryGraduation.lastGraduatedMessageId', ARGV[2])
+redis.call('JSON.SET', KEYS[1], '$.metadata.memoryGraduation.lastGraduatedAt', ARGV[3])
+if redis.call('JSON.TYPE', KEYS[1], '$.metadata.memoryGraduation.segmentIds')[1] == 'array' then
+  local length = redis.call('JSON.ARRAPPEND', KEYS[1], '$.metadata.memoryGraduation.segmentIds', ARGV[4])[1]
+  if length > 100 then
+    redis.call('JSON.ARRTRIM', KEYS[1], '$.metadata.memoryGraduation.segmentIds', length - 100, length - 1)
+  end
+else
+  redis.call('JSON.SET', KEYS[1], '$.metadata.memoryGraduation.segmentIds', '[' .. ARGV[4] .. ']')
+end
+redis.call('JSON.SET', KEYS[1], '$.last_modified_at', ARGV[1])
+return 'OK'
+`
+
+/**
+ * BL-736: a Group delete removes a chat's `metadata.group_chat` only while it still names the
+ * Group being deleted — checked and written in one step inside Redis, closing the gap between
+ * the delete route's read of every chat and this per-chat write, in which the chat can be moved to
+ * a DIFFERENT Group. The unconditional `remove` path of `updateSessionFields` stays as it is for
+ * the user's own "take this chat out of its Group" action, where there is no such gap to close.
+ * KEYS: the chat record. ARGV[1]: `last_modified_at` as JSON. ARGV[2]: the Group id being deleted,
+ * a bare string (a `$.`-prefixed JSON.GET always answers a JSON ARRAY, `["id"]`, never a bare
+ * quoted scalar, so the stored value is decoded with cjson before comparing). Answers `MISSING`
+ * (chat gone), `CHANGED` (the chat no longer names this Group — nothing written), or `OK`.
+ */
+const CLEAR_GROUP_CHAT_IF_MATCHES_SCRIPT = `
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return 'MISSING'
+end
+if redis.call('JSON.TYPE', KEYS[1], '$.metadata.group_chat.group_id')[1] ~= 'string' then
+  return 'CHANGED'
+end
+local stored = cjson.decode(redis.call('JSON.GET', KEYS[1], '$.metadata.group_chat.group_id'))[1]
+if stored ~= ARGV[2] then
+  return 'CHANGED'
+end
+redis.call('JSON.DEL', KEYS[1], '$.metadata.group_chat')
+redis.call('JSON.SET', KEYS[1], '$.last_modified_at', ARGV[1])
+return 'OK'
+`
+
+/**
+ * BL-474 step 2: one write of a reply's stored image-origin record (`imageAddressOrigins.ts`), in one
+ * step inside Redis. It checks the chat and its owner, and for a decided record the reply itself (an
+ * assistant message of this chat and user), so a write after a delete never brings a key back. It
+ * writes only when the stored record is not newer: an older end never writes over a newer one, and a
+ * pending write never replaces a decided record of the same version. KEYS: the chat, the reply, the
+ * chat's index set, the record. ARGV: user id, chat id, reply id, version, state, record JSON.
+ * Answers `OK`, `MISSING_CHAT`, `NOT_OWNER`, `MISSING_REPLY`, `NOT_REPLY`, `OLDER`, or `KEPT`.
+ */
+const WRITE_IMAGE_ORIGIN_SCRIPT = `
+-- BATSHIT_IMAGE_ORIGIN_WRITE_V1
+-- Validate the serialized body against the separately passed identity before touching Redis.
+local record = cjson.decode(ARGV[6])
+if type(record) ~= 'table' or record.messageId ~= ARGV[3] or record.state ~= ARGV[5]
+  or type(record.version) ~= 'number' or record.version ~= tonumber(ARGV[4]) then
+  return redis.error_reply('Image origin record does not match write arguments')
+end
+local indexType = redis.call('TYPE', KEYS[3]).ok
+if indexType ~= 'none' and indexType ~= 'set' then
+  return redis.error_reply('Image origin index has the wrong type')
+end
+local itemType = redis.call('TYPE', KEYS[4]).ok
+if itemType ~= 'none' and itemType ~= 'ReJSON-RL' then
+  return redis.error_reply('Image origin record has the wrong type')
+end
+local function field(key, path)
+  local raw = redis.call('JSON.GET', key, path)
+  if not raw then return nil end
+  local values = cjson.decode(raw)
+  return values[1]
+end
+if redis.call('EXISTS', KEYS[1]) == 0 then return 'MISSING_CHAT' end
+if field(KEYS[1], '$.user_id') ~= ARGV[1] then return 'NOT_OWNER' end
+if ARGV[5] == 'decided' then
+  if redis.call('EXISTS', KEYS[2]) == 0 then return 'MISSING_REPLY' end
+  if field(KEYS[2], '$.role') ~= 'assistant' or field(KEYS[2], '$.session_id') ~= ARGV[2]
+    or field(KEYS[2], '$.id') ~= ARGV[3] or field(KEYS[2], '$.user_id') ~= ARGV[1] then
+    return 'NOT_REPLY'
+  end
+end
+if itemType == 'ReJSON-RL' then
+  local previous = field(KEYS[4], '$.version')
+  local version = tonumber(ARGV[4])
+  if type(previous) == 'number' then
+    if previous > version then return 'OLDER' end
+    if previous == version and ARGV[5] == 'pending' and field(KEYS[4], '$.state') == 'decided' then
+      return 'KEPT'
+    end
+  end
+end
+redis.call('JSON.SET', KEYS[4], '$', ARGV[6])
+redis.call('SADD', KEYS[3], ARGV[3])
+return 'OK'
+`
+
+export type ImageOriginWriteAnswer =
+  | 'ok'
+  | 'missing_chat'
+  | 'not_owner'
+  | 'missing_reply'
+  | 'not_reply'
+  | 'older'
+  | 'kept'
+
+/**
+ * BL-735: the Infinite Session transition writes its two owned fields at their own path, in one
+ * step inside Redis: `metadata.fixedSession` and the top-level `locked` auto-lock. The route used
+ * to read the chat and write that copy's whole metadata back, erasing a Compact event or any other
+ * block written while the route's own reads (the ownership check, the message-history look) were
+ * in flight. Every other stored field and metadata block stays. KEYS: the chat record. ARGV[1]:
+ * `last_modified_at` as JSON. ARGV[2]: the `fixedSession` block as JSON. Answers `MISSING` or `OK`.
+ */
+const WRITE_FIXED_SESSION_MARK_SCRIPT = `
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return 'MISSING'
+end
+if redis.call('JSON.TYPE', KEYS[1], '$.metadata')[1] ~= 'object' then
+  redis.call('JSON.SET', KEYS[1], '$.metadata', '{}')
+end
+redis.call('JSON.SET', KEYS[1], '$.metadata.fixedSession', ARGV[2])
+redis.call('JSON.SET', KEYS[1], '$.locked', 'true')
+redis.call('JSON.SET', KEYS[1], '$.last_modified_at', ARGV[1])
+return 'OK'
+`
+
+/**
+ * BL-549 (N4): a nap or dreaming adds one graduation event to an Infinite Session's window
+ * (`metadata.fixedSession.graduation.events`) at its own path, in one step inside Redis. The
+ * writer used to read the chat and write that copy's whole metadata back, erasing a Compact
+ * event, another graduation event, or any other block written in between. JSON.ARRAPPEND adds to
+ * the list as stored now, so two appends at once both stay. KEYS: the chat record. ARGV: the
+ * event as JSON, a whole `graduation` block holding only this event as JSON (for a chat with no
+ * event list yet), and `last_modified_at` as JSON. Answers `MISSING`, `NOT_FIXED` (not an
+ * Infinite Session: `metadata.fixedSession.enabled` is not true), or `OK`.
+ */
+const APPEND_FIXED_SESSION_GRADUATION_EVENT_SCRIPT = `
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return 'MISSING'
+end
+if redis.call('JSON.TYPE', KEYS[1], '$.metadata.fixedSession.enabled')[1] ~= 'boolean'
+  or redis.call('JSON.GET', KEYS[1], '$.metadata.fixedSession.enabled') ~= '[true]' then
+  return 'NOT_FIXED'
+end
+if redis.call('JSON.TYPE', KEYS[1], '$.metadata.fixedSession.graduation.events')[1] == 'array' then
+  redis.call('JSON.ARRAPPEND', KEYS[1], '$.metadata.fixedSession.graduation.events', ARGV[1])
+else
+  redis.call('JSON.SET', KEYS[1], '$.metadata.fixedSession.graduation', ARGV[2])
+end
+redis.call('JSON.SET', KEYS[1], '$.last_modified_at', ARGV[3])
+return 'OK'
+`
+
+/**
+ * BL-549 (N4): dreaming's era swap replaces some graduation events with one era event, at the
+ * event list's own path, in one step inside Redis, and only while every event it replaces is
+ * still in the list (the condition on what it read: the era summary was made from exactly those
+ * events). Events another writer added meanwhile, and every other metadata block, stay. The list
+ * is never re-encoded from Lua (cjson turns an empty list into an object): each replaced event is
+ * deleted by its index, last first, and the era event (encoded once, by the caller) is inserted
+ * where the first replaced one was. KEYS: the chat record. ARGV[1]: the era event as JSON.
+ * ARGV[2]: `last_modified_at` as JSON. ARGV[3..]: the ids of the events to replace. Answers
+ * `MISSING`, `NOT_FIXED`, `CHANGED:<missing ids, comma-separated>`, or `OK`.
+ */
+const SWAP_FIXED_SESSION_GRADUATION_EVENTS_SCRIPT = `
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return 'MISSING'
+end
+if redis.call('JSON.TYPE', KEYS[1], '$.metadata.fixedSession.enabled')[1] ~= 'boolean'
+  or redis.call('JSON.GET', KEYS[1], '$.metadata.fixedSession.enabled') ~= '[true]' then
+  return 'NOT_FIXED'
+end
+local path = '$.metadata.fixedSession.graduation.events'
+local events = {}
+if redis.call('JSON.TYPE', KEYS[1], path)[1] == 'array' then
+  events = cjson.decode(redis.call('JSON.GET', KEYS[1], path))[1]
+end
+local wanted = {}
+for index = 3, #ARGV do
+  wanted[ARGV[index]] = true
+end
+local found = {}
+local indexes = {}
+for index = 1, #events do
+  local event = events[index]
+  if type(event) == 'table' and type(event.id) == 'string' and wanted[event.id] then
+    found[event.id] = true
+    indexes[#indexes + 1] = index - 1
+  end
+end
+local missing = {}
+for index = 3, #ARGV do
+  if not found[ARGV[index]] then
+    missing[#missing + 1] = ARGV[index]
+  end
+end
+if #missing > 0 then
+  return 'CHANGED:' .. table.concat(missing, ',')
+end
+for position = #indexes, 1, -1 do
+  redis.call('JSON.DEL', KEYS[1], path .. '[' .. indexes[position] .. ']')
+end
+redis.call('JSON.ARRINSERT', KEYS[1], path, indexes[1], ARGV[1])
+redis.call('JSON.SET', KEYS[1], '$.last_modified_at', ARGV[2])
+return 'OK'
+`
+
+/**
+ * BL-549 (N4): a nap adds its record to the chat's nap history (`metadata.fixedSession.naps`,
+ * the last `limit` kept) at its own path, in one step inside Redis, instead of writing back a
+ * copy of the whole metadata. KEYS: the chat record. ARGV: the record as JSON, the list limit,
+ * and `last_modified_at` as JSON. A missing `metadata` or `fixedSession` object is created (the
+ * old writer did the same). Answers `MISSING`, or the stored `metadata` as JSON.
+ */
+const APPEND_FIXED_SESSION_NAP_RECORD_SCRIPT = `
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return 'MISSING'
+end
+if redis.call('JSON.TYPE', KEYS[1], '$.metadata')[1] ~= 'object' then
+  redis.call('JSON.SET', KEYS[1], '$.metadata', '{}')
+end
+if redis.call('JSON.TYPE', KEYS[1], '$.metadata.fixedSession')[1] ~= 'object' then
+  redis.call('JSON.SET', KEYS[1], '$.metadata.fixedSession', '{}')
+end
+local limit = tonumber(ARGV[2])
+if redis.call('JSON.TYPE', KEYS[1], '$.metadata.fixedSession.naps')[1] == 'array' then
+  local length = redis.call('JSON.ARRAPPEND', KEYS[1], '$.metadata.fixedSession.naps', ARGV[1])[1]
+  if length > limit then
+    redis.call('JSON.ARRTRIM', KEYS[1], '$.metadata.fixedSession.naps', length - limit, length - 1)
+  end
+else
+  redis.call('JSON.SET', KEYS[1], '$.metadata.fixedSession.naps', '[' .. ARGV[1] .. ']')
+end
+redis.call('JSON.SET', KEYS[1], '$.last_modified_at', ARGV[3])
+return redis.call('JSON.GET', KEYS[1], '$.metadata')
+`
+
+/** What `appendContextCompactionEvent` answers. */
+export type ContextCompactionEventWrite =
+  | { ok: true; contextCompaction: { version: 1; events: unknown[] } & Record<string, unknown> }
+  | { ok: false; reason: 'missing' }
+  | { ok: false; reason: 'changed'; lastEventId: string | null }
+
+async function storeUserSettingsForClient(
+  client: RedisClientType,
+  userId: string,
+  settings: UserSettingsRow
+) {
+  const settingsKey = `user:${userId}:settings`
+  // A legacy Goons settings object can carry custom upload refs at any depth.
+  // Check their metadata and deletion/restore claims in the same EVAL that
+  // publishes the final settings value, so a reservation cannot slip between
+  // a preflight check and this whole-record write.
+  const customUploadKeys = await collectGoonGuardedReferences(settings.goons_settings, userId)
+  if (customUploadKeys.length === 0) {
+    await client.json.set(settingsKey, '$', settings as any)
+    return
+  }
+  const result = await client.eval(STORE_SETTINGS_WITH_CUSTOM_GOON_REFS_SCRIPT, {
+    keys: [settingsKey],
+    arguments: [JSON.stringify(settings), JSON.stringify(customUploadKeys)]
+  })
+  if (result === 'ASSET_UNAVAILABLE') {
+    throw Object.assign(new Error('Custom Goon asset is unavailable'), {
+      code: 'ASSET_UNAVAILABLE', status: 409
+    })
+  }
+  if (result !== 'STORED') throw new Error(`Settings write failed: ${String(result)}`)
+}
 
 async function resolveRuntimeRedisUrl(): Promise<string> {
   return resolveRedisConnectionUrl({
@@ -50,9 +733,9 @@ async function resolveRuntimeRedisUrl(): Promise<string> {
 }
 
 // Every port a real Batshit Redis can listen on across install types (developer
-// default, Mac app, and isolated smoke/first-run test instances). The memory-search
-// test escape below must never match them.
-const BATSHIT_KNOWN_RUNTIME_REDIS_PORTS = new Set(['6379', '5639', '6380', '5649'])
+// default, Mac app, Pinokio, and isolated smoke/first-run test instances). The
+// memory-search test escape below must never match them.
+const BATSHIT_KNOWN_RUNTIME_REDIS_PORTS = new Set(['6379', '5639', '5659', '6380', '5649'])
 
 function isDesignatedMemorySearchTestUrl(redisUrl: string): boolean {
   if (process.env.VITEST_MEMORY_SEARCH !== 'true') return false
@@ -74,6 +757,55 @@ function isProjectPreferences(value: unknown): value is ProjectPreferences {
     typeof prefs.created_at === 'string' &&
     typeof prefs.updated_at === 'string'
   )
+}
+
+/**
+ * The fields a zip claim can live in (`zipClaimsOfMessage`), read for each message id with
+ * `JSON.MGET` in batches of 200, never the whole record. JSON.MGET answers null for a missing key
+ * AND for a key that is not JSON: a missing message claims nothing; one that exists but cannot be
+ * read might claim a zip, so the caller stops with `unreadable` and writes nothing (BL-390).
+ */
+async function readZipClaimFieldsOfMessages(
+  client: RedisClientType,
+  sessionId: string,
+  ids: string[],
+  unreadable: string
+): Promise<unknown[]> {
+  const messages: unknown[] = []
+  for (let index = 0; index < ids.length; index += 200) {
+    const batch = ids.slice(index, index + 200)
+    const keys = batch.map((id) => `message:${sessionId}:${id}`)
+    const contents = await client.json.mGet(keys, '$.content')
+    const zipIds = await client.json.mGet(keys, '$.metadata.zipIds')
+    const zipIdsSnake = await client.json.mGet(keys, '$.metadata.zip_ids')
+    const zipReferences = await client.json.mGet(keys, '$.metadata.zipReferences')
+    for (let offset = 0; offset < batch.length; offset += 1) {
+      if (contents[offset] == null) {
+        if ((await client.exists(keys[offset])) > 0) throw new Error(unreadable)
+        messages.push(null)
+        continue
+      }
+      messages.push({
+        content: firstJsonPathMatch(contents[offset]),
+        metadata: {
+          zipIds: firstJsonPathMatch(zipIds[offset]),
+          zip_ids: firstJsonPathMatch(zipIdsSnake[offset]),
+          zipReferences: firstJsonPathMatch(zipReferences[offset])
+        }
+      })
+    }
+  }
+  return messages
+}
+
+/** One zip and its zip state, queued on a MULTI (BL-390, BL-537: a lost connection applies none). */
+function queueZipRemoval(multi: ReturnType<RedisClientType['multi']>, sessionId: string, zipId: string) {
+  multi.del(`zip:${zipId}`)
+  multi.sRem(`session:${sessionId}:zips`, zipId)
+  multi.del(`unzipped_item:${sessionId}:${zipId}`)
+  multi.sRem(`unzipped:${sessionId}`, zipId)
+  multi.del(`rezipped_item:${sessionId}:${zipId}`)
+  multi.sRem(`rezipped:${sessionId}`, zipId)
 }
 
 export class RedisService {
@@ -388,22 +1120,407 @@ export class RedisService {
     })
   }
 
+  /**
+   * BL-734: write only the top-level fields the caller passed, each by path, and stamp
+   * `last_modified_at`, in one step inside Redis (the BL-690 script, the group left alone). It
+   * used to read the whole chat and write that copy back in a second round trip, erasing a
+   * Compact event, a graduation mark, or any other block written in between. `undefined` skips a
+   * field; `null` is written as null; a `metadata` passed replaces that one block. A chat that is
+   * gone throws "Session not found" and is not recreated.
+   */
   async updateSession(id: string, updates: Partial<ChatSessionRow>): Promise<void> {
     return this.execute(async (client) => {
-      // Get existing session
-      const existing = await client.json.get(`session:${id}`)
-      if (!existing) throw new Error('Session not found')
-      
-      // Update with new data
       const now = new Date().toISOString()
-      const updated = {
-        ...(existing as any),
-        ...updates,
-        last_modified_at: now
+      const pairs = Object.entries(updates).flatMap(([name, value]) => {
+        if (!/^[a-z_]+$/.test(name)) throw new Error(`Not a chat field name: ${name}`)
+        return value === undefined ? [] : [name, JSON.stringify(value)]
+      })
+      const answer = await client.eval(UPDATE_SESSION_FIELDS_SCRIPT, {
+        keys: [`session:${id}`],
+        arguments: [JSON.stringify(now), 'keep', ...pairs]
+      })
+      if (answer === 'MISSING') throw new Error('Session not found')
+      if (answer !== 'OK') {
+        throw new Error(`The update of session ${id} answered ${String(answer)}.`)
       }
-      
-      await client.json.set(`session:${id}`, '$', updated)
-      await this.touchFolderLastUsed(client, updated.user_id, updated.folder_id, now)
+      const session = (await client.json.get(`session:${id}`, {
+        path: ['$.user_id', '$.folder_id']
+      })) as Record<string, unknown[]> | null
+      const userId = session?.['$.user_id']?.[0]
+      const folderId = session?.['$.folder_id']?.[0]
+      await this.touchFolderLastUsed(
+        client,
+        typeof userId === 'string' ? userId : undefined,
+        typeof folderId === 'string' ? folderId : undefined,
+        now
+      )
+    })
+  }
+
+  /**
+   * BL-690: write the fields a browser may change, each by path, and the chat's group
+   * (`groupChat`: an object sets `metadata.group_chat`, `null` removes it, `undefined` keeps it).
+   * Every other stored field and metadata block stays. The route owns the allow list of `fields`.
+   * `false` when the chat is gone: nothing is written.
+   */
+  async updateSessionFields(
+    id: string,
+    fields: Record<string, unknown>,
+    groupChat: Record<string, unknown> | null | undefined
+  ): Promise<boolean> {
+    return this.execute(async (client) => {
+      const now = new Date().toISOString()
+      const pairs = Object.entries(fields).flatMap(([name, value]) => {
+        if (!/^[a-z_]+$/.test(name)) throw new Error(`Not a chat field name: ${name}`)
+        return [name, JSON.stringify(value ?? null)]
+      })
+      const answer = await client.eval(UPDATE_SESSION_FIELDS_SCRIPT, {
+        keys: [`session:${id}`],
+        arguments: [
+          JSON.stringify(now),
+          groupChat === undefined ? 'keep' : groupChat === null ? 'remove' : JSON.stringify(groupChat),
+          ...pairs
+        ]
+      })
+      if (answer === 'MISSING') return false
+      const session = (await client.json.get(`session:${id}`, {
+        path: ['$.user_id', '$.folder_id']
+      })) as Record<string, unknown[]> | null
+      const userId = session?.['$.user_id']?.[0]
+      const folderId = session?.['$.folder_id']?.[0]
+      await this.touchFolderLastUsed(
+        client,
+        typeof userId === 'string' ? userId : undefined,
+        typeof folderId === 'string' ? folderId : undefined,
+        now
+      )
+      return true
+    })
+  }
+
+  /**
+   * BL-723: write a regular chat's graduation mark at its own path, in one step inside Redis:
+   * the last graduated message, its time, and the new segment id added to the stored list (the
+   * last 100 kept). Every other metadata block and field stays as stored now. BL-737: the write
+   * is a compare-and-set on `expectedLastGraduatedMessageId` — the id THIS graduation read as its
+   * starting mark (`null` when it read none) — against the mark's CURRENT stored id, so two
+   * graduations racing each other settle by whichever CAS lands first, and a graduation that
+   * resumes after its old mark's message was deleted always reads and matches the current id.
+   * `'missing'` when the chat is gone; `'superseded'` when the CAS did not match (another write
+   * landed first, or a mark now exists that did not exist when this graduation started): neither
+   * writes anything. `'superseded_linked'` is the same CAS loss, but the winning write already
+   * carries THIS call's own `mark.segmentId` in its `segmentIds` (the winner reused it) — the
+   * caller must not delete a segment the winner just linked in (BL-737 review).
+   */
+  async writeRegularGraduationMark(
+    sessionId: string,
+    mark: {
+      lastGraduatedMessageId: string
+      lastGraduatedAt: string
+      segmentId: string
+    },
+    expectedLastGraduatedMessageId: string | null
+  ): Promise<'ok' | 'superseded' | 'superseded_linked' | 'missing'> {
+    return this.execute(async (client) => {
+      const now = new Date().toISOString()
+      const answer = await client.eval(WRITE_REGULAR_GRADUATION_MARK_SCRIPT, {
+        keys: [`session:${sessionId}`],
+        arguments: [
+          JSON.stringify(now),
+          JSON.stringify(mark.lastGraduatedMessageId),
+          JSON.stringify(mark.lastGraduatedAt),
+          JSON.stringify(mark.segmentId),
+          expectedLastGraduatedMessageId ?? '',
+          JSON.stringify({
+            version: 1,
+            lastGraduatedMessageId: mark.lastGraduatedMessageId,
+            lastGraduatedAt: mark.lastGraduatedAt,
+            segmentIds: [mark.segmentId]
+          })
+        ]
+      })
+      if (answer === 'MISSING') return 'missing'
+      if (answer === 'SUPERSEDED') return 'superseded'
+      if (answer === 'SUPERSEDED_LINKED') return 'superseded_linked'
+      if (answer !== 'OK') {
+        throw new Error(`The graduation mark write of session ${sessionId} answered ${String(answer)}.`)
+      }
+      const session = (await client.json.get(`session:${sessionId}`, {
+        path: ['$.user_id', '$.folder_id']
+      })) as Record<string, unknown[]> | null
+      const userId = session?.['$.user_id']?.[0]
+      const folderId = session?.['$.folder_id']?.[0]
+      await this.touchFolderLastUsed(
+        client,
+        typeof userId === 'string' ? userId : undefined,
+        typeof folderId === 'string' ? folderId : undefined,
+        now
+      )
+      return 'ok'
+    })
+  }
+
+  /**
+   * BL-736: a Group delete removes a chat's `metadata.group_chat` only while it still names the
+   * Group being deleted, checked and written in one step inside Redis. It used to be read (by the
+   * delete route, before its loop) and removed unconditionally, so a chat moved to a DIFFERENT
+   * Group in the gap between that read and this write lost its new Group. `false` when the chat is
+   * gone, or when it no longer names this Group (moved, or already cleared): nothing is written.
+   */
+  async clearGroupChatIfMatches(sessionId: string, groupId: string): Promise<boolean> {
+    return this.execute(async (client) => {
+      const now = new Date().toISOString()
+      const answer = await client.eval(CLEAR_GROUP_CHAT_IF_MATCHES_SCRIPT, {
+        keys: [`session:${sessionId}`],
+        arguments: [JSON.stringify(now), groupId]
+      })
+      if (answer === 'MISSING' || answer === 'CHANGED') return false
+      if (answer !== 'OK') {
+        throw new Error(`The group-chat clear of session ${sessionId} answered ${String(answer)}.`)
+      }
+      const session = (await client.json.get(`session:${sessionId}`, {
+        path: ['$.user_id', '$.folder_id']
+      })) as Record<string, unknown[]> | null
+      const userId = session?.['$.user_id']?.[0]
+      const folderId = session?.['$.folder_id']?.[0]
+      await this.touchFolderLastUsed(
+        client,
+        typeof userId === 'string' ? userId : undefined,
+        typeof folderId === 'string' ? folderId : undefined,
+        now
+      )
+      return true
+    })
+  }
+
+  /**
+   * BL-474 step 2: write a reply's image-origin record (pending at its run's start, decided at its
+   * end) by `WRITE_IMAGE_ORIGIN_SCRIPT`'s rules. Only `imageAddressOrigins.ts` calls it.
+   */
+  async writeImageOriginRecord(input: {
+    userId: string
+    sessionId: string
+    messageId: string
+    version: number
+    state: 'pending' | 'decided'
+    record: Record<string, unknown>
+  }): Promise<ImageOriginWriteAnswer> {
+    return this.execute(async (client) => {
+      const answer = await client.eval(WRITE_IMAGE_ORIGIN_SCRIPT, {
+        keys: [
+          `session:${input.sessionId}`,
+          `message:${input.sessionId}:${input.messageId}`,
+          `image_origins:${input.sessionId}`,
+          `image_origin:${input.sessionId}:${input.messageId}`
+        ],
+        arguments: [
+          input.userId,
+          input.sessionId,
+          input.messageId,
+          String(input.version),
+          input.state,
+          JSON.stringify(input.record)
+        ]
+      })
+      const known: Record<string, ImageOriginWriteAnswer> = {
+        OK: 'ok',
+        MISSING_CHAT: 'missing_chat',
+        NOT_OWNER: 'not_owner',
+        MISSING_REPLY: 'missing_reply',
+        NOT_REPLY: 'not_reply',
+        OLDER: 'older',
+        KEPT: 'kept'
+      }
+      const mapped = typeof answer === 'string' ? known[answer] : undefined
+      if (!mapped) throw new Error(`The image origin write answered ${String(answer)}.`)
+      return mapped
+    })
+  }
+
+  /**
+   * BL-735: write the Infinite Session transition's two owned fields (`metadata.fixedSession` and
+   * `locked`) at their own path. `false` when the chat is gone: nothing is written.
+   */
+  async writeFixedSessionMark(
+    sessionId: string,
+    fixedSession: FixedSessionMetadata
+  ): Promise<boolean> {
+    return this.execute(async (client) => {
+      const now = new Date().toISOString()
+      const answer = await client.eval(WRITE_FIXED_SESSION_MARK_SCRIPT, {
+        keys: [`session:${sessionId}`],
+        arguments: [JSON.stringify(now), JSON.stringify(fixedSession)]
+      })
+      if (answer === 'MISSING') return false
+      if (answer !== 'OK') {
+        throw new Error(`The Infinite Session mark write of session ${sessionId} answered ${String(answer)}.`)
+      }
+      const session = (await client.json.get(`session:${sessionId}`, {
+        path: ['$.user_id', '$.folder_id']
+      })) as Record<string, unknown[]> | null
+      const userId = session?.['$.user_id']?.[0]
+      const folderId = session?.['$.folder_id']?.[0]
+      await this.touchFolderLastUsed(
+        client,
+        typeof userId === 'string' ? userId : undefined,
+        typeof folderId === 'string' ? folderId : undefined,
+        now
+      )
+      return true
+    })
+  }
+
+  /** Touch the folder of a chat whose record a by-path script just wrote. */
+  private async touchFolderOfSession(client: RedisClientType, sessionId: string, now: string) {
+    const session = (await client.json.get(`session:${sessionId}`, {
+      path: ['$.user_id', '$.folder_id']
+    })) as Record<string, unknown[]> | null
+    const userId = session?.['$.user_id']?.[0]
+    const folderId = session?.['$.folder_id']?.[0]
+    await this.touchFolderLastUsed(
+      client,
+      typeof userId === 'string' ? userId : undefined,
+      typeof folderId === 'string' ? folderId : undefined,
+      now
+    )
+  }
+
+  /**
+   * BL-549 (N4): add one graduation event to an Infinite Session's window, at its own path, in
+   * one step inside Redis. Every other metadata block and every event another writer added
+   * stays. `missing` when the chat is gone, `not_fixed` when it is not an Infinite Session:
+   * nothing is written.
+   */
+  async appendFixedSessionGraduationEvent(
+    sessionId: string,
+    event: Record<string, unknown>
+  ): Promise<'ok' | 'missing' | 'not_fixed'> {
+    return this.execute(async (client) => {
+      const now = new Date().toISOString()
+      const answer = await client.eval(APPEND_FIXED_SESSION_GRADUATION_EVENT_SCRIPT, {
+        keys: [`session:${sessionId}`],
+        arguments: [
+          JSON.stringify(event),
+          JSON.stringify({ version: 1, events: [event] }),
+          JSON.stringify(now)
+        ]
+      })
+      if (answer === 'MISSING') return 'missing'
+      if (answer === 'NOT_FIXED') return 'not_fixed'
+      if (answer !== 'OK') {
+        throw new Error(`The graduation event write of session ${sessionId} answered ${String(answer)}.`)
+      }
+      await this.touchFolderOfSession(client, sessionId, now)
+      return 'ok'
+    })
+  }
+
+  /**
+   * BL-549 (N4): replace graduation events with one era event, at the event list's own path, in
+   * one step inside Redis, only while every replaced event is still stored. `changed` names the
+   * replaced ids that are gone: nothing was written.
+   */
+  async swapFixedSessionGraduationEvents(
+    sessionId: string,
+    removeEventIds: string[],
+    eraEvent: Record<string, unknown>
+  ): Promise<{ ok: true } | { ok: false; reason: 'missing' | 'not_fixed' } | { ok: false; reason: 'changed'; missing: string[] }> {
+    if (removeEventIds.length === 0) {
+      throw new Error('swapFixedSessionGraduationEvents requires at least one event id to replace.')
+    }
+    return this.execute(async (client) => {
+      const now = new Date().toISOString()
+      const answer = await client.eval(SWAP_FIXED_SESSION_GRADUATION_EVENTS_SCRIPT, {
+        keys: [`session:${sessionId}`],
+        arguments: [JSON.stringify(eraEvent), JSON.stringify(now), ...removeEventIds]
+      })
+      if (answer === 'MISSING') return { ok: false as const, reason: 'missing' as const }
+      if (answer === 'NOT_FIXED') return { ok: false as const, reason: 'not_fixed' as const }
+      if (typeof answer === 'string' && answer.startsWith('CHANGED:')) {
+        return { ok: false as const, reason: 'changed' as const, missing: answer.slice('CHANGED:'.length).split(',') }
+      }
+      if (answer !== 'OK') {
+        throw new Error(`The graduation event swap of session ${sessionId} answered ${String(answer)}.`)
+      }
+      await this.touchFolderOfSession(client, sessionId, now)
+      return { ok: true as const }
+    })
+  }
+
+  /**
+   * BL-549 (N4): add a nap's record to the chat's nap history (the last `limit` kept), at its own
+   * path, in one step inside Redis. Answers the chat's metadata as stored after the write (for
+   * the page's session store), or `null` when the chat is gone: nothing is written.
+   */
+  async appendFixedSessionNapRecord(
+    sessionId: string,
+    record: Record<string, unknown>,
+    limit: number = 20
+  ): Promise<Record<string, any> | null> {
+    return this.execute(async (client) => {
+      const now = new Date().toISOString()
+      const answer = await client.eval(APPEND_FIXED_SESSION_NAP_RECORD_SCRIPT, {
+        keys: [`session:${sessionId}`],
+        arguments: [JSON.stringify(record), String(limit), JSON.stringify(now)]
+      })
+      if (answer === 'MISSING') return null
+      if (typeof answer !== 'string') {
+        throw new Error(`The nap record write of session ${sessionId} gave no answer.`)
+      }
+      // A script answers JSON.GET's raw JSON text: a `$` path answers a list of matches.
+      const [metadata] = JSON.parse(answer) as Array<Record<string, any>>
+      await this.touchFolderOfSession(client, sessionId, now)
+      return metadata
+    })
+  }
+
+  /**
+   * BL-622 (C1, C2): add one Compact event to the chat's record, at its own path and in one step
+   * inside Redis, only while the chat's last Compact event is still `expectedLastEventId` (`null`:
+   * the Compact read no event). A Compact reads the chat, waits on its summary model, and then
+   * writes; `updateSession` would write back the metadata block it read, and erase what another
+   * writer added meanwhile. `changed` means another Compact wrote first: nothing was written.
+   */
+  async appendContextCompactionEvent(
+    sessionId: string,
+    event: Record<string, unknown>,
+    expectedLastEventId: string | null
+  ): Promise<ContextCompactionEventWrite> {
+    return this.execute(async (client) => {
+      const now = new Date().toISOString()
+      const answer = await client.eval(APPEND_CONTEXT_COMPACTION_EVENT_SCRIPT, {
+        keys: [`session:${sessionId}`],
+        arguments: [
+          JSON.stringify(event),
+          expectedLastEventId ?? '',
+          JSON.stringify({ version: 1, events: [event] }),
+          JSON.stringify(now)
+        ]
+      })
+      if (answer === 'MISSING') return { ok: false, reason: 'missing' }
+      if (typeof answer === 'string' && answer.startsWith('CHANGED:')) {
+        const lastEventId = answer.slice('CHANGED:'.length)
+        return { ok: false, reason: 'changed', lastEventId: lastEventId || null }
+      }
+      if (typeof answer !== 'string') {
+        throw new Error(`The Compact event write of session ${sessionId} gave no answer.`)
+      }
+      // A script answers JSON.GET's raw JSON text: a `$` path answers a list of matches.
+      const [contextCompaction] = JSON.parse(answer) as Array<
+        Extract<ContextCompactionEventWrite, { ok: true }>['contextCompaction']
+      >
+      const session = (await client.json.get(`session:${sessionId}`, {
+        path: ['$.user_id', '$.folder_id']
+      })) as Record<string, unknown[]> | null
+      const userId = session?.['$.user_id']?.[0]
+      const folderId = session?.['$.folder_id']?.[0]
+      await this.touchFolderLastUsed(
+        client,
+        typeof userId === 'string' ? userId : undefined,
+        typeof folderId === 'string' ? folderId : undefined,
+        now
+      )
+      return { ok: true, contextCompaction }
     })
   }
 
@@ -418,6 +1535,11 @@ export class RedisService {
     return this.execute(async (client) => {
       try {
         logger.debug(`[deleteSession] Starting deletion for session ${id}`)
+        // BL-541: every KEYS pattern below is built from this id, and Redis reads `*`, `?`, `[`,
+        // `]`, and `\` in a pattern as glob syntax: unescaped, deleting a chat named `a*` swept
+        // the records of every chat whose id starts with `a`. The create route refuses those
+        // characters; this covers an id already stored or brought back by a restore.
+        const idPattern = escapeRedisGlob(id)
         
         // Get session to find user_id
         const session = await client.json.get(`session:${id}`)
@@ -460,14 +1582,15 @@ export class RedisService {
                 }
               }
               
-              // Check for new format zips: {{batshit-zip:id}} or {{batshit-zip:id:::description}}
-              const newZipPattern = /\{\{batshit-zip:([^:}\s]+)(?::::[^}]+)?\}\}/g
-              let match
-              while ((match = newZipPattern.exec(messageObj.content || '')) !== null) {
-                zipIdsToDelete.add(match[1])
+              // Check for new format zips: {{batshit-zip:id}} or {{batshit-zip:id:::description}},
+              // read once (BL-707: the pattern searched to the first `}` again from every opener).
+              for (const reference of scanDeletionSweepZipReferences(String(messageObj.content || ''))) {
+                zipIdsToDelete.add(reference.id)
               }
               
-              // Also check for old format (backward compatibility during transition)
+              // Also check for old format (backward compatibility during transition). Linear: its
+              // id stops at the next `|`, and every opener holds one.
+              let match
               const oldZipPattern = /\{\{batshit\|id:([^|]+)\|/g
               while ((match = oldZipPattern.exec(messageObj.content || '')) !== null) {
                 zipIdsToDelete.add(match[1])
@@ -518,7 +1641,7 @@ export class RedisService {
 
         // Delete the session's episode ledger + recall/linger state (SA-104, DL-104-13)
         try {
-          const episodeKeys = await client.keys(`episode:${id}:*`)
+          const episodeKeys = await client.keys(`episode:${idPattern}:*`)
           if (episodeKeys.length > 0) {
             await client.del(episodeKeys as [string, ...string[]])
           }
@@ -532,7 +1655,7 @@ export class RedisService {
         try {
           // Use KEYS command for pattern matching (Redis 8 compatible)
           // Note: KEYS is blocking but safe for small datasets
-          const sessionClipKeys = await client.keys(`session_clip:${id}:*`)
+          const sessionClipKeys = await client.keys(`session_clip:${idPattern}:*`)
           
           if (sessionClipKeys && sessionClipKeys.length > 0) {
             await client.del(sessionClipKeys as [string, ...string[]])
@@ -547,7 +1670,7 @@ export class RedisService {
           // Use KEYS command for pattern matching (Redis 8 compatible)
           // Note: KEYS is blocking but safe for small datasets
           // Pattern matches: subagent_sessions:{sessionId}:subagent:{subagentName}
-          const subagentKeys = await client.keys(`subagent_sessions:${id}:subagent:*`)
+          const subagentKeys = await client.keys(`subagent_sessions:${idPattern}:subagent:*`)
 
           if (subagentKeys && subagentKeys.length > 0) {
             await client.del(subagentKeys as [string, ...string[]])
@@ -563,13 +1686,13 @@ export class RedisService {
         // Session Key Cleanup rule is enumerate-don't-assume: a key that expires "soon"
         // still outlives its session until it does.
         try {
-          const threadIdKeys = await client.keys(`subagent_thread:${id}:*`)
+          const threadIdKeys = await client.keys(`subagent_thread:${idPattern}:*`)
           if (threadIdKeys && threadIdKeys.length > 0) {
             await client.del(threadIdKeys as [string, ...string[]])
             logger.debug(`[deleteSession] Deleted ${threadIdKeys.length} subagent thread ids`)
           }
 
-          const subagentLockKeys = await client.keys(`subagent_lock:${id}:*`)
+          const subagentLockKeys = await client.keys(`subagent_lock:${idPattern}:*`)
           if (subagentLockKeys && subagentLockKeys.length > 0) {
             await client.del(subagentLockKeys as [string, ...string[]])
             logger.debug(`[deleteSession] Deleted ${subagentLockKeys.length} subagent run locks`)
@@ -596,7 +1719,7 @@ export class RedisService {
         // and deliberately NOT part of backup — they are short-lived credentials, not data —
         // but they are session-scoped state and belong in this sweep.
         try {
-          const callbackKeys = await client.keys(`n8n:sse-callback:${id}:*`)
+          const callbackKeys = await client.keys(`n8n:sse-callback:${idPattern}:*`)
           if (callbackKeys && callbackKeys.length > 0) {
             await client.del(callbackKeys as [string, ...string[]])
             logger.debug(`[deleteSession] Deleted ${callbackKeys.length} n8n callback tokens`)
@@ -640,59 +1763,48 @@ export class RedisService {
           console.error(`[deleteSession] Error deleting session usage:`, usageError)
         }
 
-        // Delete unzipped items tracking
-        try {
-          // Get all unzipped zip IDs for this session
-          const unzippedKey = `unzipped:${id}`
-          const unzippedIds = await client.sMembers(unzippedKey)
-
-          if (unzippedIds && unzippedIds.length > 0) {
-            logger.debug(`[deleteSession] Found ${unzippedIds.length} unzipped items to delete`)
-
-            // Delete each unzipped item metadata
-            for (const zipId of unzippedIds) {
-              try {
-                await client.del(`unzipped_item:${id}:${zipId}`)
-              } catch (itemError) {
-                console.error(`[deleteSession] Error deleting unzipped_item ${zipId}:`, itemError)
-              }
+        // Delete the zip state: the held and zipped sets and every item record. The item records
+        // are swept by PATTERN, the way backup reads them (SA-129 P2b, BL-352): a record whose
+        // set member is gone (a write that raced a release, before the zip state lock) would
+        // outlive its chat if the sweep followed only the set members.
+        for (const family of ['unzipped', 'rezipped'] as const) {
+          try {
+            const itemKeys = await client.keys(`${family}_item:${idPattern}:*`)
+            if (itemKeys.length > 0) {
+              await client.del(itemKeys)
+              logger.debug(`[deleteSession] Deleted ${itemKeys.length} ${family}_item keys`)
             }
+            await client.del(`${family}:${id}`)
+          } catch (zipStateError) {
+            console.error(`[deleteSession] Error deleting ${family} zip state:`, zipStateError)
           }
-
-          // Delete the unzipped set itself
-          await client.del(unzippedKey)
-          logger.debug(`[deleteSession] Deleted unzipped tracking for session`)
-        } catch (unzipError) {
-          console.error(`[deleteSession] Error deleting unzipped data:`, unzipError)
         }
 
-        // Delete rezipped markers
-        try {
-          const rezippedKey = `rezipped:${id}`
-          const rezippedIds = await client.sMembers(rezippedKey)
-          if (rezippedIds && rezippedIds.length > 0) {
-            for (const zipId of rezippedIds) {
-              try {
-                await client.del(`rezipped_item:${id}:${zipId}`)
-              } catch (itemError) {
-                console.error(`[deleteSession] Error deleting rezipped_item ${zipId}:`, itemError)
-              }
-            }
-          }
-          await client.del(rezippedKey)
-          logger.debug(`[deleteSession] Deleted rezipped tracking for session`)
-        } catch (rezipError) {
-          console.error(`[deleteSession] Error deleting rezipped data:`, rezipError)
-        }
-
-        // SA-120 P6: what the Jev Juice after-reply check noticed about this chat's replies
+        // SA-120 P6: what the Judge Juice after-reply check noticed about this chat's replies
         // (`jev_post_turn:{id}` + `jev_post_turn_item:{id}:*`). Session-scoped, no TTL, so this
         // sweep is the only thing that ever removes them.
         try {
           const { sweepPostTurnRecords } = await import('$lib/server/services/postTurnCheckState')
           await sweepPostTurnRecords(id)
         } catch (postTurnError) {
-          console.error(`[deleteSession] Error deleting Jev Juice after-reply records:`, postTurnError)
+          console.error(`[deleteSession] Error deleting Judge Juice after-reply records:`, postTurnError)
+        }
+
+        try {
+          const { sweepCodexCleanupWarnings } = await import('$lib/server/services/codexCleanupWarnings')
+          await sweepCodexCleanupWarnings(id)
+        } catch (cleanupWarningError) {
+          console.error(`[deleteSession] Error deleting Codex cleanup warnings:`, cleanupWarningError)
+        }
+
+        // BL-474 step 2: where each reply's outside pictures came from (`image_origins:{id}` +
+        // `image_origin:{id}:*`). Session-scoped, no TTL, so this sweep is the only thing that
+        // ever removes them.
+        try {
+          const { sweepImageOrigins } = await import('$lib/server/services/imageAddressOrigins')
+          await sweepImageOrigins(id)
+        } catch (imageOriginError) {
+          console.error(`[deleteSession] Error deleting image origin records:`, imageOriginError)
         }
 
         // Delete message counter for this session (Story 6.9b)
@@ -759,11 +1871,24 @@ export class RedisService {
 
   // ===== MESSAGES =====
 
+  /**
+   * The FIRST `limit` messages, oldest first.
+   *
+   * BL-4: this and the two readers below skip the saved message of a send that is still waiting
+   * in the chat's line (`queuedSendHiddenIds.ts`): it is not part of the conversation until its
+   * turn. They filter the list POSITIONS they were asked for and never widen them, so a window
+   * that holds a waiting message is one shorter, and no window repeats or skips a message the
+   * next one returns. Raw readers of the list (the delete sweep, `saveMessage`, the backup) see
+   * everything.
+   */
   async getMessages(sessionId: string, limit = 100): Promise<ChatMemoryRow[]> {
     return this.execute(async (client) => {
       // Get message IDs
-      const messageIds = await client.lRange(`messages:${sessionId}`, 0, limit - 1)
-      
+      const messageIds = filterQueuedSendMessageIds(
+        sessionId,
+        await client.lRange(`messages:${sessionId}`, 0, limit - 1)
+      )
+
       if (messageIds.length === 0) {
         return []
       }
@@ -803,7 +1928,10 @@ export class RedisService {
   async getRecentMessages(sessionId: string, limit = 100): Promise<ChatMemoryRow[]> {
     if (!Number.isFinite(limit) || limit <= 0) return []
     return this.execute(async (client) => {
-      const messageIds = await client.lRange(`messages:${sessionId}`, -limit, -1)
+      const messageIds = filterQueuedSendMessageIds(
+        sessionId,
+        await client.lRange(`messages:${sessionId}`, -limit, -1)
+      )
 
       if (messageIds.length === 0) {
         return []
@@ -829,7 +1957,10 @@ export class RedisService {
   /** Every stored message in conversation order. Reserved for genuinely full-history work. */
   async getAllMessages(sessionId: string): Promise<ChatMemoryRow[]> {
     return this.execute(async (client) => {
-      const messageIds = await client.lRange(`messages:${sessionId}`, 0, -1)
+      const messageIds = filterQueuedSendMessageIds(
+        sessionId,
+        await client.lRange(`messages:${sessionId}`, 0, -1)
+      )
       const messages: ChatMemoryRow[] = []
       for (const msgId of messageIds) {
         try {
@@ -888,8 +2019,8 @@ export class RedisService {
     })
   }
 
-  async saveMessage(message: Message | Partial<ChatMemoryRow>): Promise<void> {
-    return this.execute(async (client) => {
+  async saveMessage(message: Message | Partial<ChatMemoryRow>, options: { browserMutation?: BrowserMessageMutationPolicy } = {}): Promise<void> {
+    await this.execute(async (client) => {
       // SA-911: Clean up duplicate zip refs before persisting (placeholders no longer used but kept for safety)
       const dedupeZipRefs = (text: any) => {
         if (text === null || text === undefined) return ''
@@ -906,11 +2037,14 @@ export class RedisService {
               })()
 
         if (!asString) return asString
-        // Remove any stray placeholders (legacy, shouldn't exist after SA-911)
-        let cleaned = asString.replace(/\{\{TOOL_LOADING_PLACEHOLDER:[^}]+\}\}/g, '')
+        // Remove any stray placeholders (legacy, shouldn't exist after SA-911). Both token
+        // shapes are read by one scan (`braceScan.ts`): their regexes searched to the first `}`
+        // again from every opener, about 30 s for 20,000 unclosed openers in 1 MB, on this
+        // save (the reply-end save included).
+        let cleaned = replaceBracedTokens(asString, '{{TOOL_LOADING_PLACEHOLDER:', () => '')
 
         const seen = new Set<string>()
-        cleaned = cleaned.replace(/\{\{batshit-zip:[^}]+\}\}/g, (m) => {
+        cleaned = replaceBracedTokens(cleaned, '{{batshit-zip:', (m) => {
           if (seen.has(m)) return ''
           seen.add(m)
           return m
@@ -1009,7 +2143,7 @@ export class RedisService {
             : {}
         // The approvals a click answered are the server's record (`toolApprovalState.ts`): a
         // tab's copy of this message can predate the click, and its save must not undo it.
-        messageData.metadata = keepAnsweredApprovals(existingMetadata, {
+        messageData.metadata = options.browserMutation ? { ...existingMetadata, ...incomingMetadata } : keepAnsweredApprovals(existingMetadata, {
           ...existingMetadata,
           ...incomingMetadata
         })
@@ -1028,8 +2162,23 @@ export class RedisService {
         }
       }
       
-      // Store message using RedisJSON for native JSON storage
-      await client.json.set(messageKey, '$', messageData as any)
+      // Store message using RedisJSON for native JSON storage. One script, so a move that
+      // landed after the read above keeps its date (BL-195).
+      const writeResult = await client.eval(SAVE_MESSAGE_KEEPING_CREATED_AT_SCRIPT, {
+        keys: options.browserMutation ? [messageKey, `session:${messageData.session_id}`] : [messageKey],
+        arguments: [
+          JSON.stringify(messageData),
+          typeof messageData.created_at === 'string' ? messageData.created_at : '',
+          ...(options.browserMutation ? [JSON.stringify({ ...options.browserMutation,
+            // This is computed from the original user-editable metadata, before the merge.
+            // It is an internal writer policy, never copied from request policy fields.
+            mergeMetadataKeys: metadata && typeof metadata === 'object' && !Array.isArray(metadata) ? Object.keys(metadata) : []
+          })] : [])
+        ]
+      })
+      if (options.browserMutation && writeResult !== 'OK') {
+        throw new BrowserMessageMutationError(writeResult as BrowserMessageMutationError['code'])
+      }
       
       // Add to session's message list (only if not already present)
       const existingMessages = await client.lRange(`messages:${messageData.session_id}`, 0, -1)
@@ -1053,9 +2202,53 @@ export class RedisService {
         }
       }
     })
+    // A stopped Codex command may report cleanup failure before this final reply save.
+    // The warning is a separate server-owned record, flushed only after the reply exists.
+    if ((message as any).role === 'assistant' && (message as any).session_id && message.id) {
+      try {
+        const { flushPendingCodexCleanupWarning } = await import('$lib/server/services/codexCleanupWarnings')
+        await flushPendingCodexCleanupWarning((message as any).session_id, message.id)
+      } catch (error) {
+        // The reply itself is saved. A warning write failure must not turn its finalizer into
+        // a second failure; the pending entry remains for a later save until its short expiry.
+        console.error('[Codex cleanup] Could not flush pending warning after reply save:', error)
+      }
+    }
   }
 
-  async updateMessage(messageId: string, sessionId: string, updates: Partial<ChatMemoryRow>, userId: string): Promise<void> {
+  /**
+   * BL-4 — move one saved user message to the end of its chat, dated now.
+   *
+   * A send that waited in the chat's line saved its message BEFORE the reply it waited behind
+   * was written (a reply is added to the list when it is finalized), so the message sits above
+   * that reply. When its turn comes, or when it is kept unanswered (Stop, shutdown, the line's
+   * cap), it moves to the end in one script (BL-195), so no reader sees it missing or twice and
+   * no delete or save lands halfway, and `created_at` is set to now so a reader that sorts by
+   * time agrees with the list.
+   * A Send now of a kept message passes `createdAt`, the time its tab sent it
+   * (`resentMessageCreatedAt`), so the reply that tab adds next sorts after it. The record
+   * itself is never rewritten: one message, one copy. Answers `null`, touching nothing, for a
+   * message or a chat that is gone.
+   */
+  async moveMessageToEnd(
+    sessionId: string,
+    messageId: string,
+    options: { createdAt?: string | null } = {}
+  ): Promise<ChatMemoryRow | null> {
+    return this.execute(async (client) => {
+      if (!sessionId || !messageId) return null
+      const createdAt = options.createdAt ?? new Date().toISOString()
+      const moved = await client.eval(MOVE_MESSAGE_TO_END_SCRIPT, {
+        keys: [`session:${sessionId}`, `message:${sessionId}:${messageId}`, `messages:${sessionId}`],
+        arguments: [messageId, JSON.stringify(createdAt)]
+      })
+      // A script answers JSON.GET's raw JSON text; nil when the message or chat is gone.
+      return typeof moved === 'string' ? (JSON.parse(moved) as ChatMemoryRow) : null
+    })
+  }
+
+  async updateMessage(messageId: string, sessionId: string, updates: Partial<ChatMemoryRow>, userId: string,
+    options: { browserMutation?: BrowserMessageMutationPolicy } = {}): Promise<void> {
     return this.execute(async (client) => {
       // Verify session belongs to user
       const session = await client.json.get(`session:${sessionId}`)
@@ -1100,36 +2293,147 @@ export class RedisService {
         )
       }
       
-      await client.json.set(`message:${sessionId}:${messageId}`, '$', updated)
+      if (options.browserMutation) {
+        const writeResult = await client.eval(SAVE_MESSAGE_KEEPING_CREATED_AT_SCRIPT, {
+          keys: [`message:${sessionId}:${messageId}`, `session:${sessionId}`],
+          arguments: [JSON.stringify(updated), typeof updated.created_at === 'string' ? updated.created_at : '',
+            JSON.stringify(options.browserMutation)]
+        })
+        if (writeResult !== 'OK') throw new BrowserMessageMutationError(writeResult as BrowserMessageMutationError['code'])
+      } else {
+        await client.json.set(`message:${sessionId}:${messageId}`, '$', updated)
+      }
       
       // Touch session to update last activity
       await this.touchSession(sessionId)
     })
   }
 
-  async deleteMessage(messageId: string, sessionId: string, userId: string): Promise<void> {
+  async deleteMessage(
+    messageId: string,
+    sessionId: string,
+    userId: string,
+    options: { stillRunning?: () => boolean } = {}
+  ): Promise<void> {
     return this.execute(async (client) => {
       // Verify session belongs to user
       const session = await client.json.get(`session:${sessionId}`)
       if (!session) throw new Error('Session not found')
       const sessionObj = session as any
       if (sessionObj.user_id !== userId) throw new Error('Unauthorized: Session does not belong to user')
-      
-      // Delete the message
-      await client.del(`message:${sessionId}:${messageId}`)
-      
-      // Remove from session's message list
-      await client.lRem(`messages:${sessionId}`, 0, messageId)
 
-      // SA-120 P6: a Jev Juice after-reply record annotates exactly one reply and goes with it.
+      // BL-390: the zips this message made go with it, with their zip state. Deleting only the
+      // record left them in `session:{id}:zips`, so the Zip Manager still listed the deleted tool
+      // output, it could still be opened, and every later backup carried it. Every zip state
+      // writer takes the chat's zip state lock, so this one does too. Inside it: this message's
+      // read, the zip set and each zip's owner (what the zip writers change), the second running
+      // check (BL-381), and the MULTI, so the decision and the write see the same zip state.
+      // Every other message's claims, read BEFORE the lock: message saves never take the zip
+      // state lock, so holding it during these reads would order nothing, and it would keep every
+      // zip state writer of the chat waiting on a long read. Only the fields a claim can live in
+      // (`zipClaimsOfMessage`), never the whole record.
+      const otherIds = ((await client.lRange(`messages:${sessionId}`, 0, -1)) ?? []).filter((id) => id !== messageId)
+      const otherMessages = await readZipClaimFieldsOfMessages(
+        client,
+        sessionId,
+        otherIds,
+        'Another message of this chat could not be read, so nothing was deleted.'
+      )
+
+      await withZipStateLock(sessionId, async () => {
+        const messageKey = `message:${sessionId}:${messageId}`
+        // A failed read THROWS here and stops the delete with nothing deleted: it must never
+        // read as "this message has no zips". A message already gone (a retry) reads as null,
+        // and its zips are still found through their own records below.
+        const message = (await client.json.get(messageKey)) as any
+        const zipSetKey = `session:${sessionId}:zips`
+        const candidates = [
+          ...new Set([...((await client.sMembers(zipSetKey)) ?? []), ...zipClaimsOfMessage(message)])
+        ].sort()
+        const zipKeys = candidates.map((zipId) => `zip:${zipId}`)
+        const owners = zipKeys.length > 0 ? await client.json.mGet(zipKeys, '$.metadata.messageId') : []
+        const sessions = zipKeys.length > 0 ? await client.json.mGet(zipKeys, '$.metadata.sessionId') : []
+        const zipIdsToDelete = zipsOwnedOnlyByMessage({
+          messageId,
+          sessionId,
+          zips: candidates.map((zipId, index) => ({
+            zipId,
+            messageId: firstJsonPathMatch(owners[index]),
+            sessionId: firstJsonPathMatch(sessions[index])
+          })),
+          message,
+          otherMessageIds: otherIds,
+          otherMessages
+        })
+
+        // BL-381: the route's running check, again right before the write, inside the lock: a
+        // turn that started on this message since the route checked refuses it the same way.
+        if (options.stillRunning?.()) throw new MessageStillRunningError()
+
+        // One MULTI (the BL-537 rule for zip state): a lost connection applies none of it.
+        const multi = client.multi()
+        multi.del(messageKey)
+        multi.lRem(`messages:${sessionId}`, 0, messageId)
+        for (const zipId of zipIdsToDelete) queueZipRemoval(multi, sessionId, zipId)
+        await multi.exec()
+      })
+
+      // SA-120 P6: a Judge Juice after-reply record annotates exactly one reply and goes with it.
       const { deletePostTurnRecord } = await import('$lib/server/services/postTurnCheckState')
       await deletePostTurnRecord(sessionId, messageId)
+      const { deleteCodexCleanupWarning } = await import('$lib/server/services/codexCleanupWarnings')
+      await deleteCodexCleanupWarning(sessionId, messageId)
+      // BL-474 step 2: the record of where the reply's pictures came from goes with the reply.
+      const { deleteImageOrigin } = await import('$lib/server/services/imageAddressOrigins')
+      await deleteImageOrigin(sessionId, messageId)
 
       // Clear any stale per-session message cache so refresh reloads the live list.
       await client.del(`session:${sessionId}:messages`)
       
       // Touch session to update last activity
       await this.touchSession(sessionId)
+    })
+  }
+
+  /**
+   * BL-775: removes the zips `messageId` made (among `zipIds`) that no message of its chat names,
+   * the message itself included, with their zip state, by the claim rules of a message delete
+   * (BL-390, `unclaimedZipsMadeByMessage`) and under the chat's zip state lock. The finalize calls
+   * it for a reply it saved from its own copy: that copy does not name the zips the stream path
+   * made, which would otherwise be left with no reference. Answers the ids it removed. A message
+   * that exists but cannot be read stops it with nothing removed.
+   */
+  async removeUnclaimedZipsMadeByMessage(sessionId: string, messageId: string, zipIds: string[]): Promise<string[]> {
+    const candidates = [...new Set(zipIds.filter((id) => typeof id === 'string' && id.length > 0))].sort()
+    if (!sessionId || !messageId || candidates.length === 0) return []
+    return this.execute(async (client) => {
+      const ids = (await client.lRange(`messages:${sessionId}`, 0, -1)) ?? []
+      const chatMessages = await readZipClaimFieldsOfMessages(
+        client,
+        sessionId,
+        ids,
+        'A message of this chat could not be read, so no zip was removed.'
+      )
+      return withZipStateLock(sessionId, async () => {
+        const zipKeys = candidates.map((zipId) => `zip:${zipId}`)
+        const owners = await client.json.mGet(zipKeys, '$.metadata.messageId')
+        const sessions = await client.json.mGet(zipKeys, '$.metadata.sessionId')
+        const removable = unclaimedZipsMadeByMessage({
+          messageId,
+          sessionId,
+          zips: candidates.map((zipId, index) => ({
+            zipId,
+            messageId: firstJsonPathMatch(owners[index]),
+            sessionId: firstJsonPathMatch(sessions[index])
+          })),
+          chatMessages
+        })
+        if (removable.length === 0) return []
+        const multi = client.multi()
+        for (const zipId of removable) queueZipRemoval(multi, sessionId, zipId)
+        await multi.exec()
+        return removable
+      })
     })
   }
 
@@ -1156,12 +2460,11 @@ export class RedisService {
             ) as AgentRow
             agents.push(resolveUploadUrlsForBrowserInPayload(normalizedAgent))
 
+            // BL-770: by path, never the whole record read here. An empty update (review item 1):
+            // the script works the type out from the record as it is when it runs, never from
+            // this read, and removes the legacy fields.
             if (hasLegacyPrimaryAgentFields(agentData as Record<string, any>)) {
-              await client.json.set(
-                `agent:${agentId}`,
-                '$',
-                normalizeUploadUrlsForStorageInPayload(normalizedAgent) as any
-              )
+              await this.writeAgentUpdate(client, agentId, {}, {})
             }
           }
         } catch (error) {
@@ -1268,88 +2571,138 @@ export class RedisService {
     })
   }
 
-  async updateAgent(id: string, updates: Partial<AgentRow>): Promise<void> {
+  /**
+   * BL-768: write only the fields the caller passed, each by path, in one step inside Redis
+   * (`UPDATE_AGENT_FIELDS_SCRIPT`; the rules are `planAgentRecordUpdate`'s in
+   * `agentRecordUpdate.ts`). It used to read the whole record and write that copy back, so two
+   * saves at the same moment took back each other's fields. `provider_specific_settings` is
+   * written key by key (a `null` key removes it). Everything is checked first: a refused save throws
+   * `AgentUpdateRejectedError` (a 400) and writes nothing. The only read is of the type fields;
+   * the script writes `agentType` only when it is passed or the stored type is legacy or not
+   * canonical, and a worked-out type only while those fields are unchanged (else this reads them
+   * again, `AGENT_UPDATE_TYPE_TRIES` times at most, then throws `AgentUpdateConflictError`, a 409).
+   * An agent that is gone throws "Agent not found" and is not recreated.
+   *
+   * BL-1294: `options.expectedMemory` is the memory settings a save of them started from (Agent
+   * Settings' baseline). The stored memory settings are read beside the type fields and compared by
+   * value with it before the script runs; a difference throws `AgentMemorySettingsConflictError` (a
+   * 409, `memory_settings_changed`) and writes nothing. The script then checks the same raw answers
+   * again before its first write (`MEMORY_CHANGED`: read and compare again, the type rule's tries).
+   */
+  async updateAgent(id: string, updates: Partial<AgentRow>, options: AgentUpdateOptions = {}): Promise<void> {
+    return this.execute(async (client) => this.writeAgentUpdate(client, id, updates as Record<string, unknown>, options))
+  }
+
+  private async writeAgentUpdate(
+    client: RedisClientType,
+    id: string,
+    updates: Record<string, unknown>,
+    options: AgentUpdateOptions
+  ): Promise<void> {
+    const key = `agent:${id}`
+    const plan = planAgentRecordUpdate({ updates, now: new Date().toISOString() })
+    const guardsMemory = options.expectedMemory !== undefined
+    const readPaths = (paths: readonly string[]) =>
+      Promise.all(paths.map((path) => client.sendCommand<string | null>(['JSON.GET', key, path])))
+    let lastAnswer: unknown = null
+    for (let attempt = 0; attempt < AGENT_UPDATE_TYPE_TRIES; attempt += 1) {
+      // Each path's raw answer, so the script can compare the very text it reads again. Separate
+      // commands in one round trip; a mix of old and new answers cannot match the record as it is.
+      const [fields, memory] = await Promise.all([
+        readPaths(AGENT_TYPE_SOURCE_PATHS),
+        guardsMemory ? readPaths(AGENT_MEMORY_SOURCE_PATHS) : Promise.resolve(null)
+      ])
+      if (fields.some((field) => field === null) || memory?.some((answer) => answer === null)) {
+        throw new Error('Agent not found')
+      }
+      if (memory && !agentMemoryBaseMatches(agentMemoryFieldsFromAnswers(memory as string[]), options.expectedMemory)) {
+        throw new AgentMemorySettingsConflictError()
+      }
+      lastAnswer = await client.eval(UPDATE_AGENT_FIELDS_SCRIPT, {
+        keys: [key],
+        arguments: agentUpdateScriptArguments(plan, fields.join('\n'), memory ? memory.join('\n') : null)
+      })
+      if (lastAnswer === 'OK') return
+      if (lastAnswer === 'MISSING') throw new Error('Agent not found')
+      if (lastAnswer !== 'TYPE_CHANGED' && lastAnswer !== 'MEMORY_CHANGED') {
+        throw new Error(`The update of agent ${id} answered ${String(lastAnswer)}.`)
+      }
+    }
+    // A concurrent change, not a server fault: `PUT /api/agents/[id]` answers 409.
+    if (lastAnswer === 'MEMORY_CHANGED') throw new AgentMemorySettingsConflictError()
+    throw new AgentUpdateConflictError(
+      `The type of agent ${id} kept changing while it was being saved (${AGENT_UPDATE_TYPE_TRIES} tries), so nothing was saved. Try again.`
+    )
+  }
+
+  /**
+   * BL-914: write only the fields the caller passed to a Subagent record, each by path, in one
+   * step inside Redis (`UPDATE_SUBAGENT_FIELDS_SCRIPT`; the rules are `planSubagentRecordUpdate`'s
+   * in `subagentRecordUpdate.ts`, the agent update's since BL-768). `writes` is what
+   * `buildSubagentWrites` gives: the fields the request names, a `null` removing a field of
+   * `SUBAGENT_REMOVES_ON_NULL` and a key or entry of a block, never `id`, `user_id`, `slug` or
+   * `created_at`. Everything is checked first: a refused save throws `AgentUpdateRejectedError`
+   * (a 400) and writes nothing. Answers `false`, writing nothing, when the Subagent is gone (a
+   * delete landed first): it is not made again.
+   */
+  async updateSubagent(id: string, writes: Record<string, unknown>): Promise<boolean> {
+    const plan = planSubagentRecordUpdate({ writes, now: new Date().toISOString() })
     return this.execute(async (client) => {
-      const existing = await client.json.get(`agent:${id}`)
-      if (!existing) throw new Error('Agent not found')
-      
-      const updated = {
-        ...(existing as any),
-        ...updates,
-        updated_at: new Date().toISOString()
-      }
-
-      const nullableAgentFields = [
-        'buffer_size',
-        'buffer_size_image',
-        'zip_control_mode',
-        'zip_agent_control_enabled',
-        'zip_ai_view_mode',
-        'zip_tool_notes_enabled',
-        'zip_threshold_error',
-        'zip_threshold_image',
-        'zip_threshold_subagent',
-        'buffer_size_error',
-        'buffer_size_subagent',
-        'buffer_size_read_file',
-        'zip_threshold_read_file',
-        'buffer_size_write_file',
-        'zip_threshold_write_file',
-        'buffer_size_edit_file',
-        'zip_threshold_edit_file',
-        'buffer_size_execute_command',
-        'zip_threshold_execute_command',
-        'buffer_size_list_files',
-        'zip_threshold_list_files',
-        'buffer_size_all_other_tools',
-        'zip_threshold_all_other_tools',
-        'default_project_id',
-        'provider_specific_settings',
-        'primary_model_temperature',
-        'primary_model_preset_id',
-        'primary_model_max_tokens',
-        'primary_model_top_p',
-        'primary_model_top_k',
-        'primary_model_frequency_penalty',
-        'primary_model_presence_penalty',
-        'primary_model_seed',
-        'primary_model_stop_sequences',
-        'primary_model_reasoning_effort',
-        'tool_approval_mode',
-        'fallback_model_provider',
-        'fallback_model_name',
-        'fallback_model_preset_id',
-        'fallback_model_connection',
-        'fallback_model_temperature',
-        'fallback_model_max_tokens',
-        'fallback_model_top_p',
-        'fallback_model_top_k',
-        'fallback_model_frequency_penalty',
-        'fallback_model_presence_penalty',
-        'fallback_model_seed',
-        'fallback_model_stop_sequences',
-        'fallback_model_reasoning_effort',
-        'fallback_model_capabilities',
-        'fallback_provider_specific_settings',
-        'voice_profile',
-        'goon_id',
-        'defaultTools'
-      ]
-
-      for (const field of nullableAgentFields) {
-        if (field in updated && updated[field] === null) {
-          delete updated[field]
-        }
-      }
-
-      const canonicalUpdated = normalizeUploadUrlsForStorageInPayload(
-        canonicalizePrimaryAgentRecord(updated)
-      )
-      await client.json.set(`agent:${id}`, '$', canonicalUpdated as any)
+      const answer = await client.eval(UPDATE_SUBAGENT_FIELDS_SCRIPT, {
+        keys: [`subagent:${id}`],
+        arguments: [serializeAgentRecordPlan(plan.ops)]
+      })
+      if (answer === 'OK') return true
+      if (answer === 'MISSING') return false
+      throw new Error(`The update of Subagent ${id} answered ${String(answer)}.`)
     })
   }
 
-  async deleteAgent(id: string): Promise<void> {
+  /**
+   * BL-770: how an agent record is stored, for the `/fix` route: `json` (with the record), `string`
+   * (with the raw stored text, never parsed here), `none`, or `other`.
+   */
+  async readAgentRecordStorage(
+    id: string
+  ): Promise<{ type: 'none' } | { type: 'other' } | { type: 'json'; record: unknown } | { type: 'string'; raw: string }> {
+    return this.execute(async (client) => {
+      const key = `agent:${id}`
+      const type = await client.type(key)
+      if (type === 'none') return { type: 'none' as const }
+      if (type === 'ReJSON-RL' || type === 'json' || type === 'JSON') {
+        return { type: 'json' as const, record: await client.json.get(key) }
+      }
+      if (type === 'string') return { type: 'string' as const, raw: (await client.get(key)) ?? '' }
+      return { type: 'other' as const }
+    })
+  }
+
+  /**
+   * BL-770: replace an agent record stored as a JSON string with the RedisJSON `record`, only while
+   * the stored string is still `raw` (`REPLACE_STRING_AGENT_RECORD_SCRIPT`). `false` when it changed.
+   */
+  async replaceStringAgentRecord(id: string, raw: string, record: Record<string, unknown>): Promise<boolean> {
+    return this.execute(async (client) => {
+      const answer = await client.eval(REPLACE_STRING_AGENT_RECORD_SCRIPT, {
+        keys: [`agent:${id}`],
+        arguments: [raw, JSON.stringify(record)]
+      })
+      return answer === 'OK'
+    })
+  }
+
+  /**
+   * Returns the holds it released (BL-539), so the delete route can tell every open tab of
+   * those chats; this module stays free of the publisher.
+   */
+  async deleteAgent(id: string): Promise<{ releasedHolds: Array<{ sessionId: string; zipId: string }> }> {
+    // BL-608: three sweeps below (wake hooks, schedules, zip holds) find the agent's records
+    // through `agent.user_id`, and each reads the record strictly, so a failed read stops the
+    // delete there. Read it once here too, before anything is deleted, so a read that fails
+    // from the start costs nothing: before, `redis.get` answered a failed read with null, those
+    // sweeps found nothing, and the agent was deleted anyway with its hooks, schedules, and
+    // holds left behind.
+    await this.json.get(`agent:${id}`)
     // Dynamic import avoids a redis.ts <-> memoryMedia.ts module cycle. Media cleanup
     // is part of the destructive contract: fail before deleting the agent if it fails.
     const { sweepAgentMemoryMedia } = await import('$lib/server/services/memory/memoryMedia')
@@ -1383,134 +2736,151 @@ export class RedisService {
       '$lib/server/services/agentRunCredentials'
     )
     await sweepAgentRunCredentials(id)
-    return this.execute(async (client) => {
-      // Get agent to find user_id
-      const agent = await client.json.get(`agent:${id}`)
+    // SA-129 P2b (BL-351): the agent's holds (`unzipped_item` records with its `agentId`) go
+    // with it: no other agent can release them, so each would keep its file open for good.
+    // Session-scoped keys, found in the chats of the agent's user (BL-539), so BEFORE the record
+    // delete like the sweeps above; same dynamic-import reason as above.
+    const { markAgentBeingDeleted, releaseDeletedAgentHolds } = await import('$lib/server/services/zipHolds')
+    // BL-606: from here until the record is gone, no turn of this agent may write zip state: the
+    // release goes chat by chat, and a turn that finished in a chat it had already passed would
+    // hold a file for an agent that no longer exists. After the record delete, the hold step's
+    // own record check refuses.
+    const agentDeleteDone = markAgentBeingDeleted(id)
+    let releasedHolds: Array<{ sessionId: string; zipId: string }>
+    try {
+      releasedHolds = await releaseDeletedAgentHolds(id)
+      await this.execute(async (client) => {
+        // Get agent to find user_id
+        const agent = await client.json.get(`agent:${id}`)
 
-      // Delete agent
-      await client.del(`agent:${id}`)
-      await client.del(`agent:${id}:subagents`)
+        // Delete agent
+        await client.del(`agent:${id}`)
+        await client.del(`agent:${id}:subagents`)
 
-      // Delete the agent's memory store (SA-104, DL-104-13). Memories, graduated
-      // segments, and the dreaming log are agent-scoped and survive session deletion;
-      // agent deletion is the explicit lifecycle end for them. KEYS is blocking but
-      // safe at single-user scale.
-      for (const pattern of [`memory:${id}:*`, `memseg:${id}:*`, `memdream:${id}:*`]) {
-        try {
-          const memoryKeys = await client.keys(pattern)
-          if (memoryKeys.length > 0) {
-            await client.del(memoryKeys as [string, ...string[]])
-            logger.debug(`[deleteAgent] Deleted ${memoryKeys.length} keys for ${pattern}`)
-          }
-        } catch (memoryError) {
-          console.error(`[deleteAgent] Error deleting memory keys for ${pattern}:`, memoryError)
-        }
-      }
-      try {
-        await client.del(`memdream_index:${id}`)
-      } catch (dreamIndexError) {
-        console.error(`[deleteAgent] Error deleting dreaming-log index:`, dreamIndexError)
-      }
-      try {
-        await client.del(`memfold:${id}`)
-      } catch (foldError) {
-        console.error(`[deleteAgent] Error deleting awareness fold:`, foldError)
-      }
-
-      // Remove from user's agent list
-      const agentObj = agent as any
-      if (agentObj?.user_id) {
-        const userId = agentObj.user_id as string
-        await client.sRem(`user:${userId}:agents`, id)
-
-        // 2026-09-19 (Josh: "when you delete an agent, it should delete everything about that
-        // agent"): the agent's id also sits inside two per-user lists that are not the agent's
-        // own records — a skill's `enabled_agent_ids` (Settings → Skills, enabled for chosen
-        // agents) and an artifact's `agent_allowlist` (Artifacts → Agent use). Each scrub is
-        // a path-scoped write of that ONE field: a whole-record write here would race the
-        // skill registry and the artifacts service, which own those records.
-        const scrubAgentIdList = async (key: string, path: string) => {
-          const raw = await client.json.get(key, { path: `$${path}` })
-          const list = Array.isArray(raw) && raw.length > 0 && Array.isArray(raw[0]) ? raw[0] : null
-          if (!list || !list.includes(id)) return false
-          await client.json.set(key, `$${path}`, list.filter((value) => value !== id) as any)
-          return true
-        }
-        try {
-          const skillKeys = await client.keys(`slash_command:${userId}:*`)
-          let scrubbed = 0
-          for (const key of skillKeys) {
-            if (await scrubAgentIdList(key, '.enabled_agent_ids')) scrubbed += 1
-          }
-          if (scrubbed > 0) logger.debug(`[deleteAgent] Removed ${id} from ${scrubbed} skill enable-list(s)`)
-        } catch (skillError) {
-          console.error(`[deleteAgent] Error scrubbing skill enable-lists:`, skillError)
-        }
-        try {
-          const artifactIds = await client.sMembers(`user:${userId}:artifacts`)
-          let scrubbed = 0
-          for (const artifactId of artifactIds) {
-            if (await scrubAgentIdList(`artifact:${artifactId}`, '.agent_allowlist')) scrubbed += 1
-          }
-          if (scrubbed > 0) logger.debug(`[deleteAgent] Removed ${id} from ${scrubbed} artifact allow-list(s)`)
-        } catch (artifactError) {
-          console.error(`[deleteAgent] Error scrubbing artifact allow-lists:`, artifactError)
-        }
-
-        const groupIds = await client.sMembers(`user:${userId}:groups`)
-        for (const groupId of groupIds) {
+        // Delete the agent's memory store (SA-104, DL-104-13). Memories, graduated
+        // segments, and the dreaming log are agent-scoped and survive session deletion;
+        // agent deletion is the explicit lifecycle end for them. KEYS is blocking but
+        // safe at single-user scale.
+        for (const pattern of [`memory:${id}:*`, `memseg:${id}:*`, `memdream:${id}:*`]) {
           try {
-            const storedGroup = await client.json.get(`group:${groupId}`)
-            if (!storedGroup) continue
-
-            const group = storedGroup as unknown as GroupChatGroupRow
-            const existingAgentIds = Array.isArray(group.agent_ids) ? group.agent_ids : []
-            const nextAgentIds = existingAgentIds.filter((agentId) => agentId !== id)
-            const removedFromRoster = nextAgentIds.length !== existingAgentIds.length
-
-            const existingAgentSettings =
-              group.agent_settings && typeof group.agent_settings === 'object'
-                ? group.agent_settings
-                : {}
-            const removedAgentSettings = Object.prototype.hasOwnProperty.call(
-              existingAgentSettings,
-              id
-            )
-            const nextAgentSettings = { ...existingAgentSettings }
-            delete nextAgentSettings[id]
-
-            const requestedDriverAgentId =
-              typeof group.driver_agent_id === 'string' && group.driver_agent_id.trim().length > 0
-                ? group.driver_agent_id.trim()
-                : null
-            const nextDriverAgentId = group.driver_mode
-              ? requestedDriverAgentId && nextAgentIds.includes(requestedDriverAgentId)
-                ? requestedDriverAgentId
-                : nextAgentIds[0] ?? null
-              : requestedDriverAgentId === id
-                ? null
-                : requestedDriverAgentId
-            const driverChanged = nextDriverAgentId !== requestedDriverAgentId
-
-            if (!removedFromRoster && !removedAgentSettings && !driverChanged) {
-              continue
+            const memoryKeys = await client.keys(pattern)
+            if (memoryKeys.length > 0) {
+              await client.del(memoryKeys as [string, ...string[]])
+              logger.debug(`[deleteAgent] Deleted ${memoryKeys.length} keys for ${pattern}`)
             }
-
-            const updatedGroup = normalizeUploadUrlsForStorageInPayload<GroupChatGroupRow>({
-              ...group,
-              agent_ids: nextAgentIds,
-              agent_settings: nextAgentSettings,
-              driver_agent_id: nextDriverAgentId,
-              updated_at: new Date().toISOString()
-            })
-
-            await client.json.set(`group:${groupId}`, '$', updatedGroup as any)
-          } catch (error) {
-            logger.warn(`Failed to scrub deleted agent ${id} from group ${groupId}:`, error)
+          } catch (memoryError) {
+            console.error(`[deleteAgent] Error deleting memory keys for ${pattern}:`, memoryError)
           }
         }
-      }
-    })
+        try {
+          await client.del(`memdream_index:${id}`)
+        } catch (dreamIndexError) {
+          console.error(`[deleteAgent] Error deleting dreaming-log index:`, dreamIndexError)
+        }
+        try {
+          await client.del(`memfold:${id}`)
+        } catch (foldError) {
+          console.error(`[deleteAgent] Error deleting awareness fold:`, foldError)
+        }
+
+        // Remove from user's agent list
+        const agentObj = agent as any
+        if (agentObj?.user_id) {
+          const userId = agentObj.user_id as string
+          await client.sRem(`user:${userId}:agents`, id)
+
+          // 2026-09-19 (Josh: "when you delete an agent, it should delete everything about that
+          // agent"): the agent's id also sits inside two per-user lists that are not the agent's
+          // own records — a skill's `enabled_agent_ids` (Settings → Skills, enabled for chosen
+          // agents) and an artifact's `agent_allowlist` (Artifacts → Agent use). Each scrub is
+          // a path-scoped write of that ONE field: a whole-record write here would race the
+          // skill registry and the artifacts service, which own those records.
+          const scrubAgentIdList = async (key: string, path: string) => {
+            const raw = await client.json.get(key, { path: `$${path}` })
+            const list = Array.isArray(raw) && raw.length > 0 && Array.isArray(raw[0]) ? raw[0] : null
+            if (!list || !list.includes(id)) return false
+            await client.json.set(key, `$${path}`, list.filter((value) => value !== id) as any)
+            return true
+          }
+          try {
+            const skillKeys = await client.keys(`slash_command:${userId}:*`)
+            let scrubbed = 0
+            for (const key of skillKeys) {
+              if (await scrubAgentIdList(key, '.enabled_agent_ids')) scrubbed += 1
+            }
+            if (scrubbed > 0) logger.debug(`[deleteAgent] Removed ${id} from ${scrubbed} skill enable-list(s)`)
+          } catch (skillError) {
+            console.error(`[deleteAgent] Error scrubbing skill enable-lists:`, skillError)
+          }
+          try {
+            const artifactIds = await client.sMembers(`user:${userId}:artifacts`)
+            let scrubbed = 0
+            for (const artifactId of artifactIds) {
+              if (await scrubAgentIdList(`artifact:${artifactId}`, '.agent_allowlist')) scrubbed += 1
+            }
+            if (scrubbed > 0) logger.debug(`[deleteAgent] Removed ${id} from ${scrubbed} artifact allow-list(s)`)
+          } catch (artifactError) {
+            console.error(`[deleteAgent] Error scrubbing artifact allow-lists:`, artifactError)
+          }
+
+          const groupIds = await client.sMembers(`user:${userId}:groups`)
+          for (const groupId of groupIds) {
+            try {
+              const storedGroup = await client.json.get(`group:${groupId}`)
+              if (!storedGroup) continue
+
+              const group = storedGroup as unknown as GroupChatGroupRow
+              const existingAgentIds = Array.isArray(group.agent_ids) ? group.agent_ids : []
+              const nextAgentIds = existingAgentIds.filter((agentId) => agentId !== id)
+              const removedFromRoster = nextAgentIds.length !== existingAgentIds.length
+
+              const existingAgentSettings =
+                group.agent_settings && typeof group.agent_settings === 'object'
+                  ? group.agent_settings
+                  : {}
+              const removedAgentSettings = Object.prototype.hasOwnProperty.call(
+                existingAgentSettings,
+                id
+              )
+              const nextAgentSettings = { ...existingAgentSettings }
+              delete nextAgentSettings[id]
+
+              const requestedDriverAgentId =
+                typeof group.driver_agent_id === 'string' && group.driver_agent_id.trim().length > 0
+                  ? group.driver_agent_id.trim()
+                  : null
+              const nextDriverAgentId = group.driver_mode
+                ? requestedDriverAgentId && nextAgentIds.includes(requestedDriverAgentId)
+                  ? requestedDriverAgentId
+                  : nextAgentIds[0] ?? null
+                : requestedDriverAgentId === id
+                  ? null
+                  : requestedDriverAgentId
+              const driverChanged = nextDriverAgentId !== requestedDriverAgentId
+
+              if (!removedFromRoster && !removedAgentSettings && !driverChanged) {
+                continue
+              }
+
+              const updatedGroup = normalizeUploadUrlsForStorageInPayload<GroupChatGroupRow>({
+                ...group,
+                agent_ids: nextAgentIds,
+                agent_settings: nextAgentSettings,
+                driver_agent_id: nextDriverAgentId,
+                updated_at: new Date().toISOString()
+              })
+
+              await client.json.set(`group:${groupId}`, '$', updatedGroup as any)
+            } catch (error) {
+              logger.warn(`Failed to scrub deleted agent ${id} from group ${groupId}:`, error)
+            }
+          }
+        }
+      })
+    } finally {
+      agentDeleteDone()
+    }
+    return { releasedHolds }
   }
 
   // ===== GROUPS =====
@@ -1682,6 +3052,14 @@ export class RedisService {
         shared_tools: normalizedSharedTools,
         zip_settings: null,
         updated_at: new Date().toISOString()
+      }
+      // BL-482: an empty Group System Prompt is no prompt. Settings sends `''` for a cleared prompt
+      // (it sent `undefined`, which JSON drops, so the merge above kept the old one); the stored
+      // group then has no `group_system_prompt` at all, and the next group turn adds no custom
+      // prompt block.
+      const groupPrompt = (merged as { group_system_prompt?: unknown }).group_system_prompt
+      if (groupPrompt === null || (typeof groupPrompt === 'string' && groupPrompt.trim() === '')) {
+        delete updated.group_system_prompt
       }
       const storageUpdated = normalizeUploadUrlsForStorageInPayload(updated)
 
@@ -1861,7 +3239,7 @@ export class RedisService {
       }
       
       const storageSettingsData = normalizeUploadUrlsForStorageInPayload(settingsData)
-      await client.json.set(`user:${userId}:settings`, '$', storageSettingsData as any)
+      await storeUserSettingsForClient(client, userId, storageSettingsData)
       
       return resolveUploadUrlsForBrowserInPayload(storageSettingsData)
     })
@@ -1891,7 +3269,7 @@ export class RedisService {
       }
       
       const storageUpdated = normalizeUploadUrlsForStorageInPayload(updated)
-      await client.json.set(`user:${userId}:settings`, '$', storageUpdated as any)
+      await storeUserSettingsForClient(client, userId, storageUpdated)
       return resolveUploadUrlsForBrowserInPayload(storageUpdated)
     })
   }
@@ -2255,23 +3633,31 @@ export class RedisService {
     folderId: string,
     options:
       | { deleteSessions?: false }
-      | { deleteSessions: true; deleteSession: (sessionId: string) => Promise<unknown> } = {}
+      | {
+          deleteSessions: true
+          deleteSession: (sessionId: string) => Promise<unknown>
+          /** The chats the dialog showed; anything else there now deletes nothing (BL-388). */
+          expectedSessionIds: ReadonlyArray<string>
+        } = {}
   ): Promise<{
     success: boolean
     moved_to?: string
     deleted_sessions?: number
     error?: string
+    code?: string
+    total_sessions?: number
+    stopped_at?: { id: string; name: string; locked: boolean }
+    cause?: unknown
   }> {
     if (options.deleteSessions) {
       const validation = await this.execute(async (client) => {
         try {
-          const folder = await client.json.get(`folder:${userId}:${folderId}`)
-          if (!folder) {
+          // The one selection rule the delete dialog reads too (`folderChatsForDelete.ts`).
+          const selection = await selectFolderChats(client, userId, folderId)
+          if (!selection) {
             return { success: false as const, error: 'Folder not found', sessionIds: [] as string[] }
           }
-
-          const folderData = folder as unknown as ChatFolderRow
-          if (folderData.is_default) {
+          if (selection.folder.is_default) {
             console.error('[deleteFolder] Cannot delete default folder')
             return {
               success: false as const,
@@ -2280,22 +3666,16 @@ export class RedisService {
             }
           }
 
-          const rawSessionIds = await client.sMembers(`folder:${userId}:${folderId}:sessions`)
-          const sessionIds: string[] = []
-          const lockedSessionIds: string[] = []
-
-          for (const sessionId of rawSessionIds) {
-            const session = await client.json.get(`session:${sessionId}`)
-            if (!session) continue
-
-            const sessionData = session as unknown as ChatSessionRow
-            if (sessionData.user_id && sessionData.user_id !== userId) continue
-
-            sessionIds.push(sessionId)
-            if (sessionData.locked) {
-              lockedSessionIds.push(sessionId)
+          const sessionIds = selection.chats.map((chat) => chat.id)
+          if (!sameFolderChatIds(selection.chats, options.expectedSessionIds)) {
+            return {
+              success: false as const,
+              error: FOLDER_CHANGED_MESSAGE,
+              code: FOLDER_CHANGED_CODE,
+              sessionIds
             }
           }
+          const lockedSessionIds = selection.chats.filter((chat) => chat.locked).map((chat) => chat.id)
 
           if (lockedSessionIds.length > 0) {
             return {
@@ -2308,7 +3688,7 @@ export class RedisService {
             }
           }
 
-          return { success: true as const, sessionIds }
+          return { success: true as const, sessionIds, chats: selection.chats }
         } catch (error) {
           console.error('[deleteFolder] Error validating delete-with-sessions:', error)
           return {
@@ -2320,22 +3700,64 @@ export class RedisService {
       })
 
       if (!validation.success) {
-        return { success: false, error: validation.error }
+        return {
+          success: false,
+          error: validation.error,
+          ...('code' in validation ? { code: validation.code } : {})
+        }
       }
 
-      for (const sessionId of validation.sessionIds) {
-        await options.deleteSession(sessionId)
+      // BL-388: a chat whose delete throws (its reply still stopping, locked meanwhile, or a
+      // failure) stops the loop. The chats before it stay deleted and the folder stays, and the
+      // result says how far it got; the caller's error is handed back as `cause`.
+      const total = validation.chats.length
+      let deleted = 0
+      for (const chat of validation.chats) {
+        try {
+          await options.deleteSession(chat.id)
+        } catch (cause) {
+          // Whether it is locked now names the reason; a failed read leaves the reason unnamed
+          // ("could not be deleted"), never a delete.
+          const now = await this.execute((client) => client.json.get(`session:${chat.id}`)).catch(
+            () => null
+          )
+          return {
+            success: false,
+            code: 'folder_delete_stopped',
+            error: `Deleted ${deleted} of ${total} chats; "${chat.name}" could not be deleted.`,
+            deleted_sessions: deleted,
+            total_sessions: total,
+            stopped_at: {
+              id: chat.id,
+              name: chat.name,
+              locked: (now as { locked?: unknown } | null)?.locked === true
+            },
+            cause
+          }
+        }
+        deleted++
       }
 
       return this.execute(async (client) => {
         try {
+          // A chat that arrived while the loop ran keeps the folder; nothing is moved.
+          const after = await selectFolderChats(client, userId, folderId)
+          if (after && after.chats.length > 0) {
+            return {
+              success: false,
+              code: 'folder_not_empty',
+              error: 'A new chat arrived in the folder, so the folder remains.',
+              deleted_sessions: deleted,
+              total_sessions: total
+            }
+          }
           await client.del(`folder:${userId}:${folderId}`)
           await client.del(`folder:${userId}:${folderId}:sessions`)
           await client.sRem(`user:${userId}:folders`, folderId)
 
           return {
             success: true,
-            deleted_sessions: validation.sessionIds.length
+            deleted_sessions: deleted
           }
         } catch (error) {
           console.error('[deleteFolder] Error deleting folder after sessions:', error)
@@ -2665,6 +4087,110 @@ export class RedisService {
     set: async (key: string, path: string, value: any): Promise<string | null> => {
       return this.execute(async (client) => {
         return await client.json.set(key, path, value)
+      })
+    },
+    /**
+     * `JSON.SET key path value XX`: writes only when the key (at `$`) or the path already
+     * exists, and answers whether it wrote. BL-753: a read-then-write-whole-record edit uses it
+     * so a write that lands after the record's delete does not make the record again.
+     */
+    setIfExists: async (key: string, path: string, value: any): Promise<boolean> => {
+      return this.execute(async (client) => {
+        return (await client.json.set(key, path, value, { condition: 'XX' })) === 'OK'
+      })
+    },
+    /**
+     * `JSON.SET key path value NX`: writes only when the key (at `$`) or the path does not exist
+     * yet, and answers whether it wrote. BL-516: a preset create makes its record in one step, so
+     * two creates of one id at the same moment cannot both write.
+     */
+    setIfAbsent: async (key: string, path: string, value: any): Promise<boolean> => {
+      return this.execute(async (client) => {
+        return (await client.json.set(key, path, value, { condition: 'NX' })) === 'OK'
+      })
+    },
+    /**
+     * BL-1371: the exact RedisJSON text of `JSON.GET key path`, unparsed, for a compare-and-set
+     * (`setIfUnchanged`, `delIfUnchanged`). A `$` path answers a JSON array (`[]` when the path
+     * matches nothing); a missing key answers null. A failed read throws, never null.
+     */
+    getRaw: async (key: string, path: string): Promise<string | null> => {
+      return this.execute(async (client) => {
+        const raw = await client.sendCommand<string | null>(['JSON.GET', key, path])
+        if (raw !== null && typeof raw !== 'string') {
+          throw new Error(`JSON.GET ${key} ${path} answered ${typeof raw}, not text.`)
+        }
+        return raw
+      })
+    },
+    /**
+     * BL-1371: write `value` at `path` only while the stored text there is still `expectedRaw`
+     * (from `getRaw`; '' for a key that did not exist). Answers true when it wrote, false when the
+     * text changed, so the caller reads again. The value is sent as `JSON.stringify(value)`, the
+     * bytes `json.set` sends.
+     */
+    setIfUnchanged: async (key: string, path: string, expectedRaw: string, value: any): Promise<boolean> => {
+      return this.execute(async (client) => {
+        const answer = await client.eval(JSON_COMPARE_AND_WRITE_SCRIPT, {
+          keys: [key],
+          arguments: ['SET', path, expectedRaw, jsonTextOf(value)]
+        })
+        return readJsonCompareAndWriteAnswer(answer, 'SET', key, path)
+      })
+    },
+    /** BL-1371: delete `path` only while its stored text is still `expectedRaw`; as `setIfUnchanged`. */
+    delIfUnchanged: async (key: string, path: string, expectedRaw: string): Promise<boolean> => {
+      return this.execute(async (client) => {
+        const answer = await client.eval(JSON_COMPARE_AND_WRITE_SCRIPT, {
+          keys: [key],
+          arguments: ['DEL', path, expectedRaw]
+        })
+        return readJsonCompareAndWriteAnswer(answer, 'DEL', key, path)
+      })
+    },
+    /**
+     * BL-1397: move a gateway's legacy n8n Instance token into the ABSENT saved key, or (with no
+     * new key document) only retire the copy, while BOTH owners still read exactly as given.
+     * `MOVE_LEGACY_N8N_TOKEN_SCRIPT` (`n8nCredentialScripts.ts`) has the order and answers.
+     */
+    moveLegacyN8nToken: async (
+      keyKey: string,
+      registryKey: string,
+      expectedKeyRaw: string,
+      elementPath: string,
+      expectedElementRaw: string,
+      newKeyDocument: unknown | null
+    ): Promise<LegacyN8nTokenMoveAnswer> => {
+      return this.execute(async (client) => {
+        const answer = await client.eval(MOVE_LEGACY_N8N_TOKEN_SCRIPT, {
+          keys: [keyKey, registryKey],
+          arguments: [
+            expectedKeyRaw,
+            elementPath,
+            expectedElementRaw,
+            newKeyDocument === null ? '' : jsonTextOf(newKeyDocument)
+          ]
+        })
+        return readLegacyN8nTokenMoveAnswer(answer)
+      })
+    },
+    /**
+     * BL-1397: delete the saved n8n Instance token and every legacy copy planned from the WHOLE
+     * registry text, in one step that writes only while both owners read exactly as given.
+     */
+    deleteN8nToken: async (
+      keyKey: string,
+      registryKey: string,
+      expectedKeyRaw: string,
+      expectedRegistryRaw: string,
+      copyPaths: string[]
+    ): Promise<N8nTokenDeleteAnswer> => {
+      return this.execute(async (client) => {
+        const answer = await client.eval(DELETE_N8N_TOKEN_SCRIPT, {
+          keys: [keyKey, registryKey],
+          arguments: [expectedKeyRaw, expectedRegistryRaw, JSON.stringify(copyPaths)]
+        })
+        return readN8nTokenDeleteAnswer(answer)
       })
     },
     /**

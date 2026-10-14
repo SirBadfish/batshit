@@ -150,11 +150,14 @@ describe('resolveCodexCliExecutable', () => {
 
   it('keeps the Codex desktop app binary as the last native Mac fallback', () => {
     const candidates = getCodexCliExecutableCandidates('/Users/example')
+    // BL-590: ChatGPT.app keeps its Codex in `codex-cli/bin` (measured on 26.1007.21159).
+    const desktop = '/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex'
 
-    expect(candidates).toContain('/Applications/Codex.app/Contents/Resources/codex')
-    expect(candidates.at(-1)).toBe('/Applications/Codex.app/Contents/Resources/codex')
-    expect(candidates.indexOf('/usr/local/bin/codex')).toBeLessThan(
-      candidates.indexOf('/Applications/Codex.app/Contents/Resources/codex')
+    expect(candidates.at(-1)).toBe(desktop)
+    expect(candidates.filter((candidate) => candidate.startsWith('/Applications/'))).toEqual([desktop])
+    expect(candidates.indexOf('/usr/local/bin/codex')).toBeLessThan(candidates.indexOf(desktop))
+    expect(candidates.indexOf('/Users/example/.local/bin/codex')).toBeLessThan(
+      candidates.indexOf(desktop)
     )
   })
 })

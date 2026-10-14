@@ -18,6 +18,7 @@ import { createOpenAI } from '@ai-sdk/openai'
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible'
 import { createOllama } from 'ollama-ai-provider-v2'
 import { withOllamaOptionsShim } from './ollamaOptionsShim'
+import { withOllamaImageTransportGuard } from './ollamaImageTransportGuard'
 import { createGoogle } from '@ai-sdk/google'
 import { createGroq } from '@ai-sdk/groq'
 import { createMistral } from '@ai-sdk/mistral'
@@ -33,11 +34,18 @@ import { createAlibaba } from '@ai-sdk/alibaba'
 import { createOpenRouter } from '@openrouter/ai-sdk-provider'
 import { env } from '$env/dynamic/private'
 import { createGateway, type LanguageModel } from 'ai'
+import { batshitProviderHeaders, withBatshitIdentity } from './batshitIdentity'
+import {
+  PausedPlanError,
+  assertPlanNotPaused,
+  pausedPlansAllowedOnThisCopy
+} from '$lib/server/services/pausedPlans'
+import { findPausedPlan } from '$lib/data/pausedPlans'
 import { apiKeyService } from '$lib/services/apiKey.server'
 import { listCustomProvidersForRuntime } from '$lib/server/services/customProviders'
 import type { CustomProviderRuntime } from '$lib/types/customProviders'
 import type { LocalAiServerId, LocalAiServerSummary } from '$lib/types/localAi'
-import { LOCAL_AI_SERVER_IDS } from '$lib/data/localAiServers'
+import { LOCAL_AI_SERVER_DEFINITIONS, LOCAL_AI_SERVER_IDS } from '$lib/data/localAiServers'
 import {
   listLocalAiServers,
   resolveLocalAiRuntimeBaseUrl
@@ -81,7 +89,8 @@ export interface ProviderFeatures {
   streaming: boolean
   tools: boolean
   vision: boolean
-  maxTokens: number
+  /** The context window when known. BL-68: absent, never 0, when it is not. */
+  maxTokens?: number
   cacheControl?: boolean
   reasoning?: boolean // For o1 models
   longContext?: boolean // For models with >128k context
@@ -162,12 +171,24 @@ interface ProviderManagerOptions {
   customProviders?: CustomProviderRuntime[]
   localProviders?: LocalAiServerSummary[]
   /**
+   * BL-977: true when the saved Local AI servers could not be READ, so `localProviders` is empty
+   * for that reason and not because none is switched on. A request for a local model then says so,
+   * instead of "not configured".
+   */
+  localProvidersUnreadable?: boolean
+  /**
    * SA-102 P5 (DL-102-09/DL-102-14): one stored key per local program, by
    * program id. Kept separate from `apiKeys` because those carry cloud
    * env-var/availability semantics a local program has no use for, but stored
    * through the SAME encrypted `apiKeyService` so there is one secret, not two.
    */
   localApiKeys?: Record<string, string>
+  /**
+   * Plan pause (plans 3/3a): true only when the server read this copy's Dev
+   * panel gate and its "Use paused plans on this copy" switch. Absent means
+   * paused, so every caller that does not ask the server keeps the pause.
+   */
+  pausedPlansAllowed?: boolean
 }
 
 type ProviderAvailability = {
@@ -210,7 +231,9 @@ export class ProviderManager {
   private gatewayConfig: { apiKey: string | null; baseURL: string | null }
   private customProviders: CustomProviderRuntime[]
   private localProviders: LocalAiServerSummary[]
+  private localProvidersUnreadable: boolean
   private localApiKeys: Record<string, string>
+  private pausedPlansAllowed: boolean
 
   constructor(options: ProviderManagerOptions = {}) {
     logger.debug('[ProviderManager] Initializing provider management system')
@@ -221,7 +244,9 @@ export class ProviderManager {
     }
     this.customProviders = options.customProviders ?? []
     this.localProviders = options.localProviders ?? []
+    this.localProvidersUnreadable = options.localProvidersUnreadable === true
     this.localApiKeys = options.localApiKeys ?? {}
+    this.pausedPlansAllowed = options.pausedPlansAllowed === true
     this.registerProviders()
     this.setupFallbackChain()
     this.setupGatewayClient()
@@ -231,6 +256,7 @@ export class ProviderManager {
     const resolved = await resolveProviderAccess(userId)
     let customProviders: CustomProviderRuntime[] = []
     let localProviders: LocalAiServerSummary[] = []
+    let localProvidersUnreadable = false
     const localApiKeys: Record<string, string> = {}
     if (userId) {
       try {
@@ -242,7 +268,10 @@ export class ProviderManager {
         localProviders = await listLocalAiServers(userId)
         localProviders = localProviders.filter((provider) => provider.enabled !== false)
       } catch (error) {
+        // Cloud models do not depend on the Local AI records, so the manager still builds; a request
+        // for a local model says why it has none (BL-977), never "not configured".
         console.warn('[ProviderManager] Failed to load local AI servers:', error)
+        localProvidersUnreadable = true
       }
       // SA-102 P5: only for the programs actually enabled, so a disabled entry
       // never causes a key read.
@@ -263,7 +292,9 @@ export class ProviderManager {
       },
       customProviders,
       localProviders,
-      localApiKeys
+      localProvidersUnreadable,
+      localApiKeys,
+      pausedPlansAllowed: await pausedPlansAllowedOnThisCopy()
     })
   }
 
@@ -305,6 +336,7 @@ export class ProviderManager {
       if (!allowNoKey && !this.validateApiKey(resolvedKey, label)) return
 
       const client = createOpenAI({
+        headers: batshitProviderHeaders(),
         apiKey: resolvedKey,
         baseURL: baseURL ?? undefined
       })
@@ -331,14 +363,19 @@ export class ProviderManager {
     }
 
     const registerCustomProvider = (provider: CustomProviderRuntime, priority: number) => {
+      // BL-520: the user chose this key for their own host, and many accept a
+      // short placeholder (vLLM's `EMPTY`, LiteLLM's `sk-1234`). The save takes
+      // any non-empty key and `/api/models` shows the connection Ready, so it is
+      // registered with any non-empty key too; seller keys keep `validateApiKey`.
       const apiKey = provider.apiKey
       if (!apiKey) return
-      if (!this.validateApiKey(apiKey, 'Custom')) return
 
       const client = createOpenAI({
         apiKey,
         baseURL: provider.baseUrl ?? undefined,
-        headers: provider.headers ?? undefined,
+        // BL-684: Batshit's identity, unless the user set a User-Agent of
+        // their own on this connection (their explicit choice wins).
+        headers: withBatshitIdentity(provider.headers),
         name: provider.id
       })
 
@@ -413,12 +450,15 @@ export class ProviderManager {
           // Max Output Tokens on every Ollama preset, which is worse than the
           // `/v1` door it replaces.
           fetch: withOllamaOptionsShim(),
-          ...(this.localApiKeys[provider.id]
-            ? { headers: { authorization: `Bearer ${this.localApiKeys[provider.id]}` } }
-            : {})
+          headers: {
+            ...batshitProviderHeaders(),
+            ...(this.localApiKeys[provider.id]
+              ? { authorization: `Bearer ${this.localApiKeys[provider.id]}` }
+              : {})
+          }
         })
         this.providers.set(provider.id, {
-          client: (modelId: string) => ollama(modelId),
+          client: (modelId: string) => withOllamaImageTransportGuard(ollama(modelId)),
           models: [],
           features: {
             streaming: true,
@@ -447,6 +487,7 @@ export class ProviderManager {
         apiKey:
           this.localApiKeys[provider.id] ??
           ProviderManager.LOCAL_RUNTIME_PLACEHOLDER_API_KEY,
+        headers: batshitProviderHeaders(),
         includeUsage: true
       })
 
@@ -470,16 +511,16 @@ export class ProviderManager {
     const anthropicKey = this.apiKeys.anthropic ?? env.ANTHROPIC_API_KEY
     if (anthropicKey && this.validateApiKey(anthropicKey, 'Anthropic')) {
       const anthropic = createAnthropic({
+        headers: batshitProviderHeaders(),
         apiKey: anthropicKey
       })
       this.providers.set('anthropic', {
         client: (modelId: string) => anthropic(modelId),
-        models: [
-          'claude-sonnet-4-5-latest',
-          'claude-3-5-sonnet-20241022',
-          'claude-3-5-haiku-20241022',
-          'claude-3-opus-20240229'
-        ],
+        // BL-1365: Anthropic's current alias for the still-supported Claude
+        // Sonnet 4.5. Anthropic lists no "-latest" ids, and Claude 3.5 Sonnet,
+        // 3.5 Haiku and 3 Opus are retired. This list never routes a send
+        // (`buildModel` passes any id through), so dropping ids blocks no preset.
+        models: ['claude-sonnet-4-5'],
         features: {
           streaming: true,
           tools: true,
@@ -500,6 +541,7 @@ export class ProviderManager {
     if (openaiKey && this.validateApiKey(openaiKey, 'OpenAI')) {
       // Create custom OpenAI instance with API key
       const openai = createOpenAI({
+        headers: batshitProviderHeaders(),
         apiKey: openaiKey
       })
 
@@ -531,6 +573,7 @@ export class ProviderManager {
     const googleKey = this.apiKeys.google ?? env.GOOGLE_GENERATIVE_AI_API_KEY
     if (googleKey && this.validateApiKey(googleKey, 'Google')) {
       const google = createGoogle({
+        headers: batshitProviderHeaders(),
         apiKey: googleKey
       })
       this.providers.set('google', {
@@ -558,6 +601,7 @@ export class ProviderManager {
     const mistralKey = this.apiKeys.mistral ?? env.MISTRAL_API_KEY
     if (mistralKey && this.validateApiKey(mistralKey, 'Mistral')) {
       const mistral = createMistral({
+        headers: batshitProviderHeaders(),
         apiKey: mistralKey
       })
       this.providers.set('mistral', {
@@ -585,6 +629,7 @@ export class ProviderManager {
     const groqKey = this.apiKeys.groq ?? env.GROQ_API_KEY
     if (groqKey && this.validateApiKey(groqKey, 'Groq')) {
       const groq = createGroq({
+        headers: batshitProviderHeaders(),
         apiKey: groqKey
       })
       this.providers.set('groq', {
@@ -611,6 +656,7 @@ export class ProviderManager {
     const deepseekKey = this.apiKeys.deepseek ?? env.DEEPSEEK_API_KEY
     if (deepseekKey && this.validateApiKey(deepseekKey, 'DeepSeek')) {
       const deepseek = createDeepSeek({
+        headers: batshitProviderHeaders(),
         apiKey: deepseekKey,
         baseURL: env.DEEPSEEK_API_BASE_URL || undefined
       })
@@ -640,6 +686,7 @@ export class ProviderManager {
     const xaiKey = this.apiKeys.xai ?? env.XAI_API_KEY
     if (xaiKey && this.validateApiKey(xaiKey, 'xAI')) {
       const xai = createXai({
+        headers: batshitProviderHeaders(),
         apiKey: xaiKey,
         baseURL: env.XAI_API_BASE_URL || undefined
       })
@@ -765,6 +812,7 @@ export class ProviderManager {
     const qwenCloudKey = this.apiKeys.qwencloud ?? env.DASHSCOPE_API_KEY
     if (qwenCloudKey && this.validateApiKey(qwenCloudKey, 'Qwen Cloud')) {
       const qwenCloud = createAlibaba({
+        headers: batshitProviderHeaders(),
         apiKey: qwenCloudKey,
         baseURL:
           env.DASHSCOPE_API_BASE_URL ||
@@ -792,6 +840,7 @@ export class ProviderManager {
     const qwenTokenPlanKey = this.apiKeys.qwen_token_plan ?? env.QWEN_TOKEN_PLAN_API_KEY
     if (qwenTokenPlanKey && this.validateApiKey(qwenTokenPlanKey, 'Qwen Token Plan')) {
       const qwenTokenPlan = createAlibaba({
+        headers: batshitProviderHeaders(),
         apiKey: qwenTokenPlanKey,
         baseURL: env.QWEN_TOKEN_PLAN_API_BASE_URL || QWEN_TOKEN_PLAN_OPENAI_BASE_URL
       })
@@ -828,6 +877,7 @@ export class ProviderManager {
     const openRouterKey = this.apiKeys.openrouter ?? env.OPENROUTER_API_KEY
     if (openRouterKey && this.validateApiKey(openRouterKey, 'OpenRouter')) {
       const openrouter = createOpenRouter({
+        headers: batshitProviderHeaders(),
         apiKey: openRouterKey,
         baseURL: env.OPENROUTER_API_BASE_URL || undefined,
         appName: env.OPENROUTER_APP_NAME || 'Batshit',
@@ -857,6 +907,7 @@ export class ProviderManager {
     const deepInfraKey = this.apiKeys.deepinfra ?? env.DEEPINFRA_API_KEY
     if (deepInfraKey && this.validateApiKey(deepInfraKey, 'DeepInfra')) {
       const deepInfra = createDeepInfra({
+        headers: batshitProviderHeaders(),
         apiKey: deepInfraKey,
         baseURL: normalizeDeepInfraBaseURL(env.DEEPINFRA_API_BASE_URL)
       })
@@ -883,6 +934,7 @@ export class ProviderManager {
     const togetherKey = this.apiKeys.togetherai ?? env.TOGETHER_API_KEY
     if (togetherKey && this.validateApiKey(togetherKey, 'Together.ai')) {
       const together = createTogetherAI({
+        headers: batshitProviderHeaders(),
         apiKey: togetherKey,
         baseURL: env.TOGETHER_API_BASE_URL || undefined
       })
@@ -905,6 +957,7 @@ export class ProviderManager {
     const fireworksKey = this.apiKeys.fireworks ?? env.FIREWORKS_API_KEY
     if (fireworksKey && this.validateApiKey(fireworksKey, 'Fireworks AI')) {
       const fireworks = createFireworks({
+        headers: batshitProviderHeaders(),
         apiKey: fireworksKey,
         baseURL: env.FIREWORKS_API_BASE_URL || undefined
       })
@@ -927,6 +980,7 @@ export class ProviderManager {
     const basetenKey = this.apiKeys.baseten ?? env.BASETEN_API_KEY
     if (basetenKey && this.validateApiKey(basetenKey, 'Baseten')) {
       const baseten = createBaseten({
+        headers: batshitProviderHeaders(),
         apiKey: basetenKey,
         baseURL: env.BASETEN_API_BASE_URL || undefined
       })
@@ -949,6 +1003,7 @@ export class ProviderManager {
     const cerebrasKey = this.apiKeys.cerebras ?? env.CEREBRAS_API_KEY
     if (cerebrasKey && this.validateApiKey(cerebrasKey, 'Cerebras')) {
       const cerebras = createCerebras({
+        headers: batshitProviderHeaders(),
         apiKey: cerebrasKey,
         baseURL: env.CEREBRAS_API_BASE_URL || undefined
       })
@@ -973,6 +1028,7 @@ export class ProviderManager {
     const cohereKey = this.apiKeys.cohere ?? env.COHERE_API_KEY
     if (cohereKey && this.validateApiKey(cohereKey, 'Cohere')) {
       const cohere = createCohere({
+        headers: batshitProviderHeaders(),
         apiKey: cohereKey,
         baseURL: env.COHERE_API_BASE_URL || undefined
       })
@@ -1036,6 +1092,7 @@ export class ProviderManager {
 
     try {
       this.gatewayClient = createGateway({
+        headers: batshitProviderHeaders(),
         apiKey: gatewayKey,
         baseURL: this.gatewayConfig.baseURL ?? env.AI_GATEWAY_BASE_URL ?? undefined
       })
@@ -1086,6 +1143,11 @@ export class ProviderManager {
    * Implements smart fallback chain with loop prevention
    */
   getModel(modelName: string, options?: GetModelOptions): LanguageModel {
+    // Host plan authority is a live server lease, never a provider key or a
+    // broadly reusable client. Hidden consumers cannot borrow it or fall back.
+    if (options?.service === 'chatgpt-plan' || options?.service?.startsWith('chatgpt-plan:')) {
+      throw new Error('This feature cannot use ChatGPT plan credentials. Use a separate API-compatible connection.')
+    }
     const cacheKey = this.buildCacheKey(modelName, options)
 
     if (this.modelCache.has(cacheKey)) {
@@ -1097,6 +1159,9 @@ export class ProviderManager {
       this.modelCache.set(cacheKey, modelInstance)
       return modelInstance
     } catch (error) {
+      // A paused plan fails with its sentence: no silent switch to another
+      // connection, not even a configured fallback.
+      if (error instanceof PausedPlanError) throw error
       const fallback = options?.fallbackModel
       if (fallback?.modelName) {
         const isSameModel =
@@ -1130,21 +1195,26 @@ export class ProviderManager {
       return this.gatewayClient(modelName)
     }
 
-    if (this.providers.size === 0) {
-      throw new Error('No available provider')
-    }
-
     const parsed = this.parseModelName(modelName)
     const providerFromName = parsed?.[0]
     const parsedModel = parsed?.[1] ?? modelName
     const providerKey = options?.service ?? (transport === 'openrouter' ? 'openrouter' : providerFromName)
 
+    // A user with only local programs has no other provider, so this comes before "No available
+    // provider" as well as before "not configured" (BL-977).
+    const unreadableLocal = this.unreadableLocalProviderError(providerKey)
+    if (this.providers.size === 0) {
+      throw unreadableLocal ?? new Error('No available provider')
+    }
+
     if (!providerKey) {
       throw new Error(`Unable to resolve provider for model ${modelName}`)
     }
 
+    assertPlanNotPaused(providerKey, this.pausedPlansAllowed)
+
     if (!this.providers.has(providerKey)) {
-      throw new Error(`Provider ${providerKey} not configured`)
+      throw unreadableLocal ?? new Error(`Provider ${providerKey} not configured`)
     }
 
     const providerConfig = this.providers.get(providerKey)!
@@ -1174,6 +1244,18 @@ export class ProviderManager {
     return providerConfig.client(resolvedModelName)
   }
 
+  /**
+   * BL-977: the error for a request that names a local program while the saved Local AI servers could
+   * not be read (there is then no registered local program, and "not configured" would be false).
+   * Null for anything else.
+   */
+  private unreadableLocalProviderError(providerKey: string | null | undefined): Error | null {
+    if (!this.localProvidersUnreadable || !providerKey) return null
+    if (!LOCAL_AI_SERVER_IDS.has(providerKey as LocalAiServerId)) return null
+    const label = LOCAL_AI_SERVER_DEFINITIONS.find((definition) => definition.id === providerKey)?.label ?? providerKey
+    return new Error(`${label} is not available: the saved Local AI servers could not be read. Try again.`)
+  }
+
   private buildCacheKey(modelName: string, options?: GetModelOptions) {
     const transport = options?.transport ?? (this.gatewayClient ? 'vercel-gateway' : 'direct')
     const service = options?.service ?? ''
@@ -1197,7 +1279,8 @@ export class ProviderManager {
       }
       
       attemptedProviders.add(fallbackProvider)
-      
+      if (!this.pausedPlansAllowed && findPausedPlan(fallbackProvider)) continue
+
       const provider = this.providers.get(fallbackProvider)
       if (!provider || provider.models.length === 0) {
         continue
@@ -1265,7 +1348,7 @@ export class ProviderManager {
    */
   private getDefaultModel(provider: string): string {
     const defaults: Record<string, string> = {
-      anthropic: 'claude-3-5-sonnet-20241022',
+      anthropic: 'claude-sonnet-4-5',
       openai: 'gpt-4.1',  // Use gpt-4.1 as default
       google: 'gemini-2.5-pro',
       mistral: 'mistral-large-latest',
@@ -1331,10 +1414,7 @@ export class ProviderManager {
   private getDisplayName(provider: string, model: string): string {
     const displayNames: Record<string, string> = {
       // Anthropic
-      'claude-sonnet-4-5-latest': 'Claude Sonnet 4 Latest',
-      'claude-3-5-sonnet-20241022': 'Claude 3.5 Sonnet',
-      'claude-3-5-haiku-20241022': 'Claude 3.5 Haiku',
-      'claude-3-opus-20240229': 'Claude 3 Opus',
+      'claude-sonnet-4-5': 'Claude Sonnet 4.5',
       
       // OpenAI
       'gpt-4.1': 'GPT-4.1',

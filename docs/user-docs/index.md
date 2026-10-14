@@ -2,7 +2,7 @@
 
 Welcome. These are the launch-facing user docs for Batshit.
 
-Batshit is an alpha self-hosted AI workspace for people who want n8n orchestration, direct AI agents, CLI-powered agents, tools, artifacts, voice, local runtimes, and project-aware work in one place. It's powerful, broad, and still early. These docs are written to save you setup time and to be honest when a feature needs careful configuration.
+Batshit is an alpha self-hosted AI workspace for people who want `API` and `CLI` agents, tools, artifacts, voice, local AI (Ollama, LM Studio, oMLX, and more), and project-aware work in one place, with n8n workflows as tools when you want them. It's powerful, broad, and still early. These docs are written to save you setup time and to be honest when a feature needs careful configuration.
 
 ## Watch first
 
@@ -53,13 +53,13 @@ You don't need every feature on day one. A good first setup is:
 
 ## Download, videos, and community
 
-- [Download Batshit for Mac](https://github.com/SirBadfish/batshit/releases/download/v0.1.0-alpha.1/Batshit-0.1.0-macos-ReleaseSafe.dmg)
+- [Download Batshit for Mac](https://github.com/SirBadfish/batshit/releases/latest)
 - [Install with Docker](installation/install-docker.md)
 - [Watch the informal alpha walkthrough playlist](https://www.youtube.com/watch?v=hS3NfNPgW70&list=PLeodpgBXojRy4Ssreao79TIX7PylhiI1D)
 - [Batshit on GitHub](https://github.com/SirBadfish/batshit)
 - [Batshit on X](https://x.com/batshit_ai)
 - [Batshit YouTube channel](https://www.youtube.com/@batshit-ai/)
-- [Join the Discord](https://discord.gg/3saVHX5xn)
+- [Join the Discord](https://discord.gg/8cgK2qaN2c)
 
 The alpha videos are informal and aimed at AI enthusiasts, builders, and people who have used tools like Codex before.
 
@@ -98,7 +98,7 @@ These docs are grouped by subject — everything about a feature lives in one pl
 **Runtimes and operations**
 
 - [Local AI](local-ai/overview.md) — Ollama, LM Studio, oMLX, and the other programs that run models on your own hardware.
-- [Jev Juice](jev-juice/overview.md) — optional cloud judgments from TypeSafe's Jev model, off by default, with every call shown in the Execution Viewer.
+- [Judge Juice](judge-juice/overview.md) — optional cloud judgments from TypeSafe's Jev model, off by default, with every call shown in the Execution Viewer.
 - [Chat](chat/execution-viewer.md) — the chat workspace, including the Execution Viewer.
 - [Admin](admin/backup-and-restore.md) — backup and restore.
 - [Resources](resources/n8n-workflow-templates.md) — n8n workflow templates and downloads.

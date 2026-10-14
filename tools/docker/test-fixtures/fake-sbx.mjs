@@ -29,6 +29,16 @@ if (!STATE) {
   process.stderr.write('fake sbx: FAKE_SBX_STATE is not set\n')
   process.exit(2)
 }
+if (process.env.FAKE_SBX_ASSERT_NO_AUTHORITY === '1' && [
+  'BATSHIT_RUNTIME_ADDON_OPERATOR_TOKEN',
+  'BATSHIT_DOCKER_SANDBOX_OPERATOR_TOKEN',
+  'BATSHIT_HOST_VOICE_RECIPE_SIGNING_KEY',
+  'BATSHIT_HOST_VOICE_RECIPE_KEY_FILE',
+  'BATSHIT_TOKEN'
+].some((name) => process.env[name])) {
+  process.stderr.write('fake sbx inherited host operator authority\n')
+  process.exit(2)
+}
 const SANDBOXES = path.join(STATE, 'sandboxes')
 const CLAIMS = path.join(STATE, 'claims')
 const INSIDE = path.join(STATE, 'inside')

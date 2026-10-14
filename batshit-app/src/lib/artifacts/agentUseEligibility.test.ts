@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  hasNoBatshitCompletionRuntime,
   isArtifactAgentUseEligible,
   resolveArtifactAgentUseEligibility,
   USER_ONLY_COMFYUI_AGENT_USE_MESSAGE,
@@ -61,5 +62,19 @@ describe('artifact agent use eligibility', () => {
         metadata: { source_type: 'comfyui' }
       })
     ).toBe(true)
+  })
+})
+
+describe('which artifacts Batshit can run (BL-89 review)', () => {
+  // Mirrors `/api/artifacts/complete`: brain_type || (webhook_url ? 'webhook' : ai_enabled === false ? 'none' : 'built_in').
+  it.each([
+    ['brain_type none', { brain_type: 'none' }, true],
+    ['brain_type none, even with a webhook URL', { brain_type: 'none', webhook_url: 'https://n8n.example/webhook/a' }, true],
+    ['a legacy record with AI off', { ai_enabled: false }, true],
+    ['a legacy record with AI off and a webhook URL', { ai_enabled: false, webhook_url: 'https://n8n.example/webhook/a' }, false],
+    ['built-in AI', { brain_type: 'built_in' }, false],
+    ['a legacy record with nothing set', {}, false]
+  ])('%s', (_label, artifact, noRuntime) => {
+    expect(hasNoBatshitCompletionRuntime(artifact)).toBe(noRuntime)
   })
 })

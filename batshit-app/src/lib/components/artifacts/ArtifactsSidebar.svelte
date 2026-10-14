@@ -34,6 +34,7 @@
     resolveArtifactPowerSource,
     type ArtifactPowerSource
   } from '$lib/artifacts/artifactPowerSource'
+  import { artifactService, type ArtifactRow } from '$lib/services/artifactService'
   
   // Panel constraints
   const MIN_WIDTH = 480
@@ -325,18 +326,8 @@
         mode: targetMode
       }
 
-      const response = await fetch(`/api/artifacts/${currentArtifact.id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      })
-
-      if (!response.ok) {
-        const message = await response.text()
-        throw new Error(message || 'Failed to save artifact')
-      }
-
-      const updated = await response.json()
+      // Through the service, so a refused save shows the server's own sentence (BL-89).
+      const updated = await artifactService.updateArtifact(currentArtifact.id, payload as Partial<ArtifactRow>)
       replaceArtifact(updated)
       pendingMetadata = updated.metadata || pendingMetadata
       versionNote = ''
@@ -354,16 +345,8 @@
   async function rollbackVersion(targetVersion: number) {
     if (!currentArtifact) return
     try {
-      const response = await fetch('/api/artifacts/versions', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ artifactId: currentArtifact.id, targetVersion })
-      })
-
-      if (!response.ok) {
-        const message = await response.text()
-        throw new Error(message || 'Failed to restore version')
-      }
+      // The server re-checks a restored version like any save; a refusal says why (BL-89).
+      await artifactService.restoreVersion(currentArtifact.id, targetVersion)
 
       // Refresh current artifact from API to keep versions accurate
       const refreshed = await fetch(`/api/artifacts/${currentArtifact.id}`)
@@ -529,13 +512,10 @@
 	        // SA-042: Persist fabric fields reported by artifact iframe
         const fabricFields = event.data.fabricFields
         if (Array.isArray(fabricFields) && fabricFields.length > 0 && event.data.artifactId) {
-          fetch(`/api/artifacts/${event.data.artifactId}`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              metadata: { fabric_fields: fabricFields }
-            })
-          }).catch(err => console.warn('Failed to persist fabric fields:', err))
+          // Through the service: a raw fetch resolves on a 4xx, so a refused save was silent.
+          artifactService
+            .updateArtifact(event.data.artifactId, { metadata: { fabric_fields: fabricFields } } as Partial<ArtifactRow>)
+            .catch((err) => console.warn('Failed to persist fabric fields:', err instanceof Error ? err.message : err))
         }
       }
       

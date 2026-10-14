@@ -10,6 +10,12 @@ vi.mock('$lib/server/redis', () => ({
   }
 }))
 
+// BL-544: the whole-record write is one Lua step on real Redis (`command-update-keeps-access.test.ts`);
+// here it answers the record it was given, as the real write does when nothing changed meanwhile.
+vi.mock('$lib/server/services/agentAccessLists', () => ({
+  writeSlashCommandRecord: vi.fn(async (_key: string, record: unknown) => record)
+}))
+
 vi.mock('$lib/server/services/skillRegistry', () => ({
   deleteSkillIfOrphaned: vi.fn(),
   getSkill: vi.fn(),
@@ -20,6 +26,7 @@ vi.mock('$lib/server/services/skillRegistry', () => ({
 import { PUT } from './+server'
 import { redis } from '$lib/server/redis'
 import { getSkill, upsertSkill } from '$lib/server/services/skillRegistry'
+import { writeSlashCommandRecord } from '$lib/server/services/agentAccessLists'
 
 const baseCommand = {
   id: 'cmd-prompt',
@@ -74,7 +81,7 @@ describe('PUT /api/slash-commands/[id]', () => {
     expect(response.status).toBe(400)
     const payload = await response.json()
     expect(payload.error).toContain('cannot be changed')
-    expect(redis.json.set).not.toHaveBeenCalled()
+    expect(writeSlashCommandRecord).not.toHaveBeenCalled()
   })
 
   it('allows updating existing command fields when type is unchanged', async () => {
@@ -84,7 +91,7 @@ describe('PUT /api/slash-commands/[id]', () => {
     const payload = await response.json()
     expect(payload.slashCommand.type).toBe('prompt')
     expect(payload.slashCommand.name).toBe('helper-updated')
-    expect(redis.json.set).toHaveBeenCalledTimes(1)
+    expect(writeSlashCommandRecord).toHaveBeenCalledTimes(1)
   })
 
   it('blocks built-in skills from editing repo-backed fields', async () => {
@@ -99,7 +106,7 @@ describe('PUT /api/slash-commands/[id]', () => {
     const payload = await response.json()
     expect(payload.error).toContain('status and access settings')
     expect(payload.error).toContain('name')
-    expect(redis.json.set).not.toHaveBeenCalled()
+    expect(writeSlashCommandRecord).not.toHaveBeenCalled()
   })
 
   it('allows built-in skills to update status and access fields', async () => {
@@ -130,7 +137,7 @@ describe('PUT /api/slash-commands/[id]', () => {
     expect(payload.slashCommand.enabled_for_all_agents).toBe(true)
     expect(payload.slashCommand.can_be_attached_to_agents).toBe(true)
     expect(payload.slashCommand.is_system).toBe(true)
-    expect(redis.json.set).toHaveBeenCalledTimes(1)
+    expect(writeSlashCommandRecord).toHaveBeenCalledTimes(1)
   })
 
   it('allows built-in skills to change trust level only', async () => {
@@ -183,6 +190,43 @@ describe('PUT /api/slash-commands/[id]', () => {
     expect(upsertSkill).toHaveBeenCalledTimes(1)
   })
 
+  it("says a skill's files are missing instead of a generic 500 (BL-369 review 5)", async () => {
+    const skillCommand = {
+      ...baseCommand,
+      id: 'zc-notes',
+      name: 'zc-notes',
+      type: 'skill',
+      skill_id: 'zc_notes',
+      invocation_pattern: '/zc-notes'
+    }
+    const missing = () =>
+      Object.assign(new Error('The files for skill "zc_notes" are missing from /tmp/zc/skills/zc_notes.'), {
+        code: 'SKILL_FILES_MISSING'
+      })
+    const cases = [
+      // A built-in command's trust level: the route reads the skill first.
+      { command: { ...skillCommand, is_system: true }, body: { skill: { trustLevel: 'untrusted' } }, fail: 'getSkill' },
+      // Pointing a command at a skill by id reads that skill.
+      { command: skillCommand, body: { skill_id: 'zc_notes' }, fail: 'getSkill' },
+      // Saving a user skill's settings without its text is refused by the registry.
+      { command: skillCommand, body: { skill: { trustLevel: 'untrusted' } }, fail: 'upsertSkill' }
+    ] as const
+    for (const testCase of cases) {
+      vi.clearAllMocks()
+      vi.mocked(redis.json.get).mockResolvedValue(testCase.command as any)
+      if (testCase.fail === 'getSkill') vi.mocked(getSkill).mockRejectedValue(missing())
+      else vi.mocked(upsertSkill).mockRejectedValue(missing())
+
+      const response = await PUT(buildEvent(testCase.body))
+
+      expect(response.status, JSON.stringify(testCase.body)).toBe(409)
+      const payload = await response.json()
+      expect(payload).toMatchObject({ code: 'SKILL_FILES_MISSING' })
+      expect(payload.error).toContain('are missing from /tmp/zc/skills/zc_notes')
+      expect(writeSlashCommandRecord).not.toHaveBeenCalled()
+    }
+  })
+
   it('blocks built-in skills from editing repo-backed identity fields', async () => {
     vi.mocked(redis.json.get).mockResolvedValue({
       ...baseCommand,
@@ -201,14 +245,31 @@ describe('PUT /api/slash-commands/[id]', () => {
     const payload = await response.json()
     expect(payload.error).toContain('status and access settings')
     expect(payload.error).toContain('displayName')
-    expect(redis.json.set).not.toHaveBeenCalled()
+    expect(writeSlashCommandRecord).not.toHaveBeenCalled()
+  })
+
+  it('keeps the stored per-agent list unless the save sends one (BL-544)', async () => {
+    await PUT(buildEvent({ name: 'helper-updated' }))
+    expect(vi.mocked(writeSlashCommandRecord).mock.calls[0][2]).toEqual({ keepAgentAccess: true })
+
+    vi.mocked(writeSlashCommandRecord).mockClear()
+    await PUT(buildEvent({ enabled_agent_ids: ['agent-a'] }))
+    expect(vi.mocked(writeSlashCommandRecord).mock.calls[0][2]).toEqual({ keepAgentAccess: false })
+  })
+
+  it('answers 404 when the command was deleted while the save ran (BL-544)', async () => {
+    vi.mocked(writeSlashCommandRecord).mockResolvedValueOnce(null)
+
+    const response = await PUT(buildEvent({ name: 'helper-updated' }))
+
+    expect(response.status).toBe(404)
   })
 
   it('stores the all-agents flag and marks the command attachable', async () => {
     const response = await PUT(buildEvent({ enabled_for_all_agents: true, enabled_agent_ids: [] }))
 
     expect(response.status).toBe(200)
-    expect(redis.json.set).toHaveBeenCalledTimes(1)
+    expect(writeSlashCommandRecord).toHaveBeenCalledTimes(1)
 
     const payload = await response.json()
     expect(payload.slashCommand.enabled_for_all_agents).toBe(true)

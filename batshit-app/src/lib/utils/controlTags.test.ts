@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import * as registry from './controlTags'
 
 import {
   CONTROL_TAGS,
@@ -7,10 +8,9 @@ import {
   buildControlErrorRecord,
   controlTag,
   controlTagByName,
+  findControlBlocks,
   realtimeHiddenTagNames,
   realtimeHiddenTagOpenPrefixes,
-  renderHiddenOpenRegex,
-  splitTrailingPartialControlPrefix,
   ttsHiddenTagNames
 } from './controlTags'
 
@@ -43,7 +43,7 @@ describe('control tag registry', () => {
   it('derives render, tts, and realtime tag lists from one registration', () => {
     for (const spec of CONTROL_TAGS) {
       if (spec.hideFromRender) {
-        expect(renderHiddenOpenRegex().test(`<${spec.tag}>`)).toBe(true)
+        expect(findControlBlocks(`<${spec.tag}>{}</${spec.tag}>`, { final: true })).toHaveLength(1)
       }
       if (spec.hideFromTts) {
         expect(ttsHiddenTagNames()).toContain(spec.tag)
@@ -53,48 +53,49 @@ describe('control tag registry', () => {
     }
   })
 
+  it('offers no plain-search helper any more: every reader uses the one scanner (BL-442)', () => {
+    for (const retired of [
+      'pairedBlockRegexGlobal',
+      'unclosedTailRegexGlobal',
+      'renderHiddenOpenRegex',
+      'closeTagRegex',
+      'splitTrailingPartialControlPrefix',
+      'EMOTE_TAG_REGEX_SOURCE',
+      'INCOMPLETE_EMOTE_TAG_REGEX_SOURCE'
+    ]) {
+      expect(Object.keys(registry)).not.toContain(retired)
+    }
+    expect(typeof registry.findControlBlocks).toBe('function')
+  })
+
   it('keeps the plain tool-results spellings in the realtime hold-back set', () => {
     expect(realtimeHiddenTagNames()).toContain('tool-results-summary')
     expect(realtimeHiddenTagNames()).toContain('tool_results')
   })
 })
 
-describe('splitTrailingPartialControlPrefix', () => {
-  it('holds back a trailing partial control-tag prefix', () => {
-    const result = splitTrailingPartialControlPrefix('Hello there <batshit-cu')
-    expect(result.visible).toBe('Hello there ')
-    expect(result.heldPrefix).toBe('<batshit-cu')
-  })
+describe('a streaming reply holds a start that can still become a tag (R4; was splitTrailingPartialControlPrefix)', () => {
+  const held = (text: string) =>
+    findControlBlocks(text, { final: false })
+      .filter((block) => block.kind === 'held-start')
+      .map((block) => text.slice(block.start))
 
-  it('holds back a partial prefix of the memory save tag (chunk-split safety)', () => {
-    const { visible, heldPrefix } = splitTrailingPartialControlPrefix('Saved that. <batshit-mem')
-    expect(visible).toBe('Saved that. ')
-    expect(heldPrefix).toBe('<batshit-mem')
-  })
-
-  it('holds back a partial prefix of the tool-notes tag', () => {
-    const result = splitTrailingPartialControlPrefix('Saving notes now <batshit-tool-no')
-    expect(result.visible).toBe('Saving notes now ')
-    expect(result.heldPrefix).toBe('<batshit-tool-no')
+  it('holds back a trailing partial control-tag prefix, of every tag', () => {
+    expect(held('Hello there <batshit-cu')).toEqual(['<batshit-cu'])
+    expect(held('Saved that. <batshit-mem')).toEqual(['<batshit-mem'])
+    expect(held('Saving notes now <batshit-tool-no')).toEqual(['<batshit-tool-no'])
   })
 
   it('holds back a complete open tag name that has not seen its ">" yet', () => {
-    const result = splitTrailingPartialControlPrefix('Text <batshit-zip-control ')
-    expect(result.visible).toBe('Text ')
-    expect(result.heldPrefix).toBe('<batshit-zip-control ')
+    expect(held('Text <batshit-zip-control ')).toEqual(['<batshit-zip-control '])
   })
 
   it('does not hold ordinary angle-bracket text', () => {
-    const result = splitTrailingPartialControlPrefix('a < b and 3 <marquee')
-    expect(result.visible).toBe('a < b and 3 <marquee')
-    expect(result.heldPrefix).toBe('')
+    expect(held('a < b and 3 <marquee')).toEqual([])
   })
 
   it('does not hold completed tags', () => {
-    const content = 'Before <batshit-cue>{"mood":"happy"}</batshit-cue>'
-    const result = splitTrailingPartialControlPrefix(content)
-    expect(result.visible).toBe(content)
-    expect(result.heldPrefix).toBe('')
+    expect(held('Before <batshit-cue>{"mood":"happy"}</batshit-cue>')).toEqual([])
   })
 })
 

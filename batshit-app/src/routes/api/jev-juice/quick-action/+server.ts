@@ -76,7 +76,7 @@ export const POST: RequestHandler = async ({ locals, request }) => {
           }
         })
       } catch (error) {
-        console.error('[Jev Juice] quick action: failed to record the Execution Viewer entry:', error)
+        console.error('[Judge Juice] quick action: failed to record the Execution Viewer entry:', error)
         snapshotId = null
       }
     }
@@ -92,7 +92,7 @@ export const POST: RequestHandler = async ({ locals, request }) => {
       feature: QUICK_ACTION_FEATURE_ID
     })
   } catch (error) {
-    console.error('[Jev Juice] quick action check failed:', error)
+    console.error('[Judge Juice] quick action check failed:', error)
     // A failed check must never block a spoken turn: the browser sends it as usual.
     return json({ action: null, tab: null, onlyThis: false, confidence: 0, skipped: 'local_error', snapshotId: null })
   }

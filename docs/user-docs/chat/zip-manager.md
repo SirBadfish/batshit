@@ -10,21 +10,25 @@ When Batshit zips a piece of output — a long log, a big tool result, a generat
 
 The badge tells you the Zip's state at a glance:
 
-- A **clock with a number** means the item is temporarily unzipped, and the number is how many messages remain before normal behavior resumes.
-- A **hand** means you changed this Zip's state by hand.
-- The **agent-control marker** means an agent changed it (using zip-control permission, if you granted that).
-- A **lightning bolt** means [Jev Juice](../jev-juice/overview.md) opened it for a message, if you turned on **Jev Juice: Smart Zip**. It always comes with a short countdown, and it's never a lock: your own choice, or the agent's, replaces it. A result Jev Juice zipped after a reply says so when you hover its badge.
-- An **infinity icon** means it's being kept unzipped indefinitely.
-- A plain zipped item shows only the zipped state, with no extra icon.
+- A **clock with a number** means the item is held for a few messages (or the buffer is about to let it go), and the number is how many messages remain before normal behavior resumes.
+- A **hand** means you hold it, or changed it by hand.
+- The **agent marker** means an agent holds it: a file the agent read and chose to keep open. Hover the badge to see which agent, such as "Held by Scout".
+- A **lightning bolt** means [Judge Juice](../judge-juice/overview.md) holds it open for a message or two, if you turned on **Judge Juice: Smart Zip**; hovering says "Held by the judge (2 messages left)". It always comes with a short countdown, and it's never a lock: your own choice, or the agent's, replaces it. A result Judge Juice zipped after a reply says "Compressed by the judge" when you hover its badge.
+- An **infinity icon** means it's held until someone releases it.
+- A compressed item shows only the compressed state, with no extra icon. Hovering says "Compressed", or who zipped it ("Compressed: you zipped it"). An old copy of a file that the agent read again, or edited since, is compressed whatever its buffer says; hovering its badge tells you why ("Compressed: superseded by a later read").
+
+Hover the badge to read who holds it: "Held by you", "Held by you (3 messages left)", or "Held by" and the agent's name.
 
 Hover or focus a Zip and its controls appear. Depending on the item's current state, you can:
 
-- **Unzip it for a stretch** — keep it expanded and visible to the model for the next several messages, then let it return to normal.
-- **Unzip it indefinitely** — hold it open until you decide otherwise.
-- **Zip it now** — compress it immediately to save context.
-- **Return to automatic** — drop your manual override and let normal Zip behavior take over again.
+- **Hold for 10 messages** — keep it open for the model for the next ten messages, then let it return to normal. A Cool Tool result at 25,000 tokens or more cannot be held open whole.
+- **Hold** — keep it open until you release it. You can also hold something an agent holds; it becomes yours. A Cool Tool result at 25,000 tokens or more cannot be held open whole.
+- **Zip now** — compress it immediately to save context.
+- **Release** — drop your hold (or an agent's) and let normal Zip behavior take over again. An old copy an agent still holds offers Release too, even though it is already compressed.
 
-"Unzipped" here means the *model* can see the full content again on future turns — not just that you can read it. You can always read a Zip in the chat regardless; unzipping is about what the agent carries forward.
+An agent's hold stays when you switch the chat to another agent, until you release it. Deleting an agent releases all of its holds.
+
+"Held" and "open" here mean the *model* can see the full content on future turns — not just that you can read it. You can always read a Zip in the chat regardless; holding is about what the agent carries forward.
 
 ## The Zip Manager panel
 
@@ -32,16 +36,16 @@ The badges handle one Zip at a time. The Zip Manager panel handles all of them a
 
 The panel lists the Zips in the current Session and gives you two ways to cut through them:
 
-- **Filter** by `Unzipped`, `Zipped`, or `All`, so you can focus on just the items currently expanded, just the compressed ones, or everything.
+- **Filter** by `Expanded`, `Compressed`, or `All`, so you can focus on just the items currently expanded, just the compressed ones, or everything.
 - **Sort** by chat order, by manual changes first (your overrides and any agent-approved ones float to the top), by token size (biggest first), or by newest first.
 
-Click any row and Batshit jumps to that item in the conversation and briefly highlights it — handy when you remember a result exists but not where it is in a long chat.
+Click any row and Batshit jumps to that item in the conversation and briefly highlights it — handy when you remember a result exists but not where it is in a long chat. **Zip all expanded** compresses everything currently expanded at once.
 
 ## What the badge count means
 
-The Zip Manager's badge in the Token row counts **items held open against the normal rules** — the ones you deliberately opened, any an agent opened through zip-control permission, and any Jev Juice has open for a message or two. It is *not* a count of every Zip in the chat. Think of it as "how many things am I currently holding open against the normal rules," which is exactly the number worth keeping an eye on, because held-open content is content the model keeps paying for.
+The Zip Manager's badge in the Token row counts **items held open against the normal rules** — the ones you hold, the files an agent holds, and any Judge Juice has open for a message or two. The panel's summary line shows how many items are expanded, their tokens, and how many are **held**: every hold counts, whether it lasts until released or for a few messages. It is *not* a count of every Zip in the chat. Think of it as "how many things am I currently holding open against the normal rules," which is exactly the number worth keeping an eye on, because held-open content is content the model keeps paying for.
 
-A Zip you open is treated as yours: an agent shouldn't silently re-compress something you deliberately expanded. Your manual choices sit on top of Batshit's automatic buffer and threshold behavior, and they win.
+A Zip you hold is yours: an agent can't release it, re-compress it, or hold it over you, and it sees in its own context that you hold it. Your holds sit on top of Batshit's automatic buffer and threshold behavior, and they win.
 
 ## A note on timing
 

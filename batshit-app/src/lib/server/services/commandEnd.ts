@@ -1,6 +1,6 @@
 import type { ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { registerRuntimeShutdownTask } from './runtimeShutdown'
+import { endOwnedCommand, type OwnedCommand } from './ownedCommandGroup'
 
 /**
  * How Batshit ends what a command started, on a Stop and on a timeout: ONE rule for both
@@ -17,16 +17,18 @@ import { registerRuntimeShutdownTask } from './runtimeShutdown'
  *   itself exited 28.9 s after its SIGTERM.
  *
  * The rule:
- * - On the local shell each command leads its own process group, and a Stop or timeout ends the
+ * - On the local shell a guardian leads each command group, and a Stop or timeout ends the
  *   whole group: SIGTERM, then SIGKILL `COMMAND_END_GRACE_MS` later. A tag in the environment
  *   cannot do this on a Mac, because macOS hides the environment of Apple's own programs
  *   (`sleep`, `zsh`, `bash`) from `ps`; and walking the shell's children misses a program whose
  *   parent already left, which is exactly the `npm run dev &` case.
  * - Commands used to share the app server's process group, which is how quitting Batshit ended
  *   them (the Mac supervisor stops the app server by its group). So every command group stays
- *   tracked while anything in it runs, including a program that a FINISHED command left in the
+ *   tracked through a live guardian while a group scan sees another live member, including a program that a FINISHED command left in the
  *   background (`nohup server > log 2>&1 &` keeps running until then), and the app server's
- *   SIGTERM ends them all the same way (a runtime shutdown task). A normal exit kills any left.
+ *   SIGTERM ends them all the same way (a runtime shutdown task). Parent IPC EOF does the same.
+ *   Only the guardian signals its own group. Retirement revokes its token before it exits; saved
+ *   PIDs never authorize a signal. Programs that leave this group can escape cleanup (separate escape-class follow-up).
  * - Inside a sandbox each command carries a tag in its environment (`BATSHIT_COMMAND_ID`), and a
  *   Stop or timeout runs one short command in the same sandbox that ends every process carrying
  *   the tag, and the process groups they lead: SIGTERM, then SIGKILL for whatever is left about
@@ -39,121 +41,22 @@ export const COMMAND_END_GRACE_MS = 400
 
 // --- The local shell: the command's own process group ---------------------------------------
 
-/** Signal a command's whole process group. False when nothing of it is left. */
-export function signalCommandGroup(pgid: number, signal: NodeJS.Signals): boolean {
-  try {
-    process.kill(-pgid, signal)
-    return true
-  } catch {
-    return false
-  }
-}
-
-function commandGroupRuns(pgid: number) {
-  try {
-    process.kill(-pgid, 0)
-    return true
-  } catch (error) {
-    // Its only members are ones Batshit may not signal (a setuid program): still running.
-    return (error as NodeJS.ErrnoException).code === 'EPERM'
-  }
-}
-
-/**
- * End a running command: SIGTERM now and SIGKILL `graceMs` later, to its whole process group
- * when it leads one, else to the process alone. `afterKill` runs after the SIGKILL.
- */
+/** End through the live guardian; direct-child callers retain Node's child-handle semantics. */
 export function endCommandProcess(
-  child: ChildProcess,
+  child: ChildProcess | OwnedCommand,
   options: { ownGroup: boolean; graceMs?: number; afterKill?: () => void }
 ) {
-  const signal = (name: NodeJS.Signals) => {
-    if (options.ownGroup && child.pid) signalCommandGroup(child.pid, name)
-    // A process that already exited is not signalled again (Node knows it is gone).
-    else child.kill(name)
+  if (options.ownGroup) {
+    endOwnedCommand(child)
+    // This callback only bounds output collection. No parent timer may signal a saved PGID.
+    if (options.afterKill) setTimeout(options.afterKill, COMMAND_END_GRACE_MS)
+    return
   }
-  signal('SIGTERM')
+  child.kill('SIGTERM')
   setTimeout(() => {
-    signal('SIGKILL')
+    child.kill('SIGKILL')
     options.afterKill?.()
   }, options.graceMs ?? COMMAND_END_GRACE_MS)
-}
-
-type CommandGroupRegistry = {
-  groups: Set<number>
-  pruneTimer: ReturnType<typeof setInterval> | null
-  exitHooked: boolean
-}
-
-// On `globalThis`, so a module reloaded in development shares the one list.
-type CommandGroupGlobal = typeof globalThis & { __batshitCommandGroups?: CommandGroupRegistry }
-
-// A group is forgotten soon after nothing in it runs, so its number, once free for another
-// process, is never signalled.
-const PRUNE_EVERY_MS = 30_000
-
-function registry(): CommandGroupRegistry {
-  const holder = globalThis as CommandGroupGlobal
-  holder.__batshitCommandGroups ??= { groups: new Set(), pruneTimer: null, exitHooked: false }
-  return holder.__batshitCommandGroups
-}
-
-function prune(registered: CommandGroupRegistry) {
-  for (const pgid of registered.groups) {
-    if (!commandGroupRuns(pgid)) registered.groups.delete(pgid)
-  }
-  if (registered.groups.size === 0 && registered.pruneTimer) {
-    clearInterval(registered.pruneTimer)
-    registered.pruneTimer = null
-  }
-}
-
-/** Remember a command's process group until nothing in it runs, so quitting Batshit ends it. */
-export function trackCommandGroup(pgid: number) {
-  const registered = registry()
-  prune(registered)
-  registered.groups.add(pgid)
-  // Set on every call (it replaces itself): the task list lives in its own module, which a
-  // development reload may start afresh.
-  registerRuntimeShutdownTask('command-groups', async () => {
-    await endLiveCommandGroups()
-  })
-  if (!registered.pruneTimer) {
-    registered.pruneTimer = setInterval(() => prune(registered), PRUNE_EVERY_MS)
-    registered.pruneTimer.unref?.()
-  }
-  if (!registered.exitHooked) {
-    registered.exitHooked = true
-    process.on('exit', () => {
-      for (const group of registered.groups) signalCommandGroup(group, 'SIGKILL')
-    })
-  }
-}
-
-/** The command groups that still have something running. */
-export function liveCommandGroups(): number[] {
-  const registered = registry()
-  prune(registered)
-  return [...registered.groups]
-}
-
-/**
- * End every live command group the way a Stop ends one. Runs on the app server's SIGTERM, which
- * is how the Mac supervisor, `docker stop`, and the launchers stop Batshit. Answers how many
- * groups it ended.
- */
-export async function endLiveCommandGroups(): Promise<number> {
-  const groups = liveCommandGroups()
-  for (const pgid of groups) signalCommandGroup(pgid, 'SIGTERM')
-  const deadline = Date.now() + COMMAND_END_GRACE_MS
-  while (Date.now() < deadline && groups.some(commandGroupRuns)) {
-    await new Promise((resolve) => setTimeout(resolve, 25))
-  }
-  for (const pgid of groups) {
-    if (commandGroupRuns(pgid)) signalCommandGroup(pgid, 'SIGKILL')
-  }
-  prune(registry())
-  return groups.length
 }
 
 // --- Inside a sandbox: a tag in the command's environment -----------------------------------

@@ -89,6 +89,51 @@ describe('POST /api/skills/runtime', () => {
     expect(payload.skill.id).toBe('speech_setup')
   })
 
+  it('forwards offset, and returns the sizes and next call of a partial read (find 1)', async () => {
+    vi.mocked(resolveNativeToolUser).mockResolvedValue({
+      userId: 'user-1',
+      auth: 'agent',
+      agentId: 'agent-1',
+      sessionId: 'session-1',
+      credentialId: 'arc_test',
+      delegated: false
+    })
+    const readMore =
+      'Showing characters 12,001 to 24,000 of 38,635. To read on, call native_skill again with skillId "speech_setup", action "read", path "references/big.md", and offset 24000.'
+    vi.mocked(executeSkillRuntimeAction).mockResolvedValue({
+      success: true,
+      action: 'read',
+      skillId: 'speech_setup',
+      skillName: 'Speech Setup',
+      path: 'references/big.md',
+      content: 'part two',
+      contentTruncated: true,
+      originalChars: 38_635,
+      returnedChars: 12_000,
+      offset: 12_000,
+      nextOffset: 24_000,
+      readMore
+    } as any)
+
+    const response = await POST(
+      buildEvent({ skillId: 'speech_setup', action: 'read', path: 'references/big.md', offset: 12_000 })
+    )
+
+    expect(response.status).toBe(200)
+    expect(executeSkillRuntimeAction).toHaveBeenCalledWith({
+      userId: 'user-1',
+      skillId: 'speech_setup',
+      actor: { kind: 'agent', agentId: 'agent-1' },
+      action: 'read',
+      path: 'references/big.md',
+      maxChars: undefined,
+      offset: 12_000
+    })
+    const payload = await response.json()
+    expect(payload.readMore).toBe(readMore)
+    expect(payload.nextOffset).toBe(24_000)
+  })
+
   describe('whose skill access applies (BL-75)', () => {
     function blockedResult(errorCode: string) {
       return {

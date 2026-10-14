@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { SessionService } from '$lib/services/sessions'
 import * as chatRunRegistry from '$lib/stores/chatRunRegistry.svelte'
+import * as sessionStore from '$lib/stores/session.svelte'
 import SessionItem from './SessionItem.svelte'
 
 const toast = vi.hoisted(() => ({
@@ -215,5 +216,90 @@ describe('SessionItem delete refusals', () => {
     })
 
     expect(shown).toBe('Failed to delete session')
+  })
+})
+
+/**
+ * BL-605: renaming a chat to an id with a glob character (`*`, `?`, `[`, `]`, `\`) is refused by
+ * the create route (BL-541), but the rename toast showed a vague generic message instead of the
+ * route's own reason. Driven through the real menu, the ID field, `SessionService`, and
+ * `apiCall`; only the network answers are made up.
+ */
+describe('SessionItem rename refusals', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+    sessionStore.setSessions([])
+    toast.success.mockClear()
+    toast.error.mockClear()
+    toast.loading.mockClear()
+    toast.dismiss.mockClear()
+  })
+
+  async function renameWhenTheServerAnswers(createAnswer: { status: number; body: unknown }) {
+    // SessionService.updateSessionId looks the session up in the shared store, not from props.
+    sessionStore.setSessions([
+      {
+        id: 'session-rename-me',
+        name: 'Rename Me',
+        archived: false,
+        locked: false,
+        metadata: {},
+        user_id: 'test-user'
+      } as unknown as sessionStore.ChatSession
+    ])
+
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = decodeURIComponent(String(input))
+        if (init?.method === 'POST' && url.endsWith('/sessions')) {
+          return new Response(JSON.stringify(createAnswer.body), { status: createAnswer.status })
+        }
+        if (url.includes('/sessions/session-rename-me*')) {
+          // The new id does not already exist.
+          return new Response(JSON.stringify({ error: 'not found' }), { status: 404 })
+        }
+        // Messages checks (menu open, and updateSessionId's own check): no messages yet.
+        return new Response('[]', { status: 200 })
+      })
+    )
+
+    render(SessionItem, {
+      props: {
+        session: {
+          id: 'session-rename-me',
+          name: 'Rename Me',
+          archived: false,
+          locked: false,
+          metadata: {}
+        },
+        isSelected: false,
+        sessionService: new SessionService()
+      }
+    })
+
+    const trigger = screen.getByRole('button', { name: 'Rename Me chat session settings' })
+    await fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' })
+    await waitFor(() => screen.getByPlaceholderText('Edit Session ID'))
+
+    const idInput = screen.getByPlaceholderText('Edit Session ID')
+    await fireEvent.input(idInput, { target: { value: 'session-rename-me*' } })
+    await fireEvent.click(screen.getByRole('button', { name: 'Save session ID for Rename Me' }))
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledTimes(1))
+    return String(toast.error.mock.calls[0][0])
+  }
+
+  it('shows the create route’s own refusal reason, not a vague generic message', async () => {
+    const sentence = 'Session ID must be a non-empty string without ":", or the characters * ? [ ] \\.'
+
+    const shown = await renameWhenTheServerAnswers({
+      status: 400,
+      body: { error: sentence }
+    })
+
+    expect(shown).toBe(sentence)
   })
 })

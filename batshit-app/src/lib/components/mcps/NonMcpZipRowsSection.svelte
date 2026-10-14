@@ -225,6 +225,7 @@
     'On this grid, Discoverable and Display Detail control the family itself, while the ' +
     'Zip Buffer, Zip Threshold, and Zip Behavior columns only control how the results of ' +
     'a search get compressed in the conversation.'
+  const ZIP_OFF_HELP = "Off keeps this tool's results open. The size guard still applies: a result over 25,000 tokens is never sent whole."
 
   function resolveRowInfoParagraphs(
     rowId: SharedNonMcpToolGridRowId,
@@ -361,7 +362,7 @@
         <Select.Item value="off" label="Off">
           <span class="flex items-center gap-2">
             <Infinity class={`h-3.5 w-3.5 shrink-0 ${iconToneClass(false)}`} />
-            <span>Off</span>
+            <span title={ZIP_OFF_HELP}>Off</span>
           </span>
         </Select.Item>
       </Select.Content>

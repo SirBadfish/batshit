@@ -1,5 +1,5 @@
 /**
- * SA-120 P1 — the context the canonical compiler hands a Jev Juice hint provider.
+ * SA-120 P1 — the context the canonical compiler hands a Judge Juice hint provider.
  *
  * The compiler stays deterministic: it computes the agent's enabled skills and the
  * discoverable typed refs exactly as it always has, then calls the provider the route
@@ -7,7 +7,7 @@
  * and appends whatever lines come back at the very end of the DCM — the cache-free tail.
  * No provider, no lines, byte-identical output.
  *
- * SA-120 P5 adds a third route-owned seam, `JevJuiceSmartZipProvider`, for the one Jev Juice
+ * SA-120 P5 adds a third route-owned seam, `JevJuiceSmartZipProvider`, for the one Judge Juice
  * effect that must land INSIDE the compiled history rather than at the tail: Batshit opening
  * a zipped tool result for this very message. The compiler compiles history once, tells the
  * provider exactly which zips it left compressed, and expands the ones the provider returns

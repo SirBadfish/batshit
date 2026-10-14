@@ -59,10 +59,20 @@ function hasUnclosedSingleEmphasis(text: string, marker: '*' | '_'): boolean {
   return open
 }
 
+/**
+ * What the text after a last `<` looks like while a real tag is still being written (R5): a name,
+ * then attributes as HTML writes them. Words after a name ("<batshit-memory tag and it's saved")
+ * are not a tag in writing, so speech goes on.
+ */
+const TAG_STILL_BEING_WRITTEN =
+  /^<\/?(?:[A-Za-z][A-Za-z0-9:_-]*(?:\s+[A-Za-z_:][A-Za-z0-9_:.-]*(?:\s*=\s*(?:"[^"<>]*"?|'[^'<>]*'?|[^\s"'=<>`]*))?)*\s*\/?)?$/
+
 function hasUnstableSpeechMarkup(text: string, options?: SpeakableTextOptions): boolean {
   const lastOpenTag = text.lastIndexOf('<')
   const lastCloseTag = text.lastIndexOf('>')
-  if (lastOpenTag > lastCloseTag) return true
+  // BL-477: only a `<` that can still become a real tag waits for more text; a lone `<` in a
+  // sentence ("if the count is < 5") is spoken now instead of holding speech to the reply's end.
+  if (lastOpenTag > lastCloseTag && TAG_STILL_BEING_WRITTEN.test(text.slice(lastOpenTag))) return true
 
   const lastOpenZip = text.lastIndexOf('{{')
   const lastCloseZip = text.lastIndexOf('}}')

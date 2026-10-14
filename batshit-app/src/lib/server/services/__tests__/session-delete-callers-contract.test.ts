@@ -61,7 +61,7 @@ describe('who may sweep a chat', () => {
       'utf8'
     )
     expect(folderRoute).toContain(
-      '\n      deleteSessions ? { deleteSessions: true, deleteSession: deleteSessionStoppingItsTurn } : {}\n'
+      '\n        ? { deleteSessions: true, deleteSession: deleteSessionStoppingItsTurn, expectedSessionIds }\n'
     )
   })
 })

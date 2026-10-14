@@ -1,6 +1,8 @@
 import { json } from '@sveltejs/kit'
 import type { RequestHandler } from './$types'
 import { requireUser } from '$lib/server/services/routeSecurity'
+import { assertMacCustodyPathAllowed } from '$lib/server/services/macCustodyPaths'
+import path from 'node:path'
 import {
   getInternalBatshitServerApiUrl,
   getInternalBatshitServerAuthHeaders
@@ -29,6 +31,17 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       { error: `Tool "${toolName}" is not available through the file-tree proxy` },
       { status: 403 }
     )
+  }
+
+  try {
+    const params = body.params as { projectPath?: unknown } | undefined
+    const input = body.input as { filePath?: unknown; dirPath?: unknown } | undefined
+    if (typeof params?.projectPath !== 'string') return json({ error: 'A project folder is required.' }, { status: 400 })
+    assertMacCustodyPathAllowed(params.projectPath)
+    const relative = toolName === 'read_file' ? input?.filePath : input?.dirPath
+    if (typeof relative === 'string') assertMacCustodyPathAllowed(path.resolve(params.projectPath, relative))
+  } catch {
+    return json({ error: 'This folder is protected from file-tree access.' }, { status: 403 })
   }
 
   const response = await fetch(`${getInternalBatshitServerApiUrl()}/task/s`, {

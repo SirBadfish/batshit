@@ -3,21 +3,33 @@ import { redis } from '$lib/server/redis'
 import { normalizeOptionalIconRefInput } from '$lib/server/icons/iconRefInput'
 import { normalizeOptionalAvatarIconFitInput } from '$lib/server/icons/avatarIconFitInput'
 import { validateGroupAgentSettingsInput } from '$lib/types/groupChat'
+import {
+  AgentAvatarDeletionError,
+  checkBatshitServerCanDeleteAvatars,
+  deleteOwnerAvatars,
+  isAvatarOwnerId
+} from '$lib/server/services/agentAvatarDeletion'
 
+// BL-723: each of the Group's chats loses only its `metadata.group_chat`, written by path. The
+// chats are read once, before the loop; writing back each copy's whole metadata erased a Compact
+// event or any other block written since.
+//
+// BL-736: the read above is a snapshot, so a chat moved to a DIFFERENT Group in the gap between it
+// and this chat's own write must keep its new Group. The check here is only the fast skip for
+// chats the snapshot already shows in another Group; `clearGroupChatIfMatches` re-checks the LIVE
+// value and writes conditionally, closing the gap the snapshot cannot.
 async function clearDeletedGroupFromSessions(userId: string, groupId: string) {
   const sessions = await redis.getSessions(userId, true)
   const clearedSessionIds: string[] = []
 
   for (const session of sessions) {
     const metadata = session.metadata && typeof session.metadata === 'object'
-      ? { ...(session.metadata as Record<string, any>) }
+      ? (session.metadata as Record<string, any>)
       : {}
     const sessionGroupId = metadata.group_chat?.group_id
     if (sessionGroupId !== groupId) continue
 
-    delete metadata.group_chat
-    await redis.updateSession(session.id, { metadata })
-    clearedSessionIds.push(session.id)
+    if (await redis.clearGroupChatIfMatches(session.id, groupId)) clearedSessionIds.push(session.id)
   }
 
   return clearedSessionIds
@@ -100,7 +112,7 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
   }
 }
 
-// DELETE /api/groups/[id] - Delete a group
+// DELETE /api/groups/[id] - Delete a group, and its avatar pictures (BL-140, 2026-09-25).
 export const DELETE: RequestHandler = async ({ params, locals }) => {
   if (!locals.user?.id) {
     return json({ error: 'Unauthorized' }, { status: 401 })
@@ -118,6 +130,49 @@ export const DELETE: RequestHandler = async ({ params, locals }) => {
 
     if (group.user_id !== locals.user.id) {
       return json({ error: 'Unauthorized' }, { status: 403 })
+    }
+
+    // BL-140: batshit-server deletes the Group's avatar pictures, so make sure it can BEFORE
+    // anything is deleted, then ask for the sweep BEFORE the record goes (the agent delete's
+    // order, BL-41): when it cannot, the Group stays and a retry finishes the job. The sweep
+    // lives here, not in `redis.deleteGroup`, like the agent's. An id outside the owner id rule
+    // can have no picture stored for it (the upload refuses such ids), so it skips the sweep.
+    try {
+      await checkBatshitServerCanDeleteAvatars()
+    } catch (error) {
+      if (error instanceof AgentAvatarDeletionError) {
+        const retryNote = error.status === 503 ? ' Try again once batshit-server is running.' : ''
+        return json(
+          {
+            error: `${error.message} It deletes the Group's avatar pictures, so nothing was deleted: the Group is still there.${retryNote}`,
+            code: error.code
+          },
+          { status: error.status }
+        )
+      }
+      throw error
+    }
+    if (isAvatarOwnerId(params.id)) {
+      try {
+        await deleteOwnerAvatars(locals.user.id, {
+          type: 'group',
+          id: params.id,
+          avatar_url: group.avatar_url
+        })
+      } catch (error) {
+        if (error instanceof AgentAvatarDeletionError) {
+          const retryNote = error.status === 503 ? ' Try again once batshit-server is running.' : ''
+          return json(
+            { error: `${error.message} The Group was not deleted.${retryNote}`, code: error.code },
+            { status: error.status }
+          )
+        }
+        throw error
+      }
+    } else {
+      console.warn(
+        `[groups] ${params.id} is outside the avatar owner id rule, so no avatar picture can be named for it; skipped the avatar sweep`
+      )
     }
 
     await redis.deleteGroup(params.id)

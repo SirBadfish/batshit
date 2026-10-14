@@ -5,6 +5,7 @@ import {
   closeSync,
   copyFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -25,6 +26,7 @@ const PID_FILE = path.join(ROOT, '_local', 'docker', 'sandbox-operator.pid')
 const DOCKER_MCP_GATEWAY_LOG_FILE = path.join(ROOT, '_local', 'logs', 'docker-mcp-gateway-docker-current.log')
 const DOCKER_MCP_GATEWAY_PID_FILE = path.join(ROOT, '_local', 'docker', 'mcp-gateway.pid')
 const LAUNCHD_LABEL = 'ai.batshit.sandbox-operator'
+const HOST_VOICE_RECIPE_KEY_FILE = path.join(os.homedir(), '.batshit', 'host-operator-secrets', 'voice-recipe.key')
 
 const DEFAULT_OPERATOR_PORT = 5629
 const DEFAULT_CONTAINER_OPERATOR_URL = `http://host.docker.internal:${DEFAULT_OPERATOR_PORT}`
@@ -190,6 +192,53 @@ function updateEnvValue(state, key, value, shouldReplace, note) {
   if (result.changed && note) state.notes.push(note)
 }
 
+function removeEnvValue(state, key) {
+  const lines = state.text.split(/\r?\n/)
+  const next = lines.filter((line) => !line.startsWith(`${key}=`))
+  if (next.length !== lines.length) {
+    state.text = next.join('\n')
+    state.notes.push('Removed the old host voice recipe key from .env.docker; it now lives outside the workspace.')
+  }
+}
+
+/** A host-only secret: the Docker workspace and sandbox mount must never contain this file. */
+export function prepareHostVoiceRecipeSigningKey(keyFile = HOST_VOICE_RECIPE_KEY_FILE, workspaceMount = null) {
+  const dir = path.dirname(keyFile)
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  const actualDir = realpathSync(dir)
+  const under = (parent, child) => {
+    const relative = path.relative(parent, child)
+    return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+  }
+  const mountPath = workspaceMount ? resolveWorkspaceMount(workspaceMount) : null
+  if (under(realpathSync(ROOT), actualDir) ||
+      (mountPath && under(existsSync(mountPath) ? realpathSync(mountPath) : mountPath, actualDir))) {
+    throw new Error('Host voice recipe secret must stay outside the Docker workspace mount.')
+  }
+  const dirDetails = lstatSync(dir)
+  if (!dirDetails.isDirectory() || dirDetails.isSymbolicLink() ||
+      (process.platform !== 'win32' && ((dirDetails.mode & 0o077) !== 0 || dirDetails.uid !== process.getuid()))) {
+    throw new Error('Host voice recipe secret directory must be private.')
+  }
+  if (!existsSync(keyFile)) {
+    const fd = openSync(keyFile, 'wx', 0o600)
+    try {
+      writeFileSync(fd, `${randomBytes(32).toString('hex')}\n`)
+    } finally {
+      closeSync(fd)
+    }
+  }
+  const details = lstatSync(keyFile)
+  if (!details.isFile() || details.isSymbolicLink() || (process.platform !== 'win32' && ((details.mode & 0o077) !== 0 || details.uid !== process.getuid()))) {
+    throw new Error('Host voice recipe secret file must be a private regular file.')
+  }
+  const key = readFileSync(keyFile, 'utf8').trim()
+  if (!/^[a-f0-9]{64}$/i.test(key)) {
+    throw new Error('Host voice recipe secret file must contain a 32-byte hex key.')
+  }
+  return key
+}
+
 function resolveWorkspaceMount(rawValue) {
   const value = String(rawValue || '').trim()
   if (!value) return ROOT
@@ -213,13 +262,30 @@ function isDefaultHostN8nApiUrl(value) {
   )
 }
 
-function prepareEnvFile(profiles = []) {
-  mkdirSync(path.dirname(envFilePath), { recursive: true })
-  if (!existsSync(envFilePath)) {
-    copyFileSync(ENV_EXAMPLE, envFilePath)
+// This computer's time zone as an IANA name (`Europe/Paris`), or null when Node cannot name it.
+// Node's ICU gives the IANA name on every platform the launcher runs on, Windows included (ICU
+// maps Windows zone names such as `W. Europe Standard Time` to IANA ones); it reports `Etc/Unknown`
+// when it cannot name the zone (an empty `TZ`, for one).
+export function hostIanaTimeZone(resolve = () => Intl.DateTimeFormat().resolvedOptions().timeZone) {
+  let zone
+  try {
+    zone = resolve()
+  } catch {
+    return null
+  }
+  if (typeof zone !== 'string' || !/^(?:UTC|[A-Za-z][A-Za-z0-9_+-]*(?:\/[A-Za-z0-9_+-]+)+)$/.test(zone)) return null
+  return zone === 'Etc/Unknown' ? null : zone
+}
+
+// Prepares `.env.docker` (`envFile`, the launcher's own file unless a test names another): fills
+// the values it needs that are blank or placeholders, and answers the values Compose will read.
+export function prepareEnvFile(profiles = [], { envFile = envFilePath, hostTimeZone = hostIanaTimeZone() } = {}) {
+  mkdirSync(path.dirname(envFile), { recursive: true })
+  if (!existsSync(envFile)) {
+    copyFileSync(ENV_EXAMPLE, envFile)
   }
 
-  const original = readFileSync(envFilePath, 'utf8')
+  const original = readFileSync(envFile, 'utf8')
   const state = { text: original, notes: [] }
   const envBefore = parseEnv(original)
   const hasDockerMcpGatewayConfig = dockerMcpGatewayConfigured(envBefore)
@@ -283,6 +349,7 @@ function prepareEnvFile(profiles = []) {
     isBlankOrPlaceholder,
     'Generated runtime add-on operator token in .env.docker.'
   )
+  removeEnvValue(state, 'BATSHIT_HOST_VOICE_RECIPE_SIGNING_KEY')
   updateEnvValue(
     state,
     'BATSHIT_AGENT_BROWSER_SIDECAR_URL',
@@ -449,6 +516,22 @@ function prepareEnvFile(profiles = []) {
     'Set Docker Sandbox host workspace root.'
   )
 
+  // The containers' time zone (BL-109). The app tells agents the time, and memory's calendar-day
+  // search counts days, in the process's zone, and a container has none of its own: it used to
+  // read New York from the example. Filled once from this computer when blank; a zone the user
+  // set (or an earlier start filled) is never changed. n8n's schedules follow GENERIC_TIMEZONE.
+  if (hostTimeZone) {
+    for (const key of ['TZ', 'GENERIC_TIMEZONE']) {
+      updateEnvValue(
+        state,
+        key,
+        hostTimeZone,
+        (current) => !current,
+        `Set ${key} in .env.docker to this computer's time zone (${hostTimeZone}).`
+      )
+    }
+  }
+
   if (hasComposeProfile(profiles, 'n8n')) {
     updateEnvValue(
       state,
@@ -462,10 +545,10 @@ function prepareEnvFile(profiles = []) {
   if (state.text !== original) {
     // The Docker launcher updates its Batshit-owned .env.docker file after validating generated values.
     // codeql[js/file-system-race]
-    writeFileSync(envFilePath, state.text.endsWith('\n') ? state.text : `${state.text}\n`)
+    writeFileSync(envFile, state.text.endsWith('\n') ? state.text : `${state.text}\n`)
   }
 
-  const env = parseEnv(readFileSync(envFilePath, 'utf8'))
+  const env = parseEnv(readFileSync(envFile, 'utf8'))
   const finalWorkspace = resolveWorkspaceMount(env.get('BATSHIT_WORKSPACE_MOUNT'))
   if (!existsSync(finalWorkspace)) {
     throw new Error(
@@ -545,7 +628,7 @@ async function fetchOperatorHealth(env) {
 
 // Must match `SANDBOX_REVISION` in runtime-addon-operator.mjs. An operator started by an
 // older checkout keeps running its old code until it is restarted.
-const REQUIRED_OPERATOR_SANDBOX_REVISION = 6
+const REQUIRED_OPERATOR_SANDBOX_REVISION = 12
 
 function operatorSupportsCurrentRuntimeControls(health) {
   return (
@@ -625,6 +708,8 @@ export function renderMacLaunchAgentPlist({ plistPath, projectName = '' }) {
     <string>${xmlEscape(ROOT)}</string>
     <key>BATSHIT_RUNTIME_ADDON_OPERATOR_ENV_FILE</key>
     <string>${xmlEscape(envFilePath)}</string>
+    <key>BATSHIT_HOST_VOICE_RECIPE_KEY_FILE</key>
+    <string>${xmlEscape(HOST_VOICE_RECIPE_KEY_FILE)}</string>
     <key>BATSHIT_RUNTIME_ADDON_OPERATOR_LAUNCH_AGENT</key>
     <string>${xmlEscape(plistPath)}</string>${
       projectName
@@ -888,15 +973,18 @@ function startDetachedOperator(projectName) {
   // The operator log path is a Batshit-owned local runtime file.
   // codeql[js/file-system-race]
   const err = openSync(LOG_FILE, 'a')
+  const operatorEnv = {
+    ...process.env,
+    BATSHIT_RUNTIME_ADDON_OPERATOR_ROOT: ROOT,
+    BATSHIT_RUNTIME_ADDON_OPERATOR_ENV_FILE: envFilePath,
+    BATSHIT_HOST_VOICE_RECIPE_KEY_FILE: HOST_VOICE_RECIPE_KEY_FILE,
+    ...(projectName ? { COMPOSE_PROJECT_NAME: projectName } : {})
+  }
+  delete operatorEnv.BATSHIT_HOST_VOICE_RECIPE_SIGNING_KEY
   const child = spawn(process.execPath, [OPERATOR_SCRIPT], {
     cwd: ROOT,
     detached: true,
-    env: {
-      ...process.env,
-      BATSHIT_RUNTIME_ADDON_OPERATOR_ROOT: ROOT,
-      BATSHIT_RUNTIME_ADDON_OPERATOR_ENV_FILE: envFilePath,
-      ...(projectName ? { COMPOSE_PROJECT_NAME: projectName } : {})
-    },
+    env: operatorEnv,
     stdio: ['ignore', out, err]
   })
   child.unref()
@@ -955,9 +1043,9 @@ async function ensureSandboxOperator(env, projectName = '') {
   printOperatorStatus(status, 'Docker Sandbox operator started.')
 }
 
-function printOperatorStatus(status, prefix) {
+export function printOperatorStatus(status, prefix) {
   if (status.available) {
-    console.log(`${prefix} Docker Sandbox is ready (${status.version || status.cli || 'sbx'}).`)
+    console.log(`${prefix} Docker Sandbox sbx checks passed (${status.version || status.cli || 'sbx'}). Sandbox creation is checked on first use.`)
     return
   }
   console.log(prefix)
@@ -1005,6 +1093,9 @@ async function main() {
 
   const { env, notes } = prepareEnvFile(options.profiles)
   for (const note of notes) console.log(note)
+  process.env.BATSHIT_HOST_VOICE_RECIPE_SIGNING_KEY = prepareHostVoiceRecipeSigningKey(
+    HOST_VOICE_RECIPE_KEY_FILE, env.get('BATSHIT_WORKSPACE_MOUNT')
+  )
 
   if (options.startSandboxOperator) {
     await ensureSandboxOperator(env, options.projectName)

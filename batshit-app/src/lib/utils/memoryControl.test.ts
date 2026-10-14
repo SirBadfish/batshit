@@ -226,12 +226,32 @@ describe('extractMemoryControls', () => {
     const content = [
       'Answer.',
       block(VALID_SAVE),
-      block('not json at all')
+      block('{not json at all')
     ].join('\n')
     const result = extractMemoryControls(content)
     expect(result.blocks).toHaveLength(2)
     expect(result.blocks[0].payload).toBeTruthy()
     expect(result.blocks[1].parseError).toBeTruthy()
+  })
+
+  it('reads a closed block whose payload is not JSON as a block, with the loud error (BL-442 R2 b)', () => {
+    const result = extractMemoryControls(`Answer.\n${block('not json at all')}`)
+    expect(result.hadBlock).toBe(true)
+    expect(result.blocks).toHaveLength(1)
+    expect(result.blocks[0].parseError).toBeTruthy()
+    expect(result.cleaned).toBe('Answer.')
+  })
+
+  it('reads a cut tag at the end as no block (R4)', () => {
+    expect(extractMemoryControls('Noted. <batshit-memo').hadBlock).toBe(false)
+    expect(extractMemoryControls('Noted. <batshit-memory>').hadBlock).toBe(false)
+  })
+
+  it('reads a tag named in a sentence with no closing tag as text (BL-442 R2, BL-473)', () => {
+    const content = 'Answer. I write a <batshit-memory> block when you ask me to remember something.'
+    const result = extractMemoryControls(content)
+    expect(result.hadBlock).toBe(false)
+    expect(result.cleaned).toBe(content)
   })
 
   it('has NO bare-JSON fallback — an untagged payload is not a save', () => {
@@ -595,5 +615,24 @@ describe('agent memory settings draft (Settings ↔ record round-trip)', () => {
     expect(roundTripped.lingerTurns).toBe(3)
     expect(roundTripped.budgets).toEqual({ onMyMind: 500, triggers: 700, recalled: 900 })
     expect(roundTripped.window.napThresholdPercent).toBe(90)
+  })
+
+  // BL-1294: `PUT /api/agents/[id]` compares a memory save's base with the stored settings through
+  // these two functions on both sides (`agentMemoryBaseMatches`), so writing what was read and reading
+  // it again must give the same fields: from canonical, older camelCase, absent and out-of-range records.
+  it('reading, writing and reading again gives the same fields (the memory base compare relies on it)', () => {
+    const normalize = (source: unknown) => buildAgentMemoryRecordFields(resolveAgentMemorySettingsDraft(source))
+    const records: unknown[] = [
+      {},
+      null,
+      { memory_enabled: true, memory_linger_turns: 4, memory_recall_linger_turns: 2, memory_lane_budgets: { on_my_mind: 1_500, triggers: 900, recalled: 3_000 } },
+      { memoryEnabled: true, memoryLingerTurns: 5, memoryRecallLingerTurns: 1, memoryLaneBudgets: { on_my_mind: 40, triggers: 50, recalled: 60 } },
+      { memory_linger_turns: 99, memory_lane_budgets: { on_my_mind: 99_999, triggers: -3, recalled: 'x' } },
+      { memory_window: { floor_mode: 'custom', floor_tokens: 64_000 }, memoryWindow: { floor_mode: 'auto' } }
+    ]
+    for (const record of records) {
+      const once = normalize(record)
+      expect(normalize(once)).toEqual(once)
+    }
   })
 })

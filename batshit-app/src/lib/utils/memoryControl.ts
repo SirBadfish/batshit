@@ -17,7 +17,12 @@
  * constraint stands on the surviving client consumers.)
  */
 
-import { controlTag, pairedBlockRegexGlobal } from '$lib/utils/controlTags'
+import {
+  controlTag,
+  findControlBlocks,
+  removeControlBlocks,
+  type ControlBlock
+} from '$lib/utils/controlTags'
 
 export const MEMORY_CONTROL_TAG = controlTag('memory').tag
 
@@ -631,14 +636,60 @@ export interface MemoryControlExtraction {
   hadBlock: boolean
 }
 
-const MEMORY_BLOCK_REGEX = pairedBlockRegexGlobal(MEMORY_CONTROL_TAG)
-const MEMORY_UNCLOSED_OPEN_REGEX = new RegExp(`<${MEMORY_CONTROL_TAG}\\b[^>]*>`, 'i')
+/**
+ * BL-442: the most memory save blocks one reply is READ for. More than
+ * `MAX_INLINE_MEMORY_SAVE_BLOCKS` (12, `replyControlFinalize.ts`) saves none anyway, and each block
+ * read adds a parse and possibly an error line the reply keeps, so a reply of thousands of tiny
+ * blocks is bounded the way BL-543 bounded Tool Notes. Every block is still removed, and one error
+ * line says how many were not read.
+ */
+export const MEMORY_BLOCK_READ_LIMIT = 20
 
-function memoryBlockInner(block: string): string {
-  const openEnd = block.indexOf('>')
-  const closeStart = block.toLowerCase().lastIndexOf(`</${MEMORY_CONTROL_TAG}`)
-  if (openEnd === -1 || closeStart === -1 || closeStart <= openEnd) return ''
-  return block.slice(openEnd + 1, closeStart).trim()
+function readMemoryBlock(raw: string): ExtractedMemoryBlock {
+  if (!raw) return { raw: '', parseError: 'Memory save block is empty.' }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch (error) {
+    return {
+      raw,
+      parseError: error instanceof Error ? error.message : 'Failed to parse memory save block.'
+    }
+  }
+  const validation = validateMemorySavePayload(parsed)
+  if (!validation.ok) return { raw, parseError: validation.error }
+  return { raw, payload: validation.value }
+}
+
+/**
+ * The memory save blocks among a reply's control blocks (`findControlBlocks`, final), in order.
+ * EVERY complete block is one save (up to `MEMORY_BLOCK_READ_LIMIT`); an unclosed one is a loud
+ * error, never a silent drop (DL-104-05). A tag in code or named in a sentence is not among the
+ * blocks at all (BL-442, BL-473).
+ */
+export function readMemoryBlocks(content: string, blocks: readonly ControlBlock[]): ExtractedMemoryBlock[] {
+  const own = blocks.filter((block) => block.id === 'memory')
+  const paired = own.filter((block) => block.kind === 'paired')
+  const read: ExtractedMemoryBlock[] = []
+  // The cap line goes FIRST, as the Tool Notes cap does: the next turn's DCM shows only the first
+  // four tag errors (`buildControlErrorDcmLines`), and this one must never be cut off by them.
+  if (paired.length > MEMORY_BLOCK_READ_LIMIT) {
+    read.push({
+      raw: '',
+      parseError: `This reply had ${paired.length} memory save blocks. Batshit read only the first ${MEMORY_BLOCK_READ_LIMIT}; the other ${paired.length - MEMORY_BLOCK_READ_LIMIT} were removed from the reply and not saved.`
+    })
+  }
+  for (const block of paired.slice(0, MEMORY_BLOCK_READ_LIMIT)) {
+    read.push(readMemoryBlock(content.slice(block.bodyStart, block.bodyEnd).trim()))
+  }
+  const unclosed = own.find((block) => block.kind === 'unclosed')
+  if (unclosed) {
+    read.push({
+      raw: content.slice(unclosed.start),
+      parseError: `Unclosed <${MEMORY_CONTROL_TAG}> block (missing </${MEMORY_CONTROL_TAG}>).`
+    })
+  }
+  return read
 }
 
 /**
@@ -652,51 +703,16 @@ export function extractMemoryControls(content: string): MemoryControlExtraction 
     return { cleaned: content, blocks: [], hadBlock: false }
   }
 
-  const matches = Array.from(content.matchAll(MEMORY_BLOCK_REGEX))
-  const blocks: ExtractedMemoryBlock[] = []
-
-  for (const match of matches) {
-    const raw = memoryBlockInner(match[0])
-    if (!raw) {
-      blocks.push({ raw: '', parseError: 'Memory save block is empty.' })
-      continue
-    }
-    let parsed: unknown
-    try {
-      parsed = JSON.parse(raw)
-    } catch (error) {
-      blocks.push({
-        raw,
-        parseError: error instanceof Error ? error.message : 'Failed to parse memory save block.'
-      })
-      continue
-    }
-    const validation = validateMemorySavePayload(parsed)
-    if (!validation.ok) {
-      blocks.push({ raw, parseError: validation.error })
-      continue
-    }
-    blocks.push({ raw, payload: validation.value })
+  const own = findControlBlocks(content, { final: true }).filter(
+    (block) => block.id === 'memory' && block.kind !== 'held-start'
+  )
+  if (own.length === 0) {
+    return { cleaned: content, blocks: [], hadBlock: false }
   }
-
-  let cleaned = content.replace(MEMORY_BLOCK_REGEX, '')
-
-  // An unclosed opening tag reaching message end is a malformed save, not silent noise.
-  const unclosed = MEMORY_UNCLOSED_OPEN_REGEX.exec(cleaned)
-  if (unclosed && unclosed.index !== undefined) {
-    blocks.push({
-      raw: cleaned.slice(unclosed.index),
-      parseError: `Unclosed <${MEMORY_CONTROL_TAG}> block (missing </${MEMORY_CONTROL_TAG}>).`
-    })
-    cleaned = cleaned.slice(0, unclosed.index)
-  }
-
-  cleaned = cleaned.replace(/\n{3,}/g, '\n\n').trim()
-
   return {
-    cleaned: blocks.length > 0 ? cleaned : content,
-    blocks,
-    hadBlock: blocks.length > 0
+    cleaned: removeControlBlocks(content, own).replace(/\n{3,}/g, '\n\n').trim(),
+    blocks: readMemoryBlocks(content, own),
+    hadBlock: true
   }
 }
 

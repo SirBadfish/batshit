@@ -19,6 +19,7 @@
   } from '$lib/components/ui/alert-dialog'
   import { Edit3, ImageUp, Trash2 } from '@lucide/svelte'
   import { toast } from 'svelte-sonner'
+  import { expiresAtUpdate, expiryToDateInput } from '$lib/utils/memoryExpiry'
 
   interface Props {
     agentId: string
@@ -43,6 +44,8 @@
   let draftLingerMode = $state<'default' | 'turns' | 'episode'>('default')
   let draftLingerTurns = $state(2)
   let draftExpiresAt = $state('')
+  // BL-437: the day the picker showed at load; Save sends expires_at only when it changed.
+  let hydratedExpiresAt = $state('')
   let hydratedId = $state<string | null>(null)
   let saving = $state(false)
   let contentEditorOpen = $state(false)
@@ -72,7 +75,11 @@
       draftLingerMode = 'default'
       draftLingerTurns = 2
     }
-    draftExpiresAt = record.expires_at ? String(record.expires_at).slice(0, 10) : ''
+    // BL-437: the LOCAL day the stored instant falls on (the ISO string's date part is the
+    // UTC day, the next day for a late-evening expiry west of UTC).
+    const loadedExpiry = expiryToDateInput(record.expires_at)
+    hydratedExpiresAt = loadedExpiry
+    draftExpiresAt = loadedExpiry
   })
 
   // Per-lane form (2026-08-28, Josh's model): each field appears where it matters —
@@ -172,6 +179,15 @@
       toast.error('A Trigger Memory (STM) needs at least one trigger term, or it can never fire.')
       return
     }
+    // BL-437: an untouched expiry is not sent, so its stored time of day stays as it was; a
+    // picked day expires at the end of that local day.
+    let expiry: { expires_at?: string | null }
+    try {
+      expiry = expiresAtUpdate(draftExpiresAt, hydratedExpiresAt)
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'The expiry date is not valid.')
+      return
+    }
     await patchRecord(
       {
         gist: draftGist.trim() ? draftGist.trim() : null,
@@ -186,7 +202,7 @@
             : draftLingerMode === 'turns'
               ? Math.min(Math.max(Math.floor(draftLingerTurns) || 0, 0), 30)
               : null,
-        expires_at: draftExpiresAt ? new Date(draftExpiresAt).toISOString() : null
+        ...expiry
       },
       'Memory updated.'
     )

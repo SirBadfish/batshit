@@ -63,3 +63,12 @@ describe('batshitCue', () => {
     expect(result.notes).toEqual([])
   })
 })
+
+describe('extractVisibleBatshitCueState: what counts as a cue block (BL-442)', () => {
+  it('shows a cue in code and a cue tag named in a sentence, and reads only the real block', () => {
+    const words = 'Use `<batshit-cue>{"goon_mood":"calm"}</batshit-cue>` to set a mood; the <batshit-cue> tag. If x < 5.'
+    const state = extractVisibleBatshitCueState(`${words}\n<batshit-cue>{"goon_mood":"happy"}</batshit-cue>`)
+    expect(state.cleanedContent).toBe(words)
+    expect(state.notes).toEqual([{ kind: 'mood', label: 'Mood: happy', value: 'happy' }])
+  })
+})

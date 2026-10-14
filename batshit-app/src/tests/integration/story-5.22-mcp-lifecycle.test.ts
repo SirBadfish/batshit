@@ -3,6 +3,8 @@
  *
  * CRITICAL: Tests use REAL n8n MCP Trigger workflows (no mocks)
  * Risk Coverage: TECH-002 (MCP client connection leaks)
+ * Run deliberately with BATSHIT_LIVE_MCP_GATEWAYS=1; the default lane skips
+ * the whole suite, including gateway health checks.
  *
  * P0 Tests:
  * - 5.22-INT-012: Connect to real n8n MCP Trigger workflow
@@ -25,6 +27,8 @@ import { DockerMCPGatewayClient } from '$lib/server/services/dockerMCPGatewayCli
 import { MCPGatewayDiscovery } from '$lib/server/services/mcpGatewayDiscovery'
 import type { MCPGateway } from '$lib/types/database'
 
+const LIVE = process.env.BATSHIT_LIVE_MCP_GATEWAYS === '1'
+
 // Test gateway URLs
 const TEST_N8N_URL = 'http://localhost:5678/mcp/test-code-tools'
 const TEST_DOCKER_URL = 'http://localhost:8080/mcp'
@@ -45,7 +49,7 @@ const TEST_DOCKER_GATEWAY: MCPGateway = {
   enabled: true
 }
 
-describe('Story 5.22 - P0: MCP Client Lifecycle (REAL Infrastructure)', () => {
+describe.runIf(LIVE)('Story 5.22 - P0: MCP Client Lifecycle (REAL Infrastructure)', () => {
 
   let n8nAvailable = false
   let dockerAvailable = false
@@ -71,10 +75,9 @@ describe('Story 5.22 - P0: MCP Client Lifecycle (REAL Infrastructure)', () => {
 
   describe('P0-INT: n8n MCP Gateway Client Lifecycle (TECH-002)', () => {
 
-    test('5.22-INT-012: Connect to real n8n MCP Trigger workflow', async () => {
+    test('5.22-INT-012: Connect to real n8n MCP Trigger workflow', async ({ skip }) => {
       if (!n8nAvailable) {
-        console.warn('Skipping 5.22-INT-012: n8n workflow not available')
-        return
+        skip('n8n workflow not available')
       }
 
       const client = new N8nMCPGatewayClient()
@@ -98,10 +101,9 @@ describe('Story 5.22 - P0: MCP Client Lifecycle (REAL Infrastructure)', () => {
       })
     })
 
-    test('5.22-INT-013: Close MCP client after successful discovery (CRITICAL)', async () => {
+    test('5.22-INT-013: Close MCP client after successful discovery (CRITICAL)', async ({ skip }) => {
       if (!n8nAvailable) {
-        console.warn('Skipping 5.22-INT-013: n8n workflow not available')
-        return
+        skip('n8n workflow not available')
       }
 
       const client = new N8nMCPGatewayClient()
@@ -149,10 +151,9 @@ describe('Story 5.22 - P0: MCP Client Lifecycle (REAL Infrastructure)', () => {
 
   describe('P0-INT: Docker Gateway Client Lifecycle (TECH-002)', () => {
 
-    test('Docker client closes after successful discovery', async () => {
+    test('Docker client closes after successful discovery', async ({ skip }) => {
       if (!dockerAvailable) {
-        console.warn('Skipping Docker lifecycle test: Gateway not available')
-        return
+        skip('Docker gateway not available')
       }
 
       const client = new DockerMCPGatewayClient()
@@ -175,7 +176,7 @@ describe('Story 5.22 - P0: MCP Client Lifecycle (REAL Infrastructure)', () => {
 
   describe('P0-INT: Unified Gateway Discovery Lifecycle (TECH-002)', () => {
 
-    test('5.22-INT-023: 100 sequential discoveries do NOT leak connections (LOAD TEST)', async () => {
+    test('5.22-INT-023: 100 sequential discoveries do NOT leak connections (LOAD TEST)', async ({ skip }) => {
       const gateways: MCPGateway[] = []
 
       // Add available gateways
@@ -183,8 +184,7 @@ describe('Story 5.22 - P0: MCP Client Lifecycle (REAL Infrastructure)', () => {
       if (dockerAvailable) gateways.push(TEST_DOCKER_GATEWAY)
 
       if (gateways.length === 0) {
-        console.warn('Skipping 5.22-INT-023: No gateways available for load test')
-        return
+        skip('No gateways available for load test')
       }
 
       const discovery = new MCPGatewayDiscovery()
@@ -220,15 +220,14 @@ describe('Story 5.22 - P0: MCP Client Lifecycle (REAL Infrastructure)', () => {
       expect(true).toBe(true)
     }, 120000) // 2 minute timeout for load test
 
-    test('Parallel discoveries with Promise.allSettled', async () => {
+    test('Parallel discoveries with Promise.allSettled', async ({ skip }) => {
       const gateways: MCPGateway[] = []
 
       if (n8nAvailable) gateways.push(TEST_N8N_GATEWAY)
       if (dockerAvailable) gateways.push(TEST_DOCKER_GATEWAY)
 
       if (gateways.length === 0) {
-        console.warn('Skipping parallel discovery test: No gateways available')
-        return
+        skip('No gateways available for parallel discovery test')
       }
 
       const discovery = new MCPGatewayDiscovery()

@@ -39,7 +39,7 @@ class ExecutionViewerService {
   }
 
   private boundDebugPayload<T>(value: T): T {
-    const seen = new WeakSet<object>()
+    const ancestors = new WeakSet<object>()
 
     const visit = (node: unknown, key?: string): unknown => {
       if (typeof node === 'string') {
@@ -67,20 +67,24 @@ class ExecutionViewerService {
         return node
       }
 
-      if (seen.has(node as object)) {
+      if (ancestors.has(node as object)) {
         return '[Execution Viewer omitted circular reference]'
       }
-      seen.add(node as object)
+      ancestors.add(node as object)
+      try {
+        if (Array.isArray(node)) {
+          return node.map((entry) => visit(entry, key))
+        }
 
-      if (Array.isArray(node)) {
-        return node.map((entry) => visit(entry, key))
+        const output: Record<string, unknown> = {}
+        for (const [key, child] of Object.entries(node as Record<string, unknown>)) {
+          output[key] = visit(child, key)
+        }
+        return output
+      } finally {
+        // Sharing a completed branch is valid; only an active ancestor is a cycle.
+        ancestors.delete(node as object)
       }
-
-      const output: Record<string, unknown> = {}
-      for (const [key, child] of Object.entries(node as Record<string, unknown>)) {
-        output[key] = visit(child, key)
-      }
-      return output
     }
 
     return visit(value) as T
@@ -329,10 +333,74 @@ class ExecutionViewerService {
     })
   }
 
+  /** Read only context evidence, never the compiled prompts, tool payloads or event logs. */
+  async getCliContextSnapshots(
+    sessionId: string
+  ): Promise<Pick<ExecutionSnapshot, 'agentId' | 'createdAt' | 'runtime'>[]> {
+    const fields = ['agentId', 'createdAt', 'runtime.runtimeId', 'runtime.metadata.cliContextWindow']
+    const paths = Array.from({ length: EXECUTION_VIEWER_MAX_SNAPSHOTS }, (_, index) =>
+      fields.map(field => `$[${index}].${field}`)).flat()
+    return await redis.execute(async client => {
+      const data = await client.json.get(this.getKey(sessionId), { path: paths })
+      if (data === null) return []
+      if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        throw new Error('Invalid CLI context evidence projection')
+      }
+      const projection = data as Record<string, unknown>
+      const result: Pick<ExecutionSnapshot, 'agentId' | 'createdAt' | 'runtime'>[] = []
+      const read = (index: number, field: string): unknown => {
+        const values = projection[`$[${index}].${field}`]
+        if (!Array.isArray(values)) throw new Error('Invalid CLI context evidence path')
+        return values[0]
+      }
+      for (let index = 0; index < EXECUTION_VIEWER_MAX_SNAPSHOTS; index += 1) {
+        const agentId = read(index, 'agentId')
+        const createdAt = read(index, 'createdAt')
+        const runtimeId = read(index, 'runtime.runtimeId')
+        const report = read(index, 'runtime.metadata.cliContextWindow')
+        if (typeof createdAt !== 'string' || (agentId !== null && typeof agentId !== 'string')) continue
+        result.push({
+          agentId,
+          createdAt,
+          ...(['codex', 'claude', 'vercel'].includes(String(runtimeId)) ? {
+            runtime: { runtimeId: runtimeId as 'codex' | 'claude' | 'vercel', metadata: { cliContextWindow: report } }
+          } : {})
+        })
+      }
+      return result.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+    })
+  }
+
   async clearSnapshots(sessionId: string): Promise<void> {
     const key = this.getKey(sessionId)
     await redis.execute(async (client) => {
       await client.del(key)
+    })
+  }
+
+  /**
+   * BL-321: the tool steps a snapshot already holds, or none. An API-lane approval resume writes
+   * into the paused reply's snapshot, and every write of `intermediateSteps` replaces the list,
+   * so the resume reads these first and adds its own after them.
+   */
+  async getSnapshotSteps(sessionId: string, snapshotId: string): Promise<any[]> {
+    const current = await this.getSnapshot(sessionId, snapshotId)
+    return Array.isArray(current?.intermediateSteps) ? current.intermediateSteps : []
+  }
+
+  /**
+   * BL-525: one stored snapshot, or null. An approval resume reads the paused half's snapshot
+   * once, before it records its own under the same id, and continues every number from it
+   * (`continueResumedSnapshotPatch`), exactly as it continues the steps (BL-321).
+   */
+  async getSnapshot(sessionId: string, snapshotId: string): Promise<ExecutionSnapshot | null> {
+    const key = this.getKey(sessionId)
+    return await redis.execute(async (client) => {
+      const ids = await this.getSnapshotIds(client, key)
+      if (!ids) return null
+      const index = ids.lastIndexOf(snapshotId)
+      if (index === -1) return null
+      return (await this.getSnapshotAt(client, key, index)) ?? null
     })
   }
 

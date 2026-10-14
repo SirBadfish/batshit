@@ -1,6 +1,14 @@
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
+import { hostProfileResource, withHostCommandDeletion } from '$lib/server/services/hostCommandOwnership'
+import {
+  withAgentProfileFolder,
+  withManagedProfileRunWrite,
+  writeAgentProfileFolderIfAgentExists,
+  ManagedProfileRunRefusedError,
+  type ManagedProfileRunOwner
+} from '$lib/server/services/agentProfileFolderGate'
 
 import { env } from '$env/dynamic/private'
 import { redis } from '$lib/server/redis'
@@ -26,15 +34,23 @@ import {
   MODE4_INTERNAL_HELPER_TOOL_NAMES,
   resolveEnabledMode4InternalHelperTools,
   isMode4InternalHelperTool,
-  buildMode4InternalHelpersGatewayId,
-  buildMode4InternalHelpersGatewaySlug
+  CLI_HELPER_MCP_SERVER_NAME,
+  CLI_HELPER_TOOL_TIMEOUT_MS
 } from '$lib/server/services/mode4InternalTools'
 import {
   buildManagedStdioEnvironmentPlan,
   sanitizeStdioGatewayConfig
 } from '$lib/server/services/mcpGatewayStdio'
 import { resolveCliToolSelectionScope } from '$lib/server/services/cliToolRegistry'
-import { resolveCliHelperBatshitBaseUrl } from '$lib/server/services/cliHelperBaseUrl'
+import {
+  cliHelperScriptRef,
+  cliHelperUrlArgRef,
+  cliDockerGatewayUrlRef,
+  fillCliHelperLaunchRefs,
+  hasCliHelperLaunchRef,
+  resolveCliHelperLaunchValues,
+  type CliHelperLaunchValues
+} from '$lib/server/services/cliHelperLaunch'
 import {
   buildSubagentSlugCollisionError,
   normalizeSubagentSlugValue
@@ -45,6 +61,21 @@ import {
   buildCliSubagentMcpToolNameForKey
 } from '$lib/utils/cliSubagentToolNames'
 import { resolveWorkersEnabled } from '$lib/utils/delegationCapabilities'
+import {
+  CODEX_HOME_DIR_NAME,
+  MANAGED_CODEX_ROOT_DIR,
+  USER_CODEX_HOME,
+  assertBatshitManagedCodexHome,
+  assertCodexProfileFolderInsideRoot,
+  assertManagedCodexProfileId,
+  describeManagedFileLinkRefusal,
+  isBatshitManagedCodexHome,
+  isManagedCodexHomeRefusal,
+  isManagedFileLinkError,
+  readFileWithoutLinks,
+  replaceLinkedCodexFolders,
+  writeFileWithoutLinks
+} from '$lib/server/services/codexManagedHome'
 import toml from '@iarna/toml'
 const { parse: parseToml, stringify: stringifyToml } = toml
 
@@ -52,10 +83,11 @@ const MANAGED_START = '# >>> Batshit codex config (managed) >>>'
 const MANAGED_END = '# <<< Batshit codex config (managed) <<<'
 const PROFILE_PREFIX = 'batshit_agent_'
 const MANAGED_GATEWAY_PREFIX = 'batshit_gateway_'
-const MANAGED_ROOT_DIR = path.join(os.homedir(), '.batshit', 'agents')
+// BL-7 review: `codexManagedHome.ts` owns where managed homes live and what counts as one.
+const MANAGED_ROOT_DIR = MANAGED_CODEX_ROOT_DIR
 const LEGACY_ROOT_DIR = path.join(os.homedir(), 'batshit-codex')
-const CODEX_DIR_NAME = '.codex'
-const REAL_CODEX_HOME = path.join(os.homedir(), CODEX_DIR_NAME)
+const CODEX_DIR_NAME = CODEX_HOME_DIR_NAME
+const REAL_CODEX_HOME = USER_CODEX_HOME
 export const DOCKER_AUTH_ENV_VAR = 'BATSHIT_DOCKER_MCP_TOKEN'
 export const N8N_INSTANCE_MCP_TOKEN_ENV = 'BATSHIT_N8N_INSTANCE_MCP_TOKEN'
 const UNGROUPED_GROUP_SLUG = 'ungrouped'
@@ -79,7 +111,10 @@ const MANAGED_CONFIG_OVERRIDE_PREFIXES = [
   'history.',
   'mcp_servers.',
   'projects.',
-  'sandbox_workspace_write.'
+  'sandbox_workspace_write.',
+  // BL-7 review: Codex's bundled-skills switch (`skills.bundled` and every key under it) is
+  // Batshit's for a managed home. The prefix also covers `skills.bundled` itself.
+  'skills.bundled.'
 ]
 
 export interface CodexConfigOverrideIssue {
@@ -91,8 +126,18 @@ export interface CodexConfigOverrideIssue {
 void scheduleCodexSessionCleanupOnBoot()
 
 async function ensureAgentCodexDir(profileId: string) {
-  const dir = path.join(MANAGED_ROOT_DIR, profileId, CODEX_DIR_NAME)
+  // BL-7 review: a profile id is refused before it becomes a path (a stored `../..` was the
+  // user's own `~/.codex`), the profile folder before `.codex` is made in it, and the home
+  // after it exists and before anything is linked into it (an agent folder whose `.codex` is a
+  // symlink to `~/.codex` passes the id rule). Everything that writes a managed home comes
+  // through here.
+  const profileDir = path.join(MANAGED_ROOT_DIR, assertManagedCodexProfileId(profileId))
+  await fs.mkdir(profileDir, { recursive: true })
+  await assertCodexProfileFolderInsideRoot(profileDir)
+  const dir = path.join(profileDir, CODEX_DIR_NAME)
   await fs.mkdir(dir, { recursive: true })
+  await assertBatshitManagedCodexHome(dir)
+  await replaceLinkedCodexFolders(dir)
   await ensureCredentialSymlinks(dir)
   return dir
 }
@@ -116,7 +161,29 @@ export async function cleanupCodexSessionDirs(options?: { respectPersistence?: b
     const profileId = entry.trim()
     if (!profileId || !profileId.startsWith(PROFILE_PREFIX)) continue
 
-    const sessionsDir = path.join(MANAGED_ROOT_DIR, profileId, CODEX_DIR_NAME, 'sessions')
+    // BL-7 review: this deletes inside the agent's `.codex`, so that folder must be a
+    // Batshit-managed home. An agent folder whose `.codex` is a symlink to the user's own
+    // `~/.codex` (an in-app agent can plant one: sandboxes mount `~/.batshit`) made this
+    // delete the user's own Codex session history. A folder with no `.codex` is quietly
+    // passed over, as before; one that fails the check is passed over and logged.
+    const codexHome = path.join(MANAGED_ROOT_DIR, profileId, CODEX_DIR_NAME)
+    try {
+      await fs.lstat(codexHome)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        console.warn('[CodexProfileManager] Failed to read a Codex home for cleanup', { codexHome, error })
+      }
+      continue
+    }
+    if (!(await isBatshitManagedCodexHome(codexHome))) {
+      console.warn(
+        '[CodexProfileManager] Skipped session cleanup for a Codex home that is not Batshit-managed',
+        { profileId, codexHome }
+      )
+      continue
+    }
+
+    const sessionsDir = path.join(codexHome, 'sessions')
     let hasSessions = false
     try {
       const stat = await fs.stat(sessionsDir)
@@ -149,7 +216,13 @@ export async function cleanupCodexSessionDirs(options?: { respectPersistence?: b
     }
 
     try {
-      await fs.rm(sessionsDir, { recursive: true, force: true })
+      if (process.platform === 'win32') {
+        await fs.rm(sessionsDir, { recursive: true, force: true }) // BL-364: no host identity proof yet.
+      } else {
+        await withHostCommandDeletion([hostProfileResource(profileId)], async () => {
+          await fs.rm(sessionsDir, { recursive: true, force: true })
+        })
+      }
       cleaned += 1
     } catch (error) {
       console.warn('[CodexProfileManager] Failed to delete Codex sessions dir', { sessionsDir, error })
@@ -161,7 +234,11 @@ export async function cleanupCodexSessionDirs(options?: { respectPersistence?: b
   }
 }
 
-async function ensureCredentialSymlinks(codexDir: string) {
+/**
+ * Links the user's Codex credentials into a managed home. Only `ensureAgentCodexDir` calls
+ * it, after the home passed the managed-home check; it is exported for its safety test.
+ */
+export async function ensureCredentialSymlinks(codexDir: string) {
   await Promise.all([
     ensureCredentialSymlink(codexDir, 'auth.json'),
     ensureCredentialSymlink(codexDir, 'credentials.json')
@@ -180,6 +257,13 @@ async function ensureCredentialSymlink(codexDir: string, filename: string) {
   }
 
   const linkPath = path.join(codexDir, filename)
+  // BL-7 review: never remove anything that already IS the source file. When the link path
+  // resolves to the user's real credential (the user's own home, a home that is a symlink
+  // to it, or a hard link), the `rm` below deleted the real `auth.json` and the `symlink`
+  // after it pointed the file at itself.
+  if (await isSameFile(linkPath, source)) {
+    return
+  }
   try {
     const stat = await fs.lstat(linkPath)
     if (stat.isSymbolicLink()) {
@@ -198,7 +282,35 @@ async function ensureCredentialSymlink(codexDir: string, filename: string) {
   try {
     await fs.symlink(source, linkPath)
   } catch (error) {
+    // BL-7: runs of one agent that start together both find the link missing on a fresh
+    // home and both create it, so one of them gets EEXIST for the link it wanted. That is
+    // not a failure; a link pointing anywhere else still is.
+    if (
+      (error as NodeJS.ErrnoException).code === 'EEXIST' &&
+      (await symlinkPointsAt(linkPath, source))
+    ) {
+      return
+    }
     console.warn(`[CodexProfileManager] Failed to create symlink for ${filename}`, error)
+  }
+}
+
+async function symlinkPointsAt(linkPath: string, target: string) {
+  try {
+    const stat = await fs.lstat(linkPath)
+    return stat.isSymbolicLink() && (await fs.readlink(linkPath)) === target
+  } catch {
+    return false
+  }
+}
+
+/** Both paths name one file on disk (every symlink followed). False when either is missing. */
+async function isSameFile(first: string, second: string) {
+  try {
+    const [a, b] = await Promise.all([fs.stat(first), fs.stat(second)])
+    return a.dev === b.dev && a.ino === b.ino
+  } catch {
+    return false
   }
 }
 
@@ -282,8 +394,27 @@ export function buildManagedGatewayId(gatewayId: string | null | undefined, slug
   return `${MANAGED_GATEWAY_PREFIX}${sanitized}`
 }
 
-export async function syncAgentCodexProfiles(userId: string) {
+/**
+ * BL-310: the `url` a managed profile writes for a gateway. A Docker gateway is reached at the
+ * address the app itself uses for it (`buildDockerGatewayUrl`: this lane's
+ * `DOCKER_MCP_GATEWAY_PORT` or URL, and the in-app proxy in Docker Batshit), never the URL
+ * saved with the record, which names whatever gateway Settings saw when the record was added.
+ * That address differs between Batshit processes, and every Batshit on the Mac rewrites the
+ * shared profile files, so they carry a reference that each run fills with its own process's
+ * address (`cliHelperLaunch.ts`, the BL-152 rule). Every other gateway keeps its saved URL.
+ * Both profile managers call this.
+ */
+export function resolveManagedGatewayUrl(
+  gateway: Pick<MCPGateway, 'type' | 'url'>
+): string | null {
+  if (gateway.type === 'docker-catalog') return cliDockerGatewayUrlRef()
+  const saved = typeof gateway.url === 'string' ? gateway.url.trim() : ''
+  return saved.length > 0 ? saved : null
+}
+
+export async function syncAgentCodexProfiles(userId: string, requiredProfileId?: string) {
   if (env.BATSHIT_CODEX_PROVIDER_ENABLED === 'false') return
+  let requiredProfileFailed = false
   const agents = await redis.getAgents(userId)
   const gateways = await mcpGatewayService.list(userId)
   const n8nInstanceToken = await migrateLegacyN8nInstanceMcpTokens({
@@ -352,15 +483,7 @@ export async function syncAgentCodexProfiles(userId: string) {
       })
     } catch (error) {
       console.error('[CodexProfileManager] Failed to resolve MCP selections for agent', agent.id, error)
-    }
-
-    try {
-      await deleteManagedCodexInstructionsFile(profileId)
-    } catch (error) {
-      console.warn('[CodexProfileManager] Failed to remove stale managed Codex instructions file', {
-        profileId,
-        error
-      })
+      if (profileId === requiredProfileId) requiredProfileFailed = true
     }
 
     const entry: CodexProfileEntry = {
@@ -372,7 +495,45 @@ export async function syncAgentCodexProfiles(userId: string) {
       gateways: gatewaysData
     }
 
-    await writeAgentManagedBlock(entry)
+    // BL-745: `agents` was read before the awaits above; an agent deleted since then must not
+    // get its folder back. Written in the folder's turn, only while its record still exists.
+    try {
+      const written = await writeAgentProfileFolderIfAgentExists(agent.id, profileId, async () => {
+        try {
+          await deleteManagedCodexInstructionsFile(profileId)
+        } catch (error) {
+          console.warn('[CodexProfileManager] Failed to remove stale managed Codex instructions file', {
+            profileId,
+            error
+          })
+          if (profileId === requiredProfileId) requiredProfileFailed = true
+        }
+
+        try {
+          await writeAgentManagedBlock(entry)
+        } catch (error) {
+          // BL-7 review: one agent's refused home (its folder resolves outside Batshit's agents
+          // folder, or to the user's own `~/.codex`) must not stop every other agent's profile.
+          // Nothing was written through it, and that agent's own run still fails loudly when it
+          // prepares its home.
+          if (!isManagedCodexHomeRefusal(error)) throw error
+          console.error('[CodexProfileManager] Skipped a Codex profile whose home was refused', {
+            profileId,
+            error: (error as Error).message
+          })
+          if (profileId === requiredProfileId) requiredProfileFailed = true
+        }
+      })
+      if (!written && profileId === requiredProfileId) requiredProfileFailed = true
+    } catch (error) {
+      // A failed fresh owner read must not prevent other agents' profiles from syncing.
+      // This is not run admission: ensureManagedCodexHome checks its own owner separately.
+      console.error('[CodexProfileManager] Failed to sync agent profile', { agentId: agent.id, profileId, error })
+      if (profileId === requiredProfileId) requiredProfileFailed = true
+    }
+  }
+  if (requiredProfileFailed) {
+    throw new ManagedProfileRunRefusedError('The managed Codex profile could not be synced for this run.')
   }
 }
 
@@ -519,8 +680,9 @@ async function buildManagedServers(params: {
         ? stdioConfig.cwdValue
         : undefined
 
+    const gatewayUrl = gateway.type === 'stdio' ? null : resolveManagedGatewayUrl(gateway)
     if (gateway.type === 'stdio' && !stdioConfig?.command) continue
-    if (gateway.type !== 'stdio' && !gateway.url) continue
+    if (gateway.type !== 'stdio' && !gatewayUrl) continue
 
     servers.push({
       gatewayId: gateway.id,
@@ -543,7 +705,7 @@ async function buildManagedServers(params: {
                 : undefined
           }
         : {
-            url: gateway.url
+            url: gatewayUrl ?? undefined
           }),
       slug: gateway.slug,
       managedId,
@@ -587,8 +749,6 @@ async function buildManagedServers(params: {
     if (!managedId) {
       throw new Error('Cannot register the subagent MCP bridge without a primary agent id.')
     }
-    const scriptPath = path.join(process.cwd(), 'scripts', 'codex-subagent-mcp.cjs')
-    const helperBaseUrl = resolveCliHelperBatshitBaseUrl()
     const enabledTools = [
       ...buildSubagentBridgeEnabledTools(assigned),
       ...(workerToolsAllowed ? [CLI_WORKER_SPAWN_TOOL_NAME] : []),
@@ -599,11 +759,12 @@ async function buildManagedServers(params: {
       name: `${params.agent.displayName || params.agent.id} · subagents`,
       url: undefined,
       command: 'node',
+      // BL-152: this Batshit's script folder and URL are filled in by each run.
       args: [
-        scriptPath,
+        cliHelperScriptRef('codex-subagent-mcp.cjs'),
         `--agent=${params.agent.id}`,
         `--user=${params.userId ?? ''}`,
-        `--url=${helperBaseUrl}`
+        cliHelperUrlArgRef()
       ],
       envVars: [
         // SA-117 DL-117-06/08: the subagent bridge authenticates with THIS run's credential.
@@ -633,19 +794,17 @@ async function buildManagedServers(params: {
   }
 
   if (params.agent && typeof params.userId === 'string' && params.userId.trim().length > 0) {
-    const slugSource = params.agent.slug ?? params.agent.id
-    const managedId = buildManagedGatewayId(
-      buildMode4InternalHelpersGatewayId(params.agent.id),
-      buildMode4InternalHelpersGatewaySlug(slugSource)
-    )
-    const scriptPath = path.join(process.cwd(), 'scripts', 'mode4-controls-mcp.cjs')
+    // BL-5: one fixed name in every profile, so `mcp__<server>__<tool>` stays inside Codex's
+    // 64-byte limit for every helper and every agent (see `cliHelperToolNames.ts`).
+    const managedId = CLI_HELPER_MCP_SERVER_NAME
     const nativeToolSettings = resolveNativeToolSettings(
       params.agent.provider_specific_settings ?? null
     )
     const cliToolScope = await resolveCliToolSelectionScope({
       userId: params.userId,
       agentId: params.agent.id,
-      selectedToolIds: params.selectedCliToolIds
+      // The run's server-resolved list (BL-686); absent reads the agent's saved list.
+      cliToolScope: params.selectedCliToolIds ?? undefined
     })
     const hasCliTools = cliToolScope.toolIds.length > 0
     const enabledMode4HelperTools = resolveEnabledMode4InternalHelperTools(nativeToolSettings, {
@@ -655,18 +814,17 @@ async function buildManagedServers(params: {
     const disabledMode4HelperTools = MODE4_INTERNAL_HELPER_TOOL_NAMES
       .filter((toolName) => !enabledMode4HelperToolSet.has(toolName))
       .sort()
-    const helperBaseUrl = resolveCliHelperBatshitBaseUrl()
-
     servers.push({
-      gatewayId: buildMode4InternalHelpersGatewayId(params.agent.id),
-      name: `${params.agent.displayName || params.agent.id} · mode4 controls`,
+      gatewayId: managedId,
+      name: `${params.agent.displayName || params.agent.id} · Batshit helpers`,
       url: undefined,
       command: 'node',
+      // BL-152: this Batshit's script folder and URL are filled in by each run.
       args: [
-        scriptPath,
+        cliHelperScriptRef('mode4-controls-mcp.cjs'),
         `--agent=${params.agent.id}`,
         `--user=${params.userId}`,
-        `--url=${helperBaseUrl}`,
+        cliHelperUrlArgRef(),
         // SA-105 P3 (AMD-105-09): tells the bridge which CLI is consuming its
         // results, which is what decides whether a recalled memory image can
         // ride back as MCP image content this turn. Codex renders those blocks;
@@ -687,8 +845,11 @@ async function buildManagedServers(params: {
         'PUBLIC_BASE_URL',
         'ORIGIN'
       ],
+      // BL-318: Codex cuts a tool call after `tool_timeout_sec` (60 s unless set), and an
+      // artifact run may take its own run limit (up to 10 minutes).
+      toolTimeoutSec: Math.ceil(CLI_HELPER_TOOL_TIMEOUT_MS / 1000),
       managedId,
-      slug: buildMode4InternalHelpersGatewaySlug(slugSource),
+      slug: managedId,
       enabled: enabledMode4HelperTools.length > 0,
       enabledTools: enabledMode4HelperTools,
       disabledTools: disabledMode4HelperTools,
@@ -858,37 +1019,22 @@ async function writeAgentManagedBlock(entry: CodexProfileEntry) {
   const codexDir = await ensureAgentCodexDir(entry.profileId)
   const configPath = path.join(codexDir, 'config.toml')
 
-  let existing = ''
-  try {
-    existing = await fs.readFile(configPath, 'utf8')
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      const legacyAgentPath = getLegacyAgentConfigPath(entry.profileId)
-      let copied = false
-      try {
-        const legacyContents = await fs.readFile(legacyAgentPath, 'utf8')
-        existing = legacyContents
-        await fs.writeFile(configPath, legacyContents, 'utf8')
-        copied = true
-      } catch (legacyAgentError) {
-        if ((legacyAgentError as NodeJS.ErrnoException).code !== 'ENOENT') {
-          throw legacyAgentError
-        }
-      }
-      if (!copied) {
-        const legacyPath = path.join(LEGACY_ROOT_DIR, entry.profileId, 'config.toml')
-        try {
-          const legacyContents = await fs.readFile(legacyPath, 'utf8')
-          existing = legacyContents
-          await fs.writeFile(configPath, legacyContents, 'utf8')
-        } catch (legacyError) {
-          if ((legacyError as NodeJS.ErrnoException).code !== 'ENOENT') {
-            throw legacyError
-          }
-        }
-      }
-    } else {
-      throw error
+  // BL-7 review: the managed config is read and written without following a link. A
+  // `config.toml` that is a symlink is never read, so it counts as missing (its target is
+  // never merged), and the write below replaces the link with Batshit's own file (see
+  // codexManagedHome.ts). The legacy configs are read the same way.
+  let existing = await readManagedConfigWithoutLinks(configPath, MANAGED_ROOT_DIR)
+  if (existing === null) {
+    existing = ''
+    for (const [legacyPath, legacyRoot] of [
+      [getLegacyAgentConfigPath(entry.profileId), MANAGED_ROOT_DIR],
+      [path.join(LEGACY_ROOT_DIR, entry.profileId, 'config.toml'), LEGACY_ROOT_DIR]
+    ] as const) {
+      const legacyContents = await readManagedConfigWithoutLinks(legacyPath, legacyRoot)
+      if (legacyContents === null) continue
+      existing = legacyContents
+      await writeFileWithoutLinks(configPath, legacyContents, MANAGED_ROOT_DIR)
+      break
     }
   }
 
@@ -903,7 +1049,25 @@ async function writeAgentManagedBlock(entry: CodexProfileEntry) {
     parseToml(nextContents)
   }
 
-  await fs.writeFile(configPath, nextContents || '', 'utf8')
+  await writeFileWithoutLinks(configPath, nextContents || '', MANAGED_ROOT_DIR)
+}
+
+/**
+ * A managed or legacy Codex config, read without following a link. Null when it does not
+ * exist, and ALSO when it (or a folder on its way) is a link: a linked file's content is
+ * never read.
+ */
+async function readManagedConfigWithoutLinks(filePath: string, root: string) {
+  try {
+    return await readFileWithoutLinks(filePath, root)
+  } catch (error) {
+    if (!isManagedFileLinkError(error)) throw error
+    console.warn(`[CodexProfileManager] Did not read a managed config: ${describeManagedFileLinkRefusal(error)}`, {
+      filePath,
+      reason: (error as Error).message
+    })
+    return null
+  }
 }
 
 async function deleteManagedCodexInstructionsFile(profileId: string) {
@@ -931,7 +1095,10 @@ function getLegacyAgentConfigPath(profileId: string) {
 export async function deleteAgentCodexConfig(agentId: string | null | undefined) {
   const profileId = buildAgentProfileId(agentId ?? undefined)
   const dir = path.join(MANAGED_ROOT_DIR, profileId)
-  await fs.rm(dir, { recursive: true, force: true })
+  // BL-745: after any profile sync write already under way for this folder.
+  const remove = async () => withAgentProfileFolder(profileId, () => fs.rm(dir, { recursive: true, force: true }))
+  if (process.platform === 'win32') return remove() // BL-364: no supported host identity proof yet.
+  return withHostCommandDeletion([hostProfileResource(profileId)], async () => remove())
 }
 
 function removeManagedBlock(contents: string) {
@@ -1348,9 +1515,16 @@ function extractHistoryPersistenceFromRawToml(contents: string) {
 }
 
 async function readAgentToml(profileId: string) {
-  for (const candidate of [getAgentConfigPath(profileId), getLegacyAgentConfigPath(profileId), path.join(LEGACY_ROOT_DIR, profileId, 'config.toml')]) {
+  for (const [candidate, root] of [
+    [getAgentConfigPath(profileId), MANAGED_ROOT_DIR],
+    [getLegacyAgentConfigPath(profileId), MANAGED_ROOT_DIR],
+    [path.join(LEGACY_ROOT_DIR, profileId, 'config.toml'), LEGACY_ROOT_DIR]
+  ] as const) {
     try {
-      const contents = await fs.readFile(candidate, 'utf8')
+      // BL-7 review: never read a config through a link; one that is a link is treated as
+      // unreadable, so the session cleanup leaves that agent alone.
+      const contents = await readFileWithoutLinks(candidate, root)
+      if (contents === null) continue
       if (!contents.trim().length) {
         return {}
       }
@@ -1371,6 +1545,13 @@ async function readAgentToml(profileId: string) {
         }
       }
     } catch (error) {
+      if (isManagedFileLinkError(error)) {
+        console.warn(
+          `[CodexProfileManager] Did not read a managed config: ${describeManagedFileLinkRefusal(error)}`,
+          { candidate, reason: (error as Error).message }
+        )
+        return { __batshit_invalid_config: true }
+      }
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
         console.warn('[CodexProfileManager] Failed to read managed config:', error)
         return {}
@@ -1456,22 +1637,109 @@ function extractTomlTableName(line: string): string | null {
   return tableMatch ? tableMatch[1] : null
 }
 
+/** Read the user's actual managed setting; never write or increase the vendor limit. */
+export async function readManagedCodexToolOutputTokenLimit(configHome: string): Promise<number | null> {
+  const contents = await readFileWithoutLinks(path.join(configHome, 'config.toml'), MANAGED_ROOT_DIR)
+  if (contents === null) return null
+  const parsed = parseToml(contents) as Record<string, unknown>
+  const value = parsed.tool_output_token_limit
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null
+}
+
+/**
+ * BL-152 — the `--config` overrides that launch this managed home's helper servers with THIS
+ * process's script folder and URL. The shared `config.toml` writes each helper's args with
+ * references (`cliHelperLaunch.ts`), because every Batshit on the Mac rewrites it; Codex does
+ * not expand them, so each run replaces the args of every server whose args carry one, and
+ * (BL-310) the `url` of a Docker gateway, which names this process's gateway address the same
+ * way.
+ *
+ * The bridge reads it right before the spawn (after the start gate), from the file Codex will
+ * read, so the overrides name exactly the servers in those bytes: an override for a server the
+ * file lacks is an invalid server table and Codex refuses to start (`invalid transport`,
+ * measured on codex-cli 0.139.0). A missing file gives no overrides (Codex then has no config
+ * and no helpers either). A file that is a link or has a second name (BL-117, BL-163), that
+ * does not parse, or that names a server whose id cannot be passed as a `--config` key throws,
+ * and the run fails, instead of starting helpers with a literal reference.
+ */
+
+export async function readManagedCodexHelperLaunchOverrides(
+  configHome: string,
+  values: CliHelperLaunchValues = resolveCliHelperLaunchValues()
+): Promise<string[]> {
+  const configPath = path.join(configHome, 'config.toml')
+  const contents = await readFileWithoutLinks(configPath, MANAGED_ROOT_DIR)
+  if (contents === null) return []
+  let parsed: Record<string, unknown>
+  try {
+    parsed = parseToml(contents) as Record<string, unknown>
+  } catch (error) {
+    throw new Error(
+      `Batshit could not read ${configPath} to start this run's helper servers (${(error as Error).message}).`,
+      { cause: error }
+    )
+  }
+  const servers = parsed.mcp_servers
+  if (!servers || typeof servers !== 'object') return []
+
+  const overrides: string[] = []
+  for (const [serverId, server] of Object.entries(servers as Record<string, unknown>).sort(([a], [b]) =>
+    a.localeCompare(b)
+  )) {
+    const args = (server as { args?: unknown } | null)?.args
+    const url = (server as { url?: unknown } | null)?.url
+    const argsCarryRef = Array.isArray(args) && args.some(hasCliHelperLaunchRef)
+    // BL-310: a Docker gateway's address is a reference too.
+    const urlCarriesRef = hasCliHelperLaunchRef(url)
+    if (!argsCarryRef && !urlCarriesRef) continue
+    // Codex splits a `--config` key at every dot and takes no quoted segment.
+    if (!/^[A-Za-z0-9_-]+$/.test(serverId)) {
+      throw new Error(`Batshit cannot pass this run's helper launch for the MCP server "${serverId}" in ${configPath}.`)
+    }
+    if (argsCarryRef) {
+      const filled = (args as unknown[]).map((arg) =>
+        typeof arg === 'string' ? fillCliHelperLaunchRefs(arg, values) : String(arg)
+      )
+      overrides.push(`mcp_servers.${serverId}.args=[${filled.map((arg) => JSON.stringify(arg)).join(', ')}]`)
+    }
+    if (urlCarriesRef) {
+      overrides.push(`mcp_servers.${serverId}.url=${JSON.stringify(fillCliHelperLaunchRefs(url as string, values))}`)
+    }
+  }
+  return overrides
+}
+
 export async function ensureManagedCodexHome(options: {
   userId: string
   profileId?: string | null
+  owner: ManagedProfileRunOwner
   historyPersistence?: CodexRuntimeSettings['historyPersistence'] | null
 }) {
   if (!options.profileId || !options.userId) return null
-  const codexDir = await ensureAgentCodexDir(options.profileId)
-  const configPath = path.join(codexDir, 'config.toml')
-  await syncAgentCodexProfiles(options.userId)
-  if (!(await pathExists(configPath))) {
-    console.warn('[CodexProfileManager] Managed Codex config missing after sync', {
-      profileId: options.profileId
-    })
-    return null
+  if (options.owner?.userId !== options.userId) {
+    throw new ManagedProfileRunRefusedError('The managed Codex profile owner does not match this user.')
   }
-  return codexDir
+  // The first turn retains the early positive home check: a refused home fails before any
+  // whole-user sync. The second turn checks this run's owner again after that sync's awaits.
+  const codexDir = await withManagedProfileRunWrite(options.owner, options.profileId, () =>
+    ensureAgentCodexDir(options.profileId!)
+  )
+  try {
+    await syncAgentCodexProfiles(options.userId, options.profileId)
+  } catch (error) {
+    throw new ManagedProfileRunRefusedError('The managed Codex profile could not be synced for this run.', { cause: error })
+  }
+  return withManagedProfileRunWrite(options.owner, options.profileId, async () => {
+    await assertBatshitManagedCodexHome(codexDir)
+    const configPath = path.join(codexDir, 'config.toml')
+    if (!(await pathExists(configPath))) {
+      console.warn('[CodexProfileManager] Managed Codex config missing after sync', {
+        profileId: options.profileId
+      })
+      return null
+    }
+    return codexDir
+  })
 }
 
 function parseOverrideValue(raw: string | undefined) {

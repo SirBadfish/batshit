@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
-import { redis } from '$lib/server/redis'
+import { RedisService, redis } from '$lib/server/redis'
 import { POST } from './+server'
 
 /**
@@ -25,6 +25,7 @@ import { POST } from './+server'
 useRedisTestServer()
 
 const USER = 'user-chat-settings'
+const REAL_REDIS_LANE = process.env.VITEST_USE_REAL_REDIS === 'true'
 
 function post(body: Record<string, unknown>) {
   return POST({
@@ -106,5 +107,56 @@ describe('global_chat_settings', () => {
         expect(lastUpdateArgument().global_chat_settings).toEqual({ busy_send_mode: 'steer' })
       }
     }
+  })
+})
+
+describe('legacy custom Goon references in settings', () => {
+  it.runIf(REAL_REDIS_LANE)('refuses a reservation installed after the settings read, then allows a released retry', async () => {
+    const uploadKey = 'upload:goon_custom_models:settings-shared.glb'
+    const markerKey = 'goon_asset_delete:goon_custom_models:settings-shared.glb'
+    const goonsSettings = { legacy: { model: { ref: '/uploads/goon_custom_models/settings-shared.glb' } } }
+    await redis.json.set(uploadKey, '$', { filename: 'settings-shared.glb' })
+
+    const service = new RedisService()
+    const getSettings = service.getUserSettings.bind(service)
+    const readSpy = vi.spyOn(service, 'getUserSettings').mockImplementation(async (userId) => {
+      const existing = await getSettings(userId)
+      await redis.execute((client) => client.set(markerKey, JSON.stringify({
+        contract: 'goon-asset-deletion/v1', phase: 'reserved'
+      })))
+      return existing
+    })
+    try {
+      await expect(service.updateUserSettings(USER, {
+        goons_settings: goonsSettings as any,
+        upload_provider: 'local'
+      })).rejects.toMatchObject({ code: 'ASSET_UNAVAILABLE', status: 409 })
+    } finally {
+      readSpy.mockRestore()
+    }
+    expect(await redis.getUserSettings(USER)).toBeNull()
+
+    const refused = await post({ goons_settings: goonsSettings, upload_provider: 'local' })
+    expect(refused.status).toBe(409)
+    expect((await refused.json()).error).toContain('Custom Goon asset is unavailable')
+    expect(await redis.getUserSettings(USER)).toBeNull()
+
+    await redis.execute((client) => client.del(markerKey))
+    const accepted = await post({ goons_settings: goonsSettings, upload_provider: 'local' })
+    expect(accepted.status).toBe(200)
+    expect(((await redis.json.get(`user:${USER}:settings`)) as any)?.goons_settings).toEqual(goonsSettings)
+
+    await redis.execute((client) => client.set(markerKey, JSON.stringify({
+      contract: 'goon-asset-deletion/v1', phase: 'reserved'
+    })))
+    await expect(new RedisService().saveUserSettings(USER, { changed: true }))
+      .rejects.toMatchObject({ code: 'ASSET_UNAVAILABLE', status: 409 })
+    expect(((await redis.getUserSettings(USER)) as any)?.ui_settings?.changed).toBeUndefined()
+    await redis.execute((client) => client.del(markerKey))
+
+    await redis.execute((client) => client.del(uploadKey))
+    const deleted = await post({ goons_settings: goonsSettings, upload_provider: 'remote' })
+    expect(deleted.status).toBe(409)
+    expect(((await redis.getUserSettings(USER)) as any)?.upload_provider).toBe('local')
   })
 })

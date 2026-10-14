@@ -41,9 +41,11 @@ describe('JevJuicePostTurnChip', () => {
     expect(chip.textContent).toContain('Reply check: 2 flags · Style: 1 note')
     expect(chip.className).toContain('message-memory-chip')
     expect(chip.className).toContain('is-jev-juice')
+    // SA-120 P10b: the record keeps no judge, so the chip says "the judge", never a name it cannot know.
+    expect(chip.getAttribute('aria-label')).toBe('Show what the judge noticed about this reply')
   })
 
-  it('draws the ordinary Jev Juice note, and no chip, when a lane could not run', async () => {
+  it('draws the ordinary Judge Juice note, and no chip, when a lane could not run', async () => {
     render(JevJuicePostTurnChip, {
       props: {
         record: record({
@@ -53,8 +55,8 @@ describe('JevJuicePostTurnChip', () => {
       }
     })
     const note = await screen.findByTestId('jev-juice-note')
-    expect(note.textContent).toContain('Jev Juice: Reply check skipped')
-    expect(note.getAttribute('title')).toBe('Jev Juice is off in Settings → Admin. This reply was not checked.')
+    expect(note.textContent).toContain('Judge Juice: Reply check skipped')
+    expect(note.getAttribute('title')).toBe('Judge Juice is off in Settings → Admin. This reply was not checked.')
     expect(screen.queryByTestId('jev-juice-post-turn')).toBeNull()
   })
 })

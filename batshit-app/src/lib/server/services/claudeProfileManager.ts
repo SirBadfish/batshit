@@ -1,6 +1,15 @@
-import { promises as fs } from 'node:fs'
+import { getManagedAgentRootDir } from './batshitHome'
+import { promises as fs, type Stats } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
+import { hostProfileResource, withHostCommandDeletion } from '$lib/server/services/hostCommandOwnership'
+import {
+  withAgentProfileFolder,
+  withManagedProfileRunWrite,
+  writeAgentProfileFolderIfAgentExists,
+  ManagedProfileRunRefusedError,
+  type ManagedProfileRunOwner
+} from '$lib/server/services/agentProfileFolderGate'
 
 import { env } from '$env/dynamic/private'
 import { redis } from '$lib/server/redis'
@@ -11,25 +20,44 @@ import { resolveMCPSelections } from '$lib/server/services/mcpSelectionResolver'
 import { mcpGatewayService } from '$lib/server/services/mcpGatewayService'
 import { getDockerGatewayAuthToken } from '$lib/server/services/dockerGatewayConfig'
 import { apiKeyService } from '$lib/services/apiKey.server'
-import { buildAgentProfileId, buildManagedGatewayId } from '$lib/server/services/codexProfileManager'
+import {
+  buildAgentProfileId,
+  buildManagedGatewayId,
+  resolveManagedGatewayUrl
+} from '$lib/server/services/codexProfileManager'
 import { migrateLegacyN8nInstanceMcpTokens } from '$lib/server/services/mcpGatewayTokenMigration'
 import { resolveNativeToolSettings } from '$lib/server/services/nativeTools'
-import { applyClaudeRuntimeOwnership } from '$lib/server/services/claudeRuntimeUser'
+import {
+  applyClaudeRuntimeOwnershipToHandle,
+  applyClaudeRuntimeOwnershipWithoutFollowing,
+  resolveClaudeRunAsIdentity
+} from '$lib/server/services/claudeRuntimeUser'
 import {
   isMode4InternalHelperTool,
   resolveEnabledMode4InternalHelperTools,
-  buildMode4InternalHelpersGatewayId,
-  buildMode4InternalHelpersGatewaySlug
+  CLI_HELPER_MCP_SERVER_NAME,
+  CLI_HELPER_TOOL_TIMEOUT_MS
 } from '$lib/server/services/mode4InternalTools'
 import {
   buildManagedStdioEnvironmentPlan,
   sanitizeStdioGatewayConfig
 } from '$lib/server/services/mcpGatewayStdio'
 import { resolveCliToolSelectionScope } from '$lib/server/services/cliToolRegistry'
-import { resolveCliHelperBatshitBaseUrl } from '$lib/server/services/cliHelperBaseUrl'
+import { cliHelperScriptRef, cliHelperUrlArgRef } from '$lib/server/services/cliHelperLaunch'
 import { buildCliSubagentMcpServerName } from '$lib/utils/cliSubagentToolNames'
 import { resolveWorkersEnabled } from '$lib/utils/delegationCapabilities'
 import type { MCPToolSelections } from '$lib/types/database'
+import {
+  describeFsError,
+  describeManagedFileLinkRefusal,
+  describeUnmanagedAgentHome,
+  isManagedCodexProfileId,
+  isManagedFileLinkError,
+  readFileWithoutLinks,
+  readManagedHomeFile,
+  writeFileWithoutLinks,
+  type ManagedAgentHomeLayout
+} from '$lib/server/services/codexManagedHome'
 
 const CLAUDE_DIR_NAME = '.claude'
 const CLAUDE_APPROVAL_TOOL = 'batshit_permission_prompt'
@@ -54,15 +82,140 @@ export function buildClaudeProfileId(agentId: string | null | undefined) {
   return buildAgentProfileId(agentId ?? undefined)
 }
 
+export function agentClaudeProfileResource(agentId: string | null | undefined): string {
+  return hostProfileResource(buildClaudeProfileId(agentId), getManagedRootDir())
+}
+
 function getManagedRootDir() {
-  const configuredRoot = env.BATSHIT_AGENT_RUNTIME_ROOT?.trim()
+  return getManagedAgentRootDir(env.BATSHIT_AGENT_RUNTIME_ROOT)
+}
+
+/**
+ * BL-7 review — the Claude lane's managed homes follow the Codex lane's positive rule
+ * (`codexManagedHome.ts`). A profile id is a folder name, and a stored `claude_profile_id`
+ * was used unchecked: `../..` made every managed path `~/.claude/…`, so the run's
+ * `--settings`, `--mcp-config` and `--plugin-dir` pointed into the user's own Claude home and
+ * a CLI Subagent profile write merged Batshit's keys into their `settings.json`. A folder
+ * symlinked out of the agents folder reached the same files by a valid name.
+ */
+export const MANAGED_CLAUDE_HOME_REFUSED = 'CLAUDE_MANAGED_HOME_REFUSED'
+
+export class ManagedClaudeHomeRefusedError extends Error {
+  readonly code = MANAGED_CLAUDE_HOME_REFUSED
+
+  constructor(message: string) {
+    super(message)
+    this.name = 'ManagedClaudeHomeRefusedError'
+  }
+}
+
+export function isManagedClaudeHomeRefusal(error: unknown): boolean {
+  return (error as { code?: unknown } | null)?.code === MANAGED_CLAUDE_HOME_REFUSED
+}
+
+/**
+ * Every Claude profile id Batshit builds comes from `buildAgentProfileId` (an agent's id, or a
+ * CLI Subagent's or Worker's `subagent_cli_<slug>`), so the Codex lane's id rule is this one.
+ */
+export function assertManagedClaudeProfileId(profileId: unknown): string {
+  if (isManagedCodexProfileId(profileId)) return profileId
+  const shown = typeof profileId === 'string' ? JSON.stringify(profileId) : String(profileId)
+  throw new ManagedClaudeHomeRefusedError(
+    `Batshit refused to use ${shown} as a managed Claude profile: a managed profile id is ` +
+      '"batshit_agent_" followed by lowercase letters, digits, "_" or "-", so its folder stays ' +
+      `inside ${getManagedRootDir()}.`
+  )
+}
+
+/** The user's own Claude home(s): `~/.claude`, and `CLAUDE_CONFIG_DIR` when it is set. */
+function getUsersOwnClaudeHomes() {
   const home = process.env.HOME?.trim() || os.homedir()
-  const runtimeRoot = configuredRoot ? path.resolve(configuredRoot) : path.join(home, '.batshit')
-  return path.join(runtimeRoot, 'agents')
+  const homes = [path.join(home, CLAUDE_DIR_NAME)]
+  const configured = process.env.CLAUDE_CONFIG_DIR?.trim()
+  if (configured) homes.push(path.resolve(configured))
+  return homes
+}
+
+/**
+ * BL-270 (option A, Opie/Josh 2026-09-27): the deny rules that keep a managed Claude run from
+ * writing into the user's own plans folder. In Plan mode Claude Code writes its plan to
+ * `<config dir>/plans` (the user's `~/.claude/plans`), and it refuses a `plansDirectory` outside
+ * the project (2.1.280: "plansDirectory must be within project root"), while moving the whole
+ * config folder (`CLAUDE_CONFIG_DIR`) would need a second Claude login. So the write is denied
+ * (`Edit` rules cover every file-editing tool; `//` is an absolute path) and the plan stays in
+ * the reply, which Batshit keeps.
+ */
+export function buildUsersClaudePlansDenyRules(): string[] {
+  // Docker runs Claude Code as its own user (`BATSHIT_CLAUDE_RUN_AS_HOME`, compose.yaml), with
+  // that user's HOME in the child, so its plans land in that home's `.claude/plans`.
+  const runAsHome = resolveClaudeRunAsIdentity().home
+  const homes = Array.from(
+    new Set([...getUsersOwnClaudeHomes(), ...(runAsHome ? [path.join(runAsHome, CLAUDE_DIR_NAME)] : [])])
+  )
+  return homes.map((home) => {
+    const plans = path.join(home, 'plans')
+    const posix = plans
+      .replace(/\\/g, '/')
+      .replace(/^([A-Za-z]):/, (_m, drive: string) => `/${drive.toLowerCase()}`)
+      // `--disallowedTools` is one comma- or space-separated list, so a space or comma in the
+      // path becomes `?` (one character, never `/`, in the rule's gitignore syntax).
+      .replace(/[ ,]/g, '?')
+    return `Edit(/${posix.startsWith('/') ? posix : `/${posix}`}/**)`
+  })
+}
+
+function refuseClaudeHome(candidate: string, reason: string): never {
+  throw new ManagedClaudeHomeRefusedError(
+    `Batshit refused to use ${candidate} as a managed Claude home: ${reason}. A managed Claude ` +
+      `run uses only its own folder under ${getManagedRootDir()}, never your own ` +
+      `${getUsersOwnClaudeHomes().join(' or ')}.`
+  )
+}
+
+function getManagedClaudeHomeLayout(): ManagedAgentHomeLayout {
+  return {
+    root: getManagedRootDir(),
+    dirName: CLAUDE_DIR_NAME,
+    cliName: 'Claude',
+    userHomes: getUsersOwnClaudeHomes()
+  }
+}
+
+/** The home must resolve (every symlink followed) to `<agents>/<profile id>/.claude`. */
+async function assertBatshitManagedClaudeHome(candidate: string) {
+  const reason = await describeUnmanagedAgentHome(candidate, getManagedClaudeHomeLayout())
+  if (reason !== null) refuseClaudeHome(candidate, reason)
+}
+
+/**
+ * Reads a managed Claude file to SHOW it (the managed-config viewers): the home must pass the
+ * managed-home check and the file is never read through a link. Null when it does not exist.
+ */
+export function readManagedClaudeHomeFile(filePath: string) {
+  return readManagedHomeFile(filePath, getManagedClaudeHomeLayout())
+}
+
+/**
+ * The profile folder itself must be `<agents>/<profile id>` once resolved, checked BEFORE
+ * `.claude` is made in it: a profile folder that is a symlink would otherwise get a new
+ * `.claude` (and its `plugins`) created wherever it points.
+ */
+async function assertProfileFolderInsideRoot(profileDir: string, profileId: string) {
+  let realRoot: string
+  let realProfile: string
+  try {
+    realRoot = await fs.realpath(getManagedRootDir())
+    realProfile = await fs.realpath(profileDir)
+  } catch (error) {
+    refuseClaudeHome(profileDir, `the folder cannot be resolved (${describeFsError(error)})`)
+  }
+  if (realProfile !== path.join(realRoot, profileId)) {
+    refuseClaudeHome(profileDir, `it resolves to ${realProfile}, outside ${realRoot}`)
+  }
 }
 
 function getAgentClaudeDir(profileId: string) {
-  return path.join(getManagedRootDir(), profileId, CLAUDE_DIR_NAME)
+  return path.join(getManagedRootDir(), assertManagedClaudeProfileId(profileId), CLAUDE_DIR_NAME)
 }
 
 export function getManagedClaudePaths(profileId: string) {
@@ -76,13 +229,42 @@ export function getManagedClaudePaths(profileId: string) {
 }
 
 async function ensureAgentClaudeDir(profileId: string) {
-  const dir = getAgentClaudeDir(profileId)
-  const pluginsDir = path.join(dir, 'plugins')
+  // BL-7 review: the id is refused before it becomes a path, the profile folder before
+  // anything is made in it, and the home before anything is written, owned, or linked to.
+  const profileDir = path.join(getManagedRootDir(), assertManagedClaudeProfileId(profileId))
+  await fs.mkdir(profileDir, { recursive: true })
+  await assertProfileFolderInsideRoot(profileDir, profileId)
+  const dir = path.join(profileDir, CLAUDE_DIR_NAME)
   await fs.mkdir(dir, { recursive: true })
+  await assertBatshitManagedClaudeHome(dir)
+  const pluginsDir = path.join(dir, 'plugins')
+  // BL-7 review: a `plugins` that is a symlink is replaced with Batshit's own folder, so
+  // `--plugin-dir` never points at, and ownership never reaches, what the link pointed at.
+  const plugins = await fs.lstat(pluginsDir).catch(() => null)
+  if (plugins?.isSymbolicLink()) {
+    console.warn("[ClaudeProfileManager] Replaced a symlinked plugins folder with Batshit's own", {
+      pluginsDir
+    })
+    await fs.unlink(pluginsDir)
+  }
   await fs.mkdir(pluginsDir, { recursive: true })
-  await applyClaudeRuntimeOwnership(dir)
-  await applyClaudeRuntimeOwnership(pluginsDir)
+  // BL-7 review: `lchown` never follows a link, so a folder swapped for one after these
+  // checks cannot redirect the run-as ownership.
+  await applyClaudeRuntimeOwnershipWithoutFollowing(dir)
+  await applyClaudeRuntimeOwnershipWithoutFollowing(pluginsDir)
   return dir
+}
+
+/**
+ * The paths a managed Claude run hands the CLI (`--settings`, `--mcp-config`,
+ * `--plugin-dir`), for a home that exists and passed the check above. Throws
+ * `ManagedClaudeHomeRefusedError` otherwise; no flag is ever built from an unchecked id.
+ */
+export async function ensureManagedClaudeHome(profileId: string, owner: ManagedProfileRunOwner) {
+  return withManagedProfileRunWrite(owner, profileId, async () => {
+    await ensureAgentClaudeDir(profileId)
+    return getManagedClaudePaths(profileId)
+  })
 }
 
 function mapPermissionMode(mode: string) {
@@ -253,8 +435,10 @@ async function buildManagedMcpServers(params: {
 
     const managedId = buildManagedGatewayId(gateway.id, gateway.slug)
     const stdioConfig = sanitizeStdioGatewayConfig(gateway.stdioConfig)
+    // BL-310: a Docker gateway at the address the app itself uses, not its saved URL.
+    const gatewayUrl = gateway.type === 'stdio' ? null : resolveManagedGatewayUrl(gateway)
     if (gateway.type === 'stdio' && !stdioConfig?.command) continue
-    if (gateway.type !== 'stdio' && !gateway.url) continue
+    if (gateway.type !== 'stdio' && !gatewayUrl) continue
     const fixedCwd =
       gateway.type === 'stdio' && stdioConfig?.cwdPolicy === 'fixed'
         ? stdioConfig.cwdValue
@@ -273,7 +457,7 @@ async function buildManagedMcpServers(params: {
           }
         : {
             type: 'http',
-            url: gateway.url
+            url: gatewayUrl
           }
 
     if (gateway.type !== 'stdio') {
@@ -310,15 +494,15 @@ async function buildManagedMcpServers(params: {
     if (!managedId) {
       throw new Error('Cannot register the subagent MCP bridge without a primary agent id.')
     }
-    const scriptPath = path.join(process.cwd(), 'scripts', 'codex-subagent-mcp.cjs')
+    // BL-152: script folder and URL by reference; Claude Code expands them from the run's env.
     servers[managedId] = {
       type: 'stdio',
       command: 'node',
       args: [
-        scriptPath,
+        cliHelperScriptRef('codex-subagent-mcp.cjs'),
         `--agent=${params.agent.id}`,
         `--user=${params.userId}`,
-        `--url=${resolveCliHelperBatshitBaseUrl()}`
+        cliHelperUrlArgRef()
       ]
     }
   }
@@ -328,7 +512,8 @@ async function buildManagedMcpServers(params: {
     const cliToolScope = await resolveCliToolSelectionScope({
       userId: params.userId,
       agentId: params.agent.id,
-      selectedToolIds: params.selectedCliToolIds
+      // The run's server-resolved list (BL-686); absent reads the agent's saved list.
+      cliToolScope: params.selectedCliToolIds ?? undefined
     })
     const hasCliTools = cliToolScope.toolIds.length > 0
     const enabledMode4HelperTools = resolveEnabledMode4InternalHelperTools(nativeToolSettings, {
@@ -336,20 +521,16 @@ async function buildManagedMcpServers(params: {
     })
 
     if (enabledMode4HelperTools.length > 0) {
-      const slugSource = params.agent.slug ?? params.agent.id
-      const managedId = buildManagedGatewayId(
-        buildMode4InternalHelpersGatewayId(params.agent.id),
-        buildMode4InternalHelpersGatewaySlug(slugSource)
-      )
-      const scriptPath = path.join(process.cwd(), 'scripts', 'mode4-controls-mcp.cjs')
-      servers[managedId] = {
+      // BL-5: one fixed name in every profile; `ClaudeBridge` scopes the tools under it.
+      // BL-152: script folder and URL by reference; Claude Code expands them from the run's env.
+      servers[CLI_HELPER_MCP_SERVER_NAME] = {
         type: 'stdio',
         command: 'node',
         args: [
-          scriptPath,
+          cliHelperScriptRef('mode4-controls-mcp.cjs'),
           `--agent=${params.agent.id}`,
           `--user=${params.userId}`,
-          `--url=${resolveCliHelperBatshitBaseUrl()}`,
+          cliHelperUrlArgRef(),
           // SA-105 P3 (AMD-105-09): the symmetric half of the Codex flag. Claude
           // Code stores MCP ImageContent as text at 10-20x the token cost
           // (anthropic/claude-code#31208, closed not-planned), so this runtime
@@ -370,16 +551,23 @@ async function buildManagedMcpServers(params: {
           BATSHIT_FRONTEND_URL: '${BATSHIT_FRONTEND_URL}',
           PUBLIC_BASE_URL: '${PUBLIC_BASE_URL}',
           ORIGIN: '${ORIGIN}'
-        }
+        },
+        // BL-318: a per-server tool timeout in milliseconds (Claude Code's MCP docs), longer
+        // than the helper's own longest wait, so a slow artifact run ends with Batshit's
+        // answer. Without it the user's own `MCP_TOOL_TIMEOUT` would decide.
+        timeout: CLI_HELPER_TOOL_TIMEOUT_MS
       }
     }
   }
 
-  const approvalScriptPath = path.join(process.cwd(), 'scripts', 'claude-permission-mcp.cjs')
   servers[CLAUDE_APPROVAL_SERVER_ID] = {
     type: 'stdio',
     command: 'node',
-    args: [approvalScriptPath]
+    args: [cliHelperScriptRef('claude-permission-mcp.cjs')],
+    // BL-496 (A5): the approval helper waits up to 10 minutes for the user, and the card says
+    // so (`expiresAt`). Eleven here, so a user's own `MCP_TOOL_TIMEOUT` in the app's
+    // environment cannot end the call before the card does.
+    timeout: CLI_HELPER_TOOL_TIMEOUT_MS
   }
 
   return servers
@@ -470,11 +658,17 @@ function isClaudeAgent(agent: AgentRow) {
 
 async function writeJsonFile(filePath: string, payload: Record<string, any>) {
   const contents = JSON.stringify(payload, null, 2)
-  // Managed mcp.json carries gateway auth plumbing; keep it owner-only. `mode` only applies
-  // when the file is created, so chmod explicitly to tighten pre-existing files on rewrite.
-  await fs.writeFile(filePath, contents, { encoding: 'utf8', mode: 0o600 })
-  await fs.chmod(filePath, 0o600)
-  await applyClaudeRuntimeOwnership(filePath)
+  // Managed mcp.json carries gateway auth plumbing; keep it owner-only. BL-7 review: written as
+  // a new owner-only file renamed over the old one, so a symlink there is replaced, never
+  // written through (and its target is never chmod-ed or chown-ed).
+  await writeManagedClaudeFile(filePath, contents)
+}
+
+async function writeManagedClaudeFile(filePath: string, contents: string) {
+  await writeFileWithoutLinks(filePath, contents, getManagedRootDir(), {
+    mode: 0o600,
+    prepareHandle: applyClaudeRuntimeOwnershipToHandle
+  })
 }
 
 function splitConfigPath(key: string) {
@@ -604,11 +798,21 @@ function removeManagedSettingsPaths(payload: Record<string, unknown>) {
 
 async function readExistingJsonFile(filePath: string) {
   try {
-    const contents = await fs.readFile(filePath, 'utf8')
+    // BL-7 review: never read through a link. A managed file that is a symlink is rebuilt
+    // from Batshit's settings (the write replaces the link); its target is never merged.
+    const contents = await readFileWithoutLinks(filePath, getManagedRootDir())
+    if (contents === null) return {}
     const parsed = JSON.parse(contents)
     return isPlainObject(parsed) ? parsed : {}
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return {}
+    }
+    if (isManagedFileLinkError(error)) {
+      console.warn(`[ClaudeProfileManager] Did not read a managed file: ${describeManagedFileLinkRefusal(error)}`, {
+        filePath,
+        reason: (error as Error).message
+      })
       return {}
     }
 
@@ -630,13 +834,12 @@ async function writeManagedSettingsFile(
   const merged = deepMergeJson(preserved, payload)
   const withOverrides = applyConfigOverrides(merged, configOverrides)
   const contents = JSON.stringify(withOverrides, null, 2)
-  await fs.writeFile(filePath, contents, 'utf8')
-  await fs.chmod(filePath, 0o600)
-  await applyClaudeRuntimeOwnership(filePath)
+  await writeManagedClaudeFile(filePath, contents)
 }
 
-export async function syncAgentClaudeProfiles(userId: string): Promise<Record<string, string>> {
+export async function syncAgentClaudeProfiles(userId: string, requiredProfileId?: string): Promise<Record<string, string>> {
   if (env.BATSHIT_CLAUDE_PROVIDER_ENABLED === 'false') return {}
+  let requiredProfileFailed = false
 
   const agents = await redis.getAgents(userId)
   const gateways = await mcpGatewayService.list(userId)
@@ -662,13 +865,6 @@ export async function syncAgentClaudeProfiles(userId: string): Promise<Record<st
       continue
     }
 
-    try {
-      await ensureAgentClaudeDir(profileId)
-    } catch (error) {
-      console.warn('[ClaudeProfileManager] Failed to create managed Claude directory', { profileId, error })
-      continue
-    }
-
     let gatewayToolMap: Record<string, string[]> = {}
     let resolvedGateways: string[] | undefined
 
@@ -686,6 +882,7 @@ export async function syncAgentClaudeProfiles(userId: string): Promise<Record<st
       resolvedGateways = resolution.resolvedGateways
     } catch (error) {
       console.error('[ClaudeProfileManager] Failed to resolve MCP selections for agent', agent.id, error)
+      if (profileId === requiredProfileId) requiredProfileFailed = true
     }
 
     const servers = await buildManagedMcpServers({
@@ -704,12 +901,47 @@ export async function syncAgentClaudeProfiles(userId: string): Promise<Record<st
     const settingsPayload = buildSettingsFile(runtimeSettings)
     const mcpPayload = { mcpServers: servers }
 
+    // BL-745: `agents` was read before the awaits above; an agent deleted since then must not
+    // get its folder back. Its home is made and written in the folder's turn, only while its
+    // record still exists.
     try {
-      await writeManagedSettingsFile(settingsPath, settingsPayload, runtimeSettings.configOverrides)
-      await writeJsonFile(mcpPath, mcpPayload)
+      const written = await writeAgentProfileFolderIfAgentExists(agent.id, profileId, async () => {
+        try {
+          await ensureAgentClaudeDir(profileId)
+        } catch (error) {
+          // BL-7 review: a refused home is skipped loudly; nothing is written through it, and
+          // that agent's own run still fails when it prepares its home.
+          if (isManagedClaudeHomeRefusal(error)) {
+            console.error('[ClaudeProfileManager] Skipped a Claude profile whose home was refused', {
+              profileId,
+              error: (error as Error).message
+            })
+          } else {
+            console.warn('[ClaudeProfileManager] Failed to create managed Claude directory', { profileId, error })
+          }
+          if (profileId === requiredProfileId) requiredProfileFailed = true
+          return
+        }
+
+        try {
+          await writeManagedSettingsFile(settingsPath, settingsPayload, runtimeSettings.configOverrides)
+          await writeJsonFile(mcpPath, mcpPayload)
+        } catch (error) {
+          console.warn('[ClaudeProfileManager] Failed to write managed Claude config', { profileId, error })
+          if (profileId === requiredProfileId) requiredProfileFailed = true
+        }
+      })
+      if (!written && profileId === requiredProfileId) requiredProfileFailed = true
     } catch (error) {
-      console.warn('[ClaudeProfileManager] Failed to write managed Claude config', { profileId, error })
+      // A failed fresh read for one agent must not stop unrelated profiles from syncing.
+      // Run admission checks the current run's owner separately and fails closed.
+      console.error('[ClaudeProfileManager] Failed to sync agent profile', { agentId: agent.id, profileId, error })
+      if (profileId === requiredProfileId) requiredProfileFailed = true
     }
+  }
+
+  if (requiredProfileFailed) {
+    throw new ManagedProfileRunRefusedError('The managed Claude profile could not be synced for this run.')
   }
 
   return gatewayHeaderEnv
@@ -717,6 +949,37 @@ export async function syncAgentClaudeProfiles(userId: string): Promise<Record<st
 
 export async function deleteAgentClaudeConfig(agentId: string | null | undefined) {
   const profileId = buildClaudeProfileId(agentId ?? undefined)
-  const dir = path.join(getManagedRootDir(), profileId, CLAUDE_DIR_NAME)
-  await fs.rm(dir, { recursive: true, force: true })
+  const removeHome = async () => {
+    // BL-7 review: `rm -rf` of `<profile>/.claude` resolves THROUGH a profile folder that is a
+    // symlink, so it deleted whatever `.claude` the link reached (the user's own, for a link to
+    // their home), and an unlink there removed a link outside the agents folder. The profile
+    // folder is checked first; then a `.claude` that is itself a symlink loses only the link,
+    // and a real folder goes only when it is a managed home.
+    const profileDir = path.join(getManagedRootDir(), assertManagedClaudeProfileId(profileId))
+    try {
+      await fs.lstat(profileDir)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+      throw error
+    }
+    await assertProfileFolderInsideRoot(profileDir, profileId)
+    const dir = path.join(profileDir, CLAUDE_DIR_NAME)
+    let entry: Stats
+    try {
+      entry = await fs.lstat(dir)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+      throw error
+    }
+    if (entry.isSymbolicLink()) {
+      await fs.unlink(dir)
+      return
+    }
+    await assertBatshitManagedClaudeHome(dir)
+    await fs.rm(dir, { recursive: true, force: true })
+  }
+  // BL-745: after any profile sync write already under way for this folder.
+  const remove = () => withAgentProfileFolder(profileId, removeHome)
+  if (process.platform === 'win32') return remove() // BL-364: no supported host identity proof yet.
+  return withHostCommandDeletion([agentClaudeProfileResource(agentId)], async () => remove())
 }

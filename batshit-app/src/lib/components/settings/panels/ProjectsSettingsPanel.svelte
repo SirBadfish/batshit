@@ -1081,8 +1081,8 @@
                   <SettingsInfoMenu ariaLabel="About Project Rules" contentClass="w-80">
                     <p>
                       Additional exclusions filter files out of agent access. AI Rules are passed to
-                      agents through DYNAMIC INFO whenever this project resolves as the active or default
-                      project context.
+                      agents in the Dynamic Current Message (DCM) whenever this project resolves as the
+                      active or default project context.
                     </p>
                   </SettingsInfoMenu>
               {/snippet}

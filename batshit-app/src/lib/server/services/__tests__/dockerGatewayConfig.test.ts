@@ -21,15 +21,19 @@ describe('dockerGatewayConfig', () => {
         DOCKER_MCP_GATEWAY_URL: 'http://localhost:8080',
         DOCKER_MCP_GATEWAY_PORT: '5608'
       })
-    ).toBe('http://localhost:5608')
+    ).toBe('http://127.0.0.1:5608')
   })
 
-  it('derives the local gateway URL from DOCKER_MCP_GATEWAY_PORT', () => {
+  // The Mac app's gateway listens on 127.0.0.1 only (2026-09-25), and `localhost` resolves to ::1
+  // first on a Mac, so the URL Batshit builds from the port names 127.0.0.1. A URL the user wrote
+  // keeps its host (above).
+  it('derives the local gateway URL from DOCKER_MCP_GATEWAY_PORT, on 127.0.0.1', () => {
     expect(
       resolveDockerGatewayBaseUrl({
         DOCKER_MCP_GATEWAY_PORT: '5608'
       })
-    ).toBe('http://localhost:5608')
+    ).toBe('http://127.0.0.1:5608')
+    expect(buildDockerGatewayUrl('/mcp', { DOCKER_MCP_GATEWAY_PORT: '8080' })).toBe('http://127.0.0.1:8080/mcp')
   })
 
   it('derives the host gateway URL from DOCKER_MCP_GATEWAY_PORT inside Dockerized Batshit', () => {

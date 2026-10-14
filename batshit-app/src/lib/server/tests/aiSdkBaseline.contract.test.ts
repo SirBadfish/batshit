@@ -32,6 +32,7 @@ import {
   generateText,
   jsonSchema,
   isStepCount,
+  StreamProviderError,
   streamText,
   tool,
   wrapLanguageModel
@@ -553,6 +554,11 @@ describe('AI SDK contract — stream part families and feature surfaces', () => 
     expect(await result.reasoningText).toBe('thinking...')
   })
 
+  // The SDK set of 2026-09-29 (ai 7.0.119; normalizeStreamProviderError since 7.0.80): a
+  // provider's error object in a stream becomes a real `StreamProviderError` (name
+  // `AI_StreamProviderError`) with the provider's own message and the object in `.data`, and no
+  // `.cause`. Every Batshit reader takes an `Error` as it comes (send-routed's `case 'error'`,
+  // `delegatedStreamErrorFrom`), so the user's card and the saved text keep the same words.
   it('pins error-part behavior: stream yields {type:"error", error} without throwing', async () => {
     const model = new MockLanguageModelV4({
       doStream: async () => ({
@@ -574,7 +580,33 @@ describe('AI SDK contract — stream part families and feature surfaces', () => 
       if (part.type === 'error') errorParts.push(part)
     }
     expect(errorParts).toHaveLength(1)
-    expect(errorParts[0].error).toEqual({ message: 'provider blew up' })
+    const error = errorParts[0].error
+    expect(error).toBeInstanceOf(Error)
+    expect(StreamProviderError.isInstance(error)).toBe(true)
+    expect(error.name).toBe('AI_StreamProviderError')
+    expect(error.message).toBe('provider blew up')
+    expect(error.data).toEqual({ message: 'provider blew up' })
+    expect(error.cause).toBeUndefined()
+  })
+
+  it('pins that an error part that is already an Error reaches the loop unchanged', async () => {
+    const original = new TypeError('schema said no')
+    const model = new MockLanguageModelV4({
+      doStream: async () => ({
+        stream: convertArrayToReadableStream([
+          { type: 'stream-start' as const, warnings: [] },
+          { type: 'error' as const, error: original },
+          finishChunk(STEP_TWO_USAGE)
+        ])
+      })
+    })
+    const result = streamText({ model, prompt: 'x' })
+    const errorParts: any[] = []
+    for await (const part of result.stream) {
+      if (part.type === 'error') errorParts.push(part)
+    }
+    expect(errorParts).toHaveLength(1)
+    expect(errorParts[0].error).toBe(original)
   })
 
   it('pins abort: onAbort runs BEFORE the loop reads the abort part, and onFinish never runs', async () => {

@@ -1,0 +1,33 @@
+{
+  "case": "search-comfyui",
+  "capturedAt": "2026-09-22T14:25:49.557Z",
+  "pinokio": {
+    "desktop": "8.2.0",
+    "pinokiod": "8.2.0",
+    "pterm": "0.0.25",
+    "script": "8.0.0"
+  },
+  "platform": "macOS 27.0 (26A428), Apple Silicon, Node 24.12.0 (Homebrew) running pterm through its shebang",
+  "sanitized": {
+    "/Users/tester": "the real home folder",
+    "192.168.1.10": "the real LAN address"
+  },
+  "argv": [
+    "pterm",
+    "search",
+    "comfyui",
+    "--mode",
+    "balanced",
+    "--min-match",
+    "1",
+    "--limit",
+    "8"
+  ],
+  "exitCode": 0,
+  "signal": null,
+  "timedOut": false,
+  "durationMs": 181,
+  "stdout": "{\n  \"q\": \"comfyui\",\n  \"mode\": \"balanced\",\n  \"min_match\": 1,\n  \"terms\": [\n    \"comfyui\"\n  ],\n  \"count\": 1,\n  \"apps\": [\n    {\n      \"app_id\": \"comfy.git\",\n      \"name\": \"comfy.git\",\n      \"title\": \"Comfyui\",\n      \"description\": \"The most powerful and modular diffusion model GUI, api and backend with a graph/nodes interface. https://github.com/comfyanonymous/ComfyUI\",\n      \"icon\": \"/asset/api/comfy.git/icon.jpeg\",\n      \"running\": false,\n      \"ready\": false,\n      \"ready_url\": null,\n      \"external_ready_urls\": [],\n      \"state\": \"offline\",\n      \"score\": 19.6789,\n      \"adjusted_score\": 20.4998,\n      \"preference_boost\": 0.8209,\n      \"matches\": [\n        {\n          \"file\": \"pinokio.meta\",\n          \"source\": \"metadata\",\n          \"snippet\": \"comfy.git\\nComfyui\\nThe most powerful and modular diffusion model GUI, api and backend with a graph/nodes interface. https://github.com/comfyanonymous/ComfyUI\",\n          \"pass\": \"strict\"\n        },\n        {\n          \"file\": \"app/README.md\",\n          \"source\": \"subdir-readme\",\n          \"snippet\": \"<div align=\\\"center\\\">\\n\\n# ComfyUI\\n**The most powerful and modular AI engine for content creation.**\\n\\n[![Website][website-shield]][website-url]\\n[![Dynamic JSON Badge][discord-shield]][discord-url]\\n[![Twitter][twitter-shield...\",\n          \"pass\": \"strict\"\n        },\n        {\n          \"file\": \"update.js\",\n          \"source\": \"root\",\n          \"snippet\": \"...ll.run\\\",\\n params: {\\n path: \\\"app\\\",\\n message: \\\"git pull\\\"\\n }\\n }, {\\n when: \\\"{{!exists('app/user/default/workflows/ComfyUI_examples')}}\\\",\\n method: \\\"shell.run\\\",\\n params: {\\n message: [\\n \\\"git clone https://github.com/comfyanonym...\",\n          \"pass\": \"strict\"\n        }\n      ],\n      \"matched_terms_count\": 1,\n      \"matched_terms\": [\n        \"comfyui\"\n      ],\n      \"starred\": false,\n      \"starred_at\": null,\n      \"last_launch_at\": \"2026-09-21T17:25:26.017Z\",\n      \"last_launch_source\": \"ui\",\n      \"launch_count_total\": 3,\n      \"launch_count_pterm\": 0,\n      \"launch_count_ui\": 3,\n      \"source\": {\n        \"host\": \"192.168.1.10\",\n        \"name\": \"p25\",\n        \"local\": true\n      },\n      \"ref\": \"pinokio://192.168.1.10:42000/api/comfy.git\"\n    }\n  ]\n}\n",
+  "stderr": "",
+  "note": "search the skill's way (1 term: --mode balanced --min-match 1 --limit 8); stdout is JSON"
+}

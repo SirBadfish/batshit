@@ -1,5 +1,6 @@
 import { redirect } from '@sveltejs/kit'
 import type { PageServerLoad } from './$types'
+import { readClaudeContextEnvironment } from '$lib/utils/cliContextWindow'
 
 export const load: PageServerLoad = async ({ locals, url }) => {
   // Redirect to login if not authenticated
@@ -7,5 +8,5 @@ export const load: PageServerLoad = async ({ locals, url }) => {
     throw redirect(303, `/login?returnUrl=${encodeURIComponent(url.pathname)}`)
   }
   
-  return {}
+  return { claudeContextEnvironment: readClaudeContextEnvironment() }
 }

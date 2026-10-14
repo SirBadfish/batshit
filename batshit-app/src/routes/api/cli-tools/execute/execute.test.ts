@@ -62,6 +62,9 @@ describe('/api/cli-tools/execute', () => {
       // PR #106 review F-5: the route hands the lane down so the card lands where it can be answered.
       actorType: 'service',
       projectPath: '/Users/example/batshit'
+    }, {
+      // The service lane has no bound chat, so no Stop (`stop-signal.test.ts` pins the agent lane).
+      abortSignal: undefined
     })
   })
 
@@ -89,7 +92,8 @@ describe('/api/cli-tools/execute', () => {
     expect(mocks.executeCliTool).toHaveBeenCalledWith(
       expect.objectContaining({
         projectPath: null
-      })
+      }),
+      { abortSignal: undefined }
     )
   })
 })

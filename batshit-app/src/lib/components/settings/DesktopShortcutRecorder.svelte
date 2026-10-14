@@ -70,7 +70,7 @@
       {disabled}
       aria-label="Desktop Controls shortcut recorder"
       aria-describedby={`${id}-hint ${id}-feedback`}
-      class={recording ? 'border-primary ring-1 ring-primary/40' : ''}
+      class={recording ? 'border-primary-text ring-1 ring-primary-text/40' : ''}
       onfocus={() => {
         recording = true
         feedback = 'Press the shortcut you want to use.'

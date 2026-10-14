@@ -1,5 +1,6 @@
 <script lang="ts">
-  import type { Component } from 'svelte'
+  import { tick, type Component } from 'svelte'
+  import type { LazyPanelHandle, SettingsPanelHandle } from '$lib/appActions/owners'
   import { AlertTriangle, Loader2, RefreshCw } from '@lucide/svelte'
   import { Button } from '$lib/components/ui/button'
 
@@ -10,14 +11,30 @@
     label: string
     loader: PanelLoader
     panelProps?: Record<string, unknown>
+    onAppActionHandle?: (handle: LazyPanelHandle | null) => void
   }
 
-  let { active = false, label, loader, panelProps = {} }: Props = $props()
+  let { active = false, label, loader, panelProps = {}, onAppActionHandle }: Props = $props()
 
   let Panel = $state<Component<any> | null>(null)
   let loading = $state(false)
   let errorMessage = $state<string | null>(null)
   let loadAttempt = $state(0)
+  let panelInstance = $state<unknown>(null)
+  let panelMounted = $state(false)
+  const handle: LazyPanelHandle = {
+    readAppActionState: () => ({ mounted: panelMounted, error: errorMessage,
+      panel: panelInstance as SettingsPanelHandle | null })
+  }
+  $effect(() => {
+    onAppActionHandle?.(handle)
+    return () => { onAppActionHandle?.(null) }
+  })
+  function mountedPanel(node: HTMLElement) {
+    let alive = true
+    void tick().then(() => { if (alive && node.isConnected) panelMounted = true })
+    return { destroy() { alive = false; panelMounted = false; loadAttempt++ } }
+  }
 
   async function loadPanel() {
     if (Panel || loading) return
@@ -32,6 +49,7 @@
       if (attempt !== loadAttempt) return
       Panel = module.default
     } catch (error) {
+      if (attempt !== loadAttempt) return
       console.error(`Failed to load ${label} settings panel`, error)
       errorMessage = error instanceof Error ? error.message : 'Unknown loading error'
     } finally {
@@ -55,7 +73,9 @@
 </script>
 
 {#if Panel}
-  <Panel {...panelProps} />
+  <div class="contents" use:mountedPanel>
+    <Panel bind:this={panelInstance} {...panelProps} />
+  </div>
 {:else if active}
   <div class="flex min-h-[220px] items-center justify-center p-6">
     {#if errorMessage}

@@ -157,9 +157,10 @@ describe('MCPGatewayDiscovery', () => {
       userId: 'josh',
       projectPath: '/Users/example/batshit'
     })
-    expect(mocks.targetExecute).toHaveBeenCalledWith({
-      path: '/Users/example/batshit/README.md'
-    })
+    expect(mocks.targetExecute).toHaveBeenCalledWith(
+      { path: '/Users/example/batshit/README.md' },
+      { abortSignal: undefined }
+    )
   })
 
   // SA-096 P6 moved the enabled filter from mcpGatewayService.listEnabled into

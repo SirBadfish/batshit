@@ -238,13 +238,11 @@
     fullWidthTable?: boolean
     compactDropdownMode?: boolean
     toolGridTitle?: string
-    zipAgentControlEnabled?: string
     zipAiViewMode?: string
     zipToolNotesEnabled?: string
     nonMcpZipRows?: NonMcpZipRow[]
     getNonMcpZipOverride: (rowId: string) => NonMcpZipOverrideSnapshot
     onNonMcpZipOverrideChange: (rowId: string, patch: NonMcpZipOverridePatch) => void
-    onZipAgentControlChange: (value: string) => void
     onZipAiViewModeChange: (value: string) => void
     onZipToolNotesChange?: (value: string) => void
     onResetToGlobalSettings?: () => void
@@ -291,7 +289,6 @@
     fullWidthTable = false,
     compactDropdownMode = false,
     toolGridTitle = 'Tool Settings Grid',
-    zipAgentControlEnabled = '__inherit__',
     zipAiViewMode = '__inherit__',
     zipToolNotesEnabled = '__inherit__',
     nonMcpZipRows = [],
@@ -302,7 +299,6 @@
       min_buffer: 2
     }),
     onNonMcpZipOverrideChange = () => {},
-    onZipAgentControlChange = () => {},
     onZipAiViewModeChange = () => {},
     onZipToolNotesChange = () => {},
     onResetToGlobalSettings = () => {},
@@ -316,7 +312,9 @@
   }: Props = $props()
 
   const ZIP_AUTO_INHERIT = '__inherit__'
-  const ZIP_PERMISSION_INHERIT = '__inherit__'
+  // SA-129 DL-06 (BL-1484): no select for the zip control permission here. The parked permission
+  // reads only a hidden experiment key that no Settings form reads or writes; the startup sweep
+  // removes the retired keys.
   const ZIP_LAYOUT_INHERIT = '__inherit__'
   const ZIP_NOTES_INHERIT = '__inherit__'
 
@@ -948,12 +946,6 @@
     return TOOL_DISPLAY_OPTIONS.find((option) => option.value === value)?.label ?? 'Inherit Group/Default'
   }
 
-  function getZipPermissionLabel(value: string): string {
-    if (value === 'enabled') return 'Enabled'
-    if (value === 'disabled') return 'Disabled'
-    return 'Use Global Default'
-  }
-
   function getZipLayoutLabel(value: string): string {
     if (value === 'inline') return 'Inline'
     if (value === 'appended') return 'Appended (Recommended)'
@@ -961,7 +953,7 @@
   }
 
   function getZipNotesLabel(value: string): string {
-    if (value === 'enabled') return 'Enabled'
+    if (value === 'enabled') return 'Enabled (Recommended)'
     if (value === 'disabled') return 'Disabled'
     return 'Use Global Default'
   }
@@ -1464,36 +1456,6 @@
       {#if showZipControls}
         <div class="grid gap-3 md:grid-cols-3">
           <label class="space-y-1">
-            <span class="batshit-settings-form-label-line"><span class="batshit-settings-form-label">Zip Control Permissions</span>
-              <SettingsInfoMenu ariaLabel="About Zip Control Permissions">
-                Lets the AI request unzip or zip changes and save Tool Notes through Batshit's hidden zip-control block. Changes apply on the next user message.
-                {#if isCodexMode}
-                  CLI caution: Codex and Claude CLI already apply their own context-management behavior. Batshit ZCP adds another layer.
-                {/if}
-              </SettingsInfoMenu>
-            </span>
-            <Select.Root
-              type="single"
-              value={zipAgentControlEnabled}
-              onValueChange={(value) => onZipAgentControlChange(value ?? ZIP_PERMISSION_INHERIT)}
-            >
-              <Select.Trigger
-                class={`batshit-settings-select-compact w-full ${inheritTriggerClass(zipAgentControlEnabled === ZIP_PERMISSION_INHERIT)}`}
-                size="sm"
-              >
-                {getZipPermissionLabel(zipAgentControlEnabled)}
-              </Select.Trigger>
-              <Select.Content>
-                <Select.Item value={ZIP_PERMISSION_INHERIT} label="Use Global Default">
-                  Use Global Default
-                </Select.Item>
-                <Select.Item value="enabled" label="Enabled">Enabled</Select.Item>
-                <Select.Item value="disabled" label="Disabled">Disabled</Select.Item>
-              </Select.Content>
-            </Select.Root>
-          </label>
-
-          <label class="space-y-1">
             <span class="batshit-settings-form-label-line"><span class="batshit-settings-form-label">AI Zip Layout</span>
               <SettingsInfoMenu ariaLabel="About AI Zip Layout">
                 Controls how unzipped content is delivered back to the AI. Inline expands content where the zip reference appears. Appended keeps the chat clean and adds an organized unzip index plus unzipped-content block at the end.
@@ -1523,7 +1485,7 @@
           <label class="space-y-1">
             <span class="batshit-settings-form-label-line"><span class="batshit-settings-form-label">Tool Notes</span>
               <SettingsInfoMenu ariaLabel="About Tool Notes">
-                Lets the AI save short summaries of important tool results so useful facts remain visible after raw tool output is zipped.
+                Lets the agent save short notes about important tool results, so the facts it needs stay in view after the full result is compressed and it reads files again less. Recommended.
               </SettingsInfoMenu>
             </span>
             <Select.Root
@@ -1541,7 +1503,7 @@
                 <Select.Item value={ZIP_NOTES_INHERIT} label="Use Global Default">
                   Use Global Default
                 </Select.Item>
-                <Select.Item value="enabled" label="Enabled">Enabled</Select.Item>
+                <Select.Item value="enabled" label="Enabled (Recommended)">Enabled (Recommended)</Select.Item>
                 <Select.Item value="disabled" label="Disabled">Disabled</Select.Item>
               </Select.Content>
             </Select.Root>

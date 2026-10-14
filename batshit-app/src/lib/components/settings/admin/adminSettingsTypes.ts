@@ -51,9 +51,19 @@ export type AdminSettingsState = {
   webSearchPerplexityMaxTokensPerPage: number
 }
 
+/**
+ * BL-1381: how one Backup export ended, as the Admin panel saw it. The Backup card checks the
+ * upload files only after `failed`, and refreshes a list it already shows only after
+ * `exported`. `canceled` (the With Secrets confirmation, the Mac save chooser or the download's
+ * save chooser) and `busy` (an export is already running) start no check.
+ */
+export type BackupExportOutcome = 'exported' | 'failed' | 'canceled' | 'busy'
+
 export type BackupPreflightSummary = {
   ok: true
   manifest: {
+    /** BL-378 Phase 1b: a partial backup (schema 2) says so; a complete one has no such field. */
+    completeness?: 'partial'
     app: { name: 'Batshit'; version: string }
     createdAt: string
     options: { includeSecrets: boolean }
@@ -80,6 +90,9 @@ export type BackupPreflightSummary = {
   redisRecordCount: number
   fileAssetCount: number
   fileAssetBytes: number
+  /** Skill files and clone voice recordings (BL-373/BL-369). */
+  hostFileCount: number
+  hostFileBytes: number
   requiresDestructiveConfirmation: boolean
   currentRecordCount: number
   sourceUserId: string
@@ -155,12 +168,24 @@ export type DiagnosticsPreviewSummary = {
   }
 }
 
+type GoonAssetAuditFile = {
+  uploadType: string
+  filename: string
+  size: number
+  cleanupEligible: boolean
+  reason: string
+}
+
 export type GoonAssetAuditSummary = {
   uploadRecordCount: number
   referencedRecordCount: number
   orphanRecordCount: number
   uploadBytes: number
   orphanBytes: number
+  cleanupCandidateCount: number
+  cleanupCandidateBytes: number
+  preservedOrphanRecordCount: number
+  cleanupCandidates: GoonAssetAuditFile[]
   byType: Array<{
     uploadType: string
     uploadRecordCount: number
@@ -169,11 +194,7 @@ export type GoonAssetAuditSummary = {
     uploadBytes: number
     orphanBytes: number
   }>
-  orphans: Array<{
-    uploadType: string
-    filename: string
-    size: number
-  }>
+  orphans: GoonAssetAuditFile[]
 }
 
 export type GoonAssetCleanupResult = {
@@ -253,13 +274,4 @@ export function normalizeExaSearchType(value: unknown): ExaSearchType {
   return normalized === 'fast' || normalized === 'neural' || normalized === 'deep'
     ? normalized
     : DEFAULT_WEB_SEARCH_EXA_TYPE
-}
-
-export function normalizeWebSearchProviderForAvailability(
-  provider: NativeWebSearchProvider,
-  availability: Record<'exa' | 'perplexity', boolean>
-): NativeWebSearchProvider {
-  if (provider === 'exa' && !availability.exa) return DEFAULT_WEB_SEARCH_PROVIDER
-  if (provider === 'perplexity' && !availability.perplexity) return DEFAULT_WEB_SEARCH_PROVIDER
-  return provider
 }

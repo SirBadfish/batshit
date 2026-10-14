@@ -318,6 +318,91 @@ describe('executionViewerService retention', () => {
     expect(serialized).not.toContain('data:image/png;base64')
   })
 
+  it.each(['record', 'update'] as const)('keeps shared compiled content and metadata during %s (BL-763)', async (operation) => {
+    const content = [{ type: 'text', text: 'A compiled input with shared content' }]
+    const metadata = { memoryContext: { awarenessCount: 2, source: 'compile' } }
+    const snapshot = buildSnapshot('run-shared', '2026-05-14T12:00:00.000Z')
+    snapshot.structuredInput = { messages: [{ role: 'user', content }], metadata }
+    snapshot.compiledMessages = [{ role: 'user', content }]
+    snapshot.compileMetadata = { ...metadata }
+
+    if (operation === 'record') {
+      await executionViewerService.recordSnapshot(snapshot)
+    } else {
+      await executionViewerService.recordSnapshot(buildSnapshot(snapshot.id, snapshot.createdAt))
+      await executionViewerService.updateSnapshot(snapshot.sessionId, snapshot.id, {
+        structuredInput: snapshot.structuredInput,
+        compiledMessages: snapshot.compiledMessages,
+        compileMetadata: snapshot.compileMetadata
+      })
+    }
+
+    const stored = await executionViewerService.getSnapshot(snapshot.sessionId, snapshot.id)
+    expect(stored?.structuredInput.messages[0].content).toEqual(content)
+    expect(stored?.compiledMessages?.[0].content).toEqual(content)
+    expect(stored?.structuredInput.metadata).toEqual(metadata)
+    expect(stored?.compileMetadata).toEqual(metadata)
+    expect(JSON.stringify(stored)).not.toContain('omitted circular reference')
+    expect(snapshot.structuredInput.messages[0].content).toBe(content)
+    expect(snapshot.compiledMessages[0].content).toBe(content)
+    expect(snapshot.compileMetadata.memoryContext).toBe(metadata.memoryContext)
+  })
+
+  it.each(['record', 'update'] as const)('marks actual object and array backedges during %s, retaining shared branches (BL-763)', async (operation) => {
+    const object: any = { label: 'shared object' }
+    object.self = object
+    object.child = { parent: object }
+    const array: any[] = ['shared array']
+    array.push(array)
+    const payload = { first: object, second: object, array, repeatedArray: array }
+    const snapshot = buildSnapshot('run-cycles', '2026-05-14T12:00:00.000Z')
+    if (operation === 'record') {
+      await executionViewerService.recordSnapshot({ ...snapshot, structuredInput: payload })
+    } else {
+      await executionViewerService.recordSnapshot(snapshot)
+      await executionViewerService.updateSnapshot(snapshot.sessionId, snapshot.id, { structuredInput: payload })
+    }
+
+    const stored = await executionViewerService.getSnapshot(snapshot.sessionId, snapshot.id)
+    const circular = '[Execution Viewer omitted circular reference]'
+    const expectedObject = { label: 'shared object', self: circular, child: { parent: circular } }
+    expect(stored?.structuredInput.first).toEqual(expectedObject)
+    expect(stored?.structuredInput.second).toEqual(expectedObject)
+    expect(stored?.structuredInput.array).toEqual(['shared array', circular])
+    expect(stored?.structuredInput.repeatedArray).toEqual(['shared array', circular])
+    expect(object.self).toBe(object)
+    expect(array[1]).toBe(array)
+  })
+
+  it.each(['record', 'update'] as const)('redacts and bounds each shared branch during %s without mutating the input (BL-763)', async (operation) => {
+    const rawBase64 = 'RkFLRV9JTUFHRV9CQVNFMjY0'.repeat(100)
+    const text = `${'A'.repeat(90_000)}${'B'.repeat(35_000)}`
+    const shared = { content: `data:image/png;base64,${rawBase64}`, localBase64: rawBase64, text }
+    const payload = { first: shared, second: shared }
+    const snapshot = buildSnapshot('run-redacted', '2026-05-14T12:00:00.000Z')
+    if (operation === 'record') {
+      await executionViewerService.recordSnapshot({ ...snapshot, structuredInput: payload })
+    } else {
+      await executionViewerService.recordSnapshot(snapshot)
+      await executionViewerService.updateSnapshot(snapshot.sessionId, snapshot.id, { structuredInput: payload })
+    }
+
+    const stored = await executionViewerService.getSnapshot(snapshot.sessionId, snapshot.id)
+    for (const branch of ['first', 'second']) {
+      const value = stored?.structuredInput[branch]
+      expect(value?.content).toContain('redacted image/png data URL')
+      expect(value?.localBase64).toContain('redacted base64 payload')
+      expect(value?.text.length).toBeLessThan(text.length)
+      expect(value?.text).toContain('Execution Viewer stored preview truncated')
+      expect(value?.text.endsWith('B'.repeat(20_000))).toBe(true)
+    }
+    const serialized = JSON.stringify(stored)
+    expect(serialized).not.toContain(rawBase64)
+    expect(serialized).not.toContain('data:image/png;base64')
+    expect(shared).toEqual({ content: `data:image/png;base64,${rawBase64}`, localBase64: rawBase64, text })
+    expect(payload.first).toBe(payload.second)
+  })
+
   it('clears snapshots only when explicitly asked by session cleanup or the DELETE endpoint', async () => {
     await executionViewerService.recordSnapshot(
       buildSnapshot('run-1', '2026-05-14T12:00:00.000Z')
@@ -327,5 +412,130 @@ describe('executionViewerService retention', () => {
 
     expect(redisMock.del).toHaveBeenCalledWith('session:session-ev:execution_log')
     expect(await executionViewerService.getSnapshots('session-ev')).toEqual([])
+  })
+})
+
+/**
+ * BL-245 review, finding 1 — the calls of a run that failed while its finish callback was still
+ * busy. The loop waits at most 2 s for that callback, then the failure path writes the calls it
+ * recorded; the callback's write lands afterwards, and this merge keeps both writers' rows (their
+ * fingerprints differ: the SDK's steps carry response messages, the recorder's do not). One writer
+ * claims the calls (`createLlmCaptureClaim`, taken before either awaits).
+ */
+describe('one set of calls when the finish callback outlives the 2 s wait (BL-245 review)', () => {
+  const usage = { inputTokens: 1208, outputTokens: 21, totalTokens: 1229 }
+  const sdkSteps = [
+    {
+      request: { body: { model: 'glm-5.3', messages: ['read the logs'] } },
+      response: { id: 'r1', modelId: 'glm-5.3', messages: [{ role: 'assistant', content: 'reading' }] },
+      toolCalls: [{ toolCallId: 'call_1', toolName: 'native_bash_execute', input: { command: 'cat app.log' } }],
+      toolResults: [{ toolCallId: 'call_1' }],
+      finishReason: 'tool-calls',
+      usage
+    },
+    {
+      request: { body: { model: 'glm-5.3', messages: ['…'] } },
+      response: { id: 'r2', modelId: 'glm-5.3', messages: [{ role: 'assistant', content: 'done' }] },
+      toolCalls: [],
+      toolResults: [],
+      text: 'The logs show',
+      finishReason: 'stop',
+      usage: { inputTokens: 1400, outputTokens: 9, totalTokens: 1409 }
+    }
+  ]
+
+  async function runBothWriters(useClaim: boolean) {
+    const { buildVercelLlmCapture } = await import('../executionViewerLlmCapture')
+    const { createLlmCaptureClaim, createStreamStepRecorder } = await import('../streamFailureEvidence')
+    await executionViewerService.recordSnapshot(buildSnapshot('run-slow-finish', '2026-09-25T20:00:00.000Z'))
+    const recorder = createStreamStepRecorder()
+    for (const [index, step] of sdkSteps.entries()) {
+      recorder.observe({ type: 'start-step', request: step.request })
+      for (const call of step.toolCalls) recorder.observe({ type: 'tool-call', ...call })
+      if (index === 0) recorder.observe({ type: 'finish-step', usage, finishReason: 'tool-calls', response: { id: 'r1' } })
+    }
+    const claim = createLlmCaptureClaim()
+
+    // The finish callback starts, claims, and is still busy (zips, reasoning) past the wait.
+    const finishOwns = useClaim ? claim.claim('finish') : true
+    let letFinishWrite: () => void = () => {}
+    const finishing = (async () => {
+      await new Promise<void>((resolve) => {
+        letFinishWrite = resolve
+      })
+      const capture = buildVercelLlmCapture({ steps: sdkSteps, totalUsage: null })
+      await executionViewerService.updateSnapshot('session-ev', 'run-slow-finish', {
+        ...(finishOwns ? { llmSummary: capture.llmSummary, llmCalls: capture.llmCalls } : {}),
+        responseSummary: { content: { value: 'The logs show', confidence: 'exact' } } as any
+      })
+    })()
+
+    // The failure path, after the wait.
+    if (!useClaim || claim.claim('failure')) {
+      const capture = buildVercelLlmCapture({ steps: recorder.steps('error'), totalUsage: null })
+      await executionViewerService.updateSnapshot('session-ev', 'run-slow-finish', {
+        llmSummary: capture.llmSummary,
+        llmCalls: capture.llmCalls
+      })
+    }
+    letFinishWrite()
+    await finishing
+    const [snapshot] = await executionViewerService.getSnapshots('session-ev')
+    return snapshot
+  }
+
+  it('writes one set: the finish callback claimed the calls, so the failure path writes none', async () => {
+    const snapshot = await runBothWriters(true)
+    expect(snapshot.llmCalls).toHaveLength(2)
+    expect(snapshot.llmCalls?.map((call) => call.finishReason)).toEqual(['tool-calls', 'stop'])
+    expect(snapshot.llmSummary?.callsCount.value).toBe(2)
+    expect(snapshot.responseSummary).toBeDefined()
+  })
+
+  it('two writers stack their rows in the merge (why there is one writer)', async () => {
+    const snapshot = await runBothWriters(false)
+    expect(snapshot.llmCalls).toHaveLength(4)
+  })
+})
+
+describe('an approval resume keeps the paused run’s tool steps (BL-321)', () => {
+  const step = (toolCallId: string, toolName: string) => ({ toolCallId, toolName, input: {}, output: { ok: true } })
+
+  it('reads the steps a snapshot holds, and none for a snapshot it does not have', async () => {
+    await executionViewerService.recordSnapshot({
+      ...buildSnapshot('run-1', '2026-09-25T20:36:35.000Z'),
+      intermediateSteps: [step('toolu_ocr', 'native_batshit_tool_use')]
+    })
+
+    expect(await executionViewerService.getSnapshotSteps('session-ev', 'run-1')).toEqual([
+      step('toolu_ocr', 'native_batshit_tool_use')
+    ])
+    expect(await executionViewerService.getSnapshotSteps('session-ev', 'missing')).toEqual([])
+    expect(await executionViewerService.getSnapshotSteps('session-none', 'run-1')).toEqual([])
+  })
+
+  it('the resume’s own write adds its steps after the paused run’s, in order', async () => {
+    const { mergeResumedSteps } = await import('../approvalResumeMessage')
+    await executionViewerService.recordSnapshot({
+      ...buildSnapshot('run-1', '2026-09-25T20:36:35.000Z'),
+      intermediateSteps: [step('toolu_ocr', 'native_batshit_tool_use')]
+    })
+
+    // The resume reads the paused steps first, then records its own compile under the same id.
+    const prior = await executionViewerService.getSnapshotSteps('session-ev', 'run-1')
+    await executionViewerService.recordSnapshot(buildSnapshot('run-1', '2026-09-25T20:37:10.000Z'))
+    await executionViewerService.updateSnapshot('session-ev', 'run-1', {
+      intermediateSteps: mergeResumedSteps(prior, [
+        step('toolu_start', 'native_batshit_tool_use'),
+        step('toolu_run', 'native_batshit_tool_use')
+      ])
+    })
+
+    const [snapshot] = await executionViewerService.getSnapshots('session-ev')
+    expect(snapshot?.intermediateSteps?.map((entry: any) => entry.toolCallId)).toEqual([
+      'toolu_ocr',
+      'toolu_start',
+      'toolu_run'
+    ])
   })
 })

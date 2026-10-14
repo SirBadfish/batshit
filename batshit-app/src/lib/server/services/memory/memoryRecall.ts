@@ -55,7 +55,7 @@ import { getOpenEpisode, whiteboardAuthor, type WhiteboardAuthor } from './memor
 
 /** SA-120 P4b: closes the `Memory context:` entries whenever one of them was inferred. */
 export const MEMORY_INFERRED_RECALL_NOTE =
-  "- Note: entries marked \"recalled (inferred)\" were brought in by Batshit's judgment model (Jev Juice) because they seemed to bear on what the user said. You did not recall them; ignore any that do not fit."
+  "- Note: entries marked \"recalled (inferred)\" were brought in by Batshit's judgment model (Judge Juice) because they seemed to bear on what the user said. You did not recall them; ignore any that do not fit."
 
 // Status icons match the DCM's existing key: new / updated / unchanged.
 const ICON_NEW = '✅'
@@ -76,14 +76,14 @@ export interface MemoryInsertCandidate {
   holdEpisode?: boolean
   firstInsertedAt?: string
   /**
-   * SA-120 P4b: set when Batshit's judgment model (Jev Juice), not the agent and not a
+   * SA-120 P4b: set when Batshit's judgment model (Judge Juice), not the agent and not a
    * trigger word, brought this memory in. `probability` is this turn's judgment; `null`
    * on a held entry that was inferred on an earlier turn.
    */
   inferred?: { probability: number | null }
 }
 
-/** SA-120 P4b: one memory the route's Jev Juice lane judged relevant to the current message. */
+/** SA-120 P4b: one memory the route's Judge Juice lane judged relevant to the current message. */
 export interface MemoryInferredRecall {
   id: string
   probability: number
@@ -350,7 +350,7 @@ function selectMemoryInserts(options: {
   budgets: MemoryLaneBudgets
   episode: MemoryEpisodeContext
   nowTs: number
-  /** SA-120 P4b: memories the Jev Juice lane inferred for this message. Absent or [] = today's selection. */
+  /** SA-120 P4b: memories the Judge Juice lane inferred for this message. Absent or [] = today's selection. */
   inferred?: MemoryInferredRecall[]
 }): MemorySelection {
   const { agentId, currentUserMessage, records, linger, budgets, episode, nowTs } = options
@@ -690,7 +690,7 @@ function formatInsertLine(
   }
   if (record.media?.length) {
     lines.push(
-      `    [${record.media.length} owned image${record.media.length === 1 ? '' : 's'} attached below — see REMEMBERED MEDIA]`
+      `    [${record.media.length} owned image${record.media.length === 1 ? '' : 's'} attached below — see remembered_media]`
     )
   }
   return lines
@@ -734,7 +734,7 @@ function formatOnMyMindEntryLines(record: MemoryRecord): string[] {
     if (record.media_mode === 'always') {
       for (const media of record.media) {
         lines.push(
-          `  image: ${media.display_name} — arrives under AWARENESS MEDIA with every message. Standing awareness, not a new upload; do not mention it unless it matters.`
+          `  image: ${media.display_name} — arrives in awareness_media with every message. Standing awareness, not a new upload; do not mention it unless it matters.`
         )
       }
     } else {
@@ -1006,7 +1006,7 @@ export async function computeMemoryCompileContext(options: {
   agentId: string
   sessionId: string
   currentUserMessage: string
-  /** SA-120 P4b: route-owned Jev Juice lane. Absent = today's selection, byte for byte. */
+  /** SA-120 P4b: route-owned Judge Juice lane. Absent = today's selection, byte for byte. */
   inferredRecallProvider?: MemoryInferredRecallProvider
 }): Promise<MemoryCompileContext> {
   const agentId = options.agentId?.trim()
@@ -1046,7 +1046,7 @@ export async function computeMemoryCompileContext(options: {
   }
   let selection = selectMemoryInserts(selectionInput)
 
-  // SA-120 P4b: the route's Jev Juice lane may add memories that bear on this message
+  // SA-120 P4b: the route's Judge Juice lane may add memories that bear on this message
   // without a trigger word. The engine only tells it what is already in context; the
   // closure owns the pre-filter, the call, the deadline, and the evidence, and it hands
   // `commitMemoryTurnState` the same answer. Still read-only, still no network call here.
@@ -1067,7 +1067,7 @@ export async function computeMemoryCompileContext(options: {
       })
       inferredRecalls = Array.isArray(answer) ? answer : []
     } catch (error) {
-      console.error('[memoryRecall] Jev Juice inferred-recall provider threw; no inferred recalls this turn:', error)
+      console.error('[memoryRecall] Judge Juice inferred-recall provider threw; no inferred recalls this turn:', error)
     }
     if (inferredRecalls.length > 0) {
       selection = selectMemoryInserts({ ...selectionInput, inferred: inferredRecalls })
@@ -1258,11 +1258,15 @@ const RECENCY_HALF_LIFE_DAYS = 14
  * recency decays with a 14-day half-life over the LAST DELIVERY (recall-refresh:
  * `last_recalled_ts` beats `saved_ts`); importance maps 1-10 linearly. Returns a new
  * array, best first. Deterministic tiebreak: original hit order, then id.
+ * Positions are normalized within the supplied records (BL-444): the search op
+ * blends current and superseded groups separately, and missing stored hits can
+ * also leave gaps in a rerank pool. Those gaps must not amplify relevance.
  *
  * SA-120 P4a: `inferredRelevance` is the optional FOURTH term — a 0..1 judgment per
  * record id (Jev's Noul) times a weight that lives in `memoryRerank.jev.ts`. It is added
  * on top of the three terms above, so this function stays the one ranking authority.
- * Absent (every caller but the rerank lane), the arithmetic is exactly what it always was.
+ * Absent (every caller but the rerank lane), no judgment term is added; the
+ * usual relevance, recency and importance weights stay unchanged.
  */
 export function blendMemoryRanking(
   records: MemoryRecord[],
@@ -1271,8 +1275,16 @@ export function blendMemoryRanking(
   inferredRelevance?: { weight: number; scoreById: ReadonlyMap<string, number> }
 ): MemoryRecord[] {
   const total = Math.max(records.length, 1)
+  const ids = new Set(records.map((record) => record.id))
+  const orderedHits = [...hitOrder].filter(([id]) => ids.has(id)).sort((a, b) => a[1] - b[1])
+  const groupOrder = new Map<string, number>()
+  let groupRank = 0
+  orderedHits.forEach(([id, originalRank], index) => {
+    if (index === 0 || originalRank !== orderedHits[index - 1][1]) groupRank = index
+    groupOrder.set(id, groupRank)
+  })
   const scored = records.map((record) => {
-    const rank = hitOrder.get(record.id) ?? total - 1
+    const rank = groupOrder.get(record.id) ?? total - 1
     const relevance = 1 - rank / total
     const freshTs = Math.max(record.saved_ts, record.last_recalled_ts ?? 0)
     const ageDays = Math.max(0, nowTs - freshTs) / 86_400_000
@@ -1285,7 +1297,7 @@ export function blendMemoryRanking(
     const score = inferredRelevance
       ? blended + inferredRelevance.weight * (inferredRelevance.scoreById.get(record.id) ?? 0)
       : blended
-    return { record, score, rank }
+    return { record, score, rank: hitOrder.get(record.id) ?? total - 1 }
   })
   scored.sort(
     (a, b) => b.score - a.score || a.rank - b.rank || a.record.id.localeCompare(b.record.id)
@@ -1305,7 +1317,7 @@ export interface MemoryInsertedItem {
   status: MemoryInsertStatus
   gist: string
   segment?: boolean
-  /** SA-120 P4b: Jev Juice brought this memory in (not the agent, not a trigger word). */
+  /** SA-120 P4b: Judge Juice brought this memory in (not the agent, not a trigger word). */
   inferred?: boolean
   matchedTerms?: string[]
   /** STM rows: the record's trigger terms (first few) so lingering rows can badge too. */

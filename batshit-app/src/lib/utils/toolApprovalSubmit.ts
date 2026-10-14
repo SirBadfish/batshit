@@ -24,6 +24,7 @@
  */
 
 import type { ToolApprovalEntry, ToolApprovalResponse } from '$lib/types/tool-approvals'
+import { APPROVAL_EXPIRED_REASON } from '$lib/utils/heldForApproval'
 
 type ApprovalEntry = Partial<ToolApprovalEntry> & Record<string, any>
 
@@ -46,7 +47,7 @@ export function buildToolApprovalResponses(decisions: ApprovalEntry[]): ToolAppr
       entry.status === 'approved'
         ? 'User approved'
         : entry.status === 'expired'
-          ? 'Approval expired after 3 minutes'
+          ? APPROVAL_EXPIRED_REASON
           : 'User denied'
   }))
 }

@@ -3,7 +3,7 @@
  *
  * send-routed holds the chat's session-turn lock from the top of a request to the end of its
  * `finally`, and `end` reaches the browser before that request's after-reply work — the
- * Execution Viewer snapshot, the Jev Juice after-reply steps, the run-end sandbox sweep. A
+ * Execution Viewer snapshot, the Judge Juice after-reply steps, the run-end sandbox sweep. A
  * message the browser QUEUES (one carrying a Clip or an `@file` mention, which cannot be
  * steered) is sent the moment `end` arrives, so it lands inside that work. Measured on the
  * smoke stack (`_local/queued-send-proof/`): it reached send-routed 0.8 to 1.6 s before the

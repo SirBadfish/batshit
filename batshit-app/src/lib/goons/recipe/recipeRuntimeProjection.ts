@@ -503,6 +503,27 @@ export function applyRecipeRevisionProjection(
   return goon;
 }
 
+/**
+ * Project a verified Recipe revision without retaining or mutating either
+ * caller-owned graph. Settings may supply deep Svelte proxies here; JSON is
+ * the persistence contract for both values and is the established projection
+ * clone boundary used by projectGoonRecipeSource.
+ */
+export function projectGoonRecipeRevision(
+  goon: GoonRecord,
+  envelope: RecipeRevisionEnvelope,
+  toFileRef: (
+    asset: RecipeStoredAssetRef,
+    role: "package" | "model" | "manifest",
+  ) => GoonFileRef,
+) {
+  return applyRecipeRevisionProjection(
+    cloneJson(goon),
+    cloneJson(envelope),
+    toFileRef,
+  );
+}
+
 export function findRecipeSiblingState(
   state: RecipeStateSnapshot,
   ids: readonly string[],

@@ -62,6 +62,25 @@ Use a `CLI` Primary Agent when:
 
 Docker note: a Docker install needs the CLI authenticated inside the app container. For Codex, Batshit shows the Docker-aware login command in Agent Settings. Provider keys saved in Batshit do not log the Codex CLI into the container.
 
+### What a chat message lets the agent do
+
+A Codex or Claude agent works in a mode. You pick it in the chat bar or in **Agent Settings**; both save it to the agent.
+
+- **Codex:** Chat (read-only), Agent (workspace write), or Agent (full access). Each mode has its own **Sandbox Level**: Read-only, Workspace write, or Danger full access. Picking a mode also sets its own level.
+- **Claude Code:** Plan, Ask before edits, Edit automatically, or Bypass permissions. Agent Settings offers all four; an older saved Ask-before-edits mode stays shown as that choice.
+
+In Agent Settings, a Codex record with no saved Sandbox Level shows its mode's own level. **Agent (full access)** keeps the Sandbox Level control disabled. An older full-access record with a tighter saved level keeps that level; opening Settings or changing another field does not widen it. Pick **Agent** to adjust the Sandbox Level.
+
+**What Agent Settings shows is the most the agent can do.** A message runs with the tighter of the chat bar's mode and what Agent Settings holds for that agent, never with more:
+
+- If you set a tighter Sandbox Level by hand in Agent Settings (for example Agent with Read-only), a message uses that level. Open the chat bar's Codex mode menu to see it: the chosen mode has a second line, such as "Sandbox Level from Agent Settings: Read-only". Picking a mode in that menu sets the mode's own level again.
+- A Sandbox Level that is looser than its mode (for example Chat with Workspace write) is not used by a chat message: Chat stays read-only.
+- In a group chat, each member runs with its own mode, never with more than its own Agent Settings allow, whatever the sender's chat bar shows.
+- A message that waits (in the chat's line, or behind a reply that is still running) uses the agent's settings as they are when its turn starts. If you make an agent tighter while a message waits, the tighter settings apply to it.
+- If Agent Settings made a reply run tighter than the chat bar's mode (for example an older window still showed a looser mode), the reply says so in one line under it, such as "Codex ran as Chat, Read-only, because Agent Settings holds that for this agent; the chat bar sent Agent (full access)."
+
+When you change the mode in the chat bar and send at once, Batshit waits for the change to save first, so the message runs with the mode you just picked. If the change could not be saved, the chat bar shows the earlier mode again and the message runs with that one. If an agent is deleted while a message for it waits, the message is not sent: it stays in the chat, unanswered.
+
 ## Choosing a Primary Agent
 
 | If you mostly want... | Start with... |
@@ -113,11 +132,25 @@ Both are valid setup paths. Mac app Batshit is the richer local workstation path
 
 If a URL works in your browser but fails from an agent, it's usually the wrong caller URL. [Ports and URLs](../reference/ports-and-urls.md) has the full caller table.
 
+## Saving Agent Settings
+
+Agent Settings saves changes automatically. While a save for the shown agent is still on its way, its controls are temporarily read-only. You can select another agent while it finishes. A draft waiting to save, or a field that needs correcting, stays editable.
+
+After 30 seconds without an answer, Settings shows a notice with **Retry**. Retry reads the saved record; it does not cancel the original save. Your draft stays visible, and choices that save several related values or a whole list wait for a successful read and for that agent’s pending writes to settle. If the read fails, use Retry; Settings keeps your draft.
+
+## Changing an agent's picture
+
+When you upload a new avatar picture, clear it, or choose an icon, the old picture is deleted once the change saves. If the change can't save (for example the name is empty), the old picture stays, so the agent never points at a picture that is gone.
+
+A new agent can't use a name a Subagent already uses (their skill and artifact access would be shared); pick another name if Batshit says it is taken.
+
 ## Deleting an agent
 
-Settings → Agents → the agent → **Delete Primary Agent**. This removes the agent and everything that is only its own: its settings, memories, DMs sent to it, schedules, and wake-up webhooks. It also drops the agent from any Group it was in, and from any skill or artifact list that named it.
+Settings → Agents → the agent → **Delete Primary Agent**. This removes the agent and everything that is only its own: its settings, avatar pictures (the one it shows now and any you replaced earlier), memories, DMs sent to it, schedules, wake-up webhooks, and, for a `CLI` agent, the folders its Workers ran in under `~/.batshit/agents/` (they hold the CLI's own log of the Workers' prompts). It also drops the agent from any Group it was in, and from any skill or artifact list that named it.
 
 The confirm dialog has an **Also delete its chats** box, checked by default. Leave it checked and the agent's own chats go with it, including its Infinite Session. Uncheck it to keep the chats. Two things never go: a Group chat (it belongs to every agent in the group; the agent is only removed from the roster), and a chat you locked yourself (unlock it first if you want it gone too; the dialog tells you how many are kept).
+
+The avatar pictures are stored by batshit-server, so Batshit checks that batshit-server is running before it deletes anything, and asks it to delete the pictures before it deletes the agent. If batshit-server is not running, nothing is deleted, not even the chats, and the error says so. Restart Batshit (in Docker, run `./start-docker.sh`) and delete the agent again. If batshit-server stops partway through, the agent stays and the error says how many of its chats were already deleted.
 
 ## Common problems
 
@@ -128,6 +161,10 @@ The confirm dialog has an **Also delete its chats** box, checked by default. Lea
 | An n8n Workflow Subagent fails | Its production webhook, credentials, callback URL, or model node is wrong. | n8n execution history and [n8n troubleshooting](../troubleshooting/n8n.md). |
 | Tools don't appear | Tool Grid discoverability is off, or the gateway is offline. | Agent Tools settings and MCP gateway health. |
 | A Group can't use an agent | The agent record is missing, retired, or not a live `API`/`CLI` type. | Delete retired records and create an `API` or `CLI` agent. |
+
+## Letting an agent adjust its own preferences
+
+A Primary Agent with the relevant Fabric Controls can read its own display name, Awareness/Triggers/Recalled Lane Budgets and the linger defaults for trigger and recalled memories. It can change that name and request your approval for those memory changes. It cannot use these actions to edit another agent, change access, expose credentials or prepare a provider. A newer edit blocks an older request. If another change conflicts with yours in Agent Settings, Batshit protects the newer saved values. Check the current setting and use **Retry** if Batshit still cannot save your edit. See [Fabric](../fabric/overview.md#asking-an-agent-to-use-the-current-view).
 
 ## Related docs
 

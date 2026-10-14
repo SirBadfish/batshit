@@ -1,6 +1,7 @@
 import { asSchema, type ModelMessage } from 'ai'
 import { createHash } from 'crypto'
 import type { ModelConnectionInfo } from '$lib/types/savedModels'
+import { COMPILED_TAG } from '$lib/utils/compiledChatTags'
 
 type ProviderOptions = Record<string, Record<string, any>>
 type ProviderKind =
@@ -33,7 +34,17 @@ export type ApiPromptCachePolicyMetadata = {
   providerOptionKeys: Record<string, string[]>
   /** Names of session-affinity request headers added to this call (values are pseudonymous hashes and stay out of metadata/logs). */
   requestHeaderNames: string[]
+  /**
+   * BL-184: the lifetime of every Anthropic-style cache point this request carries, which
+   * decides what a cache write costs (Anthropic bills 1.25x the input price for 5 minutes and
+   * 2x for 1 hour). `null` when Batshit cannot vouch for one lifetime: no such point was
+   * placed, or a point it did not place was kept. The Token Panel reads it from the Execution
+   * Viewer snapshot's `runtime.metadata.promptCachePolicy`.
+   */
+  cacheTtl: CacheTtl | null
 }
+
+export type CacheTtl = '5m' | '1h'
 
 export type ApiPromptCachePolicyInput = {
   modelId?: string | null
@@ -53,7 +64,29 @@ export type ApiPromptCachePolicyResult = {
   providerOptions?: ProviderOptions | undefined
   /** Per-call HTTP headers (session cache-affinity hints); pass to streamText/generateText, never to provider construction. */
   headers?: Record<string, string> | undefined
+  /**
+   * BL-77: provider options for a tool loop's SECOND and later steps, which the per-step hook
+   * (`buildTurnPrepareStep`) returns from `prepareStep`. The SDK merges them into that one
+   * step's call options (they are not carried to the next step), and the provider sends them
+   * as the request-level cache point that Anthropic places on the last block, so each step
+   * reads everything the previous step sent from the cache. Present only on direct Anthropic;
+   * OpenRouter gets `toolLoopTailMarker` instead (BL-185).
+   */
+  stepProviderOptions?: ProviderOptions | undefined
+  /**
+   * BL-185: the tool loop's tail point on OpenRouter with a Claude-family model, as an explicit
+   * marker the per-step hook moves to the last message from the SECOND step on
+   * (`placeToolLoopTailMarker`). OpenRouter's Amazon Bedrock route accepts the request-level
+   * field and ignores it (measured 2026-09-22 and 2026-09-25); an explicit block marker works on
+   * every upstream OpenRouter documents.
+   */
+  toolLoopTailMarker?: ToolLoopTailMarker | undefined
   metadata: ApiPromptCachePolicyMetadata
+}
+
+export type ToolLoopTailMarker = {
+  namespace: 'openrouter'
+  cacheControl: CacheControlValue
 }
 
 function hashText(value: string, length = 24): string {
@@ -398,6 +431,59 @@ function hasCacheControl(options?: Record<string, any>): boolean {
   )
 }
 
+type CacheControlValue = { type: 'ephemeral'; ttl?: '5m' | '1h' }
+
+/**
+ * BL-77: the ONE lifetime every cache point Batshit places on a request uses. A preset's
+ * request-level setting (the Anthropic "Prompt cache TTL") wins; otherwise Anthropic's
+ * default (5 minutes). One lifetime for every point keeps Anthropic's ordering rule — a
+ * longer-lived point must come before a shorter-lived one — true by construction.
+ */
+function resolveCacheControlValue(options?: Record<string, any>): CacheControlValue {
+  const value = options?.cacheControl ?? options?.cache_control
+  const ttl =
+    isPlainObject(value) && (value.ttl === '5m' || value.ttl === '1h')
+      ? (value.ttl as '5m' | '1h')
+      : undefined
+  return ttl ? { type: 'ephemeral', ttl } : { type: 'ephemeral' }
+}
+
+/** Anthropic accepts at most four cache points per request, and the request-level
+ *  (automatic) point takes one of the four. */
+const ANTHROPIC_MAX_CACHE_POINTS = 4
+
+/**
+ * Counts every place a request already carries a cache point: message level, part level,
+ * and tool level, in either namespace a provider reads (`@ai-sdk/anthropic` reads
+ * `anthropic`; the OpenRouter provider reads `openrouter`, then `anthropic`). A location
+ * that sets both counts once. Deliberately an upper bound: the provider applies a
+ * message-level point to the last part only when that part has none of its own.
+ */
+function countCachePoints(
+  messages: ModelMessage[],
+  tools?: Record<string, any>,
+): number {
+  const carries = (options: unknown) =>
+    isPlainObject(options) &&
+    (hasCacheControl(options.anthropic) || hasCacheControl(options.openrouter))
+
+  let count = 0
+  for (const message of messages) {
+    if (carries((message as any)?.providerOptions)) count += 1
+    const content = (message as any)?.content
+    if (Array.isArray(content)) {
+      for (const part of content) {
+        if (carries(part?.providerOptions)) count += 1
+      }
+    }
+  }
+  for (const toolDefinition of Object.values(tools ?? {})) {
+    if (carries((toolDefinition as any)?.providerOptions)) count += 1
+  }
+  return count
+}
+
+
 function annotateLastSystemMessageCacheControl(args: {
   messages: ModelMessage[]
   provider: 'anthropic' | 'openrouter'
@@ -434,7 +520,8 @@ function annotateLastSystemMessageCacheControl(args: {
   return { messages, applied: true, preserved: false }
 }
 
-const STANDING_MEDIA_HEADER = '==== AWARENESS MEDIA (STANDING) ===='
+// SA-128: the standing manifest is the `<awareness_media>` element (the image parts follow it).
+const STANDING_MEDIA_HEADER = `<${COMPILED_TAG.awarenessMedia}>\n`
 
 function annotateLastStandingPartCacheControl(args: {
   messages: ModelMessage[]
@@ -470,6 +557,201 @@ function annotateLastStandingPartCacheControl(args: {
   return { messages: args.messages, applied: false, preserved: false }
 }
 
+/**
+ * Places the cache points of a lane that takes Anthropic cache control (direct Anthropic,
+ * and OpenRouter for a Claude-family model):
+ *
+ * 1. The system point, on the last system message — ALWAYS. A request-level setting (a
+ *    preset's Prompt cache TTL) is added beside it, never instead of it (BL-77): alone, the
+ *    request-level point made Anthropic write a fresh entry at the end of every request and
+ *    never read the system prompt back on the next turn, which is the SA-086 live finding
+ *    that put Batshit's own point on the system message in the first place.
+ * 2. The standing Awareness media point (direct Anthropic only), on the same lifetime.
+ * 3. The tool loop's tail point (BL-77) for the per-step hook to add from a turn's second step
+ *    on. On direct Anthropic it is the request-level point (`stepProviderOptions`), which the
+ *    provider sends as Anthropic's automatic cache point on the last block. On OpenRouter it is
+ *    an explicit marker the hook moves to the last message (`toolLoopTailMarker`, BL-185),
+ *    because OpenRouter's Bedrock route ignores the request-level field. A lane whose
+ *    request-level point is already set gets nothing extra: that point rides every step.
+ *    Never added when it would be a fifth point, and only when the request's CONNECTION
+ *    names the lane: a connection-less request is classified from its model name or a
+ *    default provider id, and whatever serves it (the gateway, by default) may not take a
+ *    request-level point.
+ */
+function placeAnthropicFamilyCachePoints(args: {
+  namespace: 'anthropic' | 'openrouter'
+  requestOptions: Record<string, any> | undefined
+  messages: ModelMessage[]
+  tools?: Record<string, any>
+  standingMedia: boolean
+  /** False when only a model name or a default provider id says which lane this is. */
+  toolLoop: boolean
+  labels: { system: string; toolLoop: string }
+  applied: string[]
+  preserved: string[]
+  omitted: ApiPromptCachePolicyMetadata['omitted']
+}): {
+  messages: ModelMessage[]
+  stepProviderOptions?: ProviderOptions
+  toolLoopTailMarker?: ToolLoopTailMarker
+  cacheTtl: CacheTtl | null
+} {
+  const { namespace, labels, applied, preserved, omitted } = args
+  const requestLevel = hasCacheControl(args.requestOptions)
+  const cacheControl = resolveCacheControlValue(args.requestOptions)
+  // BL-184: every point Batshit places uses this one lifetime. A point it kept rather than
+  // placed may carry another, so the lifetime is then unknown.
+  let cacheTtl: CacheTtl | null = cacheControl.ttl ?? '5m'
+
+  const annotation = annotateLastSystemMessageCacheControl({
+    messages: args.messages,
+    provider: namespace,
+    cacheControl,
+  })
+  let messages = annotation.messages
+  if (annotation.applied) {
+    applied.push(labels.system)
+  } else if (annotation.preserved) {
+    preserved.push(labels.system)
+    cacheTtl = null
+  } else {
+    omitted.push({
+      option: labels.system,
+      reason:
+        namespace === 'anthropic'
+          ? 'No stable system message was available to mark as the Anthropic cache breakpoint.'
+          : 'No stable system message was available to mark as the OpenRouter Anthropic cache breakpoint.',
+    })
+  }
+
+  if (args.standingMedia) {
+    const standingAnnotation = annotateLastStandingPartCacheControl({
+      messages,
+      provider: 'anthropic',
+      cacheControl,
+    })
+    messages = standingAnnotation.messages
+    if (standingAnnotation.applied) {
+      applied.push('anthropic.standingMedia.cacheControl')
+    } else if (standingAnnotation.preserved) {
+      preserved.push('anthropic.standingMedia.cacheControl')
+      cacheTtl = null
+    }
+  }
+
+  if (requestLevel) {
+    preserved.push(`${namespace}.cacheControl.automatic`)
+    return { messages, cacheTtl }
+  }
+  if (!args.toolLoop) return { messages, cacheTtl }
+
+  const explicitPoints = countCachePoints(messages, args.tools)
+  if (explicitPoints + 1 > ANTHROPIC_MAX_CACHE_POINTS) {
+    omitted.push({
+      option: labels.toolLoop,
+      reason: `The request already carries ${explicitPoints} cache points; Anthropic allows ${ANTHROPIC_MAX_CACHE_POINTS} including the tool loop's request-level point.`,
+    })
+    return { messages, cacheTtl }
+  }
+
+  applied.push(labels.toolLoop)
+  if (namespace === 'openrouter') {
+    return { messages, toolLoopTailMarker: { namespace, cacheControl: { ...cacheControl } }, cacheTtl }
+  }
+  return {
+    messages,
+    stepProviderOptions: { [namespace]: { cacheControl: { ...cacheControl } } },
+    cacheTtl,
+  }
+}
+
+function withoutTailMarker<T extends Record<string, any>>(holder: T, namespace: string): T {
+  const options = holder?.providerOptions
+  if (!isPlainObject(options) || !isPlainObject(options[namespace]) || !hasCacheControl(options[namespace])) {
+    return holder
+  }
+  const { cacheControl: _cacheControl, cache_control: _cacheControlSnake, ...rest } = options[namespace]
+  return { ...holder, providerOptions: { ...options, [namespace]: rest } }
+}
+
+function withTailMarker<T extends Record<string, any>>(holder: T, marker: ToolLoopTailMarker): T {
+  const options = isPlainObject(holder?.providerOptions) ? holder.providerOptions : {}
+  const current = isPlainObject(options[marker.namespace]) ? options[marker.namespace] : {}
+  return {
+    ...holder,
+    providerOptions: {
+      ...options,
+      [marker.namespace]: { ...current, cacheControl: { ...marker.cacheControl } },
+    },
+  }
+}
+
+/**
+ * BL-185: moves Batshit's one tail marker to the last message of a tool-loop step.
+ *
+ * `firstLoopIndex` is the number of messages Batshit compiled (the policy's output): those are
+ * never touched, so the system point stays and a replayed approval continuation is never marked.
+ * Every message from there on belongs to this run's loop (the model's responses, tool results, an
+ * injected steer or image message), and none of them carries a cache marker of its own, so any
+ * marker there is the one this function placed on an earlier step. The SDK hands a step's
+ * returned messages to the next step, so that marker is stripped before the new one is placed:
+ * a request carries the system point and ONE tail point.
+ *
+ * The marker goes on the last content PART: the OpenRouter provider copies a message-level
+ * marker on a `tool` message onto every tool result in it, so parallel results would each carry
+ * one and could pass Anthropic's four. An assistant message is marked at message level (the
+ * provider reads only that).
+ *
+ * A trailing user message with ONE text part (a steer) is skipped and the loop message before it
+ * is marked: the provider sends such a message as a plain string, but as a one-block array once
+ * it carries a marker, so marking it would change more than the marker. The steer is short and
+ * lands in the next step's write, well inside Anthropic's 20-block lookback.
+ *
+ * Nothing is mutated: the SDK keeps the step's own response objects as the run's response
+ * messages, which send-routed saves and replays, so they must never see a marker. Changed
+ * messages are copies.
+ */
+export function placeToolLoopTailMarker(
+  messages: ModelMessage[],
+  firstLoopIndex: number,
+  marker: ToolLoopTailMarker,
+): ModelMessage[] {
+  let targetIndex = messages.length - 1
+  while (targetIndex >= firstLoopIndex && isOneTextUserMessage(messages[targetIndex])) targetIndex -= 1
+  if (targetIndex < firstLoopIndex) return messages
+
+  const out = messages.map((message, index) => {
+    if (index < firstLoopIndex) return message
+    let next = withoutTailMarker(message as Record<string, any>, marker.namespace)
+    const content = (next as any).content
+    if (Array.isArray(content)) {
+      const parts = content.map((part: any) => withoutTailMarker(part, marker.namespace))
+      if (parts.some((part: any, partIndex: number) => part !== content[partIndex])) {
+        next = { ...next, content: parts }
+      }
+    }
+    return next as ModelMessage
+  })
+
+  const target = out[targetIndex] as Record<string, any>
+  const content = target.content
+  if (target.role !== 'assistant' && Array.isArray(content) && content.length > 0) {
+    const parts = [...content]
+    parts[parts.length - 1] = withTailMarker(parts[parts.length - 1], marker)
+    out[targetIndex] = { ...target, content: parts } as ModelMessage
+  } else {
+    out[targetIndex] = withTailMarker(target, marker) as ModelMessage
+  }
+  return out
+}
+
+function isOneTextUserMessage(message: ModelMessage | undefined): boolean {
+  if (message?.role !== 'user') return false
+  const content = (message as any).content
+  if (typeof content === 'string') return true
+  return Array.isArray(content) && content.length === 1 && content[0]?.type === 'text'
+}
+
 export function applyApiPromptCachePolicy(
   input: ApiPromptCachePolicyInput,
 ): ApiPromptCachePolicyResult {
@@ -477,6 +759,9 @@ export function applyApiPromptCachePolicy(
   const existingOptions = cloneProviderOptions(input.providerOptions)
   const defaults: ProviderOptions = {}
   let messages = input.messages
+  let stepProviderOptions: ProviderOptions | undefined
+  let toolLoopTailMarker: ToolLoopTailMarker | undefined
+  let cacheTtl: CacheTtl | null = null
   const stablePrefix = buildStablePrefixSignature(input.messages, input.tools)
   const applied: string[] = []
   const preserved: string[] = []
@@ -499,39 +784,28 @@ export function applyApiPromptCachePolicy(
     }
   }
 
+  // BL-77: the tool loop's point needs the CONNECTION to name the lane (see the helper).
+  const connectionKind = resolveExactProviderKind({ connection: input.connection })
+
   if (provider === 'anthropic') {
-    if (!hasCacheControl(existingOptions.anthropic)) {
-      const annotation = annotateLastSystemMessageCacheControl({
-        messages,
-        provider: 'anthropic',
-        cacheControl: { type: 'ephemeral' },
-      })
-      messages = annotation.messages
-      if (annotation.applied) {
-        applied.push('anthropic.cacheControl')
-      } else if (annotation.preserved) {
-        preserved.push('anthropic.cacheControl')
-      } else {
-        omitted.push({
-          option: 'anthropic.cacheControl',
-          reason:
-            'No stable system message was available to mark as the Anthropic cache breakpoint.',
-        })
-      }
-    } else {
-      preserved.push('anthropic.cacheControl')
-    }
-    const standingAnnotation = annotateLastStandingPartCacheControl({
+    const placed = placeAnthropicFamilyCachePoints({
+      namespace: 'anthropic',
+      requestOptions: existingOptions.anthropic,
       messages,
-      provider: 'anthropic',
-      cacheControl: { type: 'ephemeral' }
+      tools: input.tools,
+      standingMedia: true,
+      toolLoop: connectionKind === 'anthropic',
+      labels: {
+        system: 'anthropic.cacheControl',
+        toolLoop: 'anthropic.toolLoop.cacheControl.fromStep2',
+      },
+      applied,
+      preserved,
+      omitted,
     })
-    messages = standingAnnotation.messages
-    if (standingAnnotation.applied) {
-      applied.push('anthropic.standingMedia.cacheControl')
-    } else if (standingAnnotation.preserved) {
-      preserved.push('anthropic.standingMedia.cacheControl')
-    }
+    messages = placed.messages
+    stepProviderOptions = placed.stepProviderOptions
+    cacheTtl = placed.cacheTtl
   }
 
   if (provider === 'openrouter') {
@@ -556,30 +830,24 @@ export function applyApiPromptCachePolicy(
     }
 
     if (modelLooksAnthropic(modelId)) {
-      if (
-        existingOptions.openrouter?.cache_control === undefined &&
-        existingOptions.openrouter?.cacheControl === undefined
-      ) {
-        const annotation = annotateLastSystemMessageCacheControl({
-          messages,
-          provider: 'openrouter',
-          cacheControl: { type: 'ephemeral' },
-        })
-        messages = annotation.messages
-        if (annotation.applied) {
-          applied.push('openrouter.cache_control')
-        } else if (annotation.preserved) {
-          preserved.push('openrouter.cache_control')
-        } else {
-          omitted.push({
-            option: 'openrouter.cache_control',
-            reason:
-              'No stable system message was available to mark as the OpenRouter Anthropic cache breakpoint.',
-          })
-        }
-      } else {
-        preserved.push('openrouter.cache_control')
-      }
+      const placed = placeAnthropicFamilyCachePoints({
+        namespace: 'openrouter',
+        requestOptions: existingOptions.openrouter,
+        messages,
+        tools: input.tools,
+        standingMedia: false,
+        toolLoop: connectionKind === 'openrouter',
+        labels: {
+          system: 'openrouter.cache_control',
+          toolLoop: 'openrouter.toolLoop.cache_control.lastMessage.fromStep2',
+        },
+        applied,
+        preserved,
+        omitted,
+      })
+      messages = placed.messages
+      toolLoopTailMarker = placed.toolLoopTailMarker
+      cacheTtl = placed.cacheTtl
     }
   }
 
@@ -588,6 +856,12 @@ export function applyApiPromptCachePolicy(
     if (existingOptions.gateway?.caching === undefined) {
       defaults.gateway.caching = 'auto'
       applied.push('gateway.caching')
+      // BL-184: the gateway's automatic points on a Claude model use Anthropic's default
+      // five-minute lifetime (Batshit sends no `cache_ttl`). A request that also carries its
+      // own Anthropic cache setting may change that, so its lifetime stays unknown.
+      if (modelLooksAnthropic(modelId) && !hasCacheControl(existingOptions.anthropic)) {
+        cacheTtl = '5m'
+      }
     } else {
       preserved.push('gateway.caching')
     }
@@ -639,6 +913,7 @@ export function applyApiPromptCachePolicy(
     omitted,
     providerOptionKeys: providerOptionKeys(providerOptions),
     requestHeaderNames: Object.keys(requestHeaders).sort(),
+    cacheTtl,
   }
 
   return {
@@ -648,6 +923,8 @@ export function applyApiPromptCachePolicy(
       ? undefined
       : providerOptions,
     headers: Object.keys(requestHeaders).length > 0 ? requestHeaders : undefined,
+    stepProviderOptions,
+    toolLoopTailMarker,
     metadata,
   }
 }

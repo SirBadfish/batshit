@@ -13,6 +13,9 @@ import {
   parseRunCredentialPresentation,
   recordRunCredentialUse,
   revokeRunCredential,
+  readDelegatedAllowedControlIds,
+  readRunCredentialProcessOwner,
+  readRunCredentialMcpGatewayScope,
   sweepAgentRunCredentials,
   validateRunCredential
 } from '../agentRunCredentials'
@@ -104,11 +107,25 @@ describe('minting a run credential', () => {
       sessionId: 'sess-1',
       messageId: 'msg-7',
       runtime: 'codex',
+      serverInstanceId: expect.any(String),
       lastUsedAt: null,
       useCount: 0
     })
     // The record the minter hands back is the same one on disk, secret excluded.
     expect(record.id).toBe(credentialId)
+  })
+
+  it('binds the managed Codex output setting and rejects invalid cross-runtime values', async () => {
+    for (const limit of [0, 25_000, 75_000]) {
+      const { token } = await mint({ codexToolOutputTokenLimit: limit })
+      const validated = await validateRunCredential(token)
+      expect(validated.valid && validated.record.codexToolOutputTokenLimit).toBe(limit)
+    }
+    for (const limit of [-1, 1.5, Number.NaN]) {
+      await expect(mint({ codexToolOutputTokenLimit: limit })).rejects.toThrow()
+    }
+    await expect(mint({ runtime: 'claude', codexToolOutputTokenLimit: 25_000 })).rejects.toThrow()
+    expect((await mint()).record.codexToolOutputTokenLimit).toBeNull()
   })
 
   it('indexes the credential under the agent and sets the 24-hour backstop', async () => {
@@ -119,6 +136,69 @@ describe('minting a run credential', () => {
     const ttl = await redis.ttl(agentRunCredentialKey(credentialId))
     expect(ttl).toBeGreaterThan(0)
     expect(ttl).toBeLessThanOrEqual(AGENT_RUN_CREDENTIAL_TTL_SECONDS)
+  })
+
+  it('binds primary commands to their agent and refuses a borrowed owner', async () => {
+    const { record } = await mint()
+    expect(readRunCredentialProcessOwner(record)).toEqual({ userId: USER, kind: 'agent', id: COOPER })
+    expect(record.commandParentAgentId).toBe(COOPER)
+    await expect(mint({ processOwner: { userId: USER, kind: 'agent', id: FAYE } }))
+      .rejects.toThrow(/cannot borrow another command owner/i)
+    await expect(mint({ commandParentAgentId: FAYE }))
+      .rejects.toThrow(/cannot borrow another command parent/i)
+  })
+
+  it('binds a named Subagent to its stored owner and a Worker to its parent agent', async () => {
+    const subagentId = 'subagent_credential_owner_proof'
+    await redis.json.set(`subagent:${subagentId}`, '$', { id: subagentId, user_id: USER } as never)
+    const named = await mint({ agentId: 'subagent_cli_owner_proof', delegated: true,
+      scopeAgentId: subagentId, allowedControlIds: [],
+      processOwner: { userId: USER, kind: 'subagent', id: subagentId } })
+    expect(readRunCredentialProcessOwner(named.record)).toEqual({ userId: USER, kind: 'subagent', id: subagentId })
+
+    const worker = await mint({ agentId: 'subagent_cli_worker_owner_proof', delegated: true,
+      scopeAgentId: 'worker_owner_proof', allowedControlIds: [],
+      processOwner: { userId: USER, kind: 'agent', id: COOPER } })
+    expect(readRunCredentialProcessOwner(worker.record)).toEqual({ userId: USER, kind: 'agent', id: COOPER })
+
+    const legacy = await mint({ agentId: 'subagent_cli_legacy_owner_proof', delegated: true,
+      scopeAgentId: 'worker_owner_proof', allowedControlIds: [] })
+    expect(readRunCredentialProcessOwner(legacy.record)).toBeNull()
+  })
+
+  it('refuses deleted and cross-user delegated physical owners at mint', async () => {
+    const base = { agentId: 'subagent_cli_missing_owner_proof', delegated: true,
+      scopeAgentId: 'worker_owner_proof', allowedControlIds: [] }
+    await expect(mint({ ...base, processOwner: { userId: USER, kind: 'subagent', id: 'missing-owner' } }))
+      .rejects.toThrow(/deleted or belongs to another user/i)
+    await expect(mint({ ...base, processOwner: { userId: OTHER_USER, kind: 'agent', id: COOPER } }))
+      .rejects.toThrow(/valid server-owned command owner/i)
+    await seedAgent('agent-another-owner', OTHER_USER)
+    await expect(mint({ ...base, processOwner: { userId: USER, kind: 'agent', id: 'agent-another-owner' } }))
+      .rejects.toThrow(/deleted or belongs to another user/i)
+  })
+
+  it('validates a delegated command parent and the Worker owner relationship', async () => {
+    const subagentId = 'subagent_command_parent_proof'
+    await redis.json.set(`subagent:${subagentId}`, '$', { id: subagentId, user_id: USER } as never)
+    const named = { agentId: 'subagent_cli_parent_proof', delegated: true,
+      scopeAgentId: subagentId, allowedControlIds: [],
+      processOwner: { userId: USER, kind: 'subagent', id: subagentId } }
+    await expect(mint({ ...named, commandParentAgentId: 'missing-parent' }))
+      .rejects.toThrow(/command parent was deleted or belongs to another user/i)
+    await seedAgent('agent-other-parent', OTHER_USER)
+    await expect(mint({ ...named, commandParentAgentId: 'agent-other-parent' }))
+      .rejects.toThrow(/command parent was deleted or belongs to another user/i)
+    const minted = await mint({ ...named, commandParentAgentId: COOPER })
+    expect(minted.record.commandParentAgentId).toBe(COOPER)
+    await redis.del(`agent:${COOPER}`)
+    expect(await validateRunCredential(minted.token)).toEqual({ valid: false, reason: 'invalid' })
+
+    await seedAgent(COOPER)
+    await expect(mint({ agentId: 'subagent_cli_worker_parent_proof', delegated: true,
+      scopeAgentId: 'worker_parent_proof', allowedControlIds: [],
+      processOwner: { userId: USER, kind: 'agent', id: COOPER },
+      commandParentAgentId: FAYE })).rejects.toThrow(/must be its parent agent/i)
   })
 
   it('refuses a missing agent, another user’s agent, and a runtime that is not a CLI lane', async () => {
@@ -176,6 +256,76 @@ describe('validating a call', () => {
       agentId: COOPER,
       sessionId: 'sess-1'
     })
+  })
+
+  it('refuses a named Subagent token when its actual owner is deleted without revocation', async () => {
+    const subagentId = 'subagent_credential_deleted_owner'
+    await redis.json.set(`subagent:${subagentId}`, '$', { id: subagentId, user_id: USER } as never)
+    const { token, credentialId } = await mint({
+      agentId: 'subagent_cli_deleted_owner', delegated: true,
+      scopeAgentId: subagentId, allowedControlIds: [],
+      processOwner: { userId: USER, kind: 'subagent', id: subagentId }
+    })
+    expect(await validateRunCredential(token)).toMatchObject({ valid: true })
+    await redis.del(`subagent:${subagentId}`)
+    expect(await getRunCredential(credentialId)).not.toBeNull()
+    expect(await validateRunCredential(token)).toEqual({ valid: false, reason: 'invalid' })
+  })
+
+  it('refuses a Worker token when its parent agent is deleted without revocation', async () => {
+    const { token, credentialId } = await mint({
+      agentId: 'subagent_cli_worker_deleted_parent', delegated: true,
+      scopeAgentId: 'worker_deleted_parent', allowedControlIds: [],
+      processOwner: { userId: USER, kind: 'agent', id: COOPER }
+    })
+    expect(await validateRunCredential(token)).toMatchObject({ valid: true })
+    await redis.del(`agent:${COOPER}`)
+    expect(await getRunCredential(credentialId)).not.toBeNull()
+    expect(await validateRunCredential(token)).toEqual({ valid: false, reason: 'invalid' })
+  })
+
+  it('refuses a primary token if its agent is deleted or its owner field is malformed', async () => {
+    const primary = await mint()
+    await redis.json.set(agentRunCredentialKey(primary.credentialId), '$.processOwner',
+      { userId: USER, kind: 'subagent', id: 'forged' } as never)
+    expect(await validateRunCredential(primary.token)).toEqual({ valid: false, reason: 'invalid' })
+    const valid = await mint()
+    await redis.del(`agent:${COOPER}`)
+    expect(await validateRunCredential(valid.token)).toEqual({ valid: false, reason: 'invalid' })
+  })
+
+  it('refuses prior app-process and legacy credentials even with the right secret', async () => {
+    const primary = await mint()
+    const delegated = await mintRunCredential({
+      userId: USER,
+      agentId: 'subagent_cli_worker_1',
+      sessionId: 'sess-worker',
+      runtime: 'claude',
+      delegated: true,
+      scopeAgentId: 'worker_1',
+      allowedControlIds: []
+    })
+    expect(primary.record.serverInstanceId).toBe(delegated.record.serverInstanceId)
+    expect(primary.record.serverInstanceId).toHaveLength(43)
+    expect(await validateRunCredential(primary.token)).toMatchObject({ valid: true })
+    expect(await validateRunCredential(delegated.token)).toMatchObject({ valid: true })
+
+    // Redis and the original secret survive a restart. The replacement process has a
+    // different random identity, so neither old primary nor delegated helper can act.
+    for (const minted of [primary, delegated]) {
+      await redis.json.set(
+        agentRunCredentialKey(minted.credentialId),
+        '$.serverInstanceId',
+        'previous-app-process' as never
+      )
+      expect(await validateRunCredential(minted.token)).toEqual({ valid: false, reason: 'invalid' })
+    }
+
+    // Credentials minted before this field existed fail closed too.
+    const legacy = await mint()
+    const { serverInstanceId: _removed, ...oldRecord } = legacy.record
+    await redis.json.set(agentRunCredentialKey(legacy.credentialId), '$', oldRecord as never)
+    expect(await validateRunCredential(legacy.token)).toEqual({ valid: false, reason: 'invalid' })
   })
 
   it('refuses a missing, malformed, unknown, or wrong-secret presentation', async () => {
@@ -478,7 +628,8 @@ describe('a delegated run credential', () => {
       sessionId: 'sess-worker',
       runtime: 'codex',
       delegated: true,
-      scopeAgentId: 'worker_1'
+      scopeAgentId: 'worker_1',
+      allowedControlIds: ['use.artifact.*']
     })
 
     expect(minted.record.delegated).toBe(true)
@@ -493,9 +644,8 @@ describe('a delegated run credential', () => {
   })
 
   it('still refuses a delegated id that collides with ANOTHER user\'s stored agent', async () => {
-    // The record check does not disappear for a delegated mint — it only stops requiring a
-    // record to exist. This is the one way a per-run runtime id could ever have named a real
-    // agent, and it stays closed.
+    // The record check does not disappear for a delegated mint: it stops requiring a record
+    // and starts refusing one (below).
     await redis.createAgent({
       id: 'subagent_cli_collision',
       user_id: 'somebody-else',
@@ -513,7 +663,42 @@ describe('a delegated run credential', () => {
         runtime: 'codex',
         delegated: true
       })
-    ).rejects.toThrow(/was not found for this user/)
+    ).rejects.toThrow(/names a stored agent/)
+  })
+
+  it('refuses a delegated id that names THIS user\'s own agent, and writes nothing (BL-81 follow-up)', async () => {
+    // The dispatch path loads `agent:{the credential's agentId}` for a run, so a delegated run
+    // whose per-run id named a real primary would get that primary's settings and permissions.
+    await redis.createAgent({
+      id: 'subagent_cli_collision_mine',
+      user_id: USER,
+      displayName: 'Collision Mine',
+      agentType: 'cli',
+      primary_model_provider: 'codex',
+      primary_model_name: 'gpt-5.6'
+    } as never)
+
+    const attempt = mintRunCredential({
+      userId: USER,
+      agentId: 'subagent_cli_collision_mine',
+      sessionId: 'sess-worker',
+      runtime: 'codex',
+      delegated: true,
+      scopeAgentId: 'worker_1',
+      allowedControlIds: ['use.artifact.*']
+    })
+    await expect(attempt).rejects.toThrow(/names a stored agent/)
+    await expect(attempt).rejects.toMatchObject({ status: 409 })
+    expect(await listAgentRunCredentialIds('subagent_cli_collision_mine')).toEqual([])
+
+    // The same id as a PRIMARY run is that agent's own, and still mints.
+    const primary = await mintRunCredential({
+      userId: USER,
+      agentId: 'subagent_cli_collision_mine',
+      sessionId: 'sess-primary',
+      runtime: 'codex'
+    })
+    expect(primary.record.delegated).toBe(false)
   })
 
   it('marks an ordinary primary run as NOT delegated', async () => {
@@ -555,7 +740,8 @@ describe('a run credential skill scope (BL-75)', () => {
       sessionId: 'sess-delegated',
       runtime: 'claude',
       delegated: true,
-      scopeAgentId: scopeAgentId as string
+      scopeAgentId: scopeAgentId as string,
+      allowedControlIds: []
     })
 
   it('stores the Subagent a delegated run runs as, and hands it back on validation', async () => {
@@ -606,5 +792,109 @@ describe('a run credential skill scope (BL-75)', () => {
         scopeAgentId: 'research_bot'
       })
     ).rejects.toThrow(/cannot carry the skill scope/)
+  })
+})
+
+/* -------------------------------------------------------------------------- *
+ * BL-81 — the control scope a delegated credential carries.
+ *
+ * A Subagent or Worker run may use, through the control routes, exactly what its DCM index
+ * offered it. The runner computes that list from the run's resolved scope; the credential
+ * carries it, server-vouched, the way a Portable Skill Token carries its allowed controls. A
+ * delegated mint without one fails the run start loudly; a record minted before BL-81 has none
+ * and is allowed nothing.
+ * -------------------------------------------------------------------------- */
+
+describe('a delegated credential\'s control scope (BL-81)', () => {
+  const delegatedMint = (allowedControlIds: unknown) =>
+    mintRunCredential({
+      userId: USER,
+      agentId: 'subagent_cli_research',
+      sessionId: 'sess-delegated',
+      runtime: 'codex',
+      delegated: true,
+      scopeAgentId: 'worker_1',
+      allowedControlIds: allowedControlIds as string[]
+    })
+
+  it('stores the list, cleaned, and hands it back on validation', async () => {
+    const minted = await delegatedMint([' use.artifact.* ', 'sys.zip.fetch', 'use.artifact.*', ''])
+
+    expect(minted.record.allowedControlIds).toEqual(['use.artifact.*', 'sys.zip.fetch'])
+    const validation = await validateRunCredential(minted.token)
+    expect(validation.valid && validation.record.allowedControlIds).toEqual([
+      'use.artifact.*',
+      'sys.zip.fetch'
+    ])
+  })
+
+  it('stores an empty list: a run offered nothing is allowed nothing', async () => {
+    const minted = await delegatedMint([])
+    expect(minted.record.allowedControlIds).toEqual([])
+  })
+
+  it('refuses a delegated mint that names no list, so a caller that forgets it fails loudly', async () => {
+    await expect(delegatedMint(undefined)).rejects.toThrow(/control/i)
+    await expect(delegatedMint(null)).rejects.toThrow(/control/i)
+    await expect(delegatedMint('use.artifact.*')).rejects.toThrow(/control/i)
+    await expect(delegatedMint(['use.artifact.*', 7])).rejects.toThrow(/control/i)
+  })
+
+  it('stores none on a primary run, and refuses a primary run that names one', async () => {
+    await seedAgent(COOPER)
+    const own = await mintRunCredential({
+      userId: USER,
+      agentId: COOPER,
+      sessionId: 'sess-primary',
+      runtime: 'codex'
+    })
+    expect(own.record.allowedControlIds).toBeNull()
+
+    await expect(
+      mintRunCredential({
+        userId: USER,
+        agentId: COOPER,
+        sessionId: 'sess-primary',
+        runtime: 'codex',
+        allowedControlIds: ['use.artifact.*']
+      })
+    ).rejects.toThrow(/primary run/i)
+  })
+
+  it('reads a delegated record\'s list, and fails closed for one minted before BL-81', () => {
+    expect(
+      readDelegatedAllowedControlIds({ delegated: true, allowedControlIds: ['sys.zip.fetch'] })
+    ).toEqual(['sys.zip.fetch'])
+    // No field at all: the shape every delegated record written before BL-81 has.
+    expect(readDelegatedAllowedControlIds({ delegated: true })).toEqual([])
+    expect(readDelegatedAllowedControlIds({ delegated: true, allowedControlIds: null })).toEqual([])
+    expect(
+      readDelegatedAllowedControlIds({ delegated: true, allowedControlIds: 'sys.*' as never })
+    ).toEqual([])
+    // A primary run has no delegated scope at all: its own settings govern, as before.
+    expect(readDelegatedAllowedControlIds({ delegated: false, allowedControlIds: null })).toBeNull()
+  })
+})
+
+describe('server-bound MCP gateway scope (BL-638)', () => {
+  it('normalizes and copies the selected gateways at mint and read time', async () => {
+    const selected = [' gateway-a ', 'gateway-b', 'gateway-a', '']
+    const minted = await mint({ mcpGatewayScope: selected })
+    selected[0] = 'attacker-gateway'
+    expect(minted.record.mcpGatewayScope).toEqual(['gateway-a', 'gateway-b'])
+
+    const stored = await getRunCredential(minted.credentialId)
+    expect(stored?.mcpGatewayScope).toEqual(['gateway-a', 'gateway-b'])
+    const exposed = readRunCredentialMcpGatewayScope(stored!)
+    exposed.push('attacker-gateway')
+    expect(readRunCredentialMcpGatewayScope(stored!)).toEqual(['gateway-a', 'gateway-b'])
+  })
+
+  it('keeps an explicit empty selection and fails closed for old or malformed records', async () => {
+    const minted = await mint({ mcpGatewayScope: [] })
+    expect(minted.record.mcpGatewayScope).toEqual([])
+    expect(readRunCredentialMcpGatewayScope({})).toEqual([])
+    expect(readRunCredentialMcpGatewayScope({ mcpGatewayScope: null })).toEqual([])
+    expect(readRunCredentialMcpGatewayScope({ mcpGatewayScope: ['gateway-a', 7] as never })).toEqual([])
   })
 })

@@ -11,9 +11,11 @@ import {
   getSteerRun,
   listInFlightSteers,
   listPendingSteers,
+  refileUndeliveredSteers,
   registerSteerRun,
   returnSteersToPending,
   takeMissedDmSteers,
+  takeMissedUserSteers,
   takePendingSteersForDelivery,
   takePendingSteersForTransport,
   takeUndeliveredSteers,
@@ -770,4 +772,82 @@ describe('a queued steer (deliver: end) — DL-119-05', () => {
     expect(takePendingSteersForTransport(SESSION, 'msg_assistant_2')).toEqual([])
     expect(listPendingSteers(SESSION).map((row) => row.steerId)).toEqual(['q1'])
   })
+})
+
+/**
+ * BL-137 — a steer the user sent into a reply that then ran out of context.
+ *
+ * Entries are filed under the assistant message id they belong inside. A context-exhaustion
+ * continuation carries the same reply on under a NEW message id, so a steer accepted during the
+ * run that ran out of room (still waiting, or written to a CLI's wire and never read) was filed
+ * under the old id: the continuation's boundaries never handed it over, the promotion took the
+ * last run's id, and the request's `finally` cleared it. The user was left with an unanswered
+ * receipt.
+ */
+describe('steers carried into a context-exhaustion continuation (BL-137)', () => {
+  const RUN_ONE = 'msg_run_one'
+  const RUN_TWO = 'msg_run_two'
+
+  it('re-files what the run that ran out of room never delivered, in acceptance order', () => {
+    enqueueSteer(SESSION, entry('a', { messageId: RUN_ONE, at: '2026-09-25T10:00:01.000Z' }))
+    enqueueSteer(SESSION, entry('b', { messageId: RUN_ONE, at: '2026-09-25T10:00:02.000Z', deliver: 'end' }))
+    enqueueSteer(SESSION, entry('c', { messageId: RUN_ONE, at: '2026-09-25T10:00:03.000Z' }))
+    enqueueSteer(SESSION, entry('dm', { messageId: RUN_ONE, at: '2026-09-25T10:00:04.000Z', source: 'dm' }))
+    enqueueSteer(SESSION, entry('other', { messageId: 'msg_someone_else', at: '2026-09-25T10:00:00.500Z' }))
+    // `a` was written to a CLI's wire and never echoed back: written is not read.
+    expect(takePendingSteersForTransport(SESSION, RUN_ONE).map((row) => row.steerId)).toEqual(['a', 'c', 'dm'])
+    returnSteersToPending(SESSION, [entry('c', { messageId: RUN_ONE }), entry('dm', { messageId: RUN_ONE })])
+
+    expect(refileUndeliveredSteers(SESSION, RUN_ONE, RUN_TWO)).toBe(4)
+
+    expect(listInFlightSteers(SESSION)).toEqual([])
+    expect(
+      listPendingSteers(SESSION)
+        .filter((row) => row.messageId === RUN_TWO)
+        .map((row) => row.steerId)
+    ).toEqual(['a', 'b', 'c', 'dm'])
+    expect(listPendingSteers(SESSION).find((row) => row.steerId === 'other')?.messageId).toBe('msg_someone_else')
+    // The continuation's boundary hands over the steers (never the queued one), and its end
+    // promotes what is left.
+    expect(takePendingSteersForDelivery(SESSION, RUN_TWO, { step: 1, lane: 'api' }).map((row) => row.steerId)).toEqual([
+      'a',
+      'c',
+      'dm'
+    ])
+    expect(takeUndeliveredSteers(SESSION, RUN_TWO, { source: 'user' }).map((row) => row.steerId)).toEqual(['b'])
+  })
+
+  it('leaves a steer the run that ran out of room already delivered in that run', () => {
+    enqueueSteer(SESSION, entry('a', { messageId: RUN_ONE }))
+    takePendingSteersForDelivery(SESSION, RUN_ONE, { step: 1, lane: 'api' })
+    expect(refileUndeliveredSteers(SESSION, RUN_ONE, RUN_TWO)).toBe(0)
+
+    // Delivered and not yet written into its transcript, beside one that still waits.
+    enqueueSteer(SESSION, entry('b', { messageId: RUN_ONE }))
+    expect(refileUndeliveredSteers(SESSION, RUN_ONE, RUN_TWO)).toBe(1)
+    expect(drainDeliveredSteers(SESSION, RUN_ONE).map((row) => row.steerId)).toEqual(['a'])
+    expect(drainDeliveredSteers(SESSION, RUN_TWO)).toEqual([])
+  })
+
+  it('does nothing for a chat with no inbox, or for the same id', () => {
+    expect(refileUndeliveredSteers('no-inbox', RUN_ONE, RUN_TWO)).toBe(0)
+    enqueueSteer(SESSION, entry('a', { messageId: RUN_ONE }))
+    expect(refileUndeliveredSteers(SESSION, RUN_ONE, RUN_ONE)).toBe(0)
+    expect(listPendingSteers(SESSION)[0].messageId).toBe(RUN_ONE)
+  })
+})
+
+
+it('takes only undelivered user ids at cleanup, preserving another live run, DMs and delivered entries (BL-1291)', () => {
+  enqueueSteer(SESSION, entry('pending'))
+  enqueueSteer(SESSION, entry('inflight'))
+  enqueueSteer(SESSION, entry('dm', { source: 'dm' }))
+  enqueueSteer(SESSION, entry('new-live', { messageId: 'new-reply' }))
+  const taken = takePendingSteersForTransport(SESSION, MESSAGE)
+  expect(taken.map(item => item.steerId)).toContain('inflight')
+  confirmSteerDelivery(SESSION, MESSAGE, { steerIds: ['pending'], step: 1, lane: 'codex' })
+  expect(takeMissedUserSteers(SESSION, { keepMessageId: 'new-reply' }).map(item => item.steerId)).toEqual(['inflight'])
+  expect(listPendingSteers(SESSION).map(item => item.steerId)).toEqual(['new-live'])
+  expect(listInFlightSteers(SESSION).map(item => item.steerId)).toEqual(['dm'])
+  expect(drainDeliveredSteers(SESSION, MESSAGE).map(item => item.steerId)).toEqual(['pending'])
 })

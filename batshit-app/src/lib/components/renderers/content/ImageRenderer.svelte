@@ -5,6 +5,12 @@
   import { toast } from 'svelte-sonner'
   import { copyTextToClipboard } from '$lib/utils/clipboard'
   import { downloadBlob } from '$lib/utils/download'
+  import { isOpenableFailedImageUrl, isUnsupportedImageScheme } from '$lib/utils/imageUrlSafety'
+  import { classifyImageSource } from '$lib/utils/imageSource'
+  import { allowImageLoad, isImageLoadAllowed, IMAGE_MESSAGE_ID_CONTEXT } from '$lib/stores/imageLoadConsent.svelte'
+  import { getContext } from 'svelte'
+  import type { ImageOriginDisplay } from '$lib/stores/imageAddressOrigins.svelte'
+  import { BATSHIT_SERVER_URL } from '$lib/services/apiClient'
   import { Copy, Download, ImageOff, Loader2, Maximize2, Plus } from '@lucide/svelte'
   
   let { 
@@ -16,7 +22,10 @@
     clipId,
     sessionId,
     fullResolutionSrc,
-    filename
+    filename,
+    messageId = '',
+    trustedClip = false,
+    origin
   } = $props<{ 
     src: string
     alt?: string
@@ -27,6 +36,12 @@
     sessionId?: string
     fullResolutionSrc?: string
     filename?: string
+    /** The message this picture is in: a Load click is for this message's address only. */
+    messageId?: string
+    /** The address came from a Clip record the server returned for this message. */
+    trustedClip?: boolean
+    /** Only reply-text pictures have an origin decision; tool/zip/Clip views keep click consent. */
+    origin?: ImageOriginDisplay
   }>()
   
   let loading = $state(true)
@@ -38,60 +53,67 @@
   let isSaving = $state(false)
   let savedClipId = $state<string | null>(null)
   let previewOpen = $state(false)
+  let sourceFromClipRecord = $state(false)
+  // A picture inside a tool card gets its message id from the message it is drawn in.
+  const contextMessageId = getContext<(() => string) | undefined>(IMAGE_MESSAGE_ID_CONTEXT)
+  const consentMessageId = $derived(messageId || contextMessageId?.() || '')
 
-  function extractUrlScheme(value: string): string | null {
-    const match = /^([a-z][a-z0-9+.-]*):/i.exec(value)
-    return match?.[1]?.toLowerCase() ?? null
+  // BL-474 step 1: an outside picture gets no address (so no request, preview, or download)
+  // until the user clicks Load; Batshit's own pictures draw at once.
+  const source = $derived(
+    classifyImageSource(actualSrc, {
+      baseUrl: page.url.href,
+      serverUrls: [BATSHIT_SERVER_URL],
+      fromTrustedClip: trustedClip || sourceFromClipRecord
+    })
+  )
+  const isOutside = $derived(source.kind === 'outside')
+  const originAllowsLoad = $derived(!origin || origin.state === 'as_read' || origin.state === 'unknown')
+  const outsideAllowed = $derived(source.kind === 'outside' && originAllowsLoad && isImageLoadAllowed(consentMessageId, source.url))
+  const outsideWaiting = $derived(isOutside && !outsideAllowed)
+  $effect(() => {
+    if (isOutside && !originAllowsLoad) previewOpen = false
+  })
+  /** The address the picture may use now: empty until an outside picture is allowed. */
+  const drawSrc = $derived.by(() => {
+    if (source.kind === 'owned') return source.url
+    if (source.kind === 'outside' && outsideAllowed) return source.url
+    return ''
+  })
+
+  function loadOutsidePicture() {
+    if (source.kind !== 'outside' || !originAllowsLoad) return
+    allowImageLoad(consentMessageId, source.url)
   }
 
-  function isLikelyFilesystemPath(value: string): boolean {
-    const trimmed = value.trim()
-    const lower = trimmed.toLowerCase()
-
-    if (!trimmed) return false
-    if (/^[a-z]:[\\/]/i.test(trimmed)) return true
-    if (lower.startsWith('\\\\')) return true
-    if (lower.startsWith('file://')) return true
-    if (
-      lower.startsWith('/var/') ||
-      lower.startsWith('/private/') ||
-      lower.startsWith('/tmp/') ||
-      lower.startsWith('/users/') ||
-      lower.startsWith('/volumes/') ||
-      lower.startsWith('/home/') ||
-      lower.startsWith('/root/')
-    ) {
-      return true
-    }
-    return false
-  }
-
-  function isUnsupportedImageScheme(value: string | null | undefined): boolean {
-    if (!value || typeof value !== 'string') return false
-    const trimmed = value.trim()
-    if (isLikelyFilesystemPath(trimmed)) return true
-    const scheme = extractUrlScheme(trimmed)
-    if (!scheme) return false
-    return !['http', 'https', 'data', 'blob'].includes(scheme)
-  }
-  
   // Check if this is an SVG (by URL extension or data URI)
   const isSvg = $derived(
     actualSrc?.toLowerCase().endsWith('.svg') || 
     actualSrc?.startsWith('data:image/svg+xml')
   )
   const canSaveToClip = $derived(
+    source.kind === 'owned' &&
     !clipId &&
     !savedClipId &&
     typeof actualSrc === 'string' &&
     actualSrc.startsWith('data:image/')
   )
 
-  const actionSrc = $derived.by(() => fullResolutionSrc || resolvedFullResolutionSrc || actualSrc)
+  const actionSrc = $derived.by(() => {
+    if (!drawSrc) return ''
+    return source.kind === 'owned' ? fullResolutionSrc || resolvedFullResolutionSrc || drawSrc : drawSrc
+  })
 
-  function applyImageSource(value: string) {
+  function applyImageSource(value: string, fromClipRecord = false) {
     actualSrc = value
-    const unsupported = isUnsupportedImageScheme(value)
+    sourceFromClipRecord = fromClipRecord
+    const unsupported =
+      isUnsupportedImageScheme(value, page.url.href) ||
+      classifyImageSource(value, {
+        baseUrl: page.url.href,
+        serverUrls: [BATSHIT_SERVER_URL],
+        fromTrustedClip: trustedClip || fromClipRecord
+      }).kind === 'unsupported'
     error = unsupported
     loading = !unsupported
   }
@@ -130,7 +152,7 @@
         if (!src || src === '') {
           const clipUrl = clipData.displayUrl || clipData.externalUrl || clipData.localUrl || ''
           if (clipUrl) {
-            applyImageSource(clipUrl)
+            applyImageSource(clipUrl, true)
           } else {
             loading = false
             error = true
@@ -232,18 +254,19 @@
     anchor.href = url
     anchor.download = downloadName
     anchor.rel = 'noopener'
+    if (isOutside) anchor.referrerPolicy = 'no-referrer'
     document.body.appendChild(anchor)
     anchor.click()
     document.body.removeChild(anchor)
   }
 
   async function downloadImage() {
-    const source = actionSrc || actualSrc
+    const source = actionSrc
     if (!source) return
     const downloadName = resolveDownloadName(source)
 
     try {
-      const response = await fetch(source)
+      const response = await fetch(source, isOutside ? { referrerPolicy: 'no-referrer' } : undefined)
       if (!response.ok) throw new Error(`Download failed: ${response.status}`)
       const blob = await response.blob()
       await downloadBlob(blob, downloadName, {
@@ -386,6 +409,25 @@
 </script>
 
 <div class="image-container">
+  {#if outsideWaiting && source.kind === 'outside'}
+    <div class="outside-picture" data-testid="outside-picture">
+      <ImageOff size={28} />
+      <span class="outside-picture-title">Picture from {source.host}</span>
+      {#if origin?.line}
+        <span class:outside-picture-warning={origin.state === 'unknown'}>{origin.line}</span>
+      {/if}
+      {#if source.carriesData}
+        <span class="outside-picture-warning">This address carries extra data. Loading it sends that data to the website.</span>
+      {/if}
+      <details class="outside-picture-address">
+        <summary>Show address</summary>
+        <code>{source.url}</code>
+      </details>
+      {#if originAllowsLoad}
+        <Button variant="outline" size={origin?.state === 'unknown' ? 'xs' : 'sm'} onclick={loadOutsidePicture}>Load picture</Button>
+      {/if}
+    </div>
+  {:else}
   {#if loading && !error}
     <div class="loading-placeholder">
       <div class="spinner"></div>
@@ -397,17 +439,18 @@
     <div class="error-placeholder">
       <ImageOff size={48} />
       <span>Failed to load image</span>
-      {#if actualSrc && !isUnsupportedImageScheme(actualSrc)}
-        <a href={actualSrc} target="_blank" class="error-link">Open URL</a>
-      {:else if actualSrc && isUnsupportedImageScheme(actualSrc)}
+      {#if drawSrc && isOpenableFailedImageUrl(drawSrc, page.url.href)}
+        <a href={drawSrc} target="_blank" rel="noopener noreferrer" class="error-link">Open URL</a>
+      {:else if actualSrc && (isUnsupportedImageScheme(actualSrc, page.url.href) || source.kind === 'unsupported')}
         <span class="error-link">Unsupported image URL scheme</span>
       {/if}
     </div>
   {/if}
 
-  {#if !error && actualSrc && !isUnsupportedImageScheme(actualSrc)}
+  {#if !error && drawSrc && !isUnsupportedImageScheme(drawSrc, page.url.href)}
     <img 
-      src={actualSrc} 
+      src={drawSrc} 
+      referrerpolicy={isOutside ? 'no-referrer' : undefined}
       {alt}
       {title}
       {width}
@@ -474,6 +517,7 @@
       </div>
     {/if}
   {/if}
+  {/if}
 </div>
 
 <Dialog.Root bind:open={previewOpen}>
@@ -491,7 +535,12 @@
 
     {#if actionSrc}
       <div class="image-preview-shell">
-        <img src={actionSrc} alt={alt || title || filename || 'Image'} class="image-preview-full" />
+        <img
+          src={actionSrc}
+          referrerpolicy={isOutside ? 'no-referrer' : undefined}
+          alt={alt || title || filename || 'Image'}
+          class="image-preview-full"
+        />
       </div>
     {/if}
 
@@ -585,11 +634,53 @@
   }
   
   .error-link {
-    color: var(--primary);
+    color: var(--primary-text);
     text-decoration: underline;
     font-size: 0.875rem;
   }
   
+  /* An outside picture before its Load click (BL-474): no address, no request. */
+  .outside-picture {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.5rem;
+    max-width: 32rem;
+    padding: 1rem;
+    color: var(--muted-foreground);
+    background: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    font-size: 0.875rem;
+  }
+
+  .outside-picture-title {
+    color: var(--foreground);
+    font-weight: 500;
+  }
+
+  .outside-picture-warning {
+    /* The chat has no warning token; this is Settings' warning text colour (--bs-settings-warning,
+       which is scoped to the Settings sheet), repeated here. */
+    color: var(--bs-settings-warning, oklch(0.666 0.179 58.318));
+  }
+
+  .outside-picture-address {
+    max-width: 100%;
+  }
+
+  .outside-picture-address summary {
+    cursor: pointer;
+  }
+
+  .outside-picture-address code {
+    display: block;
+    margin-top: 0.25rem;
+    overflow-wrap: anywhere;
+    font-family: var(--bs-font-mono);
+    font-size: 0.75rem;
+  }
+
   /* Overlay with actions */
   .image-overlay {
     position: absolute;

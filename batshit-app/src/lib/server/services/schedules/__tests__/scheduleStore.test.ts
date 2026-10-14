@@ -24,6 +24,14 @@ import {
   sweepAgentSchedules
 } from '../scheduleStore'
 import { isWellFormedScheduleId, schedulesIndexKey } from '../scheduleKeys'
+import {
+  __resetDmLocksForTests,
+  claimDm,
+  fileScheduleDm,
+  getDm,
+  listInbox,
+  SCHEDULE_DELETED_DM_RESULT
+} from '$lib/server/services/dm/dmStore'
 
 /**
  * SA-115 P1 (DL-115-02) — the schedule records.
@@ -76,6 +84,7 @@ beforeEach(async () => {
   // The due cache is module-level, so it outlives a test unless it is cleared. Every
   // assertion below about walking or not walking depends on starting from "unknown".
   __resetScheduleDueCacheForTests()
+  __resetDmLocksForTests()
   await seedAgent(COOPER)
   await seedAgent(FAYE)
 })
@@ -448,6 +457,42 @@ describe('deleting', () => {
     expect(await getSchedule(cooperSchedule.id)).toBeNull()
     expect(await getSchedule(fayeSchedule.id)).not.toBeNull()
     expect(await indexMembers(USER)).toEqual([fayeSchedule.id])
+  })
+
+  it('BL-401 S4: closes its unread notes and leaves a claimed one and other senders', async () => {
+    const record = await createSchedule(baseInput({ deliver: 'wait' }))
+    const other = await createSchedule(baseInput({ name: 'Evening check', deliver: 'wait' }))
+    const note = (input: { scheduleId: string; name: string; kind?: 'info' | 'assignment' }) =>
+      fileScheduleDm({
+        userId: USER,
+        from: { kind: 'schedule', scheduleId: input.scheduleId, name: input.name },
+        to: COOPER,
+        kind: input.kind ?? 'info',
+        subject: input.name,
+        body: 'Say good morning.',
+        deliver: 'wait',
+        ...(input.kind === 'assignment'
+          ? { requestedOutcome: 'Say what happened.', scope: 'Only this.' }
+          : {})
+      })
+
+    const claimed = await note({ scheduleId: record.id, name: record.name, kind: 'assignment' })
+    await claimDm({ dmId: claimed.record.id, agentId: COOPER, sessionId: 'sess-1' })
+    const unread = await note({ scheduleId: record.id, name: record.name })
+    const othersNote = await note({ scheduleId: other.id, name: other.name })
+
+    await deleteSchedule({ userId: USER, scheduleId: record.id })
+
+    expect(await getSchedule(record.id)).toBeNull()
+    expect(await getDm(unread.record.id)).toMatchObject({
+      status: 'done',
+      result: SCHEDULE_DELETED_DM_RESULT
+    })
+    expect((await getDm(claimed.record.id))?.status).toBe('working')
+    expect((await getDm(othersNote.record.id))?.status).toBe('new')
+    expect((await listInbox(COOPER)).map((item) => item.id).sort()).toEqual(
+      [claimed.record.id, othersNote.record.id].sort()
+    )
   })
 
   it('does nothing when the agent record is already gone', async () => {

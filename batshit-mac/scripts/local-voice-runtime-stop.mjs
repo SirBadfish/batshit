@@ -26,7 +26,7 @@
 import { execFile } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { link, mkdir, readFile, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { dirname, join, posix, win32 } from 'node:path';
 
 export const LOCAL_RUNTIME_LAUNCH_RECORD_NAME = '.batshit-local-runtime-launch.json';
 const LAUNCH_RECORD_NAME_PATTERN = /^\.batshit-local-runtime-launch(?:\.(\d+))?\.json$/;
@@ -57,6 +57,33 @@ export function launchRecordMatchesCommand(record, commandLine) {
   if (absoluteCandidates.some((candidate) => commandLine.includes(candidate))) return true;
   const base = typeof record.command === 'string' ? record.command.split('/').pop() : '';
   return Boolean(base) && commandLine.includes(base);
+}
+
+// Launch flags whose value is a secret: LiveKit's `--keys` ("key: secret") and `--config-body` (a
+// YAML config that can hold `keys:`), with one or two dashes, the value next or after "=".
+const SECRET_LAUNCH_FLAGS = new Set(['keys', 'config-body']);
+
+/**
+ * The args an attach copies from the launch it uses (BL-1332). First every secret flag and its
+ * value is dropped, so a secret that looks like a path is never left to the path filter. Then only
+ * absolute paths are kept, in POSIX or Windows form: all any identity check reads (this file's
+ * `launchRecordMatchesCommand` takes "/" paths, the Docker operator's `path.isAbsolute` ones, which
+ * on Windows include `C:\…`). Twin of `launchArgsForAttach` in `voiceRuntimeLaunchRecords.ts`.
+ */
+export function launchArgsForAttach(args) {
+  if (!Array.isArray(args)) return undefined;
+  const kept = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (typeof arg !== 'string') continue;
+    const flag = /^--?([^=]+)(=[\s\S]*)?$/.exec(arg);
+    if (flag && SECRET_LAUNCH_FLAGS.has(flag[1])) {
+      if (flag[2] === undefined) index += 1; // its value is the next arg
+      continue;
+    }
+    if (posix.isAbsolute(arg) || win32.isAbsolute(arg)) kept.push(arg);
+  }
+  return kept;
 }
 
 /**
@@ -123,12 +150,99 @@ export function localRuntimeProcessGroupFromPs(stdout, pgid) {
   return { commandLines, leaderStartedAtMs };
 }
 
+const WINDOWS_PROCESS_TABLE_COMMAND = [
+  "$ErrorActionPreference = 'Stop'",
+  '$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)',
+  '$rows = @(Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, CreationDate, CommandLine)',
+  'ConvertTo-Json -InputObject $rows -Compress -Depth 2'
+].join('; ');
+
+function windowsProcessStartMs(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  const legacy = /^\/Date\((\d+)(?:[+-]\d+)?\)\/$/.exec(String(value ?? ''));
+  const parsed = legacy ? Number(legacy[1]) : Date.parse(String(value ?? ''));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+/** Parse the one whole-table CIM read; retain missing start times so a stop fails closed. */
+export function parseWindowsLocalRuntimeProcesses(stdout) {
+  const parsed = JSON.parse(String(stdout));
+  const rows = Array.isArray(parsed) ? parsed : [parsed];
+  return rows
+    .filter((row) => row && Number.isInteger(Number(row.ProcessId)) && Number(row.ProcessId) > 0)
+    .map((row) => ({
+      pid: Number(row.ProcessId),
+      parentPid: Number(row.ParentProcessId),
+      startedAtMs: windowsProcessStartMs(row.CreationDate),
+      commandLine: typeof row.CommandLine === 'string' ? row.CommandLine : ''
+    }));
+}
+
+/** One bounded Windows process-table read serves every engine in a stop pass. */
+export async function readWindowsLocalRuntimeProcesses() {
+  if (process.platform !== 'win32') return null;
+  const stdout = await new Promise((resolve) => {
+    execFile(
+      join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+      ['-NoProfile', '-NonInteractive', '-Command', WINDOWS_PROCESS_TABLE_COMMAND],
+      { timeout: 3_000, maxBuffer: 16 * 1024 * 1024, windowsHide: true },
+      (error, output) => resolve(error ? null : String(output))
+    );
+  });
+  if (stdout === null) return null;
+  try {
+    return parseWindowsLocalRuntimeProcesses(stdout);
+  } catch {
+    return null;
+  }
+}
+
+/** The root and descendants whose parent identity is possible by creation time. */
+export function localRuntimeProcessTreeFromWindows(processes, rootPid) {
+  const root = processes.find((entry) => entry.pid === rootPid);
+  if (!root) return { commandLines: [], leaderStartedAtMs: null, members: [], unsafeDescendants: false };
+  if (!Number.isFinite(root.startedAtMs)) return null;
+  const byParent = new Map();
+  for (const entry of processes) {
+    const siblings = byParent.get(entry.parentPid) ?? [];
+    siblings.push(entry);
+    byParent.set(entry.parentPid, siblings);
+  }
+  const members = [root];
+  const seen = new Set([root.pid]);
+  let unsafeDescendants = false;
+  for (let index = 0; index < members.length; index += 1) {
+    const parent = members[index];
+    for (const child of byParent.get(parent.pid) ?? []) {
+      if (seen.has(child.pid)) continue;
+      if (!Number.isFinite(child.startedAtMs) || child.startedAtMs < parent.startedAtMs) {
+        // This child's parent PID may have been reused. Keep it out of the verified
+        // members and report ambiguity while other verified members can still stop.
+        unsafeDescendants = true;
+        continue;
+      }
+      seen.add(child.pid);
+      members.push(child);
+    }
+  }
+  return {
+    commandLines: members.map((member) => member.commandLine).filter(Boolean),
+    leaderStartedAtMs: root.startedAtMs,
+    members,
+    unsafeDescendants
+  };
+}
+
 /**
  * Read one process group for `decideLocalRuntimeGroupStop`, or null when `ps` itself failed.
  * Read from the WHOLE table: `ps -g` exits 1 for a group with no members, the same as a failed
  * `ps`, and "no members" is what a reused pid looks like, so the two must stay apart.
  */
-export async function readLocalRuntimeProcessGroup(pgid) {
+export async function readLocalRuntimeProcessGroup(pgid, windowsProcesses) {
+  if (process.platform === 'win32') {
+    const processes = windowsProcesses === undefined ? await readWindowsLocalRuntimeProcesses() : windowsProcesses;
+    return processes === null ? null : localRuntimeProcessTreeFromWindows(processes, pgid);
+  }
   const stdout = await new Promise((resolve) => {
     execFile(
       'ps',
@@ -189,13 +303,21 @@ export function decideLocalRuntimeStop({ record, alive, launchedAfterMs = null }
 
 /**
  * Records grouped by the process they name (a detached runtime leads its own
- * process group, so the launch pid is also the group id). A record that cannot
- * name a process at all is set apart for the caller to drop.
+ * process group, so the launch pid is also the group id). A record read whole
+ * that names no process (no usable pid) is set apart in `unusable` for the
+ * caller to drop. One that could not be read at all (`unreadable`, BL-1264) is
+ * set apart in `unreadable`: it may name a process that still runs, so the
+ * caller keeps it and reports it, and never drops it.
  */
 export function groupLocalRuntimeLaunchRecords(records) {
   const groups = new Map();
   const unusable = [];
+  const unreadable = [];
   for (const record of records) {
+    if (record?.unreadable) {
+      unreadable.push(record);
+      continue;
+    }
     if (!record || record.invalid || !Number.isInteger(record.pid) || record.pid <= 0) {
       unusable.push(record);
       continue;
@@ -205,7 +327,8 @@ export function groupLocalRuntimeLaunchRecords(records) {
   }
   return {
     groups: [...groups.entries()].map(([pid, grouped]) => ({ pid, records: grouped })),
-    unusable
+    unusable,
+    unreadable
   };
 }
 
@@ -351,33 +474,125 @@ export function nativeRunIsGone(launchedBy) {
   }
 }
 
-/** Every launch record under one voice-runtime state root, moved-aside ones included. */
+/**
+ * Every launch record under one voice-runtime state root, moved-aside ones included.
+ *
+ * Only "no such file" proves a folder or record absent (BL-1264). A root or engine folder that
+ * cannot be read, a record that cannot be read (a folder in its place, no permission, an I/O
+ * error), an empty record, and one that is not a JSON object are each an entry
+ * `{ engineId, unreadable: true, invalid: true, reason, recordPath }`, never left out:
+ * `recordPath` is the folder or file that could not be read, and `engineId` is null when the root
+ * itself could not be read. Such a record may name a process that still runs, so a stopper keeps it
+ * and says so (see `groupLocalRuntimeLaunchRecords`). Writers replace a record whole (a `.tmp`
+ * file renamed over it), so a record is never seen half-written.
+ */
 export async function readLocalRuntimeLaunchRecords(root) {
-  const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
+  let entries;
+  try {
+    entries = await readdir(root, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === 'ENOENT') return [];
+    return [unreadableLaunchRecord(null, root, `the voice engine records folder ${root} could not be read (${errorCode(error)})`)];
+  }
   const records = [];
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
-    const names = (await readdir(join(root, entry.name)).catch(() => []))
-      .filter(isLocalRuntimeLaunchRecordName)
-      .sort();
-    for (const name of names) {
-      const recordPath = join(root, entry.name, name);
-      const raw = await readFile(recordPath, 'utf8').catch(() => '');
-      if (!raw) continue;
-      try {
-        records.push({ engineId: entry.name, ...JSON.parse(raw), recordPath });
-      } catch {
-        records.push({ engineId: entry.name, invalid: true, recordPath });
+    const engineDir = join(root, entry.name);
+    let names;
+    try {
+      names = await readdir(engineDir);
+    } catch (error) {
+      if (error?.code === 'ENOENT') continue;
+      records.push(unreadableLaunchRecord(entry.name, engineDir, `the folder ${engineDir} could not be read (${errorCode(error)})`));
+      continue;
+    }
+    for (const name of names.filter(isLocalRuntimeLaunchRecordName).sort()) {
+      const recordPath = join(engineDir, name);
+      const current = await readLocalRuntimeLaunchRecordFileState(recordPath);
+      if (current.state === 'absent') continue;
+      if (current.state === 'unreadable') {
+        records.push(unreadableLaunchRecord(entry.name, recordPath, current.reason));
+        continue;
       }
+      // Only this reader says what could not be read: a record's own `unreadable` or `invalid`
+      // field (Batshit never writes one) is not a verdict. The app's twin does the same.
+      const { unreadable: _unreadable, invalid: _invalid, ...fields } = current.record;
+      records.push({ engineId: entry.name, ...fields, recordPath });
     }
   }
   return records;
 }
 
+/**
+ * One launch record file, read once (BL-1264, BL-1267): `{ state: 'absent' }` only for "no such
+ * file"; `{ state: 'unreadable', reason }` for any other read error (a folder in its place, no
+ * permission, an I/O error), an empty file, malformed JSON, and anything but a JSON object; else
+ * `{ state: 'record', record }`. The reader, every writer and the remover use it, so none of them
+ * takes a record it cannot read for a missing or replaceable one.
+ */
+export async function readLocalRuntimeLaunchRecordFileState(recordPath) {
+  let raw;
+  try {
+    raw = await readFile(recordPath, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { state: 'absent' };
+    return { state: 'unreadable', reason: `the launch record ${recordPath} could not be read (${errorCode(error)})` };
+  }
+  let parsed;
+  try {
+    parsed = raw.trim() ? JSON.parse(raw) : undefined;
+  } catch {
+    return { state: 'unreadable', reason: `the launch record ${recordPath} is not valid JSON` };
+  }
+  if (parsed === undefined) return { state: 'unreadable', reason: `the launch record ${recordPath} is empty` };
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { state: 'unreadable', reason: `the launch record ${recordPath} is not a JSON object` };
+  }
+  return { state: 'record', record: parsed };
+}
+
+function unreadableLaunchRecord(engineId, recordPath, reason) {
+  return { engineId, unreadable: true, invalid: true, reason, recordPath };
+}
+
+const HELD_RECORD_PATHS_SHOWN = 5;
+
+/**
+ * The whole-inventory hold (BL-1264 for the Pinokio lane, BL-1269 for the Mac supervisor, the native
+ * launcher and the Docker operator). A record that could not be read hides who uses which process:
+ * it could be an engine's explicit "keep running" for a process a readable record says to stop. So
+ * while a stop pass's inventory holds one, the pass sends no signal and removes no record; every
+ * process and record stays as it is, and a later pass decides with the whole inventory once the file
+ * is repaired or removed. Ashe's rule (2026-10-11): a process kept running with an actionable warning
+ * is safer than overriding a choice nobody can read.
+ *
+ * Answers null when nothing is unreadable, else the unreadable paths and the one line to say, without
+ * a final full stop. The line never says to remove the file while an engine it may name still runs
+ * (Ashe, 2026-10-11): those engines stop first, and a computer restart is the one sure way.
+ */
+export function holdLocalRuntimeStopsForUnreadableRecords(unreadable) {
+  if (!Array.isArray(unreadable) || unreadable.length === 0) return null;
+  const recordPaths = unreadable.map((record) => record.recordPath);
+  const shown = recordPaths.slice(0, HELD_RECORD_PATHS_SHOWN).join(', ');
+  const more = recordPaths.length > HELD_RECORD_PATHS_SHOWN ? ` and ${recordPaths.length - HELD_RECORD_PATHS_SHOWN} more` : '';
+  const one = recordPaths.length === 1;
+  return {
+    recordPaths,
+    reason:
+      `stopped no voice engine and removed no launch record: ${shown}${more} could not be read and may ` +
+      'hold an engine\'s "keep running" choice. Once the voice engines have stopped (restarting the ' +
+      `computer stops them), repair or remove ${one ? 'that file or folder' : 'those files or folders'}`
+  };
+}
+
+function errorCode(error) {
+  return error?.code ?? error?.message ?? String(error);
+}
+
 /** Is this process, or the process group it leads, still running? */
 export function isLocalRuntimeProcessAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
-  for (const target of [pid, -pid]) {
+  for (const target of process.platform === 'win32' ? [pid] : [pid, -pid]) {
     try {
       process.kill(target, 0);
       return true;
@@ -427,7 +642,10 @@ const RECORD_LOCK_NAME = '.batshit-local-runtime-launch.lock';
 const RECORD_LOCK_TOMBSTONE_PREFIX = '.batshit-local-runtime-launch.reaped-';
 // The lock folder holds one file naming its holder, so a writer removes only its own lock.
 const RECORD_LOCK_OWNER_FILE = 'owner';
-// A lock older than this was left by a writer that died holding it (a change takes milliseconds).
+// A lock older than this was left by a writer that died holding it (a record change takes
+// milliseconds). The sbx and Apple stops hold it longer, for their bounded check and stop (up to
+// their 20 s and 22 s budgets, BL-1257): age alone never takes a lock whose owner still runs, so a
+// waiter only polls until that stop releases it or its own wait ends.
 const RECORD_LOCK_STALE_MS = 10_000;
 const RECORD_LOCK_WAIT_MS = RECORD_LOCK_STALE_MS + 5_000;
 const FALLBACK_PROCESS_STARTED_AT_MS =
@@ -487,6 +705,10 @@ function parseRecordLockOwner(owner) {
 // (`ven. 21 août`) `Date.parse` cannot read it, and a reused owner pid could never be reaped.
 // Owners written before this still compare: both readings name the same instant.
 async function processStartedAt(pid) {
+  if (process.platform === 'win32') {
+    const processes = await readWindowsLocalRuntimeProcesses();
+    return processes?.find((entry) => entry.pid === pid)?.startedAtMs ?? null;
+  }
   const stdout = await new Promise((resolve) => {
     execFile(
       'ps',
@@ -707,16 +929,6 @@ async function writeRecordAtomically(recordPath, contents) {
   }
 }
 
-async function readRecordAt(recordPath) {
-  const raw = await readFile(recordPath, 'utf8').catch(() => null);
-  if (raw === null) return { missing: true };
-  try {
-    return { record: JSON.parse(raw) };
-  } catch {
-    return { invalid: true };
-  }
-}
-
 // The same launch: same process, same launch time, same role (own launch or attach).
 function sameLaunch(left, right) {
   return (
@@ -727,9 +939,73 @@ function sameLaunch(left, right) {
 }
 
 /**
+ * What writing `engineId`'s record would do now: `{ blocked: message }` when it must not write,
+ * else `{ asidePath }`, the name to move the previous record to first, or null. It must not write
+ * when a record it would replace cannot be read (BL-1267: the current one, or the moved-aside name a
+ * still-running previous launch would take), or when that moved-aside name already holds a readable
+ * record (BL-1275): renaming over it would erase that record's choice, such as another Batshit's
+ * "keep running" for the same process. Both records are kept, whatever they say.
+ * `newPid` is the launch's pid, or null before it spawns (a new process never takes a live pid).
+ */
+async function planLaunchRecordWrite(dir, newPid, isAlive) {
+  const current = await readLocalRuntimeLaunchRecordFileState(join(dir, LOCAL_RUNTIME_LAUNCH_RECORD_NAME));
+  if (current.state === 'unreadable') return { blocked: unreadableLaunchRecordWriteError(current.reason).message };
+  const previous = current.state === 'record' ? current.record : null;
+  if (
+    !previous ||
+    !Number.isInteger(previous.pid) ||
+    previous.pid <= 0 ||
+    previous.pid === newPid ||
+    !isAlive(previous.pid, previous)
+  ) {
+    return { asidePath: null };
+  }
+  const asidePath = join(dir, movedAsideLaunchRecordName(previous.pid));
+  const aside = await readLocalRuntimeLaunchRecordFileState(asidePath);
+  if (aside.state === 'unreadable') return { blocked: unreadableLaunchRecordWriteError(aside.reason).message };
+  if (aside.state === 'record') {
+    return { blocked: movedAsideCollisionMessage(join(dir, LOCAL_RUNTIME_LAUNCH_RECORD_NAME), asidePath, previous) };
+  }
+  return { asidePath };
+}
+
+// BL-1275: the true cause and what to do, naming the runtime that holds the process; never
+// "repair or remove" a record that is valid. The same words as `voiceRuntimeLaunchRecords.ts`.
+function movedAsideCollisionMessage(recordPath, asidePath, previous) {
+  const runtime = previous.startedBy || previous.engineId || 'another engine';
+  const by = previous.launchedBy ? `, started by ${previous.launchedBy}` : '';
+  return `${asidePath} already holds a launch record for process ${previous.pid} (the runtime of engine "${runtime}"${by}), so Batshit did not move ${recordPath} onto it: both records are kept. Try again once that runtime has stopped (restarting the computer stops it).`;
+}
+
+// Never tells the user to remove the file while the engine it may name still runs (Ashe, 2026-10-11).
+function unreadableLaunchRecordWriteError(reason) {
+  return new Error(
+    `${reason}. Batshit did not write over it: it may belong to a voice engine that is still running. Once that engine has stopped (restarting the computer stops it), repair or remove the file and try again.`
+  );
+}
+
+/**
+ * Why a launch of `engineId` could not record itself now, or null. A launcher checks this before it
+ * spawns, so a launch never starts a process it then cannot record (the write itself checks again
+ * under the folder's lock).
+ */
+export async function localRuntimeLaunchRecordWriteBlocker(
+  root,
+  engineId,
+  { isAlive = isLocalRuntimeProcessAlive } = {}
+) {
+  const plan = await planLaunchRecordWrite(join(root, engineId), null, isAlive);
+  return plan.blocked ?? null;
+}
+
+/**
  * Write an engine's launch record without ever discarding one whose process
  * still runs: that earlier record is moved aside under its pid. A record whose
- * process is gone, or that names the same process, is simply replaced.
+ * process is gone, or that names the same process, is simply replaced. A record
+ * that cannot be read is never written over (BL-1267): the write throws and the
+ * file stays, because it may name a process that still runs. Nor is a readable
+ * record at the moved-aside name renamed over (BL-1275): the write throws and
+ * both records stay.
  */
 export async function writeLocalRuntimeLaunchRecordFile(
   root,
@@ -739,16 +1015,9 @@ export async function writeLocalRuntimeLaunchRecordFile(
   const dir = join(root, record.engineId);
   const recordPath = join(dir, LOCAL_RUNTIME_LAUNCH_RECORD_NAME);
   await withLocalRuntimeRecordLock(dir, async () => {
-    const { record: previous } = await readRecordAt(recordPath);
-    if (
-      previous &&
-      Number.isInteger(previous.pid) &&
-      previous.pid > 0 &&
-      previous.pid !== record.pid &&
-      isAlive(previous.pid)
-    ) {
-      await rename(recordPath, join(dir, movedAsideLaunchRecordName(previous.pid)));
-    }
+    const plan = await planLaunchRecordWrite(dir, record.pid, isAlive);
+    if (plan.blocked) throw new Error(plan.blocked);
+    if (plan.asidePath) await rename(recordPath, plan.asidePath);
     await writeRecordAtomically(recordPath, record);
   });
   return recordPath;
@@ -756,15 +1025,13 @@ export async function writeLocalRuntimeLaunchRecordFile(
 
 /**
  * Remove a record a stopper decided on, only if its file still holds that same
- * launch (or, for a corrupt record, is still corrupt). Answers whether it did.
+ * launch. A record that cannot be read is never removed (BL-1264, BL-1267).
+ * Answers whether it did.
  */
 export async function removeLocalRuntimeLaunchRecord(record) {
   return withLocalRuntimeRecordLock(dirname(record.recordPath), async () => {
-    const current = await readRecordAt(record.recordPath);
-    if (current.missing) return false;
-    if (record.invalid ? !current.invalid : !current.record || !sameLaunch(current.record, record)) {
-      return false;
-    }
+    const current = await readLocalRuntimeLaunchRecordFileState(record.recordPath);
+    if (current.state !== 'record' || !sameLaunch(current.record, record)) return false;
     await rm(record.recordPath, { force: true });
     return true;
   });
@@ -776,8 +1043,8 @@ export async function removeLocalRuntimeLaunchRecord(record) {
  */
 export async function updateLocalRuntimeLaunchRecord(record, changes) {
   return withLocalRuntimeRecordLock(dirname(record.recordPath), async () => {
-    const current = await readRecordAt(record.recordPath);
-    if (!current.record || !sameLaunch(current.record, record)) return false;
+    const current = await readLocalRuntimeLaunchRecordFileState(record.recordPath);
+    if (current.state !== 'record' || !sameLaunch(current.record, record)) return false;
     await writeRecordAtomically(record.recordPath, { ...current.record, ...changes });
     return true;
   });
@@ -793,11 +1060,15 @@ export async function updateLocalRuntimeLaunchRecord(record, changes) {
  *
  * Twin of `attachLocalRuntimeLaunchRecord` in the app's
  * `voiceRuntimeLaunchRecords.ts`; the Docker host operator uses this one.
+ *
+ * `isStarter` narrows which launches may be the starter: the operator passes
+ * "launched by the Docker Batshit asking" (BL-18), so an engine never gets a
+ * say over a runtime another Docker Batshit launched.
  */
 export async function attachLocalRuntimeLaunchRecordFile(
   root,
   { engineId, endpoint, stopOnShutdown },
-  { isAlive = isLocalRuntimeProcessAlive } = {}
+  { isAlive = isLocalRuntimeProcessAlive, isStarter = () => true } = {}
 ) {
   const target = normalizeLocalRuntimeEndpoint(endpoint);
   if (!target) return false;
@@ -807,7 +1078,8 @@ export async function attachLocalRuntimeLaunchRecordFile(
         !record.invalid &&
         !record.startedBy &&
         normalizeLocalRuntimeEndpoint(record.endpoint) === target &&
-        isAlive(record.pid)
+        isStarter(record) &&
+        isAlive(record.pid, record)
     )
     .sort((left, right) => Date.parse(right.launchedAt ?? '') - Date.parse(left.launchedAt ?? ''))[0];
   if (!starter || starter.engineId === engineId) return false;
@@ -818,11 +1090,14 @@ export async function attachLocalRuntimeLaunchRecordFile(
       engineId,
       pid: starter.pid,
       command: starter.command,
-      args: starter.args,
+      // Never a secret the starter's record still holds, from before BL-1332 (and never more than
+      // the paths the identity check reads).
+      args: launchArgsForAttach(starter.args),
       cwd: starter.cwd,
       logPath: starter.logPath,
       launchedAt: starter.launchedAt,
       ...(starter.launchedBy ? { launchedBy: starter.launchedBy } : {}),
+      ...(Array.isArray(starter.windowsMembers) ? { windowsMembers: starter.windowsMembers } : {}),
       endpoint: target,
       startedBy: starter.engineId,
       stopOnShutdown

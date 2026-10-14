@@ -136,14 +136,29 @@ jobs:
         run: >
           npm run test:redis --
           src/lib/server/tests/redisPatterns.test.ts
+          src/lib/services/auth-first-admin.redis.test.ts
           src/lib/server/tests/redisStreamService.test.ts
           src/lib/server/tests/messageDeletion.test.ts
           src/lib/server/tests/redisMessageWindows.test.ts
           src/lib/server/tests/folderDeletion.test.ts
           src/lib/server/services/__tests__/backupRestoreService.test.ts
+          src/lib/server/services/__tests__/codexCleanupWarnings.test.ts
+          src/lib/server/services/__tests__/imageAddressOrigins.test.ts
+          src/routes/api/image-origins/image-origins.route.test.ts
           src/lib/server/services/__tests__/agentRunCredentials.test.ts
+          src/lib/server/services/__tests__/nativeDelegatedBashOwnership.test.ts
+          src/lib/server/services/__tests__/nativeDelegatedBashHelperLive.test.ts
+          src/lib/server/services/__tests__/nativeHelperWorkModePolicy.os.test.ts
+          src/routes/api/native-tools/dispatch/runtime-addon-consent.test.ts
+          src/lib/server/services/__tests__/toolModelResultGuard.test.ts
+          src/lib/server/services/__tests__/vercelBrain.toolModelSizeGuard.integration.test.ts
+          src/routes/api/native-tools/fetch-zip/fetch-zip.redis.test.ts
           src/lib/server/services/__tests__/nativeToolAuth.test.ts
+          src/lib/server/services/__tests__/nativeToolAuth.portable.test.ts
+          src/lib/server/tests/portableSkillRouteAdmission.test.ts
           src/routes/api/controls/use/agent-lane.test.ts
+          src/routes/api/controls/use/artifact-access-http.test.ts
+          src/routes/api/controls/use/managed-settings-parity.test.ts
           src/lib/server/services/dm/__tests__/dmStore.test.ts
           src/lib/server/services/dm/__tests__/dmTools.test.ts
           src/lib/server/services/dm/__tests__/wakeHookStore.test.ts
@@ -159,11 +174,42 @@ jobs:
           src/routes/api/internal/schedules/sweep/sweep-route.test.ts
           src/routes/api/dms/dms-routes.test.ts
           src/routes/api/messages/steer/steer-route.test.ts
+          src/routes/api/messages/compact/compact-event-write.test.ts
+          src/routes/api/messages/compact/compact-stop.test.ts
+          src/routes/api/messages/send-routed/send-routed-chatgpt-plan.test.ts
+          src/routes/api/sessions/[id]/session-update-fields.test.ts
+          src/routes/api/sessions/[id]/fixed/fixed-session-route.test.ts
+          src/lib/server/tests/sessionGraduationMark.test.ts
+          src/lib/server/tests/sessionUpdateByPath.test.ts
+          src/lib/server/tests/agentUpdateByPath.test.ts
+          src/lib/components/settings/panels/AgentSettingsPanel.agentWriteRefresh.test.ts
+          src/lib/server/tests/agentWholeRecordWriters.test.ts
+          src/lib/server/tests/subagentUpdateByPath.test.ts
+          src/lib/server/tests/redisJsonConditionalSet.test.ts
+          src/lib/server/tests/fixedSessionNapWrites.test.ts
+          src/routes/api/groups/[id]/group-delete-sessions.test.ts
+          src/routes/api/subagents/[id]/subagent-edit-delete-race.test.ts
+          src/routes/api/subagents/[id]/subagent-prompt-clear.test.ts
+          src/routes/api/subagents/[id]/subagent-update-by-path.test.ts
+          src/routes/api/subagents/[id]/subagent-partial-update.test.ts
+          src/routes/api/groups/[id]/group-prompt-clear.test.ts
+          src/routes/api/mcp/gateways/[id]/check-keeps-launch-edit.test.ts
+          src/lib/server/services/__tests__/mcpGatewayService.registryWrites.redis.test.ts
+          src/lib/server/services/__tests__/n8nInstanceCredential.redis.test.ts
+          src/routes/api/slash-commands/[id]/command-update-keeps-access.test.ts
+          src/lib/server/tests/agentAccessRoutes.test.ts
           src/lib/server/services/__tests__/steerPromotion.test.ts
+          src/lib/server/services/__tests__/zipHolds.test.ts
+          src/lib/server/services/__tests__/replyControlFinalize.test.ts
           src/routes/api/user/settings/user-settings-chat.test.ts
+          src/routes/api/user/settings/user-settings-voice.test.ts
           src/lib/server/services/__tests__/goonRecipeRepository.test.ts
           src/lib/server/services/__tests__/hairAssetRepository.server.test.ts
+          src/lib/server/services/__tests__/backupHairSnapshot.redis.test.ts
           src/lib/server/services/__tests__/goonMutationRepository.test.ts
+          src/lib/server/services/__tests__/goonAssetCleanupService.test.ts
+          src/lib/server/services/__tests__/goonCustomAssetDeletion.test.ts
+          src/routes/api/admin/goon-assets/goon-assets.route.test.ts
           src/tests/integration/story-5.22-gateway-service.test.ts
           src/tests/integration/story-5.23-redis-persistence.test.ts
           src/lib/server/icons/iconLibrary.test.ts
@@ -248,7 +294,24 @@ jobs:
         # preset, per-sandbox deny, idle stop) and send parallel requests for one chat. The end
         # command a Stop or timeout runs inside a sandbox reads `/proc`, so it runs for real here.
         # The Agent Browser sidecar runs against a fake `agent-browser` (its time limit, a Stop).
-        run: node --test tools/docker/sandbox-lifecycle-gate.test.mjs tools/docker/sbx-cli.test.mjs tools/docker/runtime-addon-operator.test.mjs tools/docker/command-end.test.mjs tools/docker/agent-browser-sidecar.test.mjs
+        run: node --test tools/docker/sandbox-lifecycle-gate.test.mjs tools/docker/sbx-cli.test.mjs tools/docker/runtime-addon-operator.test.mjs tools/docker/runtime-addon-operator.windows.test.mjs tools/docker/windows-voice-process-stop.test.mjs tools/docker/command-end.test.mjs tools/docker/agent-browser-sidecar.test.mjs tools/docker/start-docker.test.mjs
+      - name: Pinokio launcher self-tests (SA-127)
+        # pinokio/ installs Batshit through Pinokio on macOS and Linux. The live test downloads
+        # the pinned Redis packages and proves Redis starts with RedisJSON and Search on a real
+        # x64 Linux, with the runner's OpenSSL and C++ runtime standing in for Pinokio's base.
+        env:
+          BATSHIT_LIVE_PINOKIO_REDIS: '1'
+          BATSHIT_PINOKIO_BASE_LIB_DIR: /usr/lib/x86_64-linux-gnu
+        run: node --test pinokio/lib/*.test.mjs
+      - name: Docker Redis keeps saves through a hard kill (BL-111)
+        # Runs compose.yaml's real redis-init and redis as a throwaway Compose project: a save
+        # survives SIGKILL, a volume holding only a snapshot (dump.rdb) switches to append-only
+        # once without losing a key, redis refuses that volume when redis-init is skipped (Redis
+        # started append-only on it would load nothing and then overwrite the snapshot), and an
+        # appendonlydir with no manifest is refused, since Redis would ignore it and start empty.
+        env:
+          BATSHIT_LIVE_DOCKER_REDIS: '1'
+        run: node --test tools/docker/compose-redis-persistence.live.test.mjs
       - name: npm audit — production deps (fail on high/critical)
         # Blocking gate scoped to what ships: --omit=dev keeps build-chain advisories
         # (vite/esbuild and friends, which churn upstream weekly and have no path into
@@ -328,5 +391,6 @@ jobs:
           echo "No \$derived(fn) bug-pattern instances."
       - name: Skill reference mirror gates (UserDocs -> batshit-guide, in-app -> portable)
         run: |
+          node --test tools/system-skills/guide-navigation.test.mjs
           node tools/system-skills/sync-userdocs-skill-references.mjs --check
           node tools/portable-skills/sync-portable-skills.mjs --check

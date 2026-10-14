@@ -83,6 +83,8 @@ The launcher wrote `.env.docker` for you. Two values in it must stay the same af
 
 Keep a private copy of `.env.docker` with your backups.
 
+`TZ` is your time zone. A container has none of its own, so on the first start the launcher copies your computer's zone into `.env.docker` (it says `Set TZ in .env.docker to this computer's time zone`). Agents are told the time in that zone, and a memory search by date counts its days. The launcher never changes a zone that is already set. If you move, or want another zone, set `TZ` to an IANA name such as `Europe/Paris` or `America/Chicago`, or empty it so the next start copies your computer's zone again, then run `./start-docker.sh`. An `.env.docker` made before this may say `TZ=America/New_York`; change it if that is not your zone.
+
 If you'd rather choose the two secrets yourself, do it before the first start: copy the example (`cp .env.docker.example .env.docker`), make two random values with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` (run it twice; it works on every system, including Windows), and put them in place of the `replace-with-…` placeholders.
 
 By default Docker publishes Batshit's ports on `127.0.0.1` (`BATSHIT_DOCKER_BIND_HOST=127.0.0.1`), so only the computer running Docker can reach them. Setting `BATSHIT_DOCKER_BIND_HOST=0.0.0.0` in `.env.docker` exposes Batshit to your local network — only do that on a network you trust, because Batshit is a single-user app and isn't hardened for untrusted LAN access.
@@ -131,9 +133,13 @@ Set it up once:
    sbx policy init balanced
    ```
 
+   After a Mac restart, `sbx` may ask for its network rules again. Run the same command.
+
 The first sandbox downloads Docker's sandbox image (about 460 MB), so the first sandboxed command can take a minute or two. After that, a new chat's sandbox starts in a few seconds.
 
 If a step is missing, `./start-docker.sh` says which one when it starts, and so does Settings → Admin → Runtimes → Docker Sandbox Runtime.
+
+On Windows, use normal Windows Terminal for command-line startup. If you see `docker.sock` or `containerd.sock.ttrpc` errors, see [Docker Sandbox fails on a Windows socket](../troubleshooting/docker.md#docker-sandbox-fails-on-a-windows-socket).
 
 ## Start with the optional Docker n8n profile
 
@@ -199,7 +205,7 @@ N8N_API_URL=http://n8n:5678
 
 Always include `--env-file .env.docker`. Compose needs it for host port and public URL interpolation.
 
-Direct Compose does not run every host-helper preparation step that `./start-docker.sh` does. If Docker Sandbox or approved add-on start/stop controls report `Operator Required`, rerun `./start-docker.sh` or configure the operator manually.
+Direct Compose does not run every host-helper preparation step that `./start-docker.sh` does. If Docker Sandbox or approved add-on start/stop controls report `Operator Required`, rerun `./start-docker.sh` or configure the operator manually. It also does not fill `TZ`: set your time zone in `.env.docker` yourself, or the containers run on UTC.
 
 ## Start and stop after first creation
 

@@ -27,6 +27,7 @@ vi.mock('$lib/server/redis', async () => {
 })
 
 import { createClient, type RedisClientType } from 'redis'
+import { clearRedisTestDatabase } from '$lib/test-utils/redis-memory'
 
 const REAL_REDIS_LANE = process.env.VITEST_USE_REAL_REDIS === 'true'
 
@@ -71,12 +72,13 @@ describe.skipIf(!REAL_REDIS_LANE)('Redis primitive conformance (SA-101)', () => 
     expect(database, 'conformance suite must not run against database 0').toBeGreaterThan(0)
     client = createClient({ url, database }) as RedisClientType
     await client.connect()
-    await client.flushDb()
+    // BL-135: never FLUSHDB; it drops every search index on the server, DB 0's included.
+    await clearRedisTestDatabase(client)
   }, 30000)
 
   afterAll(async () => {
     if (client?.isOpen) {
-      await client.flushDb()
+      await clearRedisTestDatabase(client)
       await client.quit()
     }
   })

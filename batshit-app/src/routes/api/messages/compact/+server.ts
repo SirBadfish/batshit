@@ -6,7 +6,10 @@ import { isFixedSession } from '$lib/utils/fixedSession'
 import {
   buildCompactionTranscript,
   buildLiveProtectedItemsNote,
+  COMPACT_PENDING_APPROVAL_MESSAGE,
+  getCompactedMessageIds,
   getContextCompactionState,
+  hasPendingCompactApproval,
   normalizeGlobalAutoCompactSettings,
   resolveCompactSummaryBudget,
   resolveEffectiveAutoCompactSettings,
@@ -25,8 +28,63 @@ import {
 // SA-104 P6: the model-resolution + generation ladder moved verbatim into the shared
 // summary-generation service so memory graduation and the nap use the same rules.
 import { generateModelSummary } from '$lib/server/services/summaryGeneration'
+import { resolveCompiledSpeakerView } from '$lib/server/services/compiledSpeakerView'
+import { isTurnRunning } from '$lib/server/services/turnYield'
+import { hasTurnStartedAfter, lastTurnStartOf } from '$lib/server/services/streamAbortRegistry'
+import { isMessageProtectedFromManualTrim } from '$lib/utils/tokenPanel'
+import { startCompactRun, type CompactRun } from '$lib/server/services/compactRunRegistry'
+import type { PlanLease } from '$lib/server/services/chatgptPlanRuntime'
+import { getChatgptPlanRuntime } from '$lib/server/services/chatgptPlanHost'
+import { chatgptPlanHttpStatus } from '$lib/server/services/chatgptPlanInference'
+import { normalizeGroupChatConfig } from '$lib/server/services/groupChatUtils'
 
 type AgentRecord = AgentRow & Record<string, any>
+
+const APPROVAL_READ_BATCH_SIZE = 16
+const APPROVAL_READ_PATHS = ['$.role', '$.metadata.toolApprovals', '$.metadata.answeredApprovalIds']
+
+/** The ordinary history readers skip failed records; admission must not miss a visible card. */
+async function chatHasPendingApproval(sessionId: string, events: ContextCompactionEvent[]): Promise<boolean> {
+  const compacted = new Set(getCompactedMessageIds(events))
+  return redis.execute(async (client) => {
+    const ids = (await client.lRange(`messages:${sessionId}`, 0, -1)).filter((id) => !compacted.has(id))
+    for (let start = 0; start < ids.length; start += APPROVAL_READ_BATCH_SIZE) {
+      const messages = await Promise.all(ids.slice(start, start + APPROVAL_READ_BATCH_SIZE).map(async (id) => {
+        const key = `message:${sessionId}:${id}`
+        try {
+          const fields = await client.json.get(key, { path: APPROVAL_READ_PATHS })
+          if (fields === null) return null // A deleted message's old list entry is not a card.
+          if (!fields || typeof fields !== 'object' || Array.isArray(fields)) {
+            throw new Error('Unexpected RedisJSON approval read shape')
+          }
+          const first = (path: string) => {
+            const matches = (fields as Record<string, unknown>)[path]
+            if (!Array.isArray(matches) || matches.length > 1) {
+              throw new Error(`Unexpected RedisJSON matches for ${path}`)
+            }
+            return matches[0] // Missing fields are [] on Redis, [null] on the default fake.
+          }
+          return { id, role: first('$.role'), metadata: {
+            toolApprovals: first('$.metadata.toolApprovals'),
+            answeredApprovalIds: first('$.metadata.answeredApprovalIds')
+          } }
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error)
+          throw new Error(`Could not read Compact approval state for ${key}: ${reason}`)
+        }
+      }))
+      if (hasPendingCompactApproval(messages.filter((message) => message !== null))) return true
+    }
+    return false
+  })
+}
+
+function pendingApprovalAnswer() {
+  return json(
+    { error: COMPACT_PENDING_APPROVAL_MESSAGE, code: 'approval_pending' },
+    { status: 409 }
+  )
+}
 
 function buildCompactPrompt(params: {
   settings: EffectiveAutoCompactSettings
@@ -51,10 +109,34 @@ function buildCompactPrompt(params: {
   ].join('\n')
 }
 
+/** BL-622 (C7): the answer of a Compact its chat's Stop ended. Nothing was written. */
+function stoppedAnswer() {
+  return json(
+    { error: 'Compact stopped. It wrote nothing.', code: 'ended_early', reason: 'stopped' },
+    { status: 409 }
+  )
+}
+
+/**
+ * BL-622 (C4): the answer of a Compact that looked again after its summary call and found the chat
+ * changed under it. Nothing was written. The page words it for the user (`compactEndedEarly.ts`).
+ */
+function endedEarlyAnswer(reason: 'turn_started' | 'message_protected') {
+  const error =
+    reason === 'turn_started'
+      ? 'A reply started in this chat. This Compact wrote nothing.'
+      : 'A message this Compact summarized is now protected. This Compact wrote nothing.'
+  return json({ error, code: 'ended_early', reason }, { status: 409 })
+}
+
 export const POST: RequestHandler = async ({ request, locals, fetch: eventFetch }) => {
   const user = requireUser(locals)
   if (!user.ok) return user.response
 
+  // BL-622 (C6, C7): a running Compact is registered so its chat's Stop can end it
+  // (`POST /api/messages/compact/stop`); it leaves the registry on every path (the `finally`).
+  let compactRun: CompactRun | null = null
+  let planLease: PlanLease | undefined
   try {
     const body = await request.json()
     const sessionId = typeof body?.sessionId === 'string' ? body.sessionId.trim() : ''
@@ -68,6 +150,11 @@ export const POST: RequestHandler = async ({ request, locals, fetch: eventFetch 
 
     const sessionCheck = await requireOwnedSession(sessionId, user.value.id)
     if (!sessionCheck.ok) return sessionCheck.response
+
+    // BL-719: register right after the ownership check, not after the reads, the token estimate,
+    // and the speaker view. A Stop pressed during that setup must be seen before the model call,
+    // not only after it — the `finally` below ends this run on every exit, early or not.
+    compactRun = startCompactRun(sessionId)
 
     const [session, agent, userSettings, protections] = await Promise.all([
       redis.getSession(sessionId),
@@ -97,6 +184,37 @@ export const POST: RequestHandler = async ({ request, locals, fetch: eventFetch 
       )
     }
 
+    // BL-622 (C3): a Compact does not start beside a turn. The user's message goes first, and
+    // the Compact runs again after the reply (Auto Compact's idle check sees the same threshold).
+    // The preview is refused too, so a pressed Compact learns it before its confirm step.
+    if (isTurnRunning(sessionId)) {
+      return json(
+        { error: 'A reply is running in this chat. Compact runs after it.', code: 'turn_running' },
+        { status: 409 }
+      )
+    }
+    // BL-622 (C4): read in the same synchronous step as the check above, so the look before the
+    // write sees every turn that started after it, also one that started AND ended meanwhile.
+    const seenTurnId = lastTurnStartOf(sessionId)
+
+    // BL-711: Compact hides its source messages in both views. A pending card and the
+    // words held for it must stay visible, including the card's existing expiry handler.
+    // The request's messages can be stale or omit the card, so only persisted state admits it.
+    const compactionState = getContextCompactionState(session.metadata ?? null)
+    const groupId = typeof session.metadata?.group_chat?.group_id === 'string'
+      ? session.metadata.group_chat.group_id : null
+    const group = groupId
+      ? await redis.execute(async (client) => client.json.get(`group:${groupId}`)) as { user_id?: unknown; agent_ids?: unknown } | null
+      : null
+    const groupConfig = group && group.user_id === user.value.id
+      ? normalizeGroupChatConfig({ enabled: true, agent_ids: group.agent_ids }) : null
+    // Exactly the existing group-runner threshold. Groups cannot answer old/converted
+    // cards or hold steer words; the dead card must not newly disable their Compact.
+    const groupRunnerSession = Boolean(
+      groupConfig && Array.isArray(groupConfig.agent_ids) && groupConfig.agent_ids.length >= 2
+    )
+    if (!groupRunnerSession && await chatHasPendingApproval(sessionId, compactionState.events)) return pendingApprovalAnswer()
+
     const globalSettings = normalizeGlobalAutoCompactSettings(
       userSettings?.global_auto_compact_settings
     )
@@ -114,7 +232,6 @@ export const POST: RequestHandler = async ({ request, locals, fetch: eventFetch 
       ? messagesFromBody
       : await redis.getSessionMessages(sessionId)
 
-    const compactionState = getContextCompactionState(session.metadata ?? null)
     const selection = selectMessagesForCompaction(messages, compactionState.events, {
       protections
     })
@@ -155,7 +272,13 @@ export const POST: RequestHandler = async ({ request, locals, fetch: eventFetch 
       })
     }
 
-    const transcript = buildCompactionTranscript(selection.sourceMessages)
+    // BL-224: the summarizer reads who said what the way the agent does. A group chat's summary
+    // is spliced into every member's history, so it is for no one agent and names every agent.
+    const speakers = await resolveCompiledSpeakerView({
+      messages: selection.sourceMessages,
+      selfAgentId: session.metadata?.group_chat ? null : agentId
+    })
+    const transcript = buildCompactionTranscript(selection.sourceMessages, speakers)
     const liveProtectedNote = buildLiveProtectedItemsNote({
       protectedMessageIds: selection.protectedMessageIds,
       protectedUnzippedZipIds: protections.protectedUnzippedZipIds,
@@ -169,18 +292,31 @@ export const POST: RequestHandler = async ({ request, locals, fetch: eventFetch 
       summaryHardMaxTokens: summaryBudget.hardMaxTokens
     })
 
-    const compactResult = await generateModelSummary({
-      userId: user.value.id,
-      agent,
-      choice: {
-        modelMode: effectiveSettings.modelMode,
-        modelPresetId: effectiveSettings.modelPresetId
-      },
-      prompt,
-      summaryHardMaxTokens: summaryBudget.hardMaxTokens
-    })
+    // A Stop during setup (the reads above, the token estimate, the speaker view) already aborted
+    // this run's signal by the time we get here: answer as a stopped Compact does, with no model
+    // call and nothing written.
+    if (compactRun.signal.aborted) return stoppedAnswer()
+    let compactResult: Awaited<ReturnType<typeof generateModelSummary>>
+    try {
+      compactResult = await generateModelSummary({
+        userId: user.value.id,
+        agent,
+        choice: {
+          modelMode: effectiveSettings.modelMode,
+          modelPresetId: effectiveSettings.modelPresetId
+        },
+        prompt,
+        summaryHardMaxTokens: summaryBudget.hardMaxTokens,
+        abortSignal: compactRun.signal,
+        retainPlanLease: lease => { planLease = lease }
+      })
+    } catch (error) {
+      if (compactRun.signal.aborted) return stoppedAnswer()
+      throw error
+    }
 
     const now = new Date().toISOString()
+    if (planLease) getChatgptPlanRuntime().assertLease(planLease)
     const event: ContextCompactionEvent = {
       id: crypto.randomUUID(),
       createdAt: now,
@@ -204,14 +340,49 @@ export const POST: RequestHandler = async ({ request, locals, fetch: eventFetch 
       summary: compactResult.summary
     }
 
-    const nextMetadata = {
-      ...(session.metadata ?? {}),
-      contextCompaction: {
-        version: 1,
-        events: [...compactionState.events, event]
-      }
+    // BL-622 (C1, C2): the event is added at its own path, only while the chat's last event is the
+    // one read above, before the summary call. Writing back the metadata read above erased what
+    // another writer added during that call (a graduation mark, a group removal, a second
+    // Compact's event).
+    // A Stop that came after the model answered still stops the write.
+    if (compactRun.signal.aborted) return stoppedAnswer()
+    // BL-622 (C4): look again before the write. A message the user protected during the summary
+    // call (an unzip in the Zip Manager, an active clip) must stay live, so it cannot be inside
+    // this summary. The event list's look is C2's conditional append below.
+    const protectionsNow = await loadContextProtections(sessionId)
+    if (selection.sourceMessages.some((message) => isMessageProtectedFromManualTrim(message, protectionsNow))) {
+      return endedEarlyAnswer('message_protected')
     }
-    await redis.updateSession(sessionId, { metadata: nextMetadata })
+    // New pending cards (including an in-place resume's replacement) are saved inside a
+    // registered turn. Settlement cannot create one, and browser assistant saves are refused.
+    // The final watermark below covers those turns even if they already ended; no second scan.
+    if (compactRun.signal.aborted) return stoppedAnswer()
+    // The turn look comes last, with no I/O between it and the write's dispatch (the append's
+    // only await is the client handle, which runs no new I/O): the user's
+    // message goes first, and a turn that started since this Compact started (running now or
+    // already over) compiled a history this Compact did not see.
+    if (isTurnRunning(sessionId) || hasTurnStartedAfter(sessionId, seenTurnId)) {
+      return endedEarlyAnswer('turn_started')
+    }
+    if (planLease) getChatgptPlanRuntime().assertLease(planLease)
+    const written = await redis.appendContextCompactionEvent(
+      sessionId,
+      event as unknown as Record<string, unknown>,
+      compactionState.events.at(-1)?.id ?? null
+    )
+    if (!written.ok && written.reason === 'missing') {
+      return json({ error: 'Session not found' }, { status: 404 })
+    }
+    if (!written.ok) {
+      return json(
+        {
+          error: 'Another Compact finished in this chat first. This Compact wrote nothing.',
+          code: 'ended_early',
+          reason: 'compaction_changed'
+        },
+        { status: 409 }
+      )
+    }
 
     const afterEstimate = await estimateCurrentContextTokens({
       sessionId,
@@ -229,7 +400,7 @@ export const POST: RequestHandler = async ({ request, locals, fetch: eventFetch 
     return json({
       success: true,
       event,
-      contextCompaction: nextMetadata.contextCompaction,
+      contextCompaction: written.contextCompaction,
       compactedMessageIds: selection.sourceMessageIds,
       compactedTrimmedMessageIds,
       protectedMessageCount: selection.protectedMessageCount,
@@ -246,7 +417,10 @@ export const POST: RequestHandler = async ({ request, locals, fetch: eventFetch 
     console.error('[context-compact] Failed to compact context:', error)
     return json(
       { error: error instanceof Error ? error.message : 'Failed to compact context' },
-      { status: 500 }
+      { status: chatgptPlanHttpStatus(error) ?? 500 }
     )
+  } finally {
+    planLease?.release()
+    compactRun?.end()
   }
 }

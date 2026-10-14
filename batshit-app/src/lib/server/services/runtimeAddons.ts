@@ -935,7 +935,7 @@ export async function prepareRuntimeAddon(addonId: string): Promise<RuntimeAddon
     ]
   } else if (canStartAutomatically) {
     nextSteps = [
-      'Call the approved runtime_addon_start action for this add-on.',
+      'API and managed CLI Primary Agents: request fabric:sys.runtime_addon.start through Batshit Tools and wait for user approval. n8n automation: use runtime_addon_start.',
       'After it starts, re-check this add-on status from Batshit before claiming it is ready.',
       'Do not run arbitrary Docker or Compose commands from inside the core app container.'
     ]

@@ -74,6 +74,20 @@ export interface ParameterDefinition {
     | 'maxTokens'
   arrayDelimiter?: 'comma' | 'newline'
   /**
+   * BL-866: a choice an older preset may still hold for this select, and the choice that
+   * replaces it for THIS model. The picker shows the replacement and the mapper sends it, so what
+   * the user sees is what goes on the wire. Sonnet 5.5's Thinking mode maps a saved `disabled`
+   * to `between_tools` (the model refuses `disabled`; `between_tools` is its lowest setting).
+   */
+  savedValueAliases?: Record<string, string>
+  /**
+   * BL-866: a saved value that is not one of `options` (after `savedValueAliases`) is never sent
+   * and never swapped for another value: the mapper refuses the send with a sentence that names
+   * the value and the choices, and the Models panel shows the same sentence beside the field.
+   * Only a definition that sets this is checked; every other select sends what was saved.
+   */
+  onlyListedValues?: true
+  /**
    * SA-124 P1: turn typed escapes (\\n, \\t, \\") into the real characters, per
    * entry. A newline-delimited editor cannot hold a real newline as an ENTRY,
    * because every newline is a separator. KoboldCpp's DRY sequence breakers
@@ -818,6 +832,29 @@ const OPENAI_BASE: ParameterDefinition[] = markChatOnly([
   }
 ])
 
+/**
+ * BL-866: the Claude models that refuse `thinking: disabled` and `thinking: enabled` and take
+ * `between_tools` instead: Claude Sonnet 5.5. Anthropic answers 400 to both of the others
+ * (measured 2026-09-28, and its Sonnet 5.5 migration guide says the same). `between_tools` is
+ * the model's lowest thinking setting: no thinking before the reply, short progress notes
+ * between tool calls. It takes NO other field, so no budget is ever sent beside it. Blank sends
+ * nothing, which is Anthropic's default (adaptive thinking).
+ *
+ * The API id spells it `claude-sonnet-5-5`; the AI Gateway and OpenRouter spell it with a dot
+ * and a developer prefix (`anthropic/claude-sonnet-5.5`), and `filterParameters` also tries the
+ * part after the slash. A dated id (`claude-sonnet-5-5-<date>`) matches the `-*` pattern; a
+ * longer name that only starts with the same characters (`claude-sonnet-5-50`) does not, which is
+ * the Thinking guard's own rule (`^claude-sonnet-5-5(?:-|$)`).
+ * A model is added here only after a real call showed what it refuses; the same list drives
+ * what the panel offers (below) and what the mapper sends.
+ */
+const ANTHROPIC_BETWEEN_TOOLS_MODELS = [
+  'claude-sonnet-5-5',
+  'claude-sonnet-5-5-*',
+  'claude-sonnet-5.5',
+  'claude-sonnet-5.5-*'
+]
+
 const ANTHROPIC_PARAMETERS: ParameterDefinition[] = markChatOnly([
   {
     name: 'sendReasoning',
@@ -840,7 +877,9 @@ const ANTHROPIC_PARAMETERS: ParameterDefinition[] = markChatOnly([
     providerOptionKey: 'anthropic.thinking.type',
     section: 'reasoning',
     order: 20,
-    advanced: true
+    advanced: true,
+    // BL-866: Sonnet 5.5 has its own list of choices (`ANTHROPIC_BETWEEN_TOOLS_PARAMETERS`).
+    excludeModels: ANTHROPIC_BETWEEN_TOOLS_MODELS
   },
   {
     name: 'thinkingBudget',
@@ -851,7 +890,10 @@ const ANTHROPIC_PARAMETERS: ParameterDefinition[] = markChatOnly([
     providerOptionKey: 'anthropic.thinking.budgetTokens',
     section: 'reasoning',
     order: 30,
-    advanced: true
+    advanced: true,
+    // BL-866: `between_tools` takes no budget, and Sonnet 5.5 refuses `enabled`, the only mode
+    // that carries one: the field is not offered, so a saved budget is never sent.
+    excludeModels: ANTHROPIC_BETWEEN_TOOLS_MODELS
   },
   {
     name: 'disableParallelToolUse',
@@ -877,6 +919,29 @@ const ANTHROPIC_PARAMETERS: ParameterDefinition[] = markChatOnly([
     section: 'provider',
     order: 50,
     helperText: 'Anthropic handles cache slots automatically when enabled.'
+  }
+])
+
+/**
+ * BL-866: Thinking mode for the models in `ANTHROPIC_BETWEEN_TOOLS_MODELS`. It replaces the
+ * Disabled / Enabled list by name, in the same place in the Reasoning section. A saved
+ * `disabled` is shown and sent as `between_tools`; a saved `enabled` is not offered and is
+ * refused when a send is built (`onlyListedValues`).
+ */
+const ANTHROPIC_BETWEEN_TOOLS_PARAMETERS: ParameterDefinition[] = markChatOnly([
+  {
+    name: 'thinkingMode',
+    label: 'Thinking mode',
+    description:
+      'Claude Sonnet 5.5 cannot turn thinking off. Between tools is its lowest setting: no thinking before the reply, and short progress notes between tool calls. Leave it blank for Anthropic’s default. A saved Disabled is sent as Between tools.',
+    inputType: 'select',
+    options: [{ label: 'Between tools (lowest)', value: 'between_tools' }],
+    providerOptionKey: 'anthropic.thinking.type',
+    section: 'reasoning',
+    order: 20,
+    advanced: true,
+    savedValueAliases: { disabled: 'between_tools' },
+    onlyListedValues: true
   }
 ])
 
@@ -1301,13 +1366,14 @@ const LOCAL_SAMPLER_LIBRARY = {
    *
    * Measured and NOT offered, so nobody re-adds them:
    *   adaptive_decay      moved nothing at 0.99 vs 0.01, even over 160 tokens.
-   *   max_context_length  KoboldCpp keeps the size it was launched with; the
-   *                       server still reported 32768 after requests asked for
-   *                       4096 and 8192. The launch flag wins.
-   *   thinking_budget_tokens / reasoning_effort
-   *                       unprovable on llama3.2, which cannot think. Not
-   *                       rejected, just not measured; revisit on a thinking
-   *                       model rather than shipping a guess.
+   *   max_context_length  Not offered as a preset parameter. Upstream v1.121
+   *                       honors a smaller per-request buffer, but cannot
+   *                       enlarge the allocation reported by true_max_context_length.
+   *                       That unchanged allocation does not prove the field ignored.
+   *
+   * thinking_budget_tokens and reasoning_effort were unprovable on llama3.2,
+   * which cannot think. They were measured on a thinking model on 2026-09-22 and
+   * now ship; see the block above koboldReasoningEffort.
    */
   koboldRepPen: {
     name: 'repPen',
@@ -1547,6 +1613,78 @@ const LOCAL_SAMPLER_LIBRARY = {
     wireName: 'negative_prompt'
   },
   /**
+   * SA-124 P1 follow-up: KoboldCpp's thinking controls.
+   *
+   * Measured 2026-09-22 on Qwen3.5-9B (unsloth Q4_K_M) under KoboldCpp 1.121,
+   * started with --jinja, pinned seed, two control rows, max_tokens 400.
+   * "Thinking" is KoboldCpp's own token count of `reasoning_content`; the
+   * "(Reasoning budget exceeded)" note KoboldCpp writes when it closes the
+   * thinking adds 13 to 15 tokens to every capped row:
+   *
+   *   baseline                    359 (both controls identical)
+   *   thinking_budget_tokens      0 -> 15, 30 -> 43, 120 -> 134
+   *   reasoning_effort            none 15, minimal 54, low 113, medium 214,
+   *                               high 313: 0/10/25/50/75% of max_tokens,
+   *                               exactly as koboldcpp.py computes it
+   *   reasoning_effort: xhigh     359, byte-identical to the baseline. An
+   *                               unknown value means NO limit, so the shared
+   *                               entry's "Extra high" would be a dead option.
+   *   effort low + budget 5       113: Thinking effort wins over the budget.
+   *   chat_template_kwargs        enable_thinking true 359, false 0, {} 0.
+   *                               This GGUF's template (unsloth's) defaults
+   *                               thinking OFF, the opposite of Qwen's own, so
+   *                               whether a model thinks at all can depend on
+   *                               the file, and this field is how to say so.
+   *
+   * The limit is enforced in the sampler, which force-closes the think block,
+   * so it needs a model whose think tags KoboldCpp can find as single tokens
+   * (`<think>` models such as Qwen and DeepSeek; KoboldCpp also knows Gemma 4,
+   * Magistral and Seed-OSS tags). On a model that cannot think both limits are
+   * silent no-ops (measured on llama3.2 in P1), so unlike Ollama's thinking
+   * fields they are not gated on the preset's Reasoning capability.
+   */
+  koboldReasoningEffort: {
+    name: 'localReasoningEffort',
+    label: 'Thinking effort',
+    description:
+      'How much of the reply the model may spend thinking: None 0%, Minimal 10%, Low 25%, Medium 50%, High 75% of Max Output Tokens, or of KoboldCpp\'s own default length when that is blank. Then KoboldCpp ends the thinking and the model answers.',
+    inputType: 'select',
+    options: [
+      { label: 'None', value: 'none' },
+      { label: 'Minimal', value: 'minimal' },
+      { label: 'Low', value: 'low' },
+      { label: 'Medium', value: 'medium' },
+      { label: 'High', value: 'high' }
+    ],
+    section: 'reasoning',
+    order: 210,
+    // Owned option key, NOT the wire name — see LocalSamplerDefinition.
+    wireName: 'reasoningEffort'
+  },
+  koboldThinkingBudget: {
+    name: 'thinkingBudgetTokens',
+    label: 'Thinking budget',
+    description:
+      'The most tokens the model may think for before KoboldCpp ends the thinking. 0 skips thinking. Ignored when Thinking effort is set.',
+    inputType: 'integer',
+    min: 0,
+    section: 'reasoning',
+    order: 211,
+    wireName: 'thinking_budget_tokens'
+  },
+  koboldChatTemplateKwargs: {
+    name: 'chatTemplateKwargs',
+    label: 'Chat template options',
+    description:
+      'Extra options passed to the model\'s chat template, as JSON. {"enable_thinking": true} or false turns thinking on or off for models like Qwen. Needs KoboldCpp started with --jinja.',
+    inputType: 'json',
+    placeholder: '{"enable_thinking": true}',
+    section: 'provider',
+    order: 220,
+    advanced: true,
+    wireName: 'chat_template_kwargs'
+  },
+  /**
    * SA-125: Ollama's NATIVE door. Everything Ollama generates with lives inside
    * an `options` object, so these route to `ollama.options.*` — the mapper's
    * `assignProviderOption` already walks a dot path and builds the nesting.
@@ -1623,7 +1761,7 @@ const LOCAL_SAMPLER_LIBRARY = {
     name: 'ollamaThink',
     label: 'Thinking',
     description:
-      'Let the model think before answering. Only for models that can think; Ollama rejects the whole request otherwise.',
+      "Blank uses Batshit's off default unless Custom Parameters override it. Choose true to request thinking. Only for models that can think; Ollama rejects true otherwise.",
     inputType: 'boolean',
     // Measured 2026-09-20: `think: true` FAILS the send on a model that cannot
     // think ("llama3.2:latest" does not support thinking), exactly like the
@@ -1736,9 +1874,9 @@ const LOCAL_RUNTIME_SAMPLERS: Record<LocalAiServerId, readonly LocalSamplerKey[]
   //   the C layer, so the gap is below it. Recheck on a CUDA build before
   //   offering these; on what Batshit's Mac users run, they are dead boxes.
   //
-  //   chatTemplateKwargs — needs `--jinja` at startup AND a model whose template
-  //   reads the key. Proven unprovable on llama3.2, which has no thinking mode.
-  //   Not offered until measured on a model that can show it.
+  //   chatTemplateKwargs — the shared entry is not used: KoboldCpp reads the
+  //   field only when started with `--jinja`, and its own entry says so. It was
+  //   unprovable on llama3.2 and was measured on a thinking model on 2026-09-22.
   //
   //   The shared `mirostat` entry would have shipped broken anyway: KoboldCpp's
   //   OpenAI path runs `genparams["mirostat"] = genparams.get('mirostat_mode', 0)`,
@@ -1774,7 +1912,11 @@ const LOCAL_RUNTIME_SAMPLERS: Record<LocalAiServerId, readonly LocalSamplerKey[]
     'koboldLogitBias',
     'koboldBanEosToken',
     'koboldGuidanceScale',
-    'koboldNegativePrompt'
+    'koboldNegativePrompt',
+    // Measured on a thinking model, 2026-09-22.
+    'koboldReasoningEffort',
+    'koboldThinkingBudget',
+    'koboldChatTemplateKwargs'
   ]
 }
 
@@ -1817,7 +1959,10 @@ export const PARAMETER_SCHEMAS: ParameterSchema[] = [
   },
   {
     provider: 'anthropic',
-    base: [...COMMON_PARAMETERS, ...ANTHROPIC_PARAMETERS, ...ROLE_PARAMETERS]
+    base: [...COMMON_PARAMETERS, ...ANTHROPIC_PARAMETERS, ...ROLE_PARAMETERS],
+    modelOverrides: Object.fromEntries(
+      ANTHROPIC_BETWEEN_TOOLS_MODELS.map((pattern) => [pattern, ANTHROPIC_BETWEEN_TOOLS_PARAMETERS])
+    )
   },
   {
     provider: 'google',

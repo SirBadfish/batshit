@@ -29,6 +29,7 @@ import {
 import { createMemoryEmbedderAsync, type MemoryEmbedder } from './memoryEmbedder'
 import { getMemoryConfig, requireReadyMemoryIndexes } from './memoryIndex'
 import { deleteMemoryMedia, MEMORY_STANDING_MEDIA_CAP } from './memoryMedia'
+import { normalizeEventAtInput, normalizeExpiryInput } from '$lib/utils/memoryExpiry'
 
 function randomIdSuffix(): string {
   return Math.random().toString(36).slice(2, 8)
@@ -43,18 +44,41 @@ function nowStamps(): { iso: string; ts: number } {
   return { iso: now.toISOString(), ts: now.getTime() }
 }
 
-function activeStandingMediaCount(records: MemoryRecord[], excludeMemoryId?: string): number {
-  const nowTs = Date.now()
+/** A current, unexpired Awareness record whose images ride every message (the standing set). */
+function countsTowardStandingMedia(record: MemoryRecord, nowTs: number): boolean {
+  return (
+    record.lane === 'awareness' &&
+    record.media_mode === 'always' &&
+    record.is_superseded !== 'y' &&
+    !(typeof record.expires_ts === 'number' && record.expires_ts <= nowTs)
+  )
+}
+
+function activeStandingMediaCount(
+  records: MemoryRecord[],
+  excludeMemoryId?: string,
+  nowTs = Date.now()
+): number {
   return records
-    .filter(
-      (record) =>
-        record.id !== excludeMemoryId &&
-        record.lane === 'awareness' &&
-        record.media_mode === 'always' &&
-        record.is_superseded !== 'y' &&
-        !(typeof record.expires_ts === 'number' && record.expires_ts <= nowTs)
-    )
+    .filter((record) => record.id !== excludeMemoryId && countsTowardStandingMedia(record, nowTs))
     .reduce((sum, record) => sum + (record.media?.length ?? 0), 0)
+}
+
+/**
+ * BL-438: restoring a superseded record to current (unsupersede, dreaming's supersession repair)
+ * brings its always-on images back into the standing set, so it has to pass the same cap as a
+ * save. Returns the agent's standing-image total with `record` current again, or null when the
+ * restored record adds none (not Awareness, not `always`, expired, or no images). `records` is
+ * the agent's current record list.
+ */
+export function standingMediaTotalIfRestored(
+  records: MemoryRecord[],
+  record: MemoryRecord,
+  nowTs = Date.now()
+): number | null {
+  const restored: MemoryRecord = { ...record, superseded_by: null, is_superseded: 'n' }
+  if (!countsTowardStandingMedia(restored, nowTs) || !restored.media?.length) return null
+  return activeStandingMediaCount(records, record.id, nowTs) + restored.media.length
 }
 
 async function assertStoreStandingMediaCapacity(options: {
@@ -62,6 +86,8 @@ async function assertStoreStandingMediaCapacity(options: {
   media: MemoryMediaRecord[] | undefined
   mediaMode: MemoryMediaMode | undefined
   excludeMemoryId?: string
+  /** One more sentence after the cap wording: how this caller's actor frees a slot. */
+  hint?: string
 }): Promise<void> {
   if (options.mediaMode !== 'always' || !options.media?.length) return
   const count =
@@ -69,7 +95,8 @@ async function assertStoreStandingMediaCapacity(options: {
     options.media.length
   if (count > MEMORY_STANDING_MEDIA_CAP) {
     throw new Error(
-      `Always-on Awareness media is capped at ${MEMORY_STANDING_MEDIA_CAP} images per agent; this change would make ${count}.`
+      `Always-on Awareness media is capped at ${MEMORY_STANDING_MEDIA_CAP} images per agent; this change would make ${count}.` +
+        (options.hint ? ` ${options.hint}` : '')
     )
   }
 }
@@ -163,19 +190,25 @@ export async function createMemory(
     mediaMode: input.media_mode
   })
 
-  const embedder = await resolveWriteEmbedder(options?.embedder)
-  const [embedding] = await embedder.embedDocuments([input.content])
-  const { iso, ts } = nowStamps()
-  const eventAt = input.event_at ?? null
+  // BL-825: refuse invalid dates before resolving or spending an embedding call.
+  // BL-817: a bare day means the START of that local day (the day search reads it as); a full
+  // timestamp stays as given.
+  const eventAt = input.event_at ? normalizeEventAtInput(input.event_at) : null
   const eventTs = eventAt ? new Date(eventAt).getTime() : null
   if (eventAt && !Number.isFinite(eventTs)) {
     throw new Error(`Memory event_at is not a valid timestamp: '${eventAt}'.`)
   }
-  const expiresAt = input.expires_at ?? null
+  // BL-785: a bare day means the end of that local day (the Memory Panel's rule); a full
+  // timestamp stays as given.
+  const expiresAt = input.expires_at ? normalizeExpiryInput(input.expires_at) : null
   const expiresTs = expiresAt ? new Date(expiresAt).getTime() : null
   if (expiresAt && !Number.isFinite(expiresTs)) {
     throw new Error(`Memory expires_at is not a valid timestamp: '${expiresAt}'.`)
   }
+
+  const embedder = await resolveWriteEmbedder(options?.embedder)
+  const [embedding] = await embedder.embedDocuments([input.content])
+  const { iso, ts } = nowStamps()
 
   const record: MemoryRecord = {
     id: input.id ?? createMemoryId(ts),
@@ -221,7 +254,12 @@ export async function listMemories(agentId: string): Promise<MemoryRecord[]> {
       const record = (await client.json.get(key)) as unknown as MemoryRecord | null
       if (record) records.push(record)
     }
-    records.sort((a, b) => b.saved_ts - a.saved_ts)
+    // Newest first by saved_ts (ms). Two memories saved within the same millisecond tie on
+    // that key; without a secondary key the order would fall back to Redis's KEYS scan
+    // order, which is not insertion order and is not stable across runs (BL-741). Break
+    // ties by id (which embeds the same ts plus a random suffix) so repeated listings of
+    // the same records always come back in the same order.
+    records.sort((a, b) => b.saved_ts - a.saved_ts || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0))
     return records
   })
 }
@@ -301,9 +339,10 @@ export async function updateMemory(
   }
   if (updates.importance !== undefined) next.importance = updates.importance
   if (updates.event_at !== undefined) {
-    next.event_at = updates.event_at
-    next.event_ts = updates.event_at ? new Date(updates.event_at).getTime() : null
-    if (updates.event_at && !Number.isFinite(next.event_ts)) {
+    // BL-817: the same reading as createMemory.
+    next.event_at = updates.event_at ? normalizeEventAtInput(updates.event_at) : null
+    next.event_ts = next.event_at ? new Date(next.event_at).getTime() : null
+    if (next.event_at && !Number.isFinite(next.event_ts)) {
       throw new Error(`Memory event_at is not a valid timestamp: '${updates.event_at}'.`)
     }
   }
@@ -312,8 +351,9 @@ export async function updateMemory(
       delete next.expires_at
       delete next.expires_ts
     } else {
-      next.expires_at = updates.expires_at
-      next.expires_ts = new Date(updates.expires_at).getTime()
+      // BL-785: the same reading as createMemory.
+      next.expires_at = normalizeExpiryInput(updates.expires_at)
+      next.expires_ts = new Date(next.expires_at).getTime()
       if (!Number.isFinite(next.expires_ts)) {
         throw new Error(`Memory expires_at is not a valid timestamp: '${updates.expires_at}'.`)
       }
@@ -449,6 +489,22 @@ export async function unsupersedeMemory(agentId: string, memoryId: string): Prom
   const supersederId = record.superseded_by
   if (!supersederId) return record
 
+  // BL-438: a superseded record's always-on images stop counting, so the agent may have filled
+  // the slots since. Restoring it past the cap would fail every send of the agent at the compile;
+  // refuse before the first write instead, with the save path's own cap wording.
+  const restored: MemoryRecord = { ...record, superseded_by: null, is_superseded: 'n' }
+  if (countsTowardStandingMedia(restored, Date.now())) {
+    await assertStoreStandingMediaCapacity({
+      agentId,
+      media: restored.media,
+      mediaMode: restored.media_mode,
+      excludeMemoryId: memoryId,
+      hint:
+        `Memory ${memoryId} shows its images every message. Set media_mode to on_recall on another ` +
+        'Awareness memory or on this one, then unsupersede it again.'
+    })
+  }
+
   record.superseded_by = null
   record.is_superseded = 'n'
   record.updated_at = nowStamps().iso
@@ -519,7 +575,15 @@ export async function touchMemoryRecall(agentId: string, memoryId: string): Prom
   return record
 }
 
-/** Expiry demotes (records the demotion and moves the lane) — never erases (DL-104-02). */
+/**
+ * Expiry demotes (records the demotion and moves the lane) — never erases (DL-104-02).
+ *
+ * BL-786: only Awareness may show its images every message, so a record that leaves Awareness
+ * here keeps its images on recall (`media_mode: 'on_recall'`); left `always`, every later save of
+ * it was refused and the panel hides that switch outside Awareness. Calling this again with the
+ * record's current lane settles one an older demotion left `always`. The caller logs the change
+ * (dreaming's `expire_demote` action).
+ */
 export async function markExpiredDemotion(
   agentId: string,
   memoryId: string,
@@ -533,6 +597,7 @@ export async function markExpiredDemotion(
   }
   record.expired_demoted_to = demotedTo
   record.lane = demotedTo
+  if (demotedTo !== 'awareness' && record.media_mode === 'always') record.media_mode = 'on_recall'
   record.updated_at = nowStamps().iso
   await redis.json.set(memoryKey(agentId, memoryId), '$', record as never)
   return record
@@ -656,7 +721,11 @@ export async function touchMemorySegmentRecall(
   return record
 }
 
-/** Explicit delete only (DL-104-02); graduation never removes segments. */
+/**
+ * Explicit delete (DL-104-02). BL-751 and its BL-737 regular-session counterpart also call this,
+ * to remove a just-created segment that a graduation discards (a chat deleted underneath it, or a
+ * mark write a racing graduation's CAS beat) — never a segment a REUSED attempt is still using.
+ */
 export async function deleteMemorySegment(agentId: string, segmentId: string): Promise<boolean> {
   return redis.execute(async (client) => {
     const removed = await client.del(memorySegmentKey(agentId, segmentId))

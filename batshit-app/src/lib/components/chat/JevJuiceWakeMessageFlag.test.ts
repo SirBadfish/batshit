@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { render, screen } from '@testing-library/svelte'
-import { UNTRUSTED_TEXT_BADGE_TEXT, UNTRUSTED_TEXT_WAKE_MESSAGE_TOLD_TEXT } from '$lib/utils/jevJuice'
+import { UNTRUSTED_TEXT_WAKE_MESSAGE_TOLD_TEXT, untrustedTextBadgeText } from '$lib/utils/jevJuice'
 
 /**
  * SA-120 P7 (Josh's review, 2026-09-17) — the flag on the wake-up message itself, at the top
@@ -28,7 +28,8 @@ const FLAG = {
   ],
   harm: 0.9,
   clipped: false,
-  source: 'agent_dm' as const
+  source: 'agent_dm' as const,
+  judge: 'Jev'
 }
 
 beforeEach(() => {
@@ -41,7 +42,7 @@ describe('JevJuiceWakeMessageFlag', () => {
     briefs.set('dm_1', { from: { kind: 'agent', name: 'Cooper' }, subject: '', snippet: '', screen: FLAG })
     render(JevJuiceWakeMessageFlag, { props: { dmId: 'dm_1' } })
     const block = await screen.findByTestId('jev-juice-wake-message-flag')
-    expect(block.textContent).toContain(UNTRUSTED_TEXT_BADGE_TEXT)
+    expect(block.textContent).toContain(untrustedTextBadgeText('Jev'))
     expect(block.textContent).toContain('Categories:')
     expect(block.textContent).toContain('Potential takeover attempt (86% confidence)')
     expect(block.textContent).toContain('Potentially unwanted request (81% confidence)')
@@ -54,7 +55,7 @@ describe('JevJuiceWakeMessageFlag', () => {
     briefs.set('dm_1', { from: { kind: 'agent', name: 'Cooper' }, subject: '', snippet: '', screen: { status: 'skipped', reason: 'no_key', source: 'agent_dm' } })
     render(JevJuiceWakeMessageFlag, { props: { dmId: 'dm_1' } })
     const note = await screen.findByTestId('jev-juice-wake-message-skipped')
-    expect(note.textContent).toContain('Jev Juice: Incoming text screen skipped')
+    expect(note.textContent).toContain('Judge Juice: Incoming text screen skipped')
     expect(screen.queryByTestId('jev-juice-wake-message-flag')).toBeNull()
   })
 

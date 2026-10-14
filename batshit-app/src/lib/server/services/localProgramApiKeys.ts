@@ -70,7 +70,10 @@ export async function resolveLocalProgramIdForBaseUrl(
   try {
     servers = await listLocalAiServers(userId)
   } catch (error) {
-    logger.debug('[local-key] could not list programs', { error })
+    // The saved servers could not be read (BL-977): "no program matched", and never the default
+    // address of a program. The memory embedder then goes on with the key it was configured with;
+    // a program that needs a stored key answers 401, so this must be seen in the log.
+    logger.warn('[local-key] could not list programs, so no stored key was looked up', { error })
     return null
   }
 

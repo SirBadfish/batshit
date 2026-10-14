@@ -6,6 +6,7 @@ import {
   rewriteInternalBatshitServerUrlsInPayload
 } from '$lib/server/services/batshitServerUrls'
 import { loadGoonFacialArtworkDefinition } from '$lib/server/services/facialArtwork.server'
+import { projectGoonRecipeSource } from '$lib/goons/recipe/recipeRuntimeProjection'
 import {
   collectGoonUploadReferencesForClient,
   deleteGoonUploadAsset,
@@ -40,7 +41,9 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
     const goon = await redis.execute(async (client) => {
       const current = (await client.json.get(`goon:${params.id}`)) as GoonRecord | null
       if (!current || current.user_id !== locals.user!.id) return null
-      const definition = await loadGoonFacialArtworkDefinition(client as any, current)
+      // Artwork belongs to the editable Source definition, including when its
+      // baked Live eye definitions have a separate local-review identity.
+      const definition = await loadGoonFacialArtworkDefinition(client as any, projectGoonRecipeSource(current))
       return { current, definition }
     })
     if (!goon) return json({ error: 'Goon not found' }, { status: 404 })
@@ -58,6 +61,10 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
 
     const forward = new FormData()
     forward.append('file', file, file.name)
+    // The authenticated Goon's editable package owns the physical dependency
+    // hashes. Never forward a definition supplied by the browser. The upload
+    // service independently pins its artwork policy and assets to its catalog.
+    forward.append('packageDefinition', JSON.stringify(goon.definition))
     for (const field of [
       'role',
       'definitionSha256',

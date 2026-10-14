@@ -12,6 +12,7 @@ import { resolveLocalPromptCacheReporting } from '$lib/data/localAiServers'
 import {
   hasUsageValues as hasNormalizedUsageValues,
   mergeUsageLike,
+  normalizeAnthropicExclusiveStepUsage,
   normalizeUsageLike,
   withHonestLocalCacheUsage,
   type ApiUsageLike,
@@ -96,6 +97,16 @@ export const buildTokenUsage = (
 
 const hasUsageValues = (usage: UsageLike): boolean =>
   hasNormalizedUsageValues(usage)
+
+/**
+ * BL-503 / BL-1361: a managed CLI run's usage is `exact` only when its CLI reported it. A run that
+ * failed, was stopped, or ended without the CLI's usage has none, so its counts are unknown
+ * (`value: null` with the weaker label, the unknown an approval resume's merge already uses,
+ * BL-525), never `exact` and never zero. A run whose CLI reported usage keeps `exact`.
+ */
+export function reportedUsageConfidence(usage: UsageLike): ExecutionConfidenceLevel {
+  return hasUsageValues(usage) ? 'exact' : 'estimated'
+}
 
 const DATA_IMAGE_URL_REGEX =
   /data:(image\/[a-z0-9.+-]+);base64,([a-z0-9+/=\r\n]+)/gi
@@ -324,9 +335,14 @@ export function buildVercelLlmCapture(params: {
       finishReasonRaw === 'unknown' ? 'other' : finishReasonRaw
 
     const stepUsageFromSdk = normalizeUsageLike(step?.usage)
-    const stepUsageFromMetadata = normalizeUsageLike({
-      providerMetadata: step?.providerMetadata,
-    })
+    // BL-77: a call's input is the whole prompt it sent, as on the run summary. Anthropic's
+    // raw per-call usage counts only the fresh remainder, which once overrode the SDK's
+    // whole-prompt count here; with the tool loop cached that remainder is nearly zero.
+    const stepUsageFromMetadata =
+      normalizeAnthropicExclusiveStepUsage(step?.providerMetadata) ??
+      normalizeUsageLike({
+        providerMetadata: step?.providerMetadata,
+      })
     const normalizedStepUsage =
       stepUsageFromSdk && stepUsageFromMetadata
         ? mergeUsageLike(stepUsageFromSdk, stepUsageFromMetadata)
@@ -475,6 +491,7 @@ function buildCliModeLlmCapture(params: {
   const runtimeName =
     params.runtime === 'codex' ? 'Codex CLI' : 'Claude Code CLI'
   const usageSource = params.runtime === 'codex' ? 'codex' : 'claude'
+  const usageConfidence = reportedUsageConfidence(params.totalUsage)
   const responseNote =
     params.runtime === 'codex'
       ? 'Codex CLI does not expose a raw provider response object. See Response Summary for the final output and Debug -> Raw Runtime Events for the runtime stream.'
@@ -492,7 +509,7 @@ function buildCliModeLlmCapture(params: {
     {
       index: 1,
       runtime: params.runtime,
-      usage: buildTokenUsage(params.totalUsage, 'exact', usageSource),
+      usage: buildTokenUsage(params.totalUsage, usageConfidence, usageSource),
       requestPayload,
       requestConfidence: 'near',
       responsePayload: {
@@ -517,7 +534,7 @@ function buildCliModeLlmCapture(params: {
 
   const llmSummary: ExecutionLlmSummary = {
     callsCount: buildTokenStat(1, 'speculative', usageSource),
-    totalUsage: buildTokenUsage(params.totalUsage, 'exact', usageSource),
+    totalUsage: buildTokenUsage(params.totalUsage, usageConfidence, usageSource),
     breakdownConfidence: 'speculative',
   }
 

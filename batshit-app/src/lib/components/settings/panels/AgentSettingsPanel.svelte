@@ -1,6 +1,15 @@
 <script lang="ts">
+  import { performAvatarImport, uploadAvatarFile } from '$lib/appActions/imports/avatars'
+  import type { ImportArgs, ImportOutcome } from '$lib/appActions/imports/contracts'
+  import { refuse, type SettingsTarget } from '$lib/appActions/catalog'
+  import { appActionsHaveDrafts, type ActionContext } from '$lib/appActions/owners'
+
   import { onDestroy, onMount, untrack } from "svelte";
-  import { debounce } from "$lib/utils/debounce";
+  import { createEntitySaverCount } from "$lib/utils/entitySaverCount";
+  import { AGENT_MEMORY_GROUP, AGENT_SAVE_FIELD_GROUPS } from "$lib/utils/agentSettingsSavePatch";
+  import { agentWritableConflictLabels, rebaseAgentWritableFields } from "$lib/utils/agentWritableFieldRebase";
+  import { onUserChannelEvent, type UserChannelEvent } from "$lib/services/userChannel";
+  import { SUBAGENT_SAVE_FIELD_GROUPS } from "$lib/utils/subagentSettingsSavePatch";
   import {
     buildDcmDisplaySettingsSignature,
     cloneDcmDisplaySettings,
@@ -17,6 +26,13 @@
   import { getUserSettings } from "$lib/stores/userSettings.svelte";
   import { confirmDialog, confirmDialogWithCheckbox } from "$lib/stores/confirmDialog";
   import { copyTextToClipboard } from "$lib/utils/clipboard";
+  import { requestAvatarPictureTidy, shouldTidyAvatarPictures } from "$lib/utils/avatarPictureTidy";
+  import { sandboxUnavailableMessage } from "$lib/utils/nativeExecutionBackend";
+  import { isClaudeToolEnabled, withClaudeToolEnabled } from "$lib/utils/claudeToolSwitch";
+  import {
+    resolveAgentDeleteChatCountOutcome,
+    type AgentChatCounts,
+  } from "$lib/utils/agentDeleteChatCount";
   import type {
   AgentDcmDisplaySettings,
   AgentRow,
@@ -68,6 +84,7 @@ import {
 } from "$lib/data/codex-models";
 import { CLAUDE_CLI_MODEL_CHOICES } from "$lib/data/claude-cli-models";
   import CliRuntimeManagerCard from "$lib/components/settings/CliRuntimeManagerCard.svelte";
+  import RetiredCliModelNotice from "$lib/components/settings/agent/RetiredCliModelNotice.svelte";
   import { Input } from "$lib/components/ui/input";
   import * as Label from "$lib/components/ui/label";
   import { Button } from "$lib/components/ui/button";
@@ -93,7 +110,32 @@ import {
 } from "$lib/utils/modelVoiceSession";
 import * as savedModelsStore from "$lib/stores/savedModels.svelte";
 import type { CatalogConnectionOption } from "$lib/types/modelCatalog";
-import { getModelPresetAvailability } from "$lib/utils/modelPresetAvailability";
+import { getModelPresetAvailability, presetAvailabilityKeepsSelection } from "$lib/utils/modelPresetAvailability";
+import { applyAgentProviderSettingsUpdate, presetModelSettings } from "$lib/utils/agentProviderSettings";
+import { buildAgentSettingsSavePatch } from "$lib/utils/agentSettingsSavePatch";
+import {
+  AGENT_FIELD_BY_FIELD_BLOCKS,
+  applyAgentBlockUpdate,
+  diffAgentBlockWithGroups,
+  type AgentBlockSaveByField,
+  type AgentFieldByFieldBlock,
+} from "$lib/utils/agentBlockFieldSettings";
+import {
+  diffMcpSection,
+  diffZipPayload,
+  zipPayloadForSave,
+  type CustomToolPayload,
+  type McpPayloadBody,
+  type McpSectionSave,
+  type McpSectionValues,
+  type ZipPayloadBody,
+} from "$lib/utils/agentSettingsSectionSaves";
+import {
+  buildSubagentSettingsSavePatch,
+  makeSubagentFormSignature,
+  type LiveSubagentUpdate,
+  type SubagentSaveForm,
+} from "$lib/utils/subagentSettingsSavePatch";
 import { DEFAULT_AGENT_ICON_REF } from "$lib/icons/iconCatalog";
 import { normalizeIconRef } from "$lib/icons/iconLegacy";
 import {
@@ -170,6 +212,12 @@ import { resolveVoiceSettingsForSpeech, voiceService, type VoiceConfig } from "$
     WORKERS_MAX_RUNS_PER_TURN,
     resolveWorkersEnabled,
   } from "$lib/utils/delegationCapabilities";
+  import {
+    CODEX_PERMISSION_PRESETS,
+    CODEX_SANDBOX_LABELS,
+    CODEX_SANDBOX_ORDER,
+    sanitizeCodexSandbox,
+  } from "$lib/utils/codexRunAccess";
   import AgentWebSearchDefaultsDisclosure from "$lib/components/settings/agent/AgentWebSearchDefaultsDisclosure.svelte";
   import SubagentAccessAssignmentsSection from "$lib/components/settings/agent/SubagentAccessAssignmentsSection.svelte";
   import {
@@ -221,10 +269,7 @@ import { getToolGridDefaultAutoZip, getToolGridDefaultNumber } from "$lib/utils/
 import { listUnsupportedN8NParameters } from "$lib/utils/modelCompatibility";
 import * as compatibilityMatrixStore from "$lib/stores/compatibilityMatrix.svelte";
 import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSettingsEvents";
-import {
-  getSubagentTimeoutValidationError,
-  normalizeSubagentTimeoutSeconds,
-} from "$lib/utils/subagentTimeout";
+import { getSubagentTimeoutValidationError } from "$lib/utils/subagentTimeout";
 
   const BASIC_SAVE_DEBOUNCE_MS = 600;
   const ZIP_SAVE_DEBOUNCE_MS = 700;
@@ -346,6 +391,8 @@ import {
     policy: string;
     version: string | null;
     cli?: string | null;
+    /** Apple Container only: false when the CLI is missing (BL-83). */
+    installed?: boolean;
     /** Apple Container only: false until the first sandboxed command starts it (BL-62). */
     systemRunning?: boolean;
     reason: string | null;
@@ -370,7 +417,7 @@ import {
     wake_enabled: boolean;
     wake_timeout_minutes: number | null;
     wake_target: WakeTarget;
-    // SA-120 P1 (DL-120-01): the per-agent Jev Juice skill/tool hint switch. Default off.
+    // SA-120 P1 (DL-120-01): the per-agent Judge Juice skill/tool hint switch. Default off.
     jev_juice_skill_tool_hints: boolean;
     // SA-120 P2 (LS-050): the per-agent switch for the sys.judge.ask tool. Default off.
     jev_juice_judge_tool: boolean;
@@ -429,14 +476,6 @@ import {
     auto_zip: string;
   };
 
-  type CustomToolPayload = {
-    tool_name: string;
-    buffer_size?: number;
-    zip_threshold?: number;
-    auto_zip?: boolean;
-    zip_disabled?: boolean;
-  };
-
   type McpToolZipOverrideSnapshot = {
     buffer_size: string;
     zip_threshold: string;
@@ -468,8 +507,9 @@ import {
     Pick<NonMcpZipOverrideSnapshot, "buffer_size" | "zip_threshold" | "auto_zip">
   >;
 
+  // SA-129 DL-06 (BL-1484): no zip control permission here. The parked permission reads only the
+  // hidden experiment key, which no Settings surface reads or writes.
   interface ZipForm {
-    zip_agent_control_enabled: string;
     zip_ai_view_mode: string;
     zip_tool_notes_enabled: string;
     buffer_size: string;
@@ -623,15 +663,6 @@ import {
 
   type ManagedConfigProvider = "codex" | "claude";
 
-  const CODEX_PERMISSION_PRESETS: Record<
-    CodexPermissionMode,
-    { sandbox: CodexSandbox }
-  > = {
-    chat: { sandbox: "read-only" },
-    agent: { sandbox: "workspace-write" },
-    agent_full: { sandbox: "danger-full-access" },
-  };
-
   const CODEX_PERMISSION_OPTIONS: Array<{
     value: CodexPermissionMode;
     label: string;
@@ -642,7 +673,7 @@ import {
     { value: "agent", label: "Agent", helper: "Workspace write, ask when needed", icon: Shield },
     {
       value: "agent_full",
-      label: "Agent (full)",
+      label: "Agent (full access)",
       helper: "Full access, run without prompts",
       icon: ShieldPlus,
     },
@@ -656,14 +687,20 @@ import {
   }> = [
     { value: "plan", label: "Plan", helper: "Plan-only, no edits or commands", icon: MessageCircle },
     {
+      value: "default",
+      label: "Ask before edits",
+      helper: "Edits and commands follow Approval Policy.",
+      icon: MessageCircle,
+    },
+    {
       value: "acceptEdits",
-      label: "Edit Automatically",
+      label: "Edit automatically",
       helper: "Approved work runs automatically; extra actions follow Approval Policy.",
       icon: Shield,
     },
     {
       value: "bypassPermissions",
-      label: "Bypass Permissions",
+      label: "Bypass permissions",
       helper: "Full trust, no approvals",
       icon: ShieldPlus,
     },
@@ -712,11 +749,10 @@ import {
     },
   ];
 
-  const CODEX_SANDBOX_OPTIONS = [
-    { value: "read-only", label: "Read-only" },
-    { value: "workspace-write", label: "Workspace write" },
-    { value: "danger-full-access", label: "Danger full access" },
-  ];
+  const CODEX_SANDBOX_OPTIONS = CODEX_SANDBOX_ORDER.map((value) => ({
+    value,
+    label: CODEX_SANDBOX_LABELS[value],
+  }));
 
   const CODEX_REASONING_OPTIONS: Array<{
     value: CodexFormOptions["reasoningEffort"];
@@ -738,7 +774,6 @@ import {
     { value: "fast", label: "Fast", helper: CODEX_FAST_MODE_HELPER_TEXT },
   ];
 
-  const ZIP_PERMISSION_INHERIT = "__inherit__";
   const ZIP_LAYOUT_INHERIT = "__inherit__";
   const ZIP_NOTES_INHERIT = "__inherit__";
   const ZIP_AUTO_INHERIT = "__inherit__";
@@ -795,80 +830,8 @@ import {
     primary_model_stop_sequences?: string[] | null;
     primary_model_reasoning_effort?: string | null;
     primary_model_capabilities?: ModelCapabilities | null;
-    fallback_model_enabled?: boolean;
-    fallback_model_provider?: string | null;
-    fallback_model_name?: string | null;
-    fallback_model_preset_id?: string | null;
-    fallback_model_connection?: ModelConnectionInfo | null;
-    fallback_model_temperature?: number | null;
-    fallback_model_max_tokens?: number | null;
-    fallback_model_top_p?: number | null;
-    fallback_model_top_k?: number | null;
-    fallback_model_frequency_penalty?: number | null;
-    fallback_model_presence_penalty?: number | null;
-    fallback_model_seed?: number | null;
-    fallback_model_stop_sequences?: string[] | null;
-    fallback_model_reasoning_effort?: string | null;
-    fallback_model_capabilities?: ModelCapabilities | null;
-    fallback_provider_specific_settings?: Record<string, any> | null;
     voice_profile?: AgentVoiceProfile | null;
     auto_compact_settings?: AgentAutoCompactSettings | null;
-  }
-
-  interface ZipPayloadBody {
-    zip_agent_control_enabled?: boolean | null;
-    zip_ai_view_mode?: "inline" | "appended" | null;
-    zip_tool_notes_enabled?: boolean | null;
-    buffer_size: number | null;
-    buffer_size_image: number | null;
-    buffer_size_error: number | null;
-    buffer_size_subagent: number | null;
-    buffer_size_read_file: number | null;
-    buffer_size_write_file: number | null;
-    buffer_size_edit_file: number | null;
-    buffer_size_execute_command: number | null;
-    buffer_size_list_files: number | null;
-    buffer_size_all_other_tools: number | null;
-    zip_threshold_error: number | null;
-    zip_threshold_image: number | null;
-    zip_threshold_subagent: number | null;
-    zip_threshold_read_file: number | null;
-    zip_threshold_write_file: number | null;
-    zip_threshold_edit_file: number | null;
-    zip_threshold_execute_command: number | null;
-    zip_threshold_list_files: number | null;
-    zip_threshold_all_other_tools: number | null;
-    auto_zip_error?: boolean | null;
-    auto_zip_image?: boolean | null;
-    auto_zip_subagent?: boolean | null;
-    auto_zip_read_file?: boolean | null;
-    auto_zip_write_file?: boolean | null;
-    auto_zip_edit_file?: boolean | null;
-    auto_zip_execute_command?: boolean | null;
-    auto_zip_list_files?: boolean | null;
-    auto_zip_all_other_tools?: boolean | null;
-    zip_disabled_error?: boolean | null;
-    zip_disabled_image?: boolean | null;
-    zip_disabled_subagent?: boolean | null;
-    zip_disabled_read_file?: boolean | null;
-    zip_disabled_write_file?: boolean | null;
-    zip_disabled_edit_file?: boolean | null;
-    zip_disabled_execute_command?: boolean | null;
-    zip_disabled_list_files?: boolean | null;
-    zip_disabled_all_other_tools?: boolean | null;
-    custom_tool_settings?: Array<{
-      tool_name: string;
-      buffer_size?: number;
-      zip_threshold?: number;
-      auto_zip?: boolean;
-      zip_disabled?: boolean;
-    }> | null;
-  }
-
-  interface McpPayloadBody {
-    defaultMCPGateways: string[];
-    defaultMCPToolSelections: MCPToolSelections;
-    dcmDisplaySettings: AgentDcmDisplaySettings;
   }
 
   type SaveState = "idle" | "saving" | "saved";
@@ -940,6 +903,10 @@ import {
   ): boolean {
     if (!entityId) return false;
     if (command.enabled_for_all_agents === true) return true;
+    // BL-544: a command with no list at all is on for every agent (the runtime rule,
+    // `commandEnabledForAgent`); an empty list is on for nobody. Turning one agent off there
+    // keeps the others on: the route writes them as an explicit list.
+    if (!Object.prototype.hasOwnProperty.call(command, "enabled_agent_ids")) return true;
     return normalizeAccessEntityIds(command.enabled_agent_ids).includes(entityId);
   }
 
@@ -1027,10 +994,13 @@ import {
     );
 
     try {
-      const updated = await slashCommandStore.updateSlashCommand(command.id, {
-        enabled_agent_ids: nextEnabledAgentIds,
-        enabled_for_all_agents: false,
-      });
+      // BL-544: one agent, against the list as stored now. Sending this copy's whole list (and
+      // `enabled_for_all_agents: false`) undid every change made elsewhere since Access loaded.
+      const updated = await slashCommandStore.setSlashCommandAgentAccess(
+        command.id,
+        entityId,
+        enabled,
+      );
 
       accessSlashCommands = accessSlashCommands.map((entry) =>
         entry.id === updated.id ? updated : entry,
@@ -1068,17 +1038,20 @@ import {
       entry.id === artifact.id
         ? {
             ...entry,
-            agent_access_scope: "selected",
             agent_allowlist: nextAllowlist,
           }
         : entry,
     );
 
     try {
-      const updated = await artifactService.updateArtifact(artifact.id, {
-        agent_access_scope: "selected",
-        agent_allowlist: nextAllowlist,
-      });
+      // BL-544: one agent, against the list as stored now; Agent Use and the all-agents scope
+      // stay as they are (this copy's whole list and `agent_access_scope: "selected"` undid a
+      // list or an all-agents switch saved elsewhere since Access loaded).
+      const updated = await artifactService.setArtifactAgentAccess(
+        artifact.id,
+        entityId,
+        enabled,
+      );
 
       accessArtifacts = accessArtifacts.map((entry) =>
         entry.id === updated.id ? updated : entry,
@@ -1138,6 +1111,52 @@ import {
   let hydrationInProgress = $state(false);
   let lastAppliedInitialAgentId = $state<string | null>(null);
   let agentHydrationRequestId = 0;
+  /**
+   * BL-912: the agent whose record the forms hold (null after a reset). A read of another agent
+   * fills every section; a read of this one replaces only the sections at rest (`hydrateAgent`).
+   */
+  let hydratedAgentId: string | null = null;
+  /**
+   * BL-912: a landing that belongs to an older read, or a read that left a section alone, asks
+   * for a read of the shown agent; it runs when the panel comes to rest
+   * (`readAgentAgainWhenAtRest`). Each read clears it when it starts. Plain, like the counter.
+   */
+  let agentReadDeferred = false;
+  let agentReadDeferredUi = $state(false);
+  let primaryOwnedSaveInFlightUi = $state(false);
+  let primaryOwnedWritePendingUi = $state(false);
+  type PrimaryCaptureSection = "basic" | "codex" | "claude" | "zip" | "mcp" | "assignment";
+  const primaryDeferredCaptures = new Map<string, Set<PrimaryCaptureSection>>();
+  const primaryCaptureWake = $state({ basic: 0, codex: 0, claude: 0, zip: 0, mcp: 0, assignment: 0 });
+  let primarySaveWaitExpiredUi = $state(false);
+  let primaryReadWaitError = $state<string | null>(null);
+  /**
+   * SA-122 A-1y (BL-1294): a memory save the server refused (409 `memory_settings_changed`) because
+   * the saved memory settings changed after its baseline was read (the agent saved its own, App
+   * Actions). `memoryConflictBase` is that save's baseline: the next read of the agent rebases the
+   * busy basic section from it (`hydrateAgent`). One automatic resend per user edit
+   * (`memoryConflictResendUsed`, Ashe's refinement b): a second refusal shows the existing Retry,
+   * which reads the record and keeps the edits. Plain, like the read counter.
+   */
+  let memoryConflictBase: { agentId: string; base: BasicForm } | null = null;
+  let memoryConflictResendUsed = false;
+  const MEMORY_CONFLICT_RETRY_MESSAGE =
+    "This agent's memory settings changed while you were editing them, so your change was not saved. Retry reads them again and keeps your edits.";
+  const primarySettingsReadWaiting = $derived(detailLoading || agentReadDeferredUi || primaryReadWaitError !== null || primarySaveWaitExpiredUi || primaryOwnedSaveInFlightUi);
+  const primaryCaptureBlocked = $derived(detailLoading || primaryReadWaitError !== null || primaryOwnedWritePendingUi);
+  /**
+   * BL-912: whether each Primary saver has a save queued or on its way. The basic one counts the
+   * autosave and the multiline editors; the Tool Grid section has its own save and the CLI tools
+   * save. Each settled save asks for the deferred read.
+   */
+  const basicSaves = createEntitySaverCount(readAgentAgainWhenAtRest, () => untrack(syncPrimarySaveWaits));
+  const promptSaves = createEntitySaverCount(readAgentAgainWhenAtRest, () => untrack(syncPrimarySaveWaits));
+  const zipSaves = createEntitySaverCount(readAgentAgainWhenAtRest, () => untrack(syncPrimarySaveWaits));
+  const mcpSaves = createEntitySaverCount(readAgentAgainWhenAtRest, () => untrack(syncPrimarySaveWaits));
+  const cliToolSaves = createEntitySaverCount(readAgentAgainWhenAtRest, () => untrack(syncPrimarySaveWaits));
+  const codexSaves = createEntitySaverCount(readAgentAgainWhenAtRest, () => untrack(syncPrimarySaveWaits));
+  const claudeSaves = createEntitySaverCount(readAgentAgainWhenAtRest, () => untrack(syncPrimarySaveWaits));
+  const assignmentSaves = createEntitySaverCount(readAgentAgainWhenAtRest, () => untrack(syncPrimarySaveWaits));
 
   let basicForm = $state<BasicForm>(createDefaultBasicForm());
 
@@ -1148,6 +1167,13 @@ import {
   });
 
   let basicPersistedSignature = $state<string | null>(null);
+  /**
+   * BL-514: the form as it was loaded or last saved. A save sends only what differs from it
+   * (`buildAgentSettingsSavePatch`), so this copy cannot take back a change the chat bar made
+   * after Settings opened. Kept in step with `basicPersistedSignature`; not reactive. A landed
+   * save moves it (and the signature) to the snapshot it sent, never the live form (BL-911).
+   */
+  let basicPersistedForm: BasicForm | null = null;
   let basicValidationError = $state<string | null>(null);
   let basicSaveState = $state<SaveState>("idle");
   let basicSaveError = $state<string | null>(null);
@@ -1165,6 +1191,19 @@ import {
 
   let zipForm = $state<ZipForm>(createDefaultZipForm());
   let zipPersistedSignature = $state<string | null>(null);
+  /**
+   * BL-855: the four sections below as they were loaded or last saved. A save sends only what
+   * differs from them (`agentSettingsSectionSaves.ts`, and `diffAgentBlockWithGroups` for the Codex
+   * and Claude blocks), so a copy that the chat bar or a second Settings window has since changed is
+   * never written back over that change. A failed save leaves them as they were. Not reactive,
+   * like `basicPersistedForm`: each is set and cleared beside its `...PersistedSignature`, and no
+   * effect reads what it writes. Codex and Claude: `null` while the agent has no such block yet
+   * (its first save then writes the whole block).
+   */
+  let zipPersistedPayload: ZipPayloadBody | null = null;
+  let codexPersistedBlock: CodexAgentSettings | null = null;
+  let claudePersistedBlock: ClaudeAgentSettings | null = null;
+  let mcpPersistedValues: McpSectionValues | null = null;
   let zipValidationError = $state<string | null>(null);
   let zipSaveState = $state<SaveState>("idle");
   let zipSaveError = $state<string | null>(null);
@@ -2003,17 +2042,6 @@ import {
     return items;
   });
 
-  // SA-017: `xhigh` reasoning effort is only allowed for compatible Codex models.
-  $effect(() => {
-    if (codexForm.reasoningEffort !== "xhigh") return;
-    if (supportsCodexXhighReasoning(codexForm.model)) return;
-    codexForm = { ...codexForm, reasoningEffort: "high" };
-  });
-  $effect(() => {
-    if (codexForm.serviceTier !== "fast") return;
-    if (supportsCodexFastMode(codexForm.model)) return;
-    codexForm = { ...codexForm, serviceTier: "standard" };
-  });
   function updateProviderSpecificSetting(key: string, value: unknown) {
     untrack(() => {
       const current = basicForm.provider_specific_settings ?? {};
@@ -2232,11 +2260,13 @@ import {
     return null;
   }
 
-  function getSandboxUnavailableMessage(backend: NativeExecutionBackend): string {
-    if (backend === "apple_container") {
-      return "Apple Container is not available. Apple-backed Bash runs will fail safely until Apple Container is installed and running.";
-    }
-    return "Docker Sandbox is not available. Docker-backed Bash runs will fail safely until Docker Sandbox is ready.";
+  // BL-83: the words follow the state (not installed, not answering, not a Mac); a stopped Apple
+  // Container is `available` and gets the "not started yet" note instead.
+  function getSandboxUnavailableMessage(
+    backend: NativeExecutionBackend,
+    status: NativeSandboxStatus | null,
+  ): string {
+    return sandboxUnavailableMessage(backend, status) ?? "";
   }
 
   function isAgentBrowserRuntimeInstalled(): boolean {
@@ -2451,10 +2481,20 @@ import {
       settings.webSearchProvider ?? settings.nativeWebSearchProvider,
     );
     if (!normalized) return NATIVE_WEB_SEARCH_PROVIDER_INHERIT;
-    if (!isWebSearchProviderAvailable(normalized)) {
-      return NATIVE_WEB_SEARCH_PROVIDER_INHERIT;
-    }
+    // BL-835: the saved choice, also when its key is not ready (the label says so). It used to
+    // show as "Use Global Default" and the form dropped it, so the next autosave erased it.
     return normalized;
+  }
+
+  /**
+   * BL-835: a saved Exa or Perplexity choice is unavailable only when the key status has
+   * loaded and names no ready key. While it loads, or when it could not be loaded (that failure
+   * shows beside the picker), the panel does not know, so it does not call the choice unavailable.
+   */
+  function isWebSearchProviderKeyMissing(provider: NativeWebSearchProvider): boolean {
+    if (provider === "duckduckgo-html") return false;
+    if (!hasLoadedWebSearchProviderAvailability || webSearchProviderAvailabilityError) return false;
+    return !isWebSearchProviderAvailable(provider);
   }
 
   function getNativeWebSearchProviderLabel(
@@ -2463,7 +2503,8 @@ import {
     if (value === NATIVE_WEB_SEARCH_PROVIDER_INHERIT) {
       return `Use Global Default (${NATIVE_WEB_SEARCH_PROVIDER_LABELS[getGlobalWebSearchProviderDefault()]})`;
     }
-    return NATIVE_WEB_SEARCH_PROVIDER_LABELS[value];
+    const label = NATIVE_WEB_SEARCH_PROVIDER_LABELS[value];
+    return isWebSearchProviderKeyMissing(value) ? `${label} (Missing API key)` : label;
   }
 
   function getNativeWebSearchExaTypeValue(
@@ -2724,16 +2765,6 @@ import {
     );
   }
 
-  function clearInvalidWebSearchProviderOverrideIfNeeded() {
-    const currentProvider = normalizeNativeWebSearchProvider(
-      getNativeToolsSettings().webSearchProvider ??
-        getNativeToolsSettings().nativeWebSearchProvider,
-    );
-    if (!currentProvider) return;
-    if (isWebSearchProviderAvailable(currentProvider)) return;
-    updateNativeToolSetting("webSearchProvider", null);
-  }
-
   function updateNativeToolSetting(
     key: string,
     value: unknown,
@@ -2812,6 +2843,7 @@ import {
   const n8nRuntimeUnavailable = $derived(n8nRuntimeStatusStore.isUnavailable());
 
   let isUploadingAgentAvatar = $state(false);
+  let agentAvatarUploadRequestId = 0;
   let agentAvatarError = $state<string | null>(null);
 
   let subagents = $state<SubagentRow[]>([]);
@@ -2903,26 +2935,9 @@ import {
     return null;
   });
 
-  interface SubagentForm {
-    displayName: string;
-    subagentType: StoredSubagentType;
-    specialty: "general" | "n8n-specialist" | "claude-code" | "artifact";
-    webhook_url: string;
-    include_global_prompt: boolean;
-    system_prompt: string;
-    primary_model_provider: string;
-    primary_model_name: string;
-    timeout_seconds: string;
-    avatar: string | null;
-    avatar_icon_ref: IconRef;
-    avatar_icon_fit: AvatarIconFit;
-    provider_specific_settings: Record<string, any> | null;
-  }
-
-  type LiveSubagentUpdate = Partial<Omit<SubagentRow, "subagentType" | "timeout_seconds">> & {
-    subagentType?: SubagentType;
-    timeout_seconds?: number | null;
-  };
+  // BL-844: the form and its save live in `$lib/utils/subagentSettingsSavePatch.ts`, so the
+  // rule that decides what a save sends is testable without the panel.
+  type SubagentForm = SubagentSaveForm;
 
   let subagentForm = $state<SubagentForm>({
     displayName: "",
@@ -2933,6 +2948,8 @@ import {
     system_prompt: "",
     primary_model_provider: "",
     primary_model_name: "",
+    primary_model_preset_id: "",
+    primary_model_connection: null,
     timeout_seconds: "",
     avatar: null,
     avatar_icon_ref: DEFAULT_AGENT_ICON_REF,
@@ -2960,13 +2977,66 @@ import {
   });
 
   let subagentPersistedSignature = $state<string | null>(null);
+  /**
+   * BL-844: the Subagent form as it was loaded or last saved. A save sends only the fields that
+   * differ from it (`buildSubagentSettingsSavePatch`), so a copy of the Subagent that another tab,
+   * window, or agent tool has since changed is never written back over that change. Not reactive,
+   * like `basicPersistedForm`: it is set and cleared beside `subagentPersistedSignature`.
+   */
+  let subagentPersistedForm: SubagentForm | null = null;
+  /**
+   * BL-914: the Subagent's Tool Grid values, Codex block and Claude block as they were loaded or last
+   * saved, the twins of the Primary Agent's `mcpPersistedValues`, `codexPersistedBlock` and
+   * `claudePersistedBlock`. The Subagent PUT writes those blocks key by key, so each section save
+   * sends only what differs from its copy (`diffMcpSection`, `diffAgentBlockWithGroups`), a dropped
+   * key as `null`. Plain variables, not `$state`: set at select and at the list-effect hydrate,
+   * moved after a successful save, cleared at both resets, left as they are by a failed save; an
+   * effect that reads one does not depend on it. A Codex or Claude block of `null` is a Subagent
+   * that has none yet (its first edit sends the whole block).
+   */
+  let subagentMcpPersistedValues: McpSectionValues | null = null;
+  let subagentCodexPersistedBlock: CodexAgentSettings | null = null;
+  let subagentClaudePersistedBlock: ClaudeAgentSettings | null = null;
+  /**
+   * BL-955: raised by each read that replaces the Subagent's section forms (a pick, the list
+   * effect's hydrate, the deferred read); each Subagent save carries the value from when its
+   * payload was built (`subagentLanding`). The Primary Agent's twin is `agentHydrationRequestId`.
+   */
+  let subagentReadGeneration = 0;
+  /** BL-955: the Subagent's twin of `agentReadDeferred` (`readSubagentAgainWhenAtRest`). */
+  let subagentReadDeferred = false;
+  /** BL-955: the Subagent's savers (the core one counts the autosave and the multiline editors). */
+  const subagentCoreSaves = createEntitySaverCount(readSubagentAgainWhenAtRest, () => untrack(syncSubagentSaveWaits));
+  const subagentMcpSaves = createEntitySaverCount(readSubagentAgainWhenAtRest, () => untrack(syncSubagentSaveWaits));
+  const subagentCliToolSaves = createEntitySaverCount(readSubagentAgainWhenAtRest, () => untrack(syncSubagentSaveWaits));
+  const subagentCodexSaves = createEntitySaverCount(readSubagentAgainWhenAtRest, () => untrack(syncSubagentSaveWaits));
+  const subagentClaudeSaves = createEntitySaverCount(readSubagentAgainWhenAtRest, () => untrack(syncSubagentSaveWaits));
   let subagentDetailLoading = $state(false);
+  let subagentReadDeferredUi = $state(false);
+  let subagentOwnedSaveInFlightUi = $state(false);
+  let subagentOwnedWritePendingUi = $state(false);
+  type SubagentCaptureSection = "core" | "codex" | "claude" | "mcp";
+  const subagentDeferredCaptures = new Map<string, Set<SubagentCaptureSection>>();
+  const subagentCaptureWake = $state({ core: 0, codex: 0, claude: 0, mcp: 0 });
+  let subagentSaveWaitExpiredUi = $state(false);
+  let subagentReadWaitError = $state<string | null>(null);
+  const subagentSettingsReadWaiting = $derived(subagentDetailLoading || subagentReadDeferredUi || subagentReadWaitError !== null || subagentSaveWaitExpiredUi || subagentOwnedSaveInFlightUi);
+  const subagentCaptureBlocked = $derived(subagentDetailLoading || subagentReadWaitError !== null || subagentOwnedWritePendingUi);
+  const SETTINGS_WAIT_MS = 30_000;
+  type SaveWait = { timer: ReturnType<typeof setTimeout> | null; expired: boolean };
+  const primarySaveWaits = new Map<string, SaveWait>();
+  const subagentSaveWaits = new Map<string, SaveWait>();
+  let primaryReadTimer: ReturnType<typeof setTimeout> | null = null;
+  let subagentReadTimer: ReturnType<typeof setTimeout> | null = null;
+  let subagentReadRequestId = 0;
+  let settingsPanelAlive = true;
   let subagentEditSaveState = $state<SaveState>("idle");
   let subagentEditSaveError = $state<string | null>(null);
   let subagentEditLastSaved = $state<Date | null>(null);
   let subagentSaveScope = $state<SubagentSaveScope>("core");
   let subagentValidationError = $state<string | null>(null);
   let subagentAvatarUploading = $state(false);
+  let subagentAvatarUploadRequestId = 0;
   let subagentAvatarError = $state<string | null>(null);
   let lastInvalidSubagentSignature = $state<string | null>(null);
   let subagentPromptEditorOpen = $state(false);
@@ -3177,25 +3247,45 @@ import {
   }
 
   async function handleDeletePrimaryAgent() {
-    if (!selectedAgentId) return;
-    const current = agents.find((agent) => agent.id === selectedAgentId);
+    if (!selectedAgentId || primaryCaptureBlocked) return;
+    const targetId = selectedAgentId;
+    const current = agents.find((agent) => agent.id === targetId);
     const label = current?.displayName?.trim() || "this Primary Agent";
 
     // 2026-09-19 (Josh): deleting an agent may take its own chats with it. The count comes
     // from the same selection the delete uses, so the number shown is the number that goes.
     // Group chats are never counted or deleted; the agent only leaves their rosters.
-    let chatCounts: { deletable: number; infinite: number; keptLocked: number } | null = null;
+    //
+    // BL-778: a failed count must never fall back to the plain no-checkbox dialog below --
+    // that dialog still deletes the agent, but with `deleteChats` left false, so the agent's
+    // chats were silently kept with nothing telling the user the checkbox was ever dropped.
+    // `resolveAgentDeleteChatCountOutcome` is the one place that decides "did this actually
+    // work"; a `failed` outcome refuses the delete outright here, visibly, instead of guessing.
+    let chatCounts: AgentChatCounts | null = null;
+    let chatCountFailed = false;
     try {
-      const countResponse = await fetch(`/api/agents/${selectedAgentId}/chats`);
-      if (countResponse.ok) {
-        chatCounts = await countResponse.json();
+      const countResponse = await fetch(`/api/agents/${targetId}/chats`);
+      const body = countResponse.ok ? await countResponse.json().catch(() => null) : null;
+      const outcome = resolveAgentDeleteChatCountOutcome(countResponse, body);
+      if (outcome.status === "ok") {
+        chatCounts = outcome.counts;
+      } else {
+        chatCountFailed = true;
       }
     } catch (error) {
       console.warn("Failed to count the agent's chats:", error);
+      chatCountFailed = true;
+    }
+
+    if (chatCountFailed) {
+      toast.error(
+        `Couldn't check ${label}'s chats, so nothing was deleted. Try again in a moment.`,
+      );
+      return;
     }
 
     const description = [
-      "This permanently removes the agent's settings, model defaults, tool assignments, memories, DMs sent to it, schedules, and wake-up webhooks.",
+      "This permanently removes the agent's settings, avatar pictures, model defaults, tool assignments, memories, DMs sent to it, schedules, and wake-up webhooks.",
       "Group chats are kept; the agent is only removed from their rosters.",
     ];
     const confirmLabel = "Delete Primary Agent";
@@ -3207,6 +3297,11 @@ import {
         chatCounts.infinite > 0
           ? `, including ${chatCounts.infinite === 1 ? "its Infinite Session" : `${chatCounts.infinite} Infinite Sessions`}`
           : "";
+      // BL-778 part 2: named the same way BL-388's folder-delete dialog names archived chats
+      // (`describeFolderDeleteWithChats`, folderDeleteDialog.ts) -- the sidebar hides archived
+      // chats, so the user may not remember they exist.
+      const archivedNote =
+        chatCounts.archived > 0 ? `, ${chatCounts.archived} of them archived` : "";
       const keptNote =
         chatCounts.keptLocked > 0
           ? `${chatCounts.keptLocked} locked ${chatCounts.keptLocked === 1 ? "chat is" : "chats are"} kept; unlock ${chatCounts.keptLocked === 1 ? "it" : "them"} first to delete ${chatCounts.keptLocked === 1 ? "it" : "them"} too.`
@@ -3215,7 +3310,7 @@ import {
         title: `Delete ${label}?`,
         description,
         checkbox: {
-          label: `Also delete its ${chatCounts.deletable} ${chatWord}${infiniteNote}`,
+          label: `Also delete its ${chatCounts.deletable} ${chatWord}${infiniteNote}${archivedNote}`,
           note: keptNote,
           checked: chatCounts.deletable > 0,
         },
@@ -3234,7 +3329,7 @@ import {
         tone: "destructive",
       });
     }
-    if (!confirmed) {
+    if (!confirmed || primaryCaptureBlocked || selectedEntity?.kind !== "agent" || selectedAgentId !== targetId) {
       return;
     }
 
@@ -3243,7 +3338,7 @@ import {
 
     try {
       const response = await fetch(
-        `/api/agents/${selectedAgentId}${deleteChats ? "?chats=1" : ""}`,
+        `/api/agents/${targetId}${deleteChats ? "?chats=1" : ""}`,
         {
           method: "DELETE",
         },
@@ -3257,6 +3352,7 @@ import {
       }
       const payload = (await response.json().catch(() => null)) as {
         chats?: { deleted: number; keptLocked: number } | null;
+        notice?: string;
       } | null;
       const deletedChats = payload?.chats?.deleted ?? 0;
 
@@ -3264,6 +3360,7 @@ import {
         deletedChats > 0
           ? `Primary Agent "${label}" deleted with ${deletedChats} ${deletedChats === 1 ? "chat" : "chats"}`
           : `Primary Agent "${label}" deleted`,
+        payload?.notice ? { description: payload.notice, duration: 12000 } : undefined,
       );
       untrack(() => {
         selectedEntity = null;
@@ -3305,17 +3402,17 @@ import {
   }
 
   async function handleDeleteSubagent() {
-    if (!selectedEditableSubagentId) return;
+    if (!selectedEditableSubagentId || subagentCaptureBlocked) return;
     const targetId = selectedEditableSubagentId;
     const label = subagentForm.displayName?.trim() || "this Subagent";
     const confirmed = await confirmDialog({
       title: `Delete ${label}?`,
       description:
-        "It will be unassigned from every Primary Agent and its settings will be removed. Chat history stays intact.",
+        "It will be unassigned from every Primary Agent, and its settings, avatar pictures, and managed CLI settings folder will be removed. Chat history stays intact.",
       confirmLabel: "Delete Subagent",
       tone: "destructive",
     });
-    if (!confirmed) {
+    if (!confirmed || subagentCaptureBlocked || selectedEntity?.kind !== "subagent" || selectedEditableSubagentId !== targetId) {
       return;
     }
 
@@ -3323,8 +3420,8 @@ import {
     subagentDeleteError = null;
 
     try {
-      await subagentStore.delete(targetId);
-      toast.success(`Subagent "${label}" deleted`);
+      const notice = await subagentStore.delete(targetId);
+      toast.success(`Subagent "${label}" deleted`, notice ? { description: notice, duration: 12000 } : undefined);
 
       untrack(() => {
         const nextIds = selectedSubagentIds.filter((id) => id !== targetId);
@@ -3452,6 +3549,7 @@ import {
       LIVE_SETTINGS_EVENTS.localAiSettingsUpdated,
       handleLocalAiSettingsUpdated,
     );
+    stopAgentSettingsEvents = onUserChannelEvent(handleAgentSettingsEvent);
     await Promise.all([
       loadAgents(),
       loadProjectsForDefaults(),
@@ -3489,6 +3587,15 @@ import {
   });
 
   onDestroy(() => {
+    settingsPanelAlive = false;
+    stopAgentSettingsEvents();
+    if (primaryReadTimer) clearTimeout(primaryReadTimer);
+    if (subagentReadTimer) clearTimeout(subagentReadTimer);
+    for (const wait of [...primarySaveWaits.values(), ...subagentSaveWaits.values()]) if (wait.timer) clearTimeout(wait.timer);
+    primarySaveWaits.clear();
+    subagentSaveWaits.clear();
+    primaryDeferredCaptures.clear();
+    subagentDeferredCaptures.clear();
     window.removeEventListener(
       LIVE_SETTINGS_EVENTS.localAiSettingsUpdated,
       handleLocalAiSettingsUpdated,
@@ -3584,6 +3691,8 @@ import {
             system_prompt: "",
             primary_model_provider: "",
             primary_model_name: "",
+            primary_model_preset_id: "",
+            primary_model_connection: null,
             timeout_seconds: "",
             avatar: null,
             avatar_icon_ref: DEFAULT_AGENT_ICON_REF,
@@ -3591,19 +3700,23 @@ import {
             provider_specific_settings: null,
           };
           subagentPersistedSignature = null;
+          subagentPersistedForm = null;
           subagentDefaultMCPGateways = [];
           subagentDefaultMCPToolSelections = [];
           subagentDefaultCliToolIds = [];
           subagentCliToolIdsExplicit = false;
           subagentDcmDisplaySettings = createDefaultDcmDisplaySettings();
           subagentMcpPersistedSignature = null;
+          subagentMcpPersistedValues = null;
           subagentCodexForm = createDefaultCodexForm();
           subagentCodexPersistedSignature = null;
+          subagentCodexPersistedBlock = null;
           subagentCodexSaveState = "idle";
           subagentCodexSaveError = null;
           subagentCodexLastSaved = null;
           subagentClaudeForm = createDefaultClaudeForm();
           subagentClaudePersistedSignature = null;
+          subagentClaudePersistedBlock = null;
           subagentClaudeSaveState = "idle";
           subagentClaudeSaveError = null;
           subagentClaudeLastSaved = null;
@@ -3635,6 +3748,8 @@ import {
           system_prompt: "",
           primary_model_provider: "",
           primary_model_name: "",
+          primary_model_preset_id: "",
+          primary_model_connection: null,
           timeout_seconds: "",
           avatar: null,
           avatar_icon_ref: DEFAULT_AGENT_ICON_REF,
@@ -3642,19 +3757,23 @@ import {
           provider_specific_settings: null,
         };
         subagentPersistedSignature = null;
+        subagentPersistedForm = null;
         subagentDefaultMCPGateways = [];
         subagentDefaultMCPToolSelections = [];
         subagentDefaultCliToolIds = [];
         subagentCliToolIdsExplicit = false;
         subagentDcmDisplaySettings = createDefaultDcmDisplaySettings();
         subagentMcpPersistedSignature = null;
+        subagentMcpPersistedValues = null;
         subagentCodexForm = createDefaultCodexForm();
         subagentCodexPersistedSignature = null;
+        subagentCodexPersistedBlock = null;
         subagentCodexSaveState = "idle";
         subagentCodexSaveError = null;
         subagentCodexLastSaved = null;
         subagentClaudeForm = createDefaultClaudeForm();
         subagentClaudePersistedSignature = null;
+        subagentClaudePersistedBlock = null;
         subagentClaudeSaveState = "idle";
         subagentClaudeSaveError = null;
         subagentClaudeLastSaved = null;
@@ -3681,20 +3800,21 @@ import {
       return;
     }
 
-      untrack(() => {
-        subagentForm = normaliseSubagentForm(current);
-        subagentPersistedSignature = signature;
-        subagentCodexForm = normaliseCodexForm(current, "subagent");
-        subagentCodexPersistedSignature = makeCodexSignature(subagentCodexForm, "subagent");
-        subagentCodexSaveState = "idle";
-        subagentCodexSaveError = null;
-        subagentCodexLastSaved = null;
-        subagentClaudeForm = normaliseClaudeForm(current, "subagent");
-        subagentClaudePersistedSignature = makeClaudeSignature(subagentClaudeForm);
-        subagentClaudeSaveState = "idle";
-        subagentClaudeSaveError = null;
-        subagentClaudeLastSaved = null;
-      });
+    // BL-844 review fix: the record replaces the form only when nothing in the form is unsaved.
+    // A save that lands puts the server's record into the store; a form with edits made while
+    // that save was in flight (or waiting for its autosave) is left as it is, and the autosave
+    // sends those edits against the saved baseline. Once the form equals the baseline again
+    // (the save settled, `subagentPersistedSignature` moved), this effect runs again and the
+    // record, another window's change included, is picked up.
+    if (
+      subagentPersistedSignature !== null &&
+      untrack(() => makeSubagentFormSignature(subagentForm)) !== subagentPersistedSignature
+    ) {
+      return;
+    }
+
+      // BL-915: the core, Codex and Claude sections (not the Tool Grid), each only while at rest.
+      untrack(() => readSubagentSections(current, false, false));
       syncSelectedModelFromSubagent();
     });
 
@@ -3776,13 +3896,223 @@ import {
     }
   }
 
+  function primarySavers() {
+    return [basicSaves, promptSaves, zipSaves, mcpSaves, cliToolSaves, codexSaves, claudeSaves, assignmentSaves];
+  }
+
+  function subagentSavers() {
+    return [subagentCoreSaves, subagentMcpSaves, subagentCliToolSaves, subagentCodexSaves, subagentClaudeSaves];
+  }
+
+  // BL-1028: ownership is a gate, never an ordinary autosave dependency. A real
+  // dirty-draft/read trigger may wait once for an owned write, without retaining a payload.
+  function deferPrimaryCapture(section: PrimaryCaptureSection) {
+    return untrack(() => {
+      if (!primaryCaptureBlocked) return false;
+      const id = selectedAgentId;
+      if (id && primaryOwnedWritesPending(id)) {
+        const sections = primaryDeferredCaptures.get(id) ?? new Set<PrimaryCaptureSection>();
+        sections.add(section);
+        primaryDeferredCaptures.set(id, sections);
+      }
+      return true;
+    });
+  }
+
+  function deferSubagentCapture(section: SubagentCaptureSection) {
+    return untrack(() => {
+      if (!subagentCaptureBlocked) return false;
+      const id = selectedEditableSubagentId;
+      if (id && subagentOwnedWritesPending(id)) {
+        const sections = subagentDeferredCaptures.get(id) ?? new Set<SubagentCaptureSection>();
+        sections.add(section);
+        subagentDeferredCaptures.set(id, sections);
+      }
+      return true;
+    });
+  }
+
+  function resumeDeferredCaptures() {
+    for (const [id, sections] of primaryDeferredCaptures) {
+      if (selectedEntity?.kind !== "agent" || selectedAgentId !== id) {
+        primaryDeferredCaptures.delete(id);
+      } else if (!primaryOwnedWritesPending(id)) {
+        // Remove before waking. The effect rechecks the latest form, baseline and read.
+        primaryDeferredCaptures.delete(id);
+        for (const section of sections) primaryCaptureWake[section] += 1;
+      }
+    }
+    for (const [id, sections] of subagentDeferredCaptures) {
+      if (selectedEntity?.kind !== "subagent" || selectedEditableSubagentId !== id) {
+        subagentDeferredCaptures.delete(id);
+      } else if (!subagentOwnedWritesPending(id)) {
+        subagentDeferredCaptures.delete(id);
+        for (const section of sections) subagentCaptureWake[section] += 1;
+      }
+    }
+  }
+
+  function syncSaveWaits(kind: "agent" | "subagent") {
+    if (!settingsPanelAlive) return;
+    const savers = kind === "agent" ? primarySavers() : subagentSavers();
+    const waits = kind === "agent" ? primarySaveWaits : subagentSaveWaits;
+    const running = new Set(savers.flatMap((saver) => saver.inFlightOwners()));
+    const pending = new Set(savers.flatMap((saver) => saver.pendingOwners()));
+    for (const id of running) {
+      if (waits.has(id)) continue;
+      const wait: SaveWait = { timer: null, expired: false };
+      wait.timer = setTimeout(() => {
+        if (!settingsPanelAlive || waits.get(id) !== wait || !savers.some((saver) => saver.inFlight(id))) return;
+        wait.timer = null;
+        wait.expired = true;
+        // Timeout publishes uncertainty; it never releases or cancels the actual save.
+        if (kind === "agent" && selectedEntity?.kind === "agent" && selectedAgentId === id) setAgentReadDeferred(true);
+        if (kind === "subagent" && selectedEntity?.kind === "subagent" && selectedEditableSubagentId === id) setSubagentReadDeferred(true);
+        untrack(() => syncSaveWaits(kind));
+      }, SETTINGS_WAIT_MS);
+      waits.set(id, wait);
+    }
+    for (const [id, wait] of waits) {
+      if (running.has(id)) continue;
+      if (wait.timer) clearTimeout(wait.timer);
+      wait.timer = null;
+      if (!wait.expired) waits.delete(id);
+    }
+    if (kind === "agent") {
+      primaryOwnedSaveInFlightUi = selectedAgentId !== null && running.has(selectedAgentId);
+      primaryOwnedWritePendingUi = selectedAgentId !== null && pending.has(selectedAgentId);
+      primarySaveWaitExpiredUi = selectedAgentId !== null && waits.get(selectedAgentId)?.expired === true;
+    } else {
+      subagentOwnedSaveInFlightUi = selectedEditableSubagentId !== null && running.has(selectedEditableSubagentId);
+      subagentOwnedWritePendingUi = selectedEditableSubagentId !== null && pending.has(selectedEditableSubagentId);
+      subagentSaveWaitExpiredUi = selectedEditableSubagentId !== null && waits.get(selectedEditableSubagentId)?.expired === true;
+    }
+  }
+
+  function syncPrimarySaveWaits() { syncSaveWaits("agent"); resumeDeferredCaptures(); }
+  function syncSubagentSaveWaits() { syncSaveWaits("subagent"); resumeDeferredCaptures(); }
+
+  async function retryPrimarySettingsRead() {
+    const id = selectedAgentId;
+    if (!id || selectedEntity?.kind !== "agent") return;
+    // A-1y: the user asked again, so a memory conflict may resend once more after this read.
+    memoryConflictResendUsed = false;
+    await hydrateAgent(id);
+  }
+
+  async function retrySubagentSettingsRead() {
+    const id = selectedEditableSubagentId;
+    if (!id || selectedEntity?.kind !== "subagent") return;
+    await hydrateSubagent(id);
+  }
+
+  async function hydrateSubagent(id: string) {
+    const requestId = ++subagentReadRequestId;
+    // A real server read supersedes saves built before its snapshot; list refreshes still do not.
+    subagentReadGeneration += 1;
+    subagentDetailLoading = true;
+    subagentReadWaitError = null;
+    if (subagentReadTimer) clearTimeout(subagentReadTimer);
+    subagentReadTimer = setTimeout(() => {
+      if (settingsPanelAlive && requestId === subagentReadRequestId && selectedEntity?.kind === "subagent" && selectedEditableSubagentId === id) {
+        subagentReadWaitError = "These settings did not load within 30 seconds. Retry reads the record.";
+      }
+    }, SETTINGS_WAIT_MS);
+    try {
+      const response = await fetch(`/api/subagents/${id}`, { cache: "no-store" });
+      if (!response.ok) throw new Error(await extractError(response, "Failed to load subagent settings"));
+      const payload = await response.json();
+      const record = payload?.subagent as SubagentRow | undefined;
+      if (!record || typeof record !== "object" || Array.isArray(record) || record.id !== id) throw new Error("Subagent settings response did not contain the requested record");
+      if (!settingsPanelAlive || requestId !== subagentReadRequestId || selectedEntity?.kind !== "subagent" || selectedEditableSubagentId !== id) return;
+      untrack(() => {
+        subagentStore.acceptServerRecord(record);
+        subagents = subagents.map((existing) => existing.id === id ? record : existing);
+        readSubagentSections(record, false, true);
+        syncSelectedModelFromSubagent();
+        subagentReadWaitError = null;
+        if (!subagentOwnedWritesPending(id)) {
+          subagentSaveWaits.delete(id);
+          syncSubagentSaveWaits();
+        }
+      });
+    } catch (error) {
+      if (settingsPanelAlive && requestId === subagentReadRequestId && selectedEntity?.kind === "subagent" && selectedEditableSubagentId === id) {
+        subagentReadWaitError = error instanceof Error ? error.message : "Failed to load subagent settings";
+      }
+    } finally {
+      if (requestId === subagentReadRequestId) {
+        if (subagentReadTimer) clearTimeout(subagentReadTimer);
+        subagentReadTimer = null;
+        subagentDetailLoading = false;
+      }
+    }
+  }
+
+  function setAgentReadDeferred(value: boolean) {
+    agentReadDeferred = value;
+    agentReadDeferredUi = value;
+  }
+
+  function setSubagentReadDeferred(value: boolean) {
+    subagentReadDeferred = value;
+    subagentReadDeferredUi = value;
+  }
+
+  function primaryOwnedWritesPending(id: string) {
+    return [basicSaves, promptSaves, zipSaves, mcpSaves, cliToolSaves, codexSaves,
+      claudeSaves, assignmentSaves].some((saver) => saver.busy(id));
+  }
+
+  function subagentOwnedWritesPending(id: string) {
+    return [subagentCoreSaves, subagentMcpSaves, subagentCliToolSaves,
+      subagentCodexSaves, subagentClaudeSaves].some((saver) => saver.busy(id));
+  }
+
+  function guardPrimaryChoice<T extends (...args: any[]) => any>(callback: T): T {
+    return ((...args: Parameters<T>) => {
+      if (primaryOwnedSaveInFlightUi) return;
+      return callback(...args);
+    }) as T;
+  }
+
+  function guardSubagentChoice<T extends (...args: any[]) => any>(callback: T): T {
+    return ((...args: Parameters<T>) => {
+      if (subagentOwnedSaveInFlightUi) return;
+      return callback(...args);
+    }) as T;
+  }
+
+  function patchContainsGroupedValues(body: Record<string, unknown>, scope: "agent" | "subagent") {
+    const groups = scope === "agent" ? AGENT_SAVE_FIELD_GROUPS : SUBAGENT_SAVE_FIELD_GROUPS;
+    const groupedKeys = new Set(groups.filter(group => group.length > 1).flat());
+    return Object.entries(body).some(([key, value]) =>
+      key === "tool_approval_mode" || groupedKeys.has(key) ||
+      (value !== null && typeof value === "object"));
+  }
+
+  function requirePrimaryCaptureReady() {
+    if (primaryCaptureBlocked) throw new Error("Agent settings are waiting for a read. Retry when the read finishes.");
+  }
+
+  function requireSubagentCaptureReady() {
+    if (subagentCaptureBlocked) throw new Error("Subagent settings are waiting for a read. Retry when the read finishes.");
+  }
+
   async function hydrateAgent(agentId: string) {
     const requestId = ++agentHydrationRequestId;
+    syncPrimarySaveWaits();
+    primaryReadWaitError = null;
+    if (primaryReadTimer) clearTimeout(primaryReadTimer);
+    primaryReadTimer = setTimeout(() => {
+      if (settingsPanelAlive && requestId === agentHydrationRequestId && selectedEntity?.kind === "agent" && selectedAgentId === agentId) {
+        primaryReadWaitError = "These settings did not load within 30 seconds. Retry reads the record.";
+      }
+    }, SETTINGS_WAIT_MS);
+    // BL-912: this read shows what the record holds now; a section it leaves alone asks again.
+    setAgentReadDeferred(false);
     detailLoading = true;
     hydrationInProgress = true;
-    basicSaveError = null;
-    zipSaveError = null;
-    assignmentSaveError = null;
     subagentEditSaveError = null;
 
     try {
@@ -3796,9 +4126,10 @@ import {
       }
 
       const agent = (await response.json()) as AgentRow;
+      if (!agent || typeof agent !== "object" || Array.isArray(agent) || agent.id !== agentId) throw new Error("Agent settings response did not contain the requested record");
 
       const currentSubagents = await fetchAgentSubagents(agentId);
-      if (requestId !== agentHydrationRequestId || selectedAgentId !== agentId) {
+      if (!settingsPanelAlive || requestId !== agentHydrationRequestId || selectedAgentId !== agentId || selectedEntity?.kind !== "agent" || selectedEntity.id !== agentId) {
         return;
       }
 
@@ -3808,60 +4139,126 @@ import {
         );
         agentStore.updateAgent(agent.id, mapToStoreAgent(agent));
 
-        basicForm = normaliseBasicForm(agent);
-        basicPersistedSignature = makeBasicSignature(basicForm);
-        lastInvalidAgentSignature = null;
-        syncSelectedModelFromAgent();
+        // BL-912, BL-942: a read of another agent (a first open, a pick, a delete fallback, the
+        // prop naming another agent) fills every section. A read of the agent the forms already
+        // hold replaces a section only while it is at rest: its form equals its baseline and no
+        // save of it is queued or on its way. A section that is not at rest keeps what it shows
+        // (an edit, typed text, a failed save and its error line), and the panel reads again
+        // when it comes to rest.
+        const fill = hydratedAgentId !== agentId;
+        const atRest = agentSectionsAtRest();
+        const replaces = (section: keyof typeof atRest) => {
+          if (fill || atRest[section]) return true;
+          setAgentReadDeferred(true);
+          return false;
+        };
+        hydratedAgentId = agentId;
+        // A return can read this entity before its own earlier save has written.
+        if (primaryOwnedWritesPending(agentId)) setAgentReadDeferred(true);
 
-        promptValue = agent.system_prompt ?? "";
-        promptPersistedSignature = promptValue;
+        // A-1y: whether a refused memory save's recovery could not be done, so Retry is shown.
+        let memoryConflictNeedsRetry = false;
+        const conflict = memoryConflictBase?.agentId === agentId ? memoryConflictBase : null;
+        memoryConflictBase = null;
+        if (replaces("basic")) {
+          basicForm = normaliseBasicForm(agent);
+          basicPersistedSignature = makeBasicSignature(basicForm);
+          basicPersistedForm = $state.snapshot(basicForm) as BasicForm;
+          lastInvalidAgentSignature = null;
+          basicSaveError = null;
+          syncSelectedModelFromAgent();
+        } else if (basicPersistedForm && !basicSaves.busy(agentId)) {
+          memoryConflictNeedsRetry = rebaseBusyBasicSection(agent, conflict?.base ?? null);
+        } else if (conflict) {
+          // A save of the section is queued or on its way: it carries its own baseline and meets the
+          // same check, so this read leaves the section to it and keeps the refused save's baseline.
+          memoryConflictBase = conflict;
+        }
 
-        zipForm = normaliseZipForm(agent);
-        zipPersistedSignature = makeZipSignature(zipForm);
-        syncCustomToolOverridesFromGlobal();
+        if (replaces("prompt")) {
+          promptValue = agent.system_prompt ?? "";
+          promptPersistedSignature = promptValue;
+        }
 
-        const mcpDefaults = normaliseMcpDefaults(agent);
-        defaultMCPGateways = mcpDefaults.gateways;
-        defaultMCPToolSelections = mcpDefaults.selections;
-        defaultCliToolIds = normaliseCliToolDefaults(agent);
-        cliToolIdsExplicit =
-          Array.isArray(agent.defaultTools) ||
-          Array.isArray((agent as any).default_tools);
-        dcmDisplaySettings = mcpDefaults.dcmDisplaySettings;
-        mcpPersistedSignature = makeMcpSignature(
-          mcpDefaults.gateways,
-          mcpDefaults.selections,
-          mcpDefaults.dcmDisplaySettings,
-        );
-        mcpRenderNonce = mcpRenderNonce + 1;
+        if (replaces("zip")) {
+          zipForm = normaliseZipForm(agent);
+          zipPersistedSignature = makeZipSignature(zipForm);
+          syncCustomToolOverridesFromGlobal();
+          // After the sync: it adds the global tools as empty rows and may reorder them, which the
+          // save does not see, so opening compares equal and saves nothing.
+          zipPersistedPayload = zipPayloadForSave(buildZipPayload(zipForm));
+          zipSaveError = null;
+        }
 
-        codexForm = normaliseCodexForm(agent, "agent");
-        codexPersistedSignature = makeCodexSignature(codexForm, "agent");
-        codexSaveState = "idle";
-        codexSaveError = null;
-        codexLastSaved = null;
+        if (replaces("toolGrid")) {
+          const mcpDefaults = normaliseMcpDefaults(agent);
+          defaultMCPGateways = mcpDefaults.gateways;
+          defaultMCPToolSelections = mcpDefaults.selections;
+          defaultCliToolIds = normaliseCliToolDefaults(agent);
+          cliToolIdsExplicit =
+            Array.isArray(agent.defaultTools) ||
+            Array.isArray((agent as any).default_tools);
+          dcmDisplaySettings = mcpDefaults.dcmDisplaySettings;
+          mcpPersistedSignature = makeMcpSignature(
+            mcpDefaults.gateways,
+            mcpDefaults.selections,
+            mcpDefaults.dcmDisplaySettings,
+          );
+          // An agent that holds its display settings only under the older name has no
+          // `dcmDisplaySettings` yet: its first save writes the whole block, so the older name's
+          // entries are not dropped (the chat bar's Tools menu does the same).
+          mcpPersistedValues = {
+            gateways: [...mcpDefaults.gateways],
+            selections: cloneToolSelections(mcpDefaults.selections),
+            dcm:
+              agent.dcmDisplaySettings == null && (agent as any).dcm_display_settings != null
+                ? null
+                : cloneDcmDisplaySettings(mcpDefaults.dcmDisplaySettings),
+          };
+          mcpRenderNonce = mcpRenderNonce + 1;
+        }
 
-        claudeForm = normaliseClaudeForm(agent, "agent");
-        claudePersistedSignature = makeClaudeSignature(claudeForm);
-        claudeSaveState = "idle";
-        claudeSaveError = null;
-        claudeLastSaved = null;
+        if (replaces("codex")) {
+          codexForm = normaliseCodexForm(agent, "agent");
+          codexPersistedSignature = makeCodexSignature(codexForm, "agent");
+          codexPersistedBlock =
+            agent.codex_settings == null ? null : serializeCodexForm(codexForm, "agent");
+          codexSaveState = "idle";
+          codexSaveError = null;
+          codexLastSaved = null;
+        }
 
-        selectedSubagentIds = [...currentSubagents];
-        assignmentPersistedSignature = makeSubagentSignature(currentSubagents);
+        if (replaces("claude")) {
+          claudeForm = normaliseClaudeForm(agent, "agent");
+          claudePersistedSignature = makeClaudeSignature(claudeForm);
+          claudePersistedBlock =
+            agent.claude_settings == null ? null : serializeClaudeForm(claudeForm);
+          claudeSaveState = "idle";
+          claudeSaveError = null;
+          claudeLastSaved = null;
+        }
+
+        if (replaces("assignment")) {
+          selectedSubagentIds = [...currentSubagents];
+          assignmentPersistedSignature = makeSubagentSignature(currentSubagents);
+          assignmentSaveError = null;
+        }
         lastInvalidSubagentSignature = null;
+        primaryReadWaitError = memoryConflictNeedsRetry ? MEMORY_CONFLICT_RETRY_MESSAGE : null;
+        if (!primaryOwnedWritesPending(agentId)) {
+          primarySaveWaits.delete(agentId);
+          syncPrimarySaveWaits();
+        }
       });
-
-      if (hasLoadedWebSearchProviderAvailability) {
-        clearInvalidWebSearchProviderOverrideIfNeeded();
-      }
     } catch (error) {
       console.error("Failed to hydrate agent:", error);
-      if (requestId !== agentHydrationRequestId || selectedAgentId !== agentId) {
+      if (!settingsPanelAlive || requestId !== agentHydrationRequestId || selectedAgentId !== agentId || selectedEntity?.kind !== "agent" || selectedEntity.id !== agentId) {
         return;
       }
       untrack(() => {
-        resetAgentDetailState();
+        // A failed same-entity Retry keeps every typed draft; a first load has no own draft.
+        if (hydratedAgentId !== agentId) resetAgentDetailState();
+        primaryReadWaitError = error instanceof Error ? error.message : "Failed to load agent details";
       });
       toast.error(
         error instanceof Error ? error.message : "Failed to load agent details",
@@ -3870,6 +4267,8 @@ import {
       if (requestId !== agentHydrationRequestId) {
         return;
       }
+      if (primaryReadTimer) clearTimeout(primaryReadTimer);
+      primaryReadTimer = null;
       untrack(() => {
         hydrationInProgress = false;
         detailLoading = false;
@@ -3899,7 +4298,6 @@ import {
         perplexity: keys?.perplexity?.status === "ready",
       };
       availableWebSearchProviders = availability;
-      clearInvalidWebSearchProviderOverrideIfNeeded();
     } catch (error) {
       console.error("Failed to load web search provider availability:", error);
       webSearchProviderAvailabilityError =
@@ -4196,9 +4594,17 @@ import {
     }
   }
 
+  // The connection status is asked again only when the Primary Agent's TYPE changes: read through a
+  // `$derived`, so a rewrite of the whole form that keeps the type is not a trigger, and the load
+  // runs untracked, since it reads and writes the states its own fetch flips (a tracked call re-ran
+  // on a failed answer, forever: BL-977). A failed load shows its error and does not retry by
+  // itself; `handleLocalAiSettingsUpdated` and `refreshModelPickerData` reload with `force`.
+  const primaryTypeForConnectionOptions = $derived(basicForm.agentType);
   $effect(() => {
-    if (!isManagedPrimaryAgentType(basicForm.agentType)) return;
-    void loadModelConnectionOptionsForPanel();
+    if (!isManagedPrimaryAgentType(primaryTypeForConnectionOptions)) return;
+    untrack(() => {
+      void loadModelConnectionOptionsForPanel();
+    });
   });
 
   function handleLocalAiSettingsUpdated() {
@@ -4239,27 +4645,38 @@ import {
         }) ?? null;
     }
 
-    if (match) {
-      const availability = getModelPresetAvailability({
-        model: match,
+    selectedModelId = match && agentPresetShowsAsSelected(match) ? match.id : null;
+  }
+
+  /**
+   * Whether Agent Settings shows the agent's saved preset as its selection. A preset it cannot
+   * select (not a chat model, the wrong agent type) shows no selection, but the form keeps the
+   * saved model: opening Settings, or a preset list or connection change, never changes or saves
+   * it (hydration never saves, BL-514); only the user's pick does. A preset that is only
+   * unavailable for now stays selected with its reason shown (BL-517).
+   */
+  function agentPresetShowsAsSelected(model: SavedModel): boolean {
+    return presetAvailabilityKeepsSelection(
+      getModelPresetAvailability({
+        model,
         agentType: basicForm.agentType,
         connectionOptions: modelConnectionOptions,
-      });
-      if (
-        availability.disabled &&
-        availability.disabledBecause !== "locked"
-      ) {
-        clearAgentModelSelection();
-        return;
-      }
-    }
+      }),
+    );
+  }
 
-    selectedModelId = match ? match.id : null;
+  /**
+   * BL-514: the form's copy of `provider_specific_settings` after a model pick or clear, the way
+   * the agent PUT stores it: the preset's model keys replace the old model keys, and the agent's
+   * own keys (the Work mode, the Bash never-allow list, `codex_*`, ...) stay.
+   */
+  function withAgentModelKeys(modelKeys: Record<string, any> | null): Record<string, any> | null {
+    const next = applyAgentProviderSettingsUpdate(basicForm.provider_specific_settings, modelKeys);
+    return next && Object.keys(next).length > 0 ? next : null;
   }
 
   function applySavedModelToBasicForm(model: SavedModel) {
     const settings = model.settings ?? {};
-    const hasSettings = settings && Object.keys(settings).length > 0;
 
     basicForm = {
       ...basicForm,
@@ -4267,7 +4684,7 @@ import {
       primary_model_connection: resolveSavedModelConnection(model),
       primary_model_provider: model.provider,
       primary_model_name: model.effectiveModelId ?? model.modelId,
-      provider_specific_settings: hasSettings ? settings : null,
+      provider_specific_settings: withAgentModelKeys(presetModelSettings(settings)),
       primary_model_temperature:
         typeof settings.temperature === "number" ? settings.temperature : null,
       primary_model_max_tokens:
@@ -4408,7 +4825,7 @@ import {
       primary_model_connection: null,
       primary_model_provider: "",
       primary_model_name: "",
-      provider_specific_settings: null,
+      provider_specific_settings: withAgentModelKeys(null),
       primary_model_temperature: null,
       primary_model_max_tokens: null,
       primary_model_top_p: null,
@@ -4428,31 +4845,32 @@ import {
       return;
     }
 
-    const match = savedModels.find(
-      (model) =>
-        model.provider === subagentForm.primary_model_provider &&
-        (model.modelId === subagentForm.primary_model_name ||
-          model.effectiveModelId === subagentForm.primary_model_name),
-    );
+    const match = findSubagentFormModel(subagentForm);
+    selectedSubagentModelId = match && subagentPresetShowsAsSelected(match) ? match.id : null;
+  }
 
-    if (match) {
-      const availability = getModelPresetAvailability({
-        model: match,
+  /**
+   * BL-834, the Subagent twin of `agentPresetShowsAsSelected`: whether the picker shows the
+   * Subagent's saved preset as its selection. A preset it cannot select (not a chat model, the
+   * wrong Subagent type) shows no selection, but the form keeps the saved model: opening
+   * Settings, or a preset list change, never changes or saves it (hydration never saves); only
+   * the user's pick or clear does. A preset that is only unavailable for now stays selected with
+   * its reason shown (BL-517).
+   */
+  function subagentPresetShowsAsSelected(model: SavedModel): boolean {
+    return presetAvailabilityKeepsSelection(
+      getModelPresetAvailability({
+        model,
         agentType: getSubagentToolHostScope(subagentForm.subagentType),
         connectionOptions: null,
-      });
-      if (availability.disabled) {
-        clearSubagentModelSelection();
-        return;
-      }
-    }
-
-    selectedSubagentModelId = match ? match.id : null;
+      }),
+    );
   }
 
   function handleSubagentModelChange(
     value: string | string[] | null | undefined,
   ) {
+    if (subagentOwnedSaveInFlightUi) return;
     const nextValue = Array.isArray(value) ? value[0] : value;
     if (!nextValue) {
       clearSubagentModelSelection();
@@ -4480,11 +4898,14 @@ import {
       ...subagentForm,
       primary_model_provider: model.provider,
       primary_model_name: model.effectiveModelId ?? model.modelId,
+      primary_model_preset_id: model.id,
+      primary_model_connection: resolveSavedModelConnection(model),
     };
     seedCliSubagentFormsFromSavedModel(model);
   }
 
   function handleAgentModelChange(value: string | string[] | null | undefined) {
+    if (primaryOwnedSaveInFlightUi) return;
     const nextValue = Array.isArray(value) ? value[0] : value;
     if (!nextValue) {
       clearAgentModelSelection();
@@ -4517,10 +4938,87 @@ import {
       ...subagentForm,
       primary_model_provider: "",
       primary_model_name: "",
+      primary_model_preset_id: "",
+      primary_model_connection: null,
     };
   }
 
+  /**
+   * BL-266: the saved model a Subagent's form points at. The preset it saved wins; without one,
+   * an API Subagent shows no selection (its model was saved before Batshit kept the connection,
+   * and it will not run until the model is picked again, which saves the preset), while the
+   * other types still match by provider and model name, the way they always have.
+   */
+  function findSubagentFormModel(form: SubagentForm): SavedModel | null {
+    if (form.primary_model_preset_id) {
+      return savedModels.find((model) => model.id === form.primary_model_preset_id) ?? null;
+    }
+    if (form.subagentType === "api") return null;
+    return (
+      savedModels.find(
+        (model) =>
+          model.provider === form.primary_model_provider &&
+          (model.modelId === form.primary_model_name ||
+            model.effectiveModelId === form.primary_model_name),
+      ) ?? null
+    );
+  }
+
+  let avatarAppActionBusy = $state(false);
+
+  export function suppliedAvatarAvailability(args: ImportArgs['avatar.import_file']): string {
+    if (!settingsPanelAlive) return 'unsupported_document';
+    if (avatarAppActionBusy) return 'owner_busy';
+    if (args.entityType === 'agent') {
+      if (selectedEntity?.kind !== 'agent' || selectedAgentId !== args.entityId) return 'unsupported_target';
+      if (primarySettingsReadWaiting || !basicPersistedForm) return 'settings_unconfirmed';
+      if (primaryOwnedSaveInFlightUi || isUploadingAgentAvatar) return 'owner_busy';
+      if (!Object.values(agentSectionsAtRest()).every(Boolean)) return 'unsaved_changes';
+    } else if (args.entityType === 'subagent') {
+      if (selectedEntity?.kind !== 'subagent' || selectedEditableSubagentId !== args.entityId) return 'unsupported_target';
+      if (subagentSettingsReadWaiting || !subagentPersistedForm) return 'settings_unconfirmed';
+      if (subagentOwnedSaveInFlightUi || subagentAvatarUploading) return 'owner_busy';
+      if (!Object.values(subagentSectionsAtRest()).every(Boolean)) return 'unsaved_changes';
+    } else return 'unsupported_target';
+    return 'available';
+  }
+
+  export async function importAppActionAvatar(
+    args: ImportArgs['avatar.import_file'], files: File[], context: ActionContext
+  ): Promise<ImportOutcome> {
+    const available = suppliedAvatarAvailability(args);
+    if (available !== 'available') refuse(available);
+    const primary = args.entityType === 'agent';
+    const generation = primary ? agentHydrationRequestId : subagentReadGeneration;
+    const initialSignature = primary ? makeBasicSignature(basicForm) : makeSubagentFormSignature(subagentForm);
+    const check = () => {
+      if (!settingsPanelAlive || selectedEntity?.kind !== args.entityType || selectedEntity.id !== args.entityId ||
+        (primary ? agentHydrationRequestId : subagentReadGeneration) !== generation) refuse('target_changed');
+    };
+    avatarAppActionBusy = true;
+    if (primary) isUploadingAgentAvatar = true; else subagentAvatarUploading = true;
+    try {
+      return await performAvatarImport(files[0], args, {
+        check,
+        stage: url => {
+          const signature = primary ? makeBasicSignature(basicForm) : makeSubagentFormSignature(subagentForm);
+          if (signature !== initialSignature || (primary ? primaryOwnedSaveInFlightUi : subagentOwnedSaveInFlightUi)) refuse('unsaved_changes');
+          if (primary) { basicForm = { ...basicForm, avatar_url: url }; basicSaveError = null; isUploadingAgentAvatar = false; }
+          else { subagentForm = { ...subagentForm, avatar: url }; subagentEditSaveError = null; subagentAvatarUploading = false; }
+        },
+        savedAvatar: () => primary ? basicPersistedForm?.avatar_url ?? null : subagentPersistedForm?.avatar ?? null,
+        saveError: () => primary ? basicSaveError : subagentEditSaveError
+      }, context);
+    } finally {
+      avatarAppActionBusy = false;
+      if (primary && selectedAgentId === args.entityId) isUploadingAgentAvatar = false;
+      if (!primary && selectedEditableSubagentId === args.entityId) subagentAvatarUploading = false;
+    }
+  }
+
   async function handleAgentAvatarUpload(event: Event) {
+    if (primaryOwnedSaveInFlightUi || avatarAppActionBusy) return;
+    const targetId = selectedAgentId;
     const input = event.currentTarget as HTMLInputElement | null;
     const file = input?.files?.[0];
     if (!file) return;
@@ -4537,41 +5035,24 @@ import {
       return;
     }
 
-    if (!selectedAgentId) {
+    if (!targetId) {
       agentAvatarError = "Select an agent before uploading an avatar";
       if (input) input.value = "";
       return;
     }
 
+    const uploadRequestId = ++agentAvatarUploadRequestId;
     isUploadingAgentAvatar = true;
     agentAvatarError = null;
 
     try {
-      const formData = new FormData();
-      formData.append("file", file);
-      formData.append("entityType", "agent");
-      formData.append("entityId", selectedAgentId);
-      if (basicForm.avatar_url) {
-        formData.append("oldAvatarUrl", basicForm.avatar_url);
-      }
+      const url = await uploadAvatarFile(file, { entityType: "agent", entityId: targetId });
 
-      const uploadResponse = await fetch("/api/uploads/avatar", {
-        method: "POST",
-        body: formData,
-      });
-
-      if (!uploadResponse.ok) {
-        const message = await extractError(
-          uploadResponse,
-          "Failed to upload avatar",
-        );
-        throw new Error(message);
-      }
-
-      const result = await uploadResponse.json();
-      const url = result?.url ?? "";
-      if (!url) {
-        throw new Error("Upload succeeded but no avatar URL was returned");
+      if (!settingsPanelAlive || uploadRequestId !== agentAvatarUploadRequestId || selectedEntity?.kind !== "agent" || selectedAgentId !== targetId || primaryOwnedSaveInFlightUi) {
+        // Keep the new file owned by its original entity. Its next successful avatar change or
+        // owner delete performs the normal cutoff-aware tidy; never sweep a newer pending upload.
+        if (settingsPanelAlive) toast.info("Avatar uploaded, but its settings changed while it was uploading. Choose the image again after the save finishes.");
+        return;
       }
 
       basicForm = {
@@ -4580,10 +5061,10 @@ import {
       };
     } catch (error) {
       console.error("Agent avatar upload failed:", error);
-      agentAvatarError =
+      if (settingsPanelAlive && uploadRequestId === agentAvatarUploadRequestId && selectedEntity?.kind === "agent" && selectedAgentId === targetId) agentAvatarError =
         error instanceof Error ? error.message : "Failed to upload avatar";
     } finally {
-      isUploadingAgentAvatar = false;
+      if (settingsPanelAlive && uploadRequestId === agentAvatarUploadRequestId && selectedAgentId === targetId) isUploadingAgentAvatar = false;
       if (input) input.value = "";
     }
   }
@@ -4596,6 +5077,7 @@ import {
   }
 
   function chooseAgentAvatarIcon(iconRef: IconRef) {
+    if (primaryOwnedSaveInFlightUi) return;
     basicForm = {
       ...basicForm,
       avatar_url: null,
@@ -4605,6 +5087,8 @@ import {
   }
 
   async function handleSubagentAvatarUpload(event: Event) {
+    if (subagentOwnedSaveInFlightUi || avatarAppActionBusy) return;
+    const targetId = selectedEditableSubagentId;
     const input = event.currentTarget as HTMLInputElement | null;
     const file = input?.files?.[0];
     if (!file) return;
@@ -4621,41 +5105,24 @@ import {
       return;
     }
 
-    if (!selectedEditableSubagentId) {
+    if (!targetId) {
       subagentAvatarError = "Select a subagent before uploading an avatar";
       if (input) input.value = "";
       return;
     }
 
+    const uploadRequestId = ++subagentAvatarUploadRequestId;
     subagentAvatarUploading = true;
     subagentAvatarError = null;
 
     try {
-      const formData = new FormData();
-      formData.append("file", file);
-      formData.append("entityType", "subagent");
-      formData.append("entityId", selectedEditableSubagentId);
-      if (subagentForm.avatar) {
-        formData.append("oldAvatarUrl", subagentForm.avatar);
-      }
+      const url = await uploadAvatarFile(file, { entityType: "subagent", entityId: targetId });
 
-      const uploadResponse = await fetch("/api/uploads/avatar", {
-        method: "POST",
-        body: formData,
-      });
-
-      if (!uploadResponse.ok) {
-        const message = await extractError(
-          uploadResponse,
-          "Failed to upload avatar",
-        );
-        throw new Error(message);
-      }
-
-      const result = await uploadResponse.json();
-      const url = result?.url ?? "";
-      if (!url) {
-        throw new Error("Upload succeeded but no avatar URL was returned");
+      if (!settingsPanelAlive || uploadRequestId !== subagentAvatarUploadRequestId || selectedEntity?.kind !== "subagent" || selectedEditableSubagentId !== targetId || subagentOwnedSaveInFlightUi) {
+        // Keep the new file owned by its original entity. Its next successful avatar change or
+        // owner delete performs the normal cutoff-aware tidy; never sweep a newer pending upload.
+        if (settingsPanelAlive) toast.info("Avatar uploaded, but its settings changed while it was uploading. Choose the image again after the save finishes.");
+        return;
       }
 
       subagentForm = {
@@ -4664,10 +5131,10 @@ import {
       };
     } catch (error) {
       console.error("Subagent avatar upload failed:", error);
-      subagentAvatarError =
+      if (settingsPanelAlive && uploadRequestId === subagentAvatarUploadRequestId && selectedEntity?.kind === "subagent" && selectedEditableSubagentId === targetId) subagentAvatarError =
         error instanceof Error ? error.message : "Failed to upload avatar";
     } finally {
-      subagentAvatarUploading = false;
+      if (settingsPanelAlive && uploadRequestId === subagentAvatarUploadRequestId && selectedEditableSubagentId === targetId) subagentAvatarUploading = false;
       if (input) input.value = "";
     }
   }
@@ -4680,6 +5147,7 @@ import {
   }
 
   function chooseSubagentAvatarIcon(iconRef: IconRef) {
+    if (subagentOwnedSaveInFlightUi) return;
     subagentForm = {
       ...subagentForm,
       avatar: null,
@@ -4708,6 +5176,7 @@ import {
 
   function selectAgent(agentId: string) {
     if (createEntityMode) return;
+    if (selectedEntity?.kind !== "agent") { subagentAvatarUploadRequestId += 1; subagentAvatarUploading = false; }
     if (agentId === selectedAgentId) {
       untrack(() => {
         selectedEntity = { kind: "agent", id: agentId };
@@ -4876,7 +5345,6 @@ import {
 
   function createDefaultZipForm(includeGlobalTools = false): ZipForm {
     return {
-      zip_agent_control_enabled: ZIP_PERMISSION_INHERIT,
       zip_ai_view_mode: ZIP_LAYOUT_INHERIT,
       zip_tool_notes_enabled: ZIP_NOTES_INHERIT,
       buffer_size: "",
@@ -4919,8 +5387,14 @@ import {
   }
 
   function resetAgentDetailState() {
+    agentAvatarUploadRequestId += 1;
+    isUploadingAgentAvatar = false;
+    hydratedAgentId = null;
+    memoryConflictBase = null;
+    memoryConflictResendUsed = false;
     basicForm = createDefaultBasicForm();
     basicPersistedSignature = null;
+    basicPersistedForm = null;
     basicValidationError = null;
     basicSaveState = "idle";
     basicSaveError = null;
@@ -4934,6 +5408,7 @@ import {
     agentBrowserFlagsEditorOpen = false;
     zipForm = createDefaultZipForm(true);
     zipPersistedSignature = null;
+    zipPersistedPayload = null;
     zipValidationError = null;
     zipSaveState = "idle";
     zipSaveError = null;
@@ -4944,12 +5419,14 @@ import {
     cliToolIdsExplicit = false;
     dcmDisplaySettings = createDefaultDcmDisplaySettings();
     mcpPersistedSignature = null;
+    mcpPersistedValues = null;
     mcpSaveState = "idle";
     mcpSaveError = null;
     mcpLastSaved = null;
     mcpRenderNonce += 1;
     codexForm = createDefaultCodexForm();
     codexPersistedSignature = null;
+    codexPersistedBlock = null;
     codexSaveState = "idle";
     codexSaveError = null;
     codexLastSaved = null;
@@ -4958,6 +5435,7 @@ import {
     codexDisableDraft = "";
     claudeForm = createDefaultClaudeForm();
     claudePersistedSignature = null;
+    claudePersistedBlock = null;
     claudeSaveState = "idle";
     claudeSaveError = null;
     claudeLastSaved = null;
@@ -4975,18 +5453,6 @@ import {
   }
 
   function normaliseZipForm(agent: AgentRow): ZipForm {
-    const legacyPermission =
-      agent.zip_control_mode === "agent"
-        ? "enabled"
-        : agent.zip_control_mode === "user"
-          ? "disabled"
-          : ZIP_PERMISSION_INHERIT;
-    const permissionValue =
-      typeof agent.zip_agent_control_enabled === "boolean"
-        ? agent.zip_agent_control_enabled
-          ? "enabled"
-          : "disabled"
-        : legacyPermission;
     const layoutValue =
       agent.zip_ai_view_mode === "appended"
         ? "appended"
@@ -5000,7 +5466,6 @@ import {
           : "disabled"
         : ZIP_NOTES_INHERIT;
     return {
-      zip_agent_control_enabled: permissionValue,
       zip_ai_view_mode: layoutValue,
       zip_tool_notes_enabled: notesValue,
       buffer_size: toStringValue(agent.buffer_size),
@@ -5060,6 +5525,8 @@ import {
       system_prompt: subagent.system_prompt ?? "",
       primary_model_provider: subagent.primary_model_provider ?? "",
       primary_model_name: subagent.primary_model_name ?? "",
+      primary_model_preset_id: subagent.primary_model_preset_id ?? "",
+      primary_model_connection: subagent.primary_model_connection ?? null,
       timeout_seconds:
         typeof subagent.timeout_seconds === "number"
           ? String(subagent.timeout_seconds)
@@ -5071,18 +5538,255 @@ import {
     };
   }
 
+  /**
+   * BL-912: which Primary sections are at rest: the form equals what it last loaded or saved, and
+   * no save of the section is queued or on its way (its savers in `basicSaves` and the others). A
+   * section that has not loaded (a null persisted signature) is not at rest; the zip section is
+   * compared the way its own effect decides to save (`diffZipPayload`), because the global custom
+   * tool sync can reorder its signature without anything to send. The prompt and the CLI tools
+   * list have no form of their own to differ, so their savers decide. Plain reads, never in an
+   * effect.
+   */
+  function agentSectionsAtRest() {
+    const zipChanges = zipPersistedPayload
+      ? diffZipPayload(zipPersistedPayload, buildZipPayload(zipForm))
+      : null;
+    return {
+      basic:
+        basicPersistedSignature !== null &&
+        makeBasicSignature(basicForm) === basicPersistedSignature &&
+        !basicSaves.busy(selectedAgentId ?? ""),
+      prompt:
+        promptPersistedSignature !== null &&
+        promptValue === promptPersistedSignature &&
+        !promptSaves.busy(selectedAgentId ?? ""),
+      zip: zipChanges !== null && Object.keys(zipChanges).length === 0 && !zipSaves.busy(selectedAgentId ?? ""),
+      toolGrid:
+        mcpPersistedSignature !== null &&
+        makeMcpSignature(defaultMCPGateways, defaultMCPToolSelections, dcmDisplaySettings) ===
+          mcpPersistedSignature &&
+        !mcpSaves.busy(selectedAgentId ?? "") &&
+        !cliToolSaves.busy(selectedAgentId ?? ""),
+      codex:
+        codexPersistedSignature !== null &&
+        makeCodexSignature(codexForm, "agent") === codexPersistedSignature &&
+        !codexSaves.busy(selectedAgentId ?? ""),
+      claude:
+        claudePersistedSignature !== null &&
+        makeClaudeSignature(claudeForm) === claudePersistedSignature &&
+        !claudeSaves.busy(selectedAgentId ?? ""),
+      assignment:
+        assignmentPersistedSignature !== null &&
+        makeSubagentSignature(selectedSubagentIds) === assignmentPersistedSignature &&
+        !assignmentSaves.busy(selectedAgentId ?? ""),
+    };
+  }
+
+  let stopAgentSettingsEvents: () => void = () => {};
+  const listedAgentReads = new Map<string, number>();
+
+  /**
+   * SA-122 A-1y (BL-1294, LS-067/LS-068): a read of the shown agent while its basic section holds an
+   * edit with no save queued or on its way. The section keeps the edit (BL-942); only the fields the
+   * agent's own Settings save can change, the name and the memory settings (one saved group), take
+   * the record's values leaf by leaf (`rebaseAgentWritableFields`): an untouched leaf in the form and
+   * the baseline, an edited leaf in the baseline only, so the next save carries the edit on top of the
+   * record's values. `conflictBase` is the baseline of a refused memory save (Ashe's refinement e);
+   * without one, the form's baseline. Answers whether a refused save could not be recovered: the
+   * record reads the same as its baseline, so the two disagree on what is saved, and nothing is sent
+   * again (the loop guard: the caller shows Retry).
+   */
+  function rebaseBusyBasicSection(agent: AgentRow, conflictBase: BasicForm | null): boolean {
+    const current = $state.snapshot(basicPersistedForm) as BasicForm;
+    const result = rebaseAgentWritableFields(
+      $state.snapshot(basicForm) as BasicForm,
+      conflictBase ?? current,
+      normaliseBasicForm(agent),
+      current,
+    );
+    if (!result.baseChanged) return conflictBase !== null;
+    basicForm = result.draft;
+    basicPersistedForm = result.base;
+    basicPersistedSignature = makeBasicSignature(result.base);
+    lastInvalidAgentSignature = null;
+    const labels = agentWritableConflictLabels(result.conflicts);
+    if (labels.length > 0) {
+      toast.warning(`Your agent changed ${labels.join(", ")} while you were editing. Batshit kept your value.`);
+    }
+    return false;
+  }
+
+  /**
+   * SA-122 A-1y (LS-067/LS-068): the agent saved its own Settings (App Actions), heard on the user
+   * channel. No tab made that save, so this panel reads the agent again. The shown agent: the
+   * BL-912 read (now when the panel is at rest, else when it comes to rest; a busy basic section
+   * takes the agent's name and memory settings leaf by leaf in `hydrateAgent`). Another listed agent:
+   * its list entry. `reconnected`: an event may have been missed while the connection was down.
+   */
+  function handleAgentSettingsEvent(event: UserChannelEvent) {
+    if (!settingsPanelAlive) return;
+    // The selected agent, loaded or still loading: `readAgentAgainWhenAtRest` replaces a first read
+    // that is still on its way (its answer may predate the agent's save) and waits for rest otherwise.
+    const shownAgentId = selectedEntity?.kind === "agent" ? selectedAgentId : null;
+    const readShownAgent = () =>
+      untrack(() => {
+        setAgentReadDeferred(true);
+        readAgentAgainWhenAtRest();
+      });
+    if (event.type === "reconnected") {
+      if (shownAgentId !== null) readShownAgent();
+      return;
+    }
+    if (event.type !== "agent_settings_changed" || typeof event.agentId !== "string") return;
+    if (shownAgentId !== null && event.agentId === shownAgentId) readShownAgent();
+    else if (agents.some((agent) => agent.id === event.agentId)) void refreshListedAgent(event.agentId);
+  }
+
+  /** A-1y: a listed agent that is not shown, read again for its list entry (the picker's name). */
+  async function refreshListedAgent(agentId: string) {
+    const generation = (listedAgentReads.get(agentId) ?? 0) + 1;
+    listedAgentReads.set(agentId, generation);
+    try {
+      const response = await fetch(`/api/agents/${encodeURIComponent(agentId)}`, { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const agent = (await response.json()) as AgentRow;
+      if (!settingsPanelAlive || listedAgentReads.get(agentId) !== generation || agent?.id !== agentId) return;
+      untrack(() => {
+        agents = agents.map((existing) => (existing.id === agentId ? agent : existing));
+      });
+    } catch (error) {
+      console.warn(`[AgentSettingsPanel] Could not read agent ${agentId} again after it changed its own settings:`, error);
+    }
+  }
+
+  /**
+   * BL-912: the read that a landing, or a read that left a section alone, asked for. It runs when
+   * every section is at rest (a settled save calls this), for the agent shown then, and obeys the
+   * at-rest rule of `hydrateAgent` when it comes back. A read that fills every section and is still
+   * on its way is simply replaced by it. The read also wipes a failed Subagent save's error line,
+   * so it waits for that too.
+   */
+  function readAgentAgainWhenAtRest() {
+    if (!settingsPanelAlive) return;
+    const agentId = selectedAgentId;
+    if (!agentReadDeferred || !agentId || selectedEntity?.kind !== "agent" || selectedEntity.id !== agentId) return;
+    const filling = hydrationInProgress && hydratedAgentId !== agentId;
+    if (!filling) {
+      if (hydratedAgentId !== agentId || subagentEditSaveError !== null) return;
+      if (!Object.values(agentSectionsAtRest()).every(Boolean)) return;
+    }
+    void hydrateAgent(agentId);
+  }
+
+  /**
+   * BL-912: how a Primary save lands. "current": the panel shows the agent and no read replaced its
+   * forms since the payload was built (`hydrationGeneration` is `agentHydrationRequestId` then); the
+   * landing moves the baseline as it always did. "older": a read came between and may have put an
+   * older record into the form and the baseline, and a baseline moved under that form would make
+   * the section's effect send the older value back, so the landing moves nothing of the form, the
+   * baseline or the signature, puts its save state back to idle and asks for a read at rest.
+   * "other": another agent is shown; the landing touches nothing of it.
+   *
+   * A "current" landing while a read is still on its way (a prompt, multiline editor or CLI tools
+   * save is built while a read travels, so it carries the newer counter) also asks for a read: that
+   * read may have read the record before this save wrote it, and its answer would put the older
+   * record over the saved section. The new read starts after this write; when every section is at
+   * rest at the settle it supersedes the older one, otherwise the older answer can still cover the
+   * saved section until the next read (an open condition, listed in settings-panel.md).
+   */
+  type SaveLanding = "current" | "older" | "other";
+  function agentLanding(agentId: string, hydrationGeneration: number): SaveLanding {
+    if (selectedAgentId !== agentId) return "other";
+    if (hydrationGeneration === agentHydrationRequestId) {
+      if (hydrationInProgress) setAgentReadDeferred(true);
+      return "current";
+    }
+    setAgentReadDeferred(true);
+    return "older";
+  }
+
+  /**
+   * SA-122 A-1y (BL-1294): a save that names a memory setting says which saved values it started
+   * from: the baseline its body was worked out from, written the way the save writes them. The
+   * server refuses it (409 `memory_settings_changed`) when the saved ones changed meanwhile.
+   */
+  function basicRequestBody(body: Partial<BasicPayloadBody>, baseForm: BasicForm): Record<string, unknown> {
+    return AGENT_MEMORY_GROUP.some((field) => field in body)
+      ? { ...body, expectedMemory: buildAgentMemoryRecordFields(baseForm.memory_settings) }
+      : body;
+  }
+
+  class MemorySettingsChangedError extends Error {}
+
+  /**
+   * A-1y (BL-1294, Ashe's refinement b): the server refused this memory save. The first time for
+   * this edit, read the agent once the save has settled and rebase from the save's own baseline
+   * (`hydrateAgent`): the section's effect then sends the edit once more. A second refusal shows
+   * the existing Retry, which reads the record and keeps the edits; never a loop.
+   */
+  function recoverRefusedMemorySave(payload: { id: string; baseForm: BasicForm }) {
+    if (!settingsPanelAlive || selectedEntity?.kind !== "agent" || selectedAgentId !== payload.id) {
+      // The user left this agent (another one is shown, or Settings closed) before its queued save
+      // went out. Nothing was saved, and no form is left to rebase: say so, never silently.
+      const name = agents.find((agent) => agent.id === payload.id)?.displayName || "an agent";
+      toast.error(
+        `Your memory change to ${name} was not saved, because the agent changed its memory settings meanwhile. Open it in Settings and try again.`,
+      );
+      return;
+    }
+    memoryConflictBase = { agentId: payload.id, base: payload.baseForm };
+    basicSaveState = "idle";
+    if (memoryConflictResendUsed) {
+      primaryReadWaitError = MEMORY_CONFLICT_RETRY_MESSAGE;
+      return;
+    }
+    memoryConflictResendUsed = true;
+    // After this save has settled: the read rebases only a section with no save queued or on its way.
+    setTimeout(() => {
+      if (settingsPanelAlive && selectedEntity?.kind === "agent" && selectedAgentId === payload.id) {
+        void hydrateAgent(payload.id);
+      }
+    }, 0);
+  }
+
+  /**
+   * `savedForm` is the form snapshot a basic save (the autosave, the multiline editors) built its
+   * body from: when the save lands it becomes the new baseline (`basicPersistedForm`, BL-514) and
+   * the persisted signature follows it (BL-911, the way BL-844 does it for the Subagent form). The
+   * LIVE form is left alone: whatever was typed while the save was in flight is still in it, and
+   * the next autosave sends just that (the baseline is the saved snapshot). `applyToLive` is for a
+   * save whose change is not in the live form yet (the multiline editors change the form only when
+   * their save works): it is laid over the live form as the save lands. A failed save changes
+   * nothing: the baseline stays as it was, so the next edit sends this change again.
+   *
+   * `payload.hydrationGeneration` is `agentHydrationRequestId` when the body was built: a landing
+   * after a newer read touches neither the form nor the baseline and asks for a read at rest
+   * (`agentLanding`, BL-912). `payload.baseForm` is the baseline the body was worked out from
+   * (A-1y): a memory save carries it as `expectedMemory`, and a refused one rebases from it.
+   */
   async function persistBasic(
-    payload: { id: string; body: BasicPayloadBody },
-    nextForm: BasicForm = basicForm,
+    payload: { id: string; body: Partial<BasicPayloadBody>; hydrationGeneration: number; baseForm: BasicForm },
+    savedForm: BasicForm,
+    applyToLive?: (form: BasicForm) => BasicForm,
   ) {
+    const stored = agents.find((agent) => agent.id === payload.id);
+    const previousAvatar = stored?.avatar ?? stored?.avatar_url ?? null;
     try {
       const response = await fetch(`/api/agents/${payload.id}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload.body),
+        body: JSON.stringify(basicRequestBody(payload.body, payload.baseForm)),
       });
 
       if (!response.ok) {
+        if (response.status === 409) {
+          const answer = await response.clone().json().catch(() => null);
+          if (answer?.code === "memory_settings_changed") {
+            throw new MemorySettingsChangedError(
+              "This agent's memory settings changed while you were editing them, so nothing was saved. Batshit reads them again and keeps your edits.",
+            );
+          }
+        }
         const message = await extractError(
           response,
           "Failed to save agent settings",
@@ -5091,25 +5795,45 @@ import {
       }
 
       untrack(() => {
-        if (selectedAgentId === payload.id) {
-          basicForm = nextForm;
-          basicPersistedSignature = makeBasicSignature(nextForm);
+        const landing = agentLanding(payload.id, payload.hydrationGeneration);
+        if (landing === "current") {
+          memoryConflictResendUsed = false;
+          if (applyToLive) basicForm = applyToLive(basicForm);
+          basicPersistedSignature = makeBasicSignature(savedForm);
+          basicPersistedForm = $state.snapshot(savedForm) as BasicForm;
           lastInvalidAgentSignature = null;
           basicSaveState = "saved";
           basicSaveError = null;
           basicLastSaved = new Date();
+        } else if (landing === "older") {
+          basicSaveState = "idle";
         }
+        // BL-514: the body holds only what this save changed; a field it left out keeps its value.
         updateAgentCollections(payload.id, {
           ...payload.body,
-          displayName: payload.body.displayName,
-          webhookUrl: payload.body.webhookUrl,
-          model: payload.body.primary_model_name,
+          ...("primary_model_name" in payload.body
+            ? { model: payload.body.primary_model_name }
+            : {}),
         } as Partial<AgentRow>);
       });
+      // BL-142: the save changed the picture, so the pictures the agent no longer shows go.
+      if (
+        "avatar_url" in payload.body &&
+        shouldTidyAvatarPictures({
+          previous: previousAvatar,
+          saved: payload.body.avatar_url,
+          current: selectedAgentId === payload.id ? basicForm.avatar_url : payload.body.avatar_url,
+          uploading: selectedAgentId === payload.id && isUploadingAgentAvatar,
+        })
+      ) {
+        void requestAvatarPictureTidy("agent", payload.id, previousAvatar);
+      }
     } catch (error) {
       console.error("Failed to save agent settings:", error);
       untrack(() => {
-        if (selectedAgentId === payload.id) {
+        if (error instanceof MemorySettingsChangedError) {
+          recoverRefusedMemorySave(payload);
+        } else if (selectedAgentId === payload.id) {
           basicSaveState = "idle";
           basicSaveError =
             error instanceof Error ? error.message : "Failed to save agent";
@@ -5127,15 +5851,19 @@ import {
     }
   }
 
-  const saveBasic = debounce(
-    (payload: { id: string; body: BasicPayloadBody; nextForm: BasicForm }) => {
-      void persistBasic(payload, payload.nextForm);
-    },
+  const saveBasic = basicSaves.debounce(
+    (payload: {
+      id: string;
+      body: Partial<BasicPayloadBody>;
+      nextForm: BasicForm;
+      hydrationGeneration: number;
+      baseForm: BasicForm;
+    }) => persistBasic(payload, payload.nextForm),
     BASIC_SAVE_DEBOUNCE_MS,
   );
 
   async function persistPrompt(
-    payload: { id: string; system_prompt: string },
+    payload: { id: string; system_prompt: string; hydrationGeneration: number },
     nextPrompt: string = promptValue,
   ) {
     try {
@@ -5154,7 +5882,10 @@ import {
       }
 
       untrack(() => {
-        if (selectedAgentId === payload.id) {
+        // The prompt has no form of its own to differ from a baseline and no effect that saves it
+        // (only the editor's Save does), so nothing can send an older prompt back and an older
+        // landing moves it as it always did; only another agent's landing leaves it alone.
+        if (agentLanding(payload.id, payload.hydrationGeneration) !== "other") {
           promptValue = nextPrompt;
           promptPersistedSignature = nextPrompt;
         }
@@ -5170,8 +5901,15 @@ import {
     }
   }
 
-  const saveZipSettings = debounce(
-    async (payload: { id: string; body: ZipPayloadBody; signature: string }) => {
+  const saveZipSettings = zipSaves.debounce(
+    async (payload: {
+      id: string;
+      body: Partial<ZipPayloadBody>;
+      signature: string;
+      /** The whole payload the body was worked out from: the baseline once the save lands. */
+      full: ZipPayloadBody;
+      hydrationGeneration: number;
+    }) => {
       try {
         const response = await fetch(`/api/agents/${payload.id}`, {
           method: "PUT",
@@ -5188,11 +5926,15 @@ import {
         }
 
         untrack(() => {
-          if (selectedAgentId === payload.id) {
+          const landing = agentLanding(payload.id, payload.hydrationGeneration);
+          if (landing === "current") {
             zipPersistedSignature = payload.signature;
+            zipPersistedPayload = zipPayloadForSave(payload.full);
             zipSaveState = "saved";
             zipSaveError = null;
             zipLastSaved = new Date();
+          } else if (landing === "older") {
+            zipSaveState = "idle";
           }
           updateAgentCollections(
             payload.id,
@@ -5223,8 +5965,15 @@ import {
     ZIP_SAVE_DEBOUNCE_MS,
   );
 
-  const saveMcpSettings = debounce(
-    async (payload: { id: string; body: McpPayloadBody; signature: string }) => {
+  const saveMcpSettings = mcpSaves.debounce(
+    async (payload: {
+      id: string;
+      body: McpSectionSave;
+      signature: string;
+      /** The values the body was worked out from: the baseline once the save lands. */
+      values: McpSectionValues;
+      hydrationGeneration: number;
+    }) => {
       try {
         const response = await fetch(`/api/agents/${payload.id}`, {
           method: "PUT",
@@ -5241,17 +5990,18 @@ import {
         }
 
         untrack(() => {
-          if (selectedAgentId === payload.id) {
+          const landing = agentLanding(payload.id, payload.hydrationGeneration);
+          if (landing === "current") {
             mcpPersistedSignature = payload.signature;
+            mcpPersistedValues = payload.values;
             mcpSaveState = "saved";
             mcpSaveError = null;
             mcpLastSaved = new Date();
+          } else if (landing === "older") {
+            mcpSaveState = "idle";
           }
-          updateAgentCollections(payload.id, {
-            defaultMCPGateways: payload.body.defaultMCPGateways,
-            defaultMCPToolSelections: payload.body.defaultMCPToolSelections,
-            dcmDisplaySettings: payload.body.dcmDisplaySettings,
-          });
+          // BL-855: the body names only what changed; each copy takes it the way the server does.
+          updateAgentCollections(payload.id, payload.body);
         });
       } catch (error) {
         console.error("Failed to save default MCP settings:", error);
@@ -5277,8 +6027,12 @@ import {
     MCP_SAVE_DEBOUNCE_MS,
   );
 
-  const saveCliToolSettings = debounce(
-    async (payload: { id: string; body: { defaultTools: string[] | null } }) => {
+  const saveCliToolSettings = cliToolSaves.debounce(
+    async (payload: {
+      id: string;
+      body: { defaultTools: string[] | null };
+      hydrationGeneration: number;
+    }) => {
       try {
         const response = await fetch(`/api/agents/${payload.id}`, {
           method: "PUT",
@@ -5295,10 +6049,13 @@ import {
         }
 
         untrack(() => {
-          if (selectedAgentId === payload.id) {
+          const landing = agentLanding(payload.id, payload.hydrationGeneration);
+          if (landing === "current") {
             mcpSaveState = "saved";
             mcpSaveError = null;
             mcpLastSaved = new Date();
+          } else if (landing === "older") {
+            mcpSaveState = "idle";
           }
           updateAgentCollections(payload.id, {
             defaultTools: payload.body.defaultTools ?? undefined,
@@ -5335,16 +6092,28 @@ import {
     MCP_SAVE_DEBOUNCE_MS,
   );
 
-  const saveSubagentMcpSettings = debounce(
-    async (payload: { id: string; body: McpPayloadBody }) => {
+  const saveSubagentMcpSettings = subagentMcpSaves.debounce(
+    async (payload: {
+      id: string;
+      body: McpSectionSave;
+      signature: string;
+      /** The values the body was worked out from: the baseline once the save lands. */
+      values: McpSectionValues;
+      readGeneration: number;
+    }) => {
       try {
-        await persistSubagentDetails(payload);
+        const landing = await persistSubagentDetails({
+          id: payload.id,
+          body: payload.body,
+          readGeneration: payload.readGeneration,
+        });
         untrack(() => {
-          subagentMcpPersistedSignature = makeMcpSignature(
-            payload.body.defaultMCPGateways,
-            payload.body.defaultMCPToolSelections,
-            payload.body.dcmDisplaySettings,
-          );
+          // Only the Subagent the panel still shows, and only when no read came between: a save
+          // that lands after another Subagent was picked, or after a newer read, moves nothing.
+          if (landing === "current") {
+            subagentMcpPersistedSignature = payload.signature;
+            subagentMcpPersistedValues = payload.values;
+          }
         });
       } catch (error) {
         console.error("Failed to save subagent MCP settings:", error);
@@ -5353,8 +6122,12 @@ import {
     MCP_SAVE_DEBOUNCE_MS,
   );
 
-  const saveSubagentCliToolSettings = debounce(
-    async (payload: { id: string; body: { defaultTools: string[] | null } }) => {
+  const saveSubagentCliToolSettings = subagentCliToolSaves.debounce(
+    async (payload: {
+      id: string;
+      body: { defaultTools: string[] | null };
+      readGeneration: number;
+    }) => {
       try {
         await persistSubagentDetails(payload);
       } catch (error) {
@@ -5369,11 +6142,14 @@ import {
     MCP_SAVE_DEBOUNCE_MS,
   );
 
-  const saveCodexSettings = debounce(
+  const saveCodexSettings = codexSaves.debounce(
     async (payload: {
       id: string;
-      body: { codex_settings: CodexAgentSettings };
+      body: { codex_settings: NonNullable<AgentBlockSaveByField["codex_settings"]> };
       signature: string;
+      /** The whole block the body was worked out from: the baseline once the save lands. */
+      block: CodexAgentSettings;
+      hydrationGeneration: number;
     }) => {
       try {
         const response = await fetch(`/api/agents/${payload.id}`, {
@@ -5391,11 +6167,15 @@ import {
         }
 
         untrack(() => {
-          if (selectedAgentId === payload.id) {
+          const landing = agentLanding(payload.id, payload.hydrationGeneration);
+          if (landing === "current") {
             codexPersistedSignature = payload.signature;
+            codexPersistedBlock = payload.block;
             codexSaveState = "saved";
             codexSaveError = null;
             codexLastSaved = new Date();
+          } else if (landing === "older") {
+            codexSaveState = "idle";
           }
           updateAgentCollections(payload.id, {
             codex_settings: payload.body.codex_settings,
@@ -5425,11 +6205,14 @@ import {
     CODEX_SAVE_DEBOUNCE_MS,
   );
 
-  const saveClaudeSettings = debounce(
+  const saveClaudeSettings = claudeSaves.debounce(
     async (payload: {
       id: string;
-      body: { claude_settings: ClaudeAgentSettings };
+      body: { claude_settings: NonNullable<AgentBlockSaveByField["claude_settings"]> };
       signature: string;
+      /** The whole block the body was worked out from: the baseline once the save lands. */
+      block: ClaudeAgentSettings;
+      hydrationGeneration: number;
     }) => {
       try {
         const response = await fetch(`/api/agents/${payload.id}`, {
@@ -5447,11 +6230,15 @@ import {
         }
 
         untrack(() => {
-          if (selectedAgentId === payload.id) {
+          const landing = agentLanding(payload.id, payload.hydrationGeneration);
+          if (landing === "current") {
             claudePersistedSignature = payload.signature;
+            claudePersistedBlock = payload.block;
             claudeSaveState = "saved";
             claudeSaveError = null;
             claudeLastSaved = new Date();
+          } else if (landing === "older") {
+            claudeSaveState = "idle";
           }
           updateAgentCollections(payload.id, {
             claude_settings: payload.body.claude_settings,
@@ -5481,24 +6268,43 @@ import {
     CLAUDE_SAVE_DEBOUNCE_MS,
   );
 
-  const saveSubagentCodexSettings = debounce(
-    async (payload: { id: string; body: { codex_settings: CodexAgentSettings } }) => {
+  const saveSubagentCodexSettings = subagentCodexSaves.debounce(
+    async (payload: {
+      id: string;
+      body: { codex_settings: NonNullable<AgentBlockSaveByField["codex_settings"]> };
+      signature: string;
+      /** The whole block the body was worked out from: the baseline once the save lands. */
+      block: CodexAgentSettings;
+      readGeneration: number;
+    }) => {
       try {
-        await persistSubagentDetails(payload);
+        const landing = await persistSubagentDetails({
+          id: payload.id,
+          body: payload.body,
+          readGeneration: payload.readGeneration,
+        });
         untrack(() => {
-          subagentCodexPersistedSignature = makeCodexSignature(subagentCodexForm, "subagent");
-          subagentCodexSaveState = "saved";
-          subagentCodexSaveError = null;
-          subagentCodexLastSaved = new Date();
+          // The Primary Agent's rule (`agentLanding`).
+          if (landing === "current") {
+            subagentCodexPersistedSignature = payload.signature;
+            subagentCodexPersistedBlock = payload.block;
+            subagentCodexSaveState = "saved";
+            subagentCodexSaveError = null;
+            subagentCodexLastSaved = new Date();
+          } else if (landing === "older") {
+            subagentCodexSaveState = "idle";
+          }
         });
       } catch (error) {
         console.error("Failed to save subagent Codex settings:", error);
         untrack(() => {
-          subagentCodexSaveState = "idle";
-          subagentCodexSaveError =
-            error instanceof Error
-              ? error.message
-              : "Failed to save subagent Codex settings";
+          if (selectedEditableSubagentId === payload.id) {
+            subagentCodexSaveState = "idle";
+            subagentCodexSaveError =
+              error instanceof Error
+                ? error.message
+                : "Failed to save subagent Codex settings";
+          }
         });
       } finally {
         setTimeout(() => {
@@ -5513,24 +6319,43 @@ import {
     CODEX_SAVE_DEBOUNCE_MS,
   );
 
-  const saveSubagentClaudeSettings = debounce(
-    async (payload: { id: string; body: { claude_settings: ClaudeAgentSettings } }) => {
+  const saveSubagentClaudeSettings = subagentClaudeSaves.debounce(
+    async (payload: {
+      id: string;
+      body: { claude_settings: NonNullable<AgentBlockSaveByField["claude_settings"]> };
+      signature: string;
+      /** The whole block the body was worked out from: the baseline once the save lands. */
+      block: ClaudeAgentSettings;
+      readGeneration: number;
+    }) => {
       try {
-        await persistSubagentDetails(payload);
+        const landing = await persistSubagentDetails({
+          id: payload.id,
+          body: payload.body,
+          readGeneration: payload.readGeneration,
+        });
         untrack(() => {
-          subagentClaudePersistedSignature = makeClaudeSignature(subagentClaudeForm);
-          subagentClaudeSaveState = "saved";
-          subagentClaudeSaveError = null;
-          subagentClaudeLastSaved = new Date();
+          // The Primary Agent's rule (`agentLanding`).
+          if (landing === "current") {
+            subagentClaudePersistedSignature = payload.signature;
+            subagentClaudePersistedBlock = payload.block;
+            subagentClaudeSaveState = "saved";
+            subagentClaudeSaveError = null;
+            subagentClaudeLastSaved = new Date();
+          } else if (landing === "older") {
+            subagentClaudeSaveState = "idle";
+          }
         });
       } catch (error) {
         console.error("Failed to save subagent Claude settings:", error);
         untrack(() => {
-          subagentClaudeSaveState = "idle";
-          subagentClaudeSaveError =
-            error instanceof Error
-              ? error.message
-              : "Failed to save subagent Claude settings";
+          if (selectedEditableSubagentId === payload.id) {
+            subagentClaudeSaveState = "idle";
+            subagentClaudeSaveError =
+              error instanceof Error
+                ? error.message
+                : "Failed to save subagent Claude settings";
+          }
         });
       } finally {
         setTimeout(() => {
@@ -5545,19 +6370,27 @@ import {
     CLAUDE_SAVE_DEBOUNCE_MS,
   );
 
-  const saveSubagentAssignments = debounce(
-    async (payload: { id: string; subagentIds: string[]; signature: string }) => {
+  const saveSubagentAssignments = assignmentSaves.debounce(
+    async (payload: {
+      id: string;
+      subagentIds: string[];
+      signature: string;
+      hydrationGeneration: number;
+    }) => {
       try {
         await subagentStore.updateAgentSubagents(
           payload.id,
           payload.subagentIds,
         );
         untrack(() => {
-          if (selectedAgentId === payload.id) {
+          const landing = agentLanding(payload.id, payload.hydrationGeneration);
+          if (landing === "current") {
             assignmentPersistedSignature = payload.signature;
             assignmentSaveState = "saved";
             assignmentSaveError = null;
             assignmentLastSaved = new Date();
+          } else if (landing === "older") {
+            assignmentSaveState = "idle";
           }
           updateAgentCollections(payload.id, {
             assigned_subagent_ids: payload.subagentIds,
@@ -5587,23 +6420,139 @@ import {
     SUBAGENT_SAVE_DEBOUNCE_MS,
   );
 
+  /**
+   * Whether the Subagent's core form holds an edit that is not saved: waiting in its autosave
+   * debounce, in flight, or failed. The form differs from the persisted signature exactly then
+   * (only a core save moves that signature). Read untracked, so an effect that asks does not
+   * start depending on the form.
+   */
+  function subagentCoreEditUnsaved(): boolean {
+    return untrack(
+      () =>
+        selectedEditableSubagentId !== null &&
+        subagentPersistedSignature !== null &&
+        makeSubagentFormSignature(subagentForm) !== subagentPersistedSignature,
+    );
+  }
+
+  /**
+   * BL-955: which Subagent sections are at rest, the Primary Agent's rule
+   * (`agentSectionsAtRest`): the form equals its baseline and no save of it is queued or on its
+   * way. The CLI tools list has no baseline, so its saver decides with the Tool Grid's.
+   */
+  function subagentSectionsAtRest() {
+    return {
+      core:
+        subagentPersistedSignature !== null &&
+        makeSubagentFormSignature(subagentForm) === subagentPersistedSignature &&
+        !subagentCoreSaves.busy(selectedEditableSubagentId ?? ""),
+      toolGrid:
+        subagentMcpPersistedSignature !== null &&
+        makeMcpSignature(
+          subagentDefaultMCPGateways,
+          subagentDefaultMCPToolSelections,
+          subagentDcmDisplaySettings,
+        ) === subagentMcpPersistedSignature &&
+        !subagentMcpSaves.busy(selectedEditableSubagentId ?? "") &&
+        !subagentCliToolSaves.busy(selectedEditableSubagentId ?? ""),
+      codex:
+        subagentCodexPersistedSignature !== null &&
+        makeCodexSignature(subagentCodexForm, "subagent") === subagentCodexPersistedSignature &&
+        !subagentCodexSaves.busy(selectedEditableSubagentId ?? ""),
+      claude:
+        subagentClaudePersistedSignature !== null &&
+        makeClaudeSignature(subagentClaudeForm) === subagentClaudePersistedSignature &&
+        !subagentClaudeSaves.busy(selectedEditableSubagentId ?? ""),
+    };
+  }
+
+  /**
+   * BL-955: the Subagent's deferred read, the Primary Agent's rule (`readAgentAgainWhenAtRest`):
+   * when every section is at rest, the shown Subagent is read again through its real GET route.
+   */
+  function readSubagentAgainWhenAtRest() {
+    if (!settingsPanelAlive || subagentDetailLoading) return;
+    const id = selectedEditableSubagentId;
+    if (!subagentReadDeferred || !id || selectedEntity?.kind !== "subagent" || selectedEntity.id !== id) return;
+    if (!Object.values(subagentSectionsAtRest()).every(Boolean)) return;
+    void hydrateSubagent(id);
+  }
+
+  /** BL-955: how a Subagent save lands, the Primary Agent's rule (`agentLanding`). */
+  function subagentLanding(id: string, readGeneration: number): SaveLanding {
+    if (selectedEditableSubagentId !== id) return "other";
+    if (readGeneration === subagentReadGeneration) return "current";
+    setSubagentReadDeferred(true);
+    return "older";
+  }
+
+  /**
+   * `savedForm` is the form a core save (the autosave, the multiline editors) built its body
+   * from: when the save lands it becomes the new baseline (BL-844), and the persisted signature
+   * follows it. The LIVE form is left alone: whatever was typed while the save was in flight is
+   * still in it, and the next autosave sends just that (the baseline is the saved snapshot).
+   * `applyToLive` is for a save whose change is not in the live form yet (the multiline editors
+   * change the form only when their save works): it is laid over the live form as the save lands.
+   *
+   * The saves of the other sections (the Tool Settings Grid, CLI tools, Codex, Claude) name no
+   * form and leave the baseline AND the persisted signature alone: they save none of the core
+   * fields, so a core edit that is unsaved (waiting in its debounce, in flight, or failed) stays
+   * a difference from the baseline, the store-refresh effect can tell it is unsaved, and the
+   * next core edit sends it. The save error and the "Saved" status belong to the core edit while
+   * one is unsaved, so none of the four sections touches them then: not when it starts (the Tool
+   * Settings Grid and CLI tools clear the error only when no core edit is unsaved; Codex and
+   * Claude clear only their own error) and not when it lands (no "Saved", no cleared error). The
+   * error of a failed core save stays on screen until a core save works.
+   */
   async function persistSubagentDetails(
-    payload: { id: string; body: LiveSubagentUpdate },
-    nextForm: SubagentForm = subagentForm,
-  ) {
+    payload: { id: string; body: LiveSubagentUpdate; readGeneration: number },
+    savedForm?: SubagentForm,
+    applyToLive?: (form: SubagentForm) => SubagentForm,
+  ): Promise<SaveLanding> {
+    const previousAvatar = subagents.find((subagent) => subagent.id === payload.id)?.avatar ?? null;
     try {
       await subagentStore.update(payload.id, payload.body);
-      untrack(() => {
-        subagentForm = nextForm;
-        subagentPersistedSignature = makeSubagentFormSignature(nextForm);
-        lastInvalidSubagentSignature = null;
-        subagentEditSaveState = "saved";
-        subagentEditSaveError = null;
-        subagentEditLastSaved = new Date();
+      const landing = untrack(() => {
+        // Only the Subagent the panel still shows, and only when no read replaced its forms since
+        // the payload was built (`subagentLanding`, BL-955): otherwise the landing moves nothing.
+        const kind = subagentLanding(payload.id, payload.readGeneration);
+        // A save of another section says nothing about a core edit that is still unsaved: it
+        // neither reads "Saved" beside that text nor hides the error of a failed core save.
+        const coreEditUnsaved = !savedForm && kind !== "other" && subagentCoreEditUnsaved();
+        if (kind === "current") {
+          if (savedForm) {
+            if (applyToLive) subagentForm = applyToLive(subagentForm);
+            subagentPersistedSignature = makeSubagentFormSignature(savedForm);
+            subagentPersistedForm = $state.snapshot(savedForm) as SubagentForm;
+            lastInvalidSubagentSignature = null;
+          }
+          if (!coreEditUnsaved) {
+            subagentEditSaveState = "saved";
+            subagentEditSaveError = null;
+          }
+          subagentEditLastSaved = new Date();
+        } else if (kind === "older" && !coreEditUnsaved) {
+          subagentEditSaveState = "idle";
+        }
+        return kind;
       });
+      // BL-142: the save changed the picture, so the pictures the Subagent no longer shows go.
+      if (
+        Object.prototype.hasOwnProperty.call(payload.body, "avatar") &&
+        shouldTidyAvatarPictures({
+          previous: previousAvatar,
+          saved: payload.body.avatar,
+          current: selectedEditableSubagentId === payload.id ? subagentForm.avatar : payload.body.avatar,
+          uploading: selectedEditableSubagentId === payload.id && subagentAvatarUploading,
+        })
+      ) {
+        void requestAvatarPictureTidy("subagent", payload.id, previousAvatar);
+      }
+      return landing;
     } catch (error) {
       console.error("Failed to save subagent:", error);
       untrack(() => {
+        if (selectedEntity?.kind !== "subagent" || selectedEditableSubagentId !== payload.id) return;
         subagentEditSaveState = "idle";
         subagentEditSaveError =
           error instanceof Error ? error.message : "Failed to save subagent";
@@ -5620,19 +6569,34 @@ import {
     }
   }
 
-  const saveSubagentDetails = debounce(
-    (payload: { id: string; body: LiveSubagentUpdate }) => {
-      void persistSubagentDetails(payload);
+  const saveSubagentDetails = subagentCoreSaves.debounce(
+    async (payload: {
+      id: string;
+      body: LiveSubagentUpdate;
+      nextForm: SubagentForm;
+      readGeneration: number;
+    }) => {
+      try {
+        await persistSubagentDetails(
+          { id: payload.id, body: payload.body, readGeneration: payload.readGeneration },
+          payload.nextForm,
+        );
+      } catch {
+        // `persistSubagentDetails` logged the failure and set `subagentEditSaveError`, which the
+        // panel shows; the baseline stays as it was, so the next edit sends this change again.
+      }
     },
     700,
   );
 
   $effect(() => {
+    primaryCaptureWake.basic;
     if (!selectedAgentId || listLoading || detailLoading || hydrationInProgress)
       return;
     const signature = makeBasicSignature(basicForm);
     if (
       !basicPersistedSignature ||
+      !basicPersistedForm ||
       signature === basicPersistedSignature ||
       signature === lastInvalidAgentSignature
     ) {
@@ -5649,48 +6613,81 @@ import {
     }
 
     lastInvalidAgentSignature = null;
+    // A snapshot: it is the baseline when this save lands, so a nested list or object the user
+    // changes while the save is in flight must not reach it (BL-911).
+    const nextForm = $state.snapshot(cloneBasicForm(basicForm)) as BasicForm;
+    // A-1y: the baseline the body is worked out from; a memory save says it started from it.
+    const baseForm = $state.snapshot(basicPersistedForm) as BasicForm;
+    const body = buildBasicSavePatch(nextForm);
+    if (patchContainsGroupedValues(body, "agent") && deferPrimaryCapture("basic")) return;
+    // A form that differs from the saved copy only in ways the save does not see (a reordered
+    // block) has nothing to send.
+    if (Object.keys(body).length === 0) return;
+
     basicSaveState = "saving";
     basicSaveError = null;
-
-    const nextForm = cloneBasicForm(basicForm);
     saveBasic({
       id: selectedAgentId,
-      body: buildBasicPayload(nextForm),
+      body,
       nextForm,
+      // Read when the body is built: a re-read of the agent during the debounce or the round trip
+      // is what `persistBasic` checks at the landing (BL-911).
+      hydrationGeneration: agentHydrationRequestId,
+      baseForm,
     });
   });
 
   $effect(() => {
+    primaryCaptureWake.codex;
     if (!selectedAgentId || listLoading || detailLoading || hydrationInProgress)
       return;
     if (!isCodexProvider) return;
     const signature = makeCodexSignature(codexForm, "agent");
     if (!codexPersistedSignature || signature === codexPersistedSignature) return;
+    // BL-848: only the keys that differ from the block as it loaded or was last saved, a key the
+    // form dropped as `null`; a form that differs only in ways the save does not see sends nothing.
+    // BL-919: the permission trio (mode, sandbox, approval) is one choice: a change to any of its
+    // keys sends all three, so an older copy never leaves a mix with another window's mode.
+    const block = serializeCodexForm(codexForm, "agent");
+    const change = diffAgentBlockWithGroups("codex_settings", codexPersistedBlock, block);
+    if (change == null) return;
+    if (deferPrimaryCapture("codex")) return;
     codexSaveState = "saving";
     codexSaveError = null;
     saveCodexSettings({
       id: selectedAgentId,
-      body: { codex_settings: serializeCodexForm(codexForm, "agent") },
+      body: { codex_settings: change },
       signature,
+      block,
+      hydrationGeneration: agentHydrationRequestId,
     });
   });
 
   $effect(() => {
+    primaryCaptureWake.claude;
     if (!selectedAgentId || listLoading || detailLoading || hydrationInProgress)
       return;
     if (!isClaudeCliProvider) return;
     const signature = makeClaudeSignature(claudeForm);
     if (!claudePersistedSignature || signature === claudePersistedSignature) return;
+    // BL-848, BL-919: as the Codex section above; the thinking switch and its budget are one pair.
+    const block = serializeClaudeForm(claudeForm);
+    const change = diffAgentBlockWithGroups("claude_settings", claudePersistedBlock, block);
+    if (change == null) return;
+    if (deferPrimaryCapture("claude")) return;
     claudeSaveState = "saving";
     claudeSaveError = null;
     saveClaudeSettings({
       id: selectedAgentId,
-      body: { claude_settings: serializeClaudeForm(claudeForm) },
+      body: { claude_settings: change },
       signature,
+      block,
+      hydrationGeneration: agentHydrationRequestId,
     });
   });
 
   $effect(() => {
+    subagentCaptureWake.codex;
     if (
       !selectedEditableSubagentId ||
       subagentDetailLoading ||
@@ -5701,16 +6698,31 @@ import {
     }
     if (!(subagentForm.subagentType === "cli" && isCodexCliSubagentProvider)) return;
     const signature = makeCodexSignature(subagentCodexForm, "subagent");
-    if (signature === subagentCodexPersistedSignature) return;
+    // A null signature is a Subagent that is not hydrated yet: nothing is saved from it.
+    if (subagentCodexPersistedSignature === null || signature === subagentCodexPersistedSignature) return;
+    // BL-914: the Subagent PUT writes `codex_settings` key by key, so only the keys that differ
+    // from the block as it loaded or was last saved go, a key the form dropped as `null`; a
+    // Subagent with no block yet gets the whole block. BL-919: the permission trio is one choice
+    // and goes whole when any of its keys changed. A Subagent has no Tool Approval tie (CLI
+    // Subagents never pause for approval), so `serializeCodexForm(..., "subagent")` always gives
+    // approval `never`, and the trio always carries it.
+    const block = serializeCodexForm(subagentCodexForm, "subagent");
+    const change = diffAgentBlockWithGroups("codex_settings", subagentCodexPersistedBlock, block);
+    if (change == null) return;
+    if (deferSubagentCapture("codex")) return;
     subagentCodexSaveState = "saving";
     subagentCodexSaveError = null;
     saveSubagentCodexSettings({
       id: selectedEditableSubagentId,
-      body: { codex_settings: serializeCodexForm(subagentCodexForm, "subagent") },
+      body: { codex_settings: change },
+      signature,
+      block,
+      readGeneration: subagentReadGeneration,
     });
   });
 
   $effect(() => {
+    subagentCaptureWake.claude;
     if (
       !selectedEditableSubagentId ||
       subagentDetailLoading ||
@@ -5721,16 +6733,25 @@ import {
     }
     if (!(subagentForm.subagentType === "cli" && isClaudeCliSubagentProvider)) return;
     const signature = makeClaudeSignature(subagentClaudeForm);
-    if (signature === subagentClaudePersistedSignature) return;
+    if (subagentClaudePersistedSignature === null || signature === subagentClaudePersistedSignature) return;
+    // BL-914, BL-919: as the Codex section above; the thinking switch and its budget are one pair.
+    const block = serializeClaudeForm(subagentClaudeForm);
+    const change = diffAgentBlockWithGroups("claude_settings", subagentClaudePersistedBlock, block);
+    if (change == null) return;
+    if (deferSubagentCapture("claude")) return;
     subagentClaudeSaveState = "saving";
     subagentClaudeSaveError = null;
     saveSubagentClaudeSettings({
       id: selectedEditableSubagentId,
-      body: { claude_settings: serializeClaudeForm(subagentClaudeForm) },
+      body: { claude_settings: change },
+      signature,
+      block,
+      readGeneration: subagentReadGeneration,
     });
   });
 
   $effect(() => {
+    primaryCaptureWake.zip;
     if (!selectedAgentId || listLoading || detailLoading || hydrationInProgress)
       return;
     const signature = makeZipSignature(zipForm);
@@ -5746,14 +6767,27 @@ import {
       return;
     }
 
+    // BL-855: only the zip fields that differ from the payload as it loaded or was last saved
+    // (`custom_tool_settings` whole, and only when a custom tool row differs).
+    const payload = buildZipPayload(zipForm);
+    if (!zipPersistedPayload) return;
+    const body = diffZipPayload(zipPersistedPayload, payload);
+    if (Object.keys(body).length === 0) return;
+    if (deferPrimaryCapture("zip")) return;
+
     zipSaveState = "saving";
     zipSaveError = null;
-
-    const payload = buildZipPayload(zipForm);
-    saveZipSettings({ id: selectedAgentId, body: payload, signature });
+    saveZipSettings({
+      id: selectedAgentId,
+      body,
+      signature,
+      full: payload,
+      hydrationGeneration: agentHydrationRequestId,
+    });
   });
 
   $effect(() => {
+    primaryCaptureWake.mcp;
     if (!selectedAgentId || listLoading || detailLoading || hydrationInProgress)
       return;
     const signature = makeMcpSignature(
@@ -5765,17 +6799,36 @@ import {
       return;
     }
 
-    mcpSaveState = "saving";
-    mcpSaveError = null;
+    // BL-855: the gateway list and the tool selections whole, only when they differ; the display
+    // settings entry by entry (`diffAgentBlock`).
+    if (!mcpPersistedValues) return;
     const payload = buildMcpPayload(
       defaultMCPGateways,
       defaultMCPToolSelections,
       dcmDisplaySettings,
     );
-    saveMcpSettings({ id: selectedAgentId, body: payload, signature });
+    const values: McpSectionValues = {
+      gateways: payload.defaultMCPGateways,
+      selections: payload.defaultMCPToolSelections,
+      dcm: payload.dcmDisplaySettings,
+    };
+    const body = diffMcpSection(mcpPersistedValues, values);
+    if (Object.keys(body).length === 0) return;
+    if (deferPrimaryCapture("mcp")) return;
+
+    mcpSaveState = "saving";
+    mcpSaveError = null;
+    saveMcpSettings({
+      id: selectedAgentId,
+      body,
+      signature,
+      values,
+      hydrationGeneration: agentHydrationRequestId,
+    });
   });
 
   $effect(() => {
+    subagentCaptureWake.mcp;
     if (
       !selectedEditableSubagentId ||
       subagentDetailLoading ||
@@ -5797,17 +6850,37 @@ import {
       return;
     }
 
-    subagentEditSaveState = "saving";
-    subagentEditSaveError = null;
+    // BL-914: the gateway list and the tool selections whole, only when they differ; the display
+    // settings entry by entry (a removed entry as `null`), the Primary Agent's rule
+    // (`diffMcpSection`). A change that leaves every value as it was sends nothing.
+    if (!subagentMcpPersistedValues) return;
     const payload = buildMcpPayload(
       subagentDefaultMCPGateways,
       subagentDefaultMCPToolSelections,
       subagentDcmDisplaySettings,
     );
-    saveSubagentMcpSettings({ id: selectedEditableSubagentId, body: payload });
+    const values: McpSectionValues = {
+      gateways: payload.defaultMCPGateways,
+      selections: payload.defaultMCPToolSelections,
+      dcm: payload.dcmDisplaySettings,
+    };
+    const body = diffMcpSection(subagentMcpPersistedValues, values);
+    if (Object.keys(body).length === 0) return;
+    if (deferSubagentCapture("mcp")) return;
+
+    subagentEditSaveState = "saving";
+    if (!subagentCoreEditUnsaved()) subagentEditSaveError = null;
+    saveSubagentMcpSettings({
+      id: selectedEditableSubagentId,
+      body,
+      signature,
+      values,
+      readGeneration: subagentReadGeneration,
+    });
   });
 
   $effect(() => {
+    primaryCaptureWake.assignment;
     if (!selectedAgentId || listLoading || detailLoading || hydrationInProgress)
       return;
     const signature = makeSubagentSignature(selectedSubagentIds);
@@ -5818,16 +6891,19 @@ import {
       return;
     }
 
+    if (deferPrimaryCapture("assignment")) return;
     assignmentSaveState = "saving";
     assignmentSaveError = null;
     saveSubagentAssignments({
       id: selectedAgentId,
       subagentIds: [...selectedSubagentIds],
       signature,
+      hydrationGeneration: agentHydrationRequestId,
     });
   });
 
   $effect(() => {
+    subagentCaptureWake.core;
     if (
       !selectedEditableSubagentId ||
       subagentDetailLoading ||
@@ -5840,6 +6916,7 @@ import {
     const signature = makeSubagentFormSignature(subagentForm);
     if (
       !subagentPersistedSignature ||
+      !subagentPersistedForm ||
       signature === subagentPersistedSignature ||
       signature === lastInvalidSubagentSignature
     ) {
@@ -5856,12 +6933,21 @@ import {
     }
 
     lastInvalidSubagentSignature = null;
+    const nextForm = $state.snapshot(subagentForm) as SubagentForm;
+    const body = buildSubagentSavePatch(nextForm);
+    if (patchContainsGroupedValues(body, "subagent") && deferSubagentCapture("core")) return;
+    // A form that differs from the saved copy only in ways the save does not see (a workflow URL
+    // an API Subagent does not keep) has nothing to send.
+    if (Object.keys(body).length === 0) return;
+
     subagentEditSaveState = "saving";
     subagentEditSaveError = null;
 
     saveSubagentDetails({
       id: selectedEditableSubagentId,
-      body: buildSubagentPayload(subagentForm),
+      body,
+      nextForm,
+      readGeneration: subagentReadGeneration,
     });
   });
 
@@ -5876,7 +6962,7 @@ import {
       savedModels.find((model) => model.provider === provider && model.modelId === modelId) ??
       null;
 
-    const nextId = match ? match.id : null;
+    const nextId = match && agentPresetShowsAsSelected(match) ? match.id : null;
 
     if (selectedModelId !== nextId) {
       selectedModelId = nextId;
@@ -5884,13 +6970,10 @@ import {
   });
 
   $effect(() => {
-    const provider = subagentForm.primary_model_provider;
-    const modelId = subagentForm.primary_model_name;
+    const form = subagentForm;
     savedModels;
-    const match = savedModels.find(
-      (model) => model.provider === provider && model.modelId === modelId,
-    );
-    const nextId = match ? match.id : null;
+    const match = findSubagentFormModel(form);
+    const nextId = match && subagentPresetShowsAsSelected(match) ? match.id : null;
     if (selectedSubagentModelId !== nextId) {
       selectedSubagentModelId = nextId;
     }
@@ -6083,6 +7166,7 @@ import {
   }
 
   function handleSubagentToggle(id: string, checked: boolean) {
+    if (primaryOwnedSaveInFlightUi) return;
     const set = new Set(selectedSubagentIds);
     if (checked) {
       set.add(id);
@@ -6104,6 +7188,8 @@ import {
 
   function selectSubagent(id: string) {
     if (createEntityMode) return;
+    agentAvatarUploadRequestId += 1;
+    isUploadingAgentAvatar = false;
     createEntityMode = false;
     activeAgentSettingsTab = "core";
     activeSubagentSettingsTab = "core";
@@ -6113,25 +7199,41 @@ import {
     selectEditableSubagent(id);
   }
 
-  function selectEditableSubagent(id: string) {
-    if (createEntityMode) return;
-    const match = subagents.find((item) => item.id === id);
-    if (!match) return;
+  /**
+   * BL-955, BL-915: puts `match`, the panel's copy of the shown Subagent, into its section forms.
+   * `fill` (a first open, a pick of another Subagent) fills every section and raises
+   * `subagentReadGeneration`; every real GET also raises it before taking a snapshot.
+   * A save built before either read moves nothing when it lands
+   * (`subagentLanding`) and the status the earlier Subagent's save left is put back to idle: that
+   * save lands as "other" and can no longer end it. Otherwise (the list effect's hydrate, the
+   * real GET) a section is replaced only while it is at rest (`subagentSectionsAtRest`): no
+   * section that a save is on its way for is replaced, so no save of it can land under an older
+   * record. A cached-list refresh keeps the counter, while a real GET supersedes older saves. A
+   * section left alone asks for a read at rest. The list effect's hydrate leaves the Tool Grid out
+   * (`withToolGrid`), as it always did. Called untracked.
+   */
+  function readSubagentSections(match: SubagentRow, fill: boolean, withToolGrid: boolean) {
+    if (fill) {
+      subagentReadGeneration += 1;
+      subagentEditSaveState = "idle";
+    }
+    setSubagentReadDeferred(false);
+    const atRest = subagentSectionsAtRest();
+    if (subagentOwnedWritesPending(match.id)) setSubagentReadDeferred(true);
+    const replaces = (section: keyof typeof atRest) => {
+      if (fill || atRest[section]) return true;
+      setSubagentReadDeferred(true);
+      return false;
+    };
 
-    subagentDetailLoading = true;
-
-    const normalisedSubagentForm = normaliseSubagentForm(match);
-    const normalisedCodexForm = normaliseCodexForm(match, "subagent");
-    const normalisedClaudeForm = normaliseClaudeForm(match, "subagent");
-
-    untrack(() => {
-      const mcpDefaults = normaliseSubagentMcpDefaults(match);
-      selectedEditableSubagentId = id;
-      selectedEntity = { kind: "subagent", id };
-      createEntityMode = false;
-      activeSubagentSettingsTab = "core";
+    if (replaces("core")) {
+      const normalisedSubagentForm = normaliseSubagentForm(match);
       subagentForm = normalisedSubagentForm;
       subagentPersistedSignature = makeSubagentFormSignature(normalisedSubagentForm);
+      subagentPersistedForm = $state.snapshot(normalisedSubagentForm) as SubagentForm;
+    }
+    if (withToolGrid && replaces("toolGrid")) {
+      const mcpDefaults = normaliseSubagentMcpDefaults(match);
       subagentDefaultMCPGateways = mcpDefaults.gateways;
       subagentDefaultMCPToolSelections = mcpDefaults.selections;
       subagentDefaultCliToolIds = normaliseCliToolDefaults(match as unknown as AgentRow);
@@ -6144,17 +7246,64 @@ import {
         mcpDefaults.selections,
         mcpDefaults.dcmDisplaySettings,
       );
+      // A Subagent that holds its display settings only under the older name has no
+      // `dcmDisplaySettings` yet: its first save writes the whole block, so the older name's
+      // entries are not dropped (the Primary Agent's rule, and the runtime readers still take the
+      // older name).
+      subagentMcpPersistedValues = {
+        gateways: [...mcpDefaults.gateways],
+        selections: cloneToolSelections(mcpDefaults.selections),
+        dcm:
+          match.dcmDisplaySettings == null && (match as any).dcm_display_settings != null
+            ? null
+            : cloneDcmDisplaySettings(mcpDefaults.dcmDisplaySettings),
+      };
       subagentMcpRenderNonce += 1;
+    }
+    if (replaces("codex")) {
+      const normalisedCodexForm = normaliseCodexForm(match, "subagent");
       subagentCodexForm = normalisedCodexForm;
       subagentCodexPersistedSignature = makeCodexSignature(normalisedCodexForm, "subagent");
+      subagentCodexPersistedBlock =
+        match.codex_settings == null ? null : serializeCodexForm(normalisedCodexForm, "subagent");
       subagentCodexSaveState = "idle";
       subagentCodexSaveError = null;
       subagentCodexLastSaved = null;
+    }
+    if (replaces("claude")) {
+      const normalisedClaudeForm = normaliseClaudeForm(match, "subagent");
       subagentClaudeForm = normalisedClaudeForm;
       subagentClaudePersistedSignature = makeClaudeSignature(normalisedClaudeForm);
+      subagentClaudePersistedBlock =
+        match.claude_settings == null ? null : serializeClaudeForm(normalisedClaudeForm);
       subagentClaudeSaveState = "idle";
       subagentClaudeSaveError = null;
       subagentClaudeLastSaved = null;
+    }
+  }
+
+  function selectEditableSubagent(id: string) {
+    if (createEntityMode) return;
+    const match = subagents.find((item) => item.id === id);
+    if (!match) return;
+
+    if (selectedEditableSubagentId !== id) {
+      subagentAvatarUploadRequestId += 1;
+      subagentAvatarUploading = false;
+      subagentReadRequestId += 1;
+      if (subagentReadTimer) clearTimeout(subagentReadTimer);
+      subagentReadTimer = null;
+      subagentReadWaitError = null;
+    }
+    subagentDetailLoading = true;
+
+    untrack(() => {
+      const fill = selectedEditableSubagentId !== id;
+      selectedEditableSubagentId = id;
+      selectedEntity = { kind: "subagent", id };
+      createEntityMode = false;
+      activeSubagentSettingsTab = "core";
+      readSubagentSections(match, fill, true);
       subagentValidationError = null;
       subagentAvatarError = null;
       selectedSubagentModelId = null;
@@ -6163,13 +7312,14 @@ import {
 
     syncSelectedModelFromSubagent();
     subagentDetailLoading = false;
+    syncSubagentSaveWaits();
   }
 
   function resetZipOverrides() {
+    if (primaryCaptureBlocked) return;
     if (!selectedAgentId) return;
     const nextForm: ZipForm = {
       ...zipForm,
-      zip_agent_control_enabled: ZIP_PERMISSION_INHERIT,
       zip_ai_view_mode: ZIP_LAYOUT_INHERIT,
       zip_tool_notes_enabled: ZIP_NOTES_INHERIT,
       custom_tool_settings: (globalZipSettings?.custom_tool_settings ?? []).map((tool) => ({
@@ -6202,14 +7352,17 @@ import {
   }
 
   function handleMcpGatewaysChange(gateways: string[]) {
+    if (primaryOwnedSaveInFlightUi) return;
     defaultMCPGateways = [...gateways];
   }
 
   function handleMcpDcmDisplaySettingsChange(settings: AgentDcmDisplaySettings) {
+    if (primaryOwnedSaveInFlightUi) return;
     dcmDisplaySettings = cloneDcmDisplaySettings(settings);
   }
 
   function clearMcpDefaults(showToast = true) {
+    if (primaryCaptureBlocked) return;
     if (
       defaultMCPGateways.length === 0 &&
       defaultMCPToolSelections.length === 0 &&
@@ -6233,6 +7386,7 @@ import {
         body: {
           defaultTools: null,
         },
+        hydrationGeneration: agentHydrationRequestId,
       });
     }
     if (showToast) {
@@ -6241,6 +7395,7 @@ import {
   }
 
   function resetToolGridToGlobalSettings() {
+    if (primaryCaptureBlocked) return;
     if (!selectedAgentId || selectedAgentId === CREATE_AGENT_SENTINEL) return;
     resetZipOverrides();
     clearMcpDefaults(false);
@@ -6461,6 +7616,22 @@ import {
     };
   }
 
+  /**
+   * BL-514: the save for `form`: only what differs from the copy the form loaded or last saved
+   * (`basicPersistedForm`), so a stale copy never takes back a newer chat-bar change, and a
+   * native-tool setting the form removed goes as `null` (the server keeps an own key a save
+   * leaves out).
+   */
+  function buildBasicSavePatch(form: BasicForm): Partial<BasicPayloadBody> {
+    if (!basicPersistedForm) {
+      throw new Error("Agent settings have not loaded yet, so nothing can be saved.");
+    }
+    return buildAgentSettingsSavePatch(
+      buildBasicPayload(basicPersistedForm) as unknown as Record<string, unknown>,
+      buildBasicPayload(form) as unknown as Record<string, unknown>,
+    ) as Partial<BasicPayloadBody>;
+  }
+
   function buildBasicPayload(form: BasicForm): BasicPayloadBody {
     if (form.agentType === "n8n") {
       throw new Error("This Primary Agent uses the retired n8n type and can only be deleted.");
@@ -6513,41 +7684,27 @@ import {
       primary_model_stop_sequences: form.primary_model_stop_sequences,
       primary_model_reasoning_effort: form.primary_model_reasoning_effort,
       primary_model_capabilities: form.primary_model_capabilities,
-      // Clear any legacy fallback-model config without keeping the dead settings lane.
-      fallback_model_enabled: false,
-      fallback_model_provider: null,
-      fallback_model_name: null,
-      fallback_model_preset_id: null,
-      fallback_model_connection: null,
-      fallback_model_temperature: null,
-      fallback_model_max_tokens: null,
-      fallback_model_top_p: null,
-      fallback_model_top_k: null,
-      fallback_model_frequency_penalty: null,
-      fallback_model_presence_penalty: null,
-      fallback_model_seed: null,
-      fallback_model_stop_sequences: null,
-      fallback_model_reasoning_effort: null,
-      fallback_model_capabilities: null,
-      fallback_provider_specific_settings: null,
       voice_profile: buildVoiceProfilePayload(form.voice_profile),
     };
   }
 
   async function saveAgentPromptFromEditor(nextPrompt: string) {
+    requirePrimaryCaptureReady();
     const agentId = requireHydratedAgentDetail(
       selectedAgentId,
       promptPersistedSignature,
       "the agent prompt",
     );
     basicSaveScope = "instructions";
-    await persistPrompt({ id: agentId, system_prompt: nextPrompt }, nextPrompt);
+    const payload = { id: agentId, system_prompt: nextPrompt, hydrationGeneration: agentHydrationRequestId };
+    await promptSaves.run(agentId, () => persistPrompt(payload, nextPrompt));
   }
 
   async function saveBasicMultilineEditor(
     scope: BasicSaveScope,
     mutator: (current: BasicForm) => BasicForm,
   ) {
+    requirePrimaryCaptureReady();
     const agentId = requireHydratedAgentDetail(
       selectedAgentId,
       basicPersistedSignature,
@@ -6560,19 +7717,38 @@ import {
       throw new Error(validation);
     }
 
+    const savedForm = $state.snapshot(nextForm) as BasicForm;
+    const baseForm = $state.snapshot(basicPersistedForm) as BasicForm;
+    const body = buildBasicSavePatch(savedForm);
+    if (Object.keys(body).length === 0) return;
+
     basicSaveScope = scope;
     basicSaveState = "saving";
     basicSaveError = null;
-    await persistBasic(
-      { id: agentId, body: buildBasicPayload(nextForm) },
-      nextForm,
-    );
+    // BL-911: the editor's change is not in the live form yet: it is laid over the form as the
+    // save lands, so text typed elsewhere during the round trip stays (unless the agent was read
+    // again meanwhile: `persistBasic` then leaves the form to that read and asks for another).
+    const payload = { id: agentId, body, hydrationGeneration: agentHydrationRequestId, baseForm };
+    await basicSaves.run(agentId, () => persistBasic(payload, savedForm, mutator));
+  }
+
+  /**
+   * BL-844: the Subagent's save for `form`: only what differs from the copy the form loaded or
+   * last saved (`subagentPersistedForm`), so a change made to the Subagent elsewhere since
+   * Settings opened is never taken back. The Subagent form has no save before it loaded.
+   */
+  function buildSubagentSavePatch(form: SubagentForm): LiveSubagentUpdate {
+    if (!subagentPersistedForm) {
+      throw new Error("Subagent settings have not loaded yet, so nothing can be saved.");
+    }
+    return buildSubagentSettingsSavePatch(subagentPersistedForm, form);
   }
 
   async function saveSubagentMultilineEditor(
     scope: SubagentSaveScope,
     mutator: (current: SubagentForm) => SubagentForm,
   ) {
+    requireSubagentCaptureReady();
     if (!selectedEditableSubagentId) return;
     const nextForm = mutator(subagentForm);
     const validation = validateSubagentForm(nextForm);
@@ -6581,13 +7757,15 @@ import {
       throw new Error(validation);
     }
 
+    const savedForm = $state.snapshot(nextForm) as SubagentForm;
+    const body = buildSubagentSavePatch(savedForm);
+    if (Object.keys(body).length === 0) return;
+
     subagentSaveScope = scope;
     subagentEditSaveState = "saving";
     subagentEditSaveError = null;
-    await persistSubagentDetails(
-      { id: selectedEditableSubagentId, body: buildSubagentPayload(nextForm) },
-      nextForm,
-    );
+    const payload = { id: selectedEditableSubagentId, body, readGeneration: subagentReadGeneration };
+    await subagentCoreSaves.run(payload.id, () => persistSubagentDetails(payload, savedForm, mutator));
   }
 
   function makeZipSignature(form: ZipForm) {
@@ -6596,54 +7774,6 @@ import {
 
   function makeSubagentSignature(ids: string[]) {
     return JSON.stringify([...ids].sort());
-  }
-
-  function makeSubagentFormSignature(form: SubagentForm) {
-    return JSON.stringify({
-      displayName: form.displayName.trim(),
-      subagentType: form.subagentType,
-      specialty: form.specialty,
-      webhook_url: form.webhook_url.trim(),
-      include_global_prompt: form.include_global_prompt,
-      system_prompt: form.system_prompt.trim(),
-      primary_model_provider: form.primary_model_provider,
-      primary_model_name: form.primary_model_name,
-      timeout_seconds: form.timeout_seconds.trim(),
-      avatar: form.avatar ?? "",
-      avatar_icon_ref: iconRefKey(form.avatar_icon_ref),
-      avatar_icon_fit: form.avatar_icon_fit,
-      provider_specific_settings: form.provider_specific_settings ?? null,
-    });
-  }
-
-  function buildSubagentPayload(form: SubagentForm): LiveSubagentUpdate {
-    if (form.subagentType === "n8n-subnode") {
-      throw new Error(
-        "n8n Subnode Subagents were removed from Batshit. Delete this record from Agent Settings.",
-      );
-    }
-    return {
-      displayName: form.displayName.trim(),
-      subagentType: form.subagentType,
-      specialty: form.specialty,
-      webhook_url:
-        isWorkflowBackedSubagentType(form.subagentType)
-          ? form.webhook_url.trim() || undefined
-          : undefined,
-      webhookUrl:
-        isWorkflowBackedSubagentType(form.subagentType)
-          ? form.webhook_url.trim() || undefined
-          : undefined,
-      include_global_prompt: form.include_global_prompt,
-      system_prompt: form.system_prompt.trim() || undefined,
-      primary_model_provider: form.primary_model_provider || undefined,
-      primary_model_name: form.primary_model_name || undefined,
-      timeout_seconds: normalizeSubagentTimeoutSeconds(form.timeout_seconds) ?? null,
-      avatar: form.avatar ?? null,
-      avatar_icon_ref: form.avatar_icon_ref,
-      avatar_icon_fit: form.avatar_icon_fit,
-      provider_specific_settings: form.provider_specific_settings ?? undefined,
-    };
   }
 
   function buildZipPayload(form: ZipForm): ZipPayloadBody {
@@ -6670,12 +7800,6 @@ import {
         return payload;
       })
       .filter((tool): tool is CustomToolPayload => Boolean(tool));
-    const zipPermission =
-      form.zip_agent_control_enabled === "enabled"
-        ? true
-        : form.zip_agent_control_enabled === "disabled"
-          ? false
-          : null;
     const zipAiViewMode =
       form.zip_ai_view_mode === "inline" || form.zip_ai_view_mode === "appended"
         ? form.zip_ai_view_mode
@@ -6688,7 +7812,6 @@ import {
           : null;
 
     return {
-      zip_agent_control_enabled: zipPermission,
       zip_ai_view_mode: zipAiViewMode,
       zip_tool_notes_enabled: zipToolNotesEnabled,
       buffer_size: toNumberOrNull(form.buffer_size),
@@ -6763,6 +7886,7 @@ import {
   }
 
   function handleCliToolSelectionsChange(toolIds: string[]) {
+    if (primaryCaptureBlocked) return;
     defaultCliToolIds = [...toolIds];
     cliToolIdsExplicit = true;
     if (!selectedAgentId || selectedAgentId === CREATE_AGENT_SENTINEL) return;
@@ -6773,34 +7897,40 @@ import {
       body: {
         defaultTools: [...toolIds],
       },
+      hydrationGeneration: agentHydrationRequestId,
     });
   }
 
   function handleSubagentCliToolSelectionsChange(toolIds: string[]) {
+    if (subagentCaptureBlocked) return;
     subagentDefaultCliToolIds = [...toolIds];
     subagentCliToolIdsExplicit = true;
     if (!selectedEditableSubagentId) return;
     subagentEditSaveState = "saving";
-    subagentEditSaveError = null;
+    if (!subagentCoreEditUnsaved()) subagentEditSaveError = null;
     saveSubagentCliToolSettings({
       id: selectedEditableSubagentId,
       body: {
         defaultTools: [...toolIds],
       },
+      readGeneration: subagentReadGeneration,
     });
   }
 
   function handleSubagentMcpGatewaysChange(gateways: string[]) {
+    if (subagentOwnedSaveInFlightUi) return;
     subagentDefaultMCPGateways = [...gateways];
   }
 
   function handleSubagentMcpDcmDisplaySettingsChange(
     settings: AgentDcmDisplaySettings,
   ) {
+    if (subagentOwnedSaveInFlightUi) return;
     subagentDcmDisplaySettings = cloneDcmDisplaySettings(settings);
   }
 
   function clearSubagentMcpDefaults() {
+    if (subagentCaptureBlocked) return;
     if (
       subagentDefaultMCPGateways.length === 0 &&
       subagentDefaultMCPToolSelections.length === 0 &&
@@ -6822,20 +7952,18 @@ import {
         body: {
           defaultTools: null,
         },
+        readGeneration: subagentReadGeneration,
       });
     }
     toast.success("Cleared Subagent Tool Grid defaults");
   }
 
-  function zipPayloadToAgentUpdates(body: ZipPayloadBody): Partial<AgentRow> {
+  function zipPayloadToAgentUpdates(body: Partial<ZipPayloadBody>): Partial<AgentRow> {
     const result: Partial<AgentRow> = {};
     for (const [key, value] of Object.entries(body)) {
       if (key === "custom_tool_settings") {
         result.custom_tool_settings =
           (value as ZipPayloadBody["custom_tool_settings"]) ?? undefined;
-      } else if (key === "zip_agent_control_enabled") {
-        result.zip_agent_control_enabled =
-          (value as AgentRow["zip_agent_control_enabled"]) ?? null;
       } else if (key === "zip_ai_view_mode") {
         result.zip_ai_view_mode =
           (value as AgentRow["zip_ai_view_mode"]) ?? null;
@@ -6998,6 +8126,7 @@ import {
     toolName: string,
     patch: McpToolZipOverridePatch,
   ) {
+    if (primaryOwnedSaveInFlightUi) return;
     const normalizedName = toolName.trim();
     if (!normalizedName) return;
 
@@ -7130,6 +8259,7 @@ import {
     rowId: NonMcpZipRowId,
     patch: NonMcpZipOverridePatch,
   ) {
+    if (primaryOwnedSaveInFlightUi) return;
     const config = NON_MCP_ZIP_ROW_CONFIG[rowId];
     if (config.mode === "custom") {
       handleMcpToolZipOverrideChange(config.toolName, patch);
@@ -7161,15 +8291,13 @@ import {
     handleNonMcpZipOverrideChange(rowId, patch);
   }
 
-  function handleZipAgentControlChange(value: string) {
-    zipForm = { ...zipForm, zip_agent_control_enabled: value };
-  }
-
   function handleZipAiViewModeChange(value: string) {
+    if (primaryOwnedSaveInFlightUi) return;
     zipForm = { ...zipForm, zip_ai_view_mode: value };
   }
 
   function handleZipToolNotesChange(value: string) {
+    if (primaryOwnedSaveInFlightUi) return;
     zipForm = { ...zipForm, zip_tool_notes_enabled: value };
   }
 
@@ -7348,9 +8476,12 @@ import {
     options.streamingEffect = true;
     options.unifiedExec = true;
     options.search = source ? source.search !== false : providerSettings?.codex_search !== false;
-    if (source?.sandbox) {
-      options.sandbox = source.sandbox;
-    }
+    // BL-941 S: mirror the runtime's saved level; missing is this mode's own preset.
+    // A structured block is authoritative; only an absent block reads the legacy bag.
+    const savedSandbox = source ? source.sandbox : providerSettings?.codex_sandbox;
+    options.sandbox = savedSandbox == null
+      ? CODEX_PERMISSION_PRESETS[options.permissionMode].sandbox
+      : sanitizeCodexSandbox(savedSandbox) ?? "read-only";
     if (source?.approval) {
       options.approval = source.approval;
     }
@@ -7392,9 +8523,11 @@ import {
         : null;
 
     const permission = source?.permissionMode ?? providerSettings?.claude_permission_mode;
-    if (permission === "acceptEdits" || permission === "plan" || permission === "bypassPermissions") {
+    if (permission === "default" || permission === "acceptEdits" || permission === "plan" || permission === "bypassPermissions") {
       options.permissionMode = permission;
-    } else if (permission === "default" || permission === "chat" || permission === "agent") {
+    } else if (permission === "chat") {
+      options.permissionMode = "default";
+    } else if (permission === "agent") {
       options.permissionMode = "acceptEdits";
     } else if (permission === "agent_full") {
       options.permissionMode = "bypassPermissions";
@@ -7534,6 +8667,7 @@ import {
     updater: (current: CodexFormOptions) => CodexFormOptions,
     scope: CliSettingsScope = "agent",
   ) {
+    if (scope === "agent" ? primaryOwnedSaveInFlightUi : subagentOwnedSaveInFlightUi) return;
     if (scope === "subagent") {
       subagentCodexForm = updater(subagentCodexForm);
       return;
@@ -7541,10 +8675,37 @@ import {
     codexForm = updater(codexForm);
   }
 
+  /**
+   * SA-017, BL-910: the form for a Codex model the USER just picked. `xhigh` reasoning effort and
+   * the `fast` service tier are only allowed for the models the static support sets name, so a pick
+   * of a model outside them lowers the value in the pick itself (it shows, and it saves once).
+   * Nothing else lowers them: opening an agent never changes the form, so a saved value the sets
+   * do not know (a model outside Batshit's list) stays as saved; the server passes it through and
+   * Codex itself validates it.
+   */
+  function codexFormForPickedModel(
+    current: CodexFormOptions,
+    model: string,
+  ): CodexFormOptions {
+    return {
+      ...current,
+      model,
+      reasoningEffort:
+        current.reasoningEffort === "xhigh" && !supportsCodexXhighReasoning(model)
+          ? "high"
+          : current.reasoningEffort,
+      serviceTier:
+        current.serviceTier === "fast" && !supportsCodexFastMode(model)
+          ? "standard"
+          : current.serviceTier,
+    };
+  }
+
   function updateClaudeForm(
     updater: (current: ClaudeFormOptions) => ClaudeFormOptions,
     scope: CliSettingsScope = "agent",
   ) {
+    if (scope === "agent" ? primaryOwnedSaveInFlightUi : subagentOwnedSaveInFlightUi) return;
     if (scope === "subagent") {
       subagentClaudeForm = updater(subagentClaudeForm);
       return;
@@ -7700,17 +8861,16 @@ import {
     }), scope);
   }
 
-  function hasClaudeToolEntry(list: string[], toolName: string) {
-    const normalizedTool = toolName.trim().toLowerCase();
-    return list.some((entry) => entry.trim().toLowerCase() === normalizedTool);
-  }
-
+  // BL-499: this switch (Agent Settings' "Allow Claude Web Search") is driven by
+  // `disallowedTools` alone, from the shared, unit-tested `claudeToolSwitch` module — never
+  // `allowedTools`, and never reimplemented inline here. Claude Code reads `allowedTools` as
+  // "skip the permission prompt for these", not "only these tools work", so a tool absent from
+  // it still runs normally; consulting it here used to show the switch OFF for a tool that was
+  // still fully working the moment any OTHER Allowed Tools entry existed, and could silently
+  // erase an existing denial when turning it OFF in that state.
   function getClaudeToolEnabled(toolName: string, scope: CliSettingsScope = "agent") {
     const form = scope === "subagent" ? subagentClaudeForm : claudeForm;
-    if (form.allowedTools.length > 0) {
-      return hasClaudeToolEntry(form.allowedTools, toolName);
-    }
-    return !hasClaudeToolEntry(form.disallowedTools, toolName);
+    return isClaudeToolEnabled(form.disallowedTools, toolName);
   }
 
   function setClaudeToolEnabled(
@@ -7718,45 +8878,12 @@ import {
     enabled: boolean,
     scope: CliSettingsScope = "agent",
   ) {
-    const normalizedTool = toolName.trim();
-    if (!normalizedTool) return;
-
     updateClaudeForm((current) => {
-      const hasAllowedList = current.allowedTools.length > 0;
-      const nextDisallowed = current.disallowedTools.filter(
-        (entry) => entry.trim().toLowerCase() !== normalizedTool.toLowerCase(),
-      );
-
-      if (hasAllowedList) {
-        const nextAllowed = enabled
-          ? hasClaudeToolEntry(current.allowedTools, normalizedTool)
-            ? current.allowedTools
-            : [...current.allowedTools, normalizedTool]
-          : current.allowedTools.filter(
-              (entry) => entry.trim().toLowerCase() !== normalizedTool.toLowerCase(),
-            );
-
-        return {
-          ...current,
-          allowedTools: nextAllowed,
-          disallowedTools: nextDisallowed,
-        };
-      }
-
-      if (enabled) {
-        return {
-          ...current,
-          disallowedTools: nextDisallowed,
-        };
-      }
-
-      if (hasClaudeToolEntry(current.disallowedTools, normalizedTool)) {
-        return current;
-      }
-
+      const nextDisallowed = withClaudeToolEnabled(current.disallowedTools, toolName, enabled);
+      if (nextDisallowed === current.disallowedTools) return current;
       return {
         ...current,
-        disallowedTools: [...current.disallowedTools, normalizedTool],
+        disallowedTools: nextDisallowed,
       };
     }, scope);
   }
@@ -7828,20 +8955,68 @@ import {
     return trimmed.length === 0 ? null : trimmed;
   }
 
-  function updateAgentCollections(id: string, updates: Partial<AgentRow>) {
-    agents = agents.map((agent) =>
-      agent.id === id ? { ...agent, ...updates } : agent,
-    );
-    const storeUpdates: Partial<AgentStoreRecord> = {
-      ...(updates as Partial<AgentStoreRecord>),
+  /**
+   * What a save names, as a copy takes it. The Codex and Claude settings and the Tool Grid display
+   * settings are written key by key (BL-848, BL-855), so a save of them names only the keys (or
+   * map entries) it changed, a removed one as `null`, and a copy takes them the way the server
+   * does (`applyAgentBlockUpdate`), never as a whole replacement of the block.
+   */
+  type AgentCollectionsUpdate = Omit<Partial<AgentRow>, AgentFieldByFieldBlock> & {
+    [Field in AgentFieldByFieldBlock]?: AgentBlockSaveByField[Field] | null;
+  };
+
+  function updateAgentCollections(id: string, updates: AgentCollectionsUpdate) {
+    // BL-514: a saved block is laid over each copy the way the agent PUT stores it (model keys
+    // replaced, the agent's own keys kept unless named), each over its own copy: the store's
+    // may hold a newer chat-bar change than this panel's list.
+    const hasProviderSettings = "provider_specific_settings" in updates;
+    const plainUpdates: Record<string, unknown> = { ...updates };
+    for (const field of AGENT_FIELD_BY_FIELD_BLOCKS) delete plainUpdates[field];
+    const layBlocks = (copy: object | null | undefined): Record<string, unknown> => {
+      const laid: Record<string, unknown> = {};
+      for (const field of AGENT_FIELD_BY_FIELD_BLOCKS) {
+        if (field in updates) {
+          laid[field] = applyAgentBlockUpdate(
+            field,
+            (copy as Record<string, unknown> | null | undefined)?.[field],
+            updates[field],
+          );
+        }
+      }
+      return laid;
     };
+    agents = agents.map((agent) =>
+      agent.id === id
+        ? ({
+            ...agent,
+            ...plainUpdates,
+            ...(hasProviderSettings
+              ? {
+                  provider_specific_settings: applyAgentProviderSettingsUpdate(
+                    agent.provider_specific_settings,
+                    updates.provider_specific_settings,
+                  ),
+                }
+              : {}),
+            ...layBlocks(agent),
+          } as AgentRow)
+        : agent,
+    );
+    const storeUpdates: Record<string, unknown> = { ...plainUpdates };
+    if (hasProviderSettings) {
+      storeUpdates.provider_specific_settings = applyAgentProviderSettingsUpdate(
+        agentStore.getAgentById(id)?.provider_specific_settings,
+        updates.provider_specific_settings,
+      );
+    }
+    Object.assign(storeUpdates, layBlocks(agentStore.getAgentById(id)));
     if (
       "assigned_subagent_ids" in updates &&
       Array.isArray(updates.assigned_subagent_ids)
     ) {
       storeUpdates.assignedSubagents = updates.assigned_subagent_ids;
     }
-    agentStore.updateAgent(id, storeUpdates);
+    agentStore.updateAgent(id, storeUpdates as Partial<AgentStoreRecord>);
   }
 
   function mapToStoreAgent(agent: AgentRow): AgentStoreRecord {
@@ -8008,6 +9183,27 @@ import {
       return fallback;
     }
   }
+
+  // P1's direct target seam never invokes create, Save, or a queued human continuation.
+  export function readAppActionState() {
+    const subagent = selectedEntity?.kind === "subagent";
+    return {
+      entityId: selectedEntity?.kind === "agent" ? selectedAgentId : null,
+      busy: listLoading || detailLoading || hydrationInProgress || subagentDetailLoading || primaryOwnedWritePendingUi || subagentOwnedWritePendingUi,
+      dirty: createEntityMode || (subagent
+        ? subagentPersistedSignature !== null && !Object.values(subagentSectionsAtRest()).every(Boolean)
+        : hydratedAgentId === selectedAgentId && selectedAgentId !== null && !Object.values(agentSectionsAtRest()).every(Boolean)),
+      error: listError ?? (subagent ? subagentReadWaitError : primaryReadWaitError)
+    };
+  }
+  export function selectAppActionTarget(target: SettingsTarget, context: ActionContext) {
+    context.check();
+    if (appActionsHaveDrafts()) refuse("unsaved_changes");
+    if (!target.agentId || !agents.some(agent => agent.id === target.agentId)) refuse("missing_entity");
+    if (readAppActionState().busy) refuse("busy");
+    selectAgent(target.agentId);
+  }
+
 </script>
 
 {#if listLoading}
@@ -8076,6 +9272,19 @@ import {
     {#if selectedEntity?.kind === "agent" && selectedAgentId}
       <!-- Primary Agent Settings Start -->
       <div class="batshit-settings-surface space-y-6">
+              {#if primarySettingsReadWaiting || primaryOwnedSaveInFlightUi}
+                <div class="batshit-settings-note is-dashed flex items-center gap-2" data-testid="primary-settings-read-wait" role="status">
+                  {#if primaryReadWaitError || primarySaveWaitExpiredUi}
+                    <AlertCircle class="h-4 w-4" />
+                    <span>{primaryReadWaitError ?? "Your last change to this agent did not confirm within 30 seconds. Batshit does not know if it was saved. Retry reads the record."}</span>
+                  {:else}
+                    <Loader2 class="h-4 w-4 animate-spin" />
+                    <span>Waiting for saved agent settings…</span>
+                  {/if}
+                  <Button variant="outline" size="sm" onclick={retryPrimarySettingsRead}>Retry</Button>
+                </div>
+              {/if}
+              <fieldset disabled={primaryOwnedSaveInFlightUi} inert={primaryOwnedSaveInFlightUi} class="min-w-0 space-y-6 border-0 p-0 m-0">
               {#if detailLoading}
                 <div
                   class="batshit-settings-note is-dashed flex items-center gap-2"
@@ -8147,21 +9356,19 @@ import {
                 nativeCliToolsEnabled={getNativeToolToggle("cliToolsEnabled", true)}
                 nativeToolSettings={getNativeToolsSettings("agent")}
                 isCodexMode={isCliProvider}
-                onGatewaysChange={handleMcpGatewaysChange}
-                onDcmDisplaySettingsChange={handleMcpDcmDisplaySettingsChange}
-                onCliToolIdsChange={handleCliToolSelectionsChange}
+                onGatewaysChange={guardPrimaryChoice(handleMcpGatewaysChange)}
+                onDcmDisplaySettingsChange={guardPrimaryChoice(handleMcpDcmDisplaySettingsChange)}
+                onCliToolIdsChange={guardPrimaryChoice(handleCliToolSelectionsChange)}
                 getToolZipOverride={getMcpToolZipOverride}
-                onToolZipOverrideChange={handleMcpToolZipOverrideChange}
+                onToolZipOverrideChange={guardPrimaryChoice(handleMcpToolZipOverrideChange)}
                 showZipControls={true}
-                zipAgentControlEnabled={zipForm.zip_agent_control_enabled}
                 zipAiViewMode={zipForm.zip_ai_view_mode}
                 zipToolNotesEnabled={zipForm.zip_tool_notes_enabled}
                 nonMcpZipRows={NON_MCP_ZIP_ROW_ORDER}
                 getNonMcpZipOverride={getNonMcpZipOverrideById}
-                onNonMcpZipOverrideChange={handleNonMcpZipOverrideChangeById}
-                onZipAgentControlChange={handleZipAgentControlChange}
-                onZipAiViewModeChange={handleZipAiViewModeChange}
-                onZipToolNotesChange={handleZipToolNotesChange}
+                onNonMcpZipOverrideChange={guardPrimaryChoice(handleNonMcpZipOverrideChangeById)}
+                onZipAiViewModeChange={guardPrimaryChoice(handleZipAiViewModeChange)}
+                onZipToolNotesChange={guardPrimaryChoice(handleZipToolNotesChange)}
                 onResetToGlobalSettings={resetToolGridToGlobalSettings}
                 zipSaveState={zipSaveState}
                 zipSaveError={zipSaveError}
@@ -8264,10 +9471,10 @@ import {
                                   <Select.Root
                                     type="single"
                                     value={(selectedModelId ?? "") as unknown as string}
-                                    onValueChange={(value) =>
+                                    onValueChange={guardPrimaryChoice((value) =>
                                       handleAgentModelChange(
                                         Array.isArray(value) ? value[0] : value,
-                                      )}
+                                      ))}
                                   >
                                     <Select.Trigger class="w-full justify-between">
                                       {#if selectedModelId}
@@ -8504,11 +9711,11 @@ import {
                             <Select.Root
                               type="single"
                               value={basicForm.goon_id || "none"}
-                              onValueChange={(value: string) =>
+                              onValueChange={guardPrimaryChoice((value: string) =>
                                 (basicForm = {
                                   ...basicForm,
                                   goon_id: value === "none" ? null : value,
-                                })}
+                                }))}
                             >
                               <Select.Trigger class="w-full">
                                 {basicForm.goon_id
@@ -8532,21 +9739,21 @@ import {
                           {savedModelsLoading}
                           {savedModelsError}
                           onRefreshModels={refreshModelPickerData}
-                          onChange={(nextSettings) =>
+                          onChange={guardPrimaryChoice((nextSettings) =>
                             (basicForm = {
                               ...basicForm,
                               auto_compact_settings: nextSettings,
-                            })}
+                            }))}
                         />
 
                         <AgentMemorySettingsCard
                           draft={basicForm.memory_settings}
                           {savedModels}
-                          onChange={(nextDraft) =>
+                          onChange={guardPrimaryChoice((nextDraft) =>
                             (basicForm = {
                               ...basicForm,
                               memory_settings: nextDraft,
-                            })}
+                            }))}
                         />
 
                         <AgentDmsSettingsCard
@@ -8554,27 +9761,27 @@ import {
                           dmSenderScope={basicForm.dm_sender_scope}
                           dmSenderAgentIds={basicForm.dm_sender_agent_ids}
                           senderCandidates={dmSenderCandidates}
-                          onDmsEnabledChange={(enabled) =>
-                            (basicForm = { ...basicForm, dms_enabled: enabled })}
-                          onDmSenderScopeChange={(scope) =>
-                            (basicForm = { ...basicForm, dm_sender_scope: scope })}
-                          onDmSenderAgentIdsChange={(agentIds) =>
+                          onDmsEnabledChange={guardPrimaryChoice((enabled) =>
+                            (basicForm = { ...basicForm, dms_enabled: enabled }))}
+                          onDmSenderScopeChange={guardPrimaryChoice((scope) =>
+                            (basicForm = { ...basicForm, dm_sender_scope: scope }))}
+                          onDmSenderAgentIdsChange={guardPrimaryChoice((agentIds) =>
                             (basicForm = {
                               ...basicForm,
                               dm_sender_agent_ids: agentIds,
-                            })}
+                            }))}
                           wakeEnabled={basicForm.wake_enabled}
                           wakeTimeoutMinutes={basicForm.wake_timeout_minutes}
                           wakeTarget={basicForm.wake_target}
-                          onWakeEnabledChange={(enabled) =>
-                            (basicForm = { ...basicForm, wake_enabled: enabled })}
-                          onWakeTimeoutMinutesChange={(minutes) =>
+                          onWakeEnabledChange={guardPrimaryChoice((enabled) =>
+                            (basicForm = { ...basicForm, wake_enabled: enabled }))}
+                          onWakeTimeoutMinutesChange={guardPrimaryChoice((minutes) =>
                             (basicForm = {
                               ...basicForm,
                               wake_timeout_minutes: minutes,
-                            })}
-                          onWakeTargetChange={(target) =>
-                            (basicForm = { ...basicForm, wake_target: target })}
+                            }))}
+                          onWakeTargetChange={guardPrimaryChoice((target) =>
+                            (basicForm = { ...basicForm, wake_target: target }))}
                         />
 
                         <AgentJevJuiceSettingsCard
@@ -8585,18 +9792,18 @@ import {
                           replyCheckEnabled={basicForm.jev_juice_reply_check}
                           styleCoachEnabled={basicForm.jev_juice_style_coach}
                           memoryEnabled={basicForm.memory_settings?.enabled === true}
-                          onSkillToolHintsEnabledChange={(enabled) =>
-                            (basicForm = { ...basicForm, jev_juice_skill_tool_hints: enabled })}
-                          onJudgeToolEnabledChange={(enabled) =>
-                            (basicForm = { ...basicForm, jev_juice_judge_tool: enabled })}
-                          onMemoryRerankEnabledChange={(enabled) =>
-                            (basicForm = { ...basicForm, jev_juice_memory_rerank: enabled })}
-                          onMemoryRecallEnabledChange={(enabled) =>
-                            (basicForm = { ...basicForm, jev_juice_memory_recall: enabled })}
-                          onReplyCheckEnabledChange={(enabled) =>
-                            (basicForm = { ...basicForm, jev_juice_reply_check: enabled })}
-                          onStyleCoachEnabledChange={(enabled) =>
-                            (basicForm = { ...basicForm, jev_juice_style_coach: enabled })}
+                          onSkillToolHintsEnabledChange={guardPrimaryChoice((enabled) =>
+                            (basicForm = { ...basicForm, jev_juice_skill_tool_hints: enabled }))}
+                          onJudgeToolEnabledChange={guardPrimaryChoice((enabled) =>
+                            (basicForm = { ...basicForm, jev_juice_judge_tool: enabled }))}
+                          onMemoryRerankEnabledChange={guardPrimaryChoice((enabled) =>
+                            (basicForm = { ...basicForm, jev_juice_memory_rerank: enabled }))}
+                          onMemoryRecallEnabledChange={guardPrimaryChoice((enabled) =>
+                            (basicForm = { ...basicForm, jev_juice_memory_recall: enabled }))}
+                          onReplyCheckEnabledChange={guardPrimaryChoice((enabled) =>
+                            (basicForm = { ...basicForm, jev_juice_reply_check: enabled }))}
+                          onStyleCoachEnabledChange={guardPrimaryChoice((enabled) =>
+                            (basicForm = { ...basicForm, jev_juice_style_coach: enabled }))}
                         />
 
                       </div>
@@ -8712,13 +9919,13 @@ import {
                       <Select.Root
                         type="single"
                         value={claudeForm.model.length ? claudeForm.model : "default"}
-                        onValueChange={(value) => {
+                        onValueChange={guardPrimaryChoice((value) => {
                           const nextValue = (Array.isArray(value) ? value[0] : value) as string;
                           updateClaudeForm((current) => ({
                             ...current,
                             model: nextValue === "default" ? "" : nextValue,
                           }));
-                        }}
+                        })}
                       >
                         <Select.Trigger class="w-full">
                           {@const label = claudeForm.model.length
@@ -8767,6 +9974,7 @@ import {
                           {/each}
                         </Select.Content>
                       </Select.Root>
+                      <RetiredCliModelNotice runtime="claude" model={claudeForm.model} />
                     </div>
                   </div>
 
@@ -8791,7 +9999,7 @@ import {
                     </div>
                     <Switch.Root
                       checked={claudeForm.alwaysThinkingEnabled}
-                      onCheckedChange={(checked) =>
+                      onCheckedChange={guardPrimaryChoice((checked) =>
                         updateClaudeForm((current) => ({
                           ...current,
                           alwaysThinkingEnabled: checked === true,
@@ -8801,7 +10009,7 @@ import {
                                 ? current.maxThinkingTokens
                                 : String(CLAUDE_DEFAULT_MAX_THINKING_TOKENS)
                               : "",
-                        }))} />
+                        })))} />
                   </div>
 
                   {#if claudeForm.alwaysThinkingEnabled}
@@ -8895,7 +10103,7 @@ import {
                       size="lg"
                       class="batshit-settings-permission-toggle-group"
                       aria-label="Batshit permissions mode"
-                      onValueChange={(value) => {
+                      onValueChange={guardPrimaryChoice((value) => {
                         const next = Array.isArray(value) ? value[0] : value;
                         if (!NATIVE_BASH_ACCESS_MODE_OPTIONS.includes(next as NativeBashAccessMode)) return;
                         const mode = next as NativeBashAccessMode;
@@ -8908,7 +10116,7 @@ import {
                         if (mode !== "agent") {
                           updateNativeToolSetting("bashAgentApprovalCardsEnabled", false);
                         }
-                      }}
+                      })}
                     >
                       {#each NATIVE_PERMISSION_OPTIONS as option}
                         <ToggleGroup.Item
@@ -8975,11 +10183,11 @@ import {
                         <Select.Root
                           type="single"
                           value={selectedSandboxBackend as unknown as string}
-                          onValueChange={(value) => {
+                          onValueChange={guardPrimaryChoice((value) => {
                             const next = Array.isArray(value) ? value[0] : value;
                             const normalized = normalizeNativeExecutionBackend(next) ?? getDefaultNativeExecutionBackend();
                             updateNativeToolSetting("executionBackend", normalized);
-                          }}
+                          })}
                         >
                           <Select.Trigger class="justify-between">
                             <span class="truncate">
@@ -8998,7 +10206,7 @@ import {
                           <p class="batshit-settings-form-help">Checking sandbox status...</p>
                         {:else if selectedSandboxBackend !== "local" && !selectedSandboxStatus?.available}
                           <p class="batshit-settings-form-help is-danger">
-                            {getSandboxUnavailableMessage(selectedSandboxBackend)}
+                            {getSandboxUnavailableMessage(selectedSandboxBackend, selectedSandboxStatus)}
                           </p>
                           {#if selectedSandboxStatus?.reason}
                             <p class="batshit-settings-form-help is-danger">{selectedSandboxStatus.reason}</p>
@@ -9044,14 +10252,14 @@ import {
                       <Select.Root
                         type="single"
                         value={basicForm.tool_approval_mode}
-                        onValueChange={(value) => {
+                        onValueChange={guardPrimaryChoice((value) => {
                           const next = (Array.isArray(value) ? value[0] : value) as "off" | "all";
                           basicSaveScope = "permissions";
                           basicForm = {
                             ...basicForm,
                             tool_approval_mode: !toolApprovalEligible ? "off" : next,
                           };
-                        }}
+                        })}
                         disabled={!toolApprovalEligible}
                       >
                         <Select.Trigger>
@@ -9093,14 +10301,14 @@ import {
                         <Select.Root
                           type="single"
                           value={String(getNativeBashTimeoutMs()) as unknown as string}
-                          onValueChange={(value) => {
+                          onValueChange={guardPrimaryChoice((value) => {
                             const next = Array.isArray(value) ? value[0] : value;
                             const parsed = Number.parseInt(String(next ?? ""), 10);
                             updateNativeToolSetting(
                               "bashTimeoutMs",
                               Number.isFinite(parsed) ? parsed : 30_000,
                             );
-                          }}
+                          })}
                         >
                           <Select.Trigger class="justify-between">
                             <span class="truncate">{Math.round(getNativeBashTimeoutMs() / 1000)} seconds</span>
@@ -9267,13 +10475,15 @@ import {
                       <Select.Root
                         type="single"
                         value={codexForm.model}
-                        onValueChange={(value) =>
-                          updateCodexForm((current) => ({
-                            ...current,
-                            model: Array.isArray(value)
-                              ? (value[0] as string)
-                              : (value as string),
-                          }))}
+                        onValueChange={guardPrimaryChoice((value) =>
+                          updateCodexForm((current) =>
+                            codexFormForPickedModel(
+                              current,
+                              Array.isArray(value)
+                                ? (value[0] as string)
+                                : (value as string),
+                            ),
+                          ))}
                       >
                         <Select.Trigger class="w-full">
                           {@const label = CODEX_SUBMODEL_CHOICES.find((option) => option.value === codexForm.model)?.label ?? codexForm.model}
@@ -9305,6 +10515,7 @@ import {
                         {/each}
                         </Select.Content>
                       </Select.Root>
+                      <RetiredCliModelNotice runtime="codex" model={codexForm.model} />
                     </div>
                   </div>
 
@@ -9333,13 +10544,13 @@ import {
                       <Select.Root
                         type="single"
                         value={codexForm.reasoningEffort}
-                        onValueChange={(value) =>
+                        onValueChange={guardPrimaryChoice((value) =>
                           updateCodexForm((current) => ({
                             ...current,
                             reasoningEffort: (Array.isArray(value)
                               ? value[0]
                               : value) as CodexFormOptions["reasoningEffort"],
-                          }))}
+                          })))}
                       >
                         <Select.Trigger class="w-full">
                           {@const label = CODEX_REASONING_OPTIONS.find((option) => option.value === codexForm.reasoningEffort)?.label ?? "Auto"}
@@ -9394,13 +10605,13 @@ import {
                       <Select.Root
                         type="single"
                         value={codexForm.serviceTier}
-                        onValueChange={(value) =>
+                        onValueChange={guardPrimaryChoice((value) =>
                           updateCodexForm((current) => ({
                             ...current,
                             serviceTier: (Array.isArray(value)
                               ? value[0]
                               : value) as CodexServiceTier,
-                          }))}
+                          })))}
                       >
                         <Select.Trigger class="w-full">
                           <span>
@@ -9484,11 +10695,11 @@ import {
                 <Select.Root
                   type="single"
                   value={basicForm.default_project_id || "none"}
-                  onValueChange={(value: string) =>
+                  onValueChange={guardPrimaryChoice((value: string) =>
                     (basicForm = {
                       ...basicForm,
                       default_project_id: value === "none" ? null : value,
-                    })}
+                    }))}
                 >
                   <Select.Trigger class="w-full sm:w-[420px]">
                     {#if basicForm.default_project_id}
@@ -9669,11 +10880,11 @@ import {
                   </div>
                   <Switch.Root
                     checked={claudeForm.includeProjectInstructions}
-                    onCheckedChange={(checked) =>
+                    onCheckedChange={guardPrimaryChoice((checked) =>
                       updateClaudeForm((current) => ({
                         ...current,
                         includeProjectInstructions: checked === true,
-                      }))}
+                      })))}
                   />
                 </div>
 
@@ -9689,7 +10900,7 @@ import {
                   </div>
                   <Switch.Root
                     checked={claudeForm.includeCoreSystemPrompt}
-                    onCheckedChange={(checked) =>
+                    onCheckedChange={guardPrimaryChoice((checked) =>
                       updateClaudeForm((current) => ({
                         ...current,
                         includeCoreSystemPrompt: checked === true,
@@ -9697,7 +10908,7 @@ import {
                         systemPrompt:
                           checked === true ? "" : MODE4_PRELAUNCH_REPLACEMENT_PROMPT,
                         systemPromptFile: "",
-                      }))}
+                      })))}
                   />
                 </div>
               </div>
@@ -9742,11 +10953,11 @@ import {
                   </div>
                   <Switch.Root
                     checked={codexForm.includeProjectInstructions}
-                    onCheckedChange={(checked) =>
+                    onCheckedChange={guardPrimaryChoice((checked) =>
                       updateCodexForm((current) => ({
                         ...current,
                         includeProjectInstructions: checked === true,
-                      }))}
+                      })))}
                   />
                 </div>
               </div>
@@ -9806,11 +11017,11 @@ import {
                     size="lg"
                     class="batshit-settings-permission-toggle-group"
                     aria-label="Claude permissions mode"
-                    onValueChange={(value) => {
+                    onValueChange={guardPrimaryChoice((value) => {
                       const next = Array.isArray(value) ? value[0] : value;
                       if (!next) return;
                       setClaudePermissionMode(next as ClaudePermissionMode);
-                    }}
+                    })}
                   >
                     {#each CLAUDE_PERMISSION_OPTIONS as option}
                       <ToggleGroup.Item
@@ -9846,8 +11057,7 @@ import {
                             </span>
                           {/each}
                           <span class="mt-2 block">
-                            Claude only uses this in <span class="batshit-settings-inline-strong">Edit Automatically</span>.
-                            Plan never prompts, and Bypass Permissions never asks.
+                            This controls requests from Claude's own tools in <span class="batshit-settings-inline-strong">Edit Automatically</span> or an effective Default mode. Batshit helpers do not ask through this policy: the Bash helper follows its saved Work mode and allow/never-allow rules. Fabric controls may have separate approvals. Claude Plan and Bypass Permissions do not ask.
                           </span>
                         </SettingsInfoMenu>
                       </div>
@@ -9856,14 +11066,14 @@ import {
                       <Select.Root
                         type="single"
                         value={basicForm.tool_approval_mode}
-                        onValueChange={(value) => {
+                        onValueChange={guardPrimaryChoice((value) => {
                           const next = (Array.isArray(value) ? value[0] : value) as "off" | "all";
                           basicSaveScope = "approvals";
                           basicForm = {
                             ...basicForm,
                             tool_approval_mode: next,
                           };
-                        }}
+                        })}
                       >
                         <Select.Trigger>
                           <span>{getPrimaryApprovalPolicyLabel(basicForm.tool_approval_mode)}</span>
@@ -9994,7 +11204,8 @@ import {
             >
               {#snippet info()}
                 <SettingsInfoMenu ariaLabel="About Codex Permissions">
-                  Controls how freely Codex can act when tools are enabled.
+                  A chat send uses the tighter of the mode and this Sandbox Level.
+                  Choosing a mode sets its own level.
                 </SettingsInfoMenu>
               {/snippet}
               {#snippet actions()}
@@ -10035,11 +11246,11 @@ import {
                       size="lg"
                       class="batshit-settings-permission-toggle-group"
                       aria-label="Codex permissions mode"
-                      onValueChange={(value) => {
+                      onValueChange={guardPrimaryChoice((value) => {
                         const next = Array.isArray(value) ? value[0] : value;
                         if (!next) return;
                         setCodexPermissionMode(next as CodexPermissionMode);
-                      }}
+                      })}
                     >
                       {#each CODEX_PERMISSION_OPTIONS as option}
                         <ToggleGroup.Item
@@ -10067,13 +11278,14 @@ import {
                       <Select.Root
                         type="single"
                         value={codexForm.sandbox}
-                        onValueChange={(value) =>
+                        disabled={codexForm.permissionMode === "agent_full"}
+                        onValueChange={guardPrimaryChoice((value) =>
                           updateCodexForm((current) => ({
                             ...current,
                             sandbox: (Array.isArray(value)
                               ? value[0]
                               : value) as CodexSandbox,
-                          }))}
+                          })))}
                       >
                         <Select.Trigger>
                           <span>
@@ -10090,6 +11302,14 @@ import {
                       </Select.Root>
                     </div>
                   </div>
+                  {#if codexForm.permissionMode === "agent_full"}
+                    <div class="batshit-settings-note" data-testid="agent-codex-full-sandbox-note">
+                      {#if codexForm.sandbox !== CODEX_PERMISSION_PRESETS.agent_full.sandbox}
+                        This agent keeps its saved {CODEX_SANDBOX_LABELS[codexForm.sandbox]} Sandbox Level.
+                      {/if}
+                      To limit the sandbox, pick Agent.
+                    </div>
+                  {/if}
                   <div class="batshit-settings-form-row">
                     <div class="batshit-settings-form-copy">
                       <div class="batshit-settings-form-label-line">
@@ -10104,7 +11324,7 @@ import {
                           {/each}
                           <span class="mt-2 block">
                             Codex only uses this in <span class="batshit-settings-inline-strong">Agent</span> mode.
-                            Chat and Agent (full) never prompt.
+                            Chat and Agent (full access) never prompt.
                           </span>
                         </SettingsInfoMenu>
                       </div>
@@ -10113,14 +11333,14 @@ import {
                       <Select.Root
                         type="single"
                         value={basicForm.tool_approval_mode}
-                        onValueChange={(value) => {
+                        onValueChange={guardPrimaryChoice((value) => {
                           const next = (Array.isArray(value) ? value[0] : value) as "off" | "all";
                           basicSaveScope = "approvals";
                           basicForm = {
                             ...basicForm,
                             tool_approval_mode: next,
                           };
-                        }}
+                        })}
                       >
                         <Select.Trigger>
                           <span>
@@ -10292,11 +11512,11 @@ import {
                   <Select.Root
                     type="single"
                     value={basicForm.default_project_id || "none"}
-                    onValueChange={(value: string) =>
+                    onValueChange={guardPrimaryChoice((value: string) =>
                       (basicForm = {
                         ...basicForm,
                         default_project_id: value === "none" ? null : value,
-                      })}
+                      }))}
                   >
                     <Select.Trigger class="w-full sm:w-[420px]">
                       {#if basicForm.default_project_id}
@@ -10476,11 +11696,11 @@ import {
                   </div>
                   <Switch.Root
                     checked={claudeForm.chrome}
-                    onCheckedChange={(checked) =>
+                    onCheckedChange={guardPrimaryChoice((checked) =>
                       updateClaudeForm((current) => ({
                         ...current,
                         chrome: checked === true,
-                      }))}
+                      })))}
                   />
                 </div>
 
@@ -10495,7 +11715,7 @@ import {
                   </div>
                   <Switch.Root
                     checked={getClaudeToolEnabled("WebSearch")}
-                    onCheckedChange={(checked) => setClaudeToolEnabled("WebSearch", checked === true)}
+                    onCheckedChange={guardPrimaryChoice((checked) => setClaudeToolEnabled("WebSearch", checked === true))}
                   />
                 </div>
                 </div>
@@ -10631,11 +11851,11 @@ import {
                     </div>
                     <Switch.Root
                       checked={codexForm.search}
-                      onCheckedChange={(checked) =>
+                      onCheckedChange={guardPrimaryChoice((checked) =>
                         updateCodexForm((current) => ({
                           ...current,
                           search: checked === true,
-                        }))}
+                        })))}
                     />
                   </div>
 
@@ -10855,8 +12075,8 @@ import {
                   </div>
                   <Switch.Root
                     checked={primaryBashAvailable && getNativeToolToggle("bashEnabled", true)}
-                    onCheckedChange={(checked) =>
-                      updateNativeToolSetting("bashEnabled", checked === true)}
+                    onCheckedChange={guardPrimaryChoice((checked) =>
+                      updateNativeToolSetting("bashEnabled", checked === true))}
                     disabled={!primaryBashAvailable}
                   />
                 </div>
@@ -10873,8 +12093,8 @@ import {
                   </div>
                   <Switch.Root
                     checked={getNativeToolToggle("dynamicMcpEnabled", true)}
-                    onCheckedChange={(checked) =>
-                      updateNativeToolSetting("dynamicMcpEnabled", checked === true)}
+                    onCheckedChange={guardPrimaryChoice((checked) =>
+                      updateNativeToolSetting("dynamicMcpEnabled", checked === true))}
                   />
                 </div>
 
@@ -10890,8 +12110,8 @@ import {
                   </div>
                   <Switch.Root
                     checked={getNativeToolToggle("cliToolsEnabled", true)}
-                    onCheckedChange={(checked) =>
-                      updateNativeToolSetting("cliToolsEnabled", checked === true)}
+                    onCheckedChange={guardPrimaryChoice((checked) =>
+                      updateNativeToolSetting("cliToolsEnabled", checked === true))}
                   />
                 </div>
 
@@ -10907,8 +12127,8 @@ import {
                   </div>
                     <Switch.Root
                       checked={getNativeToolToggle("artifactRuntimeEnabled", true)}
-                      onCheckedChange={(checked) =>
-                        updateNativeToolSetting("artifactRuntimeEnabled", checked === true)}
+                      onCheckedChange={guardPrimaryChoice((checked) =>
+                        updateNativeToolSetting("artifactRuntimeEnabled", checked === true))}
                     />
                   </div>
 
@@ -10928,8 +12148,8 @@ import {
                     </div>
                     <Switch.Root
                       checked={primaryFabricAvailable && getNativeToolToggle("batshitToolsEnabled", true)}
-                      onCheckedChange={(checked) =>
-                        updateNativeToolSetting("batshitToolsEnabled", checked === true)}
+                      onCheckedChange={guardPrimaryChoice((checked) =>
+                        updateNativeToolSetting("batshitToolsEnabled", checked === true))}
                       disabled={!primaryFabricAvailable}
                     />
                   </div>
@@ -10972,31 +12192,31 @@ import {
                       NATIVE_WEB_SEARCH_PERPLEXITY_MAX_TOKENS_PER_PAGE_INHERIT
                     )}
                     perplexityOptions={NATIVE_WEB_SEARCH_PERPLEXITY_MAX_TOKENS_PER_PAGE_OPTIONS}
-                    onEnabledChange={(enabled) => updateNativeToolSetting("webSearchEnabled", enabled)}
-                    onProviderValueChange={(next) => {
+                    onEnabledChange={guardPrimaryChoice((enabled) => updateNativeToolSetting("webSearchEnabled", enabled))}
+                    onProviderValueChange={guardPrimaryChoice((next) => {
                       if (next === NATIVE_WEB_SEARCH_PROVIDER_INHERIT) {
                         updateNativeToolSetting("webSearchProvider", null);
                         return;
                       }
                       const provider = normalizeNativeWebSearchProvider(next);
                       updateNativeToolSetting("webSearchProvider", provider);
-                    }}
-                    onExaTypeValueChange={(next) => {
+                    })}
+                    onExaTypeValueChange={guardPrimaryChoice((next) => {
                       if (next === NATIVE_WEB_SEARCH_EXA_TYPE_INHERIT) {
                         updateNativeToolSetting("webSearchExaType", null);
                         return;
                       }
                       const normalized = normalizeNativeExaSearchType(next);
                       updateNativeToolSetting("webSearchExaType", normalized);
-                    }}
-                    onPerplexityMaxTokensValueChange={(next) => {
+                    })}
+                    onPerplexityMaxTokensValueChange={guardPrimaryChoice((next) => {
                       if (next === NATIVE_WEB_SEARCH_PERPLEXITY_MAX_TOKENS_PER_PAGE_INHERIT) {
                         updateNativeToolSetting("webSearchPerplexityMaxTokensPerPage", null);
                         return;
                       }
                       const normalized = normalizePerplexityMaxTokensPerPage(next);
                       updateNativeToolSetting("webSearchPerplexityMaxTokensPerPage", normalized);
-                    }}
+                    })}
                   />
                   <Collapsible.Root bind:open={primaryAgentBrowserDefaultsOpen}>
                     <div class="batshit-settings-toggle-disclosure-row">
@@ -11039,12 +12259,12 @@ import {
                         <div class="batshit-settings-toggle-disclosure-control">
                           <Switch.Root
                             checked={getNativeAgentBrowserEnabledForUi()}
-                            onCheckedChange={(checked) => {
+                            onCheckedChange={guardPrimaryChoice((checked) => {
                               updateNativeToolSetting("agentBrowserEnabled", checked === true);
                               if (checked !== true) {
                                 primaryAgentBrowserDefaultsOpen = false;
                               }
-                            }}
+                            })}
                             disabled={agentBrowserRuntimeStatusLoading || !isAgentBrowserRuntimeInstalled()}
                           />
                           {#if getNativeAgentBrowserEnabledForUi()}
@@ -11089,8 +12309,8 @@ import {
                               </div>
                               <Switch.Root
                                 checked={getNativeAgentBrowserLiveViewEnabled()}
-                                onCheckedChange={(checked) =>
-                                  updateNativeToolSetting("agentBrowserLiveViewEnabled", checked === true)}
+                                onCheckedChange={guardPrimaryChoice((checked) =>
+                                  updateNativeToolSetting("agentBrowserLiveViewEnabled", checked === true))}
                               />
                             </div>
 
@@ -11108,11 +12328,11 @@ import {
                                 <Select.Root
                                   type="single"
                                   value={getNativeAgentBrowserRuntimeMode() as unknown as string}
-                                  onValueChange={(value) => {
+                                  onValueChange={guardPrimaryChoice((value) => {
                                     const next = Array.isArray(value) ? value[0] : value;
                                     const normalized = normalizeNativeAgentBrowserRuntimeMode(next) ?? "chromium";
                                     updateNativeToolSetting("agentBrowserRuntimeMode", normalized);
-                                  }}
+                                  })}
                                 >
                                   <Select.Trigger class="justify-between">
                                     <span class="truncate">
@@ -11171,14 +12391,14 @@ import {
                                 <Select.Root
                                   type="single"
                                   value={String(getNativeAgentBrowserTimeoutMs()) as unknown as string}
-                                  onValueChange={(value) => {
+                                  onValueChange={guardPrimaryChoice((value) => {
                                     const next = Array.isArray(value) ? value[0] : value;
                                     const parsed = Number.parseInt(String(next ?? ""), 10);
                                     updateNativeToolSetting(
                                       "agentBrowserTimeoutMs",
                                       Number.isFinite(parsed) ? parsed : DEFAULT_NATIVE_AGENT_BROWSER_TIMEOUT_MS,
                                     );
-                                  }}
+                                  })}
                                 >
                                   <Select.Trigger class="justify-between">
                                     <span class="truncate">{Math.round(getNativeAgentBrowserTimeoutMs() / 1000)} seconds</span>
@@ -11210,11 +12430,11 @@ import {
                                 <Select.Root
                                   type="single"
                                   value={getNativeAgentBrowserProvider() as unknown as string}
-                                  onValueChange={(value) => {
+                                  onValueChange={guardPrimaryChoice((value) => {
                                     const next = Array.isArray(value) ? value[0] : value;
                                     const normalized = normalizeNativeAgentBrowserProvider(next) ?? "local";
                                     updateNativeToolSetting("agentBrowserProvider", normalized);
-                                  }}
+                                  })}
                                 >
                                   <Select.Trigger class="justify-between">
                                     <span class="truncate">
@@ -11532,7 +12752,7 @@ import {
                     <Select.Root
                       type="single"
                       value={(basicForm.voice_profile.sttProvider || VOICE_PROVIDER_INHERIT) as unknown as string}
-                      onValueChange={(value) => {
+                      onValueChange={guardPrimaryChoice((value) => {
                         const next = Array.isArray(value) ? value[0] : value;
                         basicForm = {
                           ...basicForm,
@@ -11542,7 +12762,7 @@ import {
                             sttModel: "",
                           },
                         };
-                      }}
+                      })}
                     >
                       <Select.Trigger class="justify-between">
                         <span class="flex min-w-0 items-center gap-2">
@@ -11591,14 +12811,14 @@ import {
                     <Select.Root
                       type="single"
                       value={(basicForm.voice_profile.sttModel || "") as unknown as string}
-                      onValueChange={(value) =>
+                      onValueChange={guardPrimaryChoice((value) =>
                         (basicForm = {
                           ...basicForm,
                           voice_profile: {
                             ...basicForm.voice_profile,
                             sttModel: Array.isArray(value) ? value[0] : value,
                           },
-                        })}
+                        }))}
                       disabled={!basicForm.voice_profile.sttProvider}
                     >
                       <Select.Trigger class="justify-between">
@@ -11694,7 +12914,7 @@ import {
                     <Select.Root
                       type="single"
                       value={(basicForm.voice_profile.voiceSessionRuntime || VOICE_PROVIDER_INHERIT) as unknown as string}
-                      onValueChange={(value) => {
+                      onValueChange={guardPrimaryChoice((value) => {
                         const next = Array.isArray(value) ? value[0] : value;
                         basicForm = {
                           ...basicForm,
@@ -11703,7 +12923,7 @@ import {
                             voiceSessionRuntime: next === "direct" || next === "livekit" ? next : "",
                           },
                         };
-                      }}
+                      })}
                       disabled={voiceModeLockedBySpeechToSpeech}
                     >
                       <Select.Trigger class="justify-between">
@@ -11750,7 +12970,7 @@ import {
                     <Select.Root
                       type="single"
                       value={(basicForm.voice_profile.voiceModeInputMode || VOICE_PROVIDER_INHERIT) as unknown as string}
-                      onValueChange={(value) => {
+                      onValueChange={guardPrimaryChoice((value) => {
                         const next = Array.isArray(value) ? value[0] : value;
                         basicForm = {
                           ...basicForm,
@@ -11759,7 +12979,7 @@ import {
                             voiceModeInputMode: next === "stt" || next === "text" ? next : "",
                           },
                         };
-                      }}
+                      })}
                       disabled={voiceModeLockedBySpeechToSpeech}
                     >
                       <Select.Trigger class="justify-between">
@@ -11821,7 +13041,7 @@ import {
                     <Select.Root
                       type="single"
                       value={(basicForm.voice_profile.voiceModeSubmitMode || VOICE_PROVIDER_INHERIT) as unknown as string}
-                      onValueChange={(value) => {
+                      onValueChange={guardPrimaryChoice((value) => {
                         const next = Array.isArray(value) ? value[0] : value;
                         if (next === "manual" && !agentManualTurnAvailable) return;
                         basicForm = {
@@ -11831,7 +13051,7 @@ import {
                             voiceModeSubmitMode: next === "auto" || next === "manual" ? next : "",
                           },
                         };
-                      }}
+                      })}
                       disabled={voiceModeLockedBySpeechToSpeech}
                     >
                       <Select.Trigger class="justify-between">
@@ -11911,7 +13131,7 @@ import {
                     <Select.Root
                       type="single"
                       value={(basicForm.voice_profile.realtimeSttProvider || VOICE_PROVIDER_INHERIT) as unknown as string}
-                      onValueChange={(value) => {
+                      onValueChange={guardPrimaryChoice((value) => {
                         const next = Array.isArray(value) ? value[0] : value;
                         basicForm = {
                           ...basicForm,
@@ -11921,7 +13141,7 @@ import {
                             realtimeSttModel: "",
                           },
                         };
-                      }}
+                      })}
                       disabled={voiceModeLockedBySpeechToSpeech || !agentVoiceModeUsesSttInput}
                     >
                       <Select.Trigger class="justify-between">
@@ -11971,14 +13191,14 @@ import {
                     <Select.Root
                       type="single"
                       value={(basicForm.voice_profile.realtimeSttModel || "") as unknown as string}
-                      onValueChange={(value) =>
+                      onValueChange={guardPrimaryChoice((value) =>
                         (basicForm = {
                           ...basicForm,
                           voice_profile: {
                             ...basicForm.voice_profile,
                             realtimeSttModel: Array.isArray(value) ? value[0] : value,
                           },
-                        })}
+                        }))}
                       disabled={
                         !basicForm.voice_profile.realtimeSttProvider ||
                         voiceModeLockedBySpeechToSpeech ||
@@ -12041,8 +13261,8 @@ import {
                       <Select.Root
                         type="single"
                         value={(basicForm.voice_profile.provider || VOICE_PROVIDER_INHERIT) as unknown as string}
-                        onValueChange={(value) =>
-                          handleVoiceProviderChange(Array.isArray(value) ? value[0] : value)}
+                        onValueChange={guardPrimaryChoice((value) =>
+                          handleVoiceProviderChange(Array.isArray(value) ? value[0] : value))}
                         disabled={voiceModeLockedBySpeechToSpeech}
                       >
                         <Select.Trigger class="justify-between">
@@ -12098,14 +13318,14 @@ import {
                         <Select.Root
                           type="single"
                           value={(basicForm.voice_profile.model || "") as unknown as string}
-                          onValueChange={(value) =>
+                          onValueChange={guardPrimaryChoice((value) =>
                             (basicForm = {
                               ...basicForm,
                               voice_profile: {
                                 ...basicForm.voice_profile,
                                 model: Array.isArray(value) ? value[0] : value,
                               },
-                            })}
+                            }))}
                           disabled={voiceModeLockedBySpeechToSpeech}
                         >
                           <Select.Trigger class="min-w-0 flex-1 justify-between">
@@ -12190,7 +13410,7 @@ import {
                           <Select.Root
                             type="single"
                             value={(basicForm.voice_profile.voiceId || "") as unknown as string}
-                            onValueChange={(value) => {
+                            onValueChange={guardPrimaryChoice((value) => {
                               const voiceId = Array.isArray(value) ? value[0] : value;
                               const selected = agentVoiceOptions.find(
                                 (option) => option.id === voiceId,
@@ -12207,7 +13427,7 @@ import {
                                       : basicForm.voice_profile.model,
                                 },
                               };
-                            }}
+                            })}
                             disabled={voiceModeLockedBySpeechToSpeech}
                           >
                             <Select.Trigger class="min-w-0 flex-1 justify-between">
@@ -12319,7 +13539,7 @@ import {
                       type="single"
                       value={(basicForm.voice_profile.ttsItalicNarrationBehavior ||
                         VOICE_ITALIC_NARRATION_INHERIT) as unknown as string}
-                      onValueChange={(value) => {
+                      onValueChange={guardPrimaryChoice((value) => {
                         const next = Array.isArray(value) ? value[0] : value;
                         basicForm = {
                           ...basicForm,
@@ -12329,7 +13549,7 @@ import {
                               next === "speak" || next === "silent" ? next : "",
                           },
                         };
-                      }}
+                      })}
                       disabled={voiceModeLockedBySpeechToSpeech}
                     >
                       <Select.Trigger class="justify-between">
@@ -12425,9 +13645,9 @@ import {
             workersEnabled={basicForm.workers_enabled}
             workersMaxConcurrent={WORKERS_MAX_CONCURRENT}
             workersMaxRunsPerTurn={WORKERS_MAX_RUNS_PER_TURN}
-            onWorkersEnabledChange={(enabled) => {
+            onWorkersEnabledChange={guardPrimaryChoice((enabled) => {
               basicForm = { ...basicForm, workers_enabled: enabled };
-            }}
+            })}
             {accessSaveState}
             {accessSaveError}
             {accessSaveScope}
@@ -12457,7 +13677,7 @@ import {
             paragraphs={[
               basicForm.agentType === "n8n"
                 ? "This saved record uses the retired n8n Primary Agent type. Deleting it is the only supported action; create an API or CLI agent for chat."
-                : "Permanently removes this Primary Agent’s settings, zip overrides, MCP defaults, and avatar reference. Chat sessions remain stored.",
+                : "Permanently removes this Primary Agent’s settings, zip overrides, MCP defaults, and avatar pictures. The confirm dialog asks whether to delete its own chats too; group chats stay.",
               "Subagent assignments and MCP selections are cleared during deletion."
             ]}
             error={agentDeleteError}
@@ -12465,11 +13685,25 @@ import {
             disabled={!selectedAgentId || agentDeleteState === "deleting"}
             onDelete={handleDeletePrimaryAgent}
           />
+              </fieldset>
       </div>
       <!-- Primary Agent Settings End -->
     {:else if selectedEntity?.kind === "subagent" && selectedEditableSubagentId}
       <!-- Subagent Settings Start -->
       <div class="batshit-settings-surface space-y-6">
+              {#if subagentSettingsReadWaiting || subagentOwnedSaveInFlightUi}
+                <div class="batshit-settings-note is-dashed flex items-center gap-2" data-testid="subagent-settings-read-wait" role="status">
+                  {#if subagentReadWaitError || subagentSaveWaitExpiredUi}
+                    <AlertCircle class="h-4 w-4" />
+                    <span>{subagentReadWaitError ?? "Your last change to this subagent did not confirm within 30 seconds. Batshit does not know if it was saved. Retry reads the record."}</span>
+                  {:else}
+                    <Loader2 class="h-4 w-4 animate-spin" />
+                    <span>Waiting for saved subagent settings…</span>
+                  {/if}
+                  <Button variant="outline" size="sm" onclick={retrySubagentSettingsRead}>Retry</Button>
+                </div>
+              {/if}
+              <fieldset disabled={subagentOwnedSaveInFlightUi} inert={subagentOwnedSaveInFlightUi} class="min-w-0 space-y-6 border-0 p-0 m-0">
               {#if subagentDetailLoading}
                 <div
                   class="batshit-settings-note is-dashed flex items-center gap-2"
@@ -12534,18 +13768,17 @@ import {
                   nativeCliToolsEnabled={getNativeToolToggle("cliToolsEnabled", true, "subagent")}
                   nativeToolSettings={getNativeToolsSettings("subagent")}
                   isCodexMode={isCodexCliSubagentProvider}
-                  onGatewaysChange={handleSubagentMcpGatewaysChange}
-                  onDcmDisplaySettingsChange={handleSubagentMcpDcmDisplaySettingsChange}
-                  onCliToolIdsChange={handleSubagentCliToolSelectionsChange}
+                  onGatewaysChange={guardSubagentChoice(handleSubagentMcpGatewaysChange)}
+                  onDcmDisplaySettingsChange={guardSubagentChoice(handleSubagentMcpDcmDisplaySettingsChange)}
+                  onCliToolIdsChange={guardSubagentChoice(handleSubagentCliToolSelectionsChange)}
                   getToolZipOverride={getMcpToolZipOverride}
-                  onToolZipOverrideChange={handleMcpToolZipOverrideChange}
+                  onToolZipOverrideChange={guardSubagentChoice(handleMcpToolZipOverrideChange)}
                   showZipControls={false}
                   showZipModeControls={false}
                   showPostTableControls={false}
                   getNonMcpZipOverride={getNonMcpZipOverrideById}
-                  onNonMcpZipOverrideChange={handleNonMcpZipOverrideChangeById}
-                  onZipAgentControlChange={handleZipAgentControlChange}
-                  onZipAiViewModeChange={handleZipAiViewModeChange}
+                  onNonMcpZipOverrideChange={guardSubagentChoice(handleNonMcpZipOverrideChangeById)}
+                  onZipAiViewModeChange={guardSubagentChoice(handleZipAiViewModeChange)}
                   fullWidthTable={true}
                 />
               {/if}
@@ -12665,10 +13898,10 @@ import {
                                   <Select.Root
                                     type="single"
                                     value={(selectedSubagentModelId ?? "") as unknown as string}
-                                    onValueChange={(value) =>
+                                    onValueChange={guardSubagentChoice((value) =>
                                       handleSubagentModelChange(
                                         Array.isArray(value) ? value[0] : value,
-                                      )}
+                                      ))}
                                   >
                                     <Select.Trigger class="w-full justify-between">
                                       {#if selectedSubagentModelId}
@@ -12758,6 +13991,10 @@ import {
                                     {availability.reason}
                                   </p>
                                 {/if}
+                              {:else if subagentForm.subagentType === "api" && subagentForm.primary_model_name && !subagentForm.primary_model_preset_id}
+                                <p class="batshit-settings-form-meta is-warning">
+                                  Pick this Subagent's model again ({subagentForm.primary_model_name}) so Batshit knows which connection to use. It will not run until you do.
+                                </p>
                               {/if}
                             </div>
                           </div>
@@ -12944,13 +14181,13 @@ import {
                           <Select.Root
                             type="single"
                             value={subagentClaudeForm.model.length ? subagentClaudeForm.model : "default"}
-                            onValueChange={(value) => {
+                            onValueChange={guardSubagentChoice((value) => {
                               const nextValue = (Array.isArray(value) ? value[0] : value) as string;
                               updateClaudeForm((current) => ({
                                 ...current,
                                 model: nextValue === "default" ? "" : nextValue,
                               }), "subagent");
-                            }}
+                            })}
                           >
                             <Select.Trigger class="w-full">
                               {@const label = subagentClaudeForm.model.length
@@ -12999,6 +14236,7 @@ import {
                               {/each}
                             </Select.Content>
                           </Select.Root>
+                          <RetiredCliModelNotice runtime="claude" model={subagentClaudeForm.model} />
                         </div>
                       </div>
 
@@ -13023,7 +14261,7 @@ import {
                         </div>
                         <Switch.Root
                           checked={subagentClaudeForm.alwaysThinkingEnabled}
-                          onCheckedChange={(checked) =>
+                          onCheckedChange={guardSubagentChoice((checked) =>
                             updateClaudeForm((current) => ({
                               ...current,
                               alwaysThinkingEnabled: checked === true,
@@ -13033,7 +14271,7 @@ import {
                                     ? current.maxThinkingTokens
                                     : String(CLAUDE_DEFAULT_MAX_THINKING_TOKENS)
                                   : "",
-                            }), "subagent")} />
+                            }), "subagent"))} />
                       </div>
 
                       {#if subagentClaudeForm.alwaysThinkingEnabled}
@@ -13126,13 +14364,13 @@ import {
                           <Select.Root
                             type="single"
                             value={subagentCodexForm.model}
-                            onValueChange={(value) =>
+                            onValueChange={guardSubagentChoice((value) =>
                               updateCodexForm((current) => ({
                                 ...current,
                                 model: Array.isArray(value)
                                   ? (value[0] as string)
                                   : (value as string),
-                              }), "subagent")}
+                              }), "subagent"))}
                           >
                             <Select.Trigger class="w-full">
                               {@const label = CODEX_SUBMODEL_CHOICES.find((option) => option.value === subagentCodexForm.model)?.label ?? subagentCodexForm.model}
@@ -13164,6 +14402,7 @@ import {
                               {/each}
                             </Select.Content>
                           </Select.Root>
+                          <RetiredCliModelNotice runtime="codex" model={subagentCodexForm.model} />
                         </div>
                       </div>
 
@@ -13192,13 +14431,13 @@ import {
                           <Select.Root
                             type="single"
                             value={subagentCodexForm.reasoningEffort}
-                            onValueChange={(value) =>
+                            onValueChange={guardSubagentChoice((value) =>
                               updateCodexForm((current) => ({
                                 ...current,
                                 reasoningEffort: (Array.isArray(value)
                                   ? value[0]
                                   : value) as CodexFormOptions["reasoningEffort"],
-                              }), "subagent")}
+                              }), "subagent"))}
                           >
                             <Select.Trigger class="w-full">
                               {@const label = CODEX_REASONING_OPTIONS.find((option) => option.value === subagentCodexForm.reasoningEffort)?.label ?? "Auto"}
@@ -13253,13 +14492,13 @@ import {
                           <Select.Root
                             type="single"
                             value={subagentCodexForm.serviceTier}
-                            onValueChange={(value) =>
+                            onValueChange={guardSubagentChoice((value) =>
                               updateCodexForm((current) => ({
                                 ...current,
                                 serviceTier: (Array.isArray(value)
                                   ? value[0]
                                   : value) as CodexServiceTier,
-                              }), "subagent")}
+                              }), "subagent"))}
                           >
                             <Select.Trigger class="w-full">
                               <span>
@@ -13327,11 +14566,11 @@ import {
                           </div>
                           <Switch.Root
                             checked={subagentClaudeForm.includeProjectInstructions}
-                            onCheckedChange={(checked) =>
+                            onCheckedChange={guardSubagentChoice((checked) =>
                               updateClaudeForm((current) => ({
                                 ...current,
                                 includeProjectInstructions: checked === true,
-                              }), "subagent")}
+                              }), "subagent"))}
                           />
                         </div>
 
@@ -13347,7 +14586,7 @@ import {
                           </div>
                           <Switch.Root
                             checked={subagentClaudeForm.includeCoreSystemPrompt}
-                            onCheckedChange={(checked) =>
+                            onCheckedChange={guardSubagentChoice((checked) =>
                               updateClaudeForm((current) => ({
                                 ...current,
                                 includeCoreSystemPrompt: checked === true,
@@ -13355,7 +14594,7 @@ import {
                                 systemPrompt:
                                   checked === true ? "" : MODE4_PRELAUNCH_REPLACEMENT_PROMPT,
                                 systemPromptFile: "",
-                              }), "subagent")}
+                              }), "subagent"))}
                           />
                         </div>
                       </div>
@@ -13400,11 +14639,11 @@ import {
                           </div>
                           <Switch.Root
                             checked={subagentCodexForm.includeProjectInstructions}
-                            onCheckedChange={(checked) =>
+                            onCheckedChange={guardSubagentChoice((checked) =>
                               updateCodexForm((current) => ({
                                 ...current,
                                 includeProjectInstructions: checked === true,
-                              }), "subagent")}
+                              }), "subagent"))}
                           />
                         </div>
                       </div>
@@ -13507,11 +14746,11 @@ import {
                       </div>
                       <Switch.Root
                         checked={subagentClaudeForm.chrome}
-                        onCheckedChange={(checked) =>
+                        onCheckedChange={guardSubagentChoice((checked) =>
                           updateClaudeForm((current) => ({
                             ...current,
                             chrome: checked === true,
-                          }), "subagent")}
+                          }), "subagent"))}
                       />
                     </div>
 
@@ -13526,8 +14765,8 @@ import {
                       </div>
                       <Switch.Root
                         checked={getClaudeToolEnabled("WebSearch", "subagent")}
-                        onCheckedChange={(checked) =>
-                          setClaudeToolEnabled("WebSearch", checked === true, "subagent")}
+                        onCheckedChange={guardSubagentChoice((checked) =>
+                          setClaudeToolEnabled("WebSearch", checked === true, "subagent"))}
                       />
                     </div>
 
@@ -13662,11 +14901,11 @@ import {
                         </div>
                         <Switch.Root
                           checked={subagentCodexForm.search}
-                          onCheckedChange={(checked) =>
+                          onCheckedChange={guardSubagentChoice((checked) =>
                             updateCodexForm((current) => ({
                               ...current,
                               search: checked === true,
-                            }), "subagent")}
+                            }), "subagent"))}
                         />
                       </div>
 
@@ -13826,8 +15065,8 @@ import {
                 </div>
                 <Switch.Root
                   checked={subagentBashAvailable && getNativeToolToggle("bashEnabled", true, "subagent")}
-                  onCheckedChange={(checked) =>
-                    updateNativeToolSetting("bashEnabled", checked === true, "subagent")}
+                  onCheckedChange={guardSubagentChoice((checked) =>
+                    updateNativeToolSetting("bashEnabled", checked === true, "subagent"))}
                   disabled={!subagentBashAvailable}
                 />
               </div>
@@ -13844,8 +15083,8 @@ import {
                 </div>
                 <Switch.Root
                   checked={getNativeToolToggle("dynamicMcpEnabled", true, "subagent")}
-                  onCheckedChange={(checked) =>
-                    updateNativeToolSetting("dynamicMcpEnabled", checked === true, "subagent")}
+                  onCheckedChange={guardSubagentChoice((checked) =>
+                    updateNativeToolSetting("dynamicMcpEnabled", checked === true, "subagent"))}
                 />
               </div>
 
@@ -13861,8 +15100,8 @@ import {
                 </div>
                 <Switch.Root
                   checked={getNativeToolToggle("cliToolsEnabled", true, "subagent")}
-                  onCheckedChange={(checked) =>
-                    updateNativeToolSetting("cliToolsEnabled", checked === true, "subagent")}
+                  onCheckedChange={guardSubagentChoice((checked) =>
+                    updateNativeToolSetting("cliToolsEnabled", checked === true, "subagent"))}
                 />
               </div>
 
@@ -13878,8 +15117,8 @@ import {
                 </div>
                   <Switch.Root
                     checked={getNativeToolToggle("artifactRuntimeEnabled", true, "subagent")}
-                    onCheckedChange={(checked) =>
-                      updateNativeToolSetting("artifactRuntimeEnabled", checked === true, "subagent")}
+                    onCheckedChange={guardSubagentChoice((checked) =>
+                      updateNativeToolSetting("artifactRuntimeEnabled", checked === true, "subagent"))}
                   />
                 </div>
 
@@ -13899,8 +15138,8 @@ import {
                   </div>
                   <Switch.Root
                     checked={subagentFabricAvailable && getNativeToolToggle("batshitToolsEnabled", true, "subagent")}
-                    onCheckedChange={(checked) =>
-                      updateNativeToolSetting("batshitToolsEnabled", checked === true, "subagent")}
+                    onCheckedChange={guardSubagentChoice((checked) =>
+                      updateNativeToolSetting("batshitToolsEnabled", checked === true, "subagent"))}
                     disabled={!subagentFabricAvailable}
                   />
                 </div>
@@ -13945,25 +15184,25 @@ import {
                       NATIVE_WEB_SEARCH_PERPLEXITY_MAX_TOKENS_PER_PAGE_INHERIT
                     )}
                     perplexityOptions={NATIVE_WEB_SEARCH_PERPLEXITY_MAX_TOKENS_PER_PAGE_OPTIONS}
-                    onEnabledChange={(enabled) =>
-                      updateNativeToolSetting("webSearchEnabled", enabled, "subagent")}
-                    onProviderValueChange={(next) => {
+                    onEnabledChange={guardSubagentChoice((enabled) =>
+                      updateNativeToolSetting("webSearchEnabled", enabled, "subagent"))}
+                    onProviderValueChange={guardSubagentChoice((next) => {
                       if (next === NATIVE_WEB_SEARCH_PROVIDER_INHERIT) {
                         updateNativeToolSetting("webSearchProvider", null, "subagent");
                         return;
                       }
                       const provider = normalizeNativeWebSearchProvider(next);
                       updateNativeToolSetting("webSearchProvider", provider, "subagent");
-                    }}
-                    onExaTypeValueChange={(next) => {
+                    })}
+                    onExaTypeValueChange={guardSubagentChoice((next) => {
                       if (next === NATIVE_WEB_SEARCH_EXA_TYPE_INHERIT) {
                         updateNativeToolSetting("webSearchExaType", null, "subagent");
                         return;
                       }
                       const normalized = normalizeNativeExaSearchType(next);
                       updateNativeToolSetting("webSearchExaType", normalized, "subagent");
-                    }}
-                    onPerplexityMaxTokensValueChange={(next) => {
+                    })}
+                    onPerplexityMaxTokensValueChange={guardSubagentChoice((next) => {
                       if (next === NATIVE_WEB_SEARCH_PERPLEXITY_MAX_TOKENS_PER_PAGE_INHERIT) {
                         updateNativeToolSetting(
                           "webSearchPerplexityMaxTokensPerPage",
@@ -13978,7 +15217,7 @@ import {
                         normalized,
                         "subagent"
                       );
-                    }}
+                    })}
                   />
 
                 <Collapsible.Root bind:open={subagentAgentBrowserDefaultsOpen}>
@@ -14018,12 +15257,12 @@ import {
                       <div class="batshit-settings-toggle-disclosure-control">
                         <Switch.Root
                           checked={isAgentBrowserRuntimeInstalled() && getNativeToolToggle("agentBrowserEnabled", true, "subagent")}
-                          onCheckedChange={(checked) => {
+                          onCheckedChange={guardSubagentChoice((checked) => {
                             updateNativeToolSetting("agentBrowserEnabled", checked === true, "subagent");
                             if (checked !== true) {
                               subagentAgentBrowserDefaultsOpen = false;
                             }
-                          }}
+                          })}
                           disabled={agentBrowserRuntimeStatusLoading || !isAgentBrowserRuntimeInstalled()}
                         />
                         {#if isAgentBrowserRuntimeInstalled() && getNativeToolToggle("agentBrowserEnabled", true, "subagent")}
@@ -14067,8 +15306,8 @@ import {
                               </div>
                               <Switch.Root
                                 checked={getNativeAgentBrowserLiveViewEnabled("subagent")}
-                                onCheckedChange={(checked) =>
-                                  updateNativeToolSetting("agentBrowserLiveViewEnabled", checked === true, "subagent")}
+                                onCheckedChange={guardSubagentChoice((checked) =>
+                                  updateNativeToolSetting("agentBrowserLiveViewEnabled", checked === true, "subagent"))}
                               />
                             </div>
 
@@ -14082,11 +15321,11 @@ import {
                                 <Select.Root
                                   type="single"
                                   value={getNativeAgentBrowserRuntimeMode("subagent") as unknown as string}
-                                  onValueChange={(value) => {
+                                  onValueChange={guardSubagentChoice((value) => {
                                     const next = Array.isArray(value) ? value[0] : value;
                                     const normalized = normalizeNativeAgentBrowserRuntimeMode(next) ?? "chromium";
                                     updateNativeToolSetting("agentBrowserRuntimeMode", normalized, "subagent");
-                                  }}
+                                  })}
                                 >
                                   <Select.Trigger class="justify-between">
                                     <span class="truncate">
@@ -14142,7 +15381,7 @@ import {
                                 <Select.Root
                                   type="single"
                                   value={String(getNativeAgentBrowserTimeoutMs("subagent")) as unknown as string}
-                                  onValueChange={(value) => {
+                                  onValueChange={guardSubagentChoice((value) => {
                                     const next = Array.isArray(value) ? value[0] : value;
                                     const parsed = Number.parseInt(String(next ?? ""), 10);
                                     updateNativeToolSetting(
@@ -14150,7 +15389,7 @@ import {
                                       Number.isFinite(parsed) ? parsed : DEFAULT_NATIVE_AGENT_BROWSER_TIMEOUT_MS,
                                       "subagent",
                                     );
-                                  }}
+                                  })}
                                 >
                                   <Select.Trigger class="justify-between">
                                     <span class="truncate">{Math.round(getNativeAgentBrowserTimeoutMs("subagent") / 1000)} seconds</span>
@@ -14182,11 +15421,11 @@ import {
                                 <Select.Root
                                   type="single"
                                   value={getNativeAgentBrowserProvider("subagent") as unknown as string}
-                                  onValueChange={(value) => {
+                                  onValueChange={guardSubagentChoice((value) => {
                                     const next = Array.isArray(value) ? value[0] : value;
                                     const normalized = normalizeNativeAgentBrowserProvider(next) ?? "local";
                                     updateNativeToolSetting("agentBrowserProvider", normalized, "subagent");
-                                  }}
+                                  })}
                                 >
                                   <Select.Trigger class="justify-between">
                                     <span class="truncate">
@@ -14356,11 +15595,11 @@ import {
                           size="lg"
                           class="batshit-settings-permission-toggle-group"
                           aria-label="Subagent Claude permissions mode"
-                          onValueChange={(value) => {
+                          onValueChange={guardSubagentChoice((value) => {
                             const next = Array.isArray(value) ? value[0] : value;
                             if (!next) return;
                             setClaudePermissionMode(next as ClaudePermissionMode, "subagent");
-                          }}
+                          })}
                         >
                           {#each CLAUDE_PERMISSION_OPTIONS as option}
                             <ToggleGroup.Item
@@ -14495,7 +15734,7 @@ import {
                 >
                   {#snippet info()}
                         <SettingsInfoMenu ariaLabel="About Subagent Codex Permissions">
-                          Controls how freely Codex can act when tools are enabled.
+                          Sandbox Level is saved with this Subagent. Choosing a mode sets its own level.
                         </SettingsInfoMenu>
                   {/snippet}
                   {#snippet actions()}
@@ -14528,11 +15767,11 @@ import {
                           size="lg"
                           class="batshit-settings-permission-toggle-group"
                           aria-label="Subagent Codex permissions mode"
-                          onValueChange={(value) => {
+                          onValueChange={guardSubagentChoice((value) => {
                             const next = Array.isArray(value) ? value[0] : value;
                             if (!next) return;
                             setCodexPermissionMode(next as CodexPermissionMode, "subagent");
-                          }}
+                          })}
                         >
                           {#each CODEX_PERMISSION_OPTIONS as option}
                             <ToggleGroup.Item
@@ -14560,13 +15799,14 @@ import {
                             <Select.Root
                               type="single"
                               value={subagentCodexForm.sandbox}
-                              onValueChange={(value) =>
+                              disabled={subagentCodexForm.permissionMode === "agent_full"}
+                              onValueChange={guardSubagentChoice((value) =>
                                 updateCodexForm((current) => ({
                                   ...current,
                                   sandbox: (Array.isArray(value)
                                     ? value[0]
                                     : value) as CodexSandbox,
-                                }), "subagent")}
+                                }), "subagent"))}
                             >
                               <Select.Trigger>
                                 <span>
@@ -14583,6 +15823,14 @@ import {
                             </Select.Root>
                           </div>
                         </div>
+                  {#if subagentCodexForm.permissionMode === "agent_full"}
+                    <div class="batshit-settings-note" data-testid="subagent-codex-full-sandbox-note">
+                      {#if subagentCodexForm.sandbox !== CODEX_PERMISSION_PRESETS.agent_full.sandbox}
+                        This Subagent keeps its saved {CODEX_SANDBOX_LABELS[subagentCodexForm.sandbox]} Sandbox Level.
+                      {/if}
+                      To limit the sandbox, pick Agent.
+                    </div>
+                  {/if}
                       </div>
 
                     <div class="batshit-settings-muted-panel batshit-settings-caption">
@@ -14735,7 +15983,7 @@ import {
                       size="lg"
                       class="batshit-settings-permission-toggle-group"
                       aria-label="Subagent Batshit permissions mode"
-                      onValueChange={(value) => {
+                      onValueChange={guardSubagentChoice((value) => {
                         const next = Array.isArray(value) ? value[0] : value;
                         if (!NATIVE_BASH_ACCESS_MODE_OPTIONS.includes(next as NativeBashAccessMode)) return;
                         const mode = next as NativeBashAccessMode;
@@ -14746,7 +15994,7 @@ import {
                           "subagent",
                         );
                         updateNativeToolSetting("bashPolicyMode", null, "subagent");
-                      }}
+                      })}
                     >
                       {#each NATIVE_PERMISSION_OPTIONS as option}
                         <ToggleGroup.Item
@@ -14804,11 +16052,11 @@ import {
                         <Select.Root
                           type="single"
                           value={subagentSelectedSandboxBackend as unknown as string}
-                          onValueChange={(value) => {
+                          onValueChange={guardSubagentChoice((value) => {
                             const next = Array.isArray(value) ? value[0] : value;
                             const normalized = normalizeNativeExecutionBackend(next) ?? getDefaultNativeExecutionBackend();
                             updateNativeToolSetting("executionBackend", normalized, "subagent");
-                          }}
+                          })}
                         >
                           <Select.Trigger class="justify-between">
                             <span class="truncate">
@@ -14827,7 +16075,7 @@ import {
                           <p class="batshit-settings-form-help">Checking sandbox status...</p>
                         {:else if subagentSelectedSandboxBackend !== "local" && !subagentSelectedSandboxStatus?.available}
                           <p class="batshit-settings-form-help is-danger">
-                            {getSandboxUnavailableMessage(subagentSelectedSandboxBackend)}
+                            {getSandboxUnavailableMessage(subagentSelectedSandboxBackend, subagentSelectedSandboxStatus)}
                           </p>
                           {#if subagentSelectedSandboxStatus?.reason}
                             <p class="batshit-settings-form-help is-danger">{subagentSelectedSandboxStatus.reason}</p>
@@ -14872,7 +16120,7 @@ import {
                       <Select.Root
                         type="single"
                         value={String(getNativeBashTimeoutMs("subagent")) as unknown as string}
-                        onValueChange={(value) => {
+                        onValueChange={guardSubagentChoice((value) => {
                           const next = Array.isArray(value) ? value[0] : value;
                           const parsed = Number.parseInt(String(next ?? ""), 10);
                           updateNativeToolSetting(
@@ -14880,7 +16128,7 @@ import {
                             Number.isFinite(parsed) ? parsed : 30_000,
                             "subagent",
                           );
-                        }}
+                        })}
                       >
                         <Select.Trigger class="justify-between">
                           <span class="truncate">
@@ -15025,6 +16273,7 @@ import {
             disabled={!selectedEditableSubagentId || subagentDeleteState === "deleting"}
             onDelete={handleDeleteSubagent}
           />
+              </fieldset>
       </div>
       <!-- Subagent Settings End -->
     {:else}

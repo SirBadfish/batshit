@@ -74,6 +74,42 @@ function describeSavedFailure(result: GatewayDiscoveryResult): string {
   return ` (remembered from ${ageSeconds}s ago; asked again ${MCP_TOOL_LIST_FAILURE_SAVED_MS / 1000}s after it)`
 }
 
+/**
+ * BL-454: resolve with `work`, or reject with the Stop's reason when `signal` aborts first.
+ * A value that arrives after the Stop goes to `discardLate` (a started client is closed).
+ * The listener is removed when either side settles.
+ */
+function settleBeforeAbort<T>(
+  work: Promise<T>,
+  signal: AbortSignal | undefined,
+  discardLate: (value: T) => void
+): Promise<T> {
+  if (!signal) return work
+  return new Promise<T>((resolve, reject) => {
+    let stopped = false
+    const onAbort = () => {
+      stopped = true
+      reject(signal.reason)
+    }
+    if (signal.aborted) {
+      onAbort()
+    } else {
+      signal.addEventListener('abort', onAbort, { once: true })
+    }
+    work.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort)
+        if (stopped) discardLate(value)
+        else resolve(value)
+      },
+      (error) => {
+        signal.removeEventListener('abort', onAbort)
+        if (!stopped) reject(error)
+      }
+    )
+  })
+}
+
 export class MCPGatewayDiscovery {
   /**
    * Sanitize name for OpenAI API compatibility
@@ -564,8 +600,31 @@ export class MCPGatewayDiscovery {
       description: originalTool.description,
       inputSchema: wrappedSchema,  // ✅ Use wrapped schema instead of raw JSON Schema
       strict: false,
-      execute: async (args: any) => {
+      // BL-454: `options.abortSignal` is the reply's Stop (the AI SDK hands it to a directly
+      // selected tool; Batshit Tool Use and the helper dispatch pass it on). It reaches the MCP
+      // call, and a Stop closes this call's client, which ends a STDIO gateway's process.
+      execute: async (args: any, options?: { abortSignal?: AbortSignal }) => {
+        const abortSignal = options?.abortSignal
+        abortSignal?.throwIfAborted()
+
         let mcpClient: any | undefined
+        let closing: Promise<void> | undefined
+        const closeClient = (): Promise<void> => {
+          if (!mcpClient) return Promise.resolve()
+          const client = mcpClient
+          closing ??= Promise.resolve()
+            .then(() => client.close())
+            .then(
+              () => logger.debug(`[MCP Tool Execution] Closed client for ${toolName}`),
+              (closeError: unknown) =>
+                console.error(`[MCP Tool Execution] Error closing client for ${toolName}:`, closeError)
+            )
+          return closing
+        }
+        const onAbort = () => {
+          void closeClient()
+        }
+        abortSignal?.addEventListener('abort', onAbort, { once: true })
 
         try {
           logger.debug(`[MCP Tool Execution] Creating fresh client for ${toolName} on ${gateway.name}`)
@@ -575,12 +634,22 @@ export class MCPGatewayDiscovery {
               client,
               stderrChunks,
               toolCallTimeoutMs
-            } = await stdioMCPGatewayClient.createClient({
-              gateway,
-              userId: executionContext?.userId,
-              projectPath: executionContext?.projectPath
-            })
+            } = await settleBeforeAbort(
+              stdioMCPGatewayClient.createClient({
+                gateway,
+                userId: executionContext?.userId,
+                projectPath: executionContext?.projectPath
+              }),
+              abortSignal,
+              // A client that finishes starting after the Stop is closed, with its process.
+              (late) => {
+                void Promise.resolve()
+                  .then(() => late.client.close())
+                  .catch(() => undefined)
+              }
+            )
             mcpClient = client
+            abortSignal?.throwIfAborted()
 
             const tools = await mcpClient.tools()
             const targetTool = tools[originalTool.name]
@@ -598,7 +667,7 @@ export class MCPGatewayDiscovery {
             })
 
             try {
-              return await Promise.race([targetTool.execute(args), timeout])
+              return await Promise.race([targetTool.execute(args, { abortSignal }), timeout])
             } catch (error) {
               const stderr = stderrChunks.join('').trim()
               if (stderr) {
@@ -636,7 +705,11 @@ export class MCPGatewayDiscovery {
             url,
             headers ? { requestInit: { headers } } : undefined
           )
-          mcpClient = await createMCPClient({ transport })
+          mcpClient = await createMCPClient({
+            transport,
+            ...(abortSignal ? { initializationOptions: { signal: abortSignal } } : {})
+          })
+          abortSignal?.throwIfAborted()
 
           // Get the tools from this client
           const tools = await mcpClient.tools()
@@ -648,7 +721,7 @@ export class MCPGatewayDiscovery {
           }
 
           // Execute the tool
-          const result = await targetTool.execute(args)
+          const result = await targetTool.execute(args, { abortSignal })
           logger.debug(`[MCP Tool Execution] Successfully executed ${toolName}`)
 
           // FIX: Unwrap MCP result if it's wrapped in content array
@@ -675,17 +748,21 @@ export class MCPGatewayDiscovery {
 
           return result
         } catch (error) {
-          console.error(`[MCP Tool Execution] Error executing ${toolName}:`, error)
+          if (abortSignal?.aborted) {
+            logger.debug(`[MCP Tool Execution] Stopped ${toolName} on ${gateway.name}`)
+          } else {
+            console.error(`[MCP Tool Execution] Error executing ${toolName}:`, error)
+          }
           throw error
         } finally {
-          // ✅ CRITICAL: Always close the client after execution
-          if (mcpClient) {
-            try {
-              await mcpClient.close()
-              logger.debug(`[MCP Tool Execution] Closed client for ${toolName}`)
-            } catch (closeError) {
-              console.error(`[MCP Tool Execution] Error closing client for ${toolName}:`, closeError)
-            }
+          // No listener outlives the call (BL-246), and the client always closes.
+          abortSignal?.removeEventListener('abort', onAbort)
+          if (abortSignal?.aborted) {
+            // A stopped call answers now: a STDIO close can take about 4 s (stdin end, 2 s,
+            // SIGTERM, 2 s). `closeClient` still logs a failed close.
+            void closeClient()
+          } else {
+            await closeClient()
           }
         }
       }

@@ -4,7 +4,7 @@ import {
   normalizeGroupMaxAgents,
   normalizeGroupMaxFollowupsTotal
 } from '$lib/types/groupChat'
-import { EMOTE_TAG_REGEX_SOURCE, controlTag } from '$lib/utils/controlTags'
+import { controlTag, findControlBlocks, removeControlBlocks, stripEmoteTags } from '$lib/utils/controlTags'
 
 export type GroupControlMode = 'responding' | 'listening'
 
@@ -28,17 +28,11 @@ const GROUP_CONTROL_TAG_BLOCK_REGEX = new RegExp(
   'i'
 )
 const GROUP_CONTROL_BUFFER_LIMIT = 2000
-const GROUP_PRESENTATION_CUE_BLOCK_REGEX = new RegExp(
-  `<${CUE_TAG}\\b[^>]*>[\\s\\S]*?<\\/${CUE_TAG}>`,
-  'gi'
-)
-const GROUP_PRESENTATION_CUE_TAIL_REGEX = new RegExp(`<${CUE_TAG}\\b[\\s\\S]*$`, 'gi')
 const GROUP_LEADING_PRESENTATION_CUE_BLOCK_REGEX = new RegExp(
   `^\\s*<${CUE_TAG}\\b[^>]*>[\\s\\S]*?<\\/${CUE_TAG}>`,
   'i'
 )
 const GROUP_LEADING_PRESENTATION_CUE_START_REGEX = new RegExp(`^\\s*<${CUE_TAG}\\b`, 'i')
-const GROUP_EMOTE_TAG_REGEX = new RegExp(EMOTE_TAG_REGEX_SOURCE, 'gi')
 const GROUP_LEADING_EMOTE_TAG_REGEX =
   /^\s*<(?:emote|goon-emote)(?:-[a-zA-Z0-9_-]+)?\b[^>]*\/>[ \t]*|^\s*<(?:emote|goon-emote)(?:-[a-zA-Z0-9_-]+)?\b[^>]*>[\s\S]*?<\/(?:emote|goon-emote)(?:-[a-zA-Z0-9_-]+)?>[ \t]*/i
 const GROUP_GOON_STAGE_DIRECTION_REGEX = /\*goon:\s*[^*]*\*[ \t]*/gi
@@ -167,12 +161,16 @@ export function stripRepeatedLeadingGroupControlBlocks(content: string): string 
   return remaining
 }
 
+/**
+ * A group reply as the other agents and the chat present it: Goon cue blocks, emote tags, and
+ * stage directions removed (group chat has no Goon). BL-442: a cue block counts as the registry's
+ * scanner reads a finished reply, so an example in code and a tag named in a sentence stay, and a
+ * real cue block left open is removed from its tag on. One linear pass each (no lazy regex).
+ */
 export function stripGroupChatPresentationControls(content: string): string {
   if (!content) return content
-  return content
-    .replace(GROUP_PRESENTATION_CUE_BLOCK_REGEX, '')
-    .replace(GROUP_PRESENTATION_CUE_TAIL_REGEX, '')
-    .replace(GROUP_EMOTE_TAG_REGEX, '')
+  const cueBlocks = findControlBlocks(content, { final: true }).filter((block) => block.id === 'cue')
+  return stripEmoteTags(removeControlBlocks(content, cueBlocks))
     .replace(GROUP_GOON_STAGE_DIRECTION_REGEX, '')
     .replace(/[ \t]+\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
@@ -261,7 +259,7 @@ export function buildSpeakPolicyInstructions(
     case 'smart':
       // SA-120 P3: the DCM tail (`jev_juice_group`) tells the picked agent what Jev decided.
       lines.push(
-        'Speaking preset: smart (Jev Juice, Batshit\'s judgment model, picks the speaker and skips follow-ups that add nothing; when you are picked, respond unless you truly have nothing new to add).'
+        'Speaking preset: smart (Judge Juice, Batshit\'s judgment model, picks the speaker, may skip a user message that needs no reply, and skips follow-ups that add nothing; when you are picked, respond unless you truly have nothing new to add).'
       )
       break
     default:

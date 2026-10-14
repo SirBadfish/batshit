@@ -13,8 +13,12 @@ import {
   acknowledgeInfoDm,
   claimDm,
   clearDmNeedsUser,
+  clearDmNeedsUserStamp,
   clearNeedsUserForHumanReply,
   closeDm,
+  closeUnreadScheduleDms,
+  fileScheduleDm,
+  SCHEDULE_DELETED_DM_RESULT,
   acknowledgeDeliveredDmSteers,
   createDm,
   degradeMissedDmSteers,
@@ -35,6 +39,10 @@ import {
   userCloseDm
 } from '../dmStore'
 import { dmInboxKey, dmSentKey, dmUserIndexKey } from '../dmKeys'
+import {
+  __resetWakeRunRegistryForTests,
+  registerWakeRun
+} from '$lib/server/services/wakeRunRegistry'
 import type { DmRecord } from '$lib/types/dm'
 
 /**
@@ -51,6 +59,7 @@ vi.mock('$lib/server/ssePublisher', () => ({ publishUserEvent }))
 
 useRedisTestServer()
 
+const DAY_MS = 24 * 60 * 60 * 1000
 const USER = 'user-dm-store'
 const COOPER = 'agent-cooper'
 const FAYE = 'agent-faye'
@@ -501,6 +510,38 @@ describe('F-SEC-1b — telling the user a woken chat is stuck on them', () => {
     // The moment the chat stopped needing the agent is the fact worth keeping; a second
     // refusal in the same stuck turn must not move it.
     expect((await getDm(record.id))?.delivery.needsUser).toEqual(first)
+  })
+
+  /**
+   * BL-496 (A4): a Claude approval card in a woken turn marks the DM while it waits and takes
+   * the mark back when it ends. It may only take back its OWN mark: another holdup's, or a later
+   * one after the user replied, must stay.
+   */
+  it('reports whether this stamp set the mark, and takes back only a mark it set', async () => {
+    const record = await seedAssignment({ deliver: 'wake' })
+    const mine = await stampDmNeedsUser(record.id, 'Waiting on a Claude card.')
+    expect(mine).toBe((await getDm(record.id))?.delivery.needsUser?.at)
+    // A second holdup keeps the first mark and says it set nothing.
+    expect(await stampDmNeedsUser(record.id, 'Waiting on a risky control.')).toBeNull()
+
+    expect(await clearDmNeedsUserStamp(record.id, 'another-holdup-time')).toBe(false)
+    expect((await getDm(record.id))?.delivery.needsUser).toBeDefined()
+
+    expect(await clearDmNeedsUserStamp(record.id, mine!)).toBe(true)
+    expect((await getDm(record.id))?.delivery.needsUser).toBeUndefined()
+    expect(lastInboxEvent()?.needsUserCount).toBe(0)
+  })
+
+  it('does not take back a mark that another holdup set after its own was cleared', async () => {
+    const record = await seedAssignment({ deliver: 'wake' })
+    const mine = await stampDmNeedsUser(record.id, 'Waiting on a Claude card.')
+    await clearDmNeedsUser(record.id)
+    await new Promise((resolve) => setTimeout(resolve, 2))
+    const theirs = await stampDmNeedsUser(record.id, 'Waiting on a risky control.')
+    expect(theirs).not.toBe(mine)
+
+    expect(await clearDmNeedsUserStamp(record.id, mine!)).toBe(false)
+    expect((await getDm(record.id))?.delivery.needsUser?.reason).toBe('Waiting on a risky control.')
   })
 
   it('clears on a human reply, and the count goes back to zero', async () => {
@@ -1094,5 +1135,355 @@ describe('SA-114 — degrading a DM steer that never landed', () => {
     // A vanished DM is silent (`stampDmDelivery` returns on a missing record), and the one
     // that is still there is stamped.
     expect(stamped).toEqual([dm.id])
+  })
+})
+
+/**
+ * BL-401 (Faye's design, 2026-09-27) — a schedule's notes must not fill an inbox.
+ *
+ * Every fire used to write a new open DM, and the 50-item cap refuses EVERY sender at 50, so
+ * an hourly `wait` schedule on a quiet agent filled its inbox in about two days; after that
+ * another agent's DM, a webhook, and even the result of a closed assignment were refused.
+ * S1-S5 are the design's rules, one describe block each.
+ */
+describe('BL-401 — a schedule keeps one unread note in an inbox', () => {
+  const HOUR = 60 * 60 * 1000
+  const T0 = Date.parse('2026-09-27T14:00:00.000Z')
+
+  function fire(overrides: Record<string, any> = {}) {
+    return fileScheduleDm({
+      userId: USER,
+      from: { kind: 'schedule' as const, scheduleId: 'sch_queue', name: 'Queue check' },
+      to: COOPER,
+      kind: 'info',
+      subject: 'Queue check',
+      body: 'Check the queue and say what is in it.',
+      deliver: 'wait',
+      ...overrides
+    })
+  }
+
+  function at(ts: number) {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(ts)
+  }
+
+  beforeEach(() => {
+    __resetWakeRunRegistryForTests()
+  })
+
+  afterEach(() => {
+    __resetWakeRunRegistryForTests()
+  })
+
+  describe('S1 — a fire updates the open unread note', () => {
+    it('counts the fires on ONE note and keeps the first and the last fire', async () => {
+      at(T0)
+      const first = await fire()
+      expect(first.updated).toBe(false)
+
+      at(T0 + HOUR)
+      const second = await fire()
+      at(T0 + 2 * HOUR)
+      const third = await fire()
+
+      expect(second).toMatchObject({ updated: true })
+      expect(third.record.id).toBe(first.record.id)
+      expect(second.record.id).toBe(first.record.id)
+
+      const inbox = await listInbox(COOPER)
+      expect(inbox).toHaveLength(1)
+      const stored = await getDm(first.record.id)
+      expect(stored).toMatchObject({
+        status: 'new',
+        fireCount: 3,
+        firstFiredAt: new Date(T0).toISOString(),
+        lastFiredAt: new Date(T0 + 2 * HOUR).toISOString(),
+        // The record keeps when it was first written; the fire fields carry the rest.
+        createdAt: new Date(T0).toISOString(),
+        createdTs: T0
+      })
+    })
+
+    it('S3: the expiry counts from the LAST fire', async () => {
+      at(T0)
+      const first = await fire()
+      expect(first.record.expiresAt).toBe(new Date(T0 + 7 * DAY_MS).toISOString())
+
+      at(T0 + 3 * DAY_MS)
+      await fire()
+      expect((await getDm(first.record.id))?.expiresAt).toBe(
+        new Date(T0 + 3 * DAY_MS + 7 * DAY_MS).toISOString()
+      )
+    })
+
+    it('holds for an assignment too, and takes the latest fire\'s words', async () => {
+      at(T0)
+      const assignment = {
+        kind: 'assignment',
+        requestedOutcome: 'Do what the message asks and say what happened.',
+        scope: 'Only what this message asks for.'
+      }
+      const first = await fire(assignment)
+      at(T0 + HOUR)
+      const second = await fire({
+        ...assignment,
+        body: 'Check the queue.\n\n(This run was due 9:00 AM and is running late.)'
+      })
+
+      expect(second.record.id).toBe(first.record.id)
+      const stored = await getDm(first.record.id)
+      expect(stored).toMatchObject({ kind: 'assignment', fireCount: 2 })
+      expect(stored?.body).toContain('running late')
+      // An assignment's expiry is 14 days, from the last fire.
+      expect(stored?.expiresAt).toBe(new Date(T0 + HOUR + 14 * DAY_MS).toISOString())
+    })
+
+    it('an assignment turned note loses the assignment fields', async () => {
+      at(T0)
+      const first = await fire({
+        kind: 'assignment',
+        requestedOutcome: 'Say what happened.',
+        scope: 'Only this.'
+      })
+      at(T0 + HOUR)
+      await fire()
+
+      const stored = await getDm(first.record.id)
+      expect(stored).toMatchObject({ kind: 'info', fireCount: 2 })
+      expect(stored).not.toHaveProperty('requestedOutcome')
+      expect(stored).not.toHaveProperty('scope')
+      expect(stored).not.toHaveProperty('resultDelivery')
+    })
+
+    it('joins the NEWEST of several unread notes left from before BL-401', async () => {
+      // Before BL-401 every fire wrote its own note, so an inbox can hold several.
+      const legacy = (ts: number) => {
+        at(ts)
+        return createDm({
+          userId: USER,
+          from: { kind: 'schedule' as const, scheduleId: 'sch_queue', name: 'Queue check' },
+          to: COOPER,
+          kind: 'info',
+          subject: 'Queue check',
+          body: 'Check the queue and say what is in it.',
+          deliver: 'wait'
+        })
+      }
+      const older = await legacy(T0)
+      const newer = await legacy(T0 + HOUR)
+
+      at(T0 + 2 * HOUR)
+      const next = await fire()
+      expect(next.record.id).toBe(newer.id)
+      expect((await getDm(newer.id))?.fireCount).toBe(2)
+      expect((await getDm(older.id))?.fireCount).toBeUndefined()
+    })
+
+    it('a full inbox takes the next fire, because it adds nothing', async () => {
+      at(T0)
+      const note = await fire()
+      for (let index = 1; index < MAX_OPEN_DMS_PER_INBOX; index += 1) {
+        await seedInfo({ subject: `Note ${index}` })
+      }
+      expect(await listInbox(COOPER)).toHaveLength(MAX_OPEN_DMS_PER_INBOX)
+
+      at(T0 + HOUR)
+      const next = await fire()
+      expect(next.record.id).toBe(note.record.id)
+      expect((await getDm(note.record.id))?.fireCount).toBe(2)
+      expect(await listInbox(COOPER)).toHaveLength(MAX_OPEN_DMS_PER_INBOX)
+      // The cap itself still holds for everybody else.
+      await expect(seedInfo({ subject: 'One too many' })).rejects.toMatchObject({
+        code: 'inbox_full'
+      })
+    })
+
+    it('a refused wake that became a wait is updated too, and its old reason goes', async () => {
+      at(T0)
+      const first = await fire({ deliver: 'wake' })
+      await stampDmDelivery(first.record.id, { actual: 'wait', reason: 'Over the hourly limit.' })
+
+      at(T0 + HOUR)
+      const second = await fire({ deliver: 'wake' })
+      expect(second.record.id).toBe(first.record.id)
+      const stored = await getDm(first.record.id)
+      expect(stored?.fireCount).toBe(2)
+      // The delivery describes THIS fire; the caller stamps what its wake did next.
+      expect(stored?.delivery).toEqual({ requested: 'wake', actual: 'wait' })
+    })
+
+    it('another schedule\'s note is its own item', async () => {
+      at(T0)
+      const queue = await fire()
+      const other = await fire({
+        from: { kind: 'schedule' as const, scheduleId: 'sch_other', name: 'Other' },
+        subject: 'Other'
+      })
+      expect(other.record.id).not.toBe(queue.record.id)
+      expect(await listInbox(COOPER)).toHaveLength(2)
+    })
+
+    it('announces the change, so an open drawer re-reads the count', async () => {
+      at(T0)
+      await fire()
+      publishUserEvent.mockClear()
+      at(T0 + HOUR)
+      await fire()
+      expect(lastInboxEvent()).toMatchObject({ agentId: COOPER, openCount: 1, newCount: 1 })
+    })
+  })
+
+  describe('S2 — a note the agent works on is never changed', () => {
+    it('a claimed note stays as it is; the fire writes a new one, and S1 holds for that', async () => {
+      at(T0)
+      const first = await fire({
+        kind: 'assignment',
+        requestedOutcome: 'Say what happened.',
+        scope: 'Only this.'
+      })
+      await claimDm({ dmId: first.record.id, agentId: COOPER, sessionId: 'sess-1' })
+      const claimed = await getDm(first.record.id)
+
+      at(T0 + HOUR)
+      const second = await fire()
+      expect(second.updated).toBe(false)
+      expect(second.record.id).not.toBe(first.record.id)
+      expect(await getDm(first.record.id)).toEqual(claimed)
+
+      at(T0 + 2 * HOUR)
+      const third = await fire()
+      expect(third.record.id).toBe(second.record.id)
+      expect((await getDm(second.record.id))?.fireCount).toBe(2)
+    })
+
+    it('a note marked Needs you stays as it is', async () => {
+      at(T0)
+      const first = await fire({ deliver: 'wake' })
+      await stampDmNeedsUser(first.record.id, 'This chat is waiting for you to approve a tool.')
+      const stamped = await getDm(first.record.id)
+
+      at(T0 + HOUR)
+      const second = await fire({ deliver: 'wake' })
+      expect(second.record.id).not.toBe(first.record.id)
+      expect(await getDm(first.record.id)).toEqual(stamped)
+    })
+
+    it('a note a running woken turn is delivering stays as it is', async () => {
+      at(T0)
+      const first = await fire({ deliver: 'wake' })
+      registerWakeRun({
+        sessionId: 'wake-sess-1',
+        agentId: COOPER,
+        userId: USER,
+        origin: { kind: 'schedule', label: 'Queue check', scheduleId: 'sch_queue', dmId: first.record.id } as any,
+        startedAt: T0,
+        assistantMessageId: 'msg-woken-turn',
+        controller: new AbortController(),
+        timer: setTimeout(() => undefined, 0)
+      })
+      const running = await getDm(first.record.id)
+
+      at(T0 + HOUR)
+      const second = await fire({ deliver: 'wake' })
+      expect(second.record.id).not.toBe(first.record.id)
+      expect(await getDm(first.record.id)).toEqual(running)
+    })
+  })
+
+  describe('S4 — deleting a schedule closes its unread notes', () => {
+    it('closes the new note and leaves a working one, a Needs you one, and other senders', async () => {
+      at(T0)
+      const working = await fire({
+        kind: 'assignment',
+        requestedOutcome: 'Say what happened.',
+        scope: 'Only this.'
+      })
+      await claimDm({ dmId: working.record.id, agentId: COOPER, sessionId: 'sess-1' })
+      const parked = await fire({ deliver: 'wake' })
+      await stampDmNeedsUser(parked.record.id, 'This chat is waiting for you to approve a tool.')
+      const unread = await fire()
+      expect(unread.record.id).not.toBe(parked.record.id)
+      const otherSchedule = await fire({
+        from: { kind: 'schedule' as const, scheduleId: 'sch_other', name: 'Other' },
+        subject: 'Other'
+      })
+      const agentNote = await seedInfo()
+
+      const closed = await closeUnreadScheduleDms({ agentId: COOPER, scheduleId: 'sch_queue' })
+
+      expect(closed).toEqual([unread.record.id])
+      expect(await getDm(unread.record.id)).toMatchObject({
+        status: 'done',
+        result: SCHEDULE_DELETED_DM_RESULT
+      })
+      expect((await getDm(working.record.id))?.status).toBe('working')
+      // A Needs you note is the holdup signal of a chat still parked on the user; it closes
+      // when the user replies there, never behind their back.
+      expect((await getDm(parked.record.id))?.delivery.needsUser).toBeTruthy()
+      expect((await getDm(parked.record.id))?.status).toBe('new')
+      expect((await getDm(otherSchedule.record.id))?.status).toBe('new')
+      expect((await getDm(agentNote.id))?.status).toBe('new')
+      // A closed note gets the same 30-day retention every closed DM gets.
+      expect(await redis.ttl(`dm:${unread.record.id}`)).toBeGreaterThan(0)
+      expect(lastInboxEvent()).toMatchObject({ agentId: COOPER, openCount: 4 })
+    })
+
+    it('is silent when the schedule has nothing unread', async () => {
+      expect(await closeUnreadScheduleDms({ agentId: COOPER, scheduleId: 'sch_none' })).toEqual([])
+    })
+  })
+
+  describe('S5 — a result is never refused by the cap', () => {
+    async function fillFayeInbox() {
+      for (let index = 0; index < MAX_OPEN_DMS_PER_INBOX; index += 1) {
+        await createDm({
+          userId: USER,
+          from: sender(COOPER, 'Cooper'),
+          to: FAYE,
+          kind: 'info',
+          subject: `Note ${index}`,
+          body: 'x',
+          deliver: 'wait'
+        })
+      }
+    }
+
+    it('the report of a closed assignment lands in a full inbox', async () => {
+      const assignment = await seedAssignment()
+      await fillFayeInbox()
+
+      const result = await createDm({
+        userId: USER,
+        from: sender(COOPER, 'Cooper'),
+        to: FAYE,
+        kind: 'result',
+        subject: 'Result: Verify the package',
+        body: 'It passed.',
+        relatedDmId: assignment.id,
+        deliver: 'wait',
+        assignmentReport: true
+      })
+      expect(result.kind).toBe('result')
+      expect(await listInbox(FAYE)).toHaveLength(MAX_OPEN_DMS_PER_INBOX + 1)
+    })
+
+    it('a result an agent writes itself still meets the cap', async () => {
+      const assignment = await seedAssignment()
+      await fillFayeInbox()
+
+      await expect(
+        createDm({
+          userId: USER,
+          from: sender(COOPER, 'Cooper'),
+          to: FAYE,
+          kind: 'result',
+          subject: 'Result: Verify the package',
+          body: 'It passed.',
+          relatedDmId: assignment.id,
+          deliver: 'wait'
+        })
+      ).rejects.toMatchObject({ code: 'inbox_full' })
+    })
   })
 })

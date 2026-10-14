@@ -640,6 +640,8 @@ export async function decideApproval(options: {
   approvalId: unknown
   approved: boolean
   now?: Date
+  /** Server-owned account fence, evaluated inside the approval lock after its read. */
+  mutate?: (write: () => Promise<void>) => Promise<void>
 }): Promise<ControlApprovalRecord | null> {
   const approvalId = trimmed(options.approvalId)
   if (!isWellFormedApprovalId(approvalId)) return null
@@ -653,19 +655,24 @@ export async function decideApproval(options: {
 
     const decidedAt = (options.now ?? new Date()).toISOString()
     const status: ControlApprovalStatus = options.approved ? 'approved' : 'denied'
-    const written = await patchApprovalFields(approvalId, { status, decidedAt })
-    if (!written) return null
-
-    if (options.approved && record.scopeKey) {
-      // The one window DL-116-04 keeps: an approved voice-engine setup lets a retry for
-      // that same engine within five minutes skip the card. Seeded here and nowhere else.
-      await recordScopedRiskWindow({
-        userId: record.userId,
-        controlId: record.controlId,
-        agentId: record.agentId,
-        scopeKey: record.scopeKey
-      })
+    let written = false
+    const write = async () => {
+      written = await patchApprovalFields(approvalId, { status, decidedAt })
+      if (!written) return
+      if (options.approved && record.scopeKey) {
+        // The one window DL-116-04 keeps: an approved voice-engine setup lets a retry for
+        // that same engine within five minutes skip the card. Seeded here and nowhere else.
+        await recordScopedRiskWindow({
+          userId: record.userId,
+          controlId: record.controlId,
+          agentId: record.agentId,
+          scopeKey: record.scopeKey
+        })
+      }
     }
+    if (options.mutate) await options.mutate(write)
+    else await write()
+    if (!written) return null
 
     return { ...record, status, decidedAt }
   })

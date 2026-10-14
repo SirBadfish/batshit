@@ -1,3 +1,4 @@
+import { retainCatalogSourceEntries } from '$lib/server/services/catalogRetention'
 import { inferModelPurpose } from '$lib/utils/modelPurpose'
 import { logger } from '$lib/utils/logger'
 import { normalizePositiveInteger, sanitizeCatalogMaxOutputTokens } from '$lib/utils/modelOutputTokens'
@@ -5,12 +6,13 @@ import type { ModelPurpose } from '$lib/types/savedModels'
 import { storeCatalogSyncReport } from '$lib/server/services/modelCatalogReportStore'
 import { getRuntimeEnv } from '$lib/server/services/runtimeEnv'
 import { upstashKvGet, upstashKvSet } from '$lib/server/services/upstashKv'
-import type { CatalogSyncTrigger } from '$lib/types/modelCatalogSyncReport'
+import type { CatalogSyncTrigger, CatalogSyncVariantCollision } from '$lib/types/modelCatalogSyncReport'
 import {
   FAL_DEVELOPER_OVERRIDE_EXACT,
   FAL_DEVELOPER_OVERRIDE_KEYWORDS,
   FAL_DEVELOPER_OVERRIDE_PREFIX
 } from '$lib/data/fal-developer-overrides'
+import { RECOVERED_FAL_ENTRIES } from '$lib/data/catalog-recovered-entries'
 import {
   QWEN_TOKEN_PLAN_OPENAI_BASE_URL,
   QWEN_TOKEN_PLAN_TEXT_MODELS
@@ -30,6 +32,25 @@ import {
   MIMO_TOKEN_PLAN_OPENAI_BASE_URL
 } from '$lib/server/constants/mimoTokenPlan'
 import { canonicalizeCatalogDeveloperId } from '$lib/utils/catalogDeveloperIdentity'
+import {
+  buildListedPricing,
+  readArtificialAnalysisPrice,
+  gatewayZeroPriceContext,
+  holdsPositivePrice,
+  listedPriceVaries,
+  readListedCentsPerTokenPrice,
+  readListedPerTokenPrice,
+  readListedPrice,
+  withoutFalseZeros,
+  type ListedPricing,
+  type ZeroPriceContext
+} from '$lib/utils/catalogPricing'
+import type { CatalogConnectionLimits } from '$lib/types/modelCatalog'
+import {
+  isOpenAICompletionsOnlyModel,
+  resolveReviewedCatalogIdentity,
+  type CatalogIdentityRule
+} from '$lib/server/services/catalogModelIdentity'
 
 const GATEWAY_ENDPOINT = 'https://ai-gateway.vercel.sh/v1/models'
 const OPENROUTER_ENDPOINT = 'https://openrouter.ai/api/v1/models'
@@ -81,6 +102,7 @@ interface OpenRouterModel {
   supported_parameters?: string[]
   architecture?: {
     input_modalities?: string[]
+    output_modalities?: string[]
   }
 }
 
@@ -105,6 +127,10 @@ interface CatalogEntry {
       modelId: string
       effectiveId: string
       source: 'vercel' | 'openrouter' | 'manual' | 'direct'
+      /** BL-68 / BL-132: this connection's own limits; see CatalogModelIdVariant. */
+      limits?: CatalogConnectionLimits
+      /** BL-132: this connection's own price; see CatalogModelIdVariant. */
+      pricing?: ListedPricing
     }
   >
   pricing?: {
@@ -116,9 +142,11 @@ interface CatalogEntry {
     streaming: boolean
     tools: boolean
     vision: boolean
-    maxTokens: number
+    /** BL-68: the known context window; absent when unknown, never 0. */
+    maxTokens?: number
     reasoning?: boolean
     cacheControl?: boolean
+    /** BL-68: absent when the window is unknown. */
     longContext?: boolean
     code?: boolean
     fast?: boolean
@@ -128,6 +156,17 @@ interface CatalogEntry {
   transport: CatalogTransport
   connectionId: CatalogConnectionId
   modelType?: string | null
+  /**
+   * Working fields, set by `recordOwnNumbers` and never published
+   * (`withoutWorkingFields`): the name a reviewed identity rule maps this entry
+   * to and the rule (BL-68), and the limits and price this connection's own
+   * source listed before Artificial Analysis filled in model-wide numbers
+   * (BL-68, BL-132).
+   */
+  identityName?: string
+  identityRule?: CatalogIdentityRule
+  ownLimits?: CatalogConnectionLimits
+  ownPricing?: ListedPricing | null
 }
 
 interface CatalogPayload {
@@ -142,6 +181,8 @@ const CATALOG_SOURCE_TIMEOUT_MS = 30_000
 
 type SourceFetchOptions = {
   signal?: AbortSignal
+  onFallbackError?: (error: unknown) => void
+  onCompleteLiveList?: () => void
 }
 
 const DIRECT_PROVIDER_IDS = [
@@ -188,11 +229,7 @@ type DirectProviderEntry = {
   tags?: string[]
   contextWindow?: number
   maxOutputTokens?: number
-  pricing?: {
-    input: number | undefined
-    output: number | undefined
-    cachedInput: number | undefined
-  }
+  pricing?: ListedPricing
   modelType?: string | null
 }
 
@@ -687,31 +724,52 @@ function inferTagsFromIdentifier(id: string, description?: string | null): strin
   return Array.from(set)
 }
 
-function mapPricing(pricing?: Record<string, string | number>) {
+/**
+ * A per-token price list (gateway, OpenRouter, Baseten) in dollars per million
+ * tokens. BL-131: a listed 0 is a free model and stays 0; a blank or negative
+ * price (OpenRouter's -1 on its routers) is unknown and stays absent.
+ */
+function mapPricing(pricing?: Record<string, unknown>, context: ZeroPriceContext = {}) {
   if (!pricing) return undefined
-  const toNumber = (value?: string | number) => {
-    if (value === undefined || value === null) return undefined
-    const parsed = typeof value === 'number' ? value : Number(value)
-    if (!Number.isFinite(parsed)) return undefined
-    return Math.round(parsed * 1_000_000 * 1000) / 1000
-  }
-
-  const mapped = {
-    input: toNumber(pricing.input ?? pricing.prompt ?? pricing.price_1m_input_tokens),
-    output: toNumber(pricing.output ?? pricing.completion ?? pricing.price_1m_output_tokens),
-    cachedInput: toNumber(pricing.input_cache_read ?? pricing.cached_input ?? pricing.cached_input_price)
-  }
-
-  if (!mapped.input && !mapped.output && !mapped.cachedInput) {
-    return undefined
-  }
-
-  return mapped
+  return buildListedPricing(
+    withoutFalseZeros(
+      {
+        input: readListedPerTokenPrice(pricing.input ?? pricing.prompt ?? pricing.price_1m_input_tokens),
+        output: readListedPerTokenPrice(pricing.output ?? pricing.completion ?? pricing.price_1m_output_tokens),
+        cachedInput: readListedPerTokenPrice(pricing.input_cache_read ?? pricing.cached_input ?? pricing.cached_input_price)
+      },
+      { ...context, varies: listedPriceVaries(pricing) }
+    )
+  )
 }
 
-function asFiniteNumber(value: unknown) {
-  const parsed = typeof value === 'number' ? value : Number(value)
-  return Number.isFinite(parsed) ? parsed : undefined
+/** Review finding 1: OpenRouter's per-request and per-image prices, its output modalities, and its `:free` mark. */
+const OPENROUTER_NON_TOKEN_PRICE_KEYS = ['request', 'image', 'image_output', 'audio_output']
+
+function openRouterZeroPriceContext(raw: OpenRouterModel): ZeroPriceContext {
+  const pricing = raw.pricing as Record<string, unknown> | undefined
+  const outputs = raw.architecture?.output_modalities ?? []
+  return {
+    pricedOtherwise:
+      outputs.some((modality) => modality.toLowerCase() !== 'text') ||
+      OPENROUTER_NON_TOKEN_PRICE_KEYS.some((key) => holdsPositivePrice(pricing?.[key])),
+    // `:free` rows, and `openrouter/free`, its router over them.
+    markedFree: /(:free|\/free)$/i.test(raw.id)
+  }
+}
+
+/**
+ * BL-131: Together lists per-million prices. A null is unknown (it used to read
+ * as $0). A row priced 0 in and 0 out has no per-token price at all: on
+ * 2026-09-25 all 98 such chat rows were dedicated-endpoint, LoRA, NIM, or base
+ * models (every one `running: false`, `hourly: 0`), none of them free, so that
+ * pair is unknown too. A single 0 beside a real price is kept as listed.
+ */
+function mapTogetherPricing(pricing: TogetherCatalogModel['pricing']) {
+  const input = readListedPrice(pricing?.input)
+  const output = readListedPrice(pricing?.output)
+  if (input === 0 && output === 0) return undefined
+  return buildListedPricing({ input, output, cachedInput: readListedPrice(pricing?.cached_input) })
 }
 
 function mapTogetherModels(models: TogetherCatalogModel[]): DirectProviderEntry[] {
@@ -719,12 +777,6 @@ function mapTogetherModels(models: TogetherCatalogModel[]): DirectProviderEntry[
     .filter((model) => model?.type === 'chat')
     .map((model) => {
       const id = safeString(model.id).trim()
-      const pricing = {
-        input: asFiniteNumber(model.pricing?.input),
-        output: asFiniteNumber(model.pricing?.output),
-        cachedInput: asFiniteNumber(model.pricing?.cached_input)
-      }
-      const hasPricing = Object.values(pricing).some((value) => value !== undefined)
 
       return {
         id,
@@ -732,7 +784,7 @@ function mapTogetherModels(models: TogetherCatalogModel[]): DirectProviderEntry[
         displayName: safeString(model.display_name).trim() || undefined,
         tags: Array.from(new Set(['chat', ...inferTagsFromIdentifier(id)])),
         contextWindow: normalizePositiveInteger(model.context_length),
-        pricing: hasPricing ? pricing : undefined,
+        pricing: mapTogetherPricing(model.pricing),
         modelType: 'chat'
       }
     })
@@ -832,7 +884,11 @@ function mapBasetenModels(models: BasetenCatalogModel[]): DirectProviderEntry[] 
         tags,
         contextWindow: normalizePositiveInteger(model.context_length),
         maxOutputTokens: normalizePositiveInteger(model.max_completion_tokens),
-        pricing: mapPricing(model.pricing),
+        // Baseten marks no free models; a per-request or per-image price still
+        // means its 0 token price is not a free model.
+        pricing: mapPricing(model.pricing, {
+          pricedOtherwise: ['request', 'image'].some((key) => holdsPositivePrice(model.pricing?.[key]))
+        }),
         modelType: 'chat'
       }
     })
@@ -846,6 +902,49 @@ function normalizeDeveloperId(value: unknown, fallback: string) {
     .replace(/[^a-z0-9._-]+/g, '-')
     .replace(/^-+|-+$/g, '')
   return normalized || fallback
+}
+
+/**
+ * BL-292: DashScope's `/models` (Qwen Cloud) lists `owned_by: "system"` for
+ * every row (172 of 172 in a live read on 2026-09-27), which names no maker, so
+ * `kimi-k3` there never joined Moonshot's row. The maker comes from the id, the
+ * way a gateway's `developer/model` id names it; this reviewed list covers the
+ * ids that do not spell the maker's catalog namespace:
+ * - a `namespace/` prefix DashScope uses for a partner (`kimi/kimi-k3`,
+ *   `ZHIPU/GLM-5.3`) maps to that maker;
+ * - a bare id's family maps to its maker: Qwen (the Qwen Token Plan's and
+ *   OpenRouter's `qwen`), DeepSeek, Z.ai's GLM, Moonshot's Kimi, and Alibaba's
+ *   own non-Qwen models (Wan and Z-Image from Tongyi Lab, `tongyi-*`,
+ *   `text-embedding-v*`, and the Tongyi CCAI `ccai-pro`; the gateway lists Wan
+ *   as `alibaba`).
+ * An id no rule knows keeps a real `owned_by`, else the connection's own id,
+ * never "system". The model id itself stays exactly what DashScope listed.
+ */
+const QWEN_CLOUD_NAMESPACE_DEVELOPERS: Readonly<Record<string, string>> = Object.freeze({
+  kimi: 'moonshotai',
+  zhipu: 'zai'
+})
+
+const QWEN_CLOUD_FAMILY_DEVELOPERS: ReadonlyArray<{ pattern: RegExp; developerId: string }> = [
+  { pattern: /^(?:qwen|qwq|qvq)/i, developerId: 'qwen' },
+  { pattern: /^deepseek-/i, developerId: 'deepseek' },
+  { pattern: /^glm-/i, developerId: 'zai' },
+  { pattern: /^kimi-/i, developerId: 'moonshotai' },
+  { pattern: /^(?:wan\d|z-image-|tongyi-|text-embedding-v|ccai-)/i, developerId: 'alibaba' }
+]
+
+const OWNED_BY_NAMES_NO_MAKER = new Set(['system'])
+
+function resolveQwenCloudDeveloperId(id: string, ownedBy: unknown): string {
+  const slash = id.indexOf('/')
+  if (slash > 0) {
+    const namespace = normalizeDeveloperId(id.slice(0, slash), 'qwencloud')
+    return QWEN_CLOUD_NAMESPACE_DEVELOPERS[namespace] ?? namespace
+  }
+  const family = QWEN_CLOUD_FAMILY_DEVELOPERS.find((rule) => rule.pattern.test(id))
+  if (family) return family.developerId
+  const owner = normalizeDeveloperId(ownedBy, 'qwencloud')
+  return OWNED_BY_NAMES_NO_MAKER.has(owner) ? 'qwencloud' : owner
 }
 
 function mapOpenAICompatibleCatalogModels(
@@ -877,7 +976,10 @@ function mapOpenAICompatibleCatalogModels(
 
       return {
         id,
-        developerId: normalizeDeveloperId(model.owned_by, provider),
+        developerId:
+          provider === 'qwencloud'
+            ? resolveQwenCloudDeveloperId(id, model.owned_by)
+            : normalizeDeveloperId(model.owned_by, provider),
         modelId: id,
         effectiveId: id,
         displayName: id,
@@ -925,10 +1027,14 @@ function mapCohereModels(models: CohereCatalogModel[]): DirectProviderEntry[] {
     .filter((model) => Boolean(model.id) && Boolean(model.modelType))
 }
 
-function deriveFeatures(tags: string[], contextWindow?: number | null, pricing?: ReturnType<typeof mapPricing>) {
+function deriveFeatures(
+  tags: string[],
+  contextWindow?: number | null,
+  pricing?: ReturnType<typeof mapPricing>
+): CatalogEntry['features'] {
   const normalized = new Set(tags.map((tag) => tag.toLowerCase()))
 
-  return {
+  const features: CatalogEntry['features'] = {
     streaming: true,
     tools: normalized.has('tool-use') || normalized.has('tool') || normalized.has('tools'),
     vision:
@@ -936,13 +1042,34 @@ function deriveFeatures(tags: string[], contextWindow?: number | null, pricing?:
       normalized.has('image') ||
       normalized.has('image-input') ||
       normalized.has('multimodal'),
-    maxTokens: contextWindow ?? 0,
     reasoning: normalized.has('reasoning'),
     cacheControl: pricing?.cachedInput !== undefined,
-    longContext: (contextWindow ?? 0) >= 128_000,
     code: normalized.has('code') || normalized.has('coding'),
     fast: normalized.has('fast') || normalized.has('realtime')
   }
+  return withKnownWindow(features, contextWindow)
+}
+
+/**
+ * BL-68: a window nobody reported is unknown. Publish `maxTokens` and the
+ * `longContext` claim built on it only for a known, positive window; otherwise
+ * leave both out, never `maxTokens: 0` (blank sends nothing, zero is real).
+ */
+/** BL-68: drop a stored `maxTokens` that is not a known window, and the claim built on it. */
+function withoutUnknownWindow(features: CatalogEntry['features']): CatalogEntry['features'] {
+  const maxTokens = features.maxTokens
+  if (typeof maxTokens === 'number' && Number.isFinite(maxTokens) && maxTokens > 0) return features
+  const { maxTokens: _maxTokens, longContext: _longContext, ...rest } = features
+  return rest
+}
+
+function withKnownWindow(
+  features: CatalogEntry['features'],
+  contextWindow: number | null | undefined
+): CatalogEntry['features'] {
+  const { maxTokens: _maxTokens, longContext: _longContext, ...rest } = features
+  if (typeof contextWindow !== 'number' || !Number.isFinite(contextWindow) || contextWindow <= 0) return rest
+  return { ...rest, maxTokens: contextWindow, longContext: contextWindow >= 128_000 }
 }
 
 function categorizeModel(tags: string[], contextWindow?: number | null): CatalogEntry['category'] {
@@ -1187,6 +1314,44 @@ function buildOpenAICompatibleModelsUrl(baseUrl: string) {
   return `${trimmed}/v1/models`
 }
 
+function requireModelList(payload: unknown, source: string, fields: readonly string[]): any[] {
+  if (Array.isArray(payload)) {
+    if (!fields.includes('array')) throw new Error(`${source} model list has an unexpected array response`)
+    return payload
+  }
+  if (!payload || typeof payload !== 'object') throw new Error(`${source} model list is malformed`)
+  if (Object.prototype.hasOwnProperty.call(payload, 'error') &&
+    (payload as { error?: unknown }).error != null) {
+    throw new Error(`${source} model list returned an error`)
+  }
+  for (const field of fields) {
+    if (field === 'array') continue
+    if (Object.prototype.hasOwnProperty.call(payload, field)) {
+      const models = (payload as Record<string, unknown>)[field]
+      if (!Array.isArray(models)) throw new Error(`${source} model list ${field} is malformed`)
+      return models
+    }
+  }
+  throw new Error(`${source} model list is missing its model array`)
+}
+
+function requireModelIds(models: any[], source: string, field: string): void {
+  if (models.some((model) => !model || typeof model !== 'object' ||
+    typeof model[field] !== 'string' || !model[field].trim())) {
+    throw new Error(`${source} model list has a row without ${field}`)
+  }
+}
+
+function readNextPageToken(payload: unknown, source: string, field: string): string | null {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new Error(`${source} model list page is malformed`)
+  }
+  const token = (payload as Record<string, unknown>)[field]
+  if (token == null) return null
+  if (typeof token !== 'string') throw new Error(`${source} model list ${field} is malformed`)
+  return token.trim() || null
+}
+
 async function fetchOpenAICompatibleModels({
   baseUrl,
   apiKey,
@@ -1204,14 +1369,22 @@ async function fetchOpenAICompatibleModels({
     signal
   })
 
-  const data = Array.isArray(payload?.data)
-    ? payload.data
-    : Array.isArray(payload?.models)
-      ? payload.models
-      : Array.isArray(payload)
-        ? payload
-        : []
-
+  const data = requireModelList(payload, url, ['data', 'models', 'array'])
+  // These compatible endpoints have no shared pagination request protocol.
+  // An explicit continuation cannot qualify as a completed source refresh.
+  if (!Array.isArray(payload)) {
+    for (const field of ['has_more', 'hasMore']) {
+      if (Object.prototype.hasOwnProperty.call(payload, field) && payload[field] !== false) {
+        throw new Error(`${url} model list pagination is incomplete or malformed (${field})`)
+      }
+    }
+    for (const field of ['next_page_token', 'nextPageToken', 'next_cursor', 'nextCursor', 'next']) {
+      if (payload[field] != null && payload[field] !== '') {
+        throw new Error(`${url} model list pagination is incomplete or malformed (${field})`)
+      }
+    }
+  }
+  requireModelIds(data, url, 'id')
   return data
 }
 
@@ -1238,7 +1411,10 @@ async function fetchOpenAIEntries(options: SourceFetchOptions = {}): Promise<Dir
     signal: options.signal
   })
 
-  return (payload.data ?? []).map((model) => ({ id: model.id })).filter((model) => Boolean(model.id))
+  const models = requireModelList(payload, 'OpenAI', ['data'])
+  requireModelIds(models, 'OpenAI', 'id')
+  options.onCompleteLiveList?.()
+  return models.map((model) => ({ id: model.id }))
 }
 
 async function fetchGroqEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
@@ -1253,6 +1429,7 @@ async function fetchGroqEntries(options: SourceFetchOptions = {}): Promise<Direc
     signal: options.signal
   })
 
+  options.onCompleteLiveList?.()
   return ids.map((id) => ({ id }))
 }
 
@@ -1269,6 +1446,7 @@ async function fetchDeepSeekEntries(options: SourceFetchOptions = {}): Promise<D
     signal: options.signal
   })
 
+  options.onCompleteLiveList?.()
   return ids.map((id) => ({ id }))
 }
 
@@ -1284,23 +1462,16 @@ function mapDeepInfraModels(models: DeepInfraCatalogModel[]): DirectProviderEntr
     .map((model) => {
       const id = safeString(model.model_name).trim()
       const tags = Array.from(new Set([...(model.tags ?? []), 'chat'])).map((tag) => tag.toLowerCase())
-      const input = model.pricing?.cents_per_input_token
-      const output = model.pricing?.cents_per_output_token
-      const cachedRate = model.pricing?.rate_per_input_token_cached
-      const inputPerMillion = typeof input === 'number' && Number.isFinite(input) ? input * 10_000 : undefined
-      const outputPerMillion = typeof output === 'number' && Number.isFinite(output) ? output * 10_000 : undefined
-      const cachedInputPerMillion =
-        inputPerMillion !== undefined && typeof cachedRate === 'number' && Number.isFinite(cachedRate)
-          ? inputPerMillion * cachedRate
-          : undefined
-      const pricing =
-        inputPerMillion !== undefined || outputPerMillion !== undefined || cachedInputPerMillion !== undefined
-          ? {
-              input: inputPerMillion,
-              output: outputPerMillion,
-              cachedInput: cachedInputPerMillion
-            }
-          : undefined
+      // BL-295: through the shared price rules (catalogPricing.ts), in cents per token.
+      const cachedRate = readListedPrice(model.pricing?.rate_per_input_token_cached)
+      const pricing = buildListedPricing({
+        input: readListedCentsPerTokenPrice(model.pricing?.cents_per_input_token),
+        output: readListedCentsPerTokenPrice(model.pricing?.cents_per_output_token),
+        cachedInput:
+          cachedRate === undefined
+            ? undefined
+            : readListedCentsPerTokenPrice(model.pricing?.cents_per_input_token, cachedRate)
+      })
 
       return {
         id,
@@ -1319,7 +1490,11 @@ async function fetchDeepInfraEntries(options: SourceFetchOptions = {}): Promise<
   const payload = await fetchJson<DeepInfraCatalogModel[]>(DEEPINFRA_MODELS_ENDPOINT, {
     signal: options.signal
   })
-  return mapDeepInfraModels(Array.isArray(payload) ? payload : [])
+  const models = requireModelList(payload, 'DeepInfra', ['array']) as DeepInfraCatalogModel[]
+  requireModelIds(models, 'DeepInfra', 'model_name')
+  const entries = mapDeepInfraModels(models)
+  options.onCompleteLiveList?.()
+  return entries
 }
 
 async function fetchTogetherEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
@@ -1332,7 +1507,9 @@ async function fetchTogetherEntries(options: SourceFetchOptions = {}): Promise<D
     apiKey,
     signal: options.signal
   })
-  return mapTogetherModels(models)
+  const entries = mapTogetherModels(models)
+  options.onCompleteLiveList?.()
+  return entries
 }
 
 async function fetchFireworksEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
@@ -1340,6 +1517,7 @@ async function fetchFireworksEntries(options: SourceFetchOptions = {}): Promise<
   if (!apiKey) return []
 
   const collected: FireworksCatalogModel[] = []
+  const seenPageTokens = new Set<string>()
   let pageToken: string | null = null
 
   do {
@@ -1356,11 +1534,17 @@ async function fetchFireworksEntries(options: SourceFetchOptions = {}): Promise<
       signal: options.signal
     })
 
-    collected.push(...(payload.models ?? []))
-    pageToken = safeString(payload.nextPageToken).trim() || null
+    const models = requireModelList(payload, 'Fireworks', ['models']) as FireworksCatalogModel[]
+    requireModelIds(models, 'Fireworks', 'name')
+    collected.push(...models)
+    pageToken = readNextPageToken(payload, 'Fireworks', 'nextPageToken')
+    if (pageToken && seenPageTokens.has(pageToken)) throw new Error('Fireworks model list repeated a page token')
+    if (pageToken) seenPageTokens.add(pageToken)
   } while (pageToken)
 
-  return mapFireworksModels(collected)
+  const entries = mapFireworksModels(collected)
+  options.onCompleteLiveList?.()
+  return entries
 }
 
 async function fetchBasetenEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
@@ -1373,7 +1557,9 @@ async function fetchBasetenEntries(options: SourceFetchOptions = {}): Promise<Di
     apiKey,
     signal: options.signal
   })
-  return mapBasetenModels(models)
+  const entries = mapBasetenModels(models)
+  options.onCompleteLiveList?.()
+  return entries
 }
 
 async function fetchCerebrasEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
@@ -1386,7 +1572,9 @@ async function fetchCerebrasEntries(options: SourceFetchOptions = {}): Promise<D
     apiKey,
     signal: options.signal
   })
-  return mapOpenAICompatibleCatalogModels('cerebras', models)
+  const entries = mapOpenAICompatibleCatalogModels('cerebras', models)
+  options.onCompleteLiveList?.()
+  return entries
 }
 
 async function fetchMiniMaxEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
@@ -1399,7 +1587,9 @@ async function fetchMiniMaxEntries(options: SourceFetchOptions = {}): Promise<Di
     apiKey,
     signal: options.signal
   })
-  return mapOpenAICompatibleCatalogModels('minimax', models)
+  const entries = mapOpenAICompatibleCatalogModels('minimax', models)
+  options.onCompleteLiveList?.()
+  return entries
 }
 
 async function fetchMiniMaxTokenPlanEntries(
@@ -1416,8 +1606,10 @@ async function fetchMiniMaxTokenPlanEntries(
   try {
     const models = await fetchOpenAICompatibleModels({ baseUrl, apiKey, signal: options.signal })
     const live = mapOpenAICompatibleCatalogModels('minimax_token_plan', models)
+    options.onCompleteLiveList?.()
     if (live.length) return mergeDirectProviderEntries(live, curated)
   } catch (error) {
+    options.onFallbackError?.(error)
     console.warn(
       '[catalog] MiniMax Token Plan model list fetch failed; falling back to the docs-backed list:',
       normalizeError(error)
@@ -1437,7 +1629,9 @@ async function fetchMimoEntries(options: SourceFetchOptions = {}): Promise<Direc
     apiKey,
     signal: options.signal
   })
-  return mapOpenAICompatibleCatalogModels('mimo', models)
+  const entries = mapOpenAICompatibleCatalogModels('mimo', models)
+  options.onCompleteLiveList?.()
+  return entries
 }
 
 async function fetchMimoTokenPlanEntries(
@@ -1454,8 +1648,10 @@ async function fetchMimoTokenPlanEntries(
   try {
     const models = await fetchOpenAICompatibleModels({ baseUrl, apiKey, signal: options.signal })
     const live = mapOpenAICompatibleCatalogModels('mimo_token_plan', models)
+    options.onCompleteLiveList?.()
     if (live.length) return mergeDirectProviderEntries(live, curated)
   } catch (error) {
+    options.onFallbackError?.(error)
     console.warn(
       '[catalog] MiMo Token Plan model list fetch failed; falling back to the docs-backed list:',
       normalizeError(error)
@@ -1477,7 +1673,9 @@ async function fetchQwenCloudEntries(options: SourceFetchOptions = {}): Promise<
     apiKey,
     signal: options.signal
   })
-  return mapOpenAICompatibleCatalogModels('qwencloud', models)
+  const entries = mapOpenAICompatibleCatalogModels('qwencloud', models)
+  options.onCompleteLiveList?.()
+  return entries
 }
 
 async function fetchQwenTokenPlanEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
@@ -1513,10 +1711,12 @@ async function fetchQwenTokenPlanEntries(options: SourceFetchOptions = {}): Prom
       ]
     })
 
+    options.onCompleteLiveList?.()
     if (live.length) {
       return mergeDirectProviderEntries(live, curated)
     }
   } catch (error) {
+    options.onFallbackError?.(error)
     console.warn(
       '[catalog] Qwen Token Plan model list fetch failed; falling back to the docs-backed list:',
       normalizeError(error)
@@ -1534,21 +1734,11 @@ async function fetchMoonshotEntries(options: SourceFetchOptions = {}): Promise<D
 
   const baseUrl = (await getRuntimeEnv('MOONSHOT_API_BASE_URL')) || 'https://api.moonshot.ai/v1'
 
-  try {
-    const ids = await fetchOpenAICompatibleModelIds({
-      baseUrl,
-      apiKey,
-      signal: options.signal
-    })
-
-    if (ids.length) {
-      return ids.map((id) => ({ id }))
-    }
-  } catch (error) {
-    console.warn('[catalog] Moonshot model list fetch failed; falling back to manual list:', normalizeError(error))
-  }
-
-  return MANUAL_DIRECT_MODELS.moonshot ?? []
+  // Let the source status carry HTTP/auth/timeout errors. A manual list here
+  // used to disguise a rejected key as a successful short provider response.
+  const ids = await fetchOpenAICompatibleModelIds({ baseUrl, apiKey, signal: options.signal })
+  options.onCompleteLiveList?.()
+  return ids.map((id) => ({ id }))
 }
 
 async function fetchKimiCodeEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
@@ -1560,6 +1750,7 @@ async function fetchKimiCodeEntries(options: SourceFetchOptions = {}): Promise<D
 
   try {
     const ids = await fetchOpenAICompatibleModelIds({ baseUrl, apiKey, signal: options.signal })
+    options.onCompleteLiveList?.()
     if (ids.length) {
       return mergeDirectProviderEntries(
         ids.map((id) => ({
@@ -1572,6 +1763,7 @@ async function fetchKimiCodeEntries(options: SourceFetchOptions = {}): Promise<D
       )
     }
   } catch (error) {
+    options.onFallbackError?.(error)
     console.warn(
       '[catalog] Kimi Code model list fetch failed; falling back to the docs-backed list:',
       normalizeError(error)
@@ -1597,6 +1789,7 @@ async function fetchZaiEntries(options: SourceFetchOptions = {}): Promise<Direct
       signal: options.signal
     })
 
+    options.onCompleteLiveList?.()
     if (ids.length) {
       return mergeDirectProviderEntries(
         ids.map((id) => ({ id })),
@@ -1604,6 +1797,7 @@ async function fetchZaiEntries(options: SourceFetchOptions = {}): Promise<Direct
       )
     }
   } catch (error) {
+    options.onFallbackError?.(error)
     console.warn('[catalog] Z.ai model list fetch failed; falling back to manual list:', normalizeError(error))
   }
 
@@ -1627,6 +1821,7 @@ async function fetchZaiCodingEntries(options: SourceFetchOptions = {}): Promise<
     })
 
     const currentAndFutureIds = filterZaiCodingPlanModelIds(ids)
+    options.onCompleteLiveList?.()
     if (currentAndFutureIds.length) {
       return mergeDirectProviderEntries(
         currentAndFutureIds.map((id) => ({ id, developerId: 'zai', modelId: id, effectiveId: id })),
@@ -1634,6 +1829,7 @@ async function fetchZaiCodingEntries(options: SourceFetchOptions = {}): Promise<
       )
     }
   } catch (error) {
+    options.onFallbackError?.(error)
     console.warn(
       '[catalog] Z.ai Coding Plan model list fetch failed; falling back to manual list:',
       normalizeError(error)
@@ -1653,6 +1849,10 @@ function applyDirectSourceCatalogPolicy(
   provider: DirectProviderId,
   entries: CatalogEntry[]
 ): CatalogEntry[] {
+  if (provider === 'openai') {
+    // BL-68: completions-only models cannot run on Batshit's OpenAI connection.
+    return entries.filter((entry) => !isOpenAICompletionsOnlyModel(entry.name))
+  }
   if (provider !== 'zai_coding') return entries
   return entries.filter(
     (entry) => !ZAI_CODING_PLAN_LEGACY_MODEL_ID_SET.has(entry.name.trim().toLowerCase())
@@ -1674,6 +1874,7 @@ async function fetchFalEntries(options: SourceFetchOptions = {}): Promise<Direct
   let cursor: string | null = null
   const collected: DirectProviderEntry[] = []
   const seen = new Set<string>()
+  const seenCursors = new Set<string>()
   let pages = 0
 
   while (pages < maxPages) {
@@ -1684,7 +1885,8 @@ async function fetchFalEntries(options: SourceFetchOptions = {}): Promise<Direct
       headers,
       signal: options.signal
     })
-    const models = Array.isArray(payload?.models) ? payload.models : []
+    const models = requireModelList(payload, 'Fal', ['models'])
+    requireModelIds(models, 'Fal', 'endpoint_id')
 
     for (const model of models) {
       const endpointId = safeString(model?.endpoint_id).trim()
@@ -1708,10 +1910,15 @@ async function fetchFalEntries(options: SourceFetchOptions = {}): Promise<Direct
       })
     }
 
-    cursor = safeString(payload?.next_cursor).trim() || null
+    cursor = readNextPageToken(payload, 'Fal', 'next_cursor')
     if (!cursor) break
+    if (seenCursors.has(cursor)) throw new Error('Fal model list repeated a cursor')
+    seenCursors.add(cursor)
     pages += 1
   }
+
+  if (cursor) throw new Error(`Fal model list incomplete after ${maxPages} pages`)
+  options.onCompleteLiveList?.()
 
   if (!collected.length) {
     return MANUAL_DIRECT_MODELS.fal ?? []
@@ -1740,13 +1947,19 @@ async function fetchReplicateEntries(options: SourceFetchOptions = {}): Promise<
     headers,
     signal: options.signal
   })
-  const models = Array.isArray(payload?.models) ? payload.models : []
+  const models = requireModelList(payload, 'Replicate', ['models'])
 
   for (const model of models) {
+    if (!model || typeof model !== 'object' || typeof model.is_official !== 'boolean') {
+      throw new Error('Replicate model list has a malformed official model flag')
+    }
     if (model?.is_official !== true) continue
-    const owner = safeString(model?.owner).trim()
-    const name = safeString(model?.name).trim()
-    if (!owner || !name) continue
+    if (typeof model.owner !== 'string' || !model.owner.trim() ||
+      typeof model.name !== 'string' || !model.name.trim()) {
+      throw new Error('Replicate model list has an official row without owner/name')
+    }
+    const owner = model.owner.trim()
+    const name = model.name.trim()
     const fullId = `${owner}/${name}`
     if (seen.has(fullId)) continue
     seen.add(fullId)
@@ -1763,6 +1976,7 @@ async function fetchReplicateEntries(options: SourceFetchOptions = {}): Promise<
     })
   }
 
+  options.onCompleteLiveList?.()
   if (!collected.length) {
     return MANUAL_DIRECT_MODELS.replicate ?? []
   }
@@ -1806,11 +2020,28 @@ async function fetchCohereEntries(options: SourceFetchOptions = {}): Promise<Dir
   const apiKey = await getRuntimeEnv('COHERE_API_KEY')
   if (!apiKey) return []
 
-  const payload = await fetchJson<{ models?: CohereCatalogModel[] }>(COHERE_MODELS_ENDPOINT, {
-    headers: { Authorization: `Bearer ${apiKey}` },
-    signal: options.signal
-  })
-  return mapCohereModels(payload.models ?? [])
+  const collected: CohereCatalogModel[] = []
+  const seenPageTokens = new Set<string>()
+  let pageToken: string | null = null
+  do {
+    const url = new URL(COHERE_MODELS_ENDPOINT)
+    url.searchParams.set('page_size', '1000')
+    if (pageToken) url.searchParams.set('page_token', pageToken)
+    const payload = await fetchJson<{ models?: CohereCatalogModel[]; next_page_token?: string | null }>(
+      url.toString(),
+      { headers: { Authorization: `Bearer ${apiKey}` }, signal: options.signal }
+    )
+    const models = requireModelList(payload, 'Cohere', ['models']) as CohereCatalogModel[]
+    requireModelIds(models, 'Cohere', 'name')
+    collected.push(...models)
+    pageToken = readNextPageToken(payload, 'Cohere', 'next_page_token')
+    if (pageToken && seenPageTokens.has(pageToken)) throw new Error('Cohere model list repeated a page token')
+    if (pageToken) seenPageTokens.add(pageToken)
+  } while (pageToken)
+
+  const entries = mapCohereModels(collected)
+  options.onCompleteLiveList?.()
+  return entries
 }
 
 async function fetchMistralEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
@@ -1826,9 +2057,10 @@ async function fetchMistralEntries(options: SourceFetchOptions = {}): Promise<Di
     signal: options.signal
   })
 
-  const data = Array.isArray(payload?.data) ? payload.data : Array.isArray(payload) ? payload : []
+  const data = requireModelList(payload, 'Mistral', ['data', 'array'])
+  requireModelIds(data, 'Mistral', 'id')
 
-  return data
+  const entries = data
     .map((model: any) => ({
       id: safeString(model?.id),
       description: safeString(model?.description) || undefined,
@@ -1836,6 +2068,8 @@ async function fetchMistralEntries(options: SourceFetchOptions = {}): Promise<Di
       modelType: safeString(model?.TYPE || model?.type || null) || null
     }))
     .filter((model: DirectProviderEntry) => Boolean(model.id))
+  options.onCompleteLiveList?.()
+  return entries
 }
 
 type GoogleGeminiModel = {
@@ -1855,6 +2089,7 @@ async function fetchGoogleEntries(options: SourceFetchOptions = {}): Promise<Dir
 
   const entries: DirectProviderEntry[] = []
   let pageToken: string | null = null
+  const seenPageTokens = new Set<string>()
 
   do {
     const url = new URL(GOOGLE_GEMINI_MODELS_ENDPOINT)
@@ -1873,7 +2108,12 @@ async function fetchGoogleEntries(options: SourceFetchOptions = {}): Promise<Dir
       signal: options.signal
     })
 
-    for (const model of payload.models ?? []) {
+    const models = requireModelList(payload, 'Google', ['models']) as GoogleGeminiModel[]
+    if (models.some((model) => !model || typeof model !== 'object' ||
+      ![model.name, model.baseModelId].some((id) => typeof id === 'string' && id.trim()))) {
+      throw new Error('Google model list has a row without name/baseModelId')
+    }
+    for (const model of models) {
       const rawName = safeString(model?.name)
       const id = rawName.startsWith('models/')
         ? rawName.slice('models/'.length)
@@ -1890,9 +2130,12 @@ async function fetchGoogleEntries(options: SourceFetchOptions = {}): Promise<Dir
       })
     }
 
-    pageToken = safeString(payload.nextPageToken) || null
+    pageToken = readNextPageToken(payload, 'Google', 'nextPageToken')
+    if (pageToken && seenPageTokens.has(pageToken)) throw new Error('Google model list repeated a page token')
+    if (pageToken) seenPageTokens.add(pageToken)
   } while (pageToken)
 
+  options.onCompleteLiveList?.()
   return entries
 }
 
@@ -1901,6 +2144,58 @@ type AnthropicModelInfo = {
   display_name?: string
   created_at?: string
   type?: string
+  /** The context window (Models API, since March 2026). */
+  max_input_tokens?: number | null
+  /** The output cap. */
+  max_tokens?: number | null
+  /** A tree of `{ supported: boolean }` leaves, such as `image_input` and `thinking`. */
+  capabilities?: Record<string, unknown> | null
+}
+
+/**
+ * BL-199: Anthropic's own list reports `max_input_tokens` 1,000,000 for Sonnet
+ * 4.5, but Anthropic's context-window guide (checked 2026-09-25) says "Other
+ * Claude models, including Claude Sonnet 4.5, have a 200k-token context window":
+ * its 1M window needs a beta header Batshit's direct connection does not send.
+ * This is the only model where the two disagree.
+ */
+const ANTHROPIC_DIRECT_WINDOW_WITHOUT_BETA: ReadonlyArray<{ idPrefix: string; contextWindow: number }> = [
+  { idPrefix: 'claude-sonnet-4-5', contextWindow: 200_000 }
+]
+
+function anthropicCapabilitySupported(capabilities: Record<string, unknown> | null | undefined, name: string) {
+  const leaf = capabilities?.[name]
+  return Boolean(leaf && typeof leaf === 'object' && (leaf as { supported?: unknown }).supported === true)
+}
+
+/**
+ * BL-199: the direct connection's own limits and capabilities, as Anthropic's
+ * `GET /v1/models` lists them, so the per-connection limits of a merged row
+ * are Anthropic's real numbers instead of unknown.
+ */
+function mapAnthropicModels(models: AnthropicModelInfo[]): DirectProviderEntry[] {
+  const entries: DirectProviderEntry[] = []
+  for (const model of models) {
+    const id = safeString(model?.id)
+    if (!id) continue
+    const listedWindow = normalizePositiveInteger(model?.max_input_tokens)
+    const withoutBeta = ANTHROPIC_DIRECT_WINDOW_WITHOUT_BETA.find((rule) => id.startsWith(rule.idPrefix))
+    const contextWindow =
+      listedWindow !== undefined && withoutBeta ? Math.min(listedWindow, withoutBeta.contextWindow) : listedWindow
+    const tags = [
+      ...(anthropicCapabilitySupported(model?.capabilities, 'image_input') ? ['vision'] : []),
+      ...(anthropicCapabilitySupported(model?.capabilities, 'thinking') ? ['reasoning'] : [])
+    ]
+    entries.push({
+      id,
+      displayName: safeString(model?.display_name) || undefined,
+      modelType: safeString(model?.type) || 'model',
+      tags,
+      contextWindow,
+      maxOutputTokens: normalizePositiveInteger(model?.max_tokens)
+    })
+  }
+  return entries
 }
 
 async function fetchAnthropicEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
@@ -1911,6 +2206,7 @@ async function fetchAnthropicEntries(options: SourceFetchOptions = {}): Promise<
 
   const entries: DirectProviderEntry[] = []
   let afterId: string | null = null
+  const seenAfterIds = new Set<string>()
 
   do {
     const url = new URL(ANTHROPIC_ENDPOINT)
@@ -1931,19 +2227,18 @@ async function fetchAnthropicEntries(options: SourceFetchOptions = {}): Promise<
       signal: options.signal
     })
 
-    for (const model of payload.data ?? []) {
-      const id = safeString(model?.id)
-      if (!id) continue
-      entries.push({
-        id,
-        displayName: safeString(model?.display_name) || undefined,
-        modelType: safeString(model?.type) || 'model'
-      })
-    }
+    const models = requireModelList(payload, 'Anthropic', ['data']) as AnthropicModelInfo[]
+    requireModelIds(models, 'Anthropic', 'id')
+    if (typeof payload.has_more !== 'boolean') throw new Error('Anthropic model list has malformed has_more')
+    entries.push(...mapAnthropicModels(models))
 
-    afterId = payload.has_more ? safeString(payload.last_id) || null : null
+    afterId = payload.has_more ? readNextPageToken(payload, 'Anthropic', 'last_id') : null
+    if (payload.has_more && !afterId) throw new Error('Anthropic model list is incomplete: has_more without last_id')
+    if (afterId && seenAfterIds.has(afterId)) throw new Error('Anthropic model list repeated last_id')
+    if (afterId) seenAfterIds.add(afterId)
   } while (afterId)
 
+  options.onCompleteLiveList?.()
   return entries
 }
 
@@ -1954,45 +2249,50 @@ async function fetchGatewayEntries(options: SourceFetchOptions = {}): Promise<Ca
   }>(GATEWAY_ENDPOINT, {
     signal: options.signal
   })
-  const rawModels = Array.isArray(payload?.data) ? payload!.data! : (payload?.models ?? [])
-  return rawModels.map((raw) => {
-    const provider = normalizeProvider(raw.id)
-    const name = raw.id.split('/').slice(1).join('/') || raw.name
-    const canonicalId = buildCanonicalId(provider, name)
-    const tags = (raw.tags ?? []).map((tag) => tag.toLowerCase())
-    const contextWindow = raw.context_window ?? raw.max_tokens
-    const pricing = mapPricing(raw.pricing)
-    const purpose = inferModelPurpose({
-      modelType: raw.type ?? null,
-      id: raw.id,
-      name,
-      tags
-    })
+  const rawModels = requireModelList(payload, 'Gateway', ['data', 'models']) as GatewayModel[]
+  requireModelIds(rawModels, 'Gateway', 'id')
+  return rawModels.map(mapGatewayModelToCatalogEntry)
+}
 
-    return {
-      id: raw.id,
-      canonicalId,
-      provider,
-      upstreamProvider: 'vercel',
-      name,
-      displayName: raw.name,
-      description: raw.description,
-      tags,
-      contextWindow: contextWindow ?? undefined,
-      maxOutputTokens: sanitizeCatalogMaxOutputTokens({
-        maxOutputTokens: raw.max_tokens,
-        contextWindow
-      }),
-      purpose,
-      pricing,
-      features: deriveFeatures(tags, contextWindow, pricing),
-      category: categorizeModel(tags, contextWindow),
-      source: 'vercel' as const,
-      transport: 'vercel-gateway' as const,
-      connectionId: 'vercel-gateway' as const,
-      modelType: raw.type ?? null
-    }
+function mapGatewayModelToCatalogEntry(raw: GatewayModel): CatalogEntry {
+  const provider = normalizeProvider(raw.id)
+  const name = raw.id.split('/').slice(1).join('/') || raw.name
+  const canonicalId = buildCanonicalId(provider, name)
+  const tags = (raw.tags ?? []).map((tag) => tag.toLowerCase())
+  // A window of 0 (the gateway lists one for mistral-embed and minimax-h3) is
+  // unknown, never published as 0: blank sends nothing.
+  const contextWindow = normalizePositiveInteger(raw.context_window ?? raw.max_tokens)
+  const pricing = mapPricing(raw.pricing, gatewayZeroPriceContext(raw))
+  const purpose = inferModelPurpose({
+    modelType: raw.type ?? null,
+    id: raw.id,
+    name,
+    tags
   })
+
+  return {
+    id: raw.id,
+    canonicalId,
+    provider,
+    upstreamProvider: 'vercel',
+    name,
+    displayName: raw.name,
+    description: raw.description,
+    tags,
+    contextWindow,
+    maxOutputTokens: sanitizeCatalogMaxOutputTokens({
+      maxOutputTokens: raw.max_tokens,
+      contextWindow
+    }),
+    purpose,
+    pricing,
+    features: deriveFeatures(tags, contextWindow, pricing),
+    category: categorizeModel(tags, contextWindow),
+    source: 'vercel' as const,
+    transport: 'vercel-gateway' as const,
+    connectionId: 'vercel-gateway' as const,
+    modelType: raw.type ?? null
+  }
 }
 
 async function fetchOpenRouterEntries(options: SourceFetchOptions = {}): Promise<CatalogEntry[]> {
@@ -2002,14 +2302,17 @@ async function fetchOpenRouterEntries(options: SourceFetchOptions = {}): Promise
     signal: options.signal
   })
 
-  return payload.data.map(mapOpenRouterModelToCatalogEntry)
+  const models = requireModelList(payload, 'OpenRouter', ['data']) as OpenRouterModel[]
+  requireModelIds(models, 'OpenRouter', 'id')
+  return models.map(mapOpenRouterModelToCatalogEntry)
 }
 
 function mapOpenRouterModelToCatalogEntry(raw: OpenRouterModel): CatalogEntry {
   const tags = deriveOpenRouterTags(raw)
-  const contextWindow = raw.context_length ?? undefined
+  // A window of 0 is unknown, never published as 0.
+  const contextWindow = normalizePositiveInteger(raw.context_length)
   const outputContextWindow = raw.top_provider?.context_length ?? contextWindow
-  const pricing = mapPricing(raw.pricing as Record<string, string | number>)
+  const pricing = mapPricing(raw.pricing as Record<string, unknown>, openRouterZeroPriceContext(raw))
   const provider = normalizeProvider(raw.id)
   const name = raw.id.split('/').slice(1).join('/') || raw.name
   const canonicalId = buildCanonicalId(provider, name)
@@ -2075,7 +2378,6 @@ function deriveOpenRouterFeatures(model: OpenRouterModel, tags: string[], pricin
   }
   features.tools = model.supported_parameters?.some((param) => param.includes('tool')) ?? false
   features.streaming = true
-  features.maxTokens = model.context_length ?? 0
   return features
 }
 
@@ -2107,17 +2409,43 @@ function normalizeName(value?: string | null) {
   return value?.toLowerCase().replace(/[^a-z0-9]/g, '') ?? ''
 }
 
+/**
+ * Record, before Artificial Analysis fills in model-wide numbers, the limits
+ * and price this connection's own source listed (BL-68, BL-132), and what a
+ * reviewed identity rule says the entry is (BL-68).
+ */
+function recordOwnNumbers(entry: CatalogEntry): CatalogEntry {
+  const reviewed = resolveReviewedCatalogIdentity(entry)
+  return {
+    ...entry,
+    ...(reviewed ? { identityName: reviewed.name, identityRule: reviewed.rule } : {}),
+    ownLimits: {
+      contextWindow: normalizePositiveInteger(entry.contextWindow) ?? null,
+      maxOutputTokens: normalizePositiveInteger(entry.maxOutputTokens) ?? null
+    },
+    ownPricing: entry.pricing ? buildListedPricing(entry.pricing) ?? null : null
+  }
+}
+
 function enrichWithAA(entry: CatalogEntry, aaMap: Map<string, any>) {
-  const match = aaMap.get(normalizeName(entry.name))
+  const match = aaMap.get(normalizeName(entry.identityName ?? entry.name))
   if (!match) return entry
 
-  const pricing = match.pricing
-    ? {
-        input: match.pricing.price_1m_input_tokens ?? match.pricing.price_1m_blended_3_to_1 ?? entry.pricing?.input,
-        output: match.pricing.price_1m_output_tokens ?? entry.pricing?.output,
-        cachedInput: entry.pricing?.cachedInput
-      }
-    : entry.pricing
+  // A price this entry's own source listed wins (decision A, 2026-09-25): it is
+  // what that connection charges. Artificial Analysis fills only an entry that
+  // lists no price at all, and never partly, so an embedding row's lone input
+  // price gains no invented output price. AA lists 0 for a price it does not
+  // know (BL-130), so only a positive number of theirs is a price.
+  const listsOwnPrice = Boolean(entry.pricing && buildListedPricing(entry.pricing))
+  const pricing =
+    match.pricing && !listsOwnPrice
+      ? buildListedPricing({
+          input:
+            readArtificialAnalysisPrice(match.pricing.price_1m_input_tokens) ??
+            readArtificialAnalysisPrice(match.pricing.price_1m_blended_3_to_1),
+          output: readArtificialAnalysisPrice(match.pricing.price_1m_output_tokens)
+        })
+      : entry.pricing
   const contextWindow =
     normalizePositiveInteger(
       match.context_window ?? match.context_window_tokens ?? match.context ?? match.max_context
@@ -2126,7 +2454,7 @@ function enrichWithAA(entry: CatalogEntry, aaMap: Map<string, any>) {
   return {
     ...entry,
     aaSlug: typeof match.slug === 'string' && match.slug.trim().length ? match.slug.trim() : entry.aaSlug,
-    pricing: pricing ?? entry.pricing,
+    pricing,
     contextWindow,
     maxOutputTokens: sanitizeCatalogMaxOutputTokens({
       maxOutputTokens: entry.maxOutputTokens,
@@ -2137,26 +2465,127 @@ function enrichWithAA(entry: CatalogEntry, aaMap: Map<string, any>) {
 
 type CatalogMergeKey = string
 
-function buildCatalogMergeKey(entry: Pick<CatalogEntry, 'provider' | 'canonicalId' | 'aaSlug'>): CatalogMergeKey {
+function buildCatalogMergeKey(
+  entry: Pick<CatalogEntry, 'provider' | 'canonicalId' | 'aaSlug' | 'identityName'>
+): CatalogMergeKey {
   const developerId = canonicalizeCatalogDeveloperId(entry.provider)
   const aaSlug = entry.aaSlug?.trim().toLowerCase()
   if (developerId && aaSlug) return `${developerId}::aa:${aaSlug}`
-  const [, ...modelParts] = entry.canonicalId.split('/')
+  // BL-68: a reviewed identity (Anthropic's dated snapshot) keys as its alias.
+  const canonicalId = entry.identityName ? buildCanonicalId(entry.provider, entry.identityName) : entry.canonicalId
+  const [, ...modelParts] = canonicalId.split('/')
   return developerId && modelParts.length
     ? `${developerId}/${modelParts.join('/')}`
-    : entry.canonicalId
+    : canonicalId
 }
 
-function buildIdVariants(entries: CatalogEntry[]) {
+type MergedRowNumbers = Pick<CatalogEntry, 'contextWindow' | 'maxOutputTokens' | 'pricing'>
+
+/**
+ * BL-68 / BL-132: the limits a connection keeps on its variant. A connection
+ * that joined through a reviewed identity rule always keeps its own (`null` =
+ * unknown, never the row's). Any other connection keeps its own when a limit
+ * its source listed differs from the row's (a limit it did not list is `null`,
+ * never borrowed); one that listed none, or listed the row's, takes the row's.
+ */
+function ownLimitsForVariant(entry: CatalogEntry, isBase: boolean, row: MergedRowNumbers) {
+  const own = entry.ownLimits
+  if (!own) return undefined
+  if (entry.identityRule) return own
+  if (isBase) return undefined
+  const differs =
+    (own.contextWindow !== null && own.contextWindow !== (normalizePositiveInteger(row.contextWindow) ?? null)) ||
+    (own.maxOutputTokens !== null && own.maxOutputTokens !== (normalizePositiveInteger(row.maxOutputTokens) ?? null))
+  return differs ? own : undefined
+}
+
+/**
+ * BL-295 review: each direct connection that is a model maker's own API, and
+ * the catalog developer ids of that maker. Vercel AI Gateway charges "the
+ * provider's list price with no platform markup on tokens"
+ * (https://vercel.com/docs/ai-gateway/pricing), so on a gateway-based row the
+ * row's price is what the maker's own API charges. Reviewed by hand, like the
+ * developer aliases; a subscription plan counts as its maker's own API.
+ */
+const MAKERS_OWN_CONNECTIONS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  'direct:openai': ['openai'],
+  'direct:anthropic': ['anthropic'],
+  'direct:google': ['google'],
+  'direct:mistral': ['mistral'],
+  'direct:xai': ['xai', 'x-ai', 'spacexai'],
+  'direct:deepseek': ['deepseek'],
+  'direct:moonshot': ['moonshotai'],
+  'direct:kimi_code': ['moonshotai'],
+  'direct:zai': ['zai'],
+  'direct:zai_coding': ['zai'],
+  'direct:cohere': ['cohere'],
+  'direct:minimax': ['minimax'],
+  'direct:minimax_token_plan': ['minimax'],
+  'direct:mimo': ['xiaomi'],
+  'direct:mimo_token_plan': ['xiaomi'],
+  'direct:qwencloud': ['qwen', 'alibaba'],
+  'direct:qwen_token_plan': ['qwen', 'alibaba'],
+  'direct:fireworks': ['fireworks']
+})
+
+/** BL-295 review: the maker's own API on a row whose price is the gateway's list price. */
+function takesGatewayListPrice(connectionId: string, rowDeveloper: string, baseConnectionId: string | undefined) {
+  if (baseConnectionId !== 'vercel-gateway') return false
+  return (MAKERS_OWN_CONNECTIONS[connectionId] ?? []).includes(canonicalizeCatalogDeveloperId(rowDeveloper))
+}
+
+function samePricing(left: ListedPricing, right: ListedPricing | undefined, allowUnlisted: boolean) {
+  return !(['input', 'output', 'cachedInput'] as const).some((field) => {
+    const mine = left[field]
+    const rows = right?.[field]
+    if (mine === undefined) return !allowUnlisted && rows !== undefined
+    if (rows === undefined) return true
+    // DeepInfra's cents-per-token arithmetic once listed $3 as 2.9999999999999996.
+    return Math.abs(mine - rows) > 1e-9 * Math.max(1, Math.abs(mine), Math.abs(rows))
+  })
+}
+
+/**
+ * The price a connection keeps on its variant (absent: it takes the row's).
+ * - BL-132: a connection keeps the price its own source listed when a price it
+ *   listed differs from the row's (an open-model host such as DeepInfra or
+ *   Together sells the gateway's model at its own price); a price it did not
+ *   list is then unknown, never borrowed. One that listed the row's takes it.
+ * - BL-295 review, replacing BL-132's "one that listed none takes the row's"
+ *   for every connection but the maker's own API on a gateway-based row: a
+ *   connection that lists no price never shows another host's. It keeps the
+ *   price it had on its own (Artificial Analysis's, which lists no cached
+ *   price), or an empty price (Unknown) when AA names none. Qwen Cloud's
+ *   qwen3-max had taken OpenRouter's $0.78 over Alibaba's $1.2.
+ */
+function ownPricingForVariant(entry: CatalogEntry, base: CatalogEntry | undefined, row: MergedRowNumbers) {
+  if (entry === base) return undefined
+  const takesGatewayPrice = base
+    ? takesGatewayListPrice(entry.connectionId, base.provider, base.connectionId)
+    : false
+  const listed = entry.ownPricing
+  if (listed) return samePricing(listed, row.pricing, takesGatewayPrice) ? undefined : listed
+  if (takesGatewayPrice) return undefined
+  const alone = entry.pricing ? buildListedPricing(entry.pricing) : undefined
+  if (!alone) return row.pricing && buildListedPricing(row.pricing) ? {} : undefined
+  return samePricing(alone, row.pricing, false) ? undefined : alone
+}
+
+function buildIdVariants(entries: CatalogEntry[], base?: CatalogEntry, row?: MergedRowNumbers) {
   const variants: NonNullable<CatalogEntry['idVariants']> = {}
 
   for (const entry of entries) {
     if (!entry?.connectionId) continue
+    const isBase = entry === base
+    const limits = ownLimitsForVariant(entry, isBase, row ?? entry)
+    const pricing = ownPricingForVariant(entry, base, row ?? entry)
     variants[entry.connectionId] = {
       developerId: entry.provider,
       modelId: entry.name,
       effectiveId: entry.id,
-      source: entry.source
+      source: entry.source,
+      ...(limits ? { limits } : {}),
+      ...(pricing ? { pricing } : {})
     }
 
     for (const [connectionId, variant] of Object.entries(entry.idVariants ?? {})) {
@@ -2167,7 +2596,124 @@ function buildIdVariants(entries: CatalogEntry[]) {
   return Object.keys(variants).length ? variants : undefined
 }
 
-function mergeCatalogEntries(entries: CatalogEntry[]): CatalogEntry[] {
+/** BL-68 (bug-batch find b): what the merge guard did with a same-connection collision. */
+type VariantCollision = CatalogSyncVariantCollision
+
+function withoutWorkingFields(entry: CatalogEntry): CatalogEntry {
+  const {
+    identityName: _identityName,
+    identityRule: _identityRule,
+    ownLimits: _ownLimits,
+    ownPricing: _ownPricing,
+    ...published
+  } = entry
+  return published
+}
+
+/**
+ * BL-68 (bug-batch find b): a row holds one variant per connection, and a second
+ * entry of the same connection in one group used to vanish without a word (the
+ * 2026-09-22 registry listed 53 Mistral entries but carried 52 variants).
+ *
+ * The entry whose variant the row has always published keeps it (the last one,
+ * as before), so no saved preset changes model. Each other entry is returned to
+ * become a row of its own. A reviewed identity rule must never cause this: it
+ * would be a wrong merge, so the sync refuses to publish.
+ */
+function findSameConnectionLosers(
+  key: CatalogMergeKey,
+  group: CatalogEntry[],
+  collisions: VariantCollision[]
+): Map<CatalogEntry, VariantCollision> {
+  const byConnection = new Map<string, CatalogEntry[]>()
+  for (const entry of group) {
+    const connections = new Set(
+      [entry.connectionId, ...Object.keys(entry.idVariants ?? {})].filter((value): value is string => Boolean(value))
+    )
+    for (const connectionId of connections) {
+      byConnection.set(connectionId, [...(byConnection.get(connectionId) ?? []), entry])
+    }
+  }
+
+  const losers = new Map<CatalogEntry, VariantCollision>()
+  for (const [connectionId, list] of byConnection) {
+    if (list.length < 2) continue
+    if (list.some((entry) => entry.identityRule)) {
+      throw new Error(
+        `Catalog sync refused to publish: the reviewed identity rule put ${list.length} ${connectionId} entries ` +
+          `in one row (${list.map((entry) => entry.id).join(', ')}).`
+      )
+    }
+    const kept = list[list.length - 1]
+    const collision: VariantCollision = { group: key, connectionId, kept: kept.id, split: [], dropped: [] }
+    collisions.push(collision)
+    for (const loser of list.slice(0, -1)) {
+      if (!losers.has(loser)) losers.set(loser, collision)
+    }
+  }
+  return losers
+}
+
+/**
+ * BL-295: whether this entry shows a name rather than the bare id it sends. A
+ * list that names nothing (MiMo's and DashScope's `/models`) leaves the id as
+ * the name, so a merged MiMo audio row showed "mimo-v2.5-asr" beside the plan's
+ * "MiMo V2.5 ASR". Only such a row borrows a name: a derived name (DeepInfra's
+ * "DeepSeek-R1-0528") stays, so a host's own label ("... NVFP4") never lands
+ * on another host's row.
+ */
+function listsOwnDisplayName(entry: CatalogEntry): boolean {
+  const displayName = entry.displayName?.trim()
+  return Boolean(displayName) && displayName !== entry.id
+}
+
+function buildMergedRow(group: CatalogEntry[], members: CatalogEntry[]): CatalogEntry | null {
+  const base =
+    group.find((entry) => entry.source === 'vercel') ??
+    group.find((entry) => entry.source === 'openrouter') ??
+    group.find((entry) => entry.source === 'direct') ??
+    group[0]
+  if (!base) return null
+
+  const rowNumbers: MergedRowNumbers = {
+    // BL-295: the row's price is its base's (with Artificial Analysis's when the
+    // base lists none), never another connection's: a member that lists its own
+    // price keeps it on its variant, and the base's own price stays unknown.
+    pricing: base.pricing,
+    // BL-572: the same for limits. A base that lists no window or output cap
+    // leaves the row's unknown; a member's own limits stay on its variant
+    // (`ownLimitsForVariant`), so they never become the limits of every
+    // connection that takes the row's.
+    contextWindow: base.contextWindow,
+    maxOutputTokens: base.maxOutputTokens
+  }
+  const idVariants = buildIdVariants(members, base, rowNumbers) ?? base.idVariants
+  const availableConnections = Array.from(
+    new Set([...members.map((entry) => entry.connectionId), ...Object.keys(idVariants ?? {})].filter(Boolean))
+  )
+
+  const purpose = mergePurpose(group.map((entry) => entry.purpose))
+
+  return withoutWorkingFields({
+    ...base,
+    // The group lists its base first (gateway, OpenRouter, then direct), so a
+    // base with a name of its own keeps it.
+    displayName: group.find(listsOwnDisplayName)?.displayName ?? base.displayName,
+    canonicalId: buildCanonicalId(base.provider, base.name),
+    provider: canonicalizeCatalogDeveloperId(base.provider),
+    ...rowNumbers,
+    description: base.description ?? group.find((entry) => entry.description)?.description,
+    tags: Array.from(new Set(group.flatMap((entry) => entry.tags ?? []))),
+    availableConnections,
+    purpose,
+    idVariants
+  })
+}
+
+function mergeCatalogEntriesWithReport(entries: CatalogEntry[]): {
+  models: CatalogEntry[]
+  variantCollisions: VariantCollision[]
+} {
   const groups = new Map<CatalogMergeKey, CatalogEntry[]>()
 
   for (const entry of entries) {
@@ -2180,40 +2726,35 @@ function mergeCatalogEntries(entries: CatalogEntry[]): CatalogEntry[] {
   }
 
   const merged: CatalogEntry[] = []
+  const variantCollisions: VariantCollision[] = []
+  const pendingSplits: Array<{ entry: CatalogEntry; collision: VariantCollision }> = []
 
-  for (const group of groups.values()) {
-    const base =
-      group.find((entry) => entry.source === 'vercel') ??
-      group.find((entry) => entry.source === 'openrouter') ??
-      group.find((entry) => entry.source === 'direct') ??
-      group[0]
-    if (!base) continue
-
-    const idVariants = buildIdVariants(group) ?? base.idVariants
-    const availableConnections = Array.from(
-      new Set([...group.map((entry) => entry.connectionId), ...Object.keys(idVariants ?? {})].filter(Boolean))
-    )
-
-    const purpose = mergePurpose(group.map((entry) => entry.purpose))
-
-    const mergedEntry: CatalogEntry = {
-      ...base,
-      canonicalId: buildCanonicalId(base.provider, base.name),
-      provider: canonicalizeCatalogDeveloperId(base.provider),
-      pricing: base.pricing ?? group.find((entry) => entry.pricing)?.pricing,
-      contextWindow: base.contextWindow ?? group.find((entry) => entry.contextWindow)?.contextWindow,
-      maxOutputTokens: base.maxOutputTokens ?? group.find((entry) => entry.maxOutputTokens)?.maxOutputTokens,
-      description: base.description ?? group.find((entry) => entry.description)?.description,
-      tags: Array.from(new Set(group.flatMap((entry) => entry.tags ?? []))),
-      availableConnections,
-      purpose,
-      idVariants
-    }
-
-    merged.push(mergedEntry)
+  for (const [key, group] of groups) {
+    const losers = findSameConnectionLosers(key, group, variantCollisions)
+    const row = buildMergedRow(group, losers.size ? group.filter((entry) => !losers.has(entry)) : group)
+    if (row) merged.push(row)
+    for (const [entry, collision] of losers) pendingSplits.push({ entry, collision })
   }
 
-  return merged
+  // A split entry becomes a row of its own only when no row uses its canonical id:
+  // instances merge rows by canonical id (`/api/models`), which would drop it again.
+  const usedCanonicalIds = new Set(merged.map((row) => row.canonicalId))
+  for (const { entry, collision } of pendingSplits) {
+    const row = buildMergedRow([entry], [entry])
+    if (!row || usedCanonicalIds.has(row.canonicalId)) {
+      collision.dropped.push(entry.id)
+      continue
+    }
+    usedCanonicalIds.add(row.canonicalId)
+    merged.push(row)
+    collision.split.push(entry.id)
+  }
+
+  return { models: merged, variantCollisions }
+}
+
+function mergeCatalogEntries(entries: CatalogEntry[]): CatalogEntry[] {
+  return mergeCatalogEntriesWithReport(entries).models
 }
 
 type CatalogIdentityIssue = {
@@ -2264,12 +2805,52 @@ function assertCatalogIdentityIntegrity(models: CatalogEntry[]) {
   throw new Error(`Catalog identity integrity failed for ${issues.length} connection variant(s): ${sample}`)
 }
 
+/**
+ * The pure middle of a sync run: reviewed identities first (so each entry's own
+ * limits are recorded before Artificial Analysis fills in model-wide numbers),
+ * then Artificial Analysis, then the guarded merge, then the identity check.
+ */
+function assembleCatalogModels({
+  gatewayEntries,
+  openRouterEntries,
+  directEntriesByProvider,
+  aaMap
+}: {
+  gatewayEntries: CatalogEntry[]
+  openRouterEntries: CatalogEntry[]
+  directEntriesByProvider: Partial<Record<DirectProviderId, CatalogEntry[]>>
+  aaMap: Map<string, any>
+}): { models: CatalogEntry[]; variantCollisions: VariantCollision[] } {
+  const allEntries = [
+    ...gatewayEntries,
+    ...openRouterEntries,
+    ...DIRECT_PROVIDER_IDS.flatMap((provider) => directEntriesByProvider[provider] ?? [])
+  ].map((entry) => enrichWithAA(recordOwnNumbers(entry), aaMap))
+
+  const { models, variantCollisions } = mergeCatalogEntriesWithReport(allEntries)
+  models.sort((a, b) => a.displayName.localeCompare(b.displayName))
+  assertCatalogIdentityIntegrity(models)
+  return { models, variantCollisions }
+}
+
+export function _assembleCatalogModelsForTest(args: Parameters<typeof assembleCatalogModels>[0]) {
+  return assembleCatalogModels(args)
+}
+
+export function _buildFallbackEntriesFromExistingForTest(args: Parameters<typeof buildFallbackEntriesFromExisting>[0]) {
+  return buildFallbackEntriesFromExisting(args)
+}
+
 export function _mergeCatalogEntriesForTest(entries: CatalogEntry[]): CatalogEntry[] {
   return mergeCatalogEntries(entries)
 }
 
 export function _findCatalogIdentityIssuesForTest(models: CatalogEntry[]): CatalogIdentityIssue[] {
   return findCatalogIdentityIssues(models)
+}
+
+export function _mapGatewayModelToCatalogEntryForTest(raw: GatewayModel): CatalogEntry {
+  return mapGatewayModelToCatalogEntry(raw)
 }
 
 export function _mapOpenRouterModelToCatalogEntryForTest(raw: OpenRouterModel): CatalogEntry {
@@ -2289,6 +2870,10 @@ export function _mergeDirectProviderEntriesForTest(
 
 export function _mapDeepInfraModelsForTest(models: DeepInfraCatalogModel[]): DirectProviderEntry[] {
   return mapDeepInfraModels(models)
+}
+
+export function _mapAnthropicModelsForTest(models: AnthropicModelInfo[]): DirectProviderEntry[] {
+  return mapAnthropicModels(models)
 }
 
 export function _mapTogetherModelsForTest(models: TogetherCatalogModel[]): DirectProviderEntry[] {
@@ -2356,6 +2941,11 @@ type CatalogSyncSourceStatus = {
   usedFallback: boolean
   skipped?: boolean
   fetchedCount: number
+  /** Missing upstream IDs retained until a reviewed source policy confirms retirement. */
+  pendingRemovalIds?: string[]
+  confirmedRemovalIds?: string[]
+  /** Saved identities removed by the reviewed connection incompatibility policy. */
+  policyRemovalIds?: string[]
   error?: string
   warning?: string
 }
@@ -2369,6 +2959,12 @@ type RunModelCatalogSyncResult = {
 type RunModelCatalogSyncOptions = {
   trigger?: CatalogSyncTrigger
   initiatedBy?: string | null
+  /**
+   * BL-68: build the catalog and return it without writing anything: no upload
+   * to Upstash and no stored report. Sources are still fetched live, so this
+   * still calls every provider whose key is configured.
+   */
+  dryRun?: boolean
 }
 
 type ExistingCatalogPayload = {
@@ -2407,6 +3003,7 @@ type CatalogSyncReport = {
   previousFetchedAt?: string
   sources: CatalogSyncSourceStatus[]
   diff: CatalogSyncDiff
+  variantCollisions: VariantCollision[]
   warningStreak: number
   warningAlert?: {
     active: boolean
@@ -2417,17 +3014,36 @@ type CatalogSyncReport = {
 }
 
 async function fetchExistingCatalog(): Promise<ExistingCatalogPayload | null> {
-  let parsed: ExistingCatalogPayload | null
-  try {
-    parsed = await upstashKvGet<ExistingCatalogPayload>('catalog:v1', {
-      required: false,
-      timeoutMs: CATALOG_FETCH_TIMEOUT_MS
-    })
-  } catch {
-    return null
+  // A missing key permits the first publish. An unreadable or malformed saved
+  // catalog does not: source failures would otherwise lose their fallback rows.
+  const parsed = await upstashKvGet<ExistingCatalogPayload>('catalog:v1', {
+    required: true,
+    timeoutMs: CATALOG_FETCH_TIMEOUT_MS
+  })
+  if (parsed === null) return null
+  if (!parsed || !Array.isArray(parsed.models) || parsed.models.length === 0) {
+    throw new Error('Cannot sync model catalog: existing catalog is malformed')
   }
-  if (!parsed || !Array.isArray(parsed.models)) return null
 
+  const supportedConnections = new Set<string>([
+    'vercel-gateway', 'openrouter', ...DIRECT_PROVIDER_IDS.map(asDirectConnectionId)
+  ])
+  for (const model of parsed.models) {
+    if (!model || typeof model !== 'object' || typeof model.id !== 'string' || !model.id.trim() ||
+      !Array.isArray(model.availableConnections) || !model.availableConnections.length ||
+      !model.idVariants || typeof model.idVariants !== 'object') {
+      throw new Error('Cannot sync model catalog: existing catalog has an unusable saved identity')
+    }
+    const connections = new Set([...model.availableConnections, model.connectionId, ...Object.keys(model.idVariants)].filter(Boolean))
+    for (const connection of connections) {
+      const variant = model.idVariants[connection]
+      if (!supportedConnections.has(connection) || !variant ||
+        !['developerId', 'modelId', 'effectiveId'].every(key =>
+          typeof variant[key] === 'string' && variant[key].trim())) {
+        throw new Error('Cannot sync model catalog: existing catalog has an unusable saved identity')
+      }
+    }
+  }
   return parsed as ExistingCatalogPayload
 }
 
@@ -2484,28 +3100,68 @@ function buildFallbackEntriesFromExisting({
     const effectiveId =
       safeString(variant?.effectiveId) ||
       (connectionId === 'openrouter' || connectionId === 'vercel-gateway' ? `${provider}/${name}` : name)
+    // BL-68: a connection that keeps its own limits is rebuilt with them, never
+    // with the merged row's numbers, which may belong to another connection.
+    const ownLimits = variant?.limits && typeof variant.limits === 'object' ? variant.limits : null
+    // BL-572: the row's numbers are its base's own, so only the base is rebuilt
+    // with them. Any other connection without limits of its own took the row's
+    // by rule; it is rebuilt with none (unknown), so it takes the row's again on
+    // the next merge instead of keeping today's as if its own list named them.
+    // A row that names no base connection (an older snapshot) rebuilds as before.
+    const rowConnection = safeString(model?.connectionId)
+    const limitsFromRow = !ownLimits && (!rowConnection || rowConnection === connectionId)
+    // A snapshot that still carries a window or output cap of 0 is rebuilt
+    // with it unknown, never 0.
+    const contextWindow = normalizePositiveInteger(
+      ownLimits ? ownLimits.contextWindow : limitsFromRow ? model?.contextWindow : undefined
+    )
+    const maxOutputTokens = normalizePositiveInteger(
+      ownLimits ? ownLimits.maxOutputTokens : limitsFromRow ? model?.maxOutputTokens : undefined
+    )
 
     results.push({
       id: effectiveId,
       canonicalId,
       provider,
-      upstreamProvider: source === 'vercel' ? 'vercel' : source,
+      // BL-133: the same value a live fetch writes: `vercel`, `openrouter`, or
+      // the direct provider's own id (`anthropic`, `togetherai`), never `direct`.
+      upstreamProvider: connectionId.startsWith('direct:') ? connectionId.slice('direct:'.length) : source,
       name,
       displayName: safeString(model?.displayName) || name,
-      description: safeString(model?.description) || undefined,
+      // BL-133: an empty description stays empty and a missing one stays missing.
+      ...(typeof model?.description === 'string' ? { description: model.description } : {}),
       tags,
-      contextWindow: typeof model?.contextWindow === 'number' ? model.contextWindow : undefined,
-      maxOutputTokens: typeof model?.maxOutputTokens === 'number' ? model.maxOutputTokens : undefined,
+      contextWindow,
+      maxOutputTokens,
       purpose,
-      pricing: typeof model?.pricing === 'object' ? model.pricing : undefined,
+      // BL-132 / BL-295 review: each connection is rebuilt with the price it was
+      // published with: its variant's own (an empty one is Unknown), else the
+      // row's, which was its own price. The maker's own API on a gateway-based
+      // row is the exception: it took the row's by rule, so it is rebuilt with
+      // none and takes the row's again when the gateway's price moves.
+      pricing:
+        variant?.pricing && typeof variant.pricing === 'object'
+          ? variant.pricing
+          : takesGatewayListPrice(connectionId, safeString(model?.provider), safeString(model?.connectionId))
+            ? undefined
+            : model?.pricing && typeof model.pricing === 'object'
+              ? model.pricing
+              : undefined,
       features:
-        typeof model?.features === 'object'
-          ? model.features
-          : deriveFeatures(tags, typeof model?.contextWindow === 'number' ? model.contextWindow : undefined, undefined),
+        typeof model?.features === 'object' && model.features
+          ? limitsFromRow
+            ? withoutUnknownWindow(model.features)
+            : withKnownWindow(model.features, contextWindow)
+          : deriveFeatures(tags, contextWindow, undefined),
       category: model?.category,
       source,
       transport,
-      connectionId
+      connectionId,
+      // BL-133: the published model type survives a fail-safe rebuild (an
+      // OpenRouter row, which never has one, still has none).
+      ...(model && 'modelType' in model
+        ? { modelType: typeof model.modelType === 'string' ? model.modelType : null }
+        : {})
     })
   }
 
@@ -2515,15 +3171,6 @@ function buildFallbackEntriesFromExisting({
 function normalizeError(error: unknown) {
   if (error instanceof Error) return error.message
   return safeString(error) || 'unknown error'
-}
-
-function shouldUseFallback({ fetchedCount, previousCount }: { fetchedCount: number; previousCount: number }) {
-  if (!previousCount) {
-    return fetchedCount === 0
-  }
-  if (fetchedCount === 0) return true
-  const dropRatio = fetchedCount / previousCount
-  return dropRatio < 0.5
 }
 
 function buildSourceFallbackWarning({
@@ -2546,10 +3193,6 @@ function buildSourceFallbackWarning({
     return 'Source returned 0 models and no previous list is available'
   }
   return undefined
-}
-
-export function _shouldUseFallbackForTest(args: { fetchedCount: number; previousCount: number }) {
-  return shouldUseFallback(args)
 }
 
 export function _buildSourceFallbackWarningForTest(args: {
@@ -2778,8 +3421,12 @@ export async function runModelCatalogSync(
 ): Promise<RunModelCatalogSyncResult> {
   logger.debug('[catalog] Building model catalog snapshot...')
 
-  const createSourceOptions = (): SourceFetchOptions => ({
-    signal: AbortSignal.timeout(CATALOG_SOURCE_TIMEOUT_MS)
+  const completedLiveLists = new Set<DirectProviderId>()
+  const fallbackErrors = new Map<DirectProviderId, string>()
+  const createSourceOptions = (provider?: DirectProviderId): SourceFetchOptions => ({
+    signal: AbortSignal.timeout(CATALOG_SOURCE_TIMEOUT_MS),
+    onFallbackError: provider ? error => fallbackErrors.set(provider, normalizeError(error)) : undefined,
+    onCompleteLiveList: provider ? () => { completedLiveLists.add(provider) } : undefined
   })
 
   const existing = await fetchExistingCatalog()
@@ -2827,7 +3474,7 @@ export async function runModelCatalogSync(
     fetchGatewayEntries(createSourceOptions()),
     fetchOpenRouterEntries(createSourceOptions()),
     fetchArtificialAnalysis(createSourceOptions()),
-    ...DIRECT_PROVIDER_IDS.map((provider) => DIRECT_SOURCE_FETCHERS[provider](createSourceOptions()))
+    ...DIRECT_PROVIDER_IDS.map((provider) => DIRECT_SOURCE_FETCHERS[provider](createSourceOptions(provider)))
   ])
 
   const directSourceResultsByProvider = Object.fromEntries(
@@ -2846,14 +3493,11 @@ export async function runModelCatalogSync(
         transport: 'vercel-gateway'
       })
     : []
-  const useGatewayFallback =
-    !gatewayEntriesFresh ||
-    shouldUseFallback({
-      fetchedCount: gatewayEntriesFresh.length,
-      previousCount: previousGatewayCount
-    })
+  const gatewayReconciled = retainCatalogSourceEntries('vercel-gateway', gatewayEntriesFresh ?? [], gatewayFallback)
+  const useGatewayFallback = !gatewayEntriesFresh || gatewayReconciled.pendingRemovalIds.length > 0 ||
+    (gatewayEntriesFresh.length === 0 && previousGatewayCount === 0)
 
-  const gatewayEntries = useGatewayFallback ? gatewayFallback : gatewayEntriesFresh
+  const gatewayEntries = !gatewayEntriesFresh ? gatewayFallback : gatewayReconciled.entries
   if (!hasExisting && (!gatewayEntriesFresh || gatewayEntriesFresh.length === 0)) {
     const reason = gatewayError ? ` (${gatewayError})` : ''
     throw new Error(`Gateway model import failed and no existing catalog is available${reason}`)
@@ -2861,11 +3505,13 @@ export async function runModelCatalogSync(
 
   sources.push({
     connectionId: 'vercel-gateway',
-    ok: Boolean(gatewayEntriesFresh) && !useGatewayFallback,
+    ok: Boolean(gatewayEntriesFresh) && !useGatewayFallback && !gatewayReconciled.pendingRemovalIds.length,
+    pendingRemovalIds: gatewayEntriesFresh ? gatewayReconciled.pendingRemovalIds : undefined,
+    confirmedRemovalIds: gatewayEntriesFresh ? gatewayReconciled.confirmedRemovalIds : undefined,
     usedFallback: useGatewayFallback,
     fetchedCount: gatewayEntriesFresh?.length ?? 0,
     error: gatewayError,
-    warning: buildSourceFallbackWarning({
+    warning: (gatewayEntriesFresh && gatewayReconciled.warning) || buildSourceFallbackWarning({
       useFallback: useGatewayFallback,
       previousCount: previousGatewayCount,
       fetchedCount: gatewayEntriesFresh?.length ?? 0
@@ -2882,22 +3528,21 @@ export async function runModelCatalogSync(
         transport: 'openrouter'
       })
     : []
-  const useOpenRouterFallback =
-    !openRouterEntriesFresh ||
-    shouldUseFallback({
-      fetchedCount: openRouterEntriesFresh.length,
-      previousCount: previousOpenRouterCount
-    })
+  const openRouterReconciled = retainCatalogSourceEntries('openrouter', openRouterEntriesFresh ?? [], openRouterFallback)
+  const useOpenRouterFallback = !openRouterEntriesFresh || openRouterReconciled.pendingRemovalIds.length > 0 ||
+    (openRouterEntriesFresh.length === 0 && previousOpenRouterCount === 0)
 
-  const openRouterEntries = useOpenRouterFallback ? openRouterFallback : openRouterEntriesFresh
+  const openRouterEntries = !openRouterEntriesFresh ? openRouterFallback : openRouterReconciled.entries
 
   sources.push({
     connectionId: 'openrouter',
-    ok: Boolean(openRouterEntriesFresh) && !useOpenRouterFallback,
+    ok: Boolean(openRouterEntriesFresh) && !useOpenRouterFallback && !openRouterReconciled.pendingRemovalIds.length,
+    pendingRemovalIds: openRouterEntriesFresh ? openRouterReconciled.pendingRemovalIds : undefined,
+    confirmedRemovalIds: openRouterEntriesFresh ? openRouterReconciled.confirmedRemovalIds : undefined,
     usedFallback: useOpenRouterFallback,
     fetchedCount: openRouterEntriesFresh?.length ?? 0,
     error: openRouterError,
-    warning: buildSourceFallbackWarning({
+    warning: (openRouterEntriesFresh && openRouterReconciled.warning) || buildSourceFallbackWarning({
       useFallback: useOpenRouterFallback,
       previousCount: previousOpenRouterCount,
       fetchedCount: openRouterEntriesFresh?.length ?? 0
@@ -2914,42 +3559,63 @@ export async function runModelCatalogSync(
     const connectionId = asDirectConnectionId(provider)
     const sourceConfigured = directSourceConfigured[provider]
 
-    const fresh = result.status === 'fulfilled' ? mapDirectProviderEntries(provider, result.value) : null
-    const error = result.status === 'rejected' ? normalizeError(result.reason) : undefined
-    const fallback = existing
-      ? applyDirectSourceCatalogPolicy(
-          provider,
-          buildFallbackEntriesFromExisting({
-            existing,
-            connectionId,
-            source: 'direct',
-            transport: 'direct'
-          })
-        )
+    const fresh = result.status === 'fulfilled'
+      ? applyDirectSourceCatalogPolicy(provider, mapDirectProviderEntries(provider, result.value))
+      : null
+    const error = result.status === 'rejected' ? normalizeError(result.reason) : fallbackErrors.get(provider)
+    const savedEntries = existing
+      ? buildFallbackEntriesFromExisting({ existing, connectionId, source: 'direct', transport: 'direct' })
       : []
+    const savedFallback = applyDirectSourceCatalogPolicy(provider, savedEntries)
+    const compatibleSavedIds = new Set(savedFallback.map(entry => entry.id))
+    const policyRemovalIds = [...new Set(savedEntries.filter(entry => !compatibleSavedIds.has(entry.id)).map(entry => entry.id))]
+    // These dated identities were lost before exact-ID retention existed. Keep
+    // them as prior coverage so only a complete list plus reviewed retirement
+    // can remove them; never count them as freshly fetched Fal models.
+    const recoveredFalEntries = provider === 'fal'
+      ? mapDirectProviderEntries('fal', RECOVERED_FAL_ENTRIES.map(({ id, displayName, tags, modelType }) => ({
+          id, displayName, tags: [...tags], modelType
+        })))
+      : []
+    // A reviewed retirement must not resurrect a recovered-only ID during a
+    // later outage. Saved rows still follow the normal no-retirement-on-error
+    // contract, and a complete live list still reports the confirmed removal.
+    const eligibleRecovery = provider !== 'fal'
+      ? []
+      : error || !sourceConfigured || !completedLiveLists.has(provider)
+        ? retainCatalogSourceEntries(connectionId, [], recoveredFalEntries).entries
+        : recoveredFalEntries
+    const savedIds = new Set(savedFallback.map(entry => entry.id))
+    const fallback = [...savedFallback, ...eligibleRecovery.filter(entry => !savedIds.has(entry.id))]
     const previousCount = previousDirectCounts[provider] ?? 0
-    const useFallback =
-      !fresh ||
-      shouldUseFallback({
-        fetchedCount: fresh.length,
-        previousCount
-      })
+    const reconciled = retainCatalogSourceEntries(connectionId, fresh ?? [], fallback, error || !sourceConfigured || !completedLiveLists.has(provider) ? [] : undefined)
+    const useFallback = Boolean(error) || !fresh || reconciled.pendingRemovalIds.length > 0 ||
+      (fresh.length === 0 && previousCount === 0)
 
-    const entries = useFallback ? fallback : fresh
+    const entries = !fresh ? fallback : reconciled.entries
     sources.push({
       connectionId,
-      ok: Boolean(fresh) && !useFallback,
+      ok: Boolean(fresh) && !useFallback && !reconciled.pendingRemovalIds.length,
+      pendingRemovalIds: fresh ? reconciled.pendingRemovalIds : undefined,
+      confirmedRemovalIds: fresh ? reconciled.confirmedRemovalIds : [],
+      policyRemovalIds,
       usedFallback: useFallback,
       skipped: !sourceConfigured,
       fetchedCount: fresh?.length ?? 0,
       error,
-      warning: !sourceConfigured
-        ? `API key not configured; ${previousCount ? 'preserving previous list' : 'skipping import'}`
-        : buildSourceFallbackWarning({
+      warning: [!sourceConfigured
+        ? provider === 'fal' && fallback.length
+          ? `API key not configured; preserving ${fallback.length} prior/recovered Fal entries without a live refresh`
+          : `API key not configured; ${previousCount ? 'preserving previous list' : 'skipping import'}`
+        : (fresh && reconciled.warning) || buildSourceFallbackWarning({
             useFallback,
             previousCount,
             fetchedCount: fresh?.length ?? 0
-          })
+          }),
+        policyRemovalIds.length
+          ? `Reviewed connection policy excludes saved IDs: ${policyRemovalIds.join(', ')}`
+          : undefined
+      ].filter(Boolean).join('; ') || undefined
     })
 
     return entries
@@ -2974,16 +3640,12 @@ export async function runModelCatalogSync(
     )
   }
 
-  const allEntries = [
-    ...gatewayEntries.map((entry) => enrichWithAA(entry, aaMap)),
-    ...openRouterEntries.map((entry) => enrichWithAA(entry, aaMap)),
-    ...DIRECT_PROVIDER_IDS.flatMap((provider) =>
-      directEntriesByProvider[provider].map((entry) => enrichWithAA(entry, aaMap))
-    )
-  ]
-
-  const merged = mergeCatalogEntries(allEntries).sort((a, b) => a.displayName.localeCompare(b.displayName))
-  assertCatalogIdentityIntegrity(merged)
+  const { models: merged, variantCollisions } = assembleCatalogModels({
+    gatewayEntries,
+    openRouterEntries,
+    directEntriesByProvider,
+    aaMap
+  })
 
   const payload: CatalogPayload = {
     version: 2,
@@ -2996,13 +3658,32 @@ export async function runModelCatalogSync(
     models: merged
   }
 
-  await uploadCatalog(payload)
+  // Source retention is not sufficient if a later policy/merge drops an ID.
+  // Verify the complete output before any publication, including dry-run proof.
+  const identityKey = (connection: string, id: string) => JSON.stringify([connection, id])
+  const outputIdentities = new Set(merged.flatMap(model =>
+    Object.entries(model.idVariants ?? {}).map(([connection, variant]) => identityKey(connection, variant.effectiveId))))
+  const approvedRemovals = new Set(sources.flatMap(source =>
+    [...(source.confirmedRemovalIds ?? []), ...(source.policyRemovalIds ?? [])]
+      .map(id => identityKey(source.connectionId, id))))
+  for (const model of existing?.models ?? []) {
+    for (const [connection, variant] of Object.entries(model.idVariants ?? {})) {
+      const key = identityKey(connection, (variant as { effectiveId: string }).effectiveId)
+      if (!outputIdentities.has(key) && !approvedRemovals.has(key)) {
+        throw new Error('Cannot publish catalog: downstream processing removed an unapproved saved connection')
+      }
+    }
+  }
+
+  if (!options.dryRun) {
+    await uploadCatalog(payload)
+  }
   const directTotal = DIRECT_PROVIDER_IDS.reduce(
     (total, provider) => total + directEntriesByProvider[provider].length,
     0
   )
   logger.debug(
-    `[catalog] Uploaded ${merged.length} models (vercel=${gatewayEntries.length}, openrouter=${openRouterEntries.length}, direct=${directTotal})`
+    `[catalog] ${options.dryRun ? 'Built (dry run, not uploaded)' : 'Uploaded'} ${merged.length} models (vercel=${gatewayEntries.length}, openrouter=${openRouterEntries.length}, direct=${directTotal})`
   )
   const diff = buildCatalogSyncDiff({ previous: existing, next: payload })
   const reportBase = {
@@ -3011,11 +3692,15 @@ export async function runModelCatalogSync(
     previousFetchedAt: safeString(existing?.fetchedAt) || undefined,
     sources,
     diff,
+    variantCollisions,
     warningStreak: 0,
     warningAlert: null
   }
 
   let report: CatalogSyncReport = reportBase
+  if (options.dryRun) {
+    return { payload, sources, report }
+  }
 
   try {
     const stored = await storeCatalogSyncReport({
@@ -3028,7 +3713,8 @@ export async function runModelCatalogSync(
         counts: payload.counts,
         models: payload.models.length,
         sources: reportBase.sources,
-        diff: reportBase.diff
+        diff: reportBase.diff,
+        variantCollisions: reportBase.variantCollisions
       }
     })
     report = {
@@ -3041,4 +3727,76 @@ export async function runModelCatalogSync(
   }
 
   return { payload, sources, report }
+}
+
+/**
+ * BL-68: rebuild the catalog the current code would publish from a published
+ * snapshot, with no network at all: every source is rebuilt from the snapshot
+ * exactly as the sync's own fail-safe path does, and Artificial Analysis is
+ * replayed from the slugs the snapshot carries. Used by
+ * `npm run sync:model-catalog -- --replay <snapshot.json> --out <file>` to show
+ * what a code change does to today's catalog before any real sync runs.
+ *
+ * It cannot recover what a snapshot has already lost (an entry an older merge
+ * dropped, or the per-source numbers merged away), so its output is proof of
+ * what the rules do to the snapshot, not a substitute for a live run.
+ */
+export function buildCatalogFromSnapshot(snapshot: ExistingCatalogPayload): {
+  payload: CatalogPayload
+  variantCollisions: VariantCollision[]
+} {
+  const gatewayEntries = buildFallbackEntriesFromExisting({
+    existing: snapshot,
+    connectionId: 'vercel-gateway',
+    source: 'vercel',
+    transport: 'vercel-gateway'
+  })
+  const openRouterEntries = buildFallbackEntriesFromExisting({
+    existing: snapshot,
+    connectionId: 'openrouter',
+    source: 'openrouter',
+    transport: 'openrouter'
+  })
+  const directEntriesByProvider = Object.fromEntries(
+    DIRECT_PROVIDER_IDS.map((provider) => [
+      provider,
+      applyDirectSourceCatalogPolicy(
+        provider,
+        buildFallbackEntriesFromExisting({
+          existing: snapshot,
+          connectionId: asDirectConnectionId(provider),
+          source: 'direct',
+          transport: 'direct'
+        })
+      )
+    ])
+  ) as Record<DirectProviderId, CatalogEntry[]>
+
+  // Only the slugs: prices and windows already sit in the snapshot's rows.
+  const aaMap = new Map<string, any>()
+  for (const model of snapshot.models ?? []) {
+    const slug = safeString(model?.aaSlug).trim()
+    if (slug) aaMap.set(normalizeName(slug), { slug })
+  }
+
+  const { models, variantCollisions } = assembleCatalogModels({
+    gatewayEntries,
+    openRouterEntries,
+    directEntriesByProvider,
+    aaMap
+  })
+
+  return {
+    payload: {
+      version: 2,
+      fetchedAt: safeString(snapshot.fetchedAt) || new Date().toISOString(),
+      counts: {
+        vercel: gatewayEntries.length,
+        openrouter: openRouterEntries.length,
+        ...Object.fromEntries(DIRECT_PROVIDER_IDS.map((provider) => [provider, directEntriesByProvider[provider].length]))
+      },
+      models
+    },
+    variantCollisions
+  }
 }

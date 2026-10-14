@@ -1,0 +1,27 @@
+{
+  "case": "status-offline",
+  "capturedAt": "2026-09-22T14:26:05.844Z",
+  "pinokio": {
+    "desktop": "8.2.0",
+    "pinokiod": "8.2.0",
+    "pterm": "0.0.25",
+    "script": "8.0.0"
+  },
+  "platform": "macOS 27.0 (26A428), Apple Silicon, Node 24.12.0 (Homebrew) running pterm through its shebang",
+  "sanitized": {
+    "/Users/tester": "the real home folder",
+    "192.168.1.10": "the real LAN address"
+  },
+  "argv": [
+    "pterm",
+    "status",
+    "comfy.git"
+  ],
+  "exitCode": 0,
+  "signal": null,
+  "timedOut": false,
+  "durationMs": 158,
+  "stdout": "{\n  \"app_id\": \"comfy.git\",\n  \"name\": \"comfy.git\",\n  \"title\": \"Comfyui\",\n  \"description\": \"The most powerful and modular diffusion model GUI, api and backend with a graph/nodes interface. https://github.com/comfyanonymous/ComfyUI\",\n  \"icon\": \"/asset/api/comfy.git/icon.jpeg\",\n  \"path\": \"/Users/tester/pinokio/api/comfy.git\",\n  \"install_script\": \"install.js\",\n  \"start_script\": \"start.js\",\n  \"default_target\": \"/Users/tester/pinokio/api/comfy.git/start.js\",\n  \"default_script\": \"start.js\",\n  \"running\": false,\n  \"ready\": false,\n  \"ready_url\": null,\n  \"external_ready_urls\": [],\n  \"state\": \"offline\",\n  \"running_scripts\": [],\n  \"ready_script\": null,\n  \"local_entries\": [],\n  \"probe\": null,\n  \"last_error\": null,\n  \"preference\": {\n    \"starred\": false,\n    \"starred_at\": null,\n    \"protection_enabled\": false,\n    \"last_launch_at\": \"2026-09-21T17:25:26.017Z\",\n    \"last_launch_source\": \"ui\",\n    \"launch_count_total\": 3,\n    \"launch_count_pterm\": 0,\n    \"launch_count_ui\": 3,\n    \"launch_count_unknown\": 0\n  },\n  \"source\": {\n    \"host\": \"192.168.1.10\",\n    \"name\": \"p25\",\n    \"local\": true\n  },\n  \"ref\": \"pinokio://192.168.1.10:42000/api/comfy.git\"\n}\n",
+  "stderr": "",
+  "note": "status <app_id> before the first run: state offline"
+}

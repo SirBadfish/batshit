@@ -216,3 +216,85 @@ describe('BuiltInService product repo protection', () => {
     ).toBe('**/node_modules/**,**/dist/**,**/*.log,**/.env,**/.env.*,**/.git/**');
   });
 });
+
+describe('BuiltInService validatePathWithinProject (BL-728)', () => {
+  const service = new BuiltInService();
+  const projectPath = '/tmp/project';
+
+  it('allows the project root itself', () => {
+    expect(() => service.validatePathWithinProject(projectPath, '/tmp/project')).not.toThrow();
+  });
+
+  it('allows a child path', () => {
+    expect(() => service.validatePathWithinProject(projectPath, '/tmp/project/file.txt')).not.toThrow();
+  });
+
+  it('allows a deep child path', () => {
+    expect(() => service.validatePathWithinProject(projectPath, '/tmp/project/a/b/c/file.txt')).not.toThrow();
+  });
+
+  it('rejects a sibling directory that only shares a name prefix', () => {
+    expect(() => service.validatePathWithinProject(projectPath, '/tmp/project-other')).toThrow(
+      /Path traversal attempt detected/
+    );
+  });
+
+  it('rejects a file inside a sibling directory that only shares a name prefix', () => {
+    expect(() => service.validatePathWithinProject(projectPath, '/tmp/project-other/file.txt')).toThrow(
+      /Path traversal attempt detected/
+    );
+  });
+
+  it('rejects another sibling with a numeric suffix prefix collision', () => {
+    expect(() => service.validatePathWithinProject(projectPath, '/tmp/project2')).toThrow(
+      /Path traversal attempt detected/
+    );
+  });
+
+  it('rejects .. traversal that escapes the project', () => {
+    expect(() => service.validatePathWithinProject(projectPath, '/tmp/project/../project-other/file.txt')).toThrow(
+      /Path traversal attempt detected/
+    );
+  });
+
+  it('allows a project path with a trailing slash', () => {
+    expect(() => service.validatePathWithinProject('/tmp/project/', '/tmp/project/file.txt')).not.toThrow();
+  });
+
+  it('allows a child folder whose name starts with two dots', () => {
+    expect(() => service.validatePathWithinProject(projectPath, '/tmp/project/..cache')).not.toThrow();
+    expect(() => service.validatePathWithinProject(projectPath, '/tmp/project/..cache/file.txt')).not.toThrow();
+  });
+
+  it('keeps the exact error message text', () => {
+    expect(() => service.validatePathWithinProject(projectPath, '/tmp/project-other')).toThrow(
+      'Path traversal attempt detected. Path /tmp/project-other is outside of project root.'
+    );
+  });
+});
+
+describe('BuiltInService._isPathWithinRoot (BL-728 sweep)', () => {
+  const service = new BuiltInService();
+  const root = '/tmp/root';
+
+  it('treats the root itself as within the root', () => {
+    expect(service._isPathWithinRoot(root, '/tmp/root')).toBe(true);
+  });
+
+  it('treats a child as within the root', () => {
+    expect(service._isPathWithinRoot(root, '/tmp/root/child')).toBe(true);
+  });
+
+  it('treats a child folder whose name starts with two dots as within the root', () => {
+    expect(service._isPathWithinRoot(root, '/tmp/root/..cache')).toBe(true);
+    expect(service._isPathWithinRoot(root, '/tmp/root/..cache/file.txt')).toBe(true);
+  });
+
+  it('treats a sibling with the same prefix as outside the root', () => {
+    expect(service._isPathWithinRoot(root, '/tmp/root-other')).toBe(false);
+  });
+
+  it('treats .. traversal as outside the root', () => {
+    expect(service._isPathWithinRoot(root, '/tmp/root/../root-other')).toBe(false);
+  });
+});

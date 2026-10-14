@@ -233,7 +233,7 @@ async function openVoiceTab(name: 'Global Voice Settings' | 'Voice Studio' | 'Vo
 }
 
 async function openVoiceEngineSection(
-  name: 'Text-to-Speech Engines' | 'Speech-to-Text Engines' | 'Installed Engine Controls'
+  name: 'Voice Runtimes' | 'Text-to-Speech Engines' | 'Speech-to-Text Engines' | 'Installed Engine Controls'
 ) {
   const title = await screen.findByText(name)
   const details = title.closest('details')
@@ -329,9 +329,10 @@ describe('VoiceSettingsPanel external engine refresh', () => {
     })
 
     await screen.findByRole('tab', { name: 'Global Voice Settings' })
+    // BL-962: the controls appear once the saved settings have been read.
+    expect((await screen.findAllByText('3D Goon Lip Sync')).length).toBeGreaterThan(0)
     expect(screen.queryByText('Speak AI responses')).not.toBeInTheDocument()
     expect(screen.queryByText('Auto-mute zipped content')).not.toBeInTheDocument()
-    expect(screen.getAllByText('3D Goon Lip Sync').length).toBeGreaterThan(0)
     const previewInput = screen.getByLabelText('Voice Preview')
     expect(previewInput).toHaveAttribute('type', 'text')
     expect(previewInput).toHaveAttribute('name', 'voice-preview-phrase')
@@ -763,6 +764,136 @@ describe('VoiceSettingsPanel external engine refresh', () => {
     await fireEvent.click(await installedSection.findByRole('button', { name: /Chatterbox Turbo/i }))
 
     expect(await installedSection.findByText('Delete local files too')).toBeInTheDocument()
+  })
+
+  it.each(['per-engine', 'all-owned'] as const)('shows %s runtime controls without changing saved OFF preferences, including an unrelated save', async (policy) => {
+    vi.useFakeTimers()
+    const storedVoice = { ...baseVoiceSettings, voiceRuntimes: { livekit: { startup: { stopOnShutdown: false, autoStartOnLaunch: false } } } }
+    const managedEngine = {
+      ...byoEngine,
+      localRuntime: {
+        installOwnership: 'batshit-managed', canStopOnShutdown: true, shutdownStopPolicy: policy,
+        startup: { autoStartOnLaunch: false, stopOnShutdown: false }
+      }
+    }
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = resolveUrl(input)
+      if (url.includes('/api/user/settings')) {
+        const saved = init?.method === 'POST' ? JSON.parse(String(init.body)).voice_settings : storedVoice
+        return jsonResponse({ settings: { voice_settings: saved } })
+      }
+      if (url.includes('/api/voice/runtime/livekit')) return jsonResponse({
+        runtime: { id: 'livekit', name: 'LiveKit', installed: false, selected: false, autoStartOnLaunch: false,
+          status: 'not-installed', statusHint: 'Not installed.', healthUrl: '', agentName: null },
+        runtimeContext: { localVoiceEngineStopPolicy: policy }
+      })
+      if (url.includes('/api/voice/byo/engines')) {
+        const saved = init?.method === 'PUT' ? JSON.parse(String(init.body)).engines[0] : null
+        return jsonResponse({ engines: [saved ? { ...managedEngine, ...saved, localRuntime: { ...managedEngine.localRuntime, ...saved.localRuntime } } : managedEngine] })
+      }
+      if (url.includes('/api/voice/providers')) return jsonResponse({ providers: [browserProvider, byoProvider] })
+      if (url.includes('/api/voice/profiles')) return jsonResponse({ profiles: [] })
+      throw new Error(`Unhandled fetch: ${url}`)
+    })
+    // @ts-expect-error test override
+    global.fetch = fetchMock
+    render(VoiceSettingsPanel, { props: { data: { user: { id: 'josh' }, userSettings: { voice_settings: storedVoice } } } })
+    await openVoiceTab('Voice Engines')
+    const runtimeSection = await openVoiceEngineSection('Voice Runtimes')
+    const stopLabel = policy === 'all-owned' ? 'Always Stop with Batshit' : 'Stop with Batshit'
+    const liveKitStopRow = (await runtimeSection.findByText(stopLabel)).closest('.batshit-settings-muted-panel') as HTMLElement
+    const liveKitStop = within(liveKitStopRow).getByRole('switch')
+    expect(liveKitStop).toHaveAttribute('aria-checked', policy === 'all-owned' ? 'true' : 'false')
+    expect(liveKitStop.hasAttribute('disabled')).toBe(policy === 'all-owned')
+    const installedSection = await openVoiceEngineSection('Installed Engine Controls')
+    await fireEvent.click(await installedSection.findByRole('button', { name: /Chatterbox Turbo/i }))
+    const engineStopRow = (await installedSection.findByText(stopLabel)).closest('.batshit-settings-pill') as HTMLElement
+    const engineStop = within(engineStopRow).getByRole('switch')
+    expect(engineStop).toHaveAttribute('aria-checked', policy === 'all-owned' ? 'true' : 'false')
+    expect(engineStop.hasAttribute('disabled')).toBe(policy === 'all-owned')
+    await vi.advanceTimersByTimeAsync(700)
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT' || init?.method === 'POST')).toHaveLength(0)
+
+    const engineStartRow = (await installedSection.findByText('Start with Batshit')).closest('.batshit-settings-pill') as HTMLElement
+    await fireEvent.click(within(engineStartRow).getByRole('switch'))
+    await openVoiceEngineSection('Voice Runtimes')
+    const liveKitStartRow = (await runtimeSection.findByText('Start with Batshit')).closest('.batshit-settings-muted-panel') as HTMLElement
+    await fireEvent.click(within(liveKitStartRow).getByRole('switch'))
+    await vi.advanceTimersByTimeAsync(700)
+    await waitFor(() => {
+      const engineSave = fetchMock.mock.calls.find(([, init]) => init?.method === 'PUT')
+      const voiceSave = fetchMock.mock.calls.find(([, init]) => init?.method === 'POST')
+      expect(engineSave).toBeTruthy()
+      expect(voiceSave).toBeTruthy()
+      const engineBody = JSON.parse(String(engineSave?.[1]?.body)).engines[0].localRuntime
+      expect(engineBody.startup.stopOnShutdown).toBe(false)
+      expect(engineBody).not.toHaveProperty('shutdownStopPolicy')
+      expect(JSON.parse(String(voiceSave?.[1]?.body)).voice_settings.voiceRuntimes.livekit.startup.stopOnShutdown).toBe(false)
+    })
+  })
+
+  // A saved record the registry cannot read (a newer Batshit wrote it) is kept unchanged on the
+  // server, which names it beside the engines it lists; the card says so instead of hiding it.
+  async function renderInstalledEnginesWith(unreadableEngines: unknown[]) {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = resolveUrl(input)
+      if (url.includes('/api/user/settings')) {
+        return jsonResponse({ settings: { voice_settings: baseVoiceSettings } })
+      }
+      if (url.includes('/api/voice/runtime/livekit')) {
+        return jsonResponse({ status: 'not-installed' })
+      }
+      if (url.includes('/api/voice/byo/engines')) {
+        return jsonResponse({ engines: [byoEngine], unreadableEngines })
+      }
+      if (url.includes('/api/voice/providers')) {
+        return jsonResponse({ providers: [browserProvider, byoProvider] })
+      }
+      if (url.includes('/api/voice/profiles')) {
+        return jsonResponse({ profiles: [] })
+      }
+      throw new Error(`Unhandled fetch: ${url}`)
+    })
+
+    // @ts-expect-error test override
+    global.fetch = fetchMock
+
+    render(VoiceSettingsPanel, {
+      props: { data: { user: { id: 'josh' }, userSettings: { voice_settings: baseVoiceSettings } } }
+    })
+
+    await openVoiceTab('Voice Engines')
+    return openVoiceEngineSection('Installed Engine Controls')
+  }
+
+  it('says when a saved engine record cannot be read, and that it is kept unchanged', async () => {
+    const installedSection = await renderInstalledEnginesWith([
+      { scope: 'record', id: 'dots-tts-mf', reason: 'has settings this Batshit does not know: futureOption' }
+    ])
+
+    const notice = await installedSection.findByText(/A saved engine can.t be read: dots-tts-mf/)
+    expect(notice).toHaveTextContent('has settings this Batshit does not know: futureOption')
+    expect(notice).toHaveTextContent("Batshit keeps it unchanged and won't edit or delete it.")
+    expect(notice).toHaveClass('batshit-settings-inline-alert', 'is-warning')
+  })
+
+  it('a record with no usable id is one engine, not the whole list', async () => {
+    const installedSection = await renderInstalledEnginesWith([
+      { scope: 'record', id: null, reason: 'id: Invalid input: expected string, received undefined' }
+    ])
+
+    const notice = await installedSection.findByText(/A saved engine can.t be read: an engine with no usable id/)
+    expect(notice).toHaveTextContent('id: Invalid input')
+    expect(notice).not.toHaveTextContent('engine list')
+  })
+
+  it('says when the saved engine list as a whole cannot be read', async () => {
+    const installedSection = await renderInstalledEnginesWith([
+      { scope: 'list', id: null, reason: 'it is format version 2, and this Batshit reads version 1' }
+    ])
+
+    const notice = await installedSection.findByText(/The saved engine list can.t be read \(it is format version 2/)
+    expect(notice).toHaveTextContent("Batshit keeps it unchanged and won't change it.")
   })
 
   it('shows BYO default model and voice hints when the provider has no remote voice list', async () => {
@@ -1301,7 +1432,7 @@ describe('VoiceSettingsPanel external engine refresh', () => {
     render(VoiceSettingsPanel, { props: { data: { user: { id: 'josh' }, userSettings: { voice_settings: stored } } } })
     await screen.findByText('Text-to-Speech (TTS)')
 
-    const quickActions = screen.getByRole('switch', { name: /Jev Juice: Quick Actions/i })
+    const quickActions = screen.getByRole('switch', { name: /Judge Juice: Quick Actions/i })
     expect(quickActions).toHaveAttribute('aria-checked', 'true')
 
     // An unrelated edit (the italic narration switch) must carry the field along, not drop it.

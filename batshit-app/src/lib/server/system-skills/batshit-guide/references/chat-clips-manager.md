@@ -19,6 +19,8 @@ The panel is split into two parts:
 
 Attaching is a click: pick a Clip from the Vault and it joins your clipped items for this message. Click an attached Clip again, or use its remove (X) control, to take it back off. Nothing is deleted from your Vault when you remove it from a message — you're only changing what's attached to *this* send.
 
+A batch can save some files before a later attachment fails. If an uncertainty warning appears, **Refresh Clips** checks current attachments without repeating the upload. It cannot stop an earlier request. See [upload and attachment status](../clips/overview.md#upload-and-attachment-status) before retrying or deleting.
+
 ## How long a Clip stays attached
 
 By default, an attached Clip stays clipped to the composer across sends until you remove it — useful when an agent should keep considering the same image or file over several messages.

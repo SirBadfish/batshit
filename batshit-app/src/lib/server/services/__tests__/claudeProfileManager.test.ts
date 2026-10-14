@@ -1,10 +1,12 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { beforeAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import os from 'node:os'
 import path from 'node:path'
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 
 const mockRedis = {
   getAgents: vi.fn(),
+  // BL-745: a profile sync writes an agent's folder only while the agent's record exists.
+  json: { get: vi.fn(async (key: string) => (key.startsWith('agent:') ? { id: key.slice('agent:'.length) } : null)) },
   get: vi.fn(),
   getUserSettings: vi.fn()
 }
@@ -19,6 +21,28 @@ const mockApiKeyService = {
   retrieve: vi.fn(),
   store: vi.fn()
 }
+
+/**
+ * BL-160: the profile managers write under the home folder, and the Codex one reads
+ * `os.homedir()` when its modules load. Setting `process.env.HOME` alone moves it on the
+ * default (forks) lane only: on the real-Redis (threads) lane a worker's `process.env` is a
+ * copy, `os.homedir()` still answers the real home, and these tests wrote
+ * `batshit_agent_agent-1` and `batshit_agent_subagent_cli_bl7_override` into the real
+ * `~/.batshit/agents`. So `node:os` itself answers the temporary home, through both import
+ * styles, and refuses to answer before a test has set one (the pattern of
+ * `cliHelperServerParity.test.ts`).
+ */
+const testHome = vi.hoisted(() => ({ current: '' }))
+/** The profile folders this suite's fixtures write (`batshit_agent_<fixture id>`). */
+const SUITE_PROFILE_FOLDER = /^batshit_agent_(agent-|subagent_cli_bl7_override)/
+vi.mock('node:os', async (importOriginal) => {
+  const real = await importOriginal<typeof import('node:os')>()
+  const homedir = () => {
+    if (!testHome.current) throw new Error('claudeProfileManager.test: no temporary home is set')
+    return testHome.current
+  }
+  return { ...real, homedir, default: { ...real, homedir } }
+})
 
 vi.mock('$env/dynamic/private', () => ({
   env: {
@@ -44,16 +68,34 @@ vi.mock('$lib/server/services/dockerGatewayConfig', async (importOriginal) => {
 describe('claudeProfileManager stdio config', () => {
   const originalHome = process.env.HOME
   let tempHome = ''
+  let realAgentsRoot = ''
+  let realAgentsBefore: string[] = []
+
+  const listRealAgents = async () => (await readdir(realAgentsRoot).catch(() => [] as string[])).sort()
+
+  beforeAll(async () => {
+    // The real home, read from the real module before any test moves HOME.
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os')
+    realAgentsRoot = path.join(realOs.homedir(), '.batshit', 'agents')
+    realAgentsBefore = await listRealAgents()
+  })
 
   beforeEach(async () => {
     vi.clearAllMocks()
     vi.resetModules()
     tempHome = await mkdtemp(path.join(os.tmpdir(), 'claude-profile-test-'))
+    testHome.current = tempHome
     process.env.HOME = tempHome
 
     mockApiKeyService.retrieve.mockResolvedValue(null)
     mockApiKeyService.store.mockResolvedValue(undefined)
-    mockGatewayService.update.mockResolvedValue(undefined)
+    // BL-1371: answer as the real `update` does, the listed gateway with the change applied (a
+    // function change runs on that gateway), so the token migration's caller copy is what is stored.
+    mockGatewayService.update.mockImplementation(async (_userId: string, gatewayId: string, change: any) => {
+      const listed = ((await mockGatewayService.list.mock.results.at(-1)?.value) ?? []) as any[]
+      const stored = structuredClone(listed.find((gateway) => gateway.id === gatewayId) ?? { id: gatewayId })
+      return { ...stored, ...(typeof change === 'function' ? change(stored) : change) }
+    })
     mockRedis.get.mockResolvedValue(null)
     mockRedis.getUserSettings.mockResolvedValue(null)
   })
@@ -64,9 +106,16 @@ describe('claudeProfileManager stdio config', () => {
     } else {
       process.env.HOME = originalHome
     }
+    testHome.current = ''
     if (tempHome) {
       await rm(tempHome, { recursive: true, force: true })
     }
+    // Safety net: no test may add one of this suite's profile folders to the real home (other
+    // Batshit processes may add their own there meanwhile, so only this suite's ids count).
+    const added = (await listRealAgents()).filter(
+      (entry) => !realAgentsBefore.includes(entry) && SUITE_PROFILE_FOLDER.test(entry)
+    )
+    expect(added).toEqual([])
   })
 
   it('writes stdio MCP entries with env placeholders into managed mcp.json', async () => {
@@ -121,7 +170,8 @@ describe('claudeProfileManager stdio config', () => {
     const mcpPath = path.join(tempHome, '.batshit', 'agents', profileId, '.claude', 'mcp.json')
     const payload = JSON.parse(await readFile(mcpPath, 'utf8')) as Record<string, any>
     const managed = payload.mcpServers?.batshit_gateway_stdio_gateway
-    const mode4Server = payload.mcpServers?.['batshit_gateway_managed-claude-mode4-controls']
+    // BL-5: one fixed helper server name, whatever the agent id or slug.
+    const mode4Server = payload.mcpServers?.batshit_helpers
 
     expect(managed).toMatchObject({
       type: 'stdio',

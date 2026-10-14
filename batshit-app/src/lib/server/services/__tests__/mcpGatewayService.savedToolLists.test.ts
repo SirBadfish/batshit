@@ -7,7 +7,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const redisMock = vi.hoisted(() => ({
-  execute: vi.fn()
+  execute: vi.fn(),
+  json: {} as Record<string, unknown>
 }))
 
 vi.mock('$lib/server/redis', () => ({
@@ -20,6 +21,7 @@ vi.mock('$lib/utils/logger', () => ({
 
 import { mcpGatewayService } from '../mcpGatewayService'
 import { mcpToolListCache } from '../mcpToolListCache'
+import { createJsonCompareAndWriteTwinsForMap } from '$lib/test-utils/redisJsonCompareAndWriteTwin'
 
 function createFakeRedis() {
   const json = new Map<string, any>()
@@ -36,6 +38,8 @@ function createFakeRedis() {
     sMembers: vi.fn(async () => [])
   }
   redisMock.execute.mockImplementation(async (fn: (c: typeof client) => any) => fn(client))
+  // BL-1371: the service's registry writes are the facade's compare-and-set over the same store.
+  Object.assign(redisMock.json, createJsonCompareAndWriteTwinsForMap(json))
   return { json }
 }
 

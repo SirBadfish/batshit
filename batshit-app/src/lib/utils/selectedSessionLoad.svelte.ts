@@ -8,7 +8,7 @@ import { untrack } from 'svelte'
  * run registry. Both became dependencies, so the load's own `setMessagesForSession` (and every
  * streamed chunk, tool event, or run-state change in between) re-ran the effect, which loaded
  * again. From 2026-06-06 (`cb7f6be05`) the selected chat was re-fetched about ten times a
- * second, forever: messages, the execution log, and the Jev Juice after-reply notes.
+ * second, forever: messages, the execution log, and the Judge Juice after-reply notes.
  *
  * The rule now: a load happens because the SELECTED CHAT changed, or because its "still being
  * created" hold lifted. Nothing the load itself reads or writes can start another one.
@@ -76,21 +76,29 @@ export function watchSelectedSessionLoad(handlers: SelectedSessionLoadHandlers) 
  * catch-up load, never a queue of them.
  */
 export function createChatLoadQueue(load: (sessionId: string) => Promise<void>) {
-  const inFlight = new Set<string>()
+  /** Each chat's running load, chained to the follow-up load it owes (BL-382). */
+  const inFlight = new Map<string, Promise<void>>()
   const wantedAgain = new Set<string>()
 
-  const request = async (sessionId: string): Promise<void> => {
-    if (inFlight.has(sessionId)) {
+  // A request made while a load runs gets that load's promise, which settles only after the
+  // follow-up load (the running answer was read before the request): a caller that awaits its
+  // request (the reconnect catch-up) never reads the store the old answer left.
+  const request = (sessionId: string): Promise<void> => {
+    const running = inFlight.get(sessionId)
+    if (running) {
       wantedAgain.add(sessionId)
-      return
+      return running
     }
-    inFlight.add(sessionId)
-    try {
-      await load(sessionId)
-    } finally {
-      inFlight.delete(sessionId)
-      if (wantedAgain.delete(sessionId)) await request(sessionId)
-    }
+    const chain = (async () => {
+      try {
+        await load(sessionId)
+      } finally {
+        inFlight.delete(sessionId)
+        if (wantedAgain.delete(sessionId)) await request(sessionId)
+      }
+    })()
+    inFlight.set(sessionId, chain)
+    return chain
   }
 
   return {

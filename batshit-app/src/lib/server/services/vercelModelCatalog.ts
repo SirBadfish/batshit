@@ -4,7 +4,15 @@ import type { ProviderFeatures } from '$lib/server/services/providers'
 import type { ModelPurpose } from '$lib/types/savedModels'
 import type { CatalogModelIdVariant } from '$lib/types/modelCatalog'
 import { inferModelPurpose } from '$lib/utils/modelPurpose'
-import { sanitizeCatalogMaxOutputTokens } from '$lib/utils/modelOutputTokens'
+import { normalizePositiveInteger, sanitizeCatalogMaxOutputTokens } from '$lib/utils/modelOutputTokens'
+import {
+  buildListedPricing,
+  gatewayZeroPriceContext,
+  listedPriceVaries,
+  readListedPerTokenPrice,
+  withoutFalseZeros,
+  type ZeroPriceContext
+} from '$lib/utils/catalogPricing'
 import { upstashKvGet } from '$lib/server/services/upstashKv'
 
 const GATEWAY_FALLBACK_ENDPOINT = 'https://ai-gateway.vercel.sh/v1/models'
@@ -144,6 +152,28 @@ async function fetchGatewayFallback(): Promise<CatalogCachePayload | null> {
   }
 }
 
+/**
+ * The cached catalog's `fetchedAt`, read without the payload (one small path read): a caller that
+ * keeps something built from the catalog can tell whether the cache changed. null when no catalog
+ * is cached or it carries no stamp. Never the network.
+ */
+export async function readCachedVercelModelCatalogStamp(): Promise<string | null> {
+  const answer = await redis.execute(async (client) => client.json.get(CACHE_KEY, { path: '$.fetchedAt' }))
+  const stamp = Array.isArray(answer) ? answer[0] : null
+  return typeof stamp === 'string' && stamp.length > 0 ? stamp : null
+}
+
+/**
+ * The cached catalog as stored, whatever its age, or null when none is cached (review of BL-517).
+ * Never the network: a send checks a gateway preset against this and must not wait on the
+ * registry, Upstash, or the gateway's own list, which `fetchVercelModelCatalog` tries one after
+ * another with no time limit once the hour-old cache is stale.
+ */
+export async function readCachedVercelModelCatalog(): Promise<CatalogCachePayload | null> {
+  const cached = (await redis.get(CACHE_KEY)) as CatalogCachePayload | null
+  return cached?.models?.length ? cached : null
+}
+
 export async function fetchVercelModelCatalog(forceRefresh = false): Promise<CatalogCachePayload> {
   if (!forceRefresh) {
     const cached = (await redis.get(CACHE_KEY)) as CatalogCachePayload | null
@@ -256,13 +286,23 @@ function getObjectString(value: unknown, key: string): string | null {
   return null
 }
 
-export async function findVercelCatalogEntryById(id?: string | null) {
+/**
+ * A catalog row by its id or canonical id. BL-68: with a `connectionId`, also a
+ * row whose variant for exactly that connection has this id, which is how a
+ * preset saved on a row that later merged into another (Anthropic's dated
+ * `claude-haiku-4-5-20251001`, now a variant of `anthropic/claude-haiku-4.5`)
+ * still finds its model. Never another connection's variant.
+ */
+export async function findVercelCatalogEntryById(id?: string | null, connectionId?: string | null) {
   if (!id) return null
   const catalog = await fetchVercelModelCatalog()
   const normalized = normalize(id)
   return (
     catalog.models.find((entry) => normalize(entry.id) === normalized) ??
     catalog.models.find((entry) => normalize(entry.canonicalId) === normalized) ??
+    (connectionId
+      ? catalog.models.find((entry) => normalize(entry.idVariants?.[connectionId]?.effectiveId) === normalized)
+      : undefined) ??
     null
   )
 }
@@ -284,7 +324,7 @@ function transformGatewayModel(raw: RawGatewayModel | null | undefined): VercelC
   const name = raw.id.split('/').slice(1).join('/') || raw.name
   const tags = (raw.tags ?? []).map((tag) => tag.toLowerCase())
   const contextWindow = raw.context_window ?? raw.max_tokens
-  const pricing = mapPricing(raw.pricing)
+  const pricing = mapPricing(raw.pricing, gatewayZeroPriceContext(raw))
   const category = categorizeModel(tags, contextWindow)
 
   return {
@@ -346,7 +386,10 @@ function finalizeCatalogEntry(entry: VercelCatalogEntry): VercelCatalogEntry {
     normalizePurpose(entry.purpose) ??
     inferModelPurpose({ modelType: entry.modelType, id: entry.id || canonicalId, name, tags: entry.tags })
   const displayName = entry.source === 'openrouter' ? normalizeOpenRouterDisplayName(rawDisplayName, provider) : rawDisplayName
-  const maxOutputTokens = normalizeCatalogMaxOutputTokens(entry)
+  // A window of 0 is unknown, never kept as 0: the gateway fallback lists some
+  // (mistral-embed), and a registry published before the sync fix still does.
+  const contextWindow = normalizePositiveInteger(entry.contextWindow)
+  const maxOutputTokens = normalizeCatalogMaxOutputTokens({ ...entry, contextWindow })
 
   return {
     ...entry,
@@ -358,6 +401,7 @@ function finalizeCatalogEntry(entry: VercelCatalogEntry): VercelCatalogEntry {
     transport,
     connectionId,
     upstreamProvider,
+    contextWindow,
     maxOutputTokens,
     availableConnections,
     idVariants: Object.keys(idVariants).length ? idVariants : undefined,
@@ -379,32 +423,31 @@ function inferVariantSource(source?: CatalogSource | null): CatalogModelIdVarian
   return 'manual'
 }
 
-function mapPricing(pricing?: Record<string, string | number>): VercelModelPricing | undefined {
+/**
+ * Gateway pricing is per token; the UI reads dollars per million tokens.
+ * BL-131: a listed 0 is a free model and stays 0; a blank or negative price is
+ * unknown and stays absent (`catalogPricing.ts` owns the rule for the sync too).
+ */
+function mapPricing(pricing?: Record<string, unknown>, context: ZeroPriceContext = {}): VercelModelPricing | undefined {
   if (!pricing) return undefined
-  const toNumber = (value?: string | number) => {
-    if (value === undefined || value === null) return undefined
-    const parsed = typeof value === 'number' ? value : Number(value)
-    if (!Number.isFinite(parsed)) return undefined
-    // Gateway pricing is per token. Convert to per million tokens to match UI expectations.
-    const perMillion = parsed * 1_000_000
-    return Math.round(perMillion * 1000) / 1000
-  }
-
-  const mapped: VercelModelPricing = {
-    input: toNumber(pricing.input ?? pricing.price_1m_input_tokens ?? pricing.price_1m_blended_3_to_1),
-    output: toNumber(pricing.output ?? pricing.price_1m_output_tokens),
-    cachedInput: toNumber(pricing.input_cache_read ?? pricing.cached_input ?? pricing.cached_input_price)
-  }
-
-  if (!mapped.input && !mapped.output && !mapped.cachedInput) {
-    return undefined
-  }
-
-  return mapped
+  return buildListedPricing(
+    withoutFalseZeros(
+      {
+        input: readListedPerTokenPrice(pricing.input ?? pricing.price_1m_input_tokens ?? pricing.price_1m_blended_3_to_1),
+        output: readListedPerTokenPrice(pricing.output ?? pricing.price_1m_output_tokens),
+        cachedInput: readListedPerTokenPrice(pricing.input_cache_read ?? pricing.cached_input ?? pricing.cached_input_price)
+      },
+      { ...context, varies: listedPriceVaries(pricing) }
+    )
+  )
 }
 
 function deriveFeatures(tags: string[], contextWindow?: number | null, pricing?: VercelModelPricing): ProviderFeatures {
   const normalized = new Set(tags.map((tag) => tag.toLowerCase()))
+  // BL-68: a window nobody reported is unknown, so neither it nor the
+  // long-context claim built on it is published (never `maxTokens: 0`).
+  const knownWindow =
+    typeof contextWindow === 'number' && Number.isFinite(contextWindow) && contextWindow > 0 ? contextWindow : null
 
   return {
     streaming: true,
@@ -414,10 +457,9 @@ function deriveFeatures(tags: string[], contextWindow?: number | null, pricing?:
       normalized.has('image') ||
       normalized.has('image-input') ||
       normalized.has('multimodal'),
-    maxTokens: contextWindow ?? 0,
+    ...(knownWindow !== null ? { maxTokens: knownWindow, longContext: knownWindow >= 128_000 } : {}),
     reasoning: normalized.has('reasoning'),
     cacheControl: pricing?.cachedInput !== undefined,
-    longContext: (contextWindow ?? 0) >= 128_000,
     code: normalized.has('code') || normalized.has('coding'),
     fast: normalized.has('fast') || normalized.has('realtime')
   }

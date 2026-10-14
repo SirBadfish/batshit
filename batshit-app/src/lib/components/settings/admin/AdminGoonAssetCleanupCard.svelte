@@ -34,8 +34,9 @@
     <SettingsInfoMenu ariaLabel="About Goon Asset Cleanup" contentClass="w-80">
       <p>
         Finds uploaded Goon files that no current Goon, Motion Vault item, Closet item, or Scene
-        uses anymore. Cleanup only removes orphaned upload records and files; it does not change
-        active Goon settings.
+        references. Inspect explains each orphan. Scene files with unknown reference history are
+        preserved because a failed or partial settings write can remove their references.
+        Cleanup never restores settings or guesses where a file belonged.
       </p>
     </SettingsInfoMenu>
   {/snippet}
@@ -47,7 +48,9 @@
           <SettingsInfoMenu ariaLabel="About Goon Garbage Collection" contentClass="w-80">
             <p>
               Use Inspect first to see how many Goon upload records are still referenced and how many
-              are orphaned. Clean Orphans asks for confirmation before deleting anything.
+              are orphaned. An orphan has no current saved reference; that alone does not prove it
+              was removed intentionally. Clean Orphans asks for confirmation and deletes only the
+              inspected eligible files. Preserved files stay in storage.
             </p>
           </SettingsInfoMenu>
         </div>
@@ -74,7 +77,7 @@
             size="sm"
             variant="destructive"
             onclick={onCleanup}
-            disabled={auditBusy || cleanupBusy || (audit !== null && audit.orphanRecordCount <= 0)}
+            disabled={auditBusy || cleanupBusy || !audit || audit.cleanupCandidateCount <= 0}
           >
             {#if cleanupBusy}
               <Loader2 class="animate-spin" aria-hidden="true" />
@@ -95,8 +98,16 @@
         <Badge variant="outline">{audit.uploadRecordCount} upload records</Badge>
         <Badge variant="outline">{audit.referencedRecordCount} referenced</Badge>
         <Badge variant="outline">{audit.orphanRecordCount} orphaned</Badge>
-        <Badge variant="outline">{formatBackupBytes(audit.orphanBytes)} orphaned</Badge>
+        <Badge variant="outline">{audit.cleanupCandidateCount} eligible for cleanup</Badge>
+        <Badge variant="outline">{audit.preservedOrphanRecordCount} preserved</Badge>
+        <Badge variant="outline">{formatBackupBytes(audit.cleanupCandidateBytes)} eligible</Badge>
       </div>
+      {#if audit.preservedOrphanRecordCount > 0}
+        <p class="batshit-settings-form-help is-warning">
+          Scene files are preserved. The audit has no earlier settings snapshot to determine
+          whether their references were lost recently or removed intentionally.
+        </p>
+      {/if}
       {#if audit.orphanRecordCount > 0}
         <div class="mt-3 grid gap-2 sm:grid-cols-2">
           {#each visibleGoonAssetTypeRows(audit).filter((entry) => entry.orphanRecordCount > 0) as entry}
@@ -112,6 +123,23 @@
             </div>
           {/each}
         </div>
+      {/if}
+      {#if audit.orphans.length > 0 || audit.cleanupCandidates.length > 0}
+        <details class="mt-3">
+          <summary class="batshit-settings-form-label">Files and Reasons</summary>
+          <div class="mt-3 space-y-3">
+            {#each [...audit.orphans, ...audit.cleanupCandidates.filter((candidate) => !audit.orphans.some((orphan) => orphan.uploadType === candidate.uploadType && orphan.filename === candidate.filename))] as file (`${file.uploadType}/${file.filename}`)}
+              <div class="batshit-settings-form-stack">
+                <div class="batshit-settings-form-label-line">
+                  <span class="batshit-settings-form-label break-all">{file.filename}</span>
+                  <Badge variant="outline">{file.cleanupEligible ? 'Eligible' : 'Preserved'}</Badge>
+                </div>
+                <p class="batshit-settings-form-help">{formatGoonUploadType(file.uploadType)} · {formatBackupBytes(file.size)}</p>
+                <p class="batshit-settings-form-help">{file.reason}</p>
+              </div>
+            {/each}
+          </div>
+        </details>
       {/if}
     </div>
   {/if}

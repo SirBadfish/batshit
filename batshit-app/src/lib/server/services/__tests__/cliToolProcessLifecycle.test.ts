@@ -1,4 +1,5 @@
 // @vitest-environment node
+import { isTestProcessRunning } from '$lib/test-utils/process-state'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -9,14 +10,6 @@ import { runCliProcess } from '../cliToolRegistry'
 const createdGroups = new Set<number>()
 const createdDirs = new Set<string>()
 
-function processRuns(pid: number): boolean {
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === 'EPERM'
-  }
-}
 
 async function waitFor<T>(
   read: () => Promise<T | null>,
@@ -32,12 +25,12 @@ async function waitFor<T>(
   }
 }
 
-async function waitUntilGone(pids: number[], timeoutMs = 3_000): Promise<void> {
+async function waitUntilNotRunning(pids: number[], timeoutMs = 3_000): Promise<void> {
   const deadline = Date.now() + timeoutMs
-  while (pids.some(processRuns) && Date.now() < deadline) {
+  while (pids.some(isTestProcessRunning) && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 20))
   }
-  expect(pids.filter(processRuns)).toEqual([])
+  expect(pids.filter(isTestProcessRunning)).toEqual([])
 }
 
 async function startProcessTree(options: {
@@ -107,7 +100,7 @@ describe.runIf(process.platform !== 'win32')(
       expect(result.stopped).toBe(true)
       expect(result.timedOut).toBe(false)
       expect(result.durationMs).toBeLessThan(2_000)
-      await waitUntilGone(pids)
+      await waitUntilNotRunning(pids)
     })
 
     it('timeout ends the CLI process and its stubborn descendant', async () => {
@@ -120,7 +113,7 @@ describe.runIf(process.platform !== 'win32')(
       expect(result.stopped).toBe(false)
       expect(result.timedOut).toBe(true)
       expect(result.durationMs).toBeLessThan(2_000)
-      await waitUntilGone(pids)
+      await waitUntilNotRunning(pids)
     })
   }
 )

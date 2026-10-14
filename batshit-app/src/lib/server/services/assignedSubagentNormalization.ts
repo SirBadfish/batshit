@@ -38,6 +38,10 @@ export function normalizeAssignedSubagent(raw: RawSubagent): any {
     description: raw.description,
     primary_model_provider,
     primary_model_name,
+    // BL-266: an API Subagent's own model runs through this preset's connection
+    // (`subagentModelSelection.ts`); this copy is what the send path hands the runner.
+    primary_model_preset_id: raw.primary_model_preset_id ?? null,
+    primary_model_connection: raw.primary_model_connection ?? null,
     timeout_seconds: raw.timeout_seconds,
     provider_specific_settings: raw.provider_specific_settings ?? null,
     codex_settings: raw.codex_settings ?? null,

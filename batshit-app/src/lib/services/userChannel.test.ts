@@ -13,7 +13,8 @@ const stores = vi.hoisted(() => ({
   deleteSession: vi.fn(),
   applyServerRunStatus: vi.fn(),
   resetRunState: vi.fn(),
-  applyDmInboxChanged: vi.fn()
+  applyDmInboxChanged: vi.fn(),
+  refreshAgentFieldsFromServer: vi.fn(async () => {})
 }))
 
 vi.mock('$lib/services/liveHub/liveHubClient', () => ({
@@ -43,6 +44,9 @@ vi.mock('$lib/stores/chatRunRegistry.svelte', () => ({
 }))
 vi.mock('$lib/stores/dmInbox.svelte', () => ({
   applyDmInboxChanged: stores.applyDmInboxChanged
+}))
+vi.mock('$lib/stores/agents.svelte', () => ({
+  refreshAgentFieldsFromServer: stores.refreshAgentFieldsFromServer
 }))
 
 import {
@@ -113,6 +117,26 @@ describe('user channel over the live hub', () => {
     stop()
   })
 
+  it('an agent that changed its own Settings: the agent store reads that family again, and listeners hear it (SA-122 A-1y)', () => {
+    startUserChannel('josh')
+    const heard: unknown[] = []
+    const stop = onUserChannelEvent((event) => heard.push(event))
+    const { handlers } = hub.subscriptions[0]
+
+    handlers.onEvent(JSON.stringify({ type: 'agent_settings_changed', agentId: 'agent-7', family: 'memory' }))
+    handlers.onEvent(JSON.stringify({ type: 'agent_settings_changed', agentId: 'agent-7', family: 'identity' }))
+    // Malformed: no agent, an unknown family. The store reads nothing for them.
+    handlers.onEvent(JSON.stringify({ type: 'agent_settings_changed', family: 'memory' }))
+    handlers.onEvent(JSON.stringify({ type: 'agent_settings_changed', agentId: 'agent-7', family: 'voice' }))
+
+    expect(stores.refreshAgentFieldsFromServer.mock.calls).toEqual([
+      ['agent-7', 'memory'],
+      ['agent-7', 'identity']
+    ])
+    expect(heard).toContainEqual({ type: 'agent_settings_changed', agentId: 'agent-7', family: 'memory' })
+    stop()
+  })
+
   it('reports connected only while the hub says the subscription is open', () => {
     startUserChannel('josh')
     expect(isUserChannelConnected()).toBe(false)
@@ -120,6 +144,32 @@ describe('user channel over the live hub', () => {
     expect(isUserChannelConnected()).toBe(true)
     hub.subscriptions[0].current = 'down'
     expect(isUserChannelConnected()).toBe(false)
+  })
+
+  it('tells its listeners when the server added the channel again, not on the first open (BL-382)', () => {
+    startUserChannel('josh')
+    const heard: unknown[] = []
+    const stop = onUserChannelEvent((event) => heard.push(event))
+    const { handlers } = hub.subscriptions[0]
+
+    handlers.onStatus('open')
+    expect(heard).toEqual([])
+    handlers.onStatus('down')
+    handlers.onStatus('open')
+    expect(heard).toEqual([{ type: 'reconnected' }])
+    // A tab the hub took back after a silence hears a second `open` with no `down`.
+    handlers.onStatus('open')
+    expect(heard).toEqual([{ type: 'reconnected' }, { type: 'reconnected' }])
+    stop()
+  })
+
+  it('never takes a `reconnected` from the server (it is this tab\'s own signal)', () => {
+    startUserChannel('josh')
+    const heard: unknown[] = []
+    const stop = onUserChannelEvent((event) => heard.push(event))
+    hub.subscriptions[0].handlers.onEvent(JSON.stringify({ type: 'reconnected' }))
+    expect(heard).toEqual([])
+    stop()
   })
 
   it('starts over for a different user', () => {

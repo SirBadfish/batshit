@@ -1,6 +1,5 @@
 // Serve uploaded files from Redis metadata and optional local file-backed storage.
 const express = require('express');
-const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
 const config = require('../config');
@@ -83,16 +82,17 @@ async function serveFileBackedUpload(fileData, filename, req, res, headOnly = fa
     return true;
   }
 
-  const stream = fs.createReadStream(filePath);
-  stream.on('error', (error) => {
+  // Express handles byte ranges and aborted transfers. Video decoders need
+  // partial responses to seek/loop without downloading the entire asset again.
+  res.sendFile(filePath, { acceptRanges: true, cacheControl: false, lastModified: false }, (error) => {
+    if (!error || error.code === 'ECONNABORTED' || req.aborted) return;
     logger.error('Error streaming uploaded file:', error);
     if (!res.headersSent) {
-      res.status(500).json({ error: 'Failed to stream file' });
+      res.status(error.statusCode || 500).json({ error: 'Failed to stream file' });
     } else {
       res.destroy(error);
     }
   });
-  stream.pipe(res);
   return true;
 }
 

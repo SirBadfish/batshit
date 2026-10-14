@@ -46,6 +46,7 @@ import {
   DM_KINDS,
   DM_PRIORITIES,
   isOpenDmStatus,
+  readDmFires,
   type DmKind,
   type DmPriority,
   type DmRecord,
@@ -53,6 +54,7 @@ import {
   type DmStatus
 } from '$lib/types/dm'
 import type { UntrustedTextScreen } from '$lib/types/typesafe'
+import { listWakeRuns } from '$lib/server/services/wakeRunRegistry'
 import {
   dmInboxKey,
   dmInboxScore,
@@ -73,6 +75,19 @@ export class DmStoreError extends Error {
     super(message)
     this.name = 'DmStoreError'
   }
+}
+
+/**
+ * BL-40 — the one answer for a DM id that does not exist, for every agent-side operation.
+ *
+ * It carries no hint on purpose. `sys.dm.read` used to fold this case into its "not in your
+ * inbox / Only the recipient can read a DM" refusal, so an agent that mistyped or invented an
+ * id was told it had a permissions problem and went looking for a recipient that did not
+ * exist (Bob, 2026-09-18). `requireOwnedDm` and `readDmOp` both build it here, so the two can
+ * never say different things about the same missing id again.
+ */
+export function buildDmNotFoundError(dmId: string): DmStoreError {
+  return new DmStoreError(`DM "${dmId}" was not found (it may have expired).`, 'not_found')
 }
 
 /* ------------------------------------------------------------------ *
@@ -358,6 +373,17 @@ export interface CreateDmInput {
   callbackUrl?: string | null
   /** Shared across a broadcast so every copy of one note carries one message id. */
   messageId?: string
+  /**
+   * BL-401 S5 — this `result` is the ONE report Batshit writes when an assignment closes
+   * (`reportBack`) or expires unclaimed (`settleExpiredAssignments`) AND goes back to the agent
+   * that sent that assignment (`reportsToItsOwnSender`). Such a result is never refused by the
+   * open-item cap: it answers an assignment the recipient itself sent, so their number is
+   * bounded by its own assignments, and a refused one used to be lost with a log line. A report
+   * to a third agent named in `report_back_to` still meets the cap (review finding 1). Set
+   * only by those two callers; `sys.dm.send` builds its input field by field and never sets it,
+   * so a result an agent writes itself still meets the cap like any other DM.
+   */
+  assignmentReport?: boolean
 }
 
 function requireText(value: unknown, field: string, max: number): string {
@@ -374,11 +400,23 @@ function requireText(value: unknown, field: string, max: number): string {
   return text
 }
 
+/** A DM input that passed validation, with the values every writer below uses. */
+interface PreparedDm {
+  input: CreateDmInput
+  to: string
+  priority: DmPriority
+  subject: string
+  body: string
+  nowTs: number
+  expiresAt: string
+}
+
 /**
- * Write one DM and index it three ways. Validation, the caps, and the two loop guards all
- * live here, so a webhook (P3) and `sys.dm.send` cannot disagree about what is allowed.
+ * Every check a new DM passes before it takes the recipient's lock. Shared by `createDm` and
+ * `fileScheduleDm`, so a schedule's note and any other DM cannot disagree about what a valid
+ * DM is.
  */
-export async function createDm(input: CreateDmInput): Promise<DmRecord> {
+function prepareDm(input: CreateDmInput): PreparedDm {
   if (!DM_KINDS.includes(input.kind)) {
     throw new DmStoreError(`"${input.kind}" is not a DM kind (info, assignment, result).`, 'invalid_input')
   }
@@ -437,94 +475,280 @@ export async function createDm(input: CreateDmInput): Promise<DmRecord> {
 
   const nowTs = Date.now()
   const expiresAt = resolveExpiresAt(input.kind, input.expiresInHours, nowTs)
+  return { input, to, priority, subject, body, nowTs, expiresAt }
+}
 
-  return withInboxLock(to, async () => {
-    const existing = await listInbox(to)
+/** The record a prepared DM becomes, as `createDm` has always written it. */
+function buildDmRecord(prepared: PreparedDm, id: string): DmRecord {
+  const { input, to, priority, subject, body, nowTs, expiresAt } = prepared
+  return {
+    id,
+    messageId: input.messageId ?? id,
+    userId: input.userId,
+    kind: input.kind,
+    priority,
+    from: input.from,
+    to,
+    subject,
+    body,
+    ...(input.requestedOutcome?.trim()
+      ? { requestedOutcome: input.requestedOutcome.trim() }
+      : {}),
+    ...(input.scope?.trim() ? { scope: input.scope.trim() } : {}),
+    ...(input.reportBackTo?.trim() ? { reportBackTo: input.reportBackTo.trim() } : {}),
+    ...(input.relatedDmId?.trim() ? { relatedDmId: input.relatedDmId.trim() } : {}),
+    deliver: input.deliver,
+    ...(input.deliver === 'steer'
+      ? { steerFallback: input.steerFallback ?? 'wait' }
+      : {}),
+    ...(input.kind === 'assignment'
+      ? { resultDelivery: input.resultDelivery ?? 'wait' }
+      : {}),
+    status: 'new',
+    createdAt: new Date(nowTs).toISOString(),
+    createdTs: nowTs,
+    expiresAt,
+    // The wake attempt has not happened yet; `sys.dm.send` stamps the outcome.
+    delivery: { requested: input.deliver, actual: 'wait' },
+    senderSessionId: input.senderSessionId ?? null,
+    senderMessageId: input.senderMessageId ?? null,
+    ...(input.callbackUrl?.trim() ? { callbackUrl: input.callbackUrl.trim() } : {})
+  }
+}
 
-    if (existing.length >= MAX_OPEN_DMS_PER_INBOX) {
-      throw new DmStoreError(
-        `That agent's inbox is full (${existing.length} open items, limit ${MAX_OPEN_DMS_PER_INBOX}).`,
-        'inbox_full',
-        'Ask it to close some items, or wait for them to expire.'
-      )
+/**
+ * Write one NEW DM and index it three ways, under the recipient's lock the caller already
+ * holds. `existing` is that inbox's open items, read inside the same lock.
+ */
+async function insertDmLocked(prepared: PreparedDm, existing: DmRecord[]): Promise<DmRecord> {
+  const { input, to, subject, body, nowTs } = prepared
+
+  // BL-401 S5: the report of an assignment the recipient itself sent is never refused here
+  // (see `assignmentReport`). Everything else, a result an agent writes itself included,
+  // meets the cap.
+  const cappedHere = !(input.kind === 'result' && input.assignmentReport === true)
+  if (cappedHere && existing.length >= MAX_OPEN_DMS_PER_INBOX) {
+    throw new DmStoreError(
+      `That agent's inbox is full (${existing.length} open items, limit ${MAX_OPEN_DMS_PER_INBOX}).`,
+      'inbox_full',
+      'Ask it to close some items, or wait for them to expire.'
+    )
+  }
+
+  // Loop guard 2: the same DM twice inside ten minutes is a loop, not a reminder.
+  //
+  // **A schedule is exempt (SA-115 F-P1-1), and it is the one sender kind that has to
+  // be.** This guard catches an agent or a program repeating itself; repeating itself is
+  // exactly what a schedule is FOR. Every fire of "every 5 minutes, check the queue"
+  // carries the same kind, subject, body, and sender by construction, so with the guard
+  // applied, any interval under this ten-minute window whose previous DM is still open
+  // has its next fire refused as a duplicate — the floor is five minutes, so a schedule
+  // at the lock's own minimum would fail every other fire. A schedule's loop guards are
+  // its five-minute floor, the per-agent and per-instance caps, and the hourly wake caps
+  // it spends like any other wake. Since BL-401 a fire whose previous note is still UNREAD
+  // updates that note instead of reaching here at all (`fileScheduleDm`); the exemption
+  // still carries the case where that note is claimed, marked Needs you, or being delivered
+  // by a running woken turn, and the next fire has to write a second note.
+  const duplicate =
+    input.from.kind === 'schedule'
+      ? undefined
+      : existing.find(
+          (record) =>
+            record.kind === input.kind &&
+            record.subject === subject &&
+            record.body === body &&
+            sameSender(record.from, input.from) &&
+            nowTs - record.createdTs < DM_DUPLICATE_WINDOW_MS
+        )
+  if (duplicate) {
+    throw new DmStoreError(
+      `That exact DM was already sent ${Math.round((nowTs - duplicate.createdTs) / 1000)}s ago (${duplicate.id}).`,
+      'duplicate',
+      'Read the existing item instead of sending it again.'
+    )
+  }
+
+  const id = createDmId(nowTs)
+  const record = buildDmRecord(prepared, id)
+
+  await writeDm(record)
+  const score = dmInboxScore(record.priority, nowTs)
+  await redis.execute(async (client) => {
+    await client.zAdd(dmInboxKey(to), { score, value: id })
+    if (record.from.kind === 'agent') {
+      await client.zAdd(dmSentKey(record.from.agentId), { score, value: id })
+    }
+    await client.zAdd(dmUserIndexKey(input.userId), { score: nowTs, value: id })
+  })
+  await announceInboxChanged(to, input.userId)
+  return record
+}
+
+/**
+ * Write one DM and index it three ways. Validation, the caps, and the two loop guards all
+ * live here, so a webhook (P3) and `sys.dm.send` cannot disagree about what is allowed.
+ */
+export async function createDm(input: CreateDmInput): Promise<DmRecord> {
+  const prepared = prepareDm(input)
+  return withInboxLock(prepared.to, async () =>
+    insertDmLocked(prepared, await listInbox(prepared.to))
+  )
+}
+
+/* ------------------------------------------------------------------ *
+ * A schedule's one unread note (BL-401)
+ * ------------------------------------------------------------------ */
+
+/**
+ * BL-401 S1 + S2 — is this the open, UNREAD note of that schedule, the one a fire may update?
+ *
+ * `new` only, and never a note the agent works on (S2): a claimed note is `working` and fails
+ * the status check; a note marked Needs you is the holdup signal of a chat still parked on the
+ * user; and a note a running woken turn is delivering is that turn's first message. The wake
+ * registry is the server's own record of which DM started which running turn (never a request
+ * body), and it is in-process and synchronous, so this answer holds for the whole locked write.
+ */
+function isUnreadScheduleNote(record: DmRecord, scheduleId: string): boolean {
+  if (record.status !== 'new') return false
+  if (record.from.kind !== 'schedule' || record.from.scheduleId !== scheduleId) return false
+  if (record.delivery?.needsUser) return false
+  return !listWakeRuns().some((run) => run.origin?.dmId === record.id)
+}
+
+/**
+ * Every content field a sender decides that a DM may or may not carry. An update clears them
+ * before it lays the new fire's content on top, so a note that was an assignment and is now a
+ * note loses its `requestedOutcome` and `scope` (an `undefined` field is dropped on write, on
+ * both Redis lanes).
+ */
+const OPTIONAL_DM_CONTENT_FIELDS = [
+  'requestedOutcome',
+  'scope',
+  'reportBackTo',
+  'relatedDmId',
+  'steerFallback',
+  'resultDelivery',
+  'callbackUrl'
+] as const
+
+/**
+ * BL-401 — deliver one schedule fire as a DM: update the schedule's open unread note, or write
+ * a new one.
+ *
+ * A schedule has at most ONE open, unread note in an agent's inbox (S1). A fire that finds it
+ * counts itself on it (`fireCount`, and the first and last fire's times), takes this fire's
+ * words and delivery, and restarts the expiry from this fire (S3), so a quiet agent's inbox
+ * holds one row per schedule instead of one per fire, and a full inbox still takes the fire
+ * because nothing is added. A note the agent works on is never changed (S2,
+ * `isUnreadScheduleNote`); then this fire writes a new note, and S1 holds for that one.
+ *
+ * The delivery is reset to this fire's request: what an earlier fire's wake did (a refusal
+ * reason, the chat it opened) describes a delivery that is over, and the caller stamps what
+ * THIS fire's wake does next, exactly as it does on a new note.
+ *
+ * Under the recipient's inbox lock, with the inbox read inside it, like every writer here.
+ * The ZSET scores keep the first fire, so the note keeps its place in the roster; the "new"
+ * mark follows the last fire (`readDmFires`).
+ */
+export async function fileScheduleDm(
+  input: CreateDmInput
+): Promise<{ record: DmRecord; updated: boolean }> {
+  if (input.from.kind !== 'schedule') {
+    throw new DmStoreError('Only a schedule files a schedule note.', 'invalid_input')
+  }
+  const scheduleId = input.from.scheduleId
+  const prepared = prepareDm(input)
+
+  return withInboxLock(prepared.to, async () => {
+    const existing = await listInbox(prepared.to)
+    // Several unread notes of one schedule exist only from before BL-401; the newest one is
+    // the note the last fire wrote, so that is the one this fire joins.
+    const open = existing
+      .filter((record) => isUnreadScheduleNote(record, scheduleId))
+      .sort((a, b) => readDmFires(b).lastTs - readDmFires(a).lastTs)[0]
+    if (!open) {
+      return { record: await insertDmLocked(prepared, existing), updated: false }
     }
 
-    // Loop guard 2: the same DM twice inside ten minutes is a loop, not a reminder.
-    //
-    // **A schedule is exempt (SA-115 F-P1-1), and it is the one sender kind that has to
-    // be.** This guard catches an agent or a program repeating itself; repeating itself is
-    // exactly what a schedule is FOR. Every fire of "every 5 minutes, check the queue"
-    // carries the same kind, subject, body, and sender by construction, so with the guard
-    // applied, any interval under this ten-minute window whose previous DM is still open
-    // has its next fire refused as a duplicate — the floor is five minutes, so a schedule
-    // at the lock's own minimum would fail every other fire. A schedule's loop guards are
-    // its five-minute floor, the per-agent and per-instance caps, and the hourly wake caps
-    // it spends like any other wake.
-    const duplicate =
-      input.from.kind === 'schedule'
-        ? undefined
-        : existing.find(
-            (record) =>
-              record.kind === input.kind &&
-              record.subject === subject &&
-              record.body === body &&
-              sameSender(record.from, input.from) &&
-              nowTs - record.createdTs < DM_DUPLICATE_WINDOW_MS
-          )
-    if (duplicate) {
-      throw new DmStoreError(
-        `That exact DM was already sent ${Math.round((nowTs - duplicate.createdTs) / 1000)}s ago (${duplicate.id}).`,
-        'duplicate',
-        'Read the existing item instead of sending it again.'
-      )
+    const fires = readDmFires(open)
+    const fresh = buildDmRecord(prepared, open.id)
+    const cleared = Object.fromEntries(
+      OPTIONAL_DM_CONTENT_FIELDS.map((field) => [field, undefined])
+    ) as Partial<DmRecord>
+    const content: Partial<DmRecord> = {
+      kind: fresh.kind,
+      priority: fresh.priority,
+      from: fresh.from,
+      subject: fresh.subject,
+      body: fresh.body,
+      deliver: fresh.deliver
     }
-
-    const id = createDmId(nowTs)
-    const record: DmRecord = {
-      id,
-      messageId: input.messageId ?? id,
-      userId: input.userId,
-      kind: input.kind,
-      priority,
-      from: input.from,
-      to,
-      subject,
-      body,
-      ...(input.requestedOutcome?.trim()
-        ? { requestedOutcome: input.requestedOutcome.trim() }
-        : {}),
-      ...(input.scope?.trim() ? { scope: input.scope.trim() } : {}),
-      ...(input.reportBackTo?.trim() ? { reportBackTo: input.reportBackTo.trim() } : {}),
-      ...(input.relatedDmId?.trim() ? { relatedDmId: input.relatedDmId.trim() } : {}),
-      deliver: input.deliver,
-      ...(input.deliver === 'steer'
-        ? { steerFallback: input.steerFallback ?? 'wait' }
-        : {}),
-      ...(input.kind === 'assignment'
-        ? { resultDelivery: input.resultDelivery ?? 'wait' }
-        : {}),
-      status: 'new',
-      createdAt: new Date(nowTs).toISOString(),
-      createdTs: nowTs,
-      expiresAt,
-      // The wake attempt has not happened yet; `sys.dm.send` stamps the outcome.
-      delivery: { requested: input.deliver, actual: 'wait' },
-      senderSessionId: input.senderSessionId ?? null,
-      senderMessageId: input.senderMessageId ?? null,
-      ...(input.callbackUrl?.trim() ? { callbackUrl: input.callbackUrl.trim() } : {})
+    for (const field of OPTIONAL_DM_CONTENT_FIELDS) {
+      if (fresh[field] !== undefined) (content as Record<string, unknown>)[field] = fresh[field]
     }
+    const updated: DmRecord = {
+      // Identity, the first fire's place in the indexes, and anything a later writer added.
+      ...open,
+      ...cleared,
+      ...content,
+      expiresAt: fresh.expiresAt,
+      delivery: fresh.delivery,
+      fireCount: fires.count + 1,
+      firstFiredAt: fires.firstAt,
+      lastFiredAt: fresh.createdAt
+    }
+    await writeDm(updated)
+    // The open count did not change; the event is what an open drawer re-reads on.
+    await announceInboxChanged(prepared.to, updated.userId)
+    return { record: updated, updated: true }
+  })
+}
 
-    await writeDm(record)
-    const score = dmInboxScore(priority, nowTs)
-    await redis.execute(async (client) => {
-      await client.zAdd(dmInboxKey(to), { score, value: id })
-      if (record.from.kind === 'agent') {
-        await client.zAdd(dmSentKey(record.from.agentId), { score, value: id })
-      }
-      await client.zAdd(dmUserIndexKey(input.userId), { score: nowTs, value: id })
-    })
-    await announceInboxChanged(to, input.userId)
-    return record
+/**
+ * The result text of a schedule note that was closed unread because its schedule was deleted
+ * (BL-401 S4). One constant, so the drawer shows one wording for one event.
+ */
+export const SCHEDULE_DELETED_DM_RESULT = 'Closed unread, because its schedule was deleted.'
+
+/**
+ * BL-401 S4 — a deleted schedule's unread notes are about a schedule that is gone, so they
+ * close. `deleteSchedule` calls this before it deletes the record.
+ *
+ * Exactly the notes a fire would have updated (`isUnreadScheduleNote`): a `working` note stays,
+ * because the agent is on it; a note marked Needs you stays, because it is the only signal that
+ * a chat is parked on the user, and it closes when the user replies there; and a note a running
+ * woken turn is delivering stays, because that turn is reading it right now (an `info` one is
+ * acknowledged when the turn completes).
+ *
+ * Answers the ids it closed. Under the agent's inbox lock, with one announce at the end.
+ */
+export async function closeUnreadScheduleDms(input: {
+  agentId: string
+  scheduleId: string
+}): Promise<string[]> {
+  const agentId = typeof input.agentId === 'string' ? input.agentId.trim() : ''
+  const scheduleId = typeof input.scheduleId === 'string' ? input.scheduleId.trim() : ''
+  if (!agentId || !scheduleId) return []
+
+  return withInboxLock(agentId, async () => {
+    const open = await listInbox(agentId)
+    const closed: string[] = []
+    let userId: string | null = null
+    const completedAt = new Date().toISOString()
+    for (const record of open) {
+      if (!isUnreadScheduleNote(record, scheduleId)) continue
+      await writeDm({
+        ...record,
+        status: 'done',
+        result: SCHEDULE_DELETED_DM_RESULT,
+        completedAt
+      })
+      await applyRetention(record.id)
+      closed.push(record.id)
+      userId = record.userId
+    }
+    if (userId) await announceInboxChanged(agentId, userId)
+    return closed
   })
 }
 
@@ -652,6 +876,29 @@ export async function closeDm(input: {
 }
 
 /**
+ * BL-702 (BL-401 review finding 2) — the guard a woken turn's END passes to its three writes.
+ *
+ * `finishWokenTurn` drops the turn from the wake registry first and only then, after awaits,
+ * stamps the delivery, maybe stamps Needs you, and acknowledges an info note. A schedule fire
+ * in that gap no longer sees the note as being delivered, so it updates it (`fileScheduleDm`)
+ * with a new fire the ended turn never showed the agent. `turnStartedAt` is the wake run's
+ * `startedAt`: a note whose last fire is later was fired again after the turn began, so the
+ * ended turn writes nothing onto it. Checked inside the inbox lock, on the record re-read
+ * there. A note that fired once reads as one fire at `createdAt` (`readDmFires`), which is
+ * always before its own turn started, so every other DM behaves exactly as before.
+ */
+export interface WokenTurnGuard {
+  turnStartedAt?: number
+}
+
+function firedAfterTurnStarted(record: DmRecord, options: WokenTurnGuard): boolean {
+  return (
+    typeof options.turnStartedAt === 'number' &&
+    readDmFires(record).lastTs > options.turnStartedAt
+  )
+}
+
+/**
  * The result text an `info` note gets when a WAKE closed it rather than the agent reading
  * it. One constant because two places write it — `finishWokenTurn` on a completed turn
  * (SA-115 F-P1-2) and `clearNeedsUserForHumanReply` when the human replies in a chat whose
@@ -670,11 +917,13 @@ export const WAKE_DELIVERED_INFO_RESULT = 'Delivered as the first message of a w
 export async function acknowledgeInfoDm(
   dmId: string,
   agentId: string,
-  result = 'Read and acknowledged.'
+  result = 'Read and acknowledged.',
+  options: WokenTurnGuard = {}
 ): Promise<DmRecord> {
   return withInboxLock(agentId, async () => {
     const record = await requireOwnedDm(dmId, agentId)
     if (record.kind !== 'info' || !isOpenDmStatus(record.status)) return record
+    if (firedAfterTurnStarted(record, options)) return record
     const acked: DmRecord = {
       ...record,
       status: 'done',
@@ -710,7 +959,7 @@ export async function linkResultDm(dmId: string, resultDmId: string): Promise<vo
 async function requireOwnedDm(dmId: string, agentId: string): Promise<DmRecord> {
   const record = await getDm(dmId)
   if (!record) {
-    throw new DmStoreError(`DM "${dmId}" was not found (it may have expired).`, 'not_found')
+    throw buildDmNotFoundError(dmId)
   }
   if (record.to !== agentId) {
     throw new DmStoreError(
@@ -742,7 +991,8 @@ async function requireOwnedDm(dmId: string, agentId: string): Promise<DmRecord> 
  */
 export async function stampDmDelivery(
   dmId: string,
-  patch: Partial<DmRecord['delivery']>
+  patch: Partial<DmRecord['delivery']>,
+  options: WokenTurnGuard = {}
 ): Promise<boolean> {
   if (!dmId?.trim()) return false
   const record = await getDm(dmId)
@@ -755,6 +1005,7 @@ export async function stampDmDelivery(
   return withInboxLock(record.to, async () => {
     const current = await getDm(dmId)
     if (!current) return false
+    if (firedAfterTurnStarted(current, options)) return false
     // F-P4-1 (the P4 review): a field stamped `undefined` is REMOVED on write, on both
     // lanes (JSON serialisation drops it) — which is how a caller clears `sessionId` on a
     // steer that landed nowhere. Pinned by the "drops a field stamped as undefined" test.
@@ -871,25 +1122,61 @@ export async function acknowledgeDeliveredDmSteers(
  * the FIRST holdup of a turn is recorded: a second refusal must not restamp a newer time
  * over the moment the chat actually stopped needing the agent.
  */
-export async function stampDmNeedsUser(dmId: string, reason: string): Promise<void> {
-  if (!dmId?.trim()) return
+export async function stampDmNeedsUser(
+  dmId: string,
+  reason: string,
+  options: WokenTurnGuard = {}
+): Promise<string | null> {
+  if (!dmId?.trim()) return null
   const trimmed = typeof reason === 'string' ? reason.trim() : ''
-  if (!trimmed) return
+  if (!trimmed) return null
   const record = await getDm(dmId)
-  if (!record) return
+  if (!record) return null
+  let stampedAt: string | null = null
   await withInboxLock(record.to, async () => {
     const current = await getDm(dmId)
     if (!current) return
     if (current.delivery?.needsUser) return
+    if (firedAfterTurnStarted(current, options)) return
+    const at = new Date().toISOString()
     await writeDm({
       ...current,
       delivery: {
         ...current.delivery,
-        needsUser: { reason: trimmed.slice(0, DM_RESULT_MAX_CHARS), at: new Date().toISOString() }
+        needsUser: { reason: trimmed.slice(0, DM_RESULT_MAX_CHARS), at }
       }
     })
+    stampedAt = at
     await announceInboxChanged(current.to, current.userId)
   })
+  // BL-496 (A4): the stamp's own time when THIS call set the mark, else null (an earlier
+  // holdup's mark stands). A caller that may later take its mark back keeps this.
+  return stampedAt
+}
+
+/**
+ * BL-496 (A4) — take back the "needs you" mark ONE holdup set, and only that one.
+ *
+ * A Claude approval card in a woken turn marks the DM while it waits and takes the mark back
+ * when it is answered or ends. The mark may belong to someone else by then: a Fabric pause
+ * or another card stamped first (only the first holdup is recorded), or the user replied and
+ * a later holdup stamped again. So the mark goes only while it is still the one stamped at
+ * `stampedAt`.
+ */
+export async function clearDmNeedsUserStamp(dmId: string, stampedAt: string): Promise<boolean> {
+  if (!dmId?.trim() || !stampedAt) return false
+  const record = await getDm(dmId)
+  if (record?.delivery?.needsUser?.at !== stampedAt) return false
+  let cleared = false
+  await withInboxLock(record.to, async () => {
+    const current = await getDm(dmId)
+    if (current?.delivery?.needsUser?.at !== stampedAt) return
+    const { needsUser: _cleared, ...delivery } = current.delivery
+    await writeDm({ ...current, delivery })
+    cleared = true
+    await announceInboxChanged(current.to, current.userId)
+  })
+  return cleared
 }
 
 /**
@@ -987,7 +1274,7 @@ export async function setDmCallbackStatus(dmId: string, callbackStatus: string):
 }
 
 /**
- * SA-120 P7: store what the Jev Juice incoming-text screen said about this DM.
+ * SA-120 P7: store what the Judge Juice incoming-text screen said about this DM.
  *
  * On the DM record itself, on purpose: the screen then shares the record's deletion
  * (`deleteAgent`, the drawer's Delete), its 30-day retention, and its `dms` backup group, and

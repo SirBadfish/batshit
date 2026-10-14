@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { calculateZipActivation } from './zipActivation'
+import { calculateZipActivation, describeReadCompressHint, READ_COMPRESS_HINT_LAST_REPLY } from './zipActivation'
 import { getToolSettings } from './toolRenderMap'
 
 describe('calculateZipActivation', () => {
@@ -532,11 +532,11 @@ describe('calculateZipActivation', () => {
     expect(result.shouldCompress).toBe(false)
   })
 
-  it('keeps tool zips expanded when a tool is explicitly turned off', () => {
+  it('keeps large tool zips expanded when a tool is explicitly turned off', () => {
     const result = calculateZipActivation({
       zipType: 'cool_tool',
       messagesFromEnd: 50,
-      zipData: { tokens: 50000, metadata: { toolName: 'read_file' } },
+      zipData: { tokens: 24999, metadata: { toolName: 'read_file' } },
       agentSettings: {
         custom_tool_settings: [
           { tool_name: 'read_file', zip_disabled: true, auto_zip: true }
@@ -549,7 +549,7 @@ describe('calculateZipActivation', () => {
     expect(result.shouldCompress).toBe(false)
   })
 
-  it('forces compression for oversized tool payloads marked by metadata', () => {
+  it('ignores an old storage-size forceCompress stamp for a small transcript', () => {
     const result = calculateZipActivation({
       zipType: 'cool_tool',
       messagesFromEnd: 0,
@@ -566,7 +566,95 @@ describe('calculateZipActivation', () => {
       }
     })
 
+    expect(result.shouldCompress).toBe(false)
+    expect(result.sizeGuard).toBeNull()
+  })
+})
+
+describe('calculateZipActivation: dead copies (SA-129 DL-01)', () => {
+  const readZip = { tokens: 800, metadata: { operationKind: 'read_file', toolName: 'read_file' } }
+  const normal = { buffer_size_read_file: 8, zip_threshold_read_file: 0, auto_zip_read_file: false }
+  const activate = (overrides: Record<string, any> = {}, settings: Record<string, any> = normal) =>
+    calculateZipActivation({
+      zipType: 'cool_tool',
+      messagesFromEnd: 1,
+      zipData: readZip,
+      agentSettings: settings,
+      deadCopy: { reason: 'superseded', repliesUntilDead: 1 },
+      ...overrides
+    })
+
+  it('a dead copy compresses inside its buffer, and names why', () => {
+    const result = activate()
     expect(result.shouldCompress).toBe(true)
+    expect(result.deadCopy).toBe('superseded')
+    expect(result.deadCopyNamed).toBe(true)
+    expect(activate({ deadCopy: null }).shouldCompress).toBe(false)
+  })
+
+  it('only an Off row and a user unzip keep a dead copy open', () => {
+    const off = activate({}, { ...normal, zip_disabled_read_file: true })
+    expect(off.shouldCompress).toBe(false)
+    expect(off.deadCopy).toBeNull()
+    const userUnzip = activate({ isUnzipped: true, isUserUnzipped: true })
+    expect(userUnzip.shouldCompress).toBe(false)
+    expect(userUnzip.deadCopy).toBeNull()
+    // An agent's or Batshit's unzip, and a recovery hold, do not.
+    expect(activate({ isUnzipped: true, isUserUnzipped: false }).shouldCompress).toBe(true)
+    expect(activate({ recoveryHold: true }).shouldCompress).toBe(true)
+  })
+
+  it('names the reason only for a copy that died while the automatic rules still kept it open', () => {
+    // Died after 7 of 8 replies: still open then, so the reference says why.
+    expect(activate({ messagesFromEnd: 20, deadCopy: { reason: 'stale', repliesUntilDead: 7 } }).deadCopyNamed).toBe(true)
+    // Died after 8 of 8 replies: the buffer had already compressed it, so its reference never changes.
+    const aged = activate({ messagesFromEnd: 20, deadCopy: { reason: 'stale', repliesUntilDead: 8 } })
+    expect(aged.shouldCompress).toBe(true)
+    expect(aged.deadCopy).toBe('stale')
+    expect(aged.deadCopyNamed).toBe(false)
+    // Auto, a size-safety row, and a rezip compress it anyway: plain.
+    expect(activate({}, { ...normal, auto_zip_read_file: true }).deadCopyNamed).toBe(false)
+    expect(activate({ zipData: { ...readZip, tokens: 10000 } }).deadCopyNamed).toBe(false)
+    expect(activate({ isRezipped: true }).deadCopyNamed).toBe(false)
+    // Below the size floor the buffer never compresses it, so a late death still names why.
+    expect(activate({ deadCopy: { reason: 'stale', repliesUntilDead: 30 } }, { ...normal, zip_threshold_read_file: 5000 }).deadCopyNamed).toBe(true)
+  })
+})
+
+describe('describeReadCompressHint (SA-129 DL-03)', () => {
+  const readZip = { tokens: 800, metadata: { operationKind: 'read_file', toolName: 'read_file' } }
+  const activate = (messagesFromEnd: number, settings: Record<string, any>, extra: Record<string, any> = {}) =>
+    calculateZipActivation({ zipType: 'cool_tool', messagesFromEnd, zipData: readZip, agentSettings: settings, ...extra })
+  const normal = { buffer_size_read_file: 3, zip_threshold_read_file: 0, auto_zip_read_file: false }
+
+  it('says the same line until the last reply, then warns once', () => {
+    expect(describeReadCompressHint(activate(0, normal), { isUnzipped: false })).toBe('Compresses 3 replies after it was read.')
+    expect(describeReadCompressHint(activate(1, normal), { isUnzipped: false })).toBe('Compresses 3 replies after it was read.')
+    expect(describeReadCompressHint(activate(2, normal), { isUnzipped: false })).toBe(READ_COMPRESS_HINT_LAST_REPLY)
+    // SA-129 P2 added the second way to keep a read open (DL-03: "P2 adds `or hold the file`").
+    expect(READ_COMPRESS_HINT_LAST_REPLY).toBe('Compresses after this reply. Note what you need or hold the file.')
+    expect(describeReadCompressHint(activate(0, { ...normal, buffer_size_read_file: 1 }), { isUnzipped: false })).toBe(READ_COMPRESS_HINT_LAST_REPLY)
+  })
+
+  it('stays about twelve tokens or fewer (the last-reply line, with P2\'s hold, about fifteen)', () => {
+    expect(Math.ceil('Compresses 12 replies after it was read.'.length / 4)).toBeLessThanOrEqual(12)
+    // It appears on one reply per result, then the result compresses; P2's "or hold the file" is
+    // the lock's own wording (DL-03).
+    expect(Math.ceil(READ_COMPRESS_HINT_LAST_REPLY.length / 4)).toBeLessThanOrEqual(17)
+  })
+
+  it('an Auto result open only through a recovery hold compresses after this reply', () => {
+    const auto = { ...normal, auto_zip_read_file: true }
+    expect(describeReadCompressHint(activate(0, auto, { recoveryHold: true }), { isUnzipped: false })).toBe(READ_COMPRESS_HINT_LAST_REPLY)
+    // A recovery hold past the buffer: the hold ends with this reply, then the buffer compressions it.
+    expect(describeReadCompressHint(activate(5, normal, { recoveryHold: true }), { isUnzipped: false })).toBe(READ_COMPRESS_HINT_LAST_REPLY)
+  })
+
+  it('says nothing for a compressed result, an Off row, a result below the size floor, or an unzip', () => {
+    expect(describeReadCompressHint(activate(3, normal), { isUnzipped: false })).toBeNull()
+    expect(describeReadCompressHint(activate(0, { ...normal, zip_disabled_read_file: true }), { isUnzipped: false })).toBeNull()
+    expect(describeReadCompressHint(activate(9, { ...normal, zip_threshold_read_file: 5000 }), { isUnzipped: false })).toBeNull()
+    expect(describeReadCompressHint(activate(9, normal, { isUnzipped: true }), { isUnzipped: true })).toBeNull()
   })
 })
 

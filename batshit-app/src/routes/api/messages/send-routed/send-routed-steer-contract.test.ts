@@ -64,7 +64,11 @@ describe('send-routed steer contracts (SA-114 P1)', () => {
     // hands the note over just as surely, so it closes at delivery — otherwise the same
     // note re-lists on every later roster and the drawer shows it open for a week.
     const drain = source.indexOf('const drainSteersIntoTranscript = async')
-    const body = source.slice(drain, source.indexOf('const extractZipIdFromReference', drain))
+    // The declaration after the drain (BL-707 moved the zip id helper that ended it before).
+    const drainEnd = source.indexOf('const imageZipSettings = getTypeZipSettings(', drain)
+    expect(drain).toBeGreaterThan(-1)
+    expect(drainEnd).toBeGreaterThan(drain)
+    const body = source.slice(drain, drainEnd)
     const delivered = body.indexOf("type: 'steer_delivered'")
     const ack = body.indexOf('await acknowledgeDeliveredDmSteers(')
     expect(drain).toBeGreaterThan(-1)
@@ -81,7 +85,7 @@ describe('send-routed steer contracts (SA-114 P1)', () => {
     // the server's own save and was erased by the client's a moment later — invisible to
     // P1 and P2, which drove the route with no browser.
     const drain = source.indexOf('const drainSteersIntoTranscript')
-    const drainEnd = source.indexOf('const extractZipIdFromReference', drain)
+    const drainEnd = source.indexOf('const imageZipSettings = getTypeZipSettings(', drain)
     expect(drain).toBeGreaterThan(-1)
     expect(drainEnd).toBeGreaterThan(drain)
 
@@ -89,7 +93,8 @@ describe('send-routed steer contracts (SA-114 P1)', () => {
     expect(body).toContain('streamAdapter.emitChunk({ content: `${prefix}${placeholder}` })')
     // The SAME bytes go into the record and onto the wire, or the rebuild and the record
     // disagree about where the steer sits.
-    expect(body).toContain('streamedMessageContent += `${prefix}${placeholder}`')
+    // BL-759: with no segment, so a lane's retract can never take the marker back.
+    expect(body).toContain('streamedReply.append(`${prefix}${placeholder}`)')
     // NOT through `emitTextChunk`: that sets `streamedNonSteerContent`, and a turn whose
     // only streamed bytes were markers must still let the finish text win.
     expect(body).not.toContain('emitTextChunk(')
@@ -271,7 +276,9 @@ describe('send-routed steer contracts (SA-114 P1)', () => {
     // Stop means stop.
     expect(body).toContain('streamResult.response.status === 499')
     expect(body).toContain("(streamResult.metadata as any)?.interrupted === true")
-    expect(body).toContain('if (interrupted) break')
+    const stopped = body.slice(body.indexOf('if (interrupted) {'), body.indexOf('// DL-114-13:'))
+    expect(stopped).toContain('break')
+    expect(stopped).not.toContain('promoteSteersToNextTurn')
 
     // An agent's text must never start a user turn — and P4 made that a filter on the TAKE
     // rather than on the result, so a DM steer is still in the inbox for the end of the
@@ -296,13 +303,29 @@ describe('send-routed steer contracts (SA-114 P1)', () => {
     expect(promotion).toBeGreaterThan(autoContinue)
   })
 
+  it('a context-exhaustion continuation carries on the steers its predecessor never delivered (BL-137)', () => {
+    const loop = source.indexOf('while (\n            streamResult.contextExhausted === true')
+    const call = source.indexOf('            streamResult = await handleBatshitAgentStream({\n', loop)
+    const between = source.slice(loop, call)
+    // The continuation's id exists before its run does, and the steers move to it first.
+    expect(between).toContain('\n            const continuationMessageId = await generateMessageId(sessionId)\n')
+    expect(between).toContain(
+      '\n            refileUndeliveredSteers(sessionId, previousMessageId, continuationMessageId)\n'
+    )
+    expect(between.indexOf('refileUndeliveredSteers(')).toBeGreaterThan(
+      between.indexOf('const continuationMessageId = await generateMessageId(sessionId)')
+    )
+    expect(source.slice(call, call + 400)).toContain('\n              messageId: continuationMessageId,\n')
+  })
+
   it('saves stranded text rather than dropping it if the chain bound ever fires', () => {
     const tail = source.indexOf('if (steerPromotions >= MAX_STEER_PROMOTIONS) {')
-    const body = source.slice(tail, tail + 1400)
+    const body = source.slice(tail, source.indexOf('          if (\n            !streamResult.response.ok', tail))
 
     expect(body).toContain('takeUndeliveredSteers(')
     expect(body).toContain("{ source: 'user' }")
-    expect(body).toContain('await promoteSteersToNextTurn({')
+    expect(body).toContain('await saveSteersWithoutAnswer({')
+    expect(body).not.toContain('await promoteSteersToNextTurn({')
     expect(body).toContain('console.error(')
   })
 })
@@ -363,7 +386,9 @@ describe('a queued steer never reaches a tool boundary (SA-119 DL-119-05)', () =
   it('a Stop still drops them, because nothing about the promotion loop reads `deliver`', () => {
     const loop = source.indexOf('while (steerPromotions < MAX_STEER_PROMOTIONS) {')
     const body = source.slice(loop, source.indexOf('if (steerPromotions >= MAX_STEER_PROMOTIONS) {', loop))
-    expect(body).toContain('if (interrupted) break')
+    const stopped = body.slice(body.indexOf('if (interrupted) {'), body.indexOf('// DL-114-13:'))
+    expect(stopped).toContain('break')
+    expect(stopped).not.toContain('promoteSteersToNextTurn')
     // No special case: a queued message is promoted with everything else, or dropped with
     // everything else. A `deliver` test here would be a second rule about the same field.
     // (`takeUndeliveredSteers` contains the letters, so the check is on the FIELD.)

@@ -10,7 +10,13 @@
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest'
+// Ollama registration uses the SDK's model wrapper; keep its model identity real.
+vi.unmock('ai')
 import { ProviderManager } from './index'
+import { BATSHIT_USER_AGENT } from './batshitIdentity'
+
+// BL-684: every provider client carries Batshit's own User-Agent.
+const BATSHIT_IDENTITY_HEADERS = { 'User-Agent': BATSHIT_USER_AGENT }
 import { LOCAL_AI_SERVER_DEFINITIONS } from '$lib/data/localAiServers'
 import { env as testEnv } from '$env/dynamic/private'
 import { createDeepInfra } from '@ai-sdk/deepinfra'
@@ -224,6 +230,16 @@ describe('ProviderManager - Story 5.3 Tests', () => {
       expect(firstModel).toHaveProperty('category')
     })
 
+    it('BL-1365: lists only Anthropic\'s current Sonnet 4.5 alias, labelled Claude Sonnet 4.5', () => {
+      // Anthropic lists no "-latest" ids; Claude 3.5 Sonnet, 3.5 Haiku and 3 Opus
+      // are retired (claude-api skill models table, 2026-10-06; models overview, 2026-10-11).
+      expect(providerManager.getProviderInfo('anthropic')?.models).toEqual(['claude-sonnet-4-5'])
+      const anthropic = providerManager.listAvailableModels().filter((model) => model.provider === 'anthropic')
+      expect(anthropic.map((model) => [model.name, model.displayName])).toEqual([
+        ['claude-sonnet-4-5', 'Claude Sonnet 4.5']
+      ])
+    })
+
     it('5.3-UNIT-008: Model sorting algorithm', () => {
       const models = providerManager.listAvailableModels()
 
@@ -270,6 +286,8 @@ describe('ProviderManager - Story 5.3 Tests', () => {
       expect(model).toBeDefined()
       expect(model).toHaveProperty('modelId')
       expect(model).toHaveProperty('provider')
+      // BL-1365: Anthropic's default is its current Sonnet 4.5 alias, not a retired id.
+      expect(model).toMatchObject({ provider: 'anthropic', modelId: 'claude-sonnet-4-5' })
     })
 
     it('5.3-UNIT-013: Fallback chain logic', () => {
@@ -367,6 +385,7 @@ describe('ProviderManager - Story 5.3 Tests', () => {
     it('registers DeepInfra with its dedicated AI SDK provider and preserves namespaced model IDs', () => {
       expect(providerManager.hasProvider('deepinfra')).toBe(true)
       expect(createDeepInfra).toHaveBeenCalledWith({
+        headers: BATSHIT_IDENTITY_HEADERS,
         apiKey: 'placeholder',
         baseURL: 'https://api.deepinfra.com/v1'
       })
@@ -419,30 +438,43 @@ describe('ProviderManager - Story 5.3 Tests', () => {
         })
       ).toMatchObject({ modelId: 'qwen-plus', provider: 'qwencloud' })
       expect(createAlibaba).toHaveBeenCalledWith({
+        headers: BATSHIT_IDENTITY_HEADERS,
         apiKey: 'dashscope-placeholder',
         baseURL: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1'
       })
 
       expect(createOpenAI).toHaveBeenCalledWith({
+        headers: BATSHIT_IDENTITY_HEADERS,
         apiKey: 'kimi-code-placeholder',
         baseURL: 'https://api.kimi.ai/coding/v1'
       })
       expect(createOpenAI).toHaveBeenCalledWith({
+        headers: BATSHIT_IDENTITY_HEADERS,
         apiKey: 'minimax-token-plan-placeholder',
         baseURL: 'https://api.minimax.io/v1'
       })
       expect(createOpenAI).toHaveBeenCalledWith({
+        headers: BATSHIT_IDENTITY_HEADERS,
         apiKey: 'mimo-token-plan-placeholder',
         baseURL: 'https://token-plan-sgp.xiaomimimo.com/v1'
       })
 
-      expect(
+      // Plan pause: the Qwen Token Plan is paused by default and routes only
+      // where the server allowed paused plans (a Dev copy with the switch on).
+      expect(() =>
         providerManager.getModel('qwen3.8-max', {
+          transport: 'direct',
+          service: 'qwen_token_plan'
+        })
+      ).toThrow('Qwen Token Plan is paused')
+      expect(
+        new ProviderManager({ pausedPlansAllowed: true }).getModel('qwen3.8-max', {
           transport: 'direct',
           service: 'qwen_token_plan'
         })
       ).toMatchObject({ modelId: 'qwen3.8-max', provider: 'qwen_token_plan' })
       expect(createAlibaba).toHaveBeenCalledWith({
+        headers: BATSHIT_IDENTITY_HEADERS,
         apiKey: 'qwen-token-plan-placeholder',
         baseURL: 'https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1'
       })
@@ -466,6 +498,7 @@ describe('ProviderManager - Story 5.3 Tests', () => {
         new ProviderManager()
 
         expect(createAlibaba).toHaveBeenCalledWith({
+          headers: BATSHIT_IDENTITY_HEADERS,
           apiKey: 'qwen-token-plan-placeholder',
           baseURL: 'https://token-plan.example.test/compatible-mode/v1'
         })
@@ -521,22 +554,27 @@ describe('ProviderManager - Story 5.3 Tests', () => {
       }
 
       expect(createTogetherAI).toHaveBeenCalledWith({
+        headers: BATSHIT_IDENTITY_HEADERS,
         apiKey: 'together-placeholder',
         baseURL: undefined
       })
       expect(createFireworks).toHaveBeenCalledWith({
+        headers: BATSHIT_IDENTITY_HEADERS,
         apiKey: 'fireworks-placeholder',
         baseURL: undefined
       })
       expect(createBaseten).toHaveBeenCalledWith({
+        headers: BATSHIT_IDENTITY_HEADERS,
         apiKey: 'baseten-placeholder',
         baseURL: undefined
       })
       expect(createCerebras).toHaveBeenCalledWith({
+        headers: BATSHIT_IDENTITY_HEADERS,
         apiKey: 'cerebras-placeholder',
         baseURL: undefined
       })
       expect(createCohere).toHaveBeenCalledWith({
+        headers: BATSHIT_IDENTITY_HEADERS,
         apiKey: 'cohere-placeholder',
         baseURL: undefined
       })
@@ -544,10 +582,12 @@ describe('ProviderManager - Story 5.3 Tests', () => {
 
     it('uses dedicated AI SDK providers for xAI and DeepSeek', () => {
       expect(createXai).toHaveBeenCalledWith({
+        headers: BATSHIT_IDENTITY_HEADERS,
         apiKey: 'xai-placeholder',
         baseURL: undefined
       })
       expect(createDeepSeek).toHaveBeenCalledWith({
+        headers: BATSHIT_IDENTITY_HEADERS,
         apiKey: 'deepseek-placeholder',
         baseURL: undefined
       })
@@ -641,8 +681,8 @@ describe('ProviderManager - Story 5.3 Tests', () => {
     it('Handles model name variations', () => {
       // Test various model name formats
       const variations = [
-        'claude-sonnet-4-5-latest',
-        'anthropic/claude-sonnet-4-5-latest',
+        'claude-sonnet-4-5',
+        'anthropic/claude-sonnet-4-5',
         'gpt-5',
         'openai/gpt-5',
         'gemini-2.5-pro',
@@ -658,8 +698,8 @@ describe('ProviderManager - Story 5.3 Tests', () => {
 
     it('Cache management works correctly', () => {
       // Get same model twice
-      const model1 = providerManager.getModel('claude-sonnet-4-5-latest')
-      const model2 = providerManager.getModel('claude-sonnet-4-5-latest')
+      const model1 = providerManager.getModel('claude-sonnet-4-5')
+      const model2 = providerManager.getModel('claude-sonnet-4-5')
 
       // Should return same cached instance
       expect(model1).toBe(model2)
@@ -668,7 +708,7 @@ describe('ProviderManager - Story 5.3 Tests', () => {
       providerManager.clearCache()
 
       // Should get new instance
-      const model3 = providerManager.getModel('claude-sonnet-4-5-latest')
+      const model3 = providerManager.getModel('claude-sonnet-4-5')
       expect(model3).not.toBe(model1)
     })
   })

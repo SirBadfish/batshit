@@ -10,11 +10,15 @@ import {
   decideLocalRuntimeGroupStop,
   decideLocalRuntimeStop,
   groupLocalRuntimeLaunchRecords,
+  holdLocalRuntimeStopsForUnreadableRecords,
+  launchArgsForAttach,
   launchRecordMatchesCommand,
+  localRuntimeLaunchRecordWriteBlocker,
   localRuntimeProcessGroupFromPs,
   nativeRunIsGone,
   normalizeLocalRuntimeEndpoint,
   parsePsStartTimeUtc,
+  readLocalRuntimeLaunchRecordFileState,
   readLocalRuntimeLaunchRecords,
   readLocalRuntimeProcessGroup,
   removeLocalRuntimeLaunchRecord,
@@ -157,7 +161,8 @@ test('launch records are read per engine, and a corrupt one is flagged not guess
 
   assert.equal(byId['whisper-cpp'].stopOnShutdown, false);
   assert.equal(byId.broken.invalid, true);
-  assert.equal(decideLocalRuntimeStop({ record: byId.broken, alive: true }).action, 'drop-record');
+  assert.equal(byId.broken.unreadable, true, 'kept by every stopper, never dropped (BL-1264)');
+  assert.match(byId.broken.reason, /is not valid JSON/);
 
   // A root that does not exist is empty, not a crash: a machine with no local
   // engines must still shut down cleanly.
@@ -292,11 +297,108 @@ test('records group by the process they name; unusable records are set apart', (
     { engineId: 'whisper-cpp', pid: 19339, command: '/bin/whisper-server' },
     shared('kokoro', { startedBy: 'chatterbox-turbo' }),
     { engineId: 'broken', invalid: true },
-    { engineId: 'no-pid', command: '/bin/x' }
+    { engineId: 'no-pid', command: '/bin/x' },
+    { engineId: 'unreadable', unreadable: true, invalid: true, reason: 'the launch record x could not be read (EACCES)' }
   ]);
   const byPid = Object.fromEntries(groups.map((group) => [group.pid, group.records.map((r) => r.engineId)]));
   assert.deepEqual(byPid, { 10778: ['chatterbox-turbo', 'kokoro'], 19339: ['whisper-cpp'] });
   assert.deepEqual(unusable.map((record) => record.engineId), ['broken', 'no-pid']);
+});
+
+test('a record that could not be read is set apart to be kept, never with the ones to drop (BL-1264)', () => {
+  const { groups, unusable, unreadable } = groupLocalRuntimeLaunchRecords([
+    { engineId: 'whisper-cpp', pid: 19339, command: '/bin/whisper-server' },
+    { engineId: 'no-pid', command: '/bin/x' },
+    { engineId: 'locked', unreadable: true, invalid: true, reason: 'the launch record x could not be read (EACCES)', pid: 19339 },
+    { engineId: null, unreadable: true, invalid: true, reason: 'the voice engine records folder r could not be read (EIO)' }
+  ]);
+  assert.deepEqual(groups.map((group) => group.records.map((record) => record.engineId)), [['whisper-cpp']]);
+  assert.deepEqual(unusable.map((record) => record.engineId), ['no-pid']);
+  assert.deepEqual(unreadable.map((record) => record.engineId), ['locked', null]);
+});
+
+test('the record reader: only "no such file" is absent; every other folder or record it cannot read is an entry (BL-1264)', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'batshit-launch-records-unreadable-'));
+  const RECORD = '.batshit-local-runtime-launch.json';
+  const unlock = [];
+  try {
+    // No root at all: nothing to stop. A file where the root should be, or a root that cannot be read: one entry.
+    assert.deepEqual(await readLocalRuntimeLaunchRecords(join(base, 'missing')), []);
+    await writeFile(join(base, 'a-file'), 'not a folder');
+    let [entry, ...rest] = await readLocalRuntimeLaunchRecords(join(base, 'a-file'));
+    assert.deepEqual(rest, []);
+    assert.deepEqual([entry.engineId, entry.unreadable, entry.invalid, entry.recordPath], [null, true, true, join(base, 'a-file')]);
+    assert.match(entry.reason, /records folder .* could not be read \(ENOTDIR\)/);
+    const lockedRoot = join(base, 'locked-root');
+    await mkdir(join(lockedRoot, 'kokoro'), { recursive: true });
+    await chmod(lockedRoot, 0o000);
+    unlock.push(lockedRoot);
+    [entry, ...rest] = await readLocalRuntimeLaunchRecords(lockedRoot);
+    assert.deepEqual(rest, []);
+    assert.match(entry.reason, /could not be read \(EACCES\)/);
+
+    // One root, one engine folder per shape, beside one good record.
+    const root = join(base, 'root');
+    const shapes = {
+      good: async (dir) => writeFile(join(dir, RECORD), JSON.stringify({ pid: 11, command: '/bin/x' })),
+      'record-is-folder': async (dir) => mkdir(join(dir, RECORD), { recursive: true }),
+      'record-no-permission': async (dir) => {
+        await writeFile(join(dir, RECORD), JSON.stringify({ pid: 12, command: '/bin/x' }));
+        await chmod(join(dir, RECORD), 0o000);
+        unlock.push(join(dir, RECORD));
+      },
+      'folder-no-permission': async (dir) => {
+        await writeFile(join(dir, RECORD), JSON.stringify({ pid: 13, command: '/bin/x' }));
+        await chmod(dir, 0o000);
+        unlock.push(dir);
+      },
+      empty: async (dir) => writeFile(join(dir, RECORD), ''),
+      whitespace: async (dir) => writeFile(join(dir, RECORD), ' \n\t '),
+      malformed: async (dir) => writeFile(join(dir, RECORD), '{ "pid": '),
+      array: async (dir) => writeFile(join(dir, RECORD), '[{ "pid": 14 }]'),
+      string: async (dir) => writeFile(join(dir, RECORD), '"14"'),
+      null: async (dir) => writeFile(join(dir, RECORD), 'null'),
+      'moved-aside-empty': async (dir) => writeFile(join(dir, '.batshit-local-runtime-launch.4242.json'), ''),
+      'temp-file-only': async (dir) => writeFile(join(dir, '.batshit-local-runtime-launch.1.abcdef.tmp'), '')
+    };
+    for (const [name, make] of Object.entries(shapes)) {
+      await mkdir(join(root, name), { recursive: true });
+      await make(join(root, name));
+    }
+    const records = await readLocalRuntimeLaunchRecords(root);
+    const byId = Object.fromEntries(records.map((record) => [record.engineId, record]));
+    assert.deepEqual(
+      Object.keys(byId).sort(),
+      Object.keys(shapes).filter((name) => name !== 'temp-file-only').sort(),
+      'every shape is an entry, except a writer\'s temp file, which is not a record'
+    );
+    assert.equal(byId.good.pid, 11);
+    assert.equal(byId.good.unreadable, undefined);
+    const expected = {
+      'record-is-folder': /could not be read \(EISDIR\)/,
+      'record-no-permission': /could not be read \(EACCES\)/,
+      'folder-no-permission': /the folder .* could not be read \(EACCES\)/,
+      empty: /is empty/,
+      whitespace: /is empty/,
+      malformed: /is not valid JSON/,
+      array: /is not a JSON object/,
+      string: /is not a JSON object/,
+      null: /is not a JSON object/,
+      'moved-aside-empty': /\.4242\.json is empty/
+    };
+    for (const [name, reason] of Object.entries(expected)) {
+      assert.equal(byId[name].unreadable, true, name);
+      assert.equal(byId[name].invalid, true, name);
+      assert.equal(byId[name].pid, undefined, `${name}: names no process`);
+      assert.match(byId[name].reason, reason, name);
+    }
+    const { groups, unreadable } = groupLocalRuntimeLaunchRecords(records);
+    assert.deepEqual(groups.map((group) => group.pid), [11]);
+    assert.equal(unreadable.length, Object.keys(expected).length);
+  } finally {
+    for (const path of unlock.reverse()) await chmod(path, 0o755).catch(() => {});
+    await rm(base, { recursive: true, force: true });
+  }
 });
 
 // ---- The leader's start time names the launch (2026-09-21, BL-60) -------------------------
@@ -529,6 +631,59 @@ test('a new launch never discards the record of a process that still runs', asyn
     '.batshit-local-runtime-launch.json'
   ]);
   assert.equal(JSON.parse(await readFile(join(dir, '.batshit-local-runtime-launch.json'), 'utf8')).stopOnShutdown, false);
+});
+
+test('an attach copies no secret flag or its value, even one that starts with "/", and only the paths (BL-1332)', () => {
+  // Every form LiveKit takes: the value next, or after "=", with one or two dashes; and a key or
+  // secret that begins with "/", which a path filter alone would keep.
+  assert.deepEqual(launchArgsForAttach(['--dev', '--bind', '127.0.0.1', '--keys', '/devkey: /a-secret', '/opt/livekit/serve.yaml']), [
+    '/opt/livekit/serve.yaml'
+  ]);
+  assert.deepEqual(launchArgsForAttach(['--keys=/devkey: /a-secret', '/opt/livekit/serve.yaml']), ['/opt/livekit/serve.yaml']);
+  assert.deepEqual(launchArgsForAttach(['-keys', '/devkey: /a-secret', '-keys=/devkey: /a-secret', '/opt/a']), ['/opt/a']);
+  assert.deepEqual(launchArgsForAttach(['--config-body', 'keys:\n  /devkey: /a-secret', '--config-body=keys: {k: /s}', '/opt/a']), ['/opt/a']);
+  // A flag at the end with no value drops nothing else; non-strings and plain words are left out.
+  assert.deepEqual(launchArgsForAttach(['/opt/a', 7, '--port', '8012', '--keys']), ['/opt/a']);
+  assert.equal(launchArgsForAttach(undefined), undefined);
+  // Windows paths stay (the Docker operator's identity check reads them); a key that looks like
+  // one, as a drive path or a share, still goes.
+  assert.deepEqual(
+    launchArgsForAttach(['C:\\Batshit\\installs\\x\\serve.py', '--keys', 'C:\\devkey: s', '--keys', '\\\\host\\share: s', 'serve.py']),
+    ['C:\\Batshit\\installs\\x\\serve.py']
+  );
+});
+
+test('an attach to a launch whose record still holds its keys copies neither them nor anything but paths (BL-1332)', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'batshit-launch-records-'));
+  try {
+    const running = new Set([10778]);
+    const isAlive = (pid) => running.has(pid);
+    // A record written before BL-1332: the LiveKit server's keys on its args.
+    await writeLocalRuntimeLaunchRecordFile(
+      root,
+      {
+        engineId: 'chatterbox-turbo',
+        pid: 10778,
+        ...MLX,
+        args: ['--port', '8012', '--keys', '/devkey: /a-secret', '/Users/x/.batshit/installs/chatterbox-turbo/serve.py'],
+        endpoint: 'http://127.0.0.1:8012'
+      },
+      { isAlive }
+    );
+    assert.equal(
+      await attachLocalRuntimeLaunchRecordFile(root, { engineId: 'kokoro', endpoint: 'http://127.0.0.1:8012', stopOnShutdown: false }, { isAlive }),
+      true
+    );
+
+    const text = await readFile(join(root, 'kokoro', '.batshit-local-runtime-launch.json'), 'utf8');
+    assert.deepEqual(JSON.parse(text).args, ['/Users/x/.batshit/installs/chatterbox-turbo/serve.py']);
+    assert.equal(text.includes('a-secret'), false);
+    // The starter's own record is not this change's to rewrite.
+    const starter = JSON.parse(await readFile(join(root, 'chatterbox-turbo', '.batshit-local-runtime-launch.json'), 'utf8'));
+    assert.ok(starter.args.includes('/devkey: /a-secret'));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('one listener has one spelling, so engines sharing a port are recognized', () => {
@@ -857,6 +1012,277 @@ test('a stopper removes a record only if it is still the record it decided on', 
   assert.equal(kept.pid, 222);
   assert.equal(await removeLocalRuntimeLaunchRecord(kept), true);
   assert.deepEqual(await readLocalRuntimeLaunchRecords(root), []);
+});
+
+// ---- A record that cannot be read is never written over or removed (BL-1267) ------------
+//
+// The writers used to read "could not be read" as missing (a folder in its place, no permission)
+// and "malformed" as replaceable, so a launch or an attach wrote its own record over one that might
+// name a process that still runs: nothing could stop that process again.
+
+const RECORD_NAME = '.batshit-local-runtime-launch.json';
+
+// Each shape a record can take that is not a readable record, made in `dir`. Answers its bytes
+// when it has any, so a test can prove they are untouched.
+const UNREADABLE_SHAPES = {
+  'record-is-folder': async (dir) => mkdir(join(dir, RECORD_NAME), { recursive: true }),
+  'record-no-permission': async (dir, unlock) => {
+    await writeFile(join(dir, RECORD_NAME), JSON.stringify({ pid: 12, command: '/bin/x', stopOnShutdown: false }));
+    await chmod(join(dir, RECORD_NAME), 0o000);
+    unlock.push(join(dir, RECORD_NAME));
+  },
+  empty: async (dir) => writeFile(join(dir, RECORD_NAME), ''),
+  malformed: async (dir) => writeFile(join(dir, RECORD_NAME), '{ "pid": 12, "stopOnShutdown": fal'),
+  array: async (dir) => writeFile(join(dir, RECORD_NAME), '[{ "pid": 12 }]'),
+  null: async (dir) => writeFile(join(dir, RECORD_NAME), 'null')
+};
+const UNREADABLE_REASONS = {
+  'record-is-folder': /could not be read \(EISDIR\)/,
+  'record-no-permission': /could not be read \(EACCES\)/,
+  empty: /is empty/,
+  malformed: /is not valid JSON/,
+  array: /is not a JSON object/,
+  null: /is not a JSON object/
+};
+
+// What is in an engine folder now: each entry's name and, for a file, its bytes.
+async function folderSnapshot(dir) {
+  const out = {};
+  for (const name of (await readdir(dir)).sort()) {
+    const info = await stat(join(dir, name));
+    if (info.isDirectory()) out[name] = 'folder';
+    else {
+      await chmod(join(dir, name), 0o644);
+      out[name] = await readFile(join(dir, name), 'utf8');
+    }
+  }
+  return out;
+}
+
+test('a writer never writes over a launch record it cannot read, and says what to do (BL-1267)', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'batshit-launch-records-refuse-'));
+  const unlock = [];
+  try {
+    for (const [name, make] of Object.entries(UNREADABLE_SHAPES)) {
+      const dir = join(root, name);
+      await mkdir(dir, { recursive: true });
+      await make(dir, unlock);
+      const state = await readLocalRuntimeLaunchRecordFileState(join(dir, RECORD_NAME));
+      assert.equal(state.state, 'unreadable', name);
+      assert.match(state.reason, UNREADABLE_REASONS[name], name);
+
+      const blocked = await localRuntimeLaunchRecordWriteBlocker(root, name);
+      assert.match(blocked ?? '', UNREADABLE_REASONS[name], `${name}: a launcher can check before it spawns`);
+      await assert.rejects(
+        writeLocalRuntimeLaunchRecordFile(root, { engineId: name, pid: 84894, ...MLX }, { isAlive: () => true }),
+        (error) => {
+          assert.match(error.message, UNREADABLE_REASONS[name]);
+          assert.match(
+            error.message,
+            /Batshit did not write over it: it may belong to a voice engine that is still running\. Once that engine has stopped \(restarting the computer stops it\), repair or remove the file and try again\.$/
+          );
+          return true;
+        },
+        name
+      );
+    }
+    for (const path of unlock) await chmod(path, 0o644);
+    // Every file kept its bytes; no temp file, moved-aside record or lock was left.
+    for (const name of Object.keys(UNREADABLE_SHAPES)) {
+      const snapshot = await folderSnapshot(join(root, name));
+      assert.deepEqual(Object.keys(snapshot), [RECORD_NAME], name);
+    }
+    assert.equal((await folderSnapshot(join(root, 'malformed')))[RECORD_NAME], '{ "pid": 12, "stopOnShutdown": fal');
+    assert.equal(
+      (await folderSnapshot(join(root, 'record-no-permission')))[RECORD_NAME],
+      JSON.stringify({ pid: 12, command: '/bin/x', stopOnShutdown: false })
+    );
+
+    // Only "no such file" is absent: that engine's launch records itself.
+    assert.deepEqual(await readLocalRuntimeLaunchRecordFileState(join(root, 'fresh', RECORD_NAME)), { state: 'absent' });
+    assert.equal(await localRuntimeLaunchRecordWriteBlocker(root, 'fresh'), null);
+    await writeLocalRuntimeLaunchRecordFile(root, { engineId: 'fresh', pid: 84894, ...MLX });
+    assert.equal(JSON.parse(await readFile(join(root, 'fresh', RECORD_NAME), 'utf8')).pid, 84894);
+  } finally {
+    for (const path of unlock) await chmod(path, 0o644).catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('a running launch is never moved onto a moved-aside name that cannot be read (BL-1267)', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'batshit-launch-records-aside-'));
+  try {
+    const dir = join(root, 'chatterbox-turbo');
+    const isAlive = (pid) => pid === 10778;
+    await writeLocalRuntimeLaunchRecordFile(root, { engineId: 'chatterbox-turbo', pid: 10778, ...MLX }, { isAlive });
+    const aside = '.batshit-local-runtime-launch.10778.json';
+    await writeFile(join(dir, aside), '{ "pid": 10778, "stopOnShutdown": fal');
+    const before = await folderSnapshot(dir);
+
+    assert.match(await localRuntimeLaunchRecordWriteBlocker(root, 'chatterbox-turbo', { isAlive }), /\.10778\.json is not valid JSON/);
+    await assert.rejects(
+      writeLocalRuntimeLaunchRecordFile(root, { engineId: 'chatterbox-turbo', pid: 84894, ...MLX }, { isAlive }),
+      /\.10778\.json is not valid JSON\. Batshit did not write over it/
+    );
+    assert.deepEqual(await folderSnapshot(dir), before, 'both records kept their bytes');
+
+    // Its process gone, the current record is simply replaced: nothing is moved onto that name.
+    await writeLocalRuntimeLaunchRecordFile(root, { engineId: 'chatterbox-turbo', pid: 84894, ...MLX }, { isAlive: () => false });
+    assert.equal((await folderSnapshot(dir))[aside], before[aside]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// BL-1275: a readable record at the moved-aside name is never renamed over; both records stay.
+const COLLISION =
+  /already holds a launch record for process \d+ \(the runtime of engine "[^"]+"(, started by [^)]+)?\), so Batshit did not move .+ onto it: both records are kept\. Try again once that runtime has stopped \(restarting the computer stops it\)\.$/;
+
+test('a running launch is never moved onto a moved-aside name that already holds a readable record (BL-1275)', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'batshit-launch-records-collision-'));
+  try {
+    const dir = join(root, 'chatterbox-turbo');
+    const isAlive = (pid) => pid === 10778;
+    await writeLocalRuntimeLaunchRecordFile(root, { engineId: 'chatterbox-turbo', pid: 10778, ...MLX }, { isAlive });
+    const aside = '.batshit-local-runtime-launch.10778.json';
+    await writeFile(join(dir, aside), JSON.stringify({ engineId: 'chatterbox-turbo', pid: 10778, ...MLX, startedBy: 'kokoro', stopOnShutdown: false }));
+    const before = await folderSnapshot(dir);
+
+    // The pre-spawn check sees it too, so the operator and the launchers refuse before they spawn.
+    assert.match(await localRuntimeLaunchRecordWriteBlocker(root, 'chatterbox-turbo', { isAlive }), COLLISION);
+    await assert.rejects(
+      writeLocalRuntimeLaunchRecordFile(root, { engineId: 'chatterbox-turbo', pid: 84894, ...MLX }, { isAlive }),
+      COLLISION
+    );
+    assert.deepEqual(await folderSnapshot(dir), before, 'both records kept their bytes');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('a moved-aside name of another pid is no collision (BL-1275)', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'batshit-launch-records-collision-'));
+  try {
+    const dir = join(root, 'chatterbox-turbo');
+    const isAlive = (pid) => pid === 10778 || pid === 20202;
+    await writeLocalRuntimeLaunchRecordFile(root, { engineId: 'chatterbox-turbo', pid: 10778, ...MLX }, { isAlive });
+    const other = '.batshit-local-runtime-launch.20202.json';
+    await writeFile(join(dir, other), JSON.stringify({ engineId: 'chatterbox-turbo', pid: 20202, ...MLX }));
+    const otherBytes = await readFile(join(dir, other), 'utf8');
+
+    await writeLocalRuntimeLaunchRecordFile(root, { engineId: 'chatterbox-turbo', pid: 84894, ...MLX }, { isAlive });
+
+    assert.deepEqual((await readdir(dir)).sort(), ['.batshit-local-runtime-launch.10778.json', other, RECORD_NAME].sort());
+    assert.equal(await readFile(join(dir, other), 'utf8'), otherBytes);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("three Batshits sharing one engine folder: a re-attach never erases another's keep-running (BL-1275)", async () => {
+  const root = await mkdtemp(join(tmpdir(), 'batshit-launch-records-collision-'));
+  try {
+    const P = 31001;
+    const Q = 31002;
+    const isAlive = (pid) => pid === P || pid === Q;
+    await writeLocalRuntimeLaunchRecordFile(root, { engineId: 'starter-p', pid: P, ...MLX, endpoint: 'http://127.0.0.1:8012', stopOnShutdown: true }, { isAlive });
+    await writeLocalRuntimeLaunchRecordFile(root, { engineId: 'starter-q', pid: Q, ...MLX, endpoint: 'http://127.0.0.1:8013', stopOnShutdown: true }, { isAlive });
+    const attach = (endpoint, stopOnShutdown) =>
+      attachLocalRuntimeLaunchRecordFile(root, { engineId: 'e', endpoint, stopOnShutdown }, { isAlive });
+
+    await attach('http://127.0.0.1:8012', false); // A: E keeps P running
+    await attach('http://127.0.0.1:8013', true); // C: E uses Q (P's record moves aside)
+    await attach('http://127.0.0.1:8012', true); // B: E uses P (Q's record moves aside)
+    const dir = join(root, 'e');
+    const asideP = `.batshit-local-runtime-launch.${P}.json`;
+    assert.equal(JSON.parse(await readFile(join(dir, asideP), 'utf8')).stopOnShutdown, false);
+    const before = await folderSnapshot(dir);
+
+    await assert.rejects(attach('http://127.0.0.1:8013', true), COLLISION); // C again: refused
+    await assert.rejects(attach('http://127.0.0.1:8013', true), /the runtime of engine "starter-p"/);
+    assert.deepEqual(await folderSnapshot(dir), before);
+    // P's group still holds A's keep-running, so a stop pass keeps P.
+    const { groups } = groupLocalRuntimeLaunchRecords(await readLocalRuntimeLaunchRecords(root));
+    const pGroup = groups.find((group) => group.pid === P);
+    assert.ok(pGroup.records.some((record) => record.stopOnShutdown === false));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('an attach never writes over its engine\'s record that cannot be read, as the operator\'s stop does (BL-1267)', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'batshit-launch-records-attach-'));
+  try {
+    const isAlive = (pid) => pid === 10778;
+    await writeLocalRuntimeLaunchRecordFile(
+      root,
+      { engineId: 'chatterbox-turbo', pid: 10778, ...MLX, endpoint: 'http://127.0.0.1:8012' },
+      { isAlive }
+    );
+    await mkdir(join(root, 'kokoro'), { recursive: true });
+    // kokoro's own "keep running", malformed: the attach would have replaced it with a "stop".
+    await writeFile(join(root, 'kokoro', RECORD_NAME), '{ "pid": 10778, "startedBy": "chatterbox-turbo", "stopOnShutdown": fal');
+    await assert.rejects(
+      attachLocalRuntimeLaunchRecordFile(root, { engineId: 'kokoro', endpoint: 'http://localhost:8012', stopOnShutdown: true }, { isAlive }),
+      /is not valid JSON\. Batshit did not write over it/
+    );
+    assert.deepEqual(await folderSnapshot(join(root, 'kokoro')), {
+      [RECORD_NAME]: '{ "pid": 10778, "startedBy": "chatterbox-turbo", "stopOnShutdown": fal'
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('a stopper never removes, and an update never rewrites, a record that cannot be read (BL-1264, BL-1267)', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'batshit-launch-records-remove-'));
+  try {
+    await writeLocalRuntimeLaunchRecordFile(root, { engineId: 'kokoro', pid: 111, ...MLX }, { isAlive: () => false });
+    const [decidedOn] = await readLocalRuntimeLaunchRecords(root);
+    // The record became unreadable after the stopper read it.
+    await writeFile(decidedOn.recordPath, '{ "pid": 111');
+    assert.equal(await removeLocalRuntimeLaunchRecord(decidedOn), false);
+    assert.equal(await updateLocalRuntimeLaunchRecord(decidedOn, { stopOnShutdown: false }), false);
+    // An unreadable entry as the reader gives it: once removed while it stayed corrupt, now kept.
+    const [unreadable] = await readLocalRuntimeLaunchRecords(root);
+    assert.equal(unreadable.unreadable, true);
+    assert.equal(await removeLocalRuntimeLaunchRecord(unreadable), false);
+    assert.deepEqual(await folderSnapshot(join(root, 'kokoro')), { [RECORD_NAME]: '{ "pid": 111' });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('only the reader decides what could not be read: a record\'s own unreadable or invalid field is not a verdict', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'batshit-launch-records-own-flags-'));
+  try {
+    await mkdir(join(root, 'kokoro'), { recursive: true });
+    await writeFile(join(root, 'kokoro', RECORD_NAME), JSON.stringify({ pid: 10778, ...MLX, unreadable: true, invalid: true }));
+    const [record] = await readLocalRuntimeLaunchRecords(root);
+    assert.equal(record.unreadable, undefined);
+    assert.equal(record.invalid, undefined);
+    const { groups, unusable, unreadable } = groupLocalRuntimeLaunchRecords([record]);
+    assert.deepEqual([groups.map((group) => group.pid), unusable.length, unreadable.length], [[10778], 0, 0]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('the whole-inventory hold names the files and never says to remove one while its engine may run (BL-1269)', () => {
+  assert.equal(holdLocalRuntimeStopsForUnreadableRecords([]), null);
+  assert.equal(holdLocalRuntimeStopsForUnreadableRecords(undefined), null);
+  const one = holdLocalRuntimeStopsForUnreadableRecords([{ recordPath: '/r/kokoro/x.json', reason: 'r' }]);
+  assert.deepEqual(one.recordPaths, ['/r/kokoro/x.json']);
+  assert.equal(
+    one.reason,
+    'stopped no voice engine and removed no launch record: /r/kokoro/x.json could not be read and may hold an engine\'s "keep running" choice. Once the voice engines have stopped (restarting the computer stops them), repair or remove that file or folder'
+  );
+  const many = holdLocalRuntimeStopsForUnreadableRecords(
+    Array.from({ length: 7 }, (_, index) => ({ recordPath: `/r/e${index}.json` }))
+  );
+  assert.match(many.reason, /\/r\/e4\.json and 2 more could not be read/);
+  assert.match(many.reason, /repair or remove those files or folders$/);
+  assert.equal(many.recordPaths.length, 7);
 });
 
 // ---- Which Batshit launched it (2026-09-18, review of 22aa935de) -------------------------

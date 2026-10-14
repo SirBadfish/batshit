@@ -96,9 +96,13 @@ const API_KEY_PATTERNS: Record<string, RegExp> = {
   n8n_instance_mcp_token: GENERIC_SECRET_PATTERN,
   batshit_token: INTERNAL_SECRET_PATTERN,
   batshit_artifact_complete_url: /^https?:\/\/.+/i,
-  // SA-120 (DL-120-01): Jev Juice. TypeSafe System One key, encrypted like every other
+  // SA-120 (DL-120-01): Judge Juice. TypeSafe System One key, encrypted like every other
   // provider key; read by `resolveTypesafeApiKey` with `TYPESAFE_API_KEY` as the env fallback.
   typesafe: GENERIC_SECRET_PATTERN,
+  // SA-120 P10a (DL-120-18): the other two judge keys. A Cloudflare API token for a Workers AI judge, and the one
+  // key a System One URL judge sends when its record says so (a hosted service such as Liquid AI).
+  cloudflare_workers_ai: GENERIC_SECRET_PATTERN,
+  systemone_url: GENERIC_SECRET_PATTERN,
   // SA-102 P5 (DL-102-09, DL-102-14): local AI programs that can require a key.
   // ONE store per program, encrypted through the same AES-256-GCM path as every
   // other Batshit credential, shared by the chat transport and the memory
@@ -148,6 +152,21 @@ class ApiKeyService {
    */
   async store(service: string, apiKey: string, userId: string): Promise<void> {
     const normalizedService = normalizeApiKeyServiceName(service);
+    const document = this.buildStoredDocument(normalizedService, apiKey);
+
+    // Store in Redis as JSON
+    await redis.execute(async (client) => {
+      await client.json.set(`api_keys:${userId}:${normalizedService}`, '$', document as unknown as RedisJSON);
+    });
+  }
+
+  /**
+   * The validated, encrypted record `store` writes, without writing it. Throws the same format and
+   * injection errors (their messages never carry the value). BL-1397: the n8n Instance token move
+   * writes it inside its own guarded script.
+   */
+  buildStoredDocument(service: string, apiKey: string): StoredApiKey {
+    const normalizedService = normalizeApiKeyServiceName(service);
     const normalizedApiKey = normalizeApiKeyValue(apiKey);
 
     // Validate format first
@@ -162,16 +181,49 @@ class ApiKeyService {
 
     // Encrypt the API key
     const encryptedData = apiKeyEncryption.encrypt(normalizedApiKey);
+    return {
+      encrypted: encryptedData.encrypted,
+      iv: encryptedData.iv,
+      authTag: encryptedData.authTag,
+      updatedAt: new Date().toISOString()
+    };
+  }
 
-    // Store in Redis as JSON
-    await redis.execute(async (client) => {
-      await client.json.set(`api_keys:${userId}:${normalizedService}`, '$', {
-        encrypted: encryptedData.encrypted,
-        iv: encryptedData.iv,
-        authTag: encryptedData.authTag,
-        updatedAt: new Date().toISOString()
-      } as unknown as RedisJSON);
-    });
+  /** The Redis key of one saved key. */
+  storedKeyName(service: string, userId: string): string {
+    return `api_keys:${userId}:${normalizeApiKeyServiceName(service)}`;
+  }
+
+  /**
+   * BL-1397: the saved key's exact `$` text ('' when there is none) and what it holds, for a
+   * compare-and-set. A record that does not decrypt or has the wrong shape is `unreadable`: it is
+   * PRESENT, never taken for absent. The value stays in memory and is never logged.
+   */
+  async readStoredState(
+    service: string,
+    userId: string
+  ): Promise<
+    | { raw: ''; state: 'absent' }
+    | { raw: string; state: 'readable'; value: string }
+    | { raw: string; state: 'unreadable' }
+  > {
+    const raw = await redis.json.getRaw(this.storedKeyName(service, userId), '$');
+    if (raw === null) return { raw: '', state: 'absent' };
+    try {
+      const parsed = JSON.parse(raw);
+      const record = Array.isArray(parsed) && parsed.length === 1 ? parsed[0] : null;
+      if (
+        record &&
+        typeof record.encrypted === 'string' &&
+        typeof record.iv === 'string' &&
+        typeof record.authTag === 'string'
+      ) {
+        return { raw, state: 'readable', value: apiKeyEncryption.decrypt(record.encrypted, record.iv, record.authTag) };
+      }
+    } catch {
+      // Not decryptable or not JSON: unreadable, below.
+    }
+    return { raw, state: 'unreadable' };
   }
 
   /**

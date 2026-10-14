@@ -24,6 +24,7 @@ export * from "./appearanceRecipePhysicalProof";
 export * from "./appearanceRecipeSemanticProof";
 export * from "./archiveContainmentContracts";
 export * from "./componentMapContracts";
+export * from "./recipePackageComponentMaps";
 export * from "./contractIds";
 export * from "./liveBuildContracts";
 export * from "./liveGoonBaker";

@@ -24,6 +24,27 @@ describe('codexSettings override guards', () => {
     expect(result.duplicateKeys).toEqual(['model_context_window'])
   })
 
+  it("BL-7 review: an agent's own override can never turn Codex's bundled skills back on", () => {
+    // Batshit passes `skills.bundled.enabled=false` for every run in a managed home. An
+    // override of that key, of its table, or of the whole `skills` table (which would also
+    // replace Batshit's `skills.config`) is Batshit's, and is refused like the other
+    // managed keys: dropped at runtime, rejected by the agent API.
+    for (const key of ['skills.bundled.enabled', 'skills.bundled', 'skills', 'Skills.Bundled.Enabled']) {
+      const result = sanitizeCodexConfigOverrides([{ key, value: 'true' }])
+      expect(result.overrides, key).toEqual([])
+      expect(result.reservedKeys, key).toEqual([key])
+      expect(
+        getCodexConfigOverrideValidationError({ configOverrides: [{ key, value: 'true' }] } as any),
+        key
+      ).toContain("can't redefine Batshit-managed settings")
+    }
+
+    // Other `skills.*` keys stay the agent's own.
+    expect(
+      sanitizeCodexConfigOverrides([{ key: 'skills.include_instructions', value: 'false' }]).overrides
+    ).toEqual([{ key: 'skills.include_instructions', value: 'false' }])
+  })
+
   it('sanitizes runtime settings before Codex CLI args are built', () => {
     const settings = buildCodexRuntimeSettings({
       permissionMode: 'chat',

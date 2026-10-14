@@ -7,7 +7,6 @@ const { glob } = require('glob');
 const { minimatch } = require('minimatch');
 const { nanoid } = require('nanoid');
 const logger = require('../utils/logger');
-const { lintCode } = require('../plugins/built-in/tools/lint_code');
 const redisService = require('./redisService');
 
 const PRODUCT_REPO_ROOT = path.resolve(__dirname, '../../../../');
@@ -84,11 +83,28 @@ async function initializeRuff() {
   return { ruffWasm, ruffWorkspace };
 }
 
+/**
+ * Whether `target` is `root` itself or a real descendant of it, comparing whole
+ * resolved path segments rather than raw string prefixes. Both arguments must
+ * already be absolute, resolved paths (e.g. via `path.resolve`) — this helper
+ * does not resolve symlinks and does not itself normalize a relative input.
+ *
+ * A sibling directory that merely starts with the same characters as `root`
+ * (`/tmp/project-other` next to `/tmp/project`) is NOT inside; `..` segments
+ * that walk back out of `root` are NOT inside; `root` itself, and any child
+ * whose name happens to start with `..` (e.g. `/tmp/project/..cache`), ARE
+ * inside.
+ */
+function isPathWithin(root, target) {
+  const relative = path.relative(root, target);
+  return relative === '' || (!relative.startsWith('..' + path.sep) && relative !== '..' && !path.isAbsolute(relative));
+}
+
 class BuiltInService {
   constructor() {
     this.name = 'built-in';
     this.version = '0.4.0';
-    this.description = 'Comprehensive built-in tools for file operations, analysis, git, linting, and system commands';
+    this.description = 'Comprehensive built-in tools for file operations, analysis, git, and system commands';
     this.redisService = redisService;
   }
 
@@ -180,8 +196,7 @@ class BuiltInService {
   }
 
   _isPathWithinRoot(rootPath, targetPath) {
-    const relative = path.relative(rootPath, targetPath);
-    return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+    return isPathWithin(rootPath, targetPath);
   }
 
   _isProtectedProductRepoPath(targetPath) {
@@ -207,6 +222,12 @@ class BuiltInService {
     }
   }
 
+  async _readUnprotectedFile(filePath, ...options) {
+    const { assertMacCustodyPathAllowed } = require('../utils/macCustodyPaths.cjs');
+    assertMacCustodyPathAllowed(filePath);
+    return fsp.readFile(filePath, ...options);
+  }
+
   // FILE OPERATIONS
 
   /**
@@ -216,8 +237,11 @@ class BuiltInService {
     try {
       const absolutePath = path.resolve(projectPath, filePath);
       this.validatePathWithinProject(projectPath, absolutePath);
+      const { assertMacCustodyPathAllowed } = require('../utils/macCustodyPaths.cjs');
+      assertMacCustodyPathAllowed(projectPath);
+      assertMacCustodyPathAllowed(absolutePath);
       
-      const content = await fsp.readFile(absolutePath, { encoding });
+      const content = await this._readUnprotectedFile(absolutePath, { encoding });
       const stats = await fsp.stat(absolutePath);
       
       // Calculate line count
@@ -326,7 +350,7 @@ class BuiltInService {
       this._assertProductRepoWriteAllowed(absolutePath);
       
       // Read the current file content
-      const currentContent = await fsp.readFile(absolutePath, 'utf8');
+      const currentContent = await this._readUnprotectedFile(absolutePath, 'utf8');
       let modifiedContent = currentContent;
       
       // Apply edits
@@ -947,6 +971,9 @@ class BuiltInService {
 
       const targetDir = dirPath ? path.join(projectPath, dirPath) : projectPath;
       this.validatePathWithinProject(projectPath, targetDir);
+      const { assertMacCustodyPathAllowed } = require('../utils/macCustodyPaths.cjs');
+      assertMacCustodyPathAllowed(projectPath);
+      assertMacCustodyPathAllowed(targetDir);
 
       // Use glob for pattern matching. withFileTypes gives us Path entries with
       // directory/file type info from the walk itself, so type classification
@@ -969,6 +996,7 @@ class BuiltInService {
       const truncated = totalBeforeTruncation > entryLimit;
       const walkEntries = truncated ? globEntries.slice(0, entryLimit) : globEntries;
 
+      for (const entry of walkEntries) assertMacCustodyPathAllowed(path.join(targetDir, entry.relative()));
       const files = [];
 
       if (lite) {
@@ -1084,7 +1112,7 @@ class BuiltInService {
         const absolutePath = path.join(projectPath, filePath);
         
         try {
-          const content = await fsp.readFile(absolutePath, 'utf8');
+          const content = await this._readUnprotectedFile(absolutePath, 'utf8');
           const lines = content.split('\n');
           const matches = [];
           
@@ -1431,7 +1459,7 @@ class BuiltInService {
     }
   }
 
-  // CODE QUALITY & LINTING TOOLS
+  // CODE QUALITY TOOLS
 
   /**
    * Format code using Prettier for most languages, Black for Python
@@ -1460,7 +1488,7 @@ class BuiltInService {
         absolutePath = path.resolve(projectPath, filePath);
         
         this.validatePathWithinProject(projectPath, absolutePath);
-        codeToFormat = await fsp.readFile(absolutePath, 'utf8');
+        codeToFormat = await this._readUnprotectedFile(absolutePath, 'utf8');
       }
       
       // Check if this is a Python file
@@ -1546,54 +1574,6 @@ class BuiltInService {
     }
   }
 
-  /**
-   * Lint code using ESLint and other linters
-   */
-  async lintCodeTool(projectPath, params) {
-    const { codeContent, languageHint, filePath, useProjectConfig = true, applyFixes = false } = params;
-    
-    try {
-      // Validate required parameters
-      if (!codeContent) {
-        return {
-          success: false,
-          tool: 'lint_code',
-          error: 'codeContent parameter is required'
-        };
-      }
-
-      if (!languageHint) {
-        return {
-          success: false,
-          tool: 'lint_code',
-          error: 'languageHint parameter is required'
-        };
-      }
-
-      // When useProjectConfig is false, pass null as projectPath to force default config usage
-      // When useProjectConfig is true, pass the actual projectPath for config discovery
-      const effectiveProjectPath = useProjectConfig ? projectPath : null;
-      
-      logger.debug(`lintCodeTool: useProjectConfig=${useProjectConfig}, effectiveProjectPath=${effectiveProjectPath}`);
-      
-      const result = await lintCode(codeContent, languageHint, filePath, effectiveProjectPath, useProjectConfig, applyFixes);
-
-      return {
-        success: result.isSuccess,
-        tool: 'lint_code',
-        result
-      };
-
-    } catch (error) {
-      logger.error(`Error in lint_code tool: ${error.message}`);
-      return {
-        success: false,
-        tool: 'lint_code',
-        error: error.message
-      };
-    }
-  }
-
   // ENVIRONMENT & SYSTEM TOOLS
 
   /**
@@ -1644,66 +1624,6 @@ class BuiltInService {
         error: error.message,
         ...(error.stdout && { stdout: error.stdout }),
         ...(error.stderr && { stderr: error.stderr })
-      };
-    }
-  }
-
-  /**
-   * Fetch a zip payload from Redis (peek without unzipping in chat)
-   */
-  async fetchZip(_projectPath, { zipId, maxChars = 4000 } = {}) {
-    try {
-      if (!zipId) {
-        return {
-          success: false,
-          tool: 'fetch_zip',
-          error: 'zipId is required'
-        };
-      }
-
-      await this.ensureRedis();
-      const zip = await this.redisService.getZip(zipId);
-
-      if (!zip) {
-        return {
-          success: false,
-          tool: 'fetch_zip',
-          zipId,
-          error: 'Zip not found'
-        };
-      }
-
-      const rawContent = typeof zip.content === 'string'
-        ? zip.content
-        : JSON.stringify(zip.content, null, 2);
-      const totalLength = rawContent.length;
-      const limit = Number.isFinite(Number(maxChars)) ? Number(maxChars) : 0;
-      const shouldTruncate = limit > 0 && rawContent.length > limit;
-      const content = shouldTruncate ? rawContent.slice(0, limit) : rawContent;
-
-      return {
-        success: true,
-        tool: 'fetch_zip',
-        zipId,
-        truncated: shouldTruncate,
-        totalLength,
-        content,
-        metadata: {
-          type: zip.type,
-          tokens: zip.tokens,
-          name: zip.name,
-          description: zip.description,
-          source: zip.source,
-          ...(zip.metadata ? { metadata: zip.metadata } : {})
-        }
-      };
-    } catch (error) {
-      logger.error(`Error fetching zip ${zipId}: ${error.message}`);
-      return {
-        success: false,
-        tool: 'fetch_zip',
-        zipId,
-        error: error.message
       };
     }
   }
@@ -1947,8 +1867,8 @@ class BuiltInService {
   validatePathWithinProject(projectPath, targetPath) {
     const resolvedProjectPath = path.resolve(projectPath);
     const resolvedTargetPath = path.resolve(targetPath);
-    
-    if (!resolvedTargetPath.startsWith(resolvedProjectPath)) {
+
+    if (!isPathWithin(resolvedProjectPath, resolvedTargetPath)) {
       throw new Error(`Path traversal attempt detected. Path ${targetPath} is outside of project root.`);
     }
   }
@@ -2111,7 +2031,7 @@ class BuiltInService {
         const ext = path.extname(file).toLowerCase() || 'no-extension';
         
         try {
-          const content = await fsp.readFile(filePath, 'utf8');
+          const content = await this._readUnprotectedFile(filePath, 'utf8');
           const lines = content.split('\n');
           
           // Initialize extension stats if needed
@@ -2266,7 +2186,7 @@ class BuiltInService {
         const ext = path.extname(file).toLowerCase();
         
         try {
-          const content = await fsp.readFile(filePath, 'utf8');
+          const content = await this._readUnprotectedFile(filePath, 'utf8');
           const fileImports = this._extractImports(content, ext);
           
           if (fileImports.length > 0) {
@@ -2373,7 +2293,7 @@ class BuiltInService {
         case 'pnpm': {
           const packageJsonPath = path.join(projectPath, 'package.json');
           if (fs.existsSync(packageJsonPath)) {
-            const packageJson = JSON.parse(await fsp.readFile(packageJsonPath, 'utf8'));
+            const packageJson = JSON.parse(await this._readUnprotectedFile(packageJsonPath, 'utf8'));
             results.dependencies = packageJson.dependencies || {};
             results.devDependencies = packageJson.devDependencies || {};
             results.totalDependencies = Object.keys(results.dependencies).length;
@@ -2386,7 +2306,7 @@ class BuiltInService {
         case 'pip': {
           const requirementsPath = path.join(projectPath, 'requirements.txt');
           if (fs.existsSync(requirementsPath)) {
-            const content = await fsp.readFile(requirementsPath, 'utf8');
+            const content = await this._readUnprotectedFile(requirementsPath, 'utf8');
             const lines = content.split('\n').filter(line => line.trim() && !line.startsWith('#'));
             lines.forEach(line => {
               const [pkg, version] = line.split(/[=<>]/);
@@ -2402,7 +2322,7 @@ class BuiltInService {
           const pyprojectPath = path.join(projectPath, 'pyproject.toml');
           if (fs.existsSync(pyprojectPath)) {
             const toml = require('toml');
-            const content = await fsp.readFile(pyprojectPath, 'utf8');
+            const content = await this._readUnprotectedFile(pyprojectPath, 'utf8');
             const parsed = toml.parse(content);
             if (parsed.tool && parsed.tool.poetry) {
               results.dependencies = parsed.tool.poetry.dependencies || {};
@@ -2504,7 +2424,7 @@ class BuiltInService {
       } else {
         const absolutePath = path.resolve(projectPath, filePath);
         this.validatePathWithinProject(projectPath, absolutePath);
-        codeToValidate = await fsp.readFile(absolutePath, 'utf8');
+        codeToValidate = await this._readUnprotectedFile(absolutePath, 'utf8');
       }
       
       // Perform validation based on language
@@ -3607,7 +3527,7 @@ class BuiltInService {
         const reqPath = path.join(fullPath, 'requirements.txt');
         if (fs.existsSync(reqPath)) {
           result.hasPythonDeps = true;
-          const content = await fsp.readFile(reqPath, 'utf8');
+          const content = await this._readUnprotectedFile(reqPath, 'utf8');
           result.pythonDeps = content.split('\n')
             .map(line => line.trim())
             .filter(line => line && !line.startsWith('#'))
@@ -3619,7 +3539,7 @@ class BuiltInService {
         const pkgPath = path.join(fullPath, 'package.json');
         if (fs.existsSync(pkgPath)) {
           result.hasNodeDeps = true;
-          const content = await fsp.readFile(pkgPath, 'utf8');
+          const content = await this._readUnprotectedFile(pkgPath, 'utf8');
           const pkg = JSON.parse(content);
           result.nodeDeps = Object.keys(pkg.dependencies || {});
           result.estimatedDependencies.push('node', 'npm');
@@ -3629,7 +3549,7 @@ class BuiltInService {
         const dockerPath = path.join(fullPath, 'Dockerfile');
         if (fs.existsSync(dockerPath)) {
           result.hasDockerfile = true;
-          const content = await fsp.readFile(dockerPath, 'utf8');
+          const content = await this._readUnprotectedFile(dockerPath, 'utf8');
           // Extract base image
           const fromMatch = content.match(/^FROM\s+([^\s]+)/im);
           result.dockerInfo = {

@@ -59,14 +59,14 @@ describe('formatToolDisplayName', () => {
 		expect(formatToolDisplayName('fabric:sys.cli_tool.list')).toBe('CLI Tool List')
 	})
 
-	it('SA-120 P2: names the Jev Juice judgment control the way its card reads', () => {
-		// The derived name would be "Jev Juice Ask", which reads backwards; the alias says
+	it('SA-120 P2: names the Judge Juice judgment control the way its card reads', () => {
+		// The derived name would be "Judge Juice Ask", which reads backwards; the alias says
 		// what the agent did. The prefix label keeps any later `sys.judge.*` control on the
 		// product name (DL-120-13: two words, both capitalized).
-		expect(formatToolDisplayName('sys.judge.ask')).toBe('Ask Jev Juice')
-		expect(formatToolDisplayName('fabric:sys.judge.ask')).toBe('Ask Jev Juice')
-		expect(formatBatshitToolTargetDisplayName('sys.judge.ask')).toBe('Ask Jev Juice')
-		expect(formatBatshitToolTargetDisplayName('sys.judge.rank')).toBe('Jev Juice Rank')
+		expect(formatToolDisplayName('sys.judge.ask')).toBe('Ask Judge Juice')
+		expect(formatToolDisplayName('fabric:sys.judge.ask')).toBe('Ask Judge Juice')
+		expect(formatBatshitToolTargetDisplayName('sys.judge.ask')).toBe('Ask Judge Juice')
+		expect(formatBatshitToolTargetDisplayName('sys.judge.rank')).toBe('Judge Juice Rank')
 	})
 
 	it('keeps Batshit branding lowercase for unknown names', () => {
@@ -101,6 +101,15 @@ describe('formatBatshitToolTargetDisplayName — SA-118 Guard 2', () => {
 		)
 		// The family words go through the same casing rules as the suffix.
 		expect(formatBatshitToolTargetDisplayName('sys.dm_digest.list')).toBe('DM Digest List')
+	})
+
+	it('SA-072 P1: names the Pinokio family by derivation alone, the words its cards and Approve card show', () => {
+		expect(formatBatshitToolTargetDisplayName('sys.pinokio.status')).toBe('Pinokio Status')
+		expect(formatBatshitToolTargetDisplayName('sys.pinokio.search')).toBe('Pinokio Search')
+		expect(formatBatshitToolTargetDisplayName('sys.pinokio.app_status')).toBe('Pinokio App Status')
+		expect(formatBatshitToolTargetDisplayName('sys.pinokio.logs')).toBe('Pinokio Logs')
+		expect(formatBatshitToolTargetDisplayName('sys.pinokio.run')).toBe('Pinokio Run')
+		expect(formatToolDisplayName('fabric:sys.pinokio.run')).toBe('Pinokio Run')
 	})
 
 	it('still returns null for a target that is not a sys.* control id', () => {

@@ -1,4 +1,8 @@
 import { redis } from '$lib/server/redis'
+import {
+  collectGoonGuardedReferences,
+  CUSTOM_GOON_UPLOAD_GUARD_LUA
+} from './goonCustomAssetOwnership.server'
 import type { GoonRecord } from '$lib/types/goons'
 import {
   GOON_RECIPE_AUTHORING_REVISION_CONTRACT,
@@ -32,16 +36,20 @@ import {
 const ZERO_SHA256 = '0'.repeat(64)
 
 const CREATE_DUPLICATE_RECIPE_GOON_SCRIPT = `
+${CUSTOM_GOON_UPLOAD_GUARD_LUA}
 for index = 1, #KEYS - 1 do
   if redis.call('EXISTS', KEYS[index]) == 1 then
     return 'COLLISION'
   end
 end
+if not customGoonUploadsAvailable(ARGV[#ARGV]) then
+  return 'ASSET_UNAVAILABLE'
+end
 redis.call('JSON.SET', KEYS[1], '$', ARGV[1])
 for index = 2, #KEYS - 1 do
   redis.call('JSON.SET', KEYS[index], '$', ARGV[index])
 end
-redis.call('SADD', KEYS[#KEYS], ARGV[#ARGV])
+redis.call('SADD', KEYS[#KEYS], ARGV[#ARGV - 1])
 return 'CREATED'
 `
 
@@ -131,7 +139,9 @@ async function copyEnvelope(input: {
       ? copyDocument({ ...input, ref: source.revision.updateReport })
       : Promise.resolve(null)
   ])
-  const revisionId = `duplicate_${input.targetGoonId}_${source.revision.recipeRevision}_${source.envelopeSha256.slice(0, 16)}`
+  // The shared immutable Live assets and build receipt bind this revision id.
+  // Ownership is already isolated by user + Goon in every revision/document key.
+  const revisionId = source.revision.revisionId
   const revision = {
     ...source.revision,
     revisionId,
@@ -266,7 +276,8 @@ export async function duplicateRecipeGoon(input: {
   const arguments_ = [
     JSON.stringify(clone),
     ...recordEntries.map(([, value]) => JSON.stringify(value)),
-    input.targetGoonId
+    input.targetGoonId,
+    JSON.stringify(await collectGoonGuardedReferences([clone, ...recordEntries.map(([, value]) => value)], input.userId))
   ]
   const result = await redis.execute((client: any) => {
     if (typeof client.eval !== 'function') {
@@ -275,6 +286,12 @@ export async function duplicateRecipeGoon(input: {
     return client.eval(CREATE_DUPLICATE_RECIPE_GOON_SCRIPT, { keys, arguments: arguments_ })
   })
   if (result !== 'CREATED') {
+    if (result === 'ASSET_UNAVAILABLE') {
+      throw new GoonRecipeDuplicationError(
+        'A custom Goon asset is unavailable or being deleted. Reload before retrying.',
+        409
+      )
+    }
     throw new GoonRecipeDuplicationError('The duplicate Goon id or Recipe lineage already exists.', 409)
   }
   return clone

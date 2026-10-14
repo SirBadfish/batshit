@@ -1,7 +1,8 @@
 const fs = require('fs/promises');
 const os = require('os');
 const path = require('path');
-const { zipSync, strToU8 } = require('fflate');
+const { zipSync, strToU8, Zip, ZipPassThrough } = require('fflate');
+const { GOON_MANIFEST_MAX_BYTES, GOON_CUSTOM_MODEL_MAX_BYTES } = require('../goonPackageLimits.json');
 const {
   inspectAndExtractRecipeArchive
 } = require('../goonRecipeArchiveService');
@@ -90,5 +91,72 @@ describe('Recipe archive extraction', () => {
         { maxModelBytes: 64 }
       )
     ).rejects.toThrow(/avatar.glb exceeds the allowed extracted size/);
+  });
+
+  it.each([7522825, GOON_MANIFEST_MAX_BYTES])('accepts a %i-byte manifest through the bounded production extractor', async (size) => {
+    expect(GOON_MANIFEST_MAX_BYTES).toBe(16 * 1024 * 1024);
+    expect(GOON_CUSTOM_MODEL_MAX_BYTES).toBe(594 * 1024 * 1024);
+    const manifestBytes = strToU8(JSON.stringify({ payload: 'x'.repeat(size - 14) }));
+    expect(manifestBytes.byteLength).toBe(size);
+    const result = await inspect({ 'avatar.json': manifestBytes, 'avatar.glb': glbBytes() }, {
+      maxArchiveBytes: 600 * 1024 * 1024,
+      maxModelBytes: GOON_CUSTOM_MODEL_MAX_BYTES,
+      maxManifestBytes: GOON_MANIFEST_MAX_BYTES,
+      maxTotalUncompressedBytes: 600 * 1024 * 1024,
+      maxExpansionRatio: 20
+    });
+    expect(result.manifestText).toHaveLength(size);
+    expect(result.members.find(member => member.role === 'manifest').bytes).toBe(size);
+  });
+
+  it.each([false, true])('rejects the manifest ceiling plus one byte before promotion (streaming descriptor: %s)', async (streaming) => {
+    const entries = {
+      'avatar.json': strToU8(JSON.stringify({ payload: 'x'.repeat(GOON_MANIFEST_MAX_BYTES - 13) })),
+      'avatar.glb': glbBytes()
+    };
+    let archivePath;
+    if (streaming) {
+      // A streaming ZIP does not announce the final size in its local header;
+      // the same ceiling must still stop the actual decompressed byte stream.
+      const chunks = [];
+      const zip = new Zip((error, data) => {
+        if (error) throw error;
+        chunks.push(Buffer.from(data));
+      });
+      for (const [name, bytes] of Object.entries(entries)) {
+        const member = new ZipPassThrough(name);
+        zip.add(member);
+        member.push(bytes, true);
+      }
+      zip.end();
+      archivePath = path.join(root, 'streaming.bgoon');
+      await fs.writeFile(archivePath, Buffer.concat(chunks));
+    } else archivePath = await writeArchive(entries);
+    await expect(inspectAndExtractRecipeArchive({
+      archivePath, outputDir: root,
+      maxArchiveBytes: 600 * 1024 * 1024,
+      maxModelBytes: GOON_CUSTOM_MODEL_MAX_BYTES,
+      maxManifestBytes: GOON_MANIFEST_MAX_BYTES,
+      maxTotalUncompressedBytes: 600 * 1024 * 1024,
+      maxExpansionRatio: 20
+    })).rejects.toThrow(/avatar.json exceeds the allowed extracted size/);
+    expect((await fs.readdir(root)).filter(name => name.endsWith('.extracting'))).toEqual([]);
+  });
+
+  it('retains total-byte and 20:1 expansion limits independently of valid individual member sizes', async () => {
+    await expect(inspect({ 'avatar.json': strToU8('{}'), 'avatar.glb': glbBytes(128) }, {
+      maxTotalUncompressedBytes: 128
+    })).rejects.toThrow(/allowed total size/);
+    const archivePath = path.join(root, 'compressed.bgoon');
+    await fs.writeFile(archivePath, zipSync({
+      'avatar.json': strToU8(JSON.stringify({ payload: 'x'.repeat(32000) })),
+      'avatar.glb': glbBytes()
+    }, { level: 9 }));
+    await expect(inspectAndExtractRecipeArchive({
+      archivePath, outputDir: root, maxArchiveBytes: 600 * 1024 * 1024,
+      maxModelBytes: GOON_CUSTOM_MODEL_MAX_BYTES, maxManifestBytes: GOON_MANIFEST_MAX_BYTES,
+      maxTotalUncompressedBytes: 600 * 1024 * 1024, maxExpansionRatio: 20
+    })).rejects.toThrow(/allowed expansion ratio/);
+    expect((await fs.readdir(root)).filter(name => name.endsWith('.extracting'))).toEqual([]);
   });
 });

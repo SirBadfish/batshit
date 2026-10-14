@@ -7,6 +7,14 @@ import type { AgentDcmDisplaySettings } from '$lib/types/database'
 import type { AvatarIconFit, IconRef } from '$lib/icons/iconTypes'
 import type { StoredPrimaryAgentType } from '$lib/utils/primaryAgentType'
 import type { AgentAutoCompactSettings } from '$lib/utils/contextCompaction'
+import { applyAgentProviderSettingsUpdate } from '$lib/utils/agentProviderSettings'
+import {
+  AGENT_FIELD_BY_FIELD_BLOCKS,
+  applyAgentBlockUpdate,
+  type AgentBlockSaveByField,
+  type AgentFieldByFieldBlock
+} from '$lib/utils/agentBlockFieldSettings'
+import { AGENT_MEMORY_STORED_FIELDS } from '$lib/utils/agentSettingsSavePatch'
 export interface Agent {
   id: string
   user_id: string
@@ -34,8 +42,7 @@ export interface Agent {
   auto_zip_error?: boolean
   auto_zip_image?: boolean
   auto_zip_subagent?: boolean
-  zip_control_mode?: 'user' | 'agent' | null  // DEPRECATED (legacy agent-managed toggle)
-  zip_agent_control_enabled?: boolean | null
+  zip_agent_control_experiment?: boolean | null  // The parked zip control permission (BL-1484); no UI
   zip_ai_view_mode?: 'inline' | 'appended' | null
   zip_tool_notes_enabled?: boolean | null
   zip_threshold_error?: number  // Tokens threshold for errors (default 0)
@@ -76,34 +83,19 @@ export interface Agent {
   primary_model_provider?: string
   primary_model_name?: string
   primary_model_preset_id?: string
-  primary_model_temperature?: number
-  primary_model_max_tokens?: number
-  primary_model_top_p?: number
-  primary_model_top_k?: number
-  primary_model_frequency_penalty?: number
-  primary_model_presence_penalty?: number
+  // BL-515: null clears a value (the agent PUT stores null as absent).
+  primary_model_temperature?: number | null
+  primary_model_max_tokens?: number | null
+  primary_model_top_p?: number | null
+  primary_model_top_k?: number | null
+  primary_model_frequency_penalty?: number | null
+  primary_model_presence_penalty?: number | null
   primary_model_capabilities?: ModelCapabilities | null
   primary_model_connection?: ModelConnectionInfo | null
-  primary_model_seed?: number
-  primary_model_stop_sequences?: string[]
-  primary_model_reasoning_effort?: string
+  primary_model_seed?: number | null
+  primary_model_stop_sequences?: string[] | null
+  primary_model_reasoning_effort?: string | null
   custom_model_settings?: string  // Advanced key=value pairs for power users
-  fallback_model_enabled?: boolean
-  fallback_model_provider?: string
-  fallback_model_name?: string
-  fallback_model_preset_id?: string
-  fallback_model_connection?: ModelConnectionInfo | null
-  fallback_model_temperature?: number
-  fallback_model_max_tokens?: number
-  fallback_model_top_p?: number
-  fallback_model_top_k?: number
-  fallback_model_frequency_penalty?: number
-  fallback_model_presence_penalty?: number
-  fallback_model_seed?: number
-  fallback_model_stop_sequences?: string[]
-  fallback_model_reasoning_effort?: string
-  fallback_model_capabilities?: ModelCapabilities | null
-  fallback_provider_specific_settings?: Record<string, any>
   model_routing_rules?: any  // JSONB
   ai_permissions?: any  // JSONB
   provider_specific_settings?: Record<string, any>  // JSONB
@@ -123,6 +115,15 @@ export interface Agent {
   assignedSubagents?: string[]  // Array of subagent IDs assigned to this agent
   codex_settings?: CodexAgentSettings | null
   claude_settings?: ClaudeAgentSettings | null
+}
+
+/**
+ * What a save of agent fields sends (`updateAgentSettings`). The Codex and Claude settings and the
+ * Tool Grid display settings are written field by field (BL-848, BL-855), so a save of them names
+ * only the keys (or map entries) it changes, a removed one as `null`: `diffAgentBlock` builds it.
+ */
+export type AgentSettingsUpdate = Omit<Partial<Agent>, AgentFieldByFieldBlock> & {
+  [Field in AgentFieldByFieldBlock]?: AgentBlockSaveByField[Field] | null
 }
 
 let agents = $state<Agent[]>([])
@@ -195,9 +196,23 @@ export function getAgentById(id: string | null | undefined) {
 }
 
 // Function to update agent settings (alias for updateAgent)
-export async function updateAgentSettings(id: string, updates: Partial<Agent>) {
+export async function updateAgentSettings(id: string, updates: AgentSettingsUpdate) {
   const previousAgent = agents.find((agent) => agent.id === id) ?? null
-  updateAgent(id, updates)
+  // BL-514: the copy takes the save the way the server stores it: a block's model keys replace
+  // the old ones and the agent's own keys stay unless the save names them. BL-848, BL-855: the
+  // Codex and Claude settings and the Tool Grid display settings take the keys (and map entries)
+  // the save names and keep the rest, never a shallow replace of the block.
+  const localUpdates: Record<string, unknown> = { ...updates }
+  if ('provider_specific_settings' in updates) {
+    localUpdates.provider_specific_settings = applyAgentProviderSettingsUpdate(
+      previousAgent?.provider_specific_settings,
+      updates.provider_specific_settings
+    )
+  }
+  for (const field of AGENT_FIELD_BY_FIELD_BLOCKS) {
+    if (field in updates) localUpdates[field] = applyAgentBlockUpdate(field, previousAgent?.[field], updates[field])
+  }
+  updateAgent(id, localUpdates as Partial<Agent>)
   
   // Also update in database
   try {
@@ -217,6 +232,51 @@ export async function updateAgentSettings(id: string, updates: Partial<Agent>) {
     console.error('Error updating agent settings:', error)
     throw error
   }
+}
+
+export type AgentSettingsFamily = 'memory' | 'identity'
+
+/** The record fields each family of an agent's own Settings save can change (App Actions). */
+const AGENT_SETTINGS_FAMILY_FIELDS: Record<AgentSettingsFamily, readonly string[]> = {
+  identity: ['displayName'],
+  memory: AGENT_MEMORY_STORED_FIELDS
+}
+
+/**
+ * One counter per agent AND family: a later identity read never drops an earlier memory read (that
+ * memory change would then never reach this copy), and only a newer read of the same family drops
+ * an older one, whatever order their answers come in.
+ */
+const familyReadGenerations = new Map<string, number>()
+
+/**
+ * SA-122 A-1y (LS-067/LS-068): the agent changed its own Settings (`agent_settings_changed` on the
+ * user channel, `userChannel.ts`). Reads the agent again and takes only that family's fields, so the
+ * labels that read this store (the agent picker, the chat bar, the chat page) show the saved value.
+ * A field the record no longer holds is cleared in the copy too. An agent this tab has not loaded
+ * is not read. A failed read changes nothing and says so in the console; the page reads the
+ * selected agent again before each send.
+ */
+export async function refreshAgentFieldsFromServer(agentId: string, family: AgentSettingsFamily): Promise<void> {
+  if (!agents.some((agent) => agent.id === agentId)) return
+  const key = `${agentId}\n${family}`
+  const generation = (familyReadGenerations.get(key) ?? 0) + 1
+  familyReadGenerations.set(key, generation)
+  let record: Record<string, unknown>
+  try {
+    const response = await fetch(`/api/agents/${encodeURIComponent(agentId)}`, { cache: 'no-store' })
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    record = await response.json()
+    if (!record || typeof record !== 'object' || Array.isArray(record) || record.id !== agentId) {
+      throw new Error('the answer is not this agent')
+    }
+  } catch (error) {
+    console.warn(`[agents] Could not read agent ${agentId} again after its ${family} settings changed:`, error)
+    return
+  }
+  if (familyReadGenerations.get(key) !== generation) return
+  const fields = AGENT_SETTINGS_FAMILY_FIELDS[family]
+  updateAgent(agentId, Object.fromEntries(fields.map((field) => [field, record[field]])) as Partial<Agent>)
 }
 
 // Function to load agents from database

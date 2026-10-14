@@ -6,8 +6,10 @@ import {
   getTypesafeConfig,
   normalizeStoredTypesafeConfig,
   setTypesafeConfig,
+  TypesafeConfigValidationError,
   validateTypesafeConfigInput
 } from '../typesafeConfig'
+import { resolveJudgeProviderForLane, UNREADABLE_JUDGE_CHOICE } from '$lib/utils/judgeProviders'
 import {
   TYPESAFE_CONFIG_KEY,
   TYPESAFE_DEFAULT_IN_CHAT_WAIT_MS,
@@ -42,6 +44,9 @@ describe('normalizeStoredTypesafeConfig', () => {
       attemptTimeoutMs: DEFAULT_TYPESAFE_CONFIG.attemptTimeoutMs,
       inChatWaitMs: DEFAULT_TYPESAFE_CONFIG.inChatWaitMs,
       screenIncomingText: false,
+      providers: [],
+      defaultProviderId: 'typesafe',
+      laneProviders: {},
       updatedAt: '2026-09-16T00:00:00.000Z'
     })
   })
@@ -171,5 +176,136 @@ describe('get/setTypesafeConfig', () => {
     await setTypesafeConfig({ enabled: true })
     await expect(setTypesafeConfig({ modelId: 'jev-latest' })).rejects.toThrow(/pinned/)
     await expect(getTypesafeConfig()).resolves.toMatchObject({ enabled: true, modelId: DEFAULT_TYPESAFE_CONFIG.modelId })
+  })
+})
+
+/**
+ * SA-120 P10a (DL-120-18) — judge providers on the same record. The record-shape tolerance case is FIRST and named
+ * for the reviewer: a record written before P10a reads as the built-in TypeSafe judge only, with nothing to save.
+ */
+describe('SA-120 P10a: judges on batshit:typesafe_config', () => {
+  const OLLAMA = { id: 'ollama-mac', kind: 'ollama', label: 'Ollama on this Mac', baseUrl: 'http://127.0.0.1:11434', modelId: 'clef-flash' } as const
+  const CLOUDFLARE = { id: 'cf', kind: 'cloudflare', label: 'Cloudflare', accountId: '0123456789abcdef0123456789abcdef', modelId: 'clef' } as const
+
+  beforeEach(async () => {
+    await redis.del(TYPESAFE_CONFIG_KEY)
+  })
+
+  it('RECORD-SHAPE TOLERANCE: a record written before P10a reads as TypeSafe only (no judges, default typesafe, no choices)', async () => {
+    // Exactly the shape P8 wrote (every field it had), stored on the real record.
+    const preP10a = {
+      enabled: true,
+      modelId: 'jev-1.13.0',
+      attemptTimeoutMs: 5000,
+      inChatWaitMs: 1250,
+      screenIncomingText: true,
+      updatedAt: '2026-10-01T12:00:00.000Z'
+    }
+    await redis.json.set(TYPESAFE_CONFIG_KEY, '$', preP10a as never)
+    const read = await getTypesafeConfig()
+    expect(read).toEqual({ ...preP10a, providers: [], defaultProviderId: 'typesafe', laneProviders: {} })
+    // Reading wrote nothing: the stored record is byte-for-byte what P8 left.
+    expect(await redis.json.get(TYPESAFE_CONFIG_KEY)).toEqual(preP10a)
+  })
+
+  it('stores the judges, the default, and the choices, and a patch naming only the master switch keeps them all', async () => {
+    await setTypesafeConfig({
+      providers: [OLLAMA, CLOUDFLARE] as never,
+      defaultProviderId: 'ollama-mac',
+      laneProviders: { untrusted_text: 'cf' }
+    })
+    await setTypesafeConfig({ enabled: true })
+    const read = await getTypesafeConfig()
+    expect(read).toMatchObject({
+      enabled: true,
+      providers: [OLLAMA, CLOUDFLARE],
+      defaultProviderId: 'ollama-mac',
+      laneProviders: { untrusted_text: 'cf' }
+    })
+    const stored = (await redis.json.get(TYPESAFE_CONFIG_KEY)) as Record<string, unknown>
+    expect(stored.providers).toEqual([OLLAMA, CLOUDFLARE])
+    // No key ever lands on this record.
+    expect(JSON.stringify(stored)).not.toMatch(/apiKey|token|secret/i)
+  })
+
+  it('refuses a save whose default or feature choice names a judge it does not hold, and writes nothing', async () => {
+    await setTypesafeConfig({ providers: [OLLAMA] as never, defaultProviderId: 'ollama-mac', laneProviders: { smart_zip: 'ollama-mac' } })
+    const before = await redis.json.get(TYPESAFE_CONFIG_KEY)
+    // Removing the judge without moving the choices that name it.
+    await expect(setTypesafeConfig({ providers: [] })).rejects.toBeInstanceOf(TypesafeConfigValidationError)
+    await expect(setTypesafeConfig({ providers: [] })).rejects.toThrow(/default, smart_zip/)
+    await expect(setTypesafeConfig({ laneProviders: { reply_check: 'nobody' } })).rejects.toThrow(/reply_check/)
+    expect(await redis.json.get(TYPESAFE_CONFIG_KEY)).toEqual(before)
+    // Moving them in the same save is accepted.
+    await setTypesafeConfig({ providers: [], defaultProviderId: 'typesafe', laneProviders: {} })
+    expect(await getTypesafeConfig()).toMatchObject({ providers: [], defaultProviderId: 'typesafe', laneProviders: {} })
+  })
+
+  it('reads a stored invalid judge as absent and KEEPS the choice that named it (it then denies, never reroutes)', () => {
+    const read = normalizeStoredTypesafeConfig({
+      providers: [OLLAMA, { ...CLOUDFLARE, accountId: 'nope' }],
+      defaultProviderId: 'cf',
+      laneProviders: { smart_zip: 'ollama-mac', bogus: 'cf' }
+    })
+    expect(read.providers).toEqual([OLLAMA])
+    expect(read.defaultProviderId).toBe('cf')
+    expect(read.laneProviders).toEqual({ smart_zip: 'ollama-mac' })
+  })
+
+  it('round 1, M2: a PRESENT but damaged default or lane value names no judge and denies; only an absent default is TypeSafe', async () => {
+    for (const damaged of [42, '', null, 'Not An Id']) {
+      expect(normalizeStoredTypesafeConfig({ defaultProviderId: damaged }).defaultProviderId).toBe(UNREADABLE_JUDGE_CHOICE)
+    }
+    expect(normalizeStoredTypesafeConfig({ enabled: true }).defaultProviderId).toBe('typesafe')
+    // A restored record whose default named a local judge with a damaged id: every lane denies, none goes to TypeSafe.
+    await redis.json.set(TYPESAFE_CONFIG_KEY, '$', { enabled: true, providers: [OLLAMA], defaultProviderId: 7, laneProviders: { judge_ask: false } } as never)
+    const read = await getTypesafeConfig()
+    expect(read.defaultProviderId).toBe(UNREADABLE_JUDGE_CHOICE)
+    expect(read.laneProviders).toEqual({ judge_ask: UNREADABLE_JUDGE_CHOICE })
+    expect(resolveJudgeProviderForLane(read, 'smart_zip').provider).toBeNull()
+    expect(resolveJudgeProviderForLane(read, 'judge_ask').provider).toBeNull()
+  })
+
+  it('round 1, S3: a damaged stored choice never blocks switching Judge Juice off, and still denies afterwards', async () => {
+    await redis.json.set(TYPESAFE_CONFIG_KEY, '$', {
+      enabled: true,
+      providers: [OLLAMA],
+      defaultProviderId: 'gone-judge',
+      laneProviders: { smart_zip: 12 }
+    } as never)
+    const saved = await setTypesafeConfig({ enabled: false })
+    expect(saved).toMatchObject({ enabled: false, defaultProviderId: 'gone-judge', laneProviders: { smart_zip: UNREADABLE_JUDGE_CHOICE } })
+    // The card sends its whole draft back, broken choices included: still accepted, because the save creates none.
+    await setTypesafeConfig({ inChatWaitMs: 900, defaultProviderId: 'gone-judge', laneProviders: { smart_zip: UNREADABLE_JUDGE_CHOICE } })
+    const read = await getTypesafeConfig()
+    expect(read).toMatchObject({ enabled: false, inChatWaitMs: 900 })
+    expect(resolveJudgeProviderForLane(read, 'reply_check').provider).toBeNull()
+    expect(resolveJudgeProviderForLane(read, 'smart_zip').provider).toBeNull()
+    // Creating a NEW broken choice is still refused.
+    await expect(setTypesafeConfig({ laneProviders: { smart_zip: UNREADABLE_JUDGE_CHOICE, reply_check: 'nobody' } })).rejects.toThrow(/reply_check/)
+  })
+
+  it('validates every new field on the write side', () => {
+    expect(validateTypesafeConfigInput({ providers: [OLLAMA] })).toEqual({ ok: true, value: { providers: [OLLAMA] } })
+    expect(validateTypesafeConfigInput({ providers: [{ ...OLLAMA, kind: 'openai' }] })).toMatchObject({ ok: false })
+    expect(validateTypesafeConfigInput({ providers: {} })).toMatchObject({ ok: false, error: '`providers` must be a list.' })
+    expect(validateTypesafeConfigInput({ defaultProviderId: 'ollama-mac' })).toEqual({ ok: true, value: { defaultProviderId: 'ollama-mac' } })
+    expect(validateTypesafeConfigInput({ defaultProviderId: '' })).toMatchObject({ ok: false })
+    expect(validateTypesafeConfigInput({ defaultProviderId: 'Not An Id' })).toMatchObject({ ok: false })
+    expect(validateTypesafeConfigInput({ laneProviders: { smart_zip: 'cf', reply_check: null } })).toEqual({
+      ok: true,
+      value: { laneProviders: { smart_zip: 'cf' } }
+    })
+    expect(validateTypesafeConfigInput({ laneProviders: { not_a_lane: 'cf' } })).toMatchObject({ ok: false })
+  })
+
+  it('the default read hands out fresh lists, so changing one read never changes the next', async () => {
+    const first = await getTypesafeConfig()
+    first.providers.push(OLLAMA as never)
+    first.laneProviders.smart_zip = 'ollama-mac'
+    const second = await getTypesafeConfig()
+    expect(second.providers).toEqual([])
+    expect(second.laneProviders).toEqual({})
+    expect(DEFAULT_TYPESAFE_CONFIG.providers).toEqual([])
   })
 })

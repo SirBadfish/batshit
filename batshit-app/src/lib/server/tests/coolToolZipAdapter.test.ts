@@ -4,11 +4,13 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { guardCutNotice } from '$lib/test-utils/guard-cut-notice'
 import { adaptCoolToolsToZipSystem, hasSubagentToolSettings, getDefaultSubagentSettings } from '../coolToolZipAdapter'
 import { createZipFromContent } from '../zipService'
 import { buildCoolToolAiContent, shouldPreferRawSidecarForAiExpansion } from '$lib/utils/coolToolAiContent'
 import type { AgentRow } from '$lib/types/database'
 import { calculateZipActivation } from '$lib/utils/zipActivation'
+import { describeToolResultFiles } from '$lib/utils/zipDeadCopies'
 import {
   FETCHED_ZIP_ID,
   apiBrokeredZipFetchStep,
@@ -41,6 +43,12 @@ import { ClaudeEventAdapter } from '$lib/server/services/claudeEventAdapter'
 import { isFailedToolFact } from '$lib/server/services/postTurnCheck.jev'
 import { normalizeToolArgs } from '$lib/server/services/sseToolNormalization'
 import { buildHydratedCoolToolStep } from '$lib/components/chat/coolToolHydration'
+import {
+  CLI_HELPER_STEP_CASES,
+  LEGACY_CLI_HELPER_SERVER,
+  renameHelperServer
+} from '$lib/test-utils/cli-helper-steps'
+import { CLI_HELPER_MCP_SERVER_NAME } from '$lib/utils/cliHelperToolNames'
 
 // Mock the zipService
 vi.mock('../zipService', () => ({
@@ -1342,6 +1350,133 @@ describe('CoolToolZipAdapter', () => {
       })
     })
 
+    it.each([
+      ['mcp.batshit_helpers.batshit_server_bash_execute', { command: 'cat oversized.txt' }, 'bash'],
+      ['mcp.batshit_helpers.batshit_server_cli_tool_use', { toolId: 'cli-reader' }, 'cli_tool']
+    ])('BL-666 keeps a guarded command view in its saved %s card', async (toolName, toolArgs, operationKind) => {
+      const modelText = `Command output\nstatus: exitCode=0\nstdout:\n${'A'.repeat(7_000)}\n${guardCutNotice(7_042, 'raw-1')}`
+      await adaptCoolToolsToZipSystem([{
+        toolName, toolArgs, toolResult: { content: [{ type: 'text', text: modelText }], structured_content: null }, toolProvider: 'mcp'
+      }], sessionId, messageId, {})
+      const main = vi.mocked(createZipFromContent).mock.calls.find((call) => call[1] === 'cool_tool')
+      expect(main).toBeDefined()
+      const card = JSON.parse(main![0] as string)
+      const metadata = main![4] as Record<string, any>
+      expect(card.operationKind).toBe(operationKind)
+      expect(card.toolResult.content).toBe(modelText)
+      expect(card.rendererFamily).toBe('generic_tool')
+      expect(card.toolResult.modelTextOnly).toBe(true)
+      expect(card.toolResult.exitCode).toBeUndefined()
+      expect(metadata.promptTokens).toBeGreaterThanOrEqual(Math.ceil(modelText.length / 4))
+      expect(metadata.aiChars).toBeGreaterThan(modelText.length)
+      expect(card.rawSidecar?.zipId).not.toBe('raw-1')
+    })
+
+    // BL-677: a first part with no line end filled the old 100,000-character ceiling, so its
+    // saved card was itself 25,000 tokens and no Off row or Hold could ever keep it open.
+    it('keeps a real guard cut of one long line under the too-large size, so Off keeps it open', async () => {
+      const { formatToolModelTextCut } = await import('$lib/utils/toolModelTextSizeGuard')
+      const modelText = formatToolModelTextCut('Z'.repeat(400_000), 'tool_raw_bl677').text
+      await adaptCoolToolsToZipSystem([{
+        toolName: 'mcp.batshit_helpers.batshit_server_bash_execute', toolArgs: { command: 'cat one-line.txt' },
+        toolResult: { content: [{ type: 'text', text: modelText }], structured_content: null }, toolProvider: 'mcp'
+      }], sessionId, messageId, {})
+      const main = vi.mocked(createZipFromContent).mock.calls.find((call) => call[1] === 'cool_tool')
+      const content = main![0] as string
+      const metadata = main![4] as Record<string, any>
+      expect(JSON.parse(content).toolResult).toMatchObject({ content: modelText, modelTextOnly: true })
+      expect(metadata.promptTokens).toBeGreaterThanOrEqual(10_000)
+      expect(metadata.promptTokens).toBeLessThan(25_000)
+      const zipData = { type: 'cool_tool', content, tokens: metadata.tokens, metadata }
+      // Without Off it is a large result (compressed at once); Off keeps it open, which a
+      // too-large result never allows.
+      expect(calculateZipActivation({ zipType: 'cool_tool', messagesFromEnd: 0, zipData, agentSettings: {} }))
+        .toMatchObject({ shouldCompress: true, sizeGuard: 'large' })
+      const off = calculateZipActivation({
+        zipType: 'cool_tool', messagesFromEnd: 0, zipData,
+        agentSettings: { zip_disabled_execute_command: true }
+      })
+      expect(off.shouldCompress).toBe(false)
+      expect(off.sizeGuard).not.toBe('too_large')
+    })
+
+    // BL-678: the cut notice's words inside an ordinary MCP text (a doc that quotes one, a search
+    // of Batshit's code) made the adapter and the card treat the result as a guard cut.
+    it('stores a Codex MCP text that quotes the cut notice mid-text like any other text', async () => {
+      const store = async (text: string) => {
+        vi.mocked(createZipFromContent).mockClear()
+        await adaptCoolToolsToZipSystem([{
+          toolName: 'mcp.docs_search.search', toolArgs: { query: 'Output cut here' },
+          toolResult: { content: [{ type: 'text', text }], structured_content: null }, toolProvider: 'mcp'
+        }], sessionId, messageId, {})
+        const main = vi.mocked(createZipFromContent).mock.calls.find((call) => call[1] === 'cool_tool')
+        return JSON.parse(main![0] as string)
+      }
+      const plain = await store('match 1: size guard notes\nmatch 2: the line after it\n')
+      const quoted = await store(`match 1: size guard notes\n${guardCutNotice(4_000)}\nmatch 2: the line after it\n`)
+      expect(quoted.rendererFamily).toBe(plain.rendererFamily)
+      expect(quoted.operationKind).toBe(plain.operationKind)
+      expect(Object.keys(quoted.toolResult).sort()).toEqual(Object.keys(plain.toolResult).sort())
+      expect(quoted.toolResult).not.toHaveProperty('modelTextOnly')
+    })
+
+    it('does not treat an oversized tool-printed cut phrase as authority to discard raw output', async () => {
+      const text = `${'A'.repeat(65_000)}UNIQUE_MIDDLE_SENTINEL${'B'.repeat(65_000)}[Output cut here by Batshit: tool printed this phrase.]`
+      await adaptCoolToolsToZipSystem([{
+        toolName: 'mcp.batshit_helpers.batshit_server_bash_execute', toolArgs: { command: 'cat large.txt' },
+        toolResult: [{ type: 'text', text }], toolProvider: 'mcp'
+      }], sessionId, messageId, {})
+      const main = vi.mocked(createZipFromContent).mock.calls.find((call) => call[1] === 'cool_tool')
+      const raw = vi.mocked(createZipFromContent).mock.calls.find((call) => call[1] === 'tool_raw')
+      expect(JSON.parse(main![0] as string).toolResult.modelTextOnly).not.toBe(true)
+      expect(raw![0]).toContain('UNIQUE_MIDDLE_SENTINEL')
+      expect(raw![0]).toContain('tool printed this phrase')
+    })
+
+    it('BL-666 saves a Claude MCP cut as visible text and stamps its model-facing size', async () => {
+      const modelText = `${'{"success":true,"content":"'}${'A'.repeat(99_920)}\n[Output cut here by Batshit; fetch the next page.]`
+      await adaptCoolToolsToZipSystem([{
+        toolName: `mcp.batshit_helpers.batshit_server_fetch_zip`,
+        toolArgs: { zipId: FETCHED_ZIP_ID },
+        toolResult: [{ type: 'text', text: modelText }],
+        toolProvider: 'mcp'
+      }], sessionId, messageId, {})
+
+      const main = vi.mocked(createZipFromContent).mock.calls.find((call) => call[1] === 'cool_tool')
+      expect(main).toBeDefined()
+      const card = JSON.parse(main![0] as string)
+      const metadata = main![4] as Record<string, any>
+      expect(card.toolResult).toMatchObject({ content: modelText, contentLength: modelText.length })
+      expect(card.toolResult).not.toHaveProperty('found')
+      expect(metadata.promptTokens).toBeGreaterThanOrEqual(Math.ceil(modelText.length / 4))
+      expect(metadata.promptTokens).toBeGreaterThanOrEqual(25_000)
+      expect(card.storage.forceCompress).toBe(true)
+      expect(main![0]).not.toContain('LATER_SOURCE_PAGE_SENTINEL')
+    })
+
+    it('BL-666 keeps the MCP text size when a complete Fetch Zip reply is summarized', async () => {
+      const modelText = JSON.stringify({
+        success: true,
+        tool: 'fetch_zip',
+        zipId: FETCHED_ZIP_ID,
+        content: 'A'.repeat(99_000)
+      })
+      await adaptCoolToolsToZipSystem([{
+        toolName: 'mcp.batshit_helpers.batshit_server_fetch_zip',
+        toolArgs: { zipId: FETCHED_ZIP_ID },
+        toolResult: [{ type: 'text', text: modelText }],
+        toolProvider: 'mcp'
+      }], sessionId, messageId, {})
+
+      const main = vi.mocked(createZipFromContent).mock.calls.find((call) => call[1] === 'cool_tool')
+      const card = JSON.parse(main![0] as string)
+      const metadata = main![4] as Record<string, any>
+      expect(card.toolResult.found).toBe(true)
+      expect(card.toolResult.content.length).toBeLessThan(modelText.length / 4)
+      expect(metadata.promptTokens).toBeGreaterThanOrEqual(Math.ceil(modelText.length / 4))
+      expect(metadata.tokenBasis).toBe('model_facing_mcp_text')
+    })
+
     it('stores brokered artifact create controls as artifact write renderer payloads', async () => {
       const content = '<!doctype html>\n<html><body><h1>Nano Banana 2</h1></body></html>'
       const step = {
@@ -1493,7 +1628,7 @@ describe('CoolToolZipAdapter', () => {
       expect(parsed.rawSidecar.status).toBe('stored')
     })
 
-    it('marks oversized payloads to stay compressed for AI history', async () => {
+    it('does not force-compress a small Bash transcript because its raw storage is large', async () => {
       const step = {
         toolName: 'native_bash_execute',
         toolArgs: {
@@ -1515,8 +1650,9 @@ describe('CoolToolZipAdapter', () => {
       const parsed = JSON.parse((mainCall as any)[0])
 
       expect(parsed.operationKind).toBe('bash')
-      expect(parsed.storage.forceCompress).toBe(true)
-      expect((mainCall as any)[4].forceCompress).toBe(true)
+      expect(parsed.storage.forceCompress).toBe(false)
+      expect((mainCall as any)[4].forceCompress).toBe(false)
+      expect((mainCall as any)[4].promptTokens).toBeLessThan(10000)
     })
 
     it('marks moderately large file transcripts to stay compressed for AI history', async () => {
@@ -1819,7 +1955,7 @@ describe('a shell command stored as a file action keeps its failure (F-P6-5)', (
         status: 'failed'
       })
 
-      expect(stored.description).toBe(`read_file: ${MISSING_FILE_PATH} - exit 1 - 2 lines`)
+      expect(stored.description).toBe(`read_file: ${MISSING_FILE_PATH} - exit 1 - 1 line`)
       expect(stored.metadata).toMatchObject({
         operationKind: 'read_file',
         zipDescriptionLabel: 'read_file',
@@ -1836,10 +1972,22 @@ describe('a shell command stored as a file action keeps its failure (F-P6-5)', (
         }
       })
       expect(stored.aiView).toBe(
-        `Tool result: read_file\nPath: ${MISSING_FILE_PATH}\nExit code: 1\nLines: 2\nChars/bytes: 64\n` +
+        `Tool result: read_file\nPath: ${MISSING_FILE_PATH}\nExit code: 1\nLines: 1\nChars/bytes: 64\n` +
           `Content:\n\`\`\`plaintext\n${MISSING_FILE_ERROR.trimEnd()}\n\`\`\``
       )
       expect(stored.failed).toBe(true)
+    })
+
+    // BL-678: the ledger took the notice's words anywhere in a read for a cut, so this whole
+    // read never superseded an older copy and could not be held.
+    it('stores a Codex `cat` of a file that quotes the cut notice as a whole read', async () => {
+      const quoted = `# Size guard\n${guardCutNotice(4_000)}\nThat line is quoted from the guard.\n`
+      const stored = await storeCodexCommand({
+        id: 'call_quoted_notice_cat', command: PRESENT_FILE_COMMAND, output: quoted, exitCode: 0, status: 'completed'
+      })
+      expect(stored.payload.toolResult.content).toBe(quoted.trimEnd())
+      expect(describeToolResultFiles({ operationKind: stored.metadata.operationKind, payload: stored.payload }, { projectPath: DIR }))
+        .toEqual({ kind: 'read', files: new Map([['notes.md', 'whole']]) })
     })
 
     it('keeps a successful Codex `cat` exactly as it was stored before', async () => {
@@ -1851,14 +1999,14 @@ describe('a shell command stored as a file action keeps its failure (F-P6-5)', (
         status: 'completed'
       })
 
-      expect(stored.description).toBe(`read_file: ${PRESENT_FILE_PATH} - 5 lines`)
+      expect(stored.description).toBe(`read_file: ${PRESENT_FILE_PATH} - 4 lines`)
       expect(stored.metadata).not.toHaveProperty('zipDescriptionStatus')
       expect(stored.payload.error).toBeUndefined()
       expect(stored.payload.toolResult).toEqual({
         filePath: PRESENT_FILE_PATH,
         path: PRESENT_FILE_PATH,
         content: PRESENT_FILE_CONTENT.trimEnd(),
-        lineCount: 5,
+        lineCount: 4,
         size: 34,
         language: 'markdown',
         contentTruncated: false,
@@ -1866,7 +2014,7 @@ describe('a shell command stored as a file action keeps its failure (F-P6-5)', (
         contentChars: 34
       })
       expect(stored.aiView).toBe(
-        `Tool result: read_file\nPath: ${PRESENT_FILE_PATH}\nLines: 5\nChars/bytes: 34\n` +
+        `Tool result: read_file\nPath: ${PRESENT_FILE_PATH}\nLines: 4\nChars/bytes: 34\n` +
           `Content:\n\`\`\`markdown\n${PRESENT_FILE_CONTENT.trimEnd()}\n\`\`\``
       )
       expect(stored.failed).toBe(false)
@@ -1932,13 +2080,13 @@ describe('a shell command stored as a file action keeps its failure (F-P6-5)', (
       const stored = await storeStep(apiFailedReadStep())
       const printed = `cat: can't open '${MISSING_FILE_PATH}': No such file or directory`
 
-      expect(stored.description).toBe(`read_file: ${MISSING_FILE_PATH} - error - 2 lines`)
+      expect(stored.description).toBe(`read_file: ${MISSING_FILE_PATH} - error - 1 line`)
       // fp65h: the native result names no reason, so the failure gives its exit code.
       expect(stored.payload.error).toBe('The command failed with exit code 1.')
       expect(stored.payload.toolResult).toMatchObject({ content: printed, exitCode: 1 })
       expect(stored.payload.toolResult.content).not.toContain('sandboxName')
       expect(stored.aiView).toBe(
-        `Tool result: read_file\nPath: ${MISSING_FILE_PATH}\nExit code: 1\nLines: 2\nChars/bytes: 77\n` +
+        `Tool result: read_file\nPath: ${MISSING_FILE_PATH}\nExit code: 1\nLines: 1\nChars/bytes: 77\n` +
           `Content:\n\`\`\`plaintext\n${printed}\n\`\`\``
       )
       expect(stored.failed).toBe(true)
@@ -1955,7 +2103,7 @@ describe('a shell command stored as a file action keeps its failure (F-P6-5)', (
 
       expect(stored.payload.toolResult).not.toHaveProperty('exitCode')
       expect(stored.metadata).not.toHaveProperty('zipDescriptionStatus')
-      expect(stored.description).toBe(`read_file: ${PRESENT_FILE_PATH} - 5 lines`)
+      expect(stored.description).toBe(`read_file: ${PRESENT_FILE_PATH} - 4 lines`)
     })
   })
 
@@ -3161,12 +3309,6 @@ describe('the F-P6-5 follow-up found-in-passing defects', () => {
         description: 'read_file: /Users/example/other/empty.txt - error - 0 lines'
       },
       {
-        lane: 'read_file',
-        command: 'cat /Users/example/hello/big.txt; exit 3',
-        text: 'This Bash command contains multiple operations. The following part requires approval: exit 3',
-        description: 'read_file: /Users/example/hello/big.txt - error - 0 lines'
-      },
-      {
         lane: 'search_files',
         command: 'grep -rn zzz /Users/example/other',
         text: "grep in '/Users/example/other' was blocked. For security, Claude Code may only search for patterns in files from the allowed working directories for this session: '/Users/example/hello'.",
@@ -3382,6 +3524,65 @@ describe('the F-P6-5 follow-up found-in-passing defects', () => {
       expect(buildHydratedCoolToolStep(stored.payload).isSubagent).toBe(false)
     })
 
+    // BL-15 (2026-09-22): the Claude adapter labels its own helper `Claude Code Helper` on the step
+    // (SA-111 P4, AMD-111-03), and `prepareCoolTool` never read the step's own label, so the stored
+    // card said "Agent". Both real result shapes: an async launch and a finished helper run (Claude
+    // Code 2.1.258 transcripts, text and ids replaced).
+    it.each([
+      {
+        shape: 'an async launch',
+        input: { description: 'Find the tests', subagent_type: 'Explore', prompt: 'Find every test file.' },
+        block: [{ type: 'text', text: 'Async agent launched successfully.' }],
+        result: {
+          isAsync: true,
+          status: 'async_launched',
+          agentId: 'a0000000000000000',
+          description: 'Find the tests',
+          resolvedModel: 'claude-sonnet-5',
+          prompt: 'Find every test file.',
+          outputFile: '/tmp/agent-output.txt',
+          canReadOutputFile: true
+        }
+      },
+      {
+        shape: 'a finished run',
+        input: { description: 'Read the docs', subagent_type: 'claude-code-guide', prompt: 'Summarize the effort settings.', run_in_background: false },
+        block: [
+          { type: 'text', text: '## Effort settings\n\nThe docs list four levels.' },
+          { type: 'text', text: "agentId: a1111111111111111 (use SendMessage with to: 'a1111111111111111' to continue this agent)\n<usage>subagent_tokens: 102787\ntool_uses: 6\nduration_ms: 59964</usage>" }
+        ],
+        result: {
+          status: 'completed',
+          prompt: 'Summarize the effort settings.',
+          agentId: 'a1111111111111111',
+          agentType: 'claude-code-guide',
+          harnessNoteCount: 0,
+          harnessTailCount: 0,
+          harnessSectionHash: '0000000000000000',
+          content: [{ type: 'text', text: '## Effort settings\n\nThe docs list four levels.' }],
+          resolvedModel: 'claude-haiku-4-5-20251001',
+          totalDurationMs: 59964,
+          totalTokens: 102787,
+          totalToolUseCount: 6,
+          usage: { input_tokens: 8, output_tokens: 1341 },
+          toolStats: { readCount: 0, searchCount: 0, bashCount: 0, editFileCount: 0, linesAdded: 0, linesRemoved: 0, otherToolCount: 6 }
+        }
+      }
+    ])("stores Claude Code's own helper ($shape) with its label, as a generic card", async ({ input, block, result }) => {
+      const stored = await storeClaudeCall('Agent', input, block, result)
+      const hydrated = buildHydratedCoolToolStep(stored.payload)
+
+      expect(stored.payload.displayToolName).toBe('Claude Code Helper')
+      expect(stored.metadata.displayToolName).toBe('Claude Code Helper')
+      expect(hydrated.displayToolName).toBe('Claude Code Helper')
+      // Still never a Batshit Subagent (SA-111 P4): the label changes nothing else.
+      expect(stored.payload.operationKind).toBe('unknown_tool')
+      expect(stored.payload.rendererFamily).toBe('generic_tool')
+      expect(hydrated.isSubagent).toBe(false)
+      expect(stored.payload.toolName).toBe('Agent')
+      expect(stored.description.startsWith('Agent: Claude Code Helper - ')).toBe(true)
+    })
+
     // A tool's own `code` is not a command's exit code (the F-P6-5 rule): a WebFetch reports the
     // page's HTTP status there, and the description called a fetched page `exit 200`, which the reply
     // check read as a failed tool.
@@ -3498,7 +3699,9 @@ describe('the F-P6-5 follow-up found-in-passing defects', () => {
       }
     })
 
-    it('keeps the path of a command remapped to a read as written (item 8)', async () => {
+    // Item 8 kept a remapped read's path as written. BL-233 took the remap away: the mapper names
+    // `cat <path>; exit 3` a command, so every lane stores it as one, a refusal included.
+    it('stores a read that ends in another statement as the command the mapper names it (item 8, BL-233)', async () => {
       const path = '/Users/Example/Hello/Notes.MD'
       const lanes = await onEveryLane(`cat ${path}; exit 3`, '# Notes\n', 3)
       const refused = await storeClaudeBash({
@@ -3509,10 +3712,575 @@ describe('the F-P6-5 follow-up found-in-passing defects', () => {
       })
 
       for (const stored of [...Object.values(lanes), refused]) {
-        expect(stored.payload.operationKind).toBe('read_file')
-        expect(stored.payload.toolResult.filePath).toBe(path)
-        expect(stored.description.startsWith(`read_file: ${path} - `)).toBe(true)
+        expect(stored.payload.operationKind).toBe('bash')
+        expect(stored.payload.toolResult).not.toHaveProperty('filePath')
+        expect(stored.description.startsWith(`bash: cat ${path}; exit 3 - `)).toBe(true)
       }
+    })
+  })
+})
+
+/* -------------------------------------------------------------------------------------------- *
+ * BL-5 — the helper bridge's server was renamed from `batshit_gateway_<agent>-mode4-controls` to
+ * `batshit_helpers`. Through the real store path (adapter, zip description, AI view) and the
+ * reload path (`buildHydratedCoolToolStep`), a step under either name must come out the same:
+ * the same card, the same zip description, the same kind.
+ * -------------------------------------------------------------------------------------------- */
+describe('BL-5: a helper step is stored and reloaded the same under its old and new server name', () => {
+  const sessionId = 'session-helper-rename'
+  const messageId = 'msg-helper-rename'
+
+  // Zip ids and stamps carry the clock; nothing else may differ. Every 13-digit millisecond
+  // stamp becomes one fixed 13-digit number, so a bare number stays valid JSON.
+  const withoutClock = <T>(value: T): T =>
+    JSON.parse(
+      JSON.stringify(value)
+        .replace(/\d{13}/g, '1000000000000')
+        .replace(/\d{4}-\d\d-\d\dT[\d:.]+Z/g, '<iso>')
+    )
+
+  async function storeStep(step: Record<string, any>) {
+    vi.mocked(createZipFromContent).mockClear()
+    await adaptCoolToolsToZipSystem([step], sessionId, messageId, {
+      buffer_size_all_other_tools: 0,
+      zip_threshold_all_other_tools: 0
+    })
+    const call = vi.mocked(createZipFromContent).mock.calls.find((entry) => entry[1] === 'cool_tool')
+    expect(call).toBeTruthy()
+    const content = (call as any)[0] as string
+    const metadata = (call as any)[4]
+    const payload = JSON.parse(content)
+    const { generateZipDescription } = await vi.importActual<typeof import('../zipService')>('../zipService')
+    // The stored size counts the bytes of the stored names, and the new name is shorter; the
+    // tokens the agent is charged (`tokens`, `promptTokens`) must not move, and do not.
+    const { storageChars: _chars, storageTokens: _tokens, ...sizeFreeMetadata } = metadata
+    return withoutClock({
+      payload,
+      metadata: sizeFreeMetadata,
+      description: generateZipDescription(content, 'cool_tool', metadata),
+      aiView: buildCoolToolAiContent('zip_helper_rename', { content, metadata }, payload),
+      reloaded: buildHydratedCoolToolStep(payload)
+    })
+  }
+
+  for (const testCase of CLI_HELPER_STEP_CASES) {
+    it(testCase.label, async () => {
+      const legacy = await storeStep(testCase.build(LEGACY_CLI_HELPER_SERVER))
+      const current = await storeStep(testCase.build(CLI_HELPER_MCP_SERVER_NAME))
+
+      expect(legacy.metadata.operationKind).toBe(testCase.expectedKind)
+      expect(current.metadata.operationKind).toBe(testCase.expectedKind)
+      expect(current.reloaded.rendererFamily).toBe(legacy.reloaded.rendererFamily)
+      expect(current.description).toBe(
+        renameHelperServer(legacy.description, LEGACY_CLI_HELPER_SERVER, CLI_HELPER_MCP_SERVER_NAME)
+      )
+      expect(current).toEqual(
+        renameHelperServer(legacy, LEGACY_CLI_HELPER_SERVER, CLI_HELPER_MCP_SERVER_NAME)
+      )
+    })
+  }
+})
+
+/* -------------------------------------------------------------------------------------------- *
+ * BL-233 — the zip lane follows the one mapping. Every lane classifies a shell command once, with
+ * the shared mapper (`mapBashCommandToRendererTool`): the API lane in send-routed, Codex and Claude
+ * in their adapters. `normalizeToolStep` used to classify a command the mapper called a plain
+ * command a second time, by a regex over the command text, so a test run piped into `tail` and
+ * followed by `node src/cli.js` was stored as a Read File of `src/cli.js`: its output saved as the
+ * file's content, Read File's zip rule, and a Read File card, while the Execution Viewer and Plan
+ * mode said Bash.
+ * -------------------------------------------------------------------------------------------- */
+describe('BL-233: the zip lane follows the one mapping', () => {
+  const sessionId = 'session-one-mapping'
+  const messageId = 'msg-one-mapping'
+  const request: any = {
+    sessionId,
+    messageId,
+    agentId: 'agent-one-mapping',
+    userId: 'user-one-mapping',
+    model: 'cli',
+    messages: [{ role: 'user', content: 'Run the tests' }],
+    availableTools: [],
+    maxToolRounds: 1
+  }
+  // The benchmark agent's own lanes: Read File keeps 8 responses, Bash 1.
+  const settings = {
+    buffer_size_read_file: 8,
+    zip_threshold_read_file: 0,
+    auto_zip_read_file: false,
+    buffer_size_execute_command: 1,
+    zip_threshold_execute_command: 0,
+    auto_zip_execute_command: false
+  }
+  const TEST_RUN =
+    "cd /tmp/batshit-example/habit-streaks && npm test 2>&1 | tail -12 && echo '--- CLI check ---' && node src/cli.js examples/meditate.json 2026-01-10"
+  const TEST_OUTPUT = [
+    '✔ a multi-day streak ending today is counted in full (0.068458ms)',
+    'ℹ tests 22',
+    'ℹ pass 22',
+    'ℹ fail 0',
+    '--- CLI check ---',
+    'Meditate',
+    'Current streak: 1',
+    'Longest streak: 5'
+  ].join('\n')
+
+  beforeEach(() => {
+    vi.mocked(createZipFromContent).mockClear()
+  })
+
+  async function toolResultChunk(adapter: CodexEventAdapter | ClaudeEventAdapter, events: any[]) {
+    async function* stream() {
+      yield* events
+    }
+    let found: any = null
+    for await (const chunk of adapter.stream(stream() as any)) {
+      if ((chunk as any).type === 'tool-result') found = chunk
+    }
+    expect(found).toBeTruthy()
+    return found
+  }
+
+  async function storeStep(step: Record<string, any>) {
+    vi.mocked(createZipFromContent).mockClear()
+    await adaptCoolToolsToZipSystem([step], sessionId, messageId, settings)
+    const call = vi.mocked(createZipFromContent).mock.calls.find((entry) => entry[1] === 'cool_tool')
+    const content = (call as any)[0] as string
+    const metadata = (call as any)[4]
+    const payload = JSON.parse(content)
+    const { generateZipDescription } = await vi.importActual<typeof import('../zipService')>('../zipService')
+    return {
+      payload,
+      metadata,
+      description: generateZipDescription(content, 'cool_tool', metadata),
+      reloaded: buildHydratedCoolToolStep(payload)
+    }
+  }
+
+  async function onEveryLane(command: string, printed: string, exitCode = 0) {
+    const api = await storeStep(apiShellStep({ id: 'toolu_one_mapping', command, stdout: printed, exitCode }, sessionId))
+    const codexAdapter = new CodexEventAdapter({ request, transport: 'cli' })
+    const codexChunk = await toolResultChunk(
+      codexAdapter,
+      codexCommandEvents({
+        id: 'call_one_mapping',
+        command,
+        output: printed,
+        exitCode,
+        status: exitCode === 0 ? 'completed' : 'failed'
+      })
+    )
+    const codex = await storeStep(cliStepForZip(codexChunk, codexAdapter.getToolMetadataResolver(), sessionId))
+    const claudeAdapter = new ClaudeEventAdapter({ request, transport: 'cli' })
+    const text = printed.trimEnd()
+    const claudeChunk = await toolResultChunk(
+      claudeAdapter,
+      claudeBashEvents(
+        exitCode === 0
+          ? {
+              id: 'toolu_one_mapping_claude',
+              command,
+              isError: false,
+              content: text,
+              toolUseResult: { stdout: text, stderr: '', interrupted: false, isImage: false, noOutputExpected: false }
+            }
+          : {
+              id: 'toolu_one_mapping_claude',
+              command,
+              isError: true,
+              content: `Exit code ${exitCode}\n${text}`,
+              toolUseResult: `Error: Exit code ${exitCode}\n${text}`
+            }
+      )
+    )
+    const claude = await storeStep(cliStepForZip(claudeChunk, claudeAdapter.getToolMetadataResolver(), sessionId))
+    return { api, codex, claude }
+  }
+
+  const kinds = (lanes: Record<string, { payload: any }>) =>
+    Object.fromEntries(Object.entries(lanes).map(([lane, stored]) => [lane, stored.payload.operationKind]))
+
+  it('stores a test run the mapper calls a command as Bash on every lane, not as a Read File of its script', async () => {
+    const lanes = await onEveryLane(TEST_RUN, `${TEST_OUTPUT}\n`)
+
+    expect(kinds(lanes)).toEqual({ api: 'bash', codex: 'bash', claude: 'bash' })
+    // Claude Code reports no exit code for a command that succeeded, so its status slot is empty.
+    expect(lanes.api.metadata.zipDescriptionStatus).toBe('exit 0')
+    expect(lanes.codex.metadata.zipDescriptionStatus).toBe('exit 0')
+    expect(lanes.claude.metadata.zipDescriptionStatus).toBeUndefined()
+    for (const stored of Object.values(lanes)) {
+      expect(stored.payload.rendererFamily).toBe('bash')
+      expect(stored.payload.toolName).toBe('bash')
+      expect(stored.reloaded.rendererFamily).toBe('bash')
+      // Bash's zip rule, not Read File's.
+      expect(stored.metadata.bufferSize).toBe(1)
+      expect(stored.payload.toolArgs).not.toHaveProperty('filePath')
+      expect(stored.payload.toolResult).not.toHaveProperty('filePath')
+      expect(stored.payload.toolResult).not.toHaveProperty('content')
+      expect(stored.payload.toolResult.stdout).toContain('Longest streak: 5')
+      expect(stored.metadata).toMatchObject({ zipDescriptionLabel: 'bash', zipDescriptionSize: '8 lines' })
+      expect(stored.metadata.zipDescriptionTarget.startsWith('cd /tmp/batshit-example/habit-streaks && npm test')).toBe(true)
+      expect(stored.description.startsWith('bash: cd /tmp/batshit-example/habit-streaks && npm test')).toBe(true)
+    }
+  })
+
+  it('stores a command that ends in another statement as the mapper names it: a command', async () => {
+    const path = '/Users/Example/Hello/Notes.MD'
+    const lanes = await onEveryLane(`cat ${path}; exit 3`, '# Notes\n', 3)
+
+    expect(kinds(lanes)).toEqual({ api: 'bash', codex: 'bash', claude: 'bash' })
+    for (const stored of Object.values(lanes)) {
+      expect(stored.payload.toolResult).not.toHaveProperty('filePath')
+      expect(stored.description.startsWith(`bash: cat ${path}; exit 3 - `)).toBe(true)
+    }
+  })
+
+  it('still stores a read the mapper maps as a read, with its path as written', async () => {
+    const path = '/Users/Example/Hello/Notes.MD'
+    const lanes = await onEveryLane(`cat ${path}`, '# Notes\n')
+
+    expect(kinds(lanes)).toEqual({ api: 'read_file', codex: 'read_file', claude: 'read_file' })
+    for (const stored of Object.values(lanes)) {
+      expect(stored.payload.toolResult.filePath).toBe(path)
+      expect(stored.payload.toolResult.content).toBe('# Notes')
+      expect(stored.metadata.bufferSize).toBe(8)
+      // A final newline ends the one line; it is not a second one (found in BL-233's proof).
+      expect(stored.payload.toolResult.lineCount).toBe(1)
+      expect(stored.description).toBe(`read_file: ${path} - 1 line`)
+    }
+  })
+})
+
+/* -------------------------------------------------------------------------------------------- *
+ * BL-166 — counts that read lower than the truth. A listing's per-type counts counted only the 200
+ * rows a card keeps; a command's description counted only its 220-line preview; and the API lane's
+ * own cut (`truncated: true`, from the shell runner's limit or Apple Container's) was dropped by
+ * the shapers, so a cut output read as whole.
+ * -------------------------------------------------------------------------------------------- */
+describe('BL-166: counts read what the tool produced', () => {
+  const sessionId = 'session-true-counts'
+  const messageId = 'msg-true-counts'
+  const DIR = '/tmp/batshit-example/big'
+  // The line the API lane's shell runner (`limitedOutput`, commandOutputLimit.ts) ends a cut stream with;
+  // `nativeTools.test.ts` holds the real runner to it.
+  const BATSHIT_CUT = (limit: number) =>
+    `[Output cut here by Batshit: the command printed more than ${limit.toLocaleString('en-US')} characters.]`
+
+  beforeEach(() => {
+    vi.mocked(createZipFromContent).mockClear()
+  })
+
+  async function storeStep(step: Record<string, any>) {
+    vi.mocked(createZipFromContent).mockClear()
+    await adaptCoolToolsToZipSystem([step], sessionId, messageId, {})
+    const call = vi.mocked(createZipFromContent).mock.calls.find((entry) => entry[1] === 'cool_tool')
+    const content = (call as any)[0] as string
+    const metadata = (call as any)[4]
+    const payload = JSON.parse(content)
+    const { generateZipDescription } = await vi.importActual<typeof import('../zipService')>('../zipService')
+    return {
+      payload,
+      metadata,
+      description: generateZipDescription(content, 'cool_tool', metadata),
+      aiView: buildCoolToolAiContent('zip_true_counts', { content, metadata }, payload)
+    }
+  }
+
+  const longLsLine = (kind: 'd' | '-', name: string) =>
+    `${kind}rw-r--r--  1 josh  staff  96 Sep 25 10:00 ${name}`
+
+  it('counts a listing of more than 200 entries by type over every entry, not the 200 it keeps', async () => {
+    const lines = [
+      'total 1000',
+      ...Array.from({ length: 250 }, (_, i) => longLsLine('-', `a-file-${String(i).padStart(3, '0')}.txt`)),
+      ...Array.from({ length: 250 }, (_, i) => longLsLine('d', `z-dir-${String(i).padStart(3, '0')}`))
+    ]
+    const stored = await storeStep(
+      apiShellStep({ id: 'toolu_big_listing', command: `ls -la ${DIR}`, stdout: `${lines.join('\n')}\n`, exitCode: 0 }, sessionId)
+    )
+
+    expect(stored.payload.operationKind).toBe('list_files')
+    expect(stored.payload.toolResult.files).toHaveLength(200)
+    expect(stored.payload.toolResult).toMatchObject({ totalItems: 500, totalFiles: 250, totalDirectories: 250 })
+    expect(stored.description).toBe(`list_files: ${DIR} - 500 entries`)
+  })
+
+  it("sizes a command's description by what it printed, not by its 220-line preview", async () => {
+    const printed = Array.from({ length: 1000 }, (_, i) => `line ${i + 1}`).join('\n')
+    const stored = await storeStep(
+      apiShellStep({ id: 'toolu_long_output', command: 'node print-lines.js', stdout: `${printed}\n`, exitCode: 0 }, sessionId)
+    )
+
+    expect(stored.payload.operationKind).toBe('bash')
+    expect(stored.payload.toolResult.stdout.split('\n')).toHaveLength(220)
+    expect(stored.metadata.zipDescriptionSize).toBe('1000 lines')
+  })
+
+  // Found in BL-166's proof: the 220-line preview was never shown as a cut, so the agent read 220
+  // lines as the whole output.
+  it("says in the AI view that a command's preview shows only its first lines", async () => {
+    const printed = Array.from({ length: 1000 }, (_, i) => `line ${i + 1}`).join('\n')
+    const stored = await storeStep(
+      apiShellStep({ id: 'toolu_long_preview', command: 'node print-lines.js', stdout: `${printed}\n`, exitCode: 0 }, sessionId)
+    )
+
+    expect(stored.aiView).toContain('Output shown: the first 220 of 1,000 lines.')
+  })
+
+  it('says in the AI view that a listing of more than 200 entries lists only the first 200', async () => {
+    const names = Array.from({ length: 300 }, (_, i) => `file-${String(i).padStart(3, '0')}.txt`)
+    const stored = await storeStep(
+      apiShellStep({ id: 'toolu_long_listing_ai', command: `ls -1 ${DIR}`, stdout: `${names.join('\n')}\n`, exitCode: 0 }, sessionId)
+    )
+
+    expect(stored.aiView).toContain('Items: 300 (the first 200 are listed)')
+  })
+
+  it('keeps a short command exactly as before (no new field)', async () => {
+    const stored = await storeStep(
+      apiShellStep({ id: 'toolu_short_output', command: 'node print-lines.js', stdout: 'one\ntwo\n', exitCode: 0 }, sessionId)
+    )
+
+    expect(stored.payload.toolResult).not.toHaveProperty('totalLines')
+    expect(stored.payload.toolResult).not.toHaveProperty('outputCut')
+    expect(stored.metadata.zipDescriptionSize).toBe('2 lines')
+    expect(stored.aiView).not.toContain('Output shown')
+  })
+
+  describe("the API lane's own cut", () => {
+    const LIMIT = 1_000
+    // What the runner kept: whole lines that fit under the limit, then its cut line.
+    function cutStream(lines: string[]) {
+      let kept = ''
+      for (const line of lines) {
+        if (kept.length + line.length + 1 > LIMIT - BATSHIT_CUT(LIMIT).length) break
+        kept += `${line}\n`
+      }
+      return { kept, text: `${kept}${BATSHIT_CUT(LIMIT)}` }
+    }
+
+    it('stores a cut command as its first lines, says it was cut, and keeps no cut line in its output', async () => {
+      const lines = Array.from({ length: 400 }, (_, i) => `line ${i + 1}`)
+      const { kept, text } = cutStream(lines)
+      const stored = await storeStep(
+        apiShellStep({ id: 'toolu_cut_command', command: 'node print-lines.js', stdout: text, exitCode: 0, truncated: true }, sessionId)
+      )
+      const keptLines = kept.trimEnd().split('\n').length
+
+      expect(stored.payload.operationKind).toBe('bash')
+      expect(stored.payload.toolResult.outputCut).toEqual({ by: 'Batshit', keptBytes: Buffer.byteLength(kept) })
+      expect(stored.payload.toolResult.stdout).not.toContain('Output cut here')
+      expect(stored.metadata.zipDescriptionSize).toBe(`first ${keptLines} lines`)
+      expect(stored.aiView).toContain(`Batshit cut this output: only the first ${Buffer.byteLength(kept).toLocaleString('en-US')} bytes kept.`)
+    })
+
+    it('stores a cut listing as its first entries, with no entry made of the cut line', async () => {
+      const names = Array.from({ length: 300 }, (_, i) => `file-${String(i).padStart(3, '0')}.txt`)
+      const { kept, text } = cutStream(names)
+      const stored = await storeStep(
+        apiShellStep({ id: 'toolu_cut_listing', command: `ls -1 ${DIR}`, stdout: text, exitCode: 0, truncated: true }, sessionId)
+      )
+      const keptEntries = kept.trimEnd().split('\n').length
+
+      expect(stored.payload.operationKind).toBe('list_files')
+      expect(stored.payload.toolResult.outputCut).toMatchObject({ by: 'Batshit' })
+      expect(JSON.stringify(stored.payload.toolResult.files)).not.toContain('Output cut here')
+      expect(stored.description).toBe(`list_files: ${DIR} - first ${keptEntries} entries`)
+    })
+
+    it("reads Apple Container's own cut the same way, keeping only whole lines", async () => {
+      const lines = Array.from({ length: 400 }, (_, i) => `line ${i + 1}`)
+      const full = `${lines.join('\n')}\n`
+      // `truncateOutput` (appleContainerSandbox.ts): the first N characters, then a line naming the rest.
+      const appleCut = `${full.slice(0, LIMIT)}\n...[truncated ${full.length - LIMIT} chars]`
+      const wholeLines = full.slice(0, full.slice(0, LIMIT).lastIndexOf('\n') + 1)
+      const stored = await storeStep(
+        apiShellStep({ id: 'toolu_apple_cut', command: 'node print-lines.js', stdout: appleCut, exitCode: 0, truncated: true }, sessionId)
+      )
+
+      expect(stored.payload.toolResult.stdout).toBe(wholeLines.trimEnd())
+      expect(stored.payload.toolResult.outputCut).toEqual({ by: 'Batshit', keptBytes: Buffer.byteLength(wholeLines) })
+      expect(stored.metadata.zipDescriptionSize).toBe(`first ${wholeLines.trimEnd().split('\n').length} lines`)
+    })
+
+    it('keeps the cut line in a cut read, where it tells the reader where the file stops', async () => {
+      const lines = Array.from({ length: 400 }, (_, i) => `line ${i + 1}`)
+      const { text } = cutStream(lines)
+      const stored = await storeStep(
+        apiShellStep({ id: 'toolu_cut_read', command: `cat ${DIR}/big.log`, stdout: text, exitCode: 0, truncated: true }, sessionId)
+      )
+
+      expect(stored.payload.operationKind).toBe('read_file')
+      expect(stored.payload.toolResult.content.endsWith(BATSHIT_CUT(LIMIT))).toBe(true)
+    })
+  })
+})
+
+/* -------------------------------------------------------------------------------------------- *
+ * The independent review of BL-166 and BL-233 (2026-09-25). A cut that keeps only whole lines
+ * dropped a long last line entirely; a cut line the command printed itself could fake a cut; and a
+ * command step no lane had classified (batshit-server's own `execute_command`, a third-party or
+ * n8n tool) was always stored as Bash.
+ * -------------------------------------------------------------------------------------------- */
+describe('BL-166 and BL-233 review follow-ups', () => {
+  const sessionId = 'session-review-follow-ups'
+  const messageId = 'msg-review-follow-ups'
+  const DIR = '/tmp/batshit-example/review'
+  const LIMIT = 1_000
+  const BATSHIT_CUT = `[Output cut here by Batshit: the command printed more than ${LIMIT.toLocaleString('en-US')} characters.]`
+
+  beforeEach(() => {
+    vi.mocked(createZipFromContent).mockClear()
+  })
+
+  async function storeStep(step: Record<string, any>) {
+    vi.mocked(createZipFromContent).mockClear()
+    await adaptCoolToolsToZipSystem([step], sessionId, messageId, {})
+    const call = vi.mocked(createZipFromContent).mock.calls.find((entry) => entry[1] === 'cool_tool')
+    const content = (call as any)[0] as string
+    const metadata = (call as any)[4]
+    const payload = JSON.parse(content)
+    const { generateZipDescription } = await vi.importActual<typeof import('../zipService')>('../zipService')
+    return {
+      payload,
+      metadata,
+      description: generateZipDescription(content, 'cool_tool', metadata),
+      aiView: buildCoolToolAiContent('zip_review', { content, metadata }, payload)
+    }
+  }
+
+  describe('a cut keeps the start of a long last line (finding 1)', () => {
+    const HEADER = 'HTTP/1.1 200 OK\n'
+    const LONG = 'x'.repeat(3_000)
+
+    it("keeps the partial line the runner kept, before its cut line", async () => {
+      // What the runner keeps: the header and the start of the long line, then its cut line.
+      const kept = `${HEADER}${LONG}`.slice(0, LIMIT - BATSHIT_CUT.length - 1)
+      const stored = await storeStep(
+        apiShellStep(
+          { id: 'toolu_long_line', command: 'curl -si https://example.test/api', stdout: `${kept}\n${BATSHIT_CUT}`, exitCode: 0, truncated: true },
+          sessionId
+        )
+      )
+
+      expect(stored.payload.toolResult.stdout).toBe(kept)
+      expect(stored.payload.toolResult.outputCut).toEqual({ by: 'Batshit', keptBytes: Buffer.byteLength(`${kept}\n`) })
+    })
+
+    it("keeps Apple Container's partial line when its last newline is far behind the cut", async () => {
+      const full = `${HEADER}${LONG}\n`
+      const appleCut = `${full.slice(0, LIMIT)}\n...[truncated ${full.length - LIMIT} chars]`
+      const stored = await storeStep(
+        apiShellStep(
+          { id: 'toolu_apple_long_line', command: 'curl -si https://example.test/api', stdout: appleCut, exitCode: 0, truncated: true },
+          sessionId
+        )
+      )
+
+      expect(stored.payload.toolResult.stdout).toBe(full.slice(0, LIMIT))
+      expect(stored.payload.toolResult.outputCut).toEqual({ by: 'Batshit', keptBytes: LIMIT })
+    })
+  })
+
+  describe('a cut line the command printed itself is not a cut (finding 3)', () => {
+    it('leaves a run that was not cut exactly as it printed', async () => {
+      const stdout = `one\n${BATSHIT_CUT}`
+      const stored = await storeStep(
+        apiShellStep({ id: 'toolu_forged_uncut', command: 'node print-cut-line.js', stdout, exitCode: 0 }, sessionId)
+      )
+
+      expect(stored.payload.toolResult).not.toHaveProperty('outputCut')
+      expect(stored.payload.toolResult.stdout).toBe(stdout)
+    })
+
+    it("leaves a short stream alone when the run's other stream was cut", async () => {
+      const lines = Array.from({ length: 400 }, (_, i) => `line ${i + 1}`)
+      let kept = ''
+      for (const line of lines) {
+        if (kept.length + line.length + 1 > LIMIT - BATSHIT_CUT.length - 1) break
+        kept += `${line}\n`
+      }
+      const stderr = `warning: one\n${BATSHIT_CUT}`
+      const stored = await storeStep(
+        apiShellStep(
+          { id: 'toolu_forged_stderr', command: 'node print-lines.js', stdout: `${kept}${BATSHIT_CUT}`, stderr, exitCode: 0, truncated: true },
+          sessionId
+        )
+      )
+
+      expect(stored.payload.toolResult.stdout).toBe(kept.trimEnd())
+      expect(stored.payload.toolResult.stderr).toBe(stderr)
+      expect(stored.payload.toolResult.outputCut).toEqual({ by: 'Batshit', keptBytes: Buffer.byteLength(kept) })
+    })
+  })
+
+  describe("an Apple Container cut line the command printed itself is not a cut (finding 3)", () => {
+    it("leaves a short stream alone when the run's other stream was cut", async () => {
+      const full = `${Array.from({ length: 400 }, (_, i) => `line ${i + 1}`).join('\n')}\n`
+      const appleCut = `${full.slice(0, LIMIT)}\n...[truncated ${full.length - LIMIT} chars]`
+      const stderr = 'warning: one\n...[truncated 12 chars]'
+      const stored = await storeStep(
+        apiShellStep(
+          { id: 'toolu_forged_apple', command: 'node print-lines.js', stdout: appleCut, stderr, exitCode: 0, truncated: true },
+          sessionId
+        )
+      )
+
+      expect(stored.payload.toolResult.stderr).toBe(stderr)
+      expect(stored.payload.toolResult.outputCut).toEqual({
+        by: 'Batshit',
+        keptBytes: full.slice(0, LIMIT).lastIndexOf('\n') + 1
+      })
+    })
+  })
+
+  // Finding 2: batshit-server's `execute_command` (builtInService.js), as an n8n Workflow Subagent or
+  // an MCP client calls it, never passed through a lane's mapper; the regex BL-233 removed had been
+  // its only classifier, so `ls` became a Bash card. The zip write now runs the SAME mapper.
+  describe('a command step no lane classified is classified by the shared mapper (finding 2)', () => {
+    function batshitServerCommandStep(command: string, stdout: string) {
+      return {
+        toolName: 'batshit_server_execute_command',
+        originalToolName: 'batshit_server_execute_command',
+        toolInput: { command },
+        toolArgs: { command },
+        toolResult: {
+          success: true,
+          tool: 'execute_command',
+          toolName: 'Execute Command',
+          command,
+          workingDir: DIR,
+          exitCode: 0,
+          stdout,
+          stderr: '',
+          toolInput: { command, workingDir: DIR, timeout: 30000, shell: true }
+        },
+        toolCallId: `call_unmapped_${command.length}`,
+        timestamp: '2026-09-25T20:00:00.000Z',
+        metadata: { sessionId }
+      }
+    }
+
+    it('stores a listing as List Files', async () => {
+      const stored = await storeStep(batshitServerCommandStep(`ls ${DIR}`, 'a.md\nb.md\n'))
+
+      expect(stored.payload.operationKind).toBe('list_files')
+      expect(stored.description).toBe(`list_files: ${DIR} - 2 entries`)
+    })
+
+    it('stores a read as Read File of its own path', async () => {
+      const stored = await storeStep(batshitServerCommandStep(`cat ${DIR}/notes.md`, '# Notes\n'))
+
+      expect(stored.payload.operationKind).toBe('read_file')
+      expect(stored.payload.toolResult.filePath).toBe(`${DIR}/notes.md`)
+    })
+
+    it('stores a test run as Bash, as the mapper names it', async () => {
+      const command = `cd ${DIR} && npm test 2>&1 | tail -12 && node src/cli.js examples/a.json`
+      const stored = await storeStep(batshitServerCommandStep(command, 'ok\n'))
+
+      expect(stored.payload.operationKind).toBe('bash')
+      expect(stored.payload.toolResult).not.toHaveProperty('filePath')
     })
   })
 })

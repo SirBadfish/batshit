@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { dispatchModelConnectionsUpdated } from '$lib/utils/liveSettingsEvents'
   import { onMount } from 'svelte'
   import { dmrModels, type DmrModel } from '$lib/services/dmrModels'
   import { Button } from '$lib/components/ui/button'
@@ -36,6 +37,7 @@
   async function loadModels() {
     try {
       models = await dmrModels.getInstalledModels(baseUrl, openaiPath)
+      dispatchModelConnectionsUpdated('local-ai')
     } catch (error) {
       toast.error('Failed to load Docker Model Runner models')
     }

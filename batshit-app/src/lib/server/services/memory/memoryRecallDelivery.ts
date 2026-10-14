@@ -185,7 +185,7 @@ export async function applyRecallMediaDelivery(
         if (later.length > 0) {
           const reasons = Array.from(new Set(later.map((m) => m.reason).filter(Boolean)))
           parts.push(
-            `${later.length} image${later.length === 1 ? '' : 's'} arrive${later.length === 1 ? 's' : ''} in your REMEMBERED MEDIA with the next message${reasons.length ? ` (${reasons.join(', ')})` : ''}.`
+            `${later.length} image${later.length === 1 ? '' : 's'} arrive${later.length === 1 ? 's' : ''} in your remembered_media with the next message${reasons.length ? ` (${reasons.join(', ')})` : ''}.`
           )
         }
         return { ...row, media, media_note: parts.join(' ') }

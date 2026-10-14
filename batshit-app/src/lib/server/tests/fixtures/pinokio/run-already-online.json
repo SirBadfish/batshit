@@ -1,0 +1,27 @@
+{
+  "case": "run-already-online",
+  "capturedAt": "2026-09-22T14:28:57.356Z",
+  "pinokio": {
+    "desktop": "8.2.0",
+    "pinokiod": "8.2.0",
+    "pterm": "0.0.25",
+    "script": "8.0.0"
+  },
+  "platform": "macOS 27.0 (26A428), Apple Silicon, Node 24.12.0 (Homebrew) running pterm through its shebang",
+  "sanitized": {
+    "/Users/tester": "the real home folder",
+    "192.168.1.10": "the real LAN address"
+  },
+  "argv": [
+    "pterm",
+    "run",
+    "/Users/tester/pinokio/api/comfy.git"
+  ],
+  "exitCode": null,
+  "signal": "SIGKILL",
+  "timedOut": true,
+  "durationMs": 30008,
+  "stdout": "http://localhost:8188\n",
+  "stderr": "",
+  "note": "pterm run <absolute app path> while the app is online: prints the ready URL, then hangs (killed by the capture timeout with SIGKILL). Capture note: pterm run <path> while the app is already online+ready"
+}

@@ -25,7 +25,14 @@ export type ArtifactDraftPreviewDetail = {
 }
 
 export type ModelConnectionsUpdatedDetail = {
-  source: 'api-keys' | 'custom-providers' | 'local-ai' | 'saved-models' | 'runtime' | 'unknown'
+  source:
+    | 'api-keys'
+    | 'custom-providers'
+    | 'local-ai'
+    | 'saved-models'
+    | 'runtime'
+    | 'paused-plans'
+    | 'unknown'
 }
 
 export type ProjectPreferencesUpdatedDetail = {
@@ -40,7 +47,18 @@ export type DesktopGoonPreferencesUpdatedDetail = {
 export type SessionClipStateChangedDetail = {
   sessionId: string
   clipId?: string
-  source: 'artifact-share' | 'clip-manager' | 'upload' | 'runtime' | 'unknown'
+  source: 'artifact-share' | 'clip-manager' | 'upload' | 'countdown' | 'runtime' | 'unknown'
+}
+
+/**
+ * The `source` of a server's `clip_state_changed` event, as the page hands it on: an artifact
+ * share, or a spent Clip countdown (`countdown`, BL-505: every send, promoted steer, and group
+ * round that spends one says so); anything else is `runtime`.
+ */
+export function resolveServerClipStateSource(
+  source: unknown
+): 'artifact-share' | 'countdown' | 'runtime' {
+  return source === 'artifact-share' || source === 'countdown' ? source : 'runtime'
 }
 
 export type SlashCommandsUpdatedDetail = {

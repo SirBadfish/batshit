@@ -17,6 +17,7 @@ import {
   extractAppServerSpawnArgs,
 } from '../services/codexBridge'
 import { resolveCodexTransportLane } from '../services/codexSettings'
+import { getCodexRunProcesses } from '../services/codexRunProcesses'
 import {
   CAPTURED_ADD_DELETE_MOVE_EDIT,
   CAPTURED_UPDATE_AND_RENAME,
@@ -171,6 +172,7 @@ describe('usage mapping and guard math', () => {
         total: {
           inputTokens: 100,
           cachedInputTokens: 60,
+          cacheWriteInputTokens: 30,
           outputTokens: 20,
           reasoningOutputTokens: 5,
         },
@@ -179,10 +181,37 @@ describe('usage mapping and guard math', () => {
     ).toEqual({
       input_tokens: 100,
       cached_input_tokens: 60,
+      cache_write_input_tokens: 30,
       output_tokens: 20,
       reasoning_output_tokens: 5,
     })
-    expect(mapAppServerUsage(null)).toEqual({
+  })
+
+  it('preserves cache-write-only reports and real zero without inventing other counts (BL-1383)', () => {
+    expect(mapAppServerUsage({ total: { cacheWriteInputTokens: 30 } })).toEqual({ cache_write_input_tokens: 30 })
+    expect(mapAppServerUsage({ total: { cacheWriteInputTokens: 0 } })).toEqual({ cache_write_input_tokens: 0 })
+    // No aggregate report: last-request cache writes are not this fresh thread's aggregate.
+    expect(mapAppServerUsage({ last: { cacheWriteInputTokens: 30 } })).toBeNull()
+  })
+
+  it.each([undefined, NaN, Infinity, -Infinity])('leaves an absent or non-finite cache-write count unknown (%s)', (cacheWriteInputTokens) => {
+    expect(mapAppServerUsage({ total: { inputTokens: 100, cacheWriteInputTokens } })).toEqual({ input_tokens: 100 })
+    expect(mapAppServerUsage({ total: { cacheWriteInputTokens } })).toBeNull()
+  })
+
+  it('keeps only the counts Codex reported: a missing count is unknown, a reported 0 is real (BL-1376)', () => {
+    // No usage notification, or one without totals or counts: no usage at all, never zeros.
+    expect(mapAppServerUsage(null)).toBeNull()
+    expect(mapAppServerUsage({ last: { inputTokens: 10, outputTokens: 2 } })).toBeNull()
+    expect(mapAppServerUsage({ total: {} })).toBeNull()
+    // A count Codex left out stays out.
+    expect(mapAppServerUsage({ total: { outputTokens: 20 } })).toEqual({ output_tokens: 20 })
+    // Reported zeros are counts.
+    expect(
+      mapAppServerUsage({
+        total: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0 },
+      }),
+    ).toEqual({
       input_tokens: 0,
       cached_input_tokens: 0,
       output_tokens: 0,
@@ -199,6 +228,11 @@ describe('usage mapping and guard math', () => {
         last: { inputTokens: 100, cachedInputTokens: 60, outputTokens: 20, totalTokens: 120 },
       }),
     ).toBe(120)
+    // Cache reads/writes are portions of input; neither they nor aggregate totals add pressure.
+    expect(computeContextUsedTokens({
+      last: { inputTokens: 100, cachedInputTokens: 20, cacheWriteInputTokens: 30, outputTokens: 10 },
+      total: { inputTokens: 500, cacheWriteInputTokens: 150, outputTokens: 50, totalTokens: 550 },
+    })).toBe(110)
   })
 
   it('guard stop message is classified as context exhaustion', () => {
@@ -452,9 +486,34 @@ describe('environment sanity', () => {
 })
 
 describe('startCodexAppServerRun', () => {
+  it('BL-1361: freezes context-guard accounting and keeps an independent copy after cleanup', async () => {
+    const fake = createFakeAppServer({ tokenUsageSequence: [{ used: 90, window: 100 }] })
+    spawnMock.mockReturnValue(fake.child)
+    const run = startCodexAppServerRun({ executable: 'codex', env: {}, threadParams: { ephemeral: true }, prompt: 'task' })
+    const events: any[] = []
+    for await (const event of run.events) events.push(event)
+    await run.cleanup()
+    expect(events.some((event) => event.type === 'turn.failed' && isContextExhaustionError(new Error(event.error.message)))).toBe(true)
+    expect(events.some((event) => event.type === 'turn.completed')).toBe(false)
+    const observation = run.getObservedUsage()
+    expect(observation).toEqual({ input_tokens: 90, output_tokens: 0, cached_input_tokens: 0, reasoning_output_tokens: 0 })
+    observation!.input_tokens = 999
+    expect(run.getObservedUsage()?.input_tokens).toBe(90)
+  })
+
+  it('BL-1361: reports replace an aggregate rather than sum it', async () => {
+    const fake = createFakeAppServer({ tokenUsageSequence: [{ used: 20, window: 1000 }, { used: 60, window: 1000 }] })
+    spawnMock.mockReturnValue(fake.child)
+    const run = startCodexAppServerRun({ executable: 'codex', env: {}, threadParams: { ephemeral: true }, prompt: 'task' })
+    for await (const event of run.events) void event
+    await run.cleanup()
+    expect(run.getObservedUsage()?.input_tokens).toBe(60)
+  })
   it('streams mapped events and finishes on turn completion', async () => {
+    const reportedWindows: number[] = []
     const fake = createFakeAppServer({
-      tokenUsageSequence: [{ used: 10_000, window: 121_600 }],
+      // Sanitized from a managed Codex 0.157.1 gpt-6-luna no-tool usage notification.
+      tokenUsageSequence: [{ used: 10_000, window: 258_400 }],
     })
     spawnMock.mockReturnValue(fake.child)
 
@@ -465,6 +524,7 @@ describe('startCodexAppServerRun', () => {
       cwd: '/tmp/work',
       threadParams: { ephemeral: true, cwd: '/tmp/work', model: 'gpt-5.3-codex-spark' },
       prompt: 'do the thing',
+      onContextWindow: (window) => reportedWindows.push(window),
     })
 
     const events: any[] = []
@@ -479,7 +539,10 @@ describe('startCodexAppServerRun', () => {
       'turn.completed',
     ])
     expect(events.at(-1).usage).toMatchObject({ input_tokens: 10_000 })
+    expect(reportedWindows).toEqual([258_400])
     expect(fake.interruptCalls).toHaveLength(0)
+    // BL-287: the run hands out its process, whose exit a Subagent delete waits for.
+    expect(run.process).toBe(fake.child)
     expect(spawnMock).toHaveBeenCalledWith(
       'codex',
       ['app-server', '--config', 'default_tools_enabled=false'],
@@ -574,5 +637,131 @@ describe('startCodexAppServerRun', () => {
     }
     await run.cleanup()
     expect(failure?.message).toContain('exited unexpectedly')
+  })
+
+  /* ---------------------------------------------------------------------------------------- *
+   * BL-7 — the start gate. Codex runs its SQLite migrations and (0.139.0) its bundled-skills
+   * install before the app server can answer `initialize`, so that answer is the end of the
+   * one-time setup two starts in one CODEX_HOME must not do at once.
+   * ---------------------------------------------------------------------------------------- */
+
+  function createHeldAppServer() {
+    const child = new EventEmitter() as FakeChild
+    child.stdin = new PassThrough()
+    child.stdout = new PassThrough()
+    child.stderr = new PassThrough()
+    child.killed = false
+    child.kill = () => {
+      child.killed = true
+      return true
+    }
+    const received: string[] = []
+    let initializeId: number | null = null
+    let buffered = ''
+    child.stdin.on('data', (chunk) => {
+      buffered += String(chunk)
+      let index = buffered.indexOf('\n')
+      while (index >= 0) {
+        const line = buffered.slice(0, index)
+        buffered = buffered.slice(index + 1)
+        index = buffered.indexOf('\n')
+        if (!line.trim()) continue
+        const msg = JSON.parse(line)
+        received.push(msg.method)
+        if (msg.method === 'initialize') initializeId = msg.id
+      }
+    })
+    const answerInitialize = () =>
+      child.stdout.write(
+        JSON.stringify({ jsonrpc: '2.0', id: initializeId, result: { userAgent: 'fake' } }) + '\n'
+      )
+    return { child, received, answerInitialize }
+  }
+
+  const waitFor = async (check: () => boolean, label: string) => {
+    const end = Date.now() + 2000
+    while (!check()) {
+      if (Date.now() > end) throw new Error(`timed out waiting for ${label}`)
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+  }
+
+  it('BL-7: tells the start gate once, when initialize is answered and before the thread starts', async () => {
+    const fake = createHeldAppServer()
+    spawnMock.mockReturnValue(fake.child)
+    const settled: string[][] = []
+
+    const run = startCodexAppServerRun({
+      executable: 'codex',
+      env: {},
+      threadParams: { ephemeral: true },
+      prompt: 'task',
+      onStartupSettled: () => settled.push([...fake.received]),
+    })
+
+    await waitFor(() => fake.received.includes('initialize'), 'initialize to be sent')
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    expect(settled).toEqual([])
+
+    fake.answerInitialize()
+    await waitFor(() => fake.received.includes('thread/start'), 'thread/start')
+    expect(settled).toEqual([['initialize']])
+
+    fake.child.emit('close', 0, null)
+    await run.cleanup()
+    expect(settled).toHaveLength(1)
+  })
+
+  it('BL-7: a start that dies before answering frees the gate once its process is gone', async () => {
+    const fake = createHeldAppServer()
+    spawnMock.mockReturnValue(fake.child)
+    const onStartupSettled = vi.fn()
+
+    const run = startCodexAppServerRun({
+      executable: 'codex',
+      env: {},
+      threadParams: { ephemeral: true },
+      prompt: 'task',
+      onStartupSettled,
+    })
+    await waitFor(() => fake.received.includes('initialize'), 'initialize to be sent')
+    fake.child.emit('close', 1, null)
+
+    let failure: Error | null = null
+    try {
+      for await (const event of run.events) void event
+    } catch (error) {
+      failure = error as Error
+    }
+    await run.cleanup()
+    expect(failure?.message).toContain('exited unexpectedly')
+    expect(onStartupSettled).toHaveBeenCalledTimes(1)
+  })
+
+  it('BL-7: a Stop during the start frees the gate when the process exits, not when it is told to', async () => {
+    // A killed start can still be half way through its migrations; the next start must not
+    // begin until it is gone.
+    const fake = createHeldAppServer()
+    spawnMock.mockReturnValue(fake.child)
+    const onStartupSettled = vi.fn()
+
+    const run = startCodexAppServerRun({
+      executable: 'codex',
+      env: {},
+      threadParams: { ephemeral: true },
+      prompt: 'task',
+      onStartupSettled,
+    })
+    await waitFor(() => fake.received.includes('initialize'), 'initialize to be sent')
+
+    // This transport fake has no OS pid. Real-process tests cover signalling; here
+    // cleanup must reach its controller without releasing the startup gate early.
+    const endProcesses = vi.spyOn(getCodexRunProcesses(fake.child)!, 'end')
+    await run.cleanup()
+    expect(endProcesses).toHaveBeenCalledTimes(1)
+    expect(onStartupSettled).not.toHaveBeenCalled()
+
+    fake.child.emit('close', null, 'SIGTERM')
+    expect(onStartupSettled).toHaveBeenCalledTimes(1)
   })
 })

@@ -128,7 +128,7 @@ describe('buildUntrustedTextHintProvider', () => {
     }
   })
 
-  it('leaves the quiet Jev Juice note under the woken reply when the screen could not run', async () => {
+  it('leaves the quiet Judge Juice note under the woken reply when the screen could not run', async () => {
     const { options, collector } = input(dm({ screen: screenOf('skipped') }))
     expect(await buildUntrustedTextHintProvider(options)!(CONTEXT)).toEqual([])
     expect(collector.notes).toEqual([

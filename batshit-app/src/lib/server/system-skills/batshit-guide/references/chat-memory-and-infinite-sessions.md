@@ -12,14 +12,16 @@ Batshit uses three plain labels, and you'll see them everywhere — in settings,
 
 - **Awareness** — what the agent simply knows right now: the recent conversation plus the memories it deliberately keeps in front of itself at all times (like "Josh's birthday is coming up" — optionally with an expiry so it can let go afterward). An Awareness memory can also keep one of its pictures visibly in the agent's standing awareness on every message.
 - **STM (Trigger Memories)** — memories attached to trigger words. Say "Maggie" and the agent instantly *knows* about Maggie — no search, no delay, like hearing a name and remembering the person. Trigger Memories can carry photos: save one from a Clip and a vision-capable agent sees the picture when the memory fires. When the agent deliberately recalls a photo memory while answering, supported API models and Codex CLI can see it in that same reply too.
-- **LTM (Long-term Memory)** — everything else, searchable. The agent "thinks a little harder": it searches by meaning, by keywords, and by time ("what were we doing last week?").
+- **LTM (Long-term Memory)** — everything else, searchable. The agent "thinks a little harder": it searches by meaning, by keywords, and by time ("what were we doing last week?"). Ordinary search balances relevance, freshness, and importance within current and outdated memories separately. Current facts come first; outdated facts remain clearly marked.
+
+When your agent narrows a memory search by calendar date, the search includes the whole day in your Batshit instance's timezone, even when the clocks change.
 
 When an agent saves a memory, it picks where it belongs. You can see and change every choice.
 
 ## What "remembering" looks like in chat
 
 - A small **Memory saved** chip appears under an agent reply that stored something. Click it to see what was saved.
-- A **memories surfaced** chip appears when memories were pulled into the conversation. Click it to see which memories, whether a trigger word fired them, the agent searched for them, or (with the optional [Jev Juice](../jev-juice/overview.md) recall switch on) Jev Juice brought them in, and how long each one is lingering.
+- A **memories surfaced** chip appears when memories were pulled into the conversation. Click it to see which memories, whether a trigger word fired them, the agent searched for them, or (with the optional [Judge Juice](../judge-juice/overview.md) recall switch on) Judge Juice brought them in, and how long each one is lingering.
 - The [Execution Viewer](execution-viewer.md) has a **Memory Context** section showing exactly which memories the agent received on any turn — nothing is invisible.
 - When facts change, agents **supersede** instead of delete: "your favorite color is green" replaces blue, but blue stays in history, clearly flagged as outdated. Ask "what used to be my favorite color?" and the agent can tell you.
 
@@ -32,6 +34,8 @@ Memory is **per agent** and off by default:
 3. The first enable downloads a small local embedding model (about 325 MB, one time) with a visible progress bar. This is what makes memory search work **without any API key** — everything runs on your machine.
 
 That's it. The agent can now save and recall memories in ordinary chats. You don't need an Infinite Session to use memory.
+
+An ordinary API agent connected through a ChatGPT plan can use the same local memory system. The plan connection cannot provide memory embeddings: keep the built-in model or choose a separate embedding preset. Editing or restoring a preset to use ChatGPT does not switch memory work to a paid API key. Automatic naps and memory graduation also require a separate supported summary preset; plain Compact supports the plan connection.
 
 The same card holds the tuning knobs (sensible defaults; you can ignore them): how long inserted memories "linger" (one default for trigger memories, one for recalled ones), token budgets for inserted memories, and the Infinite Session window settings described below. A single Trigger Memory can also carry its own linger setting — a custom number of messages, or "rest of the episode" so one mention keeps it present until that chapter of the conversation ends. Edit that per-memory setting in the Memory Panel, or let the agent set it when it saves.
 
@@ -61,7 +65,11 @@ Where you see it: the Infinite Session's menu in the sidebar says "Whiteboard ac
 
 ### Naps
 
-When one very long conversation gets close to the model's context limit, the agent takes a **nap** — a between-turns cleanup that graduates finished episodes, compresses stale tool output, and if needed condenses the oldest part of the current episode into memory. The agent keeps an **episode whiteboard** in front of itself (goal, decisions, open items), and that board is the agent's: a nap only fills it in when the agent has not written one, and never rewrites a board the agent wrote. You'll see a Nap button in the token panel (replacing Compact, which is intentionally disabled in Infinite Sessions), and every nap leaves a visible record of what it did.
+When one very long conversation gets close to the model's context limit, the agent takes a **nap** — a between-turns cleanup that graduates finished episodes, compresses stale tool output, and if needed condenses the oldest part of the current episode into memory. The agent keeps an **episode whiteboard** in front of itself (goal, decisions, open items), and that board is the agent's: a nap only fills it in when the agent has not written one, and never rewrites a board the agent wrote. You'll see a Nap button in the token panel (replacing Compact, which is intentionally disabled in Infinite Sessions), and every nap leaves a visible record of what it did. You can still send a message while a nap runs. Your message goes first: the nap stops before its next step, keeps what it already finished, and its record says it ended early. The next nap picks up the rest.
+
+Naps and memory graduation use the model limit for that chat, including a matching limit learned from a CLI run. A named CLI model can supply a known estimate without a model preset; a runtime report can refine it. With CLI default or an unknown model, Batshit needs a known preset or a report before it can calculate the nap threshold. Changing model/settings prevents reuse of an older report. The summary-model requirements below still apply.
+
+Compressing stale tool output needs no embedding model. If there is no finished episode to summarize and compression frees enough room, a nap can finish even when embedding setup is unavailable. When a summary is needed, embedding setup must succeed before the summary call. If it fails after some tool output was compressed, that completed work stays and the nap record reports the failure. Sending a message or deleting the chat while setup runs stops the nap before it makes a summary.
 
 One setup note, honestly: **nap and graduation summaries need a model that can write them.**
 
@@ -84,13 +92,17 @@ Between conversations — never during one — the agent's memory "dreams": it m
 - Every memory shows full content, dates, importance, attached photos, and **provenance** — which chat it came from, so "you told me that in another chat last month" is a checkable claim — plus supersession chains (what replaced what, and when).
 - A saved memory owns its own copy of every photo. Deleting the original Clip cannot break the memory. You can preview, replace, or delete the memory's copy here without changing the original Clip.
 - Awareness photos include a **Show this image every message** option. Batshit shows the approximate image-token cost and the count against the four-image limit before you leave it on. This is standing awareness, not a fresh upload on every turn; turning it off returns the image to normal recall-only behavior.
+- The four-image limit also holds when a replaced memory comes back. If the agent undoes a supersede and the memory's photos would go over the limit, Batshit refuses and tells the agent how to free a slot. If dreaming brings a memory back (for example after you deleted the memory that replaced it), its photos return in recall-only mode, and the dreaming log says so. The photos are kept; turn **Show this image every message** back on once a slot is free.
+- When an Awareness memory with a photo shown every message expires, dreaming moves it out of Awareness and its photos return to recall-only mode. The dreaming log says so, and you can still edit the memory.
+- An Awareness memory's **Expires** date is a day on your own calendar: the memory stays in Awareness until the end of that whole day, including a repeated final hour when the clocks change. Saving a change to another field, like importance, leaves the expiry exactly as it was. Existing saved expiry times stay as stored. Memory searches include that whole day.
+- Impossible event or expiry dates are refused before creating a memory or asking the embedding model to process it.
 - Edit anything, move memories between lanes, or delete (with confirmation).
 - The **Dreaming** log.
 - The **Memory System** card: which embedding model powers memory search. The default is the built-in local model (no key needed). To use anything else, create a model preset for your embedding model in Settings → Models (set its Purpose to Utility — cloud like OpenAI or Google, or local like nomic-embed-text on Ollama), then just pick that preset here. Batshit detects the technical details (like vector dimensions) automatically when you save. Changing models requires an explicit **Re-Index** — Batshit walks you through it and refuses to run in a silently broken state.
 
 ## Privacy and limits, honestly
 
-- **Memories are stored on your instance.** Memory search uses a local model by default. Memories and photos included in a chat go to the model you selected, including a hosted provider when you use one. If you configure an API embedding provider, memory text also goes to that provider for indexing. The two optional [Jev Juice](../jev-juice/overview.md) memory switches (**Recall by Meaning** and **Rerank Memory Search**, both off by default, per agent) send memory text to TypeSafe's servers while they are on; leave them off and that never happens.
+- **Memories are stored on your instance.** Memory search uses a local model by default. Memories and photos included in a chat go to the model you selected, including a hosted provider when you use one. If you configure an API embedding provider, memory text also goes to that provider for indexing. The two optional [Judge Juice](../judge-juice/overview.md) memory switches (**Recall by Meaning** and **Rerank Memory Search**, both off by default, per agent) send memory text to TypeSafe's servers while they are on; leave them off and that never happens.
 - **The agent has no secret notebook.** Everything it stores is visible and editable in the Memory Panel. (A "private reflections" mode is a possible future idea — if it ever ships, it will be explicit and opt-in.)
 - **Memory is per-agent.** Agents don't share memories. Deleting an agent deletes its memories (and, if you leave the "Also delete its chats" box checked, its own chats too; group chats stay); deleting a session keeps agent memories but marks their origin as deleted.
 - **Backups include memory.** [Backup and restore](../admin/backup-and-restore.md) covers memories, their owned photos, graduated episodes, and settings; the search index rebuilds automatically after a restore.
@@ -104,9 +116,14 @@ Between conversations — never during one — the agent's memory "dreams": it m
 
 - **"Memory search index is not ready" or similar loud errors** — open Settings → Memory and run **Re-Index**. This rebuilds the search index from your stored memories (originals are never at risk).
 - **Nap fails asking for a compact model preset** — that's the Claude `CLI` requirement above. Pick an API-compatible preset in Auto Compact settings or the Agent Memory card.
+- **Nap fails because embedding setup is unavailable** — check the selected embedding preset or local model in Settings → Memory. A nap can still compress stale tool output when no summary is needed; a required summary reports the setup error before calling its model.
 - **First memory save is slow** — enable memory from Agent Settings first; the toggle pre-downloads the model with a progress bar so saves are instant afterward.
 - **A trigger didn't fire** — check the memory's trigger words in the Memory Panel (matching is whole-word), and note that superseded or expired memories deliberately never auto-fire.
 - **The agent claims it did something (closed an episode, saved a memory) but nothing shows** — trust the visible records (chips, session menu episode line, Memory Panel) over the words, and ask it to actually call the tool. The records exist precisely so overclaiming can't hide.
+
+## Agent-requested memory preference changes
+
+Through Fabric, a Primary Agent can read its own memory Lane Budgets (Awareness, Triggers, Recalled) and the two linger defaults, then request your approval to change them. This changes those preferences only; it does not enable memory, configure embeddings, rewrite memories or alter existing linger entries. If someone changed the preference while the agent was updating it, Batshit rejects the older change. If the save result is unclear, check the current setting before requesting another change; the first change may already have taken effect.
 
 ## Related docs
 
@@ -114,5 +131,5 @@ Between conversations — never during one — the agent's memory "dreams": it m
 - [Compact and Trim](compact-and-trim.md)
 - [Execution Viewer](execution-viewer.md)
 - [Clips](../clips/overview.md)
-- [Jev Juice (optional)](../jev-juice/overview.md): recall by meaning and a sharper memory search
+- [Judge Juice (optional)](../judge-juice/overview.md): recall by meaning and a sharper memory search
 - [Backup and restore](../admin/backup-and-restore.md)

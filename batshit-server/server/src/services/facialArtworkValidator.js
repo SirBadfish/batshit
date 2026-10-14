@@ -23,6 +23,12 @@ const SOURCE_KINDS = new Set([
   'approved-external'
 ]);
 const HASH_PATTERN = /^[a-f0-9]{64}$/;
+const MAX_PACKAGE_DEFINITION_BYTES = 64 * 1024;
+const PHYSICAL_DEPENDENCY_SCHEMAS = {
+  eyeApertureSeam: 'eye-aperture-seam/v2',
+  eyeAppearance: 'eye-appearance/v5',
+  socketEyeSurface: 'socket-eye-surface/v2'
+};
 const PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
 const TRUSTED_ARTWORK_OWNERS = [
   'brows:left',
@@ -71,6 +77,98 @@ function canonicalJson(value) {
 
 function canonicalDefinitionSha256(contract) {
   return sha256(canonicalJson({ ...contract, definitionSha256: null }));
+}
+
+function isJsonObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+// Compare shape before canonicalizing untrusted JSON. Its depth and field inventory
+// must match the finite trusted catalog, so deeply nested or unknown input cannot
+// reach the recursive hash encoder. Array order remains part of the contract.
+function matchesTrustedDefinition(candidate, trusted) {
+  const pending = [[candidate, trusted]];
+  while (pending.length > 0) {
+    const [actual, expected] = pending.pop();
+    if (actual === expected) continue;
+    if (
+      actual === null || expected === null ||
+      typeof actual !== 'object' || typeof expected !== 'object' ||
+      Array.isArray(actual) !== Array.isArray(expected)
+    ) return false;
+    const actualKeys = Object.keys(actual).sort();
+    const expectedKeys = Object.keys(expected).sort();
+    if (
+      actualKeys.length !== expectedKeys.length ||
+      actualKeys.some((key, index) => key !== expectedKeys[index])
+    ) return false;
+    for (const key of expectedKeys) pending.push([actual[key], expected[key]]);
+  }
+  return true;
+}
+
+function validateDefinitionBinding(input, trusted) {
+  if (input.packageDefinition === undefined) {
+    if (input.definitionSha256 !== trusted.definitionSha256) {
+      fail(`definitionSha256 does not match the trusted ${CONTRACT} contract`);
+    }
+    return;
+  }
+  if (
+    typeof input.packageDefinition !== 'string' ||
+    Buffer.byteLength(input.packageDefinition, 'utf8') > MAX_PACKAGE_DEFINITION_BYTES
+  ) {
+    fail('packageDefinition must be a JSON string of at most 64 KiB');
+  }
+  let candidate;
+  try {
+    candidate = JSON.parse(input.packageDefinition);
+  } catch {
+    fail('packageDefinition is invalid JSON');
+  }
+  if (
+    !isJsonObject(candidate) ||
+    candidate.schemaVersion !== CONTRACT ||
+    candidate.stateSchemaVersion !== STATE_CONTRACT ||
+    typeof candidate.definitionSha256 !== 'string' ||
+    !HASH_PATTERN.test(candidate.definitionSha256)
+  ) fail('packageDefinition has an unsupported contract or definition hash');
+  if (input.definitionSha256 !== candidate.definitionSha256) {
+    fail('definitionSha256 does not match packageDefinition');
+  }
+  const dependencies = candidate.dependencies;
+  const dependencyIds = Object.keys(PHYSICAL_DEPENDENCY_SCHEMAS).sort();
+  if (
+    !isJsonObject(dependencies) ||
+    Object.keys(dependencies).sort().join('|') !== dependencyIds.join('|')
+  ) fail('packageDefinition must declare the exact physical dependency inventory');
+  for (const id of dependencyIds) {
+    const dependency = dependencies[id];
+    if (
+      !isJsonObject(dependency) ||
+      Object.keys(dependency).sort().join('|') !== 'definitionSha256|schemaVersion' ||
+      dependency.schemaVersion !== PHYSICAL_DEPENDENCY_SCHEMAS[id] ||
+      typeof dependency.definitionSha256 !== 'string' ||
+      !HASH_PATTERN.test(dependency.definitionSha256)
+    ) fail(`packageDefinition has an invalid ${id} dependency`);
+  }
+  // The authenticated app supplies its server-loaded Source definition. Only its
+  // physical dependency bindings may vary; masks, assets, roles and every policy
+  // still come from this server's trusted catalog.
+  const catalogBinding = {
+    ...candidate,
+    definitionSha256: trusted.definitionSha256,
+    dependencies: Object.fromEntries(dependencyIds.map((id) => [id, {
+      ...dependencies[id],
+      definitionSha256: trusted.dependencies[id].definitionSha256
+    }]))
+  };
+  if (!matchesTrustedDefinition(catalogBinding, trusted)) {
+    fail('packageDefinition changes trusted artwork fields beyond physical dependency hashes');
+  }
+  if (candidate.definitionSha256 !== canonicalDefinitionSha256(candidate)) {
+    fail('packageDefinition canonical definition hash does not match its content');
+  }
 }
 
 function validateRoleAlphaPolicies(contract) {
@@ -393,9 +491,7 @@ async function prepareFacialArtworkUpload(input) {
   const roleId = String(input.role || '');
   const role = contract.roles.find((candidate) => candidate.id === roleId);
   if (!role) fail('role is unknown');
-  if (input.definitionSha256 !== contract.definitionSha256) {
-    fail(`definitionSha256 does not match the trusted ${CONTRACT} contract`);
-  }
+  validateDefinitionBinding(input, contract);
   const template = contract.templates.find((candidate) => candidate.id === role.template);
   const variant = resolveTemplateVariant(template, input.orientation);
   if (

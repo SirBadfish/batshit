@@ -8,7 +8,8 @@ import {
   formatParameterDisplayValue,
   matchesCatalogRole,
   parseFormattedNumber,
-  resolveConnectionIconKey
+  resolveConnectionIconKey,
+  formatPrice
 } from './modelSettingsFormatters'
 import type { CatalogConnectionOption, CatalogModel } from '$lib/types/modelCatalog'
 
@@ -114,5 +115,23 @@ describe('modelSettingsFormatters', () => {
     } as CatalogConnectionOption
 
     expect(resolveConnectionIconKey(option)).toBe('batshit-icon')
+  })
+})
+
+describe('formatPrice never shows a real price as $0 (new find in the 2026-09-25 bug batch)', () => {
+  it('shows a price below a tenth of a cent with its own digits', () => {
+    expect(formatPrice(0.0001)).toBe('0.0001')
+    expect(formatPrice(0.00015)).toBe('0.00015')
+    expect(formatPrice(0.0000001)).toBe('0.0000001')
+  })
+
+  it('keeps the usual three decimals, a real $0, and unknown', () => {
+    expect(formatPrice(2.5)).toBe('2.5')
+    expect(formatPrice(0.075)).toBe('0.075')
+    expect(formatPrice(2.9999999999999996)).toBe('3')
+    expect(formatPrice(100)).toBe('100')
+    expect(formatPrice(0)).toBe('0')
+    expect(formatPrice(undefined)).toBeNull()
+    expect(formatPrice(null)).toBeNull()
   })
 })

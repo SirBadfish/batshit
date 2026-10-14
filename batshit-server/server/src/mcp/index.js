@@ -2,14 +2,15 @@
 
 /**
  * Batshit-Server MCP Server - streamlined retained tool set for Lane A transition
- * Currently exposed: fetch_zip + Dynamic MCP + Control Registry.
+ * Currently exposed: Dynamic MCP + Control Registry.
  * Provides MCP tools for Batshit tool orchestration paths.
  */
 
-// Load environment variables from .env file
+// stdout is the MCP stdio channel: nothing but JSON-RPC may reach it. dotenv 17 prints a line there
+// unless it is quiet, here and in every other dotenv call this process makes (src/config.js loads the
+// same file again), so quiet is set for the whole process before anything loads.
+process.env.DOTENV_CONFIG_QUIET = 'true';
 require('dotenv').config({ path: require('path').resolve(__dirname, '../../.env') });
-
-const path = require('path');
 
 const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
@@ -19,16 +20,23 @@ const {
 } = require('@modelcontextprotocol/sdk/types.js');
 const axios = require('axios');
 const logger = require('../utils/logger');
-const { builtInService } = require('../services');
+const { resolveBatshitAppUrl } = require('../utils/batshitAppUrl');
 const { enhancedBuiltInTools } = require('./enhanced-tools');
+const {
+  ONE_REQUEST_ENV,
+  endAfterOneRequest,
+  installStdioLifecycle,
+  oneRequestGraceMs
+} = require('./stdioLifecycle');
 
 // Log to stderr immediately
 console.error('MCP Server: Script started');
 
-// Configure logger for MCP mode (stderr only)
+// Configure logger for MCP mode (stderr only). winston's Console transport writes every level to
+// stdout unless the level is in its stderrLevels (there is no `stderrOnly` option).
 logger.transports.forEach(transport => {
   if (transport.name === 'console') {
-    transport.stderrOnly = true;
+    transport.stderrLevels = Object.fromEntries(Object.keys(logger.levels).map((level) => [level, true]));
   }
 });
 
@@ -48,50 +56,7 @@ class BatshitMcpServer {
       }
     );
 
-    this.batshitServerApiUrl = process.env.BATSHIT_SERVER_URL || 'http://localhost:5600/api/v1';
     this.setupHandlers();
-  }
-
-  resolveProjectPath(projectPath) {
-    if (typeof projectPath === 'string' && projectPath.trim() !== '') {
-      return projectPath;
-    }
-
-    if (typeof process.env.BATSHIT_PROJECT_ROOT === 'string' && process.env.BATSHIT_PROJECT_ROOT.trim() !== '') {
-      return process.env.BATSHIT_PROJECT_ROOT;
-    }
-
-    return path.resolve(__dirname, '../../../../');
-  }
-
-  normalizeToolArgs(toolName, args) {
-    const normalized = { ...(args || {}) };
-
-    if (!normalized.projectPath) {
-      normalized.projectPath = normalized.project_path || normalized.rootPath || normalized.cwd;
-    }
-
-    const assignFirst = (targetKey, ...aliases) => {
-      if (normalized[targetKey]) return;
-      for (const alias of aliases) {
-        if (normalized[alias]) {
-          normalized[targetKey] = normalized[alias];
-          return;
-        }
-      }
-    };
-
-    if (toolName === 'batshit_server_fetch_zip') {
-      assignFirst('zipId', 'zip_id', 'id');
-      assignFirst('maxChars', 'max_chars', 'max', 'limit');
-    }
-
-    return normalized;
-  }
-
-  resolveBuiltInMethodName(toolName) {
-    const cleanName = toolName.replace(/^batshit_server_/, '');
-    return cleanName.replace(/_([a-z])/g, (_, letter) => letter.toUpperCase());
   }
 
   resolveBatshitServiceToken() {
@@ -127,11 +92,15 @@ class BatshitMcpServer {
     const { name, arguments: args } = request.params;
 
     try {
-      // All built-in tool names (with batshit_server_ prefix)
-      const builtInTools = [
-        // Retained non-artifact tools
-        'batshit_server_fetch_zip'
-      ];
+      if (name === 'batshit_server_fetch_zip') {
+        return {
+          isError: true,
+          content: [{
+            type: 'text',
+            text: 'The standalone file-server MCP Fetch Zip tool is retired. API agents use fabric:sys.zip.fetch through Batshit Tool Use; managed CLI agents use the Fetch Zip tool in batshit_helpers.'
+          }]
+        };
+      }
 
       // SA-009: Dynamic MCP Tools (call Batshit API, not local service)
       if (name === 'batshit_server_dynamic_mcp_find') {
@@ -159,10 +128,6 @@ class BatshitMcpServer {
         return await this.handleControlUse(args);
       }
 
-      if (builtInTools.includes(name)) {
-        return await this.handleBuiltInTool(name, args);
-      }
-
       // Everything else is parked/unknown
       throw new Error(`Unknown tool: ${name}`);
     } catch (error) {
@@ -174,41 +139,6 @@ class BatshitMcpServer {
           },
         ],
       };
-    }
-  }
-
-  async handleBuiltInTool(toolName, args) {
-    const normalizedArgs = this.normalizeToolArgs(toolName, args);
-    const { projectPath, ...params } = normalizedArgs;
-    const effectiveProjectPath = this.resolveProjectPath(projectPath);
-
-    try {
-      // Remove batshit_server_ prefix and convert to camelCase service method name
-      const methodName = this.resolveBuiltInMethodName(toolName);
-      
-      if (typeof builtInService[methodName] !== 'function') {
-        throw new Error(`Built-in tool method not found: ${methodName}`);
-      }
-      
-      // Call the built-in service method
-      const result = await builtInService[methodName](effectiveProjectPath, params);
-      
-      // COOL TOOLS FIX: Preserve structured data instead of stringifying!
-      // This allows our frontend to receive the actual data structure
-      // instead of quadruple-escaped JSON strings
-      
-      const responseText = JSON.stringify(result, null, 2);
-      
-      return {
-        content: [
-          {
-            type: 'text',
-            text: responseText
-          },
-        ],
-      };
-    } catch (error) {
-      throw new Error(`Built-in tool error: ${error.message}`);
     }
   }
 
@@ -250,8 +180,8 @@ class BatshitMcpServer {
         throw new Error('query, tool, or group is required for dynamic MCP find');
       }
 
-      // Batshit frontend URL
-      const batshitUrl = process.env.BATSHIT_FRONTEND_URL || 'http://localhost:5620';
+      // BL-562: the app's address, or a clear error; never the Mac app's port by default.
+      const batshitUrl = resolveBatshitAppUrl();
 
       // Service token for auth
       const serviceToken = this.resolveBatshitServiceToken();
@@ -376,8 +306,8 @@ class BatshitMcpServer {
         effectiveParams = { ...effectiveParams, ...extraArgs };
       }
 
-      // Batshit frontend URL
-      const batshitUrl = process.env.BATSHIT_FRONTEND_URL || 'http://localhost:5620';
+      // BL-562: the app's address, or a clear error; never the Mac app's port by default.
+      const batshitUrl = resolveBatshitAppUrl();
 
       // Service token for auth
       const serviceToken = this.resolveBatshitServiceToken();
@@ -486,7 +416,8 @@ class BatshitMcpServer {
         throw new Error('userId is required for control find');
       }
 
-      const batshitUrl = process.env.BATSHIT_FRONTEND_URL || 'http://localhost:5620';
+      // BL-562: the app's address, or a clear error; never the Mac app's port by default.
+      const batshitUrl = resolveBatshitAppUrl();
       const serviceToken = this.resolveBatshitServiceToken();
       if (!serviceToken) {
         throw new Error('BATSHIT_TOKEN not configured - required for Fabric Registry');
@@ -583,7 +514,8 @@ class BatshitMcpServer {
             ? params
             : (Object.keys(extraArgs).length > 0 ? extraArgs : {});
 
-      const batshitUrl = process.env.BATSHIT_FRONTEND_URL || 'http://localhost:5620';
+      // BL-562: the app's address, or a clear error; never the Mac app's port by default.
+      const batshitUrl = resolveBatshitAppUrl();
       const serviceToken = this.resolveBatshitServiceToken();
       if (!serviceToken) {
         throw new Error('BATSHIT_TOKEN not configured - required for Fabric Registry');
@@ -637,6 +569,19 @@ class BatshitMcpServer {
   async run() {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
+    // After connect, never before: stdin is paused until the transport listens (stdioLifecycle.js).
+    // Ends this process when its parent goes, even while an app request is pending (BL-206).
+    const lifecycle = installStdioLifecycle({
+      log: (line) => console.error(line)
+    });
+    // Started by supergateway's stateless mode (the streamable helper's preload says so): one request
+    // per process, and supergateway never ends it, so it ends itself once that request is answered.
+    if (process.env[ONE_REQUEST_ENV] === '1') {
+      endAfterOneRequest(transport, {
+        graceMs: oneRequestGraceMs(),
+        onIdle: () => lifecycle.shutdown('one-request-answered')
+      });
+    }
     logger.info('Batshit-Server MCP Server started');
   }
 }

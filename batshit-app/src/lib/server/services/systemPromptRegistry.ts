@@ -67,7 +67,8 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     description: 'Core instructions for API-backed Batshit primary agents.',
     warning: COMMON_CORE_PROMPT_WARNING,
     defaultFile: 'batshit_primary_agent_api_system_prompt.md',
-    defaultVersion: '2026-09-21'
+    // BL-474 L3: outside pictures need a user click, and agents should use only exact addresses they read.
+    defaultVersion: '2026-09-30'
   },
   {
     id: 'cli_primary',
@@ -76,7 +77,8 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     description: 'Core instructions for CLI-backed Batshit primary agents.',
     warning: COMMON_CORE_PROMPT_WARNING,
     defaultFile: 'batshit_primary_agent_cli_system_prompt.md',
-    defaultVersion: '2026-09-21'
+    // BL-474 L3: outside pictures need a user click, and agents should use only exact addresses they read.
+    defaultVersion: '2026-09-30'
   },
   {
     id: 'subagent_base',
@@ -107,7 +109,8 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     defaultFile: 'batshit_subagent_guidance.md',
     // SA-111 P2 bumped this for the fresh/resume/reset rule; P4 bumps it again so an
     // uncustomized copy picks up the Workers section on boot.
-    defaultVersion: '2026-09-05'
+    // Bumped for SA-128 (DL-04): the roster lives in `<dynamic_info>`, no longer a DYNAMIC INFO header.
+    defaultVersion: '2026-09-22'
   },
   {
     id: 'tool_guidance_zip_enabled',
@@ -121,7 +124,16 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     // `[The user said, mid-reply: ...]` is the user and `[Agent DM — ... not from the
     // user ...]` is not. Bumped again for SA-118 (DL-118-07): the DM bracket was taught
     // with a hyphen and emitted with an em dash, so the taught spelling never matched.
-    defaultVersion: '2026-09-12'
+    // Bumped for SA-128's follow-up sweep: the appended index is `<zip_index>`, no longer an
+    // UNZIP INDEX header, so the two lines that name it now say so.
+    // Bumped for SA-129 P1: dead copies compress at once, the compression hint, and Fetch Zip for exact old results.
+    // Bumped for SA-129 P2: hold and release by file path in the Tool Notes block, and the held lines.
+    // BL-494 P1: explain the live 10k/25k Cool Tool guard and Hold refusal.
+    // BL-442: a tag in a code block does nothing; that is how to show one as an example.
+    // BL-677: on the Codex lane a result is cut at the run's own tool output limit.
+    // BL-360 (SA-129 DL-06): "keep this file open" is a hold; the parked `unzip` is only for a
+    // result that is not a file; the user wins both ways and a refusal is said.
+    defaultVersion: '2026-10-13'
   },
   {
     id: 'tool_guidance_zip_disabled',
@@ -131,8 +143,12 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     warning: COMMON_CORE_PROMPT_WARNING,
     defaultFile: 'batshit_tool_prompt_zip_control_disabled.md',
     // Bumped for SA-114 P4 (DL-114-16) and again for SA-118 (DL-118-07), same sentence
-    // as the enabled variant.
-    defaultVersion: '2026-09-12'
+    // as the enabled variant. Bumped for SA-129 P1, the same dead-copy paragraph as the enabled variant.
+    // Bumped for SA-129 P2: hold and release (the same paragraph as the enabled variant).
+    // BL-494 P1: explain the live 10k/25k Cool Tool guard and Hold refusal.
+    // BL-442: a tag in a code block does nothing (the same sentence as the enabled variant).
+    // BL-677: the same Codex clause as the enabled variant.
+    defaultVersion: '2026-09-27e'
   },
   {
     id: 'tool_guidance_memory',
@@ -142,7 +158,9 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     warning: COMMON_CORE_PROMPT_WARNING,
     defaultFile: 'batshit_tool_prompt_memory.md',
     // Bumped 2026-09-19: the agent owns its whiteboard; a nap fills only an empty board.
-    defaultVersion: '2026-09-19'
+    // Bumped for SA-128 (DL-04): `<dynamic_info>`, `<remembered_media>`, and `<awareness_media>` replace the old headers.
+    // Bumped for BL-442: write the save block as plain text; a tag in a code block does nothing.
+    defaultVersion: '2026-09-27'
   },
   {
     id: 'dm_guidance',
@@ -177,21 +195,25 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     // and never a schema, so a mode the block does not name is a mode no agent will use —
     // and one it names without its fields is a guaranteed first-call failure (the P2, P5
     // and SA-115 lesson, three times).
-    defaultVersion: '2026-09-11'
+    // Bumped for SA-128 (DL-04): the DMs roster lives in `<dynamic_info>`.
+    // Bumped for BL-401: a schedule keeps one unread note that each new fire updates, and
+    // its roster line gained the phrase that says so (`fired 3 times, first …, last …`).
+    defaultVersion: '2026-09-27'
   },
   {
     id: 'jev_juice_guidance',
     redisKey: 'batshit:jev_juice_guidance',
-    label: 'Jev Juice Guidance',
+    label: 'Judge Juice Guidance',
     description:
-      'Injected for agents with the Jev Juice judgment tool turned on: what sys.judge.ask takes (state plus typed noul, choice, and score questions), what comes back, how to ask many narrow questions in one call, and what Jev cannot do.',
+      'Injected for agents with the Judge Juice judgment tool turned on: what sys.judge.ask takes (state plus typed noul, choice, and score questions), what comes back, how to ask many narrow questions in one call, and what the judge cannot do.',
     warning: COMMON_CORE_PROMPT_WARNING,
     defaultFile: 'batshit_jev_juice_guidance.md',
     // SA-120 P2 (H1): first version. Gated on the agent's `jev_juice_judge_tool` switch,
     // the same switch that opens `sys.judge.*` in the broker, so a control the agent
     // cannot call is never taught (the DM block's lesson: name the fields, or the first
-    // call fails on guessed names).
-    defaultVersion: '2026-09-16'
+    // call fails on guessed names). Bumped for SA-120 R1: the family is Judge Juice.
+    // Bumped for SA-120 P10b: the block names "the judge", not Jev, and says a smaller judge takes fewer.
+    defaultVersion: '2026-10-12'
   },
   {
     id: 'dynamic_mcp',
@@ -229,6 +251,15 @@ const RETIRED_SYSTEM_PROMPT_KEYS: Array<{ label: string; keys: string[] }> = [
 
 function promptMetaKey(id: CoreSystemPromptId) {
   return `batshit:system_prompt_meta:${id}`
+}
+
+/**
+ * BL-372: the Redis key of one core prompt's metadata (which default its text was, and
+ * whether the user edited it). Backup carries it beside the prompt text, so a restore into a
+ * newer Batshit can still tell an older default (refreshed) from an edit (kept).
+ */
+export function corePromptMetadataKey(id: CoreSystemPromptId) {
+  return promptMetaKey(id)
 }
 
 function hashPrompt(value: string) {
@@ -345,8 +376,19 @@ function buildSummary(
   }
 }
 
+/**
+ * A stored prompt's text, or `null` only when the key is absent. A read that FAILS throws: the
+ * facade's `redis.get` answers null for any error (BL-230), and here a null means "store the
+ * default", so a failed read would write the default over a user's edit or a restored prompt.
+ * It reads the raw string, so text that starts with `{` is never parsed as JSON.
+ */
+async function readStoredPromptText(key: string): Promise<string | null> {
+  const value = await redis.execute((client) => client.get(key))
+  return value === null || value === undefined ? null : String(value)
+}
+
 async function ensurePromptValue(definition: PromptDefinition, defaultValue: string) {
-  const existing = await redis.get(definition.redisKey)
+  const existing = await readStoredPromptText(definition.redisKey)
   const defaultHash = hashPrompt(defaultValue)
 
   if (existing !== null && existing !== undefined) {
@@ -379,6 +421,17 @@ async function ensurePromptValue(definition: PromptDefinition, defaultValue: str
       })
     }
 
+    // BL-372: no metadata (a restore of a backup made before backups carried it) and the
+    // text IS today's default: record that, so the next update can refresh it. Text that
+    // differs stays without metadata, which reads as customized: it may be the user's edit,
+    // so it is never overwritten on a guess.
+    if (!metadata && currentHash === defaultHash) {
+      await savePromptMetadata(definition.id, {
+        defaultHash,
+        customized: false
+      })
+    }
+
     return value
   }
 
@@ -393,6 +446,21 @@ async function ensurePromptValue(definition: PromptDefinition, defaultValue: str
 
 export function listCoreSystemPromptDefinitions() {
   return [...CORE_SYSTEM_PROMPTS]
+}
+
+/**
+ * BL-230: the packaged default of a core prompt, named by its Redis key. The compiler uses it
+ * when the stored Primary Agent prompt is absent or blank (the boot seed is fire-and-forget,
+ * so a failed seed or a restore without the key leaves nothing stored). It only reads: the
+ * compile writes nothing, and the next boot seed or an Admin visit stores the key. Throws for
+ * a key that is not a core prompt and for a packaged file that cannot be read.
+ */
+export async function readPackagedCoreSystemPromptDefault(redisKey: string): Promise<string> {
+  const definition = CORE_SYSTEM_PROMPTS.find((entry) => entry.redisKey === redisKey)
+  if (!definition) {
+    throw new Error(`Not a core system prompt key: ${redisKey}`)
+  }
+  return readDefaultPrompt(definition)
 }
 
 /**
@@ -453,6 +521,27 @@ export async function listCoreSystemPrompts(): Promise<CoreSystemPromptSummary[]
   }
 
   return summaries
+}
+
+/**
+ * BL-372: run the boot seed's default check right after a backup restore. The restore wrote
+ * prompt text and metadata from another point in time, and agents compile from the stored text
+ * directly, so an uncustomized older default must be refreshed now, not at the next app start.
+ */
+export async function reconcileCoreSystemPromptsAfterRestore(): Promise<void> {
+  // One prompt that cannot be checked (an unreadable packaged default, a failed read) is skipped
+  // with a warning and never written; the others are still checked.
+  for (const definition of CORE_SYSTEM_PROMPTS) {
+    try {
+      const defaultValue = await readDefaultPrompt(definition)
+      await ensurePromptValue(definition, defaultValue)
+    } catch (error) {
+      console.warn(
+        `[SystemPrompts] After the restore, Batshit could not check "${definition.label}" against its default and left it as restored:`,
+        error instanceof Error ? error.message : error
+      )
+    }
+  }
 }
 
 export async function getCoreSystemPrompt(id: string): Promise<CoreSystemPromptDetail> {

@@ -17,12 +17,14 @@ import {
 import {
   listCurrentHairBuiltinAssets,
   migrateHairBuiltinStateToCurrent,
-  parseHairBuiltinCatalog,
   type HairBuiltinCatalogV2,
   type HairBuiltinStateMigration
 } from '$lib/goons/hairBuiltinCatalog'
 import { canonicalRecipeString, sha256Hex } from '$lib/goons/recipe/recipeCanonical'
 import { redis } from '$lib/server/redis'
+import { loadHairBuiltinCatalogMetadata } from './hairBuiltinCatalogMetadata.server'
+import { collectCustomGoonUploadKeys, CUSTOM_GOON_UPLOAD_GUARD_LUA } from './goonCustomAssetOwnership.server'
+import { collectAllGoonUploadReferencesForClient, hasGoonUploadReference, reserveGoonUploadAsset, releaseGoonUploadReservation, deleteReservedGoonUploadAsset, type GoonAssetReservation } from './goonAssetCleanupService'
 
 import {
   getInternalBatshitServerAuthHeaders,
@@ -61,14 +63,20 @@ export type HairAssetDependency = {
   redisKey: string
   assetId: string
   assetRevisionId: string
+  usage?: string
+  previousVersion?: boolean
 }
 
 type RepositoryDependencies = {
   builtinAssets?: readonly HairAssetV1[]
-  deleteOwnedFile?: (ref: HairAssetFileRefV1) => Promise<void>
+  deleteOwnedFile?: (ref: HairAssetFileRefV1, reservation: GoonAssetReservation) => Promise<void>
+  reserveOwnedFile?: (ref: HairAssetFileRefV1) => Promise<GoonAssetReservation>
+  releaseOwnedFile?: (ref: HairAssetFileRefV1, reservation: GoonAssetReservation) => Promise<unknown>
 }
 
 const REGISTER_USER_HAIR_ASSET_REVISION_SCRIPT = `
+${CUSTOM_GOON_UPLOAD_GUARD_LUA}
+if not customGoonUploadsAvailable(ARGV[3]) then return { 'ASSET_UNAVAILABLE' } end
 local function deepEqual(left, right)
   if left == cjson.null or right == cjson.null then
     return left == cjson.null and right == cjson.null
@@ -117,6 +125,8 @@ return { 'INSERTED' }
 `
 
 const COMMIT_IMPORTED_HAIR_ASSET_REVISION_SCRIPT = `
+${CUSTOM_GOON_UPLOAD_GUARD_LUA}
+if not customGoonUploadsAvailable(ARGV[9]) then return { 'ASSET_UNAVAILABLE' } end
 local function deepEqual(left, right)
   if left == cjson.null or right == cjson.null then
     return left == cjson.null and right == cjson.null
@@ -225,9 +235,7 @@ function parseIndexMember(value: string) {
 export async function loadHairBuiltinCatalog(): Promise<HairBuiltinCatalogV2> {
   if (!builtinCatalogPromise) {
     builtinCatalogPromise = (async () => {
-      const path = resolve(process.cwd(), 'static/goon-assets/hair/v2/catalog.json')
-      const raw = JSON.parse(await readFile(path, 'utf8')) as unknown
-      const catalog = await parseHairBuiltinCatalog(raw)
+      const catalog = await loadHairBuiltinCatalogMetadata()
       await Promise.all(
         catalog.assets.flatMap((asset) =>
           collectHairAssetFileRefs(asset).map((ref) => readHairAssetFileBytes(asset, ref))
@@ -395,7 +403,8 @@ async function verifyOwnedFileRefs(client: any, refs: readonly HairAssetFileRefV
       record.uploadType !== USER_HAIR_UPLOAD_TYPE ||
       record.relativePath !== `${USER_HAIR_UPLOAD_TYPE}/${filename}` ||
       record.sha256 !== ref.sha256 ||
-      record.size !== ref.bytes
+      record.size !== ref.bytes ||
+      (record.mimetype !== undefined && record.mimetype !== ref.mimeType)
     ) {
       throw new HairAssetRepositoryError(
         'INVALID_OWNED_FILE',
@@ -551,7 +560,7 @@ export async function putUserHairAssetRevision(
     }
     const result = await client.eval(REGISTER_USER_HAIR_ASSET_REVISION_SCRIPT, {
       keys: [key, indexKey],
-      arguments: [canonicalAsset, member]
+      arguments: [canonicalAsset, member, JSON.stringify(collectCustomGoonUploadKeys(asset))]
     })
     if (!Array.isArray(result) || typeof result[0] !== 'string') {
       throw new HairAssetRepositoryError(
@@ -562,6 +571,9 @@ export async function putUserHairAssetRevision(
       )
     }
     const [status, detail] = result
+    if (status === 'ASSET_UNAVAILABLE') {
+      throw new HairAssetRepositoryError('INVALID_OWNED_FILE', 'Hair Asset files are unavailable or being deleted. Retry after cleanup finishes.', 409)
+    }
     if (status === 'INSERTED') return asset
     if (status === 'IMMUTABLE_CONFLICT') {
       throw new HairAssetRepositoryError(
@@ -654,7 +666,8 @@ export async function commitImportedHairAssetRevision(input: {
         asset.assetId,
         asset.revisionId,
         input.jobId,
-        canonicalRecipeString(refitSource)
+        canonicalRecipeString(refitSource),
+        JSON.stringify(collectCustomGoonUploadKeys([asset, refitSource]))
       ]
     })
     if (!Array.isArray(result) || typeof result[0] !== 'string') {
@@ -666,6 +679,9 @@ export async function commitImportedHairAssetRevision(input: {
       )
     }
     const [status, detail] = result
+    if (status === 'ASSET_UNAVAILABLE') {
+      throw new HairAssetRepositoryError('INVALID_OWNED_FILE', 'Hair Asset files are unavailable or being deleted. Retry after cleanup finishes.', 409)
+    }
     if (status === 'INSERTED') return asset
     if (status === 'EXISTING' && typeof detail === 'string') {
       const existing = await verifyHairAsset(JSON.parse(detail))
@@ -749,140 +765,147 @@ export async function findHairAssetDependenciesForClient(
   const goonIds = ((await client.sMembers(`user:${userId}:goons`)) as string[]).sort((a, b) =>
     a.localeCompare(b)
   )
-  const keys = new Set<string>(goonIds.map((goonId) => `goon:${goonId}`))
+  const keys = new Set<string>([...goonIds.map((goonId) => `goon:${goonId}`),
+    ...await client.keys('goon:*'), `user:${userId}:settings`])
   for (const pattern of [
     `goon_recipe_revision:${userId}:*`,
     `goon_recipe_document:${userId}:*`,
-    `goon_recipe_job:${userId}:*`
+    `goon_recipe_job:${userId}:*`,
+    `hair_import_job:${userId}:*`
   ]) {
     for (const key of (await client.keys(pattern)) as string[]) keys.add(key)
+  }
+  const usageByKey = new Map<string, { usage: string; previousVersion: boolean }>()
+  for (const goonId of goonIds) {
+    const key = `goon:${goonId}`
+    const goon = await client.json.get(key)
+    if (!goon) continue
+    const name = typeof goon.name === 'string' && goon.name.trim() ? goon.name.trim() : 'Unnamed Goon'
+    usageByKey.set(key, { usage: `the saved Goon “${name}”`, previousVersion: false })
+    for (const [field, label] of [
+      ['activeRevision', 'the current version'],
+      ['previousRevision', 'Previous Version (rollback)']
+    ] as const) {
+      const ref = goon.recipe?.[field]?.ref
+      if (typeof ref === 'string') {
+        usageByKey.set(ref, { usage: `${label} of “${name}”`, previousVersion: field === 'previousRevision' })
+      }
+    }
   }
   const dependencies: HairAssetDependency[] = []
   for (const key of [...keys].sort((left, right) => left.localeCompare(right))) {
     const value = await client.json.get(key)
-    if (value) collectStateDependencies(value, key, dependencies)
+    if (value) {
+      collectStateDependencies(value, key, dependencies)
+      if (key.startsWith('hair_import_job:') && value.target?.kind === 'refit' &&
+          value.target.assetId === assetId && value.target.sourceRevisionId === revisionId) {
+        dependencies.push({ redisKey: key, assetId, assetRevisionId: revisionId, usage: 'an unfinished Hair refit' })
+      }
+    }
   }
   return dependencies.filter(
     (dependency) => dependency.assetId === assetId && dependency.assetRevisionId === revisionId
-  )
+  ).map((dependency) => ({ ...dependency, ...usageByKey.get(dependency.redisKey) }))
 }
 
-async function deleteOwnedFile(ref: HairAssetFileRefV1) {
-  const filename = uploadFilename(ref)
-  const response = await fetch(`${getInternalBatshitServerUrl()}/api/upload/asset`, {
-    method: 'DELETE',
-    headers: {
-      ...getInternalBatshitServerAuthHeaders(),
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({ uploadType: USER_HAIR_UPLOAD_TYPE, filename })
-  })
-  if (!response.ok) {
-    const details = await response.text()
-    throw new Error(`batshit-server rejected ${ref.ref}: ${response.status} ${details}`)
-  }
+function hairAssetInUseMessage(dependencies: HairAssetDependency[]): string {
+  const usages = [...new Set(dependencies.map((entry) => entry.usage ?? 'a retained Goon recipe or build'))]
+  const explanation = dependencies.some((entry) => entry.previousVersion)
+    ? 'Keeping that rollback version also keeps its Hair. Choosing No Hair for the current version does not remove it from Previous Version.'
+    : 'Choose and save different Hair on the affected Goon, and check any retained versions or builds.'
+  return `This Hair is still needed by ${usages.join('; ')}. ${explanation} It can be deleted once no saved version or build uses it.`
 }
 
-export async function deleteUserHairAssetRevision(
-  userId: string,
-  assetId: string,
-  revisionId: string,
-  dependencies: RepositoryDependencies = {}
-) {
-  const deleted = await redis.execute(async (client: any) => {
-    const key = userHairAssetRevisionKey(userId, assetId, revisionId)
-    const value = await client.json.get(key)
-    if (!value) {
-      throw new HairAssetRepositoryError(
-        'NOT_FOUND',
-        `Hair Asset ${assetId}@${revisionId} was not found.`,
-        404
-      )
-    }
-    const asset = await verifyHairAsset(value)
-    if (asset.sourceClass !== 'user') {
-      throw new HairAssetRepositoryError(
-        'NOT_FOUND',
-        'Built-in Hair Assets are read-only and cannot be deleted.',
-        404
-      )
-    }
-    const assetDependencies = await findHairAssetDependenciesForClient(
-      client,
-      userId,
-      assetId,
-      revisionId
-    )
-    if (assetDependencies.length > 0) {
-      throw new HairAssetRepositoryError(
-        'ASSET_IN_USE',
-        `Hair Asset ${assetId}@${revisionId} is still referenced and cannot be deleted without an explicit replace or remove decision.`,
-        409,
-        assetDependencies
-      )
-    }
-    const otherAssets = (
-      await listUserAssetsForClient(client, userId, { verifyFiles: false })
-    ).filter((entry) => entry.assetId !== assetId || entry.revisionId !== revisionId)
-    const refitValue = await client.json.get(userHairRefitSourceKey(userId, assetId, revisionId))
-    const refitSource = refitValue
-      ? assertRefitIdentity(parseHairRefitSource(refitValue), assetId, revisionId)
-      : null
-    const otherRefitSources: HairRefitSourceV1[] = []
-    for (const otherAsset of otherAssets) {
-      const value = await client.json.get(
-        userHairRefitSourceKey(userId, otherAsset.assetId, otherAsset.revisionId)
-      )
-      if (!value) continue
-      otherRefitSources.push(
-        assertRefitIdentity(
-          parseHairRefitSource(value),
-          otherAsset.assetId,
-          otherAsset.revisionId
-        )
-      )
-    }
-    const sharedRefs = new Set(
-      [
-        ...otherAssets.flatMap((entry) => collectHairAssetFileRefs(entry)),
-        ...otherRefitSources.map((entry) => entry.source)
-      ].map((ref) => ref.ref)
-    )
-    const deletableRefs = [
-      ...new Map(
-        [
-          ...collectHairAssetFileRefs(asset),
-          ...(refitSource ? [refitSource.source] : [])
-        ].map((ref) => [ref.ref, ref])
-      ).values()
-    ].filter((ref) => !sharedRefs.has(ref.ref))
-    await client.json.del(key)
-    await client.json.del(userHairRefitSourceKey(userId, assetId, revisionId))
-    await client.sRem(userHairAssetIndexKey(userId), indexMember(assetId, revisionId))
-    return { asset, deletableRefs }
-  })
+const RETIRE_USER_HAIR_REVISION_SCRIPT = `
+local current = redis.call('JSON.GET', KEYS[1])
+local source = redis.call('JSON.GET', KEYS[2])
+if current ~= ARGV[1] or (source or '') ~= ARGV[2] then return 'CHANGED' end
+local indexType = redis.call('TYPE', KEYS[3]).ok
+if indexType ~= 'none' and indexType ~= 'set' then return 'INVALID_INDEX' end
+local claims = cjson.decode(ARGV[4])
+for _, claim in ipairs(claims) do
+  local raw = redis.call('GET', claim.key)
+  if not raw then return 'CHANGED_CLAIM' end
+  local marker = cjson.decode(raw)
+  if marker.contract ~= 'goon-asset-deletion/v1' or marker.token ~= claim.token or marker.phase ~= 'reserved' then return 'CHANGED_CLAIM' end
+end
+redis.call('DEL', KEYS[1], KEYS[2])
+redis.call('SREM', KEYS[3], ARGV[3])
+return 'RETIRED'
+`
 
-  const deleteFile = dependencies.deleteOwnedFile ?? deleteOwnedFile
-  const failures: Array<{ ref: string; error: string }> = []
-  for (const ref of deleted.deletableRefs) {
-    try {
-      await deleteFile(ref)
-    } catch (error) {
-      failures.push({
-        ref: ref.ref,
-        error: error instanceof Error ? error.message : String(error)
-      })
+export async function deleteUserHairAssetRevision(userId: string, assetId: string, revisionId: string,
+  dependencies: RepositoryDependencies = {}) {
+  const held: Array<{ ref: HairAssetFileRefV1; reservation: GoonAssetReservation }> = []
+  const reserve = dependencies.reserveOwnedFile ?? ((ref: HairAssetFileRefV1) => reserveGoonUploadAsset('goon_hair_assets', uploadFilename(ref)))
+  const release = dependencies.releaseOwnedFile ?? ((ref: HairAssetFileRefV1, reservation: GoonAssetReservation) =>
+    releaseGoonUploadReservation('goon_hair_assets', uploadFilename(ref), reservation))
+  let retirementDispatched = false
+  try {
+    const deleted = await redis.execute(async (client: any) => {
+      const key = userHairAssetRevisionKey(userId, assetId, revisionId)
+      const sourceKey = userHairRefitSourceKey(userId, assetId, revisionId)
+      const readRaw = async (recordKey: string): Promise<string | null> => typeof client.sendCommand === 'function'
+        ? client.sendCommand(['JSON.GET', recordKey]) : JSON.stringify(await client.json.get(recordKey))
+      const raw = await readRaw(key)
+      if (!raw || raw === 'null') throw new HairAssetRepositoryError('NOT_FOUND', `Hair Asset ${assetId}@${revisionId} was not found.`, 404)
+      const asset = await verifyHairAsset(JSON.parse(raw))
+      if (asset.sourceClass !== 'user') throw new HairAssetRepositoryError('NOT_FOUND', 'Built-in Hair Assets are read-only and cannot be deleted.', 404)
+      const sourceRaw = await readRaw(sourceKey)
+      const source = sourceRaw && sourceRaw !== 'null' ? assertRefitIdentity(parseHairRefitSource(JSON.parse(sourceRaw)), assetId, revisionId) : null
+      const refs = [...new Map([...collectHairAssetFileRefs(asset), ...(source ? [source.source] : [])].map((ref) => [ref.ref, ref])).values()]
+      // Fence EVERY file before the dependency read, including shared files.
+      // New identity selections check the exact revision and these same claims.
+      for (const ref of refs) {
+        const reservation = await reserve(ref)
+        held.push({ ref, reservation })
+        if (reservation.phase !== 'reserved') throw new HairAssetRepositoryError('OWNED_FILE_DELETE_FAILED', 'Hair cleanup is already deleting a file. Finish cleanup before retrying library removal.', 409)
+      }
+      await verifyOwnedFiles(client, asset)
+      if (source) await verifyOwnedFileRefs(client, [source.source])
+      const borrowers = await findHairAssetDependenciesForClient(client, userId, assetId, revisionId)
+      if (borrowers.length) throw new HairAssetRepositoryError('ASSET_IN_USE', hairAssetInUseMessage(borrowers), 409, borrowers)
+      const retained = await collectAllGoonUploadReferencesForClient(client, { excludedRecordKeys: [key, sourceKey],
+        candidateFiles: held.map(({ ref }) => ({ uploadType: 'goon_hair_assets', filename: uploadFilename(ref) })) })
+      retirementDispatched = true
+      if (typeof client.eval === 'function') {
+        const result = await client.eval(RETIRE_USER_HAIR_REVISION_SCRIPT, {
+          keys: [key, sourceKey, userHairAssetIndexKey(userId)],
+          arguments: [raw, sourceRaw === 'null' || !sourceRaw ? '' : sourceRaw, indexMember(assetId, revisionId),
+            JSON.stringify(held.map(({ ref, reservation }) => ({ key: `goon_asset_delete:goon_hair_assets:${uploadFilename(ref)}`, token: reservation.token })))]
+        })
+        if (result !== 'RETIRED') {
+          retirementDispatched = false // Definitive pre-mutation refusal; reserved tokens can be released.
+          throw new HairAssetRepositoryError('OWNED_FILE_DELETE_FAILED', 'Hair library ownership changed. Retry from its current state.', 409, result)
+        }
+      } else {
+        if (process.env.VITEST !== 'true' || process.env.VITEST_USE_REAL_REDIS === 'true') throw new HairAssetRepositoryError('ATOMIC_REGISTRATION_FAILED', 'Redis EVAL is required for safe Hair library removal.', 500)
+        if (await readRaw(key) !== raw || await readRaw(sourceKey) !== sourceRaw) throw new HairAssetRepositoryError('OWNED_FILE_DELETE_FAILED', 'Hair library ownership changed.', 409)
+        await client.json.del(key)
+        await client.json.del(sourceKey)
+        await client.sRem(userHairAssetIndexKey(userId), indexMember(assetId, revisionId))
+      }
+      return { asset, retained }
+    })
+    const failures: Array<{ ref: string; error: string }> = []
+    for (const { ref, reservation } of held) {
+      try {
+        if (hasGoonUploadReference(deleted.retained, 'goon_hair_assets', uploadFilename(ref))) await release(ref, reservation)
+        else if (dependencies.deleteOwnedFile) await dependencies.deleteOwnedFile(ref, reservation)
+        else await deleteReservedGoonUploadAsset('goon_hair_assets', uploadFilename(ref), reservation, undefined, ref)
+      } catch (error) { failures.push({ ref: ref.ref, error: error instanceof Error ? error.message : String(error) }) }
     }
+    if (failures.length) throw new HairAssetRepositoryError('OWNED_FILE_DELETE_FAILED',
+      'Hair library metadata was retired, but file cleanup did not finish. Retry the exact unfinished cleanup in Admin.', 500, failures)
+    return deleted.asset
+  } catch (error) {
+    // Before retirement dispatch no physical IO owns these reservations. After
+    // uncertain CAS/IO, keep tokens so exact Admin recovery remains possible.
+    if (!retirementDispatched) {
+      for (const { ref, reservation } of held) if (reservation.phase === 'reserved') await release(ref, reservation)
+    }
+    throw error
   }
-  if (failures.length > 0) {
-    throw new HairAssetRepositoryError(
-      'OWNED_FILE_DELETE_FAILED',
-      'Hair Asset metadata was deleted, but one or more now-unreferenced owned files could not be removed.',
-      500,
-      failures
-    )
-  }
-  return deleted.asset
 }
 
 export const HAIR_ASSET_REDIS_CONTRACT = {

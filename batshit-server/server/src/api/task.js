@@ -27,7 +27,6 @@ const BUILT_IN_TOOL_ALLOW_LIST = new Set([
   'git_branches',
   'format_code',
   'validate_syntax',
-  'lint_code',
   'execute_command',
   'get_environment_info',
   'check_installation',
@@ -79,6 +78,12 @@ router.post('/s', async (req, res) => {
       return res.status(404).json({
         error: `Tool "${toolName}" not found in built-in service`
       });
+    }
+
+    const { assertMacCustodyPathAllowed } = require('../utils/macCustodyPaths.cjs');
+    assertMacCustodyPathAllowed(projectPath);
+    for (const field of ['filePath', 'dirPath', 'sourcePath', 'targetPath', 'repoPath']) {
+      if (typeof input?.[field] === 'string') assertMacCustodyPathAllowed(path.resolve(projectPath, input[field]));
     }
 
     result = await builtInService[methodName](projectPath, input);

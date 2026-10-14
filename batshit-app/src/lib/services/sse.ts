@@ -12,6 +12,10 @@
  * - `onError` is called when the live connection drops (the hub reconnects and re-adds the chat
  *   by itself; the server replays the chat's live turn, and the page's `SseEventDeduper` drops
  *   what it already had) and when the server refuses the chat.
+ * - `onReconnect` is called for every `open` after the first one (BL-382): the server added this
+ *   listener again, after a dropped connection (`down` then `open`) or after the hub dropped a
+ *   silent tab and took it back (a second `open`). The server replays only a LIVE turn, and a
+ *   finished turn's buffer goes 5 s after its `end`, so the page must read the chat again.
  */
 
 import {
@@ -28,7 +32,11 @@ export class SSEService {
 
   constructor(private sessionId: string) {}
 
-  connect(onMessage: (data: any) => void, onError?: (error: any) => void): Promise<void> {
+  connect(
+    onMessage: (data: any) => void,
+    onError?: (error: any) => void,
+    onReconnect?: () => void
+  ): Promise<void> {
     return new Promise((resolve, reject) => {
       if (this.subscription) {
         this.disconnect()
@@ -58,7 +66,10 @@ export class SSEService {
                 settled = true
                 logger.debug('[SSE] Connection opened')
                 resolve()
+                return
               }
+              logger.debug('[SSE] The server added this chat again; the page reads it again.')
+              onReconnect?.()
               return
             }
             if (status === 'down') {

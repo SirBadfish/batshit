@@ -14,13 +14,17 @@
  * switch and the key are re-checked inside `runTypesafeJudgment` on every call. The
  * control is `safe` and `actsAsAgent: false` — it reads nothing the agent owns; it only
  * checks the agent's switch — so it never touches `decideRiskGate` (DL-120-12).
+ *
+ * SA-120 P10a (DL-120-18): the call goes to the judge chosen for this feature (Settings → Admin → Judge Juice),
+ * TypeSafe's Jev unless the user picked another. An optional `model` must be that judge's own model, and a request
+ * over the judge's limits comes back as `provider_limit` with a fix the agent can act on.
  */
 
 import type { TypesafeCallRecord } from '$lib/types/typesafe'
 import { describeTypesafeReason } from '$lib/utils/jevJuice'
 import { resolveAgentJevJudgeToolEnabled } from '$lib/utils/jevJuiceControl'
+import { judgeModelName, judgeServiceName, resolveJudgeProviderForLane } from '$lib/utils/judgeProviders'
 import { redis } from '$lib/server/redis'
-import { TYPESAFE_PINNED_MODEL_ID_PATTERN } from './typesafe/typesafe.constants'
 import { runTypesafeJudgment } from './typesafe/typesafeAvailability'
 import type { JevQuestion, JevQuestions, TypesafeClient } from './typesafe/typesafeClient'
 import { getTypesafeConfig } from './typesafe/typesafeConfig'
@@ -94,8 +98,8 @@ export async function requireJudgeEnabledAgent(
   }
   if (!resolveAgentJevJudgeToolEnabled(agent)) {
     throw new JudgeAskError(
-      'Jev Juice: Judgment Tool is off for this agent.',
-      'The user can turn it on in Settings → Agents → this agent → Jev Juice: Judgment Tool.'
+      'Judge Juice: Judgment Tool is off for this agent.',
+      'The user can turn it on in Settings → Agents → this agent → Judge Juice: Judgment Tool.'
     )
   }
   return agent
@@ -157,8 +161,12 @@ export function validateJudgeAskInput(input: unknown): { state: unknown; questio
   for (const id of ids) questions[id] = validateJudgeQuestion(id, input.questions[id])
   let model: string | null = null
   if (input.model !== undefined && input.model !== null && input.model !== '') {
-    if (typeof input.model !== 'string' || !TYPESAFE_PINNED_MODEL_ID_PATTERN.test(input.model.trim())) {
-      throw new JudgeAskError('model must be a pinned Jev id such as jev-1.13.0, or omitted for the configured one. jev-latest is not allowed.')
+    // SA-120 P10a: the judge may not be TypeSafe, so any model id is a candidate here; the op then requires it to
+    // equal the configured judge's model. jev-latest is a moving alias and is refused by name (DL-120-08).
+    if (typeof input.model !== 'string' || !input.model.trim() || input.model.trim().length > 200 || input.model.trim() === 'jev-latest') {
+      throw new JudgeAskError(
+        "model must be the configured judge's model id (a pinned Jev id such as jev-1.13.0 for TypeSafe), or omitted for the configured one. jev-latest is not allowed."
+      )
     }
     model = input.model.trim()
   }
@@ -179,11 +187,12 @@ export async function judgeAskOp(context: JudgeAskContext, rawInput: unknown): P
   }
 
   if (model) {
-    const config = await getTypesafeConfig()
-    if (model !== config.modelId) {
+    // The judge this feature asks (SA-120 P10a); a missing one is denied below by the access rule.
+    const { provider } = resolveJudgeProviderForLane(await getTypesafeConfig(), JUDGE_ASK_FEATURE_ID)
+    if (provider && model !== provider.modelId) {
       throw new JudgeAskError(
-        `model ${model} is not the configured Jev model (${config.modelId}).`,
-        'Omit model to use the configured one; the user can change it in Settings → Admin → Jev Juice.'
+        `model ${model} is not the configured ${judgeModelName(provider)} model (${provider.modelId}).`,
+        'Omit model to use the configured one; the user can change it in Settings → Admin → Judge Juice.'
       )
     }
   }
@@ -207,15 +216,20 @@ export async function judgeAskOp(context: JudgeAskContext, rawInput: unknown): P
 
   if (!result.response) {
     const reason = result.record.reason ?? 'unavailable'
+    const judge = result.record.provider ?? null
     throw new JudgeAskError(
-      `${describeTypesafeReason(reason)}${result.record.detail ? ` (${result.record.detail})` : ''}`,
+      `${describeTypesafeReason(reason, judge)}${result.record.detail ? ` (${result.record.detail})` : ''}`,
       reason === 'master_off'
-        ? 'The user can turn Jev Juice on in Settings → Admin → Jev Juice.'
+        ? 'The user can turn Judge Juice on in Settings → Admin → Judge Juice.'
         : reason === 'no_key'
-          ? 'The user can save a TypeSafe key in Settings → API Keys.'
-          : reason === 'deadline' || reason === 'timeout' || reason === 'rate_limited'
-            ? 'Try again with less state or fewer options; do not loop on it.'
-            : undefined
+          ? `The user can save a ${judgeServiceName(judge)} key in Settings → API Keys.`
+          : reason === 'no_provider'
+            ? 'The user can choose a judge for the Judgment Tool in Settings → Admin → Judge Juice.'
+            : reason === 'provider_limit'
+              ? 'Send fewer questions, fewer options, or less state; split independent questions across calls only, never one Choice\'s options. The same request will not fit this judge.'
+              : reason === 'deadline' || reason === 'timeout' || reason === 'rate_limited'
+                ? 'Try again with less state or fewer options; do not loop on it.'
+                : undefined
     )
   }
 

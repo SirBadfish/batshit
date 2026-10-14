@@ -50,7 +50,7 @@ export interface MemoryLingerEntry {
   /** Open episode id at creation ('episode' holds in Infinite Sessions; else absent). */
   episode_id?: string | null
   /**
-   * SA-120 P4b: true when Batshit's judgment model (Jev Juice) brought the memory in, so a
+   * SA-120 P4b: true when Batshit's judgment model (Judge Juice) brought the memory in, so a
    * held line keeps saying `recalled (inferred)`. A later deliberate recall rewrites the
    * entry without it: explicit beats inferred.
    */

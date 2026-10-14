@@ -251,13 +251,6 @@ async function persistFileBackedUpload({
   return storedPayload;
 }
 
-async function deleteFileBackedPayload(payload, uploadRoot = config.uploadsDir) {
-  const filePath = resolveFileBackedPayloadPath(payload, uploadRoot);
-  if (!filePath) return false;
-  await fs.rm(filePath, { force: true });
-  return true;
-}
-
 function normalizeScanBatch(value) {
   if (Array.isArray(value)) return value;
   return value ? [value] : [];
@@ -349,6 +342,8 @@ async function migrateLegacyBase64Uploads({
     scanned: 0,
     migrated: 0,
     skippedEphemeral: 0,
+    retainedNonJson: 0,
+    retainedNonJsonByType: { string: 0, hash: 0, list: 0, set: 0, zset: 0, stream: 0, other: 0 },
     bytesMoved: 0,
     interrupted: false
   };
@@ -358,76 +353,98 @@ async function migrateLegacyBase64Uploads({
     logger.info(`[UploadMigration] Removed ${abandonedTemps.length} abandoned upload temp file(s).`);
   }
 
-  for await (const scanValue of client.scanIterator({ MATCH: 'upload:*', COUNT: 25 })) {
-    for (const redisKey of normalizeScanBatch(scanValue)) {
-      if (shouldStop()) {
-        result.interrupted = true;
-        return result;
-      }
-      result.scanned += 1;
-      const payload = await client.json.get(redisKey);
-      if (!payload || typeof payload !== 'object' || typeof payload.base64 !== 'string') continue;
-
-      const ttlMs = await client.pTTL(redisKey);
-      const ephemeral =
-        payload.ephemeralUpload === true ||
-        (Number.isFinite(payload.ttlSeconds) && payload.ttlSeconds > 0) ||
-        ttlMs >= 0;
-      if (ephemeral) {
-        result.skippedEphemeral += 1;
-        continue;
-      }
-
-      const { uploadType, filename } = uploadIdentityFromRecord(redisKey, payload);
-      const buffer = Buffer.from(payload.base64, 'base64');
-      if (Number.isFinite(payload.size) && payload.size !== buffer.length) {
-        throw new Error(
-          `Legacy upload size mismatch at ${redisKey}: metadata=${payload.size}, decoded=${buffer.length}.`
-        );
-      }
-
-      const filePath = resolveStoredUploadPath(uploadType, filename, uploadRoot);
-      const written = await writeVerifiedFileAtomically(filePath, buffer);
-      const relativePath = path.relative(path.resolve(uploadRoot), filePath).split(path.sep).join('/');
-
-      if (shouldStop()) {
-        if (written.created) await fs.rm(filePath, { force: true });
-        result.interrupted = true;
-        return result;
-      }
-
-      try {
-        await markAofRewritePending({ redisService, uploadRoot });
-        const switched = await client.eval(MIGRATE_UPLOAD_METADATA_SCRIPT, {
-          keys: [redisKey],
-          arguments: [
-            String(payload.base64.length),
-            JSON.stringify('filesystem'),
-            JSON.stringify(relativePath),
-            JSON.stringify(filePath),
-            String(buffer.length),
-            JSON.stringify(written.sha256)
-          ]
-        });
-        if (Number(switched) !== 1) {
-          await verifyExistingFile(filePath, { bytes: buffer.length, sha256: written.sha256 });
+  try {
+    for await (const scanValue of client.scanIterator({ MATCH: 'upload:*', COUNT: 25 })) {
+      for (const redisKey of normalizeScanBatch(scanValue)) {
+        if (shouldStop()) {
+          result.interrupted = true;
+          return result;
+        }
+        result.scanned += 1;
+        const redisType = await client.type(redisKey);
+        if (typeof redisType !== 'string') {
+          throw new Error('Unexpected Redis type reply during legacy upload migration.');
+        }
+        if (redisType === 'none') continue;
+        if (redisType !== 'ReJSON-RL') {
+          const bucket = Object.hasOwn(result.retainedNonJsonByType, redisType) ? redisType : 'other';
+          result.retainedNonJson += 1;
+          result.retainedNonJsonByType[bucket] += 1;
           continue;
         }
-      } catch (error) {
-        if (written.created) await fs.rm(filePath, { force: true }).catch(() => {});
-        throw error;
-      }
+        const payload = await client.json.get(redisKey);
+        if (!payload || typeof payload !== 'object' || typeof payload.base64 !== 'string') continue;
 
-      result.migrated += 1;
-      result.bytesMoved += buffer.length;
-      logger.info(
-        `[UploadMigration] Migrated ${redisKey} to ${relativePath} (${buffer.length} bytes).`
+        const ttlMs = await client.pTTL(redisKey);
+        const ephemeral =
+          payload.ephemeralUpload === true ||
+          (Number.isFinite(payload.ttlSeconds) && payload.ttlSeconds > 0) ||
+          ttlMs >= 0;
+        if (ephemeral) {
+          result.skippedEphemeral += 1;
+          continue;
+        }
+
+        const { uploadType, filename } = uploadIdentityFromRecord(redisKey, payload);
+        const buffer = Buffer.from(payload.base64, 'base64');
+        if (Number.isFinite(payload.size) && payload.size !== buffer.length) {
+          throw new Error(
+            `Legacy upload size mismatch at ${redisKey}: metadata=${payload.size}, decoded=${buffer.length}.`
+          );
+        }
+
+        const filePath = resolveStoredUploadPath(uploadType, filename, uploadRoot);
+        const written = await writeVerifiedFileAtomically(filePath, buffer);
+        const relativePath = path.relative(path.resolve(uploadRoot), filePath).split(path.sep).join('/');
+
+        if (shouldStop()) {
+          if (written.created) await fs.rm(filePath, { force: true });
+          result.interrupted = true;
+          return result;
+        }
+
+        try {
+          await markAofRewritePending({ redisService, uploadRoot });
+          const switched = await client.eval(MIGRATE_UPLOAD_METADATA_SCRIPT, {
+            keys: [redisKey],
+            arguments: [
+              String(payload.base64.length),
+              JSON.stringify('filesystem'),
+              JSON.stringify(relativePath),
+              JSON.stringify(filePath),
+              String(buffer.length),
+              JSON.stringify(written.sha256)
+            ]
+          });
+          if (Number(switched) !== 1) {
+            await verifyExistingFile(filePath, { bytes: buffer.length, sha256: written.sha256 });
+            continue;
+          }
+        } catch (error) {
+          if (written.created) await fs.rm(filePath, { force: true }).catch(() => {});
+          throw error;
+        }
+
+        result.migrated += 1;
+        result.bytesMoved += buffer.length;
+        logger.info(
+          `[UploadMigration] Migrated ${redisKey} to ${relativePath} (${buffer.length} bytes).`
+        );
+      }
+    }
+
+    await completeAofRewriteMarker({ redisService, uploadRoot });
+    return result;
+  } finally {
+    if (result.retainedNonJson > 0) {
+      // The logger's formatter emits the message only. Keep this fixed type/count
+      // summary in it, with no raw values, paths, keys or unknown type names.
+      logger.warn(
+        `[UploadMigration] Retained ${result.retainedNonJson} non-JSON upload record(s) outside migration eligibility; ` +
+          `types=${JSON.stringify(result.retainedNonJsonByType)}. Records were not converted or validated.`
       );
     }
   }
-
-  await completeAofRewriteMarker({ redisService, uploadRoot });
-  return result;
 }
 
 function parseRedisInfo(info) {
@@ -549,7 +566,6 @@ async function ensureAofRewriteAfterMigration({
 module.exports = {
   MIGRATE_UPLOAD_METADATA_SCRIPT,
   buildFileBackedPayload,
-  deleteFileBackedPayload,
   cleanupAbandonedUploadTemps,
   ensureAofRewriteAfterMigration,
   migrateLegacyBase64Uploads,

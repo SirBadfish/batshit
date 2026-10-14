@@ -5,6 +5,7 @@
   import CodeRenderer from './CodeRenderer.svelte'
   import { decorateFileMentionsForMarkdown, parseProjectQuickViewHrefTarget } from '$lib/utils/fileMentions'
   import { escapeHtml } from '$lib/utils/htmlEntities'
+  import { CHAT_MARKDOWN_OPTIONS } from '$lib/utils/markdownCodeRegions'
   import { formatSkillInlineDisplayName } from '$lib/utils/skillInlineNotes'
 
   let { content, renderFileMentions = false } = $props<{
@@ -12,10 +13,9 @@
     renderFileMentions?: boolean
   }>()
 
-  const chatMarkdownParser = new Marked({
-    breaks: true,
-    gfm: true
-  })
+  // The same options the code-region reader parses with (`markdownCodeRegions.ts`), so a tag the
+  // server reads as code is the one this view draws as code (BL-442).
+  const chatMarkdownParser = new Marked({ ...CHAT_MARKDOWN_OPTIONS })
   
   // Parse markdown and extract structure
   type MarkdownSegment = 

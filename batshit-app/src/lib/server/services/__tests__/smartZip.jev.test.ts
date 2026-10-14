@@ -60,10 +60,11 @@ function zip(zipId: string, description: string, overrides: Partial<ZipCompressi
     tokens: 1200,
     operationKind: 'read_file',
     toolName: 'read_file',
-    forceCompress: false,
+    sizeGuard: null,
     rezipped: false,
     rezippedBy: null,
     groupUnshared: false,
+    deadCopy: null,
     messagesFromEnd: 3,
     ...overrides
   }
@@ -122,7 +123,7 @@ describe('selectSmartZipCandidates', () => {
       ['z2', 'zip_bbb'],
       ['z3', 'zip_ccc']
     ])
-    expect(candidates[1]).toMatchObject({ description: 'bash: npm run check - exit 0 - 3 lines', tokens: 40, forceCompress: false, rezippedBy: null })
+    expect(candidates[1]).toMatchObject({ description: 'bash: npm run check - exit 0 - 3 lines', tokens: 40, sizeGuard: null, rezippedBy: null })
   })
 
   it('drops what is not a tool result, has no description, is a fetch-zip peek, repeats, or belongs to another group agent', () => {
@@ -200,9 +201,9 @@ describe('selectSmartZipCandidates', () => {
 
   it('carries the oversized safety flag and clips a pathological description', () => {
     const { candidates } = selectSmartZipCandidates([
-      zip('zip_big', `read_file: ${'x'.repeat(900)}`, { forceCompress: true, tokens: 41_000.4 })
+      zip('zip_big', `read_file: ${'x'.repeat(900)}`, { sizeGuard: 'too_large', tokens: 41_000.4 })
     ])
-    expect(candidates[0].forceCompress).toBe(true)
+    expect(candidates[0].sizeGuard).toBe('too_large')
     expect(candidates[0].tokens).toBe(41_000)
     expect(candidates[0].description.length).toBe(SMART_ZIP_LIMITS.maxDescriptionChars)
   })
@@ -313,7 +314,7 @@ describe('decideSmartZipHints', () => {
 
 describe('decideSmartZipOpens', () => {
   const hint = (zipId: string, probability: number, overrides: Partial<SmartZipCandidate> = {}) => ({
-    candidate: { zipId, key: zipId, description: `read_file: ${zipId}.ts - 10 lines`, tokens: 1000, forceCompress: false, rezippedBy: null, ...overrides },
+    candidate: { zipId, key: zipId, description: `read_file: ${zipId}.ts - 10 lines`, tokens: 1000, sizeGuard: null, rezippedBy: null, ...overrides },
     probability
   })
 
@@ -338,7 +339,7 @@ describe('decideSmartZipOpens', () => {
   })
 
   it('never opens an oversized safety row: an unzip cannot expand it', () => {
-    const { opened, notOpened } = decideSmartZipOpens([hint('big', 0.99, { forceCompress: true, tokens: 41_000 }), hint('small', 0.7)])
+    const { opened, notOpened } = decideSmartZipOpens([hint('big', 0.99, { sizeGuard: 'too_large', tokens: 41_000 }), hint('small', 0.7)])
     expect(opened.map((entry) => entry.candidate.zipId)).toEqual(['small'])
     expect(notOpened.map((entry) => [entry.candidate.zipId, entry.reason])).toEqual([['big', 'oversized']])
   })
@@ -358,7 +359,7 @@ describe('decideSmartZipOpens', () => {
 describe('buildSmartZipDcmLines', () => {
   const request = buildSmartZipRequest('make the cue fire earlier', [
     ...ZIPPED,
-    zip('zip_big', 'read_file: send-routed/+server.ts - 4000 lines', { forceCompress: true, tokens: 41_000 }),
+    zip('zip_big', 'read_file: send-routed/+server.ts - 4000 lines', { sizeGuard: 'too_large', tokens: 41_000 }),
     zip('zip_mine', 'read_file: notes.md - 12 lines', { rezipped: true, rezippedBy: 'agent', tokens: 90 })
   ])!
 

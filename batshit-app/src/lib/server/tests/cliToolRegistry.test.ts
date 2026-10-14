@@ -6,6 +6,7 @@ vi.mock('$lib/server/redis', async () => {
 })
 
 import { redis } from '$lib/server/redis'
+import { getCommandModelCapture } from '$lib/server/services/commandModelCapture'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import {
   createCliTool,
@@ -39,6 +40,21 @@ const REAL_REDIS_LANE = process.env.VITEST_USE_REAL_REDIS === 'true'
 describe.runIf(REAL_REDIS_LANE)('cliToolRegistry', () => {
   beforeEach(async () => {
     await seedAgent()
+  })
+
+  it('refuses a virtual delegated agent without a server-owned physical owner', async () => {
+    const result = await executeCliTool({
+      userId, agentId: 'subagent_cli_runtime', toolId: 'missing_tool', input: {}, actorType: 'agent'
+    })
+    expect(result).toMatchObject({ success: false, blocked: true, code: 'OWNER_UNAVAILABLE' })
+  })
+
+  it('accepts a server-resolved owner from service dispatch', async () => {
+    const result = await executeCliTool({
+      userId, agentId, toolId: 'missing_tool', input: {}, actorType: 'service',
+      processOwner: { userId, kind: 'agent', id: agentId }
+    })
+    expect(result).toMatchObject({ success: false, code: 'NOT_FOUND' })
   })
 
   it('creates and lists sanitized CLI tool records', async () => {
@@ -179,6 +195,84 @@ describe.runIf(REAL_REDIS_LANE)('cliToolRegistry', () => {
     expect(result.results[0].toolId).toBe('local_screenshot')
   })
 
+  // BL-686: the caller's list is a filter on the agent's saved list, never a new list.
+  it("refuses a caller's list naming a tool only another agent has saved; a narrower list still runs", async () => {
+    const echoTool = (toolId: string) => ({
+      toolId,
+      title: toolId,
+      description: 'Echoes input as JSON.',
+      tags: ['json'],
+      origin: 'manual' as const,
+      status: 'active' as const,
+      executable: process.execPath,
+      argsTemplate: [
+        { kind: 'literal' as const, value: '-e' },
+        { kind: 'literal' as const, value: 'process.stdout.write(JSON.stringify({ echo: process.argv[1] }))' },
+        { kind: 'input' as const, field: 'query', required: true }
+      ],
+      inputSchema: {
+        type: 'object' as const,
+        properties: { query: { type: 'string' as const, required: true } },
+        required: ['query']
+      },
+      outputMode: 'json' as const,
+      parseMode: 'json' as const,
+      cwdPolicy: 'none' as const,
+      timeoutMs: 60000,
+      riskLevel: 'safe' as const,
+      allowNetwork: false,
+      allowWrite: false
+    })
+    await createCliTool(userId, echoTool('a_echo'))
+    await createCliTool(userId, echoTool('shared_echo'))
+    await createCliTool(userId, echoTool('b_echo'))
+    await redis.updateAgent(agentId, { defaultTools: ['a_echo', 'shared_echo'] })
+    await redis.createAgent({
+      id: 'cli-tools-agent-b',
+      user_id: userId,
+      displayName: 'Other CLI Tester',
+      agentType: 'batshit',
+      batshitMode: 'direct',
+      defaultTools: ['b_echo']
+    })
+
+    const found = await findCliTools({ userId, agentId, selectedToolIds: ['b_echo'], query: 'echo' })
+    expect(found.results.map((entry) => entry.toolId)).toEqual([])
+
+    const refused = await executeCliTool({
+      userId,
+      agentId,
+      toolId: 'b_echo',
+      selectedToolIds: ['b_echo'],
+      input: { query: 'x' }
+    })
+    expect(refused).toMatchObject({ success: false, code: 'OUT_OF_SCOPE' })
+
+    // A run's bound list is the ceiling the same way.
+    const boundRefused = await executeCliTool({
+      userId,
+      agentId,
+      toolId: 'b_echo',
+      cliToolScope: ['a_echo'],
+      selectedToolIds: ['b_echo'],
+      input: { query: 'x' }
+    })
+    expect(boundRefused).toMatchObject({ success: false, code: 'OUT_OF_SCOPE' })
+
+    const narrowFound = await findCliTools({ userId, agentId, selectedToolIds: ['shared_echo'], query: 'echo' })
+    expect(narrowFound.results.map((entry) => entry.toolId)).toEqual(['shared_echo'])
+
+    const narrowRun = await executeCliTool({
+      userId,
+      agentId,
+      toolId: 'shared_echo',
+      selectedToolIds: ['shared_echo'],
+      input: { query: 'narrow' }
+    })
+    expect(narrowRun.success).toBe(true)
+    if (narrowRun.success) expect(narrowRun.parsedOutput).toEqual({ echo: 'narrow' })
+  })
+
   it('validates and executes JSON CLI tools through the selected agent scope', async () => {
     await createCliTool(userId, {
       toolId: 'json_echo',
@@ -230,10 +324,108 @@ describe.runIf(REAL_REDIS_LANE)('cliToolRegistry', () => {
     })
 
     expect(execution.success).toBe(true)
+    expect(getCommandModelCapture(execution)?.text).toContain('status: exitCode=0')
+    expect(JSON.stringify(execution)).not.toContain('originalTextChars')
     if (execution.success) {
       expect(execution.parsedOutput).toEqual({ echo: 'batshit' })
       expect(execution.exitCode).toBe(0)
     }
+  })
+
+  it('reports a cut JSON result as incomplete rather than a generic parse failure', async () => {
+    await createCliTool(userId, {
+      toolId: 'large_json',
+      title: 'Large JSON',
+      description: 'Emits a JSON result larger than the saved CLI output cap.',
+      tags: ['json'],
+      origin: 'manual',
+      status: 'active',
+      executable: process.execPath,
+      argsTemplate: [
+        { kind: 'literal', value: '-e' },
+        { kind: 'literal', value: "process.stdout.write(JSON.stringify({ text: 'x'.repeat(200000) }))" }
+      ],
+      inputSchema: { type: 'object', properties: {} },
+      outputMode: 'json',
+      parseMode: 'json',
+      cwdPolicy: 'none',
+      timeoutMs: 60_000,
+      riskLevel: 'safe',
+      allowNetwork: false,
+      allowWrite: false,
+      validationInput: {}
+    })
+    await seedAgent(['large_json'])
+
+    const validation = await validateCliTool(userId, 'large_json', { persist: false })
+    expect(validation.success).toBe(false)
+    expect(validation.error).toContain('stdout was cut at 200,000 characters')
+
+    const result = await executeCliTool({ userId, agentId, toolId: 'large_json', input: {} })
+
+    expect(result.success).toBe(false)
+    expect(getCommandModelCapture(result)?.text).toContain('status: exitCode=0')
+    if (!result.success) {
+      expect(result.code).toBe('OUTPUT_PARSE_FAILED')
+      expect(result.error).toContain('stdout was cut at 200,000 characters')
+      expect(result.stdout?.endsWith('[Output cut here by Batshit: the command printed more than 200,000 characters.]')).toBe(true)
+    }
+  })
+
+  it('keeps process failure capture private through the saved CLI result', async () => {
+    await createCliTool(userId, {
+      toolId: 'failed_output',
+      title: 'Failed Output',
+      description: 'Prints output and exits nonzero.',
+      tags: [], origin: 'manual', status: 'active',
+      executable: process.execPath,
+      argsTemplate: [
+        { kind: 'literal', value: '-e' },
+        { kind: 'literal', value: "process.stdout.write('before failure'); process.exit(7)" }
+      ],
+      inputSchema: { type: 'object', properties: {} },
+      outputMode: 'text', parseMode: 'text', cwdPolicy: 'none', timeoutMs: 60_000,
+      riskLevel: 'safe', allowNetwork: false, allowWrite: false
+    })
+    await seedAgent(['failed_output'])
+
+    const result = await executeCliTool({ userId, agentId, toolId: 'failed_output', input: {} })
+    expect(result.success).toBe(false)
+    expect(getCommandModelCapture(result)?.text).toContain('status: exitCode=7')
+    expect(getCommandModelCapture(result)?.text.endsWith('stderr:\n\nstdout:\nbefore failure')).toBe(true)
+    expect(JSON.stringify(result)).not.toContain('status: exitCode=')
+  })
+
+  it('propagates timeout and Stop capture through final saved CLI failures', async () => {
+    await createCliTool(userId, {
+      toolId: 'long_output',
+      title: 'Long Output',
+      description: 'Prints once and waits.',
+      tags: [], origin: 'manual', status: 'active',
+      executable: process.execPath,
+      argsTemplate: [
+        { kind: 'literal', value: '-e' },
+        { kind: 'literal', value: "process.stdout.write('started'); setInterval(() => {}, 1000)" }
+      ],
+      inputSchema: { type: 'object', properties: {} },
+      outputMode: 'text', parseMode: 'text', cwdPolicy: 'none', timeoutMs: 1_000,
+      riskLevel: 'safe', allowNetwork: false, allowWrite: false
+    })
+    await seedAgent(['long_output'])
+
+    const timedOut = await executeCliTool({ userId, agentId, toolId: 'long_output', input: {} })
+    expect(timedOut.success).toBe(false)
+    expect(getCommandModelCapture(timedOut)?.text).toContain('timedOut=true')
+
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 250)
+    const stopped = await executeCliTool(
+      { userId, agentId, toolId: 'long_output', input: {} },
+      { abortSignal: controller.signal }
+    )
+    clearTimeout(timer)
+    expect(stopped.success).toBe(false)
+    expect(getCommandModelCapture(stopped)?.text).toContain('stopped=true')
   })
 
   it('requires explicit approval before executing non-safe CLI tools', async () => {

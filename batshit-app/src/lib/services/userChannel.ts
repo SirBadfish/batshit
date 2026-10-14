@@ -24,11 +24,19 @@
 import * as sessionStore from '$lib/stores/session.svelte'
 import * as chatRunRegistry from '$lib/stores/chatRunRegistry.svelte'
 import { applyDmInboxChanged } from '$lib/stores/dmInbox.svelte'
+import { refreshAgentFieldsFromServer } from '$lib/stores/agents.svelte'
 import { subscribeLive, type LiveSubscription } from '$lib/services/liveHub/liveHubClient'
 import { logger } from '$lib/utils/logger'
 
 export type UserChannelEvent =
   | { type: 'connected'; scope: 'user' }
+  /**
+   * BL-382: THIS TAB's own signal, never the server's (a server event of this type is dropped):
+   * the server added the user channel again after the live connection came back (or after the
+   * hub took back a silent tab). What it said meanwhile is gone (`session_run_status` of a woken
+   * turn that ended, for one), so the chat page catches up the chats it still thinks are busy.
+   */
+  | { type: 'reconnected' }
   | { type: 'session_created'; session: Record<string, any> }
   | { type: 'session_updated'; sessionId: string; patch: Record<string, any> }
   /**
@@ -80,20 +88,34 @@ export type UserChannelEvent =
       }[]
     }
   /**
-   * SA-120 P5 — Batshit itself changed zip state in a session (Jev Juice smart zip opened a
-   * zipped result for a message, or zipped a finished one after a reply; `source: 'inferred'`).
-   * The server wrote Redis; every tab showing that session re-reads zip state so the badge and
-   * the ordinary countdown are right. Handled by the chat page, not by `applyToStores`.
+   * The SERVER changed zip state in a session: Judge Juice smart zip opened or zipped a result
+   * (SA-120 P5, `source: 'inferred'`), an agent's reply held, released, or moved a hold, or ran a
+   * parked zip action (SA-129 P2, `agent`), or a temporary hold counted a message or ended
+   * (`countdown`). The server wrote Redis; every tab showing that session re-reads zip state so
+   * the badge and the countdown are right. Handled by the chat page, not by `applyToStores`.
    */
-  | { type: 'zip_state_changed'; sessionId: string; source: 'inferred'; opened: string[]; rezipped: string[] }
+  | {
+      type: 'zip_state_changed'
+      sessionId: string
+      source: 'inferred' | 'agent' | 'countdown'
+      opened: string[]
+      rezipped: string[]
+    }
   /**
-   * SA-120 P6 — the Jev Juice after-reply check stored something about a finished reply (a
+   * SA-120 P6 — the Judge Juice after-reply check stored something about a finished reply (a
    * flag, a style note, or a note that a lane could not run). It happens once the session
    * stream has already emitted `end`, so the user channel carries it, and every tab showing
    * that session re-reads the chat's after-reply records to draw the chip. Handled by the chat
    * page, not by `applyToStores`.
    */
   | { type: 'jev_juice_post_turn'; sessionId: string; messageId: string }
+  /** Server-owned warning learned after a stopped Codex reply's stream ended. */
+  | { type: 'codex_cleanup_warning'; sessionId: string; messageId: string }
+  /**
+   * BL-474 step 2: the server decided where a reply's outside pictures came from (written before
+   * that reply's `end`). The tab showing the chat re-reads its records. Handled by the chat page.
+   */
+  | { type: 'image_origin_changed'; sessionId: string; messageId: string }
   /**
    * The SERVER changed a chat's stored messages in a way no stream event can show a tab:
    * an approval resume that streams into a message every tab has already marked finished,
@@ -104,6 +126,13 @@ export type UserChannelEvent =
    * times a second, so none of these ever had to be said out loud.
    */
   | { type: 'session_messages_changed'; sessionId: string; reason: string }
+  /**
+   * SA-122 A-1y (LS-067/LS-068): the agent saved its own Settings (App Actions), or sent a save whose
+   * answer was lost. No tab made it, so no tab has it: the shared agent store reads that agent's
+   * family of fields again here (`applyToStores`), and a mounted Agents or Memory panel reads it
+   * again by its own rules. It carries no values: the record is the one source.
+   */
+  | { type: 'agent_settings_changed'; agentId: string; family: 'memory' | 'identity' }
   | (Record<string, any> & { type: string })
 
 type Listener = (event: UserChannelEvent) => void
@@ -188,6 +217,13 @@ function applyToStores(event: UserChannelEvent) {
       applyDmInboxChanged(event as any)
       break
     }
+    case 'agent_settings_changed': {
+      const { agentId, family } = event as any
+      if (typeof agentId === 'string' && agentId && (family === 'memory' || family === 'identity')) {
+        void refreshAgentFieldsFromServer(agentId, family)
+      }
+      break
+    }
     default:
       break
   }
@@ -201,6 +237,7 @@ function handleMessage(text: string) {
     return
   }
   if (!parsed || typeof parsed.type !== 'string') return
+  if (parsed.type === 'reconnected') return
   applyToStores(parsed)
   emit(parsed)
 }
@@ -209,13 +246,18 @@ function open(userId: string) {
   if (typeof window === 'undefined') return
   if (subscription) return
   connectedUserId = userId
+  let opened = false
   subscription = subscribeLive(
     { scope: 'user' },
     {
       onEvent: handleMessage,
       onStatus: (status, code) => {
-        if (status === 'open') logger.debug('[UserChannel] Connected.')
-        else if (status === 'down') logger.debug('[UserChannel] Live connection dropped; reconnecting.')
+        if (status === 'open') {
+          logger.debug('[UserChannel] Connected.')
+          // BL-382: every `open` after the first means the server added the channel again.
+          if (opened) emit({ type: 'reconnected' })
+          opened = true
+        } else if (status === 'down') logger.debug('[UserChannel] Live connection dropped; reconnecting.')
         else logger.warn('[UserChannel] The server refused the user channel:', code)
       }
     }

@@ -6,7 +6,7 @@ import { validateDmSenderFields } from '$lib/utils/dmControl'
 import { validateJevJuiceAgentFields } from '$lib/utils/jevJuiceControl'
 import { getCodexConfigOverrideValidationError } from '$lib/server/services/codexSettings'
 import { getClaudeConfigOverrideValidationError } from '$lib/server/services/claudeSettings'
-import { sanitizeId } from '$lib/utils/idSanitizer' // Story 6.9c
+import { resolveNewAgentId } from '$lib/server/services/agentIdRules' // Story 6.9c, BL-283
 import { normalizeOptionalIconRefInput } from '$lib/server/icons/iconRefInput'
 import { normalizeOptionalAvatarIconFitInput } from '$lib/server/icons/avatarIconFitInput'
 import {
@@ -75,20 +75,32 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     if (dmSenderValidationError) {
       return json({ error: dmSenderValidationError }, { status: 400 })
     }
-    // SA-120 P1: the per-agent Jev Juice switch must be a boolean (absent reads as OFF).
+    // SA-120 P1: the per-agent Judge Juice switch must be a boolean (absent reads as OFF).
     const jevJuiceValidationError = validateJevJuiceAgentFields(body)
     if (jevJuiceValidationError) {
       return json({ error: jevJuiceValidationError }, { status: 400 })
     }
 
-    // Story 6.9c: Use provided ID or generate from displayName
-    const agentId = body.id?.trim() || sanitizeId(body.displayName)
+    // Story 6.9c: Use provided ID or generate from displayName. BL-283/BL-285: an id the
+    // delete, the avatar pictures, or a CLI Subagent's profile folder cannot live with is refused.
+    const requestedId = resolveNewAgentId('agent', body.id, body.displayName)
+    if (!requestedId.ok) {
+      return json({ error: requestedId.error, code: requestedId.code }, { status: 400 })
+    }
+    const agentId = requestedId.id
 
     // Story 6.9c: Check for ID collision
     const exists = await redis.exists(`agent:${agentId}`)
     if (exists) {
       return json({
         error: `Agent slug '${agentId}' is already taken. Choose another slug or delete/rename the original agent.`
+      }, { status: 400 })
+    }
+    // BL-187 (2026-09-25): a skill's or artifact's access list names ids with no kind, so an
+    // agent sharing a Subagent's id would share its access. Refuse the id instead.
+    if (await redis.exists(`subagent:${agentId}`)) {
+      return json({
+        error: `A Subagent already uses the id '${agentId}'. Give this agent another name, so their skill and artifact access stay separate.`
       }, { status: 400 })
     }
 

@@ -55,12 +55,19 @@ vi.mock('$lib/utils/jevJuiceQuickActions', async (importOriginal) => {
 
 import * as actualQuickActionsModule from '$lib/utils/jevJuiceQuickActions'
 import {
+  approvalResumeReplyTurn,
+  buildContinuedReplySteps,
   buildJevJuiceMessageMetadata,
+  buildGroupSpeakerProvider,
+  buildPostTurnCheckAfterReply,
   buildPostTurnCheckTurn,
   buildQuickActionTellProvider,
   buildSemanticRecallTurn,
+  buildSmartZipAfterReply,
   buildSmartZipTurn,
   collectEarlierToolLabels,
+  earlierReplyPartOf,
+  findContextContinuationTurn,
   inlineControlLabels,
   composeJevJuiceHintProviders,
   createJevJuiceTurnCollector,
@@ -69,6 +76,24 @@ import {
 
 const AGENT = { id: 'agent-1', user_id: 'josh', memory_enabled: true, jev_juice_memory_recall: true }
 const RECORD = { feature: 'memory_recall', status: 'ok', latencyMs: 210 } as never
+
+describe('buildGroupSpeakerProvider', () => {
+  it('keeps the visible fallback note without duplicating a call already recorded in its own EV entry', async () => {
+    const collector = createJevJuiceTurnCollector()
+    const note = { feature: 'group_speaker', status: 'error', reason: 'local_error', at: '2026-10-11T05:00:00Z' } as const
+    const provider = buildGroupSpeakerProvider({ lines: [], record: null, note }, collector)
+    expect(await provider({} as never)).toEqual([])
+    expect(collector.records).toEqual([])
+    expect(collector.notes).toEqual([note])
+  })
+
+  it('still records an ordinary speaker judgment once', async () => {
+    const collector = createJevJuiceTurnCollector()
+    const provider = buildGroupSpeakerProvider({ lines: ['group hint'], record: RECORD, note: null }, collector)
+    expect(await provider({} as never)).toEqual(['group hint'])
+    expect(collector.records).toEqual([RECORD])
+  })
+})
 
 function input(overrides: Record<string, unknown> = {}) {
   return {
@@ -420,6 +445,30 @@ describe('replyProseForJudgment', () => {
     )
     expect(replyProseForJudgment('')).toBe('')
   })
+
+  it('keeps an example in code and a tag named in a sentence: they are what the agent said (BL-442)', () => {
+    const raw = [
+      'Here is the syntax:',
+      '```',
+      '<batshit-memory>{"lane":"ltm","content":"example"}</batshit-memory>',
+      '```',
+      'I write a <batshit-memory> block to save, if x < 5.',
+      '<batshit-cue>{"goon_mood":"happy"}</batshit-cue>',
+      'The end <'
+    ].join('\n')
+    expect(replyProseForJudgment(raw)).toBe(
+      [
+        'Here is the syntax:',
+        '```',
+        '<batshit-memory>{"lane":"ltm","content":"example"}</batshit-memory>',
+        '```',
+        'I write a <batshit-memory> block to save, if x < 5.',
+        '',
+        'The end <'
+      ].join('\n')
+    )
+    expect(inlineControlLabels(raw)).toEqual(['goon cue (inline block)'])
+  })
 })
 
 describe('composeJevJuiceHintProviders', () => {
@@ -508,8 +557,8 @@ describe('buildQuickActionTellProvider (SA-120 P9)', () => {
     expect(provider).toBeDefined()
     expect(await provider!(CONTEXT)).toEqual([
       'jev_juice_quick_actions (Batshit acted on what your user said in Voice Mode, judged by a fast judgment model; your user saw a mark for each one):',
-      '- The user said "open the dock" and Batshit opened the Goon Dock for them (a quick action by Jev, not you); that turn never reached you.',
-      '- In this message the user also asked Batshit to act, and Batshit opened Settings (Voice) (a quick action by Jev, not you) before you read it.'
+      "- The user said \"open the dock\" and Batshit opened the Goon Dock for them (a quick action by Batshit's judgment model, not you); that turn never reached you.",
+      "- In this message the user also asked Batshit to act, and Batshit opened Settings (Voice) (a quick action by Batshit's judgment model, not you) before you read it."
     ])
   })
 
@@ -827,5 +876,263 @@ describe('buildPostTurnCheckTurn', () => {
         { role: 'assistant', content: '{{batshit-zip:z3:::read_file: a.ts - 9 lines}} {{batshit-zip:z4}}' }
       ])
     ).toEqual(['read_file: a.ts - 9 lines', 'bash: ls - exit 0'])
+  })
+})
+
+/**
+ * BL-527 — a reply that a LATER run finishes. An API approval resume continues the message the
+ * card was on; a context continuation answers after the run(s) that ran out of room. Neither has
+ * a user message of its own, so before BL-527 neither after-reply step ever judged such a reply.
+ * The run that finishes it now gets the two steps ALONE (no provider before the reply, no replay,
+ * no told mark), built from the request the reply answers, and judges the WHOLE reply: the parts
+ * the earlier runs stored, then its own.
+ */
+describe('a reply that a later run finishes (BL-527)', () => {
+  const REQUEST = 'List the folder, then tell me the biggest file.'
+  const BEFORE = [
+    { id: 'u0', role: 'user', content: 'Hi.' },
+    { id: 'a0', role: 'assistant', agent_id: 'agent-1', content: 'Hello!' }
+  ]
+  /** The words before the card, as the paused run stored them (its memory block already applied and removed). */
+  const PAUSED = {
+    id: 'msg-card',
+    role: 'assistant',
+    content: 'Saving your preference now. I need to list the folder. {{batshit-zip:zip_ls:::bash: ls - 3 lines}}',
+    metadata: {
+      zipReferences: [{ zipId: 'zip_ls', reference: '{{batshit-zip:zip_ls:::bash: ls - 3 lines}}' }],
+      memorySaves: [{ id: 'mem-1', gist: 'likes tabs' }],
+      toolApprovals: { approvals: [{ approvalId: 'a1', status: 'pending' }] }
+    },
+    intermediateSteps: [{ toolName: 'batshit_tool_use', toolArgs: { arguments: { ref: 'fabric:sys.memory.search', input: {} } } }]
+  }
+  const ZIPS: Record<string, Record<string, unknown>> = {
+    zip_ls: {
+      type: 'cool_tool',
+      description: 'bash: ls - 3 lines',
+      metadata: { operationKind: 'bash', zipDescriptionLabel: 'bash', zipDescriptionTarget: 'ls', zipDescriptionStatus: 'exit 0' }
+    },
+    zip_du: {
+      type: 'cool_tool',
+      description: 'bash: du -sh * - 3 lines',
+      metadata: { operationKind: 'bash', zipDescriptionLabel: 'bash', zipDescriptionTarget: 'du -sh *', zipDescriptionStatus: 'exit 0' }
+    }
+  }
+
+  describe('earlierReplyPartOf', () => {
+    it('keeps the stored words, the zips the part made, its tool steps, and what its control blocks did', () => {
+      expect(earlierReplyPartOf(PAUSED)).toEqual({
+        text: PAUSED.content,
+        zipIds: ['zip_ls'],
+        toolSteps: PAUSED.intermediateSteps,
+        // The block itself is gone from the stored words; its save is what tells.
+        inlineControls: ['memory: save (inline block)'],
+        memorySaveAttempted: true
+      })
+    })
+
+    it('reads a memory block that failed, a zip-control block, and a Tool Notes block from the stored record', () => {
+      const part = earlierReplyPartOf({
+        content: 'Done.',
+        metadata: {
+          controlErrors: [{ tag: 'batshit-memory', error: 'Missing "gist".', at: 'x' }],
+          zipControl: { unzip: [], zip: ['zip_ls'], toolResultsSummary: [{ toolName: 'bash', summary: 'listed' }] }
+        }
+      })
+      expect(part.memorySaveAttempted).toBe(true)
+      expect(part.inlineControls).toEqual([
+        'memory: save (inline block)',
+        'zip control: zip or unzip tool results (inline block)',
+        'tool notes (inline block)'
+      ])
+      // An empty zipControl, or an error from another block, is no fact.
+      expect(
+        earlierReplyPartOf({ content: 'x', metadata: { zipControl: { unzip: [], zip: [], toolResultsSummary: [] }, controlErrors: [{ tag: 'batshit-tool-notes' }] } })
+      ).toMatchObject({ inlineControls: [], memorySaveAttempted: false })
+    })
+
+    it('a failed part that kept only its error line adds no words; one that kept its work keeps them', () => {
+      const errorOnly = earlierReplyPartOf({
+        content: 'The model ran out of context room.',
+        metadata: { response_failed: true, error_message: 'The model ran out of context room.' }
+      })
+      expect(errorOnly.text).toBe('')
+      const partial = earlierReplyPartOf({
+        content: 'Listing the folder first.',
+        metadata: { response_failed: true, failure_kind: 'context_exhausted', error_message: 'The model ran out of context room.' }
+      })
+      expect(partial.text).toBe('Listing the folder first.')
+    })
+  })
+
+  describe('finding the request a reply answers', () => {
+    it('an API approval resume answers the paused turn\'s user message, with the paused message as its earlier part', () => {
+      const continued = approvalResumeReplyTurn({ currentText: `  ${REQUEST} `, history: BEFORE }, PAUSED)
+      expect(continued).toEqual({ request: REQUEST, history: BEFORE, earlierParts: [earlierReplyPartOf(PAUSED)] })
+      expect(approvalResumeReplyTurn({ currentText: '  ', history: BEFORE }, PAUSED)).toBeNull()
+    })
+
+    it('a context continuation answers the user message before every failed part it continues, oldest part first', () => {
+      const first = { id: 'a1', role: 'assistant', content: 'Listing.', metadata: { response_failed: true, failure_kind: 'context_exhausted' } }
+      const second = { id: 'a2', role: 'assistant', content: 'Still listing.', metadata: { response_failed: true, failure_kind: 'context_exhausted' } }
+      const messages = [...BEFORE, { id: 'u1', role: 'user', content: [{ type: 'text', text: REQUEST }] }, first, second]
+      const continued = findContextContinuationTurn(messages, 'a2')
+      expect(continued?.request).toBe(REQUEST)
+      expect(continued?.history).toEqual(BEFORE)
+      expect(continued?.earlierParts.map((part) => part.text)).toEqual(['Listing.', 'Still listing.'])
+      // A message held after the part (words typed while it ran) is not part of the reply.
+      expect(findContextContinuationTurn([...messages, { id: 'held', role: 'user', content: 'Later.' }], 'a2')?.request).toBe(REQUEST)
+    })
+
+    it('finds nothing when the history does not hold that shape', () => {
+      const failed = { id: 'a1', role: 'assistant', content: 'Listing.', metadata: { response_failed: true } }
+      expect(findContextContinuationTurn([...BEFORE, { id: 'u1', role: 'user', content: REQUEST }, failed], 'missing')).toBeNull()
+      expect(findContextContinuationTurn([...BEFORE, { id: 'u1', role: 'user', content: REQUEST }, failed], '  ')).toBeNull()
+      // The part it names did not fail: it is a finished reply, not a part.
+      expect(findContextContinuationTurn([...BEFORE, { id: 'u1', role: 'user', content: REQUEST }, { ...failed, metadata: {} }], 'a1')).toBeNull()
+      // No user message before the parts, or one with no words.
+      expect(findContextContinuationTurn([failed], 'a1')).toBeNull()
+      expect(findContextContinuationTurn([{ id: 'u1', role: 'user', content: '  ' }, failed], 'a1')).toBeNull()
+    })
+  })
+
+  describe('the steps it gets (buildContinuedReplySteps)', () => {
+    const steps = (overrides: Record<string, unknown> = {}) =>
+      buildContinuedReplySteps({
+        userId: 'josh',
+        sessionId: 'session-1',
+        agent: { id: 'agent-1', jev_juice_reply_check: true },
+        globalZipSettings: { jev_juice_smart_zip: true },
+        isGroupTurn: false,
+        continued: { request: REQUEST, history: BEFORE, earlierParts: [earlierReplyPartOf(PAUSED)] },
+        ...overrides
+      } as never)
+
+    it('gets the two after-reply steps alone: nothing that runs before a reply or at the accepted-send boundary', () => {
+      const built = steps()!
+      expect(Object.keys(built.smartZip!)).toEqual(['runPostTurn'])
+      expect(Object.keys(built.postTurnCheck!)).toEqual(['runPostTurn'])
+      expect(built.earlierParts).toEqual([earlierReplyPartOf(PAUSED)])
+    })
+
+    it('builds each step only behind its own switch, never for a group turn, and nothing when no step is on', () => {
+      expect(steps({ globalZipSettings: {} })).toMatchObject({ smartZip: undefined })
+      expect(steps({ agent: { id: 'agent-1' } })).toMatchObject({ postTurnCheck: undefined })
+      expect(steps({ agent: { id: 'agent-1' }, globalZipSettings: {} })).toBeNull()
+      expect(steps({ isGroupTurn: true })).toBeNull()
+      expect(buildSmartZipAfterReply({ userId: 'josh', sessionId: 'session-1', agent: { id: 'agent-1' }, globalZipSettings: { jev_juice_smart_zip: true }, message: ' ', isGroupTurn: false })).toBeUndefined()
+      expect(buildPostTurnCheckAfterReply({ userId: 'josh', sessionId: '', agent: { id: 'agent-1', jev_juice_reply_check: true }, message: REQUEST, isGroupTurn: false, history: [] })).toBeUndefined()
+    })
+
+    it('says so in the log when a step is on and the history holds no request, and stays quiet when none is on', () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      try {
+        expect(steps({ continued: null })).toBeNull()
+        expect(warn).toHaveBeenCalledTimes(1)
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining('the after-reply steps do not run'), { sessionId: 'session-1' })
+        warn.mockClear()
+        expect(steps({ continued: null, agent: { id: 'agent-1' }, globalZipSettings: {} })).toBeNull()
+        expect(steps({ continued: null, isGroupTurn: true })).toBeNull()
+        expect(warn).not.toHaveBeenCalled()
+      } finally {
+        warn.mockRestore()
+      }
+    })
+  })
+
+  describe('the steps judge the WHOLE reply', () => {
+    const RESUMED = 'The biggest file is a.log. {{batshit-zip:zip_du:::bash: du -sh * - 3 lines}}'
+    const deps = () => ({
+      loadZip: vi.fn(async (zipId: string) => ZIPS[zipId] ?? null),
+      loadRecord: vi.fn(async () => null),
+      writeRecord: vi.fn(async () => true),
+      writeRezips: vi.fn(async () => []),
+      appendRecords: vi.fn(async () => true),
+      publish: vi.fn(async () => undefined)
+    })
+
+    beforeEach(() => {
+      computeSmartZipRezips.mockReset()
+      computeSmartZipRezips.mockResolvedValue({ rezips: [], record: { feature: 'smart_zip', status: 'ok' }, decision: null })
+      computeReplyCheck.mockReset()
+      computeStyleCoach.mockReset()
+      computeReplyCheck.mockResolvedValue({ findings: [], record: { feature: 'reply_check', status: 'ok' }, note: null })
+      computeStyleCoach.mockResolvedValue({ findings: [], record: null, note: null })
+    })
+
+    it('smart zip: the request the reply answers, both parts\' words, and the results both parts made', async () => {
+      const d = deps()
+      const step = buildSmartZipAfterReply({
+        userId: 'josh',
+        sessionId: 'session-1',
+        agent: { id: 'agent-1' },
+        globalZipSettings: { jev_juice_smart_zip: true },
+        message: REQUEST,
+        isGroupTurn: false,
+        postTurnDeps: d as never
+      })!
+      await step.runPostTurn({ messageId: 'msg-card', reply: RESUMED, newZipIds: ['zip_du'], earlierParts: [earlierReplyPartOf(PAUSED)] })
+      const asked = computeSmartZipRezips.mock.calls[0][0]
+      expect(asked.userRequest).toBe(REQUEST)
+      expect(asked.reply).toBe(
+        'Saving your preference now. I need to list the folder. [tool result: bash: ls - 3 lines]\n\nThe biggest file is a.log. [tool result: bash: du -sh * - 3 lines]'
+      )
+      expect(asked.newResults.map((result: { zipId: string }) => result.zipId)).toEqual(['zip_ls', 'zip_du'])
+      // This run's compile handed the compiler no observer: nothing from history is offered.
+      expect(asked.exposed).toEqual([])
+      expect(d.appendRecords).toHaveBeenCalledWith('session-1', 'msg-card', [{ feature: 'smart_zip', status: 'ok' }])
+    })
+
+    it('joins the parts the way the saved message does: a run that writes the earlier words again is not given them twice', async () => {
+      const step = buildSmartZipAfterReply({
+        userId: 'josh',
+        sessionId: 'session-1',
+        agent: { id: 'agent-1' },
+        globalZipSettings: { jev_juice_smart_zip: true },
+        message: REQUEST,
+        isGroupTurn: false,
+        postTurnDeps: deps() as never
+      })!
+      const earlier = earlierReplyPartOf({ content: 'I need to list the folder.' })
+      await step.runPostTurn({ messageId: 'm', reply: 'I need to list the folder. Done: 3 files.', newZipIds: [], earlierParts: [earlier] })
+      await step.runPostTurn({ messageId: 'm', reply: '', newZipIds: [], earlierParts: [earlier] })
+      await step.runPostTurn({ messageId: 'm', reply: 'Done.', newZipIds: [], earlierParts: [earlierReplyPartOf({ content: '' }), earlier] })
+      expect(computeSmartZipRezips.mock.calls.map((call) => call[0].reply)).toEqual([
+        'I need to list the folder. Done: 3 files.',
+        'I need to list the folder.',
+        'I need to list the folder.\n\nDone.'
+      ])
+    })
+
+    it('Check Replies: both parts\' words and tool facts, the earlier part\'s memory save as a fact, the chat before the request', async () => {
+      const d = deps()
+      const step = buildPostTurnCheckAfterReply({
+        userId: 'josh',
+        sessionId: 'session-1',
+        agent: { id: 'agent-1', memory_enabled: true, jev_juice_reply_check: true },
+        message: REQUEST,
+        isGroupTurn: false,
+        history: BEFORE,
+        deps: d as never
+      })!
+      await step.runPostTurn({
+        messageId: 'msg-card',
+        reply: RESUMED,
+        newZipIds: ['zip_du'],
+        toolSteps: [],
+        awaitingApproval: false,
+        earlierParts: [earlierReplyPartOf(PAUSED)]
+      })
+      const facts = computeReplyCheck.mock.calls[0][0]
+      expect(facts.userRequest).toBe(REQUEST)
+      expect(facts.reply).toBe(
+        'Saving your preference now. I need to list the folder. [tool result: bash: ls - 3 lines]\n\nThe biggest file is a.log. [tool result: bash: du -sh * - 3 lines]'
+      )
+      expect(facts.tools.map((tool: { target: string }) => tool.target)).toEqual(['ls', 'du -sh *'])
+      // "Saving your preference now" is accounted for: the paused part saved a memory.
+      expect(facts.memorySaveAttempted).toBe(true)
+      expect(facts.extraToolLabels).toEqual(['memory: search', 'memory: save (inline block)'])
+      expect(facts.earlierToolLabels).toEqual([])
+      expect(d.appendRecords).toHaveBeenCalledWith('session-1', 'msg-card', [{ feature: 'reply_check', status: 'ok' }])
+    })
   })
 })

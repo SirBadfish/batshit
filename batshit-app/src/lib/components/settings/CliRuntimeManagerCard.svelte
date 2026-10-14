@@ -27,6 +27,10 @@
       source: 'env' | 'managed' | 'path' | 'well-known' | 'not-found'
       managedVersion?: string
       found: boolean
+      /** BL-268: what the found CLI reports as its version. */
+      version?: string | null
+      /** BL-268: the found CLI is older than the version Batshit installs. */
+      olderThanPinned?: boolean
     }
   }
 
@@ -238,6 +242,18 @@
         <span class="batshit-settings-caption">Optional — your own install keeps working.</span>
       {/if}
     </div>
+    {#if summary.resolution.olderThanPinned}
+      <!-- BL-268: an older CLI refuses newer models on the list ("requires a newer version"). -->
+      <p class="batshit-settings-form-meta is-warning" data-testid="cli-runtime-older-than-pinned">
+        {#if summary.resolution.source === 'managed'}
+          Batshit's copy is version {summary.resolution.version}, older than {summary.managed.pinnedVersion}.
+          Reinstall it to use every model on the list.
+        {:else}
+          This {displayName} is version {summary.resolution.version}, older than {summary.managed.pinnedVersion},
+          the version Batshit installs. It may refuse newer models on the list. Install Batshit's copy to use them.
+        {/if}
+      </p>
+    {/if}
     {#if summary.managed.installed && summary.resolution.source !== 'managed'}
       <p class="batshit-settings-form-meta is-warning">
         A Batshit-managed install exists, but an explicit environment override is being used instead.

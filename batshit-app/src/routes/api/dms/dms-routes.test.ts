@@ -1,7 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { redis } from '$lib/server/redis'
-import { __resetDmLocksForTests, createDm, getDm, listInbox } from '$lib/server/services/dm/dmStore'
+import {
+  __resetDmLocksForTests,
+  createDm,
+  fileScheduleDm,
+  getDm,
+  listInbox
+} from '$lib/server/services/dm/dmStore'
 import { __resetWakeRunRegistryForTests } from '$lib/server/services/wakeRunRegistry'
 import type { DmRecord } from '$lib/types/dm'
 
@@ -118,6 +124,33 @@ describe('GET /api/dms', () => {
     expect(payload.agents[0]).toHaveProperty('state')
   })
 
+  it('BL-401: a schedule note that fired twice carries its fires on its row', async () => {
+    const note = () =>
+      fileScheduleDm({
+        userId: USER,
+        from: { kind: 'schedule', scheduleId: 'sch_rows', name: 'Queue check' },
+        to: COOPER,
+        kind: 'info',
+        subject: 'Queue check',
+        body: 'Check the queue.',
+        deliver: 'wait'
+      })
+    const first = await note()
+    await note()
+
+    const payload = await (await list(USER)).json()
+    expect(payload.dms).toHaveLength(1)
+    expect(payload.dms[0]).toMatchObject({ id: first.record.id, fireCount: 2 })
+    expect(payload.dms[0].firstFiredAt).toBe(first.record.createdAt)
+    expect(typeof payload.dms[0].lastFiredAt).toBe('string')
+
+    // Any other DM says nothing about fires.
+    await seedAssignment()
+    const again = await (await list(USER)).json()
+    const other = again.dms.find((row: any) => row.id !== first.record.id)
+    expect(other).toMatchObject({ fireCount: null, firstFiredAt: null, lastFiredAt: null })
+  })
+
   it('shows only this user\'s DMs', async () => {
     await seedAssignment()
     await createDm({
@@ -151,7 +184,7 @@ describe('GET /api/dms', () => {
   })
 })
 
-describe('the Jev Juice incoming-text screen on a row (SA-120 P7)', () => {
+describe('the Judge Juice incoming-text screen on a row (SA-120 P7)', () => {
   const SCREEN = {
     version: 1,
     source: 'agent_dm',

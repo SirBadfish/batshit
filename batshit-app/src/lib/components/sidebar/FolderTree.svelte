@@ -10,6 +10,10 @@
   import { isFixedSession } from '$lib/utils/fixedSession'
   import { toast } from 'svelte-sonner'
   import { confirmDialog } from '$lib/stores/confirmDialog'
+  import {
+    describeFolderDeleteLocked,
+    describeFolderDeleteWithChats
+  } from '$lib/utils/folderDeleteDialog'
 
   interface Props {
     sessions: ChatSessionRow[]
@@ -108,15 +112,26 @@
       return
     }
 
-    const sessionCount = sessions.filter(
-      (session) => session.folder_id === folder.id && !session.archived
-    ).length
+    // BL-388: count what the delete sweeps, archived chats included, from the server's list.
+    // The page's `sessions` cannot say: archived chats stay in the folder and are deleted too.
+    const folderChats = await foldersStore.loadFolderChatsForDelete(folder.id)
+    if (!folderChats.success) {
+      toast.error(
+        `Could not read the chats in "${folder.name}", so nothing was deleted. ${folderChats.error}`
+      )
+      return
+    }
+    // The server refuses the delete while a chat is locked, so the dialog names them and
+    // offers no delete.
+    const locked = describeFolderDeleteLocked(folder.name, folderChats.chats)
+    if (locked) {
+      await confirmDialog({ ...locked, confirmLabel: 'OK' })
+      return
+    }
+    const { title, description } = describeFolderDeleteWithChats(folder.name, folderChats.chats)
     const confirmed = await confirmDialog({
-      title: `Delete "${folder.name}" and ${sessionCount} chat${sessionCount === 1 ? '' : 's'}?`,
-      description:
-        sessionCount > 0
-          ? 'This permanently deletes every chat session in this folder. Locked sessions must be unlocked first. This action cannot be undone.'
-          : 'This folder has no active chat sessions. The folder will be permanently deleted.',
+      title,
+      description,
       confirmLabel: 'Delete Folder + Sessions',
       tone: 'destructive'
     })
@@ -125,7 +140,8 @@
     }
 
     const result = await foldersStore.deleteFolder(folder.id, {
-      deleteSessions: true
+      deleteSessions: true,
+      expectedChatIds: folderChats.chats.map((chat) => chat.id)
     })
     if (result.success) {
       if (sessionService) {
@@ -138,6 +154,12 @@
       )
     } else {
       toast.error(result.error || 'Failed to delete folder and sessions')
+      // A refused or stopped delete may have deleted some chats first (BL-388): show what is
+      // really left.
+      await foldersStore.loadFolders()
+      if (sessionService) {
+        await sessionService.loadSessions(folder.user_id, false)
+      }
     }
   }
   

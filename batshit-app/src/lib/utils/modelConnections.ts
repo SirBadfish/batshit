@@ -5,11 +5,13 @@ import type {
 } from '$lib/types/modelCatalog'
 import type { SavedModel, ModelConnectionInfo } from '$lib/types/savedModels'
 import { LOCAL_AI_SERVER_IDS } from '$lib/data/localAiServers'
+import { isChatgptPlanConnection } from './chatgptPlanConnection'
 
 export function resolveConnectionServiceFromId(
   connectionId?: string | null
 ): string | undefined {
   if (!connectionId) return undefined
+  if (isChatgptPlanConnection(connectionId)) return 'chatgpt-plan'
   if (connectionId === 'vercel-gateway') return 'vercel'
   if (connectionId === 'openrouter') return 'openrouter'
   if (connectionId.startsWith('direct:')) {
@@ -33,6 +35,7 @@ const DIRECT_MULTI_DEVELOPER_SERVICES = new Set([
   'kimi_code',
   'minimax_token_plan',
   'mimo_token_plan',
+  'chatgpt-plan',
   ...LOCAL_AI_SERVER_IDS
 ])
 

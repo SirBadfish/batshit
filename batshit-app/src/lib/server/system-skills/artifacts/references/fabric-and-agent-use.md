@@ -1,225 +1,67 @@
-# Making Your Artifact Agent-Friendly
+# Agent Use and Fabric
 
-Your artifact is built — nice work! Now let's set it up so your AI agents can discover and use it as a tool. This is the step that makes Batshit artifacts genuinely special: they're not just widgets you click, they're tools your agents can find and operate on their own.
+**Load when:** the user wants agents to use (or stop using) an artifact, you need to limit which agents can, or an agent run of an artifact fails. The field contract itself (`fabricId` plus `metadata.fabric_fields`) is already in SKILL.md and `builder-kit-api.md`.
 
-**If you're building a Gradio or HuggingFace Space embed**, skip this doc entirely. These embeds are user-only, must save with `agent_use_enabled: false`, and do not appear in Agent settings. The embed reference doc explains this.
+## Which artifacts agents can run
 
-**Important:** for all normal Batshit artifacts, this Fabric setup is not optional anymore when structure enforcement is on. Saves are blocked unless the artifact declares `metadata.fabric_fields` or `metadata.run_only=true`.
+Agents run an artifact through its `artifact:use.artifact.{slug}` ref. Batshit offers that ref only when all of these hold:
 
-Run `sys.artifact.validate_structure` before every save while you are doing this work. It gives you the same Builder Kit + Fabric verdict Batshit will enforce later, but earlier in the loop.
+1. It has a Batshit runtime: **Built-in AI**, **n8n Workflow**, **Custom Webhook**, or **Pinokio App** (`runtime-pinokio.md`). Static / No AI tools, ComfyUI panel artifacts, and Gradio / HuggingFace embeds are user-only: they work in their panel, and no ref is offered.
+2. It is **published**.
+3. It declares its fields (`metadata.fabric_fields`, matched by `fabricId`s in the page) or `metadata.run_only: true`.
+4. Agent use is on for that agent (below).
 
----
+If the user asks you to run a user-only artifact, say you cannot run it as an agent and why. Never change its power source or `brain_type` to force it. If they need an agent-runnable version, build a Built-in AI or webhook artifact, or a Pinokio App artifact when the app is installed in Pinokio.
 
-## Step 1: Ask the User About Agent Access
+## Who can use it
 
-Before configuring anything, ask the user:
+A new artifact is **on for all agents** by default (`agent_use_enabled` true, `agent_access_scope: "all"`), so there is nothing to set. State the initial access in your build summary. Creation settings do not give you authority to change access on an existing artifact.
 
-> "Should your AI agents be able to use this artifact as a tool? That means your agents could discover it and use it on their own — for example, if you asked an agent to generate an image, it could find this artifact and run it automatically without you having to open it yourself. You can always change this later, so there's no pressure either way."
+Only the user changes existing access. Direct them to Settings → Artifacts for **Agent Use** and **Enable For All Agents**, or Settings → Agents → Access for the per-agent checklist. A `"selected"` scope with an empty allowlist means no agent can use it.
 
-If the user doesn't understand, explain it more simply: "Right now only you can use this artifact by clicking on it. If we turn on agent access, your AI assistants can also use it when they need to — like having a tool in their toolbox."
+Never send `agent_use_enabled`, `agent_access_scope`, or `agent_allowlist` to `sys.artifact.update`, even when the user asks in chat. Batshit refuses the whole update with `ARTIFACT_ACCESS_USER_ONLY`; no accompanying content edit is saved. Explain the setting the user needs to change and continue any independent content work without those fields.
 
-**Whether the user says yes or no**, you'll still set up the technical pieces (fabricId on form fields, fabric_fields in metadata). This way the artifact is ready for agent access the moment they decide to turn it on — no rebuild needed.
+Build every runnable artifact with its fields declared even when agent use is off, so switching it on later needs no rebuild.
 
----
+## The field contract
 
-## Step 2: Add fabricId to Your Form Fields
-
-Every form field that an agent should be able to fill in needs a `fabricId`. This is the name agents use to set that field's value when they call the artifact programmatically.
-
-```javascript
-window.batshit.builder.form.text({
-  label: 'Search Query',           // What the user sees
-  placeholder: 'What to search...',
-  fabricId: 'search-query',        // What agents use to fill this field
-  onChange: (val) => { query = val; }
-})
-
-window.batshit.builder.form.select({
-  label: 'Output Format',
-  options: ['Summary', 'Table', 'Raw JSON'],
-  value: 'Summary',
-  fabricId: 'output-format',
-  onChange: (val) => { format = val; }
-})
-```
-
-After creating a Builder Kit field, mount it with `window.batshit.builder.mount(container, field)`. When you need the underlying DOM control, use `field.input`.
-
-**Naming rules:**
-- Use clear, descriptive names: `positive-prompt`, `output-format`, `temperature` — not `field1`, `input2`
-- Each fabricId must be unique within the artifact
-- File inputs (`uploadButton`, `dropFile`) do not support fabricId (browser security limitation)
-- For image-generation artifacts, use semantic text fields for agent-provided source/reference images. Supported naming patterns include `source-image-1-url`, `source-image-2-url`, `source-image-3-url`, `reference-image-url`, and `input-image-url`. When the artifact's configured model is image-capable, Batshit sends those values as structured image inputs instead of prompt text. Common controls such as `image-count`, `aspect-ratio`, and xAI `resolution` are also mapped to runtime options.
-
-### Which Field Types Map to What
-
-| Builder Kit Primitive | fabricId Type | What Agents Send |
-|---|---|---|
-| `text`, `textarea` | `string` | `{ type: "string" }` |
-| `number` | `number` | `{ type: "number", minimum?, maximum? }` |
-| `slider` | `number` | `{ type: "number", minimum?, maximum? }` |
-| `select`, `radio` | `string` with enum | `{ type: "string", enum: [...] }` |
-| `multiselect` | `array` | `{ type: "array", items: { type: "string", enum: [...] } }` |
-| `checkbox`, `toggle` | `boolean` | `{ type: "boolean" }` |
-| `promptPair` | `object` | `{ type: "object", properties: { prompt, negativePrompt } }` |
-
----
-
-## Step 3: Declare fabric_fields in Metadata
-
-After building the artifact code with fabricId on form fields, update the artifact's metadata so Batshit knows what fields exist:
+`metadata.fabric_fields` lists what the artifact accepts: `{ fabricId, type, label }`, plus `required`, `options` (select, radio, multiselect), and `min` / `max` (number, slider) when they apply.
 
 ```json
-{
-  "controlId": "sys.artifact.update",
-  "input": {
-    "artifactId": "...",
-    "metadata": {
-      "fabric_fields": [
-        { "fabricId": "search-query", "type": "text", "label": "Search Query" },
-        { "fabricId": "output-format", "type": "select", "label": "Output Format", "options": ["Summary", "Table", "Raw JSON"] }
-      ]
-    }
-  }
-}
+{ "metadata": { "source_type": "built_in", "fabric_fields": [
+  { "fabricId": "search-query", "type": "text", "label": "Search query", "required": true },
+  { "fabricId": "output-format", "type": "select", "label": "Output format", "options": ["Summary", "Table"] }
+] } }
 ```
 
-The `fabric_fields` array tells Batshit (and agents) exactly what parameters this artifact accepts. Each entry needs at minimum: `fabricId`, `type`, and `label`.
+- A trigger with no inputs sets `metadata.run_only: true` instead.
+- Keep `required` for what an agent must send (often just the main text or prompt); everything else should have a sensible default.
+- Image generators use the semantic IDs from `ai-capabilities.md` (`source-image-1-url`, `image-count`, `aspect-ratio`, `resolution`).
+- An agent run sends the field values and an optional `prompt`; the artifact's `system_prompt` supplies the standing instructions.
 
-**For trigger-only artifacts** (no input fields — just a button that runs something), set `metadata.run_only: true` instead of `fabric_fields`.
+## The three kinds of refs
 
----
+- **`sys.artifact.*`**: the building controls (create, update, publish, get, ...).
+- **`use.artifact.{slug}`**: the runtime tool for one published, agent-usable artifact. Search `native_batshit_tool_search` with `family: "artifact"`; use the exact `artifact:` ref it returns.
+- **`artifact.<id>.field.*` / `artifact.<id>.action.*`**: per-artifact settings controls (model, system prompt, zone, details, publish). They change settings, never the HTML.
 
-## Step 4: Configure Agent Access
+## Test run
 
-Now set whether agents can actually discover and use this artifact:
+1. Publish it (`mode: "published"` on create, or `sys.artifact.publish`).
+2. Search `family: "artifact"` for its name and copy the exact ref.
+3. Call it with realistic values.
+4. Image generators: read `sys.artifact.run_logs.get` even on success; `result.fileCount` (or `generatedFileCount`) must be above 0.
 
-**If the user said yes to agent access:**
-```json
-{
-  "controlId": "sys.artifact.update",
-  "input": {
-    "artifactId": "...",
-    "agent_use_enabled": true,
-    "agent_allowlist": ["agent_id_1", "agent_id_2"]
-  }
-}
-```
+A portable agent whose token cannot run artifact tools asks the user to run it once in Batshit instead.
 
-Ask which agents should have access. The user needs to select at least one agent — if the allowlist is empty, no agents can use it even with agent_use_enabled on.
+If no ref appears, check: is it a runtime power source, published, declaring fields or `run_only`, with agent use on for you? A user-only artifact is expected not to appear.
 
-If the user says "all agents," translate that into an explicit `agent_allowlist` containing all currently available agent IDs. Do not leave the allowlist empty.
-If the user just says "yes, agents should use it" and does not name specific agents, default to **all current agents**.
-If an allowlist ever becomes empty again, treat that as disabled agent use rather than saving an empty enabled state.
+If you published only to test and the user wants it kept as a draft, set `publish: false` afterwards.
 
-**If the user said no to agent access:**
-```json
-{
-  "controlId": "sys.artifact.update",
-  "input": {
-    "artifactId": "...",
-    "agent_use_enabled": false
-  }
-}
-```
+## When something goes wrong
 
-The Fabric infrastructure is still in place (fabricId, fabric_fields) — it just won't be discoverable by agents until they toggle it on.
-
-**Important nuance**: `agent_use_enabled: true` with an empty allowlist = invisible to all agents (same as disabled). Only `agent_use_enabled: undefined` (legacy artifacts created before this system) = visible to all agents. This is a subtle but important distinction.
-
----
-
-## Step 5: Understand the Three Prefixes
-
-You'll see three kinds of control IDs. Here's what each one is for:
-
-- **`sys.artifact.*`** — Fabric control-plane building tools. These are what you've been using to create, update, configure, and publish artifacts. Call them through the Fabric control transport available in your current lane.
-
-- **`use.artifact.{slug}`** — Runtime capability. This only appears after an artifact is published with agent use enabled, a non-empty allowlist, and a valid backend Batshit runtime contract (fabric_fields or run_only). Agents call it through the Artifact runtime tool lane, not through the general artifact-management controls. Portable Artifact Tokens do not automatically grant this runtime lane.
-
-User-only panel artifacts do not get a `use.artifact.{slug}` runtime tool. That includes raw Gradio/HuggingFace embeds and current ComfyUI panel artifacts, even when they have Builder Kit controls. If the user asks you to use one, tell them it is user-only for now. Do not change its `brain_type`, Artifact Power Source, or runtime settings to force agent use.
-
-- **`artifact.<id>.field.*` / `artifact.<id>.action.*`** — Per-instance controls for a specific artifact's metadata fields. These may appear in current-message agent context for existing artifacts. They can only set metadata — not create artifacts or set HTML content.
-
----
-
-## Step 6: Publish and Test (Required Order)
-
-`use.artifact.{slug}` only appears after publish + runtime contract checks. So the safe order is:
-
-1. Publish the artifact first
-2. If your current lane can search the Artifact runtime tool family, search for `use.artifact.{slug}` and make sure it appears
-3. If your current lane can invoke that runtime tool, call it with test values
-4. If your lane cannot invoke published artifact runtime tools, ask the user to run the published artifact in Batshit or test it from a normal Batshit agent with access
-5. If it is a generated-image artifact, inspect the scrubbed run log even when the tool reports success. `result.fileCount` or runtime `generatedFileCount` must be greater than 0.
-6. If the run fails or returns the wrong kind of output, inspect the scrubbed run log with `sys.artifact.run_logs.list` and `sys.artifact.run_logs.get` before guessing
-
-If `use.artifact.{slug}` doesn't appear, check: is the artifact published? Is agent_use_enabled true? Is the allowlist non-empty? Does it have fabric_fields or run_only?
-
-If the artifact is a user-only Gradio/HuggingFace embed or a ComfyUI panel artifact, stop here. It is expected not to appear as an agent tool.
-
----
-
-## Step 7: Confirm Final Publish State
-
-If it isn't published yet, publish it:
-
-```json
-{
-  "controlId": "sys.artifact.publish",
-  "input": { "artifactId": "...", "publish": true, "zone": "panel" }
-}
-```
-
-Confirm the zone is what the user wants. Then tell them where to find their artifact — "Your artifact is now live in the panel zone. You'll see it in your workspace panel."
-
-If you published only for runtime testing and the user wants to keep it private/draft for now, explicitly set publish back to `false` after testing.
-
----
-
-## If Something Goes Wrong
-
-### Control not found
-
-If an artifact runtime call returns `CONTROL_NOT_FOUND`: rerun the current lane's Artifact runtime search without filters, copy the exact `artifact:` ref from the results, and retry once. If the lane cannot search Artifact runtime tools, verify in the app that the artifact is published and agent-usable.
-
-### Risk approval needed
-
-`CONTROL_RISK_REQUIRES_APPROVAL` means Batshit **paused** the call and put an **Approve** /
-**Deny** card on your message. It is not a refusal, and it is not something you can unlock.
-
-- Tell the user what the control does and why, then stop
-- Never pass `allowRisky` — it is ignored on every chat lane
-- **API agent:** the user's click re-runs that same call with that same input. Do not retry
-  it yourself
-- **Codex / Claude agent:** the click resumes you with an
-  `[Approval — from the user, not from the agent]` message. Retry the same ref with the
-  **same input** then
-- A different input is a different call, so it earns a new card
-- **Deny** starts no turn; you are told on the user's next message, and you must not retry
-
-### Prompt is required
-
-If an artifact runtime call fails with `prompt is required`: retry with a non-empty `input.prompt` field.
-
-### Runtime completed but output is wrong
-
-Use `sys.artifact.run_logs.list` for the artifact, then `sys.artifact.run_logs.get` for the latest run. Check the session/message linkage, scrubbed prompt preview, resolved model, chosen transport, output counts, usage, and sanitized error list. These logs are scrubbed: they do not include API keys, auth tokens, cookies, or raw image/audio/base64 payloads. They are retained for about two weeks, deleted when the Artifact is deleted, and kept across Artifact version edits, rollbacks, or version deletion.
-
-For image generators, a runtime success with `result.fileCount: 0` or `generatedFileCount: 0` is not complete. Fix the selected image model, saved provider key, or runtime helper call and test again before handoff.
-
-### Stuck in a loop
-
-After 2 consecutive failures on the same operation: **stop looping.** Provide a clear summary of the blocker, the exact IDs you attempted, and the next best action. Don't keep retrying the same thing.
-
----
-
-## Why This Matters
-
-Making artifacts agent-friendly is what sets Batshit apart from every other AI platform. Here are just a few examples of what becomes possible:
-
-- An agent researches a topic and drops the findings into a RAG artifact, which triggers an n8n workflow to upload to a vector store
-- An AI persona uses a character-consistent image generation artifact and shares the result through the standard action controls
-- A monitoring agent periodically reads a dashboard artifact's state and alerts the user when something needs attention
-
-The artifact becomes a permanent tool in the agent's toolbox — discoverable by name, callable with typed parameters, results flowing back into the conversation. No other platform does this.
+- **`CONTROL_NOT_FOUND`:** search `family: "artifact"` again without filters, copy the exact ref, retry once.
+- **`CONTROL_RISK_REQUIRES_APPROVAL`:** Batshit **paused** the call and put an **Approve** / **Deny** card on your message. It is not a refusal, and you cannot unlock it yourself. Tell the user what the control does and why, then stop. Never pass `allowRisky`: it is ignored on every chat lane. An API agent does not retry: the user's click re-runs that same call. A Codex or Claude agent is resumed with an `[Approval — from the user, not from the agent]` message and then retries the same ref with the **same input** (a different input is a different call, and earns a new card). **Deny** starts no turn; you hear about it on the user's next message, and you must not retry.
+- **`prompt is required`:** retry with a non-empty `input.prompt`.
+- **Wrong or empty output:** `sys.artifact.run_logs.list`, then `sys.artifact.run_logs.get` for the latest run: the chat link, a scrubbed prompt preview, the resolved model, the route, output counts, usage, and sanitized errors. For a model problem, load `ai-models.md`.
+- **Two failures in a row on the same step:** stop. Tell the user the blocker, the exact IDs you tried, and the next best action.

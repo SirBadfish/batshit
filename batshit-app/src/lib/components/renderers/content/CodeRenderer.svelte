@@ -39,7 +39,7 @@
     }
     
     // Add line count
-    parts.push(`${lineCount} lines`)
+    parts.push(`${lineCount} ${lineCount === 1 ? 'line' : 'lines'}`)
     
     return parts.length > 0 ? parts.join(' • ') : ''
   })

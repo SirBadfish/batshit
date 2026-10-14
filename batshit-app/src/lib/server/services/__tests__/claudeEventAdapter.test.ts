@@ -1,6 +1,24 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ClaudeEventAdapter } from '../claudeEventAdapter'
+import { buildDelegatedExecutionSummary } from '../delegatedRunAccounting'
+import { buildClaudeLlmCapture } from '../executionViewerLlmCapture'
+import { buildCliSubagentMcpServerName } from '$lib/utils/cliSubagentToolNames'
 import type { NativeModeRequest } from '../vercelBrain'
+import {
+  CLAUDE_AGENT_CALL_ID,
+  CLAUDE_HELPER_BASH_ID,
+  CLAUDE_HELPER_FINAL_TEXT,
+  CLAUDE_HELPER_OPENING_TEXT,
+  CLAUDE_HELPER_THINKING,
+  CLAUDE_MAIN_REPLY_TEXT,
+  claudeAgentHelperRunEvents
+} from '$lib/test-utils/claude-stream-agent-helper'
+import {
+  CLAUDE_ERROR_RESULT_COUNTS,
+  claudeApiErrorResult,
+  claudeErrorResult,
+  claudeSessionCrashResult
+} from '$lib/test-utils/claude-stream-error-results'
 
 function buildRequest(overrides: Partial<NativeModeRequest> = {}): NativeModeRequest {
   return {
@@ -119,6 +137,91 @@ describe('ClaudeEventAdapter', () => {
     expect(resultChunk?.metadata?.displayToolName).toBe('Claude Code Helper')
     // Pinned so nothing downstream can promote it into the subagent renderer family.
     expect(resultChunk?.metadata?.metadata?.operationKind).toBe('unknown_tool')
+  })
+
+  it('observes only raw Claude tool_result text blocks and reports non-text or unknown blocks', async () => {
+    // BL-1029: both parity runs use the same clock, including tool execution timing.
+    vi.spyOn(Date, 'now').mockReturnValue(10_000)
+    const rawText = 'Raw Claude result https://claude-raw.example/result.png'
+    const observations: any[] = []
+    const events = async function* () {
+      yield {
+        type: 'assistant',
+        message: { content: [{ type: 'tool_use', id: 'raw-result', name: 'mcp__docs__lookup', input: {} }] }
+      }
+      yield {
+        type: 'user',
+        tool_use_result: { stdout: 'Claude side-channel https://side-channel.example/not-in-tool-result.png' },
+        message: {
+          role: 'user',
+          content: [{
+            type: 'tool_result',
+            tool_use_id: 'raw-result',
+            content: [
+              { type: 'text', text: rawText },
+              { type: 'image', source: { type: 'base64', data: 'AAAA' } },
+              { type: 'future_block', value: 'not classified' }
+            ]
+          }]
+        }
+      }
+      yield { type: 'result', usage: { input_tokens: 1, output_tokens: 1 } }
+    }
+    const run = async (onCliModelResult?: NativeModeRequest['onCliModelResult']) => {
+      const adapter = new ClaudeEventAdapter({ request: buildRequest({ onCliModelResult }), transport: 'cli' })
+      const chunks = await collectChunks(adapter.stream(events() as any))
+      return { chunks, steps: (adapter as any).intermediateSteps }
+    }
+
+    const observed: any[] = []
+    const withObserver = await run((delivery) => observed.push(delivery))
+    const withoutObserver = await run()
+
+    expect(observed).toEqual([{
+      callId: 'raw-result',
+      texts: [rawText],
+      nonTextInputs: 1,
+      unaccountedInputs: 1
+    }])
+    expect(JSON.stringify(observed)).not.toContain('side-channel.example')
+    expect(withObserver.chunks).toEqual(withoutObserver.chunks)
+    const withoutStepTimestamps = (steps: any[]) => steps.map(({ timestamp, ...step }) => step)
+    expect(withoutStepTimestamps(withObserver.steps)).toEqual(withoutStepTimestamps(withoutObserver.steps))
+  })
+
+  it('contains a raw-result observer exception and marks that call unaccounted if possible', async () => {
+    const privateResult = 'https://private-claude-result.example/do-not-log.png'
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    let firstCall = true
+    const fallbackObservations: any[] = []
+    const adapter = new ClaudeEventAdapter({
+      request: buildRequest({
+        onCliModelResult: (delivery) => {
+          if (firstCall) {
+            firstCall = false
+            throw new Error(privateResult)
+          }
+          fallbackObservations.push(delivery)
+        }
+      }),
+      transport: 'cli'
+    })
+    async function* mockEvents() {
+      yield { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'throw-result', name: 'Bash', input: { command: 'cat file' } }] } }
+      yield {
+        type: 'user',
+        message: { content: [{ type: 'tool_result', tool_use_id: 'throw-result', content: privateResult }] }
+      }
+      yield { type: 'result', usage: { input_tokens: 1, output_tokens: 1 } }
+    }
+
+    const chunks = await collectChunks(adapter.stream(mockEvents() as any))
+
+    expect(chunks.some((chunk) => chunk.type === 'finish')).toBe(true)
+    expect(fallbackObservations).toEqual([{
+      callId: 'throw-result', texts: [], nonTextInputs: 0, unaccountedInputs: 1
+    }])
+    expect(JSON.stringify(consoleError.mock.calls)).not.toContain(privateResult)
   })
 
   it('normalizes built-in web search into the web_search lane', async () => {
@@ -553,6 +656,55 @@ describe('ClaudeEventAdapter', () => {
         totalMatchingFiles: 1
       }
     })
+  })
+
+  // BL-272: the subagent was the first `subagent_` anywhere in the tool name. An agent slugged
+  // `subagent` registers its bridge as `batshit_gateway_subagent_<hash>`, so its Subagent card
+  // named the hash and its Workers call read as a Subagent call. The managed shape decides now.
+  it('reads the subagent from the tool of the managed shape, never from the bridge name (BL-272)', async () => {
+    const server = buildCliSubagentMcpServerName({ id: 'subagent', slug: 'subagent' })!
+    expect(server).toMatch(/^batshit_gateway_subagent_[0-9a-f]{6}$/)
+    const adapter = new ClaudeEventAdapter({
+      request: buildRequest(),
+      transport: 'cli'
+    })
+
+    async function* mockEvents() {
+      yield {
+        type: 'assistant',
+        message: {
+          content: [
+            { type: 'tool_use', id: 'sa-1', name: `mcp__${server}__subagent_researcher`, input: { chatInput: 'look it up' } },
+            { type: 'tool_use', id: 'w-1', name: `mcp__${server}__spawn_workers`, input: { tasks: [{ prompt: 'count' }] } }
+          ]
+        }
+      }
+      yield {
+        type: 'user',
+        message: {
+          content: [
+            { type: 'tool_result', tool_use_id: 'sa-1', content: 'Found it.' },
+            { type: 'tool_result', tool_use_id: 'w-1', content: 'Workers done.' }
+          ]
+        }
+      }
+      yield { type: 'result', usage: { input_tokens: 1, output_tokens: 1 } }
+    }
+
+    const chunks = await collectChunks(adapter.stream(mockEvents()))
+    const results = chunks.filter((chunk) => chunk.type === 'tool-result')
+    const subagentResult = results.find((chunk) => chunk.toolName.endsWith('.subagent_researcher'))
+    const workersResult = results.find((chunk) => chunk.toolName.endsWith('.spawn_workers'))
+
+    expect(subagentResult?.metadata).toMatchObject({
+      toolProvider: 'subagent',
+      isSubagent: true,
+      subagentId: 'researcher',
+      subagentName: 'Researcher'
+    })
+    expect(workersResult).toBeTruthy()
+    expect(workersResult?.metadata?.isSubagent).toBeUndefined()
+    expect(workersResult?.metadata?.toolProvider).not.toBe('subagent')
   })
 
   it('marks managed API subagent MCP results with managed subagent metadata', async () => {
@@ -1185,10 +1337,13 @@ describe('ClaudeEventAdapter output too large to show (Bug C)', () => {
     }
   }
 
-  async function runBash(options: { command: string; content: string; toolUseResult: unknown; isError?: boolean }) {
+  async function runBash(
+    options: { command: string; content: string; toolUseResult: unknown; isError?: boolean },
+    onCliModelResult?: NativeModeRequest['onCliModelResult']
+  ) {
     let finished: any = null
     const adapter = new ClaudeEventAdapter({
-      request: buildRequest(),
+      request: buildRequest({ onCliModelResult }),
       transport: 'cli',
       onFinish: (payload) => {
         finished = payload
@@ -1219,7 +1374,7 @@ describe('ClaudeEventAdapter output too large to show (Bug C)', () => {
       yield { type: 'result', usage: { input_tokens: 1, output_tokens: 1 } }
     }
     const chunks = await collectChunks(adapter.stream(mockEvents() as any))
-    return { chunk: chunks.find((chunk) => chunk.type === 'tool-result'), step: finished?.steps?.[0] }
+    return { chunks, chunk: chunks.find((chunk) => chunk.type === 'tool-result'), step: finished?.steps?.[0] }
   }
 
   const OUTPUT = `${rows(900)}\n`
@@ -1238,6 +1393,37 @@ describe('ClaudeEventAdapter output too large to show (Bug C)', () => {
     expect(JSON.stringify(chunk.result)).not.toContain('persisted-output')
     expect(step.type).toBe('tool')
     expect(step.error).toBeUndefined()
+  })
+
+  it('observes Claude raw tool_result notice, not the larger tool_use_result stdout, without changing output', async () => {
+    const readbackOnlyUrl = 'https://tool-use-result-only.example/not-in-the-tool-result.png'
+    const output = `${rows(34)}\n${readbackOnlyUrl}\n${rows(900)}\n`
+    const persisted = persistedBash({ command: 'cat /tmp/big.txt', output })
+    const observations: any[] = []
+
+    const { observed, unobserved } = await (async () => {
+      vi.useFakeTimers()
+      vi.setSystemTime(new Date('2026-09-29T12:00:00.000Z'))
+      try {
+        return {
+          observed: await runBash(persisted, (delivery) => observations.push(delivery)),
+          unobserved: await runBash(persisted)
+        }
+      } finally {
+        vi.useRealTimers()
+      }
+    })()
+
+    expect(observations).toEqual([{
+      callId: 'bash-big',
+      texts: [persisted.content],
+      nonTextInputs: 0,
+      unaccountedInputs: 0
+    }])
+    expect(observations[0].texts[0]).not.toContain(readbackOnlyUrl)
+    expect(observed.step.toolResult.content).toContain(readbackOnlyUrl)
+    expect(observed.chunks).toEqual(unobserved.chunks)
+    expect(observed.step).toEqual(unobserved.step)
   })
 
   it('never keeps half a line or half a character from the cut', async () => {
@@ -1318,6 +1504,58 @@ describe('ClaudeEventAdapter output too large to show (Bug C)', () => {
     expect(chunk.result.stdout).toBe(WHOLE_LINES)
     expect(JSON.stringify(chunk.result)).not.toContain('persisted-output')
     expect(JSON.stringify(chunk.result)).not.toContain('Output cut here')
+  })
+
+  // BL-8 (2026-09-22): those lanes get the whole lines only, so what they count (a listing's entries,
+  // a search's matches, a command's lines) was a lower bound nobody could see (`461 entries` of
+  // 1,500). The cut travels beside the lines instead, for the shapers to keep.
+  it.each([
+    ['a listing', 'ls -1 /tmp/tree', 'batshit_server_list_files'],
+    ['a search', 'grep -n row /tmp/big.txt', 'batshit_server_search_files'],
+    ['a plain command', 'node print-rows.js', 'batshit_server_execute_command']
+  ])('tells %s that Claude Code cut the output, and how much it kept', async (_label, command, toolName) => {
+    const { chunk } = await runBash(persistedBash({ command, output: OUTPUT }))
+
+    expect(chunk.toolName).toBe(toolName)
+    expect(chunk.result.outputCut).toEqual({
+      by: 'Claude Code',
+      keptBytes: Buffer.byteLength(WHOLE_LINES),
+      totalBytes: OUTPUT_BYTES
+    })
+  })
+
+  it('names no total when Claude sent no stdout, and no cut when it kept every byte', async () => {
+    const kept = rows(32)
+    const missing = await runBash(persistedBash({ command: 'ls -1 /tmp/tree', output: OUTPUT, toolUseResult: 'missing' }))
+    const small = rows(30)
+    const whole = await runBash({
+      command: 'ls -1 /tmp/tree',
+      content: notice(small),
+      toolUseResult: {
+        stdout: small,
+        stderr: '',
+        interrupted: false,
+        isImage: false,
+        noOutputExpected: false,
+        persistedOutputPath: NOTICE_PATH,
+        persistedOutputSize: Buffer.byteLength(small)
+      }
+    })
+
+    expect(missing.chunk.result.outputCut).toEqual({ by: 'Claude Code', keptBytes: Buffer.byteLength(kept) })
+    expect(whole.chunk.result).not.toHaveProperty('outputCut')
+  })
+
+  // A read, a write, and an edit store what the command printed, and their text already ends with
+  // the cut line: their results stay exactly as they were.
+  it('leaves the lanes whose text carries the cut line as they were', async () => {
+    const read = await runBash(persistedBash({ command: 'cat /tmp/big.txt', output: OUTPUT }))
+    const write = await runBash(
+      persistedBash({ command: 'cat /tmp/big.txt > /tmp/copy.txt && cat /tmp/copy.txt', output: OUTPUT })
+    )
+
+    expect(read.chunk.result).not.toHaveProperty('outputCut')
+    expect(write.chunk.result).not.toHaveProperty('outputCut')
   })
 
   it("keeps Claude's own note after the notice, as a read of normal size keeps it", async () => {
@@ -1583,5 +1821,574 @@ describe("ClaudeEventAdapter failed calls of Claude Code's own file tools (bug s
       expect(call.chunk.result).not.toHaveProperty('success')
       expect(call.step.type).toBe('tool')
     }
+  })
+})
+
+/** The chunks a stream yielded before it threw, and what it threw. */
+async function collectUntilThrow(generator: AsyncGenerator<any>) {
+  const chunks: any[] = []
+  try {
+    for await (const chunk of generator) chunks.push(chunk)
+  } catch (error) {
+    return { chunks, error: error as Error }
+  }
+  return { chunks, error: null }
+}
+
+describe("ClaudeEventAdapter: Claude Code's own helper stays out of the reply (BL-501)", () => {
+  /**
+   * Claude Code's `Agent` helper runs a model of its own, and the CLI forwards that model's
+   * messages on the same stream with `parent_tool_use_id` naming the main thread's Agent call.
+   * The main model reads only the Agent call's result. The helper's words, reasoning, and tool
+   * calls are not the reply's, and its tool results are not what the main model read.
+   */
+  it("keeps the helper's words, reasoning, tool steps, and read results out of the reply", async () => {
+    const finished: any[] = []
+    const observed: any[] = []
+    const adapter = new ClaudeEventAdapter({
+      request: buildRequest({ onCliModelResult: (delivery) => observed.push(delivery) }),
+      transport: 'cli',
+      onFinish: (payload) => {
+        finished.push(payload)
+      }
+    })
+    const events = claudeAgentHelperRunEvents()
+    async function* replay() {
+      for (const event of events) yield event
+    }
+
+    const chunks = await collectChunks(adapter.stream(replay()))
+
+    const replyText = chunks
+      .filter((chunk) => chunk.type === 'text-delta')
+      .map((chunk) => chunk.text)
+      .join('')
+    expect(replyText).toBe(CLAUDE_MAIN_REPLY_TEXT)
+    expect(chunks.filter((chunk) => chunk.type === 'thinking')).toEqual([])
+    expect(chunks.filter((chunk) => chunk.type === 'tool-call').map((chunk) => chunk.toolCallId)).toEqual([
+      CLAUDE_AGENT_CALL_ID
+    ])
+    const toolResults = chunks.filter((chunk) => chunk.type === 'tool-result')
+    expect(toolResults.map((chunk) => chunk.toolCallId)).toEqual([CLAUDE_AGENT_CALL_ID])
+    // The Agent call keeps its card and the helper's answer, which is what the main model read.
+    expect(toolResults[0].metadata.displayToolName).toBe('Claude Code Helper')
+    expect(JSON.stringify(toolResults[0].result)).toContain('nothing else in the config folder')
+    expect(JSON.stringify(chunks)).not.toContain(CLAUDE_HELPER_BASH_ID)
+
+    expect(finished).toHaveLength(1)
+    expect(finished[0].text).toBe(CLAUDE_MAIN_REPLY_TEXT)
+    expect(finished[0].steps.map((step: any) => step.toolCallId)).toEqual([CLAUDE_AGENT_CALL_ID])
+    expect(finished[0].reasoning).toEqual([])
+    const finishedJson = JSON.stringify(finished[0])
+    expect(finishedJson).not.toContain(CLAUDE_HELPER_OPENING_TEXT)
+    expect(finishedJson).not.toContain(CLAUDE_HELPER_THINKING)
+    expect(finishedJson).not.toContain(CLAUDE_HELPER_BASH_ID)
+
+    // BL-474: only the Agent call's own result reached the main model.
+    expect(observed.map((delivery) => delivery.callId)).toEqual([CLAUDE_AGENT_CALL_ID])
+    expect(observed[0].texts[0]).toBe(CLAUDE_HELPER_FINAL_TEXT)
+
+    // The run's raw event log is the transport's record and keeps every event.
+    expect(adapter.getRawEvents()).toHaveLength(events.length)
+  })
+
+  it("drops a helper's partial events too, so they never write into a main-thread block", async () => {
+    // A guard for the stream-json schema, not a captured shape: Claude Code 2.1.296 does not
+    // forward a helper's partial events (its partial-event writer sets `parent_tool_use_id: null`),
+    // but the schema allows a string there. Block indexes restart with each model, so a helper's
+    // partial event would land in the main thread's open block of the same index.
+    const finished: any[] = []
+    const adapter = new ClaudeEventAdapter({
+      request: buildRequest(),
+      transport: 'cli',
+      onFinish: (payload) => {
+        finished.push(payload)
+      }
+    })
+    const helper = { parent_tool_use_id: CLAUDE_AGENT_CALL_ID, session_id: 's' }
+    const main = { parent_tool_use_id: null, session_id: 's' }
+    async function* events() {
+      yield {
+        type: 'stream_event',
+        event: {
+          type: 'content_block_start',
+          index: 0,
+          content_block: { type: 'tool_use', id: 'toolu_main_read', name: 'Read', input: {} }
+        },
+        ...main
+      }
+      yield {
+        type: 'stream_event',
+        event: { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"file_path":"/helper' } },
+        ...helper
+      }
+      yield {
+        type: 'stream_event',
+        event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'HELPER WORDS' } },
+        ...helper
+      }
+      yield {
+        type: 'stream_event',
+        event: { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"file_path":"/main.md"}' } },
+        ...main
+      }
+      yield { type: 'stream_event', event: { type: 'content_block_stop', index: 0 }, ...main }
+      yield { type: 'result', subtype: 'success', is_error: false, result: '', usage: { input_tokens: 1, output_tokens: 1 } }
+    }
+
+    const chunks = await collectChunks(adapter.stream(events()))
+
+    expect(chunks.filter((chunk) => chunk.type === 'text-delta')).toEqual([])
+    expect(chunks.find((chunk) => chunk.type === 'tool-call')?.toolCallId).toBe('toolu_main_read')
+    expect(finished[0].text).toBe('')
+    expect(JSON.stringify(chunks)).not.toContain('/helper')
+  })
+})
+
+describe('ClaudeEventAdapter: a run that ends in an error result (BL-503)', () => {
+  it.each([
+    ['error_max_turns', ['Reached maximum number of turns (3)'], 'Reached maximum number of turns (3)'],
+    [
+      'error_during_execution',
+      // 2.1.296: its own diagnostic line, then each error it logged, `Name: message` and the stack.
+      [
+        '[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null',
+        'Error: Tool permission stream closed before response received\n    at Qx (/$bunfs/root/claude:1:2)\n    at async Wd (/$bunfs/root/claude:3:4)',
+        'AbortError: Request was aborted.\n    at Zr (/$bunfs/root/claude:5:6)'
+      ],
+      'Error: Tool permission stream closed before response received; AbortError: Request was aborted.'
+    ],
+    ['error_max_budget_usd', ['Reached the maximum budget ($0.05)'], 'Reached the maximum budget ($0.05)']
+  ] as const)('fails with the reason Claude Code gave for %s, and hands over its evidence with the usage it reported', async (subtype, errors, reason) => {
+    const onFinish = vi.fn()
+    const adapter = new ClaudeEventAdapter({ request: buildRequest(), transport: 'cli', onFinish })
+    async function* events() {
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'Working on it.' }] }, parent_tool_use_id: null }
+      yield claudeErrorResult(subtype, [...errors])
+    }
+
+    const { chunks, error } = await collectUntilThrow(adapter.stream(events()))
+
+    // The run still fails, with its own reason, and no `finish` chunk.
+    expect(error?.message).toBe(`Claude Code CLI run failed (${subtype}): ${reason}`)
+    expect(chunks).toEqual([{ type: 'text-delta', text: 'Working on it.' }])
+    // BL-503 / BL-1361: the finish callback is the one evidence writer, for a failed run too.
+    // It gets the partial work and the counts the error result reported.
+    const { input, cacheRead, cacheCreation, output } = CLAUDE_ERROR_RESULT_COUNTS
+    expect(onFinish).toHaveBeenCalledTimes(1)
+    expect(onFinish.mock.calls[0][0]).toMatchObject({ text: 'Working on it.', steps: [] })
+    expect(onFinish.mock.calls[0][0].totalUsage).toEqual({
+      inputTokens: input + cacheRead + cacheCreation,
+      outputTokens: output,
+      totalTokens: input + cacheRead + cacheCreation + output,
+      cachedInputTokens: cacheRead,
+      cacheCreationInputTokens: cacheCreation
+    })
+  })
+
+  it("keeps an error result's own words when it carries a result string", async () => {
+    const onFinish = vi.fn()
+    const adapter = new ClaudeEventAdapter({ request: buildRequest(), transport: 'cli', onFinish })
+    async function* events() {
+      yield {
+        type: 'result',
+        subtype: 'success',
+        is_error: true,
+        result: 'API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}',
+        usage: { input_tokens: 1, output_tokens: 0 }
+      }
+    }
+
+    const { error } = await collectUntilThrow(adapter.stream(events()))
+
+    expect(error?.message).toBe('API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}')
+    expect(onFinish).toHaveBeenCalledTimes(1)
+    // No `modelUsage` names a model, so its counts are not a ledger's: unknown.
+    expect(onFinish.mock.calls[0][0].totalUsage).toBeUndefined()
+  })
+
+  it('names the newest errors only, each by its first line and cut to length', async () => {
+    const adapter = new ClaudeEventAdapter({ request: buildRequest(), transport: 'cli' })
+    const longMessage = `Error: ${'x'.repeat(400)}`
+    async function* events() {
+      yield claudeErrorResult('error_during_execution', [
+        '[ede_diagnostic] result_type=assistant last_content_type=text stop_reason=end_turn',
+        'Error: first\n    at a (/x:1:1)',
+        'Error: second',
+        'Error: third',
+        `${longMessage}\n    at b (/x:2:2)`,
+        // A repeat counts where it last happened.
+        'Error: second'
+      ])
+    }
+
+    const { error } = await collectUntilThrow(adapter.stream(events()))
+
+    expect(error?.message).toBe(
+      `Claude Code CLI run failed (error_during_execution): Error: third; ${longMessage.slice(0, 299)}…; Error: second (and 1 earlier)`
+    )
+  })
+
+  it('names the subtype when an error result gives no reason of its own', async () => {
+    const adapter = new ClaudeEventAdapter({ request: buildRequest(), transport: 'cli' })
+    async function* events() {
+      yield claudeErrorResult('error_during_execution', [
+        '[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null'
+      ])
+    }
+
+    const { error } = await collectUntilThrow(adapter.stream(events()))
+
+    expect(error?.message).toBe('Claude Code CLI run failed (error_during_execution).')
+  })
+
+  it('says the run failed when an error result has an empty result and no errors', async () => {
+    const onFinish = vi.fn()
+    const adapter = new ClaudeEventAdapter({ request: buildRequest(), transport: 'cli', onFinish })
+    async function* events() {
+      yield { type: 'result', subtype: 'success', is_error: true, result: '', usage: { input_tokens: 1, output_tokens: 0 } }
+    }
+
+    const { error } = await collectUntilThrow(adapter.stream(events()))
+
+    expect(error?.message).toBe('Claude Code CLI run failed.')
+    expect(onFinish).toHaveBeenCalledTimes(1)
+  })
+
+  it('still hands the finish callback the partial work when the event stream itself throws', async () => {
+    // The context guard stops a run by throwing out of the event stream (claude-code-integration.md
+    // §6.7), and send-routed relies on the finish callback that the adapter's `finally` still makes
+    // then, as it does for a failed `result`.
+    const onFinish = vi.fn()
+    const adapter = new ClaudeEventAdapter({ request: buildRequest(), transport: 'cli', onFinish })
+    async function* events() {
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'Partial answer.' }] }, parent_tool_use_id: null }
+      throw new Error('Batshit context guard: Claude context window usage reached 81% mid-task.')
+    }
+
+    const { error } = await collectUntilThrow(adapter.stream(events()))
+
+    expect(error?.message).toContain('Batshit context guard')
+    expect(onFinish).toHaveBeenCalledTimes(1)
+    expect(onFinish.mock.calls[0][0].text).toBe('Partial answer.')
+  })
+
+  it('reports no input usage for a result that reports no input counter, never a zero', async () => {
+    const adapter = new ClaudeEventAdapter({ request: buildRequest(), transport: 'cli' })
+    async function* events() {
+      yield { type: 'result', subtype: 'success', is_error: false, result: 'done', usage: {} }
+    }
+
+    const chunks = await collectChunks(adapter.stream(events()))
+    const finish = chunks.find((chunk) => chunk.type === 'finish')
+
+    expect(finish?.usage?.inputTokens).toBeUndefined()
+    expect(finish?.usage?.totalTokens).toBeUndefined()
+  })
+
+  it('reports an unknown total beside a reported output count when no input counter came', async () => {
+    const adapter = new ClaudeEventAdapter({ request: buildRequest(), transport: 'cli' })
+    async function* events() {
+      yield { type: 'result', subtype: 'success', is_error: false, result: 'done', usage: { output_tokens: 12 } }
+    }
+
+    const chunks = await collectChunks(adapter.stream(events()))
+    const finish = chunks.find((chunk) => chunk.type === 'finish')
+
+    expect(finish?.usage).toMatchObject({ outputTokens: 12 })
+    expect(finish?.usage?.inputTokens).toBeUndefined()
+    // It was the output alone (12) before: a total that left out the unknown input.
+    expect(finish?.usage?.totalTokens).toBeUndefined()
+  })
+})
+
+describe('ClaudeEventAdapter: a failed result keeps the usage Claude Code reported on it (BL-1361)', () => {
+  /** The finish callback's payload for a run that ends in `result`, and what the run threw. */
+  async function failWith(result: Record<string, unknown>) {
+    const onFinish = vi.fn()
+    const adapter = new ClaudeEventAdapter({ request: buildRequest(), transport: 'cli', onFinish })
+    async function* events() {
+      yield result
+    }
+    const { chunks, error } = await collectUntilThrow(adapter.stream(events()))
+    // The failed result yields no `finish` chunk; it fails the run, after the one finish callback.
+    expect(chunks).toEqual([])
+    expect(onFinish).toHaveBeenCalledTimes(1)
+    return { error, totalUsage: onFinish.mock.calls[0][0].totalUsage }
+  }
+
+  /** The Execution Viewer's call-row usage for those counts, as send-routed's finish write builds it. */
+  const viewerUsage = (totalUsage: unknown) =>
+    buildClaudeLlmCapture({ prompt: 'p', totalUsage: (totalUsage ?? null) as any }).llmSummary.totalUsage
+
+  /** The main loop's error result with its own `usage` counters in place of the full set. */
+  const withUsage = (usage: Record<string, unknown>) => ({
+    ...claudeErrorResult('error_max_turns', ['Reached maximum number of turns (3)']),
+    usage
+  })
+
+  it('reports every count, and a reported 0 as 0, with the exact label', async () => {
+    const { error, totalUsage } = await failWith(
+      claudeErrorResult('error_max_turns', ['Reached maximum number of turns (3)'], {
+        input: 9,
+        cacheRead: 0,
+        cacheCreation: 1200,
+        output: 0
+      })
+    )
+
+    expect(error?.message).toBe('Claude Code CLI run failed (error_max_turns): Reached maximum number of turns (3)')
+    expect(totalUsage).toEqual({
+      inputTokens: 1209,
+      outputTokens: 0,
+      totalTokens: 1209,
+      cachedInputTokens: 0,
+      cacheCreationInputTokens: 1200
+    })
+    expect(viewerUsage(totalUsage)).toMatchObject({
+      inputTokens: { value: 1209, confidence: 'exact' },
+      outputTokens: { value: 0, confidence: 'exact' },
+      totalTokens: { value: 1209, confidence: 'exact' },
+      cachedInputTokens: { value: 0, confidence: 'exact' },
+      cacheCreationInputTokens: { value: 1200, confidence: 'exact' }
+    })
+  })
+
+  it('reports the counts of an API error that ended the run after its earlier model calls', async () => {
+    const words = 'API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}'
+    const { error, totalUsage } = await failWith(claudeApiErrorResult(words, 529))
+
+    const { input, cacheRead, cacheCreation, output } = CLAUDE_ERROR_RESULT_COUNTS
+    expect(error?.message).toBe(words)
+    expect(totalUsage).toEqual({
+      inputTokens: input + cacheRead + cacheCreation,
+      outputTokens: output,
+      totalTokens: input + cacheRead + cacheCreation + output,
+      cachedInputTokens: cacheRead,
+      cacheCreationInputTokens: cacheCreation
+    })
+  })
+
+  it('keeps the counters it reported and leaves the rest unknown; a total never leaves one out', async () => {
+    // Fresh input and cache read came; output and cache creation did not. The input counts the
+    // missing cache creation as 0, Claude Code's own ledger rule, and leaves that counter unset.
+    const inputOnly = await failWith(withUsage({ input_tokens: 30, cache_read_input_tokens: 0 }))
+    expect(inputOnly.totalUsage).toEqual({ inputTokens: 30, cachedInputTokens: 0 })
+    expect(viewerUsage(inputOnly.totalUsage)).toMatchObject({
+      inputTokens: { value: 30, confidence: 'exact' },
+      outputTokens: { value: null },
+      totalTokens: { value: null },
+      cachedInputTokens: { value: 0 }
+    })
+    expect(viewerUsage(inputOnly.totalUsage)).not.toHaveProperty('cacheCreationInputTokens')
+
+    // Output and cache creation came; fresh input did not, so the input and the total are unknown.
+    const noFreshInput = await failWith(withUsage({ output_tokens: 9, cache_creation_input_tokens: 100 }))
+    expect(noFreshInput.totalUsage).toEqual({ outputTokens: 9, cacheCreationInputTokens: 100 })
+    expect(viewerUsage(noFreshInput.totalUsage)).toMatchObject({
+      inputTokens: { value: null },
+      outputTokens: { value: 9, confidence: 'exact' },
+      totalTokens: { value: null }
+    })
+  })
+
+  it.each([
+    ['no counter at all', withUsage({})],
+    ['no usage object', { ...claudeErrorResult('error_max_turns', ['Reached maximum number of turns (3)']), usage: undefined }],
+    [
+      // 2.1.296's session-crash result: the all-zero template and an empty `modelUsage`.
+      'the session-crash zeros',
+      claudeSessionCrashResult(['[session_crash] error_name=TypeError api_error_status=none cause_name=none', 'TypeError: boom'])
+    ]
+  ])('reports no usage, never an exact zero, for %s', async (_case, result) => {
+    const { error, totalUsage } = await failWith(result)
+
+    expect(error?.message).toMatch(/^Claude Code CLI run failed \(/)
+    expect(totalUsage).toBeUndefined()
+    expect(viewerUsage(totalUsage)).toMatchObject({
+      inputTokens: { value: null, confidence: 'estimated' },
+      outputTokens: { value: null, confidence: 'estimated' },
+      totalTokens: { value: null, confidence: 'estimated' }
+    })
+  })
+})
+
+describe("ClaudeEventAdapter: Batshit runs the helper's model started count in the reply's spend only (BL-1362)", () => {
+  // The name the managed profile registers for a primary's Subagent bridge (BL-154: no hyphen).
+  const BRIDGE = `mcp__${buildCliSubagentMcpServerName({ id: 'zbclaude-primary', slug: 'zbclaude' })!}`
+  const SUBAGENT_CALL = 'toolu_01HelperSubagentCall0001'
+  const WORKERS_CALL = 'toolu_01HelperWorkersCall00001'
+  const HELPER_BASH = 'toolu_01HelperBashCall0000001'
+  const helper = {
+    parent_tool_use_id: CLAUDE_AGENT_CALL_ID,
+    agent_id: 'a3f9c2e17b4d60851',
+    session_id: 's',
+    subagent_type: 'general-purpose',
+    task_description: 'Research the port'
+  }
+  // The bridge's own text: managed-execute's JSON (`codex-subagent-mcp.cjs` callSubagent/callSpawnWorkers).
+  const subagentText = JSON.stringify(
+    {
+      success: true,
+      kind: 'subagent',
+      output: 'Researcher found the port in the server config.',
+      intermediateSteps: [],
+      subagentType: 'api',
+      subagentId: 'researcher',
+      subagentName: 'Researcher',
+      usage: { inputTokens: 1200, outputTokens: 300, totalTokens: 1500 },
+      modelId: 'claude-sonnet-5-5',
+      provider: 'anthropic',
+      durationMs: 4200,
+      status: 'completed',
+      thread: 'fresh',
+      toolSource: 'managed-api-subagent'
+    },
+    null,
+    2
+  )
+  const workersText = JSON.stringify(
+    {
+      kind: 'workers',
+      success: true,
+      workers: [
+        {
+          name: 'Worker 1',
+          status: 'completed',
+          usage: { inputTokens: 500, outputTokens: 100, totalTokens: 600 },
+          durationMs: 1500,
+          modelId: 'claude-haiku-5-5',
+          provider: 'anthropic'
+        }
+      ]
+    },
+    null,
+    2
+  )
+  const helperCall = (id: string, name: string, input: Record<string, unknown>) => ({
+    type: 'assistant',
+    message: { role: 'assistant', content: [{ type: 'tool_use', id, name, input }] },
+    ...helper
+  })
+  const helperResult = (id: string, text: string) => ({
+    type: 'user',
+    message: { role: 'user', content: [{ tool_use_id: id, type: 'tool_result', content: [{ type: 'text', text }] }] },
+    tool_use_result: [{ type: 'text', text }],
+    ...helper
+  })
+
+  function runEvents() {
+    const all = claudeAgentHelperRunEvents()
+    // Insert the helper's Batshit calls right after its Bash result, before the Agent result.
+    const at = all.findIndex(
+      (event: any) => event.type === 'user' && event.message?.content?.[0]?.tool_use_id === CLAUDE_AGENT_CALL_ID
+    )
+    return [
+      ...all.slice(0, at),
+      helperCall(SUBAGENT_CALL, `${BRIDGE}__subagent_researcher`, { chatInput: 'Find the port.' }),
+      helperResult(SUBAGENT_CALL, subagentText),
+      // A second result for the same call is not a second run.
+      helperResult(SUBAGENT_CALL, subagentText),
+      helperCall(WORKERS_CALL, `${BRIDGE}__spawn_workers`, { workers: [{ task: 'Check the docs.' }] }),
+      helperResult(WORKERS_CALL, workersText),
+      helperCall(HELPER_BASH, 'Bash', { command: 'ls' }),
+      helperResult(HELPER_BASH, 'src\ndocs'),
+      ...all.slice(at)
+    ]
+  }
+
+  it("keeps the helper's Batshit runs for the delegated summary and out of everything else", async () => {
+    const finished: any[] = []
+    const observed: any[] = []
+    const adapter = new ClaudeEventAdapter({
+      request: buildRequest({ onCliModelResult: (delivery) => observed.push(delivery) }),
+      transport: 'cli',
+      onFinish: (payload) => {
+        finished.push(payload)
+      }
+    })
+    const events = runEvents()
+    async function* replay() {
+      for (const event of events) yield event
+    }
+
+    const chunks = await collectChunks(adapter.stream(replay()))
+    const helperSteps = adapter.getHelperDelegatedSteps()
+
+    // Accounting only: one step per Batshit run the helper started, none for its own Bash.
+    expect(helperSteps.map((step) => step.toolCallId)).toEqual([SUBAGENT_CALL, WORKERS_CALL])
+    expect(helperSteps[0]).toMatchObject({ type: 'tool', isSubagent: true, originalToolName: `${BRIDGE}__subagent_researcher` })
+
+    // Nowhere else: no chunk, no reply step, no read evidence, no text.
+    const chunksJson = JSON.stringify(chunks)
+    for (const id of [SUBAGENT_CALL, WORKERS_CALL, HELPER_BASH]) expect(chunksJson).not.toContain(id)
+    expect(chunksJson).not.toContain('Researcher found the port')
+    expect(finished[0].steps.map((step: any) => step.toolCallId)).toEqual([CLAUDE_AGENT_CALL_ID])
+    expect(finished[0].text).toBe(CLAUDE_MAIN_REPLY_TEXT)
+    expect(observed.map((delivery) => delivery.callId)).toEqual([CLAUDE_AGENT_CALL_ID])
+
+    // The reply's delegated summary counts the Subagent and the Worker, once each, and never
+    // Claude Code's own helper (the Agent call is not a Batshit run, whatever its own bill).
+    const summary = buildDelegatedExecutionSummary([...finished[0].steps, ...helperSteps])
+    expect(summary?.runs.map((run) => [run.kind, run.name, run.status])).toEqual([
+      ['subagent', 'Researcher', 'completed'],
+      ['worker', 'Worker 1', 'completed']
+    ])
+    expect(summary?.totals).toMatchObject({ runs: 2, usageKnownRuns: 2 })
+    // Deduped by toolCallId when the same steps reach it twice.
+    expect(buildDelegatedExecutionSummary([...helperSteps, ...helperSteps])?.totals.runs).toBe(2)
+  })
+
+  it("reads each of two parallel results from its own block, and ignores a user gateway's look-alike", async () => {
+    const adapter = new ClaudeEventAdapter({ request: buildRequest(), transport: 'cli' })
+    // A user's own gateway shares the `batshit_gateway_` prefix but not the bridge's server shape.
+    const lookAlike = 'mcp__batshit_gateway_mytools__subagent_researcher'
+    const LOOK_ALIKE_CALL = 'toolu_01UserGatewayLookAlike01'
+    async function* replay() {
+      yield {
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: SUBAGENT_CALL, name: `${BRIDGE}__subagent_researcher`, input: { chatInput: 'a' } },
+            { type: 'tool_use', id: WORKERS_CALL, name: `${BRIDGE}__spawn_workers`, input: { workers: [] } },
+            { type: 'tool_use', id: LOOK_ALIKE_CALL, name: lookAlike, input: {} }
+          ]
+        },
+        ...helper
+      }
+      yield {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            { tool_use_id: SUBAGENT_CALL, type: 'tool_result', content: [{ type: 'text', text: subagentText }] },
+            { tool_use_id: WORKERS_CALL, type: 'tool_result', content: [{ type: 'text', text: workersText }] },
+            { tool_use_id: LOOK_ALIKE_CALL, type: 'tool_result', content: [{ type: 'text', text: subagentText }] }
+          ]
+        },
+        // One value for the whole event: it must not stand in for the second block's run.
+        tool_use_result: [{ type: 'text', text: subagentText }],
+        ...helper
+      }
+      yield { type: 'result', subtype: 'success', is_error: false, result: '', usage: { input_tokens: 1, output_tokens: 1 } }
+    }
+
+    await collectChunks(adapter.stream(replay()))
+    const helperSteps = adapter.getHelperDelegatedSteps()
+
+    expect(helperSteps.map((step) => step.toolCallId)).toEqual([SUBAGENT_CALL, WORKERS_CALL])
+    expect(buildDelegatedExecutionSummary(helperSteps)?.runs.map((run) => run.kind)).toEqual(['subagent', 'worker'])
+  })
+
+  it('counts nothing for a helper that started no Batshit run', async () => {
+    const adapter = new ClaudeEventAdapter({ request: buildRequest(), transport: 'cli' })
+    async function* replay() {
+      for (const event of claudeAgentHelperRunEvents()) yield event
+    }
+
+    await collectChunks(adapter.stream(replay()))
+
+    expect(adapter.getHelperDelegatedSteps()).toEqual([])
   })
 })

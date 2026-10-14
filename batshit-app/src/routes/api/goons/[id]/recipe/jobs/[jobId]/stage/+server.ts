@@ -15,7 +15,8 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
       expectedWriteVersion: body.expectedWriteVersion,
       expectedJobStateVersion: body.expectedJobStateVersion,
       liveBuildReceipt: body.liveBuildReceipt,
-      live: body.live
+      live: body.live,
+      signal: request.signal
     }))
   } catch (error) {
     return recipeRouteError(error)

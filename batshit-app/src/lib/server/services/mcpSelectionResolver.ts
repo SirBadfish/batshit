@@ -15,6 +15,9 @@ interface MCPSelectionResolverOptions {
   agentId?: string | null
   agent?: AgentRow | null
   agentMetadata?: Record<string, any> | null
+  /** Server-resolved scope for this run. Caller selections may only narrow it. */
+  mcpGatewayScope?: string[] | null
+  /** Untrusted discovery/execution filter, not an authority to add gateways. */
   selectedGateways?: string[] | null
   toolSelections?: MCPToolSelections | null
   includeGatewayToolMap?: boolean
@@ -76,7 +79,9 @@ export async function resolveMCPSelections(
     agentId,
     agent,
     agentMetadata,
-    selectedGateways
+    // This entry point is used only while the server resolves the turn/profile. Its
+    // selected gateways are the trusted chat-bar selection, which can widen defaults.
+    mcpGatewayScope: selectedGateways
   })
   const { resolvedGateways, defaultGateways } = scopeResolution
   // SA-009: Tool selections are now flat string arrays
@@ -113,18 +118,37 @@ export async function resolveMCPSelections(
 export async function resolveDynamicMcpGatewayScope(
   options: Pick<
     MCPSelectionResolverOptions,
-    'userId' | 'agentId' | 'agent' | 'agentMetadata' | 'selectedGateways'
+    'userId' | 'agentId' | 'agent' | 'agentMetadata' | 'mcpGatewayScope' | 'selectedGateways'
   >
 ): Promise<DynamicMcpGatewayScopeResolution> {
-  const { userId, agentId, agent: preloadedAgent, agentMetadata, selectedGateways } = options
+  const { userId, agentId, agent: preloadedAgent, agentMetadata, mcpGatewayScope, selectedGateways } = options
   const hasScopedAgent =
     (typeof agentId === 'string' && agentId.trim().length > 0) ||
     preloadedAgent !== undefined ||
     agentMetadata !== undefined
-  const overrideGateways = sanitizeStringArray(selectedGateways)
-  if (overrideGateways !== undefined) {
+  const requestedGateways = sanitizeStringArray(selectedGateways)
+  const narrowToRequested = (scope: string[]): string[] =>
+    requestedGateways === undefined
+      ? scope
+      : scope.filter((gatewayId) => requestedGateways.includes(gatewayId))
+
+  // A supplied record must belong to this user even when a run snapshot is present.
+  // A delegated per-run id need not have an `agent:` record, so the snapshot path
+  // does not fetch one merely to validate an id bound by the caller's auth lane.
+  if (preloadedAgent && preloadedAgent.user_id !== userId) {
+    throw new Error('MCP gateway scope agent is not owned by this user')
+  }
+  if (agentMetadata?.user_id && agentMetadata.user_id !== userId) {
+    throw new Error('MCP gateway scope metadata is not owned by this user')
+  }
+
+  // A run credential or in-process turn supplies this snapshot. Null and malformed
+  // snapshots are explicit empty scopes; neither the caller's filter nor agent defaults
+  // may turn them back into permission.
+  if (mcpGatewayScope !== undefined) {
+    const boundGateways = sanitizeStringArray(mcpGatewayScope) ?? []
     return {
-      resolvedGateways: overrideGateways,
+      resolvedGateways: narrowToRequested(boundGateways),
       defaultGateways: null,
       source: 'selected'
     }
@@ -135,10 +159,23 @@ export async function resolveDynamicMcpGatewayScope(
     agent = (await redis.get(`agent:${agentId}`)) as AgentRow | null
   }
 
+  // An id is not proof of ownership. Reject a stale or forged cross-user record
+  // before its defaults can affect discovery.
+  if (agent && agent.user_id !== userId) {
+    throw new Error('MCP gateway scope agent is not owned by this user')
+  }
+
+  // A missing agent id cannot be repaired with a caller's selectedGateways list.
+  // Server-supplied metadata may represent a delegated subagent rather than an
+  // `agent:` record; when an id is given it must carry the same user ownership.
+  if (agentId && !agent && agentMetadata && agentMetadata.user_id !== userId) {
+    return { resolvedGateways: [], defaultGateways: [], source: 'agent' }
+  }
+
   const defaultGateways = extractDefaultGateways(agentMetadata, agent)
   if (Array.isArray(defaultGateways)) {
     return {
-      resolvedGateways: defaultGateways,
+      resolvedGateways: narrowToRequested(defaultGateways),
       defaultGateways,
       source: 'agent'
     }
@@ -162,7 +199,7 @@ export async function resolveDynamicMcpGatewayScope(
   )
 
   return {
-    resolvedGateways: fallbackGateways,
+    resolvedGateways: narrowToRequested(fallbackGateways),
     defaultGateways: null,
     source: 'user-global'
   }
@@ -299,12 +336,12 @@ async function runDynamicOnlySelectionReset(userId: string): Promise<void> {
 
     if (!hasCamelSelections && !hasSnakeSelections) continue
 
-    const nextAgent = {
-      ...agent,
+    // BL-770: clear the two legacy lists by path. It wrote back the whole record `getAgents`
+    // answered (with its browser upload URLs), taking back any save made meanwhile.
+    await redis.updateAgent(agent.id, {
       [LEGACY_AGENT_MCP_SELECTION_FIELDS[0]]: [],
       [LEGACY_AGENT_MCP_SELECTION_FIELDS[1]]: []
-    }
-    await redis.set(`agent:${agent.id}`, nextAgent)
+    } as any)
   }
 
   await redis.execute(async (client) => {
@@ -315,5 +352,6 @@ async function runDynamicOnlySelectionReset(userId: string): Promise<void> {
 // Export helpers for unit tests
 export const __testUtils = {
   sanitizeStringArray,
-  normalizeToolSelectionsInput
+  normalizeToolSelectionsInput,
+  runDynamicOnlySelectionReset
 }

@@ -1,8 +1,21 @@
-import { error, json, type RequestHandler } from '@sveltejs/kit'
-import { apiError } from '$lib/server/services/apiResponses'
+import { error, isHttpError, isRedirect, json, type RequestHandler } from '@sveltejs/kit'
+import { apiError, serviceRefusalResponse } from '$lib/server/services/apiResponses'
 import { ArtifactsService } from '$lib/server/artifacts/artifactsService'
 
 const artifactsService = new ArtifactsService()
+
+// A refusal from ArtifactsService (not found, a structure or field-name rule on the restored or
+// added content) answers with its own status and sentence; rethrown, SvelteKit turned it into 500
+// "Internal Error" (BL-89). SvelteKit's own errors pass through; anything else is the route's 500.
+function refusalOrRethrow(err: unknown, action: string): Response | null {
+  const refusal = serviceRefusalResponse(err)
+  if (refusal) {
+    console.warn(`Artifact ${action} refused:`, err instanceof Error ? err.message.split('\n')[0] : err)
+    return refusal
+  }
+  if (isHttpError(err) || isRedirect(err)) throw err
+  return null
+}
 
 /**
  * GET: Retrieve version history or a specific version for an artifact
@@ -30,7 +43,8 @@ export const GET: RequestHandler = async ({ url, locals }) => {
       versions: [...versions].sort((a, b) => b.version - a.version)
     })
   } catch (err: any) {
-    if (err?.status) throw err
+    const refusal = refusalOrRethrow(err, 'version read')
+    if (refusal) return refusal
     console.error('Error getting versions:', err)
     throw error(500, 'Failed to retrieve versions')
   }
@@ -55,7 +69,8 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       message: `Version ${updated.version} created`
     })
   } catch (err: any) {
-    if (err?.status) throw err
+    const refusal = refusalOrRethrow(err, 'version add')
+    if (refusal) return refusal
     console.error('Error creating version:', err)
     throw error(500, 'Failed to create version')
   }
@@ -82,7 +97,8 @@ export const PUT: RequestHandler = async ({ request, locals }) => {
       message: `Restored to version ${targetVersion} as new version ${updated.version}`
     })
   } catch (err: any) {
-    if (err?.status) throw err
+    const refusal = refusalOrRethrow(err, 'version restore')
+    if (refusal) return refusal
     console.error('Error rolling back version:', err)
     throw error(500, 'Failed to rollback version')
   }
@@ -102,7 +118,8 @@ export const DELETE: RequestHandler = async ({ url, locals }) => {
     await artifactsService.deleteVersion(artifactId, locals.user.id, Number(versionNumber))
     return json({ success: true, message: `Version ${versionNumber} deleted` })
   } catch (err: any) {
-    if (err?.status) throw err
+    const refusal = refusalOrRethrow(err, 'version delete')
+    if (refusal) return refusal
     console.error('Error deleting version:', err)
     throw error(500, 'Failed to delete version')
   }

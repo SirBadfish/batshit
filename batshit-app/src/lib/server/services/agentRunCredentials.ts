@@ -49,6 +49,15 @@ import { redis } from '$lib/server/redis'
 const CREDENTIAL_ID_BYTES = 12
 const TOKEN_SECRET_BYTES = 32
 
+// Vite may reload this module while the app process stays alive. A global value keeps runs
+// minted before that reload usable; a new app process gets a fresh random value. Redis records
+// deliberately do not carry enough authority to survive that process ending.
+const SERVER_INSTANCE_ID_KEY = Symbol.for('batshit.agentRunCredentials.serverInstanceId')
+const processGlobals = globalThis as unknown as Record<symbol, unknown>
+const serverInstanceId = typeof processGlobals[SERVER_INSTANCE_ID_KEY] === 'string'
+  ? processGlobals[SERVER_INSTANCE_ID_KEY] as string
+  : (processGlobals[SERVER_INSTANCE_ID_KEY] = randomBytes(32).toString('base64url')) as string
+
 export const AGENT_RUN_CREDENTIAL_KEY_PREFIX = 'agent_run_credential:'
 export const AGENT_RUN_CREDENTIALS_INDEX_PREFIX = 'agent_run_credentials:'
 
@@ -71,12 +80,21 @@ export const AGENT_RUN_CREDENTIAL_TTL_SECONDS = 60 * 60 * 24
 
 export const AGENT_RUN_CREDENTIAL_RUNTIMES = ['codex', 'claude'] as const
 export type AgentRunCredentialRuntime = (typeof AGENT_RUN_CREDENTIAL_RUNTIMES)[number]
+export type AgentRunProcessOwner = { userId: string; kind: 'agent' | 'subagent'; id: string }
 
 export type AgentRunCredentialRecord = {
   id: string
+  /** Random app-process identity; absent on old records, which cannot authenticate. */
+  serverInstanceId: string
   userId: string
   agentId: string
   sessionId: string
+  /** Physical commands belong to this stored owner, never a delegated virtual runtime id. */
+  processOwner?: AgentRunProcessOwner | null
+  /** Stored primary agent governing Native Bash; a Worker names its owning agent. */
+  commandParentAgentId?: string | null
+  /** Delegated run's own Bash toggle snapshot; absent grants no Bash. */
+  delegatedBashEnabled?: boolean | null
   /** The assistant message the run is writing, when the bridge knows it. */
   messageId?: string | null
   runtime: AgentRunCredentialRuntime
@@ -103,6 +121,27 @@ export type AgentRunCredentialRecord = {
    * no skill access at all, and it expires with its run anyway.
    */
   scopeAgentId?: string | null
+  /**
+   * BL-81 — what a DELEGATED run may use through the control routes: the control ids its DCM
+   * index offered it (`resolveDelegatedRunAllowedControlIds`), computed by the runner from the
+   * scope that index was built from. Server-vouched the way a Portable Skill Token's allowed
+   * controls are: `/api/controls/use` refuses every other control for this credential, and
+   * `/api/controls/find` lists nothing else. `null` on a primary run, whose own settings govern
+   * as before. A delegated record written before BL-81 has no field and is allowed nothing
+   * (`readDelegatedAllowedControlIds`); it expires with its run anyway.
+   */
+  allowedControlIds?: string[] | null
+  /** BL-638: the server-resolved MCP gateways selected for this turn, including `[]`. */
+  mcpGatewayScope?: string[] | null
+  /**
+   * BL-686: the saved CLI tools this run may reach, resolved when the run starts (the agent's
+   * saved list, a Subagent's own list, or the user's Tool Grid list), including `[]`.
+   */
+  cliToolScope?: string[] | null
+  /** BL-494 P2: the managed helper profile actually offered Fetch Zip for this run. */
+  fetchZipAllowed?: boolean
+  /** User setting read from this run's managed profile; null uses conservative paging. */
+  codexToolOutputTokenLimit?: number | null
   /**
    * sha256 hex of the secret half. **No fragment of the secret itself is stored.**
    *
@@ -316,6 +355,80 @@ async function resolveCredentialScopeAgentId(options: {
 }
 
 /**
+ * BL-81 — check the control scope a mint names, the way the skill scope is checked: a caller
+ * that forgets it would start a run that can use nothing it was offered, so it fails the run
+ * start loudly instead. A delegated run must name a list (an empty one is a real answer:
+ * nothing); a primary run names none, because its own settings govern it as they always have.
+ */
+function resolveCredentialAllowedControlIds(options: {
+  agentId: string
+  delegated: boolean
+  allowedControlIds: unknown
+}): string[] | null {
+  const list = options.allowedControlIds
+  if (!options.delegated) {
+    if (list !== undefined && list !== null) {
+      throw new AgentRunCredentialError(
+        `A primary run of "${options.agentId}" carries no delegated control scope, so no run credential was minted.`
+      )
+    }
+    return null
+  }
+  if (!Array.isArray(list) || list.some((entry) => typeof entry !== 'string')) {
+    throw new AgentRunCredentialError(
+      'A Subagent or Worker run needs the control ids its instructions offer it, so no run credential was minted.'
+    )
+  }
+  return Array.from(new Set(list.map((entry) => entry.trim()).filter((entry) => entry.length > 0)))
+}
+
+/**
+ * BL-81 — what a validated credential lets a DELEGATED run use through the control routes.
+ *
+ * `null` for a primary run: it has no delegated scope, and its own settings govern. For a
+ * delegated run, the list it was minted with, or `[]` when the record predates BL-81 (or its
+ * field is anything but a list of strings): a delegated call with no list is allowed nothing.
+ */
+export function readDelegatedAllowedControlIds(
+  record: Pick<AgentRunCredentialRecord, 'delegated' | 'allowedControlIds'>
+): string[] | null {
+  if (record.delegated !== true) return null
+  const list = record.allowedControlIds
+  if (!Array.isArray(list)) return []
+  return list.filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0)
+}
+
+/** Old or malformed credentials cannot name any MCP gateway. Always return a fresh list. */
+export function readRunCredentialMcpGatewayScope(
+  record: Pick<AgentRunCredentialRecord, 'mcpGatewayScope'>
+): string[] {
+  const scope = record.mcpGatewayScope
+  if (!Array.isArray(scope) || scope.some((entry) => typeof entry !== 'string')) return []
+  return Array.from(new Set(scope.map((entry) => entry.trim()).filter(Boolean)))
+}
+
+/** BL-686: old or malformed credentials cannot name any saved CLI tool. A fresh list. */
+export function readRunCredentialCliToolScope(
+  record: Pick<AgentRunCredentialRecord, 'cliToolScope'>
+): string[] {
+  const scope = record.cliToolScope
+  if (!Array.isArray(scope) || scope.some((entry) => typeof entry !== 'string')) return []
+  return Array.from(new Set(scope.map((entry) => entry.trim()).filter(Boolean)))
+}
+
+/** A legacy or malformed record grants no physical command owner. */
+export function readRunCredentialProcessOwner(
+  record: Pick<AgentRunCredentialRecord, 'userId' | 'agentId' | 'delegated' | 'processOwner'>
+): AgentRunProcessOwner | null {
+  const owner = record.processOwner
+  if (!owner || owner.userId !== record.userId ||
+    (owner.kind !== 'agent' && owner.kind !== 'subagent') ||
+    typeof owner.id !== 'string' || !owner.id.trim()) return null
+  if (!record.delegated && (owner.kind !== 'agent' || owner.id !== record.agentId)) return null
+  return { userId: owner.userId, kind: owner.kind, id: owner.id }
+}
+
+/**
  * Mint one credential for one managed CLI run, and return the token ONCE.
  *
  * The token is `<credentialId>.<secret>`. Neither half contains a `.` (both are base64url
@@ -334,8 +447,11 @@ async function resolveCredentialScopeAgentId(options: {
  * subagent's slug — `subagent_cli_…` — and nothing is stored under `agent:{that id}`. The
  * credential is still minted, because that run's helper still needs to authenticate, and the
  * flag travels on the record so the acting-identity gate can refuse it. The check does NOT
- * disappear: if a record happens to exist at that id it must still belong to this user, which
- * closes the only way a delegated id could ever name a real agent.
+ * disappear; for a delegated mint it is stricter: the per-run id must name NO stored agent at
+ * all, this user's own included (BL-81 follow-up). A record at that id would be the agent the
+ * dispatch path loads for the run (`context.agent_id` is bound to the credential's `agentId`,
+ * then read as `agent:{id}`), handing a Subagent or Worker that agent's settings and
+ * permissions. Refusing the mint is the only place that closes it before the run starts.
  */
 export async function mintRunCredential(options: {
   userId: string
@@ -345,12 +461,30 @@ export async function mintRunCredential(options: {
   runtime: unknown
   /** A Subagent or Worker run, whose `agentId` is a per-run runtime id (F-P2-1). */
   delegated?: boolean
+  /** Server-vouched physical owner of a delegated run; a Worker names its parent agent. */
+  processOwner?: AgentRunProcessOwner | null
+  /** Primary agent that governs Native Bash for this run. */
+  commandParentAgentId?: string | null
+  delegatedBashEnabled?: boolean | null
   /**
    * BL-75 — the Subagent or Worker whose skill access governs a delegated run. Required when
    * `delegated`, and it must be this user's subagent or a built-in Worker's `worker_…` id. A
    * primary run may omit it or repeat its own `agentId`; anything else is refused.
    */
   scopeAgentId?: string | null
+  /**
+   * BL-81 — the control ids a delegated run's DCM index offered it. Required when `delegated`
+   * (an empty list is a real answer: nothing); refused on a primary run.
+   */
+  allowedControlIds?: string[] | null
+  /** Server-resolved gateway selection for this run; absent means no gateways. */
+  mcpGatewayScope?: string[] | null
+  /** BL-686: server-resolved saved CLI tools for this run; absent means none. */
+  cliToolScope?: string[] | null
+  /** Snapshot of the server-resolved helper profile. Missing/old credentials mean false. */
+  fetchZipAllowed?: boolean
+  /** User setting read from this run's managed profile; null uses conservative paging. */
+  codexToolOutputTokenLimit?: number | null
 }): Promise<{ credentialId: string; token: string; record: AgentRunCredentialRecord }> {
   const userId = requireIdentifier(options.userId, 'a user id')
   const agentId = requireIdentifier(options.agentId, 'an agent id')
@@ -363,11 +497,65 @@ export async function mintRunCredential(options: {
 
   const delegated = options.delegated === true
   const agent = (await redis.get(`agent:${agentId}`)) as Record<string, any> | null
+  if (delegated && agent) {
+    throw new AgentRunCredentialError(
+      `A Subagent or Worker run's id "${agentId}" names a stored agent, so no run credential was ` +
+        'minted: a delegated run must never borrow an agent\'s record. Rename that agent or the ' +
+        'Subagent, then run it again.',
+      409
+    )
+  }
   if ((!agent && !delegated) || (agent?.user_id && agent.user_id !== userId)) {
     throw new AgentRunCredentialError(
       `Agent "${agentId}" was not found for this user, so no run credential was minted.`,
       404
     )
+  }
+  let processOwner: AgentRunProcessOwner | null
+  let commandParentAgentId: string | null
+  if (!delegated) {
+    processOwner = { userId, kind: 'agent', id: agentId }
+    commandParentAgentId = agentId
+    if (options.processOwner && (options.processOwner.userId !== userId ||
+      options.processOwner.kind !== 'agent' || options.processOwner.id !== agentId)) {
+      throw new AgentRunCredentialError('A primary run cannot borrow another command owner.')
+    }
+    if (options.commandParentAgentId != null && options.commandParentAgentId !== agentId) {
+      throw new AgentRunCredentialError('A primary run cannot borrow another command parent.')
+    }
+  } else if (options.processOwner == null) {
+    // Older/auth-only delegated credentials have no physical command authority. Both command
+    // routes refuse them, while their existing non-command helper scope stays intact.
+    processOwner = null
+    if (options.commandParentAgentId != null) {
+      throw new AgentRunCredentialError('A delegated run without an owner cannot name a command parent.')
+    }
+    commandParentAgentId = null
+  } else {
+    const owner = options.processOwner
+    if (owner.userId !== userId || !['agent', 'subagent'].includes(owner.kind) ||
+      typeof owner.id !== 'string' || !owner.id.trim()) {
+      throw new AgentRunCredentialError('A delegated run needs a valid server-owned command owner.')
+    }
+    const stored = (await redis.get(`${owner.kind}:${owner.id}`)) as { user_id?: string } | null
+    if (!stored || stored.user_id !== userId) {
+      throw new AgentRunCredentialError('The delegated command owner was deleted or belongs to another user.')
+    }
+    processOwner = { userId, kind: owner.kind, id: owner.id }
+    if (options.commandParentAgentId == null) {
+      // Auth-only fixture credentials may have an owner but cannot enter Native Bash.
+      commandParentAgentId = null
+    } else {
+      const parentId = requireIdentifier(options.commandParentAgentId, 'a command parent agent id')
+      if (owner.kind === 'agent' && owner.id !== parentId) {
+        throw new AgentRunCredentialError('A Worker command owner must be its parent agent.')
+      }
+      const parent = (await redis.get(`agent:${parentId}`)) as { user_id?: string } | null
+      if (!parent || parent.user_id !== userId) {
+        throw new AgentRunCredentialError('The delegated command parent was deleted or belongs to another user.')
+      }
+      commandParentAgentId = parentId
+    }
   }
   const scopeAgentId = await resolveCredentialScopeAgentId({
     userId,
@@ -375,18 +563,48 @@ export async function mintRunCredential(options: {
     delegated,
     scopeAgentId: options.scopeAgentId
   })
+  const allowedControlIds = resolveCredentialAllowedControlIds({
+    agentId,
+    delegated,
+    allowedControlIds: options.allowedControlIds
+  })
+  const mcpGatewayScope = readRunCredentialMcpGatewayScope({
+    mcpGatewayScope: options.mcpGatewayScope
+  })
+  const cliToolScope = readRunCredentialCliToolScope({ cliToolScope: options.cliToolScope })
+  const fetchZipAllowed = options.fetchZipAllowed === true
+  if (delegated && fetchZipAllowed) {
+    throw new AgentRunCredentialError(
+      'A managed CLI Subagent or Worker cannot be granted Fetch Zip.'
+    )
+  }
+
+  const codexToolOutputTokenLimit = options.codexToolOutputTokenLimit ?? null
+  if (codexToolOutputTokenLimit !== null && (runtime !== 'codex' ||
+    !Number.isSafeInteger(codexToolOutputTokenLimit) || codexToolOutputTokenLimit < 0)) {
+    throw new AgentRunCredentialError('The Codex tool output limit must be a non-negative integer from the managed profile.')
+  }
 
   const secret = generateCredentialSecret()
   const createdAt = Date.now()
   const record: AgentRunCredentialRecord = {
     id: generateCredentialId(),
+    serverInstanceId,
     userId,
     agentId,
     sessionId,
+    processOwner,
+    commandParentAgentId,
+    delegatedBashEnabled: delegated ? options.delegatedBashEnabled === true : null,
     messageId,
     runtime,
     delegated,
     scopeAgentId,
+    allowedControlIds,
+    mcpGatewayScope,
+    cliToolScope,
+    fetchZipAllowed,
+    codexToolOutputTokenLimit,
     tokenHash: hashSecret(secret),
     createdAt: new Date(createdAt).toISOString(),
     expiresAt: new Date(createdAt + AGENT_RUN_CREDENTIAL_TTL_SECONDS * 1000).toISOString(),
@@ -460,8 +678,40 @@ export async function validateRunCredential(
   if (!hashesMatch(record.tokenHash, hashSecret(parts.secret))) {
     return { valid: false, reason: 'invalid' }
   }
+  // A bridge that outlived an app restart can still hold the right secret while its Redis
+  // record remains. Missing (legacy) and prior-process identities both fail closed here.
+  if (record.serverInstanceId !== serverInstanceId) {
+    return { valid: false, reason: 'invalid' }
+  }
   if (!record.expiresAt || Date.parse(record.expiresAt) <= Date.now()) {
     return { valid: false, reason: 'expired' }
+  }
+  // A delegated runtime id has no stored agent record. Its helper credential must still die
+  // when the actual Subagent (or a Worker's parent agent) is deleted, even if the bridge
+  // crashed before revocation. Primary runs also recheck their stored agent here.
+  const owner = readRunCredentialProcessOwner(record)
+  if (!owner) {
+    // Old/auth-only delegated records can still authenticate non-command helpers. Both
+    // command routes refuse them. A present but malformed owner grants no authority at all.
+    if (record.delegated !== true || record.processOwner != null) {
+      return { valid: false, reason: 'invalid' }
+    }
+  } else {
+    const storedOwner = (await redis.get(`${owner.kind}:${owner.id}`)) as { user_id?: string } | null
+    if (!storedOwner || storedOwner.user_id !== record.userId) {
+      return { valid: false, reason: 'invalid' }
+    }
+  }
+  const parentId = record.commandParentAgentId
+  if (!record.delegated && parentId !== record.agentId) return { valid: false, reason: 'invalid' }
+  if (record.delegated && parentId != null &&
+    (typeof parentId !== 'string' || !parentId.trim() || !owner ||
+      (owner.kind === 'agent' && owner.id !== parentId))) {
+    return { valid: false, reason: 'invalid' }
+  }
+  if (typeof parentId === 'string') {
+    const parent = (await redis.get(`agent:${parentId}`)) as { user_id?: string } | null
+    if (!parent || parent.user_id !== record.userId) return { valid: false, reason: 'invalid' }
   }
   return { valid: true, record }
 }

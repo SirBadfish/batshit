@@ -58,7 +58,7 @@
 		class="bs-switch-thumb is-centered"
 	>
 		{#if isIndeterminate}
-			<Minus class="size-3 text-primary dark:text-primary" />
+			<Minus class="size-3 text-primary-text" />
 		{/if}
 	</div>
 </button>

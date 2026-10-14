@@ -112,11 +112,14 @@
 	}
 	let changesCount = $derived(countChanges(diffContent, tool.toolResult?.changeCount))
 	let subtitle = $derived(
-		changesCount.total !== null ? `${subtitleTarget} • ${changesCount.total} changes` : subtitleTarget
+		changesCount.total !== null
+			? `${subtitleTarget} • ${changesCount.total} ${changesCount.total === 1 ? 'change' : 'changes'}`
+			: subtitleTarget
 	)
 
 	// Build metadata
 	let metadata = $derived({
+		...(tool.toolResult?.shell ? { Shell: tool.toolResult.shell } : {}),
 		'File Path': filePath,
 		...(failureReason
 			? {

@@ -8,6 +8,11 @@ export type CatalogSyncSourceStatus = {
   usedFallback: boolean
   skipped?: boolean
   fetchedCount: number
+  /** Missing upstream IDs retained pending retirement evidence; not published deletions. */
+  pendingRemovalIds?: string[]
+  confirmedRemovalIds?: string[]
+  /** Saved IDs excluded by a reviewed connection incompatibility policy, not provider retirement. */
+  policyRemovalIds?: string[]
   error?: string
   warning?: string
 }
@@ -36,6 +41,19 @@ export type CatalogSyncDiff = {
   truncated: boolean
 }
 
+/**
+ * BL-68: two entries of one connection landed in one merged row. The row keeps
+ * the variant it has always published; the others become rows of their own
+ * (`split`), unless another row already uses their canonical id (`dropped`).
+ */
+export type CatalogSyncVariantCollision = {
+  group: string
+  connectionId: string
+  kept: string
+  split: string[]
+  dropped: string[]
+}
+
 export type CatalogSyncWarningAlert = {
   active: boolean
   streak: number
@@ -54,6 +72,8 @@ export type CatalogSyncStoredReport = {
   models: number
   sources: CatalogSyncSourceStatus[]
   diff: CatalogSyncDiff
+  /** BL-68: absent on reports stored before 2026-09-22. */
+  variantCollisions?: CatalogSyncVariantCollision[]
   warningStreak: number
   warningAlert?: CatalogSyncWarningAlert | null
 }

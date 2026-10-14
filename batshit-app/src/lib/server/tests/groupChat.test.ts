@@ -73,11 +73,11 @@ describe('Group chat utils', () => {
     expect(instructions).toContain('redis, svelte')
   })
 
-  // SA-120 P3: the `smart` preset (Jev Juice) is a real preset with its own line.
+  // SA-120 P3: the `smart` preset (Judge Juice) is a real preset with its own line.
   it('builds the smart preset line and keeps the preset in a normalized config', () => {
     const instructions = buildSpeakPolicyInstructions('smart')
     expect(instructions).toContain('Speaking preset: smart')
-    expect(instructions).toContain('Jev Juice')
+    expect(instructions).toContain('Judge Juice')
     expect(instructions).toContain('respond unless you truly have nothing new to add')
     expect(GROUP_CHAT_SPEAK_POLICIES).toContain('smart')
     expect(isGroupChatSpeakPolicy('smart')).toBe(true)
@@ -219,5 +219,23 @@ describe('Group chat utils', () => {
     )
 
     expect(cleaned).toBe('Visible group reply.')
+  })
+
+  it('keeps a cue shown in code, a cue tag named in a sentence, and a lone < in a group reply (BL-442)', () => {
+    const words = [
+      'Example:',
+      '```',
+      '<batshit-cue>{"goon_mood":"happy"}</batshit-cue>',
+      '```',
+      'The <batshit-cue> tag sets a mood; `<batshit-cue>` is how. If x < 5, wait.'
+    ].join('\n')
+    const cleaned = stripGroupChatPresentationControls(
+      `${words}\n<batshit-cue>{"goon_mood":"calm"}</batshit-cue>\nThe end <`
+    )
+    expect(cleaned).toBe(`${words}\n\nThe end <`)
+    expect(stripGroupChatPresentationControls('Bye. <batshit-cue>{"goon_mood":"ca')).toBe('Bye.')
+    // A finished reply (R4): a short start is text; a cut `<batshit-…` is hidden.
+    expect(stripGroupChatPresentationControls('Bye <bat')).toBe('Bye <bat')
+    expect(stripGroupChatPresentationControls('Bye <batshit-cu')).toBe('Bye')
   })
 })

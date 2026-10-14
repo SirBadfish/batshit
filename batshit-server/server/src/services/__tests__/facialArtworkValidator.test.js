@@ -28,6 +28,29 @@ function canonicalJson(value) {
     .join(',')}}`;
 }
 
+function rehashDefinition(definition) {
+  definition.definitionSha256 = crypto
+    .createHash('sha256')
+    .update(canonicalJson({ ...definition, definitionSha256: null }))
+    .digest('hex');
+  return definition;
+}
+
+function sourceDefinition() {
+  const definition = structuredClone(CONTRACT);
+  for (const [index, dependency] of Object.values(definition.dependencies).entries()) {
+    dependency.definitionSha256 = String(index + 1).repeat(64);
+  }
+  return rehashDefinition(definition);
+}
+
+function packageInput(buffer, definition) {
+  return input(buffer, {
+    definitionSha256: definition.definitionSha256,
+    packageDefinition: JSON.stringify(definition)
+  });
+}
+
 function input(buffer, overrides = {}) {
   const orientation = overrides.orientation || TEMPLATE.canonicalOrientation;
   const variant =
@@ -215,12 +238,135 @@ describe('facialArtworkValidator', () => {
     });
   }, 30000);
 
-  test('rejects package-specific definition drift even when template identity is exact', async () => {
+  test('rejects a non-stock hash without a verified package definition', async () => {
     const buffer = await createPaintedTemplateFixture(TEMPLATE);
     const packageDefinitionSha256 = 'f'.repeat(64);
     await expect(
       prepareFacialArtworkUpload(input(buffer, { definitionSha256: packageDefinitionSha256 }))
     ).rejects.toThrow(/does not match the trusted facial-artwork\/v6 contract/);
+  });
+
+  test('binds Source physical dependencies while preserving canonical image bytes and catalog policy', async () => {
+    const buffer = await createPaintedTemplateFixture(TEMPLATE);
+    const stock = await prepareFacialArtworkUpload(input(buffer));
+    const source = sourceDefinition();
+    expect(source.definitionSha256).not.toBe(CONTRACT.definitionSha256);
+    const prepared = await prepareFacialArtworkUpload(packageInput(buffer, source));
+    expect(prepared.buffer.equals(stock.buffer)).toBe(true);
+    expect(prepared.preparation).toEqual(stock.preparation);
+    expect(prepared.artwork).toEqual({
+      ...stock.artwork,
+      definitionSha256: source.definitionSha256
+    });
+
+    // JSON object key order is not a new definition; array order remains owned.
+    const reordered = Object.fromEntries(Object.entries(source).reverse());
+    const reorderedResult = await prepareFacialArtworkUpload(packageInput(buffer, reordered));
+    expect(reorderedResult).toEqual(prepared);
+    const explicitStock = await prepareFacialArtworkUpload(packageInput(buffer, CONTRACT));
+    expect(explicitStock).toEqual(stock);
+  }, 30000);
+
+  test('rejects stale or arbitrary package definition hashes even when artwork policy matches', async () => {
+    const source = sourceDefinition();
+    const wrongHash = { ...source, definitionSha256: 'f'.repeat(64) };
+    await expect(prepareFacialArtworkUpload(packageInput(Buffer.alloc(0), wrongHash)))
+      .rejects.toThrow(/canonical definition hash does not match/);
+    await expect(prepareFacialArtworkUpload({
+      ...packageInput(Buffer.alloc(0), source),
+      definitionSha256: CONTRACT.definitionSha256
+    })).rejects.toThrow(/definitionSha256 does not match packageDefinition/);
+    source.dependencies.eyeAppearance.definitionSha256 = 'e'.repeat(64);
+    await expect(prepareFacialArtworkUpload(packageInput(Buffer.alloc(0), source)))
+      .rejects.toThrow(/canonical definition hash does not match/);
+  });
+
+  test('bounds package JSON bytes and rejects malformed values before image decoding', async () => {
+    const invalidValues = [null, {}, [], 1, true];
+    for (const packageDefinition of invalidValues) {
+      await expect(prepareFacialArtworkUpload(input(Buffer.alloc(0), { packageDefinition })))
+        .rejects.toThrow(/JSON string of at most 64 KiB/);
+    }
+    for (const packageDefinition of ['', '{', '{"definitionSha256":']) {
+      await expect(prepareFacialArtworkUpload(input(Buffer.alloc(0), { packageDefinition })))
+        .rejects.toThrow(/invalid JSON/);
+    }
+    for (const packageDefinition of ['null', '[]', '1', 'true', '"definition"']) {
+      await expect(prepareFacialArtworkUpload(input(Buffer.alloc(0), { packageDefinition })))
+        .rejects.toThrow(/unsupported contract or definition hash/);
+    }
+    // A character-count bound would admit this JSON string; UTF-8 bytes must not.
+    const multibyte = JSON.stringify('é'.repeat(33 * 1024));
+    expect(multibyte.length).toBeLessThan(64 * 1024);
+    await expect(prepareFacialArtworkUpload(input(Buffer.alloc(0), { packageDefinition: multibyte })))
+      .rejects.toThrow(/JSON string of at most 64 KiB/);
+    const valid = JSON.stringify(CONTRACT);
+    const exactLimit = valid.padEnd(64 * 1024, ' ');
+    await expect(prepareFacialArtworkUpload(input(Buffer.alloc(0), { packageDefinition: exactLimit })))
+      .rejects.toThrow(/not a PNG/);
+    await expect(prepareFacialArtworkUpload(input(Buffer.alloc(0), { packageDefinition: `${exactLimit} ` })))
+      .rejects.toThrow(/JSON string of at most 64 KiB/);
+  });
+
+  test('requires exactly the three declared physical dependency contracts and valid hashes', async () => {
+    const mutations = [
+      (value) => { delete value.dependencies.eyeAppearance; },
+      (value) => { value.dependencies.other = value.dependencies.eyeAppearance; },
+      (value) => { value.dependencies = []; },
+      (value) => { value.dependencies.eyeAppearance = null; },
+      (value) => { value.dependencies.eyeAppearance.extra = true; },
+      (value) => { value.dependencies.eyeAppearance.schemaVersion = 'eye-appearance/v4'; },
+      (value) => { value.dependencies.eyeApertureSeam.schemaVersion = 'eye-aperture-seam/v3'; },
+      (value) => { value.dependencies.socketEyeSurface.schemaVersion = 'socket-eye-surface/v1'; },
+      (value) => { value.dependencies.eyeAppearance.definitionSha256 = 'A'.repeat(64); },
+      (value) => { value.dependencies.eyeApertureSeam.definitionSha256 = 'a'.repeat(63); },
+      (value) => { value.dependencies.socketEyeSurface.definitionSha256 = ['a'.repeat(64)]; }
+    ];
+    for (const mutate of mutations) {
+      const changed = sourceDefinition();
+      mutate(changed);
+      rehashDefinition(changed);
+      await expect(prepareFacialArtworkUpload(packageInput(Buffer.alloc(0), changed)))
+        .rejects.toThrow(/physical dependency inventory|invalid .* dependency/);
+    }
+  });
+
+  test('rejects self-consistently hashed template, mask, role, path and policy changes', async () => {
+    const mutations = [
+      (value) => { value.unknown = true; },
+      (value) => { delete value.roles[0].alphaPolicy; },
+      (value) => { value.roles[0].alphaPolicy.fullyOpaqueAllowed = true; },
+      (value) => { value.roles[0].projection = 'untrusted-projection/v1'; },
+      (value) => { value.roles[0].id = 'new-role'; },
+      (value) => { value.roles.reverse(); },
+      (value) => { value.templates[0].version = 'untrusted-version'; },
+      (value) => { value.templates[0].dimensions[0] = 1; },
+      (value) => { value.templates[0].safePaintMask.sha256 = 'a'.repeat(64); },
+      (value) => { value.templates[0].safePaintMask.path = '/tmp/untrusted-mask.png'; },
+      (value) => { value.templates[0].guide.sha256 = 'b'.repeat(64); },
+      (value) => { value.templates[0].guide.path = 'goons/facial-artwork/v6/../../secret'; },
+      (value) => { value.trustedArtwork.entries[0].asset.sha256 = 'c'.repeat(64); },
+      (value) => { value.trustedArtwork.entries[0].asset.path = '/tmp/untrusted-artwork.png'; }
+    ];
+    for (const mutate of mutations) {
+      const changed = sourceDefinition();
+      mutate(changed);
+      rehashDefinition(changed);
+      await expect(prepareFacialArtworkUpload(packageInput(Buffer.alloc(0), changed)))
+        .rejects.toThrow(/changes trusted artwork fields beyond physical dependency hashes/);
+    }
+  });
+
+  test('rejects excessive nesting by trusted shape without entering the recursive hash encoder', async () => {
+    const source = sourceDefinition();
+    const definition = JSON.stringify(source);
+    const nested = '['.repeat(10000) + '0' + ']'.repeat(10000);
+    const packageDefinition = definition.replace('"roles":[', `"roles":[${nested},`);
+    expect(Buffer.byteLength(packageDefinition)).toBeLessThan(64 * 1024);
+    await expect(prepareFacialArtworkUpload(input(Buffer.alloc(0), {
+      definitionSha256: source.definitionSha256,
+      packageDefinition
+    }))).rejects.toThrow(/changes trusted artwork fields beyond physical dependency hashes/);
   });
 
   test('reloads the trusted definition when its file changes without a server restart', async () => {

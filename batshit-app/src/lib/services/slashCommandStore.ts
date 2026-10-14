@@ -51,6 +51,22 @@ export class SlashCommandStore extends RedisStoreBase {
     return slashCommand
   }
 
+  /**
+   * BL-544: turn ONE agent or Subagent on or off for one Skill or Prompt (Settings > Agents >
+   * Access). The server adds or removes that id against the list as stored now, so a list changed
+   * elsewhere since this page loaded it is never replaced by this page's copy. Answers the command
+   * as stored.
+   */
+  async setSlashCommandAgentAccess(id: string, agentId: string, enabled: boolean) {
+    const response = await this.apiCall(`/slash-commands/${encodeURIComponent(id)}/agent-access`, {
+      method: 'PUT',
+      body: JSON.stringify({ agentId, enabled })
+    })
+    const slashCommand = response.slashCommand as SlashCommandRow
+    dispatchSlashCommandsUpdated({ source: 'agent-access', commandId: slashCommand.id })
+    return slashCommand
+  }
+
   async deleteSlashCommand(id: string) {
     await this.apiCall(`/slash-commands/${id}`, {
       method: 'DELETE'

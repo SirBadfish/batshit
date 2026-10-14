@@ -2,6 +2,7 @@ import { json, type RequestHandler } from '@sveltejs/kit'
 
 import { redis } from '$lib/server/redis'
 import { evaluateSkillDependencies, getSkill } from '$lib/server/services/skillRegistry'
+import { isSkillFilesMissingError } from '$lib/server/services/skillFilesMissing'
 import {
   bootstrapSystemSlashCommands,
   expectedSystemSkillIdForCommand
@@ -411,6 +412,11 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
       usage
     })
   } catch (error) {
+    // BL-369: a user skill whose files are missing says so (the folder it looked in), never a
+    // generic failure.
+    if (isSkillFilesMissingError(error)) {
+      return json({ error: error.message, code: error.code }, { status: 409 })
+    }
     console.error('Error invoking slash command:', error)
     return json({ error: 'Failed to invoke slash command' }, { status: 500 })
   }

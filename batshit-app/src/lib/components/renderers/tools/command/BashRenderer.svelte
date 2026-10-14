@@ -2,6 +2,7 @@
 <script lang="ts">
 	import FullTool from '../templates/FullTool.svelte'
 	import type { ToolData } from '../toolRendererRegistry'
+	import { describeCommandPreview, describeOutputCut, toolOutputCut } from '$lib/utils/toolActivityContract'
 	import { FolderOpen, Search, Terminal, Check, X } from '@lucide/svelte'
 	
 	let { tool }: { tool: ToolData } = $props()
@@ -115,12 +116,17 @@
 		}
 		return tool.success ? 'success' : 'error'
 	}) as 'success' | 'error'
+	// BL-8: an output its lane cut (Claude Code keeps only a big output's first 30,000 bytes) holds
+	// only its first matches, entries, or lines.
+	let outputCut = $derived(toolOutputCut(tool.toolResult))
+	let commandPreview = $derived(operationKind === 'bash' ? describeCommandPreview(tool.toolResult) : undefined)
 	let subtitle = $derived.by(() => {
+		const first = outputCut ? 'first ' : ''
 		if (operationKind === 'search_files') {
-			return `${totalMatches} match${totalMatches === 1 ? '' : 'es'} in ${totalMatchingFiles} file${totalMatchingFiles === 1 ? '' : 's'}`
+			return `${first}${totalMatches} match${totalMatches === 1 ? '' : 'es'} in ${totalMatchingFiles} file${totalMatchingFiles === 1 ? '' : 's'}`
 		}
 		if (operationKind === 'list_files') {
-			return `${totalItems} item${totalItems === 1 ? '' : 's'}`
+			return `${first}${totalItems} item${totalItems === 1 ? '' : 's'}`
 		}
 		if (command && command !== 'Unknown command') return command
 		return 'Shell activity'
@@ -128,6 +134,7 @@
 
 	// Build metadata
 	let metadata = $derived.by(() => ({
+		...(tool.toolResult?.shell ? { Shell: tool.toolResult.shell } : {}),
 		...(workingDir ? { 'Working Directory': workingDir } : {}),
 		...(typeof exitCode === 'number' ? { 'Exit Code': exitCode } : {}),
 		...(operationKind === 'search_files'
@@ -151,6 +158,9 @@
 						Items: totalItems
 				  }
 			: {}),
+		...(outputCut ? { Note: describeOutputCut(outputCut) } : {}),
+		// The stored preview keeps at most 220 lines of stdout (found in BL-166's proof).
+		...(commandPreview ? { 'Output shown': commandPreview } : {}),
 		...(tool.metadata?.executionTime && { 'Duration': `${tool.metadata.executionTime}ms` }),
 		...(tool.rawSidecar?.zipId ? { 'Raw Payload Zip': tool.rawSidecar.zipId } : {})
 	}))

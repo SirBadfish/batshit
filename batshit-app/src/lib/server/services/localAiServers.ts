@@ -11,6 +11,8 @@ import type {
   LocalAiImageTransport
 } from '$lib/types/localAi'
 import { rewriteLoopbackUrlToDockerHostForRuntime } from '$lib/server/services/runtimeUrlRewrites'
+import { managedProfileHelper } from './localAiManagedProfiles'
+import type { KoboldManagedProfileReference } from '$lib/types/localAi'
 
 const LOCAL_AI_SET_PREFIX = 'user'
 
@@ -83,7 +85,8 @@ function buildSummary(
       record?.imageBaseUrl ?? definition.defaultImageBaseUrl,
     createdAt: record?.createdAt,
     updatedAt: record?.updatedAt,
-    source: record ? 'stored' : 'default'
+    source: record ? 'stored' : 'default',
+    managedProfile: record?.managedProfile
   }
 }
 
@@ -93,6 +96,14 @@ async function loadRecord(userId: string, id: LocalAiServerId): Promise<LocalAiS
   })
 }
 
+/**
+ * Every Local AI server, each with its saved record or, when none was ever saved, its default.
+ *
+ * A record that does not exist is a default (`source: 'default'`). A record whose READ FAILED is
+ * neither: it may be saved, so listing it as a default would show a made-up address as if it were the
+ * saved one, and a settings screen that then saved would write it over the real one (BL-977).
+ * The whole list fails instead, with the failure as its `cause`.
+ */
 export async function listLocalAiServers(userId: string): Promise<LocalAiServerSummary[]> {
   const recordsById = new Map<LocalAiServerId, LocalAiServerRecord>()
 
@@ -104,6 +115,7 @@ export async function listLocalAiServers(userId: string): Promise<LocalAiServerS
       }
     } catch (error) {
       console.warn(`[Local AI] Failed to load ${definition.id}:`, error)
+      throw new Error('Could not read the saved Local AI servers.', { cause: error })
     }
   }
 
@@ -161,7 +173,13 @@ export async function saveLocalAiServers(
     }
 
     await redis.execute(async (client) => {
-      await client.json.set(providerKey(userId, update.id), '$', record as unknown as RedisJSON)
+      if (!existing) await client.json.set(providerKey(userId, update.id), '$', record as unknown as RedisJSON)
+      else {
+        // Ordinary connection saves own these fields, never the managed grant reference.
+        for (const [field, value] of Object.entries(record)) {
+          await client.json.set(providerKey(userId, update.id), `$.${field}`, value as RedisJSON)
+        }
+      }
       await client.sAdd(providerSetKey(userId), update.id)
     })
   }
@@ -169,12 +187,27 @@ export async function saveLocalAiServers(
   return listLocalAiServers(userId)
 }
 
-export async function deleteLocalAiServer(userId: string, id: LocalAiServerId): Promise<void> {
+/** Low-level record removal. Public deletion composes restart custody in localAiServerDeletion.ts. */
+export async function deleteLocalAiServerRecord(userId: string, id: LocalAiServerId): Promise<void> {
   if (!LOCAL_AI_SERVER_IDS.has(id)) {
     throw new Error('Unknown local AI server')
+  }
+  const existing = await loadRecord(userId, id)
+  if (id === 'koboldcpp' && process.env.BATSHIT_RUNTIME_OWNER === 'mac-app' && process.env.BATSHIT_CONTAINERIZED !== '1') {
+    // Durable revoke must complete before the reference disappears. Files remain
+    // because pending native reads/recovery cannot be proven absent by deletion.
+    await managedProfileHelper('revoke-owner', { userId, requireState: Boolean(existing?.managedProfile) })
   }
   await redis.execute(async (client) => {
     await client.del(providerKey(userId, id))
     await client.sRem(providerSetKey(userId), id)
+  })
+}
+
+export async function saveKoboldManagedProfileReference(userId: string, reference: KoboldManagedProfileReference): Promise<void> {
+  const existing = await loadRecord(userId, 'koboldcpp')
+  if (!existing) throw new Error('Save the KoboldCpp connection before enabling local context editing.')
+  await redis.execute(async client => {
+    await client.json.set(providerKey(userId, 'koboldcpp'), '$.managedProfile', reference as unknown as RedisJSON)
   })
 }

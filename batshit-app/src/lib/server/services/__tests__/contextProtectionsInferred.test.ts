@@ -6,7 +6,7 @@ import { loadContextProtections } from '../contextTokenPreview'
 import { writeInferredUnzips } from '../zipStateInferred'
 
 /**
- * SA-120 P5 — a result Jev Juice opened (`source: 'inferred'`) is Batshit's guess, not a pin.
+ * SA-120 P5 — a result Judge Juice opened (`source: 'inferred'`) is Batshit's guess, not a pin.
  * Every other unzip shields its message from Manual Trim, Compact, and a nap; this one must
  * not, or an inferred state would outrank the user's own context controls.
  */
@@ -14,7 +14,7 @@ import { writeInferredUnzips } from '../zipStateInferred'
 useRedisTestServer()
 
 describe('loadContextProtections', () => {
-  it('protects what the user and the agent hold open, and never what Jev Juice opened', async () => {
+  it('protects what the user and the agent hold open, and never what Judge Juice opened', async () => {
     const sessionId = `protections-${Date.now()}`
     for (const [zipId, source] of [['zip_user', 'user'], ['zip_agent', 'agent']] as const) {
       await redis.sAdd(`unzipped:${sessionId}`, zipId)

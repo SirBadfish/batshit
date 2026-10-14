@@ -22,6 +22,13 @@
  */
 
 import { redis } from '$lib/server/redis'
+import { withZipStateLock } from '$lib/server/services/zipStateLock'
+import {
+  hasTurnStartedAfter,
+  isSessionDeleting,
+  lastTurnStartOf
+} from '$lib/server/services/streamAbortRegistry'
+import { resolveCompiledSpeakerView } from '$lib/server/services/compiledSpeakerView'
 import type { Message } from '$lib/stores/messages.svelte'
 import { countMessageTokens, countTotalTokens } from '$lib/utils/tokenCounter'
 import {
@@ -63,14 +70,19 @@ import {
 } from '$lib/server/services/summaryGeneration'
 import {
   createMemorySegment,
+  deleteMemorySegment,
   listMemorySegments
 } from './memoryStore'
-import type { MemoryEmbedder } from './memoryEmbedder'
+import { createMemoryEmbedderAsync, type MemoryEmbedder } from './memoryEmbedder'
+import { getMemoryConfig } from './memoryIndex'
 import { foldAwarenessState } from './memoryRecall'
 import {
+  EpisodeNotOpenError,
+  EpisodeWhiteboardChangedError,
   getOpenEpisode,
   listEpisodes,
   markEpisodeGraduated,
+  readWhiteboard,
   updateEpisodeWhiteboard,
   whiteboardAuthor,
   type EpisodeRecord
@@ -173,6 +185,41 @@ export function buildDefaultSummaryGenerator(params: {
   }
 }
 
+/**
+ * BL-549 (N1, N2): why a nap, or dreaming in one chat, ended before its next writing step. A
+ * turn started in the chat since the job began (`turn_started`: the user's message goes first),
+ * or the chat is being deleted or is gone (`chat_deleted`, BL-623: nothing more is written).
+ */
+export type BackgroundJobEndedEarlyReason = 'turn_started' | 'chat_deleted'
+
+/** BL-549 (N2): what a nap record and a dreaming action say when a turn ended the job early. */
+export const ENDED_EARLY_MESSAGE_ARRIVED = 'ended early: a message arrived'
+
+/** The look a background job asks before each step that writes. */
+export type BackgroundJobLook = () => Promise<BackgroundJobEndedEarlyReason | null>
+
+/**
+ * BL-549 (N1): the look a nap (or dreaming, in one chat) asks before each step that writes. It
+ * reads the chat's last turn start NOW, when the job begins, so call it before the job's first
+ * await: the nap route's "no turn running" check and this read are then one synchronous step,
+ * and no turn can start between them unseen. The look answers `chat_deleted` while the chat is
+ * being deleted or once its record is gone (a delete's sweep also forgets the chat's turn trace,
+ * so this is asked first), then `turn_started` when a turn of this chat started since
+ * (`hasTurnStartedAfter`, the registry of this process: a turn that started AND ended since
+ * counts too). A job takes no lock, so a look is not atomic with the write after it: a write that
+ * can still meet a turn is made safe on its own (by path, N4; conditional, N3).
+ */
+export function createBackgroundJobLook(sessionId: string): BackgroundJobLook {
+  const seenTurnId = lastTurnStartOf(sessionId)
+  return async () => {
+    if (isSessionDeleting(sessionId)) return 'chat_deleted'
+    if (!(await redis.exists(`session:${sessionId}`))) return 'chat_deleted'
+    if (isSessionDeleting(sessionId)) return 'chat_deleted'
+    if (hasTurnStartedAfter(sessionId, seenTurnId)) return 'turn_started'
+    return null
+  }
+}
+
 function randomIdSuffix(): string {
   return Math.random().toString(36).slice(2, 8)
 }
@@ -225,10 +272,25 @@ function buildLiveWindow(messages: Message[], session: Record<string, any> | nul
 }
 
 interface GraduationWriteResult {
+  ok: true
   segmentId: string
   eventId: string
   summary: string
   summaryTokenEstimate: number
+  /** `false` when this call's `createMemorySegment` made a brand-new segment record. */
+  reused: boolean
+}
+
+/**
+ * BL-751: `createMemorySegment` embeds before it writes, so a chat deleted during that call is
+ * still there when the segment write lands, but gone by the time the window event write runs
+ * right after. The event write then answers `missing`; the caller ends early as `chat_deleted`
+ * instead of failing, and the segment this call just created (never wired into any window) is
+ * removed rather than left as an orphan with no event.
+ */
+interface GraduationWriteChatDeleted {
+  ok: false
+  reason: 'chat_deleted'
 }
 
 /**
@@ -250,7 +312,7 @@ async function writeGraduationForMessages(options: {
   /** Regular sessions write no window event (DL-104-12) — memseg only. */
   writeWindowEvent: boolean
   now: Date
-}): Promise<GraduationWriteResult> {
+}): Promise<GraduationWriteResult | GraduationWriteChatDeleted> {
   const sourceIds = options.sourceMessages.map((message) => message.id)
   const first = options.sourceMessages[0]
   const last = options.sourceMessages[options.sourceMessages.length - 1]
@@ -310,33 +372,42 @@ async function writeGraduationForMessages(options: {
   }
 
   if (options.writeWindowEvent) {
-    await appendGraduationEvent(options.sessionId, event)
+    const written = await appendGraduationEvent(options.sessionId, event)
+    if (written === 'chat_deleted') {
+      // BL-751: only a segment THIS call just created is an orphan — a reused one was already
+      // linked (or is owned by whatever attempt reused it) and is left alone.
+      if (!reusable) await deleteMemorySegment(options.agentId, segment.id).catch(() => {})
+      return { ok: false, reason: 'chat_deleted' }
+    }
   }
 
   return {
+    ok: true,
     segmentId: segment.id,
     eventId: event.id,
     summary: segment.summary,
-    summaryTokenEstimate
+    summaryTokenEstimate,
+    reused: Boolean(reusable)
   }
 }
 
+/**
+ * BL-549 (N4): the event is added at its own path, in one step inside Redis. It used to read the
+ * chat and write that copy's whole metadata back, erasing what another writer (a turn's Compact,
+ * a second graduation) added in between. BL-751: a chat gone by the time this runs answers
+ * `chat_deleted`, not an error — the segment it belonged to embedded before this write and can
+ * still find the chat deleted underneath it.
+ */
 async function appendGraduationEvent(
   sessionId: string,
   event: FixedSessionGraduationEvent
-): Promise<void> {
-  const fresh = await redis.getSession(sessionId)
-  if (!fresh) throw new Error(`Session ${sessionId} disappeared during graduation.`)
-  if (!isFixedSession(fresh)) {
+): Promise<'ok' | 'chat_deleted'> {
+  const written = await redis.appendFixedSessionGraduationEvent(sessionId, { ...event })
+  if (written === 'missing') return 'chat_deleted'
+  if (written === 'not_fixed') {
     throw new Error(`Session ${sessionId} is not an Infinite Session; graduation events require one.`)
   }
-  const metadata = { ...(fresh.metadata ?? {}) } as Record<string, any>
-  const state = getFixedSessionGraduationState(metadata)
-  metadata.fixedSession = {
-    ...(metadata.fixedSession ?? {}),
-    graduation: { version: 1, events: [...state.events, event] }
-  }
-  await redis.updateSession(sessionId, { metadata })
+  return 'ok'
 }
 
 /**
@@ -347,53 +418,45 @@ async function appendGraduationEvent(
  * retries). The underlying memsegs and original messages are untouched by design
  * (DL-104-02: era consolidation thins the window's splice list, never the archive).
  */
+/**
+ * BL-751: `chat_deleted` when the chat went away underneath the swap (the era memseg's own embed
+ * call is the last gap left open before this write) — the caller ends early instead of failing,
+ * and removes the era memseg it just created rather than leave an orphan with no event.
+ */
 export async function swapGraduationEvents(
   sessionId: string,
   removeEventIds: string[],
   eraEvent: FixedSessionGraduationEvent
-): Promise<void> {
+): Promise<'ok' | 'chat_deleted'> {
   if (removeEventIds.length === 0) {
     throw new Error('swapGraduationEvents requires at least one event id to replace.')
   }
-  const fresh = await redis.getSession(sessionId)
-  if (!fresh) throw new Error(`Session ${sessionId} disappeared during era consolidation.`)
-  if (!isFixedSession(fresh)) {
-    throw new Error(`Session ${sessionId} is not an Infinite Session; graduation events require one.`)
-  }
-  const metadata = { ...(fresh.metadata ?? {}) } as Record<string, any>
-  const state = getFixedSessionGraduationState(metadata)
-  const present = new Set(state.events.map((event) => event.id))
-  const missing = removeEventIds.filter((id) => !present.has(id))
-  if (missing.length > 0) {
+  // BL-549 (N4): one step inside Redis, at the event list's own path, only while every replaced
+  // event is still stored. Events and blocks another writer added meanwhile stay.
+  const swapped = await redis.swapFixedSessionGraduationEvents(sessionId, removeEventIds, { ...eraEvent })
+  if (swapped.ok) return 'ok'
+  if (swapped.reason === 'changed') {
     throw new Error(
-      `Era consolidation aborted: graduation event(s) ${missing.join(', ')} changed underneath the pass.`
+      `Era consolidation aborted: graduation event(s) ${swapped.missing.join(', ')} changed underneath the pass.`
     )
   }
-  const removeSet = new Set(removeEventIds)
-  const firstIndex = state.events.findIndex((event) => removeSet.has(event.id))
-  const events = state.events.filter((event) => !removeSet.has(event.id))
-  events.splice(firstIndex, 0, eraEvent)
-  metadata.fixedSession = {
-    ...(metadata.fixedSession ?? {}),
-    graduation: { version: 1, events }
-  }
-  await redis.updateSession(sessionId, { metadata })
+  if (swapped.reason === 'missing') return 'chat_deleted'
+  throw new Error(`Session ${sessionId} is not an Infinite Session; graduation events require one.`)
 }
 
+/**
+ * BL-549 (N4): the nap's record is added at its own path (the last 20 kept), in one step inside
+ * Redis. Answers the chat's metadata as stored after the write, or `null` for a chat that is gone.
+ */
 async function appendNapRecord(
   sessionId: string,
   record: FixedSessionNapRecord
 ): Promise<Record<string, any> | null> {
-  const fresh = await redis.getSession(sessionId)
-  if (!fresh) return null
-  const metadata = { ...(fresh.metadata ?? {}) } as Record<string, any>
-  const existing = Array.isArray(metadata.fixedSession?.naps) ? metadata.fixedSession.naps : []
-  metadata.fixedSession = {
-    ...(metadata.fixedSession ?? {}),
-    naps: [...existing, record].slice(-FIXED_SESSION_NAP_HISTORY_LIMIT)
-  }
-  await redis.updateSession(sessionId, { metadata })
-  return metadata
+  return redis.appendFixedSessionNapRecord(
+    sessionId,
+    { ...record },
+    FIXED_SESSION_NAP_HISTORY_LIMIT
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -503,11 +566,24 @@ function selectEpisodeSourceMessages(options: {
   return { sourceMessages, excludedProtectedCount, excludedRecoveryHoldCount, intersectsFloor }
 }
 
-function buildEpisodeTranscript(episode: EpisodeRecord, sourceMessages: Message[]): string {
+/**
+ * BL-224: every graduation transcript is read for the agent whose memory it becomes, with the
+ * compiler's speaker view: that agent is `<assistant>`, any other agent in the segment is named.
+ */
+async function buildAgentTranscript(agentId: string, messages: Message[]): Promise<string> {
+  const speakers = await resolveCompiledSpeakerView({ messages, selfAgentId: agentId })
+  return buildCompactionTranscript(messages, speakers)
+}
+
+async function buildEpisodeTranscript(
+  agentId: string,
+  episode: EpisodeRecord,
+  sourceMessages: Message[]
+): Promise<string> {
   const whiteboardBlock = episode.whiteboard?.content?.trim()
     ? `EPISODE WHITEBOARD AT CLOSE (working facts the agent kept in front of itself):\n${episode.whiteboard.content.trim()}\n\n`
     : ''
-  return `${whiteboardBlock}${buildCompactionTranscript(sourceMessages)}`
+  return `${whiteboardBlock}${await buildAgentTranscript(agentId, sourceMessages)}`
 }
 
 // ---------------------------------------------------------------------------
@@ -518,6 +594,8 @@ export interface ClosedEpisodeGraduationResult {
   /** One entry per graduated episode; segmentId is null on the mark-only recovery path. */
   graduated: Array<{ episodeId: string; segmentId: string | null }>
   skippedEpisodes: Array<{ episodeId: string; reason: string }>
+  /** BL-549 (N2): set when the look stopped the pass before an episode's write. */
+  endedEarly?: BackgroundJobEndedEarlyReason
 }
 
 /**
@@ -538,9 +616,16 @@ export async function graduateClosedEpisodesForSession(options: {
   recoveryHoldIds: Set<string>
   generateSummary: SummaryGenerator
   embedder?: MemoryEmbedder
+  /** Nap-only lazy setup: resolve before an eligible summary, then look again. */
+  resolveEmbedder?: () => Promise<MemoryEmbedder>
   now: Date
   /** Optional per-pass bound (dreaming); the nap graduates every closed episode. */
   maxEpisodes?: number
+  /**
+   * BL-549 (N1): asked before each episode's writes (its summary call, then its memseg, event
+   * and mark). An answer ends the pass: episodes already graduated stay, no other one starts.
+   */
+  look?: BackgroundJobLook
 }): Promise<ClosedEpisodeGraduationResult> {
   const { sessionId, window, messages, protections, recoveryHoldIds, now } = options
   const graduated: Array<{ episodeId: string; segmentId: string | null }> = []
@@ -556,6 +641,8 @@ export async function graduateClosedEpisodesForSession(options: {
       : closedEpisodes
 
   for (const episode of limited) {
+    const stopBefore = options.look ? await options.look() : null
+    if (stopBefore) return { graduated, skippedEpisodes, endedEarly: stopBefore }
     const currentSession = await redis.getSession(sessionId)
     const graduatedIds = new Set(
       getGraduatedMessageIds(
@@ -616,9 +703,29 @@ export async function graduateClosedEpisodesForSession(options: {
       `Aim for roughly ${budget.softTargetTokens.toLocaleString()} tokens; do not exceed about ${budget.hardMaxTokens.toLocaleString()}.`,
       '',
       'CONVERSATION SEGMENT TO GRADUATE:',
-      buildEpisodeTranscript(episode, selection.sourceMessages)
+      await buildEpisodeTranscript(options.agentId, episode, selection.sourceMessages)
     ].join('\n')
+    let embedder = options.embedder
+    if (options.resolveEmbedder) {
+      try {
+        embedder = await options.resolveEmbedder()
+      } catch (error) {
+        const stop = options.look ? await options.look() : null
+        if (stop) return { graduated, skippedEpisodes, endedEarly: stop }
+        throw error
+      }
+      const stopAfterSetup = options.look ? await options.look() : null
+      if (stopAfterSetup) return { graduated, skippedEpisodes, endedEarly: stopAfterSetup }
+    }
     const summary = await options.generateSummary(prompt, budget.hardMaxTokens)
+    // The summary call is the long wait: look again before this episode's writes. BL-549 option A
+    // (Faye, 2026-09-27): a closed episode does not change when a message arrives, so a summary
+    // whose call finished is written when a turn started (by path, no lock a turn waits for),
+    // and the pass ends after it. A deleted chat gets nothing.
+    const stopAfterCall = options.look ? await options.look() : null
+    if (stopAfterCall === 'chat_deleted') {
+      return { graduated, skippedEpisodes, endedEarly: stopAfterCall }
+    }
 
     const written = await writeGraduationForMessages({
       userId: options.userId,
@@ -628,12 +735,17 @@ export async function graduateClosedEpisodesForSession(options: {
       source: options.source,
       sourceMessages: selection.sourceMessages,
       summary,
-      embedder: options.embedder,
+      embedder,
       writeWindowEvent: true,
       now
     })
+    // BL-751: the chat went away between the summary call above and the event write inside
+    // `writeGraduationForMessages` (its embed call is the last gap left open). No episode mark:
+    // the chat's records are gone.
+    if (!written.ok) return { graduated, skippedEpisodes, endedEarly: 'chat_deleted' }
     await markEpisodeGraduated(sessionId, episode.id)
     graduated.push({ episodeId: episode.id, segmentId: written.segmentId })
+    if (stopAfterCall) return { graduated, skippedEpisodes, endedEarly: stopAfterCall }
   }
 
   return { graduated, skippedEpisodes }
@@ -644,7 +756,12 @@ export async function graduateClosedEpisodesForSession(options: {
 // ---------------------------------------------------------------------------
 
 export interface FixedSessionNapOutcome {
-  status: 'completed' | 'not_needed' | 'failed'
+  /**
+   * `ended_early` (BL-549 N2): a turn started in the chat, or the chat was deleted, before one of
+   * the nap's writing steps; `endedEarly` says which. The finished steps stay.
+   */
+  status: 'completed' | 'not_needed' | 'failed' | 'ended_early'
+  endedEarly?: BackgroundJobEndedEarlyReason
   record: FixedSessionNapRecord | null
   /** Fresh session metadata after the nap's writes (for the client store). */
   metadata: Record<string, any> | null
@@ -668,6 +785,9 @@ export async function runFixedSessionNap(options: {
 }): Promise<FixedSessionNapOutcome> {
   const now = options.now ?? new Date()
   const sessionId = options.sessionId
+  // BL-549 (N1): read the chat's last turn start before the first await, in the same synchronous
+  // step as the route's "no turn running" check.
+  const look = createBackgroundJobLook(sessionId)
   const agentId = String(options.agent?.id ?? '')
   if (!agentId) throw new Error('Nap requires an agent id.')
   if (!resolveAgentMemoryEnabled(options.agent)) {
@@ -679,7 +799,7 @@ export async function runFixedSessionNap(options: {
   if (!isFixedSession(session)) throw new Error('Naps only run in Infinite Sessions.')
 
   const windowSettings = resolveMemoryWindowSettings(options.agent)
-  const budgetSettings = await resolveAgentBudgetSettings(options.agent)
+  const budgetSettings = await resolveAgentBudgetSettings(options.agent, sessionId)
   const window = resolveEffectiveMemoryWindow(windowSettings, budgetSettings.contextLimit)
   if (!window) {
     throw new Error(
@@ -734,7 +854,7 @@ export async function runFixedSessionNap(options: {
   let compaction: FixedSessionNapRecord['compaction'] = null
 
   const finish = async (
-    status: 'completed' | 'failed',
+    status: 'completed' | 'failed' | 'ended_early',
     tokensAfter: number | null,
     error?: string
   ): Promise<FixedSessionNapOutcome> => {
@@ -742,13 +862,19 @@ export async function runFixedSessionNap(options: {
     // — the nap already resets the provider cache (or runs between turns anyway),
     // so the fold is free here. A failed fold never fails the nap: the SP keeps
     // compiling the previous snapshot and the pending notes stay honest.
+    // BL-549 (N2): a nap that a message ended early starts no further step, the fold included;
+    // the next nap folds.
     let awarenessFold: string
-    try {
-      const fold = await foldAwarenessState({ agentId, reason: 'nap', now })
-      awarenessFold = fold.changed ? 'folded' : 'unchanged'
-    } catch (foldError) {
-      awarenessFold = `failed: ${foldError instanceof Error ? foldError.message : 'unknown error'}`
-      console.error('[memoryGraduation] Awareness fold during the nap failed:', foldError)
+    if (status === 'ended_early') {
+      awarenessFold = 'skipped'
+    } else {
+      try {
+        const fold = await foldAwarenessState({ agentId, reason: 'nap', now })
+        awarenessFold = fold.changed ? 'folded' : 'unchanged'
+      } catch (foldError) {
+        awarenessFold = `failed: ${foldError instanceof Error ? foldError.message : 'unknown error'}`
+        console.error('[memoryGraduation] Awareness fold during the nap failed:', foldError)
+      }
     }
     const record: FixedSessionNapRecord = {
       id: napId,
@@ -764,11 +890,18 @@ export async function runFixedSessionNap(options: {
       rezippedZipCount,
       compaction,
       awarenessFold,
+      // Both facts (option A): a message ended it, and how many closed episodes it wrote.
+      ...(status === 'ended_early'
+        ? {
+            endedEarly: `${ENDED_EARLY_MESSAGE_ARRIVED}; ${graduatedEpisodeIds.length} closed episode${graduatedEpisodeIds.length === 1 ? '' : 's'} written`
+          }
+        : {}),
       ...(error ? { error } : {})
     }
     const metadata = await appendNapRecord(sessionId, record)
     return {
-      status: status === 'failed' ? 'failed' : 'completed',
+      status,
+      ...(status === 'ended_early' ? { endedEarly: 'turn_started' as const } : {}),
       record,
       metadata,
       window,
@@ -778,7 +911,39 @@ export async function runFixedSessionNap(options: {
     }
   }
 
+  // BL-549 (N2): a turn ends the nap with its record (the finished steps stay); a deleted chat
+  // ends it with no further write at all (BL-623): no record, no fold.
+  const endEarly = async (
+    reason: BackgroundJobEndedEarlyReason,
+    tokensAfter: number | null
+  ): Promise<FixedSessionNapOutcome> => {
+    if (reason === 'turn_started') return finish('ended_early', tokensAfter)
+    return {
+      status: 'ended_early',
+      endedEarly: 'chat_deleted',
+      record: null,
+      metadata: null,
+      window,
+      tokensBefore,
+      tokensAfter
+    }
+  }
+
   try {
+    // BL-436: one embedder for every segment this nap writes, built for the signed-in user as
+    // dreaming builds it. A Model Manager preset on a local runtime, or an API key saved in
+    // Settings, resolves only with a user; the store's no-user default failed every such nap.
+    // BL-790: step 2 needs no embedder. Resolve only before an eligible step-1/3 summary,
+    // still before spending its model call, and reuse the exact instance for every write.
+    let embedderPromise: Promise<MemoryEmbedder> | undefined
+    const resolveEmbedder = () => {
+      embedderPromise ??= options.embedder
+        ? Promise.resolve(options.embedder)
+        : getMemoryConfig().then((config) =>
+            createMemoryEmbedderAsync(config.embedding, { userId: options.userId })
+          )
+      return embedderPromise
+    }
     const messages = await loadOrderedSessionMessages(sessionId)
     const protections = await loadContextProtections(sessionId)
     const recoveryHold = calculateRecoveryHoldByIndex(messages)
@@ -797,14 +962,16 @@ export async function runFixedSessionNap(options: {
       protections,
       recoveryHoldIds,
       generateSummary,
-      embedder: options.embedder,
-      now
+      resolveEmbedder,
+      now,
+      look
     })
     graduatedEpisodeIds.push(...stepOne.graduated.map((entry) => entry.episodeId))
     segmentIds.push(
       ...stepOne.graduated.flatMap((entry) => (entry.segmentId ? [entry.segmentId] : []))
     )
     skippedEpisodes.push(...stepOne.skippedEpisodes)
+    if (stepOne.endedEarly) return await endEarly(stepOne.endedEarly, null)
 
     let tokensAfter = await estimate()
     if (tokensAfter < window.napAtTokens) {
@@ -816,40 +983,55 @@ export async function runFixedSessionNap(options: {
       const currentSession = await redis.getSession(sessionId)
       const liveWindow = buildLiveWindow(messages, currentSession)
       const floorProtectedIds = computeFloorProtectedIds(liveWindow, window.floorTokens)
-      const unzippedIds = new Set(
-        ((await redis.sMembers(`unzipped:${sessionId}`).catch(() => [])) ?? []).filter(
-          (id): id is string => typeof id === 'string' && id.trim().length > 0
+      // The held set is read and the markers written under the chat's zip state lock (SA-129
+      // P2b, BL-352), so a Hold the user clicks meanwhile is never compressed over.
+      const stepTwoStop = await withZipStateLock(sessionId, async () => {
+        // BL-549 (N1) / BL-623: the look comes inside the lock, right before the writes. A delete
+        // that landed during the estimate above used to leave `rezipped:{id}` behind.
+        const stop = await look()
+        if (stop) return stop
+        const unzippedIds = new Set(
+          ((await redis.sMembers(`unzipped:${sessionId}`).catch(() => [])) ?? []).filter(
+            (id): id is string => typeof id === 'string' && id.trim().length > 0
+          )
         )
-      )
-      const rezippedIds = new Set(
-        ((await redis.sMembers(`rezipped:${sessionId}`).catch(() => [])) ?? []).filter(
-          (id): id is string => typeof id === 'string' && id.trim().length > 0
+        const rezippedIds = new Set(
+          ((await redis.sMembers(`rezipped:${sessionId}`).catch(() => [])) ?? []).filter(
+            (id): id is string => typeof id === 'string' && id.trim().length > 0
+          )
         )
-      )
 
-      for (const message of liveWindow) {
-        if (floorProtectedIds.has(message.id)) continue
-        if (isWindowSummaryMessage(message)) continue
-        if (recoveryHoldIds.has(message.id)) continue
-        if (isMessageProtectedFromManualTrim(message, protections)) continue
-        const zipIds = Array.isArray(message.metadata?.zipIds) ? message.metadata.zipIds : []
-        for (const zipId of zipIds) {
-          if (typeof zipId !== 'string' || !zipId.trim()) continue
-          if (unzippedIds.has(zipId)) continue // manual unzips are pins
-          if (rezippedIds.has(zipId)) continue
-          await redis.sAdd(`rezipped:${sessionId}`, zipId)
-          await redis.set(`rezipped_item:${sessionId}:${zipId}`, {
-            zipId,
-            sessionId,
-            source: 'agent',
-            reason: 'nap',
-            napId,
-            at: now.toISOString()
-          })
-          rezippedIds.add(zipId)
-          rezippedZipCount += 1
+        for (const message of liveWindow) {
+          if (floorProtectedIds.has(message.id)) continue
+          if (isWindowSummaryMessage(message)) continue
+          if (recoveryHoldIds.has(message.id)) continue
+          if (isMessageProtectedFromManualTrim(message, protections)) continue
+          const zipIds = Array.isArray(message.metadata?.zipIds) ? message.metadata.zipIds : []
+          for (const zipId of zipIds) {
+            if (typeof zipId !== 'string' || !zipId.trim()) continue
+            if (unzippedIds.has(zipId)) continue // manual unzips are pins
+            if (rezippedIds.has(zipId)) continue
+            // BL-749: this loop can span several Redis round trips, and the delete does not take
+            // this lock, so a delete can start in the gap between two of them. A synchronous check
+            // right before each write catches it the same way `look()` does above.
+            if (isSessionDeleting(sessionId)) return 'chat_deleted'
+            await redis.sAdd(`rezipped:${sessionId}`, zipId)
+            if (isSessionDeleting(sessionId)) return 'chat_deleted'
+            await redis.set(`rezipped_item:${sessionId}:${zipId}`, {
+              zipId,
+              sessionId,
+              source: 'agent',
+              reason: 'nap',
+              napId,
+              at: now.toISOString()
+            })
+            rezippedIds.add(zipId)
+            rezippedZipCount += 1
+          }
         }
-      }
+        return null
+      })
+      if (stepTwoStop) return await endEarly(stepTwoStop, tokensAfter)
     }
 
     tokensAfter = await estimate()
@@ -859,6 +1041,8 @@ export async function runFixedSessionNap(options: {
 
     // ---- Step 3: open-episode narrative compaction + whiteboard extraction ----
     {
+      const stepThreeStop = await look()
+      if (stepThreeStop) return await endEarly(stepThreeStop, tokensAfter)
       const currentSession = await redis.getSession(sessionId)
       const graduatedIds = new Set(
         getGraduatedMessageIds(
@@ -912,10 +1096,24 @@ export async function runFixedSessionNap(options: {
           : `CURRENT EPISODE WHITEBOARD (kept by the agent; context only, not yours to change):\n${currentWhiteboard}`,
         '',
         'OLDER OPEN-EPISODE SEGMENT TO COMPACT:',
-        buildCompactionTranscript(candidates)
+        await buildAgentTranscript(agentId, candidates)
       ].join('\n')
 
+      let embedder: MemoryEmbedder
+      try {
+        embedder = await resolveEmbedder()
+      } catch (error) {
+        const stop = await look()
+        if (stop) return await endEarly(stop, tokensAfter)
+        throw error
+      }
+      const afterSetupStop = await look()
+      if (afterSetupStop) return await endEarly(afterSetupStop, tokensAfter)
       const generated = await generateSummary(prompt, budget.hardMaxTokens)
+      // The summary call is the long wait: a message sent meanwhile goes first, and this step's
+      // summary, event and board are not written.
+      const afterCallStop = await look()
+      if (afterCallStop) return await endEarly(afterCallStop, tokensAfter)
       const sections = parseNapCompactionSections(generated, { whiteboard: napWritesBoard })
 
       const written = await writeGraduationForMessages({
@@ -926,10 +1124,13 @@ export async function runFixedSessionNap(options: {
         source: 'nap',
         sourceMessages: candidates,
         summary: sections.summary,
-        embedder: options.embedder,
+        embedder,
         writeWindowEvent: true,
         now
       })
+      // BL-751: the chat went away between the summary call above and this write's own embed
+      // call. No board write follows: the episode's records are gone.
+      if (!written.ok) return await endEarly('chat_deleted', tokensAfter)
       segmentIds.push(written.segmentId)
       compaction = {
         segmentId: written.segmentId,
@@ -938,7 +1139,20 @@ export async function runFixedSessionNap(options: {
         whiteboard: whiteboardOutcome
       }
       if (openEpisode && napWritesBoard && sections.whiteboard) {
-        await updateEpisodeWhiteboard(sessionId, openEpisode.id, sections.whiteboard, 'nap')
+        // BL-549: the board is written only if it is still the board read above, before the
+        // summary call. A turn sent during that call can have the agent write its board (that
+        // board is the agent's, and it stays) or close the episode (its board stays on the closed
+        // episode). Either way the summary and event above are complete, and the nap is too.
+        try {
+          await updateEpisodeWhiteboard(sessionId, openEpisode.id, sections.whiteboard, 'nap', {
+            onlyIf: readWhiteboard(openEpisode.whiteboard)
+          })
+        } catch (error) {
+          if (!(error instanceof EpisodeWhiteboardChangedError) && !(error instanceof EpisodeNotOpenError)) {
+            throw error
+          }
+          compaction.whiteboard = 'kept'
+        }
       }
     }
 
@@ -956,7 +1170,7 @@ export async function runFixedSessionNap(options: {
 // ---------------------------------------------------------------------------
 
 export interface RegularSessionGraduationOutcome {
-  status: 'graduated' | 'not_idle' | 'too_small' | 'nothing_new'
+  status: 'graduated' | 'not_idle' | 'too_small' | 'nothing_new' | 'superseded' | 'chat_deleted'
   segmentId?: string
   messageCount?: number
 }
@@ -990,8 +1204,12 @@ export async function graduateRegularSessionTail(options: {
   const watermark = (session.metadata as Record<string, any> | undefined)?.memoryGraduation as
     | Record<string, any>
     | undefined
+  // BL-737 review: an empty-string stored id is "no mark", the same as a missing/absent one —
+  // never a real message id to search for or to CAS against.
   const lastGraduatedId =
-    typeof watermark?.lastGraduatedMessageId === 'string' ? watermark.lastGraduatedMessageId : null
+    typeof watermark?.lastGraduatedMessageId === 'string' && watermark.lastGraduatedMessageId !== ''
+      ? watermark.lastGraduatedMessageId
+      : null
 
   let tailStart = 0
   if (lastGraduatedId) {
@@ -1028,7 +1246,16 @@ export async function graduateRegularSessionTail(options: {
     })
   }
 
-  const budgetSettings = await resolveAgentBudgetSettings(options.agent)
+  // BL-436: the signed-in user's embedder, as dreaming builds it (a local-runtime preset or a key
+  // saved in Settings resolves only with a user). Built before the summary call, so a broken
+  // embedder setup fails before a model call is spent.
+  const embedder =
+    options.embedder ??
+    (await createMemoryEmbedderAsync((await getMemoryConfig()).embedding, {
+      userId: options.userId
+    }))
+
+  const budgetSettings = await resolveAgentBudgetSettings(options.agent, options.sessionId)
   const sourceTokens = tail.reduce((total, message) => total + countMessageTokens(message), 0)
   const budget = resolveCompactSummaryBudget({
     contextLimit: budgetSettings.contextLimit,
@@ -1041,7 +1268,7 @@ export async function graduateRegularSessionTail(options: {
     `Aim for roughly ${budget.softTargetTokens.toLocaleString()} tokens; do not exceed about ${budget.hardMaxTokens.toLocaleString()}.`,
     '',
     'CONVERSATION SEGMENT TO GRADUATE:',
-    buildCompactionTranscript(tail)
+    await buildAgentTranscript(agentId, tail)
   ].join('\n')
   const summary = await generateSummary(prompt, budget.hardMaxTokens)
 
@@ -1053,25 +1280,47 @@ export async function graduateRegularSessionTail(options: {
     source: options.reason === 'close' ? 'session_close' : 'idle',
     sourceMessages: tail,
     summary,
-    embedder: options.embedder,
+    embedder,
     writeWindowEvent: false,
     now
   })
+  // `writeWindowEvent` is false above, so `appendGraduationEvent` never runs and this call can
+  // only ever answer `ok` here (BL-751's race is specific to that write; the equivalent gap for a
+  // regular session — the chat deleted during THIS call's own embed, inside `createMemorySegment`
+  // — surfaces below, at the mark write, since there is no window event here to catch it first).
+  if (!written.ok) {
+    throw new Error(`Unreachable: regular graduation of session ${options.sessionId} answered chat_deleted.`)
+  }
 
-  // Advance the watermark (regular sessions: memseg only, window untouched).
-  const fresh = await redis.getSession(options.sessionId)
-  if (fresh) {
-    const metadata = { ...(fresh.metadata ?? {}) } as Record<string, any>
-    const previousSegmentIds = Array.isArray(metadata.memoryGraduation?.segmentIds)
-      ? metadata.memoryGraduation.segmentIds
-      : []
-    metadata.memoryGraduation = {
-      version: 1,
+  // Advance the watermark (regular sessions: memseg only, window untouched). BL-723: only the
+  // mark, at its own path; the segment joins the stored list. Writing back a copy of the whole
+  // metadata erased a Compact event or any other block written since that copy was read. BL-737:
+  // the write is a compare-and-set on `lastGraduatedId` — the id THIS graduation read as its
+  // starting mark (`tailStart` above is really keyed on that id's position in the message list,
+  // never on any message's timestamp) — so two overlapping graduations settle by whichever CAS
+  // lands first, and a graduation that resumes after its old mark's message was deleted always
+  // reads and matches the current stored id instead of getting stuck. `superseded`: another
+  // graduation's write landed first — this call's segment already duplicates ground the winner
+  // covers, so it is discarded (a reused segment is left alone; something else still needs it).
+  // `missing`: the chat was deleted during this call's own embed (BL-751's regular-session
+  // counterpart) — same discard, reported honestly instead of as `graduated`. `superseded_linked`
+  // (BL-737 review): the winner already reused THIS call's own segment and linked it into the
+  // mark it wrote — deleting it here would leave the mark naming a segment that no longer exists.
+  const markWrite = await redis.writeRegularGraduationMark(
+    options.sessionId,
+    {
       lastGraduatedMessageId: tail[tail.length - 1].id,
       lastGraduatedAt: now.toISOString(),
-      segmentIds: [...previousSegmentIds, written.segmentId].slice(-100)
+      segmentId: written.segmentId
+    },
+    lastGraduatedId
+  )
+
+  if (markWrite !== 'ok') {
+    if (!written.reused && markWrite !== 'superseded_linked') {
+      await deleteMemorySegment(agentId, written.segmentId).catch(() => {})
     }
-    await redis.updateSession(options.sessionId, { metadata })
+    return { status: markWrite === 'missing' ? 'chat_deleted' : 'superseded' }
   }
 
   return { status: 'graduated', segmentId: written.segmentId, messageCount: tail.length }

@@ -17,9 +17,27 @@ const LOCAL_PROVIDER_IDS: ReadonlySet<string> = LOCAL_AI_SERVER_IDS
 
 export type ModelPresetAvailability = {
   disabled: boolean
-  disabledBecause: 'non_chat' | 'incompatible' | 'locked' | 'voice_session' | null
+  /**
+   * `unlisted` (BL-517): the saved-models list answer marked the preset (`unavailableReason`)
+   * because its connection no longer lists its model. Like `locked`, the preset cannot be picked
+   * now but stays saved and stays the agent's selection until the user picks another.
+   */
+  disabledBecause: 'non_chat' | 'incompatible' | 'locked' | 'unlisted' | 'voice_session' | null
   reason: string | null
   connectionOption: CatalogConnectionOption | null
+}
+
+/**
+ * Whether a panel keeps an agent's or Subagent's saved preset selected when it opens. A preset
+ * that is only unavailable for now (a locked connection, a model its connection stopped listing)
+ * stays selected with its reason shown; clearing it would erase the saved choice on the next save.
+ */
+export function presetAvailabilityKeepsSelection(availability: ModelPresetAvailability): boolean {
+  return (
+    !availability.disabled ||
+    availability.disabledBecause === 'locked' ||
+    availability.disabledBecause === 'unlisted'
+  )
 }
 
 function normalize(value?: string | null) {
@@ -174,6 +192,11 @@ export function getModelPresetAvailability({
       reason: 'CLI presets are only available for CLI agents',
       connectionOption
     }
+  }
+
+  const unavailableReason = normalize(model.unavailableReason ?? null)
+  if (unavailableReason) {
+    return { disabled: true, disabledBecause: 'unlisted', reason: unavailableReason, connectionOption }
   }
 
   if (connectionOption?.status === 'locked') {

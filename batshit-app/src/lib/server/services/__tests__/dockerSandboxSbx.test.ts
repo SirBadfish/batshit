@@ -1,4 +1,9 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+import { createHash } from 'node:crypto'
+import { createRequire } from 'node:module'
+import os from 'node:os'
+import path from 'node:path'
+import { mkdir, mkdtemp, rm, symlink } from 'node:fs/promises'
 import {
   SBX_ABANDONED_AFTER_MS,
   buildSbxSandboxName,
@@ -95,9 +100,32 @@ describe('dockerSandboxSbx', () => {
       workspaceRoot: '/Users/example/project',
       sessionId: 'session_1'
     })
-    expect(name).toMatch(/^batshit-josh-alt-s[0-9a-f]{8}-[0-9a-f]{10}$/)
+    expect(name).toMatch(/^batshit-josh-alt-s[0-9a-f]{8}-m4-[0-9a-f]{10}$/)
     expect(name).toContain(buildSbxSessionMarker('session_1'))
-    expect(buildSbxSandboxName({ userId: '__', workspaceRoot: '/w' })).toMatch(/^batshit-user-[0-9a-f]{10}$/)
+    const oldHash = createHash('sha256').update('/Users/example/project').digest('hex').slice(0, 10)
+    expect(name.endsWith(oldHash)).toBe(false)
+    const previousMountHash = createHash('sha256').update('managed-mounts-v2:/Users/example/project').digest('hex').slice(0, 10)
+    expect(name.endsWith(previousMountHash)).toBe(false)
+    // BL-1277: an m3 VM may have been made for a folder that is protected now; m4 never reuses one.
+    const m3Hash = createHash('sha256').update('managed-mounts-v3:/Users/example/project').digest('hex').slice(0, 10)
+    expect(name.endsWith(m3Hash)).toBe(false)
+    expect(buildSbxSandboxName({ userId: '__', workspaceRoot: '/w' })).toMatch(/^batshit-user-m4-[0-9a-f]{10}$/)
+  })
+
+  it('names agree with the Docker host operator, so both lanes leave the same m3 sandboxes behind (BL-1277)', () => {
+    // The operator's twin (plain JavaScript beside the app, loaded by Node).
+    const operatorCli = createRequire(import.meta.url)(path.resolve(process.cwd(), '../tools/docker/sbx-cli.mjs')) as {
+      buildSbxSandboxName: (options: { userId?: string; workspaceRoot: string; sessionId?: string }) => string
+    }
+    for (const options of [
+      { userId: 'josh', workspaceRoot: '/Users/example/project' },
+      { userId: 'Josh_Alt.', workspaceRoot: '/w', sessionId: 'session_1' },
+      { userId: '', workspaceRoot: path.join(os.homedir(), '.batshit', 'workspaces') }
+    ]) {
+      const name = buildSbxSandboxName(options)
+      expect(name).toContain('-m4-')
+      expect(operatorCli.buildSbxSandboxName(options)).toBe(name)
+    }
   })
 
   it('creates a plain shell sandbox with all network denied from the start', () => {
@@ -115,8 +143,65 @@ describe('dockerSandboxSbx', () => {
       '**',
       'shell',
       '/Users/example/project',
-      '/Users/example/.batshit'
+      '/Users/example/.batshit/installs',
+      '/Users/example/.batshit/tools',
+      '/Users/example/.batshit/skills',
+      '/Users/example/.batshit/portable-skills',
+      '/Users/example/.batshit/voice-profiles',
+      '/Users/example/.batshit/workspaces',
+      '/Users/example/.batshit/ab-profile'
     ])
+  })
+
+  it.each(['runtime', 'pinokio', 'pinokio.admission'])('refuses protected %s as a direct workspace or extra mount', (name) => {
+    const home = path.join(os.homedir(), '.batshit')
+    for (const root of [path.join(home, name), path.join(home, name, 'nested')]) {
+      expect(() => sbxCreateArgs({ sandboxName: 'batshit-x', workspaceRoot: root })).toThrow(/protected runtime/)
+      expect(() => sbxCreateArgs({ sandboxName: 'batshit-x', workspaceRoot: '/w', extraWorkspaces: [root] })).toThrow(/protected runtime/)
+    }
+  })
+
+  it('keeps ordinary mounts permitted beside the protected admission folder (BL-1277)', () => {
+    const home = path.join(os.homedir(), '.batshit')
+    for (const root of [path.join(home, 'workspaces', 'project'), path.join(home, 'pinokio.admission-notes'), path.join(home, 'pinokio-notes')]) {
+      expect(sbxCreateArgs({ sandboxName: 'batshit-x', workspaceRoot: '/w', extraWorkspaces: [root] })).toContain(root)
+    }
+  })
+
+  it('refuses a workspace that exposes managed agent homes', () => {
+    expect(() => sbxCreateArgs({ sandboxName: 'batshit-x', workspaceRoot: '/Users/example', extraWorkspaces: ['/Users/example/.batshit'] })).toThrow(/managed agent homes/)
+    expect(() => sbxCreateArgs({ sandboxName: 'batshit-x', workspaceRoot: '/w', extraWorkspaces: ['/Users/example/.batshit/agents'] })).toThrow(/managed agent homes/)
+  })
+
+  it.each(['agents', 'runtime', 'pinokio', 'pinokio.admission'])('refuses a workspace alias that resolves into protected %s', async (protectedName) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'batshit-sbx-mount-test-'))
+    try {
+      const home = path.join(root, '.batshit')
+      const agents = path.join(home, protectedName)
+      await mkdir(agents, { recursive: true })
+      const alias = path.join(root, 'workspace-alias')
+      await symlink(agents, alias)
+      expect(() => sbxCreateArgs({ sandboxName: 'batshit-x', workspaceRoot: alias, extraWorkspaces: [home] })).toThrow(/managed agent homes/)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses an agents root under a configured home with any folder name', async () => {
+    const temp = await mkdtemp(path.join(os.tmpdir(), 'batshit-custom-home-'))
+    const home = path.join(temp, 'first-run-home')
+    vi.stubEnv('BATSHIT_HOME_DIR', home)
+    try {
+      await mkdir(path.join(home, 'agents'), { recursive: true })
+      const alias = path.join(temp, 'alias')
+      await symlink(path.join(home, 'agents'), alias)
+      for (const workspaceRoot of [home, path.join(home, 'agents'), alias]) {
+        expect(() => sbxCreateArgs({ sandboxName: 'batshit-x', workspaceRoot })).toThrow(/managed agent homes/)
+      }
+    } finally {
+      vi.unstubAllEnvs()
+      await rm(temp, { recursive: true, force: true })
+    }
   })
 
   it('scopes the deny-all rule to one sandbox with --sandbox', () => {

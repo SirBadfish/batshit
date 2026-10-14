@@ -251,7 +251,10 @@
 		} catch (error) {
 			console.error('Failed to update session ID:', error);
 			const { toast } = await import('svelte-sonner');
-			toast.error('Error updating session ID. Check console for details.');
+			// BL-605: show the server's own reason (e.g. BL-541's glob-character refusal) when it
+			// gave one, and fall back to the generic message only when it did not.
+			const reason = error instanceof Error ? error.message.trim() : '';
+			toast.error(reason || 'Error updating session ID. Check console for details.');
 			currentEditId = session.id;
 		}
 	}
@@ -460,7 +463,7 @@
 		flex: 0 0 auto;
 		align-items: center;
 		margin-left: 0.25rem;
-		color: var(--bs-app-primary);
+		color: var(--bs-app-primary-text);
 		line-height: 1;
 		width: 0.75rem;
 		height: 0.75rem;
@@ -518,10 +521,10 @@
 	.session-item-group-badge {
 		margin-left: 0.5rem;
 		padding: 0.125rem 0.375rem;
-		border: 1px solid color-mix(in oklab, var(--primary) 30%, transparent);
+		border: 1px solid var(--bs-app-primary-soft);
 		border-radius: 999px;
-		background: color-mix(in oklab, var(--primary) 10%, transparent);
-		color: var(--primary);
+		background: var(--bs-app-primary-faint);
+		color: var(--bs-app-primary-text);
 		font-size: 0.5625rem;
 		font-weight: 600;
 	}

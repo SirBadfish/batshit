@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { redis } from '../redis'
+import { generateNdjsonConsumerScript } from '$lib/utils/ndjsonConsumer'
 
 vi.mock('$lib/server/redis', async () => {
   const actual = await vi.importActual<typeof import('$lib/server/redis')>('$lib/server/redis')
@@ -354,6 +355,71 @@ describe.runIf(REAL_REDIS_LANE)('POST /api/artifacts/complete', () => {
         toolsEnabled: false
       })
     )
+  })
+
+  it.each([
+    { label: 'an Error before text', partial: '', error: Object.assign(new Error('Provider overloaded'), { code: 'overloaded_error' }), expected: 'Provider overloaded' },
+    { label: 'an Error after partial text', partial: 'Partial answer', error: Object.assign(new Error('Provider disconnected'), { code: 'connection_error' }), expected: 'Provider disconnected' },
+    { label: 'a string error', partial: '', error: 'Provider unavailable', expected: 'Provider unavailable' },
+    { label: 'an object error', partial: '', error: { message: 'Provider quota exhausted' }, expected: 'Provider quota exhausted' },
+    { label: 'an undefined error', partial: '', error: undefined, expected: 'Artifact completion failed' },
+    { label: 'a null error', partial: '', error: null, expected: 'Artifact completion failed' },
+    { label: 'an empty object error', partial: '', error: {}, expected: 'Artifact completion failed' },
+    { label: 'an empty string error', partial: '', error: '', expected: 'Artifact completion failed' }
+  ])('fails Mode 3 for $label without reporting success', async ({ partial, error: providerError, expected }) => {
+    const { POST } = await import('../../../routes/api/artifacts/complete/+server')
+    await redis.del('ratelimit:artifact:user_1:art_1')
+    let continuedAfterError = false
+    let iteratorClosed = false
+    const filesRead = vi.fn(() => [{ mediaType: 'image/png', base64: 'ZmFrZQ==' }])
+    aiMocks.streamNativeMode.mockResolvedValueOnce({
+      stream: (async function* () {
+        try {
+          if (partial) yield { type: 'text-delta', text: partial }
+          yield { type: 'error', error: providerError }
+          continuedAfterError = true
+          yield { type: 'text-delta', text: 'Incorrect continuation' }
+          yield { type: 'finish', usage: { totalTokens: 5 } }
+        } finally {
+          iteratorClosed = true
+        }
+      })(),
+      get files() { return filesRead() }
+    })
+
+    const response = await POST(buildEvent({ artifactId: 'art_1', prompt: 'provider failure' }))
+    expect(response.status).toBe(200)
+    const onError = vi.fn()
+    const onEnd = vi.fn()
+    // Execute the same browser-compatible consumer injected into artifact iframes.
+    const consume = new Function(`${generateNdjsonConsumerScript()}; return consumeNdjson;`)()
+    const result = await consume(response, { onError, onEnd })
+    expect(result.text).toBe(partial)
+    expect(result.events.map((event: any) => event.type)).toEqual(
+      partial ? ['start', 'chunk', 'error'] : ['start', 'error']
+    )
+    expect(onError).toHaveBeenCalledExactlyOnceWith(expected, expect.objectContaining({ type: 'error' }))
+    expect(onEnd).not.toHaveBeenCalled()
+    expect(result.files).toEqual([])
+    expect(filesRead).not.toHaveBeenCalled()
+    expect(continuedAfterError).toBe(false)
+    expect(iteratorClosed).toBe(true)
+    const runId = result.events[0].metadata.runId
+    const runLog = await waitForArtifactRun('art_1', runId, (record) => record.completedAt !== null)
+    expect(runLog.status).toBe('error')
+    expect(runLog.result.chunkChars).toBe(partial.length)
+    expect(runLog.result.fileCount).toBe(0)
+    expect(runLog.events.map((event: any) => event.type)).toEqual(
+      partial ? ['start', 'chunk', 'error'] : ['start', 'error']
+    )
+    expect(runLog.errors).toContainEqual(expect.objectContaining({ message: expected, source: 'stream' }))
+    if (providerError instanceof Error) {
+      expect(runLog.errors).toContainEqual(expect.objectContaining({
+        name: providerError.name,
+        code: (providerError as Error & { code: string }).code,
+        stackPreview: expect.arrayContaining([expect.stringContaining(providerError.message)])
+      }))
+    }
   })
 
   it('streams Mode 3 completions using saved generation settings instead of hardcoded caps', async () => {

@@ -99,7 +99,7 @@ Check:
 - The relevant MCP gateway or saved CLI Tool is healthy.
 - `Batshit Subagent Tools` is connected to the n8n agent node.
 - The request preserves the scoped native-tool token and parent context.
-- The Subagent is not trying to fetch a prior Batshit Zip directly; Fetch Zip is Primary-only.
+- The Subagent is not trying to fetch a prior Batshit Zip directly; n8n Workflow Subagents never get Fetch Zip.
 
 ## n8n API key or Instance MCP does not work
 

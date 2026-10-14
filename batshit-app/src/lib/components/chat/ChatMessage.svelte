@@ -5,11 +5,16 @@
   import JevJuiceFlagNotice from './JevJuiceFlagNotice.svelte'
   import JevJuiceWakeMessageFlag from './JevJuiceWakeMessageFlag.svelte'
   import JevJuiceQuickActionChip from './JevJuiceQuickActionChip.svelte'
+  import JevJuiceGroupReplyChip from './JevJuiceGroupReplyChip.svelte'
+  import { readGroupReplySkipped } from '$lib/utils/groupReplySkipped'
   import { readQuickActionMark } from '$lib/utils/jevJuiceQuickActions'
   import type { WakeTurnRef } from '$lib/utils/jevJuice'
   import JevJuiceNote from './JevJuiceNote.svelte'
   import JevJuicePostTurnChip from './JevJuicePostTurnChip.svelte'
   import { getJevJuicePostTurnRecord } from '$lib/stores/jevJuicePostTurn.svelte'
+  import { getCodexCleanupWarning } from '$lib/stores/codexCleanupWarnings.svelte'
+  import { codexCleanupWarningText } from '$lib/utils/codexCleanupWarning'
+  import { modeLimitedNoteText } from '$lib/utils/modeLimitedNote'
   import { jevJuiceGapDetail, jevJuiceGapText, readJevJuiceGaps, readJevJuiceNotes } from '$lib/utils/jevJuice'
   import { copyTextToClipboard } from '$lib/utils/clipboard'
   import MessageApprovalPanel from './MessageApprovalPanel.svelte'
@@ -20,6 +25,7 @@
   import * as DropdownMenu from '$lib/components/ui/dropdown-menu'
   import * as agentStore from '$lib/stores/agents.svelte'
   import { page } from '$app/state'
+  import { getUserSettings } from '$lib/stores/userSettings.svelte'
   import { Button } from '$lib/components/ui/button'
   import { resolveVoiceSettingsForSpeech, voiceService, type VoiceConfig } from '$lib/services/voice'
   import type { VoiceSettings } from '$lib/types/voice'
@@ -27,7 +33,8 @@
   import * as chatRunRegistry from '$lib/stores/chatRunRegistry.svelte'
   import {
     describeControlApproval,
-    resolveApprovalSubmitSource
+    resolveApprovalSubmitSource,
+    describeExpiredApprovalClick
   } from '$lib/utils/controlApprovalPresentation'
   import {
     buildToolApprovalResponses,
@@ -39,6 +46,7 @@
   import { getPlaybackState } from '$lib/stores/voicePlayback.svelte'
   import { toast } from 'svelte-sonner'
   import { DatabaseService } from '$lib/services/databaseRedis.client'
+  import { ApiCallError } from '$lib/services/redisCore'
   import { postSendRouted } from '$lib/services/sendRoutedClient'
   import {
     normalizePrimaryAgentType,
@@ -95,7 +103,7 @@
     voiceSettings?: VoiceSettings
     /**
      * SA-120 P7: the wake-up that started this message's turn, when a DM, a webhook, or a
-     * schedule did: on a reply, for the approval card's origin line and the Jev Juice notice
+     * schedule did: on a reply, for the approval card's origin line and the Judge Juice notice
      * above it; on the user message that IS the wake-up message, for the flag under its text.
      */
     wakeTurn?: WakeTurnRef | null
@@ -106,6 +114,7 @@
   const isWakeMessage = $derived(!isAI && wakeTurn !== null && wakeTurn.messageId === message.id)
   // SA-120 P9: a spoken turn Batshit acted on carries its mark in the stored message.
   const quickActionMark = $derived(!isAI ? readQuickActionMark(message.metadata) : null)
+  const groupReplySkipped = $derived(!isAI ? readGroupReplySkipped(message.metadata, message.id, message.content ?? '') : null)
   const responseFailed = $derived(
     isAI &&
       message.status !== 'in_progress' &&
@@ -289,7 +298,7 @@
       triggerTerms?: string[]
       turnsRemaining?: number
       holdEpisode?: boolean
-      /** SA-120 P4b: Jev Juice brought this memory in, not the agent and not a trigger word. */
+      /** SA-120 P4b: Judge Juice brought this memory in, not the agent and not a trigger word. */
       inferred?: boolean
     }>
   })
@@ -329,7 +338,7 @@
     if (item.source === 'recall') {
       // SA-120 P4b (DL-120-04): an inferred row says who brought it in.
       const how = item.inferred
-        ? 'brought in by Jev'
+        ? 'brought in by the judge'
         : item.segment
           ? 'recalled episode summary'
           : 'recalled by search'
@@ -337,7 +346,7 @@
     }
     return status
   }
-  // SA-120 (DL-120-02): a Jev Juice lane that could not run this turn leaves a note beside
+  // SA-120 (DL-120-02): a Judge Juice lane that could not run this turn leaves a note beside
   // the memory chips; the message was sent without it. Never a pop-up.
   const jevJuiceNotes = $derived.by(() => (isAI ? readJevJuiceNotes(message.metadata) : []))
   // SA-120 P1 (B6): a capability the request looked like it needed but the agent does not
@@ -348,6 +357,29 @@
   // `end`, when the browser already owns the next save of this message.
   const jevJuicePostTurn = $derived.by(() =>
     isAI ? getJevJuicePostTurnRecord(sessionId || message.session_id, message.id) : null
+  )
+  const codexCleanupWarning = $derived.by(() =>
+    isAI ? getCodexCleanupWarning(sessionId || message.session_id, message.id) : null
+  )
+  // BL-775: the server saved this reply from its own copy, because the live record of the stream
+  // could not be had (a stream event did not reach it). The words are whole; the notice says why
+  // the reply may look different from what streamed.
+  const savedFromOwnCopy = $derived(
+    isAI && (message.metadata as any)?.replySavedFromOwnCopy === true
+  )
+  // BL-759: the agent's program lost its connection mid-answer and started the answer again; the
+  // unfinished first try was taken out of the reply. The server saves the note; a tab that saw it
+  // live shows it at once.
+  const restartedAfterLostConnection = $derived.by(() => {
+    if (!isAI) return null
+    const note = (message.metadata as any)?.restartedAfterLostConnection
+    if (!note || typeof note !== 'object') return null
+    return typeof note.program === 'string' && note.program.trim() ? note.program.trim() : 'The agent'
+  })
+  // BL-941: the agent's record made this run tighter than the mode its send carried (a group
+  // member, an older window); the server saves the note with the reply at every way it ends.
+  const modeLimitedNote = $derived(
+    isAI ? modeLimitedNoteText((message.metadata as any)?.modeLimitedByAgentSettings) : null
   )
   const hasMemoryAffordances = $derived(
     memorySaves.length > 0 ||
@@ -366,11 +398,14 @@
     isAI && (planItems.length > 0 || Boolean(planSummary))
   )
   
-  // Get user settings from page data
-  const userSettings = $derived(page.data.userSettings)
+  // The live settings store (a rename in Settings reaches a mounted bubble), then the page's
+  // load-time copy until the store is seeded.
+  const userSettings = $derived(getUserSettings() ?? page.data.userSettings)
 
   const agentDisplayName = $derived(agent?.displayName || 'AI')
-  const userDisplayName = $derived(userSettings?.display_name || 'Me')
+  // BL-240: settings save the name as `displayName`; `display_name` is an older record's field.
+  const userSettingsName = $derived(firstString(userSettings?.displayName, userSettings?.display_name))
+  const userDisplayName = $derived(userSettingsName || 'Me')
   const agentAvatarUrl = $derived(
     agent?.avatar_url || agent?.avatar || (agent?.avatar_icon_ref ? null : '/assets/batshit_default_AI_Avatar_1.png')
   )
@@ -585,7 +620,16 @@
         toast.success('Message deleted')
       } catch (error) {
         console.error('Failed to delete message from database:', error)
-        toast.error('Failed to delete message')
+        // The server's own sentence (`ApiCallError`): a 409 says the reply is still running
+        // (BL-381) and is shown as it is; any other failure keeps the plain prefix.
+        const reason = error instanceof Error ? error.message.trim() : ''
+        if (error instanceof ApiCallError && error.status === 409 && reason) {
+          // Nothing to retry in the dialog while the reply runs: close it so the toast is read.
+          showDeleteDialog = false
+          toast.error(reason)
+        } else {
+          toast.error(reason ? `Failed to delete message: ${reason}` : 'Failed to delete message')
+        }
       }
       return
     }
@@ -900,6 +944,11 @@
         ...entry,
         status: 'expired',
         submitted: false,
+        // BL-496 (A6): a Claude card's clock is its helper's wait, so running out means
+        // nobody answered it.
+        ...(resolveApprovalSubmitSource(entry, summary.source) === 'claude'
+          ? { expiryReason: 'unanswered' }
+          : {}),
         expiredAt: nowIso,
         ...(entry.expiresAt
           ? {}
@@ -925,8 +974,13 @@
       (entry) =>
         entry?.status === 'approved' || entry?.status === 'denied' || entry?.status === 'expired'
     )
+    // BL-496 (A5): a Claude card ends with its helper's wait, on the same clock, and the
+    // helper says so itself; nothing is sent for it. `send-routed` never answers a Claude card.
+    const onlyClaudeCards = nextApprovals.every(
+      (entry) => resolveApprovalSubmitSource(entry, summary.source) === 'claude'
+    )
 
-    if (allResolved) {
+    if (allResolved && !onlyClaudeCards) {
       await submitToolApprovals(nextApprovals)
     }
   }
@@ -934,7 +988,10 @@
   async function handleApprovalAction(approvalId: string, approved: boolean) {
     const selectedApproval = toolApprovals.find((entry) => entry?.approvalId === approvalId)
     if (selectedApproval?.status === 'expired') {
-      approvalError = 'This approval already expired after 3 minutes. Ask the agent to run it again.'
+      approvalError = describeExpiredApprovalClick({
+        ...selectedApproval,
+        source: resolveApprovalSubmitSource(selectedApproval, toolApprovalSummary?.source)
+      })
       toast.error(approvalError)
       return
     }
@@ -1092,7 +1149,7 @@
       {userAvatarUrl}
       userAvatarIconRef={userSettings?.avatar_icon_ref}
       userAvatarIconFit={userSettings?.avatar_icon_fit}
-      userInitialsSource={userSettings?.display_name || userSettings?.email}
+      userInitialsSource={userSettingsName || userSettings?.email}
       {timestamp}
       {isSpeaking}
       {messageModelBadge}
@@ -1184,6 +1241,10 @@
           <JevJuiceQuickActionChip mark={quickActionMark} agentName={agentDisplayName} />
         {/if}
 
+        {#if groupReplySkipped}
+          <JevJuiceGroupReplyChip mark={groupReplySkipped} />
+        {/if}
+
         {#if responseFailed && !shouldShowLoading}
           <div class="message-failure-banner" data-testid="message-failure-banner">
             <div class="message-failure-heading">
@@ -1191,12 +1252,50 @@
               <span>
                 {responseFailureKind === 'context_exhausted'
                   ? 'This response hit the context limit before completing'
-                  : 'This response was cut short by an error'}
+                  : responseFailureKind === 'output_limit'
+                    ? "This response stopped at the model's output limit"
+                    : 'This response was cut short by an error'}
               </span>
             </div>
             {#if responseFailureDetail}
               <p class="message-failure-detail">{responseFailureDetail}</p>
             {/if}
+          </div>
+        {/if}
+
+        {#if savedFromOwnCopy && !shouldShowLoading}
+          <div class="message-failure-banner" data-testid="reply-saved-from-own-copy">
+            <div class="message-failure-heading">
+              <TriangleAlert class="message-failure-icon" aria-hidden="true" />
+              <span>Batshit saved this reply from its own copy, because the live copy was incomplete.</span>
+            </div>
+          </div>
+        {/if}
+
+        {#if restartedAfterLostConnection && !shouldShowLoading}
+          <div class="message-failure-banner" data-testid="reply-restarted-after-lost-connection">
+            <div class="message-failure-heading">
+              <TriangleAlert class="message-failure-icon" aria-hidden="true" />
+              <span>{restartedAfterLostConnection} lost its connection during this answer and started it again. The unfinished first try was removed.</span>
+            </div>
+          </div>
+        {/if}
+
+        {#if modeLimitedNote && !shouldShowLoading}
+          <div class="message-failure-banner" data-testid="reply-mode-limited-by-agent-settings">
+            <div class="message-failure-heading">
+              <TriangleAlert class="message-failure-icon" aria-hidden="true" />
+              <span>{modeLimitedNote}</span>
+            </div>
+          </div>
+        {/if}
+
+        {#if codexCleanupWarning && !shouldShowLoading}
+          <div class="message-failure-banner" data-testid="codex-cleanup-warning" role="alert">
+            <div class="message-failure-heading">
+              <TriangleAlert class="message-failure-icon" aria-hidden="true" />
+              <span>{codexCleanupWarningText(codexCleanupWarning.kind)}</span>
+            </div>
           </div>
         {/if}
 
@@ -1385,6 +1484,7 @@
       {isAI}
       {isSpeaking}
       tokens={message.metadata?.tokens}
+      canDelete={message.status !== 'in_progress'}
       onPlayPause={handlePlayPause}
       onCopyMarkdown={handleCopyMarkdown}
       onDelete={handleDelete}

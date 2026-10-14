@@ -90,7 +90,7 @@
   }
 
   .settings-live-preview-resize-handle-active {
-    background: oklch(from var(--primary) l c h / 0.4);
+    background: var(--bs-app-primary-soft);
   }
 
   .settings-live-preview-pane {

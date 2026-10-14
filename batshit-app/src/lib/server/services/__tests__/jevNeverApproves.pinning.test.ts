@@ -20,10 +20,10 @@ import type { UntrustedTextScreen } from '$lib/types/typesafe'
  *   1. INPUTS. The exact set of fields each gate accepts. A new field is a decision somebody
  *      has to make in review with this file open, not a quiet addition.
  *   2. REACH. Neither gate's module, nor anything it statically or dynamically imports, is a
- *      Jev Juice module. The gate cannot read a screen it cannot import.
+ *      Judge Juice module. The gate cannot read a screen it cannot import.
  *   3. BEHAVIOR. In a chat a DM started, the gate's answer is the same when that DM carries a
  *      flag, carries "no flag", or was never screened: a flag cannot refuse or skip an approved
- *      call, and "no flag" cannot un-pause a woken turn. The Jev Juice entry points throw if
+ *      call, and "no flag" cannot un-pause a woken turn. The Judge Juice entry points throw if
  *      anything here calls them.
  *
  * The Approve card's badge is assembled in the BROWSER from `GET /api/jev-juice/screens`
@@ -126,7 +126,11 @@ describe('1. INPUTS — the fields each gate accepts', () => {
       'toolId',
       'input',
       'agentId',
+      // Server-vouched process ownership for delegated command cleanup, not a judgment.
+      'processOwner',
       'sessionId',
+      // BL-686: the run's server-resolved saved CLI tool list. A scope, not a judgment.
+      'cliToolScope',
       'selectedToolIds',
       'allowRisky',
       'messageId',
@@ -334,7 +338,12 @@ describe('3. BEHAVIOR — a screen never moves the gate', () => {
     expect(Object.keys(decision.request).sort()).toEqual(
       ['approvalId', 'controlId', 'controlTitle', 'input', 'inputSummary', 'lane', 'requestedAt', 'riskLevel'].sort()
     )
-    expect(JSON.stringify(decision.request)).not.toMatch(/screen|flag|jev/i)
+    // The approval id is 12 random bytes of base64url, so it can spell any of the three words
+    // (seen: `apr_jevxaMLEa299l2WB`, BL-178). It is checked for that shape, which carries
+    // nothing, and left out of the word check.
+    const { approvalId, ...requestWithoutId } = decision.request
+    expect(approvalId).toMatch(/^apr_[A-Za-z0-9_-]{16}$/)
+    expect(JSON.stringify(requestWithoutId)).not.toMatch(/screen|flag|jev/i)
     expect(decision.wokenDmId).toBe('dm_1789000000000_aaaaaa')
     expect(jevCalled.count).toBe(0)
   })

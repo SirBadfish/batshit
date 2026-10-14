@@ -6,16 +6,26 @@ import {
   clearStreamAbort,
   getActiveSessionTurn,
   hasRunningRequest,
+  holdQueueForApprovalClick,
   isSessionDeleting,
+  isUserMessageQueued,
+  queueSessionTurn,
   registerGroupAbort,
   registerSessionTurn,
   registerStreamAbort,
   releaseSessionTurn
 } from '$lib/server/services/streamAbortRegistry'
+import { isQueuedSendMessageHidden } from '$lib/server/services/queuedSendHiddenIds'
 import {
   __resetWakeRunRegistryForTests,
   registerWakeRun
 } from '$lib/server/services/wakeRunRegistry'
+import {
+  __resetReplyRecordsForTests,
+  hasReplyRecord,
+  recordReplyEvent,
+  startReplyRecord
+} from '$lib/server/services/replyStreamRecord'
 import {
   SESSION_DELETE_TURN_STOP_MS,
   SessionDeleteRefusedError,
@@ -98,6 +108,18 @@ describe('deleteSessionAfterItsTurn', () => {
     expect(sweep).toHaveBeenCalledTimes(1)
     expect(sandboxRemoval).not.toHaveBeenCalled()
     expect(isSessionDeleting(SESSION)).toBe(false)
+  })
+
+  it('forgets the chat’s recorded reply events once it has swept (BL-775), and not before', async () => {
+    __resetReplyRecordsForTests()
+    startReplyRecord(SESSION, { type: 'start', messageId: 'msg_reply' })
+    recordReplyEvent(SESSION, { type: 'chunk', messageId: 'msg_reply', content: 'words' })
+    const seenAtSweep: boolean[] = []
+    await deleteSessionAfterItsTurn(SESSION, async () => {
+      seenAtSweep.push(hasReplyRecord(SESSION, 'msg_reply'))
+    })
+    expect(seenAtSweep).toEqual([true])
+    expect(hasReplyRecord(SESSION, 'msg_reply')).toBe(false)
   })
 
   it('stops a streaming reply, and sweeps only after its request lets go', async () => {
@@ -214,6 +236,7 @@ describe('deleteSessionAfterItsTurn', () => {
         chainDepth: 1
       } as never,
       startedAt: Date.now(),
+      assistantMessageId: 'msg-woken-turn',
       controller: wake,
       timer: setTimeout(() => undefined, 60_000)
     })
@@ -312,6 +335,92 @@ describe('deleteSessionAfterItsTurn', () => {
     releaseSessionTurn(SESSION, turn.turnId)
     await vi.advanceTimersByTimeAsync(150)
     expect(first.sweep).toHaveBeenCalledTimes(1)
+  })
+
+  it('a refused delete keeps the sends waiting in the chat’s line, and they run once it is free (BL-194)', async () => {
+    // The delete used to cancel the line the moment it began, so each waiting send answered
+    // "This chat was deleted." Refused 30 s later, the chat was still there, with those words
+    // in it unanswered.
+    vi.useFakeTimers()
+    const { turn } = streamingReply()
+    const waiting = queueSessionTurn(SESSION, { kind: 'single', messageId: 'msg-b-reply', userMessageId: 'msg-b' })
+    let handover: unknown = null
+    void waiting.outcome.then((outcome) => {
+      handover = outcome
+    })
+    const { record } = startDelete()
+
+    await vi.advanceTimersByTimeAsync(30_100)
+    expect(record.error).toBeInstanceOf(SessionDeleteRefusedError)
+    expect(handover).toBeNull()
+    expect(isUserMessageQueued(SESSION, 'msg-b')).toBe(true)
+    expect(isQueuedSendMessageHidden(SESSION, 'msg-b')).toBe(true)
+
+    releaseSessionTurn(SESSION, turn.turnId)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(handover).toMatchObject({ kind: 'run' })
+  })
+
+  it('a delete that sweeps tells the sends waiting in the chat’s line that it was deleted, after the sweep', async () => {
+    vi.useFakeTimers()
+    const order: string[] = []
+    const { turn } = streamingReply()
+    const waiting = queueSessionTurn(SESSION, { kind: 'single', messageId: 'msg-b-reply', userMessageId: 'msg-b' })
+    void waiting.outcome.then((outcome) => {
+      order.push(`send ${outcome.kind}`)
+    })
+    const { record } = startDelete(order)
+    await vi.advanceTimersByTimeAsync(200)
+    expect(order).toEqual([])
+
+    releaseSessionTurn(SESSION, turn.turnId)
+    await vi.advanceTimersByTimeAsync(150)
+    expect(record.outcome).toMatchObject({ kind: 'stopped' })
+    expect(order).toEqual(['sweep', 'send cancelled'])
+    expect(isQueuedSendMessageHidden(SESSION, 'msg-b')).toBe(false)
+  })
+
+  it('a delete with no request to stop still tells a waiting line the chat was deleted, after the sweep', async () => {
+    // A line can wait with no request running: an approval click on the finished reply's card
+    // holds it for a moment.
+    const holder = registerSessionTurn(SESSION, 'single', 'msg_reply')
+    if (!holder.ok) throw new Error('registration refused')
+    const waiting = queueSessionTurn(SESSION, { kind: 'single', messageId: 'msg-b-reply', userMessageId: 'msg-b' })
+    const releaseClick = holdQueueForApprovalClick(SESSION)
+    releaseSessionTurn(SESSION, holder.entry.turnId)
+    expect(hasRunningRequest(SESSION)).toBe(false)
+    const order: string[] = []
+    void waiting.outcome.then((outcome) => {
+      order.push(`send ${outcome.kind}`)
+    })
+
+    const { record } = startDelete(order)
+    await Promise.resolve()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    releaseClick()
+    expect(record.outcome).toMatchObject({ kind: 'no_turn' })
+    expect(order).toEqual(['sweep', 'send cancelled'])
+  })
+
+  it('a delete whose sweep fails gives the waiting sends the chat back: each reads the chat for itself', async () => {
+    vi.useFakeTimers()
+    const { turn } = streamingReply()
+    const waiting = queueSessionTurn(SESSION, { kind: 'single', messageId: 'msg-b-reply', userMessageId: 'msg-b' })
+    let handover: unknown = null
+    void waiting.outcome.then((outcome) => {
+      handover = outcome
+    })
+    let error: unknown = null
+    void deleteSessionAfterItsTurn(SESSION, async () => {
+      throw new Error('redis down')
+    }).catch((failure) => {
+      error = failure
+    })
+
+    releaseSessionTurn(SESSION, turn.turnId)
+    await vi.advanceTimersByTimeAsync(150)
+    expect(String(error)).toContain('redis down')
+    expect(handover).toMatchObject({ kind: 'run' })
   })
 
   it('ends the mark when the sweep itself fails', async () => {

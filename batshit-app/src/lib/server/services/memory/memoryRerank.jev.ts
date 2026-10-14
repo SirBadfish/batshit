@@ -1,11 +1,11 @@
 /**
- * SA-120 P4a (design record A1) — Jev Juice memory search rerank.
+ * SA-120 P4a (design record A1) — Judge Juice memory search rerank.
  *
  * THE constants module for this feature (DL-120-03): the question, its criteria, the
  * weight, and every cap live here, so a reviewer reads the whole decision surface in one
  * file. The weight changes in code review, never in a prompt.
  *
- * What it does. When an agent with "Jev Juice: Rerank Memory Search" ON calls
+ * What it does. When an agent with "Judge Juice: Rerank Memory Search" ON calls
  * `sys.memory.search`, the usual search runs exactly as always, and then a second hybrid
  * search fetches a WIDER shortlist than the agent asked for (more candidates per leg, so
  * Redis's default of ten vector neighbours does not cap it). Jev answers one Noul per

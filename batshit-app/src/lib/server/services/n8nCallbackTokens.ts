@@ -12,6 +12,7 @@ type N8nSseCallbackTokenRecord = {
   messageId: string
   userId: string
   agentId?: string
+  subagentId?: string
   projectPath?: string
   createdAt: string
   expiresAt: string
@@ -22,6 +23,7 @@ type CreateN8nSseCallbackTokenInput = {
   messageId: string
   userId: string
   agentId?: string | null
+  subagentId?: string | null
   projectPath?: string | null
 }
 
@@ -114,6 +116,7 @@ export async function createN8nSseCallbackToken({
   messageId,
   userId,
   agentId,
+  subagentId,
   projectPath,
 }: CreateN8nSseCallbackTokenInput): Promise<{
   token: string
@@ -123,6 +126,7 @@ export async function createN8nSseCallbackToken({
   const normalizedMessageId = normalizeIdentifier(messageId)
   const normalizedUserId = normalizeIdentifier(userId)
   const normalizedAgentId = normalizeIdentifier(agentId)
+  const normalizedSubagentId = normalizeIdentifier(subagentId)
   const normalizedProjectPath = normalizeIdentifier(projectPath)
 
   if (!normalizedSessionId) {
@@ -133,6 +137,9 @@ export async function createN8nSseCallbackToken({
   }
   if (!normalizedUserId) {
     throw new Error('User ID is required to create an n8n callback token.')
+  }
+  if (normalizedSubagentId && !normalizedAgentId) {
+    throw new Error('A Workflow Subagent callback token needs its parent agent ID.')
   }
 
   const createdAtDate = new Date()
@@ -145,6 +152,7 @@ export async function createN8nSseCallbackToken({
     messageId: normalizedMessageId,
     userId: normalizedUserId,
     ...(normalizedAgentId ? { agentId: normalizedAgentId } : {}),
+    ...(normalizedSubagentId ? { subagentId: normalizedSubagentId } : {}),
     ...(normalizedProjectPath ? { projectPath: normalizedProjectPath } : {}),
     createdAt: createdAtDate.toISOString(),
     expiresAt: expiresAtDate.toISOString(),
@@ -219,7 +227,31 @@ export async function validateN8nScopedCallbackRequest(
   }
 
   const storedAgentId = normalizeIdentifier(stored.agentId)
-  if (storedAgentId) {
+  const storedSubagentId = normalizeIdentifier(stored.subagentId)
+  const isNativeDispatch = new URL(request.url).pathname.endsWith('/api/native-tools/dispatch')
+  if (isNativeDispatch) {
+    const context = readRecord(readRecord(data).context)
+    // The dispatcher reads these snake-case fields. Aliases must never mask a forged value
+    // on either a Workflow Subagent or a primary callback.
+    const contextActorType = normalizeIdentifier(context.actor_type).toLowerCase()
+    const contextAgentId = normalizeIdentifier(context.agent_id)
+    const contextParentAgentId = normalizeIdentifier(context.parent_agent_id)
+    if (
+      normalizeIdentifier(context.session_id) !== stored.sessionId ||
+      normalizeIdentifier(context.message_id) !== stored.messageId
+    ) {
+      return { valid: false }
+    }
+    if (contextActorType === 'subagent') {
+      // A parent-only token minted before subagent binding cannot choose its own scope.
+      if (!storedSubagentId || !storedAgentId || contextAgentId !== storedSubagentId ||
+          contextParentAgentId !== storedAgentId) return { valid: false }
+    } else if (contextActorType === 'primary') {
+      if (storedSubagentId || !storedAgentId || contextAgentId !== storedAgentId) return { valid: false }
+    } else {
+      return { valid: false }
+    }
+  } else if (storedAgentId) {
     const effectiveAgentId =
       actorType === 'subagent' ? parentAgentId || agentId : agentId
     if (effectiveAgentId && effectiveAgentId !== storedAgentId) {

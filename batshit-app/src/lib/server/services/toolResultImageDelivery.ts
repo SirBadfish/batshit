@@ -377,13 +377,21 @@ export interface EphemeralImageRegistry {
   /** Reads AND clears, so a delivery is injected exactly once. */
   take(toolCallId: string): EphemeralImageRegistryEntry | undefined
   pending(): number
+  /**
+   * BL-474 step 2: how many pictures were registered for the model in this run, ever. A picture
+   * can show an address the text does not hold, so a run with any is not one Batshit can account
+   * for in full.
+   */
+  registered(): number
 }
 
 export function createEphemeralImageRegistry(): EphemeralImageRegistry {
   const entries = new Map<string, EphemeralImageRegistryEntry>()
+  let registeredImages = 0
   return {
     register(toolCallId, source, images, purpose) {
       if (!toolCallId || !images.length) return
+      registeredImages += images.length
       entries.set(toolCallId, { source, purpose: purpose ?? null, images })
     },
     take(toolCallId) {
@@ -393,6 +401,9 @@ export function createEphemeralImageRegistry(): EphemeralImageRegistry {
     },
     pending() {
       return entries.size
+    },
+    registered() {
+      return registeredImages
     }
   }
 }

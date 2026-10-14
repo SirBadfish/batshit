@@ -8,11 +8,11 @@
   import { onUserChannelEvent } from '$lib/services/userChannel'
   import { hydrateDmInboxCounts } from '$lib/stores/dmInbox.svelte'
   import {
-    UNTRUSTED_TEXT_BADGE_TEXT,
     UNTRUSTED_TEXT_DRAWER_TOLD_TEXT,
     jevJuiceNoteDetail,
     jevJuiceNoteText,
     readUntrustedTextScreen,
+    untrustedTextBadgeText,
     untrustedTextFlagDetail,
     untrustedTextSkippedNote
   } from '$lib/utils/jevJuice'
@@ -66,9 +66,16 @@
     resultDmId: string | null
     callbackStatus: string | null
     hasResult: boolean
+    /**
+     * BL-401: a schedule keeps one unread note, and a fire that finds it counts itself on it.
+     * Present (and above one) only on such a note; `createdAt` is its first fire.
+     */
+    fireCount?: number | null
+    firstFiredAt?: string | null
+    lastFiredAt?: string | null
     runningSessionId: string | null
     /**
-     * SA-120 P7: what the Jev Juice incoming-text screen stored on this DM, as the route sent
+     * SA-120 P7: what the Judge Juice incoming-text screen stored on this DM, as the route sent
      * it. Read ONLY through `readUntrustedTextScreen`, which draws a flag or a skipped note and
      * answers `null` for "no flag": a missing flag proves nothing, so it is never a badge.
      */
@@ -419,7 +426,7 @@
                     data-testid="jev-juice-dm-flag"
                   >
                     <Zap class="dm-drawer-badge-icon" aria-hidden="true" />
-                    {UNTRUSTED_TEXT_BADGE_TEXT}
+                    {untrustedTextBadgeText(rowScreen.judge)}
                   </span>
                 {:else if rowScreen?.status === 'skipped'}
                   <span
@@ -450,6 +457,11 @@
                   </span>
                 {:else}
                   <span class="batshit-settings-status-badge">waiting in inbox</span>
+                {/if}
+                {#if typeof row.fireCount === 'number' && row.fireCount > 1}
+                  <span class="dm-drawer-row-time" data-testid="dm-drawer-fire-count">
+                    fired {row.fireCount} times, last {formatWhen(row.lastFiredAt)}
+                  </span>
                 {/if}
                 {#if row.status === 'new' || row.status === 'working'}
                   <span class="dm-drawer-row-time">{expiresIn(row.expiresAt)}</span>
@@ -624,7 +636,7 @@
 
   .dm-drawer-tab[aria-selected='true'] {
     border-color: var(--border);
-    background: color-mix(in oklab, var(--primary) 18%, transparent);
+    background: var(--bs-app-primary-faint);
     color: var(--foreground);
   }
 
@@ -816,7 +828,7 @@
     font-weight: 500;
   }
 
-  /* SA-120 P7: the Jev Juice flag. Same amber as `batshit-settings-status-badge.is-warning`;
+  /* SA-120 P7: the Judge Juice flag. Same amber as `batshit-settings-status-badge.is-warning`;
      the serious tone uses the danger tokens this drawer already falls back on. */
   :global(.dm-drawer-badge-icon) {
     width: 11px;

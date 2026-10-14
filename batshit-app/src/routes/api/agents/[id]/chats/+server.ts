@@ -23,7 +23,10 @@ export const GET: RequestHandler = async ({ params, locals }) => {
     return json({
       deletable: selection.deletable.length,
       infinite: selection.deletable.filter((chat) => chat.fixed).length,
-      keptLocked: selection.keptLocked.length
+      keptLocked: selection.keptLocked.length,
+      // BL-778 part 2: named in the delete dialog's checkbox, the same word BL-388's folder
+      // delete uses -- the sidebar hides archived chats, so the user may not remember them.
+      archived: selection.deletable.filter((chat) => chat.archived).length
     })
   } catch (error) {
     console.error('[Agents API] Failed to count agent chats:', error)

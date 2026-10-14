@@ -84,9 +84,9 @@ describe('cacheForensics API adapter (P4)', () => {
           {
             role: 'user',
             content: [
-              { type: 'text', text: '==== AWARENESS MEDIA (STANDING) ====\n- portrait.png — image' },
+              { type: 'text', text: '<awareness_media>\n- portrait.png — image\n</awareness_media>' },
               { type: 'image', source: { type: 'base64', data: 'AAAA' } },
-              { type: 'text', text: '==== CURRENT USER MESSAGE ====\n\nhello' }
+              { type: 'text', text: '<user time="9:00 AM">\nhello\n</user>' }
             ]
           }
         ]

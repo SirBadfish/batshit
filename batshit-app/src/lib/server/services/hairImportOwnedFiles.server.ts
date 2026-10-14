@@ -1,9 +1,13 @@
+import { HAIR_IMPORT_UPLOAD_RECEIPT_CONTRACT, type HairImportUploadOwner } from "./hairImportCandidateIdentity";
 import { createHash } from "node:crypto";
 import { deflateSync } from "node:zlib";
 
 import type { HairAssetFileRefV1 } from "$lib/goons/hairAssets";
 import { canonicalRecipeString } from "$lib/goons/recipe/recipeCanonical";
 import type { HairImportOwnedFile } from "./hairImportJobRepository.server";
+import { deleteGoonUploadAssetDisposition } from './goonAssetCleanupService'
+import { isDiscoveredHairCleanupFile, type HairCleanupContext } from './hairCleanupContext'
+import { hairCleanupContextForTransport } from './hairCleanupTransport.server'
 import {
   getInternalBatshitServerAuthHeaders,
   getInternalBatshitServerUrl,
@@ -83,10 +87,13 @@ export function createHairImportTexturePng(
     scanlines[row] = 0;
     for (let x = 0; x < width; x += 1) {
       const offset = row + 1 + x * 4;
-      const value =
-        kind === "neutral-value"
-          ? 128
-          : Math.round((1 - y / (height - 1)) * 255);
+      // UV.u crosses an authored lock; UV.v follows its length. Most of the
+      // lock stays Base, with one soft Highlight streak instead of tinting
+      // opposite sides of the entire wig with a global gradient.
+      const distance = Math.abs(x / (width - 1) - 0.5);
+      const transition = Math.min(1, Math.max(0, (0.18 - distance) / 0.1));
+      const streak = transition * transition * (3 - 2 * transition);
+      const value = kind === "neutral-value" ? 128 : Math.round(streak * 255);
       scanlines[offset] = value;
       scanlines[offset + 1] = value;
       scanlines[offset + 2] = value;
@@ -191,6 +198,7 @@ export async function storeHairAssetArtifact(input: {
   assetId: string;
   revisionId: string;
   role: HairArtifactRole;
+  importOwner?: HairImportUploadOwner & { stateVersion: number };
   filename: string;
   mimeType: string;
   bytes: Uint8Array;
@@ -200,6 +208,14 @@ export async function storeHairAssetArtifact(input: {
   form.set("assetId", input.assetId);
   form.set("revisionId", input.revisionId);
   form.set("role", input.role);
+  if (input.importOwner) {
+    form.set("hairImportOwner", JSON.stringify({
+      contract: HAIR_IMPORT_UPLOAD_RECEIPT_CONTRACT,
+      userId: input.importOwner.userId,
+      jobId: input.importOwner.jobId,
+    }));
+    form.set("hairImportStateVersion", String(input.importOwner.stateVersion));
+  }
   form.set(
     "file",
     new Blob([ownedArrayBuffer(input.bytes)], { type: input.mimeType }),
@@ -253,22 +269,25 @@ export async function readHairImportOwnedFile(file: HairImportOwnedFile) {
 
 export async function deleteHairImportOwnedFile(
   file: Pick<HairImportOwnedFile, "uploadType" | "filename">,
+  cleanupContext?: HairCleanupContext,
 ) {
-  const response = await fetch(
-    `${getInternalBatshitServerUrl()}/api/upload/asset`,
-    {
-      method: "DELETE",
-      headers: {
-        ...getInternalBatshitServerAuthHeaders(),
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        uploadType: file.uploadType,
-        filename: file.filename,
-      }),
-    },
-  );
-  if (!response.ok) throw responseError(response.status, await response.text());
+  return deleteGoonUploadAssetDisposition(file.uploadType, file.filename, cleanupContext)
+
+}
+
+/** Join the actual publication queue before looking for an upload whose
+ * response was lost. The caller records this exact subset before deletion. */
+export async function discoverHairImportCleanupFiles(cleanupContext: HairCleanupContext): Promise<HairImportOwnedFile[]> {
+  const response = await fetch(`${getInternalBatshitServerUrl()}/api/upload/asset-deletion/discover-hair-import`, {
+    method: 'POST', headers: { ...getInternalBatshitServerAuthHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ cleanupContext: hairCleanupContextForTransport(cleanupContext) })
+  })
+  if (!response.ok) throw responseError(response.status, await response.text())
+  const payload = await response.json()
+  if (!Array.isArray(payload?.files) || payload.files.length > 4096 || !payload.files.every(isDiscoveredHairCleanupFile)) {
+    throw new Error('Hair cleanup discovery returned an invalid file list. Retry without changing the saved job.')
+  }
+  return payload.files
 }
 
 export function hairAssetFileRef(

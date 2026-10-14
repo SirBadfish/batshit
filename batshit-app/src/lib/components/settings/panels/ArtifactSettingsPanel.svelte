@@ -1,4 +1,7 @@
 <script lang="ts">
+  import { refuse, type SettingsTarget } from '$lib/appActions/catalog'
+  import { appActionsHaveDrafts, type ActionContext } from '$lib/appActions/owners'
+
   import { onDestroy, onMount, untrack } from 'svelte'
   import * as Card from '$lib/components/ui/card'
   import * as Label from '$lib/components/ui/label'
@@ -35,6 +38,8 @@
   import type { CustomIconRecord, IconRef, IconLibraryPrefs } from '$lib/icons/iconTypes'
   import { iconLibraryService } from '$lib/services/iconLibraryService'
   import { artifactService, type ArtifactRow } from '$lib/services/artifactService'
+  import { ApiCallError } from '$lib/services/redisCore'
+  import { changedArtifactSettingsFields } from '$lib/artifacts/artifactSettingsPayload'
   import { copyTextToClipboard } from '$lib/utils/clipboard'
   import { downloadText } from '$lib/utils/download'
   import {
@@ -55,7 +60,11 @@
     resolveArtifactPowerSource,
     type ArtifactPowerSource
   } from '$lib/artifacts/artifactPowerSource'
-  import { resolveArtifactAgentUseEligibility } from '$lib/artifacts/agentUseEligibility'
+  import {
+    hasNoBatshitCompletionRuntime,
+    resolveArtifactAgentUseEligibility
+  } from '$lib/artifacts/agentUseEligibility'
+  import ArtifactPinokioAppFields from '$lib/components/settings/artifacts/ArtifactPinokioAppFields.svelte'
   import {
     dispatchArtifactDeleted,
     dispatchArtifactDraftPreview,
@@ -156,8 +165,23 @@
     artifactId: string
     signature: string
     payload: Record<string, any>
+    effective: {
+      content: string
+      metadata: Record<string, any>
+      mode: 'edit' | 'published'
+      agentUseEnabled: boolean
+    }
   } | null>(null)
   let artifactDetailLoadSerial = 0
+  // BL-545 / BL-546: what the panel loaded for the selected artifact. Nothing saves until the
+  // artifact's full detail (content and versions) is hydrated (`artifactDetailLoadedId`); a save
+  // sends only the fields that differ from `artifactSettingsBaseline`, and a content save names
+  // `artifactLoadedVersion`, the version its edit was made on.
+  let artifactDetailLoadedId = $state<string | null>(null)
+  let artifactLoadedVersion = $state<number | null>(null)
+  let artifactSettingsBaseline = $state.raw<Record<string, any> | null>(null)
+  // A save refused because the artifact changed: the saved copy loads once every editor is closed.
+  let artifactConflictReloadId = $state<string | null>(null)
   const artifactStructureEnforced = $derived.by(() =>
     isBatshitArtifactStructureEnforced(pendingMetadata)
   )
@@ -184,6 +208,16 @@
       ai_enabled: selectedPowerSourceOption.brainType !== 'none',
       metadata: applyArtifactPowerSourceToMetadata(pendingMetadata, powerSource),
       icon_ref: editableIconRef
+    })
+  )
+
+  // BL-174: a Static / No AI artifact has no Batshit runtime, so Agent Use gives agents its
+  // settings controls only, never a run (BL-121). The card says so in a note; it is not an
+  // eligibility refusal, so the switch, the saved choice and the autosave stay as they are.
+  const selectedRunsOnlyForUser = $derived(
+    hasNoBatshitCompletionRuntime({
+      brain_type: selectedPowerSourceOption.brainType,
+      ai_enabled: selectedPowerSourceOption.brainType !== 'none'
     })
   )
 
@@ -273,10 +307,14 @@
 
     artifactHydrating = true
     untrack(() => {
+      const detailLoaded = hasFullArtifactDetail(selectedArtifact)
       editableIconRef = resolveArtifactIconRef(selectedArtifact)
       editableName = selectedArtifact.name || 'Untitled Artifact'
       slug = selectedArtifact.slug || slugifyName(selectedArtifact.name || 'artifact')
-      slugEdited = false
+      // BL-545: a saved slug that is not the slug of the name (an agent renamed the artifact and
+      // the server kept the old slug, or a `_v2` twin) is the user's slug: it must not follow the
+      // name, or opening the panel rewrites it and autosaves.
+      slugEdited = Boolean(selectedArtifact.slug) && selectedArtifact.slug !== slugifyName(editableName)
       webhookUrl = selectedArtifact.webhook_url || ''
       editorContent = selectedArtifact.content || ''
       versionNote = ''
@@ -286,14 +324,11 @@
       systemPrompt = selectedArtifact.system_prompt || selectedArtifact.custom_prompt || ''
       const agentUseEligibility = resolveArtifactAgentUseEligibility(selectedArtifact)
       agentUseEnabled = agentUseEligibility.eligible && selectedArtifact.agent_use_enabled !== false
-      agentUseAllAgents =
-        (agentUseEligibility.eligible &&
-          (selectedArtifact as any).agent_access_scope === 'all') ||
-        (agentUseEligibility.eligible &&
-          (selectedArtifact as any).agent_access_scope !== 'selected' &&
-          selectedArtifact.agent_use_enabled !== true &&
-          !Array.isArray(selectedArtifact.agent_allowlist))
-      agentAllowlist = agentUseEligibility.eligible && Array.isArray(selectedArtifact.agent_allowlist)
+      // BL-830: the scope and the per-agent list are kept whatever the power source is (a user-only
+      // type turns Agent Use off and hides the choice; it never changes either), like BL-815 keeps
+      // the list while Agent Use is off.
+      agentUseAllAgents = readAllAgentsChoice(selectedArtifact)
+      agentAllowlist = Array.isArray(selectedArtifact.agent_allowlist)
         ? [...selectedArtifact.agent_allowlist]
         : []
 
@@ -301,9 +336,25 @@
       artifactSaveState = 'idle'
       artifactSaveError = null
       artifactPersistedSignature = makeArtifactAutosaveSignature()
+      artifactDetailLoadedId = detailLoaded ? selectedArtifact.id : null
+      artifactLoadedVersion = detailLoaded ? selectedArtifact.version : null
+      const loadedSettings = detailLoaded ? buildArtifactSettingsState() : null
+      artifactSettingsBaseline = loadedSettings ? $state.snapshot(loadedSettings.fields) : null
     })
     artifactHydrating = false
   })
+
+  /**
+   * The "Enable For All Agents" choice a record holds: its saved scope, or, for a record that never
+   * saved one, no list and Agent Use not turned on (every agent). This is the panel's own older
+   * reading: the Fabric registry, Agents > Access and the server also count an EMPTY list as "no
+   * list", which this does not. The eligibility of the power source plays no part (BL-830).
+   */
+  function readAllAgentsChoice(artifact: ArtifactRow): boolean {
+    const scope = (artifact as any).agent_access_scope
+    if (scope === 'all') return true
+    return scope !== 'selected' && artifact.agent_use_enabled !== true && !Array.isArray(artifact.agent_allowlist)
+  }
 
   function hasFullArtifactDetail(artifact: ArtifactRow | null) {
     if (!artifact) return false
@@ -319,7 +370,12 @@
 
     artifactService.getArtifact(artifact.id)
       .then((detail) => {
-        if (!detail || serial !== artifactDetailLoadSerial) return
+        if (serial !== artifactDetailLoadSerial) return
+        if (!detail) {
+          // BL-545: the panel never saves a copy it did not load, so say so instead of waiting.
+          artifactsError = 'Failed to load artifact detail'
+          return
+        }
         artifacts = artifacts.map((entry) => (entry.id === detail.id ? detail : entry))
       })
       .catch((error) => {
@@ -359,6 +415,30 @@
     })
     lastAppliedInitialArtifactId = target.id
   })
+
+  $effect(() => {
+    const artifactId = artifactConflictReloadId
+    if (!artifactId) return
+    // An open editor resets its draft when its value changes under it, so the saved copy loads
+    // only once every editor is closed: the user keeps the refused edit until they close it.
+    if (systemPromptEditorOpen || contentEditorOpen || blueprintEditorOpen) return
+    untrack(() => {
+      artifactConflictReloadId = null
+      void reloadArtifactAfterConflict(artifactId)
+    })
+  })
+
+  async function reloadArtifactAfterConflict(artifactId: string) {
+    const detail = await artifactService.getArtifact(artifactId)
+    if (!detail) {
+      artifactsError = 'Failed to load the saved copy of this artifact'
+      return
+    }
+    artifacts = artifacts.map((entry) => (entry.id === detail.id ? detail : entry))
+    toast.warning(
+      `Loaded the saved version ${detail.version} of ${detail.name || 'this artifact'}. Make your change again on it.`
+    )
+  }
 
   async function loadArtifacts(preserveSelection = true) {
     if (!userId) return
@@ -488,13 +568,19 @@
     })
   }
 
-  function buildArtifactPayload(options?: {
+  type ArtifactSaveOptions = {
     systemPromptValue?: string
     contentValue?: string
     blueprintValue?: string
     versionDescription?: string | null
     zoneValue?: string | null
-  }) {
+  }
+
+  /**
+   * Every saved field as the panel holds it now. Hydration keeps this as the baseline, and a save
+   * sends only what differs from it (`buildChangedArtifactPayload`, BL-546).
+   */
+  function buildArtifactSettingsState(options?: ArtifactSaveOptions) {
     const artifact = selectedArtifact
     if (!artifact) return null
 
@@ -510,16 +596,17 @@
       icon_ref: editableIconRef
     })
     const payloadAgentUseEnabled = agentUseEligibility.eligible ? agentUseEnabled : false
-    const payloadAgentUseAllAgents = agentUseEligibility.eligible && agentUseAllAgents
-    const payloadAgentAllowlist = agentUseEligibility.eligible ? agentAllowlist : []
+    // BL-830: a user-only power source (HuggingFace, Gradio, ComfyUI panel) turns Agent Use off but
+    // never changes the scope or empties the per-agent list, so switching back finds both. A save
+    // sends each only when the user changed it (the baseline holds the same reading).
+    const payloadAgentUseAllAgents = agentUseAllAgents
+    const payloadAgentAllowlist = [...agentAllowlist]
 
-    const payload: Record<string, any> = {
+    const fields: Record<string, any> = {
       icon_ref: editableIconRef,
-      icon: null,
       name: editableName.trim() || 'Untitled Artifact',
       slug: slug?.trim() || null,
       content: options?.contentValue ?? editorContent,
-      versionDescription: options?.versionDescription || undefined,
       brain_type: sourceOption.brainType,
       ai_enabled: sourceOption.brainType !== 'none',
       webhook_url: sourceOption.usesWebhook ? (webhookUrl.trim() || null) : null,
@@ -531,60 +618,88 @@
         : null,
       zone: nextZone || null,
       blueprint: options?.blueprintValue ?? (blueprintContent || null),
-      widget_position: null,
       agent_use_enabled: payloadAgentUseEnabled,
       agent_access_scope: payloadAgentUseAllAgents ? 'all' : 'selected',
       agent_allowlist: payloadAgentAllowlist,
       metadata,
-      sessionId: artifact.last_edited_session || artifact.created_in_session || '',
       mode: targetMode
     }
 
     return {
       artifactId: artifact.id,
-      payload,
+      fields,
       targetMode
     }
   }
 
-  async function putArtifactPayload(artifactId: string, payload: Record<string, any>) {
-    const targetMode = (payload.mode ?? 'edit') as ArtifactMode
-    const structureValidation = validateBatshitArtifactStructure(
-      String(payload.content ?? ''),
-      (payload.metadata as Record<string, any>) ?? {}
-    )
+  /**
+   * The save for what the user changed since the artifact loaded (BL-546): only differing fields,
+   * and a content change carries the version it was made on so the server can refuse it when an
+   * agent or another window saved a newer one. Null before the detail loaded (BL-545).
+   */
+  function buildChangedArtifactPayload(options?: ArtifactSaveOptions) {
+    const built = buildArtifactSettingsState(options)
+    if (!built || !artifactSettingsBaseline || artifactDetailLoadedId !== built.artifactId) return null
+
+    const payload = changedArtifactSettingsFields(artifactSettingsBaseline, built.fields) as Record<string, any>
+    if ('content' in payload) {
+      payload.baseVersion = artifactLoadedVersion
+      if (options?.versionDescription) payload.versionDescription = options.versionDescription
+    }
+
+    return {
+      artifactId: built.artifactId,
+      payload,
+      effective: {
+        content: String(built.fields.content ?? ''),
+        metadata: built.fields.metadata as Record<string, any>,
+        mode: built.targetMode,
+        agentUseEnabled: built.fields.agent_use_enabled === true
+      }
+    }
+  }
+
+  type ArtifactEffectiveState = {
+    content: string
+    metadata: Record<string, any>
+    mode: ArtifactMode
+    agentUseEnabled: boolean
+  }
+
+  async function putArtifactPayload(
+    artifactId: string,
+    payload: Record<string, any>,
+    effective: ArtifactEffectiveState
+  ) {
+    // The payload holds only changed fields; the checks read the artifact as it will be saved.
+    const targetMode = effective.mode
+    const structureValidation = validateBatshitArtifactStructure(effective.content, effective.metadata)
     if (
       structureValidation.enforced &&
       !structureValidation.ok &&
-      !artifactStructureValidationCanBeDeferred(String(payload.content ?? ''), targetMode)
+      !artifactStructureValidationCanBeDeferred(effective.content, targetMode)
     ) {
       throw new Error(buildArtifactStructureEnforcementMessage(structureValidation))
     }
 
     const runtimeSchemaReady =
-      hasFabricFieldsMetadata((payload.metadata as Record<string, any>) ?? {}) ||
-      isRunOnlyMetadata((payload.metadata as Record<string, any>) ?? {})
+      hasFabricFieldsMetadata(effective.metadata) || isRunOnlyMetadata(effective.metadata)
 
     let nextPayload = { ...payload }
-    if (nextPayload.agent_use_enabled && targetMode === 'published' && !runtimeSchemaReady) {
+    // The server refuses to publish an agent-usable artifact with no Fabric fields or run-only
+    // flag when a save changes its mode, agent use, or metadata; such a save turns agent use off.
+    const meetsRuntimeContractCheck =
+      'mode' in payload || 'agent_use_enabled' in payload || 'metadata' in payload
+    if (effective.agentUseEnabled && targetMode === 'published' && !runtimeSchemaReady && meetsRuntimeContractCheck) {
       nextPayload = {
         ...nextPayload,
         agent_use_enabled: false
       }
     }
 
-    const response = await fetch(`/api/artifacts/${artifactId}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(nextPayload)
-    })
-
-    if (!response.ok) {
-      const message = await response.text()
-      throw new Error(message || 'Failed to save artifact')
-    }
-
-    return (await response.json()) as ArtifactRow
+    // Through the service, so a refused save shows the server's own sentence, not its raw body
+    // (it read `{"message":"Internal Error"}` before the routes answered refusals; BL-89).
+    return await artifactService.updateArtifact(artifactId, nextPayload as Partial<ArtifactRow>)
   }
 
   function markArtifactSaved() {
@@ -607,10 +722,8 @@
         pendingMetadata = updated.metadata || pendingMetadata
         const agentUseEligibility = resolveArtifactAgentUseEligibility(updated)
         agentUseEnabled = agentUseEligibility.eligible && updated.agent_use_enabled !== false
-        agentUseAllAgents = agentUseEligibility.eligible && (updated as any).agent_access_scope === 'all'
-        agentAllowlist = agentUseEligibility.eligible && Array.isArray(updated.agent_allowlist)
-          ? [...updated.agent_allowlist]
-          : []
+        agentUseAllAgents = readAllAgentsChoice(updated)
+        agentAllowlist = Array.isArray(updated.agent_allowlist) ? [...updated.agent_allowlist] : []
         artifactPersistedSignature = signature ?? makeArtifactAutosaveSignature()
       })
     }
@@ -624,23 +737,55 @@
     queuedArtifactAutosave = null
 
     try {
-      const updated = await putArtifactPayload(queued.artifactId, queued.payload)
+      const updated = await putArtifactPayload(queued.artifactId, queued.payload, queued.effective)
       applyUpdatedArtifact(updated, queued.signature)
       markArtifactSaved()
     } catch (error) {
       console.error('Failed to autosave artifact:', error)
       artifactSaveState = 'idle'
+      const conflict = artifactSaveConflictMessage(error)
+      if (conflict) {
+        artifactConflictReloadId = queued.artifactId
+        artifactSaveError = conflict
+        throw new Error(conflict)
+      }
       artifactSaveError = error instanceof Error ? error.message : 'Failed to save artifact'
       throw error
     }
   }
 
-  function queueArtifactAutosave(artifactId: string, signature: string, payload: Record<string, any>) {
+  /**
+   * BL-546: the server refused a save because the artifact changed after the panel loaded it.
+   * The sentence names both versions when it has them; the panel then loads the saved copy.
+   */
+  function artifactSaveConflictMessage(error: unknown): string | null {
+    if (!(error instanceof ApiCallError) || error.status !== 409) return null
+    const body = (error.payload ?? {}) as {
+      code?: unknown
+      details?: { storedVersion?: unknown; baseVersion?: unknown }
+    }
+    if (body.code === 'ARTIFACT_VERSION_CONFLICT') {
+      const stored = body.details?.storedVersion
+      const base = body.details?.baseVersion
+      return `An agent or another window saved version ${stored} while you were editing version ${base}, so your edit was not saved. Copy your changes, close this editor to load version ${stored}, then make them again.`
+    }
+    if (body.code === 'ARTIFACT_WRITE_CONFLICT') {
+      return 'Another save changed this artifact at the same moment, so your change was not saved. The saved copy loads when no editor is open; make the change again on it.'
+    }
+    return null
+  }
+
+  function queueArtifactAutosave(
+    artifactId: string,
+    signature: string,
+    payload: Record<string, any>,
+    effective: ArtifactEffectiveState
+  ) {
     if (artifactAutosaveTimeout) {
       clearTimeout(artifactAutosaveTimeout)
     }
 
-    queuedArtifactAutosave = { artifactId, signature, payload }
+    queuedArtifactAutosave = { artifactId, signature, payload, effective }
     artifactAutosaveTimeout = setTimeout(() => {
       artifactAutosaveTimeout = null
       void persistQueuedArtifactAutosave().catch(() => {
@@ -663,13 +808,29 @@
     contentValue?: string
     blueprintValue?: string
   }) {
-    const built = buildArtifactPayload({
+    if (!selectedArtifact) return
+    const built = buildChangedArtifactPayload({
       ...options,
       versionDescription: versionNote || null
     })
-    if (!built) return
+    if (!built) {
+      // BL-545: before the detail loads, the panel holds no content to save over.
+      throw new Error('This artifact is still loading. Wait a moment, then save again.')
+    }
+    if (Object.keys(built.payload).length === 0) return
 
-    const updated = await putArtifactPayload(built.artifactId, built.payload)
+    let updated: ArtifactRow
+    try {
+      updated = await putArtifactPayload(built.artifactId, built.payload, built.effective)
+    } catch (error) {
+      const conflict = artifactSaveConflictMessage(error)
+      if (conflict) {
+        artifactConflictReloadId = built.artifactId
+        artifactSaveError = conflict
+        throw new Error(conflict)
+      }
+      throw error
+    }
     applyUpdatedArtifact(updated, null)
     versionNote = ''
     markArtifactSaved()
@@ -699,7 +860,6 @@
 
     if (!selectedAgentUseEligibility.eligible) {
       agentUseEnabled = false
-      agentUseAllAgents = false
       return
     }
 
@@ -724,18 +884,20 @@
 
   $effect(() => {
     if (!selectedArtifact || artifactHydrating) return
+    // BL-545: never autosave before this artifact's detail loaded: the list copy has no content.
+    if (artifactDetailLoadedId !== selectedArtifact.id) return
 
     const signature = makeArtifactAutosaveSignature()
     if (!artifactPersistedSignature || signature === artifactPersistedSignature) {
       return
     }
 
-    const built = buildArtifactPayload()
-    if (!built) return
+    const built = buildChangedArtifactPayload()
+    if (!built || Object.keys(built.payload).length === 0) return
 
     artifactSaveState = 'saving'
     artifactSaveError = null
-    queueArtifactAutosave(built.artifactId, signature, built.payload)
+    queueArtifactAutosave(built.artifactId, signature, built.payload, built.effective)
   })
 
   async function saveSystemPromptFromEditor(nextValue: string) {
@@ -787,6 +949,24 @@
     if (artifact.widget_position === 'header-dropdown') return 'trigger'
     if (artifact.widget_position === 'panel-tab') return 'panel'
     return null
+  }
+
+
+  export function readAppActionState() {
+    return {
+      entityId: artifactDetailLoadedId,
+      busy: artifactsLoading || artifactHydrating || artifactSaveState === 'saving' || Boolean(queuedArtifactAutosave) || deleteBusy,
+      dirty: artifactPersistedSignature !== null && makeArtifactAutosaveSignature() !== artifactPersistedSignature,
+      error: artifactsError
+    }
+  }
+  export function selectAppActionTarget(target: SettingsTarget, context: ActionContext) {
+    context.check()
+    if (appActionsHaveDrafts()) refuse('unsaved_changes')
+    if (!target.artifactId || !artifacts.some(artifact => artifact.id === target.artifactId)) refuse('missing_entity')
+    if (readAppActionState().busy) refuse('busy')
+    // handleArtifactSelect flushes autosave; P1 must never use that write path.
+    selectedArtifactId = target.artifactId
   }
 
 </script>
@@ -1036,6 +1216,13 @@
                       </div>
                     </div>
 
+                    {#if powerSource === 'pinokio_app'}
+                      <ArtifactPinokioAppFields
+                        metadata={pendingMetadata}
+                        onChange={(next) => (pendingMetadata = next)}
+                      />
+                    {/if}
+
                     {#if selectedPowerSourceOption.usesWebhook}
                       <div class="batshit-settings-form-row">
                         <div class="batshit-settings-form-copy">
@@ -1163,10 +1350,18 @@
                           <div class="batshit-settings-form-label-line">
                             <p class="batshit-settings-parent-label">Agent Use</p>
                             <SettingsInfoMenu ariaLabel="About Agent Use" contentClass="w-80">
-                              <p>
-                                Allows AI agents to discover this artifact through the runtime wrappers.
-                                This is the artifact-level master switch.
-                              </p>
+                              {#if selectedRunsOnlyForUser}
+                                <p>
+                                  Allows AI agents to find this artifact's settings controls, at
+                                  most. It has no AI or webhook behind it, so agents can never run
+                                  it. This is the artifact-level master switch.
+                                </p>
+                              {:else}
+                                <p>
+                                  Allows AI agents to discover this artifact through the runtime wrappers.
+                                  This is the artifact-level master switch.
+                                </p>
+                              {/if}
                             </SettingsInfoMenu>
                           </div>
                         </div>
@@ -1196,6 +1391,13 @@
                         <Switch.Root bind:checked={agentUseAllAgents} disabled={!agentUseEnabled} />
                       </div>
                     </div>
+
+                    {#if selectedRunsOnlyForUser}
+                      <div class="batshit-settings-note is-dashed">
+                        Static / No AI runs only for you, in its panel. Agents can never run it: Agent
+                        Use gives them at most its settings and Placement.
+                      </div>
+                    {/if}
 
                     {#if agentUseEnabled && !artifactRuntimeSchemaReady(pendingMetadata)}
                       <div class="batshit-settings-note is-dashed">

@@ -1,3 +1,4 @@
+import { commandModelCaptureResponse } from '$lib/server/services/commandModelCaptureResponse'
 import { json, type RequestHandler } from '@sveltejs/kit'
 import { apiFailure } from '$lib/server/services/apiResponses'
 
@@ -5,10 +6,14 @@ import { redis } from '$lib/server/redis'
 import { resolveNativeToolUser } from '$lib/server/services/nativeToolAuth'
 import {
   bindActingAgentId,
-  bindActingSessionId
+  bindActingSessionId,
+  boundRunCredential
 } from '$lib/server/services/actingAgentIdentity'
 import { nativeToolService, resolveNativeToolSettings } from '$lib/server/services/nativeTools'
-import { getRunningReplyStopSignal } from '$lib/server/services/streamAbortRegistry'
+import {
+  getRunCredentialStopSignal,
+  getRunningReplyStopSignal
+} from '$lib/server/services/streamAbortRegistry'
 
 interface AgentBrowserRequest {
   userId?: string
@@ -120,9 +125,14 @@ export const POST: RequestHandler = async ({ request, locals }) => {
         settings: resolved.runtime,
         // A Stop of the reply running in this chat ends the call (2026-09-18); no reply running,
         // no signal, as before (`getRunningReplyStopSignal` says why the request cannot carry it).
-        abortSignal: getRunningReplyStopSignal(sessionId)
+        // BL-1321: on the agent lane the run credential decides, so a primary run hears only its
+        // own reply's Stop (already aborted once that reply has ended or been replaced); the
+        // session and n8n lanes keep the chat the body names.
+        abortSignal: auth.auth === 'agent'
+          ? getRunCredentialStopSignal(boundRunCredential(auth))
+          : getRunningReplyStopSignal(sessionId)
       })
-      return json(result, { status: result.dockerUnsupported === true ? 503 : 200 })
+      return commandModelCaptureResponse(result, auth.auth === 'agent', result.dockerUnsupported === true ? 503 : 200)
     }
 
     return json({ success: false, error: 'action must be `find` or `use`.' }, { status: 400 })

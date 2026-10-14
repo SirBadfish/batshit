@@ -119,3 +119,26 @@ describe('StreamEventAdapter', () => {
     expect(events[0].input).toEqual({ command: 'npm run build' })
   })
 })
+
+/**
+ * BL-759: a text chunk of a managed lane names its segment, so `/api/sse` can record it under
+ * that name and take it back when the lane retracts the segment. The adapter used to build a
+ * chunk from `content` alone and drop every other field.
+ */
+describe('StreamEventAdapter: segments of a reply (BL-759)', () => {
+  it('carries a chunk\'s segment, and builds the retract and the reset events', async () => {
+    const emitted: CanonicalStreamEvent[] = []
+    const adapter = new StreamEventAdapter({ sessionId: 'session-1', forward: (event) => { emitted.push(event) } })
+    await adapter.emitStart({ messageId: 'msg-1' })
+
+    await adapter.emitChunk({ content: 'Partial ', segmentId: 'msg_1' })
+    await adapter.emitChunk({ content: 'Batshit\'s own words' })
+    await adapter.emitTextRetract({ segmentId: 'msg_1', metadata: { reason: 'retry' } })
+    await adapter.emitContentReset({ content: 'Batshit\'s own words' })
+
+    expect(emitted[1]).toMatchObject({ type: 'chunk', messageId: 'msg-1', content: 'Partial ', segmentId: 'msg_1' })
+    expect(emitted[2]).toEqual({ type: 'chunk', sessionId: 'session-1', messageId: 'msg-1', content: 'Batshit\'s own words' })
+    expect(emitted[3]).toMatchObject({ type: 'text_retract', messageId: 'msg-1', segmentId: 'msg_1', metadata: { reason: 'retry' } })
+    expect(emitted[4]).toMatchObject({ type: 'content_reset', messageId: 'msg-1', content: 'Batshit\'s own words' })
+  })
+})

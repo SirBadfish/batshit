@@ -10,7 +10,7 @@ const source = readFileSync('src/routes/api/messages/send-routed/+server.ts', 'u
  * the after-reply notes, before the woken turn's screen), fed the request's own history and
  * nothing else, never for a group speaker, with no Jev call and no compiler option of its own.
  */
-describe('send-routed Jev Juice quick-action contracts', () => {
+describe('send-routed Judge Juice quick-action contracts', () => {
   const streamStart = source.indexOf('async function handleBatshitAgentStream({')
   const seam = source.indexOf('const jevJuiceHintProvider = jevJuiceGroupSelection', streamStart)
   const compile = source.indexOf('await databaseService.buildFormattedChatInput(', seam)

@@ -1,3 +1,6 @@
+import { mkdtemp, mkdir, realpath, rm, symlink } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
 // The operator's copy of batshit-app's `dockerSandboxSbx.ts` must keep the same rules as the
 // app copy (whose suite is the fuller one). Run with `node --test tools/docker/*.test.mjs`.
 import assert from 'node:assert/strict'
@@ -21,7 +24,7 @@ import { sandboxCommandEndArgv } from './command-end.mjs'
 
 test('names have no underscores and keep the session marker', () => {
   const name = buildSbxSandboxName({ userId: 'Josh_Alt.', workspaceRoot: '/w', sessionId: 'session_1' })
-  assert.match(name, /^batshit-josh-alt-s[0-9a-f]{8}-[0-9a-f]{10}$/)
+  assert.match(name, /^batshit-josh-alt-s[0-9a-f]{8}-m4-[0-9a-f]{10}$/)
   assert.ok(name.includes(buildSbxSessionMarker('session_1')))
 })
 
@@ -36,6 +39,37 @@ test('create denies all network from the start, and the deny rule is scoped with
     '/w'
   ])
   assert.deepEqual(sbxDenyAllNetworkArgs('batshit-x'), ['policy', 'deny', 'network', '--sandbox', 'batshit-x', '**'])
+})
+
+test('expands Batshit home into writable installer roots without managed agent homes', () => {
+  const args = sbxCreateArgs({ sandboxName: 'batshit-x', workspaceRoot: '/w', extraWorkspaces: ['/Users/example/.batshit'] })
+  assert.ok(args.includes('/Users/example/.batshit/installs'))
+  assert.ok(args.includes('/Users/example/.batshit/tools'))
+  assert.ok(!args.includes('/Users/example/.batshit/runtime'))
+  assert.ok(!args.includes('/Users/example/.batshit/pinokio'))
+  assert.ok(!args.includes('/Users/example/.batshit'))
+  assert.ok(!args.includes('/Users/example/.batshit/agents'))
+  assert.throws(
+    () => sbxCreateArgs({ sandboxName: 'batshit-x', workspaceRoot: '/Users/example', extraWorkspaces: ['/Users/example/.batshit'] }),
+    /managed agent homes/
+  )
+})
+
+test('protected runtime and Pinokio data cannot be explicit workspaces', () => {
+  const home = path.join(os.homedir(), '.batshit')
+  for (const name of ['runtime', 'pinokio', 'pinokio.admission']) {
+    for (const root of [path.join(home, name), path.join(home, name, 'nested')]) {
+      assert.throws(() => sbxCreateArgs({ sandboxName: 'batshit-x', workspaceRoot: root }), /protected runtime/)
+      assert.throws(() => sbxCreateArgs({ sandboxName: 'batshit-x', workspaceRoot: '/w', extraWorkspaces: [root] }), /protected runtime/)
+    }
+  }
+})
+
+test('ordinary mounts stay permitted beside the protected admission folder (BL-1277)', () => {
+  const home = path.join(os.homedir(), '.batshit')
+  for (const root of [path.join(home, 'workspaces', 'project'), path.join(home, 'pinokio.admission-notes'), path.join(home, 'pinokio-notes')]) {
+    assert.ok(sbxCreateArgs({ sandboxName: 'batshit-x', workspaceRoot: '/w', extraWorkspaces: [root] }).includes(root), root)
+  }
 })
 
 test('the list is read from JSON, and anything else is refused', () => {
@@ -118,4 +152,42 @@ test('a command carries its tag last, and a Stop or timeout ends what carries it
     'batshit-x',
     ...sandboxCommandEndArgv('tag-1')
   ])
+})
+
+test('custom home and original host protection agree with the app, even with a separate agents root', async () => {
+  const temp = await realpath(await mkdtemp(path.join(os.tmpdir(), 'sbx-custom-home-')))
+  const keys = ['BATSHIT_HOME_DIR', 'BATSHIT_AGENT_RUNTIME_ROOT', 'BATSHIT_SANDBOX_PROTECTED_HOME_DIR', 'HOME']
+  const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]))
+  const home = path.join(temp, 'lane-home')
+  const original = path.join(temp, 'original-host', '.batshit')
+  const agentParent = path.join(temp, 'separate-agents')
+  process.env.BATSHIT_HOME_DIR = home
+  process.env.BATSHIT_AGENT_RUNTIME_ROOT = agentParent
+  process.env.BATSHIT_SANDBOX_PROTECTED_HOME_DIR = original
+  try {
+    const args = sbxCreateArgs({ sandboxName: 'probe', workspaceRoot: path.join(temp, 'project'), extraWorkspaces: [home] })
+    assert.ok(args.includes(path.join(home, 'skills')))
+    assert.ok(args.includes(path.join(os.homedir(), '.batshit', 'installs')))
+    assert.ok(!args.includes(home))
+    for (const protectedRoot of [path.join(home, 'agents'), path.join(agentParent, 'agents'), ...['agents', 'runtime', 'pinokio', 'pinokio.admission'].map((name) => path.join(original, name))]) {
+      await mkdir(protectedRoot, { recursive: true })
+      const alias = `${protectedRoot}-alias`
+      await symlink(protectedRoot, alias)
+      for (const workspaceRoot of [protectedRoot, alias, path.dirname(protectedRoot)]) {
+        assert.throws(() => sbxCreateArgs({ sandboxName: 'probe', workspaceRoot }), /managed agent homes/)
+      }
+    }
+    const first = buildSbxSandboxName({ workspaceRoot: '/project' })
+    process.env.BATSHIT_HOME_DIR = path.join(temp, 'another-home')
+    assert.notEqual(buildSbxSandboxName({ workspaceRoot: '/project' }), first)
+    process.env.BATSHIT_HOME_DIR = home
+    process.env.HOME = path.join(temp, 'another-user-home')
+    assert.notEqual(buildSbxSandboxName({ workspaceRoot: '/project' }), first)
+  } finally {
+    for (const key of keys) {
+      if (previous[key] === undefined) delete process.env[key]
+      else process.env[key] = previous[key]
+    }
+    await rm(temp, { recursive: true, force: true })
+  }
 })

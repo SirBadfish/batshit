@@ -301,7 +301,7 @@ describe('voiceSchema legacy cutover normalization', () => {
     })
   })
 
-  it('SA-120 P9 (LS-060): Jev Juice: Quick Actions is ON only for a stored `true`, and an agent profile never carries it', () => {
+  it('SA-120 P9 (LS-060): Judge Juice: Quick Actions is ON only for a stored `true`, and an agent profile never carries it', () => {
     expect(normalizeVoiceModeTurnSettings({ jevJuiceQuickActions: true }).jevJuiceQuickActions).toBe(true)
     for (const value of ['true', 1, {}, null, undefined]) {
       expect(normalizeVoiceModeTurnSettings({ jevJuiceQuickActions: value }).jevJuiceQuickActions).toBe(false)

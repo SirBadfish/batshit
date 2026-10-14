@@ -161,17 +161,34 @@ export function hasLegacyPrimaryAgentFields(agent: Record<string, any> | null | 
   )
 }
 
+/** The legacy type fields a canonical agent record never keeps (`agentType` replaces them). */
+export const LEGACY_PRIMARY_AGENT_FIELDS = [
+  'agent_type',
+  'batshitMode',
+  'batshit_mode',
+  'n8nImplementation',
+  'mode'
+] as const
+
+/** The stored fields `normalizePrimaryAgentType` reads (BL-768: `updateAgent` reads only these). */
+export const PRIMARY_AGENT_TYPE_SOURCE_FIELDS = [
+  'agentType',
+  'agent_type',
+  'batshitMode',
+  'batshit_mode',
+  'mode',
+  'primary_model_provider',
+  'primary_model_name',
+  'primary_model_connection'
+] as const
+
 export function canonicalizePrimaryAgentRecord<T extends Record<string, any>>(agent: T): T & {
   agentType: StoredPrimaryAgentType
 } {
   const next = { ...agent } as Record<string, any>
   next.agentType = normalizePrimaryAgentType(next)
 
-  delete next.agent_type
-  delete next.batshitMode
-  delete next.batshit_mode
-  delete next.n8nImplementation
-  delete next.mode
+  for (const field of LEGACY_PRIMARY_AGENT_FIELDS) delete next[field]
 
   return next as T & { agentType: StoredPrimaryAgentType }
 }

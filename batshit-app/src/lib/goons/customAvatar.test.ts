@@ -1,3 +1,4 @@
+import { GoonEngine } from "./engine"
 import * as THREE from 'three'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -614,7 +615,7 @@ describe('customAvatar helpers', () => {
     expect(result.meshes).toEqual([bodyMesh])
   })
 
-  it('routes custom goons through engine.loadCustomGoon', async () => {
+  it('routes custom manifest resolution through the reserved public loader', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({
@@ -630,10 +631,16 @@ describe('customAvatar helpers', () => {
     })
     vi.stubGlobal('fetch', fetchMock)
 
+    let prepared: any
     const engine = {
       loadGoon: vi.fn(),
+      beginGoonLoad: vi.fn().mockReturnValue(31),
+      isCurrentGoonLoad: vi.fn().mockReturnValue(true),
+      finishGoonLoad: vi.fn(),
       setSocketEyeContactSettings: vi.fn(),
-      loadCustomGoon: vi.fn().mockResolvedValue(undefined)
+      loadCustomGoon: vi.fn(async (url, manifest, options) => {
+        prepared = { url, manifest, options, socketEyeContactSettings: engine.setSocketEyeContactSettings.mock.calls.at(-1)?.[0] ?? null }
+      })
     }
     const customGoon: GoonRecord = {
       ...baseGoon,
@@ -658,9 +665,10 @@ describe('customAvatar helpers', () => {
     const result = await loadAvatarIntoEngine(engine as any, customGoon)
 
     expect(result.kind).toBe('custom')
-    expect(engine.loadCustomGoon).toHaveBeenCalledWith(
-      '/avatars/custom-e3.glb',
-      {
+    expect(engine.finishGoonLoad).toHaveBeenCalledExactlyOnceWith(31)
+    expect(prepared).toEqual({
+      url: '/avatars/custom-e3.glb',
+      manifest: {
         contractVersion: 1,
         stage: {
           anchors: {
@@ -670,7 +678,8 @@ describe('customAvatar helpers', () => {
           }
         }
       },
-      {
+      socketEyeContactSettings: null,
+      options: {
         appearanceDialValues: customGoon.appearanceDials,
         eyeAppearanceState: null,
         facialArtworkState: null,
@@ -682,9 +691,105 @@ describe('customAvatar helpers', () => {
         skinAppearanceState: null,
         skinMaterialArtworkState: null
       }
-    )
+    })
     expect(engine.loadGoon).not.toHaveBeenCalled()
-    expect(engine.setSocketEyeContactSettings).toHaveBeenCalledWith(null)
+  })
+
+  it('parses proxied socket eye-contact defaults into detached public loader values', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ contractVersion: 1 })
+    }))
+
+    const sourceSettings = {
+      schemaVersion: 'socket-eye-contact-settings/v2' as const,
+      enabled: true,
+      strength: 0.7,
+      convergence: -0.12,
+      headFollow: 0.35,
+      response: 0.6
+    }
+    const proxiedSettings = new Proxy(sourceSettings, {})
+    expect(() => structuredClone(proxiedSettings)).toThrow()
+
+    let prepared: any
+    const engine = {
+      loadGoon: vi.fn(),
+      beginGoonLoad: vi.fn().mockReturnValue(31),
+      isCurrentGoonLoad: vi.fn().mockReturnValue(true),
+      finishGoonLoad: vi.fn(),
+      setSocketEyeContactSettings: vi.fn(),
+      loadCustomGoon: vi.fn(async (url, manifest, options) => {
+        prepared = { url, manifest, options, socketEyeContactSettings: engine.setSocketEyeContactSettings.mock.calls.at(-1)?.[0] ?? null }
+      })
+    }
+    const customGoon: GoonRecord = {
+      ...baseGoon,
+      kind: 'custom',
+      defaults: { socketEyeContact: proxiedSettings },
+      customAvatar: {
+        model: { url: '/avatars/proxied-eye-contact.glb', filename: 'proxied-eye-contact.glb' },
+        manifest: { url: '/avatars/proxied-eye-contact.json', filename: 'proxied-eye-contact.json' }
+      }
+    }
+
+    await loadAvatarIntoEngine(engine as any, customGoon)
+
+    expect(prepared.socketEyeContactSettings).toEqual({
+      schemaVersion: 'socket-eye-contact-settings/v2',
+      enabled: true,
+      strength: 0.7,
+      convergence: -0.12,
+      headFollow: 0.35,
+      response: 0.6
+    })
+    expect(prepared.socketEyeContactSettings).not.toBe(proxiedSettings)
+    expect(() => structuredClone(prepared.socketEyeContactSettings)).not.toThrow()
+
+    sourceSettings.strength = 0.1
+    sourceSettings.convergence = 0.2
+    expect(prepared.socketEyeContactSettings).toMatchObject({
+      strength: 0.7,
+      convergence: -0.12
+    })
+  })
+
+  it('rejects invalid proxied socket eye-contact defaults before engine loading', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ contractVersion: 1 })
+    }))
+    const engine = {
+      loadGoon: vi.fn(),
+      beginGoonLoad: vi.fn().mockReturnValue(31),
+      isCurrentGoonLoad: vi.fn().mockReturnValue(true),
+      finishGoonLoad: vi.fn(),
+      setSocketEyeContactSettings: vi.fn(),
+      loadCustomGoon: vi.fn()
+    }
+    const invalidGoon: GoonRecord = {
+      ...baseGoon,
+      kind: 'custom',
+      defaults: {
+        socketEyeContact: new Proxy({
+          schemaVersion: 'socket-eye-contact-settings/v2',
+          enabled: true,
+          strength: 1.01,
+          convergence: 0,
+          headFollow: 0.5,
+          response: 0.5
+        }, {}) as any
+      },
+      customAvatar: {
+        model: { url: '/avatars/invalid-eye-contact.glb', filename: 'invalid-eye-contact.glb' },
+        manifest: { url: '/avatars/invalid-eye-contact.json', filename: 'invalid-eye-contact.json' }
+      }
+    }
+
+    await expect(loadAvatarIntoEngine(engine as any, invalidGoon)).rejects.toThrow(
+      '[socket-eye-contact-settings/v2] settings.strength must be a finite number inside [0, 1]'
+    )
+    expect(engine.finishGoonLoad).toHaveBeenCalledExactlyOnceWith(31)
   })
 
   it('never forwards Recipe dials into a lean Live engine', async () => {
@@ -697,10 +802,16 @@ describe('customAvatar helpers', () => {
         eyeAppearance: null
       })
     }))
+    let prepared: any
     const engine = {
       loadGoon: vi.fn(),
+      beginGoonLoad: vi.fn().mockReturnValue(31),
+      isCurrentGoonLoad: vi.fn().mockReturnValue(true),
+      finishGoonLoad: vi.fn(),
       setSocketEyeContactSettings: vi.fn(),
-      loadCustomGoon: vi.fn().mockResolvedValue(undefined)
+      loadCustomGoon: vi.fn(async (url, manifest, options) => {
+        prepared = { url, manifest, options, socketEyeContactSettings: engine.setSocketEyeContactSettings.mock.calls.at(-1)?.[0] ?? null }
+      })
     }
     const liveGoon: GoonRecord = {
       ...baseGoon,
@@ -732,10 +843,12 @@ describe('customAvatar helpers', () => {
     })
 
     expect(result.role).toBe('live')
-    expect(engine.loadCustomGoon).toHaveBeenCalledWith(
-      '/avatars/live-r6.glb',
-      expect.objectContaining({ liveBuild: expect.any(Object) }),
-      {
+    expect(engine.finishGoonLoad).toHaveBeenCalledExactlyOnceWith(31)
+    expect(prepared).toEqual({
+      url: '/avatars/live-r6.glb',
+      manifest: expect.objectContaining({ liveBuild: expect.any(Object) }),
+      socketEyeContactSettings: null,
+      options: {
         eyeAppearanceState: null,
         facialArtworkState: null,
         oralAppearanceState: null,
@@ -746,8 +859,7 @@ describe('customAvatar helpers', () => {
         skinAppearanceState: null,
         skinMaterialArtworkState: null
       }
-    )
-    expect(engine.setSocketEyeContactSettings).toHaveBeenCalledWith(null)
+    })
   })
 
   it('fails loudly when mounted Recipe Live resolves an authoring manifest', async () => {
@@ -760,7 +872,11 @@ describe('customAvatar helpers', () => {
     }))
     const engine = {
       loadGoon: vi.fn(),
-      loadCustomGoon: vi.fn().mockResolvedValue(undefined)
+      beginGoonLoad: vi.fn().mockReturnValue(31),
+      isCurrentGoonLoad: vi.fn().mockReturnValue(true),
+      finishGoonLoad: vi.fn(),
+      setSocketEyeContactSettings: vi.fn(),
+      loadCustomGoon: vi.fn()
     }
     const misplacedSource: GoonRecord = {
       ...baseGoon,
@@ -782,7 +898,7 @@ describe('customAvatar helpers', () => {
     await expect(
       loadAvatarIntoEngine(engine as any, misplacedSource, { role: 'mounted-live' })
     ).rejects.toThrow(/authoring package instead of active Live/)
-    expect(engine.loadCustomGoon).not.toHaveBeenCalled()
+    expect(engine.finishGoonLoad).toHaveBeenCalledExactlyOnceWith(31)
   })
 
   it('fails loudly when a staged Recipe candidate resolves an authoring manifest', async () => {
@@ -795,7 +911,11 @@ describe('customAvatar helpers', () => {
     }))
     const engine = {
       loadGoon: vi.fn(),
-      loadCustomGoon: vi.fn().mockResolvedValue(undefined)
+      beginGoonLoad: vi.fn().mockReturnValue(31),
+      isCurrentGoonLoad: vi.fn().mockReturnValue(true),
+      finishGoonLoad: vi.fn(),
+      setSocketEyeContactSettings: vi.fn(),
+      loadCustomGoon: vi.fn()
     }
     const stagedSource: GoonRecord = {
       ...baseGoon,
@@ -813,7 +933,33 @@ describe('customAvatar helpers', () => {
     await expect(
       loadAvatarIntoEngine(engine as any, stagedSource, { role: 'recipe-live-candidate' })
     ).rejects.toThrow(/authoring package instead of lean Live/)
-    expect(engine.loadCustomGoon).not.toHaveBeenCalled()
+    expect(engine.finishGoonLoad).toHaveBeenCalledExactlyOnceWith(31)
+  })
+
+  it('returns an explicit cancellation result when a stale manifest failure is suppressed', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('stale manifest failure')))
+    const engine = {
+      loadGoon: vi.fn(),
+      beginGoonLoad: vi.fn().mockReturnValue(31),
+      isCurrentGoonLoad: vi.fn().mockReturnValue(false),
+      finishGoonLoad: vi.fn(),
+      setSocketEyeContactSettings: vi.fn(),
+      loadCustomGoon: vi.fn()
+    }
+    const staleGoon: GoonRecord = {
+      ...baseGoon,
+      kind: 'custom',
+      customAvatar: {
+        model: { url: '/avatars/stale.glb', filename: 'stale.glb' },
+        manifest: { url: '/avatars/stale.json', filename: 'stale.json' }
+      }
+    }
+
+    await expect(loadAvatarIntoEngine(engine as any, staleGoon)).resolves.toEqual({
+      kind: 'custom',
+      manifest: null,
+      role: 'cancelled'
+    })
   })
 
   it('routes guided vrms through engine.loadGoon with the guided manifest', async () => {
@@ -832,6 +978,9 @@ describe('customAvatar helpers', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     const engine = {
+      beginGoonLoad: vi.fn().mockReturnValue(7),
+      isCurrentGoonLoad: vi.fn().mockReturnValue(true),
+      finishGoonLoad: vi.fn(),
       loadGoon: vi.fn().mockResolvedValue(undefined),
       loadCustomGoon: vi.fn(),
       configureGuidedOutfitPieces: vi.fn().mockResolvedValue(undefined)
@@ -878,7 +1027,11 @@ describe('customAvatar helpers', () => {
           blink: 'blink'
         }
       }
-    })
+    }, 7)
+    expect(engine.beginGoonLoad.mock.invocationCallOrder[0]).toBeLessThan(
+      fetchMock.mock.invocationCallOrder[0]
+    )
+    expect(engine.finishGoonLoad).toHaveBeenCalledExactlyOnceWith(7)
     expect(engine.configureGuidedOutfitPieces).toHaveBeenCalledWith(
       [
         {
@@ -899,5 +1052,103 @@ describe('customAvatar helpers', () => {
       ]
     )
     expect(engine.loadCustomGoon).not.toHaveBeenCalled()
+  })
+
+  it.each(['lipArtworkPresence', 'nailSurfacePresence'] as const)(
+    'rejects %s without its manifest declaration before publishing socket settings or loading geometry',
+    async (presence) => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: true, json: async () => ({ contractVersion: 1 })
+      }))
+      const engine = {
+        beginGoonLoad: vi.fn().mockReturnValue(29),
+        isCurrentGoonLoad: vi.fn().mockReturnValue(true),
+        finishGoonLoad: vi.fn(),
+        setSocketEyeContactSettings: vi.fn(),
+        loadCustomGoon: vi.fn()
+      }
+      await expect(loadAvatarIntoEngine(engine as any, {
+        ...baseGoon, kind: 'custom',
+        defaults: { socketEyeContact: {
+          schemaVersion: 'socket-eye-contact-settings/v2', enabled: true,
+          strength: 0.5, convergence: 0, headFollow: 0.5, response: 0.5
+        } },
+        [presence]: { enabled: true },
+        customAvatar: {
+          model: { url: `/invalid-${presence}.glb`, filename: 'invalid.glb' },
+          manifest: { url: `/invalid-${presence}.json`, filename: 'invalid.json' }
+        }
+      } as GoonRecord)).rejects.toThrow()
+      expect(engine.setSocketEyeContactSettings).not.toHaveBeenCalled()
+      expect(engine.loadCustomGoon).not.toHaveBeenCalled()
+      expect(engine.finishGoonLoad).toHaveBeenCalledExactlyOnceWith(29)
+    }
+  )
+
+  it('returns cancellation after a standard VRM loader loses its reserved generation', async () => {
+    let current = true
+    const engine = {
+      beginGoonLoad: vi.fn().mockReturnValue(11),
+      isCurrentGoonLoad: vi.fn(() => current),
+      finishGoonLoad: vi.fn(),
+      loadGoon: vi.fn(async () => { current = false }),
+      configureGuidedOutfitPieces: vi.fn()
+    }
+    const goon = {
+      ...baseGoon, files: { vrm: { url: '/avatars/cancelled-standard.vrm', filename: 'standard.vrm' }, animations: [] }
+    }
+    await expect(loadAvatarIntoEngine(engine as any, goon)).resolves.toEqual({
+      kind: 'vrm', manifest: null, role: 'cancelled'
+    })
+    expect(engine.loadGoon).toHaveBeenCalledExactlyOnceWith('/avatars/cancelled-standard.vrm', null, 11)
+    expect(engine.finishGoonLoad).toHaveBeenCalledExactlyOnceWith(11)
+    expect(engine.configureGuidedOutfitPieces).not.toHaveBeenCalled()
+  })
+
+  it('returns cancellation after Guided outfit configuration loses its reserved generation', async () => {
+    let current = true
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true, json: async () => ({ contractVersion: 1 })
+    }))
+    const engine = {
+      beginGoonLoad: vi.fn().mockReturnValue(19),
+      isCurrentGoonLoad: vi.fn(() => current),
+      finishGoonLoad: vi.fn(),
+      loadGoon: vi.fn().mockResolvedValue(undefined),
+      configureGuidedOutfitPieces: vi.fn(async () => { current = false })
+    }
+    await expect(loadAvatarIntoEngine(engine as any, {
+      ...baseGoon, sourceProfile: 'guided-custom-vrm',
+      files: { vrm: { url: '/avatars/cancelled-outfit.vrm', filename: 'outfit.vrm' }, animations: [] },
+      guidedAvatar: { manifest: { url: '/avatars/cancelled-outfit.json', filename: 'outfit.json' } }
+    })).resolves.toEqual({ kind: 'vrm', manifest: null, role: 'cancelled' })
+    expect(engine.configureGuidedOutfitPieces).toHaveBeenCalledTimes(1)
+    expect(engine.finishGoonLoad).toHaveBeenCalledExactlyOnceWith(19)
+  })
+
+  it.each([false, true])('settles a failed Guided manifest and suppresses it only when stale=%s', async (stale) => {
+    let current = true
+    const failure = new Error('Guided manifest retrieval failed')
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      current = !stale
+      throw failure
+    }))
+    const engine = {
+      beginGoonLoad: vi.fn().mockReturnValue(23),
+      isCurrentGoonLoad: vi.fn(() => current),
+      finishGoonLoad: vi.fn(),
+      loadGoon: vi.fn(),
+      configureGuidedOutfitPieces: vi.fn()
+    }
+    const loading = loadAvatarIntoEngine(engine as any, {
+      ...baseGoon, sourceProfile: 'guided-custom-vrm',
+      files: { vrm: { url: `/avatars/rejected-guided-${stale}.vrm`, filename: 'rejected.vrm' }, animations: [] },
+      guidedAvatar: { manifest: { url: `/avatars/rejected-guided-${stale}.json`, filename: 'rejected.json' } }
+    })
+    if (stale) await expect(loading).resolves.toEqual({ kind: 'vrm', manifest: null, role: 'cancelled' })
+    else await expect(loading).rejects.toBe(failure)
+    expect(engine.finishGoonLoad).toHaveBeenCalledExactlyOnceWith(23)
+    expect(engine.loadGoon).not.toHaveBeenCalled()
+    expect(engine.configureGuidedOutfitPieces).not.toHaveBeenCalled()
   })
 })

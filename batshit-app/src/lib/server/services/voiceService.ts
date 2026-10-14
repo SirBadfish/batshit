@@ -32,8 +32,9 @@ import {
   getVoiceEngineSuiteRole,
   getVoiceEngineRecordByProviderId,
   isVoiceEngineHidden,
+  listVoiceEngineManagerView,
   listVoiceEngineRecords,
-  listVoiceEngineSummaries
+  VoiceEngineRecordUnreadableError
 } from '$lib/server/services/voiceEngineRegistry'
 import {
   flattenLegacyVoiceStyle,
@@ -48,6 +49,12 @@ import {
   normalizeVoiceTtsConfig
 } from '$lib/utils/voiceSchema'
 import { createOpenAI } from '@ai-sdk/openai'
+import { batshitProviderHeaders } from '$lib/server/services/providers/batshitIdentity'
+import {
+  PausedPlanError,
+  pausedPlansAllowedOnThisCopy
+} from '$lib/server/services/pausedPlans'
+import { findPausedPlan } from '$lib/data/pausedPlans'
 import { generateSpeech, transcribe } from 'ai'
 import type { AgentRow, UserSettingsRow } from '$lib/types/database'
 import type {
@@ -1001,6 +1008,19 @@ async function resolveMiniMaxVoiceCredential(userId: string): Promise<VoiceApiCr
   }
 }
 
+/**
+ * Plan pause (plans 3/3a): a saved MiMo Token Plan key is the MiMo speech
+ * credential, so while that plan is paused a MiMo speech call fails with the
+ * plan's sentence. No silent switch to the pay-as-you-go key, which bills
+ * per use where the user chose a flat fee.
+ */
+async function pausedVoicePlanError(credential: VoiceApiCredential | null, service: string) {
+  if (credential?.source !== 'token-plan') return null
+  const plan = findPausedPlan(service)
+  if (!plan || (await pausedPlansAllowedOnThisCopy())) return null
+  return new PausedPlanError(plan)
+}
+
 async function resolveMimoVoiceCredential(userId: string): Promise<VoiceApiCredential | null> {
   const tokenPlanKey = await resolveApiKey(userId, 'mimo_token_plan', ['MIMO_TOKEN_PLAN_API_KEY'])
   if (tokenPlanKey) {
@@ -1043,6 +1063,7 @@ export async function buildVoiceProviderSummary(userId: string): Promise<VoicePr
   const mistralKey = await resolveApiKey(userId, 'mistral', ['MISTRAL_API_KEY'])
   const minimaxKey = await resolveMiniMaxVoiceCredential(userId)
   const mimoKey = await resolveMimoVoiceCredential(userId)
+  const mimoPaused = await pausedVoicePlanError(mimoKey, 'mimo_token_plan')
   const alibabaKey = await resolveApiKey(userId, 'alibaba', ['ALIBABA_CLOUD_API_KEY', 'DASHSCOPE_API_KEY'])
   const inworldKey = await resolveApiKey(userId, 'inworld', ['INWORLD_API_KEY'])
   const cartesiaKey = await resolveApiKey(userId, 'cartesia', ['CARTESIA_API_KEY'])
@@ -1050,7 +1071,7 @@ export async function buildVoiceProviderSummary(userId: string): Promise<VoicePr
   const stepfunKey = await resolveApiKey(userId, 'stepfun', ['STEPFUN_API_KEY', 'STEP_API_KEY'])
   const azureKey = await resolveApiKey(userId, 'azure_speech_key', ['AZURE_SPEECH_KEY'])
   const azureRegion = await resolveApiKey(userId, 'azure_speech_region', ['AZURE_SPEECH_REGION'])
-  const byoProviders = await listVoiceEngineSummaries(userId)
+  const { engines: byoProviders, unreadableEngines } = await listVoiceEngineManagerView(userId)
 
   const withStatus = PROVIDER_SUMMARIES.map((provider) => {
     if (provider.id === 'openai') {
@@ -1075,6 +1096,7 @@ export async function buildVoiceProviderSummary(userId: string): Promise<VoicePr
       return { ...provider, ready: Boolean(minimaxKey), statusHint: minimaxKey ? undefined : 'API key missing' }
     }
     if (provider.id === 'mimo') {
+      if (mimoPaused) return { ...provider, ready: false, statusHint: mimoPaused.message }
       return { ...provider, ready: Boolean(mimoKey), statusHint: mimoKey ? undefined : 'API key missing' }
     }
     if (provider.id === 'alibaba') {
@@ -1172,7 +1194,37 @@ export async function buildVoiceProviderSummary(userId: string): Promise<VoicePr
   })
     .filter((provider) => provider.supports.tts || provider.supports.stt)
 
-  return [...withStatus, ...byoProviderSummaries]
+  // A saved engine Batshit cannot read stays in the voice pickers, not ready, so a voice chosen
+  // before does not quietly show as the browser's. The Engine Manager names it and says why.
+  const unreadableProviderSummaries: VoiceProviderSummary[] = unreadableEngines.flatMap((entry) => {
+    if (entry.scope !== 'record' || !entry.id || entry.hidden) return []
+    const supportsTts = entry.supportsTts !== false
+    const supportsStt = entry.supportsStt === true
+    if (!supportsTts && !supportsStt) return []
+    return [
+      {
+        id: toByoProviderId(entry.id),
+        label: entry.name ?? entry.id,
+        type: 'byo' as const,
+        supports: {
+          tts: supportsTts,
+          stt: supportsStt,
+          listVoices: false,
+          clone: false,
+          streaming: false,
+          styles: false,
+          emotions: false
+        },
+        ttsModels: [],
+        sttModels: [],
+        realtimeSttModels: [],
+        ready: false,
+        statusHint: "Saved settings can't be read"
+      }
+    ]
+  })
+
+  return [...withStatus, ...byoProviderSummaries, ...unreadableProviderSummaries]
 }
 
 const resolveOptionalString = (...values: Array<string | null | undefined>) => {
@@ -4025,9 +4077,15 @@ export async function resolveVoiceConfigForMetadata({
     baseTts?.profileId
   )
 
+  // This runs on every chat send, voice on or off. A saved engine Batshit cannot read must not stop
+  // the message: the reply's voice goes without that engine's defaults, the voice guidance tells
+  // the agent, and speaking with the engine fails plainly. Any other failure (Redis) still throws.
   const byoProviderConfig =
     userSettings?.user_id && provider
-      ? await getVoiceEngineRecordByProviderId(userSettings.user_id, provider)
+      ? await getVoiceEngineRecordByProviderId(userSettings.user_id, provider).catch((error: unknown) => {
+          if (error instanceof VoiceEngineRecordUnreadableError) return null
+          throw error
+        })
       : null
   const baseTtsForProvider = voiceTtsConfigAppliesToProvider(baseTts, provider)
     ? baseTts
@@ -4226,7 +4284,7 @@ async function synthesizeOpenAI({
   const apiKey = await resolveApiKey(userId, 'openai', ['OPENAI_API_KEY'])
   if (!apiKey) throw new Error('OpenAI API key not configured')
 
-  const openai = createOpenAI({ apiKey })
+  const openai = createOpenAI({ apiKey, headers: batshitProviderHeaders() })
   const speechModel = openai.speech(model)
 
   const responseFormatRaw = options?.providerOptions?.format
@@ -4747,6 +4805,8 @@ async function synthesizeMiMo({
 }): Promise<VoiceSynthesisResult> {
   const credential = await resolveMimoVoiceCredential(userId)
   if (!credential) throw new Error('MiMo API key not configured')
+  const paused = await pausedVoicePlanError(credential, 'mimo_token_plan')
+  if (paused) throw paused
 
   const format =
     typeof options?.providerOptions?.format === 'string' &&
@@ -5715,7 +5775,7 @@ async function transcribeOpenAI({
   const apiKey = await resolveApiKey(userId, 'openai', ['OPENAI_API_KEY'])
   if (!apiKey) throw new Error('OpenAI API key not configured')
 
-  const openai = createOpenAI({ apiKey })
+  const openai = createOpenAI({ apiKey, headers: batshitProviderHeaders() })
   const normalizedAudio = await normalizeUploadedAudioToPcmWav({
     audio,
     contentType,
@@ -5760,6 +5820,8 @@ async function transcribeMimo({
 
   const credential = await resolveMimoVoiceCredential(userId)
   if (!credential) throw new Error('MiMo API key not configured')
+  const paused = await pausedVoicePlanError(credential, 'mimo_token_plan')
+  if (paused) throw paused
 
   const normalizedAudio = await normalizeUploadedAudioToPcmWav({
     audio,

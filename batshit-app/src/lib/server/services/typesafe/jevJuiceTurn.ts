@@ -1,5 +1,5 @@
 /**
- * SA-120 P1 — the route-side glue for one send's Jev Juice lanes.
+ * SA-120 P1 — the route-side glue for one send's Judge Juice lanes.
  *
  * `send-routed` creates one collector per turn, hands the compiler a hint provider
  * (or nothing), then merges what the collector gathered into the Execution Viewer
@@ -26,6 +26,12 @@
  * that only REPLAYS what the after-reply check stored about the previous reply (a Redis read,
  * never a Jev call before a reply), the id to mark as told at the accepted-send boundary, and
  * the after-reply step itself, which runs beside smart zip's on the ONE after-reply site.
+ *
+ * BL-527: the two after-reply steps judge a WHOLE reply, once, at its successful end. A run with
+ * no user turn of its own (an API approval resume, a context continuation) finishes a reply an
+ * earlier run began, so it gets those two steps alone (`buildSmartZipAfterReply`,
+ * `buildPostTurnCheckAfterReply`), built from the request that reply answers, plus the parts the
+ * earlier runs stored (`EarlierReplyPart`). Nothing of a new user turn runs for it.
  *
  * SA-120 P7 adds `buildUntrustedTextHintProvider`: on a WOKEN turn only, a tail provider that
  * replays what the incoming-text screen stored on the DM that started the turn (one DM read,
@@ -61,9 +67,10 @@ import type { MemoryInferredRecall, MemoryInferredRecallProvider } from '../memo
 import { computeSemanticRecall } from '../memory/semanticRecall.jev'
 import { computeSkillToolHints } from '../skillToolHints.jev'
 import type { ZipExposed } from '$lib/services/messageCompiler'
-import { CONTROL_TAGS, pairedBlockRegexGlobal, renderHiddenTagNames } from '$lib/utils/controlTags'
+import { CONTROL_TAGS, findControlBlocks, removeControlBlocks } from '$lib/utils/controlTags'
 import { calculateZipActivation } from '$lib/utils/zipActivation'
 import { stripZipControlBlocks } from '$lib/utils/zipControl'
+import { replaceLooseZipReferences, scanLooseZipReferences } from '$lib/utils/zipReferenceSafety'
 import { redis } from '$lib/server/redis'
 import { publishUserEvent } from '$lib/server/ssePublisher'
 import {
@@ -138,7 +145,7 @@ export function buildSkillToolHintProvider(input: SkillToolHintProviderInput): J
     } catch (error) {
       // `computeSkillToolHints` is written not to throw; this is the last net so a
       // bug in the lane can never fail a send. Loud, not silent.
-      console.error('[Jev Juice] skill/tool hint lane threw; no hints this turn:', error)
+      console.error('[Judge Juice] skill/tool hint lane threw; no hints this turn:', error)
       return []
     }
   }
@@ -174,7 +181,12 @@ export interface SmartZipPostTurnInput {
   reply: string
   /** The zips this reply created (its tool results). */
   newZipIds: string[]
+  /** BL-527: the parts of this reply that earlier runs wrote (before an approval card, before a context continuation). */
+  earlierParts?: EarlierReplyPart[]
 }
+
+/** BL-527: smart zip's after-reply step alone, for a run that finishes a reply an earlier run began. */
+export type SmartZipAfterReply = Pick<SmartZipTurn, 'runPostTurn'>
 
 export interface SmartZipTurn {
   /** Handed to the compiler: makes the ONE Jev call and answers with the results to open for this compile. */
@@ -195,20 +207,221 @@ export interface SmartZipTurn {
   runPostTurn: (input: SmartZipPostTurnInput) => Promise<SmartZipRezip[]>
 }
 
+const RENDER_HIDDEN_TAG_IDS = new Set(CONTROL_TAGS.filter((spec) => spec.hideFromRender).map((spec) => spec.id))
+
 /**
  * The finished reply as prose for Jev: hidden control blocks are gone (the shared registry
  * names them all), and each inline zip reference reads as the tool result it stands for, so
- * the judgment is about what the agent SAID, never about Batshit's record marks.
+ * the judgment is about what the agent SAID, never about Batshit's record marks. The references
+ * are read once (BL-707): the old pattern searched to the first `}` again from every opener.
  */
 export function replyProseForJudgment(raw: string): string {
-  let text = stripZipControlBlocks(typeof raw === 'string' ? raw : '')
-  for (const tag of renderHiddenTagNames()) text = text.replace(pairedBlockRegexGlobal(tag), '')
-  return text
-    .replace(/\{\{batshit-zip:[^:}]+(?::::([^}]*))?\}\}/g, (_match, description: string | undefined) =>
-      description && description.trim() ? `[tool result: ${description.trim()}]` : '[tool result]'
-    )
+  const stripped = stripZipControlBlocks(typeof raw === 'string' ? raw : '')
+  // BL-442: the blocks the registry's scanner reads in a finished reply; an example in code and a
+  // tag named in a sentence are what the agent said, and stay.
+  const hidden = findControlBlocks(stripped, { final: true }).filter((block) => RENDER_HIDDEN_TAG_IDS.has(block.id))
+  return replaceLooseZipReferences(removeControlBlocks(stripped, hidden), (_match, _id, description) =>
+    description && description.trim() ? `[tool result: ${description.trim()}]` : '[tool result]'
+  )
     .replace(/\n{3,}/g, '\n\n')
     .trim()
+}
+
+// ---------------------------------------------------------------------------
+// BL-527: a reply that a later run finishes
+// ---------------------------------------------------------------------------
+
+/**
+ * A part of the reply that an EARLIER run wrote and stored: the words before an approval card (an
+ * API approval resume continues the same message), or a run that ran out of context room (a
+ * context continuation answers in a new message). The after-reply steps judge the whole reply,
+ * so the run that finishes it hands them these parts. A stored part's words no longer carry their
+ * control blocks (the reply-end step removed them), so what those blocks did is read from what
+ * the record keeps of them.
+ */
+export interface EarlierReplyPart {
+  /** The words the part kept; empty when its record holds only its error line. */
+  text: string
+  /** The tool-result zips the part made. */
+  zipIds: string[]
+  /** Its tool steps (a memory control leaves no zip). */
+  toolSteps: unknown[]
+  /** What its inline control blocks did, in the words `inlineControlLabels` uses for a raw reply. */
+  inlineControls: string[]
+  /** It carried a memory save block. */
+  memorySaveAttempted: boolean
+}
+
+/** A stored assistant message as the after-reply steps read it. */
+export interface StoredReplyRecord {
+  id?: unknown
+  role?: unknown
+  content?: unknown
+  metadata?: unknown
+  intermediateSteps?: unknown
+}
+
+/** The request a finished reply answers, the chat before it, and the parts earlier runs stored. */
+export interface ContinuedReplyTurn {
+  request: string
+  history: PostTurnHistoryMessage[]
+  earlierParts: EarlierReplyPart[]
+}
+
+function messageTextOf(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  return content
+    .map((part) =>
+      typeof part === 'string' ? part : part && typeof part === 'object' ? textOf((part as Record<string, unknown>).text) : ''
+    )
+    .join('')
+}
+
+function nonEmptyList(value: unknown): boolean {
+  return Array.isArray(value) && value.length > 0
+}
+
+export function earlierReplyPartOf(record: StoredReplyRecord): EarlierReplyPart {
+  const metadata = (record.metadata && typeof record.metadata === 'object' ? record.metadata : {}) as Record<string, any>
+  const words = messageTextOf(record.content).trim()
+  // A failed run that produced nothing stores its error line as its words (`persistFailedAssistantTurn`).
+  const errorLine = textOf(metadata.error_message).trim()
+  const text = metadata.response_failed === true && errorLine && words === errorLine ? '' : words
+  const zipIds = (Array.isArray(metadata.zipReferences) ? metadata.zipReferences : [])
+    .map((reference: unknown) => (reference && typeof reference === 'object' ? (reference as Record<string, unknown>).zipId : null))
+    .filter((zipId: unknown): zipId is string => typeof zipId === 'string' && zipId.length > 0)
+  // The reply-end step keeps what each block did: memory saves (or the error of a block that
+  // failed), and the Tool Notes / zip-control results under `zipControl`.
+  const controlErrors = Array.isArray(metadata.controlErrors) ? metadata.controlErrors : []
+  const memorySaveAttempted =
+    nonEmptyList(metadata.memorySaves) ||
+    controlErrors.some((entry: unknown) => Boolean(entry) && (entry as Record<string, unknown>).tag === 'batshit-memory')
+  const zipControl = (metadata.zipControl && typeof metadata.zipControl === 'object' ? metadata.zipControl : {}) as Record<string, unknown>
+  const inlineControls = [
+    ...(memorySaveAttempted ? [INLINE_CONTROL_LABELS.memory] : []),
+    ...(nonEmptyList(zipControl.unzip) || nonEmptyList(zipControl.zip) ? [INLINE_CONTROL_LABELS['zip-control']] : []),
+    ...(nonEmptyList(zipControl.toolResultsSummary) || nonEmptyList(zipControl.hold) || nonEmptyList(zipControl.release)
+      ? [INLINE_CONTROL_LABELS['tool-notes']]
+      : [])
+  ]
+  return {
+    text,
+    zipIds,
+    toolSteps: Array.isArray(record.intermediateSteps) ? record.intermediateSteps : [],
+    inlineControls,
+    memorySaveAttempted
+  }
+}
+
+/**
+ * An API approval resume CONTINUES the message the card was on: the request is the paused turn's
+ * user message, and the earlier part is that message as it was stored before the resume.
+ */
+export function approvalResumeReplyTurn(
+  paused: { currentText: string; history: PostTurnHistoryMessage[] },
+  prior: StoredReplyRecord
+): ContinuedReplyTurn | null {
+  const request = typeof paused.currentText === 'string' ? paused.currentText.trim() : ''
+  if (!request) return null
+  return { request, history: paused.history, earlierParts: [earlierReplyPartOf(prior)] }
+}
+
+/**
+ * A context continuation answers in a NEW message, after the run (or runs) that ran out of room.
+ * Its reply is every failed part directly before it, back to the user message they answer: the
+ * part `previousMessageId` names, and any earlier continuation part before that one. `null` when
+ * the history does not hold that shape; the steps then do not run (logged by the route).
+ */
+export function findContextContinuationTurn(
+  messages: readonly PostTurnHistoryMessage[],
+  previousMessageId: unknown
+): ContinuedReplyTurn | null {
+  const id = typeof previousMessageId === 'string' ? previousMessageId.trim() : ''
+  if (!id || !Array.isArray(messages)) return null
+  let cursor = -1
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role === 'assistant' && messages[index]?.id === id) {
+      cursor = index
+      break
+    }
+  }
+  const parts: PostTurnHistoryMessage[] = []
+  while (cursor >= 0 && messages[cursor]?.role === 'assistant' && messages[cursor]?.metadata?.response_failed === true) {
+    parts.unshift(messages[cursor])
+    cursor -= 1
+  }
+  if (parts.length === 0 || cursor < 0 || messages[cursor]?.role !== 'user') return null
+  const request = messageTextOf(messages[cursor].content).trim()
+  if (!request) return null
+  return { request, history: messages.slice(0, cursor), earlierParts: parts.map(earlierReplyPartOf) }
+}
+
+/** The after-reply steps of a run that finishes a reply an earlier run began, and that reply's earlier parts. */
+export interface ContinuedReplySteps {
+  smartZip?: SmartZipAfterReply
+  postTurnCheck?: PostTurnCheckAfterReply
+  earlierParts: EarlierReplyPart[]
+}
+
+/**
+ * BL-527: the two after-reply steps alone, for a run with no user turn of its own (an API approval
+ * resume, a context continuation). `continued` is the request that reply answers and the parts the
+ * earlier runs stored (`approvalResumeReplyTurn`, `findContextContinuationTurn`). `null` when there
+ * is nothing to build: no step switched on, a group turn, or a history without that shape, which
+ * is said in the log when a step is switched on, never skipped in silence.
+ */
+export function buildContinuedReplySteps(input: {
+  userId: string
+  sessionId: string
+  agent: Record<string, any> | null | undefined
+  globalZipSettings: Record<string, any> | null | undefined
+  isGroupTurn: boolean
+  continued: ContinuedReplyTurn | null
+}): ContinuedReplySteps | null {
+  const { userId, sessionId, agent, globalZipSettings, isGroupTurn, continued } = input
+  if (!continued) {
+    const switchedOn =
+      !!agent &&
+      !isGroupTurn &&
+      (resolveJevSmartZipEnabled(globalZipSettings) ||
+        resolveAgentJevReplyCheckEnabled(agent) ||
+        resolveAgentJevStyleCoachEnabled(agent))
+    if (switchedOn) {
+      console.warn('[Judge Juice] this run finishes a reply but its history holds no request before that reply; the after-reply steps do not run', {
+        sessionId
+      })
+    }
+    return null
+  }
+  const smartZip = buildSmartZipAfterReply({ userId, sessionId, agent, globalZipSettings, isGroupTurn, message: continued.request })
+  const postTurnCheck = buildPostTurnCheckAfterReply({
+    userId,
+    sessionId,
+    agent,
+    isGroupTurn,
+    message: continued.request,
+    history: continued.history
+  })
+  if (!smartZip && !postTurnCheck) return null
+  return { smartZip, postTurnCheck, earlierParts: continued.earlierParts }
+}
+
+/**
+ * The whole reply's words: the earlier parts' stored words, then this run's, joined the way the
+ * saved message joins them (`joinResumedContent`): a blank line between, and a run whose own words
+ * already begin with the earlier ones is not given them twice.
+ */
+function joinReplyParts(earlierParts: readonly EarlierReplyPart[], reply: string): string {
+  const own = typeof reply === 'string' ? reply.trim() : ''
+  const before = earlierParts
+    .map((part) => part.text.trim())
+    .filter(Boolean)
+    .join('\n\n')
+  if (!before) return own
+  if (!own) return before
+  if (own.startsWith(before)) return own
+  return `${before}\n\n${own}`
 }
 
 /** A stored zip record as the after-reply step needs it. `null` when it is not a tool result worth asking about. */
@@ -258,22 +471,13 @@ function describeNewResult(
  * what the compile used — the same shape as recall by meaning.
  */
 export function buildSmartZipTurn(input: SmartZipTurnInput): SmartZipTurn | undefined {
-  if (!input.agent || !resolveJevSmartZipEnabled(input.globalZipSettings)) return undefined
-  if (input.isGroupTurn) return undefined
-  const message = typeof input.message === 'string' ? input.message.trim() : ''
-  if (!message || !input.sessionId) return undefined
+  const message = smartZipTurnMessage(input)
+  if (!message) return undefined
 
   let answer: Promise<{ opens: SmartZipOpen[]; lines: string[] }> | null = null
   let settledOpens: SmartZipOpen[] = []
   let toldRezipIds: string[] = []
   let exposedByCompile: ZipExposed[] = []
-  const deps: SmartZipPostTurnDeps = {
-    loadZip: (zipId) => redis.getZip(zipId) as Promise<Record<string, any> | null>,
-    writeRezips: writeInferredRezips,
-    appendRecords: appendTypesafeCallRecords,
-    publish: publishUserEvent,
-    ...(input.postTurnDeps ?? {})
-  }
 
   const decide = (zippedItems: Parameters<JevJuiceSmartZipProvider>[0]['zippedItems']) => {
     answer ??= (async () => {
@@ -284,7 +488,7 @@ export function buildSmartZipTurn(input: SmartZipTurnInput): SmartZipTurn | unde
         closedLines = buildSmartZipClosedDcmLines(untold)
         toldRezipIds = untold.map((marker) => marker.zipId)
       } catch (error) {
-        console.error('[Jev Juice] smart zip could not read its earlier rezips; the notice is skipped this turn:', error)
+        console.error('[Judge Juice] smart zip could not read its earlier rezips; the notice is skipped this turn:', error)
       }
       try {
         const outcome = await computeSmartZipHints({
@@ -306,7 +510,7 @@ export function buildSmartZipTurn(input: SmartZipTurnInput): SmartZipTurn | unde
       } catch (error) {
         // `computeSmartZipHints` is written not to throw; this is the last net so a bug in the
         // lane can never fail a send. Loud, not silent.
-        console.error('[Jev Juice] smart zip lane threw; nothing opened and no zip hints this turn:', error)
+        console.error('[Judge Juice] smart zip lane threw; nothing opened and no zip hints this turn:', error)
         return { opens: [], lines: closedLines }
       }
     })()
@@ -323,71 +527,111 @@ export function buildSmartZipTurn(input: SmartZipTurnInput): SmartZipTurn | unde
     exposedObserver: (exposed) => {
       exposedByCompile = Array.isArray(exposed) ? [...exposed] : []
     },
-    runPostTurn: async (postTurn) => {
-      try {
-        const reply = replyProseForJudgment(postTurn.reply)
-        if (!reply) return []
-        const newResults: SmartZipNewResult[] = []
-        for (const zipId of Array.from(new Set(postTurn.newZipIds.filter(Boolean)))) {
-          const described = describeNewResult(
-            zipId,
-            await deps.loadZip(zipId),
-            input.agent as Record<string, any>,
-            input.globalZipSettings
-          )
-          if (described) newResults.push(described)
-        }
-        const outcome = await computeSmartZipRezips({
-          userId: input.userId,
-          globalZipSettings: input.globalZipSettings,
-          userRequest: message,
-          reply,
-          exposed: exposedByCompile,
-          newResults,
-          client: input.client
-        })
-        if (!outcome.record) return []
+    runPostTurn: createSmartZipPostTurn(input, message, () => exposedByCompile)
+  }
+}
 
-        let zipped: SmartZipRezip[] = []
-        if (outcome.rezips.length > 0) {
-          const stored = await deps.writeRezips(
-            input.sessionId,
-            outcome.rezips.map((rezip) => ({
-              zipId: rezip.zipId,
-              description: rezip.description,
-              done: rezip.done,
-              again: rezip.again
-            }))
-          )
-          zipped = outcome.rezips.filter((rezip) => stored.includes(rezip.zipId))
-          if (zipped.length < outcome.rezips.length) {
-            // The user or the agent acted on one between the judgment and the write: they win.
-            outcome.record.detail = `${outcome.record.detail ? `${outcome.record.detail}; ` : ''}${outcome.rezips.length - zipped.length} left alone: the user or the agent changed it first`
-          }
-          if (zipped.length > 0) {
-            await deps.publish(input.userId, {
-              type: 'zip_state_changed',
-              sessionId: input.sessionId,
-              source: 'inferred',
-              opened: [],
-              rezipped: zipped.map((rezip) => rezip.zipId)
-            })
-          }
+/** The gates every smart zip step shares: the ONE global switch, a primary turn, a request, a session. */
+function smartZipTurnMessage(input: Pick<SmartZipTurnInput, 'agent' | 'globalZipSettings' | 'isGroupTurn' | 'message' | 'sessionId'>): string | null {
+  if (!input.agent || !resolveJevSmartZipEnabled(input.globalZipSettings)) return null
+  if (input.isGroupTurn) return null
+  const message = typeof input.message === 'string' ? input.message.trim() : ''
+  return message && input.sessionId ? message : null
+}
+
+/**
+ * BL-527: smart zip's after-reply step ALONE, for a run that finishes a reply an earlier run began
+ * (an API approval resume, a context continuation). Same gates as `buildSmartZipTurn`, with the
+ * request that reply answers as its message. No open provider, no replay, no commit: this run is
+ * not a new user turn. Its compile handed no exposed observer to the compiler, so the step judges
+ * only the results the whole reply made.
+ */
+export function buildSmartZipAfterReply(
+  input: Omit<SmartZipTurnInput, 'collector' | 'loadUntoldRezips'>
+): SmartZipAfterReply | undefined {
+  const message = smartZipTurnMessage(input)
+  if (!message) return undefined
+  return { runPostTurn: createSmartZipPostTurn(input, message, () => []) }
+}
+
+function createSmartZipPostTurn(
+  input: Pick<SmartZipTurnInput, 'userId' | 'sessionId' | 'agent' | 'globalZipSettings' | 'client' | 'postTurnDeps'>,
+  message: string,
+  exposedByCompile: () => ZipExposed[]
+): SmartZipTurn['runPostTurn'] {
+  const deps: SmartZipPostTurnDeps = {
+    loadZip: (zipId) => redis.getZip(zipId) as Promise<Record<string, any> | null>,
+    writeRezips: writeInferredRezips,
+    appendRecords: appendTypesafeCallRecords,
+    publish: publishUserEvent,
+    ...(input.postTurnDeps ?? {})
+  }
+  return async (postTurn) => {
+    try {
+      const earlierParts = postTurn.earlierParts ?? []
+      const reply = replyProseForJudgment(joinReplyParts(earlierParts, postTurn.reply))
+      if (!reply) return []
+      const newResults: SmartZipNewResult[] = []
+      const zipIds = [...earlierParts.flatMap((part) => part.zipIds), ...postTurn.newZipIds]
+      for (const zipId of Array.from(new Set(zipIds.filter(Boolean)))) {
+        const described = describeNewResult(
+          zipId,
+          await deps.loadZip(zipId),
+          input.agent as Record<string, any>,
+          input.globalZipSettings
+        )
+        if (described) newResults.push(described)
+      }
+      const outcome = await computeSmartZipRezips({
+        userId: input.userId,
+        globalZipSettings: input.globalZipSettings,
+        userRequest: message,
+        reply,
+        exposed: exposedByCompile(),
+        newResults,
+        client: input.client
+      })
+      if (!outcome.record) return []
+
+      let zipped: SmartZipRezip[] = []
+      if (outcome.rezips.length > 0) {
+        const stored = await deps.writeRezips(
+          input.sessionId,
+          outcome.rezips.map((rezip) => ({
+            zipId: rezip.zipId,
+            description: rezip.description,
+            done: rezip.done,
+            again: rezip.again
+          }))
+        )
+        zipped = outcome.rezips.filter((rezip) => stored.includes(rezip.zipId))
+        if (zipped.length < outcome.rezips.length) {
+          // The user or the agent acted on one between the judgment and the write: they win.
+          outcome.record.detail = `${outcome.record.detail ? `${outcome.record.detail}; ` : ''}${outcome.rezips.length - zipped.length} left alone: the user or the agent changed it first`
         }
-        // The reply's snapshot already exists, so the row is appended to it (DL-120-07).
-        const attached = await deps.appendRecords(input.sessionId, postTurn.messageId, [outcome.record])
-        if (!attached) {
-          console.warn('[Jev Juice] smart zip after-reply row could not be attached to a snapshot:', {
+        if (zipped.length > 0) {
+          await deps.publish(input.userId, {
+            type: 'zip_state_changed',
             sessionId: input.sessionId,
-            messageId: postTurn.messageId
+            source: 'inferred',
+            opened: [],
+            rezipped: zipped.map((rezip) => rezip.zipId)
           })
         }
-        return zipped
-      } catch (error) {
-        // Loud, not silent, and never the user's problem: the reply is already complete.
-        console.error('[Jev Juice] smart zip after-reply step threw; nothing was zipped:', error)
-        return []
       }
+      // The reply's snapshot already exists, so the row is appended to it (DL-120-07).
+      const attached = await deps.appendRecords(input.sessionId, postTurn.messageId, [outcome.record])
+      if (!attached) {
+        console.warn('[Judge Juice] smart zip after-reply row could not be attached to a snapshot:', {
+          sessionId: input.sessionId,
+          messageId: postTurn.messageId
+        })
+      }
+      return zipped
+    } catch (error) {
+      // Loud, not silent, and never the user's problem: the reply is already complete.
+      console.error('[Judge Juice] smart zip after-reply step threw; nothing was zipped:', error)
+      return []
     }
   }
 }
@@ -439,6 +683,8 @@ export interface PostTurnCheckPostTurnInput {
   toolSteps: unknown[]
   /** The reply stopped to wait for an approval: it is not finished, so there is nothing to check yet. */
   awaitingApproval: boolean
+  /** BL-527: the parts of this reply that earlier runs wrote (before an approval card, before a context continuation). */
+  earlierParts?: EarlierReplyPart[]
   /**
    * Another after-reply step that appends rows to the SAME snapshot (smart zip's). Appending is
    * a read-modify-write, so two steps that run side by side would each overwrite the other's
@@ -460,7 +706,6 @@ export interface PostTurnCheckTurn {
 }
 
 const MEMORY_WRITE_CONTROLS = new Set(['sys.memory.save', 'sys.memory.update', 'sys.memory.supersede', 'sys.memory.whiteboard'])
-const ZIP_REFERENCE_DESCRIPTION = /\{\{batshit-zip:[^:}]+:::([^}]*)\}\}/g
 
 function textOf(value: unknown): string {
   return typeof value === 'string' ? value : ''
@@ -472,13 +717,17 @@ function isFinishedReply(message: PostTurnHistoryMessage): boolean {
   return metadata.response_failed !== true && metadata.interrupted !== true && Boolean(textOf(message.content).trim())
 }
 
-/** The one-line labels of tool results from earlier replies, oldest first (they sit inside each zip reference). */
+/**
+ * The one-line labels of tool results from earlier replies, oldest first: the description of each
+ * zip reference that has one. Each reply is read once (BL-707).
+ */
 export function collectEarlierToolLabels(history: PostTurnHistoryMessage[]): string[] {
   const labels: string[] = []
   for (const message of history) {
     if (message.role !== 'assistant') continue
-    for (const match of textOf(message.content).matchAll(ZIP_REFERENCE_DESCRIPTION)) {
-      const label = (match[1] ?? '').trim()
+    for (const reference of scanLooseZipReferences(textOf(message.content))) {
+      if (reference.description === undefined) continue
+      const label = reference.description.trim()
       if (label && !labels.includes(label)) labels.push(label)
     }
   }
@@ -501,7 +750,12 @@ const INLINE_CONTROL_LABELS: Record<string, string> = {
  */
 export function inlineControlLabels(rawReply: string): string[] {
   const raw = typeof rawReply === 'string' ? rawReply : ''
-  return CONTROL_TAGS.filter((spec) => spec.id in INLINE_CONTROL_LABELS && pairedBlockRegexGlobal(spec.tag).test(raw)).map(
+  const present = new Set(
+    findControlBlocks(raw, { final: true })
+      .filter((block) => block.kind === 'paired')
+      .map((block) => block.id)
+  )
+  return CONTROL_TAGS.filter((spec) => spec.id in INLINE_CONTROL_LABELS && present.has(spec.id)).map(
     (spec) => INLINE_CONTROL_LABELS[spec.id]
   )
 }
@@ -532,27 +786,13 @@ function roundFinding(finding: JevJuicePostTurnFinding): JevJuicePostTurnFinding
 /**
  * SA-120 P6: the after-reply check for one send. Returns `undefined` for every ineligible turn
  * (both switches off, a group turn, a resume with no user message), so with the switches OFF
- * the compile is today's bytes, nothing is read, and nothing is ever written.
+ * the compile is today's bytes, nothing is read, and nothing is ever written. A run that finishes
+ * a reply an earlier run began gets the check alone (`buildPostTurnCheckAfterReply`, BL-527).
  */
 export function buildPostTurnCheckTurn(input: PostTurnCheckTurnInput): PostTurnCheckTurn | undefined {
-  if (!input.agent) return undefined
-  const replyCheck = resolveAgentJevReplyCheckEnabled(input.agent)
-  const styleCoach = resolveAgentJevStyleCoachEnabled(input.agent)
-  if (!replyCheck && !styleCoach) return undefined
-  if (input.isGroupTurn) return undefined
-  const message = typeof input.message === 'string' ? input.message.trim() : ''
-  if (!message || !input.sessionId) return undefined
-
-  const agent = input.agent
-  const history = Array.isArray(input.history) ? input.history : []
-  const deps: PostTurnCheckDeps = {
-    loadZip: (zipId) => redis.getZip(zipId) as Promise<Record<string, any> | null>,
-    loadRecord: loadPostTurnRecord,
-    writeRecord: writePostTurnRecord,
-    appendRecords: appendTypesafeCallRecords,
-    publish: publishUserEvent,
-    ...(input.deps ?? {})
-  }
+  const turn = postTurnCheckTurnOf(input)
+  if (!turn) return undefined
+  const { replyCheck, styleCoach, history, deps } = turn
 
   let told: Promise<string[]> | null = null
   let toldMessageId: string | null = null
@@ -571,103 +811,165 @@ export function buildPostTurnCheckTurn(input: PostTurnCheckTurnInput): PostTurnC
           if (lines.length > 0) toldMessageId = previous.id
           return lines
         } catch (error) {
-          console.error('[Jev Juice] the after-reply notes could not be read; the agent is not told this turn:', error)
+          console.error('[Judge Juice] the after-reply notes could not be read; the agent is not told this turn:', error)
           return []
         }
       })()
       return told
     },
     getToldMessageId: () => toldMessageId,
-    runPostTurn: async (postTurn) => {
-      try {
-        if (postTurn.awaitingApproval || !postTurn.messageId) return null
-        const prose = replyProseForJudgment(postTurn.reply)
-        if (!prose) return null
+    runPostTurn: createPostTurnCheckRun(input, turn)
+  }
+}
 
-        const tools: PostTurnToolFact[] = []
-        for (const zipId of Array.from(new Set(postTurn.newZipIds.filter(Boolean)))) {
-          const fact = toolFactOf(await deps.loadZip(zipId))
-          if (fact) tools.push(fact)
-        }
-        const memoryControls = (Array.isArray(postTurn.toolSteps) ? postTurn.toolSteps : []).flatMap((step) =>
-          memoryControlIdsOfToolStep(step)
-        )
-        const agentId = typeof agent.id === 'string' ? agent.id : null
-        const replies = history
-          .filter((entry) => isFinishedReply(entry) && (!entry.agent_id || !agentId || entry.agent_id === agentId))
-          .map((entry) => replyProseForJudgment(textOf(entry.content)))
-          .filter(Boolean)
-          .slice(-STYLE_COACH_THRESHOLDS.phraseWindow)
-        const userMessages = [
-          ...history.filter((entry) => entry.role === 'user').map((entry) => textOf(entry.content)),
-          message
-        ].slice(-6)
+interface PostTurnCheckTurnSetup {
+  agent: Record<string, any>
+  message: string
+  replyCheck: boolean
+  styleCoach: boolean
+  history: PostTurnHistoryMessage[]
+  deps: PostTurnCheckDeps
+}
 
-        const [check, style] = await Promise.all([
-          computeReplyCheck({
-            userId: input.userId,
-            agent,
-            userRequest: message,
-            reply: prose,
-            tools,
-            extraToolLabels: [
-              ...Array.from(new Set(memoryControls)).map((id) => `memory: ${id.replace(/^sys\.memory\./, '')}`),
-              ...inlineControlLabels(postTurn.reply)
-            ],
-            earlierToolLabels: collectEarlierToolLabels(history),
-            memoryEnabled: resolveAgentMemoryEnabled(agent),
-            memorySaveAttempted:
-              extractMemoryControls(postTurn.reply).hadBlock || memoryControls.some((id) => MEMORY_WRITE_CONTROLS.has(id)),
-            client: input.client
-          }),
-          computeStyleCoach({
-            userId: input.userId,
-            agent,
-            reply: prose,
-            recentReplies: replies,
-            userMessages,
-            client: input.client
-          })
-        ])
+/** The gates every after-reply check shares: a switch ON, an agent, a primary turn, a request, a session. */
+function postTurnCheckTurnOf(input: PostTurnCheckTurnInput): PostTurnCheckTurnSetup | undefined {
+  if (!input.agent) return undefined
+  const replyCheck = resolveAgentJevReplyCheckEnabled(input.agent)
+  const styleCoach = resolveAgentJevStyleCoachEnabled(input.agent)
+  if (!replyCheck && !styleCoach) return undefined
+  if (input.isGroupTurn) return undefined
+  const message = typeof input.message === 'string' ? input.message.trim() : ''
+  if (!message || !input.sessionId) return undefined
+  return {
+    agent: input.agent,
+    message,
+    replyCheck,
+    styleCoach,
+    history: Array.isArray(input.history) ? input.history : [],
+    deps: {
+      loadZip: (zipId) => redis.getZip(zipId) as Promise<Record<string, any> | null>,
+      loadRecord: loadPostTurnRecord,
+      writeRecord: writePostTurnRecord,
+      appendRecords: appendTypesafeCallRecords,
+      publish: publishUserEvent,
+      ...(input.deps ?? {})
+    }
+  }
+}
 
-        const record: JevJuicePostTurnRecord = {
-          messageId: postTurn.messageId,
-          sessionId: input.sessionId,
-          agentId,
-          at: new Date().toISOString(),
-          findings: [...check.findings, ...style.findings].map(roundFinding),
-          notes: [check.note, style.note].filter((note): note is JevJuiceNote => Boolean(note)),
-          toldAgent: false
-        }
-        let stored: JevJuicePostTurnRecord | null = null
-        if (record.findings.length > 0 || record.notes.length > 0) {
-          if (await deps.writeRecord(record)) {
-            stored = record
-            // The session stream already ended, so every tab learns through the USER channel.
-            await deps.publish(input.userId, {
-              type: 'jev_juice_post_turn',
-              sessionId: input.sessionId,
-              messageId: postTurn.messageId
-            })
-          }
-        }
+/** BL-527: the after-reply check alone, for a run that finishes a reply an earlier run began. */
+export type PostTurnCheckAfterReply = Pick<PostTurnCheckTurn, 'runPostTurn'>
 
-        // The reply's snapshot already exists, so the rows are appended to it (DL-120-07), one
-        // writer at a time.
-        const rows = [check.record, style.record].filter((row): row is TypesafeCallRecord => Boolean(row))
-        if (postTurn.appendRowsAfter) await postTurn.appendRowsAfter.catch(() => undefined)
-        if (rows.length > 0 && !(await deps.appendRecords(input.sessionId, postTurn.messageId, rows))) {
-          console.warn('[Jev Juice] after-reply check rows could not be attached to a snapshot:', {
+/**
+ * BL-527: the after-reply check ALONE, for a run that finishes a reply an earlier run began (an
+ * API approval resume, a context continuation). Same gates as `buildPostTurnCheckTurn`, with the
+ * request that reply answers as its message and the chat before that request as its history. No
+ * replay and no told mark: this run is not a new user turn, and the notes about the previous reply
+ * were told (or not) when the reply began.
+ */
+export function buildPostTurnCheckAfterReply(input: PostTurnCheckTurnInput): PostTurnCheckAfterReply | undefined {
+  const turn = postTurnCheckTurnOf(input)
+  return turn ? { runPostTurn: createPostTurnCheckRun(input, turn) } : undefined
+}
+
+function createPostTurnCheckRun(
+  input: Pick<PostTurnCheckTurnInput, 'userId' | 'sessionId' | 'client'>,
+  { agent, message, history, deps }: PostTurnCheckTurnSetup
+): PostTurnCheckTurn['runPostTurn'] {
+  return async (postTurn) => {
+    try {
+      if (postTurn.awaitingApproval || !postTurn.messageId) return null
+      const earlierParts = postTurn.earlierParts ?? []
+      const prose = replyProseForJudgment(joinReplyParts(earlierParts, postTurn.reply))
+      if (!prose) return null
+
+      const tools: PostTurnToolFact[] = []
+      const zipIds = [...earlierParts.flatMap((part) => part.zipIds), ...postTurn.newZipIds]
+      for (const zipId of Array.from(new Set(zipIds.filter(Boolean)))) {
+        const fact = toolFactOf(await deps.loadZip(zipId))
+        if (fact) tools.push(fact)
+      }
+      const memoryControls = [
+        ...earlierParts.flatMap((part) => part.toolSteps),
+        ...(Array.isArray(postTurn.toolSteps) ? postTurn.toolSteps : [])
+      ].flatMap((step) => memoryControlIdsOfToolStep(step))
+      const agentId = typeof agent.id === 'string' ? agent.id : null
+      const replies = history
+        .filter((entry) => isFinishedReply(entry) && (!entry.agent_id || !agentId || entry.agent_id === agentId))
+        .map((entry) => replyProseForJudgment(textOf(entry.content)))
+        .filter(Boolean)
+        .slice(-STYLE_COACH_THRESHOLDS.phraseWindow)
+      const userMessages = [
+        ...history.filter((entry) => entry.role === 'user').map((entry) => textOf(entry.content)),
+        message
+      ].slice(-6)
+
+      const [check, style] = await Promise.all([
+        computeReplyCheck({
+          userId: input.userId,
+          agent,
+          userRequest: message,
+          reply: prose,
+          tools,
+          extraToolLabels: [
+            ...Array.from(new Set(memoryControls)).map((id) => `memory: ${id.replace(/^sys\.memory\./, '')}`),
+            ...Array.from(new Set([...earlierParts.flatMap((part) => part.inlineControls), ...inlineControlLabels(postTurn.reply)]))
+          ],
+          earlierToolLabels: collectEarlierToolLabels(history),
+          memoryEnabled: resolveAgentMemoryEnabled(agent),
+          memorySaveAttempted:
+            earlierParts.some((part) => part.memorySaveAttempted) ||
+            extractMemoryControls(postTurn.reply).hadBlock ||
+            memoryControls.some((id) => MEMORY_WRITE_CONTROLS.has(id)),
+          client: input.client
+        }),
+        computeStyleCoach({
+          userId: input.userId,
+          agent,
+          reply: prose,
+          recentReplies: replies,
+          userMessages,
+          client: input.client
+        })
+      ])
+
+      const record: JevJuicePostTurnRecord = {
+        messageId: postTurn.messageId,
+        sessionId: input.sessionId,
+        agentId,
+        at: new Date().toISOString(),
+        findings: [...check.findings, ...style.findings].map(roundFinding),
+        notes: [check.note, style.note].filter((note): note is JevJuiceNote => Boolean(note)),
+        toldAgent: false
+      }
+      let stored: JevJuicePostTurnRecord | null = null
+      if (record.findings.length > 0 || record.notes.length > 0) {
+        if (await deps.writeRecord(record)) {
+          stored = record
+          // The session stream already ended, so every tab learns through the USER channel.
+          await deps.publish(input.userId, {
+            type: 'jev_juice_post_turn',
             sessionId: input.sessionId,
             messageId: postTurn.messageId
           })
         }
-        return stored
-      } catch (error) {
-        // Loud, not silent, and never the user's problem: the reply is already complete.
-        console.error('[Jev Juice] the after-reply check threw; nothing was stored:', error)
-        return null
       }
+
+      // The reply's snapshot already exists, so the rows are appended to it (DL-120-07), one
+      // writer at a time.
+      const rows = [check.record, style.record].filter((row): row is TypesafeCallRecord => Boolean(row))
+      if (postTurn.appendRowsAfter) await postTurn.appendRowsAfter.catch(() => undefined)
+      if (rows.length > 0 && !(await deps.appendRecords(input.sessionId, postTurn.messageId, rows))) {
+        console.warn('[Judge Juice] after-reply check rows could not be attached to a snapshot:', {
+          sessionId: input.sessionId,
+          messageId: postTurn.messageId
+        })
+      }
+      return stored
+    } catch (error) {
+      // Loud, not silent, and never the user's problem: the reply is already complete.
+      console.error('[Judge Juice] the after-reply check threw; nothing was stored:', error)
+      return null
     }
   }
 }
@@ -701,7 +1003,7 @@ export interface UntrustedTextHintProviderInput {
  *   - `flagged`  → the `jev_juice_screen` lines.
  *   - `no_flag`  → NOTHING. A missing flag proves nothing, and "screened, clean" in a prompt
  *                  would lower the agent's guard toward text it must keep treating as data.
- *   - `skipped`  → no lines, and the quiet Jev Juice note under the woken reply (DL-120-02).
+ *   - `skipped`  → no lines, and the quiet Judge Juice note under the woken reply (DL-120-02).
  *
  * Evidence: a webhook is received with no turn running, so its call's Execution Viewer row has
  * had no snapshot to live in; this turn is the one that call was made for, so the row is
@@ -738,7 +1040,7 @@ export function buildUntrustedTextHintProvider(
         }
         return buildUntrustedTextDcmLines(screen)
       } catch (error) {
-        console.error('[Jev Juice] could not replay the incoming-text screen of a woken turn:', error)
+        console.error('[Judge Juice] could not replay the incoming-text screen of a woken turn:', error)
         return []
       }
     })()
@@ -765,7 +1067,7 @@ export function composeJevJuiceHintProviders(
         if (lines.length > 0) lines.push('')
         lines.push(...result.value)
       } else if (result.status === 'rejected') {
-        console.error('[Jev Juice] a hint lane rejected; its lines are omitted this turn:', result.reason)
+        console.error('[Judge Juice] a hint lane rejected; its lines are omitted this turn:', result.reason)
       }
     }
     return lines
@@ -775,7 +1077,8 @@ export function composeJevJuiceHintProviders(
 export interface GroupSpeakerProviderInput {
   /** The `jev_juice_group` lines for the agent that ended up speaking (may be empty). */
   lines: string[]
-  record: TypesafeCallRecord
+  /** Null only when the scheduler already saved this call in its own no-reply-attempt entry. */
+  record: TypesafeCallRecord | null
   note: JevJuiceNote | null
 }
 
@@ -789,7 +1092,7 @@ export function buildGroupSpeakerProvider(
   input: GroupSpeakerProviderInput,
   collector: JevJuiceTurnCollector
 ): JevJuiceHintProvider {
-  collector.records.push(input.record)
+  if (input.record) collector.records.push(input.record)
   if (input.note) collector.notes.push(input.note)
   const lines = [...input.lines]
   return async () => lines
@@ -845,7 +1148,7 @@ export function buildSemanticRecallTurn(input: SemanticRecallTurnInput): Semanti
       } catch (error) {
         // `computeSemanticRecall` is written not to throw; this is the last net so a bug in
         // the lane can never fail a send. Loud, not silent.
-        console.error('[Jev Juice] recall by meaning threw; no inferred recalls this turn:', error)
+        console.error('[Judge Juice] recall by meaning threw; no inferred recalls this turn:', error)
         return []
       }
     })()

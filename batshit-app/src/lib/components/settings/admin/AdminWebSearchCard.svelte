@@ -8,7 +8,6 @@
   import {
     EXA_SEARCH_TYPE_LABELS,
     WEB_SEARCH_PERPLEXITY_MAX_TOKENS_PER_PAGE_OPTIONS,
-    WEB_SEARCH_PROVIDER_LABELS,
     clampNumber,
     normalizeExaSearchType,
     type ExaSearchType,
@@ -19,6 +18,8 @@
 
   interface Props {
     defaultProvider: NativeWebSearchProvider
+    /** The picker's words for the saved default, "(Missing API key)" included when its key is not ready. */
+    defaultProviderLabel: string
     exaType: ExaSearchType
     perplexityMaxTokensPerPage: number
     providerOptions: Array<{ value: NativeWebSearchProvider; label: string }>
@@ -33,6 +34,7 @@
 
   let {
     defaultProvider,
+    defaultProviderLabel,
     exaType,
     perplexityMaxTokensPerPage,
     providerOptions,
@@ -77,8 +79,9 @@
           </Label.Root>
           <SettingsInfoMenu ariaLabel="About Global Default Web Search Provider" contentClass="w-80">
             <p>
-              DuckDuckGo is always available. Exa and Perplexity appear here after their API keys
-              are saved in Settings -> API Keys.
+              DuckDuckGo is always available. Exa and Perplexity can be picked once their API keys
+              are saved in Settings -> API Keys. A saved choice whose key is missing stays in the
+              list and reads "(Missing API key)".
             </p>
           </SettingsInfoMenu>
         </div>
@@ -92,7 +95,7 @@
             disabled={disabled || loadingProviders}
           >
             <Select.Trigger id="web-search-default-provider" class="w-full">
-              <span class="truncate">{WEB_SEARCH_PROVIDER_LABELS[defaultProvider]}</span>
+              <span class="truncate">{defaultProviderLabel}</span>
             </Select.Trigger>
             <Select.Content>
               {#each providerOptions as option}

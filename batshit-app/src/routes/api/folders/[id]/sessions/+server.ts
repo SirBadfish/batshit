@@ -1,6 +1,32 @@
 import { json } from '@sveltejs/kit'
 import type { RequestHandler } from './$types'
 import { redis } from '$lib/server/redis'
+import { selectFolderChats } from '$lib/server/services/folderChatsForDelete'
+
+// GET /api/folders/{id}/sessions - Every chat "Delete Folder + Sessions" would delete, archived
+// chats included (BL-388). The delete dialog counts and names these, and sends their ids back
+// with the delete, which selects by the same function (`folderChatsForDelete.ts`) and deletes
+// nothing when they differ. Only the caller's own folder: folder keys are per user.
+export const GET: RequestHandler = async ({ params, locals }) => {
+  const userId = locals.session?.user_id || locals.user?.id
+  if (!userId) {
+    return json({ error: 'Unauthorized' }, { status: 401 })
+  }
+
+  try {
+    const result = await redis.execute((client) => selectFolderChats(client, userId, params.id))
+    if (!result) {
+      return json({ error: 'Folder not found' }, { status: 404 })
+    }
+    if (result.folder.is_default) {
+      return json({ error: 'Cannot delete default folder' }, { status: 400 })
+    }
+    return json(result)
+  } catch (error) {
+    console.error('Error reading the chats in a folder:', error)
+    return json({ error: 'Failed to read the chats in this folder' }, { status: 500 })
+  }
+}
 
 // POST /api/folders/{id}/sessions - Move session(s) to folder
 export const POST: RequestHandler = async ({ params, request, locals }) => {

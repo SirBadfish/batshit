@@ -74,7 +74,7 @@ describe('stageScene', () => {
 
     expect(host.setPostureDefinitions).toHaveBeenCalledWith({})
     expect(host.setGroundProjectionLine).toHaveBeenCalledWith(0.5)
-    expect(host.setSkyboxBackground).toHaveBeenCalledWith('/skybox.hdr')
+    expect(host.setSkyboxBackground).toHaveBeenCalledWith('/skybox.hdr', { mimeType: undefined })
     expect(host.setRoomShell).toHaveBeenCalledWith(null)
     expect(host.setRoomShellBuilder).toHaveBeenCalledWith(
       normalizeRoomShellBuilder(scene.roomShellBuilder)

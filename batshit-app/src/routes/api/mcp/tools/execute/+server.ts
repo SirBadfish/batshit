@@ -15,7 +15,11 @@ import { logger } from '$lib/utils/logger'
 import { mcpGatewayDiscovery } from '$lib/server/services/mcpGatewayDiscovery'
 import { resolveDynamicMcpGatewayScope } from '$lib/server/services/mcpSelectionResolver'
 import { resolveNativeToolUser } from '$lib/server/services/nativeToolAuth'
-import { bindActingAgentId } from '$lib/server/services/actingAgentIdentity'
+import {
+  bindActingAgentId,
+  refuseDelegatedRunOutsideList,
+  refusePortableSkillOutsideList
+} from '$lib/server/services/actingAgentIdentity'
 
 interface ExecuteRequest {
   userId?: string                    // Required for service token auth
@@ -72,6 +76,22 @@ export const POST: RequestHandler = async ({ locals, request }) => {
       logger.debug(`[MCP Tools Execute] Service auth for user ${userId}, tool: ${toolName}`)
     }
 
+    const delegatedRefusal = refuseDelegatedRunOutsideList(auth, 'sys.mcp.dynamic.use')
+    if (delegatedRefusal) {
+      return json(
+        { success: false, error: delegatedRefusal.message, code: delegatedRefusal.code, toolName },
+        { status: 403 }
+      )
+    }
+    // BL-687: the same rule for a Portable Skill Token and the use control.
+    const portableRefusal = refusePortableSkillOutsideList(auth, 'sys.mcp.dynamic.use')
+    if (portableRefusal) {
+      return json(
+        { success: false, error: portableRefusal.message, code: portableRefusal.code, toolName },
+        { status: 403 }
+      )
+    }
+
     const selectedGateways = Array.isArray(body.selectedGateways)
       ? body.selectedGateways
       : Array.isArray(body.gatewayFilter)
@@ -88,6 +108,7 @@ export const POST: RequestHandler = async ({ locals, request }) => {
     const scopeResolution = await resolveDynamicMcpGatewayScope({
       userId,
       agentId: agentBinding.agentId ?? null,
+      ...(auth.auth === 'agent' ? { mcpGatewayScope: auth.mcpGatewayScope ?? [] } : {}),
       selectedGateways
     })
 
@@ -104,32 +125,9 @@ export const POST: RequestHandler = async ({ locals, request }) => {
     const meta = metadata.get(toolName)
 
     if (!tool) {
-      // Check whether tool exists globally but is out-of-scope.
-      const { tools: globalTools } = await mcpGatewayDiscovery.loadToolsForUser(
-        userId,
-        undefined,
-        undefined,
-        { skipFiltering: true }
-      )
-      const normalizedRequested = toolName.toLowerCase()
       const scopedNames = Object.keys(tools)
-      const globalNames = Object.keys(globalTools)
-      const inGlobalScope = globalNames.some((name) => name.toLowerCase() === normalizedRequested)
-
-      if (inGlobalScope) {
-        return json(
-          {
-            success: false,
-            error:
-              `Tool "${toolName}" is outside the active Dynamic MCP scope. ` +
-              'Enable the relevant gateway or adjust the current agent scope.',
-            toolName
-          } as ExecuteErrorResponse,
-          { status: 403 }
-        )
-      }
-
-      // Tool not found - provide helpful error
+      // Suggestions come only from the caller's resolved scope. A global fallback would
+      // start gateways the run is not allowed to discover just to improve this error.
       const suggestions = scopedNames
         .filter(t => t.toLowerCase().includes(toolName.toLowerCase().split('_')[0]))
         .slice(0, 5)

@@ -87,7 +87,7 @@ describe('the client send path (SA-114 P3, SA-119 P2)', () => {
   it('sends a steer as `now` and a queue as `end`, through one door (DL-119-05)', () => {
     const branch = page.indexOf('if (steerBranchEligible || serverQueueEligible) {')
     expect(branch).toBeGreaterThan(-1)
-    const body = page.slice(branch, page.indexOf('if (clientQueueEligible) {', branch))
+    const body = page.slice(branch, page.indexOf('const sendWaitsInLine =', branch))
     expect(body).toContain("const deliver: SteerDeliver = steerBranchEligible ? 'now' : 'end'")
     // One post, one bubble, both carrying it — the bubble's sentence depends on it.
     expect(body).toContain('steerInbox.noteLocalSteer({')
@@ -106,137 +106,19 @@ describe('the client send path (SA-114 P3, SA-119 P2)', () => {
     expect(page).toContain("const serverQueueEligible = turnCanHoldText && busySendAction === 'queue'")
   })
 
-  it('sends everything else the browser is holding after the reply, one at a time (DL-119-06)', () => {
-    const branch = page.indexOf('if (clientQueueEligible) {')
-    expect(branch).toBeGreaterThan(-1)
-    const body = page.slice(branch, page.indexOf('stopRealtimeSpeechPlayback()', branch))
-    // The refusal, with the words left in the composer.
-    expect(body).toContain('clientQueueWaitingBySession.has(currentSessionId)')
-    expect(body).toContain('QUEUE_ONE_AT_A_TIME_SENTENCE')
-    expect(body).toContain('QUEUE_ONE_AT_A_TIME_TEXT_SENTENCE')
-    expect(body).toContain('return false')
-    // The bubble, and the flag that tells it whether to mention files (F-P2-2).
-    expect(body).toContain("state: 'waiting'")
-    expect(body).toContain('withFiles: sendCarriesAttachments')
-    // Waiting, not interrupting, and never through the steer route.
-    expect(body).not.toContain('/api/messages/interrupt')
-    expect(body).not.toContain('postSteer(')
-    // The claim released in a `finally`, or one refused send would wedge the chat.
-    expect(body).toContain('clientQueueWaitingBySession.add(currentSessionId)')
-    expect(body).toContain('} finally {')
-    expect(body).toContain('clientQueueWaitingBySession.delete(currentSessionId)')
-  })
-
-  it('waits for the reply to actually end, not for eight seconds (F-P2-1)', () => {
-    // `waitForStreamCompletion` resolves when its 8s ceiling expires. That was survivable
-    // while the send then fell into the interrupt branch and stopped the reply first;
-    // DL-119-07 deleted that branch, so an expiry would now post into a live turn.
-    const branch = page.indexOf('if (clientQueueEligible) {')
-    const body = page.slice(branch, page.indexOf('stopRealtimeSpeechPlayback()', branch))
-    expect(body).toContain('await waitForReplyToEnd(currentSessionId, waitForMessageId)')
-    expect(body).not.toContain('await waitForStreamCompletion(')
-
-    const helper = page.indexOf('async function waitForReplyToEnd(')
-    expect(helper).toBeGreaterThan(-1)
-    const helperBody = page.slice(helper, helper + 700)
-    expect(helperBody).toContain('chatRunRegistry.isSessionBusy(sessionId)')
-    expect(helperBody).toContain('CLIENT_QUEUE_MAX_WAIT_MS')
-    // 2026-09-18: the loop is `replyEndWait.ts`, which keeps waiting while THIS tab's own
-    // request is still open after `end`; the page's old loop gave up there and parked the
-    // message as "the reply ran too long to wait for" (measured on the smoke stack).
-    expect(helperBody).toContain('\n    return waitUntilReplyIsOver(\n      messageId,\n')
-    expect(helperBody).toContain('\n        isBusy: () => chatRunRegistry.isSessionBusy(sessionId),\n')
-    // A ceiling, not a forever — and the caller must keep the words when it is hit.
-    // AMD-119-04 turned the two-way `replyEnded` test into the three-way rule below, so
-    // the ceiling's branch is named rather than negated.
-    expect(body).toContain("if (outcome === 'still-running') {")
-    // Review F-P3b-4: the composer was cleared when the message was queued (AMD-119-05), so
-    // the bubble is where the words are. It becomes the receipt; it is not forgotten.
-    expect(body).toContain("steerInbox.markSteerDropped(waitingSteerId, 'timed_out')")
-    expect(body).toContain('kept on its receipt')
-  })
-
-  it('waits for a group reply to name its message before queuing behind it (bug sweep, 2026-09-18)', () => {
-    // A group send gets no assistant id; its reply names one with its first `start` event. A
-    // message queued before that skipped the wait, went straight into the running turn, and was
-    // refused `session_turn_in_progress`, saved and never answered. `waitForReplyTarget`
-    // (`replyEndWait.ts`) has the rule and its tests; these pins are about where the page uses it.
-    const branch = page.indexOf('if (clientQueueEligible) {')
-    const body = page.slice(branch, page.indexOf('stopRealtimeSpeechPlayback()', branch))
-    const targetWait = body.indexOf('found = await waitForReplyTargetInSession(currentSessionId)')
-    const bubbleWait = body.indexOf('await waitForReplyToEnd(currentSessionId, waitForMessageId)')
-    expect(targetWait).toBeGreaterThan(-1)
-    expect(bubbleWait).toBeGreaterThan(targetWait)
-    expect(body.slice(0, targetWait)).toContain('if (!waitForMessageId) {')
-    expect(body).toContain('waitForMessageId = found.target')
-    // One queued message at a time holds for this wait too, released in a `finally`.
-    expect(body.slice(0, targetWait)).toContain('clientQueueWaitingBySession.add(currentSessionId)')
-    // A Stop in that short wait drops the send; the words are still in the composer.
-    expect(body).toContain(
-      '(manualStopCountBySession.get(currentSessionId) ?? 0) !== stopCountBeforeTargetWait'
-    )
-    const helper = page.indexOf('function waitForReplyTargetInSession(')
-    expect(helper).toBeGreaterThan(-1)
-    expect(page.slice(helper, helper + 700)).toContain('CLIENT_QUEUE_TARGET_WAIT_MS')
-  })
-
-  it('drops a browser-held queued message when the user stops the reply (AMD-119-04)', () => {
-    // Josh's decision, 2026-09-13: Stop stops everything. DL-119-05 already dropped a
-    // SERVER-held queued message with this receipt; this branch used to SEND, because a
-    // Stop is one of the ways `waitForReplyToEnd` finishes — and the receipt was already
-    // on screen, so the user was told "Not sent" about a message that then sent.
-    const branch = page.indexOf('if (clientQueueEligible) {')
-    const body = page.slice(branch, page.indexOf('stopRealtimeSpeechPlayback()', branch))
-
-    // The count is read BEFORE the await and compared after; the rule decides, not the page.
-    expect(body).toContain('const stopCountBeforeWait = manualStopCountBySession.get(currentSessionId) ?? 0')
-    expect(body).toContain('outcome = resolveQueuedSendAfterWait({')
-    expect(body).toContain('(manualStopCountBySession.get(currentSessionId) ?? 0) !== stopCountBeforeWait')
-    expect(page.match(/resolveQueuedSendAfterWait\(/g)?.length ?? 0).toBe(1)
-
-    // Stopped: the bubble SURVIVES as the receipt, and nothing is sent.
-    // Review F-P3b-4 narrowed this from "everything but a Stop" to "only a send": a wait
-    // that gives up on a reply still running keeps its bubble too, as the receipt.
-    expect(body).toContain("if (outcome === 'send') steerInbox.forgetSteer(waitingSteerId)")
-    expect(page.match(/steerInbox\.forgetSteer\(waitingSteerId\)/g)?.length ?? 0).toBe(1)
-    expect(body).toContain("if (outcome === 'dropped-by-stop') {")
-    expect(body).toContain('steerInbox.markSteerDropped(waitingSteerId)')
-    const dropped = body.indexOf("if (outcome === 'dropped-by-stop') {")
-    expect(body.slice(dropped, dropped + 1400)).toContain('return false')
-  })
-
-  it('counts every Stop, whether or not it had a message to name (AMD-119-04)', () => {
-    const stopHandler = page.indexOf('async function handleStopStream()')
-    // Outside P2b's `if (previousMessageId)` guard: the waiting queue is waiting on the
-    // GESTURE, not on what it cut.
-    // Pinned from the LINE START, not from the call: `void 0 && theCall(` still contains
-    // `theCall(`, which is how the first draft of this very pin survived its mutation.
-    expect(page).toContain(
-      '\n\t    manualStopCountBySession.set(\n\t      sessionId,\n\t      (manualStopCountBySession.get(sessionId) ?? 0) + 1\n\t    )'
-    )
-    const bump = page.indexOf('manualStopCountBySession.set(', stopHandler)
-    expect(bump).toBeGreaterThan(stopHandler)
-    expect(bump).toBeLessThan(page.indexOf("'/api/messages/interrupt'", stopHandler))
-    // One writer, one reader.
-    expect(page.match(/manualStopCountBySession\.set\(/g)?.length ?? 0).toBe(1)
-  })
-
-  it('does not send into a reply the route says already finished (DL-114-14)', () => {
+  it('sends a steer the route says already finished, and one it cannot take, as an ordinary send (DL-114-14, DL-119-07)', () => {
     // Measured on BSMS: a simulated-streaming reply finishes SERVER-side while the tab is
-    // still typing it out, so the browser can still believe it is busy. There is then
-    // nothing to queue behind, and the words go as an ordinary message.
-    expect(page).toContain('let steerRefusedAsFinished = false')
-    const refusal = page.indexOf("if (outcome.kind === 'already_finished') {")
-    expect(refusal).toBeGreaterThan(-1)
-    const body = page.slice(refusal, refusal + 300)
-    expect(body).toContain('steerRefusedAsFinished = true')
-    expect(body).toContain('clientQueueEligible = false')
-  })
-
-  it('turns a not-steerable refusal into a queue, never a stop (DL-119-07)', () => {
-    const refusal = page.indexOf("} else if (outcome.kind === 'queue') {")
-    expect(refusal).toBeGreaterThan(-1)
-    expect(page.slice(refusal, refusal + 500)).toContain('clientQueueEligible = true')
+    // still typing it out. And a reply that cannot take a steer at all is QUEUE, not a stop.
+    // Both fall through to the ordinary send, which waits in the chat's line while the reply
+    // still has the chat (BL-713); only a refusal that did not end the reply stops here.
+    const finished = page.indexOf("if (outcome.kind === 'already_finished') {")
+    const notSteerable = page.indexOf("} else if (outcome.kind === 'queue') {", finished)
+    const refused = page.indexOf('          toast.info(outcome.reason)\n', notSteerable)
+    expect(finished).toBeGreaterThan(-1)
+    expect(notSteerable).toBeGreaterThan(finished)
+    expect(refused).toBeGreaterThan(notSteerable)
+    expect(page.slice(finished, refused)).not.toContain('return')
+    expect(page.slice(refused, refused + 120)).toContain('return false')
   })
 
   it('settles steer bubbles on every finalise a stopped turn can reach (F-P3-B)', () => {
@@ -270,13 +152,13 @@ describe('the client send path (SA-114 P3, SA-119 P2)', () => {
     expect(note).toBeGreaterThan(branch)
     // Optimistic: the bubble is drawn BEFORE the round trip, as DL-114-14 describes.
     expect(note).toBeLessThan(post)
-    const refusals = page.slice(post, page.indexOf('if (clientQueueEligible) {', post))
+    const refusals = page.slice(post, page.indexOf('const sendWaitsInLine =', post))
     expect(refusals).toContain('steerInbox.forgetSteer(steerId)')
   })
 
   it('refuses a reply whose assistant id it does not know yet (F-P3-2)', () => {
     const branch = page.indexOf('if (steerBranchEligible || serverQueueEligible) {')
-    const body = page.slice(branch, page.indexOf('if (clientQueueEligible) {', branch))
+    const body = page.slice(branch, page.indexOf('const sendWaitsInLine =', branch))
     // No target: say so and keep the words in the composer.
     expect(body).toContain('if (!steerTargetMessageId) {')
     expect(body).toContain('still starting')
@@ -322,9 +204,9 @@ describe('the client send path (SA-114 P3, SA-119 P2)', () => {
  *
  * These are ORDER and REACHABILITY claims about one 7,700-line component, like the ones
  * above. What is load-bearing and cheap to get wrong: the record is written by Stop and
- * never by a send; it is consumed unconditionally, so one Stop colours one send; a
- * browser-held queue is excluded rather than assumed unreachable; and nothing here brought
- * interrupt-and-send back.
+ * never by a send; it is consumed unconditionally, so one Stop colours one send; and nothing
+ * here brought interrupt-and-send back. (The browser-held queue it once excluded is gone,
+ * BL-713: a send that waits now waits in the chat's line, posted at once.)
  */
 describe('the interruption note after a Stop (SA-119 P2b, F-P2-7)', () => {
   const handler = page.indexOf('async function handleSendMessage(')
@@ -378,7 +260,7 @@ describe('the interruption note after a Stop (SA-119 P2b, F-P2-7)', () => {
     expect(call).toBeGreaterThan(-1)
     const body = sendPath.slice(call, call + 260)
     expect(body).toContain('record: stopInterruptionRecord')
-    expect(body).toContain('browserQueued: clientQueueEligible')
+    expect(body).not.toContain('browserQueued')
     expect(body).toContain('latestAssistantMessageId')
     // And the page computes the third fact from the store rather than trusting a variable.
     expect(sendPath).toContain('const latestAssistantMessageId = (() => {')
@@ -387,16 +269,15 @@ describe('the interruption note after a Stop (SA-119 P2b, F-P2-7)', () => {
     expect(page.match(/resolveStopInterruptionStamp\(/g)?.length ?? 0).toBe(1)
   })
 
-  it('is reached only after a steer and both queues have had their say', () => {
-    // Steer and the SERVER-held queue return above it; the claim is the ORDER. The
-    // BROWSER-held queue falls THROUGH to here, which is why the rule is handed
-    // `browserQueued` at all — see the rules module's own test for what it does with it.
+  it('is reached only after a steer and a server-held queue have had their say', () => {
+    // Steer and the SERVER-held queue return above it; the claim is the ORDER. A send that
+    // waits in the chat's line (BL-713) reads it like any send, when Enter was pressed.
     const steerBranch = sendPath.indexOf('if (steerBranchEligible || serverQueueEligible) {')
-    const clientQueue = sendPath.indexOf('if (clientQueueEligible) {')
+    const line = sendPath.indexOf('const sendWaitsInLine =')
     const read = sendPath.indexOf('pendingStopInterruptionBySession.get(currentSessionId)')
     expect(steerBranch).toBeGreaterThan(-1)
-    expect(clientQueue).toBeGreaterThan(steerBranch)
-    expect(read).toBeGreaterThan(clientQueue)
+    expect(line).toBeGreaterThan(steerBranch)
+    expect(read).toBeGreaterThan(line)
   })
 
   it('rides BOTH write sites, like `metadata.wake`', () => {
@@ -452,23 +333,23 @@ describe('a queued message leaves the box (SA-119 P3b, AMD-119-05)', () => {
   const stopHandler = page.indexOf('async function handleStopStream()')
   const sendPath = page.slice(handler, stopHandler)
 
-  it('clears the composer the moment a browser-held message is queued', () => {
-    const branch = sendPath.indexOf('if (clientQueueEligible) {')
-    const body = sendPath.slice(branch, sendPath.indexOf('stopRealtimeSpeechPlayback()', branch))
+  it('clears the composer the moment a send that waits in the line is saved, like any send (BL-713)', () => {
+    // The words are a saved message from here on, and its bubble is the line's Queued bubble.
     // Pinned from the line start: `void 0 && theCall(` still contains `theCall(`.
-    expect(body).toContain(
-      "\n\t        if (typeof metadata?.onQueuedForLater === 'function') {\n\t          metadata.onQueuedForLater()"
+    const save = sendPath.indexOf('\n      await dbService.saveMessage(userMessage, currentAgentForSend)\n')
+    const accepted = sendPath.indexOf(
+      "\n    if (typeof metadata?.onAccepted === 'function') {\n      await metadata.onAccepted()\n    }\n",
+      save
     )
-    // And it happens AFTER the bubble exists, or the words would be nowhere for a moment.
-    const bubble = body.indexOf('steerInbox.noteLocalSteer({')
-    expect(bubble).toBeGreaterThan(-1)
-    expect(body.indexOf('metadata.onQueuedForLater()')).toBeGreaterThan(bubble)
+    expect(save).toBeGreaterThan(-1)
+    expect(accepted).toBeGreaterThan(save)
+    expect(sendPath.slice(sendPath.indexOf('const sendWaitsInLine ='), accepted)).not.toMatch(/return (false|true)\b/)
   })
 
-  it('clears the WORDS only — the clips are sticky and a one-time clip is unspent', () => {
+  it('the composer’s acceptance clears the words through the guarded reset', () => {
     const chatInput = readFileSync('src/lib/components/chat/ChatInput.svelte', 'utf8')
-    expect(chatInput).toContain('onQueuedForLater: () => resetAcceptedComposer(),')
-    // Delayed voice turns keep newer words; ordinary queued sends still reset immediately.
+    expect(codeOnly(chatInput)).not.toContain('onQueuedForLater')
+    // Delayed voice turns keep newer words; ordinary sends still reset immediately.
     const guardedResetStart = chatInput.indexOf('const resetAcceptedComposer = () => {')
     const guardedResetEnd = chatInput.indexOf('let acceptedHandled = false', guardedResetStart)
     expect(guardedResetStart).toBeGreaterThan(-1)
@@ -496,6 +377,9 @@ describe('a queued message leaves the box (SA-119 P3b, AMD-119-05)', () => {
     // The bubble's text has had clip syntax stripped for reading (F-P2-6), and the clip ids
     // and file references live in the metadata. Re-sending the display text would name a
     // clip it does not carry, or drop the file.
+    // BL-4 adds the second: a send the server queued behind another turn, whose exact send was
+    // kept for the length of its request and moves beside its bubble when the server says so
+    // (since BL-713, every send that waits in the line; the page's own waiting bubble is gone).
     expect(page.match(/resendableSteerPayloads\.set\(/g)?.length ?? 0).toBe(2)
     // Review F-P3b-2: through the rules module, which answers a NEW object with the
     // composer's closures stripped — never a spread of the live metadata, whose `onAccepted`
@@ -504,7 +388,10 @@ describe('a queued message leaves the box (SA-119 P3b, AMD-119-05)', () => {
       'resendableSteerPayloads.set(steerId, { content, metadata: replayableSendMetadata(metadata) })'
     )
     expect(sendPath).toContain(
-      'resendableSteerPayloads.set(waitingSteerId, { content, metadata: replayableSendMetadata(metadata) })'
+      'inFlightSendPayloads.set(userId, { content, metadata: replayableSendMetadata(metadata) })'
+    )
+    expect(page).toContain(
+      '\n      resendableSteerPayloads.set(notice.userMessageId, {\n        ...ownSend,\n        userMessageId: notice.userMessageId\n      })\n'
     )
     expect(page.match(/replayableSendMetadata\(metadata\)/g)?.length ?? 0).toBe(2)
     expect(page).not.toContain('resendableSteerPayloads.set(steerId, { content, metadata })')
@@ -524,9 +411,11 @@ describe('a queued message leaves the box (SA-119 P3b, AMD-119-05)', () => {
     expect(body).toContain('steerInbox.clearDroppedSteer(steerId)')
     expect(body).not.toContain('steerInbox.forgetSteer(')
     // Review F-P3b-1: a replay, so the send path leaves the chat's OTHER receipts alone.
+    // BL-4: a queued send's receipt also names the message it saved, which Send now reuses.
     expect(body).toContain(
-      'void handleSendMessage(payload.content, payload.metadata, { fromDroppedReceipt: true })'
+      '\n    void handleSendMessage(payload.content, payload.metadata, {\n      fromDroppedReceipt: true,\n'
     )
+    expect(body).toContain('\n      existingUserMessageId: payload.userMessageId\n')
     // The bubble goes BEFORE the send, or the words show twice for the length of a turn.
     expect(body.indexOf('steerInbox.clearDroppedSteer(steerId)')).toBeLessThan(
       body.indexOf('void handleSendMessage(')
@@ -570,11 +459,31 @@ describe('a queued message leaves the box (SA-119 P3b, AMD-119-05)', () => {
     expect(page).toContain(
       '\n      if (!sendOptions.fromDroppedReceipt) {\n        steerInbox.clearDroppedSteersForSession(sendSessionId)'
     )
-    expect(page).toContain('sendOptions: { fromDroppedReceipt?: boolean } = {}')
+    const sendOptionsDeclaration = page.match(/sendOptions: \{[^\n]+?\} = \{\}/)?.[0] ?? ''
+    expect(sendOptionsDeclaration).toContain('fromDroppedReceipt?: boolean')
+    expect(sendOptionsDeclaration).toMatch(/\} = \{\}$/)
     // And it travels as an argument, not as metadata: `requestMetadata` spreads metadata
     // into the request body and a placeholder record, and the server has no use for it.
     expect(codeOnly(page)).not.toContain('metadata.fromDroppedReceipt')
     expect(codeOnly(page)).not.toContain('metadata?.fromDroppedReceipt')
+    expect(codeOnly(page)).not.toContain('metadata.onNoReplyCompleted')
+    expect(codeOnly(page)).not.toContain('metadata?.onNoReplyCompleted')
+    expect(codeOnly(page)).not.toContain('metadata.onReplyAdmitted')
+    expect(codeOnly(page)).not.toContain('metadata?.onReplyAdmitted')
+  })
+
+  it('hands Voice completion to steer only after the server accepted the existing inbox path', () => {
+    const branch = page.indexOf("if (steerBranchEligible || serverQueueEligible)")
+    const post = page.indexOf('const outcome = await postSteer({', branch)
+    const accepted = page.indexOf("if (outcome.kind === 'accepted') {", post)
+    const admit = page.indexOf("sendOptions.onReplyAdmitted?.('steer')", accepted)
+    const reset = page.indexOf('await metadata.onAccepted()', admit)
+    const returned = page.indexOf('return true', reset)
+    expect(post).toBeGreaterThan(branch)
+    expect(admit).toBeGreaterThan(accepted)
+    expect(reset).toBeGreaterThan(admit)
+    expect(returned).toBeGreaterThan(reset)
+    expect(page.slice(branch, accepted)).not.toContain('onReplyAdmitted')
   })
 
   it('hands the replay a callback over its OWN clip ids, never the composer (review F-P3b-2)', () => {
@@ -590,7 +499,7 @@ describe('a queued message leaves the box (SA-119 P3b, AMD-119-05)', () => {
     // The key list lives in the rules module and nowhere else; the page never names the
     // replay callback, because `replayableSendMetadata` has already renamed it.
     expect(rules).toContain(
-      "export const COMPOSER_BOUND_SEND_METADATA_KEYS = [\n  'onAccepted',\n  'onQueuedForLater',\n  'busySendModeOverride'\n] as const"
+      "export const COMPOSER_BOUND_SEND_METADATA_KEYS = ['onAccepted', 'busySendModeOverride'] as const"
     )
     expect(codeOnly(page)).not.toContain('onReplayAccepted')
   })
@@ -849,5 +758,28 @@ describe("P1's open findings (F-P1-2, F-P1-5, F-P1-6)", () => {
       expect(codeOnly(source)).not.toMatch(/interrupts instead/i)
       expect(codeOnly(source)).not.toContain('Interrupt and send')
     }
+  })
+})
+
+
+describe('exact spoken inbox owner at the existing local page seam (BL-1291)', () => {
+  it('registers the generated identity before POST can race delivery, and forwards actual server events and reload records', () => {
+    const prepared = page.indexOf('sendOptions.onSteerPrepared?.({ steerId, sessionId: currentSessionId, targetMessageId: steerTargetMessageId })')
+    expect(prepared).toBeGreaterThan(-1)
+    expect(page.indexOf('await postSteer(', prepared)).toBeGreaterThan(prepared)
+    expect(page).toContain('chatInputRef?.observeVoiceReply?.({')
+    expect(page).toContain("sessionId, type: 'record', messageId: record.id,")
+    expect(page).toContain('metadata: record?.metadata ?? data.metadata')
+    expect(codeOnly(page)).not.toContain('metadata.onSteerPrepared')
+    expect(codeOnly(page)).not.toContain('metadata?.onSteerPrepared')
+  })
+})
+
+describe('saved no-answer receipt and exact Stop (BL-1310/1291)', () => {
+  it('settles a saved promotion bubble even when no answer was scheduled, and uses only confirmed exact local Stop', () => {
+    expect(page).toContain("disposition === 'unanswered' && data.savedRecord !== true")
+    expect(page).toContain('result?.success === true && previousMessageId && result.messageId === previousMessageId')
+    expect(page).toContain("(result.reason === 'aborted' || result.reason === 'setup_stopped')")
+    expect(page).toContain('chatInputRef?.voiceSteerTargetStopped?.(sessionId, previousMessageId)')
   })
 })

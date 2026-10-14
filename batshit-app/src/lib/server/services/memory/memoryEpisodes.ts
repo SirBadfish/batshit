@@ -69,6 +69,86 @@ export function whiteboardAuthor(
   return whiteboard?.written_by === 'nap' ? 'nap' : 'agent'
 }
 
+/**
+ * BL-549: what a writer read of the board, so that it can write only if the board is still
+ * that board. `null` is an empty board. A board is the same board while its author and its
+ * update time are the ones read (an absent author stays absent).
+ */
+export type WhiteboardReading = { updated_at: string | null; written_by: WhiteboardAuthor | null } | null
+
+export function readWhiteboard(
+  whiteboard: EpisodeRecord['whiteboard'] | undefined
+): WhiteboardReading {
+  if (!whiteboard) return null
+  return {
+    updated_at: typeof whiteboard.updated_at === 'string' ? whiteboard.updated_at : null,
+    written_by: whiteboard.written_by ?? null
+  }
+}
+
+/**
+ * BL-549: a conditional whiteboard write found a different board than its writer read (the
+ * agent wrote it, or another nap did, while this writer waited). Nothing was written.
+ */
+export class EpisodeWhiteboardChangedError extends Error {
+  readonly code = 'whiteboard_changed'
+  constructor(episodeId: string) {
+    super(`The whiteboard of episode ${episodeId} changed since it was read; nothing was written.`)
+    this.name = 'EpisodeWhiteboardChangedError'
+  }
+}
+
+/**
+ * The episode is no longer open (closed or graduated), so it takes no whiteboard write. A writer
+ * that waited (the nap, on its summary model) can meet this when a turn closed the episode
+ * meanwhile; it is not a failure of that writer. Nothing was written.
+ */
+export class EpisodeNotOpenError extends Error {
+  readonly code = 'episode_not_open'
+  constructor(
+    episodeId: string,
+    readonly state: string
+  ) {
+    super(`Episode ${episodeId} is ${state}; the whiteboard belongs to the open episode.`)
+    this.name = 'EpisodeNotOpenError'
+  }
+}
+
+/**
+ * BL-549: the whiteboard write in one step inside Redis, so nothing lands between its checks
+ * and its write. KEYS: the episode. ARGV: the new board as JSON (`null` clears it), then `1`
+ * when the write is conditional, then the reading it is conditional on as JSON (`null`: the
+ * board was empty). Answers `MISSING`, `NOT_OPEN:<state>`, `CHANGED`, or the written record as
+ * JSON.
+ */
+const UPDATE_EPISODE_WHITEBOARD_SCRIPT = `
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return 'MISSING'
+end
+local state = cjson.decode(redis.call('JSON.GET', KEYS[1], '$.state'))[1]
+if state ~= 'open' then
+  return 'NOT_OPEN:' .. tostring(state)
+end
+if ARGV[2] == '1' then
+  local board = cjson.decode(redis.call('JSON.GET', KEYS[1], '$.whiteboard'))[1]
+  local expected = cjson.decode(ARGV[3])
+  local function text(value)
+    if value == nil or value == cjson.null then return '' end
+    return tostring(value)
+  end
+  local boardEmpty = board == nil or board == cjson.null
+  if expected == cjson.null then
+    if not boardEmpty then return 'CHANGED' end
+  else
+    if boardEmpty then return 'CHANGED' end
+    if text(board.updated_at) ~= text(expected.updated_at) then return 'CHANGED' end
+    if text(board.written_by) ~= text(expected.written_by) then return 'CHANGED' end
+  end
+end
+redis.call('JSON.SET', KEYS[1], '$.whiteboard', ARGV[1])
+return redis.call('JSON.GET', KEYS[1])
+`
+
 export function episodeKey(sessionId: string, episodeId: string): string {
   return `episode:${sessionId}:${episodeId}`
 }
@@ -171,23 +251,49 @@ export async function updateEpisodeBounds(
  * The whiteboard lives only on the OPEN episode; closing dissolves it (kept, not compiled).
  * Every writer names itself: the agent's control writes `'agent'`, the nap writes `'nap'`,
  * and the nap checks the author before it writes (see `runFixedSessionNap` step 3).
+ *
+ * BL-549: the check that the episode is open and the write are one script, and a writer that
+ * read the board before a wait passes what it read as `onlyIf`: the write then lands only on
+ * that same board, and otherwise throws `EpisodeWhiteboardChangedError` and writes nothing. An
+ * episode that is no longer open throws `EpisodeNotOpenError`, with or without a condition.
+ * The nap reads the author, waits on its summary model, then writes; a turn sent in that wait
+ * could have the agent write its board, and the nap used to write over it. The agent's own
+ * write has no condition: the agent owns its board.
  */
 export async function updateEpisodeWhiteboard(
   sessionId: string,
   episodeId: string,
   content: string | null,
-  writtenBy: WhiteboardAuthor
+  writtenBy: WhiteboardAuthor,
+  options: { onlyIf?: WhiteboardReading } = {}
 ): Promise<EpisodeRecord> {
-  const record = await requireEpisode(sessionId, episodeId)
-  if (record.state !== 'open') {
-    throw new Error(`Episode ${episodeId} is ${record.state}; the whiteboard belongs to the open episode.`)
-  }
-  record.whiteboard =
+  const whiteboard =
     content === null
       ? null
       : { content, updated_at: new Date().toISOString(), written_by: writtenBy }
-  await redis.json.set(episodeKey(sessionId, episodeId), '$.whiteboard', record.whiteboard as never)
-  return record
+  const conditional = options.onlyIf !== undefined
+  const answer = await redis.execute((client) =>
+    client.eval(UPDATE_EPISODE_WHITEBOARD_SCRIPT, {
+      keys: [episodeKey(sessionId, episodeId)],
+      arguments: [
+        JSON.stringify(whiteboard),
+        conditional ? '1' : '0',
+        JSON.stringify(conditional ? options.onlyIf : null)
+      ]
+    })
+  )
+  if (answer === 'MISSING') {
+    throw new Error(`Episode ${episodeId} not found for session ${sessionId}.`)
+  }
+  if (typeof answer === 'string' && answer.startsWith('NOT_OPEN:')) {
+    throw new EpisodeNotOpenError(episodeId, answer.slice('NOT_OPEN:'.length))
+  }
+  if (answer === 'CHANGED') throw new EpisodeWhiteboardChangedError(episodeId)
+  if (typeof answer !== 'string') {
+    throw new Error(`The whiteboard write of episode ${episodeId} gave no answer.`)
+  }
+  // A script answers JSON.GET's raw JSON text.
+  return JSON.parse(answer) as EpisodeRecord
 }
 
 export async function closeEpisode(

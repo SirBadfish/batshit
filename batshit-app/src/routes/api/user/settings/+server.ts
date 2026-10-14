@@ -2,12 +2,13 @@ import { json } from '@sveltejs/kit'
 import type { RequestHandler } from './$types'
 import { RedisService } from '$lib/server/redis'
 import { invalidateUserSettingsCache } from '$lib/services/databaseRedis.server'
-import { normalizeVoiceSettings } from '$lib/utils/voiceSchema'
+import { normalizeVoiceSettings, shouldStopVoiceRuntimeOnShutdown } from '$lib/utils/voiceSchema'
 import { normalizeOptionalIconRefInput } from '$lib/server/icons/iconRefInput'
 import { normalizeOptionalAvatarIconFitInput } from '$lib/server/icons/avatarIconFitInput'
 import { mergeGoonsSettingsPatch } from '$lib/goons/resolve'
 import { normalizeGlobalChatSettings } from '$lib/utils/steerControl'
 import { validateJevJuiceGlobalZipFields } from '$lib/utils/jevJuiceControl'
+import { mergeVoiceSettingsSave } from '$lib/utils/voiceSettingsSave'
 
 const NO_STORE_RESPONSE = {
 	headers: {
@@ -66,7 +67,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 				}
 			}
 
-			// SA-120 P5 (LS-054): `global_zip_settings` is stored whole, so a mistyped Jev Juice
+			// SA-120 P5 (LS-054): `global_zip_settings` is stored whole, so a mistyped Judge Juice
 			// switch is refused here rather than saved and quietly read as OFF.
 			const jevJuiceError = validateJevJuiceGlobalZipFields(data.global_zip_settings)
 			if (jevJuiceError) {
@@ -78,6 +79,9 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 					? mergeGoonsSettingsPatch((existing as any).goons_settings, data.goons_settings_patch)
 					: data.goons_settings !== undefined ?
 						data.goons_settings : (existing as any).goons_settings
+			const nextVoiceSettings = data.voice_settings !== undefined || data.voice_settings_patch !== undefined
+				? mergeVoiceSettingsSave((existing as any).voice_settings, data.voice_settings, data.voice_settings_patch)
+				: (existing as any).voice_settings
 
 			// Build update object preserving existing values (but allow profile fields when provided)
 			const updateData: any = {
@@ -134,16 +138,27 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 							data.upload_provider : (existing as any).upload_provider,
 						show_zip_visual_indicators: data.show_zip_visual_indicators !== undefined ?
 							data.show_zip_visual_indicators : (existing as any).ui_settings?.show_zip_visual_indicators,
-						voice_settings: stripEngineRegistryFromVoiceSettings(
-							data.voice_settings !== undefined ?
-								data.voice_settings : (existing as any).voice_settings
-						),
+				voice_settings: nextVoiceSettings,
 				goons_settings: nextGoonsSettings
 			}
 			
 			const settings = await redis.updateUserSettings(locals.user.id, updateData)
 			invalidateUserSettingsCache(locals.user.id)
-			
+
+			// LiveKit's "Stop with Batshit" reaches this Batshit's running LiveKit launch records only
+			// once the save is confirmed (BL-1301); a failed save changes no record. The save stands
+			// either way: what the records did not take is logged here and shown in the LiveKit row.
+			const liveKitStop = (value: unknown) => shouldStopVoiceRuntimeOnShutdown(normalizeVoiceSettings(value).voiceRuntimes?.livekit?.startup)
+			if (liveKitStop((existing as any).voice_settings) !== liveKitStop((settings as any)?.voice_settings)) {
+				const { syncLiveKitStopPreference } = await import('$lib/server/services/liveKitSidecarRuntime')
+				await syncLiveKitStopPreference(locals.user.id).then(
+					(result) => {
+						if (!result.complete) console.warn('[user/settings] LiveKit Stop with Batshit did not reach every launch record:', result.problems)
+					},
+					(error) => console.warn('[user/settings] LiveKit Stop with Batshit did not reach its launch records:', error)
+				)
+			}
+
 			return json({ success: true, settings: sanitizeSettingsResponse(settings) })
 		}
 		

@@ -103,15 +103,29 @@
     }
     if (previewGenerationLoadedGoonUrl !== targetKey) {
       if (target.kind === 'custom') {
-        await loadAvatarIntoEngine(engine, target.goon)
+        const avatar = await loadAvatarIntoEngine(engine, target.goon)
+        if (avatar.role === 'cancelled') return null
       } else if (target.kind === 'custom-url') {
-        const manifest = await loadCustomAvatarManifest({
-          url: target.manifestUrl,
-          filename: target.manifestUrl.split('/').pop() || 'avatar.json'
-        })
-        await engine.loadCustomGoon(target.modelUrl, manifest)
+        const goonLoadToken = engine.beginGoonLoad()
+        try {
+          const manifest = await loadCustomAvatarManifest({
+            url: target.manifestUrl,
+            filename: target.manifestUrl.split('/').pop() || 'avatar.json'
+          })
+          if (!engine.isCurrentGoonLoad(goonLoadToken)) return null
+          await engine.loadCustomGoon(target.modelUrl, manifest, {}, goonLoadToken)
+          if (!engine.isCurrentGoonLoad(goonLoadToken)) return null
+        } finally {
+          engine.finishGoonLoad(goonLoadToken)
+        }
       } else {
-        await engine.loadGoon(target.url)
+        const goonLoadToken = engine.beginGoonLoad()
+        try {
+          await engine.loadGoon(target.url, null, goonLoadToken)
+          if (!engine.isCurrentGoonLoad(goonLoadToken)) return null
+        } finally {
+          engine.finishGoonLoad(goonLoadToken)
+        }
       }
       previewGenerationLoadedGoonUrl = targetKey
     }
@@ -294,6 +308,7 @@
     }
 
     const engine = await ensureSharedPreviewGenerationEngine(previewTarget)
+    if (!engine) return null
     await engine.syncAnimations([animationFile])
     engine.setGoonVisible(true)
 
@@ -573,12 +588,12 @@
   }
 
   .animation-preview-thumb:hover {
-    border-color: oklch(from var(--primary) l c h / 0.5);
+    border-color: oklch(from var(--primary-text) l c h / 0.5);
   }
 
   .animation-preview-thumb[data-active="true"] {
     box-shadow:
-      0 0 0 2px var(--primary),
+      0 0 0 2px var(--primary-text),
       0 0 0 4px var(--background);
   }
 

@@ -280,7 +280,7 @@
   .recipe-build-stages li.complete,
   .recipe-build-stages li.current { color: var(--bs-settings-label); }
   .recipe-build-stages li.complete .recipe-build-stage-marker { background: var(--bs-app-success-text); }
-  .recipe-build-stages li.current .recipe-build-stage-marker { background: var(--bs-settings-primary); }
+  .recipe-build-stages li.current .recipe-build-stage-marker { background: var(--bs-settings-primary-text); }
 
   .recipe-build-failure {
     display: flex;

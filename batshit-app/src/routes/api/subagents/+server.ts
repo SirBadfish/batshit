@@ -12,7 +12,7 @@ import { runTrackedN8nCompatibilitySync } from '$lib/server/services/n8nParamete
 import { normalizeOptionalIconRefInput } from '$lib/server/icons/iconRefInput'
 import { normalizeOptionalAvatarIconFitInput } from '$lib/server/icons/avatarIconFitInput'
 import type { SubagentRow } from '$lib/types/database'
-import { sanitizeId } from '$lib/utils/idSanitizer' // Story 6.9c
+import { resolveNewAgentId } from '$lib/server/services/agentIdRules' // Story 6.9c, BL-283
 import {
 	normalizeUploadUrlsForStorageInPayload,
 	resolveUploadUrlsForBrowserInPayload
@@ -139,14 +139,26 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
 		const service = redis
 
-		// Story 6.9c: Use provided ID or generate from displayName
-		const id = providedId?.trim() || sanitizeId(displayName)
+		// Story 6.9c: Use provided ID or generate from displayName. BL-283: an id the delete or
+		// the avatar pictures cannot live with is refused.
+		const requestedId = resolveNewAgentId('subagent', providedId, displayName)
+		if (!requestedId.ok) {
+			return json({ error: requestedId.error, code: requestedId.code }, { status: 400 })
+		}
+		const id = requestedId.id
 
 		// Story 6.9c: Check for ID collision
 		const exists = await service.exists(`subagent:${id}`)
 		if (exists) {
 			return json({
 				error: `Subagent slug '${id}' is already taken. Choose another slug or delete/rename the original subagent.`
+			}, { status: 400 })
+		}
+		// BL-187 (2026-09-25): a skill's or artifact's access list names ids with no kind, so a
+		// Subagent sharing a Primary Agent's id would share its access. Refuse the id instead.
+		if (await service.exists(`agent:${id}`)) {
+			return json({
+				error: `A Primary Agent already uses the id '${id}'. Give this Subagent another name, so their skill and artifact access stay separate.`
 			}, { status: 400 })
 		}
 

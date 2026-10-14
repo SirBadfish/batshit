@@ -1,5 +1,8 @@
+import { describeTooLargeToolResult, type ToolResultSizeGuard } from './toolResultSizeGuard'
+import { UNKNOWN_JUDGE_NAME } from './judgeProviders'
+
 /**
- * Who holds a zip open. `inferred` (SA-120 P5) is Batshit acting on a Jev Juice judgment: the
+ * Who holds a zip open. `inferred` (SA-120 P5) is Batshit acting on a Judge Juice judgment: the
  * weakest actor, always temporary, never a lock.
  */
 export type ZipStatusActor = 'auto' | 'user' | 'agent' | 'inferred' | null
@@ -16,9 +19,24 @@ export interface ZipStatusPresentationInput {
   manualZip?: boolean
   autoZip?: boolean
   agentControlled?: boolean
-  /** Jev Juice opened it, or zipped it after a reply (`source: 'inferred'`). */
+  /** Judge Juice opened it, or zipped it after a reply (`source: 'inferred'`). */
   inferredControlled?: boolean
   aboutToZip?: boolean
+  /**
+   * SA-129 P2 (D1): who holds it, in the user's words ("Held by you", "Held by you (3 messages
+   * left)", "Held by Opie"), from `describeHoldForUser`. Absent when nobody holds it.
+   */
+  holdLabel?: string | null
+  /** SA-129 P2 (BL-333): the prompt compresses this read as a dead copy, and why. */
+  deadCopyReason?: 'superseded' | 'stale' | null
+  sizeGuard?: ToolResultSizeGuard
+  tokens?: number
+  /**
+   * BL-1485 (SA-120 P10b): the judge that opened or zipped it, named by `judgeModelName` /
+   * `judgeNameOfCallRecord` ("Clef Flash", "Jev"). The stored zip state keeps no judge, so every
+   * caller today leaves it out and the words say "the judge" (`UNKNOWN_JUDGE_NAME`), never a guess.
+   */
+  judgeName?: string | null
 }
 
 /**
@@ -75,43 +93,79 @@ function resolveActor(input: ZipStatusPresentationInput): ZipStatusActor {
   return 'auto'
 }
 
+/** The reason a dead copy is compressed, in the words its zip reference uses (SA-129 DL-01). */
+const DEAD_COPY_TOOLTIP: Record<'superseded' | 'stale', string> = {
+  superseded: 'superseded by a later read',
+  stale: 'stale, edited since'
+}
+
+function judgeOf(input: ZipStatusPresentationInput): string {
+  const name = typeof input.judgeName === 'string' ? input.judgeName.trim() : ''
+  return name || UNKNOWN_JUDGE_NAME
+}
+
 function buildUnzippedTooltip(
   actor: ZipStatusActor,
   duration: ZipStatusDuration,
-  remainingMessages: number | null
+  remainingMessages: number | null,
+  holdLabel: string | null,
+  judge: string
 ) {
+  // SA-129 P2 (D1): a hold says who holds it, in one vocabulary for the chat and the Zip Manager.
+  if (holdLabel && (actor === 'user' || actor === 'agent')) return holdLabel
+
   if (duration === 'permanent') {
-    if (actor === 'agent') return 'Agent kept this unzipped always'
-    if (actor === 'user') return 'You kept this unzipped always'
-    return 'Unzipped always'
+    if (actor === 'agent') return 'Held by the agent'
+    if (actor === 'user') return 'Held by you'
+    return 'Held'
   }
 
+  // BL-1485: a Judge Juice open is a hold for a number of messages, said like the user's.
   if (duration === 'countdown' && remainingMessages !== null) {
     const count = pluralizeMessage(remainingMessages)
-    if (actor === 'agent') return `Agent kept this unzipped for ${count}`
-    if (actor === 'inferred') return `Jev unzipped this for ${count}`
-    if (actor === 'user') return `You kept this unzipped for ${count}`
-    return `Auto-managed: zips in ${count}`
+    if (actor === 'agent') return `Held by the agent (${count} left)`
+    if (actor === 'inferred') return `Held by ${judge} (${count} left)`
+    if (actor === 'user') return `Held by you (${count} left)`
+    return `Expanded: compresses in ${count}`
   }
 
-  if (actor === 'agent') return 'Agent kept this unzipped'
-  if (actor === 'inferred') return 'Jev unzipped this'
-  if (actor === 'user') return 'You kept this unzipped'
-  return 'Auto-managed: currently unzipped by buffer and threshold rules'
+  if (actor === 'agent') return 'Held by the agent'
+  if (actor === 'inferred') return `Held by ${judge}`
+  if (actor === 'user') return 'Held by you'
+  return 'Expanded by the automatic rules (buffer and threshold)'
 }
 
 export function buildZipStatusPresentation(
   input: ZipStatusPresentationInput
 ): ZipStatusPresentation {
+  if (input.sizeGuard === 'too_large') {
+    const tooltip = describeTooLargeToolResult(input.tokens ?? 0)
+    return {
+      state: 'zipped',
+      actor: null,
+      duration: 'none',
+      remainingMessages: null,
+      tone: 'zipped',
+      tooltip,
+      ariaLabel: tooltip
+    }
+  }
   if (input.isZipped) {
-    const agentMarker = input.agentControlled ? ' after agent zip control' : ''
-    const tooltip = input.manualZip && input.inferredControlled && !input.agentControlled
-      ? 'Zipped by Jev: the agent seemed done with it'
+    const deadCopy = input.deadCopyReason ? DEAD_COPY_TOOLTIP[input.deadCopyReason] : null
+    // BL-1485: one vocabulary. The state is "Compressed"; who zipped it, when someone did, follows.
+    const tooltip = deadCopy
+      ? input.holdLabel
+        ? `Compressed: ${deadCopy}. ${input.holdLabel}; the hold moves to the next whole read`
+        : `Compressed: ${deadCopy}`
+      : input.manualZip && input.inferredControlled && !input.agentControlled
+      ? `Compressed by ${judgeOf(input)}: the agent seemed done with it`
+      : input.agentControlled
+      ? 'Compressed: the agent zipped it'
       : input.manualZip
-      ? `Zipped manually${agentMarker}`
+      ? 'Compressed: you zipped it'
       : input.autoZip
-        ? `Auto-zipped${agentMarker}`
-        : `Zipped${agentMarker}`
+        ? 'Compressed at once (Auto)'
+        : 'Compressed'
 
     return {
       state: 'zipped',
@@ -131,7 +185,7 @@ export function buildZipStatusPresentation(
     : remainingMessages !== null
       ? 'countdown'
       : 'none'
-  const tooltip = buildUnzippedTooltip(actor, duration, remainingMessages)
+  const tooltip = buildUnzippedTooltip(actor, duration, remainingMessages, input.holdLabel ?? null, judgeOf(input))
 
   return {
     state: 'unzipped',
@@ -143,4 +197,3 @@ export function buildZipStatusPresentation(
     ariaLabel: tooltip
   }
 }
-

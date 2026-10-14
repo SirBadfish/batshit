@@ -113,7 +113,7 @@ describe('applyRecallMediaDelivery', () => {
 
     const row = result!.output.result.recalled[0]
     expect(row.media[0]).toMatchObject({ delivery: 'next_message', reason: 'lane_none' })
-    expect(row.media_note).toContain('REMEMBERED MEDIA with the next message')
+    expect(row.media_note).toContain('remembered_media with the next message')
     expect(row.media_note).toContain('lane_none')
     expect(row.media_note).not.toContain('THIS reply')
     expect(result!.record).toEqual({

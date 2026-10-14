@@ -2,7 +2,7 @@
 <script lang="ts">
 	import CompactTool from '../templates/CompactTool.svelte'
 	import type { ToolData } from '../toolRendererRegistry'
-	import { failedCommandExitCode } from '$lib/utils/toolActivityContract'
+	import { describeOutputCut, failedCommandExitCode, toolOutputCut } from '$lib/utils/toolActivityContract'
 	import { Folder, File, FolderOpen } from '@lucide/svelte'
 
 	let { tool }: { tool: ToolData } = $props()
@@ -38,22 +38,53 @@
 	})
 	let dirName = $derived(dirPath === '.' ? 'Current directory' : dirPath.split('/').pop() || dirPath)
 
-	// Extract file list and counts
+	// Extract file list and counts. BL-166: a stored listing names its own counts, which cover every
+	// entry; the rows here are at most its first 200. Only a result with no counts falls back to
+	// counting the rows. BL-315: an entry of unknown type (a plain `ls` says nothing of types) is an
+	// item, never a file: 150 files and 150 folders read "300 files".
 	let fileData = $derived(extractFiles(tool.toolResult))
-	let totalFiles = $derived(tool.toolResult?.totalFiles || fileData.filter(f => resolveEntryType(f) !== 'directory').length)
-	let totalDirs = $derived(tool.toolResult?.totalDirectories || fileData.filter(f => resolveEntryType(f) === 'directory').length)
+	let storedFiles = $derived(countField(tool.toolResult?.totalFiles))
+	let storedUnknown = $derived(countField(tool.toolResult?.totalUnknownItems))
+	let storedDirs = $derived(countField(tool.toolResult?.totalDirectories))
+	let totalFiles = $derived(storedFiles || fileData.filter((f) => resolveEntryType(f) === 'file').length)
+	let totalDirs = $derived(storedDirs || fileData.filter((f) => resolveEntryType(f) === 'directory').length)
+	let totalUnknown = $derived(storedUnknown || fileData.filter((f) => resolveEntryType(f) === 'item').length)
 	let totalItems = $derived(fileData.length)
 
-	let summary = $derived(buildSummary(totalFiles, totalDirs, totalItems))
+	// BL-8: a listing its lane cut (Claude Code keeps only a big output's first 30,000 bytes) holds
+	// only its first entries. Its count is the lines the listing kept, never the rows this card keeps.
+	let outputCut = $derived(toolOutputCut(tool.toolResult))
+	let listedItems = $derived(
+		typeof tool.toolResult?.totalItems === 'number' ? tool.toolResult.totalItems : totalItems
+	)
+	let summary = $derived(
+		outputCut
+			? `first ${listedItems} ${listedItems === 1 ? 'item' : 'items'}`
+			: buildSummary(totalFiles, totalDirs, totalUnknown, listedItems)
+	)
+	let cutNote = $derived(
+		outputCut
+			? `${describeOutputCut(outputCut)}${
+					totalItems < listedItems ? ` Showing the first ${totalItems} of those ${listedItems} entries.` : ''
+				}`
+			: totalItems > 0 && totalItems < listedItems
+				? `Showing the first ${totalItems} of ${listedItems} entries.`
+				: ''
+	)
 
 	// Build details for expanded view
 	let fileList = $derived(formatFileList(fileData))
 	
 	
-	function buildSummary(files: number, dirs: number, items: number): string {
+	function countField(value: unknown): number | undefined {
+		return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+	}
+
+	function buildSummary(files: number, dirs: number, unknown: number, items: number): string {
 		const parts = []
 		if (files > 0) parts.push(`${files} ${files === 1 ? 'file' : 'files'}`)
 		if (dirs > 0) parts.push(`${dirs} ${dirs === 1 ? 'folder' : 'folders'}`)
+		if (unknown > 0) parts.push(`${unknown} ${unknown === 1 ? 'item' : 'items'}`)
 		if (parts.length === 0 && items > 0) parts.push(`${items} ${items === 1 ? 'item' : 'items'}`)
 		return parts.join(', ') || 'Empty directory'
 	}
@@ -184,12 +215,12 @@
 					}
 				}
 
-				// Plain output lines (`ls`, `find`, `tree` fallback)
+				// Plain output lines (`ls`, `find`, `tree` fallback): only a trailing `/` says a type.
 				const name = line.replace(/^[├└│─\s]+/, '').trim()
 				if (!name || name === '.' || name === '..') return null
 				return {
 					name,
-					type: name.endsWith('/') ? 'directory' : 'file'
+					type: name.endsWith('/') ? 'directory' : 'unknown'
 				}
 			})
 			.filter(Boolean) as any[]
@@ -400,10 +431,13 @@
 	title="List Files"
 	summary={failed ? `Failed to list ${dirName}` : `${summary} in ${dirName}`}
 	status={failed ? 'error' : 'success'}
-	expandable={totalItems > 0 || failed}
+	expandable={totalItems > 0 || failed || Boolean(tool.toolResult?.shell)}
 	error={tool.error}
 >
 	<div class="file-list">
+		{#if tool.toolResult?.shell}
+			<div class="empty-message">Shell: {tool.toolResult.shell}</div>
+		{/if}
 		{#if failed}
 			<div class="error-message">{errorHeadline || 'Failed to list files'}</div>
 			{#if commandOutput}
@@ -434,6 +468,9 @@
 				</div>
 			{/each}
 		{/if}
+		{#if cutNote}
+			<div class="cut-note">{cutNote}</div>
+		{/if}
 	</div>
 </CompactTool>
 
@@ -451,6 +488,12 @@
 	.empty-message {
 		padding: 1rem;
 		text-align: center;
+		color: var(--muted-foreground);
+		font-style: italic;
+	}
+
+	.cut-note {
+		padding: 0.35rem 0.25rem 0.1rem;
 		color: var(--muted-foreground);
 		font-style: italic;
 	}

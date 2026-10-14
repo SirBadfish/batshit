@@ -6,10 +6,9 @@
 // - Every .md under a sync's sourceRoot must be listed as include or exclude,
 //   so a new UserDocs page fails this script instead of silently never
 //   reaching the skill.
-// - Destination reference folders are pure mirrors of the manifest: --write
-//   copies includes byte-for-byte and deletes unlisted files; --check exits 1
-//   on any drift (content mismatch, missing copy, stale file, unlisted or
-//   missing source).
+// - Destination reference folders contain byte-for-byte UserDocs mirrors plus
+//   one generated Guide navigation map. --write copies includes and deletes
+//   unlisted files; --check exits 1 on content, index, link, or map drift.
 // - Run this BEFORE tools/portable-skills/sync-portable-skills.mjs whenever
 //   UserDocs change, because portable bundles copy from the in-app skill
 //   folder this script writes.
@@ -17,6 +16,13 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import process from 'node:process'
 import { fileURLToPath } from 'node:url'
+import {
+  GUIDE_NAVIGATION_FILE,
+  renderGuideNavigationMap,
+  validateGuideMarkdownLinks,
+  validateGuideNavigationMap,
+  validateGuideReferenceIndex
+} from './guide-navigation.mjs'
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 const manifestPath = path.join(repoRoot, 'tools/system-skills/userdocs-skill-references.manifest.json')
@@ -139,6 +145,37 @@ async function main() {
 
     const expectedReferences = new Map(include.map((entry) => [entry.reference, entry.source]))
 
+    if (sync.id === 'batshit-guide') {
+      const skillPath = path.join(path.dirname(destinationRoot), 'SKILL.md')
+      const skillMarkdown = await fs.readFile(skillPath, 'utf8')
+      for (const problem of validateGuideReferenceIndex(skillMarkdown, include)) {
+        problems.push(`[${syncId}] ${problem}`)
+      }
+      if (include.every(({ source }) => actualSet.has(source))) {
+        const linkProblems = await validateGuideMarkdownLinks(include, (source) =>
+          fs.readFile(path.join(sourceRoot, source), 'utf8')
+        )
+        for (const problem of linkProblems) problems.push(`[${syncId}] ${problem}`)
+      }
+
+      const mapPath = path.join(destinationRoot, GUIDE_NAVIGATION_FILE)
+      const expectedMap = renderGuideNavigationMap(include)
+      let currentMap = null
+      try {
+        currentMap = await fs.readFile(mapPath, 'utf8')
+      } catch (error) {
+        if (error?.code !== 'ENOENT') throw error
+      }
+      if (validateGuideNavigationMap(currentMap, include).length > 0) {
+        if (mode === 'write') {
+          await fs.writeFile(mapPath, expectedMap, 'utf8')
+          copied += 1
+        } else {
+          problems.push(`[${syncId}] generated Guide navigation map is missing or out of date: ${toPosix(path.relative(repoRoot, mapPath))}`)
+        }
+      }
+    }
+
     for (const [reference, source] of expectedReferences) {
       const sourcePath = path.join(sourceRoot, source)
       const destinationPath = path.join(destinationRoot, reference)
@@ -173,7 +210,7 @@ async function main() {
 
     for (const entry of destinationEntries) {
       if (entry.name.startsWith('.')) continue
-      if (expectedReferences.has(entry.name) && entry.isFile()) continue
+      if ((expectedReferences.has(entry.name) || (sync.id === 'batshit-guide' && entry.name === GUIDE_NAVIGATION_FILE)) && entry.isFile()) continue
       const stalePath = path.join(destinationRoot, entry.name)
       if (mode === 'write') {
         await fs.rm(stalePath, { recursive: true, force: true })

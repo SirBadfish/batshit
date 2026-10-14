@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { buildTranscriptMarkdown, renderMessageToMarkdown } from './chatMarkdown'
 
 describe('chatMarkdown', () => {
@@ -169,5 +169,49 @@ describe('chatMarkdown', () => {
 
     expect(markdown).toContain('[clip reference omitted]')
     expect(markdown).not.toContain('{{batshit-clip:')
+  })
+})
+
+// BL-693: the real transcript API must preserve unfinished references without retrying
+// the rest of the message for every opener. These fixtures failed on the old readers.
+describe('chatMarkdown unfinished references', () => {
+  it.each([
+    ['legacy clip', '{{batshit-clip|id:unfinished}}', 20000],
+    ['modern zip', '{{batshit-zip:unfinished:::body', 16000],
+    ['modern clip', '{{batshit-clip:unfinished:::body', 16000]
+  ] as const)('exports %s openers promptly without resolving or changing them', async (kind, opener, count) => {
+    const content = opener.repeat(count)
+    const resolveZip = vi.fn(async () => null)
+    const resolveClip = vi.fn(async () => null)
+    const start = performance.now()
+    const markdown = await renderMessageToMarkdown(
+      { id: 'unfinished', role: 'user', content, metadata: {} },
+      { resolveZip, resolveClip }
+    )
+    const elapsed = performance.now() - start
+    console.info(`BL-693 ${kind}: ${content.length} bytes, ${elapsed.toFixed(1)} ms`)
+    expect(markdown).toBe(content)
+    expect(resolveZip).not.toHaveBeenCalled()
+    expect(resolveClip).not.toHaveBeenCalled()
+    expect(elapsed).toBeLessThan(1000)
+  })
+
+  it('retains sequential mixed resolver calls and legacy links in the transcript', async () => {
+    const resolved: string[] = []
+    const transcript = await buildTranscriptMarkdown(
+      {
+        session: { id: 'reference-order', name: 'Reference order' },
+        messages: [{
+          id: 'order', role: 'user', metadata: {},
+          content: 'Before {{batshit-zip:first:::One}} / {{batshit-clip:second:::Two}} / {{batshit-zip:third:::Three}} / {{batshit-clip|id:old|displayUrl:https://example.com/a.png}}chart.png{{/batshit-clip}} After'
+        }]
+      },
+      {
+        resolveZip: async (id) => { resolved.push(id); return null },
+        resolveClip: async (id) => { resolved.push(id); return null }
+      }
+    )
+    expect(resolved).toEqual(['first', 'second', 'third'])
+    expect(transcript).toContain('Before One / Two / Three / ![chart.png](<https://example.com/a.png>) After')
   })
 })

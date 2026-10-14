@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import AdminJevJuiceCard from './AdminJevJuiceCard.svelte'
 
 /**
- * SA-120 P0 — the Settings Auto-Save Contract for the Jev Juice card: hydration must
+ * SA-120 P0 — the Settings Auto-Save Contract for the Judge Juice card: hydration must
  * not save, and a real edit saves exactly once. The key and its Test button moved to
  * Settings → API Keys in the P7 review (Josh, 2026-09-17); this card only says when the key
  * is missing and points there.
@@ -72,7 +72,7 @@ describe('AdminJevJuiceCard', () => {
     render(AdminJevJuiceCard)
 
     await waitFor(() => expect(calls.some((call) => call.url.endsWith('/api/settings/typesafe'))).toBe(true))
-    const toggle = await screen.findByRole('switch', { name: /allow jev juice/i })
+    const toggle = await screen.findByRole('switch', { name: /allow judge juice/i })
     await waitFor(() => expect(toggle).not.toBeDisabled())
     // Give any hydration-triggered autosave a chance to (wrongly) fire.
     await new Promise((resolve) => setTimeout(resolve, 700))
@@ -87,7 +87,11 @@ describe('AdminJevJuiceCard', () => {
       // SA-120 P8: the In-Chat Wait Limit rides the same draft (LS-059).
       inChatWaitMs: 750,
       // SA-120 P7: the card sends its whole draft; a record from before P7 hydrates this as OFF.
-      screenIncomingText: false
+      screenIncomingText: false,
+      // SA-120 P10a: so does a record from before P10a: TypeSafe only, no judges, no per-feature choices.
+      providers: [],
+      defaultProviderId: 'typesafe',
+      laneProviders: {}
     })
     await screen.findByText('Saved')
     await new Promise((resolve) => setTimeout(resolve, 700))
@@ -97,7 +101,7 @@ describe('AdminJevJuiceCard', () => {
   it('shows the save error and does not retry on its own', async () => {
     const { calls } = installFetch({ putStatus: 400 })
     render(AdminJevJuiceCard)
-    const toggle = await screen.findByRole('switch', { name: /allow jev juice/i })
+    const toggle = await screen.findByRole('switch', { name: /allow judge juice/i })
     await waitFor(() => expect(toggle).not.toBeDisabled())
     await fireEvent.click(toggle)
     await waitFor(() => expect(putCalls(calls)).toHaveLength(1), { timeout: 3000 })
@@ -130,22 +134,23 @@ describe('AdminJevJuiceCard', () => {
   it('refuses jev-latest in the field without calling the server', async () => {
     const { calls } = installFetch()
     render(AdminJevJuiceCard)
-    const model = (await screen.findByLabelText('Model')) as HTMLInputElement
+    const model = (await screen.findByLabelText('TypeSafe Model')) as HTMLInputElement
     await waitFor(() => expect(model).not.toBeDisabled())
     await fireEvent.input(model, { target: { value: 'jev-latest' } })
     await screen.findByText(/pinned Jev id/i, undefined, { timeout: 3000 })
     expect(putCalls(calls)).toHaveLength(0)
   })
 
-  it('has no key row and no Test button: those live in Settings → API Keys', async () => {
+  it('has no key row (keys live in Settings → API Keys), and since SA-120 P10a a Test button per judge', async () => {
     installFetch()
     render(AdminJevJuiceCard)
     // Wait for hydration to finish: the missing-key note is only decided once the key status is known.
-    const model = await screen.findByLabelText('Model')
+    const model = await screen.findByLabelText('TypeSafe Model')
     await waitFor(() => expect(model).not.toBeDisabled())
-    expect(screen.queryByRole('button', { name: 'Test' })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Test TypeSafe' })).toBeTruthy()
     expect(screen.queryByText(/Needs Key/)).toBeNull()
     expect(screen.queryByText(/TypeSafe Key/)).toBeNull()
+    expect(screen.queryByLabelText(/api key/i)).toBeNull()
     expect(screen.queryByTestId('jev-juice-missing-key')).toBeNull()
   })
 
@@ -162,7 +167,7 @@ describe('AdminJevJuiceCard', () => {
     await fireEvent.click(screen.getByRole('button', { name: /Settings → API Keys/ }))
     expect(events).toEqual([{ tab: 'api-keys' }])
 
-    const master = screen.getByRole('switch', { name: /Allow Jev Juice/i })
+    const master = screen.getByRole('switch', { name: /Allow Judge Juice/i })
     await waitFor(() => expect(master).not.toBeDisabled())
     await fireEvent.click(master)
     await waitFor(() => expect(screen.getByTestId('jev-juice-missing-key').className).toContain('is-warning'))

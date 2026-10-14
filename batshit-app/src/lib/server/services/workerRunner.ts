@@ -38,6 +38,7 @@ import {
 } from '$lib/utils/subagentType'
 import { normalizeSubagentSlugValue, resolveSubagentSlug } from '$lib/utils/subagentSlug'
 import { executeManagedSubagent } from '$lib/server/services/subagentRunner'
+import type { CodexDelegatedAccounting } from './observedUsage'
 import { reserveWorkerRuns, type WorkerTurnKey } from '$lib/server/services/workerTurnBudget'
 
 /** One worker as the model asks for it (DL-111-09). */
@@ -55,6 +56,8 @@ export type WorkerRunRecord = {
   status: DelegatedRunStatus
   output: string
   usage: DelegatedUsage | null
+  observedUsage?: CodexDelegatedAccounting['observedUsage']
+  observedUsageUnavailable?: 'invalid'
   modelId: string | null
   provider: string | null
   durationMs: number
@@ -407,6 +410,8 @@ export async function spawnWorkers(params: SpawnWorkersParams): Promise<SpawnWor
             status: result.status,
             output: result.output,
             usage: result.usage,
+            ...(result.observedUsage ? { observedUsage: result.observedUsage } : {}),
+            ...(result.observedUsageUnavailable ? { observedUsageUnavailable: result.observedUsageUnavailable } : {}),
             modelId: result.modelId,
             provider: result.provider,
             durationMs: result.durationMs,

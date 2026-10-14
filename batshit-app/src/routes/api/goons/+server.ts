@@ -1,6 +1,10 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
 import { redis } from '$lib/server/redis'
 import {
+  createOwnedGoonForClient,
+  GoonMutationError
+} from '$lib/server/services/goonMutationRepository.server'
+import {
   getInternalBatshitServerAuthHeaders,
   getInternalBatshitServerUrl,
   normalizeUploadUrlsForStorageInPayload,
@@ -518,13 +522,17 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
     const storageGoon = normalizeUploadUrlsForStorageInPayload(goon)
 
-    await redis.execute(async (client) => {
-      await client.json.set(`goon:${goonId}`, '$', storageGoon as any)
-      await client.sAdd(`user:${locals.user!.id}:goons`, goonId)
-    })
+    await redis.execute((client) => createOwnedGoonForClient({
+      client,
+      userId: locals.user!.id,
+      goon: storageGoon
+    }))
 
     return json(resolveUploadUrlsForBrowserInPayload(storageGoon))
   } catch (error) {
+    if (error instanceof GoonMutationError) {
+      return json({ error: error.message, code: error.code }, { status: error.status })
+    }
     console.error('Error creating goon:', error)
     return json(
       { error: error instanceof Error ? error.message : 'Failed to create goon' },

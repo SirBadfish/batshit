@@ -234,6 +234,7 @@ export async function resolveApprovalResumeGrants(options: {
   sessionId: string
   messageId?: string | null
   responses: ToolApprovalResponse[]
+  mutate?: (write: () => Promise<void>) => Promise<void>
 }): Promise<ResolvedApprovalResumeGrants> {
   const empty: ResolvedApprovalResumeGrants = { approved: {}, denied: {} }
   const responses = Array.isArray(options.responses) ? options.responses : []
@@ -281,9 +282,11 @@ export async function resolveApprovalResumeGrants(options: {
       decided = await decideApproval({
         userId: options.userId,
         approvalId: control.approvalId,
-        approved
+        approved,
+        mutate: options.mutate
       })
     } catch (error) {
+      if (options.mutate) throw error // A fenced plan decision is a refused resume, not a missing grant.
       console.error('[SA-116] Could not record an approval decision:', error)
       continue
     }

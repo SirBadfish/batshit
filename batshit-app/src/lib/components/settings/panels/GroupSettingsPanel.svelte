@@ -1,6 +1,10 @@
 <script lang="ts">
-  import { onMount, untrack } from 'svelte'
-  import { debounce } from '$lib/utils/debounce'
+  import { performAvatarImport, uploadAvatarFile } from '$lib/appActions/imports/avatars'
+  import type { ImportArgs, ImportOutcome } from '$lib/appActions/imports/contracts'
+  import { registerAppActionDraft, type ActionContext } from '$lib/appActions/owners'
+  import { refuse } from '$lib/appActions/catalog'
+
+  import { onMount, onDestroy, untrack } from 'svelte'
   import * as Card from '$lib/components/ui/card'
   import * as Collapsible from '$lib/components/ui/collapsible'
   import { Button } from '$lib/components/ui/button'
@@ -37,6 +41,7 @@
   import SettingsTextEditor from '$lib/components/settings/SettingsTextEditor.svelte'
   import GroupToolSharingGrid from '$lib/components/settings/group/GroupToolSharingGrid.svelte'
   import { GroupService } from '$lib/services/groups'
+  import { requestAvatarPictureTidy, shouldTidyAvatarPictures } from '$lib/utils/avatarPictureTidy'
   import type { GroupChatGroupRow } from '$lib/types/database'
   import type { GroupChatAgentSettings, GroupChatSpeakPolicy } from '$lib/types/groupChat'
   import { isManagedPrimaryAgentType, normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
@@ -73,6 +78,19 @@
   }
 
   type SaveTarget = 'settings' | 'agents' | 'tools'
+  type GroupSaveRequest = {
+    groupId: string
+    form: GroupFormState
+    baseline: string
+    readGeneration: number
+    selectionGeneration: number
+    target: SaveTarget
+    effectRequested: boolean
+    writeCompleted?: boolean
+    confirmedRead?: { generation: number; signature: string }
+    resolve?: () => void
+    reject?: (error: Error) => void
+  }
 
   const SAVE_DEBOUNCE_MS = 650
   const MAX_GROUP_AVATAR_BYTES = 5 * 1024 * 1024
@@ -82,8 +100,8 @@
     { value: 'quiet', label: 'Quiet' },
     { value: 'only_when_asked', label: 'Only when asked' },
     { value: 'topic_only', label: 'Topic only' },
-    // SA-120 P3 (LS-051): Jev Juice picks the speaker and skips follow-ups that add nothing.
-    { value: 'smart', label: 'Jev Juice: Smart' }
+    // SA-120 P3 (LS-051): Judge Juice picks the speaker and skips follow-ups that add nothing.
+    { value: 'smart', label: 'Judge Juice: Smart' }
   ]
 
   const EMPTY_FORM: GroupFormState = {
@@ -118,11 +136,34 @@
   let saveTarget = $state<SaveTarget>('settings')
   let createBusy = $state(false)
   let deleteBusy = $state(false)
+  let deletingGroupId: string | null = null
   let deleteDisclosureOpen = $state(false)
   let groupPromptEditorOpen = $state(false)
   let toolGridRefreshNonce = $state(0)
   let groupAvatarInput = $state<HTMLInputElement | null>(null)
   let isUploadingGroupAvatar = $state(false)
+  let avatarAppActionBusy = $state(false)
+  let groupAvatarUploadOwner: string | null = null
+  let avatarPanelAlive = true
+  let groupReadGeneration = 0
+  let groupSelectionGeneration = 0
+  const groupDrafts = new Map<string, GroupSaveRequest>()
+  const pendingGroupSaves = new Map<string, GroupSaveRequest>()
+  const groupSaveTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  const groupSaveFlights = new Set<string>()
+  const activeGroupSaves = new Map<string, GroupSaveRequest>()
+  const groupSaveErrors = new Map<string, { message: string; outcome: 'failed' | 'unknown'; readGeneration: number }>()
+  const groupStatusTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  function destroyGroupOwner() {
+    avatarPanelAlive = false
+    if (pendingGroupSaves.size > 0) toast.error('The Group panel closed before queued changes were saved. Reopen Groups to check the saved values.')
+    for (const timer of [...groupSaveTimers.values(), ...groupStatusTimers.values()]) clearTimeout(timer)
+    for (const request of pendingGroupSaves.values()) request.reject?.(new Error('The Group panel closed before the save started.'))
+    groupSaveTimers.clear()
+    groupStatusTimers.clear()
+    pendingGroupSaves.clear()
+  }
+  onDestroy(destroyGroupOwner)
   let groupAvatarError = $state<string | null>(null)
 
   const managedAgents = $derived(
@@ -132,8 +173,10 @@
     })
   )
 
-  onMount(async () => {
-    await Promise.allSettled([loadGroups(), loadAgents()])
+  onMount(() => {
+    const unregisterDraft = registerAppActionDraft(() => groupDrafts.size > 0 || groupSaveFlights.size > 0)
+    void Promise.allSettled([loadGroups(), loadAgents()])
+    return unregisterDraft
   })
 
   async function loadAgents() {
@@ -147,13 +190,17 @@
   }
 
   async function loadGroups() {
+    const readGeneration = ++groupReadGeneration
+    const completedWrites = new Set([...activeGroupSaves.values()].filter(request => request.writeCompleted))
     listLoading = true
     listError = null
 
     try {
       const loaded = await groupService.loadGroups()
+      if (!avatarPanelAlive || readGeneration !== groupReadGeneration) return
       groups.splice(0, groups.length, ...loaded)
       groupStore.setGroups(loaded)
+      for (const group of loaded) reconcileGroupDraft(group, completedWrites)
 
       if (loaded.length > 0) {
         const preferred = selectedGroupId
@@ -168,6 +215,7 @@
         })
       }
     } catch (error) {
+      if (!avatarPanelAlive || readGeneration !== groupReadGeneration) return
       console.error('Failed to load groups:', error)
       listError = error instanceof Error ? error.message : 'Failed to load groups'
       groups.splice(0, groups.length)
@@ -178,7 +226,7 @@
         formPersistedSignature = null
       })
     } finally {
-      listLoading = false
+      if (avatarPanelAlive && readGeneration === groupReadGeneration) listLoading = false
     }
   }
 
@@ -245,17 +293,63 @@
   }
 
   function selectGroup(group: GroupChatGroupRow) {
+    groupSelectionGeneration += 1
     formHydrating = true
     untrack(() => {
       selectedGroupId = group.id
-      groupForm = normalizeGroup(group)
-      formPersistedSignature = makeFormSignature(groupForm)
-      saveError = null
+      const persisted = normalizeGroup(group)
+      const draft = groupDrafts.get(group.id)
+      groupForm = draft ? structuredClone(draft.form) : persisted
+      formPersistedSignature = makeFormSignature(persisted)
+      const failure = groupSaveErrors.get(group.id)
+      saveError = failure?.readGeneration === groupReadGeneration ? failure.message : null
       groupAvatarError = null
-      saveState = 'idle'
-      saveTarget = 'settings'
+      saveState = groupSaveFlights.has(group.id) ? 'saving' : 'idle'
+      saveTarget = draft?.target ?? 'settings'
     })
     formHydrating = false
+  }
+
+  function finishConfirmedGroupDraft(groupId: string) {
+    const draft = groupDrafts.get(groupId)
+    const proof = draft?.confirmedRead
+    const saved = groups.find(group => group.id === groupId)
+    if (!draft || !proof || groupSaveFlights.has(groupId) || proof.generation !== groupReadGeneration ||
+      !saved || makeFormSignature(normalizeGroup(saved)) !== proof.signature || makeFormSignature(draft.form) !== proof.signature) return
+    groupDrafts.delete(groupId)
+    groupSaveErrors.delete(groupId)
+    const statusTimer = groupStatusTimers.get(groupId)
+    if (statusTimer) clearTimeout(statusTimer)
+    groupStatusTimers.delete(groupId)
+    if (selectedGroupId === groupId && makeFormSignature(groupForm) === proof.signature) {
+      formPersistedSignature = proof.signature
+      saveError = null
+      saveState = 'idle'
+    }
+  }
+
+  function reconcileGroupDraft(group: GroupChatGroupRow, completedWrites: Set<GroupSaveRequest>) {
+    const draft = groupDrafts.get(group.id)
+    if (!draft) return
+    delete draft.confirmedRead
+    const signature = makeFormSignature(normalizeGroup(group))
+    if (makeFormSignature(draft.form) !== signature) return
+    const flight = activeGroupSaves.get(group.id)
+    // A late admitted write of DIFFERENT values can still replace this read.
+    // Retire a matching queue only after that write completed before the read,
+    // or when the admitted write itself carries the same values.
+    const flightSignature = flight ? makeFormSignature(normalizeGroup({ ...buildGroupPayload(flight.form), id: flight.groupId } as GroupChatGroupRow)) : null
+    if (flight && !completedWrites.has(flight) && flightSignature !== signature) return
+    draft.confirmedRead = { generation: groupReadGeneration, signature }
+    if (pendingGroupSaves.get(group.id) === draft) {
+      const timer = groupSaveTimers.get(group.id)
+      if (timer) clearTimeout(timer)
+      groupSaveTimers.delete(group.id)
+      pendingGroupSaves.delete(group.id)
+      draft.resolve?.()
+    }
+    groupSaveErrors.delete(group.id)
+    finishConfirmedGroupDraft(group.id)
   }
 
   function buildGroupPayload(nextForm: GroupFormState): Partial<GroupChatGroupRow> {
@@ -266,7 +360,10 @@
       avatar_icon_fit: nextForm.avatar_icon_fit,
       agent_ids: nextForm.agent_ids,
       agent_settings: nextForm.agent_settings,
-      group_system_prompt: nextForm.group_system_prompt.trim() || undefined,
+      // BL-482: sent even when empty. JSON drops `undefined` and the update route merges the body
+      // over the stored group, so a cleared prompt used to stay saved; the server stores `''` as no
+      // prompt.
+      group_system_prompt: nextForm.group_system_prompt.trim(),
       max_followups_total: nextForm.max_followups_total,
       max_agents: nextForm.max_agents,
       driver_mode: nextForm.driver_mode,
@@ -275,77 +372,142 @@
     }
   }
 
-  async function persistGroupForm(nextForm: GroupFormState) {
-    if (!selectedGroupId) return
+  async function persistGroupForm(request: GroupSaveRequest) {
+    const { groupId } = request
+    if (!avatarPanelAlive || request.readGeneration !== groupReadGeneration) throw new Error('The Group was refreshed before this save started. Check the saved Group before trying again.')
+    const previous = groups.find(group => group.id === groupId)
+    if (!previous || makeFormSignature(normalizeGroup(previous)) !== request.baseline) throw new Error('The saved Group changed before this save started. Check it before trying again.')
+    const payload = buildGroupPayload(request.form)
+    // BL-281: the picture the saved group showed before this save, for the tidy below.
+    const previousAvatar = previous.avatar_url ?? null
+    request.effectRequested = true
+    await groupService.updateGroup(groupId, payload)
+    request.writeCompleted = true
+    const read = await fetch(`/api/groups/${encodeURIComponent(groupId)}`, { cache: 'no-store' })
+    if (!read.ok) throw new Error('The Group save could not be confirmed. Check the saved Group before trying again.')
+    const saved = await read.json() as GroupChatGroupRow
+    if (!saved || saved.id !== groupId) throw new Error('The Group save returned an unexpected owner. Check the saved Group before trying again.')
+    const persisted = normalizeGroup(saved)
+    const signature = makeFormSignature(persisted)
 
-    const signature = makeFormSignature(nextForm)
-    if (signature === formPersistedSignature) return
+    // BL-281: the save changed the picture, so the pictures the group no longer shows go. Read
+    // the form before it is replaced below: a newer upload there means the next save tidies.
+    const tidyAvatarPictures = shouldTidyAvatarPictures({
+      previous: previousAvatar,
+      saved: saved.avatar_url,
+      current: groupDrafts.get(groupId)?.form.avatar_url ?? (selectedGroupId === groupId ? groupForm.avatar_url : saved.avatar_url),
+      uploading: selectedGroupId === groupId && isUploadingGroupAvatar
+    })
 
-    const payload = buildGroupPayload(nextForm)
-    await groupService.updateGroup(selectedGroupId, payload)
-
-    formPersistedSignature = signature
-    groupForm = { ...nextForm }
-    saveState = 'saved'
-
-    groupStore.updateGroup(selectedGroupId, payload)
-
-    const idx = groups.findIndex((group) => group.id === selectedGroupId)
-    if (idx !== -1) {
-      groups[idx] = {
-        ...groups[idx],
-        ...payload
+    // BL-579: publish only to the captured Group; a newer read, selection or
+    // edit owns its form and cannot be replaced by this response.
+    if (avatarPanelAlive && request.readGeneration === groupReadGeneration) {
+      groupStore.updateGroup(groupId, saved)
+      const idx = groups.findIndex(group => group.id === groupId)
+      if (idx !== -1) groups[idx] = saved
+      if (groupDrafts.get(groupId) === request) groupDrafts.delete(groupId)
+      const queued = pendingGroupSaves.get(groupId)
+      if (queued?.readGeneration === request.readGeneration && queued.baseline === request.baseline) queued.baseline = signature
+      groupSaveErrors.delete(groupId)
+      if (selectedGroupId === groupId && formPersistedSignature === request.baseline) {
+        formPersistedSignature = signature
+        if (makeFormSignature(groupForm) === makeFormSignature(request.form)) groupForm = persisted
+        saveState = pendingGroupSaves.has(groupId) ? 'saving' : 'saved'
+        saveError = null
+        const oldTimer = groupStatusTimers.get(groupId)
+        if (oldTimer) clearTimeout(oldTimer)
+        groupStatusTimers.set(groupId, setTimeout(() => {
+          groupStatusTimers.delete(groupId)
+          if (avatarPanelAlive && selectedGroupId === groupId && groupSelectionGeneration === request.selectionGeneration &&
+            groupReadGeneration === request.readGeneration && saveState === 'saved' && formPersistedSignature === signature) saveState = 'idle'
+        }, 1200))
       }
     }
 
-    setTimeout(() => {
-      if (saveState === 'saved') saveState = 'idle'
-    }, 1200)
+    if (tidyAvatarPictures) void requestAvatarPictureTidy('group', groupId, previousAvatar)
+
   }
-
-  const debouncedSave = debounce(async (nextForm: GroupFormState) => {
-    if (!selectedGroupId) return
-    if (makeFormSignature(nextForm) === formPersistedSignature) return
-
-    saveState = 'saving'
-    saveError = null
-
+  async function runGroupSave(groupId: string) {
+    if (!avatarPanelAlive || groupSaveFlights.has(groupId)) return
+    const request = pendingGroupSaves.get(groupId)
+    if (!request) return
+    pendingGroupSaves.delete(groupId)
+    groupSaveFlights.add(groupId)
+    activeGroupSaves.set(groupId, request)
+    if (selectedGroupId === groupId && groupSelectionGeneration === request.selectionGeneration) {
+      saveState = 'saving'
+      saveError = null
+    }
     try {
-      await persistGroupForm(nextForm)
+      await persistGroupForm(request)
+      request.resolve?.()
     } catch (error) {
       console.error('Failed to save group:', error)
-      saveError = error instanceof Error ? error.message : 'Failed to save group'
-      saveState = 'idle'
+      const failure = error instanceof Error ? error : new Error('Failed to save group')
+      if (avatarPanelAlive && (request.readGeneration === groupReadGeneration || !request.effectRequested) && groupDrafts.get(groupId) === request) {
+        groupSaveErrors.set(groupId, { message: failure.message, outcome: request.effectRequested ? 'unknown' : 'failed', readGeneration: groupReadGeneration })
+        if (selectedGroupId === groupId) {
+          saveError = failure.message
+          saveState = 'idle'
+        }
+      }
+      request.reject?.(failure)
+    } finally {
+      groupSaveFlights.delete(groupId)
+      activeGroupSaves.delete(groupId)
+      if (avatarPanelAlive) finishConfirmedGroupDraft(groupId)
+      if (avatarPanelAlive && pendingGroupSaves.has(groupId) && !groupSaveTimers.has(groupId)) void runGroupSave(groupId)
     }
-  }, SAVE_DEBOUNCE_MS)
-
+  }
+  function queueGroupSave(nextForm: GroupFormState, target: SaveTarget, immediate = false): Promise<void> | undefined {
+    if (!selectedGroupId || !formPersistedSignature || !avatarPanelAlive) return
+    const groupId = selectedGroupId
+    if (deletingGroupId === groupId) throw new Error('This Group is being deleted. Its changes cannot be saved.')
+    if (!groupSaveFlights.has(groupId) && makeFormSignature(nextForm) === formPersistedSignature) {
+      const timer = groupSaveTimers.get(groupId)
+      if (timer) clearTimeout(timer)
+      groupSaveTimers.delete(groupId)
+      pendingGroupSaves.get(groupId)?.reject?.(new Error('The Group edit was reset before saving.'))
+      pendingGroupSaves.delete(groupId)
+      groupDrafts.delete(groupId)
+      groupSaveErrors.delete(groupId)
+      saveError = null
+      return
+    }
+    const request: GroupSaveRequest = {
+      groupId, form: structuredClone($state.snapshot(nextForm)), baseline: formPersistedSignature,
+      readGeneration: groupReadGeneration, selectionGeneration: groupSelectionGeneration, target, effectRequested: false
+    }
+    pendingGroupSaves.get(groupId)?.reject?.(new Error('A newer Group edit replaced this queued save.'))
+    pendingGroupSaves.set(groupId, request)
+    groupDrafts.set(groupId, request)
+    groupSaveErrors.delete(groupId)
+    const timer = groupSaveTimers.get(groupId)
+    if (timer) clearTimeout(timer)
+    if (immediate) {
+      groupSaveTimers.delete(groupId)
+      return new Promise<void>((resolve, reject) => { request.resolve = resolve; request.reject = reject; void runGroupSave(groupId) })
+    }
+    groupSaveTimers.set(groupId, setTimeout(() => { groupSaveTimers.delete(groupId); void runGroupSave(groupId) }, SAVE_DEBOUNCE_MS))
+  }
   async function saveGroupPromptFromEditor(nextPrompt: string) {
     if (!selectedGroupId) return
+    if (deletingGroupId === selectedGroupId) throw new Error('This Group is being deleted. Its prompt cannot be saved.')
 
     saveTarget = 'settings'
-    const nextForm = {
-      ...groupForm,
-      group_system_prompt: nextPrompt
-    }
-
-    saveState = 'saving'
-    saveError = null
-
-    try {
-      await persistGroupForm(nextForm)
-    } catch (error) {
-      console.error('Failed to save group prompt:', error)
-      saveError = error instanceof Error ? error.message : 'Failed to save group prompt'
-      saveState = 'idle'
-      throw error
-    }
+    groupForm = { ...groupForm, group_system_prompt: nextPrompt }
+    await queueGroupSave(groupForm, 'settings', true)
   }
 
   function updateForm(patch: Partial<GroupFormState>, target: SaveTarget = 'settings') {
+    if (selectedGroupId && deletingGroupId === selectedGroupId) {
+      toast.error('This Group is being deleted. Its changes cannot be saved.')
+      return
+    }
     saveTarget = target
     groupForm = { ...groupForm, ...patch }
     if (formHydrating || !selectedGroupId) return
-    debouncedSave(groupForm)
+    queueGroupSave(groupForm, target)
   }
 
   function getSaveStatusProps(target: SaveTarget) {
@@ -398,24 +560,41 @@
   }
 
   async function handleDeleteGroup() {
-    if (!selectedGroupId) return
+    if (!avatarPanelAlive || !selectedGroupId || deleteBusy) return
+    const groupId = selectedGroupId
+    const selectionGeneration = groupSelectionGeneration
+    const readGeneration = groupReadGeneration
     const groupName = groupForm.name?.trim() || 'this group'
-    const confirmed = await confirmDialog({
-      title: groupName === 'this group' ? 'Delete this group?' : `Delete "${groupName}"?`,
-      description:
-        'This permanently removes the group configuration. Existing chat history is preserved.',
-      confirmLabel: 'Delete Group',
-      tone: 'destructive'
-    })
-    if (!confirmed) return
-
     deleteBusy = true
+    let effectRequested = false
     try {
-      const result = await groupService.deleteGroup(selectedGroupId)
-      groupStore.deleteGroup(selectedGroupId)
+      const confirmed = await confirmDialog({
+        title: groupName === 'this group' ? 'Delete this group?' : `Delete "${groupName}"?`,
+        description:
+          'This permanently removes the group configuration. Existing chat history is preserved.',
+        confirmLabel: 'Delete Group',
+        tone: 'destructive'
+      })
+      if (!confirmed || !avatarPanelAlive) return
+      // BL-1179: confirmation belongs to this selection and read, and cannot
+      // cancel, race or redirect this owner's pending save or avatar upload.
+      if (selectedGroupId !== groupId || groupSelectionGeneration !== selectionGeneration ||
+        groupReadGeneration !== readGeneration || !groups.some(group => group.id === groupId)) {
+        toast.error('The selected Group changed. Nothing was deleted. Select the Group and confirm again.')
+        return
+      }
+      if (pendingGroupSaves.has(groupId) || groupSaveFlights.has(groupId) || groupDrafts.has(groupId) ||
+        groupAvatarUploadOwner === groupId && (isUploadingGroupAvatar || avatarAppActionBusy)) {
+        toast.error('This Group has unsaved or pending changes. Check its save before deleting it.')
+        return
+      }
+      deletingGroupId = groupId
+      effectRequested = true
+      const result = await groupService.deleteGroup(groupId)
+      groupStore.deleteGroup(groupId)
       for (const sessionId of result.clearedSessionIds) {
         const session = sessionStore.getSessions().find((entry) => entry.id === sessionId)
-        if (!session) continue
+        if (!session || session.metadata?.group_chat?.group_id !== groupId) continue
         const metadata =
           session.metadata && typeof session.metadata === 'object'
             ? { ...session.metadata }
@@ -423,8 +602,10 @@
         delete metadata.group_chat
         sessionStore.updateSession(sessionId, { metadata })
       }
-      const nextGroups = groups.filter((group) => group.id !== selectedGroupId)
+      if (!avatarPanelAlive) return
+      const nextGroups = groups.filter((group) => group.id !== groupId)
       groups.splice(0, groups.length, ...nextGroups)
+      if (selectedGroupId !== groupId || groupSelectionGeneration !== selectionGeneration || groupReadGeneration !== readGeneration) return
       if (nextGroups.length > 0) {
         selectGroup(nextGroups[0])
       } else {
@@ -434,9 +615,12 @@
       }
     } catch (error) {
       console.error('Failed to delete group:', error)
-      toast.error(error instanceof Error ? error.message : 'Failed to delete group')
+      toast.error(effectRequested
+        ? `The Group deletion could not be confirmed. Check Groups before trying again. ${error instanceof Error ? error.message : ''}`
+        : error instanceof Error ? error.message : 'Failed to delete group')
     } finally {
-      deleteBusy = false
+      deletingGroupId = null
+      if (avatarPanelAlive) deleteBusy = false
     }
   }
 
@@ -575,7 +759,53 @@
     return fallback
   }
 
+  export function suppliedAvatarAvailability(args: ImportArgs['avatar.import_file']): string {
+    if (!avatarPanelAlive || args.entityType !== 'group' || args.entityId !== selectedGroupId) return 'unsupported_target'
+    if (listLoading || formHydrating || formPersistedSignature === null) return 'settings_unconfirmed'
+    if (deleteBusy || avatarAppActionBusy || isUploadingGroupAvatar || groupSaveFlights.size > 0 || pendingGroupSaves.size > 0) return 'owner_busy'
+    if (groupDrafts.size > 0) return 'unsaved_changes'
+    if (makeFormSignature(groupForm) !== formPersistedSignature) return 'unsaved_changes'
+    return 'available'
+  }
+
+  export async function importAppActionAvatar(
+    args: ImportArgs['avatar.import_file'], files: File[], context: ActionContext
+  ): Promise<ImportOutcome> {
+    const available = suppliedAvatarAvailability(args)
+    if (available !== 'available') refuse(available)
+    const initialSignature = makeFormSignature(groupForm)
+    const generation = groupSelectionGeneration
+    const readGeneration = groupReadGeneration
+    const check = () => { if (!avatarPanelAlive || selectedGroupId !== args.entityId || groupSelectionGeneration !== generation || groupReadGeneration !== readGeneration || listLoading || formHydrating) refuse('target_changed') }
+    avatarAppActionBusy = true
+    groupAvatarUploadOwner = args.entityId
+    isUploadingGroupAvatar = true
+    try {
+      return await performAvatarImport(files[0], args, {
+        check,
+        stage: url => {
+          if (makeFormSignature(groupForm) !== initialSignature || saveState === 'saving') refuse('unsaved_changes')
+          isUploadingGroupAvatar = false
+          saveError = null
+          updateForm({ avatar_url: url }, 'settings')
+        },
+        savedAvatar: () => groups.find(group => group.id === args.entityId)?.avatar_url ?? null,
+        saveError: () => groupSaveErrors.get(args.entityId)?.message ?? null,
+        saveFailureKind: () => groupSaveErrors.get(args.entityId)?.outcome ?? 'unknown'
+      }, context)
+    } finally {
+      avatarAppActionBusy = false
+      isUploadingGroupAvatar = false
+      groupAvatarUploadOwner = null
+    }
+  }
+
   async function handleGroupAvatarUpload(event: Event) {
+    if (avatarAppActionBusy || isUploadingGroupAvatar) return
+    if (deletingGroupId === selectedGroupId && selectedGroupId) {
+      toast.error('This Group is being deleted. Its avatar cannot be uploaded.')
+      return
+    }
     const input = event.currentTarget as HTMLInputElement | null
     const file = input?.files?.[0]
     if (!file) return
@@ -597,33 +827,19 @@
       if (input) input.value = ''
       return
     }
+    const targetId = selectedGroupId
+    const generation = groupSelectionGeneration
+    const readGeneration = groupReadGeneration
 
     isUploadingGroupAvatar = true
+    groupAvatarUploadOwner = targetId
     groupAvatarError = null
 
     try {
-      const formData = new FormData()
-      formData.append('file', file)
-      formData.append('entityType', 'group')
-      formData.append('entityId', selectedGroupId)
-      if (groupForm.avatar_url) {
-        formData.append('oldAvatarUrl', groupForm.avatar_url)
-      }
-
-      const uploadResponse = await fetch('/api/uploads/avatar', {
-        method: 'POST',
-        body: formData
-      })
-
-      if (!uploadResponse.ok) {
-        const message = await extractError(uploadResponse, 'Failed to upload avatar')
-        throw new Error(message)
-      }
-
-      const result = await uploadResponse.json()
-      const url = result?.url ?? ''
-      if (!url) {
-        throw new Error('Upload succeeded but no avatar URL was returned')
+      const url = await uploadAvatarFile(file, { entityType: 'group', entityId: targetId })
+      if (!avatarPanelAlive || selectedGroupId !== targetId || groupSelectionGeneration !== generation || groupReadGeneration !== readGeneration) {
+        toast.error('Avatar uploaded for the original Group, but it was not applied because the selected Group changed.')
+        return
       }
 
       updateForm({ avatar_url: url }, 'settings')
@@ -632,6 +848,7 @@
       groupAvatarError = error instanceof Error ? error.message : 'Failed to upload avatar'
     } finally {
       isUploadingGroupAvatar = false
+      groupAvatarUploadOwner = null
       if (input) input.value = ''
     }
   }
@@ -729,6 +946,7 @@
                   type="button"
                   class="settings-sidebar-item settings-sidebar-item-with-avatar"
                   data-state={selectedGroupId === group.id ? 'active' : 'inactive'}
+                  data-group-id={group.id}
                   onclick={() => selectGroup(group)}
                 >
                   <div class="settings-sidebar-item-media pt-0.5">
@@ -1132,9 +1350,10 @@
 
                           {#if settings.speak_policy === 'smart'}
                             <div class="batshit-settings-form-label md:col-span-2" data-testid="group-smart-preset-note">
-                              Jev Juice picks who speaks and skips follow-ups with nothing to add. When a turn needs a
+                              Judge Juice picks who speaks and skips follow-ups with nothing to add. When a turn needs a
                               pick, Batshit sends the current message, the last replies in the round, and every group
-                              agent's name and description to TypeSafe. Needs <strong>Allow Jev Juice</strong> on in
+                              agent's name and description to the judge chosen in Settings → Admin → Judge Juice (Jev at
+                              TypeSafe unless you changed it). Needs <strong>Allow Judge Juice</strong> on in
                               Settings → Admin; if it is off or slow, the usual rules pick.
                             </div>
                           {/if}

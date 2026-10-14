@@ -9,13 +9,15 @@ import {
   createAnatomyFitResult,
   createAnatomyFitState,
   normalizeAnatomyFitPhysicalOutput,
+  normalizeAnatomyFitState,
   parseAnatomyFitInput,
   parseAnatomyFitResult,
+  parseAnatomyFitRecipeSibling,
   parseAnatomyFitState,
   requireReusableAnatomyFitResult,
   selectRelevantAnatomyFitInputs,
 } from "./anatomyFitContracts";
-import { canonicalRecipeString } from "./recipeCanonical";
+import { canonicalRecipeSha256, canonicalRecipeString } from "./recipeCanonical";
 
 const sha = (character: string) => character.repeat(64);
 const DEFINITION_SHA = sha("b");
@@ -79,6 +81,57 @@ const appearance = {
 } as unknown as AppearanceDialsManifest;
 
 describe("Anatomy Fit v2 content-addressed contracts", () => {
+  it("verifies a previous oral sibling after RedisJSON precision drift while retaining every hash guard", async () => {
+    const { inputSha256: _inputHash, ...sourceInput } = await input();
+    const fitInput = await createAnatomyFitInput({
+      ...sourceInput,
+      solverVersion: ORAL_CAVITY_ANATOMY_FIT_SOLVER,
+      domain: "oral-cavity",
+    });
+    const { resultSha256: _resultHash, ...baseResult } = await result(fitInput.inputSha256);
+    const fitResult = await createAnatomyFitResult({
+      ...baseResult,
+      solverVersion: ORAL_CAVITY_ANATOMY_FIT_SOLVER,
+      domain: "oral-cavity",
+      nodeTransforms: [{ nodeId: "lower-gums", rootDeltaMatrix: [
+        1, 0, 0, 0, 1.34743637836628e-12, 1, 0, 0,
+        0, 0, 1, 0, -1.52736168765123e-12, 0, 0, 1,
+      ] }],
+    });
+    const expected = await anatomyFitRecipeSibling(await createAnatomyFitState(DEFINITION_SHA, [{ input: fitInput, result: fitResult }]));
+    const reopened = structuredClone(expected);
+    // Adjacent doubles measured in the isolated female native save/reopen.
+    reopened.state.fits[0].result.nodeTransforms[0].rootDeltaMatrix[4] = 1.3474363783662799e-12;
+    reopened.state.fits[0].result.nodeTransforms[0].rootDeltaMatrix[12] = -1.5273616876512299e-12;
+    expect(await canonicalRecipeSha256(reopened.state)).not.toBe(expected.stateSha256);
+    await expect(parseAnatomyFitRecipeSibling(reopened)).resolves.toEqual(expected);
+    expect(reopened.state.fits[0].result.nodeTransforms[0].rootDeltaMatrix[4]).toBe(1.3474363783662799e-12);
+
+    await expect(parseAnatomyFitRecipeSibling({ ...reopened, stateSha256: sha("a") })).rejects.toThrow(/sibling hashes/);
+    await expect(parseAnatomyFitRecipeSibling({ ...reopened, definitionSha256: sha("a") })).rejects.toThrow(/definitionSha256/);
+    await expect(parseAnatomyFitRecipeSibling({ ...reopened, id: "other" })).rejects.toThrow(/id/);
+    await expect(parseAnatomyFitRecipeSibling({ ...reopened, extra: true })).rejects.toThrow(/unknown|unsupported/i);
+    const edited = structuredClone(reopened);
+    edited.state.fits[0].result.nodeTransforms[0].rootDeltaMatrix[12] = .001;
+    await expect(parseAnatomyFitRecipeSibling(edited)).rejects.toThrow(/resultSha256/);
+    const forgedInner = structuredClone(expected);
+    forgedInner.state.stateSha256 = sha("a");
+    forgedInner.stateSha256 = await canonicalRecipeSha256(forgedInner.state);
+    await expect(parseAnatomyFitRecipeSibling(forgedInner)).rejects.toThrow(/stateSha256/);
+  });
+
+  it("refuses held Anatomy Fit fields and solver before normalizing public state", async () => {
+    const fitInput = await input();
+    const fitResult = await result(fitInput.inputSha256);
+    const state = await createAnatomyFitState(DEFINITION_SHA, [{ input: fitInput, result: fitResult }]);
+    expect(() => normalizeAnatomyFitState({ ...state, omissions: { presenceStateSha256: sha("a"), domains: [] } })).toThrow(/exactly/);
+    const nullable = structuredClone(state);
+    nullable.fits[0]!.result.followerMorphCoefficients = [{ followerId: "jaw", channelId: "jaw", nodeId: "jaw", morph: "jaw", weight: 0, lower: null, upper: null }] as any;
+    expect(() => normalizeAnatomyFitState(nullable)).toThrow(/finite/);
+    const { inputSha256: _hash, ...inputPayload } = fitInput;
+    await expect(createAnatomyFitInput({ ...inputPayload, solverVersion: "socket-eye-aperture-fit/v1" })).rejects.toThrow(/unsupported/);
+  });
+
   it("round-trips deterministic socket-eye verification inputs and results", async () => {
     const first = await input();
     const second = await createAnatomyFitInput({

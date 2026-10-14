@@ -336,6 +336,14 @@
     buildGoonSceneSignature,
     resolveGoonScenePlacement
   } from '$lib/goons/stageScene'
+  import {
+    SCENE_ASSET_KINDS,
+    buildUniqueSceneId,
+    collectSceneAssetFilenames,
+    duplicateSceneDefinition,
+    persistSceneLibrary,
+    type SceneAssetKind
+  } from '$lib/goons/sceneLibrary'
   import { BUILTIN_TRIM_TEXTURES } from '$lib/goons/roomTextures'
   import type {
     GoonBasePosture,
@@ -468,7 +476,7 @@
   } from '$lib/goons/recipe'
   import {
     persistGoonsSettingsPatchRequest,
-    persistGoonsSettingsRequest
+    refreshUserSettingsRequest
   } from '$lib/services/goonsSettingsPersistence'
   import { DEFAULT_DESKTOP_CONTROLS_SHORTCUT } from '$lib/goons/desktopShortcut'
   import { dispatchDesktopGoonPreferencesUpdated } from '$lib/utils/liveSettingsEvents'
@@ -478,7 +486,14 @@
   import { getGoons } from '$lib/stores/goons.svelte'
   import { getGoonAnimationLibrary } from '$lib/stores/goonAnimationLibrary.svelte'
   import { goonMotionPreviewGenerationActive } from '$lib/stores/goonMotionPreviewGeneration'
-  import { getUserSettings, setUserSettings } from '$lib/stores/userSettings.svelte'
+  import {
+    confirmUserSettings,
+    getUserSettings,
+    getUserSettingsReadError,
+    getUserSettingsReadState,
+    failUserSettingsRead,
+    type UserSettings
+  } from '$lib/stores/userSettings.svelte'
   import { logClientError, logClientEvent } from '$lib/services/clientTelemetry'
   import { buildStoredXWear, getPrimaryXWearMaterialName, getXWearMaterials, parseXWearFile } from '$lib/utils/xwear'
   import {
@@ -734,7 +749,6 @@
     entries: Record<string, Uint8Array>
     fileName: string
   }
-  type SceneAssetKind = 'skybox' | 'roomShell'
   type SceneAssetUploadTarget =
     | { session: number; mode: 'create' }
     | { session: number; mode: 'edit'; sceneId: string }
@@ -939,9 +953,16 @@
   let sceneEditorSession = 0
   const draftSceneAssetUploadFilenames: Record<SceneAssetKind, Set<string>> = {
     skybox: new Set<string>(),
-    roomShell: new Set<string>()
+    roomShell: new Set<string>(),
+    prop: new Set<string>()
   }
-  let scenePropTargetId = $state<string | null>(null)
+  const protectedSceneAssetUploadFilenames: Record<SceneAssetKind, Set<string>> = {
+    skybox: new Set<string>(),
+    roomShell: new Set<string>(),
+    prop: new Set<string>()
+  }
+  let scenePanelDestroyed = false
+  let scenePropUploadTarget: Extract<SceneAssetUploadTarget, { mode: 'edit' }> | null = null
   let roomTextureTargetKind = $state<GoonRoomTextureKind>('floor')
   let activeSceneEdit = $state<
     | {
@@ -1184,6 +1205,10 @@
 
   const userSettings = $derived(getUserSettings())
   const goonsSettings = $derived.by(() => normalizeGoonsSettings(userSettings?.goons_settings ?? null))
+  const userSettingsReadState = $derived(getUserSettingsReadState())
+  const userSettingsReadError = $derived(getUserSettingsReadError())
+  const userSettingsConfirmed = $derived(userSettingsReadState === 'confirmed')
+  let userSettingsRefreshBusy = $state(false)
   let desktopSettingsSaving = $state(false)
   let desktopNormalizedWidthDraft = $state<number | null>(null)
   const desktopNormalizedWidthPercent = $derived(
@@ -3560,6 +3585,7 @@
   }
 
   async function saveMotionsAndPostures() {
+    if (!userSettingsConfirmed) return false
     const validationError = validateMotionPostureDrafts()
     if (validationError) {
       toast.error(validationError)
@@ -3572,7 +3598,17 @@
       let savedMotionSettings = goonsSettings
       if (!postureMapsMatch(currentPostures, motionCustomPostureDraftMap)) {
         savedMotionSettings = buildMotionDraftSettings()
-        savedMotionSettings = await persistGoonsSettings(savedMotionSettings)
+        const kitchenPatch: NonNullable<GoonsSettings['kitchen']> = {
+          postures: savedMotionSettings.kitchen?.postures
+        }
+        for (const key of ['cues', 'scenes', 'defaultPack'] as const) {
+          const before = goonsSettings.kitchen?.[key]
+          const after = savedMotionSettings.kitchen?.[key]
+          if (JSON.stringify(before) !== JSON.stringify(after)) {
+            Object.assign(kitchenPatch, { [key]: after })
+          }
+        }
+        savedMotionSettings = await persistGoonsSettingsPatch({ kitchen: kitchenPatch })
       }
 
       let savedMotionLibrary: GoonAnimationLibrary = animationLibrary
@@ -6096,6 +6132,7 @@
 
       removeExtraCanvases(host)
       const engine = new EngineCtor(host, {
+        onSceneError: (message) => toast.error(message),
         quality: editorQuality,
         lipSyncEnabled: editorLipSync,
         eyeContactMode: editorEyeContactMode,
@@ -6744,6 +6781,7 @@
 
       removeExtraCanvases(host)
       const engine = new EngineCtor(host, {
+        onSceneError: (message) => toast.error(message),
         quality: kitchenPreviewQuality,
         lipSyncEnabled: false,
         eyeContactMode: activeKitchenEyeContactMode,
@@ -6794,7 +6832,9 @@
         const engine = await ensureKitchenPreviewEngine()
         if (!engine || !isKitchenPreviewLoadRequestCurrent(activeRequestId)) return false
 
-        const { kind } = await loadAvatarIntoEngine(engine, targetGoon)
+        const avatar = await loadAvatarIntoEngine(engine, targetGoon)
+        if (avatar.role === 'cancelled') return false
+        const { kind } = avatar
         if (!isKitchenPreviewLoadRequestCurrent(activeRequestId)) return false
 
         const scene = sceneId ? kitchenScenes?.[sceneId] ?? null : null
@@ -6890,7 +6930,13 @@
 
       try {
         if (shouldReload) {
-          await engine.loadGoon(STUNT_DUMMY_VRM_URL)
+          const goonLoadToken = engine.beginGoonLoad()
+          try {
+            await engine.loadGoon(STUNT_DUMMY_VRM_URL, null, goonLoadToken)
+            if (!engine.isCurrentGoonLoad(goonLoadToken)) return null
+          } finally {
+            engine.finishGoonLoad(goonLoadToken)
+          }
           if (!isKitchenPreviewLoadRequestCurrent(requestId)) return null
           applyPreviewCamera(engine, null, { forceResetIfMissing: true })
           kitchenPreviewAnimationCatalog = engine.getAnimationCatalog()
@@ -7125,7 +7171,7 @@
         ? engine.captureComparisonPreviewState()
         : null
 
-      const { kind } = await loadAvatarIntoEngine(engine, goon, {
+      const avatar = await loadAvatarIntoEngine(engine, goon, {
         role:
           mode === 'recipe-live-candidate'
             ? 'recipe-live-candidate'
@@ -7133,6 +7179,11 @@
             ? 'recipe-source'
             : 'automatic'
       })
+      if (avatar.role === 'cancelled') {
+        if (options.strict) throw new Error('The Goon preview candidate was superseded while it loaded.')
+        return false
+      }
+      const { kind } = avatar
       if (token !== previewToken) {
         if (options.strict) throw new Error('The Goon preview candidate was superseded while it loaded.')
         return false
@@ -8278,29 +8329,38 @@
     sceneDirty = false
   }
 
-  async function persistGoonsSettings(nextSettings: GoonsSettings) {
-    const persistedSettings = await persistGoonsSettingsRequest(fetch, nextSettings)
-    const currentUserSettings = getUserSettings()
-    if (currentUserSettings) {
-      setUserSettings({ ...currentUserSettings, goons_settings: persistedSettings })
+  function requireConfirmedUserSettings() {
+    if (getUserSettingsReadState() === 'confirmed') return true
+    toast.error('Load Goons settings before making saved changes.')
+    return false
+  }
+
+  async function refreshGoonsSettings() {
+    if (userSettingsRefreshBusy) return
+    userSettingsRefreshBusy = true
+    try {
+      const settings = await refreshUserSettingsRequest(fetch)
+      confirmUserSettings(settings as UserSettings | null)
+    } catch (error) {
+      failUserSettingsRead(error)
+    } finally {
+      userSettingsRefreshBusy = false
     }
-    return persistedSettings
+  }
+
+  async function persistGoonsSettingsPatch(patch: Partial<GoonsSettings>) {
+    if (!requireConfirmedUserSettings()) throw new Error('Load Goons settings before making saved changes.')
+    const settings = await persistGoonsSettingsPatchRequest(fetch, patch)
+    confirmUserSettings(settings as UserSettings)
+    return settings.goons_settings as GoonsSettings
   }
 
   async function persistDesktopGoonPreferences(patch: Partial<DesktopGoonPreferences>) {
+    if (!requireConfirmedUserSettings()) return
     if (desktopSettingsSaving) return
     desktopSettingsSaving = true
     try {
-      const persistedSettings = await persistGoonsSettingsPatchRequest(fetch, {
-        desktop: normalizeDesktopGoonPreferences({
-          ...goonsSettings.desktop,
-          ...patch
-        })
-      })
-      const currentUserSettings = getUserSettings()
-      if (currentUserSettings) {
-        setUserSettings({ ...currentUserSettings, goons_settings: persistedSettings })
-      }
+      const persistedSettings = await persistGoonsSettingsPatch({ desktop: patch })
       dispatchDesktopGoonPreferencesUpdated({
         source: 'settings',
         preferences: normalizeDesktopGoonPreferences(persistedSettings.desktop)
@@ -8321,13 +8381,11 @@
   // The GLB preview body choice is a preference, not staged library data —
   // persist it immediately instead of routing it through Save Motions.
   async function persistGlbPreviewGoonSelection(goonId: string) {
+    if (!requireConfirmedUserSettings()) return
     const trimmed = goonId.trim()
     if ((goonsSettings?.motions?.glbPreviewGoonId ?? '') === trimmed) return
     try {
-      await persistGoonsSettings({
-        ...(goonsSettings ?? {}),
-        motions: trimmed ? { glbPreviewGoonId: trimmed } : {}
-      })
+      await persistGoonsSettingsPatch({ motions: { glbPreviewGoonId: trimmed || undefined } })
     } catch (error: any) {
       toast.error(error?.message || 'Failed to save the GLB preview body choice')
     }
@@ -9063,6 +9121,7 @@
 
   async function confirmLibraryImport() {
     if (!pendingImportPack) return
+    if (!requireConfirmedUserSettings()) return
     const currentPack = pendingImportPack
     libraryImportBusy = true
 
@@ -9147,10 +9206,29 @@
           postures: importedPostures.postures
         }
       }
-      const persistedSettings = await persistGoonsSettings(imported.settings)
-      applyKitchenStateFromSettings(persistedSettings)
-      applyClosetStateFromSettings(persistedSettings)
-      applySceneStateFromSettings(persistedSettings)
+      const kitchenPatch: NonNullable<GoonsSettings['kitchen']> = {}
+      if (moods.length > 0 || emotes.length > 0) {
+        const importedCues = imported.settings.kitchen?.cues
+        if (importedCues) kitchenPatch.cues = importedCues
+      }
+      if (Object.keys(emojiMap).length > 0) {
+        const importedEmojiMap = imported.settings.kitchen?.emojiMap
+        if (importedEmojiMap) kitchenPatch.emojiMap = importedEmojiMap
+      }
+      if (scenes.length > 0) {
+        const importedScenes = imported.settings.kitchen?.scenes
+        if (importedScenes) kitchenPatch.scenes = importedScenes
+      }
+      if ((currentPack.manifest.postures?.length ?? 0) > 0) {
+        const importedPostures = imported.settings.kitchen?.postures
+        if (importedPostures) kitchenPatch.postures = importedPostures
+      }
+      if (Object.keys(kitchenPatch).length > 0) {
+        const persistedSettings = await persistGoonsSettingsPatch({ kitchen: kitchenPatch })
+        applyKitchenStateFromSettings(persistedSettings)
+        applyClosetStateFromSettings(persistedSettings)
+        applySceneStateFromSettings(persistedSettings)
+      }
       const renamedMotions = Object.keys(imported.renamedCueNames).length
       const renamedScenes = Object.keys(imported.renamedSceneNames).length
       const renamedPostures = (currentPack.manifest.postures ?? []).filter((posture) => {
@@ -9233,6 +9311,7 @@
   }
 
   function openCueEditor(goon: GoonRecord) {
+    if (sceneSaving) return
     activeTab = 'goons'
     if (editorGoonId !== goon.id) {
       pendingEditorOpeningFrameGoonId = goon.id
@@ -10730,15 +10809,29 @@
       if (!engine || requestId !== motionLibraryPreviewRequestId) return
       if (previewVrmUrl !== targetUrl || previewGoonId !== MOTION_LIBRARY_PREVIEW_GOON_ID) {
         if (previewTarget.kind === 'custom') {
-          await loadAvatarIntoEngine(engine, previewTarget.goon)
+          const avatar = await loadAvatarIntoEngine(engine, previewTarget.goon)
+          if (avatar.role === 'cancelled') return
         } else if (previewTarget.kind === 'custom-url') {
-          const manifest = await loadCustomAvatarManifest({
-            url: previewTarget.manifestUrl,
-            filename: previewTarget.manifestUrl.split('/').pop() || 'avatar.json'
-          })
-          await engine.loadCustomGoon(previewTarget.modelUrl, manifest)
+          const goonLoadToken = engine.beginGoonLoad()
+          try {
+            const manifest = await loadCustomAvatarManifest({
+              url: previewTarget.manifestUrl,
+              filename: previewTarget.manifestUrl.split('/').pop() || 'avatar.json'
+            })
+            if (!engine.isCurrentGoonLoad(goonLoadToken)) return
+            await engine.loadCustomGoon(previewTarget.modelUrl, manifest, {}, goonLoadToken)
+            if (!engine.isCurrentGoonLoad(goonLoadToken)) return
+          } finally {
+            engine.finishGoonLoad(goonLoadToken)
+          }
         } else {
-          await engine.loadGoon(STUNT_DUMMY_VRM_URL)
+          const goonLoadToken = engine.beginGoonLoad()
+          try {
+            await engine.loadGoon(STUNT_DUMMY_VRM_URL, null, goonLoadToken)
+            if (!engine.isCurrentGoonLoad(goonLoadToken)) return
+          } finally {
+            engine.finishGoonLoad(goonLoadToken)
+          }
         }
         if (requestId !== motionLibraryPreviewRequestId) return
         previewVrmUrl = targetUrl
@@ -12534,32 +12627,20 @@
   }
 
   function buildSceneId(name: string) {
-    const trimmed = name.trim().toLowerCase()
-    const slug = trimmed
-      .replace(/[^a-z0-9]+/g, '_')
-      .replace(/_+/g, '_')
-      .replace(/^_+|_+$/g, '')
-    const base = slug || `scene_${Date.now()}`
-    let candidate = base
-    let index = 2
-    while (kitchenScenes[candidate]) {
-      candidate = `${base}_${index}`
-      index += 1
-    }
-    return candidate
+    return buildUniqueSceneId(name, kitchenScenes)
   }
 
-  function resolveSceneAssetFilename(scene: GoonSceneDefinition, kind: SceneAssetKind) {
-    return (kind === 'skybox' ? scene.skybox?.filename : scene.roomShell?.filename)?.trim() || null
-  }
-
-  function collectSceneAssetFilenames(kind: SceneAssetKind, scenes?: GoonSceneMap | null) {
-    const filenames = new Set<string>()
-    for (const scene of Object.values(scenes ?? {})) {
-      const filename = resolveSceneAssetFilename(scene, kind)
-      if (filename) filenames.add(filename)
+  function duplicateScene(sceneId: string) {
+    if (sceneSaving) return
+    try {
+      const copy = duplicateSceneDefinition(kitchenScenes, sceneId)
+      kitchenScenes = { ...kitchenScenes, [copy.id]: copy }
+      sceneDirty = true
+      openSceneEditor(copy.id)
+      sceneWorldOpen = true
+    } catch (error: any) {
+      toast.error(error?.message || 'Failed to duplicate Scene')
     }
-    return filenames
   }
 
   function collectPersistedSceneAssetFilenames(
@@ -12575,31 +12656,19 @@
     referencedFilenames: Set<string>
   ) {
     for (const filename of new Set(filenames)) {
-      if (!filename || referencedFilenames.has(filename)) continue
-      if (kind === 'skybox') {
-        await deleteUnusedSceneSkyboxUpload(filename)
-      } else {
-        await deleteUnusedRoomShellUpload(filename)
+      if (!filename || referencedFilenames.has(filename) || protectedSceneAssetUploadFilenames[kind].has(filename)) continue
+      try {
+        await deleteSceneAssetUpload(kind, filename)
+      } catch (error) {
+        draftSceneAssetUploadFilenames[kind].add(filename)
+        warnSceneAssetDeleteFailure(kind, filename, error)
       }
     }
   }
 
-  async function reconcileSceneAssetUploadsAfterSave(
-    previousScenes: GoonSceneMap | undefined,
-    persistedScenes: GoonSceneMap | undefined
-  ) {
-    for (const kind of ['skybox', 'roomShell'] as const) {
-      const previousFilenames = collectSceneAssetFilenames(kind, previousScenes)
-      const persistedFilenames = collectSceneAssetFilenames(kind, persistedScenes)
-      const trackedUploads = draftSceneAssetUploadFilenames[kind]
-      const cleanupCandidates = new Set<string>([...previousFilenames, ...trackedUploads])
-      trackedUploads.clear()
-      await deleteSceneAssetFilenamesNotIn(kind, cleanupCandidates, persistedFilenames)
-    }
-  }
-
   function discardDraftSceneAssetUploads() {
-    for (const kind of ['skybox', 'roomShell'] as const) {
+    if (sceneSaving) return
+    for (const kind of SCENE_ASSET_KINDS) {
       const trackedUploads = draftSceneAssetUploadFilenames[kind]
       if (trackedUploads.size === 0) continue
       const cleanupCandidates = [...trackedUploads]
@@ -12615,6 +12684,7 @@
     sceneUploadTargetId = null
     sceneRoomShellUploadTarget = null
     sceneRoomShellTargetId = null
+    scenePropUploadTarget = null
   }
 
   function isSceneAssetUploadTargetActive(
@@ -12634,12 +12704,12 @@
   async function discardDetachedSceneAssetUpload(kind: SceneAssetKind, filename: string) {
     draftSceneAssetUploadFilenames[kind].delete(filename)
     const referencedFilenames = collectPersistedSceneAssetFilenames(kind)
-    for (const scene of Object.values(kitchenScenes ?? {})) {
-      const draftFilename = resolveSceneAssetFilename(scene, kind)
-      if (draftFilename) referencedFilenames.add(draftFilename)
+    for (const draftFilename of collectSceneAssetFilenames(kind, kitchenScenes)) {
+      referencedFilenames.add(draftFilename)
     }
     const createDraftFilename = (
-      kind === 'skybox' ? newSceneSkybox?.filename : newSceneRoomShell?.filename
+      kind === 'skybox' ? newSceneSkybox?.filename
+        : kind === 'roomShell' ? newSceneRoomShell?.filename : null
     )?.trim()
     if (createDraftFilename) referencedFilenames.add(createDraftFilename)
     await deleteSceneAssetFilenamesNotIn(kind, [filename], referencedFilenames)
@@ -12680,6 +12750,7 @@
   }
 
   function closeSceneEditor() {
+    if (sceneSaving) return
     cancelSceneEdit()
     invalidateSceneAssetUploadTargets()
     sceneWorldOpen = false
@@ -12719,6 +12790,7 @@
   }
 
   function discardSceneChanges() {
+    if (sceneSaving) return
     invalidateSceneAssetUploadTargets()
     discardDraftSceneAssetUploads()
     applySceneStateFromSettings(goonsSettings)
@@ -13095,6 +13167,7 @@
   }
 
   async function handleSceneSelection(event: Event) {
+    if (!requireConfirmedUserSettings()) return
     const input = event.currentTarget as HTMLInputElement
     const file = input.files?.[0] || null
     const uploadTarget = sceneSkyboxUploadTarget
@@ -13141,6 +13214,7 @@
   }
 
   function requestSceneSkyboxUpload(sceneId?: string) {
+    if (!requireConfirmedUserSettings()) return
     sceneUploadTargetId = sceneId ?? null
     sceneSkyboxUploadTarget = sceneId
       ? { session: sceneEditorSession, mode: 'edit', sceneId }
@@ -13149,6 +13223,7 @@
   }
 
   async function handleRoomShellSelection(event: Event) {
+    if (!requireConfirmedUserSettings()) return
     const input = event.currentTarget as HTMLInputElement
     const file = input.files?.[0] || null
     const uploadTarget = sceneRoomShellUploadTarget
@@ -13193,6 +13268,7 @@
   }
 
   function requestRoomShellUpload(sceneId?: string) {
+    if (!requireConfirmedUserSettings()) return
     sceneRoomShellTargetId = sceneId ?? null
     sceneRoomShellUploadTarget = sceneId
       ? { session: sceneEditorSession, mode: 'edit', sceneId }
@@ -13201,6 +13277,7 @@
   }
 
   async function handleRoomTextureSelection(event: Event) {
+    if (!requireConfirmedUserSettings()) return
     const input = event.currentTarget as HTMLInputElement
     const file = input.files?.[0] || null
     if (!file) return
@@ -13225,6 +13302,7 @@
   }
 
   function requestRoomTextureUpload(kind: GoonRoomTextureKind) {
+    if (!requireConfirmedUserSettings()) return
     roomTextureTargetKind = kind
     roomTextureInput?.click()
   }
@@ -13262,13 +13340,15 @@
   }
 
   async function handleScenePropSelection(event: Event) {
+    if (!requireConfirmedUserSettings()) return
     const input = event.currentTarget as HTMLInputElement
     const file = input.files?.[0] || null
+    const uploadTarget = scenePropUploadTarget
     if (!file) {
-      scenePropTargetId = null
+      scenePropUploadTarget = null
       return
     }
-    if (!scenePropTargetId) {
+    if (!isSceneAssetUploadTargetActive(uploadTarget)) {
       toast.error('Select a scene to attach this prop.')
       return
     }
@@ -13276,12 +13356,14 @@
     try {
       const allowed = await enforceModelTriangleLimit(file, 'prop')
       if (!allowed) return
+      if (!isSceneAssetUploadTargetActive(uploadTarget)) return
       const fileInfo = await uploadGoonSceneProp(file)
-      const scene = kitchenScenes[scenePropTargetId]
-      if (!scene) {
-        scenePropTargetId = null
+      draftSceneAssetUploadFilenames.prop.add(fileInfo.filename)
+      if (!isSceneAssetUploadTargetActive(uploadTarget)) {
+        await discardDetachedSceneAssetUpload('prop', fileInfo.filename)
         return
       }
+      const scene = kitchenScenes[uploadTarget.sceneId]
       const name = derivePropName(fileInfo)
       const id = buildPropId(scene.id, name)
       const nextProp: GoonSceneProp = {
@@ -13298,13 +13380,16 @@
       toast.error(error?.message || 'Upload failed')
     } finally {
       scenePropBusy = false
-      scenePropTargetId = null
+      if (scenePropUploadTarget === uploadTarget) {
+        scenePropUploadTarget = null
+      }
       if (scenePropInput) scenePropInput.value = ''
     }
   }
 
   function requestScenePropUpload(sceneId: string) {
-    scenePropTargetId = sceneId
+    if (!requireConfirmedUserSettings()) return
+    scenePropUploadTarget = { session: sceneEditorSession, mode: 'edit', sceneId }
     scenePropInput?.click()
   }
 
@@ -13316,40 +13401,22 @@
     updateScene(sceneId, { props: next })
   }
 
-  function warnSceneAssetDeleteFailure(kind: string, filename: string, error: unknown) {
+  function warnSceneAssetDeleteFailure(kind: SceneAssetKind, filename: string, error: unknown) {
+    const label = { skybox: 'Skybox', roomShell: 'Room shell', prop: 'Scene prop' }[kind]
     console.warn(`[GoonsSettings] Failed to delete ${kind} upload ${filename}:`, error)
-    toast.warning(`${kind} removed from Settings, but its uploaded file could not be deleted.`)
+    toast.warning(`${label} removed from Settings, but its uploaded file could not be deleted.`)
   }
 
-  async function deleteUnusedSceneSkyboxUpload(filename: string) {
-    try {
-      await deleteGoonSceneSkybox(filename)
-    } catch (error) {
-      warnSceneAssetDeleteFailure('Skybox', filename, error)
-    }
+  async function deleteSceneAssetUpload(kind: SceneAssetKind, filename: string) {
+    if (kind === 'skybox') await deleteGoonSceneSkybox(filename)
+    else if (kind === 'roomShell') await deleteGoonRoomShell(filename)
+    else await deleteGoonSceneProp(filename)
   }
 
-  async function deleteUnusedRoomShellUpload(filename: string) {
-    try {
-      await deleteGoonRoomShell(filename)
-    } catch (error) {
-      warnSceneAssetDeleteFailure('Room shell', filename, error)
-    }
-  }
-
-  async function deleteUnusedScenePropUpload(filename: string) {
-    try {
-      await deleteGoonSceneProp(filename)
-    } catch (error) {
-      warnSceneAssetDeleteFailure('Scene prop', filename, error)
-    }
-  }
-
-  async function removeSceneProp(sceneId: string, propId: string) {
+  function removeSceneProp(sceneId: string, propId: string) {
     const scene = kitchenScenes[sceneId]
     if (!scene) return
     const props = scene.props ?? []
-    const target = props.find((prop) => prop.id === propId)
     const next = props.filter((prop) => prop.id !== propId)
     const markers = scene.markers ?? {}
     const cleanedMarkers = Object.fromEntries(
@@ -13361,15 +13428,6 @@
       ])
     ) as GoonSceneMarkers
     updateScene(sceneId, { props: next, markers: cleanedMarkers })
-
-    const filename = target?.fileRef?.filename
-    if (!filename) return
-    const stillUsed = Object.values(kitchenScenes).some((value) =>
-      (value.props ?? []).some((prop) => prop.fileRef?.filename === filename)
-    )
-    if (!stillUsed) {
-      await deleteUnusedScenePropUpload(filename)
-    }
   }
 
   async function addSceneMarker(sceneId: string, posture: GoonPosture) {
@@ -13684,7 +13742,8 @@
     sceneDirty = true
   }
 
-  async function removeScene(sceneId: string) {
+  function removeScene(sceneId: string) {
+    if (sceneSaving) return
     const current = kitchenScenes[sceneId]
     if (!current) return
     const next = { ...(kitchenScenes ?? {}) }
@@ -13692,24 +13751,10 @@
     kitchenScenes = next
     sceneDirty = true
     if (sceneEditorId === sceneId) {
-      sceneEditorMode = null
-      sceneEditorId = null
-      cancelSceneEdit()
+      closeSceneEditor()
     }
     if (kitchenPreviewSceneId === sceneId) {
       kitchenPreviewSceneId = null
-    }
-
-    const propFiles = current.props ?? []
-    for (const prop of propFiles) {
-      const filename = prop.fileRef?.filename
-      if (!filename) continue
-      const stillUsed = Object.values(next).some((scene) =>
-        (scene.props ?? []).some((entry) => entry.fileRef?.filename === filename)
-      )
-      if (!stillUsed) {
-        await deleteUnusedScenePropUpload(filename)
-      }
     }
   }
 
@@ -14202,6 +14247,7 @@
   }
 
   async function saveKitchenSettings() {
+    if (!requireConfirmedUserSettings()) return false
     kitchenSaving = true
     try {
       const normalizedKitchenCueMap = normalizeGoonCueMap(kitchenCueMap)
@@ -14224,7 +14270,13 @@
           eyeContact: buildKitchenEyeContactSettings()
         }
       }
-      const persistedSettings = await persistGoonsSettings(nextSettings)
+      const persistedSettings = await persistGoonsSettingsPatch({
+        kitchen: {
+          cues: normalizedKitchenCueMap,
+          emojiMap: filteredEmojiMap,
+          eyeContact: nextSettings.kitchen?.eyeContact
+        }
+      })
       applyKitchenStateFromSettings(persistedSettings)
       kitchenEmojiMap = filteredEmojiMap
       kitchenEmoteEmojiDrafts = buildEmoteEmojiDrafts(normalizedKitchenCueMap, filteredEmojiMap)
@@ -14239,6 +14291,7 @@
   }
 
   async function saveClosetSettings() {
+    if (!requireConfirmedUserSettings()) return false
     closetSaving = true
     try {
       const sanitizedGlobalCloset = sanitizeGlobalClosetLibrary(globalCloset)
@@ -14246,7 +14299,7 @@
         ...goonsSettings,
         globalCloset: sanitizedGlobalCloset
       }
-      const persistedSettings = await persistGoonsSettings(nextSettings)
+      const persistedSettings = await persistGoonsSettingsPatch({ globalCloset: sanitizedGlobalCloset })
       applyClosetStateFromSettings(persistedSettings)
       toast.success('Closet updated')
       return true
@@ -14259,6 +14312,12 @@
   }
 
   async function saveScenesSettings() {
+    if (!requireConfirmedUserSettings()) return false
+    if (sceneSaving) return false
+    if (sceneUploadBusy || sceneRoomShellBusy || scenePropBusy || roomTextureBusy) {
+      toast.error('Wait for Scene uploads to finish before saving.')
+      return false
+    }
     if (activeSceneEdit?.type === 'marker') {
       toast.error('Apply or cancel the active Marker position first.')
       return false
@@ -14306,17 +14365,23 @@
           roomTextures: kitchenRoomTextures
         }
       }
-      const persistedSettings = await persistGoonsSettings(nextSettings)
-      applySceneStateFromSettings(persistedSettings)
+      const { settings: persistedSettings, cleanupFailures } = await persistSceneLibrary({
+        persist: () => persistGoonsSettingsPatch({
+          kitchen: {
+            scenes: nextSettings.kitchen?.scenes,
+            roomTextures: nextSettings.kitchen?.roomTextures
+          }
+        }),
+        previousScenes,
+        uploads: draftSceneAssetUploadFilenames,
+        protectedUploads: protectedSceneAssetUploadFilenames,
+        deleteAsset: ({ kind, filename }) => deleteSceneAssetUpload(kind, filename)
+      })
+      if (!scenePanelDestroyed) applySceneStateFromSettings(persistedSettings)
       toast.success(sceneEditorMode ? 'Scene updated' : 'Scenes updated')
-      try {
-        await reconcileSceneAssetUploadsAfterSave(
-          previousScenes,
-          persistedSettings?.kitchen?.scenes
-        )
-      } catch (cleanupError) {
-        console.warn('[GoonsSettings] Scene saved, but scene asset cleanup failed:', cleanupError)
-        toast.warning('Scene saved, but an unused Skybox or Room Shell file could not be cleaned up.')
+      if (cleanupFailures.length > 0) {
+        console.warn('[GoonsSettings] Scene saved, but scene asset cleanup failed:', cleanupFailures)
+        toast.warning('Scene saved, but an unused Skybox, Room Shell or Prop file could not be cleaned up.')
       }
       return true
     } catch (error: any) {
@@ -14324,6 +14389,7 @@
       return false
     } finally {
       sceneSaving = false
+      if (scenePanelDestroyed) discardDraftSceneAssetUploads()
     }
   }
 
@@ -14406,6 +14472,7 @@
   }
 
   function requestWorkspaceExit(intent: GoonsExitIntent) {
+    if (sceneSaving) return
     if (editorHairImportOpen) {
       toast.info('Finish or cancel the active Hair import before leaving its review.')
       return
@@ -14466,6 +14533,7 @@
   }
 
   function discardAndContinueExit() {
+    if (sceneSaving) return
     const exitIntent = pendingExitIntent
     if (!exitIntent) return
 
@@ -14804,6 +14872,7 @@
   })
 
   onDestroy(() => {
+    scenePanelDestroyed = true
     invalidateSceneAssetUploadTargets()
     discardDraftSceneAssetUploads()
     onUnsavedStateChange(null)
@@ -14820,6 +14889,38 @@
       onValueChange={handleTopLevelTabChange}
       class="flex min-h-0 flex-1 flex-col gap-6"
     >
+      {#if userSettingsReadState === 'unread'}
+        <div class="batshit-settings-group batshit-settings-caption flex items-center gap-2" role="status">
+          <Loader2 class="h-4 w-4 animate-spin" aria-hidden="true" />
+          <span>Loading Goons settings...</span>
+        </div>
+      {:else if userSettingsReadState === 'failed'}
+        <div class="batshit-settings-inline-alert is-danger" data-testid="goons-settings-load-error">
+          <div class="flex items-center justify-between gap-2">
+            <span>
+              Goons settings could not load, so saved Goons settings are hidden. Press Retry to load them.
+              {#if userSettingsReadError}Details: {userSettingsReadError}{/if}
+            </span>
+            <Button variant="outline" size="sm" onclick={refreshGoonsSettings} disabled={userSettingsRefreshBusy}>
+              <RefreshCw class={userSettingsRefreshBusy ? 'h-3.5 w-3.5 animate-spin' : 'h-3.5 w-3.5'} />
+              Retry
+            </Button>
+          </div>
+        </div>
+      {:else if userSettingsReadError}
+        <div class="batshit-settings-inline-alert is-danger" data-testid="goons-settings-refresh-error">
+          <div class="flex items-center justify-between gap-2">
+            <span>
+              Goons settings refresh failed; the last confirmed Goons settings remain in use.
+              Details: {userSettingsReadError}
+            </span>
+            <Button variant="outline" size="sm" onclick={refreshGoonsSettings} disabled={userSettingsRefreshBusy}>
+              <RefreshCw class={userSettingsRefreshBusy ? 'h-3.5 w-3.5 animate-spin' : 'h-3.5 w-3.5'} />
+              Retry
+            </Button>
+          </div>
+        </div>
+      {/if}
       <Tabs.List class="mx-auto grid w-full max-w-[1100px] grid-cols-5">
           <Tabs.Trigger value="goons" class="gap-2">
             <BatshitIcon id="goons" class="h-3.5 w-3.5" />
@@ -14846,7 +14947,7 @@
       <input
         class="hidden"
         type="file"
-        accept="image/png,image/jpeg"
+        accept="image/png,image/jpeg,video/mp4,video/webm,.mp4,.webm"
         bind:this={sceneUploadInput}
         onchange={handleSceneSelection}
       />
@@ -14877,7 +14978,7 @@
           class={`min-w-0 flex-1 min-h-0 ${dockedTopLevelFooterActive ? 'overflow-hidden' : 'overflow-y-auto'}`}
         >
           <div class={dockedTopLevelFooterActive ? 'h-full' : 'space-y-6'}>
-      {#if activeTab === 'motions'}
+      {#if userSettingsConfirmed && activeTab === 'motions'}
     <Card.Root
       class={`batshit-settings-card batshit-settings-card-default batshit-settings-l1-card ${
         dockedMotionsFooterActive ? 'flex h-full min-h-0 flex-col overflow-hidden pb-0' : ''
@@ -15808,7 +15909,7 @@
       </div>
     </SettingsAccordionCard>
     {/if}
-    {#if activeTab === 'closet'}
+    {#if userSettingsConfirmed && activeTab === 'closet'}
       <Card.Root
         class={`batshit-settings-card batshit-settings-card-default batshit-settings-l1-card ${
           dockedKitchenFooterActive ? 'flex h-full min-h-0 flex-col overflow-hidden pb-0' : ''
@@ -16122,7 +16223,7 @@
         </Card.Content>
       </Card.Root>
     {/if}
-    {#if activeTab === 'kitchen'}
+    {#if userSettingsConfirmed && activeTab === 'kitchen'}
 	      <Card.Root
           class={`batshit-settings-card batshit-settings-card-default batshit-settings-l1-card ${
             dockedKitchenFooterActive ? 'flex h-full min-h-0 flex-col overflow-hidden pb-0' : ''
@@ -16978,10 +17079,10 @@
         </Card.Content>
       </Card.Root>
 	    {/if}
-	    {#if activeTab === 'scenes'}
+	    {#if userSettingsConfirmed && activeTab === 'scenes'}
       <Card.Root
         class={`batshit-settings-card batshit-settings-card-default batshit-settings-l1-card ${
-          dockedScenesPanelActive ? 'flex h-full min-h-0 flex-col overflow-hidden pb-0' : ''
+          dockedScenesPanelActive ? 'is-column h-full min-h-0 pb-0' : ''
         }`}
       >
         <Card.Header>
@@ -17038,6 +17139,16 @@
                         <Pencil  />
                       </Button>
                       <Button
+                        variant="outline"
+                        size="icon"
+                        aria-label={`Duplicate ${scene.name}`}
+                        title="Duplicate Scene"
+                        onclick={() => duplicateScene(scene.id)}
+                        disabled={sceneSaving}
+                      >
+                        <Copy />
+                      </Button>
+                      <Button
                         variant="ghost"
                         size="icon"
 
@@ -17069,7 +17180,7 @@
           {/if}
           {#if sceneDirty}
             <div class="batshit-goon-editor-divider flex justify-end gap-2">
-              <Button variant="ghost" onclick={discardSceneChanges}>
+              <Button variant="ghost" onclick={discardSceneChanges} disabled={sceneSaving}>
                 <X aria-hidden="true" />
                 Cancel
               </Button>
@@ -17085,7 +17196,7 @@
         </Card.Content>
       </Card.Root>
 	    {/if}
-	    {#if activeTab === 'goons'}
+    {#if userSettingsConfirmed && activeTab === 'goons'}
 	      <SettingsAccordionCard name="goon-settings-cards" title="Desktop Mode" open>
 	        {#snippet info()}
 	          <SettingsInfoMenu ariaLabel="About Desktop Mode" contentClass="w-96">
@@ -21094,6 +21205,7 @@
                           World controls the 360 Skybox, how it meets the stage, and one saved Scene
                           Atmosphere layer.
                         </p>
+                        <p>Choose a 2:1 PNG/JPG image or MP4/WebM video. Videos loop silently. Images may be up to 50 MB; videos up to 250 MB, two minutes and 60 fps. For broad playback support, use a 4K H.264 MP4. Video resolution stays as uploaded, regardless of the quality setting.</p>
                       </SettingsInfoMenu>
                     </div>
                   </div>
@@ -21131,10 +21243,10 @@
                               </div>
                             {/if}
                           </div>
-                          <span class="pt-1">Skybox ready</span>
+                          <span class="pt-1">{newSceneSkybox.mimeType?.startsWith('video/') ? 'Video background ready' : 'Skybox ready'}</span>
                         </div>
                       {:else}
-                        <span>Upload a 2:1 equirectangular PNG/JPG. Batshit keeps the original file.</span>
+                        <span>Upload a 2:1 panorama image (PNG/JPG) or looping video (MP4/WebM).</span>
                       {/if}
                     </div>
                   </div>
@@ -21258,6 +21370,7 @@
                                   World controls the 360 Skybox, how it meets the stage, and one saved
                                   Scene Atmosphere layer.
                                 </p>
+                                <p>Choose a 2:1 PNG/JPG image or MP4/WebM video. Videos loop silently. Images may be up to 50 MB; videos up to 250 MB, two minutes and 60 fps. For broad playback support, use a 4K H.264 MP4. Video resolution stays as uploaded, regardless of the quality setting.</p>
                               </SettingsInfoMenu>
                             </div>
                           </div>
@@ -21300,7 +21413,7 @@
                                     {#if !resolveSceneThumbnailUrl(scene)}
                                       Update this Skybox to generate a thumbnail copy.
                                     {:else}
-                                      Skybox ready
+                                      {scene.skybox.mimeType?.startsWith('video/') ? 'Video background ready' : 'Skybox ready'}
                                     {/if}
                                   {:else}
                                     No skybox uploaded.
@@ -22428,13 +22541,14 @@
           </div>
           <div class="batshit-settings-footer-bar shrink-0">
             <div class="flex justify-end gap-2">
-              <Button variant="ghost" onclick={discardSceneChanges}>
+              <Button variant="ghost" onclick={discardSceneChanges} disabled={sceneSaving}>
                 <X aria-hidden="true" />
                 Cancel
               </Button>
               <Button
                 variant="outline"
                 onclick={() => requestWorkspaceExit({ type: 'close-scene' })}
+                disabled={sceneSaving}
               >
                 <X aria-hidden="true" />
                 Close Scene

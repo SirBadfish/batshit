@@ -80,3 +80,5 @@ A good completion report includes:
 - ComfyUI workflow result or clear blocker;
 - Scene Editor import/save steps;
 - any current Batshit limitation that still requires manual work.
+
+For an animated exterior, the bundle also includes an optional animated-panorama reference, image-first ComfyUI API graphs, and a configurable Python light-animation renderer with CPU/NVIDIA encoding choices. Agents read animation details only when video is requested. Scene Editor World accepts the resulting MP4/WebM as the skybox; it does not add video to props or room surfaces.

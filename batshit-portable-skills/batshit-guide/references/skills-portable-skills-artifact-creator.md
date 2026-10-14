@@ -33,7 +33,7 @@ Batshit enforces artifact structure by default. Normal artifacts should use Buil
 - `metadata.fabric_fields` for typed agent use, or
 - `metadata.run_only=true` for trigger-only artifacts
 
-The portable skill should run `sys.artifact.validate_structure` before create, update, patch, or publish.
+Every save checks this itself: create, update, patch, and publish refuse a broken artifact with a list of what to fix, and the agent fixes those and saves again. `sys.artifact.validate_structure` runs the same check without saving, for a dry run.
 
 ## Recommended prompt
 
@@ -43,7 +43,7 @@ Use the Batshit Portable Artifact Creator.
 Batshit base URL: http://127.0.0.1:5620
 Token env file: ~/.batshit/portable-skills/portable-skills.env
 
-Build a Batshit artifact that [describe what you want]. Validate it before saving, publish it when it is ready, and tell me where it landed.
+Build a Batshit artifact that [describe what you want]. Publish it when it is ready, and tell me where it landed.
 ```
 
 If the artifact talks to n8n, ComfyUI, Gradio, HuggingFace, a webhook, or another local runtime, say whether Batshit is Mac app or Docker so the agent chooses the right URLs.
@@ -55,7 +55,7 @@ A good completion report includes:
 - artifact name and ID;
 - new vs updated;
 - Artifact Power Source;
-- validation result;
+- save result (and any refusal it fixed);
 - published status and zone;
 - model or runtime URL truth when relevant;
 - run-log evidence when relevant.

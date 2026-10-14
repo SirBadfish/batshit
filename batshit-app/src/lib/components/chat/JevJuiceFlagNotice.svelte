@@ -5,7 +5,7 @@
    *
    * It is its OWN card, on purpose. A flag on the approval card itself made the Approve
    * button feel like approving the flag, and a flag is never approved: it is information.
-   * So the notice stands above the approval card, says what Jev flagged and how sure it was,
+   * So the notice stands above the approval card, says what the judge flagged and how sure it was,
    * quotes the start of the message, jumps to it on request, and can be closed. Closing it
    * never touches the approval card under it; Batshit remembers the close in this browser,
    * for this message, so it does not come back on every reload. The badge on the wake-up
@@ -21,9 +21,9 @@
   import {
     UNTRUSTED_TEXT_APPROVAL_HINT,
     UNTRUSTED_TEXT_DISMISS_TEXT,
-    UNTRUSTED_TEXT_NOTICE_LEAD,
     UNTRUSTED_TEXT_NOTICE_TITLE,
     UNTRUSTED_TEXT_SHOW_MESSAGE_TEXT,
+    untrustedTextNoticeLead,
     untrustedTextQuote
   } from '$lib/utils/jevJuice'
   import JevJuiceFlagBlock from './JevJuiceFlagBlock.svelte'
@@ -98,7 +98,7 @@
         <X aria-hidden="true" />
       </Button>
     </div>
-    <p class="jev-flag-notice-lead">{UNTRUSTED_TEXT_NOTICE_LEAD}</p>
+    <p class="jev-flag-notice-lead">{untrustedTextNoticeLead(flag.judge)}</p>
     <JevJuiceFlagBlock
       view={flag}
       showTitle={false}
@@ -172,7 +172,7 @@
     padding: 0;
     border: 0;
     background: none;
-    color: var(--primary);
+    color: var(--primary-text);
     font-size: 0.75rem;
     text-decoration: underline;
     cursor: pointer;

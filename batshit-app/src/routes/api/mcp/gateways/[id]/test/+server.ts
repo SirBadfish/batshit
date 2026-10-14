@@ -7,7 +7,6 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
 import { mcpGatewayService } from '$lib/server/services/mcpGatewayService'
 import { mcpGatewayDiscovery } from '$lib/server/services/mcpGatewayDiscovery'
-import { sanitizeStdioGatewayConfig } from '$lib/server/services/mcpGatewayStdio'
 
 /**
  * POST /api/mcp/gateways/[id]/test
@@ -39,18 +38,16 @@ export const POST: RequestHandler = async ({ locals, params }) => {
     // Test connection using unified discovery service
     const healthResult = await mcpGatewayDiscovery.healthCheck(gateway, userId)
 
+    // BL-550: the check takes seconds, and the user can save a new launch meanwhile, so the result
+    // goes into the gateway as it is now, field by field; the launch read above is never written.
     if (gateway.type === 'stdio') {
-      const stdioConfig = sanitizeStdioGatewayConfig(gateway.stdioConfig) ?? { command: '' }
-      await mcpGatewayService.update(userId, id, {
-        stdioConfig: {
-          ...stdioConfig,
-          lastTestStatus: healthResult.available ? 'passed' : 'failed',
-          lastTestAt: new Date().toISOString(),
-          lastError: healthResult.available ? null : healthResult.error ?? 'STDIO health check failed',
-          ...(typeof healthResult.toolCount === 'number'
-            ? { toolCount: healthResult.toolCount }
-            : {})
-        }
+      await mcpGatewayService.recordStdioCheckResult(userId, id, {
+        lastTestStatus: healthResult.available ? 'passed' : 'failed',
+        lastTestAt: new Date().toISOString(),
+        lastError: healthResult.available ? null : healthResult.error ?? 'STDIO health check failed',
+        ...(typeof healthResult.toolCount === 'number'
+          ? { toolCount: healthResult.toolCount }
+          : {})
       })
     }
 

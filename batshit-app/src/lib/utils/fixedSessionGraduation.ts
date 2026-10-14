@@ -56,8 +56,10 @@ export interface FixedSessionNapStep3Record {
   compactedMessageCount: number
   /**
    * What step 3 did to the open episode's whiteboard (2026-09-19): `filled` an empty board,
-   * `refreshed` a board a nap wrote earlier, `kept` a board the agent wrote (never touched),
-   * or `none` when no episode was open. Absent on older nap records.
+   * `refreshed` a board a nap wrote earlier, `kept` a board this nap did not write: one the
+   * agent wrote (never touched), or one that changed while the nap waited on its summary model
+   * (the agent or another nap wrote it, or a turn closed the episode; BL-549), or `none` when no
+   * episode was open. Absent on older nap records.
    */
   whiteboard?: 'filled' | 'refreshed' | 'kept' | 'none'
 }
@@ -66,7 +68,8 @@ export interface FixedSessionNapRecord {
   id: string
   at: string
   trigger: 'threshold' | 'manual'
-  status: 'completed' | 'failed'
+  /** `ended_early` (BL-549 N2): a message arrived before one of the nap's writing steps. */
+  status: 'completed' | 'failed' | 'ended_early'
   tokensBefore: number | null
   tokensAfter: number | null
   napAtTokens: number | null
@@ -78,9 +81,15 @@ export interface FixedSessionNapRecord {
   compaction: FixedSessionNapStep3Record | null
   /**
    * SA-110 P2 (DL-110-06a): the awareness fold riding the nap — 'folded',
-   * 'unchanged', or 'failed: <why>'. Absent on pre-SA-110 nap records.
+   * 'unchanged', or 'failed: <why>'; 'skipped' on an `ended_early` record (BL-549 N2).
+   * Absent on pre-SA-110 nap records.
    */
   awarenessFold?: string
+  /**
+   * BL-549 (N2, option A): on an `ended_early` record, `ended early: a message arrived; <n> closed
+   * episode(s) written`.
+   */
+  endedEarly?: string
   error?: string
 }
 
@@ -260,4 +269,24 @@ export function getFixedSessionNapRecords(
   const raw = metadata?.fixedSession?.naps
   if (!Array.isArray(raw)) return []
   return raw.filter(isNapRecord)
+}
+
+/** Why a nap's route answer ended it early (mirrors the server's own type, client-safe). */
+export type FixedSessionNapEndedEarlyReason = 'turn_started' | 'chat_deleted'
+
+/**
+ * BL-549 N6: the toast text for a nap that ended early. Only a nap the user pressed
+ * (`trigger: 'manual'`) is told, and only for `turn_started` — the reply is coming, the
+ * nap will run again after it. The idle auto-nap (`trigger: 'threshold'`) says nothing,
+ * whatever the reason, so it never interrupts with a toast the user did not ask for.
+ * `chat_deleted` also says nothing here: the chat is gone, so there is no page left to
+ * show a nap toast on; a chat that vanishes takes any pending nap status with it.
+ */
+export function describeNapEndedEarly(
+  trigger: 'threshold' | 'manual',
+  endedEarly: FixedSessionNapEndedEarlyReason | undefined
+): string | null {
+  if (trigger !== 'manual') return null
+  if (endedEarly !== 'turn_started') return null
+  return 'Nap stopped: you sent a message. It runs again after the reply.'
 }

@@ -49,6 +49,8 @@ Docker Batshit runs the core stack in Compose:
 - internal-only Redis 8
 - optional `n8n` profile, published to `http://localhost:5678`
 
+Docker Batshit also writes every save to its Redis immediately, and that Redis runs with append-only persistence: each change reaches disk within about a second, so recent saves survive a container restart, a Docker Desktop crash, or a restart of your computer.
+
 Inside Docker, services use Docker names: the app calls batshit-server at `http://batshit-server:5600`, batshit-server and n8n call the app at `http://app:3000`, the app calls the optional Docker n8n at `http://n8n:5678`, and the app reaches host services through `host.docker.internal`.
 
 Docker is not just the Mac app launcher inside a container. The core app container doesn't get raw host Docker access by default — Docker Sandbox and approved sidecar start/stop actions use a first-party host operator prepared by `./start-docker.sh`.

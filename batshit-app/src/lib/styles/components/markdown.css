@@ -308,7 +308,7 @@
   max-width: 100%;
   margin: 0.75rem 0;
   padding: 0.45rem 0.7rem;
-  border: 1px solid oklch(0.63 0.05 281.84 / 0.45);
+  border: 1px solid color-mix(in oklab, var(--bs-app-primary-text) 45%, transparent);
   border-radius: var(--radius);
   background: var(--message-user-background);
   color: var(--message-user-foreground);

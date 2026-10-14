@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('$lib/server/redis', async () => {
   const actual = await vi.importActual<typeof import('$lib/server/redis')>('$lib/server/redis')
@@ -17,6 +17,8 @@ import {
   mintRunCredential,
   validateRunCredential
 } from '$lib/server/services/agentRunCredentials'
+import { createWakeHook, getWakeHook } from '$lib/server/services/dm/wakeHookStore'
+import { dmInboxKey, dmKey } from '$lib/server/services/dm/dmKeys'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 
 useRedisTestServer()
@@ -225,5 +227,167 @@ describe.runIf(REAL_REDIS_LANE)('run credential cleanup after agent deletion (SA
     expect(await getRunCredential(survivor.credentialId)).not.toBeNull()
     expect(await validateRunCredential(survivor.token)).toMatchObject({ valid: true })
     expect(await credentialIndexMembers('agent-cred-b')).toEqual([survivor.credentialId])
+  })
+})
+
+/**
+ * BL-608 — a failed read of the agent stops its delete.
+ *
+ * Three sweeps in `deleteAgent` (wake-up webhooks, schedules, zip holds) find the agent's records
+ * through `agent.user_id`, and they read it with `redis.get`, which answers a failed read with
+ * null, the same answer as "no such agent". So a read error swept nothing and the agent was
+ * deleted anyway, leaving a live webhook credential, a ticking schedule, and a hold nobody can
+ * release. Now every one of those reads throws, and `deleteAgent` reads the record once before
+ * it deletes anything.
+ *
+ * The error is injected BELOW the facade, at the Redis client's `json.get`, where a real read
+ * error arrives: `redis.get` catches it there (that is the bug), `redis.json.get` does not.
+ */
+describe.runIf(REAL_REDIS_LANE)('a failed read of the agent stops its delete (BL-608)', () => {
+  const agentId = 'agent-readfail'
+  const sessionId = 'sess-readfail'
+  const zipId = 'zip_readfail'
+  const dmId = 'dm_readfail'
+  let hookId = ''
+  let scheduleId = ''
+
+  /** Makes the `nth` client-level JSON read of `key` fail; every other command runs as usual. */
+  function failNthRead(key: string, nth: number) {
+    const realExecute = redis.execute.bind(redis)
+    let reads = 0
+    const bind = (owner: any, member: unknown) =>
+      typeof member === 'function' ? member.bind(owner) : member
+    // The proxies' targets are empty objects: the client's `json` is a read-only data property,
+    // and a proxy of the client itself may not answer it with anything else.
+    vi.spyOn(redis, 'execute').mockImplementation(((operation: (client: any) => Promise<unknown>) =>
+      realExecute((client: any) =>
+        operation(
+          new Proxy({}, {
+            get(_, prop) {
+              const value = Reflect.get(client, prop, client)
+              if (prop !== 'json') return bind(client, value)
+              return new Proxy({}, {
+                get(__, jsonProp) {
+                  const member = Reflect.get(value, jsonProp, value)
+                  if (jsonProp !== 'get') return bind(value, member)
+                  return async (readKey: string, ...rest: unknown[]) => {
+                    if (readKey === key && ++reads === nth) {
+                      throw new Error(`Redis read of ${key} failed (BL-608 test)`)
+                    }
+                    return member.call(value, readKey, ...rest)
+                  }
+                }
+              })
+            }
+          })
+        )
+      )) as any)
+  }
+
+  async function holdIsThere(): Promise<boolean> {
+    const members = await redis.sMembers(`unzipped:${sessionId}`)
+    const item = await redis.json.get(`unzipped_item:${sessionId}:${zipId}`)
+    return members.includes(zipId) && Boolean(item)
+  }
+
+  beforeEach(async () => {
+    await seedAgent(agentId, 'Read Fail', { dms_enabled: true })
+    // A DM addressed to it: `sweepAgentDms` runs before any sweep that reads the agent.
+    await redis.json.set(dmKey(dmId), '$', { id: dmId, userId, from: { kind: 'user' } } as never)
+    await redis.execute(async (client) => client.zAdd(dmInboxKey(agentId), [{ score: 1, value: dmId }]))
+    hookId = (await createWakeHook({ userId, agentId, name: 'Read fail hook' })).record.id
+    scheduleId = (
+      await createSchedule({
+        userId,
+        agentId,
+        name: 'Read fail clock',
+        cadence: { type: 'daily', at: '09:00' },
+        timeZone: 'America/Chicago',
+        message: 'Tick.'
+      })
+    ).id
+    // One of its holds, in a chat of its user.
+    await redis.sAdd(`user:${userId}:sessions`, sessionId)
+    await redis.sAdd(`unzipped:${sessionId}`, zipId)
+    await redis.set(`unzipped_item:${sessionId}:${zipId}`, {
+      zipId,
+      sessionId,
+      source: 'agent',
+      agentId,
+      permanent: true,
+      path: 'src/app.ts',
+      unzippedAt: 1
+    })
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('deletes everything when every read works (the fixture is sweepable)', async () => {
+    failNthRead(`agent:${agentId}`, 99)
+
+    const result = await redis.deleteAgent(agentId)
+
+    expect(result.releasedHolds).toEqual([{ sessionId, zipId }])
+    vi.restoreAllMocks()
+    expect(await redis.json.get(`agent:${agentId}`)).toBeNull()
+    expect(await redis.json.get(dmKey(dmId))).toBeNull()
+    expect(await getWakeHook(hookId)).toBeNull()
+    expect(await getSchedule(scheduleId)).toBeNull()
+    expect(await holdIsThere()).toBe(false)
+  })
+
+  it('a read that fails from the start deletes nothing', async () => {
+    failNthRead(`agent:${agentId}`, 1)
+
+    await expect(redis.deleteAgent(agentId)).rejects.toThrow(/BL-608 test/)
+
+    vi.restoreAllMocks()
+    expect(await redis.json.get(`agent:${agentId}`)).toMatchObject({ id: agentId })
+    expect(await redis.json.get(dmKey(dmId))).toMatchObject({ id: dmId })
+    expect(await getWakeHook(hookId)).not.toBeNull()
+    expect(await getSchedule(scheduleId)).not.toBeNull()
+    expect(await holdIsThere()).toBe(true)
+  })
+
+  it("the wake-up webhook sweep's failed read keeps the agent and its webhook", async () => {
+    failNthRead(`agent:${agentId}`, 2)
+
+    await expect(redis.deleteAgent(agentId)).rejects.toThrow(/BL-608 test/)
+
+    vi.restoreAllMocks()
+    expect(await redis.json.get(`agent:${agentId}`)).toMatchObject({ id: agentId })
+    expect(await getWakeHook(hookId)).not.toBeNull()
+  })
+
+  it("the schedule sweep's failed read keeps the agent and its schedule", async () => {
+    failNthRead(`agent:${agentId}`, 3)
+
+    await expect(redis.deleteAgent(agentId)).rejects.toThrow(/BL-608 test/)
+
+    vi.restoreAllMocks()
+    expect(await redis.json.get(`agent:${agentId}`)).toMatchObject({ id: agentId })
+    expect(await getSchedule(scheduleId)).not.toBeNull()
+  })
+
+  it("the hold release's failed read of the agent keeps the agent and its hold", async () => {
+    failNthRead(`agent:${agentId}`, 4)
+
+    await expect(redis.deleteAgent(agentId)).rejects.toThrow(/BL-608 test/)
+
+    vi.restoreAllMocks()
+    expect(await redis.json.get(`agent:${agentId}`)).toMatchObject({ id: agentId })
+    expect(await holdIsThere()).toBe(true)
+  })
+
+  it("the hold release's failed read of a hold keeps the agent and that hold", async () => {
+    failNthRead(`unzipped_item:${sessionId}:${zipId}`, 1)
+
+    await expect(redis.deleteAgent(agentId)).rejects.toThrow(/BL-608 test/)
+
+    vi.restoreAllMocks()
+    expect(await redis.json.get(`agent:${agentId}`)).toMatchObject({ id: agentId })
+    expect(await holdIsThere()).toBe(true)
   })
 })

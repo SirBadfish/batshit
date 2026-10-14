@@ -100,6 +100,11 @@ export function isArtifactRuntimeCorsPath(path: string) {
     return true
   }
 
+  // SA-072 P2: the Pinokio app proxy, reached from a Pinokio app artifact's panel.
+  if (path.startsWith('/api/artifacts/pinokio/')) {
+    return true
+  }
+
   return /^\/api\/artifacts\/[^/]+$/.test(path)
 }
 

@@ -155,6 +155,33 @@ Use this workflow to build and iterate artifact prototypes.
     ).toBe(true)
   })
 
+  it('imports complete continued descriptions and nested block metadata (BL-1239)', async () => {
+    const skillDir = await fs.mkdtemp(path.join(os.tmpdir(), 'batshit-bl1239-import-'))
+    tempDirs.push(skillDir)
+    await fs.writeFile(path.join(skillDir, 'SKILL.md'), `---
+name: continued-skill
+description: "A long description
+  that continues: in full"
+metadata:
+  notes: |-
+    First: line
+    Second line
+  author: Batshit
+license: MIT
+---
+# Continued Skill
+
+Original body.
+`, 'utf8')
+
+    const result = await importSkillDefinition({ sourceType: 'local', source: skillDir })
+    expect(result.skill.description).toBe('A long description that continues: in full')
+    expect(result.skill.metadata).toEqual({ notes: 'First: line\nSecond line', author: 'Batshit' })
+    expect(result.skill.license).toBe('MIT')
+    expect(result.skill.standardsStatus).toBe('full')
+    expect(result.skill.standardsIssues).toEqual([])
+  })
+
   it('parses optional standards fields from frontmatter', async () => {
     const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'batshit-skill-import-test-'))
     tempDirs.push(tempRoot)
@@ -190,6 +217,43 @@ Use this skill for browser automation workflows.
     expect(result.skill.compatibility).toBe('batshit>=0.0.1')
     expect(result.skill.allowedTools).toEqual(['native_bash_execute', 'native_dynamic_mcp_use'])
     expect(result.skill.metadata).toEqual({ author: 'Batshit', category: 'browser' })
+    expect(result.skill.standardsStatus).toBe('full')
+    expect(result.skill.standardsIssues).toEqual([])
+  })
+
+  // BL-469: a folded description was saved as ">", and its lines with a colon became keys.
+  it('imports the text of a folded frontmatter description', async () => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'batshit-skill-import-test-'))
+    tempDirs.push(tempRoot)
+
+    const skillDir = path.join(tempRoot, 'typesafe-system-one')
+    await fs.mkdir(skillDir, { recursive: true })
+    await fs.writeFile(
+      path.join(skillDir, 'SKILL.md'),
+      `---
+name: typesafe-system-one
+description: >
+  TypeSafe AI's System One models (flagship: Jev): typed questions
+  about any text. Use it whenever someone wants a router: or a verifier.
+license: MIT
+---
+# TypeSafe System One
+
+Batshit's own layer over TypeSafe.
+`,
+      'utf8'
+    )
+
+    const result = await importSkillDefinition({
+      sourceType: 'local',
+      source: skillDir
+    })
+
+    expect(result.skill.name).toBe('typesafe-system-one')
+    expect(result.skill.description).toBe(
+      "TypeSafe AI's System One models (flagship: Jev): typed questions about any text. Use it whenever someone wants a router: or a verifier."
+    )
+    expect(result.skill.license).toBe('MIT')
     expect(result.skill.standardsStatus).toBe('full')
     expect(result.skill.standardsIssues).toEqual([])
   })

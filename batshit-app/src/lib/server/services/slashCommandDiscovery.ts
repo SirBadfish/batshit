@@ -1,15 +1,17 @@
+import { getManagedAgentRootDir } from './batshitHome'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import os from 'node:os'
 
 import type { SlashCommandDescriptor, SlashCommandScope } from '$lib/types/slashCommands'
 import { buildAgentProfileId } from '$lib/server/services/codexProfileManager'
+import { splitFrontmatter } from '$lib/server/services/skillFrontmatter'
 
 const CACHE_TTL_MS = 30_000
 const cache = new Map<string, { timestamp: number; commands: SlashCommandDescriptor[] }>()
 
 const HOME_DIR = os.homedir()
-const BATSHIT_MANAGED_ROOT = path.join(HOME_DIR, '.batshit', 'agents')
+const BATSHIT_MANAGED_ROOT = getManagedAgentRootDir()
 const CODEX_DIR_NAME = '.codex'
 const CLAUDE_DIR_NAME = '.claude'
 const CLAUDE_PLUGIN_DIR_NAME = 'plugins'
@@ -67,45 +69,25 @@ function parseFrontmatterValue(raw: string) {
   return trimmed
 }
 
-function parseFrontmatter(contents: string): { data: Record<string, any>; body: string } {
-  if (!contents.startsWith('---')) {
-    return { data: {}, body: contents }
-  }
-
-  const endIndex = contents.indexOf('\n---', 3)
-  if (endIndex === -1) {
-    return { data: {}, body: contents }
-  }
-
-  const raw = contents.slice(3, endIndex).trim()
-  const body = contents.slice(endIndex + 4).trimStart()
-  const data: Record<string, any> = {}
-
-  for (const line of raw.split('\n')) {
-    const trimmed = line.trim()
-    if (!trimmed || trimmed.startsWith('#')) continue
-    const sepIndex = trimmed.indexOf(':')
-    if (sepIndex === -1) continue
-    const key = trimmed.slice(0, sepIndex).trim()
-    const value = trimmed.slice(sepIndex + 1).trim()
-    data[key] = parseFrontmatterValue(value)
-  }
-
-  return { data, body }
+/** The `/` menu shows one line per command; a literal (`|`) description keeps its breaks. */
+function oneLine(value: string) {
+  return value.replace(/\s+/g, ' ').trim()
 }
 
 async function readCommandMetadata(filePath: string) {
   const contents = await safeReadFile(filePath)
   if (!contents) return {}
-  const { data } = parseFrontmatter(contents)
+  // The shared reader handles lines, nested maps and `|`/`>` blocks, so a block's lines never
+  // become keys (BL-1240); this reader's own value rules keep `[file-path]` as text.
+  const { frontmatter: data } = splitFrontmatter(contents, parseFrontmatterValue)
   const invocation = typeof data.invocation === 'string' ? normalizeInvocation(data.invocation) : undefined
   return {
-    description: typeof data.description === 'string' ? data.description : undefined,
+    description: typeof data.description === 'string' ? oneLine(data.description) : undefined,
     argumentHint:
       typeof data['argument-hint'] === 'string'
-        ? data['argument-hint']
+        ? oneLine(data['argument-hint'])
         : typeof data.argumentHint === 'string'
-          ? data.argumentHint
+          ? oneLine(data.argumentHint)
           : undefined,
     invocation: invocation && invocation !== '/' ? invocation : undefined
   }

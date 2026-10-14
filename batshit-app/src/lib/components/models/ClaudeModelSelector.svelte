@@ -3,6 +3,7 @@
   import * as DropdownMenu from '$lib/components/ui/dropdown-menu'
   import { toast } from 'svelte-sonner'
   import * as agentStore from '$lib/stores/agents.svelte'
+  import { chatBarBlockSave } from '$lib/utils/chatBarBlockSave'
   import { CLAUDE_CLI_MODEL_CHOICES } from '$lib/data/claude-cli-models'
   import ModelProviderIcon from '$lib/components/models/ModelProviderIcon.svelte'
   import type { ClaudeAgentSettings, ClaudePermissionMode } from '$lib/types/claude'
@@ -75,10 +76,17 @@
   async function handleSelect(nextModel: string) {
     if (!currentAgent) return
     try {
+      // BL-848: only the model, always sent (a pick the copy already shows must still write it: the
+      // record may hold another; the CLI default is sent as null, a removal). The server writes the
+      // Claude settings key by key, so every other key stays.
+      const viewedSettings = withDefaults(currentAgent.claude_settings, selectedModel)
       const nextSettings = withDefaults(currentAgent.claude_settings, nextModel)
-      await agentStore.updateAgentSettings(currentAgent.id, {
-        claude_settings: nextSettings
-      })
+      await agentStore.updateAgentSettings(
+        currentAgent.id,
+        chatBarBlockSave('claude_settings', currentAgent.claude_settings, viewedSettings, nextSettings, {
+          group: ['model']
+        })
+      )
     } catch (error) {
       console.error('[ClaudeModelSelector] Failed to update Claude model', error)
       toast.error('Unable to save Claude model selection')
@@ -127,7 +135,7 @@
     {#each CLAUDE_CLI_MODEL_CHOICES as option (option.value)}
       <DropdownMenu.Item
         onSelect={() => handleSelect(option.value)}
-        class={`flex items-center gap-2 ${option.value === selectedModel ? 'border-l-2 border-primary pl-2' : ''}`}
+        class={`flex items-center gap-2 ${option.value === selectedModel ? 'border-l-2 border-primary-text pl-2' : ''}`}
       >
         <ModelProviderIcon
           modelId={option.value}

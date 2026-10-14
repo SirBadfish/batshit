@@ -167,6 +167,24 @@ describe('AdminSchedulesSection — Run now reports a failed record (F-16)', () 
     await waitFor(() => expect(toast.success).toHaveBeenCalled())
     expect(toast.warning).not.toHaveBeenCalled()
   })
+
+  it('shows the route’s failure and recovery guidance in both the toast and last-run line', async () => {
+    const error = 'failed: Cooper does not have Agent DMs turned on, so it would never see this. Turn on Agent DMs for that agent in Agent Settings.'
+    mockFetchWithRunNow({
+      success: false,
+      error,
+      outcome: error,
+      recorded: true,
+      schedule: { ...SCHEDULE, lastRunAt: '2026-09-08T15:00:00.000Z', lastOutcome: error, runCount: 1 }
+    })
+
+    await pressRunNow()
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith(error))
+    expect(await screen.findByText(error, { exact: false })).toBeTruthy()
+    expect(toast.success).not.toHaveBeenCalled()
+    expect(toast.warning).not.toHaveBeenCalled()
+  })
 })
 
 /**

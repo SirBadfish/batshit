@@ -133,7 +133,7 @@ describe('POST /api/memory/recall-media', () => {
 
     const row = payload.recall.result.recalled[0]
     expect(row.media[0]).toMatchObject({ delivery: 'next_message', reason: 'lane_none' })
-    expect(row.media_note).toContain('REMEMBERED MEDIA with the next message')
+    expect(row.media_note).toContain('remembered_media with the next message')
   })
 
   it('degrades a missing image to next_message rather than failing the turn', async () => {

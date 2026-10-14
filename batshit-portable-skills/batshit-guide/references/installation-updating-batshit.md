@@ -33,7 +33,7 @@ Batshit's direct AI connections run on Vercel's AI SDK, and Batshit now uses maj
 What you might notice:
 
 - **Every provider path was re-verified live** after the upgrade: OpenAI, Anthropic, Gemini, OpenRouter, Z.ai, Vercel AI Gateway, local runtimes, plus tools, subagents, and tool approvals.
-- **A tool approval that is waiting when you update does not carry over.** Approvals already expire on their own after 3 minutes, so in practice this only matters if you update at the exact moment one is pending. Just ask the agent again.
+- **A tool approval that is waiting when you update does not carry over.** Approvals already expire on their own (after 3 minutes, or 10 for a Claude Code agent), so in practice this only matters if you update at the exact moment one is pending. Just ask the agent again.
 - **Very old approval cards in past chats may look plainer** than they did. The conversation text itself is unchanged.
 
 Export a backup before updating, same as always.

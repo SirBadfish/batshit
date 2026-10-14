@@ -1,5 +1,5 @@
 /**
- * SA-120 Jev Juice — evidence for a Jev call made MID-RUN, from inside a tool call.
+ * SA-120 Judge Juice — evidence for a Jev call made MID-RUN, from inside a tool call.
  *
  * A tool lane (`sys.judge.ask`, the memory search rerank) runs after `send-routed` has
  * recorded the turn's Execution Viewer snapshot, in a request that cannot reach the
@@ -26,13 +26,13 @@ export async function attachTypesafeRecordToActiveStream(
   if (!sessionId) return
   const messageId = getActiveStream(sessionId)?.messageId ?? null
   if (!messageId) {
-    console.warn(`[Jev Juice] ${lane} ran with no active stream; the call has no Execution Viewer row`, { sessionId })
+    console.warn(`[Judge Juice] ${lane} ran with no active stream; the call has no Execution Viewer row`, { sessionId })
     return
   }
   try {
     const attached = await appendTypesafeCallRecords(sessionId, messageId, [record])
-    if (!attached) console.warn(`[Jev Juice] ${lane}: no snapshot to attach the call record to`, { sessionId, messageId })
+    if (!attached) console.warn(`[Judge Juice] ${lane}: no snapshot to attach the call record to`, { sessionId, messageId })
   } catch (error) {
-    console.error(`[Jev Juice] ${lane}: failed to attach the Execution Viewer record:`, error)
+    console.error(`[Judge Juice] ${lane}: failed to attach the Execution Viewer record:`, error)
   }
 }

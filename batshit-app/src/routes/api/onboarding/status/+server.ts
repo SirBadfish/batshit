@@ -3,6 +3,8 @@ import type { RequestHandler } from './$types'
 import { redis } from '$lib/server/redis'
 import { resolveProviderAccess } from '$lib/server/services/providers'
 import { invalidateUserSettingsCache } from '$lib/services/databaseRedis.server'
+import { pausedPlansAllowedOnThisCopy } from '$lib/server/services/pausedPlans'
+import { findPausedPlan } from '$lib/data/pausedPlans'
 
 const CHAT_PROVIDER_LABELS = new Map<string, string>([
   ['ai_gateway', 'Vercel AI Gateway'],
@@ -40,15 +42,22 @@ function isObject(value: unknown): value is Record<string, any> {
 }
 
 async function buildStatus(userId: string) {
-  const [providerAccess, modelIds, agents, settings] = await Promise.all([
+  const [providerAccess, modelIds, agents, settings, pausedPlansAllowed] = await Promise.all([
     resolveProviderAccess(userId),
     redis.execute((client) => client.sMembers(`user:${userId}:models`)),
     redis.getAgents(userId),
-    redis.getUserSettings(userId)
+    redis.getUserSettings(userId),
+    pausedPlansAllowedOnThisCopy()
   ])
 
   const readyKeys = Array.from(CHAT_PROVIDER_LABELS.entries())
     .map(([id, label]) => {
+      // Plan pause: a paused plan's key is not a ready model connection
+      // unless this copy's Dev switch allows paused plans (the same server
+      // rule ProviderManager.createForUser reads) — a key that cannot route
+      // a call is not "ready".
+      if (!pausedPlansAllowed && findPausedPlan(id)) return null
+
       if (id === 'ai_gateway') {
         const availability = providerAccess.gateway.availability
         return availability.hasKey

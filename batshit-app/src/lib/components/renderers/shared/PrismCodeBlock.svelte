@@ -336,8 +336,8 @@
   }
 
   :global(.prism-code-block .line.target-line) {
-    background: color-mix(in oklch, var(--bs-app-primary, hsl(var(--primary))) 28%, transparent);
-    box-shadow: inset 2px 0 0 color-mix(in oklch, var(--bs-app-primary, hsl(var(--primary))) 80%, oklch(0.94 0.006 289.95));
+    background: var(--bs-app-primary-soft);
+    box-shadow: inset 2px 0 0 var(--bs-app-primary-text);
   }
 
   /* Diff styles */

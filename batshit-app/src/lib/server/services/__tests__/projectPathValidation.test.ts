@@ -1,17 +1,25 @@
-import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
 import {
 	resolveProjectRootPathForRuntime,
 	validateProjectRootPath
 } from '../projectPathValidation'
 
+const fixtureRoots: string[] = []
+
 async function tempDir(prefix: string): Promise<string> {
-	return mkdtemp(path.join(tmpdir(), prefix))
+	const root = await mkdtemp(path.join(tmpdir(), prefix))
+	fixtureRoots.push(root)
+	return root
 }
 
 describe('projectPathValidation', () => {
+	afterEach(async () => {
+		await Promise.all(fixtureRoots.splice(0).map(root => rm(root, { recursive: true, force: true })))
+	})
+
 	it('accepts an existing native directory', async () => {
 		const root = await tempDir('batshit-project-native-')
 

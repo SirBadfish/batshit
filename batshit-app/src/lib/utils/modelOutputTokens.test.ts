@@ -6,6 +6,26 @@ import {
 } from './modelOutputTokens'
 
 describe('modelOutputTokens', () => {
+  it('uses a running window as a separate bound when the preset window is unknown', () => {
+    expect(resolvePresetMaxOutputTokenResolution({ loadedContextWindow: 16_384 })).toEqual({
+      maxOutputTokens: 8_192, estimated: true, reason: 'missing'
+    })
+    expect(resolvePresetMaxOutputTokenResolution({ maxOutputTokens: 16_384, loadedContextWindow: 16_384 })).toEqual({
+      maxOutputTokens: 8_192, estimated: true, reason: 'unsafe'
+    })
+  })
+
+  it('uses the smaller valid bound and preserves intentional low output', () => {
+    expect(resolvePresetMaxOutputTokenResolution({ contextWindow: 200_000, loadedContextWindow: 16_384 }).maxOutputTokens).toBe(8_192)
+    expect(resolvePresetMaxOutputTokenResolution({ contextWindow: 8_000, loadedContextWindow: 16_384 }).maxOutputTokens).toBe(4_000)
+    expect(resolvePresetMaxOutputTokenResolution({ maxOutputTokens: 100, loadedContextWindow: 16_384 })).toEqual({
+      maxOutputTokens: 100, estimated: false, reason: 'provided'
+    })
+  })
+
+  it.each(['', 0, -1, null, undefined, NaN])('does not invent a window from %s', loadedContextWindow => {
+    expect(resolvePresetMaxOutputTokenResolution({ contextWindow: '', loadedContextWindow }).maxOutputTokens).toBe(DEFAULT_MODEL_MAX_OUTPUT_TOKENS)
+  })
   it('keeps provider output caps that leave room inside the context window', () => {
     const result = resolvePresetMaxOutputTokenResolution({
       maxOutputTokens: 128_000,

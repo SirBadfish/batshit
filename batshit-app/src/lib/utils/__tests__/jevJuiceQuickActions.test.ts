@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   DEFAULT_QUICK_ACTION_WAKE_WORD,
   QUICK_ACTION_IDS,
+  QUICK_ACTION_MARK_DETAIL_TEXT,
   QUICK_ACTIONS,
   isSwallowedQuickActionTurn,
   normalizeQuickActionWakeWord,
@@ -16,6 +17,7 @@ import {
   quickActionRoutingText,
   quickActionSettingsTabTarget,
   quickActionTellLine,
+  quickActionToastText,
   readQuickActionMark,
   readQuickActionVerdict,
   resolveJevQuickActionsEnabled
@@ -105,8 +107,12 @@ describe('readQuickActionMark / readQuickActionVerdict', () => {
 describe('the words', () => {
   const mark = { id: 'open_goon_dock' as const, tab: null, confidence: 0.984, onlyThis: true, snapshotId: null, at: '' }
 
-  it('says what Batshit did, by Jev, with a rounded percent that says "confidence"', () => {
-    expect(quickActionMarkText(mark)).toBe('Quick action by Jev: opened the Goon Dock (98% confidence)')
+  it('says what Batshit did, by the judge (the mark keeps no judge), with a rounded percent that says "confidence"', () => {
+    expect(quickActionMarkText(mark)).toBe('Quick action by the judge: opened the Goon Dock (98% confidence)')
+    expect(quickActionToastText(mark)).toBe('Quick action by the judge: opened the Goon Dock')
+    expect(QUICK_ACTION_MARK_DETAIL_TEXT).toBe(
+      'The judge read what you said and Batshit acted on it without your agent. The judge can be wrong; every quick action is one click to undo.'
+    )
     expect(quickActionDidText({ id: 'open_settings', tab: 'voice' })).toBe('opened Settings (Voice)')
     expect(quickActionDidText({ id: 'open_settings', tab: 'goons' })).toBe('opened Settings (3D Goons)')
     expect(quickActionDidText({ id: 'open_settings', tab: null })).toBe('opened Settings')
@@ -116,10 +122,10 @@ describe('the words', () => {
 
   it('tells the agent in one line, quoting what was said, and says it was not the agent', () => {
     expect(quickActionTellLine(mark, '  open   the dock ')).toBe(
-      'The user said "open the dock" and Batshit opened the Goon Dock for them (a quick action by Jev, not you); that turn never reached you.'
+      "The user said \"open the dock\" and Batshit opened the Goon Dock for them (a quick action by Batshit's judgment model, not you); that turn never reached you."
     )
     expect(quickActionTellLine({ ...mark, onlyThis: false }, 'open the dock and tell me a joke')).toBe(
-      'In this message the user also asked Batshit to act, and Batshit opened the Goon Dock (a quick action by Jev, not you) before you read it.'
+      "In this message the user also asked Batshit to act, and Batshit opened the Goon Dock (a quick action by Batshit's judgment model, not you) before you read it."
     )
     expect(quickActionTellLine(mark, 'x'.repeat(400))).toContain(`"${'x'.repeat(160)}"`)
   })

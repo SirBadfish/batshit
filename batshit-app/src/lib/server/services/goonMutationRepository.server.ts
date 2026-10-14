@@ -1,6 +1,10 @@
 import { GOON_RECIPE_OWNER_V2_CONTRACT } from '$lib/goons/recipe'
 import { RECIPE_MANAGED_GOON_FIELDS } from '$lib/goons/recipe/recipeManagedGoonFields'
 import type { GoonRecord } from '$lib/types/goons'
+import {
+  collectGoonGuardedReferences,
+  CUSTOM_GOON_UPLOAD_GUARD_LUA
+} from './goonCustomAssetOwnership.server'
 
 export { RECIPE_MANAGED_GOON_FIELDS }
 
@@ -16,6 +20,8 @@ export type GoonMutationErrorCode =
   | 'RESERVED_FIELD'
   | 'RECIPE_MANAGED_FIELD'
   | 'ATOMIC_UPDATE_UNAVAILABLE'
+  | 'ALREADY_EXISTS'
+  | 'ASSET_UNAVAILABLE'
   | 'CORRUPT_RESULT'
 
 export class GoonMutationError extends Error {
@@ -30,6 +36,7 @@ export class GoonMutationError extends Error {
 }
 
 const GENERIC_GOON_PATCH_SCRIPT = `
+${CUSTOM_GOON_UPLOAD_GUARD_LUA}
 local raw = redis.call('JSON.GET', KEYS[1])
 if not raw then
   return 'NOT_FOUND'
@@ -41,7 +48,7 @@ end
 local identityFields = { 'id', 'user_id', 'created_at', 'updated_at' }
 local recipe = current['recipe']
 local recipeManaged = recipe and recipe['contract'] == '${GOON_RECIPE_OWNER_V2_CONTRACT}'
-for index = 3, #ARGV, 2 do
+for index = 3, #ARGV - 1, 2 do
   local field = ARGV[index]
   if not string.match(field, '^[A-Za-z][A-Za-z0-9_]*$') then
     return 'RESERVED_FIELD'
@@ -59,10 +66,29 @@ for index = 3, #ARGV, 2 do
       return 'RECIPE_MANAGED_FIELD'
     end
   end
+end
+if not customGoonUploadsAvailable(ARGV[#ARGV]) then
+  return 'ASSET_UNAVAILABLE'
+end
+for index = 3, #ARGV - 1, 2 do
+  local field = ARGV[index]
   redis.call('JSON.SET', KEYS[1], '$.' .. field, ARGV[index + 1])
 end
 redis.call('JSON.SET', KEYS[1], '$.updated_at', ARGV[2])
 return redis.call('JSON.GET', KEYS[1])
+`
+
+const CREATE_GOON_SCRIPT = `
+${CUSTOM_GOON_UPLOAD_GUARD_LUA}
+if redis.call('EXISTS', KEYS[1]) == 1 then
+  return 'ALREADY_EXISTS'
+end
+if not customGoonUploadsAvailable(ARGV[3]) then
+  return 'ASSET_UNAVAILABLE'
+end
+redis.call('JSON.SET', KEYS[1], '$', ARGV[1])
+redis.call('SADD', KEYS[2], ARGV[2])
+return 'CREATED'
 `
 
 function hasOwn(value: Record<string, unknown>, field: string) {
@@ -93,6 +119,16 @@ export function assertGenericGoonPatchAllowed(
 }
 
 function throwMutationFailure(code: string): never {
+  if (code === 'ALREADY_EXISTS') {
+    throw new GoonMutationError('ALREADY_EXISTS', 'A Goon with this id already exists.', 409)
+  }
+  if (code === 'ASSET_UNAVAILABLE') {
+    throw new GoonMutationError(
+      'ASSET_UNAVAILABLE',
+      'A custom Goon asset is unavailable or being deleted. Reload before retrying.',
+      409
+    )
+  }
   if (code === 'NOT_FOUND') {
     throw new GoonMutationError('NOT_FOUND', 'Goon not found.', 404)
   }
@@ -150,7 +186,8 @@ export async function patchOwnedGoonForClient(input: {
     arguments: [
       input.userId,
       JSON.stringify(input.updatedAt),
-      ...updateArguments
+      ...updateArguments,
+      JSON.stringify(await collectGoonGuardedReferences(input.updates, input.userId))
     ]
   })
   const serialized = String(result)
@@ -164,4 +201,31 @@ export async function patchOwnedGoonForClient(input: {
     )
   }
   return stored
+}
+
+export async function createOwnedGoonForClient(input: {
+  client: any
+  userId: string
+  goon: GoonRecord
+}): Promise<GoonRecord> {
+  if (input.goon.user_id !== input.userId || !input.goon.id) {
+    throw new GoonMutationError('CORRUPT_RESULT', 'Goon creation received a mismatched owner or id.', 500)
+  }
+  if (typeof input.client.eval !== 'function') {
+    throw new GoonMutationError(
+      'ATOMIC_UPDATE_UNAVAILABLE',
+      'Redis EVAL is unavailable; the Goon cannot be created safely.',
+      500
+    )
+  }
+  const result = await input.client.eval(CREATE_GOON_SCRIPT, {
+    keys: [`goon:${input.goon.id}`, `user:${input.userId}:goons`],
+    arguments: [
+      JSON.stringify(input.goon),
+      input.goon.id,
+      JSON.stringify(await collectGoonGuardedReferences(input.goon, input.userId))
+    ]
+  })
+  if (result !== 'CREATED') throwMutationFailure(String(result))
+  return input.goon
 }

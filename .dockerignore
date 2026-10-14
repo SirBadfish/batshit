@@ -26,6 +26,7 @@ pids/
 
 batshit-app/.svelte-kit/
 batshit-app/build/
+batshit-app/scripts/anchored-project-reader
 batshit-app/.vercel/
 # Derived brand icon output is regenerated inside batshit-app/Dockerfile.
 batshit-app/static/ai-branding-generated/

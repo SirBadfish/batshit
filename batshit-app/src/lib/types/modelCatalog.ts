@@ -1,14 +1,58 @@
 import type { ModelPurpose, ModelTransport } from '$lib/types/savedModels'
 
+/** Published model properties, never an account's effective inference budget. */
+export interface PublishedModelMetadata {
+  modelId: string
+  sourceUrl: string
+  verifiedAt: string
+  contextWindow: number
+  maxOutputTokens: number
+  inputModalities: Array<'text' | 'image'>
+  outputModalities: Array<'text'>
+}
+
 export type CatalogModelTransport = ModelTransport | 'local'
 
 export type CatalogModelVariantSource = 'vercel' | 'openrouter' | 'manual' | 'direct'
+
+/**
+ * BL-68: a connection's own limits, when they may differ from the merged row's.
+ * `null` means this connection's limit is unknown. It is never a reason to
+ * borrow the row's number, which may come from another connection.
+ */
+export interface CatalogConnectionLimits {
+  contextWindow: number | null
+  maxOutputTokens: number | null
+}
 
 export interface CatalogModelIdVariant {
   developerId: string
   modelId: string
   effectiveId: string
   source: CatalogModelVariantSource
+  /**
+   * BL-68 / BL-132: this connection's own limits, when they differ from the
+   * row's. Always present for a connection that joined the row through a
+   * reviewed identity rule (Anthropic's direct API runs Sonnet 4.5 at 200,000
+   * tokens while the gateway row lists 1,000,000); present for any other
+   * connection whose own source listed a different limit (DeepInfra serving a
+   * model at a smaller window than the gateway). A preset for this connection
+   * takes these limits instead of the row's.
+   */
+  limits?: CatalogConnectionLimits
+  /**
+   * BL-132: this connection's own price (dollars per million tokens), present
+   * when its source listed one that differs from the row's. A preset for this
+   * connection takes it instead of the row's price.
+   */
+  pricing?: CatalogConnectionPricing
+}
+
+/** BL-132: a connection's own listed price; a missing field is unknown. */
+export interface CatalogConnectionPricing {
+  input?: number
+  output?: number
+  cachedInput?: number
 }
 
 export interface CatalogModel {
@@ -24,6 +68,7 @@ export interface CatalogModel {
   pricing?: any
   contextWindow?: number
   maxOutputTokens?: number
+  publishedMetadata?: PublishedModelMetadata
   category?: string
   purpose?: ModelPurpose
   idVariants?: Record<string, CatalogModelIdVariant>
@@ -42,6 +87,13 @@ export interface CatalogModel {
    * it is not — never quietly falling back to the ceiling.
    */
   localContext?: LocalContextReading | null
+  /**
+   * BL-104: the local program answers EVERY request with this row's model,
+   * whatever model id the request names. KoboldCpp does (outside router mode):
+   * a preset saved for another model still runs, on this one. Set only when the
+   * program says so; absent everywhere else.
+   */
+  servesEveryRequest?: boolean
   /**
    * SA-102 P4 (DL-102-11): the model format as the program reports it
    * (`mlx`, `gguf`, or anything else). Open-ended text, never a two-value enum:

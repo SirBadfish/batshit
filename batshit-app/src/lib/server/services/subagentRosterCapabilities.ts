@@ -72,8 +72,18 @@ function formatToolFamilies(input: SubagentRosterCapabilityInput): string {
   const native = input.scope.nativeToolSettings
   const families: string[] = []
 
-  if (native.bashEnabled) families.push('Bash')
-  if (native.webSearchEnabled) families.push('Web Search')
+  if (input.scope.subagentType === 'cli') {
+    // BL-878 (Josh, 2026-09-28): a CLI Subagent runs commands and searches with the CLI's own
+    // built-in tools. Its Bash and Web Search switches are off and greyed out on screen, and
+    // Batshit gives its runs neither (`CLI_LANE_GETS_BATSHIT_BASH`; Batshit's Web Search is not
+    // offered to the CLI lane), yet the shared resolver turns an absent value on, so printing
+    // "Bash" or "Web Search" from those toggles told the primary a CLI Subagent had tools that
+    // its own settings do not govern. Say what it does have. Its Batshit tools follow below.
+    families.push('built-in CLI tools')
+  } else {
+    if (native.bashEnabled) families.push('Bash')
+    if (native.webSearchEnabled) families.push('Web Search')
+  }
 
   if (native.dynamicMcpEnabled) {
     const gateways = input.scope.resolvedGateways

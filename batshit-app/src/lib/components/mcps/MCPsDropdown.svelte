@@ -28,7 +28,13 @@ import {
 	normalizeCliToolGridSettings
 } from '$lib/utils/toolGridCli'
 import { getToolGridDefaultAutoZip, getToolGridDefaultNumber } from '$lib/utils/toolGridZipDefaults'
-import { getCurrentAgentId, getAgents, updateAgentSettings } from '$lib/stores/agents.svelte'
+import {
+	getCurrentAgentId,
+	getAgents,
+	updateAgentSettings,
+	type AgentSettingsUpdate
+} from '$lib/stores/agents.svelte'
+import { diffAgentBlock, sameJsonValue } from '$lib/utils/agentBlockFieldSettings'
 import { getUserSettings } from '$lib/stores/userSettings.svelte'
 import { isCliPrimaryAgentType, normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
 import {
@@ -126,7 +132,6 @@ function normalizeCliToolSelections(value: unknown): string[] {
 }
 
 const ZIP_AUTO_INHERIT = '__inherit__'
-const ZIP_PERMISSION_INHERIT = '__inherit__'
 const ZIP_LAYOUT_INHERIT = '__inherit__'
 
 interface CustomToolZipFormEntry {
@@ -215,6 +220,7 @@ function extractAgentDcmDisplaySettings(agent: any): AgentDcmDisplaySettings {
 function isHiddenInternalTool(toolId: string): boolean {
 	const normalized = toolId?.toLowerCase?.() ?? ''
 	if (!normalized) return false
+	// Saved gateway lists may still carry the retired file-server Fetch Zip name.
 	return (
 		normalized.startsWith('mcp_fabric_') ||
 		normalized.startsWith('batshit_server_dynamic_mcp_') ||
@@ -270,7 +276,6 @@ let saveResetTimer: ReturnType<typeof setTimeout> | null = null
 let mcpLastSaved = $state<Date | null>(null)
 let mcpRenderNonce = $state(0)
 
-let zipAgentControlEnabled = $state(ZIP_PERMISSION_INHERIT)
 let zipAiViewMode = $state(ZIP_LAYOUT_INHERIT)
 let customToolZipOverrides = $state<CustomToolZipFormEntry[]>([])
 let nonMcpZipOverrides = $state<Record<NonMcpZipRowId, CustomToolZipFormEntry>>(
@@ -506,12 +511,6 @@ function isMcpToolDiscoverable(gatewayId: string, groupName: string, toolName: s
 	return resolveEffectiveToolMode(gatewayId, groupName, toolName) !== 'hidden'
 }
 
-function toZipPermissionValue(value: boolean | null | undefined): string {
-	if (value === true) return 'enabled'
-	if (value === false) return 'disabled'
-	return ZIP_PERMISSION_INHERIT
-}
-
 function toZipLayoutValue(value: unknown): string {
 	return value === 'inline' || value === 'appended' ? value : ZIP_LAYOUT_INHERIT
 }
@@ -733,7 +732,7 @@ function parseOptionalNumber(value: string): number | undefined {
 	return parsed
 }
 
-function toZipPayloadCustomTools(): Array<{
+function toZipPayloadCustomTools(source: CustomToolZipFormEntry[]): Array<{
 	tool_name: string
 	buffer_size?: number
 	zip_threshold?: number
@@ -746,7 +745,7 @@ function toZipPayloadCustomTools(): Array<{
 		auto_zip?: boolean
 	}> = []
 
-	for (const tool of customToolZipOverrides) {
+	for (const tool of source) {
 		const toolName = tool.tool_name.trim()
 		if (!toolName) continue
 		const buffer = parseOptionalNumber(tool.buffer_size)
@@ -765,24 +764,118 @@ function toZipPayloadCustomTools(): Array<{
 	return next.sort((left, right) => left.tool_name.localeCompare(right.tool_name))
 }
 
-async function persistMcpSettings(reason: string) {
-	if (!currentAgent?.id || !persistReady) return
+/**
+ * BL-855: what each save surface last knew of the agent's saved values. Both are set when the
+ * surface hydrates from the agent, and the hydration re-runs whenever a save changes what the
+ * surface reads (the store takes a save at once and gives it back if it fails), so a failed save
+ * leaves the baseline as it was. The MCP baseline is also set after each save of it succeeds
+ * (`mcpSaveEpoch` counts the saves and hydrations, the newest wins): a CLI tool list saved in
+ * another order reads the same to the hydration, and would otherwise be sent again by the next save.
+ * A save sends only the fields that differ from its baseline, so a surface holding an older copy
+ * than the record (another window saved since) never takes back a gateway, tool, display, or zip
+ * choice it did not change. Plain variables on purpose: no effect reads them.
+ */
+type McpSavedValues = {
+	gateways: string[]
+	cliTools: string[] | null
+	/** The Tool Grid display settings as the surface reads them; null while only the older `dcm_display_settings` name holds them. */
+	dcm: AgentDcmDisplaySettings | null
+}
 
+let mcpSavedValues: McpSavedValues | null = null
+let mcpSaveEpoch = 0
+let zipSavedFields: Record<string, unknown> | null = null
+
+function readMcpSavedValues(agent: any): McpSavedValues {
+	const holdsCliTools = Array.isArray(agent?.defaultTools) || Array.isArray(agent?.default_tools)
+	// An agent that holds its display settings only under the older name has no `dcmDisplaySettings`
+	// yet: its first save writes the whole block, so the older name's entries are not dropped.
+	const holdsOnlyOlderDcmName = agent?.dcmDisplaySettings == null && agent?.dcm_display_settings != null
+	return {
+		gateways: normalizeGatewaySelection(agent?.defaultMCPGateways),
+		cliTools: holdsCliTools ? normalizeCliToolSelections(agent?.defaultTools ?? agent?.default_tools) : null,
+		dcm: holdsOnlyOlderDcmName ? null : cloneDcmDisplaySettings(extractAgentDcmDisplaySettings(agent))
+	}
+}
+
+/**
+ * The zip fields a save writes, from the values a surface holds (`null` is a real value: inherit).
+ * SA-129 DL-06 (BL-1484): never the parked zip control permission; no Settings surface reads or
+ * writes its hidden experiment key.
+ */
+function buildZipSaveFields(source: {
+	layout: string
+	customTools: CustomToolZipFormEntry[]
+	nonMcp: Record<NonMcpZipRowId, CustomToolZipFormEntry>
+}): Record<string, unknown> {
+	const fields: Record<string, unknown> = {
+		zip_ai_view_mode: source.layout === 'inline' || source.layout === 'appended' ? source.layout : null,
+		custom_tool_settings: toZipPayloadCustomTools(source.customTools)
+	}
+	for (const row of NON_MCP_ZIP_ROW_ORDER) {
+		const config = NON_MCP_ZIP_ROW_CONFIG[row.id]
+		if (config.mode === 'custom') continue
+		const local = source.nonMcp[row.id] ?? createInheritedNonMcpZipOverrides()[row.id]
+		const buffer = parseOptionalNumber(local.buffer_size)
+		const threshold = parseOptionalNumber(local.zip_threshold)
+		const autoZip =
+			local.auto_zip === 'enabled'
+				? true
+				: local.auto_zip === 'disabled'
+					? false
+					: null
+		fields[config.bufferField] = buffer ?? null
+		fields[config.thresholdField] = threshold ?? null
+		fields[config.autoField] = autoZip
+	}
+	return fields
+}
+
+/** The gateways a user toggled on and off in one change (the card names the whole list; the toggles are its difference). */
+type GatewayToggles = { on: string[]; off: string[] }
+
+/** The saved list with the user's own toggles laid over it: a gateway switched off leaves it, one switched on joins it. */
+function applyGatewayToggles(saved: string[], toggles: GatewayToggles): string[] {
+	const kept = saved.filter((id) => !toggles.off.includes(id))
+	return [...kept, ...toggles.on.filter((id) => !kept.includes(id))]
+}
+
+/**
+ * `gatewayToggles` is set only by a change the user made to the gateway list; only then does the
+ * save name `defaultMCPGateways`, and then it is the SAVED list (what the agent held when this
+ * surface read it, disabled gateways the menu does not show included) with those toggles laid over
+ * it, never the list the menu displays (`selectedGateways`, trimmed to the gateways it could load).
+ */
+async function persistMcpSettings(reason: string, gatewayToggles?: GatewayToggles) {
+	const saved = mcpSavedValues
+	if (!currentAgent?.id || !persistReady || !saved) return
+
+	const nextGateways = gatewayToggles ? applyGatewayToggles(saved.gateways, gatewayToggles) : saved.gateways
+	const nextCliTools = selectedCliToolIdsExplicit ? [...selectedCliToolIds] : null
+	const nextDcmDisplaySettings = cloneDcmDisplaySettings(normalizedDcmDisplaySettings)
+
+	// BL-855: only what changed since the values this surface last knew. The lists go whole (each is
+	// one value), the display settings entry by entry; a save of one never carries the others.
+	const update: AgentSettingsUpdate = {}
+	if (!sameJsonValue(saved.gateways, nextGateways)) update.defaultMCPGateways = nextGateways
+	if (!sameJsonValue(saved.cliTools, nextCliTools)) update.defaultTools = nextCliTools
+	const dcmChange = diffAgentBlock('dcmDisplaySettings', saved.dcm, nextDcmDisplaySettings)
+	if (dcmChange !== undefined) update.dcmDisplaySettings = dcmChange
+	if (Object.keys(update).length === 0) return
+
+	const saveEpoch = ++mcpSaveEpoch
 	saveStatus = 'saving'
 	saveError = null
 	clearSaveResetTimer()
 
-		try {
-			const nextGateways = Array.from(selectedGateways)
-			const nextDcmDisplaySettings = cloneDcmDisplaySettings(normalizedDcmDisplaySettings)
-				await updateAgentSettings(currentAgent.id, {
-					defaultMCPGateways: nextGateways,
-					dcmDisplaySettings: nextDcmDisplaySettings,
-					defaultTools: selectedCliToolIdsExplicit ? [...selectedCliToolIds] : null
-				})
-				saveStatus = 'saved'
-			mcpLastSaved = new Date()
-			scheduleSaveReset()
+	try {
+		await updateAgentSettings(currentAgent.id, update)
+		if (saveEpoch === mcpSaveEpoch) {
+			mcpSavedValues = { gateways: nextGateways, cliTools: nextCliTools, dcm: nextDcmDisplaySettings }
+		}
+		saveStatus = 'saved'
+		mcpLastSaved = new Date()
+		scheduleSaveReset()
 	} catch (saveFailure) {
 		const message = saveFailure instanceof Error ? saveFailure.message : 'Failed to save MCP settings'
 		saveStatus = 'error'
@@ -793,48 +886,29 @@ async function persistMcpSettings(reason: string) {
 }
 
 async function persistZipSettings(reason: string) {
-	if (!currentAgent?.id || !persistReady) return
+	const saved = zipSavedFields
+	if (!currentAgent?.id || !persistReady || !saved) return
+
+	const next = buildZipSaveFields({
+		layout: zipAiViewMode,
+		customTools: customToolZipOverrides,
+		nonMcp: nonMcpZipOverrides
+	})
+	// BL-855: only the zip fields that changed since the values this surface last knew, a
+	// `custom_tool_settings` whole (it is one list) and only when a custom tool row changed.
+	const update: Record<string, unknown> = {}
+	for (const [field, value] of Object.entries(next)) {
+		if (!sameJsonValue(saved[field], value)) update[field] = value
+	}
+	if (Object.keys(update).length === 0) return
 
 	zipSaveState = 'saving'
 	zipSaveError = null
 	clearZipSaveResetTimer()
 
 	try {
-		const zipPermission =
-			zipAgentControlEnabled === 'enabled'
-				? true
-				: zipAgentControlEnabled === 'disabled'
-					? false
-					: null
-		const zipLayout =
-			zipAiViewMode === 'inline' || zipAiViewMode === 'appended' ? zipAiViewMode : null
-		const customToolPayload = toZipPayloadCustomTools()
-			const nonMcpPayload: Record<string, number | boolean | null> = {}
-			for (const row of NON_MCP_ZIP_ROW_ORDER) {
-				const config = NON_MCP_ZIP_ROW_CONFIG[row.id]
-				if (config.mode === 'custom') continue
-				const local = nonMcpZipOverrides[row.id] ?? createInheritedNonMcpZipOverrides()[row.id]
-				const buffer = parseOptionalNumber(local.buffer_size)
-				const threshold = parseOptionalNumber(local.zip_threshold)
-			const autoZip =
-				local.auto_zip === 'enabled'
-					? true
-					: local.auto_zip === 'disabled'
-						? false
-						: null
-			nonMcpPayload[config.bufferField] = buffer ?? null
-			nonMcpPayload[config.thresholdField] = threshold ?? null
-			nonMcpPayload[config.autoField] = autoZip
-		}
-
-			await updateAgentSettings(currentAgent.id, {
-				zip_agent_control_enabled: zipPermission,
-			zip_ai_view_mode: zipLayout,
-			custom_tool_settings: customToolPayload,
-				...nonMcpPayload
-			})
-
-			zipSaveState = 'saved'
+		await updateAgentSettings(currentAgent.id, update as AgentSettingsUpdate)
+		zipSaveState = 'saved'
 		zipLastSaved = new Date()
 		scheduleZipSaveReset()
 	} catch (saveFailure) {
@@ -856,10 +930,16 @@ function queuePersistZipSettings(reason: string) {
 }
 
 function handleMcpGatewaysChange(gateways: string[]) {
+	// What the user toggled is the difference from the list the menu showed a moment ago.
+	const shown = selectedGateways
+	const toggles: GatewayToggles = {
+		on: gateways.filter((id) => !shown.has(id)),
+		off: Array.from(shown).filter((id) => !gateways.includes(id))
+	}
 	selectedGateways = new Set(gateways)
 	onMCPsChange(gateways)
 	onToolSelectionsChange(normalizeToolSelections(currentAgent?.defaultMCPToolSelections))
-	void persistMcpSettings('tool-grid-gateway-change')
+	void persistMcpSettings('tool-grid-gateway-change', toggles)
 }
 
 function handleMcpDcmDisplaySettingsChange(settings: AgentDcmDisplaySettings) {
@@ -908,18 +988,12 @@ function handleMcpToolZipOverrideChange(
 	queuePersistZipSettings('tool-grid-tool-zip-change')
 }
 
-function handleZipAgentControlChange(value: string) {
-	zipAgentControlEnabled = value || ZIP_PERMISSION_INHERIT
-	queuePersistZipSettings('tool-grid-zip-permission')
-}
-
 function handleZipAiViewModeChange(value: string) {
 	zipAiViewMode = value || ZIP_LAYOUT_INHERIT
 	queuePersistZipSettings('tool-grid-zip-layout')
 }
 
 function handleResetZipOverrides() {
-	zipAgentControlEnabled = ZIP_PERMISSION_INHERIT
 	zipAiViewMode = ZIP_LAYOUT_INHERIT
 	customToolZipOverrides = []
 	nonMcpZipOverrides = createInheritedNonMcpZipOverrides()
@@ -927,15 +1001,19 @@ function handleResetZipOverrides() {
 }
 
 function handleClearDefaults() {
+	const shownGateways = Array.from(selectedGateways)
 	selectedGateways = new Set()
 	dcmDisplaySettings = createDefaultDcmDisplaySettings()
-	zipAgentControlEnabled = ZIP_PERMISSION_INHERIT
 	zipAiViewMode = ZIP_LAYOUT_INHERIT
 	customToolZipOverrides = []
 	nonMcpZipOverrides = createInheritedNonMcpZipOverrides()
 	onMCPsChange([])
 	onToolSelectionsChange(normalizeToolSelections(currentAgent?.defaultMCPToolSelections))
-	void persistMcpSettings('tool-grid-clear-defaults')
+	// Clearing the defaults clears the whole saved gateway list, the gateways the menu does not show too.
+	void persistMcpSettings('tool-grid-clear-defaults', {
+		on: [],
+		off: [...(mcpSavedValues?.gateways ?? []), ...shownGateways]
+	})
 	queuePersistZipSettings('tool-grid-clear-defaults')
 }
 
@@ -977,7 +1055,6 @@ $effect(() => {
 			: null
 	)
 	const currentZipSignature = JSON.stringify({
-		zip_agent_control_enabled: toZipPermissionValue(currentAgent?.zip_agent_control_enabled),
 		zip_ai_view_mode: toZipLayoutValue(currentAgent?.zip_ai_view_mode),
 		custom_tool_settings: normalizeCustomToolZipOverrides(currentAgent?.custom_tool_settings),
 		non_mcp_rows: normalizeNonMcpZipOverrides(currentAgent as Record<string, any>)
@@ -1007,10 +1084,19 @@ $effect(() => {
 			currentAgent?.defaultTools ?? (currentAgent as any)?.default_tools
 		)
 		dcmDisplaySettings = cloneDcmDisplaySettings(extractAgentDcmDisplaySettings(currentAgent))
-			zipAgentControlEnabled = toZipPermissionValue(currentAgent?.zip_agent_control_enabled)
 			zipAiViewMode = toZipLayoutValue(currentAgent?.zip_ai_view_mode)
 			customToolZipOverrides = normalizeCustomToolZipOverrides(currentAgent?.custom_tool_settings)
 			nonMcpZipOverrides = normalizeNonMcpZipOverrides(currentAgent as Record<string, any>)
+			// BL-855: the baselines the two saves diff against: the agent as this surface just read it.
+			mcpSaveEpoch += 1
+			mcpSavedValues = currentAgent ? readMcpSavedValues(currentAgent) : null
+			zipSavedFields = currentAgent
+				? buildZipSaveFields({
+						layout: toZipLayoutValue(currentAgent.zip_ai_view_mode),
+						customTools: normalizeCustomToolZipOverrides(currentAgent.custom_tool_settings),
+						nonMcp: normalizeNonMcpZipOverrides(currentAgent as Record<string, any>)
+					})
+				: null
 			mcpRenderNonce += 1
 		clearSaveResetTimer()
 		clearZipSaveResetTimer()
@@ -1061,10 +1147,15 @@ async function fetchGateways() {
 	} catch (loadError) {
 		error = loadError instanceof Error ? loadError.message : 'Failed to load gateways'
 		console.error('[MCPsDropdown] Error loading gateways:', loadError)
+		// A list that did not load says nothing about which gateways exist: the saved selection
+		// stays as shown, and the error state shows.
+		return
 	} finally {
 		loading = false
 	}
 
+	// What the menu shows is trimmed to the gateways it could load. Display only: a save names the
+	// saved list with the user's own toggles (`persistMcpSettings`), never this trimmed list.
 	const validIds = new Set(
 		gateways.filter((gateway) => gateway.type !== 'n8n-mcp-client').map((gateway) => gateway.id)
 	)
@@ -1257,12 +1348,10 @@ let contextBadgeTitle = $derived(totalToolsSelected > 0 ? `${totalToolsSelected}
 						compactDropdownMode={true}
 						defaultOpen={true}
 						cardCollapsible={false}
-						zipAgentControlEnabled={zipAgentControlEnabled}
 						zipAiViewMode={zipAiViewMode}
 						nonMcpZipRows={NON_MCP_ZIP_ROW_ORDER}
 						getNonMcpZipOverride={getNonMcpZipOverrideById}
 						onNonMcpZipOverrideChange={handleNonMcpZipOverrideChangeById}
-						onZipAgentControlChange={handleZipAgentControlChange}
 						onZipAiViewModeChange={handleZipAiViewModeChange}
 						zipSaveState={zipSaveState}
 						zipSaveError={zipSaveError}

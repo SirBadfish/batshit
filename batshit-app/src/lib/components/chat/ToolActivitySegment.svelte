@@ -3,6 +3,7 @@
   import CoolToolRenderer from '$lib/components/renderers/tools/CoolToolRenderer.svelte'
   import ZipbatshitWrapper from '$lib/components/renderers/wrappers/ZipbatshitWrapper.svelte'
   import { normalizeId } from '$lib/utils/idNormalizer'
+  import type { ToolResultSizeGuard } from '$lib/utils/toolResultSizeGuard'
   import {
     estimateCoolToolAiTokens,
     parseCoolToolPayload
@@ -69,6 +70,10 @@
       autoZip?: boolean
       agentControlled?: boolean
       inferredControlled?: boolean
+      holdLabel?: string | null
+      deadCopyReason?: 'superseded' | 'stale' | null
+      heldDeadCopy?: boolean
+      sizeGuard?: ToolResultSizeGuard
       manualZip?: boolean
     }
     shouldShowAsZip: (segment: any, segmentIndex: number) => boolean
@@ -152,6 +157,11 @@
   let agentControlled = $derived(Boolean(zipState.agentControlled))
   let inferredControlled = $derived(Boolean(zipState.inferredControlled))
   let manualZip = $derived(Boolean(zipState.manualZip))
+  let holdLabel = $derived(zipState.holdLabel ?? null)
+  let deadCopyReason = $derived(zipState.deadCopyReason ?? null)
+  // SA-129 P2b (BL-358): a hold that is not the user's on a dead copy still offers Release.
+  let heldDeadCopy = $derived(Boolean(zipState.heldDeadCopy))
+  let sizeGuard = $derived(zipState.sizeGuard ?? null)
 </script>
 
 <ZipbatshitWrapper
@@ -166,6 +176,10 @@
   autoZip={autoZip}
   {agentControlled}
   {inferredControlled}
+  {holdLabel}
+  {deadCopyReason}
+  {heldDeadCopy}
+  {sizeGuard}
   {manualZip}
   onToggleUnzip={(permanent: boolean) =>
     handleUnzip(

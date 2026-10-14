@@ -6,6 +6,7 @@ const router = express.Router();
 
 router.use('/task', taskRoutes);
 router.use('/backup-restore', backupRestoreStagingRoutes);
+router.use('/local-ai-managed-profiles', require('./local-ai-managed-profiles'));
 
 // API information
 router.get('/', (req, res) => {

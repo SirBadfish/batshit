@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 import {
   analyzeApprovalState,
   ANSWERED_APPROVAL_IDS_KEY,
+  approvalCardTimeoutSeconds,
+  buildToolApprovalTimeoutAddendum,
   buildApprovalHistoryMessages,
   buildControlApprovalEntry,
   findAnsweredApprovalIds,
@@ -161,6 +163,37 @@ describe('analyzeApprovalState — the three-minute sweep', () => {
     )
 
     expect(snapshot.byId.get('aitxt-1')?.status).toBe('expired')
+  })
+})
+
+describe('analyzeApprovalState — a card with its own clock (BL-496 A5)', () => {
+  const claudeCard = {
+    approvalId: 'claude-card',
+    status: 'pending',
+    requestedAt: REQUESTED_AT,
+    expiresAt: new Date(REQUESTED_AT_MS + 600_000).toISOString(),
+    toolName: 'Bash',
+    source: 'claude'
+  }
+
+  it('keeps a Claude card pending past three minutes, until its own ten are up', () => {
+    const snapshot = analyzeApprovalState(messageWith(claudeCard), FIVE_MINUTES_LATER)
+    expect(snapshot.byId.get('claude-card')?.status).toBe('pending')
+    expect(snapshot.newlyExpired).toEqual([])
+  })
+
+  it('reports the card’s own length when it does expire, not three minutes', () => {
+    const snapshot = analyzeApprovalState(messageWith(claudeCard), REQUESTED_AT_MS + 600_000)
+    expect(snapshot.newlyExpired).toEqual([
+      expect.objectContaining({ approvalId: 'claude-card', timeoutSeconds: 600 })
+    ])
+  })
+
+  it('a card with no clock of its own still reports three minutes', () => {
+    const snapshot = analyzeApprovalState(messageWith(pendingEntry()), FIVE_MINUTES_LATER)
+    expect(snapshot.newlyExpired).toEqual([
+      expect.objectContaining({ approvalId: 'aitxt-1', timeoutSeconds: TOOL_APPROVAL_TIMEOUT_MS / 1000 })
+    ])
   })
 })
 
@@ -493,6 +526,41 @@ describe('the answered-approval record', () => {
       expect(merged.toolApprovals).toBeNull()
       expect(merged[ANSWERED_APPROVAL_IDS_KEY]).toEqual(['aitxt-1'])
     })
+  })
+})
+
+/**
+ * A card may carry its own time limit (`timeoutSeconds`, or its `requestedAt` and `expiresAt`).
+ * The expiry and what the agent is told both use it: the addendum used to say "3 minutes" for
+ * every card (Opie, session C, 2026-09-28).
+ */
+describe('a card’s own time limit', () => {
+  it('expires a card by its own limit and reports that limit', () => {
+    const entry = { approvalId: 'apr-own', toolName: 'bash', status: 'pending', requestedAt: REQUESTED_AT, timeoutSeconds: 600 }
+    expect(analyzeApprovalState(messageWith(entry), FIVE_MINUTES_LATER).newlyExpired).toEqual([])
+    const later = analyzeApprovalState(messageWith(entry), REQUESTED_AT_MS + 11 * 60_000)
+    expect(later.newlyExpired).toMatchObject([{ approvalId: 'apr-own', timeoutSeconds: 600 }])
+    expect(later.byId.get('apr-own')?.timeoutSeconds).toBe(600)
+  })
+
+  it('reads the limit from requestedAt and expiresAt, and falls back to three minutes', () => {
+    expect(approvalCardTimeoutSeconds({ requestedAt: REQUESTED_AT, expiresAt: '2026-09-10T12:01:30.000Z' })).toBe(90)
+    expect(approvalCardTimeoutSeconds({})).toBe(180)
+  })
+
+  it('tells the agent each card’s own wait', () => {
+    const one = buildToolApprovalTimeoutAddendum([{ approvalId: 'a', toolName: 'bash', timeoutSeconds: 600 }])!
+    expect(one).toContain('expired after 10 minutes')
+    expect(one).not.toContain('3 minutes')
+    const mixed = buildToolApprovalTimeoutAddendum([
+      { approvalId: 'a', toolName: 'bash', timeoutSeconds: 600 },
+      { approvalId: 'b', toolName: 'write', timeoutSeconds: 90 }
+    ])!
+    expect(mixed).toContain('expired before they were answered')
+    expect(mixed).toContain('- bash (expired after 10 minutes)')
+    expect(mixed).toContain('- write (expired after 90 seconds)')
+    expect(buildToolApprovalTimeoutAddendum([{ approvalId: 'c' }])).toContain('expired after 3 minutes')
+    expect(buildToolApprovalTimeoutAddendum([])).toBeNull()
   })
 })
 

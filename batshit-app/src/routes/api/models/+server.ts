@@ -27,10 +27,14 @@ import { getN8NCredentialStatuses, type N8NCredentialStatusResult } from '$lib/s
 import { detectCodexCliStatus, type CodexCliStatus } from '$lib/server/services/codexCliStatus'
 import { detectClaudeCliStatus, type ClaudeCliStatus } from '$lib/server/services/claudeCliStatus'
 import { listCustomProviders } from '$lib/server/services/customProviders'
-import type { CustomProviderSummary } from '$lib/types/customProviders'
+import { CUSTOM_PROVIDER_KEY_NOT_USABLE, type CustomProviderSummary } from '$lib/types/customProviders'
 import { listLocalAiServers, resolveLocalAiRuntimeBaseUrl } from '$lib/server/services/localAiServers'
+import { readKoboldCppServing } from '$lib/server/services/localRuntimeContext'
 import type { LocalAiServerSummary } from '$lib/types/localAi'
 import { isManualEntryDirectProvider } from '$lib/utils/modelCatalogConnectionMode'
+import { pausedPlanStatuses, type PausedPlanStatus } from '$lib/server/services/pausedPlans'
+import { chatgptPlanConnectionOptions, chatgptPlanCatalogModels } from '$lib/server/services/chatgptPlanCatalog'
+import { readOllamaModelCapabilities } from '$lib/utils/ollamaModelCapabilities'
 
 const CODEX_PROVIDER_ENABLED = env.BATSHIT_CODEX_PROVIDER_ENABLED !== 'false'
 const CODEX_PROVIDER_ID = 'openai-codex'
@@ -67,13 +71,14 @@ export const GET: RequestHandler = async ({ locals, url }) => {
         codex: CODEX_PROVIDER_ENABLED ? codexStatus : null,
         claude: CLAUDE_PROVIDER_ENABLED ? claudeStatus : null,
         customProviders,
-        localServers
+        localServers,
+        pausedPlans: await pausedPlanStatuses()
       })
       const credentialTypes = gatherCredentialTypes(baseConnectionOptions.map((option) => option.id))
       const n8nStatusResult = await getN8NCredentialStatuses(credentialTypes, {
         userId: locals.user?.id
       })
-      const connectionOptions = applyN8NStatuses(baseConnectionOptions, n8nStatusResult)
+      const connectionOptions = [...applyN8NStatuses(baseConnectionOptions, n8nStatusResult), ...chatgptPlanConnectionOptions(locals.user.id)]
 
       return json({
         data: {
@@ -115,11 +120,11 @@ export const GET: RequestHandler = async ({ locals, url }) => {
     }
 
     // Merge catalogs, preferring Vercel entries when duplicates exist
-    const mergedModels = mergeCatalogs(catalog.models, supplementalModels)
+    const mergedModels = [...mergeCatalogs(catalog.models, supplementalModels), ...await chatgptPlanCatalogModels(locals.user.id)]
 
     const category = url.searchParams.get('category')
     const filteredModels = category ? mergedModels.filter((m) => m.category === category) : mergedModels
-    const defaultModel = filteredModels[0]?.id ?? mergedModels[0]?.id ?? 'anthropic/claude-3-5-sonnet-20241022'
+    const defaultModel = filteredModels[0]?.id ?? mergedModels[0]?.id ?? 'anthropic/claude-sonnet-4-5'
 
     const configuredProviders = providerManager.getConfiguredProviders()
     const providerSummary = configuredProviders.map((provider) => ({
@@ -173,13 +178,14 @@ export const GET: RequestHandler = async ({ locals, url }) => {
       codex: CODEX_PROVIDER_ENABLED ? codexStatus : null,
       claude: CLAUDE_PROVIDER_ENABLED ? claudeStatus : null,
       customProviders,
-      localServers
+      localServers,
+      pausedPlans: await pausedPlanStatuses()
     })
     const credentialTypes = gatherCredentialTypes(baseConnectionOptions.map((option) => option.id))
     const n8nStatusResult = await getN8NCredentialStatuses(credentialTypes, {
       userId: locals.user?.id
     })
-    const connectionOptions = applyN8NStatuses(baseConnectionOptions, n8nStatusResult)
+    const connectionOptions = [...applyN8NStatuses(baseConnectionOptions, n8nStatusResult), ...chatgptPlanConnectionOptions(locals.user.id)]
 
     // Return successful response
     // SECURITY: No API keys in response, only metadata
@@ -693,8 +699,26 @@ async function buildLocalCatalogModels(servers: LocalAiServerSummary[]): Promise
 
       // SA-102 P4: Ollama is the one plain-list runtime that can tell us what a
       // loaded model is actually running with.
-      const ollamaContext =
-        server.id === 'ollama' ? await fetchOllamaContextReadings(server) : null
+      // One native bulk metadata read, independently of model count. Preserve
+      // the configured /v1 discovery IDs; never guess aliases or fan out /show.
+      const [ollamaContext, ollamaCapabilities] = server.id === 'ollama'
+        ? await Promise.all([
+            fetchOllamaContextReadings(server),
+            fetchJsonWithTimeout(`${(resolveLocalAiRuntimeBaseUrl(server.baseUrl) ?? server.baseUrl).replace(/\/+$/, '')}/api/tags`)
+              .then(readOllamaModelCapabilities)
+          ])
+        : [null, null]
+      // BL-101 / SA-124 P4: KoboldCpp reports the size it was started with, and
+      // a model switch can change it. It lists only the model it is serving.
+      // BL-104: it answers EVERY request with that model, whatever the request
+      // names, so that row is marked for the preset editor.
+      const kobold =
+        server.id === 'koboldcpp'
+          ? await readKoboldCppServing(
+              (resolveLocalAiRuntimeBaseUrl(server.baseUrl) ?? server.baseUrl).replace(/\/+$/, ''),
+              modelIds
+            )
+          : null
 
       return modelIds.map((modelId) => {
         const canonicalId = `${server.id}/${modelId}`
@@ -708,7 +732,7 @@ async function buildLocalCatalogModels(servers: LocalAiServerSummary[]): Promise
           displayName,
           description: `${server.label} local model (${modelId})`,
           tags: ['local', server.id],
-          features: { streaming: true },
+          features: { streaming: true, ...ollamaCapabilities?.get(modelId) },
           source: 'local',
           transport: 'local',
           connectionId: `direct:${server.id}`,
@@ -724,7 +748,10 @@ async function buildLocalCatalogModels(servers: LocalAiServerSummary[]): Promise
                 maxContextWindow: null,
                 remainingTtlSeconds: null
               })
-            : null
+            : (kobold?.context ?? null)
+        }
+        if (kobold?.servedModelId === modelId) {
+          entry.servesEveryRequest = true
         }
         return entry
       })
@@ -799,6 +826,8 @@ function buildConnectionOptions(
     claude?: ClaudeCliStatus | null
     customProviders?: CustomProviderSummary[]
     localServers?: LocalAiServerSummary[]
+    /** Plan pause: the server's words for each paused plan on this copy. */
+    pausedPlans?: Record<string, PausedPlanStatus>
   }
 ): CatalogConnectionOption[] {
   const options: CatalogConnectionOption[] = []
@@ -923,15 +952,19 @@ function buildConnectionOptions(
         ? `${providerLabel} requires manual model entry (catalog sync coming later).`
         : `Call ${providerLabel} with your own API key for lowest latency.`)
     const lockedReason = `Add a ${providerLabel} API key under Settings → API Keys.`
+    // Plan pause: a paused plan is locked with its plain words; on a Dev copy
+    // that allows paused plans its description says so.
+    const pausedPlan = extras?.pausedPlans?.[provider]
+    const planLocked = pausedPlan?.paused === true
     addOption({
       id: `direct:${provider}`,
       label: `${providerLabel} (Direct)`,
       transport: 'direct',
       service: provider,
       providers: [provider],
-      description: providerDescription,
-      status: status?.hasKey ? 'ready' : 'locked',
-      lockedReason: status?.hasKey ? undefined : lockedReason,
+      description: pausedPlan ? `${pausedPlan.message} ${providerDescription}` : providerDescription,
+      status: status?.hasKey && !planLocked ? 'ready' : 'locked',
+      lockedReason: planLocked ? pausedPlan.message : status?.hasKey ? undefined : lockedReason,
       n8nStatus: 'unknown',
       n8nDescription: n8nHint,
       requiredN8NCredentials: CONNECTION_CREDENTIAL_MAP[`direct:${provider}`]
@@ -964,7 +997,10 @@ function buildConnectionOptions(
         service: provider.id,
         providers: [provider.id],
         description: 'Custom OpenAI-compatible provider (manual model entry required).',
-        status: 'ready',
+        // Packet 5 finding 1: a provider whose saved key is missing (restored
+        // without secrets) or cannot be read is never registered at run time.
+        status: provider.apiKeyUsable ? 'ready' : 'locked',
+        lockedReason: provider.apiKeyUsable ? undefined : CUSTOM_PROVIDER_KEY_NOT_USABLE,
         n8nStatus: 'locked',
         n8nDescription: 'Custom providers are only available in Batshit direct mode.',
         requiredN8NCredentials: []
@@ -1156,4 +1192,11 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       { status: 500 }
     )
   }
+}
+
+/** Test seam: the local program rows `/api/models` adds to the catalog. */
+export {
+  buildLocalCatalogModels as _buildLocalCatalogModels,
+  mergeCatalogs as _mergeCatalogs,
+  buildConnectionOptions as _buildConnectionOptions
 }

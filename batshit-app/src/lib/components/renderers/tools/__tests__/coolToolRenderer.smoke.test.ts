@@ -1,4 +1,5 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
+import { guardCutNotice } from '$lib/test-utils/guard-cut-notice'
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/svelte'
 import CoolToolRenderer from '../CoolToolRenderer.svelte'
 import { buildHydratedCoolToolStep } from '$lib/components/chat/coolToolHydration'
@@ -686,6 +687,43 @@ const subagentIconAvatarZip = {
 }
 
 describe('CoolToolRenderer (zip-hydrated)', () => {
+  it.each([
+    ['bash', 'bash', { command: 'printf large-output' }, 8_000],
+    ['read_file', 'read_file', { path: '/tmp/large.txt', command: 'cat /tmp/large.txt' }, 8_000],
+    ['batshit_server_fetch_zip', 'fetch_zip', { zipId: 'raw_1', offset: 0 }, 8_000],
+    // BL-677: a saved cut view is 96,000 characters at most.
+    ['bash', 'bash', { command: 'printf large-output' }, 96_000],
+    ['read_file', 'read_file', { path: '/tmp/large.txt', command: 'cat /tmp/large.txt' }, 96_000],
+    ['batshit_server_fetch_zip', 'fetch_zip', { zipId: 'raw_1', offset: 0 }, 96_000]
+  ] as const)('shows a saved %s model cut of %i chars through its final notice', async (toolName, operationKind, toolArgs, textLength) => {
+    const heading = 'Command output\nstdout:\n'
+    const notice = `\n${guardCutNotice(7_900, 'raw_1')}`
+    const cutText = heading + 'x'.repeat(textLength - heading.length - notice.length) + notice
+    expect(cutText).toHaveLength(textLength)
+    const step = buildHydratedCoolToolStep({
+      type: 'tool', toolName, originalToolName: toolName,
+      operationKind, rendererFamily: 'generic_tool', toolArgs,
+      toolResult: { content: cutText, modelTextOnly: true },
+      metadata: { operationKind, rendererFamily: 'generic_tool' }
+    })
+    expect(step.rendererFamily).toBe('generic_tool')
+
+    const { container } = render(CoolToolRenderer as any, {
+      props: { intermediateStep: step, toolId: `zip_cut_${operationKind}` }
+    })
+    // BL-1347: the card's renderer is a lazy import (toolRendererRegistry); wait for that import to
+    // finish here, so the cold first load of the module is not counted inside the 1000 ms waits below.
+    await vi.dynamicImportSettled()
+    const headerButton = await waitFor(() => {
+      const button = container.querySelector('button[aria-expanded="false"]')
+      expect(button).toBeTruthy()
+      return button!
+    })
+    await fireEvent.click(headerButton)
+    await waitFor(() => expect(container.querySelector('.result-text')?.textContent).toBe(cutText))
+    expect(container.textContent || '').not.toContain('Command completed with no output')
+  })
+
   it('renders normalized payload without errors', () => {
     const { container } = render(CoolToolRenderer as any, {
       props: {
@@ -1138,7 +1176,8 @@ describe('CoolToolRenderer (zip-hydrated)', () => {
     })
 
     const headerButton = await screen.findByRole('button', { name: /list files/i })
-    expect(headerButton.textContent || '').toContain('2 files')
+    // BL-315: a plain `ls` says nothing of an entry's type.
+    expect(headerButton.textContent || '').toContain('2 items')
     await fireEvent.click(headerButton)
     const text = container.textContent || ''
     expect(text).toContain('a.md')
@@ -1146,6 +1185,198 @@ describe('CoolToolRenderer (zip-hydrated)', () => {
     // The directories are the tree the entries hang under, never entries of their own.
     expect(text).not.toContain('/tmp/x:')
     expect(text).not.toContain('/tmp/y:')
+  })
+
+  // BL-8: the listing Claude cut, as `adaptCoolToolsToZipSystem` stores it: its 447 whole lines, of
+  // which the card keeps its first 200, and the cut beside them. The card said `200 files`.
+  it('shows a listing Claude cut as its first entries, and says so', async () => {
+    const files = Array.from({ length: 200 }, (_, index) => {
+      const name = `entry line ${String(index + 1).padStart(4, '0')}`
+      return { path: name, name, type: 'unknown' }
+    })
+    const step = buildHydratedCoolToolStep(
+      storedShellActionPayload({
+        lane: 'list_files',
+        toolName: 'batshit_server_list_files',
+        toolArgs: { innerCommand: 'ls -1 /tmp/tree', path: '/tmp/tree', dirPath: '/tmp/tree' },
+        toolResult: {
+          files,
+          totalFiles: 0,
+          totalDirectories: 0,
+          totalUnknownItems: 200,
+          totalItems: 447,
+          outputCut: { by: 'Claude Code', keptBytes: 29948, totalBytes: 60300 }
+        }
+      })
+    )
+    const { container } = render(CoolToolRenderer as any, {
+      props: { intermediateStep: step, toolId: 'zip_cut_listing_1' }
+    })
+
+    const headerButton = await screen.findByRole('button', { name: /list files/i })
+    expect(headerButton.textContent || '').toContain('first 447 items in tree')
+    await fireEvent.click(headerButton)
+    await waitFor(() => {
+      const text = container.textContent || ''
+      expect(text).toContain('Claude Code cut this output: 29,948 of 60,300 bytes kept.')
+      expect(text).toContain('Showing the first 200 of those 447 entries.')
+    })
+  })
+
+  // BL-166: a listing of more than 200 entries, as the shapers store it: its first 200 rows and
+  // the whole listing's counts. The card counted the 200 rows it had.
+  it('counts a listing of more than 200 entries by the whole listing, and says it shows the first 200', async () => {
+    const files = Array.from({ length: 200 }, (_, index) => {
+      const name = `entry-${String(index + 1).padStart(3, '0')}.md`
+      return { path: name, name, type: 'unknown' }
+    })
+    const step = buildHydratedCoolToolStep(
+      storedShellActionPayload({
+        lane: 'list_files',
+        toolName: 'batshit_server_list_files',
+        toolArgs: { innerCommand: 'ls -p /tmp/tree', path: '/tmp/tree', dirPath: '/tmp/tree' },
+        toolResult: { files, totalFiles: 0, totalDirectories: 100, totalUnknownItems: 250, totalItems: 350 }
+      })
+    )
+    const { container } = render(CoolToolRenderer as any, {
+      props: { intermediateStep: step, toolId: 'zip_long_listing_1' }
+    })
+
+    const headerButton = await screen.findByRole('button', { name: /list files/i })
+    // BL-315: `ls -p` marks only its folders; the other 250 entries are of unknown type.
+    expect(headerButton.textContent || '').toContain('100 folders, 250 items in tree')
+    expect(headerButton.textContent || '').not.toContain('files')
+    await fireEvent.click(headerButton)
+    await waitFor(() => expect(container.textContent || '').toContain('Showing the first 200 of 350 entries.'))
+  })
+
+  it('shows a listing nobody cut exactly as before', async () => {
+    const step = buildHydratedCoolToolStep(
+      storedShellActionPayload({
+        lane: 'list_files',
+        toolName: 'batshit_server_list_files',
+        toolArgs: { innerCommand: 'ls -1 /tmp/tree', path: '/tmp/tree', dirPath: '/tmp/tree' },
+        toolResult: {
+          files: [
+            { path: 'a.md', name: 'a.md', type: 'unknown' },
+            { path: 'b.md', name: 'b.md', type: 'unknown' }
+          ],
+          totalFiles: 0,
+          totalDirectories: 0,
+          totalUnknownItems: 2,
+          totalItems: 2
+        }
+      })
+    )
+    const { container } = render(CoolToolRenderer as any, {
+      props: { intermediateStep: step, toolId: 'zip_uncut_listing_1' }
+    })
+
+    const headerButton = await screen.findByRole('button', { name: /list files/i })
+    // BL-315: a plain `ls` says nothing of an entry's type.
+    expect(headerButton.textContent || '').toContain('2 items in tree')
+    await fireEvent.click(headerButton)
+    await waitFor(() => expect(container.textContent || '').toContain('b.md'))
+    expect(container.textContent || '').not.toContain('cut this output')
+  })
+
+  // BL-315: a plain `ls` of 150 files and 150 folders says nothing of their types, and the card
+  // read "300 files". A listing whose types are known keeps its files and folders.
+  it('calls entries of unknown type items, and keeps files and folders when the types are known', async () => {
+    const unknownRows = Array.from({ length: 200 }, (_, index) => {
+      const name = `entry-${String(index + 1).padStart(3, '0')}`
+      return { path: name, name, type: 'unknown' }
+    })
+    const plain = render(CoolToolRenderer as any, {
+      props: {
+        intermediateStep: buildHydratedCoolToolStep(
+          storedShellActionPayload({
+            lane: 'list_files',
+            toolName: 'batshit_server_list_files',
+            toolArgs: { innerCommand: 'ls /tmp/tree', path: '/tmp/tree', dirPath: '/tmp/tree' },
+            toolResult: { files: unknownRows, totalFiles: 0, totalDirectories: 0, totalUnknownItems: 300, totalItems: 300 }
+          })
+        ),
+        toolId: 'zip_plain_ls_1'
+      }
+    })
+    const plainHeader = await within(plain.container).findByRole('button', { name: /list files/i })
+    expect(plainHeader.textContent || '').toContain('300 items in tree')
+    expect(plainHeader.textContent || '').not.toContain('files')
+    plain.unmount()
+
+    const typed = render(CoolToolRenderer as any, {
+      props: {
+        intermediateStep: buildHydratedCoolToolStep(
+          storedShellActionPayload({
+            lane: 'list_files',
+            toolName: 'batshit_server_list_files',
+            toolArgs: { innerCommand: 'ls -la /tmp/tree', path: '/tmp/tree', dirPath: '/tmp/tree' },
+            toolResult: {
+              files: [
+                { path: 'a.md', name: 'a.md', type: 'file' },
+                { path: 'b.md', name: 'b.md', type: 'file' },
+                { path: 'c.md', name: 'c.md', type: 'file' },
+                { path: 'src', name: 'src', type: 'directory' },
+                { path: 'docs', name: 'docs', type: 'directory' }
+              ],
+              totalFiles: 3,
+              totalDirectories: 2,
+              totalUnknownItems: 0,
+              totalItems: 5
+            }
+          })
+        ),
+        toolId: 'zip_typed_ls_1'
+      }
+    })
+    const typedHeader = await within(typed.container).findByRole('button', { name: /list files/i })
+    expect(typedHeader.textContent || '').toContain('3 files, 2 folders in tree')
+    expect(typedHeader.textContent || '').not.toContain('items')
+  })
+
+  it('shows a search and a command Claude cut with the cut, and the search as its first matches', async () => {
+    const cut = { by: 'Claude Code', keptBytes: 29948, totalBytes: 60300 }
+    const search = render(CoolToolRenderer as any, {
+      props: {
+        intermediateStep: storedSearchStep({
+          query: 'First',
+          results: [
+            { path: '/tmp/batshit-example/a.md', matchCount: 12, matches: [{ lineNumber: 1, text: 'First line.' }] }
+          ],
+          totalMatches: 12,
+          totalMatchingFiles: 1,
+          outputCut: cut
+        }),
+        toolId: 'zip_cut_search_1'
+      }
+    })
+    const searchHeader = await within(search.container).findByRole('button', { name: /search files/i })
+    expect(searchHeader.textContent || '').toContain('first 12 matches in 1 file')
+    await fireEvent.click(searchHeader)
+    await waitFor(() =>
+      expect(search.container.textContent || '').toContain('Claude Code cut this output: 29,948 of 60,300 bytes kept.')
+    )
+
+    const command = render(CoolToolRenderer as any, {
+      props: {
+        intermediateStep: {
+          toolName: 'batshit_server_execute_command',
+          operationKind: 'bash',
+          rendererFamily: 'bash',
+          toolArgs: { command: 'node print-rows.js' },
+          toolResult: { command: 'node print-rows.js', stdout: 'entry line 0001', stderr: '', outputCut: cut },
+          metadata: { toolProvider: 'batshit-server' },
+          success: true
+        },
+        toolId: 'zip_cut_command_1'
+      }
+    })
+    const commandHeader = await within(command.container).findByRole('button', { name: /bash/i })
+    await fireEvent.click(commandHeader)
+    await waitFor(() =>
+      expect(command.container.textContent || '').toContain('Claude Code cut this output: 29,948 of 60,300 bytes kept.')
+    )
   })
 
   it('keeps mapped native bash list results expandable', async () => {
@@ -1628,5 +1859,92 @@ describe('CoolToolRenderer (zip-hydrated)', () => {
     })
     expect(container.querySelector('img[src="/assets/batshit_default_AI_Avatar_1.png"]')).toBeNull()
     expect(container.textContent || '').toContain('Icon delegation complete.')
+  })
+  // BL-169: a count of one is singular on every file card ("1 lines" was seen live).
+  describe('a count of one is singular (BL-169)', () => {
+    it('says "1 line" on a one-line read', async () => {
+      const step = buildHydratedCoolToolStep(
+        storedShellReadPayload('/tmp/one.md', { content: '# One', lineCount: 1, language: 'markdown' })
+      )
+      render(CoolToolRenderer as any, { props: { intermediateStep: step, toolId: 'zip_one_line_read' } })
+
+      const headerButton = await screen.findByRole('button', { name: /read file/i })
+      expect(headerButton.textContent || '').toContain('one.md • 1 line')
+      expect(headerButton.textContent || '').not.toContain('1 lines')
+    })
+
+    it('says "1 line written" on a one-line write', async () => {
+      const step = buildHydratedCoolToolStep(
+        storedShellActionPayload({
+          lane: 'write_file',
+          toolName: 'batshit_server_overwrite_file',
+          toolArgs: { filePath: '/tmp/one.md', path: '/tmp/one.md', content: '# One' },
+          toolResult: { filePath: '/tmp/one.md', content: '# One', lineCount: 1, language: 'markdown' }
+        })
+      )
+      render(CoolToolRenderer as any, { props: { intermediateStep: step, toolId: 'zip_one_line_write' } })
+
+      const headerButton = await screen.findByRole('button', { name: /write file/i })
+      expect(headerButton.textContent || '').toContain('1 line written')
+      expect(headerButton.textContent || '').not.toContain('1 lines')
+    })
+
+    it('says "1 change" on an edit with one changed line', async () => {
+      const step = buildHydratedCoolToolStep(
+        storedShellActionPayload({
+          lane: 'edit_file',
+          toolName: 'batshit_server_edit_file',
+          toolArgs: { filePath: '/tmp/one.md', path: '/tmp/one.md' },
+          toolResult: { filePath: '/tmp/one.md', diff: '--- a/one.md\n+++ b/one.md\n@@ -1 +1,2 @@\n # One\n+# Uno' }
+        })
+      )
+      render(CoolToolRenderer as any, { props: { intermediateStep: step, toolId: 'zip_one_change_edit' } })
+
+      const headerButton = await screen.findByRole('button', { name: /edit file/i })
+      expect(headerButton.textContent || '').toContain('one.md • 1 change')
+      expect(headerButton.textContent || '').not.toContain('1 changes')
+    })
+  })
+  // Found in the BL-166 proof: the Bash card showed a command's 220-line preview as its whole output.
+  it("says the Bash card shows only the first lines of a command's output", async () => {
+    const stdout = Array.from({ length: 220 }, (_, i) => `line ${i + 1}`).join('\n')
+    const step = buildHydratedCoolToolStep({
+      schemaVersion: 1,
+      type: 'tool',
+      toolName: 'bash',
+      displayToolName: 'native_bash_execute',
+      originalToolName: 'native_bash_execute',
+      operationKind: 'bash',
+      rendererFamily: 'bash',
+      toolCallId: 'call_long_preview',
+      toolArgs: { command: 'seq 1 1000', innerCommand: 'seq 1 1000' },
+      toolResult: { command: 'seq 1 1000', stdout, stderr: '', exitCode: 0, stdoutTruncated: true, stderrTruncated: false, totalLines: 1000 },
+      timestamp: '2026-09-25T20:00:00.000Z',
+      storage: { compacted: true, truncated: true, binaryLikeOmitted: false, forceCompress: false },
+      metadata: { operationKind: 'bash', rendererFamily: 'bash' }
+    })
+    const { container } = render(CoolToolRenderer as any, {
+      props: { intermediateStep: step, toolId: 'zip_long_preview' }
+    })
+
+    const headerButton = await screen.findByRole('button', { name: /bash/i })
+    await fireEvent.click(headerButton)
+    await waitFor(() => expect(container.textContent || '').toContain('line 220'))
+    expect((container.textContent || '').replace(/\s+/g, ' ')).toContain('Output shown: first 220 of 1,000 lines')
+  })
+
+  // Found in BL-166's review: the Read File card parsed a read's content as JSON and showed a
+  // one-line package.json as seven reformatted lines.
+  it("shows a JSON file's own text on the Read File card", async () => {
+    const content = '{ "name": "x",   "private": true, "scripts": { "test": "node --test" } }'
+    const step = buildHydratedCoolToolStep(storedShellReadPayload('/tmp/package.json', { content, lineCount: 1, language: 'json' }))
+    const { container } = render(CoolToolRenderer as any, { props: { intermediateStep: step, toolId: 'zip_json_read' } })
+
+    const headerButton = await screen.findByRole('button', { name: /read file/i })
+    await fireEvent.click(headerButton)
+    await waitFor(() => expect(container.textContent || '').toContain('name'))
+    const code = [...container.querySelectorAll('pre code, pre')].map((node) => node.textContent ?? '').join('\n')
+    expect(code).toContain('"x",   "private"')
+    expect(code).not.toContain('\n  "private"')
   })
 })

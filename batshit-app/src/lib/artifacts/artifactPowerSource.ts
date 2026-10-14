@@ -5,6 +5,12 @@ import {
   type ArtifactSourceKind
 } from '$lib/artifacts/artifactSourceBadge'
 import type { ArtifactBrainType } from '$lib/types/artifacts'
+import {
+  PINOKIO_APP_BRAIN_TYPE,
+  PINOKIO_RUNTIME_MANAGER,
+  isPinokioKind,
+  isPinokioManagedArtifact
+} from '$lib/artifacts/pinokioArtifact'
 
 export type ArtifactPowerSource =
   | 'built_in'
@@ -13,6 +19,7 @@ export type ArtifactPowerSource =
   | 'huggingface'
   | 'gradio'
   | 'custom_webhook'
+  | 'pinokio_app'
   | 'none'
 
 export interface ArtifactPowerSourceOption {
@@ -88,6 +95,18 @@ export const ARTIFACT_POWER_SOURCE_OPTIONS: ArtifactPowerSourceOption[] = [
     iconRef: { kind: 'lucide', id: 'wrench' }
   },
   {
+    // SA-072 P2 (DL-09): one entry. The app's real kind (ComfyUI, Gradio, Custom API) stays in
+    // `metadata.source_type`; this sets `runtime_manager: "pinokio"` and the app id beside it.
+    value: 'pinokio_app',
+    label: 'Pinokio App',
+    description: 'Runs an app installed in Pinokio through Batshit, and asks Pinokio to start it when needed.',
+    brainType: PINOKIO_APP_BRAIN_TYPE,
+    sourceType: 'comfyui',
+    usesWebhook: false,
+    acceptsSystemPrompt: false,
+    iconRef: { kind: 'lucide', id: 'rocket' }
+  },
+  {
     value: 'none',
     label: 'Static / No AI',
     description: 'Keeps the artifact as a UI-only mini-app with no Batshit completion runtime.',
@@ -121,6 +140,7 @@ function sourceKindToPowerSource(sourceKind: ArtifactSourceKind | null): Artifac
 }
 
 export function resolveArtifactPowerSource(artifact: any): ArtifactPowerSource {
+  if (isPinokioManagedArtifact(artifact) || artifact?.brain_type === PINOKIO_APP_BRAIN_TYPE) return 'pinokio_app'
   const explicitSource = sourceKindToPowerSource(resolveArtifactMetadataSourceKind(artifact?.metadata))
   const brainType = artifact?.brain_type
 
@@ -151,8 +171,20 @@ export function applyArtifactPowerSourceToMetadata(
   powerSource: ArtifactPowerSource
 ): Record<string, any> {
   const option = getArtifactPowerSourceOption(powerSource)
+  const base = metadata && typeof metadata === 'object' && !Array.isArray(metadata) ? metadata : {}
+  if (powerSource === 'pinokio_app') {
+    // The kind the user already picked survives; a fresh switch starts at ComfyUI.
+    return {
+      ...base,
+      runtime_manager: PINOKIO_RUNTIME_MANAGER,
+      source_type: isPinokioKind(base.source_type) ? base.source_type : option.sourceType
+    }
+  }
   return {
-    ...(metadata && typeof metadata === 'object' && !Array.isArray(metadata) ? metadata : {}),
-    source_type: option.sourceType
+    ...base,
+    source_type: option.sourceType,
+    // Leaving Pinokio: a save merges metadata over the stored copy, so the marker is cleared
+    // explicitly rather than dropped (dropping it would leave the stored "pinokio" in place).
+    ...(base.runtime_manager != null ? { runtime_manager: null } : {})
   }
 }

@@ -13,6 +13,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const workerMocks = vi.hoisted(() => ({
   processNativeMode: vi.fn(),
+  codexStreamNativeMode: vi.fn(),
+  prepareCodexProfile: vi.fn(),
   redisGetUserSettings: vi.fn(),
   resolveManagedSubagentScope: vi.fn(),
   buildManagedSubagentDynamicInfo: vi.fn(),
@@ -27,11 +29,15 @@ vi.mock('$lib/server/services/vercelBrain', () => ({
   }),
 }))
 
-vi.mock('$lib/server/services/codexBridge', () => ({ CodexBridge: vi.fn() }))
+vi.mock('$lib/server/services/codexBridge', () => ({ CodexBridge: vi.fn(function MockBridge(this: Record<string, unknown>) {
+  this.streamNativeMode = async (request: any, lease?: { abortBeforeSpawn: () => void }) => {
+    try { return await workerMocks.codexStreamNativeMode(request) } finally { lease?.abortBeforeSpawn() }
+  }
+}) }))
 vi.mock('$lib/server/services/claudeBridge', () => ({ ClaudeBridge: vi.fn() }))
 vi.mock('$lib/server/services/codexProfileManager', () => ({
-  buildAgentProfileId: vi.fn((value: string) => `profile-${value}`),
-  prepareManagedCodexSubagentProfile: vi.fn(),
+  buildAgentProfileId: vi.fn((value: string) => `batshit_agent_${value}`),
+  prepareManagedCodexSubagentProfile: workerMocks.prepareCodexProfile,
 }))
 vi.mock('$lib/server/services/claudeProfileManager', () => ({
   prepareManagedClaudeSubagentProfile: vi.fn(),
@@ -86,6 +92,9 @@ function baseSubagent() {
     include_global_prompt: true,
     primary_model_provider: 'openai',
     primary_model_name: 'gpt-5.4',
+    // BL-266: an own model names its preset; a base clone carries it.
+    primary_model_preset_id: 'preset-gpt-54',
+    primary_model_connection: { id: 'direct:openai', type: 'direct', service: 'openai' },
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   }
@@ -124,6 +133,12 @@ beforeEach(() => {
   __resetWorkerTurnBudgetForTests()
   subagentRedis.seed('batshit:sub_system_prompt', '# Base SUBAGENT prompt')
   subagentRedis.seed('batshit:worker_prompt', '# Base WORKER prompt')
+  subagentRedis.seed('model:preset-gpt-54', {
+    id: 'preset-gpt-54',
+    provider: 'openai',
+    modelId: 'gpt-5.4',
+    connection: { id: 'direct:openai', type: 'direct', service: 'openai' },
+  })
   workerMocks.redisGetUserSettings.mockResolvedValue({
     global_custom_system_prompt: 'GLOBAL IDENTITY TEXT',
   })
@@ -147,6 +162,25 @@ beforeEach(() => {
 })
 
 describe('spawnWorkers (DL-111-09)', () => {
+  it('projects a failed Codex Worker observation without losing a known sibling', async () => {
+    subagentRedis.seed('agent:primary-agent', { id: 'primary-agent', user_id: 'USER-1' })
+    workerMocks.prepareCodexProfile.mockResolvedValue({ profileId: 'batshit_agent_owned_worker_profile', resolvedGateways: [], gatewayToolMap: {} })
+    const observedUsage = { completeness: 'partial', parts: [{ source: 'codex-app-server-progress', counts: { outputTokens: 0, cacheCreationInputTokens: 3 } }] }
+    let started = 0
+    workerMocks.codexStreamNativeMode.mockImplementation(async (request: any) => {
+      const fails = started++ === 0
+      if (fails) request.registerObservedUsageSource?.(() => observedUsage)
+      return { stream: { async *[Symbol.asyncIterator]() {
+        if (fails) throw new Error('owned Codex worker failure')
+        yield { type: 'finish', totalUsage: { inputTokens: 20, outputTokens: 2, totalTokens: 22 } }
+      } } }
+    })
+    const result = await spawnWorkers({ parent: parent({ lane: 'cli', cliModelFields: { primary_model_provider: 'openai-codex', primary_model_name: 'codex-cli', codex_settings: { model: 'gpt-5.4' } } }), workers: [{ task: 'Fails' }, { task: 'Succeeds' }] })
+    expect(result, JSON.stringify(result)).toMatchObject({ success: true, requested: 2, completed: 1 })
+    expect((result as any).workers[0]).toMatchObject({ status: 'failed', usage: null, observedUsage })
+    expect((result as any).workers[1]).toMatchObject({ status: 'completed', usage: { inputTokens: 20, outputTokens: 2, totalTokens: 22 } })
+    expect(Object.keys(subagentRedis.snapshot()).some((key) => key.startsWith('subagent_sessions:') || key.startsWith('subagent_lock:'))).toBe(false)
+  })
   it('runs a batch in parallel and returns one record per worker', async () => {
     const result = await spawnWorkers({
       parent: parent(),
@@ -207,6 +241,12 @@ describe('spawnWorkers (DL-111-09)', () => {
 
     expect((result as any).workers[0]).toMatchObject({ base: 'researcher', status: 'completed' })
     expect((result as any).workers[0].name).toBe('Researcher (worker)')
+
+    // BL-266: the clone runs its base's own model through the base's preset connection.
+    expect(workerMocks.processNativeMode.mock.calls[0]?.[0]).toMatchObject({
+      model: 'gpt-5.4',
+      connection: { id: 'direct:openai', type: 'direct', service: 'openai' },
+    })
 
     const prompt = systemPromptForCall(0)
     // The clone keeps the specialist's own prompt...

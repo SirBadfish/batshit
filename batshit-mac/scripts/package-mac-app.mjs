@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { realpathSync } from 'node:fs';
 import { cp, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,7 +11,8 @@ import { sign } from '@electron/osx-sign';
 import { packager } from '@electron/packager';
 
 const macRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const electronVersion = '43.3.0';
+// The Electron the package is built with; it must be the `electron` devDependency installed here.
+export const electronVersion = '43.7.10';
 const entitlementsPath = join(macRoot, 'macos.entitlements');
 const localEntitlementsPath = join(macRoot, 'macos.local.entitlements');
 const childEntitlementsPath = join(macRoot, 'macos.child.entitlements');
@@ -68,6 +70,91 @@ export function packageBasename(artifactSuffix = '') {
   return `Batshit${artifactSuffix}`;
 }
 
+export const MAC_BUNDLE_ID = 'ai.batshit.mac';
+// The real app's name, and the executable and helper names of every package (signing, the fuses,
+// and the package audit find the bundle's binaries by it).
+export const MAC_APP_NAME = 'Batshit';
+
+/**
+ * The app a package is (BL-72). The real app is `ai.batshit.mac`, named "Batshit". A test package
+ * built with `--artifact-suffix -<Label>` is its own app: `ai.batshit.mac.<label>` (lower case, `_`
+ * as `-`, since a bundle id holds only letters, digits, dashes, and dots), named "Batshit <Label>",
+ * with "Batshit-<Label>" folders (`resolveMacShellIdentity` in electron-shell-policy.mjs reads the
+ * same rule back from the name). It used to keep the real app's bundle id and name, so it showed as a
+ * second "Batshit" in the Dock and a quit or `open -a Batshit` reached whichever one ran.
+ */
+export function macPackageIdentity(artifactSuffix = '') {
+  if (!artifactSuffix) {
+    return { suffix: '', bundleId: MAC_BUNDLE_ID, displayName: MAC_APP_NAME, dataFolderName: MAC_APP_NAME };
+  }
+  const label = artifactSuffix.startsWith('-') ? artifactSuffix.slice(1) : '';
+  const bundleSegment = label.toLowerCase().replace(/_/g, '-');
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(label) || !/^[a-z0-9-]+(\.[a-z0-9-]+)*$/.test(bundleSegment)) {
+    throw new Error(
+      `The artifact suffix ${artifactSuffix} cannot name a test package: use a dash, then letters and numbers (for example -FirstRunTest).`
+    );
+  }
+  return {
+    suffix: artifactSuffix,
+    bundleId: `${MAC_BUNDLE_ID}.${bundleSegment}`,
+    displayName: `${MAC_APP_NAME} ${label}`,
+    dataFolderName: `${MAC_APP_NAME}${artifactSuffix}`
+  };
+}
+
+/** The Electron Packager options for a package. Only the bundle id differs for a test package. */
+export function electronPackagerOptions(identity, { stagingRoot, packagerRoot, arch = process.arch }) {
+  return {
+    dir: stagingRoot,
+    name: MAC_APP_NAME,
+    platform: 'darwin',
+    arch,
+    out: packagerRoot,
+    overwrite: true,
+    asar: true,
+    prune: true,
+    electronVersion,
+    icon: join(macRoot, 'assets', 'icon.icns'),
+    appBundleId: identity.bundleId,
+    appCategoryType: 'public.app-category.productivity',
+    extendInfo: {
+      // Packager rewrites these from `name`. Apply the test display name after packaging,
+      // keeping CFBundleName fixed: Electron uses it to locate the Batshit Helper executable.
+      CFBundleDisplayName: MAC_APP_NAME,
+      CFBundleName: MAC_APP_NAME,
+      LSApplicationCategoryType: 'public.app-category.productivity',
+      UTExportedTypeDeclarations: [GOON_PACKAGE_UTI_DECLARATION],
+      NSMicrophoneUsageDescription:
+        'Batshit uses your microphone for speech-to-text, voice mode, and LiveKit voice sessions when you turn voice features on.',
+      NSSpeechRecognitionUsageDescription:
+        'Batshit uses speech recognition for Browser speech-to-text and Voice Mode when you choose the browser speech engine.'
+    }
+  };
+}
+
+/**
+ * The shell's package.json. Electron runs as its `productName`: that names the app's menus and its
+ * Keychain entry ("<name> Safe Storage"), and main.mjs picks the app's folders (and so its
+ * one-instance lock) by it.
+ */
+export function stagedShellPackageJson(identity) {
+  return {
+    name: 'batshit-electron-shell',
+    productName: identity.displayName,
+    version: '0.1.0',
+    private: true,
+    type: 'module',
+    main: 'main.mjs'
+  };
+}
+
+/** A test package's display name; CFBundleName must match Packager's helper prefix (BL-226). */
+export function applyTestPackageInfoPlistNames(appPath, identity) {
+  if (identity.bundleId === MAC_BUNDLE_ID) return;
+  const plistPath = join(appPath, 'Contents', 'Info.plist');
+  runChecked('plutil', ['-replace', 'CFBundleDisplayName', '-string', identity.displayName, plistPath]);
+}
+
 function runChecked(command, args, options = {}) {
   const result = spawnSync(command, args, {
     cwd: options.cwd || macRoot,
@@ -79,28 +166,14 @@ function runChecked(command, args, options = {}) {
   }
 }
 
-async function stageElectronSource(stagingRoot) {
+async function stageElectronSource(stagingRoot, identity) {
   await rm(stagingRoot, { recursive: true, force: true });
   await mkdir(stagingRoot, { recursive: true });
   for (const file of ELECTRON_SOURCE_FILES) {
     await cp(join(macRoot, 'src-electron', file), join(stagingRoot, file));
   }
   await cp(join(macRoot, 'frontend', 'dist'), join(stagingRoot, 'shell'), { recursive: true });
-  await writeFile(
-    join(stagingRoot, 'package.json'),
-    `${JSON.stringify(
-      {
-        name: 'batshit-electron-shell',
-        productName: 'Batshit',
-        version: '0.1.0',
-        private: true,
-        type: 'module',
-        main: 'main.mjs'
-      },
-      null,
-      2
-    )}\n`
-  );
+  await writeFile(join(stagingRoot, 'package.json'), `${JSON.stringify(stagedShellPackageJson(identity), null, 2)}\n`);
 }
 
 export function signingOptionsForFile(filePath, { appPath, mainExecutable, adHoc }) {
@@ -191,6 +264,7 @@ export async function packageMacApp(argv = process.argv.slice(2)) {
   }
 
   const { artifactSuffix } = parsePackageArgs(argv);
+  const identity = macPackageIdentity(artifactSuffix);
   const basename = packageBasename(artifactSuffix);
   const outputRoot = join(macRoot, 'electron-out');
   const output = join(outputRoot, 'package', `${basename}.app`);
@@ -199,34 +273,13 @@ export async function packageMacApp(argv = process.argv.slice(2)) {
 
   runChecked('npm', ['install', '--prefix', 'frontend']);
   runChecked('npm', ['--prefix', 'frontend', 'run', 'build']);
-  await stageElectronSource(stagingRoot);
+  await stageElectronSource(stagingRoot, identity);
   await rm(packagerRoot, { recursive: true, force: true });
   await mkdir(packagerRoot, { recursive: true });
 
-  const packagedPaths = await packager({
-    dir: stagingRoot,
-    name: 'Batshit',
-    platform: 'darwin',
-    arch: process.arch,
-    out: packagerRoot,
-    overwrite: true,
-    asar: true,
-    prune: true,
-    electronVersion,
-    icon: join(macRoot, 'assets', 'icon.icns'),
-    appBundleId: 'ai.batshit.mac',
-    appCategoryType: 'public.app-category.productivity',
-    extendInfo: {
-      CFBundleDisplayName: 'Batshit',
-      CFBundleName: 'Batshit',
-      LSApplicationCategoryType: 'public.app-category.productivity',
-      UTExportedTypeDeclarations: [GOON_PACKAGE_UTI_DECLARATION],
-      NSMicrophoneUsageDescription:
-        'Batshit uses your microphone for speech-to-text, voice mode, and LiveKit voice sessions when you turn voice features on.',
-      NSSpeechRecognitionUsageDescription:
-        'Batshit uses speech recognition for Browser speech-to-text and Voice Mode when you choose the browser speech engine.'
-    }
-  });
+  const packagedPaths = await packager(
+    electronPackagerOptions(identity, { stagingRoot, packagerRoot })
+  );
   if (packagedPaths.length !== 1) {
     throw new Error(`Electron Packager returned ${packagedPaths.length} package paths; expected exactly one.`);
   }
@@ -235,6 +288,7 @@ export async function packageMacApp(argv = process.argv.slice(2)) {
   runChecked(process.execPath, ['scripts/clean-package-output.mjs', output]);
   await mkdir(dirname(output), { recursive: true });
   await rename(generatedApp, output);
+  applyTestPackageInfoPlistNames(output, identity);
   runChecked(process.execPath, ['scripts/prepare-package-resources.mjs', output]);
   await hardenElectronBinary(output);
   await signElectronApp(output);
@@ -244,7 +298,17 @@ export async function packageMacApp(argv = process.argv.slice(2)) {
   console.log(`Electron ${electronVersion} Batshit package ready: ${output}`);
 }
 
-const invokedPath = process.argv[1] ? resolve(process.argv[1]) : '';
-if (invokedPath === fileURLToPath(import.meta.url)) {
+// Run only when started directly, not when imported. Node gives this module its REAL path, so the
+// start path is compared as a real path too: a start through a link (or macOS's /var, a link to
+// /private/var) used to exit 0 having done nothing (BL-148).
+function startedDirectly() {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+if (startedDirectly()) {
   await packageMacApp();
 }

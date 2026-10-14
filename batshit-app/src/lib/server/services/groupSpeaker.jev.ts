@@ -1,20 +1,20 @@
 /**
- * SA-120 P3 (design record E1) — Jev Juice group speaker selection and follow-up gating.
+ * SA-120 P3 (design record E1) — Judge Juice group speaker selection and follow-up gating.
  *
  * THE constants module for this feature (DL-120-03): every question, criterion, floor,
  * and cap lives here, so a reviewer reads the whole decision surface in one file.
  * Thresholds change in code review, never in a prompt.
  *
- * What it does. A group agent can carry the speaking preset `smart` ("Jev Juice: Smart").
+ * What it does. A group agent can carry the speaking preset `smart` ("Judge Juice: Smart").
  * When a group event needs a speaker and today's rules do not already decide it (the
- * user named exactly one agent, or a driver is eligible), `send-routed` asks Jev ONCE:
+ * user named any agent, or a driver is eligible), `send-routed` asks Jev ONCE:
  *   1. a Choice over the eligible candidates plus `nobody` — who is best placed to
  *      respond to this message;
  *   2. a Noul — does the message call for a reply at all;
  *   3. one Noul per candidate — would that agent add something new by replying now.
  * Code then applies the floors below:
- *   - a USER message always gets a speaker (a silent room after the user spoke would read
- *     as broken, and today's cost is one LLM call anyway): the top candidate wins when its
+ *   - a USER message may skip `smart` candidates when both `nobody` and `needs_reply`
+ *     clearly say no reply (AMD-120-09). Other presets remain eligible. Otherwise the top candidate wins when its
  *     share of the probability among the real candidates clears `speakerFloor`, else
  *     today's rules pick (random) and the Execution Viewer says why;
  *   - on an AGENT (follow-up) event, a `smart` candidate is SKIPPED — no LLM call spent
@@ -22,8 +22,9 @@
  *     agent's `adds_value` sits under `addsValueFloor`; agents on the other presets are
  *     never gated here (their own preset rules already ran). When nobody is left, the
  *     follow-up chain ends and the record lands on the previous speaker's snapshot.
- * Explicit beats inferred (DL-120-04): a single addressed agent or a driver is chosen
- * before Jev is asked, and the picked agent is told in its DCM tail (`jev_juice_group`).
+ * Explicit beats inferred (DL-120-04): any named addressee protects the user turn from
+ * this lane. A single addressee or driver decides the speaker; multiple addressees retain
+ * the ordinary scheduler. Jev's picked agent is told in its DCM tail (`jev_juice_group`).
  *
  * Runs under the user's In-Chat Wait Limit (DL-120-05/16, 750 ms by default). A miss falls back to today's
  * rules, the send proceeds, and the inline note says so (DL-120-02). Measured basis: the
@@ -34,6 +35,7 @@
 import type { GroupChatSpeakPolicy } from '$lib/types/groupChat'
 import { GROUP_CHAT_MAX_AGENT_COUNT } from '$lib/types/groupChat'
 import type { JevJuiceNote, TypesafeCallRecord } from '$lib/types/typesafe'
+import { UNKNOWN_JUDGE_NAME, judgeNameAtSentenceStart } from '$lib/utils/judgeProviders'
 import { runTypesafeJudgment } from './typesafe/typesafeAvailability'
 import type {
   JevChoiceAnswer,
@@ -58,7 +60,7 @@ export const GROUP_SPEAKER_THRESHOLDS = Object.freeze({
    * speaker. Below it, today's rules pick and the Execution Viewer says "low confidence".
    */
   speakerFloor: 0.5,
-  /** Follow-up events only: under this, the message needs no reply and every `smart` candidate is skipped. */
+  /** Under this, a follow-up needs no reply. User skips also require a clear `nobody` Choice. */
   needsReplyFloor: 0.5,
   /** Follow-up events only: a `smart` candidate under this adds too little to spend an LLM call on. */
   addsValueFloor: 0.6
@@ -130,6 +132,8 @@ export interface GroupSpeakerRequestInput {
   eventType: 'user' | 'agent'
   /** The event text: the user's message, or the source agent's reply on a follow-up. */
   message: string
+  /** False when the turn carries input Jev did not inspect. Conservative user-silence guard only. */
+  allowUserNoReply?: boolean
   /** Who spoke it, as Jev should read it: "the user (Josh)" or "Opie (an agent in this group)". */
   spokeLast: string
   /** Replies already made in this group turn, oldest first. */
@@ -144,6 +148,9 @@ export interface GroupSpeakerKeyedCandidate extends GroupSpeakerCandidate {
 
 export interface GroupSpeakerRequest {
   eventType: 'user' | 'agent'
+  /** A clipped user message cannot authorize silence: its omitted tail may ask a question. */
+  messageTruncated: boolean
+  allowUserNoReply: boolean
   state: {
     message: string
     spoke_last: string
@@ -236,7 +243,12 @@ export function buildGroupSpeakerRequest(input: GroupSpeakerRequestInput): Group
     )
   }
 
-  return { eventType: input.eventType, state, questions, candidates }
+  return {
+    eventType: input.eventType,
+    allowUserNoReply: input.allowUserNoReply !== false,
+    messageTruncated: input.message.replace(/\s+/g, ' ').trim().length > GROUP_SPEAKER_LIMITS.maxMessageChars,
+    state, questions, candidates
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -261,14 +273,16 @@ export interface GroupSpeakerPick {
   probability: number
 }
 
-export type GroupSpeakerOutcomeKind = 'picked' | 'low_confidence' | 'nobody_left'
+export type GroupSpeakerOutcomeKind = 'picked' | 'low_confidence' | 'nobody_left' | 'no_reply' | 'preset_rules' | 'only_candidate'
 
 export interface GroupSpeakerDecision {
   needsReply: number | null
-  /** Raw probability Jev put on `nobody`. Informational; the gates are the two Nouls. */
+  /** Raw probability Jev put on `nobody`; corroborates a user-event no-reply decision. */
   nobody: number
+  /** The weaker of the two no-reply probabilities, only for a corroborated user decision. */
+  noReplyConfidence: number | null
   agents: GroupSpeakerAgentReading[]
-  /** Follow-up events only: `smart` candidates under a floor, in candidate order. */
+  /** Only `smart` candidates may be gated, in candidate order. */
   skipped: GroupSpeakerAgentReading[]
   /** Candidates still eligible after gating. */
   remaining: GroupSpeakerAgentReading[]
@@ -308,6 +322,23 @@ export function decideGroupSpeaker(answers: GroupSpeakerAnswers, request: GroupS
   }))
 
   const skipped: GroupSpeakerAgentReading[] = []
+  // A tie, missing/malformed answer, clipped message or conflicting Choice cannot silence
+  // a user. Keep the existing 0.5 floors; both independent answers must agree above a tie.
+  const probabilities = answers.speaker?.probabilities
+  const expectedKeys = ['nobody', ...request.candidates.map((candidate) => candidate.key)]
+  const completeDistribution = probabilities && Object.keys(probabilities).length === expectedKeys.length &&
+    expectedKeys.every((key) => typeof probabilities[key] === 'number' && Number.isFinite(probabilities[key]) && probabilities[key] >= 0 && probabilities[key] <= 1) &&
+    Math.abs(expectedKeys.reduce((sum, key) => sum + probabilities[key], 0) - 1) < 0.001
+  const userNeedsNoReply = request.eventType === 'user' && request.messageTruncated === false && request.allowUserNoReply && completeDistribution &&
+    answers.speaker?.type === 'choice' && answers.speaker.choice === 'nobody' &&
+    needsReply !== null && needsReply >= 0 && needsReply < GROUP_SPEAKER_THRESHOLDS.needsReplyFloor &&
+    nobody > GROUP_SPEAKER_THRESHOLDS.speakerFloor && nobody <= 1 &&
+    request.candidates.every((candidate) => {
+      const probability = answers.speaker?.probabilities?.[candidate.key]
+      return typeof probability === 'number' && Number.isFinite(probability) && probability >= 0 && probability <= 1 && probability < nobody
+    })
+  const noReplyConfidence = userNeedsNoReply ? Math.min(1 - needsReply!, nobody) : null
+  if (userNeedsNoReply) skipped.push(...agents.filter((reading) => reading.smart))
   if (request.eventType === 'agent') {
     const replyNeeded = needsReply !== null && needsReply >= GROUP_SPEAKER_THRESHOLDS.needsReplyFloor
     for (const reading of agents) {
@@ -323,7 +354,13 @@ export function decideGroupSpeaker(answers: GroupSpeakerAnswers, request: GroupS
   let picked: GroupSpeakerPick | null = null
   let outcome: GroupSpeakerOutcomeKind
   if (remaining.length === 0) {
-    outcome = 'nobody_left'
+    outcome = request.eventType === 'user' ? 'no_reply' : 'nobody_left'
+  } else if (userNeedsNoReply) {
+    // Jev excluded only Smart agents. Every survivor keeps its own preset authority;
+    // renormalizing the tiny remaining Choice mass would falsely claim a confident pick.
+    outcome = 'preset_rules'
+  } else if (remaining.length === 1) {
+    outcome = 'only_candidate'
   } else {
     const total = remaining.reduce((sum, reading) => sum + reading.probability, 0)
     const top = remaining.reduce((best, reading) => (reading.probability > best.probability ? reading : best), remaining[0])
@@ -345,14 +382,18 @@ export function decideGroupSpeaker(answers: GroupSpeakerAnswers, request: GroupS
   const decided =
     outcome === 'picked' && picked
       ? `picked ${picked.name} ${pct(picked.probability)}`
+      : outcome === 'preset_rules'
+        ? 'Smart candidates skipped; surviving speaker chosen by its preset rules'
+        : outcome === 'only_candidate'
+          ? `only eligible candidate ${remaining[0].name}; usual rules`
       : outcome === 'low_confidence'
         ? 'low confidence → usual rules'
         : request.eventType === 'agent'
           ? 'follow-up skipped'
-          : 'usual rules'
+          : 'user reply skipped'
   const summary = `${parts.join('; ')} → ${decided}`
 
-  return { needsReply, nobody, agents, skipped, remaining, picked, outcome, summary }
+  return { needsReply, nobody, noReplyConfidence, agents, skipped, remaining, picked, outcome, summary }
 }
 
 // ---------------------------------------------------------------------------
@@ -363,15 +404,29 @@ export function decideGroupSpeaker(answers: GroupSpeakerAnswers, request: GroupS
 export const JEV_JUICE_GROUP_HEADING =
   "jev_juice_group (Batshit's judgment model helped choose this turn's speaker; advisory):"
 
-/** The DCM tail lines for the agent that ended up speaking. Empty only when there is nothing to tell it. */
-export function buildGroupSpeakerDcmLines(decision: GroupSpeakerDecision, selectedAgentId: string): string[] {
+/**
+ * The DCM tail lines for the agent that ended up speaking. Empty only when there is nothing to tell it.
+ * SA-120 P10b: `judge` is the name of the model that made this event's call (`judgeNameOfCallRecord` of its row),
+ * "Jev" only when TypeSafe judged; when a caller has no row it is "the judge". Only words change, never which
+ * lines exist or where they sit.
+ */
+export function buildGroupSpeakerDcmLines(
+  decision: GroupSpeakerDecision,
+  selectedAgentId: string,
+  judge: string = UNKNOWN_JUDGE_NAME
+): string[] {
   const lines: string[] = []
+  const judgeStart = judgeNameAtSentenceStart(judge)
   const pickedYou = decision.picked?.agentId === selectedAgentId
   if (pickedYou && decision.picked) {
     const count = decision.remaining.length
     lines.push(
       `- You were picked to speak now (${pct(decision.picked.probability)} among ${count} candidate${count === 1 ? '' : 's'}). If you truly have nothing new to add, answer listening.`
     )
+  } else if (decision.outcome === 'preset_rules') {
+    lines.push(`- ${judgeStart} judged that no reply was needed; Batshit picked you by your own speaking preset rules, which ${judge} does not override.`)
+  } else if (decision.outcome === 'only_candidate') {
+    lines.push(`- You were the only eligible candidate; Batshit picked you by its usual rules. ${judgeStart} did not pick you.`)
   } else {
     const top = decision.remaining.reduce<GroupSpeakerAgentReading | null>(
       (best, reading) => (!best || reading.probability > best.probability ? reading : best),
@@ -379,16 +434,15 @@ export function buildGroupSpeakerDcmLines(decision: GroupSpeakerDecision, select
     )
     lines.push(
       top
-        ? `- Jev Juice was not confident about a speaker (top ${top.name} ${pct(top.probability)}); Batshit picked you by its usual rules.`
-        : '- Jev Juice could not pick a speaker; Batshit picked you by its usual rules.'
+        ? `- Judge Juice was not confident about a speaker (top ${top.name} ${pct(top.probability)}); Batshit picked you by its usual rules.`
+        : '- Judge Juice could not pick a speaker; Batshit picked you by its usual rules.'
     )
   }
   if (decision.skipped.length > 0) {
-    lines.push(
-      `- Skipped this turn for adding little: ${decision.skipped
-        .map((reading) => `${reading.name} (${reading.addsValue === null ? '?' : pct(reading.addsValue)})`)
-        .join(', ')}.`
-    )
+    const names = decision.skipped.map((reading) => reading.name).join(', ')
+    lines.push(decision.noReplyConfidence !== null
+      ? `- ${judgeStart}'s no-reply judgment: ${pct(decision.noReplyConfidence)}. Smart agents skipped: ${names}.`
+      : `- Skipped this follow-up for adding little or needing no reply: ${names}.`)
   }
   return [JEV_JUICE_GROUP_HEADING, ...lines]
 }
@@ -396,10 +450,11 @@ export function buildGroupSpeakerDcmLines(decision: GroupSpeakerDecision, select
 /** `streamMetadata.speakerSelection` → `executionMetadata.groupChat.speakerSelection` and the message metadata. */
 export interface GroupSpeakerSelectionMetadata {
   by: 'jev' | 'rules'
-  reason: GroupSpeakerOutcomeKind | 'unavailable' | 'error'
+  reason: GroupSpeakerOutcomeKind | 'unavailable' | 'error' | 'receipt_not_saved'
   /** The pick's share among the remaining candidates, when Jev picked. */
   probability?: number
   needsReply?: number | null
+  noReplyConfidence?: number | null
   skipped: Array<{ agentId: string; agentName: string; addsValue: number | null }>
 }
 
@@ -417,6 +472,7 @@ export function buildGroupSpeakerSelectionMetadata(
     reason: pickedYou ? 'picked' : decision.outcome,
     ...(pickedYou && decision.picked ? { probability: decision.picked.probability } : {}),
     needsReply: decision.needsReply,
+    ...(decision.noReplyConfidence !== null ? { noReplyConfidence: decision.noReplyConfidence } : {}),
     skipped: decision.skipped.map((reading) => ({
       agentId: reading.agentId,
       agentName: reading.name,

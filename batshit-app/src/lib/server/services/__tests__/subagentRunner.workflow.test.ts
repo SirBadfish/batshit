@@ -82,12 +82,20 @@ import {
   DEFAULT_CLI_SUBAGENT_TIMEOUT_MS,
   DEFAULT_N8N_SUBAGENT_TIMEOUT_MS,
   DEFAULT_WORKER_TIMEOUT_MS,
-  executeManagedSubagent,
+  executeManagedSubagent as runManagedSubagent,
   resolveManagedDelegationTimeoutMs,
 } from '../subagentRunner'
 
 const subagentRedis = createSubagentRedisMock()
 workflowSubagentMocks.redisStore.current = subagentRedis
+
+// BL-287: the runner refuses a Subagent whose record is gone (a turn that loaded it before its
+// delete), so each call stores the record it runs first, as a real Subagent's is.
+async function executeManagedSubagent(params: Parameters<typeof runManagedSubagent>[0]) {
+  const id = typeof params.subagent?.id === 'string' ? params.subagent.id.trim() : ''
+  if (id && params.delegationKind !== 'worker') subagentRedis.seed(`subagent:${id}`, params.subagent)
+  return runManagedSubagent(params)
+}
 
 function workflowCall(overrides: Record<string, any> = {}) {
   return {
@@ -192,6 +200,7 @@ describe('executeManagedSubagent - n8n Workflow Subagents', () => {
         sessionId: 'session-1',
         userId: 'USER-1',
         agentId: 'primary-agent',
+        subagentId: 'workflow-helper',
       }),
     )
 

@@ -3,8 +3,12 @@ import type { NativeModeRequest } from './vercelBrain'
 import { stripToolZipControl } from './toolZipControlNotice'
 import { stripMcpImageContentBlocks } from './toolResultImageDelivery'
 import { mapBashCommandToMode4Tool } from './bashCommandMapper'
-import { hasSubagentToolSegment } from '$lib/utils/toolNameNormalization'
-import { commandFoundNothing } from '$lib/utils/toolActivityContract'
+import {
+  CLI_WORKER_SPAWN_TOOL_NAME,
+  isCliSubagentBridgeServerName,
+  parseCliSubagentToolName
+} from '$lib/utils/cliSubagentToolNames'
+import { commandFoundNothing, outputCutFields } from '$lib/utils/toolActivityContract'
 import {
   unwrapStructuredToolValue,
   unwrapSubagentToolResult
@@ -67,6 +71,32 @@ interface ClaudeEventAdapterOptions {
     totalUsage?: ClaudeUsageSummary
     reasoning?: string[]
   }) => Promise<void> | void
+}
+
+type CliModelResultDelivery = Parameters<NonNullable<NativeModeRequest['onCliModelResult']>>[0]
+
+function rawClaudeToolResultDelivery(callId: string, content: unknown): CliModelResultDelivery {
+  const texts: string[] = []
+  let nonTextInputs = 0
+  let unaccountedInputs = 0
+
+  if (typeof content === 'string') {
+    if (content.length > 0) texts.push(content)
+  } else if (Array.isArray(content)) {
+    for (const block of content) {
+      if (block?.type === 'text' && typeof block.text === 'string') {
+        if (block.text.length > 0) texts.push(block.text)
+      } else if (block?.type === 'image' || block?.type === 'file' || block?.type === 'audio') {
+        nonTextInputs += 1
+      } else {
+        unaccountedInputs += 1
+      }
+    }
+  } else {
+    unaccountedInputs += 1
+  }
+
+  return { callId, texts, nonTextInputs, unaccountedInputs }
 }
 
 interface ClaudeToolState {
@@ -461,9 +491,14 @@ function hasClaudeBashExitFraming(blockContent: unknown): boolean {
  * managed lane's 2.1.220 and in 198 transcript records of 2.1.197-2.1.275. A failed call is framed
  * differently (5,000 characters from each end around Claude's own `... [N characters truncated] ...`
  * line) and keeps that honest text (D5).
+ *
+ * Two first lines are known: "Output too large (58.9KB). Full output saved to: <path>" and, over
+ * Claude Code's 64MB persist limit, "Output exceeded the 64MB persist limit; only the first 64MB
+ * were saved to: <path>" (Claude Code 2.1.275; found in BL-166's proof, where it was stored as the
+ * notice itself with no cut marked).
  */
 const CLAUDE_PERSISTED_OUTPUT_NOTICE =
-  /^<persisted-output>\nOutput too large \([^)\n]*\)\. Full output saved to: [^\n]*\n(?:\nPreview \(first [^)\n]*\):\n([\s\S]*?)\n\.\.\.\n)?<\/persisted-output>/
+  /^<persisted-output>\n(?:Output too large \([^)\n]*\)\. Full output saved to: [^\n]*|Output exceeded the [^\n;]* persist limit; only the first [^\n]* were saved to: [^\n]*)\n(?:\nPreview \(first [^)\n]*\):\n([\s\S]*?)\n\.\.\.\n)?<\/persisted-output>/
 
 function claudeBlockText(content: unknown): string | null {
   if (typeof content === 'string') return content
@@ -490,8 +525,10 @@ function claudeCutOutputLine(keptBytes: number, totalBytes: number | undefined):
  * lane that stores what the command printed (a read, a write, an edit) gets the whole lines Claude
  * kept, one line that says the output was cut and how much was kept, and Claude's own trailing note.
  * A lane that reads `stdout` (a listing, a search, a plain command) gets the whole lines only, since
- * one more line there would be one more entry or match. With no `stdout` (a result Claude sent
- * without it) the preview is the text; a Bash result is then given the shape the lanes expect.
+ * one more line there would be one more entry or match, and `outputCut` beside them, so what it
+ * counts is known to be the first entries, matches, or lines (BL-8). With no `stdout` (a result
+ * Claude sent without it) the preview is the text; a Bash result is then given the shape the lanes
+ * expect.
  */
 function parseClaudePersistedOutput(
   blockContent: unknown,
@@ -521,13 +558,22 @@ function parseClaudePersistedOutput(
   const printedText = cut
     ? `${kept}${kept ? '\n' : ''}${claudeCutOutputLine(Buffer.byteLength(kept), totalBytes)}${trailer}`
     : `${kept}${trailer}`
+  const outputCut = cut
+    ? {
+        outputCut: {
+          by: 'Claude Code',
+          keptBytes: Buffer.byteLength(kept),
+          ...(totalBytes !== undefined ? { totalBytes } : {})
+        }
+      }
+    : {}
 
   return {
     printedText,
     toolUseResult: result
-      ? { ...result, stdout: kept }
+      ? { ...result, stdout: kept, ...outputCut }
       : isBash && toolUseResult == null
-        ? { stdout: kept, stderr: '', interrupted: false, isImage: false, noOutputExpected: false }
+        ? { stdout: kept, stderr: '', interrupted: false, isImage: false, noOutputExpected: false, ...outputCut }
         : null
   }
 }
@@ -551,7 +597,8 @@ function bashPrintedText(toolUseResult: any, fallbackContent: any): any {
 }
 
 function buildToolResult(toolName: string, toolUseResult: any, fallbackContent?: any) {
-  const isSubagentCall = hasSubagentToolSegment(toolName)
+  // BL-272: the managed shape decides, never a `subagent_` anywhere in the name.
+  const isSubagentCall = parseCliSubagentToolName(toolName) !== null
   if (isSubagentCall) {
     return unwrapSubagentToolResult(toolUseResult ?? fallbackContent)
   }
@@ -602,7 +649,8 @@ function buildToolResult(toolName: string, toolUseResult: any, fallbackContent?:
       stdout: toolUseResult.stdout ?? fallbackContent ?? '',
       stderr: toolUseResult.stderr ?? '',
       interrupted: toolUseResult.interrupted,
-      isImage: toolUseResult.isImage
+      isImage: toolUseResult.isImage,
+      ...outputCutFields(toolUseResult)
     }
   }
 
@@ -613,7 +661,8 @@ function buildToolResult(toolName: string, toolUseResult: any, fallbackContent?:
       stdout,
       stderr: toolUseResult.stderr ?? '',
       interrupted: toolUseResult.interrupted,
-      isImage: toolUseResult.isImage
+      isImage: toolUseResult.isImage,
+      ...outputCutFields(toolUseResult)
     }
   }
 
@@ -661,6 +710,138 @@ function buildToolResult(toolName: string, toolUseResult: any, fallbackContent?:
   return toolUseResult
 }
 
+/**
+ * BL-501 — an event of Claude Code's own helper model. The `Agent` tool (`Task` before it) runs a
+ * model of its own, and the CLI forwards that model's messages on this stream as `assistant` and
+ * `user` events whose `parent_tool_use_id` names the main thread's Agent call (2.1.296 does not
+ * forward the helper's partial events; the stream-json schema allows the field on a
+ * `stream_event` too). The main model never read them: it reads only the Agent call's own
+ * `tool_result`, a main-thread event. So they are not the reply's words, reasoning, or tool steps,
+ * and not what the main model read (BL-474). The context guard reads the same field to leave the
+ * helper's usage out of the main thread's (`claudeContextGuard.ts`).
+ */
+function isClaudeHelperModelEvent(event: Record<string, any>): boolean {
+  return (
+    (event.type === 'stream_event' || event.type === 'assistant' || event.type === 'user') &&
+    Boolean(event.parent_tool_use_id)
+  )
+}
+
+/**
+ * BL-1362: a Batshit Subagent or Worker call, by the exact names the managed Subagent bridge
+ * registers on its own server (`buildCliSubagentMcpServerName`): `subagent_<key>` (BL-272's
+ * shape) or `spawn_workers`. A user gateway shares the `batshit_gateway_` prefix but never the
+ * bridge's server shape (BL-271), so neither half matches one.
+ */
+function isBatshitDelegationToolName(name: string): boolean {
+  if (!name.startsWith('mcp__')) return false
+  const parts = name.slice('mcp__'.length).split('__')
+  if (parts.length !== 2 || !isCliSubagentBridgeServerName(parts[0])) return false
+  return parts[1] === CLI_WORKER_SPAWN_TOOL_NAME || parseCliSubagentToolName(name) !== null
+}
+
+/** BL-503: how many of a failed run's errors its message names, newest last, and how long each. */
+const CLAUDE_FAILURE_REASONS_SHOWN = 3
+const CLAUDE_FAILURE_REASON_MAX_CHARS = 300
+
+/**
+ * BL-503 — the reason a failed run gives. A `result` with `is_error` carries it as `result` (an API
+ * error, a prompt that is too long) or, when Claude Code stops the run itself (`error_max_turns`,
+ * `error_during_execution`, `error_max_budget_usd`; 2.1.296), as `errors[]` with no `result`.
+ * `error_during_execution`'s list is Claude Code's own `[ede_diagnostic] result_type=…` line and
+ * then every error it logged during the turn, each `Name: message` followed by its stack. The
+ * message names each error by its first line, the newest ones only; the whole list stays in the
+ * run's raw event log, which the Execution Viewer saves.
+ */
+function claudeFailedResultMessage(event: any): string {
+  if (typeof event?.result === 'string' && event.result.trim().length > 0) return event.result
+  const subtype =
+    typeof event?.subtype === 'string' && event.subtype.startsWith('error') ? event.subtype : null
+  const reasons: string[] = []
+  for (const entry of Array.isArray(event?.errors) ? event.errors : []) {
+    if (typeof entry !== 'string') continue
+    const firstLine = entry.trim().split('\n', 1)[0].trim()
+    if (!firstLine || firstLine.startsWith('[ede_diagnostic]')) continue
+    const reason =
+      firstLine.length > CLAUDE_FAILURE_REASON_MAX_CHARS
+        ? `${firstLine.slice(0, CLAUDE_FAILURE_REASON_MAX_CHARS - 1)}…`
+        : firstLine
+    // A repeated error counts where it last happened, so the newest ones are the ones named.
+    const earlierCopy = reasons.indexOf(reason)
+    if (earlierCopy !== -1) reasons.splice(earlierCopy, 1)
+    reasons.push(reason)
+  }
+  const lead = subtype ? `Claude Code CLI run failed (${subtype})` : 'Claude Code CLI run failed'
+  if (reasons.length === 0) return `${lead}.`
+  const shown = reasons.slice(-CLAUDE_FAILURE_REASONS_SHOWN)
+  const earlier = reasons.length - shown.length
+  return `${lead}: ${shown.join('; ')}${earlier > 0 ? ` (and ${earlier} earlier)` : ''}`
+}
+
+/**
+ * The counts a `result` reports, each one only when Claude Code reported it (a reported 0 stays 0).
+ * Batshit's input is fresh input plus cache read plus cache creation; it is known only when the
+ * fresh `input_tokens` counter came. A cache counter that did not come counts as 0 in that sum,
+ * the rule Claude Code's own ledger uses (2.1.296), and stays unset itself. The total is known only
+ * when the input and the output both are (BL-1361), so it never leaves an unreported one out.
+ */
+function claudeResultUsage(usage: any): ClaudeUsageSummary {
+  const freshInputTokens =
+    typeof usage?.input_tokens === 'number' ? usage.input_tokens : undefined
+  const outputTokens =
+    typeof usage?.output_tokens === 'number' ? usage.output_tokens : undefined
+  const cachedInputTokens =
+    typeof usage?.cache_read_input_tokens === 'number'
+      ? usage.cache_read_input_tokens
+      : undefined
+  const cacheCreationInputTokens = (() => {
+    if (typeof usage?.cache_creation_input_tokens === 'number') {
+      return usage.cache_creation_input_tokens
+    }
+    const cacheCreation = usage?.cache_creation
+    if (!cacheCreation || typeof cacheCreation !== 'object') return undefined
+    const values = Object.values(cacheCreation).filter(
+      (value): value is number => typeof value === 'number',
+    )
+    if (values.length === 0) return undefined
+    return values.reduce((sum, value) => sum + value, 0)
+  })()
+
+  const inputTokens =
+    typeof freshInputTokens === 'number'
+      ? freshInputTokens + (cachedInputTokens ?? 0) + (cacheCreationInputTokens ?? 0)
+      : undefined
+
+  return {
+    ...(typeof inputTokens === 'number' ? { inputTokens } : {}),
+    ...(typeof outputTokens === 'number' ? { outputTokens } : {}),
+    ...(typeof inputTokens === 'number' && typeof outputTokens === 'number'
+      ? { totalTokens: inputTokens + outputTokens }
+      : {}),
+    ...(typeof cachedInputTokens === 'number' ? { cachedInputTokens } : {}),
+    ...(typeof cacheCreationInputTokens === 'number' ? { cacheCreationInputTokens } : {}),
+  }
+}
+
+/**
+ * The counts a failed `result` reports, kept for the finish callback before the run fails. Claude
+ * Code 2.1.296 writes `modelUsage`, its ledger of the run's model calls, on every result, and its
+ * session-crash result carries a fixed all-zero `usage` with an empty `modelUsage` whatever the run
+ * spent. So the counts are read only when `modelUsage` names a model; otherwise, or when the result
+ * holds no count, the failed run's usage is unknown, never an exact zero.
+ */
+function claudeFailedResultUsage(event: any): ClaudeUsageSummary | undefined {
+  const modelUsage = event?.modelUsage
+  const accounted =
+    Boolean(modelUsage) &&
+    typeof modelUsage === 'object' &&
+    !Array.isArray(modelUsage) &&
+    Object.keys(modelUsage).length > 0
+  if (!accounted) return undefined
+  const summary = claudeResultUsage(event?.usage)
+  return Object.keys(summary).length > 0 ? summary : undefined
+}
+
 function coerceText(val: any): string {
   if (typeof val === 'string') return val
   if (Array.isArray(val)) {
@@ -698,6 +879,10 @@ export class ClaudeEventAdapter {
     | ClaudeUsageSummary
     | undefined
   private completed = false
+  /** BL-1362: the helper model's own Batshit Subagent and Worker calls, by id, until their results. */
+  private readonly helperDelegationCalls = new Map<string, { name: string; input: Record<string, any> }>()
+  /** BL-1362: accounting-only steps for those results; never yielded, never in `intermediateSteps`. */
+  private readonly helperDelegatedSteps: any[] = []
 
   constructor(options: ClaudeEventAdapterOptions) {
     this.request = options.request
@@ -705,11 +890,35 @@ export class ClaudeEventAdapter {
     this.onFinish = options.onFinish
   }
 
+  /** Observation only: raw model-result evidence never enters chunks, steps, or event logs. */
+  private reportCliModelResult(delivery: CliModelResultDelivery): void {
+    const observer = this.request.onCliModelResult
+    if (!observer) return
+    try {
+      observer(delivery)
+    } catch {
+      // The source text can be sensitive. Keep it out of this log and make the turn's evidence
+      // incomplete through the same metadata-only callback when the observer remains available.
+      console.error('[ClaudeEventAdapter] Raw CLI result observer failed; result marked unaccounted.')
+      try {
+        observer({ callId: delivery.callId, texts: [], nonTextInputs: 0, unaccountedInputs: 1 })
+      } catch {
+        // A failing metadata observer never interrupts the CLI stream.
+      }
+    }
+  }
+
   async *stream(events: AsyncGenerator<any>): AsyncGenerator<ClaudeStreamChunk> {
     try {
       for await (const event of events) {
         this.rawEvents.push(event)
         if (!event || typeof event !== 'object') continue
+        // BL-501: the helper's own model at work. The raw log above keeps its events; only a
+        // Batshit Subagent or Worker run it started is noted, for the reply's spend (BL-1362).
+        if (isClaudeHelperModelEvent(event)) {
+          this.noteHelperDelegation(event)
+          continue
+        }
 
         if (event.type === 'stream_event') {
           yield* this.handleStreamEvent(event)
@@ -958,6 +1167,9 @@ export class ClaudeEventAdapter {
       if (block?.type !== 'tool_result') continue
       const toolId = block.tool_use_id
       if (typeof toolId !== 'string') continue
+      // This is the raw tool_result content Claude's event carries. `tool_use_result` is
+      // side-channel detail used below to enrich display steps and must never count as read text.
+      this.reportCliModelResult(rawClaudeToolResultDelivery(toolId, block.content))
       const state = this.toolStates.get(toolId)
       if (state && !state.emitted) {
         yield this.emitToolCall(state)
@@ -1100,50 +1312,66 @@ export class ClaudeEventAdapter {
     }
   }
 
+  /**
+   * BL-1362 — the one thing kept from the helper model's events: a Batshit Subagent or Worker run
+   * it started. Claude Code's helper can call the same managed bridge tools under the same run
+   * credential, so that run is bound to, and billed to, this reply (managed-execute binds the chat
+   * and reply from the credential and records no spend of its own). Its step is built from the
+   * bridge's own JSON the way the delegated summary reads a main-thread step, and it goes only to
+   * `getHelperDelegatedSteps`: not a chunk, not `intermediateSteps`, not read evidence (BL-474),
+   * not a zip or a card. The helper's own model bill (the Agent result's usage) is not a Batshit
+   * delegated run and is not counted.
+   */
+  private noteHelperDelegation(event: Record<string, any>): void {
+    const content = Array.isArray(event.message?.content) ? event.message.content : []
+    if (event.type === 'assistant') {
+      for (const block of content) {
+        if (block?.type !== 'tool_use' || typeof block.id !== 'string' || typeof block.name !== 'string') continue
+        if (!isBatshitDelegationToolName(block.name)) continue
+        this.helperDelegationCalls.set(block.id, { name: block.name, input: block.input ?? {} })
+      }
+      return
+    }
+    if (event.type !== 'user') return
+    for (const block of content) {
+      if (block?.type !== 'tool_result' || typeof block.tool_use_id !== 'string') continue
+      const call = this.helperDelegationCalls.get(block.tool_use_id)
+      if (!call) continue
+      // One step per call: a second result for the same id finds nothing here.
+      this.helperDelegationCalls.delete(block.tool_use_id)
+      const normalized = normalizeToolName(call.name, call.input)
+      // The block's own content first: the event's `tool_use_result` is one value for the whole
+      // event, so two parallel results in one event would otherwise both read the first's run.
+      const result = stripToolZipControl(
+        stripMcpImageContentBlocks(unwrapSubagentToolResult(block.content ?? event.tool_use_result))
+      )
+      const isError = Boolean(block.is_error)
+      this.helperDelegatedSteps.push({
+        type: isError ? 'tool_error' : 'tool',
+        toolName: normalized.toolName,
+        originalToolName: call.name,
+        toolInput: normalized.args,
+        toolArgs: normalized.args,
+        toolResult: result,
+        toolOutput: result,
+        toolCallId: block.tool_use_id,
+        timestamp: Date.now(),
+        ...(isError ? { error: normalizeToolErrorMessage(event.tool_use_result, block.content) } : {}),
+        ...this.detectToolMetadata(normalized.toolName, normalized.args, result)
+      })
+    }
+  }
+
   private handleResultEvent(event: any): ClaudeStreamChunk {
     if (event?.is_error || event?.subtype === 'error') {
-      const message = typeof event?.result === 'string' ? event.result : 'Claude Code CLI run failed.'
-      throw new Error(message)
+      // BL-503: the run's own reason. `finalize` still makes the finish callback, which is the CLI
+      // lanes' one evidence writer for a failed run too (BL-1361). It reports the counts this
+      // result holds when Claude Code accounted the run's model calls, else none (unknown).
+      this.usageSummary = claudeFailedResultUsage(event)
+      throw new Error(claudeFailedResultMessage(event))
     }
 
-    const usage = event?.usage ?? {}
-    const freshInputTokens =
-      typeof usage?.input_tokens === 'number' ? usage.input_tokens : undefined
-    const outputTokens =
-      typeof usage?.output_tokens === 'number' ? usage.output_tokens : undefined
-    const cachedInputTokens =
-      typeof usage?.cache_read_input_tokens === 'number'
-        ? usage.cache_read_input_tokens
-        : undefined
-    const cacheCreationInputTokens = (() => {
-      if (typeof usage?.cache_creation_input_tokens === 'number') {
-        return usage.cache_creation_input_tokens
-      }
-      const cacheCreation = usage?.cache_creation
-      if (!cacheCreation || typeof cacheCreation !== 'object') return undefined
-      const values = Object.values(cacheCreation).filter(
-        (value): value is number => typeof value === 'number',
-      )
-      if (values.length === 0) return undefined
-      return values.reduce((sum, value) => sum + value, 0)
-    })()
-
-    const totalInputTokens =
-      (freshInputTokens ?? 0) +
-      (cachedInputTokens ?? 0) +
-      (cacheCreationInputTokens ?? 0)
-
-    const summary: ClaudeUsageSummary = {
-      inputTokens: totalInputTokens,
-      ...(typeof outputTokens === 'number' ? { outputTokens } : {}),
-      ...(typeof outputTokens === 'number'
-        ? { totalTokens: totalInputTokens + outputTokens }
-        : { totalTokens: totalInputTokens > 0 ? totalInputTokens : undefined }),
-      ...(typeof cachedInputTokens === 'number' ? { cachedInputTokens } : {}),
-      ...(typeof cacheCreationInputTokens === 'number'
-        ? { cacheCreationInputTokens }
-        : {}),
-    }
+    const summary = claudeResultUsage(event?.usage)
     this.usageSummary = summary
 
     if (!this.finalText && typeof event?.result === 'string') {
@@ -1223,9 +1451,11 @@ export class ClaudeEventAdapter {
       }
     }
 
-    if (lower.includes('subagent_')) {
-      const match = lower.match(/subagent_([a-z0-9_-]+)/)
-      const slug = match?.[1]
+    // BL-272: the Subagent is the tool of the managed shape (`mcp.<batshit_gateway_…>.subagent_<key>`).
+    // The first `subagent_` anywhere was the bridge's own name for an agent slugged `subagent`.
+    const subagentCall = parseCliSubagentToolName(toolName)
+    if (subagentCall) {
+      const slug = subagentCall.toolKey
       const unslugged = slug ? slug.replace(/[_-]+/g, ' ').trim() : undefined
       const displayName = unslugged
         ? unslugged
@@ -1323,6 +1553,10 @@ export class ClaudeEventAdapter {
   private async finalize() {
     if (this.completed) return
     this.completed = true
+    // Every ending makes this callback, a failed `result`, the context guard's stop, a CLI exit,
+    // and a Stop included: it is the CLI lanes' one Execution Viewer evidence writer (the prompt,
+    // the tool rows, `delegated`), and send-routed labels its usage exact only when the CLI
+    // reported it (BL-503, BL-1361). The error still reaches send-routed's failure path after it.
     const resolvedText =
       this.latestAssistantText.length > this.finalText.length
         ? this.latestAssistantText
@@ -1353,6 +1587,11 @@ export class ClaudeEventAdapter {
 
   getRawEvents() {
     return this.rawEvents
+  }
+
+  /** BL-1362: accounting-only; the live list, filled as the run streams (see `noteHelperDelegation`). */
+  getHelperDelegatedSteps() {
+    return this.helperDelegatedSteps
   }
 
   getIntermediateSteps() {

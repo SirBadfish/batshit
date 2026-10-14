@@ -1,10 +1,12 @@
 import { env } from '$env/dynamic/private'
+import { createHmac, randomUUID } from 'node:crypto'
 import type {
   LocalVoiceEngineInstallOwnership,
   VoiceEngineLaunchConfig,
   VoiceEngineRecord
 } from '$lib/types/voice'
 import { registerRuntimeShutdownTask } from '$lib/server/services/runtimeShutdown'
+import { resolveVoiceRuntimeLaunchOwner } from '$lib/server/services/voiceRuntimeLaunchRecords'
 import { shouldStopVoiceRuntimeOnShutdown } from '$lib/utils/voiceSchema'
 
 const DEFAULT_OPERATOR_TIMEOUT_MS = 180_000
@@ -18,7 +20,9 @@ const STOP_SUPPORT_CACHE_MS = 30_000
 const STOP_SUPPORT_PROBE_TIMEOUT_MS = 2_000
 /**
  * The whole shutdown stop, registry read included. `docker stop` waits 10 s before its
- * SIGKILL, and the operator's own stop needs about 2.5 s (a 2 s SIGTERM grace, then SIGKILL).
+ * SIGKILL. macOS can use its 2 s process-group grace; Windows stops each
+ * verified process through a held handle. Its time grows with member count
+ * because each member needs a fresh process-table read and identity check.
  */
 export const HOST_VOICE_SHUTDOWN_STOP_TIMEOUT_MS = 5_000
 const HOST_VOICE_SHUTDOWN_TASK = 'voice-engines-host-operator'
@@ -150,12 +154,62 @@ async function fetchOperatorJson(path: string, init: RequestInit = {}, timeoutMs
   }
 }
 
+/**
+ * Which Docker Batshit this is, sent at every start and stop (operator revision 7, BL-18): several
+ * can share one host operator, which stamps the name on each launch record and lets a stop touch
+ * only that Batshit's own launches. It is `BATSHIT_VOICE_RUNTIME_OWNER`, which `compose.yaml` sets
+ * to `docker:` and the Compose project name (as the Mac supervisor and the native launcher give
+ * their apps one); left out when unset (a container from an older `compose.yaml`), which leaves
+ * that app only unmarked launches.
+ */
+let warnedEmptyOwner = false
+
+function operatorVoiceOwner(): { owner?: string } {
+  const owner = resolveVoiceRuntimeLaunchOwner()
+  // `docker:` alone is a Compose that did not fill the project name: every Docker Batshit on it
+  // would share that one name, and stop each other's engines as if they were one. No name is the
+  // safe reading (the operator then gives this app only unmarked launches).
+  if (owner === 'docker:') {
+    if (!warnedEmptyOwner) {
+      warnedEmptyOwner = true
+      console.warn(
+        '[voice-runtime] BATSHIT_VOICE_RUNTIME_OWNER is "docker:" with no Compose project name, so this Docker Batshit sends the host operator no name.'
+      )
+    }
+    return {}
+  }
+  return owner ? { owner } : {}
+}
+
 export async function startHostVoiceRuntimeViaOperator(
-  input: HostVoiceRuntimeStartInput
+  record: VoiceEngineRecord
 ): Promise<HostVoiceRuntimeStartResult> {
+  const localRuntime = record.localRuntime
+  if (!localRuntime?.installRoot || !localRuntime.launch?.command) {
+    throw new Error('The voice engine has no saved launch recipe.')
+  }
+  const signingKey = env.BATSHIT_HOST_VOICE_RECIPE_SIGNING_KEY?.trim()
+  if (!signingKey || !/^[a-f0-9]{64}$/i.test(signingKey)) {
+    throw new Error('BATSHIT_HOST_VOICE_RECIPE_SIGNING_KEY is required to start a Docker host voice engine.')
+  }
+  const input: HostVoiceRuntimeStartInput = {
+    engineId: record.id,
+    installRoot: localRuntime.installRoot,
+    installOwnership: localRuntime.installOwnership,
+    launch: localRuntime.launch,
+    endpoint: record.baseUrl,
+    stopOnShutdown: shouldStopVoiceRuntimeOnShutdown(localRuntime.startup)
+  }
+  const recipe = { ...input, ...operatorVoiceOwner() }
+  const issuedAt = Date.now()
+  const nonce = randomUUID()
+  const signature = createHmac('sha256', Buffer.from(signingKey, 'hex'))
+    .update('batshit-host-voice-start-v1\0')
+    .update(`${issuedAt}\0${nonce}\0${JSON.stringify(recipe)}`)
+    .digest('hex')
   const payload = await fetchOperatorJson('/v1/voice-engines/start', {
     method: 'POST',
-    body: JSON.stringify(input)
+    body: JSON.stringify({ ...recipe, proof: { issuedAt, nonce, signature } })
   })
 
   return {
@@ -205,7 +259,7 @@ let stopSupportCache: { value: boolean; checkedAt: number } | null = null
  * Can the operator this container talks to stop host voice engines? Only then is "Stop with
  * Batshit" offered in Docker. False when no operator is configured, it does not answer, it is
  * older than revision 5 (`start-docker` replaces it on the next start), or it does not list
- * `stop` among its host voice controls (it runs on Windows, where the stop is not built yet).
+ * `stop` among its host voice controls. Revision 9 offers it on Windows too.
  */
 export async function hostOperatorCanStopVoiceRuntimes(): Promise<boolean> {
   if (stopSupportCache && Date.now() - stopSupportCache.checkedAt < STOP_SUPPORT_CACHE_MS) {
@@ -251,7 +305,7 @@ export async function stopHostVoiceRuntimesViaOperator(
 ): Promise<HostVoiceRuntimeStopResult> {
   const payload = await fetchOperatorJson(
     '/v1/voice-engines/stop',
-    { method: 'POST', body: JSON.stringify({ engines }) },
+    { method: 'POST', body: JSON.stringify({ engines, ...operatorVoiceOwner() }) },
     options.timeoutMs ?? HOST_VOICE_SHUTDOWN_STOP_TIMEOUT_MS
   )
   return {

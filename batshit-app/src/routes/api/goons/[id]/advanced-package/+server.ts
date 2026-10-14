@@ -7,13 +7,9 @@ import {
   rewriteInternalBatshitServerUrlsInPayload
 } from '$lib/server/services/batshitServerUrls'
 import type { GoonRecord } from '$lib/types/goons'
-import {
-  RECIPE_ARCHIVE_CONTAINMENT_RECEIPT_CONTRACT,
-  createRecipeArchiveContainmentReceipt,
-  verifyRecipeArchiveContainmentReceipt,
-  type RecipeArchiveContainmentReceipt
-} from '$lib/goons/recipe'
+import type { RecipeArchiveContainmentReceipt } from '$lib/goons/recipe'
 import { deleteGoonUploadAsset } from '$lib/server/services/goonAssetCleanupService'
+import { createTrustedRecipeArchiveReceipt } from '$lib/server/services/goonRecipePackageUpload.server'
 
 async function readUploadError(response: Response, fallback: string) {
   const text = await response.text().catch(() => '')
@@ -52,42 +48,6 @@ async function cleanupCustomPackageFiles(files: Record<string, any> | null) {
   if (failures.length > 0) {
     throw new AggregateError(failures, 'Rejected Recipe package assets could not be cleaned completely.')
   }
-}
-
-async function buildArchiveReceipt(
-  extraction: any,
-  files: Record<string, any>
-): Promise<RecipeArchiveContainmentReceipt> {
-  if (
-    extraction?.contract !== 'recipe-archive-extraction/v1' ||
-    extraction?.extractor?.id !== 'batshit-server-recipe-archive' ||
-    extraction?.extractor?.version !== 1
-  ) {
-    throw new Error('batshit-server did not return a trusted Recipe archive extraction result')
-  }
-  const receipt = await createRecipeArchiveContainmentReceipt({
-    contract: RECIPE_ARCHIVE_CONTAINMENT_RECEIPT_CONTRACT,
-    archiveFormat: 'zip',
-    extractor: extraction.extractor,
-    archive: extraction.archive,
-    entryCount: extraction.entryCount,
-    totalUncompressedBytes: extraction.totalUncompressedBytes,
-    members: extraction.members
-  })
-  const expectedRefs = [
-    `/uploads/goon_custom_packages/${files.package.filename}`,
-    `/uploads/goon_custom_models/${files.model.filename}`,
-    `/uploads/goon_custom_manifests/${files.manifest.filename}`
-  ]
-  const actualRefs = [
-    receipt.archive.ref,
-    receipt.members.find((member) => member.role === 'model')?.extracted.ref,
-    receipt.members.find((member) => member.role === 'manifest')?.extracted.ref
-  ]
-  if (expectedRefs.some((ref) => !actualRefs.includes(ref))) {
-    throw new Error('Recipe archive extraction refs do not match the stored upload assets')
-  }
-  return verifyRecipeArchiveContainmentReceipt(receipt)
 }
 
 export const POST: RequestHandler = async ({ params, request, locals }) => {
@@ -182,7 +142,7 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
     let archiveReceipt: RecipeArchiveContainmentReceipt | null = null
     if (profile === 'expert-custom-glb') {
       try {
-        archiveReceipt = await buildArchiveReceipt(uploadPayload?.archiveExtraction, files)
+        archiveReceipt = await createTrustedRecipeArchiveReceipt(uploadPayload?.archiveExtraction, files)
       } catch (error) {
         try {
           await cleanupCustomPackageFiles(files)

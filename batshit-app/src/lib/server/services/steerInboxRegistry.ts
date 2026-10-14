@@ -354,6 +354,41 @@ export function takeUndeliveredSteers(
 }
 
 /**
+ * BL-137 — the reply carries on under a new message id: a context-exhaustion continuation.
+ *
+ * Every entry is filed under the assistant message it belongs inside, and a continuation is the
+ * same reply to the user, written under a fresh id. A steer accepted while the run that ran out
+ * of room was going, and never handed to the model there (still waiting, or written to a CLI's
+ * wire and never echoed, which its killed process can no longer read), moves to the continuation
+ * as a waiting entry: its boundaries hand it over, and its end promotes what is left. Left
+ * behind, it was never delivered, the promotion took the last run's id, and the request's
+ * `finally` cleared it: the user saw only an unanswered receipt. Acceptance order is kept, and a
+ * delivered entry stays with the run whose transcript it is written into. Returns how many moved.
+ */
+export function refileUndeliveredSteers(
+  sessionId: string,
+  fromMessageId: string,
+  toMessageId: string,
+  now = Date.now()
+): number {
+  const state = getState(sessionId)
+  if (!state || fromMessageId === toMessageId) return 0
+  const fromRun = (entry: SteerEntry) => entry.messageId === fromMessageId
+  const moving = [...state.pending.filter(fromRun), ...state.inFlight.filter(fromRun)].sort((a, b) =>
+    a.at === b.at ? 0 : a.at < b.at ? -1 : 1
+  )
+  if (moving.length === 0) return 0
+  state.inFlight = state.inFlight.filter((entry) => !fromRun(entry))
+  state.pending = [
+    ...state.pending.filter((entry) => !fromRun(entry)),
+    ...moving.map((entry) => ({ ...entry, messageId: toMessageId }))
+  ]
+  state.updatedAt = now
+  inboxes.set(sessionId, state)
+  return moving.length
+}
+
+/**
  * P2 — move this turn's waiting steers onto a managed CLI's wire.
  *
  * The move happens BEFORE the write, not after it: the route can be called twice in quick
@@ -474,6 +509,23 @@ export function takeMissedDmSteers(
   const taken = [...state.pending.filter(missed), ...state.inFlight.filter(missed)]
   if (taken.length === 0) return []
 
+  state.pending = state.pending.filter((entry) => !missed(entry))
+  state.inFlight = state.inFlight.filter((entry) => !missed(entry))
+  state.updatedAt = Date.now()
+  inboxes.set(sessionId, state)
+  return taken
+}
+
+/** Exact user entries this request's clear will discard; never another live run's. */
+export function takeMissedUserSteers(
+  sessionId: string,
+  options: { keepMessageId?: string | null } = {}
+): SteerEntry[] {
+  const state = getState(sessionId)
+  if (!state) return []
+  const keep = typeof options.keepMessageId === 'string' ? options.keepMessageId : null
+  const missed = (entry: SteerEntry) => entry.source === 'user' && entry.messageId !== keep
+  const taken = [...state.pending.filter(missed), ...state.inFlight.filter(missed)]
   state.pending = state.pending.filter((entry) => !missed(entry))
   state.inFlight = state.inFlight.filter((entry) => !missed(entry))
   state.updatedAt = Date.now()

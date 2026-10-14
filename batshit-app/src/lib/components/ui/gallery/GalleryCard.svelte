@@ -24,7 +24,7 @@
 
 <div
   class={`group relative overflow-hidden rounded-lg border bg-muted/10 transition-shadow ${
-    selected ? 'ring-2 ring-primary/70' : ''
+    selected ? 'ring-2 ring-primary-text/70' : ''
   }`}
 >
   <div class="relative aspect-[4/3] bg-muted/40">

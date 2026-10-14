@@ -16,8 +16,8 @@
  * also repairs installs that already carry orphans from earlier deletes. That is
  * why `runGatewayOrphanReferenceCleanup` can share the same code path.
  *
- * ⚠️ REDIS 8 PATTERN: records are read with `json.get` and written back with
- * `json.set`. Never `JSON.stringify` before `json.set`.
+ * RedisJSON records stay JSON. Raw JSON.GET snapshots are compared inside Lua;
+ * only invalid entries are removed, never a stale record or array replacement.
  */
 
 import { redis } from '$lib/server/redis'
@@ -65,7 +65,7 @@ const DCM_MAP_FIELDS = [
   'toolDisplayPreferences'
 ] as const
 
-export const GATEWAY_REFERENCE_CLEANUP_VERSION = 'v1'
+export const GATEWAY_REFERENCE_CLEANUP_VERSION = 'v2'
 
 export function buildGatewayReferenceCleanupKey(userId: string): string {
   const normalized = typeof userId === 'string' ? userId.trim() : ''
@@ -166,7 +166,7 @@ export function pruneGatewayReferencesFromRecord(
           mapChanged = true
           continue
         }
-        nextMap[key] = value
+        Object.defineProperty(nextMap, key, { value, enumerable: true, writable: true, configurable: true })
       }
 
       if (mapChanged) {
@@ -218,29 +218,6 @@ export function collectGatewayToolNames(gateway: MCPGateway | null | undefined):
   return names
 }
 
-/**
- * Tool names that belonged to `removed` and are served by no surviving gateway.
- *
- * `defaultMCPToolSelections` stores bare tool names with no gateway prefix, so a
- * name shared with a gateway that still exists must be kept — dropping it would
- * silently disable a tool the user still has.
- */
-export function resolveOrphanToolNames(
-  removed: MCPGateway | null | undefined,
-  surviving: readonly MCPGateway[]
-): Set<string> {
-  const removedNames = collectGatewayToolNames(removed)
-  if (removedNames.size === 0) return removedNames
-
-  for (const gateway of surviving) {
-    for (const name of collectGatewayToolNames(gateway)) {
-      removedNames.delete(name)
-    }
-  }
-
-  return removedNames
-}
-
 export interface GatewayReferenceSweepResult {
   scanned: number
   updatedRecordKeys: string[]
@@ -250,110 +227,221 @@ export interface GatewayReferenceSweepResult {
 }
 
 /**
- * Sweep every agent and subagent belonging to `userId`, removing references to
- * gateway IDs that are not in the live registry.
- *
- * Fails closed: when the gateway registry cannot be read the sweep does nothing,
- * because an empty registry read would otherwise look like "every gateway was
- * deleted" and wipe legitimate selections.
+ * BL-889: snapshots are RAW JSON.GET replies, not reserialized JS values. The
+ * registry and existing record must still match before any removal. Preflight
+ * every path before mutation: Lua errors do not roll back earlier writes.
+ * Only array entries and orphan map keys are removed; siblings never round-trip
+ * through JS/cjson (including high-precision numbers in saved settings).
+ */
+export const PRUNE_GATEWAY_REFERENCES_SCRIPT = `
+local registry = redis.call('JSON.GET', KEYS[2])
+if not registry then return 'REGISTRY_UNAVAILABLE' end
+if registry ~= ARGV[2] then return 'CHANGED' end
+local record = redis.call('JSON.GET', KEYS[1])
+if not record then return 'MISSING' end
+if record ~= ARGV[1] then return 'CHANGED' end
+local ops = cjson.decode(ARGV[3])
+for _, op in ipairs(ops) do
+  local types = redis.call('JSON.TYPE', KEYS[1], op[2])
+  if #types ~= 1 then return redis.error_reply('Cleanup path unavailable') end
+  if op[1] == 'pop' then
+    if types[1] ~= 'array' then return redis.error_reply('Cleanup array unavailable') end
+  elseif op[1] ~= 'del' then
+    return redis.error_reply('Unknown cleanup operation')
+  end
+end
+for _, op in ipairs(ops) do
+  if op[1] == 'pop' then
+    redis.call('JSON.ARRPOP', KEYS[1], op[2], op[3])
+  else
+    redis.call('JSON.DEL', KEYS[1], op[2])
+  end
+end
+return 'OK'
+`
+
+const CLEANUP_TRIES = 3
+
+type CleanupOp = ['pop', string, number] | ['del', string]
+
+/** RedisJSON paths escape quotes/backslashes only, not JSON's control escapes. */
+function mapEntryPath(field: string, map: string, key: string): string {
+  // Buffer encoding would replace broken UTF-16, addressing a different key.
+  for (let index = 0; index < key.length; index += 1) {
+    const code = key.charCodeAt(index)
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = key.charCodeAt(++index)
+      if (!(next >= 0xdc00 && next <= 0xdfff)) throw new Error('Invalid cleanup key encoding')
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      throw new Error('Invalid cleanup key encoding')
+    }
+  }
+  const escaped = key.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+  return `$.${field}.${map}["${escaped}"]`
+}
+
+function planReferenceRemovals(record: Record<string, any>, pruned: GatewayReferencePruneResult): CleanupOp[] {
+  const ops: CleanupOp[] = []
+  for (const field of [...GATEWAY_FIELDS, ...TOOL_SELECTION_FIELDS]) {
+    if (record[field] === pruned.next[field]) continue
+    // Filter keeps order/duplicates; match the kept subsequence from the end so
+    // removal indices remain valid as Redis pops in descending order.
+    let keptIndex = pruned.next[field].length - 1
+    for (let index = record[field].length - 1; index >= 0; index -= 1) {
+      if (keptIndex >= 0 && record[field][index] === pruned.next[field][keptIndex]) keptIndex -= 1
+      else ops.push(['pop', `$.${field}`, index])
+    }
+  }
+  for (const field of DCM_SETTINGS_FIELDS) {
+    if (record[field] === pruned.next[field]) continue
+    for (const map of DCM_MAP_FIELDS) {
+      const previous = record[field]?.[map]
+      const next = pruned.next[field]?.[map]
+      if (previous === next) continue
+      for (const key of Object.keys(previous)) {
+        if (!Object.prototype.hasOwnProperty.call(next, key)) ops.push(['del', mapEntryPath(field, map, key)])
+      }
+    }
+  }
+  return ops
+}
+
+function readRegistry(raw: unknown): MCPGateway[] {
+  if (typeof raw !== 'string') throw new Error('Gateway cleanup registry unavailable')
+  const registry = JSON.parse(raw)
+  if (!registry || !Array.isArray(registry.gateways) || registry.gateways.some(
+    (gateway: MCPGateway) => !gateway || typeof gateway.id !== 'string' || !gateway.id.trim()
+  )) throw new Error('Gateway cleanup registry malformed')
+  return registry.gateways
+}
+
+/**
+ * Resolver-supported pre-SA-009 shape. Keep this intact: cleanup's flat-name
+ * deletion is deliberately not a legacy migration. Null optional entries and
+ * empty maps/lists are legitimate; invalid non-map/non-list payloads refuse.
+ */
+function isLegacyToolSelections(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  return Object.values(value).every((gateway) => {
+    if (gateway == null) return true
+    if (typeof gateway !== 'object' || Array.isArray(gateway)) return false
+    return Object.values(gateway).every((tools) => tools == null ||
+      (Array.isArray(tools) && tools.every((name) => typeof name === 'string')))
+  })
+}
+
+/** Malformed state is not proof of absence. Null/absent optional settings are legitimate. */
+function validateReferenceState(record: Record<string, any>, pruneTools: boolean): void {
+  for (const field of GATEWAY_FIELDS) {
+    if (record[field] != null && !Array.isArray(record[field])) throw new Error(`Gateway cleanup malformed ${field}`)
+  }
+  if (pruneTools) {
+    for (const field of TOOL_SELECTION_FIELDS) {
+      if (record[field] != null && !Array.isArray(record[field]) && !isLegacyToolSelections(record[field])) {
+        throw new Error(`Gateway cleanup malformed ${field}`)
+      }
+    }
+  }
+  for (const field of DCM_SETTINGS_FIELDS) {
+    const settings = record[field]
+    if (settings == null) continue
+    if (typeof settings !== 'object' || Array.isArray(settings)) throw new Error(`Gateway cleanup malformed ${field}`)
+    for (const map of DCM_MAP_FIELDS) {
+      if (settings[map] != null && (typeof settings[map] !== 'object' || Array.isArray(settings[map]))) {
+        throw new Error(`Gateway cleanup malformed ${field}.${map}`)
+      }
+    }
+  }
+}
+
+function validateGatewayToolMetadata(gateways: MCPGateway[]): void {
+  for (const gateway of gateways) {
+    if (gateway.discoveredTools != null && (!Array.isArray(gateway.discoveredTools) || gateway.discoveredTools.some((name) => typeof name !== 'string'))) {
+      throw new Error('Gateway cleanup unreadable discovered tools')
+    }
+    if (gateway.toolGroupings != null && (!Array.isArray(gateway.toolGroupings) || gateway.toolGroupings.some(
+      (group) => !group || !Array.isArray(group.toolIds) || group.toolIds.some((name) => typeof name !== 'string')
+    ))) throw new Error('Gateway cleanup unreadable tool groupings')
+  }
+}
+
+/**
+ * Prune current existing records. Three bounded attempts account for BOTH record
+ * and registry changes. Missing records stay missing; unreadable state/listing,
+ * failed mutations and exhausted conflicts reject so no success marker is set.
  */
 export async function sweepGatewayReferencesForUser(params: {
   userId: string
   orphanToolNames?: ReadonlySet<string>
 }): Promise<GatewayReferenceSweepResult> {
   const userId = typeof params.userId === 'string' ? params.userId.trim() : ''
-  const empty: GatewayReferenceSweepResult = {
-    scanned: 0,
-    updatedRecordKeys: [],
-    removedGatewayIds: [],
-    removedDcmKeys: [],
-    removedToolNames: []
+  const result: GatewayReferenceSweepResult = {
+    scanned: 0, updatedRecordKeys: [], removedGatewayIds: [], removedDcmKeys: [], removedToolNames: []
   }
-  if (!userId) return empty
+  if (!userId) return result
 
   return await redis.execute(async (client) => {
-    const registry = (await client.json.get(`mcp_gateways:${userId}`)) as {
-      gateways?: MCPGateway[]
-    } | null
-
-    if (!registry || !Array.isArray(registry.gateways)) {
-      // No registry to compare against — do not guess that every reference is dead.
-      return empty
-    }
-
-    const liveGatewayIds = new Set(
-      registry.gateways
-        .map((gateway) => (typeof gateway?.id === 'string' ? gateway.id.trim() : ''))
-        .filter((id) => id.length > 0)
-    )
-
-    const isOrphanGatewayId = (gatewayId: string) => !liveGatewayIds.has(gatewayId)
-
-    const result: GatewayReferenceSweepResult = {
-      scanned: 0,
-      updatedRecordKeys: [],
-      removedGatewayIds: [],
-      removedDcmKeys: [],
-      removedToolNames: []
-    }
-
-    const targets: Array<{ setKey: string; prefix: string }> = [
+    const registryKey = `mcp_gateways:${userId}`
+    // Check even when there are no records; absence must not mark a successful repair.
+    readRegistry(await client.sendCommand(['JSON.GET', registryKey]))
+    const targets = [
       { setKey: `user:${userId}:agents`, prefix: 'agent' },
       { setKey: `user:${userId}:subagents`, prefix: 'subagent' }
     ]
-
     for (const target of targets) {
-      let ids: string[] = []
-      try {
-        ids = (await client.sMembers(target.setKey)) ?? []
-      } catch (error) {
-        logger.warn(
-          `[Gateway Cleanup] Failed to list ${target.prefix} IDs for ${userId}:`,
-          error
-        )
-        continue
-      }
-
+      const ids = await client.sMembers(target.setKey)
       for (const id of ids) {
-        if (typeof id !== 'string' || id.trim().length === 0) continue
+        if (typeof id !== 'string' || !id.trim()) continue
         const recordKey = `${target.prefix}:${id}`
-
-        let record: Record<string, any> | null = null
-        try {
-          record = (await client.json.get(recordKey)) as Record<string, any> | null
-        } catch (error) {
-          logger.warn(`[Gateway Cleanup] Failed to read ${recordKey}:`, error)
-          continue
+        for (let attempt = 0; attempt < CLEANUP_TRIES; attempt += 1) {
+          // Raw reads preserve RedisJSON's exact serialization for CAS.
+          const registryRaw = await client.sendCommand(['JSON.GET', registryKey])
+          if (typeof registryRaw !== 'string') throw new Error('Gateway cleanup registry unavailable')
+          const gateways = readRegistry(registryRaw)
+          const recordRaw = await client.sendCommand(['JSON.GET', recordKey])
+          if (recordRaw === null) break
+          if (typeof recordRaw !== 'string') throw new Error(`Gateway cleanup cannot read ${recordKey}`)
+          const record = JSON.parse(recordRaw)
+          if (!record || typeof record !== 'object' || Array.isArray(record)) {
+            throw new Error(`Gateway cleanup malformed record ${recordKey}`)
+          }
+          validateReferenceState(record, Boolean(params.orphanToolNames?.size))
+          if (params.orphanToolNames?.size) validateGatewayToolMetadata(gateways)
+          if (attempt === 0) result.scanned += 1
+          const liveIds = new Set(gateways.map((gateway) => gateway.id.trim()))
+          // `defaultMCPToolSelections` holds bare names with no gateway prefix: a candidate that a
+          // gateway in THIS registry read still serves stays selected (the script refuses the write
+          // if the registry changed). BL-1396: the delete passes every name of the gateway it
+          // removed and leaves this decision here.
+          const orphanToolNames = new Set(params.orphanToolNames)
+          for (const gateway of gateways) {
+            for (const name of collectGatewayToolNames(gateway)) orphanToolNames.delete(name)
+          }
+          const pruned = pruneGatewayReferencesFromRecord(record, {
+            isOrphanGatewayId: (id) => !liveIds.has(id), orphanToolNames
+          })
+          if (!pruned.changed) break
+          const answer = await client.eval(PRUNE_GATEWAY_REFERENCES_SCRIPT, {
+            keys: [recordKey, registryKey],
+            arguments: [recordRaw, registryRaw, JSON.stringify(planReferenceRemovals(record, pruned))]
+          })
+          if (answer === 'MISSING') break
+          if (answer === 'CHANGED') {
+            if (attempt + 1 < CLEANUP_TRIES) continue
+            throw new Error(`Gateway cleanup conflict limit reached for ${recordKey}`)
+          }
+          if (answer !== 'OK') throw new Error(`Gateway cleanup failed for ${recordKey}: ${String(answer)}`)
+          result.updatedRecordKeys.push(recordKey)
+          result.removedGatewayIds.push(...pruned.removedGatewayIds)
+          result.removedDcmKeys.push(...pruned.removedDcmKeys)
+          result.removedToolNames.push(...pruned.removedToolNames)
+          break
         }
-        if (!record || typeof record !== 'object' || Array.isArray(record)) continue
-
-        result.scanned += 1
-
-        const pruned = pruneGatewayReferencesFromRecord(record, {
-          isOrphanGatewayId,
-          orphanToolNames: params.orphanToolNames
-        })
-        if (!pruned.changed) continue
-
-        await client.json.set(recordKey, '$', pruned.next as any)
-
-        result.updatedRecordKeys.push(recordKey)
-        result.removedGatewayIds.push(...pruned.removedGatewayIds)
-        result.removedDcmKeys.push(...pruned.removedDcmKeys)
-        result.removedToolNames.push(...pruned.removedToolNames)
       }
     }
-
     if (result.updatedRecordKeys.length > 0) {
-      logger.info(
-        `[Gateway Cleanup] Removed orphaned MCP gateway references from ` +
-          `${result.updatedRecordKeys.length} record(s) for ${userId}: ` +
-          `${result.removedGatewayIds.length} gateway selection(s), ` +
-          `${result.removedDcmKeys.length} Tool Grid key(s), ` +
-          `${result.removedToolNames.length} tool selection(s)`
-      )
+      logger.info(`[Gateway Cleanup] Removed orphaned MCP references from ${result.updatedRecordKeys.length} record(s) for ${userId}`)
     }
-
     return result
   })
 }

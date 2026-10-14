@@ -9,6 +9,7 @@ import {
   getCloudflaredRuntimeStatus,
   getDefaultManagedTunnelTargetUrl,
   installCloudflaredRuntime,
+  resolveCloudflaredInstallPlatform,
   resolveCloudflaredInstallDir,
   resolveRepoRoot,
   uninstallCloudflaredRuntime
@@ -69,6 +70,13 @@ afterEach(() => {
 })
 
 describe('cloudflaredRuntime', () => {
+  it('selects the native Mac architecture without requiring Rosetta', () => {
+    expect(resolveCloudflaredInstallPlatform('darwin', 'arm64')).toBe('darwin-arm64')
+    expect(resolveCloudflaredInstallPlatform('darwin', 'x64')).toBe('darwin-x64')
+    expect(resolveCloudflaredInstallPlatform('linux', 'x64')).toBe('linux-x64')
+    expect(resolveCloudflaredInstallPlatform('win32', 'x64')).toBe('windows-x64')
+  })
+
   it('resolves native installer roots outside batshit-app and under runtime data when configured', async () => {
     const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'batshit-cloudflared-root-'))
     const tempDir = await fs.realpath(tempRoot)

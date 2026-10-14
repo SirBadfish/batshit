@@ -16,7 +16,7 @@
  */
 
 import { DM_ROSTER_MAX_LINES } from '$lib/utils/dmControl'
-import { isOpenDmStatus, type DmRecord } from '$lib/types/dm'
+import { isOpenDmStatus, readDmFires, type DmRecord } from '$lib/types/dm'
 
 const DAY_MS = 24 * 60 * 60 * 1000
 
@@ -32,6 +32,12 @@ export interface DmRosterInput {
    */
   previousUserMessageTs?: number | null
   now?: number
+  /**
+   * BL-401: the zone a fire's time is written in. Left out in production, so it is the
+   * runtime's own zone (the `TZ` a launcher sets to the user's), the zone every other
+   * agent-facing time in the compile uses. Tests pin it.
+   */
+  timeZone?: string
 }
 
 export interface DmRosterResult {
@@ -50,6 +56,58 @@ function describeExpiry(expiresAt: string, now: number): string {
   if (days >= 1) return `expires in ${days}d`
   const hours = Math.max(1, Math.round(remaining / (60 * 60 * 1000)))
   return `expires in ${hours}h`
+}
+
+/**
+ * A fire's time for an agent: "9:00 AM" on the day of `now`, "Sep 25 9:00 AM" on another day,
+ * in `en-US` like the compile's other times. The narrow no-break space some ICU builds put
+ * before AM/PM becomes a plain space, so the roster's bytes do not depend on the ICU version.
+ */
+function formatFireTime(atTs: number, now: number, timeZone: string | undefined): string {
+  const zone = timeZone ? { timeZone } : {}
+  const day = (ts: number) =>
+    new Intl.DateTimeFormat('en-US', {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      ...zone
+    }).format(ts)
+  const time = new Intl.DateTimeFormat('en-US', {
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+    ...zone
+  })
+    .format(atTs)
+    .replace(/\u202f/g, ' ')
+  if (day(atTs) === day(now)) return time
+  const shortDay = new Intl.DateTimeFormat('en-US', {
+    month: 'short',
+    day: 'numeric',
+    ...zone
+  }).format(atTs)
+  return `${shortDay} ${time}`
+}
+
+/**
+ * BL-401 S3 — the phrase that tells an agent how often a schedule fired onto one note:
+ * `fired 14 times, first 9:00 AM, last 5:00 PM`. `null` for a note that fired once (and for
+ * every other DM), so an inbox without such a note compiles byte-identically to before.
+ * The roster line and `sys.dm.list` both use it.
+ */
+export function describeDmFires(
+  record: Pick<DmRecord, 'createdAt' | 'createdTs' | 'fireCount' | 'firstFiredAt' | 'lastFiredAt'>,
+  options: { now?: number; timeZone?: string } = {}
+): string | null {
+  const fires = readDmFires(record)
+  if (fires.count <= 1) return null
+  const now = options.now ?? Date.now()
+  const firstTs = Date.parse(fires.firstAt)
+  const first = Number.isFinite(firstTs)
+    ? formatFireTime(firstTs, now, options.timeZone)
+    : 'unknown'
+  const last = formatFireTime(fires.lastTs, now, options.timeZone)
+  return `fired ${fires.count} times, first ${first}, last ${last}`
 }
 
 function describeState(record: DmRecord, sessionId: string | null | undefined): string {
@@ -76,14 +134,18 @@ export function buildDmRosterDcmLines(input: DmRosterInput): DmRosterResult {
   ]
 
   for (const record of shown) {
+    // BL-401 S3: the mark follows the LAST fire, so a schedule note that fired again since
+    // the agent's previous turn reads as new again. For every other DM that is `createdTs`.
     const isNew =
       typeof input.previousUserMessageTs !== 'number' ||
-      record.createdTs > input.previousUserMessageTs
+      readDmFires(record).lastTs > input.previousUserMessageTs
     const mark = isNew ? '✅' : '🟢'
     const urgent = record.priority === 'urgent' ? ' (urgent)' : ''
+    const fires = describeDmFires(record, { now, timeZone: input.timeZone })
     lines.push(
       `- ${record.id} ${mark} ${record.kind}${urgent} from ${record.from.name}: ` +
         `"${record.subject}" — ${describeState(record, input.sessionId)}; ` +
+        (fires ? `${fires}; ` : '') +
         describeExpiry(record.expiresAt, now)
     )
   }

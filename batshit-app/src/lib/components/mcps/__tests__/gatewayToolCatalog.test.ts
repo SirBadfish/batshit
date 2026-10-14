@@ -15,13 +15,14 @@ const gateway: MCPGateway = {
     'fetch',
     'docker_list_containers',
     'batshit_server_dynamic_mcp_find',
+    'batshit_server_fetch_zip',
     'youtube_get_transcript',
     'unassigned_tool'
   ],
   toolGroupings: [
     {
       mcpName: 'Fetch',
-      toolIds: ['fetch', 'batshit_server_dynamic_mcp_find']
+      toolIds: ['fetch', 'batshit_server_dynamic_mcp_find', 'batshit_server_fetch_zip']
     },
     {
       mcpName: 'Docker Tools',
@@ -61,7 +62,8 @@ describe('gatewayToolCatalog', () => {
           name: 'Fetch',
           tools: [
             { id: 'fetch', name: 'fetch', description: 'Fetch a URL' },
-            { id: 'batshit_server_dynamic_mcp_find', name: 'batshit_server_dynamic_mcp_find' }
+            { id: 'batshit_server_dynamic_mcp_find', name: 'batshit_server_dynamic_mcp_find' },
+            { id: 'batshit_server_fetch_zip', name: 'batshit_server_fetch_zip' }
           ]
         }
       ]

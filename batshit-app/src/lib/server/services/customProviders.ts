@@ -66,6 +66,46 @@ function normalizeHeaders(headers?: CustomProviderHeaders | null): CustomProvide
   return Object.keys(normalized).length ? normalized : undefined
 }
 
+/**
+ * BL-587: the saved key of a provider an edit keeps, or a plain refusal that
+ * names what to do. A normal backup leaves the key out, so a restored record's
+ * three key fields are `null`.
+ */
+function readSavedApiKey(record: StoredCustomProvider): string {
+  const fields = [record.apiKeyEncrypted, record.apiKeyIv, record.apiKeyAuthTag] as unknown[]
+  if (fields.some((field) => typeof field !== 'string' || field.length === 0)) {
+    throw new Error(
+      `Custom provider "${record.label}" has no saved API key (a backup that leaves secrets out does not carry it). Enter its API key to save it.`
+    )
+  }
+  let apiKey: string
+  try {
+    apiKey = apiKeyEncryption.decrypt(record.apiKeyEncrypted, record.apiKeyIv, record.apiKeyAuthTag)
+  } catch {
+    throw new Error(
+      `The saved API key of custom provider "${record.label}" cannot be read. Enter its API key again to save it.`
+    )
+  }
+  if (!apiKey) {
+    throw new Error(`Custom provider "${record.label}" has no saved API key. Enter its API key to save it.`)
+  }
+  return apiKey
+}
+
+/**
+ * Packet 5 finding 1: the saved key when it can be used, else `null`. One rule
+ * for the summary's `apiKeyUsable` and for the run. The log names the provider
+ * id only, never the key or the decrypt error.
+ */
+function readUsableApiKey(record: StoredCustomProvider): string | null {
+  try {
+    return readSavedApiKey(record)
+  } catch {
+    console.warn(`[Custom Providers] The saved API key of ${record.id} is missing or cannot be read`)
+    return null
+  }
+}
+
 async function loadCustomProvider(userId: string, id: string): Promise<StoredCustomProvider | null> {
   return await redis.execute(async (client) => {
     return (await client.json.get(providerKey(userId, id))) as StoredCustomProvider | null
@@ -100,24 +140,16 @@ export async function listCustomProviders(userId: string): Promise<CustomProvide
   const summaries = records
     .filter((record): record is StoredCustomProvider => Boolean(record))
     .map((record) => {
-      let maskedKey = '****'
-      try {
-        const apiKey = apiKeyEncryption.decrypt(
-          record.apiKeyEncrypted,
-          record.apiKeyIv,
-          record.apiKeyAuthTag
-        )
-        maskedKey = apiKeyEncryption.mask(apiKey)
-      } catch (error) {
-        console.warn(`[Custom Providers] Failed to decrypt API key for ${record.id}:`, error)
-      }
-
+      // Packet 5 finding 1: the same rule as the run (`listCustomProvidersForRuntime`),
+      // so the connection is Ready exactly when the provider is registered.
+      const apiKey = readUsableApiKey(record)
       return {
         id: record.id,
         label: record.label,
         baseUrl: record.baseUrl,
         headers: record.headers,
-        maskedKey,
+        maskedKey: apiKey === null ? '****' : apiKeyEncryption.mask(apiKey),
+        apiKeyUsable: apiKey !== null,
         createdAt: record.createdAt,
         updatedAt: record.updatedAt
       }
@@ -135,18 +167,15 @@ export async function listCustomProvidersForRuntime(userId: string): Promise<Cus
 
   for (const record of records) {
     if (!record) continue
-    try {
-      const apiKey = apiKeyEncryption.decrypt(record.apiKeyEncrypted, record.apiKeyIv, record.apiKeyAuthTag)
-      providers.push({
-        id: record.id,
-        label: record.label,
-        baseUrl: record.baseUrl,
-        apiKey,
-        headers: record.headers
-      })
-    } catch (error) {
-      console.warn(`[Custom Providers] Failed to decrypt API key for ${record.id}:`, error)
-    }
+    const apiKey = readUsableApiKey(record)
+    if (apiKey === null) continue
+    providers.push({
+      id: record.id,
+      label: record.label,
+      baseUrl: record.baseUrl,
+      apiKey,
+      headers: record.headers
+    })
   }
 
   return providers
@@ -170,15 +199,23 @@ export async function upsertCustomProvider(
     let encrypted = existing.apiKeyEncrypted
     let iv = existing.apiKeyIv
     let authTag = existing.apiKeyAuthTag
+    let apiKey: string
 
     if (input.apiKey && input.apiKey.trim().length) {
       if (containsSuspiciousInput(input.apiKey)) {
         throw new Error('API key contains invalid characters')
       }
-      const encryptedData = apiKeyEncryption.encrypt(input.apiKey.trim())
+      apiKey = input.apiKey.trim()
+      const encryptedData = apiKeyEncryption.encrypt(apiKey)
       encrypted = encryptedData.encrypted
       iv = encryptedData.iv
       authTag = encryptedData.authTag
+    } else {
+      // BL-587: an edit that keeps the saved key reads it BEFORE anything is
+      // written. A provider restored from a normal backup has no key (the backup
+      // nulls the three key fields), so the edit used to write the record and
+      // then answer 400 while decrypting them.
+      apiKey = readSavedApiKey(existing)
     }
 
     const updated: StoredCustomProvider = {
@@ -201,9 +238,8 @@ export async function upsertCustomProvider(
       label: updated.label,
       baseUrl: updated.baseUrl,
       headers: updated.headers,
-      maskedKey: apiKeyEncryption.mask(
-        apiKeyEncryption.decrypt(updated.apiKeyEncrypted, updated.apiKeyIv, updated.apiKeyAuthTag)
-      ),
+      maskedKey: apiKeyEncryption.mask(apiKey),
+      apiKeyUsable: true,
       createdAt: updated.createdAt,
       updatedAt: updated.updatedAt
     }
@@ -243,6 +279,7 @@ export async function upsertCustomProvider(
     baseUrl: record.baseUrl,
     headers: record.headers,
     maskedKey: apiKeyEncryption.mask(input.apiKey.trim()),
+    apiKeyUsable: true,
     createdAt: record.createdAt,
     updatedAt: record.updatedAt
   }

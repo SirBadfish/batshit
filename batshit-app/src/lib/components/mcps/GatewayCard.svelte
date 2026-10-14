@@ -347,7 +347,7 @@ let effectiveToolList = $derived.by(() => {
 	</Card.Root>
 {:else}
 	<!-- List View -->
-	<div class="flex items-center gap-4 p-4 border rounded-lg hover:border-primary transition-colors">
+	<div class="flex items-center gap-4 p-4 border rounded-lg hover:border-primary-text transition-colors">
 		{#if readOnly}
 			<!-- Simplified list view for n8n-mcp-client -->
 			<div class="flex items-center gap-3 flex-1 min-w-0">

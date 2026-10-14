@@ -110,5 +110,5 @@
 }
 
 .header-button-icon:hover {
-  background-color: hsl(var(--accent));
+  background-color: var(--accent);
 }

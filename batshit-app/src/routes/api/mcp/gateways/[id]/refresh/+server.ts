@@ -9,7 +9,7 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
 import { mcpGatewayService } from '$lib/server/services/mcpGatewayService'
 import { mcpGatewayDiscovery } from '$lib/server/services/mcpGatewayDiscovery'
-import { sanitizeStdioGatewayConfig } from '$lib/server/services/mcpGatewayStdio'
+import { redactGatewaySecretsForBrowser } from '$lib/server/services/mcpGatewayRuntimePresentation'
 
 /**
  * POST /api/mcp/gateways/[id]/refresh
@@ -49,16 +49,14 @@ export const POST: RequestHandler = async ({ locals, params }) => {
     // Discover tools using unified discovery service
     const result = await mcpGatewayDiscovery.refreshGateway(userId, id)
 
+    // BL-550: discovery takes seconds, and the user can save a new launch meanwhile, so the result
+    // goes into the gateway as it is now, field by field; the launch read above is never written.
     if (!result.success) {
       if (gateway.type === 'stdio') {
-        const stdioConfig = sanitizeStdioGatewayConfig(gateway.stdioConfig) ?? { command: '' }
-        await mcpGatewayService.update(userId, id, {
-          stdioConfig: {
-            ...stdioConfig,
-            lastTestStatus: 'failed',
-            lastTestAt: new Date().toISOString(),
-            lastError: result.error ?? 'STDIO discovery failed'
-          }
+        await mcpGatewayService.recordStdioCheckResult(userId, id, {
+          lastTestStatus: 'failed',
+          lastTestAt: new Date().toISOString(),
+          lastError: result.error ?? 'STDIO discovery failed'
         })
       }
       return json(
@@ -68,15 +66,11 @@ export const POST: RequestHandler = async ({ locals, params }) => {
     }
 
     if (gateway.type === 'stdio') {
-      const stdioConfig = sanitizeStdioGatewayConfig(gateway.stdioConfig) ?? { command: '' }
-      await mcpGatewayService.update(userId, id, {
-        stdioConfig: {
-          ...stdioConfig,
-          lastTestStatus: 'passed',
-          lastTestAt: new Date().toISOString(),
-          lastError: null,
-          toolCount: result.tools.length
-        }
+      await mcpGatewayService.recordStdioCheckResult(userId, id, {
+        lastTestStatus: 'passed',
+        lastTestAt: new Date().toISOString(),
+        lastError: null,
+        toolCount: result.tools.length
       })
     }
 
@@ -86,7 +80,7 @@ export const POST: RequestHandler = async ({ locals, params }) => {
     return json({
       success: true,
       tools: result.tools.map(t => t.name),
-      gateway: updatedGateway
+      gateway: updatedGateway ? redactGatewaySecretsForBrowser(updatedGateway) : updatedGateway
     })
   } catch (error) {
     console.error('[API] Error refreshing gateway tools:', error)

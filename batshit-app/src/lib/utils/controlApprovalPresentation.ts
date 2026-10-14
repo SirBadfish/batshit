@@ -205,3 +205,26 @@ export function resolveApprovalSubmitSource(
   if (entrySource) return entrySource
   return typeof summarySource === 'string' ? summarySource.trim() : ''
 }
+
+/**
+ * BL-496 (A6) — the words on a card that ended with no answer.
+ *
+ * A Claude card says why: nobody answered before the permission helper's ten-minute wait ran
+ * out, or its reply ended (a Stop, a failure) while it waited. Every other card keeps the
+ * three-minute label of the clock it runs on.
+ */
+export function describeApprovalExpiry(approval: Record<string, any> | null | undefined): string {
+  if (approval?.expiryReason === 'unanswered') return 'Expired: nobody answered'
+  if (approval?.expiryReason === 'run_ended') return 'Expired: the reply ended'
+  if (approval?.expiryReason === 'wait_failed') return 'Ended: the answer could not be read'
+  return 'Expired (3m)'
+}
+
+/**
+ * The error a click on an expired card shows. A Claude card runs on its own ten-minute clock,
+ * so it never speaks of three minutes.
+ */
+export function describeExpiredApprovalClick(approval: Record<string, any> | null | undefined): string {
+  if (approval?.source === 'claude') return 'This approval has expired. Ask the agent to try again.'
+  return 'This approval already expired after 3 minutes. Ask the agent to run it again.'
+}

@@ -3,6 +3,7 @@ import type { Message } from '$lib/stores/messages.svelte'
 import { parseMessageContent, type MessageSegment } from '$lib/utils/messageFormatter'
 import { stripZipControlBlocks } from '$lib/utils/zipControl'
 import { extractVisibleBatshitCueState } from '$lib/utils/batshitCue'
+import { scanTranscriptReferences, scanTranscriptLegacyClipBlocks } from './markdownReferenceScan'
 import {
   neutralizeAllClipReferenceSyntax,
   neutralizeAllZipReferenceSyntax
@@ -46,8 +47,6 @@ type TranscriptOptions = {
   toolResultMode?: 'full' | 'summary'
 }
 
-const REFERENCE_REGEX = /\{\{(batshit-zip|batshit-clip):([^:}]+?)(?::::([^}]+))?\}\}/g
-const LEGACY_CLIP_REGEX = /\{\{batshit-clip\|([^}]+)\}\}([\s\S]*?)\{\{\/batshit-clip\}\}/g
 const STRUCTURED_TAG_REGEX = /<(terminal|diff|error|image|img|file|cool_tool)\b/i
 
 function sanitizeInlineText(value: string | null | undefined, fallback: string) {
@@ -267,9 +266,16 @@ function convertStructuredContentToMarkdown(content: string, toolResultMode: 'fu
 }
 
 async function replaceLegacyClipBlocks(content: string) {
-  return content.replace(LEGACY_CLIP_REGEX, (_, metadata, body) =>
-    formatLegacyClipMarkdown(String(metadata || ''), String(body || ''))
-  )
+  const blocks = scanTranscriptLegacyClipBlocks(content)
+  if (blocks.length === 0) return content
+  const parts: string[] = []
+  let lastIndex = 0
+  for (const block of blocks) {
+    parts.push(content.slice(lastIndex, block.start), formatLegacyClipMarkdown(block.metadata, block.body))
+    lastIndex = block.end
+  }
+  parts.push(content.slice(lastIndex))
+  return parts.join('')
 }
 
 async function replaceReferences(
@@ -277,15 +283,14 @@ async function replaceReferences(
   resolvers: MarkdownResolvers,
   toolResultMode: 'full' | 'summary'
 ) {
-  const matches = Array.from(content.matchAll(new RegExp(REFERENCE_REGEX.source, 'g')))
+  const matches = scanTranscriptReferences(content)
   if (matches.length === 0) return content
 
   let output = ''
   let lastIndex = 0
 
   for (const match of matches) {
-    const [fullMatch, rawType, refId, optionalContent] = match
-    const startIndex = match.index ?? 0
+    const { kind: rawType, id: refId, description: optionalContent, start: startIndex } = match
     output += content.slice(lastIndex, startIndex)
 
     if (rawType === 'batshit-zip') {
@@ -294,7 +299,7 @@ async function replaceReferences(
       output += await renderClipReferenceMarkdown(refId, optionalContent, resolvers.resolveClip)
     }
 
-    lastIndex = startIndex + fullMatch.length
+    lastIndex = match.end
   }
 
   output += content.slice(lastIndex)

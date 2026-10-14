@@ -10,16 +10,19 @@
 import type { ZipReference } from './zipService'
 import { createZipFromContent } from './zipService'
 import type { AgentRow } from '$lib/types/database'
-import { getToolSettings, shouldPreferFieldSettingsForTool } from '$lib/utils/toolRenderMap'
+import { canonicalToolName, getToolSettings, shouldPreferFieldSettingsForTool } from '$lib/utils/toolRenderMap'
+import { mapBashCommandToMode4Tool } from '$lib/server/services/bashCommandMapper'
 import type { IntermediateStep } from '$lib/utils/toolResultProcessor'
 import { normalizeToolStep } from '$lib/utils/toolResultProcessor'
 import {
   TOOL_ACTIVITY_FORCE_COMPRESS_TOKENS,
   TOOL_ACTIVITY_SCHEMA_VERSION,
+  modelFacingMcpText,
   normalizeCompactTool,
   resolveToolActivitySettingsName,
   shouldForceCompressToolPayload,
   shouldRetainRawSidecar,
+  toolOutputCut,
   type ToolOperationKind,
   type ToolRendererFamily
 } from '$lib/utils/toolActivityContract'
@@ -29,6 +32,7 @@ import {
   shouldPreferRawSidecarForAiExpansion
 } from '$lib/utils/coolToolAiContent'
 import { isBrokerToolUseName } from '$lib/utils/toolNameNormalization'
+import { isToolModelCutView } from '$lib/utils/toolModelTextSizeGuard'
 import { isMemoryControlToolStep } from '$lib/utils/memoryControl'
 import { logger } from '$lib/utils/logger'
 import {
@@ -90,6 +94,7 @@ type PreparedCoolTool = {
   rawTokens: number
   compactTokens: number
   forceCompress: boolean
+  modelFacingResultTokens: number
 }
 
 const normalizeToolResultShape = (input: any): any =>
@@ -783,14 +788,20 @@ function descriptionSizeForTool(
 
   switch (tool.operationKind) {
     case 'list_files':
-      return (
-        formatCount(
-          totalFromResult(result, ['totalItems', 'totalEntries']) ??
-            arrayCountFromResult(result, ['files', 'items', 'entries']),
-          'entry',
-          'entries'
-        ) || lineSize(resultLineCount)
-      )
+    case 'search_files':
+    case 'bash': {
+      // BL-8: an output its lane cut holds only the first entries, matches, or lines.
+      const size =
+        tool.operationKind === 'list_files'
+          ? formatCount(
+              totalFromResult(result, ['totalItems', 'totalEntries']) ??
+                arrayCountFromResult(result, ['files', 'items', 'entries']),
+              'entry',
+              'entries'
+            ) || lineSize(resultLineCount)
+          : lineSize(resultLineCount)
+      return size && toolOutputCut(result) ? `first ${size}` : size
+    }
     case 'dynamic_find':
     case 'tool_find':
     case 'agent_browser_find':
@@ -844,6 +855,38 @@ function buildCoolToolMetadata(step: any, normalized: IntermediateStep): Record<
     ...(step.subagentId ? { subagentId: step.subagentId } : {}),
     ...(step.subagentAvatar ? { subagentAvatar: step.subagentAvatar } : {})
   }
+}
+
+/**
+ * BL-233 review (finding 2): every lane classifies a shell command once, with the shared mapper.
+ * The API lane does it in send-routed (its result carries `mappedToolName`), Codex and Claude in
+ * their adapters (they name the step for the mapper's answer). A command step no lane's mapper saw
+ * (batshit-server's own `execute_command`, a third-party MCP tool, an n8n Workflow Subagent) is
+ * classified here by the SAME mapper, so it is stored as that mapping and never by a second
+ * reading of its text (`normalizeToolStep` reads only a result's shape). The mapper is
+ * deterministic: a Codex or Claude step it already named a command gets the same answer again.
+ */
+function applySharedCommandMapping(base: IntermediateStep): void {
+  if (canonicalToolName(base.toolName) !== 'execute_command') return
+  const result = base.toolResult
+  if (result && typeof result === 'object' && !Array.isArray(result) && typeof (result as any).mappedToolName === 'string') {
+    return
+  }
+  const args =
+    base.toolArgs && typeof base.toolArgs === 'object' && !Array.isArray(base.toolArgs)
+      ? (base.toolArgs as Record<string, any>)
+      : {}
+  const command = [
+    args.command,
+    args.cmd,
+    args.innerCommand,
+    result && typeof result === 'object' && !Array.isArray(result) ? (result as any).command : undefined
+  ].find((value): value is string => typeof value === 'string' && value.trim().length > 0)
+  if (!command) return
+  const mapping = mapBashCommandToMode4Tool(command)
+  if (mapping.toolName === 'batshit_server_execute_command') return
+  base.toolName = mapping.toolName
+  base.toolArgs = { ...args, ...mapping.args }
 }
 
 function prepareCoolTool(step: any): PreparedCoolTool {
@@ -920,6 +963,8 @@ function prepareCoolTool(step: any): PreparedCoolTool {
     ;(base as any).metadata = metadata
   }
 
+  applySharedCommandMapping(base)
+
   const sourceToolName = base.toolName
   const normalized = normalizeToolStep(base)
 
@@ -952,6 +997,9 @@ function prepareCoolTool(step: any): PreparedCoolTool {
   }
 
   const rawCandidate = step.toolResult ?? step.output ?? step.result
+  // CLI MCP text blocks are the bytes the model actually saw. A compact saved card must
+  // never make an oversized model result look small to next-turn size admission.
+  const modelFacingResultText = modelFacingMcpText(rawCandidate)
   const structuredToolNames = new Set([
     'read_file',
     'write_file',
@@ -991,7 +1039,12 @@ function prepareCoolTool(step: any): PreparedCoolTool {
     toolName: normalized.toolName || sourceToolName || 'tool',
     originalToolName: normalized.originalToolName || sourceToolName,
     toolArgs,
-    toolResult,
+    // Preserve the actual MCP text blocks for display normalization. Codex also returns
+    // structured_content:null; its wrapper otherwise stringifies content[] as JSON here.
+    // The normalizer decides presentation only, and never trusts ids inside this text.
+    toolResult: modelFacingResultText !== null && isToolModelCutView(modelFacingResultText)
+      ? [{ type: 'text', text: modelFacingResultText }]
+      : toolResult,
     metadata: mergedMetadata,
     isSubagent: normalized.isSubagent,
     toolProvider: normalized.toolProvider
@@ -1017,8 +1070,11 @@ function prepareCoolTool(step: any): PreparedCoolTool {
       : settingsIdentity || normalized.toolName || sourceToolName || 'tool'
   const inferredDisplayToolName =
     sourceToolName && sourceToolName !== normalized.toolName ? sourceToolName : undefined
+  // A lane's own label for its step comes next (the Claude adapter names Claude Code's `Agent` helper
+  // `Claude Code Helper`, SA-111 P4): the card showed the raw tool name until it was read here (BL-15).
   const displayToolName =
     compact.displayToolName ??
+    step.displayToolName ??
     (isMode1NativePackToolName(normalizedToolName)
       ? effectiveToolName && effectiveToolName !== compact.operationKind
         ? effectiveToolName
@@ -1127,7 +1183,8 @@ function prepareCoolTool(step: any): PreparedCoolTool {
     rawSidecarReason: compact.rawReason,
     rawTokens,
     compactTokens,
-    forceCompress
+    forceCompress,
+    modelFacingResultTokens: modelFacingResultText === null ? 0 : calculateTokens(modelFacingResultText)
   }
 }
 
@@ -1296,9 +1353,11 @@ export async function adaptCoolToolsToZipSystem(
       },
       promptPayload
     )
-    const promptTokens = calculateTokens(promptContent)
+    const promptTokens = Math.max(calculateTokens(promptContent), prepared.modelFacingResultTokens)
     const promptForceCompress = promptTokens >= TOOL_ACTIVITY_FORCE_COMPRESS_TOKENS
-    const forceCompress = prepared.forceCompress || promptForceCompress
+    // Stored JSON can repeat/escape the body. Only the transcript the model reads
+    // determines the size stamp; activation rechecks that live estimate (BL-493/494).
+    const forceCompress = promptForceCompress
     if (forceCompress !== prepared.forceCompress) {
       step.storage = {
         compacted: step.storage?.compacted ?? false,
@@ -1343,7 +1402,9 @@ export async function adaptCoolToolsToZipSystem(
         aiChars: promptContent.length,
         storageTokens,
         storageChars: content.length,
-        tokenBasis: 'ai_expanded',
+        tokenBasis: prepared.modelFacingResultTokens > calculateTokens(promptContent)
+          ? 'model_facing_mcp_text'
+          : 'ai_expanded',
         originalType: 'cool_tool',
         bufferSize,
         threshold,

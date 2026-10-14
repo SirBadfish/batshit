@@ -136,11 +136,27 @@ export function updateSessionClipDuration(
   }
 }
 
+/** The Clips attached for a number of messages (`next message only`, `next N messages`). */
+export function listCountdownClipIds(state: SessionClipStateRecord): string[] {
+  return state.clips
+    .filter((entry) => clampCountdown(entry.messagesUntilUnclip) !== null)
+    .map((entry) => entry.clipId)
+}
+
+/**
+ * One message spends one from every countdown. `onlyClipIds` limits the spend to those Clips: a
+ * group round spends only the Clips its first compile could have read (BL-600), so a Clip
+ * attached for the next message during the round is left for that message.
+ */
 export function decrementSessionClipDurations(
-  state: SessionClipStateRecord
+  state: SessionClipStateRecord,
+  onlyClipIds?: ReadonlySet<string>
 ): SessionClipStateRecord {
   const clips = state.clips
     .map((entry) => {
+      if (onlyClipIds && !onlyClipIds.has(entry.clipId)) {
+        return entry
+      }
       const countdown = clampCountdown(entry.messagesUntilUnclip)
       if (!countdown) {
         return entry

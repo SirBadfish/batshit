@@ -66,7 +66,7 @@ export type GroupChatSpeakPolicy =
   | 'quiet'
   | 'only_when_asked'
   | 'topic_only'
-  /** SA-120 P3 (LS-051): "Jev Juice: Smart" — Batshit's judgment model picks the speaker and skips follow-ups that add nothing. */
+  /** SA-120 P3 (LS-051): "Judge Juice: Smart" — Batshit's judgment model picks the speaker and skips follow-ups that add nothing. */
   | 'smart'
 
 /** Every accepted `speak_policy` value; the group create/update routes refuse anything else. */

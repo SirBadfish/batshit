@@ -1,6 +1,6 @@
+import { getBatshitHomeDir } from './batshitHome'
 import { env } from '$env/dynamic/private'
 import fs from 'node:fs/promises'
-import os from 'node:os'
 import path from 'node:path'
 
 import { redis } from '$lib/server/redis'
@@ -8,7 +8,7 @@ import { saveHostVoiceReferenceAudioViaOperator } from '$lib/server/services/voi
 import type { VoiceProfileRecord } from '$lib/types/voice'
 
 export function getManagedVoiceProfileStorageRoot(): string {
-  return path.join(os.homedir(), '.batshit', 'voice-profiles')
+  return path.join(getBatshitHomeDir(), 'voice-profiles')
 }
 
 function isContainerizedRuntime(): boolean {

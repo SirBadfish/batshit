@@ -4,6 +4,8 @@ import {
   clearSessionTurn,
   clearStreamAbort,
   getActiveSessionTurn,
+  queueSessionTurn,
+  QUEUED_SESSION_TURN_BACKSTOP_MS,
   registerSessionTurn,
   registerStreamAbort,
   releaseSessionTurn
@@ -177,5 +179,75 @@ describe('waitForCardReplyToFinish', () => {
     expect(outcome).toBe('timed_out')
     expect(APPROVAL_CLICK_WAIT_MS).toBe(15_000)
     expect(getActiveSessionTurn(SESSION)).toMatchObject({ messageId: CARD })
+  })
+})
+
+/**
+ * BL-4 — a send that meets another turn waits in the chat's line. A click on the card of the
+ * reply that just finished goes first: it answers that reply, and a send queued behind the reply
+ * must not take the chat in between (the click would be refused, and a long queued turn could
+ * outlast the card's three minutes).
+ */
+describe('a click keeps its place ahead of the waiting line (BL-4)', () => {
+  it('the card’s reply letting go does not hand the chat to a send queued behind it', async () => {
+    vi.useFakeTimers()
+    const reply = registerSessionTurn(SESSION, 'single', CARD)
+    if (!reply.ok) throw new Error('registration refused')
+    const queued = queueSessionTurn(SESSION, {
+      kind: 'single',
+      messageId: 'msg_later_reply',
+      userMessageId: 'msg_later'
+    })
+
+    let outcome: string | null = null
+    void waitForCardReplyToFinish(SESSION, CARD).then((value) => {
+      outcome = value
+    })
+    await vi.advanceTimersByTimeAsync(100)
+    releaseSessionTurn(SESSION, reply.entry.turnId)
+    // The chat stays free for the click.
+    expect(getActiveSessionTurn(SESSION)).toBeNull()
+
+    await vi.advanceTimersByTimeAsync(100)
+    expect(outcome).toBe('released')
+    // send-routed registers the click in the same step its wait ends, ahead of the line.
+    const click = registerSessionTurn(SESSION, 'single', CARD, { answersApproval: true })
+    expect(click.ok).toBe(true)
+    if (!click.ok) throw new Error('click refused')
+
+    // The queued send runs once the click's own turn lets go.
+    releaseSessionTurn(SESSION, click.entry.turnId)
+    expect(getActiveSessionTurn(SESSION)).toMatchObject({ messageId: 'msg_later_reply' })
+    expect((await queued.outcome).kind).toBe('run')
+  })
+
+  it('a click that does not take the chat does not strand the line', async () => {
+    vi.useFakeTimers()
+    const reply = registerSessionTurn(SESSION, 'single', CARD)
+    if (!reply.ok) throw new Error('registration refused')
+    const queued = queueSessionTurn(SESSION, {
+      kind: 'single',
+      messageId: 'msg_later_reply',
+      userMessageId: 'msg_later'
+    })
+    // Its request takes the chat the moment it is handed over, as send-routed does.
+    void queued.outcome.then((handover) => {
+      if (handover.kind === 'run') registerSessionTurn(SESSION, 'single', 'msg_later_reply', {}, handover.entry)
+    })
+
+    let outcome: string | null = null
+    void waitForCardReplyToFinish(SESSION, CARD).then((value) => {
+      outcome = value
+    })
+    await vi.advanceTimersByTimeAsync(100)
+    releaseSessionTurn(SESSION, reply.entry.turnId)
+    await vi.advanceTimersByTimeAsync(100)
+    expect(outcome).toBe('released')
+
+    // The click never registers (its caller refused it for another reason): the line's
+    // backstop hands the chat on.
+    await vi.advanceTimersByTimeAsync(QUEUED_SESSION_TURN_BACKSTOP_MS)
+    expect(getActiveSessionTurn(SESSION)).toMatchObject({ messageId: 'msg_later_reply' })
+    expect((await queued.outcome).kind).toBe('run')
   })
 })

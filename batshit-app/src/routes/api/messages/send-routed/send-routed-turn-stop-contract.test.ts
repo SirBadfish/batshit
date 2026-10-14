@@ -69,13 +69,16 @@ describe('send-routed: a turn’s own stop signal reaches every run', () => {
   it('a run forwards it into the controller the setup checkpoint reads, reason and all', () => {
     const handler = source.indexOf('\nasync function handleBatshitAgentStream({')
     const checkpoint = source.indexOf('const abortedDuringSetup = Boolean(streamAbortSignal.aborted)', handler)
+    // BL-246: relayed through `relayAbort` (its behavior, an already-stopped signal included, is
+    // tested in `turnAbortRelay.test.ts`), with the Stop's own reason, and taken back at turn end.
     const wiring = source.indexOf(
-      '\n  if (turnStopSignal) {\n    const forwardTurnStop = () => streamAbortController.abort(turnStopSignal.reason)\n    if (turnStopSignal.aborted) forwardTurnStop()\n    else turnStopSignal.addEventListener(\'abort\', forwardTurnStop, { once: true })\n  }\n',
+      '\n  relayAbort({ from: turnStopSignal, to: streamAbortController, reason: sourceAbortReason, until: turnListeners.signal })\n',
       handler
     )
     expect(handler).toBeGreaterThan(-1)
     expect(wiring).toBeGreaterThan(handler)
     expect(checkpoint).toBeGreaterThan(wiring)
+    expect(source).toContain('\nfunction sourceAbortReason(source: AbortSignal): unknown {\n  return source.reason\n}')
   })
 
   it('a stopped stream releases the wait for `onFinish`, which an aborted stream never calls', () => {
@@ -96,7 +99,7 @@ describe('send-routed: a turn’s own stop signal reaches every run', () => {
     const group = source.indexOf('\nasync function handleGroupChatStream({')
     const register = source.indexOf('registerGroupAbort(sessionId, groupAbortController)', group)
     const wiring = source.indexOf(
-      '\n  if (turnStopSignal) {\n    const forwardTurnStop = () => groupAbortController.abort(turnStopSignal.reason)\n',
+      '\n  relayAbort({ from: turnStopSignal, to: groupAbortController, reason: sourceAbortReason, until: groupListeners.signal })\n',
       group
     )
     expect(register).toBeGreaterThan(group)

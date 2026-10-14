@@ -2,7 +2,8 @@ import { json, type RequestHandler } from '@sveltejs/kit'
 
 import {
   applyVoiceEnginePublicUpdates,
-  listVoiceEngineSummaries,
+  listUnreadableVoiceEngines,
+  listVoiceEngineManagerView,
   upsertVoiceEngineRecord,
   type VoiceEnginePublicUpdate
 } from '$lib/server/services/voiceEngineRegistry'
@@ -185,8 +186,11 @@ export const GET: RequestHandler = async ({ locals }) => {
   }
 
   try {
-    const engines = await listVoiceEngineSummaries(locals.user.id)
-    return json({ engines })
+    // A saved record the registry cannot read is kept unchanged, and named here so the Engine
+    // Manager can say so. A list it cannot read as a whole answers no engines plus a `list`
+    // notice (and every change to it is refused); only a failed Redis read is an error here.
+    const { engines, unreadableEngines } = await listVoiceEngineManagerView(locals.user.id)
+    return json({ engines, unreadableEngines })
   } catch (error) {
     console.error('[voice/byo/engines] Failed to load BYO engines:', error)
     return json({ error: 'Failed to load BYO engines' }, { status: 500 })
@@ -205,8 +209,8 @@ export const POST: RequestHandler = async ({ locals, request }) => {
     }
     const payload = normalizeManualEnginePayload(data?.payload)
     const result = await upsertVoiceEngineRecord(locals.user.id, data.engineId, payload)
-    const engines = await listVoiceEngineSummaries(locals.user.id)
-    return json({ success: true, created: result.created, engine: result.summary, engines })
+    const { engines, unreadableEngines } = await listVoiceEngineManagerView(locals.user.id)
+    return json({ success: true, created: result.created, engine: result.summary, engines, unreadableEngines })
   } catch (error) {
     console.error('[voice/byo/engines] Failed to connect existing BYO engine:', error)
     return json(
@@ -227,7 +231,8 @@ export const PUT: RequestHandler = async ({ locals, request }) => {
     const data = await request.json()
     const engines = normalizePublicUpdates(data?.engines)
     const updated = await applyVoiceEnginePublicUpdates(locals.user.id, engines)
-    return json({ success: true, engines: updated })
+    const unreadableEngines = await listUnreadableVoiceEngines(locals.user.id)
+    return json({ success: true, engines: updated, unreadableEngines })
   } catch (error) {
     console.error('[voice/byo/engines] Failed to update BYO engines:', error)
     return json(

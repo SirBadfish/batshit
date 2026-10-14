@@ -18,6 +18,12 @@
   import { confirmDialog } from '$lib/stores/confirmDialog'
   import { getUserSettings } from '$lib/stores/userSettings.svelte'
   import { LIVE_SETTINGS_EVENTS } from '$lib/utils/liveSettingsEvents'
+  import { normalizeClipCompressionSettings } from '$lib/utils/clipCompressionSettings'
+  import { importClipFiles } from '$lib/appActions/imports/clips'
+  import { registerSuppliedFileOwner } from '$lib/appActions/imports/registry'
+  import type { ImportArgs, ImportOutcome } from '$lib/appActions/imports/contracts'
+  import { refuse } from '$lib/appActions/catalog'
+  import type { ActionContext } from '$lib/appActions/owners'
   import type { PageData } from '../../../routes/$types'
   
   // Props
@@ -76,6 +82,7 @@
   }
   
   // State for clips
+  let clipUploadBusy = $state(false)
   let clipVault = $state<Clip[]>([]) // All user's clips (plus system)
   let clippedItems = $state<Clip[]>([]) // Currently clipped items
   let totalTokens = $state(0)
@@ -89,24 +96,54 @@
   let bulkDeleteMode = $state(false)
   let selectedClipIds = $state<string[]>([])
   let bulkDeleteBusy = $state(false)
+  let clipAttachmentUnresolved = $state<Array<{ sessionId: string; ids: string[]; unsettledIds?: string[] }>>([])
+  let clipAttachmentFlightSession = $state<string | null>(null)
+  const clipEvidenceGenerations = new Map<string | null, number>()
+  const clipReadSequences = new Map<string | null, number>()
+  type ClipReadOwner = { sessionId: string | null; generation: number; sequence: number }
+  let attachmentRefreshBusy = $state(false)
+  let currentUnresolvedClipIds = $derived(clipAttachmentUnresolved.find(entry => entry.sessionId === sessionId)?.ids ?? [])
+  let currentUnsettledClipIds = $derived(clipAttachmentUnresolved.find(entry => entry.sessionId === sessionId)?.unsettledIds ?? [])
+  let attachmentCheckPending = $derived(clipAttachmentUnresolved.some(entry => entry.sessionId === sessionId))
   let vaultVisibleUserClips = $derived(userClipVault.filter((c) => !c.isClipped))
   let allUserClipIds = $derived(userClipVault.map((clip) => clip.id))
   let allUserClipsSelected = $derived(
     allUserClipIds.length > 0 && allUserClipIds.every((clipId) => selectedClipIds.includes(clipId))
   )
 
-  function upsertClip(clip: Clip, shouldClip: boolean) {
+  function markClipEvidence(targetSession: string | null = sessionId) {
+    clipEvidenceGenerations.set(targetSession, (clipEvidenceGenerations.get(targetSession) ?? 0) + 1)
+  }
+
+  function beginClipRead(targetSession: string | null): ClipReadOwner {
+    const sequence = (clipReadSequences.get(targetSession) ?? 0) + 1
+    clipReadSequences.set(targetSession, sequence)
+    return { sessionId: targetSession, generation: clipEvidenceGenerations.get(targetSession) ?? 0, sequence }
+  }
+
+  function clipReadCurrent(owner: ClipReadOwner) {
+    return sessionId === owner.sessionId && (clipEvidenceGenerations.get(owner.sessionId) ?? 0) === owner.generation &&
+      clipReadSequences.get(owner.sessionId) === owner.sequence
+  }
+
+  function clipAttachmentPending(targetSession: string | null = sessionId) {
+    return targetSession !== null && (clipAttachmentFlightSession === targetSession ||
+      clipAttachmentUnresolved.some(entry => entry.sessionId === targetSession && entry.unsettledIds?.length))
+  }
+
+  function upsertClip(clip: Clip, shouldClip: boolean, attachment: 'known' | 'unknown' | 'preserve' = 'preserve') {
+    markClipEvidence()
     const existingIndex = clipVault.findIndex((item) => item.id === clip.id)
     const merged = existingIndex >= 0
       ? {
           ...clipVault[existingIndex],
           ...clip,
-          isClipped: shouldClip || clipVault[existingIndex].isClipped,
+          isClipped: attachment === 'known' ? shouldClip : attachment === 'unknown' ? clipVault[existingIndex].isClipped : shouldClip || clipVault[existingIndex].isClipped,
           unclipAfter: clip.unclipAfter ?? clipVault[existingIndex].unclipAfter ?? null,
           messagesUntilUnclip:
             clip.messagesUntilUnclip ?? clipVault[existingIndex].messagesUntilUnclip ?? null
         }
-      : { ...clip, isClipped: shouldClip }
+      : { ...clip, isClipped: attachment === 'unknown' ? undefined : shouldClip }
 
     if (existingIndex >= 0) {
       clipVault = [
@@ -124,6 +161,8 @@
       } else {
         clippedItems = clippedItems.map((item) => (item.id === merged.id ? merged : item))
       }
+    } else if (attachment === 'known') {
+      clippedItems = clippedItems.filter(item => item.id !== merged.id)
     }
   }
   
@@ -148,12 +187,18 @@
         .filter((entry) => entry?.clipId)
         .map((entry) => [entry.clipId, entry])
     )
+    const pending = clipAttachmentUnresolved.find(entry => entry.sessionId === sessionId)
+    // GET observes state, never proves cancellation/completion of a POST whose
+    // response was lost. Keep that request's absence unknown and its completion
+    // notice even after positive attachment evidence arrives.
+    const unsettledIds = pending?.unsettledIds ?? []
+    const unresolvedIds = unsettledIds.filter(id => !stateMap.has(id))
 
     const nextVault = clips.map((clip) => {
       const sessionEntry = stateMap.get(clip.id)
       return {
         ...clip,
-        isClipped: Boolean(sessionEntry),
+        isClipped: sessionEntry ? true : unresolvedIds.includes(clip.id) ? undefined : false,
         unclipAfter: sessionEntry?.unclipAfter ?? null,
         messagesUntilUnclip: sessionEntry?.messagesUntilUnclip ?? null
       }
@@ -161,6 +206,28 @@
 
     clipVault = nextVault
     clippedItems = nextVault.filter((clip) => clip.isClipped)
+    clipAttachmentUnresolved = clipAttachmentUnresolved.filter(entry => entry.sessionId !== sessionId)
+    if (sessionId && unsettledIds.length) clipAttachmentUnresolved = [...clipAttachmentUnresolved, { sessionId, ids: unresolvedIds, unsettledIds }]
+    markClipEvidence()
+  }
+
+  async function refreshUnresolvedAttachments() {
+    const targetSession = sessionId
+    if (!targetSession || attachmentRefreshBusy) return
+    const owner = beginClipRead(targetSession)
+    attachmentRefreshBusy = true
+    try {
+      const response = await fetch(`/api/session-clips/state/${encodeURIComponent(targetSession)}`, { cache: 'no-store' })
+      if (!response.ok) throw new Error('Clip attachment status could not be checked')
+      const state = await response.json()
+      if (state?.sessionId !== targetSession || !Array.isArray(state.clips)) throw new Error('Clip attachment status could not be checked')
+      if (!clipReadCurrent(owner)) return
+      applySessionStateToVault(clipVault, state.clips)
+    } catch {
+      if (clipReadCurrent(owner)) toast.error('Clip attachment status could not be checked. Refresh Clips checks current state; an earlier request may still be running.')
+    } finally {
+      attachmentRefreshBusy = false
+    }
   }
 
   function deriveFileType(mimeType?: string, filename?: string): string | undefined {
@@ -268,6 +335,8 @@
   
   // Load clips from storage
   async function loadClips() {
+    const targetSession = sessionId
+    const owner = beginClipRead(targetSession)
     try {
       // Fetch user's clips from the API
       const response = await fetch('/api/clips')
@@ -287,167 +356,132 @@
           localTokens: clip.localTokens,
           storageMode: clip.storageMode,
           uploadedAt: clip.created_at,
-          isClipped: false, // Initially not clipped to current message
+          // BL-1177: a refresh that loses the session read must retain the
+          // existing per-file evidence until the explicit read succeeds.
+          isClipped: clipAttachmentUnresolved.some(entry => entry.sessionId === targetSession)
+            ? clipVault.find(existing => existing.id === clip.id)?.isClipped : false,
           systemClip: clip.systemClip === true,
           unclipAfter: null,
           messagesUntilUnclip: null
         }))
         
         // Load session clip state if we have a session (single source of truth)
-        if (sessionId) {
-          const sessionResponse = await fetch(`/api/session-clips/state/${sessionId}`)
+        if (targetSession) {
+          const sessionResponse = await fetch(`/api/session-clips/state/${encodeURIComponent(targetSession)}`)
           if (sessionResponse.ok) {
             const sessionState = await sessionResponse.json()
+            if (!clipReadCurrent(owner)) return
+            if (sessionState?.sessionId !== targetSession || !Array.isArray(sessionState.clips)) throw new Error('Clip attachment status could not be checked')
             applySessionStateToVault(
               mappedClips,
-              Array.isArray(sessionState?.clips) ? sessionState.clips : []
+              sessionState.clips
             )
             return
           }
         }
 
+        if (!clipReadCurrent(owner)) return
         clipVault = mappedClips
         clippedItems = mappedClips.filter((clip: Clip) => clip.isClipped)
+        markClipEvidence(targetSession)
       }
     } catch (error) {
+      if (!clipReadCurrent(owner)) return
       console.error('Failed to load clips:', error)
       toast.error('Failed to load clips')
     }
   }
   
-  async function uploadFilesInternal(files: File[]) {
+  async function uploadFilesInternal(
+    files: File[], args = { sessionId, attach: Boolean(sessionId) }, suppliedContext?: ActionContext
+  ): Promise<ImportOutcome | undefined> {
     if (files.length === 0) return
-
-    const uploadToast = toast.loading(`Uploading ${files.length} file${files.length > 1 ? 's' : ''}...`)
-
-    try {
-      // Fetch fresh settings from API to avoid stale pageData
-      let uiSettings: any = {}
-      try {
-        const settingsResponse = await fetch('/api/user/settings')
-        if (settingsResponse.ok) {
-          const settingsData = await settingsResponse.json()
-          uiSettings = settingsData?.settings?.ui_settings || {}
-        }
-      } catch (err) {
-        console.warn('Failed to fetch fresh settings, using pageData:', err)
-        uiSettings = pageData?.userSettings?.ui_settings || {}
-      }
-
-      const compressionSettings = {
-        compress_images: uiSettings.compress_images !== false,
-        compression_quality: uiSettings.compression_quality || 40,
-        max_image_size: uiSettings.max_image_size || '1024',
-        force_jpeg: uiSettings.force_jpeg !== false
-      }
-      
-      // Create FormData
-      const formData = new FormData()
-      for (const file of files) {
-        formData.append('files', file)
-      }
-      
-      // Add session ID
-      if (sessionId) {
-        formData.append('sessionId', sessionId)
-      }
-      
-      // Add user ID
-      if (pageData?.user?.id) {
-        formData.append('userId', pageData.user.id)
-      }
-      
-      // Add settings
-      formData.append('compressionSettings', JSON.stringify(compressionSettings))
-      formData.append('uploadSettings', JSON.stringify({
-        strategy: 'local',
-        storage_mode: 'local',
-        webhookUrl: '',
-        webhookAuth: '',
-        tunnel_url: '',
-        use_https: false,
-        tunnel_provider: 'none',
-        cloudflared_auto_start: false,
-        cloudflared_target_url: ''
-      }))
-      
-      // Upload through the session-authed app proxy (batshit-server's upload
-      // routes are service-token-gated and not browser-reachable directly)
-      const response = await fetch('/api/uploads/clips', {
-        method: 'POST',
-        body: formData
-      })
-      
-      if (!response.ok) {
-        throw new Error(`Upload failed: ${response.statusText}`)
-      }
-      
-      const result = await response.json()
-      
-      // Process uploaded files into clips
-      if (result.files) {
-        for (const file of result.files) {
-          // The server now returns clipData with the clip info
-          if (file.clipData) {
-            const storageMode: Clip['storageMode'] = 'local'
-            const returnedTokens = file.clipData.tokens
-            const clip: Clip = {
-              id: file.clipData.id,
-              filename: file.originalName,
-              fileType: deriveFileType(file.mimetype, file.originalName),
-              mimeType: file.mimetype,
-              externalUrl: file.externalUrl,
-              displayUrl: file.displayUrl, // Include displayUrl for frontend rendering
-              localUrl: file.localUrl || file.url,
-              thumbnailUrl:
-                typeof file.mimetype === 'string' && file.mimetype.startsWith('image/')
-                  ? file.displayUrl || file.localUrl || file.url
-                  : undefined,
-              externalTokens:
-                file.externalTokens ??
-                file.clipData.externalTokens,
-              localTokens:
-                file.localTokens ??
-                file.clipData.localTokens ??
-                returnedTokens,
-              storageMode,
-              uploadedAt: new Date().toISOString(),
-              isClipped: true, // Auto-clip on upload
-              unclipAfter: null,
-              messagesUntilUnclip: null
-            }
-            
-            // Add to vault and clipped items
-            clipVault = [...clipVault, clip]
-            clippedItems = [...clippedItems, clip]
-            
-            // Attach to session using NEW session state API
-            if (sessionId) {
-              try {
-                // NEW: Use session state API for tracking clips
-                await fetch('/api/session-clips/state', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    sessionId,
-                    clipId: clip.id,
-                    action: 'attach'
-                  })
-                })
-              } catch (error) {
-                console.error('Failed to attach clip to session:', error)
-              }
-            }
-          }
-        }
-        
-        toast.dismiss(uploadToast)
-        toast.success(`Uploaded and clipped ${result.files.length} file${result.files.length > 1 ? 's' : ''}`)
-      }
-    } catch (error) {
-      toast.dismiss(uploadToast)
-      toast.error(`Upload failed: ${error instanceof Error ? error.message : String(error)}`)
+    if (clipUploadBusy) {
+      if (suppliedContext) refuse('owner_busy')
+      toast.error('Wait for the current Clip upload to finish.')
+      return
     }
+    const capturedSessionId = args.sessionId
+    if (args.attach && clipAttachmentPending(capturedSessionId)) {
+      if (suppliedContext) refuse('attachment_completion_unknown')
+      toast.error('An earlier attachment request for this chat is still unconfirmed. New attachment changes must wait; Refresh only checks current state.')
+      return
+    }
+    const context: ActionContext = suppliedContext ?? {
+      sessionId: capturedSessionId, signal: new AbortController().signal,
+      check() {}, effect() {}, report() {},
+      async wait(read) { const value = read(); if (value === undefined) throw new Error('owner_unconfirmed'); return value }
+    }
+    context.check()
+    markClipEvidence(capturedSessionId)
+    clipUploadBusy = true
+    const uploadToast = toast.loading(`Uploading ${files.length} file${files.length > 1 ? 's' : ''}...`)
+    try {
+      const importingContext: ActionContext = {
+        ...context,
+        report(outcome) {
+          const receipt = (outcome as ImportOutcome).import
+          if (args.attach && capturedSessionId && Array.isArray(receipt?.unsettledIds)) {
+            const nextSession = receipt.unsettledIds.length ? capturedSessionId : null
+            if (clipAttachmentFlightSession !== nextSession) markClipEvidence(capturedSessionId)
+            clipAttachmentFlightSession = nextSession
+          }
+          context.report(outcome)
+        }
+      }
+      const result = await importClipFiles(files, args, importingContext)
+      if (args.attach && capturedSessionId) {
+        const previousUnresolved = clipAttachmentUnresolved.find(entry => entry.sessionId === capturedSessionId)
+        clipAttachmentUnresolved = clipAttachmentUnresolved.filter(entry => entry.sessionId !== capturedSessionId)
+        if (previousUnresolved || result.outcome.import.staged === 'unknown' ||
+          result.outcome.status === 'unknown_outcome' && result.outcome.import.saved === 'confirmed') {
+          const retainedIds = previousUnresolved?.ids.filter(id => !result.outcome.import.ids.includes(id)) ?? []
+          const unsettledIds = [...new Set([...(previousUnresolved?.unsettledIds ?? []), ...(result.outcome.import.unsettledIds ?? [])])]
+          clipAttachmentUnresolved = [...clipAttachmentUnresolved, {
+            sessionId: capturedSessionId, ids: [...new Set([...retainedIds, ...(result.outcome.import.unresolvedIds ?? [])])], unsettledIds
+          }]
+        }
+      }
+      for (const file of result.files) {
+        const returnedTokens = file.clipData.tokens
+        const sameSession = sessionId === capturedSessionId
+        const clipped = sameSession && result.outcome.import.attachedIds?.includes(file.clipData.id) === true
+        const unresolved = sameSession && result.outcome.import.unresolvedIds?.includes(file.clipData.id) === true
+        const clip: Clip = {
+          id: file.clipData.id, filename: file.originalName,
+          fileType: deriveFileType(file.mimetype, file.originalName), mimeType: file.mimetype,
+          externalUrl: file.externalUrl, displayUrl: file.displayUrl, localUrl: file.localUrl || file.url,
+          thumbnailUrl: file.mimetype?.startsWith('image/') ? file.displayUrl || file.localUrl || file.url : undefined,
+          externalTokens: file.externalTokens ?? file.clipData.externalTokens,
+          localTokens: file.localTokens ?? file.clipData.localTokens ?? returnedTokens,
+          storageMode: 'local', uploadedAt: new Date().toISOString(), isClipped: unresolved ? undefined : clipped,
+          unclipAfter: null, messagesUntilUnclip: null
+        }
+        upsertClip(clip, clipped, unresolved ? 'unknown' : args.attach && sameSession ? 'known' : 'preserve')
+      }
+      if (result.outcome.status === 'completed') {
+        toast.success(args.attach ? `Uploaded and clipped ${result.files.length} file${result.files.length > 1 ? 's' : ''}`
+          : `Uploaded ${result.files.length} file${result.files.length > 1 ? 's' : ''}`)
+      } else {
+        const saved = result.outcome.import.saved === 'confirmed'
+        toast.error(saved ? 'Files uploaded. Some attachment results could not be confirmed; saved attachments are kept. Check Clips before trying again.'
+          : result.outcome.reason === 'clip_settings_unconfirmed' ? 'Clip settings could not load. No upload was started.'
+          : 'The upload could not be confirmed. Check Clips before trying again.')
+      }
+      return result.outcome
+    } finally {
+      clipAttachmentFlightSession = null
+      clipUploadBusy = false
+      toast.dismiss(uploadToast)
+    }
+  }
+
+  export async function importAppActionFiles(
+    args: ImportArgs['clip.import_files'], files: File[], context: ActionContext
+  ): Promise<ImportOutcome> {
+    context.check()
+    if (args.sessionId !== null && args.sessionId !== sessionId) refuse('session_changed')
+    return (await uploadFilesInternal(files, args, context))!
   }
 
   // Handle file upload (input)
@@ -470,7 +504,13 @@
   
   // Toggle clip status
   async function toggleClip(clip: Clip) {
+    if (currentUnresolvedClipIds.includes(clip.id) || clipAttachmentPending()) {
+      toast.error('The earlier Clip attachment request is unconfirmed. Refresh can check current attachments, but cannot confirm that request has finished.')
+      return
+    }
+    markClipEvidence()
     const wasClipped = clip.isClipped
+    const targetSession = sessionId
     clip.isClipped = !clip.isClipped
     
     if (clip.isClipped) {
@@ -493,7 +533,9 @@
               ? { ...item, unclipAfter: null, messagesUntilUnclip: null }
               : item
           )
+          markClipEvidence(targetSession)
         } catch (error) {
+          markClipEvidence(targetSession)
           console.error('Failed to clip item:', error)
           // Revert on error
           clip.isClipped = wasClipped
@@ -515,7 +557,9 @@
               action: 'detach'
             })
           })
+          markClipEvidence(targetSession)
         } catch (error) {
+          markClipEvidence(targetSession)
           console.error('Failed to unclip item:', error)
           // Revert on error
           clip.isClipped = wasClipped
@@ -527,6 +571,12 @@
   }
 
   async function setClipOneTimeMode(clipId: string, enabled: boolean) {
+    if (clipAttachmentPending()) {
+      toast.error('An earlier attachment request for this chat is still unconfirmed. Duration changes must wait.')
+      return
+    }
+    markClipEvidence()
+    const targetSession = sessionId
     const nextDuration = enabled ? 1 : null
     const update = (clip: Clip) =>
       clip.id === clipId
@@ -556,6 +606,7 @@
       if (!response.ok) {
         throw new Error('Failed to persist clip duration')
       }
+      markClipEvidence(targetSession)
     } catch (error) {
       console.error('Failed to update one-message clip duration:', error)
       toast.error('Failed to update clip duration')
@@ -567,6 +618,12 @@
   
   // Unclip all
   async function unclipAll() {
+    if (clipAttachmentPending()) {
+      toast.error('An earlier Clip attachment request is still unconfirmed. Clearing all attachments could race that request.')
+      return
+    }
+    markClipEvidence()
+    const targetSession = sessionId
     clipVault = clipVault.map(c => ({ ...c, isClipped: false }))
     clippedItems = []
 
@@ -576,7 +633,9 @@
       await fetch(`/api/session-clips/state/${sessionId}`, {
         method: 'DELETE'
       })
+      markClipEvidence(targetSession)
     } catch (error) {
+      markClipEvidence(targetSession)
       console.error('Failed to clear session clip state:', error)
     }
   }
@@ -616,6 +675,8 @@
 
     const clipIds = selectedClipIds.filter((clipId) => userClipVault.some((clip) => clip.id === clipId))
     if (clipIds.length === 0) return
+    const targetSession = sessionId
+    if (clipDeleteBlocked(targetSession)) return
 
     const confirmed = await confirmDialog({
       title: `Delete ${clipIds.length} clip${clipIds.length === 1 ? '' : 's'}?`,
@@ -624,6 +685,7 @@
       tone: 'destructive'
     })
     if (!confirmed) return
+    if (clipDeleteBlocked(targetSession)) return
 
     bulkDeleteBusy = true
     try {
@@ -638,6 +700,7 @@
       }
 
       const deletedSet = new Set(clipIds)
+      markClipEvidence()
       clipVault = clipVault.filter((clip) => !deletedSet.has(clip.id))
       clippedItems = clippedItems.filter((clip) => !deletedSet.has(clip.id))
       selectedClipIds = []
@@ -657,17 +720,22 @@
       toast.error('User not authenticated')
       return
     }
+    const clipId = clip.id
+    const filename = clip.filename
+    const targetSession = sessionId
+    if (clipDeleteBlocked(targetSession)) return
     
     const confirmDelete = await confirmDialog({
-      title: `Delete "${clip.filename}"?`,
+      title: `Delete "${filename}"?`,
       description: 'This permanently deletes the clip. This action cannot be undone.',
       confirmLabel: 'Delete Clip',
       tone: 'destructive'
     })
     if (!confirmDelete) return
+    if (clipDeleteBlocked(targetSession)) return
     
     try {
-      const response = await fetch(`/api/clips/${clip.id}`, {
+      const response = await fetch(`/api/clips/${encodeURIComponent(clipId)}`, {
         method: 'DELETE',
         headers: {
           'Content-Type': 'application/json'
@@ -675,11 +743,12 @@
       })
       
       if (response.ok) {
+        markClipEvidence()
         // Remove from local state
-        clipVault = clipVault.filter(c => c.id !== clip.id)
-        clippedItems = clippedItems.filter(c => c.id !== clip.id)
-        selectedClipIds = selectedClipIds.filter((id) => id !== clip.id)
-        toast.success(`Deleted ${clip.filename}`)
+        clipVault = clipVault.filter(c => c.id !== clipId)
+        clippedItems = clippedItems.filter(c => c.id !== clipId)
+        selectedClipIds = selectedClipIds.filter((id) => id !== clipId)
+        toast.success(`Deleted ${filename}`)
       } else {
         throw new Error('Failed to delete clip')
       }
@@ -690,6 +759,14 @@
   }
   
   // Format token display
+  function clipDeleteBlocked(_targetSession: string | null) {
+    // Permanent deletion removes attachment state from every user chat. A
+    // remembered request in another chat can still write its old whole state.
+    if (clipAttachmentFlightSession === null && !clipAttachmentUnresolved.some(entry => entry.unsettledIds?.length)) return false
+    toast.error('A Clip attachment request in this or another chat is still unconfirmed. Deleting Clips could race that request.')
+    return true
+  }
+
   function formatTokens(tokens: number | undefined): string {
     if (!tokens) return '0'
     if (tokens > 1000) {
@@ -703,6 +780,11 @@
   }
   
   onMount(() => {
+    const unregisterImport = registerSuppliedFileOwner('clip.import_files', {
+      available: args => clipUploadBusy ? 'owner_busy' : args.sessionId !== null && args.sessionId !== sessionId ? 'session_changed'
+        : args.attach && clipAttachmentPending(args.sessionId) ? 'attachment_completion_unknown' : 'available',
+      execute: importAppActionFiles
+    })
     loadClips()
     if (managedTunnelEnabled) {
       void refreshManagedTunnelStatus({ silent: true })
@@ -749,6 +831,7 @@
     )
 
     return () => {
+      unregisterImport()
       window.removeEventListener('batshit:clip-uploaded', handleClipUploaded as EventListener)
       window.removeEventListener('batshit:managed-tunnel-status', handleManagedTunnelStatus as EventListener)
       window.removeEventListener(
@@ -837,6 +920,7 @@
       .map((clip) => clip.id)
 
     if (oneTimeIds.length > 0) {
+      markClipEvidence()
       clipVault = clipVault.map((clip) =>
         oneTimeIds.includes(clip.id)
           ? { ...clip, isClipped: false, unclipAfter: null, messagesUntilUnclip: null }
@@ -853,6 +937,12 @@
   // NEW: Update session clip state when clips change
   async function updateSessionClipState() {
     if (!sessionId) return
+    if (clipAttachmentPending()) {
+      toast.error('An earlier attachment request for this chat is still unconfirmed. Attachment changes must wait.')
+      return
+    }
+    markClipEvidence()
+    const targetSession = sessionId
     
     try {
       // Clear existing state
@@ -874,6 +964,8 @@
       }
     } catch (error) {
       console.error('Failed to update session clip state:', error)
+    } finally {
+      markClipEvidence(targetSession)
     }
   }
 </script>
@@ -988,9 +1080,18 @@
     <DropdownMenu.Separator />
     
     <!-- Clipped Items Section -->
+    {#if attachmentCheckPending}
+      <div class="mx-2 my-1 flex items-center justify-between gap-2 text-xs text-amber-400" role="status">
+        <span>{currentUnsettledClipIds.length ? 'An earlier attachment request has not been confirmed finished. Refresh checks current attachments; it cannot stop that request.' : 'Some Clip attachment results are unresolved.'}</span>
+        <Button variant="ghost" size="sm" class="h-6 px-2 text-[11px]" onclick={refreshUnresolvedAttachments} disabled={attachmentRefreshBusy}>
+          <RefreshCw class={`mr-1 h-3 w-3 ${attachmentRefreshBusy ? 'animate-spin' : ''}`} />
+          Refresh Clips
+        </Button>
+      </div>
+    {/if}
     {#if clippedItems.length === 0}
       <div class="px-2 py-6 text-center">
-        <div class="text-sm text-muted-foreground mb-2">No clipped items</div>
+        <div class="text-sm text-muted-foreground mb-2">{currentUnresolvedClipIds.length > 0 ? 'Clip attachment status is unknown' : 'No clipped items'}</div>
         <Button
           variant="outline"
           size="sm"
@@ -1190,6 +1291,7 @@
                 <button
                   class="clips-manager-vault-row-button flex-1 text-left px-2 py-1"
                   onclick={() => bulkDeleteMode ? toggleClipSelection(clip.id) : toggleClip(clip)}
+                  disabled={!bulkDeleteMode && (currentUnresolvedClipIds.includes(clip.id) || currentUnsettledClipIds.length > 0)}
                 >
                   <div class="flex items-center justify-between">
                     <div class="flex items-center gap-2 min-w-0">
@@ -1208,7 +1310,9 @@
                       <div class="flex flex-col gap-0.5 min-w-0">
                         <span class="text-xs truncate flex-1">
                           {clip.filename}
-                          {#if clip.isClipped}
+                          {#if currentUnresolvedClipIds.includes(clip.id)}
+                            <span class="clips-manager-inline-status">status unknown</span>
+                          {:else if clip.isClipped}
                             <span class="clips-manager-inline-status">clipped</span>
                           {/if}
                         </span>
@@ -1376,8 +1480,8 @@
   }
 
   .clips-manager-vault-row.is-selected {
-    border-color: color-mix(in oklab, var(--primary) 48%, var(--border));
-    background: color-mix(in oklab, var(--primary) 12%, transparent);
+    border-color: color-mix(in oklab, var(--primary-text) 48%, var(--border));
+    background: var(--bs-app-primary-faint);
   }
 
   .clips-manager-vault-row:focus-within {

@@ -124,7 +124,7 @@ Batshit's isolated command-execution backend. It runs through Docker's free `sbx
 
 ### Dynamic Current Message
 
-An ephemeral context block Batshit adds to the current user message before sending it to the agent. It can include Project path, file refs, tool discoverability, Subagents, Clips, Goon cues, and other current-turn context. It is not permanently stored as a normal message.
+An ephemeral context block Batshit adds to the current user message before sending it to the agent. It can include Project path, file refs, tool discoverability, Subagents, Clips, Goon cues, and other current-turn context. It reaches the agent inside `<dynamic_info>` tags and is not permanently stored as a normal message.
 
 ### Dynamic Tool Search
 
@@ -185,6 +185,10 @@ The settings area for shared Goon moods, emotes, eye-contact profiles, and relat
 A Batshit conversation where multiple Primary Agents can participate. Launch-facing Group Chat is for `API` and `CLI` Primary Agents.
 
 ## H
+
+### Hold
+
+Keeping a result open for the model instead of letting the automatic Zip rules compress it. You hold a result from its Zip badge or the Zip Manager (**Hold**, or **Hold for 10 messages**); an agent holds a file it read by naming the file in its Tool Notes. **Release** gives it back to the automatic rules. Your holds always win over an agent's. See [Zips](../tools/zips.md#hold-and-release).
 
 ### Host Operator
 
@@ -286,8 +290,9 @@ Structured guidance attached to a Project. Project rules guide agents but are no
 Sending a message while an agent is still replying, so it goes **the moment that reply ends**
 as your next message. The other choice beside **Steer**, and the one that works for every
 message, including ones with a file attached. Several queued messages arrive together, in the
-order you sent them. A text-only queued message is held on the server, so it survives closing
-the tab; one carrying files waits in the browser, one per chat at a time. See
+order you sent them. Every queued message is held on the server, so it survives a reload or a
+closed tab; one carrying files is saved the moment you send it and shows as queued in every tab
+until its turn. See
 [the chat workspace](../chat/overview.md#steer-or-queue-while-the-agent-is-busy).
 
 ### Risk Level
@@ -316,7 +321,7 @@ An isolated execution environment. In Batshit docs, this usually means Apple Con
 
 ### Schedule
 
-A saved *when* and *what* for one Primary Agent, inside Batshit — "every day at 9am, tell Cooper to check the build". Batshit's own clock checks every 60 seconds and writes a DM when a schedule is due, starting a chat for the agent if you chose that. Three cadences: every N minutes or hours, daily at a time, or on chosen weekdays at a time, each in its own time zone. Managed in Admin → Instance-wide defaults → Agent Wake-ups → Schedules. For a trigger that lives *outside* Batshit, use a [Wake-up webhook](#wake-up-webhook) instead. See [Agent DMs and wake-ups](../primary-agents/agent-dms-and-wake-ups.md).
+A saved *when* and *what* for one Primary Agent, inside Batshit — "every day at 9am, tell Cooper to check the build". Batshit's own clock checks every 60 seconds and writes a DM when a schedule is due, starting a chat for the agent if you chose that. While that DM is still unread, the next run updates it and counts the run instead of adding another, so a schedule takes one row in an inbox. Three cadences: every N minutes or hours, daily at a time, or on chosen weekdays at a time, each in its own time zone. Managed in Admin → Instance-wide defaults → Agent Wake-ups → Schedules. For a trigger that lives *outside* Batshit, use a [Wake-up webhook](#wake-up-webhook) instead. See [Agent DMs and wake-ups](../primary-agents/agent-dms-and-wake-ups.md).
 
 ### Schema Hints
 
@@ -422,7 +427,7 @@ Batshit's compressed representation of large assistant output or tool output. Zi
 
 ### Zip Control
 
-Settings and permissions that decide when an item stays compressed, expands for the model, or can be unzipped/rezipped by the user or an agent.
+Settings and permissions that decide when an item stays compressed or expands for the model, and who can change that: you can hold, zip, or release any Zip, and an agent can hold and release the files it read.
 
 ### Zip Buffer
 
@@ -434,4 +439,4 @@ The minimum token size before `Normal` Zip behavior may compress content. A thre
 
 ### Zip Behavior
 
-`Off` never zips. `Normal` uses buffer and threshold. `Auto` zips immediately by default.
+`Off` keeps output open unless a Cool Tool result reaches the 25,000-token size guard. `Normal` uses buffer and threshold. `Auto` zips immediately by default.

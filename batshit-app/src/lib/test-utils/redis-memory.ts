@@ -20,19 +20,80 @@ import { createClient, type RedisClientType } from 'redis'
  * never uses DB 0 (it refuses, to protect real data). Search-index tests therefore
  * cannot run under this harness and need a dedicated instance or db-0 prefix isolation.
  *
+ * Never FLUSHDB or FLUSHALL here (BL-135): either one drops every search index on the
+ * whole SERVER, so a flush of DB 15 deleted the Native lane's memory indexes on DB 0.
+ * Each test starts from `clearRedisTestDatabase`, which deletes this database's keys only.
+ *
  * Configure the real lane with either:
  *   - BATSHIT_REDIS_TEST_URL
  *   - VITEST_REDIS_URL
  *   - REDIS_URL (will be overridden during the test run)
  */
-export function useRedisTestServer() {
+/**
+ * BL-135: empty ONE test database, and nothing else on the server.
+ *
+ * FLUSHDB is not database-local for Redis Search: flushing any database drops every search
+ * index on the server (measured on Redis 8.10.1), including DB 0's `batshit_memory_idx` and
+ * `batshit_memseg_idx` on a developer's native Redis. SCAN + UNLINK deletes this database's
+ * keys and leaves every index alone. Refuses database 0, read from the connection itself, so
+ * a client created without its `database` option cannot empty real data. Answers the number
+ * of keys it deleted.
+ */
+export async function clearRedisTestDatabase(client: RedisClientType): Promise<number> {
+  const { db } = await client.clientInfo()
+  if (db === 0) {
+    throw new Error('clearRedisTestDatabase refuses database 0: it holds real Batshit data.')
+  }
+  let cursor = '0'
+  let removed = 0
+  do {
+    const batch = await client.scan(cursor, { COUNT: 1000 })
+    cursor = String(batch.cursor)
+    if (batch.keys.length > 0) removed += await client.unlink(batch.keys)
+  } while (cursor !== '0')
+  return removed
+}
+
+export interface RedisTestServerOptions {
+  /** Read-only, awaited admission of this existing client before any database cleanup. */
+  beforeCleanupAdmission?: (connection: { adminClient: RedisClientType; resolvedUrl: string }) => Promise<void>
+}
+
+export function useRedisTestServer(options: RedisTestServerOptions = {}) {
   const useRealRedis = process.env.VITEST_USE_REAL_REDIS === 'true'
   let adminClient: RedisClientType
   let redisUrl: string
   let previousRedisUrl: string | undefined
+  let environmentCaptured = false
+  let admitted = false
+  let closed = false
+  const admission = {
+    isAdmitted: () => admitted && !closed,
+    requireAdmission() {
+      if (!admission.isAdmitted()) throw new Error('Redis test connection has not completed admission.')
+    }
+  }
+
+  async function restoreEnvironment() {
+    if (!environmentCaptured) return
+    if (previousRedisUrl === undefined) delete process.env.REDIS_URL
+    else process.env.REDIS_URL = previousRedisUrl
+    try {
+      const envModule = await import('$env/dynamic/private')
+      if (envModule?.env) {
+        const mutableEnv = envModule.env as Record<string, string | undefined>
+        if (previousRedisUrl === undefined) delete mutableEnv.REDIS_URL
+        else mutableEnv.REDIS_URL = previousRedisUrl
+      }
+    } catch {
+      // Preserve the existing optional env-module behavior.
+    }
+    // Keep the snapshot: late lazy app acquisition can resynchronize env after teardown.
+  }
 
   beforeAll(async () => {
     if (!useRealRedis) return
+    if (closed) throw new Error('Redis test admission started after teardown.')
 
     // SA-101 renamed REDIS_STACK_TEST_URL. Fail loudly rather than silently ignoring a
     // stale export and pointing the suite at the wrong instance.
@@ -88,33 +149,55 @@ export function useRedisTestServer() {
 
     previousRedisUrl = process.env.REDIS_URL
     process.env.REDIS_URL = redisUrl
+    environmentCaptured = true
 
     try {
       const envModule = await import('$env/dynamic/private')
-      if (envModule?.env) {
+      if (envModule?.env && !closed) {
         envModule.env.REDIS_URL = redisUrl
       }
     } catch {
       // ignore if env module not available yet
     }
 
-    adminClient = createClient({ url: redisUrl, database })
-
     try {
-      await adminClient.connect()
-      await adminClient.ping()
+      if (closed) throw new Error('Redis test admission continued after teardown.')
+      adminClient = createClient({ url: redisUrl, database })
+      try {
+        await adminClient.connect()
+        await adminClient.ping()
+      } catch (error) {
+        throw new Error(
+          `Failed to connect to Redis at ${redisUrl}. ` +
+            'Start a local Redis 8 that provides the JSON module, or set BATSHIT_REDIS_TEST_URL ' +
+            'to an accessible instance. Docker users can run: docker run -p 6379:6379 redis:8-alpine',
+          { cause: error }
+        )
+      }
+      if (closed) throw new Error('Redis test admission continued after teardown.')
+      if (options.beforeCleanupAdmission) {
+        await options.beforeCleanupAdmission({ adminClient, resolvedUrl: redisUrl })
+      }
+      if (closed) throw new Error('Redis test admission finished after teardown.')
+      admitted = true
     } catch (error) {
-      throw new Error(
-        `Failed to connect to Redis at ${redisUrl}. ` +
-          'Start a local Redis 8 that provides the JSON module, or set BATSHIT_REDIS_TEST_URL ' +
-          'to an accessible instance. Docker users can run: docker run -p 6379:6379 redis:8-alpine'
-      )
+      admitted = false
+      try {
+        // Disconnect settles this owned connection without acquiring another one or deleting keys.
+        if (adminClient?.isOpen) await adminClient.disconnect()
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], 'Redis test admission and connection cleanup failed.')
+      } finally {
+        await restoreEnvironment()
+      }
+      throw error
     }
   }, 30000)
 
   beforeEach(async () => {
+    if (useRealRedis && options.beforeCleanupAdmission) admission.requireAdmission()
     if (useRealRedis && adminClient?.isOpen) {
-      await adminClient.flushDb()
+      await clearRedisTestDatabase(adminClient)
     }
 
     try {
@@ -126,31 +209,18 @@ export function useRedisTestServer() {
   })
 
   afterAll(async () => {
+    const wasAdmitted = admitted
+    closed = true
+    admitted = false
     if (!useRealRedis) return
-
-    if (adminClient?.isOpen) {
-      await adminClient.quit()
-    }
-
-    if (previousRedisUrl === undefined) {
-      delete process.env.REDIS_URL
-    } else {
-      process.env.REDIS_URL = previousRedisUrl
-    }
-
     try {
-      const envModule = await import('$env/dynamic/private')
-      if (envModule?.env) {
-        const mutableEnv = envModule.env as Record<string, string | undefined>
-
-        if (previousRedisUrl === undefined) {
-          delete mutableEnv.REDIS_URL
-        } else {
-          mutableEnv.REDIS_URL = previousRedisUrl
-        }
+      if (adminClient?.isOpen) {
+        if (wasAdmitted) await adminClient.quit()
+        else await adminClient.disconnect()
       }
-    } catch {
-      // ignore
+    } finally {
+      await restoreEnvironment()
     }
   })
+  return admission
 }

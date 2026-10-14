@@ -12,7 +12,7 @@ Agent DMs let you write to another primary agent here: **info** (a note), **assi
 
 ## Your inbox
 
-The `DMs:` roster in DYNAMIC INFO is the authority on what is waiting. It lists OPEN items only — closed ones are gone from it on purpose, so a handled DM stops costing you tokens; `sys.dm.list` finds them if you need them.
+The `DMs:` roster in `<dynamic_info>` is the authority on what is waiting. It lists OPEN items only — closed ones are gone from it on purpose, so a handled DM stops costing you tokens; `sys.dm.list` finds them if you need them. A schedule keeps one unread note; a new fire updates it: `fired 3 times, first 9:00 AM, last 5:00 PM`.
 
 `sys.dm.read` opens one and `sys.dm.claim` takes an assignment — both take `dm_id`, and a claim is **one at a time**, so finish the one you are on first. `sys.dm.done` or `sys.dm.blocked` closes it and both take `dm_id` and `result`. The result text you write IS the answer sent back, so make it real.
 

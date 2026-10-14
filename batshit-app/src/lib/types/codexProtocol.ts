@@ -104,11 +104,24 @@ export type ReasoningItem = {
   text: string
 }
 
+/**
+ * What a web search step did, as the exec stream writes it (the Responses API action, snake_case
+ * `type`). The app server writes the same action camelCase (`openPage`, `findInPage`, with `null`
+ * for a missing field); `codexAppServerLane` maps it to this shape (BL-460).
+ */
+export type WebSearchAction =
+  | { type: 'search'; query?: string; queries?: string[] }
+  | { type: 'open_page'; url?: string }
+  | { type: 'find_in_page'; url?: string; pattern?: string }
+  | { type: 'other' }
+
 /** Captures a web search request. Completes when results are returned to the agent. */
 export type WebSearchItem = {
   id: string
   type: 'web_search'
   query: string
+  /** The search, the opened page, or the find in a page; the event adapter reads its URL and queries. */
+  action?: WebSearchAction
 }
 
 /** Describes a non-fatal error surfaced as an item. */
@@ -159,20 +172,28 @@ export type TurnStartedEvent = {
 
 /** Describes the usage of tokens during a turn. */
 export type Usage = {
-  /** The number of input tokens used during the turn. */
+  /** The turn's input tokens, including cache reads and writes. */
   input_tokens: number
   /** The number of cached input tokens used during the turn. */
   cached_input_tokens: number
+  /** Cache writes included in input tokens, when reported by the app-server lane. */
+  cache_write_input_tokens?: number
   /** The number of output tokens used during the turn. */
   output_tokens: number
   /** The number of reasoning output tokens used during the turn. */
   reasoning_output_tokens: number
 }
 
-/** Emitted when a turn is completed. Typically right after the assistant's response. */
+/**
+ * Emitted when a turn is completed. Typically right after the assistant's response.
+ *
+ * BL-1376: `codex exec` always sends all four counts. The app-server lane sends only the counts
+ * Codex reported (`mapAppServerUsage`): `null` when the turn got no `thread/tokenUsage/updated`,
+ * and a count Codex left out stays out. A missing count is unknown, never a zero.
+ */
 export type TurnCompletedEvent = {
   type: 'turn.completed'
-  usage: Usage
+  usage: Partial<Usage> | null
 }
 
 /** Fatal error payload attached to a failed turn. */
@@ -225,6 +246,22 @@ export type SteerDeliveredEvent = {
   steer_ids: string[]
 }
 
+/**
+ * BL-759 — Batshit-synthetic: Codex is retrying a dropped model response by itself.
+ *
+ * The app server says so with an `error` notification whose `willRetry` is `true` (BL-457), and
+ * then starts the answer again as a NEW item, never completing the one that dropped.
+ * `codexAppServerLane` pushes this in the notice's place so the event adapter can take back every
+ * agent message that started and never completed. `message` and `details` are Codex's own words
+ * (`Reconnecting... 1/5`, and why). Nothing in `codex exec` emits it: that transport reports a
+ * retry as a plain `error` line (BL-457's known gap).
+ */
+export type StreamRetryEvent = {
+  type: 'stream.retry'
+  message: string | null
+  details: string | null
+}
+
 /** Top-level JSONL events emitted by `codex exec --json`. */
 export type ThreadEvent =
   | ThreadStartedEvent
@@ -236,3 +273,4 @@ export type ThreadEvent =
   | ItemCompletedEvent
   | ThreadErrorEvent
   | SteerDeliveredEvent
+  | StreamRetryEvent

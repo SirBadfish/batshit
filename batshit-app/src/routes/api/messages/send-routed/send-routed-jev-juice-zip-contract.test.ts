@@ -12,7 +12,7 @@ const source = readFileSync('src/routes/api/messages/send-routed/+server.ts', 'u
  * turn; and zip state is written ONLY at the accepted-send boundary, after the compile,
  * beside the memory commit, never for a group or a resume.
  */
-describe('send-routed Jev Juice smart zip contracts', () => {
+describe('send-routed Judge Juice smart zip contracts', () => {
   const streamStart = source.indexOf('async function handleBatshitAgentStream({')
   const collector = source.indexOf('const jevJuiceTurn = createJevJuiceTurnCollector()', streamStart)
   const zipTurn = source.indexOf('const jevJuiceSmartZip = jevJuiceGroupSelection', collector)
@@ -56,7 +56,7 @@ describe('send-routed Jev Juice smart zip contracts', () => {
   })
 
   it('stores what the compile opened only at the accepted-send boundary, beside the memory commit', () => {
-    const consumeGate = source.indexOf('if (consumeSessionClips) {\n    await consumePostCompileSessionClips(sessionId)', compileEnd)
+    const consumeGate = source.indexOf('if (consumeSessionClips && !isApprovalResumeWithoutUserTurn) {\n', compileEnd)
     const memoryCommit = source.indexOf('memoryTurnCommit = await commitMemoryTurnState({', consumeGate)
     const zipGate = source.indexOf('if (jevJuiceSmartZip && messageForCompilation && !groupContext) {', memoryCommit)
     const write = source.indexOf('const stored = await writeInferredUnzips(', zipGate)
@@ -91,9 +91,17 @@ describe('send-routed Jev Juice smart zip contracts', () => {
     const finalize = source.indexOf("await finalizeAssistantMessage('postStream')", compileEnd)
     const complete = source.indexOf('await streamAdapter.emitComplete()', finalize)
     const snapshot = source.indexOf("await persistRuntimeSnapshot('succeeded')", complete)
-    // SA-120 P6 shares this one site: the gate opens for either after-reply lane.
-    const postTurnGate = source.indexOf('if (!silentResponse && (jevJuiceSmartZip || jevJuicePostTurnCheck)) {', snapshot)
-    const postTurn = source.indexOf('? jevJuiceSmartZip.runPostTurn({ messageId, reply: finishedReply, newZipIds })', postTurnGate)
+    // SA-120 P6 shares this one site: the gate opens for either after-reply lane. BL-527: never
+    // while the reply waits at an approval card (rezipping on half a reply), never for a reply cut
+    // at the output limit; a run that finishes an earlier run's reply brings its own step.
+    const postTurnGate = source.indexOf(
+      '      !silentResponse &&\n      !replyAwaitsApproval &&\n      !replyOutputLimitFailure &&\n      (afterReplySmartZip || afterReplyCheck)\n',
+      snapshot
+    )
+    const postTurn = source.indexOf(
+      '? afterReplySmartZip.runPostTurn({ messageId, reply: finishedReply, newZipIds, earlierParts })',
+      postTurnGate
+    )
     const awaited = source.indexOf('await Promise.all([smartZipStep, postTurnCheckStep])', postTurn)
     const responseBuilt = source.indexOf('const response = json({', postTurn)
 
@@ -108,10 +116,13 @@ describe('send-routed Jev Juice smart zip contracts', () => {
     expect(responseBuilt).toBeGreaterThan(awaited)
 
     const body = source.slice(postTurnGate, responseBuilt)
-    expect(body).toContain("const finishedReply = finishSummary.content || finishSummary.text || ''")
+    // SA-129 P2: the reply as the model wrote it (the stored text is cleaned at the reply end).
+    expect(body).toContain("const finishedReply = rawFinishedReply ?? (finishSummary.content || finishSummary.text || '')")
     expect(body).toContain('const newZipIds = (finishSummary.zipReferences ?? [])')
+    expect(source).toContain('const afterReplySmartZip = jevJuiceSmartZip ?? jevJuiceContinuedReply?.smartZip')
     // ONE site: never on the error, abort, or interrupted paths.
-    expect(source.split('jevJuiceSmartZip.runPostTurn(').length - 1).toBe(1)
+    expect(source.split('afterReplySmartZip.runPostTurn(').length - 1).toBe(1)
+    expect(source).not.toContain('jevJuiceSmartZip.runPostTurn(')
   })
 
   it('never asks the lane directly', () => {

@@ -67,6 +67,33 @@ export function buildToolStreamStateFromContent(
   return state
 }
 
+/**
+ * BL-759: a managed lane took a segment of the reply back, and the server sent the reply's text as
+ * it now reads (`content_reset`). The tab's live state is rebuilt from that text, and it keeps its
+ * tool cards: a finished card comes back from its reference in the text; a card still running (a
+ * position only) and a card the tab drew that the text does not name (the tab's own fallback for a
+ * tool result with no zip) stay where they were. The text taken back is always the reply's end (the
+ * lane hands the retract on before anything else is written), so a kept position is never past the
+ * end of the new text; it is clamped there all the same.
+ */
+export function resetToolStreamStateFromContent(
+  previous: ToolStreamState | null | undefined,
+  content: string,
+  nextOrder: () => number
+): ToolStreamState {
+  const next = buildToolStreamStateFromContent(content, nextOrder)
+  if (!previous) return next
+  const end = next.textBuffer.length
+  for (const [key, position] of previous.toolPositions) {
+    next.toolPositions.set(key, { pos: Math.min(position.pos, end), order: position.order })
+  }
+  for (const insertion of previous.insertions) {
+    if (content.includes(insertion.ref)) continue
+    next.insertions.push({ pos: Math.min(insertion.pos, end), ref: insertion.ref, order: insertion.order })
+  }
+  return next
+}
+
 export function composeToolStreamContent(state: ToolStreamState) {
   if (state.insertions.length === 0) {
     return state.textBuffer

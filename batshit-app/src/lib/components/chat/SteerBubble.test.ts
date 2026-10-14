@@ -24,7 +24,6 @@ const entry = (over: Partial<SteerBubbleEntry> = {}): SteerBubbleEntry =>
     state: 'dropped',
     dropReason: 'stopped',
     deliver: 'end',
-    withFiles: false,
     ...over
   }) as SteerBubbleEntry
 
@@ -69,7 +68,7 @@ describe('SteerBubble — the dropped receipt (SA-119 P3b)', () => {
   })
 
   it('shows no actions at all on a bubble that is still going somewhere', () => {
-    for (const state of ['queued', 'waiting'] as const) {
+    for (const state of ['queued'] as const) {
       const { unmount } = render(SteerBubble, {
         props: {
           steer: entry({ state, dropReason: undefined }),
@@ -94,5 +93,36 @@ describe('SteerBubble — the dropped receipt (SA-119 P3b)', () => {
       'Not sent — you stopped the reply'
     )
     expect(screen.getByTestId('steer-bubble').textContent).toContain('the words that never went')
+  })
+})
+
+describe('SteerBubble — a queued send held at an approval card (BL-713)', () => {
+  const held = entry({
+    state: 'queued',
+    dropReason: undefined,
+    queuedSend: true,
+    heldForApprovalCard: 'msg_card'
+  } as Partial<SteerBubbleEntry>)
+
+  it('says it waits for the card and offers Send now, which hands the id back', () => {
+    const onSendHeldNow = vi.fn()
+    render(SteerBubble, { props: { steer: held, onSendHeldNow } })
+    expect(screen.getByTestId('steer-bubble').textContent).toContain(
+      'Waits for your answer to the approval card.'
+    )
+    screen.getByTestId('steer-held-send-now').click()
+    expect(onSendHeldNow).toHaveBeenCalledWith('steer_abc')
+    // Not a receipt: no Dismiss, the message is still going to be sent.
+    expect(screen.queryByTestId('steer-dismiss')).toBeNull()
+  })
+
+  it('offers nothing once the hold ends: the send goes when the chat is free', () => {
+    render(SteerBubble, {
+      props: {
+        steer: { ...held, heldForApprovalCard: null } as SteerBubbleEntry,
+        onSendHeldNow: () => {}
+      }
+    })
+    expect(screen.queryByTestId('steer-held-send-now')).toBeNull()
   })
 })

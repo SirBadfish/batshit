@@ -2,6 +2,12 @@
   import { onMount, tick, untrack } from 'svelte'
   import { debounce } from '$lib/utils/debounce'
   import { downloadBlob, exportBackupNatively } from '$lib/utils/download'
+  import {
+    BACKUP_MISSING_UPLOADS_HEADER,
+    describeBackupExportSummary,
+    parseMissingUploadsSummary,
+    type BackupPartialRequest
+  } from '$lib/utils/backupPartialSummary'
   import * as Collapsible from '$lib/components/ui/collapsible'
   import * as Select from '$lib/components/ui/select'
   import { Badge } from '$lib/components/ui/badge'
@@ -19,6 +25,7 @@
   import AdminUtilityCards from '$lib/components/settings/admin/AdminUtilityCards.svelte'
   import AdminAgentWakeupsCard from '$lib/components/settings/admin/AdminAgentWakeupsCard.svelte'
   import AdminJevJuiceCard from '$lib/components/settings/admin/AdminJevJuiceCard.svelte'
+  import AdminPinokioRuntimeRow from '$lib/components/settings/admin/AdminPinokioRuntimeRow.svelte'
   import { resolveInstanceWakeupsEnabled } from '$lib/utils/dmControl'
   import AdminWebSearchCard from '$lib/components/settings/admin/AdminWebSearchCard.svelte'
   import { toast } from '$lib/components/ui/sonner/settings-toast'
@@ -27,12 +34,13 @@
     ChevronDown,
     Download,
     ExternalLink,
+    Loader2,
     RefreshCw,
     ShieldCheck,
     Trash2,
     Wrench
   } from '@lucide/svelte'
-  import { setUserSettings } from '$lib/stores/userSettings.svelte'
+  import { confirmUserSettings as setUserSettings } from '$lib/stores/userSettings.svelte'
   import type { UserSettingsRow } from '$lib/types/database'
   import {
     DEFAULT_DCM_SCHEMA_HINT_MAX_CHARS,
@@ -51,8 +59,8 @@
     formatBackupBytes,
     normalizeExaSearchType,
     normalizeWebSearchProvider,
-    normalizeWebSearchProviderForAvailability,
     type AdminSettingsState,
+    type BackupExportOutcome,
     type BackupPreflightSummary,
     type CoreSystemPromptDetail,
     type CoreSystemPromptSummary,
@@ -70,13 +78,14 @@
     { value: 'linux-x64', label: 'Linux (x64)' }
   ]
   const cloudflaredPlatformOptions: Array<{ value: CloudflaredInstallPlatform; label: string }> = [
-    { value: 'darwin-x64', label: 'macOS (Intel/x64 • Apple Silicon via Rosetta)' },
+    { value: 'darwin-arm64', label: 'macOS (Apple Silicon/arm64)' },
+    { value: 'darwin-x64', label: 'macOS (Intel/x64)' },
     { value: 'windows-x64', label: 'Windows (x64)' },
     { value: 'linux-x64', label: 'Linux (x64)' }
   ]
 
   type FbxInstallPlatform = 'darwin-x64' | 'linux-x64' | 'windows-x64'
-  type CloudflaredInstallPlatform = 'darwin-x64' | 'linux-x64' | 'windows-x64'
+  type CloudflaredInstallPlatform = 'darwin-arm64' | 'darwin-x64' | 'linux-x64' | 'windows-x64'
   type FbxInstallStatus = {
     installed: boolean
     supported?: boolean
@@ -122,6 +131,9 @@
     installHelp: string
     testedVersion?: string
     runtimeMatchesTestedVersion?: boolean | null
+    sidecarRevision?: number | null
+    /** Docker: false when the running sidecar predates Stop support (revision 2), null when none runs. */
+    sidecarHearsStop?: boolean | null
   }
   type CloudflaredRuntimeStatus = {
     installed: boolean
@@ -322,8 +334,18 @@
   let saveState = $state<'idle' | 'saving' | 'saved'>('idle')
   let saveError = $state<string | null>(null)
   let isLoading = $state(true)
+  // BL-939: `adminSettings` holds saved values only after a real read of `/api/user/settings`
+  // succeeded. Until then it holds the page's older copy or the defaults, neither of which may
+  // ever be written back (the route replaces the whole `admin_settings` block), so the cards
+  // that hold Admin values are not offered and the autosave refuses. The page's copy is the copy
+  // from when the page opened: it does not count as loaded, and it cannot tell "no record yet"
+  // from "the read failed".
+  let settingsLoaded = $state(false)
+  let loadError = $state<string | null>(null)
+  let settingsLoadBusy = $state(false)
   let webSearchProvidersLoading = $state(false)
   let webSearchProvidersError = $state<string | null>(null)
+  let hasLoadedWebSearchProviderAvailability = $state(false)
   let availableWebSearchProviders = $state<Record<'exa' | 'perplexity', boolean>>({
     exa: false,
     perplexity: false
@@ -405,6 +427,23 @@
   let selectedCorePrompt = $state<CoreSystemPromptDetail | null>(null)
   let corePromptDraft = $state('')
   let corePromptBusyId = $state<string | null>(null)
+  /**
+   * BL-909: a saved Exa or Perplexity default is unavailable only when the key status has loaded
+   * and names no ready key. While it loads, or when it could not be loaded (that failure shows
+   * under the picker), the panel does not know, so it does not call the choice unavailable.
+   */
+  function isWebSearchProviderKeyMissing(provider: NativeWebSearchProvider): boolean {
+    if (provider === 'duckduckgo-html') return false
+    if (!hasLoadedWebSearchProviderAvailability || webSearchProvidersError) return false
+    return !availableWebSearchProviders[provider]
+  }
+
+  function webSearchProviderLabel(provider: NativeWebSearchProvider): string {
+    const label = WEB_SEARCH_PROVIDER_LABELS[provider]
+    // The words of the Agent Settings picker (BL-835).
+    return isWebSearchProviderKeyMissing(provider) ? `${label} (Missing API key)` : label
+  }
+
   const webSearchProviderOptions = $derived.by<
     Array<{ value: NativeWebSearchProvider; label: string }>
   >(() => {
@@ -417,17 +456,11 @@
     if (availableWebSearchProviders.perplexity) {
       options.push({ value: 'perplexity', label: WEB_SEARCH_PROVIDER_LABELS.perplexity })
     }
-    if (adminSettings.webSearchDefaultProvider === 'exa' && !availableWebSearchProviders.exa) {
-      options.push({ value: 'exa', label: `${WEB_SEARCH_PROVIDER_LABELS.exa} (key missing)` })
-    }
-    if (
-      adminSettings.webSearchDefaultProvider === 'perplexity' &&
-      !availableWebSearchProviders.perplexity
-    ) {
-      options.push({
-        value: 'perplexity',
-        label: `${WEB_SEARCH_PROVIDER_LABELS.perplexity} (key missing)`
-      })
+    // The saved choice stays listed (and selected) when its key is not ready: opening the
+    // panel never clears it, the user's own pick does.
+    const saved = adminSettings.webSearchDefaultProvider
+    if (saved !== 'duckduckgo-html' && !availableWebSearchProviders[saved]) {
+      options.push({ value: saved, label: webSearchProviderLabel(saved) })
     }
     return options
   })
@@ -587,7 +620,7 @@
         saveError = null
       })
 
-      if (updatedSettings) {
+      if (updatedSettings || result?.settings === null) {
         setUserSettings(updatedSettings)
       }
     } catch (error) {
@@ -608,7 +641,9 @@
   }, SAVE_DEBOUNCE_MS)
 
   $effect(() => {
-    if (isLoading) return
+    // BL-939: never a write built while no read of the saved settings succeeded. The controls
+    // are not offered then either; this line keeps the whole block from being sent if one ever is.
+    if (isLoading || !settingsLoaded) return
 
     const signature = makeSignature(adminSettings)
     if (signature === persistedSignature) {
@@ -636,6 +671,7 @@
   })
 
   async function loadSettings() {
+    settingsLoadBusy = true
     try {
       const response = await fetch('/api/user/settings')
       if (!response.ok) {
@@ -648,19 +684,27 @@
 
       applySettings(remoteSettings ?? data?.userSettings ?? null)
 
-      if (remoteSettings) {
+      if (remoteSettings || result?.settings === null) {
         setUserSettings(remoteSettings)
       }
+      untrack(() => {
+        settingsLoaded = true
+        // A successful (re)load clears the failure at once, the same block that resets the
+        // signature below: the autosave effect returns at its signature guard and would never
+        // reach code that clears it (BL-487's follow-up).
+        loadError = null
+      })
     } catch (error) {
       console.error('Admin settings load failed:', error)
-      toast.error(error instanceof Error ? error.message : 'Failed to load admin settings')
-      applySettings(data?.userSettings ?? null)
+      const message = error instanceof Error ? error.message : 'Failed to load admin settings'
+      toast.error(message)
       untrack(() => {
-        saveError = error instanceof Error ? error.message : 'Failed to load admin settings'
+        loadError = message
       })
     } finally {
       untrack(() => {
         isLoading = false
+        settingsLoadBusy = false
         persistedSignature = makeSignature(adminSettings)
       })
     }
@@ -1339,14 +1383,6 @@
         perplexity: keys?.perplexity?.status === 'ready'
       }
       availableWebSearchProviders = nextAvailability
-
-      const normalizedProvider = normalizeWebSearchProviderForAvailability(
-        adminSettings.webSearchDefaultProvider,
-        nextAvailability
-      )
-      if (normalizedProvider !== adminSettings.webSearchDefaultProvider) {
-        adminSettings.webSearchDefaultProvider = normalizedProvider
-      }
     } catch (error) {
       console.error('Failed to load web search provider availability:', error)
       webSearchProvidersError =
@@ -1359,11 +1395,56 @@
       }
     } finally {
       webSearchProvidersLoading = false
+      hasLoadedWebSearchProviderAvailability = true
     }
   }
 
-  async function handleBackupExport(includeSecrets = false) {
-    if (backupExportBusy) return
+  /**
+   * BL-373/BL-369: the export completes even when a skill folder or a clone voice recording
+   * could not be carried whole; the route names them in `X-Batshit-Backup-Not-Carried`.
+   */
+  function describeBackupNotCarried(header: string | null): string | null {
+    if (!header) return null
+    let parsed: { count?: unknown; items?: Array<{ root?: unknown; label?: unknown }> }
+    try {
+      parsed = JSON.parse(decodeURIComponent(header))
+    } catch {
+      return null
+    }
+    const count = typeof parsed.count === 'number' ? parsed.count : 0
+    if (count <= 0) return null
+    const names = (parsed.items ?? [])
+      .slice(0, 3)
+      .map((item) => `${item.root === 'skills' ? 'skill' : 'clone voice'} "${String(item.label ?? '')}"`)
+    const more = count > names.length ? ` and ${count - names.length} more` : ''
+    // The header is sent before the files stream, so a folder found changed while streaming is
+    // only in the backup's manifest: Inspect lists the complete set.
+    return `Backup exported, but ${count === 1 ? 'a folder was' : `${count} folders were`} not included: ${names.join(', ')}${more}. Inspect this backup before a restore for the complete list and why.`
+  }
+
+  /** BL-1390: the download body broke off after the route's 200. Only that failure says this. */
+  const BACKUP_DOWNLOAD_STOPPED =
+    'The backup stopped while it was downloading. Check Upload Files only looks for each file and cannot show that it can be read, so it may find nothing wrong. The app log may say why the backup stopped.'
+
+  /**
+   * Answers how the export ended (BL-1381), so the Backup card decides its upload check from
+   * this answer and never from the error it shows or a list it holds.
+   */
+  /**
+   * BL-378 Phase 1b: what a partial request's finished download says. The summary comes from the
+   * header (or the Mac result) through the one strict parser: unavailable never becomes a zero or
+   * a "nothing is missing". The outcome stays `exported` either way.
+   */
+  function announcePartialExport(summaryText: string | null | undefined, notCarried: string | null) {
+    const summary = parseMissingUploadsSummary(summaryText)
+    const sentence = describeBackupExportSummary(summary)
+    if (summary?.completeness === 'complete') toast.success(sentence)
+    else toast.warning(sentence)
+    if (notCarried) toast.warning(notCarried)
+  }
+
+  async function handleBackupExport(includeSecrets = false, partial?: BackupPartialRequest): Promise<BackupExportOutcome> {
+    if (backupExportBusy) return 'busy'
     if (includeSecrets) {
       const confirmed = await confirmDialog({
         title: 'Export Backup With Secrets?',
@@ -1374,18 +1455,20 @@
         confirmLabel: 'Export With Secrets',
         cancelLabel: 'Cancel'
       })
-      if (!confirmed) return
+      if (!confirmed) return 'canceled'
     }
 
     backupExportBusy = true
     backupError = null
     try {
-      const nativeResult = await exportBackupNatively(includeSecrets)
+      const nativeResult = await exportBackupNatively(includeSecrets, partial)
       if (nativeResult) {
-        if (!nativeResult.canceled) {
-          toast.success(includeSecrets ? 'Backup with secrets exported' : 'Backup exported')
-        }
-        return
+        if (nativeResult.canceled) return 'canceled'
+        const notCarried = describeBackupNotCarried(nativeResult.notCarried ?? null)
+        if (partial) announcePartialExport(nativeResult.missingUploads, notCarried)
+        else if (notCarried) toast.warning(notCarried)
+        else toast.success(includeSecrets ? 'Backup with secrets exported' : 'Backup exported')
+        return 'exported'
       }
 
       const response = await fetch('/api/admin/backup/export', {
@@ -1393,7 +1476,8 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           includeSecrets,
-          confirmIncludeSecrets: includeSecrets
+          confirmIncludeSecrets: includeSecrets,
+          ...(partial ? { partial } : {})
         })
       })
 
@@ -1402,21 +1486,33 @@
         throw new Error(message)
       }
 
-      const blob = await response.blob()
+      let blob: Blob
+      try {
+        blob = await response.blob()
+      } catch {
+        // BL-1390: the route answered 200 and began the zip, then the download broke off. The
+        // server's error cannot reach this page (it logs it), and the check that follows only
+        // looks for each file, so say both instead of the browser's network error.
+        throw new Error(BACKUP_DOWNLOAD_STOPPED)
+      }
       const disposition = response.headers.get('Content-Disposition') ?? ''
       const filenameMatch = disposition.match(/filename="([^"]+)"/)
       const filename = filenameMatch?.[1] ?? 'batshit-backup.zip'
+      const notCarried = describeBackupNotCarried(response.headers.get('X-Batshit-Backup-Not-Carried'))
       const result = await downloadBlob(blob, filename, {
         title: 'Export Batshit Backup',
         mimeType: 'application/zip'
       })
-      if (!result.canceled) {
-        toast.success(includeSecrets ? 'Backup with secrets exported' : 'Backup exported')
-      }
+      if (result.canceled) return 'canceled'
+      if (partial) announcePartialExport(response.headers.get(BACKUP_MISSING_UPLOADS_HEADER), notCarried)
+      else if (notCarried) toast.warning(notCarried)
+      else toast.success(includeSecrets ? 'Backup with secrets exported' : 'Backup exported')
+      return 'exported'
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to export backup'
       backupError = message
       toast.error(message)
+      return 'failed'
     } finally {
       backupExportBusy = false
     }
@@ -1611,11 +1707,22 @@
         const message = await extractError(response, 'Failed to restore backup')
         throw new Error(message)
       }
-      await response.json().catch(() => null)
-      toast.success('Backup restored. Reloading Batshit...')
+      const result = (await response.json().catch(() => null)) as {
+        keptHostFolders?: Array<{ root?: string; folder?: string; path?: string }>
+      } | null
+      // BL-373 review: a replaced skill or voice folder is kept, never deleted; say where.
+      const kept = Array.isArray(result?.keptHostFolders) ? result.keptHostFolders : []
+      if (kept.length > 0) {
+        const where = kept[0]?.path ? ` in ${kept[0].path.replace(/\/[^/]+$/, '')}` : ''
+        toast.success(
+          `Backup restored. Batshit kept your previous copy of ${kept.length === 1 ? 'the skill or voice folder it replaced' : `the ${kept.length} skill and voice folders it replaced`}${where}. Reloading Batshit...`
+        )
+      } else {
+        toast.success('Backup restored. Reloading Batshit...')
+      }
       window.setTimeout(() => {
         window.location.reload()
-      }, 900)
+      }, kept.length > 0 ? 6000 : 900)
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to restore backup'
       backupError = message
@@ -1655,18 +1762,23 @@
 	    if (!goonAssetAudit) {
 	      await loadGoonAssetAudit(false)
 	    }
-	    if (!goonAssetAudit || goonAssetAudit.orphanRecordCount <= 0) {
-	      toast.success('No orphaned Goon assets found')
+	    if (!goonAssetAudit || goonAssetAudit.cleanupCandidateCount <= 0) {
+	      toast.info(goonAssetAudit?.preservedOrphanRecordCount
+	        ? 'Scene files are preserved because their reference history is unknown'
+	        : 'No eligible Goon assets found')
 	      return
 	    }
+	    // Bind this click to the inspected files, even if another inspection or
+	    // settings write completes while the confirmation is open.
+	    const inspected = goonAssetAudit
+	    const selectedAssets = inspected.cleanupCandidates.map((entry) => `${entry.uploadType}/${entry.filename}`)
 
 	    const confirmed = await confirmDialog({
 	      title: 'Clean Orphaned Goon Assets?',
 	      description: [
-	        'Batshit will delete only uploaded Goon files and upload records that are not referenced by current Goons, Motion Vault, Closet, or Scenes.',
-	        `This will remove ${goonAssetAudit.orphanRecordCount} orphaned record${
-	          goonAssetAudit.orphanRecordCount === 1 ? '' : 's'
-	        } (${formatBackupBytes(goonAssetAudit.orphanBytes)}).`
+	        'Batshit will recheck the inspected eligible files and delete only those still unreferenced. Newly orphaned files are not included.',
+	        `Up to ${inspected.cleanupCandidateCount} file${inspected.cleanupCandidateCount === 1 ? '' : 's'} (${formatBackupBytes(inspected.cleanupCandidateBytes)}) can be removed.`,
+	        `${inspected.preservedOrphanRecordCount} Scene file${inspected.preservedOrphanRecordCount === 1 ? '' : 's'} with unknown reference history will stay in storage.`
 	      ],
 	      confirmLabel: 'Clean Orphans',
 	      cancelLabel: 'Cancel'
@@ -1679,7 +1791,7 @@
 	      const response = await fetch('/api/admin/goon-assets', {
 	        method: 'POST',
 	        headers: { 'Content-Type': 'application/json' },
-	        body: JSON.stringify({ confirmDeleteOrphans: true })
+	        body: JSON.stringify({ confirmDeleteOrphans: true, selectedAssets })
 	      })
 	      const result = await response.json().catch(() => null)
 	      if (!response.ok) {
@@ -1691,15 +1803,22 @@
 	      toast.success(
 	        deletedCount > 0
 	          ? `Cleaned ${deletedCount} orphaned Goon asset${deletedCount === 1 ? '' : 's'}`
-	          : 'No orphaned Goon assets found'
+	          : 'Cleanup finished; no files were removed'
 	      )
-	      await loadGoonAssetAudit(false)
+	      // The normal Inspect loader refuses while cleanup is busy. Refresh
+	      // after releasing that guard so deleted candidates disappear.
 	    } catch (error) {
 	      const message = error instanceof Error ? error.message : 'Failed to clean up Goon assets'
 	      goonAssetCleanupError = message
 	      toast.error(message)
 	    } finally {
 	      goonAssetCleanupBusy = false
+	    }
+	    const cleanupError = goonAssetCleanupError
+	    await loadGoonAssetAudit(false)
+	    if (cleanupError) {
+	      goonAssetCleanupError = goonAssetCleanupError
+	        ? `${cleanupError} ${goonAssetCleanupError}` : cleanupError
 	    }
 	  }
 
@@ -1792,7 +1911,7 @@
   <div class="space-y-4">
     <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
       <div class="flex min-w-0 items-center gap-1.5">
-        <ShieldCheck class="h-4 w-4 text-primary" />
+        <ShieldCheck class="h-4 w-4 text-primary-text" />
         <h3 class="batshit-settings-section-title">Admin</h3>
         <SettingsInfoMenu ariaLabel="About Admin Settings" contentClass="w-80">
           <p>
@@ -1802,8 +1921,8 @@
         </SettingsInfoMenu>
       </div>
       <SettingsSaveStatus
-        state={saveError ? 'error' : saveState}
-        error={saveError}
+        state={saveError || loadError ? 'error' : saveState}
+        error={saveError ?? loadError}
         savedLabel="Admin Settings Saved"
         sticky={false}
       />
@@ -1859,47 +1978,74 @@
       onCleanup={handleGoonAssetCleanup}
     />
 
-    <AdminAgentWakeupsCard
-      agentWakeupsEnabled={adminSettings.agentWakeupsEnabled}
-      disabled={isLoading}
-      onAgentWakeupsEnabledChange={(checked) => (adminSettings.agentWakeupsEnabled = checked)}
-    />
+    {#if !settingsLoaded}
+      <!-- BL-939: the cards that hold Admin values wait for a real read of the saved settings. -->
+      {#if isLoading}
+        <div class="batshit-settings-group batshit-settings-caption flex items-center gap-2">
+          <Loader2 class="h-4 w-4 animate-spin" aria-hidden="true" />
+          <span>Loading Admin settings...</span>
+        </div>
+      {:else}
+        <div class="batshit-settings-inline-alert is-danger" data-testid="admin-settings-load-error">
+          <div class="flex items-center justify-between gap-2">
+            <span>
+              Admin settings could not load, so the Agent Wake-ups, Goon Dock Utilities, Web
+              Search, and Dynamic Schema Hints cards are hidden. Press Retry to load them.
+              {#if loadError}Details: {loadError}{/if}
+            </span>
+            <Button variant="outline" size="sm" onclick={loadSettings} disabled={settingsLoadBusy}>
+              <RefreshCw class={settingsLoadBusy ? 'h-3.5 w-3.5 animate-spin' : 'h-3.5 w-3.5'} />
+              Retry
+            </Button>
+          </div>
+        </div>
+      {/if}
+    {:else}
+      <AdminAgentWakeupsCard
+        agentWakeupsEnabled={adminSettings.agentWakeupsEnabled}
+        disabled={isLoading}
+        onAgentWakeupsEnabledChange={(checked) => (adminSettings.agentWakeupsEnabled = checked)}
+      />
+    {/if}
 
     <AdminJevJuiceCard disabled={isLoading} />
 
-    <AdminUtilityCards
-      goonLipSyncLabEnabled={adminSettings.goonLipSyncLabEnabled}
-      disabled={isLoading}
-      onGoonLipSyncLabEnabledChange={(checked) =>
-        (adminSettings.goonLipSyncLabEnabled = checked)}
-    />
+    {#if settingsLoaded}
+      <AdminUtilityCards
+        goonLipSyncLabEnabled={adminSettings.goonLipSyncLabEnabled}
+        disabled={isLoading}
+        onGoonLipSyncLabEnabledChange={(checked) =>
+          (adminSettings.goonLipSyncLabEnabled = checked)}
+      />
 
-    <AdminWebSearchCard
-      defaultProvider={adminSettings.webSearchDefaultProvider}
-      exaType={adminSettings.webSearchExaType}
-      perplexityMaxTokensPerPage={adminSettings.webSearchPerplexityMaxTokensPerPage}
-      providerOptions={webSearchProviderOptions}
-      providerAvailability={availableWebSearchProviders}
-      loadingProviders={webSearchProvidersLoading}
-      providerError={webSearchProvidersError}
-      disabled={isLoading}
-      onProviderChange={(provider) => (adminSettings.webSearchDefaultProvider = provider)}
-      onExaTypeChange={(exaType) => (adminSettings.webSearchExaType = exaType)}
-      onPerplexityMaxTokensPerPageChange={(tokens) =>
-        (adminSettings.webSearchPerplexityMaxTokensPerPage = tokens)}
-    />
+      <AdminWebSearchCard
+        defaultProvider={adminSettings.webSearchDefaultProvider}
+        defaultProviderLabel={webSearchProviderLabel(adminSettings.webSearchDefaultProvider)}
+        exaType={adminSettings.webSearchExaType}
+        perplexityMaxTokensPerPage={adminSettings.webSearchPerplexityMaxTokensPerPage}
+        providerOptions={webSearchProviderOptions}
+        providerAvailability={availableWebSearchProviders}
+        loadingProviders={webSearchProvidersLoading}
+        providerError={webSearchProvidersError}
+        disabled={isLoading}
+        onProviderChange={(provider) => (adminSettings.webSearchDefaultProvider = provider)}
+        onExaTypeChange={(exaType) => (adminSettings.webSearchExaType = exaType)}
+        onPerplexityMaxTokensPerPageChange={(tokens) =>
+          (adminSettings.webSearchPerplexityMaxTokensPerPage = tokens)}
+      />
 
-    <AdminDynamicSchemaHintsCard
-      requiredLimit={adminSettings.dcmSchemaHintRequiredLimit}
-      optionalLimit={adminSettings.dcmSchemaHintOptionalLimit}
-      toolNameThreshold={adminSettings.dcmToolNameThreshold}
-      maxChars={adminSettings.dcmSchemaHintMaxChars}
-      disabled={isLoading}
-      onRequiredLimitChange={(value) => (adminSettings.dcmSchemaHintRequiredLimit = value)}
-      onOptionalLimitChange={(value) => (adminSettings.dcmSchemaHintOptionalLimit = value)}
-      onToolNameThresholdChange={(value) => (adminSettings.dcmToolNameThreshold = value)}
-      onMaxCharsChange={(value) => (adminSettings.dcmSchemaHintMaxChars = value)}
-    />
+      <AdminDynamicSchemaHintsCard
+        requiredLimit={adminSettings.dcmSchemaHintRequiredLimit}
+        optionalLimit={adminSettings.dcmSchemaHintOptionalLimit}
+        toolNameThreshold={adminSettings.dcmToolNameThreshold}
+        maxChars={adminSettings.dcmSchemaHintMaxChars}
+        disabled={isLoading}
+        onRequiredLimitChange={(value) => (adminSettings.dcmSchemaHintRequiredLimit = value)}
+        onOptionalLimitChange={(value) => (adminSettings.dcmSchemaHintOptionalLimit = value)}
+        onToolNameThresholdChange={(value) => (adminSettings.dcmToolNameThreshold = value)}
+        onMaxCharsChange={(value) => (adminSettings.dcmSchemaHintMaxChars = value)}
+      />
+    {/if}
 
     <SettingsAccordionCard
       name="admin-settings-cards"
@@ -2003,6 +2149,11 @@
               </Collapsible.Content>
             </Collapsible.Root>
           </div>
+
+          <AdminPinokioRuntimeRow
+            open={openRuntimeCardId === 'pinokio'}
+            onToggle={() => toggleRuntimeCard('pinokio')}
+          />
 
           {#if runtimeContext?.adminCards.macAppRequiredRuntime}
             <div class="batshit-settings-disclosure-row">
@@ -2246,6 +2397,11 @@
                       Stop Sidecar
                     </Button>
                   </div>
+                  {#if agentBrowserRuntimeStatus?.sidecarHearsStop === false}
+                    <p class="batshit-settings-form-label is-warning">
+                      Built before Batshit could stop its commands: a Stop waits for the current command to finish. Stop Sidecar, then Start Sidecar, to rebuild it.
+                    </p>
+                  {/if}
                   {#if agentBrowserAddonStatus?.operator?.reason}
                     <p class="batshit-settings-form-label">{agentBrowserAddonStatus.operator.reason}</p>
                   {/if}

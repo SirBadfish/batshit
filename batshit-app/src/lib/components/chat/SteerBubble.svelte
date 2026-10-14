@@ -12,7 +12,7 @@
    * It disappears on its own: `delivered` bubbles are cleared when the reply finalises and
    * the inset takes over, and `promoted` ones the moment the server's user message lands.
    */
-  import { Loader2, Paperclip, Ban } from '@lucide/svelte'
+  import { Loader2, Hourglass, Ban } from '@lucide/svelte'
   import { Button } from '$lib/components/ui/button'
   import { steerBubbleStatusLabel, type SteerBubbleEntry } from '$lib/stores/steerInbox.svelte'
 
@@ -30,30 +30,41 @@
    * Visible, not on hover. DL-119-03 settled that argument: people press Enter and nobody
    * hovers, which is the finding this whole story came from.
    */
+  /**
+   * BL-713 — a message waiting in the chat's line while the line holds for the user's answer
+   * to an approval card says so, and offers **Send now** (BL-455's words and button): the
+   * server sends that same message by its id, so every tab can offer it. It is not a receipt,
+   * so there is no Dismiss: the message is still going to be sent.
+   */
   let {
     steer,
     onSendNow = null,
     onDismiss = null,
-    canSendNow = false
+    canSendNow = false,
+    onSendHeldNow = null
   }: {
     steer: SteerBubbleEntry
     onSendNow?: ((steerId: string) => void) | null
     onDismiss?: ((steerId: string) => void) | null
     canSendNow?: boolean
+    onSendHeldNow?: ((steerId: string) => void) | null
   } = $props()
 
   // F-P3-4: the sentence lives in the store beside the state that decides it, so a drop
   // that was not the user's Stop never reads "you stopped the reply".
   const statusLabel = $derived(steerBubbleStatusLabel(steer))
   const showActions = $derived(steer.state === 'dropped' && Boolean(onDismiss))
+  const heldAtCard = $derived(
+    steer.state === 'queued' && steer.queuedSend === true && Boolean(steer.heldForApprovalCard)
+  )
 </script>
 
 <div class="steer-row" data-testid="steer-bubble" data-steer-state={steer.state}>
   <div class="steer-bubble" class:is-dropped={steer.state === 'dropped'}>
     <p class="steer-text">{steer.text}</p>
     <span class="steer-status">
-      {#if steer.state === 'waiting'}
-        <Paperclip class="steer-status-icon" aria-hidden="true" />
+      {#if heldAtCard}
+        <Hourglass class="steer-status-icon" aria-hidden="true" />
       {:else if steer.state === 'dropped'}
         <Ban class="steer-status-icon" aria-hidden="true" />
       {:else}
@@ -61,6 +72,19 @@
       {/if}
       {statusLabel}
     </span>
+    {#if heldAtCard && onSendHeldNow}
+      <div class="steer-actions" data-testid="steer-held-actions">
+        <Button
+          variant="ghost"
+          size="xs"
+          class="steer-action-button"
+          data-testid="steer-held-send-now"
+          onclick={() => onSendHeldNow?.(steer.steerId)}
+        >
+          Send now
+        </Button>
+      </div>
+    {/if}
     {#if showActions}
       <div class="steer-actions" data-testid="steer-dropped-actions">
         {#if canSendNow && onSendNow}
@@ -106,7 +130,7 @@
     flex-direction: column;
     gap: 0.3rem;
     padding: 0.5rem 0.85rem;
-    border: 1px solid oklch(0.63 0.05 281.84 / 0.45);
+    border: 1px solid color-mix(in oklab, var(--bs-app-primary-text) 45%, transparent);
     border-radius: var(--radius);
     background: oklch(from var(--message-user-tint) l c h / 0.45);
     color: var(--message-user-foreground);

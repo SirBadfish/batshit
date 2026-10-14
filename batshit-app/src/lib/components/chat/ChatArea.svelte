@@ -4,6 +4,8 @@
   import ChatMessageComponent from './ChatMessage.svelte'
   import LoadingIndicator from './LoadingIndicator.svelte'
   import SteerBubble from './SteerBubble.svelte'
+  import HeldMessageReceipt from './HeldMessageReceipt.svelte'
+  import { resolveHeldMessageReceipt } from '$lib/utils/heldForApproval'
   import * as steerInbox from '$lib/stores/steerInbox.svelte'
   import { onDestroy, onMount, tick } from 'svelte'
   import { zippingService } from '$lib/services/zipping'
@@ -26,7 +28,10 @@
     composerClipCount = 0,
     onResendDroppedSteer = null,
     onDismissDroppedSteer = null,
-    canResendDroppedSteer = null
+    canResendDroppedSteer = null,
+    sessionBusy = false,
+    onSendHeldMessage = null,
+    onSendWaitingSendNow = null
   } = $props<{ 
     messages: Message[],
     trimmedMessageIds?: string[],
@@ -44,6 +49,12 @@
     onResendDroppedSteer?: ((steerId: string) => void) | null
     onDismissDroppedSteer?: ((steerId: string) => void) | null
     canResendDroppedSteer?: ((steerId: string) => boolean) | null
+    /** BL-455: is a reply running in this chat (the resume, or the follow-up that answers it)? */
+    sessionBusy?: boolean
+    /** BL-455: Send now on a message held for an approval card. */
+    onSendHeldMessage?: ((messageId: string) => void) | null
+    /** BL-713: Send now on a message that waits in the chat's line at an approval card. */
+    onSendWaitingSendNow?: ((steerId: string) => void) | null
   }>()
   
   const BOTTOM_THRESHOLD_PX = 64
@@ -78,6 +89,13 @@
       .getPendingSteersForSession(sessionId)
       .filter((entry) => entry.state !== 'delivered' && entry.state !== 'promoted')
   )
+
+  /**
+   * BL-455 — the receipt under a message held for an approval card: its card still waits, or the
+   * user stopped the reply that would have answered it. Only while no reply follows the held
+   * message; a send the chat's line kept at the same card may stand after it (BL-905).
+   */
+  const heldReceipt = $derived(resolveHeldMessageReceipt({ messages, busy: sessionBusy }))
 
   // Update pinning service when session changes
   $effect(() => {
@@ -222,7 +240,7 @@
     // A locate is the user deliberately leaving the bottom, exactly like a wheel-up. A long
     // SMOOTH scroll from the bottom is lost here: its first scroll event still reads "at bottom",
     // re-arms bottom-follow, and the next render snaps the chat back down. So a caller that
-    // jumps far (the Jev Juice notice card's "Show the message", SA-120 P7b) asks for `'auto'`,
+    // jumps far (the Judge Juice notice card's "Show the message", SA-120 P7b) asks for `'auto'`,
     // which lands in one step, and the release below keeps the chat there.
     releaseBottomFollow()
     target.scrollIntoView({ behavior: detail?.behavior ?? 'smooth', block: 'center', inline: 'nearest' })
@@ -395,6 +413,9 @@
           planSubject={planSubjects?.[message.id]}
           {voiceSettings}
         />
+        {#if heldReceipt && heldReceipt.messageId === message.id}
+          <HeldMessageReceipt receipt={heldReceipt} onSendNow={onSendHeldMessage} />
+        {/if}
       {/each}
       {#each pendingSteers as steer (steer.steerId)}
         <SteerBubble
@@ -402,6 +423,7 @@
           onSendNow={onResendDroppedSteer}
           onDismiss={onDismissDroppedSteer}
           canSendNow={canResendDroppedSteer ? canResendDroppedSteer(steer.steerId) : false}
+          onSendHeldNow={onSendWaitingSendNow}
         />
       {/each}
       <div class="chat-bottom-sentinel" aria-hidden="true"></div>

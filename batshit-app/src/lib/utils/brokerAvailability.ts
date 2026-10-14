@@ -29,6 +29,8 @@
  * are advertised by the Batshit Tools node inside n8n. Do not narrow this union.
  */
 
+import { isApiSubagentType } from '$lib/utils/subagentType'
+
 export const BROKER_TOOL_FAMILIES = [
   'mcp',
   'cli',
@@ -183,7 +185,7 @@ export function resolveBrokerFamilies(input: BrokerAvailabilityInput): BrokerToo
   const dmReachable = toggles.batshitToolsEnabled && input.dmControlsEnabled === true
   // SA-115 P2: schedule controls, same rule again.
   const scheduleReachable = toggles.batshitToolsEnabled && input.scheduleControlsEnabled === true
-  // SA-120 P2: the Jev Juice judgment tool, same rule again.
+  // SA-120 P2: the Judge Juice judgment tool, same rule again.
   const judgeReachable = toggles.batshitToolsEnabled && input.judgeControlsEnabled === true
 
   const families: BrokerToolFamily[] = []
@@ -241,6 +243,7 @@ export const BROKER_FABRIC_FETCH_ZIP_CONTROL_ID = 'sys.zip.fetch'
  * follow their own toggles (`sys.zip.fetch` and the Dynamic MCP pair).
  */
 export const BROKER_FABRIC_BATSHIT_TOOLS_CONTROL_IDS = [
+  'sys.ui.*',
   'sys.comfyui.*',
   'sys.artifact.*',
   'artifact.*',
@@ -249,6 +252,9 @@ export const BROKER_FABRIC_BATSHIT_TOOLS_CONTROL_IDS = [
   'sys.skill.save',
   'sys.skill.import',
   'sys.runtime_addon.*',
+  // SA-072 P1 (DL-08): broad scope, no allowance constant of its own, so Subagents and Workers
+  // (which lose the Fabric control plane) never get it.
+  'sys.pinokio.*',
   'sys.voice.engine.register',
   'sys.voice.engine.update',
   'sys.voice.engine.health_check',
@@ -282,7 +288,7 @@ export const BROKER_FABRIC_DM_CONTROL_IDS = ['sys.dm.*'] as const
 export const BROKER_FABRIC_SCHEDULE_CONTROL_IDS = ['sys.schedule.*'] as const
 
 /**
- * SA-120 P2 (DL-120-06): the Jev Juice judgment tool family (`sys.judge.ask`). Same shape
+ * SA-120 P2 (DL-120-06): the Judge Juice judgment tool family (`sys.judge.ask`). Same shape
  * once more: one constant, one boolean, PRIMARY actors only, opened at the same
  * registration sites and passed explicit `false` from every subagent and Worker scope. A
  * delegated run never judges through Jev on the user's key; the primary decides for it.
@@ -359,7 +365,7 @@ export function resolveBrokerFabricAllowedControlIds(input: BrokerFabricScopeInp
     }
   }
 
-  // SA-120 P2: the Jev Juice judgment tool, same rule again.
+  // SA-120 P2: the Judge Juice judgment tool, same rule again.
   if (input.toggles.batshitToolsEnabled && input.judgeControlsEnabled === true) {
     for (const controlId of BROKER_FABRIC_JUDGE_CONTROL_IDS) {
       allowed.add(controlId)
@@ -371,6 +377,92 @@ export function resolveBrokerFabricAllowedControlIds(input: BrokerFabricScopeInp
 
 /** The artifact family's control-id scope. Typed invoke aliases only. */
 export const BROKER_ARTIFACT_ALLOWED_CONTROL_IDS = ['use.artifact.*'] as const
+
+/**
+ * The flags every Subagent and Worker scope passes to the two functions above: the published
+ * artifact tools stay, the broad Fabric control plane is primary-only (SA-064), and each
+ * agent-owned family is primary-only too (memory SA-104, DMs SA-113, schedules SA-115, the
+ * judgment tool SA-120). One constant, so the Subagent DCM index and a delegated run's control
+ * scope (BL-81) cannot drift apart.
+ */
+export const DELEGATED_RUN_BROKER_SCOPE = {
+  allowArtifactRuntimeTools: true,
+  allowFabricControlTools: false,
+  memoryControlsEnabled: false,
+  dmControlsEnabled: false,
+  scheduleControlsEnabled: false,
+  judgeControlsEnabled: false
+} as const
+
+/**
+ * BL-81 — the broker inputs a Subagent or Worker run is offered through: its runtime, from its
+ * Subagent type, and the six toggles, off its resolved native tool settings.
+ *
+ * The Subagent DCM index (`buildManagedSubagentDynamicInfo`) and the control scope minted onto a
+ * delegated CLI run's credential (`subagentRunner.ts`) both read the run this way, from the same
+ * resolved scope, so what the model is shown and what the server enforces come from one reading.
+ */
+export function resolveDelegatedRunBrokerInputs(scope: {
+  subagentType: unknown
+  nativeToolSettings: BrokerToolToggles
+}): { runtime: BrokerRuntime; toggles: BrokerToolToggles } {
+  const settings = scope.nativeToolSettings
+  return {
+    runtime: isApiSubagentType(scope.subagentType) ? 'api' : 'cli',
+    toggles: {
+      fetchZipEnabled: settings.fetchZipEnabled,
+      dynamicMcpEnabled: settings.dynamicMcpEnabled,
+      cliToolsEnabled: settings.cliToolsEnabled,
+      artifactRuntimeEnabled: settings.artifactRuntimeEnabled,
+      batshitToolsEnabled: settings.batshitToolsEnabled,
+      agentBrowserEnabled: settings.agentBrowserEnabled
+    }
+  }
+}
+
+/**
+ * BL-81 — the control ids a Subagent or Worker run may use through the control routes: exactly
+ * the two broker groups its DCM index offers it, Fabric and Artifact Tools, and nothing more.
+ *
+ * Computed with the same two functions and the same flags the index uses, so for a Subagent it
+ * can only ever be Fetch Zip (`sys.zip.fetch`, when its toggle is on and the runtime's Fabric
+ * rule opens the family) and the published artifact tools (`use.artifact.*`, when theirs is).
+ * `buildMode3NativeTools` enforces the same list on the API lane through its broker; the managed
+ * CLI helper serves every family on request, so a CLI run carries this list on its credential
+ * and `useControl` refuses everything else. Before BL-81 nothing did, and a CLI Subagent could
+ * call any Fabric control, `sys.skill.save` included.
+ *
+ * A CLI run's inputs come from its CLI profile's settings (`buildCliSubagentProviderSettings`:
+ * Fetch Zip and Batshit Tools off, read by `resolveManagedSubagentScope`), so its list is the
+ * published artifact tools or nothing; Fetch Zip reaches only an API Subagent whose toggle is on.
+ */
+export function resolveDelegatedRunAllowedControlIds(inputs: {
+  runtime: BrokerRuntime
+  toggles: BrokerToolToggles
+}): string[] {
+  const families = resolveBrokerFamilies({
+    runtime: inputs.runtime,
+    toggles: inputs.toggles,
+    ...DELEGATED_RUN_BROKER_SCOPE
+  })
+  const allowed: string[] = []
+  if (families.includes('fabric')) {
+    allowed.push(
+      ...resolveBrokerFabricAllowedControlIds({
+        toggles: inputs.toggles,
+        allowFabricControlTools: DELEGATED_RUN_BROKER_SCOPE.allowFabricControlTools,
+        memoryControlsEnabled: DELEGATED_RUN_BROKER_SCOPE.memoryControlsEnabled,
+        dmControlsEnabled: DELEGATED_RUN_BROKER_SCOPE.dmControlsEnabled,
+        scheduleControlsEnabled: DELEGATED_RUN_BROKER_SCOPE.scheduleControlsEnabled,
+        judgeControlsEnabled: DELEGATED_RUN_BROKER_SCOPE.judgeControlsEnabled
+      })
+    )
+  }
+  if (families.includes('artifact')) {
+    allowed.push(...BROKER_ARTIFACT_ALLOWED_CONTROL_IDS)
+  }
+  return allowed
+}
 
 /** Matches one control id against one allowlist entry, which may contain `*` wildcards. */
 export function controlIdMatchesAllowedEntry(controlId: string, allowedEntry: string): boolean {

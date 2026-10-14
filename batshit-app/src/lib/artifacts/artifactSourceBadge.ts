@@ -1,4 +1,5 @@
 import type { IconRef } from '$lib/icons/iconTypes'
+import { isPinokioManagedArtifact } from '$lib/artifacts/pinokioArtifact'
 
 export type ArtifactSourceKind =
   | 'built_in'
@@ -122,5 +123,11 @@ export function resolveArtifactSourceKind(artifact: any): ArtifactSourceKind {
 }
 
 export function getArtifactSourceBadge(artifact: any): ArtifactSourceBadge {
-  return SOURCE_BADGES[resolveArtifactSourceKind(artifact)]
+  const badge = SOURCE_BADGES[resolveArtifactSourceKind(artifact)]
+  // SA-072 P2 (DL-09): the real kind first, Pinokio as its manager ("ComfyUI via Pinokio"),
+  // never a bare "Pinokio".
+  if (isPinokioManagedArtifact(artifact)) {
+    return { ...badge, label: `${badge.kind === 'custom' ? 'Custom API' : badge.label} via Pinokio` }
+  }
+  return badge
 }

@@ -17,6 +17,7 @@
 import { embedMany } from 'ai'
 import { createOpenAI } from '@ai-sdk/openai'
 import path from 'node:path'
+import { isChatgptPlanConnection } from '$lib/utils/chatgptPlanConnection'
 import { resolveManagedInstallsRoot } from '$lib/server/services/voiceLocalRuntimePaths'
 import type { MemoryEmbeddingConfig } from './memoryTypes'
 
@@ -435,7 +436,14 @@ interface SavedPresetRecordLike {
   modelName?: string
   provider?: string
   purpose?: string
-  connection?: { type?: string }
+  connection?: { type?: string; id?: string; service?: string }
+}
+
+/** Embeddings have no ChatGPT-plan endpoint; never borrow the paid OpenAI key. */
+export function assertPresetEmbeddingConnection(preset: SavedPresetRecordLike) {
+  if (preset.connection?.service === 'chatgpt-plan' || isChatgptPlanConnection(preset.connection?.id)) {
+    throw new Error('ChatGPT-plan presets cannot provide memory embeddings. Choose the built-in embedding model or a separate embedding preset with its own connection in Settings → Memory.')
+  }
 }
 
 async function loadSavedPreset(presetId: string): Promise<SavedPresetRecordLike | null> {
@@ -463,6 +471,7 @@ export function resolvePresetEmbeddingTarget(input: {
       `The memory embedding model preset '${presetId}' no longer exists. Pick a preset again in Settings → Memory → Memory System (and re-index if the model changed).`
     )
   }
+  assertPresetEmbeddingConnection(preset)
   const provider = String(preset.provider ?? '').trim().toLowerCase()
   const modelId = String(preset.effectiveModelId ?? preset.modelId ?? '').trim()
   if (
@@ -534,10 +543,14 @@ class PresetMemoryEmbedder implements MemoryEmbedder {
     this.queryPrefix = preset.queryPrefix ?? ''
   }
 
-  private getModel() {
+  private async getModel() {
+    // The preset can be edited/restored while this embedder keeps a cached SDK
+    // client. Re-read its funding boundary on EVERY call, before using that client.
+    const record = await loadSavedPreset(this.preset.presetId)
+    if (!record) throw new Error(`The memory embedding model preset '${this.preset.presetId}' no longer exists. Pick a preset again in Settings → Memory.`)
+    assertPresetEmbeddingConnection(record)
     if (!this.modelPromise) {
       this.modelPromise = (async () => {
-        const record = await loadSavedPreset(this.preset.presetId)
         const { resolveProviderAccess } = await import('$lib/server/services/providers')
         const access = await resolveProviderAccess(this.userId ?? null)
         let localAiServers: Array<{ id: string; baseUrl: string; openaiPath?: string }> = []

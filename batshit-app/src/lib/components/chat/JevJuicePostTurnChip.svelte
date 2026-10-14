@@ -12,10 +12,10 @@
   } from '$lib/utils/jevJuice'
 
   /**
-   * SA-120 P6: what the Jev Juice after-reply check noticed about this reply. The same chip
-   * and click-open popover the memory chips use, with the Jev Juice mark. It only SAYS what
+   * SA-120 P6: what the Judge Juice after-reply check noticed about this reply. The same chip
+   * and click-open popover the memory chips use, with the Judge Juice mark. It only SAYS what
    * was noticed and that the agent is told on its next turn; the reply itself is never edited.
-   * A lane that could not run shows the ordinary Jev Juice note instead (DL-120-02).
+   * A lane that could not run shows the ordinary Judge Juice note instead (DL-120-02).
    */
   interface Props {
     record: JevJuicePostTurnRecord
@@ -28,7 +28,7 @@
   <DropdownMenu.Root>
     <DropdownMenu.Trigger
       class="message-memory-chip is-jev-juice"
-      aria-label="Show what Jev noticed about this reply"
+      aria-label="Show what the judge noticed about this reply"
       data-testid="jev-juice-post-turn"
     >
       <Zap class="message-memory-chip-icon" aria-hidden="true" />
@@ -39,7 +39,7 @@
       side="top"
       class="batshit-settings-info-content batshit-settings-card-elevated batshit-settings-card-info-callout z-[var(--z-popover)] w-96 message-memory-popover"
     >
-      <p class="message-memory-popover-title">Jev noticed after this reply:</p>
+      <p class="message-memory-popover-title">The judge noticed after this reply:</p>
       {#each record.findings as finding, index (`${finding.id}:${index}`)}
         <div class="message-memory-popover-row" data-testid="jev-juice-post-turn-finding" data-finding-id={finding.id}>
           <span class="message-memory-popover-lane">{jevJuicePostTurnLaneLabel(finding.lane)}</span>

@@ -1,0 +1,27 @@
+{
+  "case": "which-missing",
+  "capturedAt": "2026-09-22T14:25:43.605Z",
+  "pinokio": {
+    "desktop": "8.2.0",
+    "pinokiod": "8.2.0",
+    "pterm": "0.0.25",
+    "script": "8.0.0"
+  },
+  "platform": "macOS 27.0 (26A428), Apple Silicon, Node 24.12.0 (Homebrew) running pterm through its shebang",
+  "sanitized": {
+    "/Users/tester": "the real home folder",
+    "192.168.1.10": "the real LAN address"
+  },
+  "argv": [
+    "pterm",
+    "which",
+    "no-such-command-p0"
+  ],
+  "exitCode": 1,
+  "signal": null,
+  "timedOut": false,
+  "durationMs": 1928,
+  "stdout": "",
+  "stderr": "command not found: no-such-command-p0\n",
+  "note": "pterm which <unknown>: exit 1, one stderr line"
+}

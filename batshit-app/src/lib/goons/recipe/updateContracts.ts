@@ -11,6 +11,11 @@ import {
   canonicalRecipeString,
 } from "./recipeCanonical";
 import {
+  parseRecipeComponentMapBundle,
+  verifyRecipeComponentMapBundleHashes,
+  type RecipeComponentMapBundle,
+} from "./componentMapSchema";
+import {
   parseRecipeSourceIdentity,
   verifyRecipeSourceManifest,
   type RecipeSourceIdentity,
@@ -263,6 +268,7 @@ export type RecipeUpdatesContract = {
   contract: typeof RECIPE_UPDATES_CONTRACT;
   schemaVersion: 1;
   edges: RecipeUpdateEdge[];
+  componentMapBundles?: RecipeComponentMapBundle[];
 };
 
 export type RecipeMigrationReportEntry = {
@@ -1479,9 +1485,18 @@ export function parseRecipeUpdatesContract(
 ): RecipeUpdatesContract {
   canonicalRecipeString(value);
   const raw = requireRecord(value, "recipe updates contract");
+  const hasComponentMaps = Object.prototype.hasOwnProperty.call(
+    raw,
+    "componentMapBundles",
+  );
   requireExactKeys(
     raw,
-    ["contract", "schemaVersion", "edges"],
+    [
+      "contract",
+      "schemaVersion",
+      "edges",
+      ...(hasComponentMaps ? ["componentMapBundles"] : []),
+    ],
     "recipe updates contract",
   );
   if (raw.contract !== RECIPE_UPDATES_CONTRACT || raw.schemaVersion !== 1) {
@@ -1502,7 +1517,72 @@ export function parseRecipeUpdatesContract(
     edges.map((edge) => edge.edgeSha256),
     "recipe update edge hashes",
   );
-  return { contract: RECIPE_UPDATES_CONTRACT, schemaVersion: 1, edges };
+  const componentMapBundles = hasComponentMaps
+    ? requireArray(
+        raw.componentMapBundles,
+        "recipe update component map bundles",
+      ).map(parseRecipeComponentMapBundle)
+    : undefined;
+  if (componentMapBundles) {
+    if (componentMapBundles.length === 0) {
+      throw new Error(
+        "recipe update component map bundles must not be empty when present",
+      );
+    }
+    assertUnique(
+      componentMapBundles.map((bundle) => bundle.directEdgeKey),
+      "recipe update component map edges",
+    );
+    for (const bundle of componentMapBundles) {
+      const edge = edges.find(
+        (entry) => entry.directEdgeKey === bundle.directEdgeKey,
+      );
+      if (!edge)
+        throw new Error("embedded component map bundle has no matching update edge");
+      if (bundle.maps.length === 0)
+        throw new Error("embedded component map bundle must contain maps");
+      assertComponentMapEdgeBinding(bundle, edge);
+    }
+  }
+  return {
+    contract: RECIPE_UPDATES_CONTRACT,
+    schemaVersion: 1,
+    edges,
+    ...(componentMapBundles ? { componentMapBundles } : {}),
+  };
+}
+
+function assertComponentMapEdgeBinding(
+  bundle: RecipeComponentMapBundle,
+  edge: RecipeUpdateEdge,
+): void {
+  if (
+    bundle.directEdgeKey !== edge.directEdgeKey ||
+    bundle.edgeSha256 !== edge.edgeSha256 ||
+    canonicalRecipeString(bundle.fromSource) !==
+      canonicalRecipeString(edge.from) ||
+    canonicalRecipeString(bundle.toSource) !== canonicalRecipeString(edge.to)
+  ) {
+    throw new Error("component map bundle targets another direct update edge");
+  }
+  if (
+    bundle.maps.some(
+      (map) => map.auditedFixtureSha256 !== edge.proof.fixtureSha256,
+    )
+  ) {
+    throw new Error("component map bundle targets another audited fixture");
+  }
+}
+
+/** Source-package proof binding; the planner still verifies membership and physical equivalence. */
+export async function verifyRecipeUpdateComponentMapBundle(
+  value: unknown,
+  edgeValue: RecipeUpdateEdge,
+): Promise<RecipeComponentMapBundle> {
+  const edge = await verifyRecipeUpdateEdge(edgeValue);
+  const bundle = await verifyRecipeComponentMapBundleHashes(value);
+  assertComponentMapEdgeBinding(bundle, edge);
+  return bundle;
 }
 
 function parseReportEntry(
@@ -2215,6 +2295,16 @@ export async function verifyRecipeUpdatesContract(
 ): Promise<RecipeUpdatesContract> {
   const contract = parseRecipeUpdatesContract(value);
   await Promise.all(contract.edges.map((edge) => verifyRecipeUpdateEdge(edge)));
+  await Promise.all(
+    (contract.componentMapBundles ?? []).map((bundle) =>
+      verifyRecipeUpdateComponentMapBundle(
+        bundle,
+        contract.edges.find(
+          (edge) => edge.directEdgeKey === bundle.directEdgeKey,
+        )!,
+      ),
+    ),
+  );
   return contract;
 }
 

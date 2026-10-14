@@ -4,6 +4,7 @@ import {
   attachSessionClip,
   decrementSessionClipDurations,
   listActiveClipIds,
+  listCountdownClipIds,
   normalizeSessionClipState,
   updateSessionClipDuration,
 } from '../sessionClipState'
@@ -21,6 +22,23 @@ describe('sessionClipState', () => {
     const consumed = decrementSessionClipDurations(attached)
     expect(consumed.clips).toHaveLength(0)
     expect(listActiveClipIds(consumed)).toEqual([])
+  })
+
+  it('BL-600: lists the countdown Clips, and a limited spend spends only the Clips it names', () => {
+    let state = normalizeSessionClipState('sess-600', null)
+    state = attachSessionClip(state, { clipId: 'clip-once', unclipAfter: 1 })
+    state = attachSessionClip(state, { clipId: 'clip-twice', unclipAfter: 2 })
+    state = attachSessionClip(state, { clipId: 'clip-later', unclipAfter: 1 })
+    state = attachSessionClip(state, { clipId: 'clip-kept' })
+
+    expect(listCountdownClipIds(state)).toEqual(['clip-once', 'clip-twice', 'clip-later'])
+
+    const spent = decrementSessionClipDurations(state, new Set(['clip-once', 'clip-twice', 'clip-kept']))
+    expect(spent.clips.map((entry) => [entry.clipId, entry.messagesUntilUnclip])).toEqual([
+      ['clip-twice', 1],
+      ['clip-later', 1],
+      ['clip-kept', null],
+    ])
   })
 
   it('can switch a clip back to persistent mode', () => {

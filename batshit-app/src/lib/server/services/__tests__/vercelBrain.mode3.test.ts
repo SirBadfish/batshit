@@ -513,6 +513,117 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
     })
   })
 
+  // BL-449 / BL-452 (2026-09-27): how a delegated run's stream ends. The real-SDK wire proof
+  // is `vercelBrain.delegatedRunEnd.test.ts`; these pin the shapes the live SDK there did not
+  // take (it threw on abort), from the SDK's own `TextStreamAbortPart` / `TextStreamErrorPart`.
+  describe("the delegated run's end (BL-449, BL-452)", () => {
+    const request = (abortSignal?: AbortSignal): NativeModeRequest => ({
+      messages: [{ role: 'user', content: 'Test' }],
+      model: 'gpt-4',
+      sessionId: 'test-session',
+      messageId: 'test-message',
+      ...(abortSignal ? { abortSignal } : {}),
+    })
+    const endingWith = (parts: any[]) => {
+      const reason = new Error('user')
+      const rejected = Promise.reject(reason)
+      rejected.catch(() => undefined)
+      vi.mocked(streamText).mockResolvedValueOnce({
+        stream: (async function* () {
+          yield { type: 'text-delta', text: 'Partial' }
+          for (const part of parts) yield part
+        })(),
+        // After an abort the SDK's result promises reject with the reason; they must not be read.
+        usage: rejected,
+        steps: rejected,
+      } as any)
+    }
+
+    it("hands streamText a signal the run's abort signal fires", async () => {
+      const controller = new AbortController()
+      let handed: AbortSignal | undefined
+      vi.mocked(streamText).mockImplementationOnce(async (options: any) => {
+        handed = options.abortSignal
+        return {
+          stream: (async function* () {
+            expect(handed?.aborted).toBe(false)
+            controller.abort()
+            yield { type: 'text-delta', text: 'Partial' }
+          })(),
+          usage: Promise.resolve({ inputTokens: 1, outputTokens: 1, totalTokens: 2 }),
+          steps: Promise.resolve([]),
+        } as any
+      })
+      await expect(brain.processNativeMode(request(controller.signal))).rejects.toMatchObject({
+        name: 'AbortError',
+      })
+      expect(handed?.aborted).toBe(true)
+    })
+
+    it('a stream that ends normally with its abort part is a Stop, not the partial words', async () => {
+      const controller = new AbortController()
+      controller.abort()
+      endingWith([{ type: 'abort', reason: 'user' }])
+      await expect(brain.processNativeMode(request(controller.signal))).rejects.toMatchObject({
+        name: 'AbortError',
+      })
+    })
+
+    it('a Stop wins over an error part the stream also reported', async () => {
+      const controller = new AbortController()
+      controller.abort()
+      endingWith([{ type: 'error', error: new Error('socket closed') }, { type: 'abort' }])
+      await expect(brain.processNativeMode(request(controller.signal))).rejects.toMatchObject({
+        name: 'AbortError',
+      })
+    })
+
+    it('an abort part the stream ends with is a Stop even when the signal did not fire', async () => {
+      endingWith([{ type: 'abort' }])
+      await expect(brain.processNativeMode(request())).rejects.toMatchObject({ name: 'AbortError' })
+    })
+
+    it('the first error part ends the loop: nothing after it is counted', async () => {
+      vi.mocked(streamText).mockResolvedValueOnce({
+        stream: (async function* () {
+          yield { type: 'error', error: new Error('text part 1 not found') }
+          yield { type: 'text-delta', text: 'after' }
+          yield { type: 'tool-result', toolName: 'test_tool', input: {}, output: { ran: true } }
+          throw new Error('the loop read past the first error')
+        })(),
+        usage: Promise.resolve({ inputTokens: 1, outputTokens: 1, totalTokens: 2 }),
+        steps: Promise.resolve([]),
+      } as any)
+      await expect(brain.processNativeMode(request())).rejects.toThrow('text part 1 not found')
+      const callArgs = vi.mocked(streamText).mock.calls.at(-1)?.[0] as any
+      expect(callArgs.abortSignal.aborted).toBe(true)
+    })
+
+    it("an error part fails the run with the provider's sentence", async () => {
+      // The part as the SDK hands it over since ai 7.0.80: the provider's object normalized into a
+      // real `StreamProviderError` with the provider's own message (`aiSdkBaseline` pins it).
+      const { StreamProviderError } = await vi.importActual<typeof import('ai')>('ai')
+      vi.mocked(streamText).mockResolvedValueOnce({
+        stream: (async function* () {
+          yield { type: 'text-delta', text: 'Partial' }
+          yield {
+            type: 'error',
+            error: new StreamProviderError({
+              message: 'Overloaded',
+              type: 'overloaded_error',
+              statusCode: 529,
+              isRetryable: true,
+              data: { type: 'overloaded_error', message: 'Overloaded' }
+            })
+          }
+        })(),
+        usage: Promise.resolve({ inputTokens: 1, outputTokens: 1, totalTokens: 2 }),
+        steps: Promise.resolve([]),
+      } as any)
+      await expect(brain.processNativeMode(request())).rejects.toThrow('Overloaded')
+    })
+  })
+
   describe('Error Handling', () => {
     it('5.7-UNIT-018: Test missing API key handling', async () => {
       const request: NativeModeRequest = {
@@ -916,7 +1027,7 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
       return callArgs.prepareStep as (args: {
         messages: any[]
         steps: any[]
-      }) => { messages: any[] } | undefined
+      }) => any
     }
 
     it('registers prepareStep on every run, with or without a steer channel', async () => {
@@ -927,11 +1038,161 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
     })
 
     it('DL-105-13 parity: changes nothing when neither images nor steers are pending', async () => {
-      const prepareStep = await getPrepareStep(baseRequest({ takeSteers: () => [] }))
+      // BL-77: an Anthropic-family run now gets one cache point from step two on (pinned
+      // below), so the "change nothing" promise is pinned on the lanes it still covers.
+      const lanes: Array<Partial<NativeModeRequest>> = [
+        // The original SA-114 case: a Claude model with no connection. BL-77 gives the tail
+        // point only to a lane whose connection names it.
+        {},
+        {
+          model: 'gpt-5.5',
+          connection: { id: 'direct:openai', type: 'direct', service: 'openai' } as any,
+          providerSettings: { openaiImageGenerationTool: false }
+        },
+        {
+          model: 'gemini-3.5-flash',
+          connection: { id: 'direct:google', type: 'direct', service: 'google' } as any
+        },
+        // Vercel AI Gateway's own `caching: 'auto'` already marks the last message.
+        {
+          model: 'anthropic/claude-sonnet-5',
+          connection: { id: 'vercel-gateway', type: 'vercel-gateway' } as any
+        },
+        {
+          model: 'openai/gpt-5.5',
+          connection: { id: 'openrouter', type: 'openrouter' } as any
+        }
+      ]
+      const messages = [{ role: 'user', content: 'do some work' }]
+
+      for (const lane of lanes) {
+        const prepareStep = await getPrepareStep(baseRequest({ takeSteers: () => [], ...lane }))
+        const name = lane.model ?? 'claude-3-5-sonnet, no connection'
+        expect(prepareStep({ messages, steps: [] }), name).toBeUndefined()
+        expect(prepareStep({ messages, steps: [toolResultStep()] }), name).toBeUndefined()
+        expect(
+          prepareStep({ messages, steps: [toolResultStep(), toolResultStep()] }),
+          name
+        ).toBeUndefined()
+      }
+    })
+
+    it('BL-77: an Anthropic run adds exactly one request-level cache point from step two, and no message', async () => {
+      const prepareStep = await getPrepareStep(
+        baseRequest({
+          model: 'claude-sonnet-5',
+          connection: { id: 'direct:anthropic', type: 'direct', service: 'anthropic' } as any,
+          takeSteers: () => []
+        })
+      )
+      const messages = [{ role: 'user', content: 'do some work' }]
+
+      // Step one: nothing — a one-step reply never pays for a cache write nobody reads.
+      expect(prepareStep({ messages, steps: [] })).toBeUndefined()
+      // Every later step: the cache point and NOTHING else (the SDK keeps its own messages).
+      for (const steps of [[toolResultStep()], [toolResultStep(), toolResultStep()]]) {
+        expect(prepareStep({ messages, steps })).toEqual({
+          providerOptions: { anthropic: { cacheControl: { type: 'ephemeral' } } }
+        })
+      }
+    })
+
+    it('BL-77: each step gets its own copy, so a provider that edits its options cannot leak into the next step', async () => {
+      const prepareStep = await getPrepareStep(
+        baseRequest({
+          model: 'claude-sonnet-5',
+          connection: { id: 'direct:anthropic', type: 'direct', service: 'anthropic' } as any,
+          takeSteers: () => []
+        })
+      )
+      const messages = [{ role: 'user', content: 'do some work' }]
+
+      const first = prepareStep({ messages, steps: [toolResultStep()] })
+      first.providerOptions.anthropic.cacheControl.ttl = '1h'
+      first.providerOptions.anthropic.thinking = { type: 'adaptive' }
+      const second = prepareStep({ messages, steps: [toolResultStep(), toolResultStep()] })
+
+      expect(second.providerOptions).not.toBe(first.providerOptions)
+      expect(second).toEqual({
+        providerOptions: { anthropic: { cacheControl: { type: 'ephemeral' } } }
+      })
+    })
+
+    it('BL-185: an OpenRouter Claude run marks the last message instead, never the call options', async () => {
+      const prepareStep = await getPrepareStep(
+        baseRequest({
+          model: 'anthropic/claude-sonnet-5',
+          connection: { id: 'openrouter', type: 'openrouter' } as any,
+          takeSteers: () => []
+        })
+      )
+      // The one compiled message, then the first step's call and its result.
+      const compiled = { role: 'user', content: 'do some work' }
+      const call = { role: 'assistant', content: [{ type: 'tool-call', toolCallId: 'call_1', toolName: 'echo', input: {} }] }
+      const result = {
+        role: 'tool',
+        content: [{ type: 'tool-result', toolCallId: 'call_1', toolName: 'echo', output: { type: 'text', value: 'ok' } }]
+      }
+
+      expect(prepareStep({ messages: [compiled], steps: [] })).toBeUndefined()
+      const second = prepareStep({ messages: [compiled, call, result], steps: [toolResultStep()] })
+      expect(second.providerOptions).toBeUndefined()
+      expect(second.messages[0]).toBe(compiled)
+      expect(second.messages[1]).toBe(call)
+      expect(second.messages[2].content[0].providerOptions).toEqual({
+        openrouter: { cacheControl: { type: 'ephemeral' } }
+      })
+      // A copy: the SDK's own result object is never marked.
+      expect(result.content[0]).not.toHaveProperty('providerOptions')
+      // Nothing of the loop yet (a step that only has the compiled messages): nothing to do.
+      expect(prepareStep({ messages: [compiled], steps: [toolResultStep()] })).toBeUndefined()
+    })
+
+    it("BL-77: a preset's Prompt cache TTL already covers every step, so the hook adds nothing", async () => {
+      const prepareStep = await getPrepareStep(
+        baseRequest({
+          model: 'claude-sonnet-5',
+          connection: { id: 'direct:anthropic', type: 'direct', service: 'anthropic' } as any,
+          providerOptions: { anthropic: { cacheControl: { type: 'ephemeral', ttl: '1h' } } },
+          takeSteers: () => []
+        })
+      )
       const messages = [{ role: 'user', content: 'do some work' }]
 
       expect(prepareStep({ messages, steps: [] })).toBeUndefined()
       expect(prepareStep({ messages, steps: [toolResultStep()] })).toBeUndefined()
+    })
+
+    it('BL-77: a steer and the cache point arrive together, and the steer stays the last message', async () => {
+      const takeSteers = vi.fn().mockReturnValue([
+        {
+          steerId: 'steer_1',
+          messageId: 'test-message',
+          text: 'use a slider for the tip',
+          at: '2026-09-22T12:00:00.000Z',
+          source: 'user',
+          step: 1,
+          lane: 'api'
+        }
+      ])
+      const prepareStep = await getPrepareStep(
+        baseRequest({
+          model: 'claude-sonnet-5',
+          connection: { id: 'direct:anthropic', type: 'direct', service: 'anthropic' } as any,
+          takeSteers
+        })
+      )
+      const messages = [{ role: 'user', content: 'do some work' }]
+
+      const result = prepareStep({ messages, steps: [toolResultStep()] }) as any
+      expect(result.providerOptions).toEqual({
+        anthropic: { cacheControl: { type: 'ephemeral' } }
+      })
+      expect(result.messages).toHaveLength(2)
+      expect(result.messages[0]).toBe(messages[0])
+      expect(result.messages[1].content[0].text).toBe(
+        '[The user said, mid-reply: use a slider for the tip]'
+      )
     })
 
     it('injects one user message after a tool result, and marks the steers delivered', async () => {

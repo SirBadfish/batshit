@@ -74,7 +74,7 @@ The most important rule Batshit follows is that **an agent's identity comes from
 | Instance token | Your install's own service secret, set once at setup. | Act as **you** — everything you can do through Batshit's own service routes. It can **not** act as one of your agents: reading, claiming, or closing another agent's DMs, recalling an agent's memories, and managing an agent's schedules are all refused. |
 | Run credential | Created automatically when a managed Codex or Claude run starts, thrown away when the run ends. | Act as that one agent, for the length of that one run. After the run it is deleted, and presenting it again is refused. You never see it, name it, or rotate it — there is nothing to manage. |
 | Run credential for a Subagent or Worker | The same thing, for a delegated run. | Authenticate that helper and nothing else. A Subagent or Worker has no inbox, no memories, and no schedules of its own, so it is refused an agent identity outright. |
-| Portable Skill Token | Issued by you, for an outside coding agent, scoped to specific capability families. | Run the capabilities in its scope, as you. It never names an agent, so it cannot act as one. |
+| Portable Skill Token | Issued by you, for an outside coding agent, scoped to specific capability families. | Run the capabilities in its scope, as you, through the two control endpoints (`/api/controls/find` and `/api/controls/use`) and nowhere else. Every other app endpoint refuses it. It never names an agent, so it cannot act as one. |
 | Wake-up webhook token | Issued per webhook, shown once at creation. | Fire that one webhook, within its rate limit. Rotate or revoke it from Admin at any time. |
 | Workflow Subagent token | Created per message, for one n8n Workflow Subagent run. | Complete that one run. |
 
@@ -103,6 +103,8 @@ Project rules guide AI behavior. They are not a filesystem security boundary.
 
 Agents can be allowed to run commands. This is useful and risky. For normal agent work, prefer sandboxed Agent Mode when it's available — sandboxed execution is designed to isolate command runs better than direct host execution.
 
+Local native commands and newly started local Agent Browser processes do not inherit Batshit's service, agent, gateway, sidecar, or host-operator control tokens. Ordinary tool settings still work. This does not prevent a command running as you from reading files and other secrets available to your user account. An Agent Browser process already running keeps its original environment until its normal restart.
+
 Know the difference:
 
 | Execution shape | What it means |
@@ -112,7 +114,21 @@ Know the difference:
 | Native host command execution | Commands run with normal host access. Powerful and trusted. |
 | Docker app-container shell | Commands run inside the Batshit app container against mounted workspace paths. Useful, but not the host shell and not the Docker Sandbox. |
 
+Sandboxed commands can write their project and selected installer/work folders. Batshit keeps managed agent homes, host shutdown records, and Pinokio’s data and secrets outside those mounts, and refuses a project folder that exposes them.
+
 Sandboxed command backends must not silently downgrade into local shell execution. If Apple Container or Docker Sandbox is selected but unavailable, Batshit shows an unavailable/setup-required state.
+
+For Claude agents in **Plan** mode, ordinary tool allow rules and enabled MCP tools do not automatically grant permission to execute. Assigned Subagents remain on their explicit Plan allow list. Managed Claude plans stay in the chat reply instead of writing into your personal Claude plans folder.
+
+For Claude agents using **Ask before edits** or **Edit automatically**, **On Request** lets Claude Code show an approval card when one of its own tools asks. In Edit automatically, an escalated command or edit still needs your approval; an allowed tool rule or project folder does not bypass that prompt. Approval requests stay with the chat running that Claude agent; a tool request cannot redirect an approval into another chat.
+
+Enabled Batshit helper tools are pre-allowed in Claude Code outside Plan mode and do not raise a Claude approval card just because Approval Policy is On Request. Their effects still go through Batshit's own server rules, and each helper tool uses its own access and risk rules.
+
+Codex and Claude agents run their commands with their own shell, and Batshit does not add a Bash tool of its own for them. Those commands run where the Codex or Claude program runs them (on your Mac as you; in Docker, inside the app container), under the mode you picked for that agent. A message never runs with more than the agent's Agent Settings allow: the chat bar's mode can make a run tighter, never looser, a Codex Sandbox Level set tighter by hand holds, and a group chat member never runs looser than its own settings ([What a chat message lets the agent do](../primary-agents/overview.md#what-a-chat-message-lets-the-agent-do)). Batshit's Sandbox, Bash modes, allow list, Never Allow list, and its guard on its own source code do not reach them, and a Codex agent in Chat (read-only) mode cannot change files. If you want those limits around an agent's commands, use an API agent.
+
+A picture in an assistant reply that comes from another website never loads on its own. Batshit may explain whether it saw the exact address in information it could account as read, but a match is not proof that the agent chose the address safely. A matching address still needs your click. Batshit blocks an address when only its start was read, when an unread address may contain chat text, or when a complete API record shows it was not read. An exact address that was read but may contain chat text gets a warning and a smaller Load action. Managed Codex and Claude turns can remain unknown because Batshit cannot see all vendor context or truncation, though partial evidence can still block an address. If Batshit cannot tell and the reply is not pending, it shows a warning and a smaller Load action. Older replies and direct LiveKit voice replies have no address record; after Batshit reads the chat's records, they appear as unknown with a warning and a smaller Load action. A reply still being written, a failed record read or write, or a record that does not match the exact reply stays in “Checking where this address came from” with no Load action. These labels apply to pictures in assistant reply text. Tool-card and expanded Zip/Clip pictures follow the source rules: a Clip Batshit supplies for the message shows at once, even when its URL uses a tunnel; uploads served from Batshit's own address also show at once, while other tunnel or website pictures wait for your click (including Agent Browser screenshots). Nothing is fetched until you click **Load picture**, and the request sends no referrer. The click applies to that address in that message and browser tab until reload. This keeps a reply (for example one steered by a web page the agent read) from contacting a picture website without your say. Picture tags inside code stay code.
+
+If a chat image cannot load, **Open URL** is offered only for web or blob URLs. Script URLs and local filesystem paths are refused.
 
 ## Tools, MCPs, Skills, and workflows
 

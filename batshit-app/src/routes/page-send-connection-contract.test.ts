@@ -24,9 +24,15 @@ describe('the page and the approval card send without holding a connection', () 
 
   it('the page’s send, with its 409 retry, goes through postSendRouted with its abort signal', () => {
     const retry = page.indexOf('\n  async function postSendRoutedWithInterruptRetry(params: {')
-    const loop = page.indexOf('\n    while (true) {\n      const response = await postSendRouted(bodyText, { signal: params.signal })\n', retry)
+    // BL-713: the send also hands on the server's acceptance (a send that waits in the chat's line
+    // frees the tab's in-flight guard at its 202); the 409 retry loop and the abort signal stay.
+    const loop = page.indexOf(
+      '\n    while (true) {\n      const response = await postSendRouted(bodyText, {\n        signal: params.signal,\n        onAccepted: params.onAccepted\n      })\n',
+      retry
+    )
     expect(retry).toBeGreaterThan(-1)
     expect(loop).toBeGreaterThan(retry)
+    expect(page.slice(loop, loop + 900)).toContain('const shouldRetry = shouldRetryInterruptedSendAfterSessionTurnInProgress({')
     expect(page).toContain("\n  import { postSendRouted } from '$lib/services/sendRoutedClient'\n")
   })
 

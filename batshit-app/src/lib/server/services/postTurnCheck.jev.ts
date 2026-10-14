@@ -1,5 +1,5 @@
 /**
- * SA-120 P6 (design record H2 + J6) — Jev Juice after-reply checks.
+ * SA-120 P6 (design record H2 + J6) — Judge Juice after-reply checks.
  *
  * THE constants module for both after-reply lanes (DL-120-03): every question, its criteria,
  * every floor, ceiling, window, and cap live here, so a reviewer reads the whole decision
@@ -10,7 +10,7 @@
  * correction lines in the agent's next prompt (the DCM tail), the way `control_errors` tells an
  * agent about a malformed control block.
  *
- * REPLY CHECK (H2, per-agent switch "Jev Juice: Check Replies"). Facts first, judgment second:
+ * REPLY CHECK (H2, per-agent switch "Judge Juice: Check Replies"). Facts first, judgment second:
  *   - code knows which tool calls this turn made (their one-line labels), whether any failed
  *     and was not retried successfully, and whether a memory was saved;
  *   - ONE Jev request then judges only what code cannot know, the PROSE: does the reply say it
@@ -18,7 +18,7 @@
  *     Agent Memory is on and nothing was saved); does it mention the failure (asked only when
  *     one exists); did it skip a part of a several-part request.
  *
- * STYLE COACH (J6, per-agent switch "Jev Juice: Style Coach"). Counting first: code counts
+ * STYLE COACH (J6, per-agent switch "Judge Juice: Style Coach"). Counting first: code counts
  * repeated openers, closers, and phrases across the agent's recent replies, on this machine.
  * Counting cannot tell a habit of speech ("let me know if") from honest repetition ("38 tests
  * pass"), so ONE Jev request judges each counted repeat, and adds the two things counting

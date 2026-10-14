@@ -7,6 +7,17 @@ services:
   # fails with "Permission denied" while reads keep working: silent data loss behind a
   # server that still reports healthy. This removes those empty legacy directories and
   # takes ownership of the data directory.
+  #
+  # BL-111: it also switches a volume that holds only a snapshot (dump.rdb) to append-only
+  # persistence, once. Redis started with appendonly yes on such a volume loads NOTHING (it
+  # reads the append-only file first and there is none), then overwrites dump.rdb with the
+  # empty dataset on its next save (measured on 8.10.1). So the switch follows Redis's
+  # documented procedure: load the snapshot with append-only off, turn it on live (Redis
+  # writes the whole dataset into a new append-only file), wait for that write, then load the
+  # new file once more and compare the keys before it goes into place. dump.rdb is never
+  # modified here, so a switch that fails changes nothing. Compose stops the old redis
+  # container (a clean stop saves dump.rdb) before this container starts, so the snapshot is
+  # current. https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/
   # Runs to completion before redis starts, and fails loudly rather than guessing.
   redis-init:
     image: redis:8.10.1-alpine@sha256:becdda6c7f4b3fb42e42fd7f120bbf5c54c4caaaf16f26da24e4563d2c1f0576
@@ -24,7 +35,7 @@ services:
           if [ -n "$$(ls -A "$$dir" 2>/dev/null)" ]; then
             echo "ERROR: $$dir exists and is not empty." >&2
             echo "Batshit expected an empty leftover directory from the retired Redis Stack image." >&2
-            echo "Inspect it yourself before starting Batshit; refusing to modify it." >&2
+            echo "Inspect it yourself before starting Batshit; refusing to modify it. Nothing was changed." >&2
             exit 1
           fi
           rmdir "$$dir"
@@ -33,10 +44,131 @@ services:
         chown -R redis:redis /data
         echo "Redis data directory prepared for the redis user."
 
+        # Redis loads the append-only file through its manifest; a folder without one is
+        # ignored, and Redis would start empty.
+        if [ ! -f /data/dump.rdb ] || [ -f /data/appendonlydir/appendonly.aof.manifest ]; then
+          exit 0
+        fi
+        if [ -e /data/appendonlydir ]; then
+          echo "ERROR: /data/appendonlydir has no manifest, so Redis would ignore it and start empty." >&2
+          echo "Inspect /data yourself before starting Batshit. Nothing was changed." >&2
+          exit 1
+        fi
+        # A Redis that still answers holds changes newer than dump.rdb. Compose never
+        # leaves one running here; if one does, refuse rather than switch a stale copy.
+        case "$$(redis-cli -h redis -p 6379 ping 2>&1 || true)" in
+          "Could not connect"*) ;;
+          *)
+            echo "ERROR: Batshit's Redis is still running on this data. Nothing was changed." >&2
+            echo "Stop it with 'docker compose --env-file .env.docker stop redis', then start Batshit again." >&2
+            exit 1
+            ;;
+        esac
+
+        echo "Switching Redis to append-only persistence (one time). dump.rdb is not modified."
+        staging=appendonlydir.switching
+        sock=/tmp/redis-switch.sock
+        # A switch that stopped part way leaves only this folder and Redis's rewrite temp file;
+        # both are rebuilt from dump.rdb. No Redis runs on /data at this point.
+        rm -rf "/data/$$staging"
+        rm -f /data/temp-rewriteaof-bg-*.aof
+
+        # A private Redis on a socket only, quiet unless something goes wrong.
+        start_switch_redis() {
+          SKIP_FIX_PERMS=1 docker-entrypoint.sh redis-server --port 0 \
+            --unixsocket "$$sock" --unixsocketperm 700 --protected-mode yes \
+            --loglevel warning --dir /data --save '' \
+            --appenddirname "$$staging" --appendonly "$$1" &
+          switch_pid=$$!
+          tries=0
+          until [ "$$(redis-cli -s "$$sock" ping 2>/dev/null)" = PONG ]; do
+            if ! kill -0 "$$switch_pid" 2>/dev/null; then
+              echo "ERROR: Redis could not load /data (see above). Nothing was changed." >&2
+              exit 1
+            fi
+            tries=$$((tries + 1))
+            if [ "$$tries" -gt 2400 ]; then
+              echo "ERROR: Redis did not finish loading /data in 20 minutes. Nothing was changed." >&2
+              exit 1
+            fi
+            sleep 0.5
+          done
+        }
+        stop_switch_redis() {
+          reply="$$(redis-cli -s "$$sock" shutdown nosave 2>&1 || true)"
+          if [ -n "$$reply" ]; then
+            echo "ERROR: Redis refused to stop: $$reply. Nothing was changed." >&2
+            exit 1
+          fi
+          if ! wait "$$switch_pid"; then
+            echo "ERROR: Redis did not stop cleanly. Nothing was changed." >&2
+            exit 1
+          fi
+        }
+        persistence_field() {
+          redis-cli -s "$$sock" info persistence \
+            | awk -F: -v field="$$1" '$$1 == field { sub(/[^a-z0-9].*/, "", $$2); print $$2 }'
+        }
+        # Keys with an expiry may lapse between the two loads; keys without one cannot.
+        lasting_keys() {
+          redis-cli -s "$$sock" info keyspace \
+            | awk -F'[:=,]' '/^db[0-9]+:/ { n += $$3 - $$5 } END { print n + 0 }'
+        }
+
+        start_switch_redis no
+        keys_before="$$(lasting_keys)"
+        reply="$$(redis-cli -s "$$sock" config set appendonly yes 2>&1 || true)"
+        if [ "$$reply" != OK ]; then
+          echo "ERROR: Redis could not turn on append-only: $$reply. Nothing was changed." >&2
+          exit 1
+        fi
+        tries=0
+        while [ "$$(persistence_field aof_rewrite_in_progress)" != 0 ] \
+          || [ "$$(persistence_field aof_rewrite_scheduled)" != 0 ]; do
+          if ! kill -0 "$$switch_pid" 2>/dev/null; then
+            echo "ERROR: Redis stopped while writing the append-only file. Nothing was changed." >&2
+            exit 1
+          fi
+          # A failed rewrite is retried, slower each time, so the loop could wait for an hour.
+          if [ "$$(persistence_field aof_last_bgrewrite_status)" = err ]; then
+            echo "ERROR: Redis could not write the append-only file (see above; is the disk full?). Nothing was changed." >&2
+            exit 1
+          fi
+          tries=$$((tries + 1))
+          if [ "$$tries" -gt 7200 ]; then
+            echo "ERROR: the append-only file took more than an hour to write. Nothing was changed." >&2
+            exit 1
+          fi
+          sleep 0.5
+        done
+        if [ "$$(persistence_field aof_last_bgrewrite_status)" != ok ]; then
+          echo "ERROR: Redis could not write the append-only file (see above). Nothing was changed." >&2
+          exit 1
+        fi
+        stop_switch_redis
+
+        start_switch_redis yes
+        keys_after="$$(lasting_keys)"
+        stop_switch_redis
+        if [ "$$keys_after" != "$$keys_before" ]; then
+          echo "ERROR: the new append-only file holds $$keys_after keys without an expiry; dump.rdb holds $$keys_before. Nothing was changed." >&2
+          exit 1
+        fi
+
+        mv "/data/$$staging" /data/appendonlydir
+        echo "Redis now uses append-only persistence: $$keys_after keys without an expiry kept."
+
   redis:
     # Redis 8 (Redis Open Source). Pinned by multi-architecture manifest digest so
     # Apple Silicon and amd64 hosts resolve the identical release. Redis Stack is a
     # retired product; Redis 8 bundles JSON, Search, TimeSeries and Bloom.
+    #
+    # BL-111: append-only persistence. Redis appends every write to /data/appendonlydir and
+    # flushes it to disk every second, so a crash, a power cut, or a hard kill loses at most
+    # about one second of saves. Before this only snapshots were kept, and on a quiet chat
+    # those run as rarely as once an hour. Snapshots (dump.rdb) continue as a second copy.
+    # redis-init switches an older snapshot-only volume first; this refuses to start on
+    # one, because Redis with appendonly yes would load nothing from it.
     image: redis:8.10.1-alpine@sha256:becdda6c7f4b3fb42e42fd7f120bbf5c54c4caaaf16f26da24e4563d2c1f0576
     restart: unless-stopped
     depends_on:
@@ -44,10 +176,22 @@ services:
         condition: service_completed_successfully
     volumes:
       - batshit_redis_data:/data
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ -f /data/dump.rdb ] && [ ! -f /data/appendonlydir/appendonly.aof.manifest ]; then
+          echo "ERROR: /data holds a Redis snapshot (dump.rdb) but no append-only file yet." >&2
+          echo "Starting Redis now would load nothing and then overwrite that snapshot." >&2
+          echo "Start Batshit with ./start-docker.sh or 'docker compose --env-file .env.docker up -d' so redis-init switches it first." >&2
+          exit 1
+        fi
+        exec docker-entrypoint.sh redis-server --appendonly yes --appendfsync everysec
     healthcheck:
       # PING alone would report healthy on a Redis without the JSON module, and every
       # Batshit write path needs it. Prove both, so a JSON-less Redis fails loudly.
-      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG && redis-cli command info json.get | grep -q json.get"]
+      # BL-111: also prove append-only is on and its last write succeeded, so a Redis that
+      # cannot write its append-only file (a full disk, a permissions fault) reports it.
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG && redis-cli command info json.get | grep -q json.get && redis-cli info persistence | grep -q '^aof_enabled:1' && redis-cli info persistence | grep -q '^aof_last_write_status:ok'"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -78,6 +222,9 @@ services:
       BATSHIT_BACKUP_STAGING_DIR: /data/backup-restore-staging
       BATSHIT_SERVER_LOG_DIR: /data/logs
       BATSHIT_ARTIFACT_COMPLETE_URL: ${BATSHIT_ARTIFACT_COMPLETE_URL:-http://app:3000/api/artifacts/complete}
+      # BL-562: where batshit-server reaches the app, over Compose DNS (as n8n does below). It no
+      # longer falls back to the Mac app's port, and the browser-facing URL means this container.
+      BATSHIT_FRONTEND_URL: http://app:3000
       CORS_ORIGIN: ${ORIGIN:-http://localhost:5620}
     ports:
       # Host publishes default to loopback so another machine on the LAN cannot
@@ -127,7 +274,7 @@ services:
     environment:
       NODE_ENV: production
       BATSHIT_CONTAINERIZED: "1"
-      BATSHIT_APP_VERSION: ${BATSHIT_APP_VERSION:-0.1.0-alpha.2}
+      BATSHIT_APP_VERSION: ${BATSHIT_APP_VERSION:-0.1.0-alpha.3}
       BATSHIT_APP_CHANNEL: ${BATSHIT_APP_CHANNEL:-alpha}
       BATSHIT_UPDATE_CHECK_DISABLED: ${BATSHIT_UPDATE_CHECK_DISABLED:-0}
       BATSHIT_UPDATE_FEED_URL: ${BATSHIT_UPDATE_FEED_URL:-}
@@ -179,7 +326,13 @@ services:
       LIVEKIT_AGENT_HEALTH_URL: ${LIVEKIT_AGENT_HEALTH_URL:-http://livekit-agent:7899/worker}
       BATSHIT_RUNTIME_ADDON_OPERATOR_URL: ${BATSHIT_RUNTIME_ADDON_OPERATOR_URL:-}
       BATSHIT_RUNTIME_ADDON_OPERATOR_TOKEN: ${BATSHIT_RUNTIME_ADDON_OPERATOR_TOKEN:-}
+      BATSHIT_HOST_VOICE_RECIPE_SIGNING_KEY: ${BATSHIT_HOST_VOICE_RECIPE_SIGNING_KEY:-}
       BATSHIT_RUNTIME_ADDON_OPERATOR_TIMEOUT_MS: ${BATSHIT_RUNTIME_ADDON_OPERATOR_TIMEOUT_MS:-180000}
+      # This Docker Batshit's name for the host operator (BL-18): Compose's project name, which is
+      # what makes two running Docker Batshits two (their own containers and volumes). Several can
+      # share one operator, which records the voice engines each one starts under its name, and
+      # each one's shutdown stops only its own. Compose fills the project name on every start.
+      BATSHIT_VOICE_RUNTIME_OWNER: docker:${COMPOSE_PROJECT_NAME}
       BATSHIT_NATIVE_DOCKER_SANDBOX_DRIVER: ${BATSHIT_NATIVE_DOCKER_SANDBOX_DRIVER:-operator}
       BATSHIT_DOCKER_SANDBOX_OPERATOR_URL: ${BATSHIT_DOCKER_SANDBOX_OPERATOR_URL:-}
       BATSHIT_DOCKER_SANDBOX_OPERATOR_TOKEN: ${BATSHIT_DOCKER_SANDBOX_OPERATOR_TOKEN:-}
@@ -409,12 +562,15 @@ services:
       - livekit
     image: ${LIVEKIT_SERVER_IMAGE:-livekit/livekit-server:v1.13.5}
     restart: unless-stopped
+    # livekit-server reads LIVEKIT_KEYS exactly like its --keys flag. The secret stays off the
+    # command line, which `ps` on a Linux Docker host shows to every local user. Keep the quotes:
+    # the value is "<key>: <secret>", and an unquoted ": " is a YAML error that fails the whole file.
+    environment:
+      LIVEKIT_KEYS: "${LIVEKIT_API_KEY:?Set LIVEKIT_API_KEY in .env.docker before starting the LiveKit profile}: ${LIVEKIT_API_SECRET:?Set LIVEKIT_API_SECRET in .env.docker before starting the LiveKit profile}"
     command:
       - --dev
       - --bind
       - 0.0.0.0
-      - --keys
-      - "${LIVEKIT_API_KEY:?Set LIVEKIT_API_KEY in .env.docker before starting the LiveKit profile}: ${LIVEKIT_API_SECRET:?Set LIVEKIT_API_SECRET in .env.docker before starting the LiveKit profile}"
     ports:
       - "${BATSHIT_DOCKER_BIND_HOST:-127.0.0.1}:${BATSHIT_DOCKER_LIVEKIT_PORT:-7880}:7880"
       - "${BATSHIT_DOCKER_BIND_HOST:-127.0.0.1}:${BATSHIT_DOCKER_LIVEKIT_RTC_TCP_PORT:-7881}:7881"
@@ -479,8 +635,8 @@ services:
       - path: ${BATSHIT_DOCKER_ENV_FILE:-.env.docker}
         required: false
     environment:
-      GENERIC_TIMEZONE: ${GENERIC_TIMEZONE:-America/New_York}
-      TZ: ${TZ:-America/New_York}
+      GENERIC_TIMEZONE: ${GENERIC_TIMEZONE:-UTC}
+      TZ: ${TZ:-UTC}
       N8N_HOST: 0.0.0.0
       N8N_PORT: 5678
       N8N_PROTOCOL: http
@@ -525,8 +681,8 @@ services:
       - path: ${BATSHIT_DOCKER_ENV_FILE:-.env.docker}
         required: false
     environment:
-      GENERIC_TIMEZONE: ${GENERIC_TIMEZONE:-America/New_York}
-      TZ: ${TZ:-America/New_York}
+      GENERIC_TIMEZONE: ${GENERIC_TIMEZONE:-UTC}
+      TZ: ${TZ:-UTC}
       N8N_RUNNERS_TASK_BROKER_URI: http://n8n:5679
       N8N_RUNNERS_AUTH_TOKEN: ${N8N_RUNNERS_AUTH_TOKEN:-${BATSHIT_TOKEN:?Set BATSHIT_TOKEN in .env.docker before starting Batshit}}
     depends_on:

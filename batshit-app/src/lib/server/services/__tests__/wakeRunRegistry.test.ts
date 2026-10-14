@@ -12,6 +12,7 @@ import {
   findWakeRunForAgent,
   getWakeAbortSignal,
   hasActiveWakeRun,
+  isWokenTurnMessage,
   listWakeRuns,
   registerWakeRun,
   releaseWakeSlot,
@@ -34,6 +35,7 @@ function start(sessionId: string, agentId: string) {
     userId: 'u1',
     origin,
     startedAt: Date.now(),
+    assistantMessageId: 'msg-woken-turn',
     controller: new AbortController(),
     timer
   })
@@ -42,6 +44,20 @@ function start(sessionId: string, agentId: string) {
 afterEach(() => {
   __resetWakeRunRegistryForTests()
   vi.useRealTimers()
+})
+
+describe('isWokenTurnMessage (BL-505)', () => {
+  it('names only the woken turn\u2019s own message in its own chat, and nothing once the turn ended', () => {
+    start('s1', 'agent-a')
+    expect(isWokenTurnMessage('s1', 'msg-woken-turn')).toBe(true)
+    // The user's own send that got the chat first, or a steer promoted into its own turn.
+    expect(isWokenTurnMessage('s1', 'msg-user-reply')).toBe(false)
+    expect(isWokenTurnMessage('s2', 'msg-woken-turn')).toBe(false)
+    expect(isWokenTurnMessage('s1', null)).toBe(false)
+    expect(isWokenTurnMessage('s1', '')).toBe(false)
+    clearWakeRun('s1', 'completed')
+    expect(isWokenTurnMessage('s1', 'msg-woken-turn')).toBe(false)
+  })
 })
 
 describe('checkWakeCaps', () => {
@@ -128,6 +144,7 @@ describe('clearWakeRun', () => {
       userId: 'u1',
       origin,
       startedAt: Date.now(),
+      assistantMessageId: 'msg-woken-turn',
       controller: new AbortController(),
       timer
     })
@@ -147,6 +164,7 @@ describe('abortWakeRun (AMD-113-02)', () => {
       userId: 'u1',
       origin,
       startedAt: Date.now(),
+      assistantMessageId: 'msg-woken-turn',
       controller,
       timer
     })
@@ -171,6 +189,7 @@ describe('getWakeAbortSignal (AMD-113-02)', () => {
       userId: 'u1',
       origin,
       startedAt: Date.now(),
+      assistantMessageId: 'msg-woken-turn',
       controller,
       timer
     })
@@ -254,6 +273,7 @@ describe('F-P1-3: reservations', () => {
         userId: 'u1',
         origin,
         startedAt: Date.now(),
+        assistantMessageId: 'msg-woken-turn',
         controller: new AbortController(),
         timer
       },

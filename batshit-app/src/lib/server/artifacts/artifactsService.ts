@@ -36,7 +36,16 @@ import {
   validateArtifactHtmlPreflight,
   type ArtifactHtmlPreflightResult
 } from '$lib/server/artifacts/artifactHtmlPreflight'
+import {
+  buildFieldNameAdvisory,
+  buildFieldNameRefusalMessage,
+  buildFieldNameRequiredMessage,
+  checkArtifactFieldNames
+} from './artifactFieldNames'
 import { deleteArtifactRunLogs } from '$lib/server/artifacts/artifactRunLogs'
+import { pinokioArtifactProblems } from '$lib/artifacts/pinokioArtifact'
+import { reservedFabricFieldProblems } from '$lib/artifacts/reservedFabricIds'
+import { withArtifactWriteLock } from './artifactWriteLock'
 
 export type ArtifactMode = 'edit' | 'published'
 
@@ -93,6 +102,48 @@ type ArtifactListOptions = {
 // `artifacts-service.test.ts > isRedisJsonMissingPathError`.
 export function isRedisJsonMissingPathError(error: unknown): boolean {
   return error instanceof Error && /ERR Path (?:['"][^'"]*['"] )?does not exist/.test(error.message)
+}
+
+/**
+ * BL-546 / BL-547: the whole-record write of an artifact is a check-and-set.
+ *
+ * Every writer reads `artifact:{id}`, builds the next record, and writes it whole. The write
+ * lands only while the stored `version` and `updated_at` are still the ones that writer read,
+ * in one step inside Redis, so a save that landed in between (another process, or anything the
+ * in-process lock cannot see) is refused as `ARTIFACT_WRITE_CONFLICT` instead of overwritten.
+ * Every whole-record writer stamps a new `updated_at`; `version` moves with each content change.
+ * ARGV: the read `version` and `updated_at` as JSON (`null` when the record had none), then the
+ * next record as JSON.
+ */
+const WRITE_ARTIFACT_IF_UNCHANGED_SCRIPT = `
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return 'MISSING'
+end
+local function stored(path)
+  local found = cjson.decode(redis.call('JSON.GET', KEYS[1], path))[1]
+  if found == nil then
+    return cjson.null
+  end
+  return found
+end
+if stored('$.version') ~= cjson.decode(ARGV[1]) or stored('$.updated_at') ~= cjson.decode(ARGV[2]) then
+  return 'CHANGED'
+end
+redis.call('JSON.SET', KEYS[1], '$', ARGV[3])
+return 'OK'
+`
+
+function artifactVersionConflict(storedVersion: number, baseVersion: number): Error {
+  return Object.assign(
+    new Error(
+      `This artifact changed after this edit started: it is now at version ${storedVersion}, and the edit was made on version ${baseVersion}. Nothing was saved. Load the current version and make the edit again.`
+    ),
+    {
+      status: 409,
+      code: 'ARTIFACT_VERSION_CONFLICT',
+      details: { storedVersion, baseVersion }
+    }
+  )
 }
 
 const ARTIFACT_MODEL_ROLES: ArtifactModelRole[] = ['primary', 'visual', 'audio', 'utility']
@@ -290,27 +341,25 @@ export class ArtifactsService {
     return null
   }
 
+  /** `all` or `selected` for a value that says one (after trim and lower-case); null for anything else. */
+  private normalizeAgentAccessScope(input: unknown): 'all' | 'selected' | null {
+    if (typeof input !== 'string') return null
+    const trimmed = input.trim().toLowerCase()
+    if (trimmed === 'all') return 'all'
+    if (trimmed === 'selected') return 'selected'
+    return null
+  }
+
+  /** The scope a NEW record gets (`create()`): the one named, else what its Agent Use and list give. */
   private resolveAgentAccessScope(
     value: unknown,
     options?: {
-      existing?: unknown
       agentUseEnabled?: boolean
       allowlist?: string[] | null
     }
   ): 'all' | 'selected' {
-    const normalize = (input: unknown): 'all' | 'selected' | null => {
-      if (typeof input !== 'string') return null
-      const trimmed = input.trim().toLowerCase()
-      if (trimmed === 'all') return 'all'
-      if (trimmed === 'selected') return 'selected'
-      return null
-    }
-
-    const direct = normalize(value)
+    const direct = this.normalizeAgentAccessScope(value)
     if (direct) return direct
-
-    const existing = normalize(options?.existing)
-    if (existing) return existing
 
     if (options?.agentUseEnabled === false) {
       return 'selected'
@@ -353,21 +402,52 @@ export class ArtifactsService {
     return applyBatshitArtifactStructureSetting(normalized, normalized.enforce_batshit_artifact_structure !== false)
   }
 
+  // Every saved body of the artifact: the current content and each stored version. A field the
+  // artifact already had in any of them is not new (BL-89), so restoring a version still saves.
+  private savedContents(existing: ArtifactRecord | null | undefined): Array<string | null | undefined> {
+    if (!existing) return []
+    return [existing.content, ...(existing.versions ?? []).map((version) => version.content)]
+  }
+
   private enforceBatshitArtifactStructure(options: {
     content: string
     metadata: Record<string, any> | null | undefined
     mode: ArtifactMode
+    previousContents?: Array<string | null | undefined>
   }) {
     if (artifactStructureValidationCanBeDeferred(options.content, options.mode)) return
 
     const validation = validateBatshitArtifactStructure(options.content, options.metadata)
-    if (validation.ok || !validation.enforced) return
+    if (!validation.enforced) return
+    // BL-89: refuse only the unnamed fields this save adds; ones already saved stay a warning.
+    const fieldNames = checkArtifactFieldNames(options.content, options.previousContents ?? [])
+    const issues =
+      fieldNames.added.length > 0
+        ? [
+            ...validation.issues,
+            { code: 'FIELD_NAME_REQUIRED' as const, message: buildFieldNameRequiredMessage(fieldNames.added) }
+          ]
+        : validation.issues
+    if (issues.length === 0) return
 
-    throw Object.assign(new Error(buildArtifactStructureEnforcementMessage(validation)), {
+    const unnamedFields = fieldNames.added.map(({ element, line }) => ({ element, line }))
+    // Review of BL-89: when names are the only problem, the refusal says only how to add them. The
+    // structure refusal's opt-out advice and its "rebuild with the skill" agent step fit a page
+    // that skips Builder Kit or Fabric, not one with a field left unnamed.
+    if (validation.issues.length === 0) {
+      throw Object.assign(new Error(buildFieldNameRefusalMessage(fieldNames.added)), {
+        status: 400,
+        code: 'ARTIFACT_FIELD_NAME_REQUIRED',
+        details: { issues, unnamedFields }
+      })
+    }
+
+    throw Object.assign(new Error(buildArtifactStructureEnforcementMessage({ ...validation, ok: false, issues })), {
       status: 400,
       code: 'ARTIFACT_STRUCTURE_ENFORCED',
       details: {
-        issues: validation.issues,
+        issues,
+        unnamedFields,
         usesBuilderKit: validation.usesBuilderKit,
         usesStandardControls: validation.usesStandardControls,
         hasFabricRuntimeContract: validation.hasFabricRuntimeContract,
@@ -391,6 +471,36 @@ export class ArtifactsService {
         issues: preflight.issues,
         advisories: preflight.advisories
       }
+    })
+  }
+
+  /**
+   * SA-072 P2 (DL-09): a Pinokio app artifact names an installed app by id, keeps its real
+   * kind in `source_type`, stores no address, and carries a recipe its runner can follow once
+   * it is published. Every other artifact passes untouched.
+   */
+  private enforcePinokioArtifact(options: {
+    brainType: unknown
+    metadata: Record<string, any> | null | undefined
+    mode: ArtifactMode
+  }) {
+    const problems = pinokioArtifactProblems(options)
+    if (problems.length === 0) return
+    throw Object.assign(new Error(`This Pinokio app artifact cannot be saved: ${problems.join(' ')}`), {
+      status: 400,
+      code: 'ARTIFACT_PINOKIO_INVALID',
+      details: { issues: problems }
+    })
+  }
+
+  /** A field named like one of the run call's own keys could never be set by an agent. */
+  private enforceFabricFieldNames(metadata: Record<string, any> | null | undefined) {
+    const problems = reservedFabricFieldProblems(metadata)
+    if (problems.length === 0) return
+    throw Object.assign(new Error(`This artifact cannot be saved: ${problems.join(' ')}`), {
+      status: 400,
+      code: 'ARTIFACT_FABRIC_FIELD_RESERVED',
+      details: { issues: problems }
     })
   }
 
@@ -467,10 +577,11 @@ export class ArtifactsService {
     projected: Record<string, unknown>,
     options: Required<ArtifactListOptions>
   ): ArtifactRecord | null {
-    const read = (path: string) => {
-      const value = projected[path] ?? projected[path.slice(1)]
-      return Array.isArray(value) && value.length === 1 ? value[0] : value
-    }
+    // Values arrive as stored: a legacy `.path` multi-path JSON.GET keys each value by its
+    // path without wrapping it (only `$` JSONPath wraps matches in an array), and the
+    // whole-record fallback is the record itself. Never unwrap a one-element array here:
+    // `tags`, `agent_allowlist`, and `versions` are real lists that may hold one entry.
+    const read = (path: string) => projected[path] ?? projected[path.slice(1)]
 
     const id = read('.id')
     const userId = read('.user_id')
@@ -628,6 +739,40 @@ export class ArtifactsService {
     return record
   }
 
+  /**
+   * BL-546 / BL-547: write the whole record only while the stored one is still the record
+   * `read` holds (`WRITE_ARTIFACT_IF_UNCHANGED_SCRIPT`). A save that landed in between is
+   * refused loudly, never overwritten.
+   */
+  private async writeArtifactIfUnchanged(
+    client: any,
+    id: string,
+    read: ArtifactRecord,
+    next: ArtifactRecord
+  ): Promise<void> {
+    const answer = await client.eval(WRITE_ARTIFACT_IF_UNCHANGED_SCRIPT, {
+      keys: [`artifact:${id}`],
+      arguments: [
+        JSON.stringify(read.version ?? null),
+        JSON.stringify(read.updated_at ?? null),
+        JSON.stringify(next)
+      ]
+    })
+    if (answer === 'OK') return
+    if (answer === 'MISSING') {
+      throw Object.assign(new Error('Artifact not found'), { status: 404 })
+    }
+    if (answer === 'CHANGED') {
+      throw Object.assign(
+        new Error(
+          'This artifact was changed by another save while this one was being written, so this change was not saved. Load the artifact again and repeat the change.'
+        ),
+        { status: 409, code: 'ARTIFACT_WRITE_CONFLICT' }
+      )
+    }
+    throw new Error(`The write of artifact ${id} answered ${String(answer)}.`)
+  }
+
   async listByUser(userId: string, options: ArtifactListOptions = {}): Promise<ArtifactRecord[]> {
     const listOptions: Required<ArtifactListOptions> = {
       includeContent: options.includeContent === true,
@@ -762,7 +907,9 @@ export class ArtifactsService {
       metadata,
       allowMetadataFallback: true
     })
-    const agentAllowlist = agentUseEnabled ? resolvedAgentAllowlist : []
+    // BL-815: the per-agent list is kept while Agent Use is off (the Fabric registration and every
+    // Access view check Agent Use first), so turning Agent Use on brings the same agents back.
+    const agentAllowlist = resolvedAgentAllowlist ?? []
     const agentAccessScope = this.resolveAgentAccessScope((input as any).agent_access_scope, {
       agentUseEnabled,
       allowlist: agentAllowlist
@@ -773,6 +920,8 @@ export class ArtifactsService {
       mode
     })
     this.enforceArtifactHtmlPreflight(initialContent)
+    this.enforcePinokioArtifact({ brainType, metadata, mode })
+    this.enforceFabricFieldNames(metadata)
     this.enforcePublishGuard({
       mode,
       zone,
@@ -844,7 +993,29 @@ export class ArtifactsService {
     return artifact
   }
 
-  async update(id: string, userId: string, input: UpdateInput): Promise<ArtifactRecord> {
+  /**
+   * Update one artifact. Writes to one artifact take turns (BL-547, `withArtifactWriteLock`),
+   * and the write is a check-and-set against the record this call read.
+   *
+   * `expectedVersion` (BL-546): the content `version` the caller's edit was made on. When the
+   * stored version is another one, nothing is written and the call is refused
+   * `ARTIFACT_VERSION_CONFLICT` (409). The Settings panel sends it with every content save.
+   */
+  async update(
+    id: string,
+    userId: string,
+    input: UpdateInput,
+    options: { expectedVersion?: number } = {}
+  ): Promise<ArtifactRecord> {
+    return await withArtifactWriteLock(id, () => this.updateUnderLock(id, userId, input, options))
+  }
+
+  private async updateUnderLock(
+    id: string,
+    userId: string,
+    input: UpdateInput,
+    options: { expectedVersion?: number }
+  ): Promise<ArtifactRecord> {
     const updates = this.sanitizeUpdateInput(input)
     const client = await this.client()
     const existing = await client.json.get(`artifact:${id}`) as ArtifactRecord | null
@@ -853,6 +1024,9 @@ export class ArtifactsService {
     }
     if (existing.user_id !== userId) {
       throw Object.assign(new Error('Access denied'), { status: 403 })
+    }
+    if (options.expectedVersion !== undefined && existing.version !== options.expectedVersion) {
+      throw artifactVersionConflict(existing.version, options.expectedVersion)
     }
 
     const now = new Date().toISOString()
@@ -919,18 +1093,28 @@ export class ArtifactsService {
         existing: existing.agent_allowlist
       }
     )
-    const nextAgentAllowlist = nextAgentUseEnabled ? resolvedNextAgentAllowlist : []
-    const nextAgentAccessScope = this.resolveAgentAccessScope((updates as any).agent_access_scope, {
-      existing: existing.agent_access_scope,
-      agentUseEnabled: nextAgentUseEnabled,
-      allowlist: nextAgentAllowlist
-    })
+    // BL-815: Agent Use off keeps the list (it used to be emptied, so switching Agent Use back on
+    // left no agent selected). Nothing reads the list while Agent Use is off: the Fabric records,
+    // the DCM, and Agents > Access all check Agent Use first. An explicit `null` still clears it.
+    const nextAgentAllowlist = nextAgentUseEnabled
+      ? resolvedNextAgentAllowlist
+      : (resolvedNextAgentAllowlist ?? [])
+    // BL-886: a save that names no scope leaves the saved one exactly as it is, also when the record
+    // never saved one (Fabric reads such a record by its list and Agent Use, so a scope invented
+    // here would change what every agent sees). Turning Agent Use off does not pick `selected`
+    // either. Only `all` or `selected` (after trim and lower-case) names a scope: a save that leaves
+    // it out, or sends `null` or any other value, names none. (`setAgentAccess` names one on purpose
+    // to pin a record that has none.)
+    const namedAgentAccessScope = this.normalizeAgentAccessScope((updates as any).agent_access_scope)
     this.enforceBatshitArtifactStructure({
       content: nextContent,
       metadata,
-      mode: nextMode
+      mode: nextMode,
+      previousContents: this.savedContents(existing)
     })
     this.enforceArtifactHtmlPreflight(nextContent)
+    this.enforcePinokioArtifact({ brainType: resolvedBrainType, metadata, mode: nextMode })
+    this.enforceFabricFieldNames(metadata)
     this.enforcePublishGuard({
       mode: nextMode,
       zone,
@@ -998,7 +1182,8 @@ export class ArtifactsService {
       metadata,
       zone,
       zone_compatibility: zoneCompatibility,
-      agent_access_scope: nextAgentAccessScope,
+      // Only a scope this save names is written; otherwise the record's own (`...existing`) stands.
+      ...(namedAgentAccessScope !== null ? { agent_access_scope: namedAgentAccessScope } : {}),
       agent_allowlist: nextAgentAllowlist,
       agent_use_enabled: nextAgentUseField,
       artifact_handoff_prompt:
@@ -1023,8 +1208,44 @@ export class ArtifactsService {
       widget_position: null
     }
 
-    await client.json.set(`artifact:${id}`, '$', updated)
+    await this.writeArtifactIfUnchanged(client, id, existing, updated)
     return updated
+  }
+
+  /**
+   * BL-544: turn ONE agent on or off in this artifact's `agent_allowlist` (Settings > Agents >
+   * Access), against the list as stored now: under the artifact's write lock and through the same
+   * check-and-set write as every update (BL-547), so a list saved by another writer since the
+   * caller loaded the artifact is never replaced by the caller's copy. Agent Use and the access
+   * scope stay as they are; a record that never saved a scope keeps the one it has in effect now
+   * (the Fabric rule, `resolveDynamicArtifactAccessScope`), so taking out its last agent does not
+   * open it to every agent. Adding an agent already there, or removing one that is not, writes
+   * nothing and answers the stored record.
+   */
+  async setAgentAccess(id: string, userId: string, agentId: string, enabled: boolean): Promise<ArtifactRecord> {
+    return await withArtifactWriteLock(id, async () => {
+      const client = await this.client()
+      const existing = (await client.json.get(`artifact:${id}`)) as ArtifactRecord | null
+      if (!existing) {
+        throw Object.assign(new Error('Artifact not found'), { status: 404 })
+      }
+      if (existing.user_id !== userId) {
+        throw Object.assign(new Error('Access denied'), { status: 403 })
+      }
+      const current = this.normalizeStringArray(existing.agent_allowlist) ?? []
+      if (current.includes(agentId) === enabled) return existing
+
+      const updates: UpdateInput = {
+        agent_allowlist: enabled ? [...current, agentId] : current.filter((entry) => entry !== agentId)
+      }
+      const storedScope =
+        typeof existing.agent_access_scope === 'string' ? existing.agent_access_scope.trim().toLowerCase() : ''
+      if (storedScope !== 'all' && storedScope !== 'selected') {
+        updates.agent_access_scope =
+          current.length > 0 || existing.agent_use_enabled === true ? 'selected' : 'all'
+      }
+      return await this.updateUnderLock(id, userId, updates, {})
+    })
   }
 
   async validateStructure(
@@ -1068,12 +1289,33 @@ export class ArtifactsService {
     const validation = validateBatshitArtifactStructure(content, metadata)
     const htmlPreflight = validateArtifactHtmlPreflight(content)
     const canDefer = artifactStructureValidationCanBeDeferred(content, mode)
-    const canSave = htmlPreflight.ok && (validation.ok || !validation.enforced || canDefer)
+    // BL-89: the same field-name rule the save applies, against the same saved versions.
+    const fieldNames = checkArtifactFieldNames(content, this.savedContents(existing))
+    const issues =
+      fieldNames.added.length > 0
+        ? [
+            ...validation.issues,
+            { code: 'FIELD_NAME_REQUIRED' as const, message: buildFieldNameRequiredMessage(fieldNames.added) }
+          ]
+        : validation.issues
+    const canSave = htmlPreflight.ok && (issues.length === 0 || !validation.enforced || canDefer)
     const advisories: string[] = []
 
     for (const advisory of htmlPreflight.advisories) {
       const lineSuffix = typeof advisory.line === 'number' ? ` Line ${advisory.line}:` : ''
       advisories.push(`${lineSuffix} ${advisory.message}`.trim())
+    }
+
+    if (fieldNames.kept.length > 0) {
+      advisories.push(buildFieldNameAdvisory(fieldNames.kept))
+    }
+
+    // Review of BL-89: a dry run with no artifact to compare treats every unnamed field as new,
+    // which is right for a new artifact and wrong for an edit; say which one this was.
+    if (!existing && fieldNames.unnamed.length > 0) {
+      advisories.push(
+        'No artifactId was given, so fields a saved page already had cannot be told apart from new ones: every field with no name counts as new here. Pass the artifactId to check an edit exactly as its save will.'
+      )
     }
 
     if (!validation.usesStandardControls && !isRunOnlyMetadata(metadata)) {
@@ -1090,7 +1332,10 @@ export class ArtifactsService {
     if (!htmlPreflight.ok) {
       message = buildArtifactHtmlPreflightMessage(htmlPreflight)
     } else if (!canSave) {
-      message = buildArtifactStructureEnforcementMessage(validation)
+      message =
+        validation.issues.length === 0
+          ? buildFieldNameRefusalMessage(fieldNames.added)
+          : buildArtifactStructureEnforcementMessage({ ...validation, ok: false, issues })
     } else if (advisories.length > 0) {
       message = advisories[0]
     }
@@ -1113,7 +1358,7 @@ export class ArtifactsService {
           code: issue.code,
           message: issue.message
         })),
-        ...validation.issues
+        ...issues
       ],
       advisories,
       htmlPreflight,
@@ -1122,6 +1367,20 @@ export class ArtifactsService {
   }
 
   async applyPatch(
+    id: string,
+    userId: string,
+    patch: string,
+    options?: {
+      versionDescription?: string
+      sessionId?: string
+    }
+  ): Promise<ArtifactRecord> {
+    // BL-547: the read, the patch, and the write run as one turn for this artifact, so two
+    // patches made at the same moment both land; the write refuses a change made on another base.
+    return await withArtifactWriteLock(id, () => this.applyPatchUnderLock(id, userId, patch, options))
+  }
+
+  private async applyPatchUnderLock(
     id: string,
     userId: string,
     patch: string,
@@ -1193,11 +1452,16 @@ export class ArtifactsService {
       )
     }
 
-    return await this.update(id, userId, {
-      content: nextContent,
-      versionDescription: options?.versionDescription,
-      sessionId: options?.sessionId
-    })
+    return await this.update(
+      id,
+      userId,
+      {
+        content: nextContent,
+        versionDescription: options?.versionDescription,
+        sessionId: options?.sessionId
+      },
+      { expectedVersion: artifact.version }
+    )
   }
 
   async delete(id: string, userId: string): Promise<void> {
@@ -1230,23 +1494,51 @@ export class ArtifactsService {
     return await this.ensureRecordSlug(artifact, client)
   }
 
-  async addVersion(id: string, userId: string, content: string, description?: string): Promise<ArtifactRecord> {
-    return await this.update(id, userId, {
-      content,
-      versionDescription: description || `Updated on ${new Date().toLocaleDateString()}`
-    })
+  /**
+   * Save `content` as the next version and the current page (a whole-page write). `expectedVersion`
+   * (BL-818) is the content `version` the caller edited: the write is refused
+   * `ARTIFACT_VERSION_CONFLICT` (409) when another one is stored, like `update`.
+   */
+  async addVersion(
+    id: string,
+    userId: string,
+    content: string,
+    description?: string,
+    options: { expectedVersion?: number } = {}
+  ): Promise<ArtifactRecord> {
+    return await this.update(
+      id,
+      userId,
+      {
+        content,
+        versionDescription: description || `Updated on ${new Date().toLocaleDateString()}`
+      },
+      options
+    )
   }
 
   async rollbackToVersion(id: string, userId: string, targetVersion: number): Promise<ArtifactRecord> {
-    const artifact = await this.getOwned(id, userId)
-    const match = (artifact.versions || []).find(v => v.version === targetVersion)
-    if (!match) {
-      throw Object.assign(new Error('Version not found'), { status: 404 })
-    }
-    return await this.addVersion(id, userId, match.content, `Restored from version ${targetVersion}`)
+    // BL-547: the read of the old version and the write of the restore are one turn.
+    return await withArtifactWriteLock(id, async () => {
+      const artifact = await this.getOwned(id, userId)
+      const match = (artifact.versions || []).find(v => v.version === targetVersion)
+      if (!match) {
+        throw Object.assign(new Error('Version not found'), { status: 404 })
+      }
+      return await this.update(
+        id,
+        userId,
+        { content: match.content, versionDescription: `Restored from version ${targetVersion}` },
+        { expectedVersion: artifact.version }
+      )
+    })
   }
 
   async deleteVersion(id: string, userId: string, versionNumber: number): Promise<ArtifactRecord> {
+    return await withArtifactWriteLock(id, () => this.deleteVersionUnderLock(id, userId, versionNumber))
+  }
+
+  private async deleteVersionUnderLock(id: string, userId: string, versionNumber: number): Promise<ArtifactRecord> {
     const client = await this.client()
     const artifact = await this.getOwned(id, userId)
 
@@ -1265,7 +1557,7 @@ export class ArtifactsService {
       updated_at: new Date().toISOString()
     }
 
-    await client.json.set(`artifact:${id}`, '$', updated)
+    await this.writeArtifactIfUnchanged(client, id, artifact, updated)
     return updated
   }
 }

@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import {
   access,
   appendFile,
@@ -23,6 +23,7 @@ import { fileURLToPath } from 'node:url';
 
 import {
   inspectManagedRuntimePortability,
+  isMachOFile,
   MAC_RUNTIME_MINIMUM_VERSION
 } from './managed-runtime-portability.mjs';
 import { DAV1D_PROOF_FILES, inspectFfmpegRuntimeCapabilities } from './ffmpeg-runtime-capabilities.mjs';
@@ -31,12 +32,19 @@ import {
   decideLocalRuntimeGroupStop,
   decideLocalRuntimeStop,
   groupLocalRuntimeLaunchRecords,
+  holdLocalRuntimeStopsForUnreadableRecords,
   nativeRunIsGone,
   readLocalRuntimeLaunchRecords,
   readLocalRuntimeProcessGroup,
   removeLocalRuntimeLaunchRecord
 } from './local-voice-runtime-stop.mjs';
 import { resolveSbxDaemonStateDir, stopSbxDaemonIfBatshitStartedIt } from './sbx-daemon-stop.mjs';
+import {
+  findContainerOnPath,
+  resolveAppleContainerStateDir,
+  stopAppleContainerSystemIfBatshitStartedIt,
+  writeAppleContainerSystemRecord
+} from './apple-container-system-stop.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const macRoot = resolve(__dirname, '..');
@@ -57,7 +65,6 @@ const FACIAL_ARTWORK_RUNTIME_FILE_COUNT = 161;
 const LIP_ARTWORK_RUNTIME_RELATIVE_ROOT = 'assets/goons/lip-artwork/v2';
 const NAIL_SURFACE_RUNTIME_RELATIVE_ROOT = 'assets/goons/nail-surface/v1';
 const SKIN_APPEARANCE_RUNTIME_RELATIVE_ROOT = 'assets/goons/skin-appearance/v1';
-const CLOTHING_CATALOG_RUNTIME_RELATIVE_ROOT = 'batshit-app/static/goon-assets/clothing/v1';
 const packagedFacialArtworkRoot = join(
   packagedRuntimeRoot,
   ...FACIAL_ARTWORK_RUNTIME_RELATIVE_ROOT.split('/')
@@ -100,7 +107,7 @@ const DEFAULT_APP_ORIGIN = `http://127.0.0.1:${DEFAULT_PORTS.app}`;
 const DEFAULT_SERVER_ORIGIN = `http://127.0.0.1:${DEFAULT_PORTS.server}`;
 const DEFAULT_MCP_ORIGIN = `http://127.0.0.1:${DEFAULT_PORTS.mcp}`;
 const DEFAULT_LIVEKIT_AGENT_NAME = 'batshit-livekit-agent';
-const DEFAULT_APP_VERSION = '0.1.0-alpha.2';
+const DEFAULT_APP_VERSION = '0.1.0-alpha.3';
 const DEFAULT_APP_CHANNEL = 'alpha';
 const APPLE_CONTAINER_INSTALL_URL = 'https://github.com/apple/container/releases/latest';
 
@@ -147,12 +154,20 @@ const REDIS_SHUTDOWN_WAIT_MS = 30_000;
 const runtimeFingerprintPaths = [
   join(appRoot, 'build', 'index.js'),
   join(appRoot, 'build', 'server', 'manifest.js'),
+  join(appRoot, 'scripts', 'command-group-guardian.mjs'),
+  join(appRoot, 'scripts', 'anchored-project-reader'),
   join(serverRoot, 'package.json'),
   join(serverRoot, 'src', 'index.js'),
   join(serverRoot, 'src', 'mcp', 'index.js'),
+  join(serverRoot, 'src', 'mcp', 'loopbackListen.cjs'),
   fileURLToPath(import.meta.url),
   runtimeEnvPath
 ];
+
+/** The files whose change restarts the packaged services (a copy, for tests). */
+export function runtimeFingerprintFiles() {
+  return [...runtimeFingerprintPaths];
+}
 const macLaunchPathEntries = [
   '/opt/homebrew/bin',
   '/opt/homebrew/sbin',
@@ -266,7 +281,11 @@ function createServiceDefinitions(env = null, options = {}) {
       healthUrl: `${mcpOrigin}/mcp`,
       acceptableStatuses: [200, 400, 405],
       command: nodeCommand,
+      // supergateway has no listen-address option, and the helper serves Batshit's MCP tools with
+      // no login of its own: the preload binds it to 127.0.0.1 (loopbackListen.cjs).
       args: [
+        '-r',
+        join(serverRoot, 'src', 'mcp', 'loopbackListen.cjs'),
         'node_modules/supergateway/dist/index.js',
         '--stdio',
         `${shellQuote(nodeCommand)} src/mcp/index.js`,
@@ -279,7 +298,11 @@ function createServiceDefinitions(env = null, options = {}) {
         '--logLevel',
         'none'
       ],
-      matchCommandFragments: ['supergateway', 'src/mcp/index.js', `--port ${ports.mcp}`]
+      matchCommandFragments: ['supergateway', 'src/mcp/index.js', `--port ${ports.mcp}`],
+      env: {
+        // Supergateway's stdio children inherit this environment and load batshit-server's logger.
+        BATSHIT_SERVER_LOG_DIR: paths.logs
+      }
     },
     batshitApp: {
       label: 'Batshit App',
@@ -1252,54 +1275,115 @@ async function waitForRedisStatus(env, ms = 10_000) {
   return latest;
 }
 
-async function appleContainerStatus() {
-  if (process.platform !== 'darwin') {
-    return {
-      label: 'Apple Container',
-      available: false,
-      installed: false,
-      supported: false,
-      healthy: false,
-      version: null,
-      error: 'Apple Container is only supported on macOS.',
-      installUrl: APPLE_CONTAINER_INSTALL_URL
-    };
-  }
-  const version = await run('container', ['--version'], { timeoutMs: 5000 });
-  if (!version.ok) {
-    return {
-      label: 'Apple Container',
-      available: false,
-      installed: false,
-      supported: true,
-      healthy: false,
-      version: null,
-      error: 'Apple Container CLI is not installed or not on PATH.',
-      installUrl: APPLE_CONTAINER_INSTALL_URL
-    };
-  }
-  const system = await run('container', ['system', 'status'], { timeoutMs: 5000 });
-  return {
+// Apple Container as Runtime Doctor reports it (BL-83). `healthy` means Batshit can use it now:
+// installed and answering. A stopped system counts, because the first sandboxed command starts
+// it (BL-62), so installed-but-not-started is the normal resting state, not a problem;
+// `systemRunning` says whether it runs right now. Only Apple's own answers count: exit 0 with
+// "running", or the stopped answer 0.12.3 gives (SystemStatus.swift: exit 1, "apiserver is not
+// running and not registered with launchd"). Anything else is "not answering", with its own words:
+// the time limit, an XPC or launchd error, or a registered apiserver that did not answer its ping
+// (exit 1, "apiserver is not running"). The same rule is `readAppleContainerSystemState` in the
+// app's appleContainerSandbox.ts.
+const APPLE_CONTAINER_STOPPED_ANSWER = /not registered with launchd/i;
+function classifyAppleContainerStatus({ platform = process.platform, versionRun = null, statusRun = null } = {}) {
+  const base = {
     label: 'Apple Container',
+    available: false,
+    installed: false,
+    supported: platform === 'darwin',
+    healthy: false,
+    systemRunning: false,
+    version: null,
+    error: null,
+    installUrl: APPLE_CONTAINER_INSTALL_URL
+  };
+  if (platform !== 'darwin') {
+    return { ...base, error: 'Apple Container is only supported on macOS.' };
+  }
+  if (!versionRun?.ok) {
+    return { ...base, error: 'Apple Container CLI is not installed or not on PATH.' };
+  }
+  const version = (versionRun.stdout || versionRun.stderr).trim().split('\n')[0] || null;
+  const running = statusRun?.ok === true && statusRun.stdout.includes('running');
+  const statusWords = `${statusRun?.stderr ?? ''}\n${statusRun?.stdout ?? ''}`.trim();
+  const stopped =
+    !running &&
+    Boolean(statusRun) &&
+    !statusRun.signal &&
+    statusRun.code !== 0 &&
+    APPLE_CONTAINER_STOPPED_ANSWER.test(statusWords);
+  let error = null;
+  if (!running && !stopped) {
+    error = statusRun?.signal || !statusRun
+      ? `\`container system status\` did not answer${statusRun?.signal ? ' in time' : ''}.`
+      : `\`container system status\` failed: ${statusWords.split('\n').filter(Boolean).pop() || `exit ${statusRun.code}`}.`;
+  }
+  return {
+    ...base,
     available: true,
     installed: true,
-    supported: true,
-    healthy: system.ok && system.stdout.includes('running'),
-    version: (version.stdout || version.stderr).trim().split('\n')[0] || null,
-    installUrl: APPLE_CONTAINER_INSTALL_URL,
-    error:
-      system.ok && system.stdout.includes('running')
-        ? null
-        : (system.stderr || system.stdout || 'Apple Container system is not running.').trim()
+    healthy: running || stopped,
+    systemRunning: running,
+    version,
+    error
   };
 }
 
-async function startAppleContainer() {
-  const before = await appleContainerStatus();
+async function appleContainerStatus() {
+  if (process.platform !== 'darwin') return classifyAppleContainerStatus();
+  const versionRun = await run('container', ['--version'], { timeoutMs: 5000 });
+  if (!versionRun.ok) return classifyAppleContainerStatus({ versionRun });
+  const statusRun = await run('container', ['system', 'status'], { timeoutMs: 5000 });
+  return classifyAppleContainerStatus({ versionRun, statusRun });
+}
+
+// Where the Apple Container system record lives: the runtime env's override, the process's, or the
+// default the app and the native launcher use too (`apple-container-system-stop.mjs`).
+function appleContainerStateDir(env = null) {
+  return resolveAppleContainerStateDir(
+    env?.get?.('BATSHIT_APPLE_CONTAINER_STATE_DIR') || process.env.BATSHIT_APPLE_CONTAINER_STATE_DIR
+  );
+}
+
+// Runtime Doctor's Start button started the system: record it as this Batshit's, so quitting stops it
+// again when nothing runs (BL-62 part 2). A record that cannot be written leaves the system running
+// at quit, so it is logged.
+async function recordAppleContainerStartByThisApp({ callStartedAt, callEndedAt }) {
+  try {
+    await writeAppleContainerSystemRecord(appleContainerStateDir(await loadRuntimeEnv()), {
+      launchedBy: macVoiceRuntimeOwner(),
+      callStartedAt,
+      callEndedAt,
+      containerPath: findContainerOnPath(withMacLaunchPath(process.env).PATH)
+    });
+  } catch (error) {
+    await supervisorLog('apple-container', `Could not record the Apple Container start this app made: ${normalizeError(error)}`);
+  }
+}
+
+// BL-129: Apple's `system start` asks on stdin whether to install a Linux kernel when none is set, and
+// Batshit cannot answer, so it never lets it ask (`--disable-kernel-install`, every release since
+// 0.1.0). A start that asked anyway names the one command; the app says the same words
+// (`APPLE_CONTAINER_NO_KERNEL_REASON` in appleContainerSandbox.ts), and its first create finds a
+// missing kernel the same way.
+const APPLE_CONTAINER_NO_KERNEL_REASON =
+  'Apple Container has no Linux kernel yet, so it cannot start a sandbox. Run `container system kernel set --recommended` once in Terminal (it downloads about 600 MB), then try again. See https://docs.batshit.ai/installation/install-mac-app/#apple-container-has-no-linux-kernel-yet';
+const APPLE_CONTAINER_NO_KERNEL_ANSWER = /default kernel not found|no default kernel configured|failed to read user input/i;
+
+// Starts the system only when it is not running, and records a start it made. `healthy` would be
+// wrong here: a stopped system is healthy (usable) since BL-83, and this start needs to know whether
+// it runs. Only Runtime Doctor's Start button calls this; the packaged app no longer starts the
+// system at launch (BL-62 part 2): its first sandboxed command does, and records it.
+async function startAppleContainer({
+  readStatus = appleContainerStatus,
+  runCommand = run,
+  recordStart = recordAppleContainerStartByThisApp
+} = {}) {
+  const before = await readStatus();
   if (!before.supported) {
     return { ok: false, skipped: true, before, error: before.error };
   }
-  if (before.healthy) {
+  if (before.systemRunning) {
     return {
       ok: true,
       skipped: true,
@@ -1309,18 +1393,38 @@ async function startAppleContainer() {
     };
   }
 
-  const result = await run('container', ['system', 'start'], { timeoutMs: 120_000 });
-  const after = await appleContainerStatus();
+  const callStartedAt = Date.now();
+  const result = await runCommand('container', ['system', 'start', '--disable-kernel-install'], { timeoutMs: 120_000 });
+  const callEndedAt = Date.now();
+  const after = await readStatus();
+  // Only a start from Apple's own stopped answer is Batshit's to record. A system that did not
+  // answer may be the user's: the start still tries to repair it, but it rewrites the plist inside
+  // this window, and a record would make Batshit stop the user's system at quit.
+  const startedFromStopped = before.healthy && !before.systemRunning;
+  if (startedFromStopped && after.systemRunning) await recordStart({ callStartedAt, callEndedAt });
+  // Running, but nothing can run in it without a kernel: not a success.
+  const noKernel = !result.ok && APPLE_CONTAINER_NO_KERNEL_ANSWER.test(`${result.stderr}\n${result.stdout}`);
+  if (noKernel) {
+    return {
+      ok: false,
+      skipped: false,
+      before,
+      after,
+      stdout: result.stdout.trim(),
+      stderr: result.stderr.trim(),
+      error: APPLE_CONTAINER_NO_KERNEL_REASON
+    };
+  }
   return {
-    ok: after.healthy,
+    ok: after.systemRunning,
     skipped: false,
     before,
     after,
     stdout: result.stdout.trim(),
     stderr: result.stderr.trim(),
-    error: after.healthy
+    error: after.systemRunning
       ? null
-      : (result.stderr || result.stdout || after.error || 'Apple Container did not become healthy.').trim()
+      : (result.stderr || result.stdout || after.error || 'Apple Container did not start.').trim()
   };
 }
 
@@ -1565,20 +1669,27 @@ async function removeDockerMcpGatewayOwnershipIfCurrent(expected) {
   return true;
 }
 
+// Is the running gateway, by its launch record, the one this runtime would start now: its port,
+// profile, and URL, and the loopback bind? A gateway started before the bind (2026-09-25) has no
+// `host` in its record and listens on every interface, so it is restarted rather than reused.
+function dockerMcpGatewayMetadataIsCurrent(metadata, { port, profile, url }) {
+  if (!metadata || typeof metadata !== 'object') return false;
+  return (
+    Number(metadata.port) === port &&
+    metadata.profile === profile &&
+    metadata.url === url &&
+    metadata.host === DOCKER_MCP_GATEWAY_HOST
+  );
+}
+
 async function dockerMcpGatewayNeedsRestart(env, currentStatus) {
   if (!currentStatus?.pidAlive && !currentStatus?.pidGroupAlive) return false;
   const metadata = await dockerMcpGatewayMetadata();
-  if (!metadata || typeof metadata !== 'object') return true;
-
-  const desiredPort = dockerMcpGatewayPort(env);
-  const desiredProfile = dockerMcpGatewayProfile(env);
-  const desiredUrl = dockerMcpGatewayUrl(env);
-
-  return (
-    Number(metadata.port) !== desiredPort ||
-    metadata.profile !== desiredProfile ||
-    metadata.url !== desiredUrl
-  );
+  return !dockerMcpGatewayMetadataIsCurrent(metadata, {
+    port: dockerMcpGatewayPort(env),
+    profile: dockerMcpGatewayProfile(env),
+    url: dockerMcpGatewayUrl(env)
+  });
 }
 
 function parseProcessRows(stdout) {
@@ -1826,12 +1937,21 @@ function heldStdinSpawnArgs(command, args = []) {
   return ['-c', script, '_', command, ...args];
 }
 
+// The `docker` arguments the packaged app starts its Docker MCP Gateway with. It serves this Mac only
+// (the app and n8n reach it at 127.0.0.1), so it binds loopback: with `--port` alone it listened on
+// every network interface (2026-09-25). The launch record keeps the bind (`host`).
+const DOCKER_MCP_GATEWAY_HOST = '127.0.0.1';
+function dockerMcpGatewayRunArgs(port, profile) {
+  const args = ['mcp', 'gateway', 'run', '--port', String(port), '--host', DOCKER_MCP_GATEWAY_HOST, '--transport', 'streaming'];
+  if (profile) args.push('--profile', profile);
+  return args;
+}
+
 async function startDetachedDockerMcpGateway(env) {
   const port = dockerMcpGatewayPort(env);
   const profile = dockerMcpGatewayProfile(env);
   const token = dockerMcpGatewayToken(env);
-  const args = ['mcp', 'gateway', 'run', '--port', String(port), '--transport', 'streaming'];
-  if (profile) args.push('--profile', profile);
+  const args = dockerMcpGatewayRunArgs(port, profile);
 
   await mkdir(dirname(dockerMcpGatewayLogFile), { recursive: true });
   await writeFile(
@@ -1860,6 +1980,7 @@ async function startDetachedDockerMcpGateway(env) {
         generation: randomBytes(16).toString('hex'),
         port,
         profile,
+        host: DOCKER_MCP_GATEWAY_HOST,
         url: dockerMcpGatewayUrl(env),
         generatedAt: new Date().toISOString()
       },
@@ -2082,6 +2203,35 @@ async function status() {
   };
 }
 
+// What Runtime Doctor says about Apple Container (BL-83). Missing: sandboxed Bash fails until it is
+// installed. Installed, whether running or not: nothing, because the first sandboxed command starts
+// a stopped system (BL-62). Installed but `system status` did not answer: sandboxed Bash fails until
+// it does.
+function appleContainerDoctorAction(appleContainer) {
+  if (!appleContainer?.available) {
+    return {
+      id: 'apple-container-missing',
+      severity: 'warning',
+      title: 'Apple Container is not installed',
+      detail:
+        'Apple Container is the default Mac sandbox for Agent Mode. Bash commands that use it fail until it is installed. Install Apple’s signed package; Batshit starts it with the first sandboxed command. Docker Sandbox remains available as an explicit agent setting.',
+      externalUrl: APPLE_CONTAINER_INSTALL_URL,
+      externalLabel: 'Install Apple Container'
+    };
+  }
+  if (!appleContainer.healthy) {
+    return {
+      id: 'apple-container-not-answering',
+      severity: 'warning',
+      title: 'Apple Container is not answering',
+      detail: `Apple Container is installed, but ${appleContainer.error || '`container system status` did not answer.'} Bash commands that use it fail until it answers. Docker Sandbox remains available as an explicit agent setting.`,
+      repairCommand: 'appleContainerStart',
+      repairLabel: 'Start Apple Container'
+    };
+  }
+  return null;
+}
+
 function doctorAdvice(report) {
   const actions = [];
   if (!report.tools.node.available) {
@@ -2165,27 +2315,8 @@ function doctorAdvice(report) {
           : 'Motion and Goon preview transcoding need FFmpeg. Chat can still run without it.'
     });
   }
-  if (!report.tools.appleContainer.available) {
-    actions.push({
-      id: 'apple-container-missing',
-      severity: 'warning',
-      title: 'Apple Container is not installed',
-      detail:
-        'Apple Container is the default Mac sandbox for Agent Mode. Install Apple’s signed package, then return here and start the Apple Container system.',
-      externalUrl: APPLE_CONTAINER_INSTALL_URL,
-      externalLabel: 'Install Apple Container'
-    });
-  } else if (!report.tools.appleContainer.healthy) {
-    actions.push({
-      id: 'apple-container-stopped',
-      severity: 'warning',
-      title: 'Apple Container sandbox is not ready',
-      detail:
-        'Apple Container is the default Mac sandbox for Agent Mode. Apple-backed Bash runs will fail clearly until Apple Container is installed and running. Docker Sandbox remains available as an explicit agent setting.',
-      repairCommand: 'appleContainerStart',
-      repairLabel: 'Start Apple Container'
-    });
-  }
+  const appleContainerAction = appleContainerDoctorAction(report.tools.appleContainer);
+  if (appleContainerAction) actions.push(appleContainerAction);
   if (!report.tools.docker.available) {
     actions.push({
       id: 'docker-missing',
@@ -2423,7 +2554,9 @@ async function spawnService(definition, env, options = {}) {
   // stdio wiring: fd 1 (stdout) and fd 2 (stderr) both append to the per-service log file,
   // so a dying child always leaves its final output there.
   const log = await open(definition.logFile, 'a');
-  const serviceEnv = { ...env, ...(definition.env || {}) };
+  // Give both local services the actual supervisor-owned root, including a
+  // first-run/test override. A runtime.env value must not redirect custody.
+  const serviceEnv = { ...env, ...(definition.env || {}), BATSHIT_MAC_DATA_DIR: paths.data };
   const child = spawn(definition.command, definition.args, {
     cwd: definition.cwd,
     env: serviceEnv,
@@ -2486,7 +2619,8 @@ async function start() {
   // Running healthy services (and their live cloudflared tunnels) are not touched,
   // and already-running voice engines stay up for auto-start to reuse.
   const sweep = await sweepOrphans('start', env, serviceDefinitions);
-  const appleContainer = await startAppleContainer();
+  // Apple's container system is not started here (BL-62 part 2): the first sandboxed command starts
+  // it and records the start, so quitting stops what Batshit started and nothing else.
   const redis = await startRedis(env);
   if (redis.ok === false) {
     const report = await status();
@@ -2494,7 +2628,6 @@ async function start() {
       ok: false,
       sweep,
       started: {
-        appleContainer,
         redis,
         dockerMcpGateway: { skipped: true, reason: 'Redis is not ready.' },
         batshitServer: { skipped: true, reason: 'Redis is not ready.' },
@@ -2515,7 +2648,6 @@ async function start() {
     ok: report.ok,
     sweep,
     started: {
-      appleContainer,
       redis,
       dockerMcpGateway,
       batshitServer: server,
@@ -2533,7 +2665,7 @@ async function stopService(definition) {
   if (!processAlive(pid) && !processGroupAlive(pid)) {
     await rm(definition.pidFile, { force: true });
     await rm(definition.metaFile, { force: true });
-    return { skipped: true, reason: `${definition.label} was not running.` };
+    return { skipped: true, notRunning: true, reason: `${definition.label} was not running.` };
   }
   const group = await processGroupMatchesTrackedEntry(definition, pid);
   if (!group.rows.length || !group.matches) {
@@ -2705,19 +2837,49 @@ async function stopOneManagedLocalRuntime({ pid, records }) {
 
 async function stopManagedLocalRuntimes(env = null) {
   const results = [];
-  const { groups, unusable } = groupLocalRuntimeLaunchRecords(
+  const { groups, unusable, unreadable } = groupLocalRuntimeLaunchRecords(
     await readLocalRuntimeLaunchRecords(voiceRuntimeStateRoot(env))
   );
 
+  // A record that could not be read may name a process that still runs: it is kept for the next
+  // quit, never removed, and the log says which (BL-1264).
+  for (const record of unreadable) {
+    const reason = `Local runtime${record.engineId ? ` "${record.engineId}"` : 's'}: ${record.reason}; kept it for the next quit.`;
+    await supervisorLog('stop', reason);
+    results.push({ engineId: record.engineId, skipped: true, reason });
+  }
+
+  // While one is unreadable, it may be an engine's "keep running" for a process a readable record says
+  // to stop: this quit sends no signal and removes no record, and every process stays as it is, held
+  // with one line that says what to do (BL-1269, the shared hold the Pinokio lane uses). A held
+  // process is a skipped result, not a failed quit.
+  const hold = holdLocalRuntimeStopsForUnreadableRecords(unreadable);
+  if (hold) {
+    if (groups.length > 0 || unusable.length > 0) {
+      const held = groups.map(({ pid, records }) => `${localRuntimeLabel(records)} (pgid ${pid})`);
+      await supervisorLog('stop', `Local runtimes: ${hold.reason}.${held.length ? ` Left as they are: ${held.join(', ')}.` : ''}`);
+    }
+    for (const { pid, records } of groups) {
+      for (const record of records) {
+        results.push({ engineId: record.engineId, skipped: true, held: true, pid, reason: `Local runtimes: ${hold.reason}.` });
+      }
+    }
+    return results;
+  }
+
   for (const record of unusable) {
     const decision = decideLocalRuntimeStop({ record, alive: false });
+    let outcome = 'could not remove its launch record';
     try {
-      await removeLocalRuntimeLaunchRecord(record);
+      // False when the file changed since it was read, or can no longer be read (then it stays).
+      outcome = (await removeLocalRuntimeLaunchRecord(record))
+        ? 'removed its launch record'
+        : 'left its launch record, which changed since it was read';
     } catch (error) {
       await supervisorLog('stop', `Local runtime "${record.engineId}": could not remove its launch record: ${normalizeError(error)}`);
     }
-    const reason = `Local runtime "${record.engineId}" ${decision.reason}; removed its launch record.`;
-    if (record.invalid) await supervisorLog('stop', reason);
+    const reason = `Local runtime "${record.engineId}" ${decision.reason}; ${outcome}.`;
+    await supervisorLog('stop', reason);
     results.push({ engineId: record.engineId, skipped: true, reason });
   }
 
@@ -3595,9 +3757,13 @@ async function containedStopStep(operation, failed = (error) => ({ ok: false, er
 async function executeOrderedRuntimeStop(operations) {
   const monitor = await containedStopStep(operations.monitor);
   const batshitApp = await containedStopStep(operations.batshitApp);
-  // Docker's sbx daemon runs beside the rest, once the app is down, and nothing waits on it but the
-  // end: Redis's clean shutdown never waits behind an `sbx` call.
+  // Docker's sbx daemon and Apple's container system run beside the rest, once the app is down (it
+  // is what starts sandboxes), and nothing waits on them but the end: Redis's clean shutdown never
+  // waits behind an `sbx` or `container` call.
   const sbxDaemonStop = containedStopStep(operations.sbxDaemon);
+  // The Apple step removes the app's own sandboxes only when the app is down (BL-149), so it is
+  // handed the app's stop result.
+  const appleContainerSystemStop = containedStopStep(() => operations.appleContainerSystem(batshitApp));
   const [localRuntimes, mcpProxy, batshitServer, dockerMcpGateway] = await Promise.all([
     containedStopStep(operations.localRuntimes, (error) => [{ ok: false, error }]),
     containedStopStep(operations.mcpProxy),
@@ -3607,6 +3773,7 @@ async function executeOrderedRuntimeStop(operations) {
   const redis = await containedStopStep(operations.redis);
   const sweep = await containedStopStep(operations.sweep, (error) => ({ issues: [`The final sweep failed: ${error}`] }));
   const sbxDaemon = await sbxDaemonStop;
+  const appleContainerSystem = await appleContainerSystemStop;
   return {
     monitor,
     batshitApp,
@@ -3615,6 +3782,7 @@ async function executeOrderedRuntimeStop(operations) {
     batshitServer,
     dockerMcpGateway,
     sbxDaemon,
+    appleContainerSystem,
     redis,
     sweep
   };
@@ -3640,6 +3808,54 @@ async function stopSbxDaemonStartedByThisApp(env = null) {
   return result;
 }
 
+// Is Batshit App down, by its own stop's answer? Stopped, or found not running. With no pid file, a pid
+// that no longer matches its launch record, or a group that survived SIGKILL, the app may still be
+// running a command in one of its sandboxes (BL-149 review).
+function batshitAppIsDown(result) {
+  return result?.notRunning === true || (result?.skipped === false && result?.ok === true);
+}
+
+// Apple's container system, only when this app's own call started it and no container runs
+// (2026-09-22, BL-62 part 2; `apple-container-system-stop.mjs`), after removing the sandboxes this app
+// left running, which a quit in the middle of a chat run leaves (BL-149), when Batshit App's own stop
+// (`appStop`) says the app is down. The app writes the record and labels the sandboxes, so it runs
+// after the app has stopped: nothing can start another sandbox behind it.
+async function stopAppleContainerSystemStartedByThisApp(env = null, { appStop = null } = {}) {
+  const appIsDown = batshitAppIsDown(appStop);
+  const result = await stopAppleContainerSystemIfBatshitStartedIt({
+    stateDir: appleContainerStateDir(env),
+    owner: macVoiceRuntimeOwner(),
+    ownerIsGone: nativeRunIsGone,
+    removeOwnSandboxes: appIsDown
+  });
+  if (!appIsDown) {
+    // In the app stop's own words: no pid file, a pid that is someone else's now, a group that
+    // survived SIGKILL, or a stop step that failed.
+    const why = appStop?.reason || appStop?.error || "Batshit App's stop gave no answer.";
+    await supervisorLog('stop', `Left this Batshit's Apple Container sandboxes for their chats' next turn: ${why}`);
+  }
+  const sandboxes = result.sandboxes;
+  if (sandboxes?.removed?.length) {
+    await supervisorLog('stop', `Removed the Apple Container sandboxes this Batshit left running: ${sandboxes.removed.join(', ')}.`);
+  }
+  if (sandboxes?.notRemoved?.length) {
+    await supervisorLog(
+      'stop',
+      `Could not remove the Apple Container sandboxes this Batshit left running (${sandboxes.notRemoved.join(', ')}): ${sandboxes.reason}.`
+    );
+  } else if (sandboxes?.reason) {
+    await supervisorLog('stop', `Could not look for Apple Container sandboxes this Batshit left running: ${sandboxes.reason}.`);
+  }
+  if (result.action === 'stopped') {
+    await supervisorLog('stop', "Stopped Apple's container system, which this Batshit started.");
+  } else if (result.action === 'keep') {
+    await supervisorLog('stop', `Left Apple's container system running: ${result.reason}.`);
+  } else if (result.action === 'drop-record') {
+    await supervisorLog('stop', `Apple's container system: ${result.reason}; removed its record.`);
+  }
+  return result;
+}
+
 async function stop() {
   await supervisorLog('stop', 'Runtime stop requested.');
   const env = await loadRuntimeEnv();
@@ -3655,6 +3871,7 @@ async function stop() {
     batshitServer: () => stopService(serviceDefinitions.batshitServer),
     dockerMcpGateway: stopDockerMcpGateway,
     sbxDaemon: () => stopSbxDaemonStartedByThisApp(env),
+    appleContainerSystem: (batshitApp) => stopAppleContainerSystemStartedByThisApp(env, { appStop: batshitApp }),
     redis: () => stopRedis(env),
     sweep: () => sweepOrphans('stop', env, serviceDefinitions)
   });
@@ -3666,6 +3883,7 @@ async function stop() {
       results.batshitServer,
       results.dockerMcpGateway,
       results.sbxDaemon,
+      results.appleContainerSystem,
       results.redis
     ].some((result) => result && result.ok === false) &&
     !results.localRuntimes.some((result) => result.ok === false) &&
@@ -3804,6 +4022,35 @@ async function auditManagedNodeRuntime(nodeRuntimeRoot) {
   return issues;
 }
 
+export async function auditAnchoredProjectReader(runtimeRoot, entry) {
+  const issues = [];
+  const source = join(runtimeRoot, 'batshit-app', 'scripts', 'anchored-project-reader.c');
+  const executable = join(runtimeRoot, 'batshit-app', 'scripts', 'anchored-project-reader');
+  if (entry?.contract !== 'bl320/1' ||
+      entry?.source !== 'batshit-app/scripts/anchored-project-reader.c' ||
+      entry?.executable !== 'batshit-app/scripts/anchored-project-reader' ||
+      entry?.platform !== 'darwin' ||
+      entry?.architecture !== 'arm64' ||
+      entry?.minimumMacosVersion !== MAC_RUNTIME_MINIMUM_VERSION ||
+      !/^[a-f0-9]{64}$/.test(entry?.sourceSha256 || '')) {
+    issues.push('runtime-manifest.json has no valid anchored project reader build record.');
+  }
+  const sourceInfo = await lstat(source).catch(() => null);
+  if (!sourceInfo?.isFile()) {
+    issues.push('The packaged anchored project reader C source is missing or is not a regular file.');
+  } else if (entry?.sourceSha256) {
+    const actual = createHash('sha256').update(await readFile(source)).digest('hex');
+    if (actual !== entry.sourceSha256) issues.push('The packaged anchored project reader source hash differs from its build record.');
+  }
+  const executableInfo = await lstat(executable).catch(() => null);
+  if (!executableInfo?.isFile() || executableInfo.size === 0 || !(executableInfo.mode & 0o111)) {
+    issues.push('The packaged anchored project reader executable is missing, empty, or not executable.');
+  } else if (!(await isMachOFile(executable))) {
+    issues.push('The packaged anchored project reader is not a Mach-O executable.');
+  }
+  return issues;
+}
+
 async function packageAudit(packagePath) {
   const target = resolve(packagePath || join(macRoot, 'electron-out', 'package'));
   const realTarget = await realpath(target).catch(() => null);
@@ -3842,6 +4089,9 @@ async function packageAudit(packagePath) {
     ...DAV1D_PROOF_FILES.map((path) => `Contents/Resources/runtime/vendor/ffmpeg/${path}`),
     'Contents/Resources/runtime/batshit-app/package.json',
     'Contents/Resources/runtime/batshit-app/build/index.js',
+    'Contents/Resources/runtime/batshit-app/scripts/command-group-guardian.mjs',
+    'Contents/Resources/runtime/batshit-app/scripts/anchored-project-reader.c',
+    'Contents/Resources/runtime/batshit-app/scripts/anchored-project-reader',
     'Contents/Resources/runtime/runtime-manifest.json',
     'Contents/Resources/runtime/batshit-server/server/package.json',
     'Contents/Resources/runtime/batshit-server/server/src/index.js',
@@ -3916,6 +4166,10 @@ async function packageAudit(packagePath) {
   } catch {
     runtimeAssetIssues.push('runtime-manifest.json is not valid JSON.');
   }
+  runtimeAssetIssues.push(...(await auditAnchoredProjectReader(
+    join(realTarget, 'Contents', 'Resources', 'runtime'),
+    runtimeManifest?.anchoredProjectReader
+  )));
   const facialArtworkAssets = runtimeManifest?.assets?.facialArtwork;
   if (
     facialArtworkAssets?.contract !== 'facial-artwork/v6' ||
@@ -4172,62 +4426,6 @@ async function packageAudit(packagePath) {
     }
   }
 
-  const clothingCatalogAssets = runtimeManifest?.assets?.clothingCatalog;
-  if (
-    clothingCatalogAssets?.contract !== 'clothing-catalog/v1' ||
-    clothingCatalogAssets?.root !== CLOTHING_CATALOG_RUNTIME_RELATIVE_ROOT ||
-    clothingCatalogAssets?.definition !== 'catalog.json' ||
-    !Array.isArray(clothingCatalogAssets?.files) ||
-    clothingCatalogAssets.files.length < 1
-  ) {
-    runtimeAssetIssues.push(
-      'runtime-manifest.json is missing the complete clothing-catalog/v1 trusted asset inventory.'
-    );
-  } else {
-    const seenPaths = new Set();
-    for (const entry of clothingCatalogAssets.files) {
-      const relative = entry?.path;
-      if (
-        typeof relative !== 'string' ||
-        relative.startsWith('/') ||
-        relative.includes('\\') ||
-        relative.split('/').includes('..') ||
-        seenPaths.has(relative) ||
-        !/^[a-f0-9]{64}$/.test(entry?.sha256 || '')
-      ) {
-        runtimeAssetIssues.push(
-          `Invalid Clothing Asset runtime manifest entry: ${JSON.stringify(entry)}`
-        );
-        continue;
-      }
-      seenPaths.add(relative);
-      const assetPath = join(
-        realTarget,
-        'Contents',
-        'Resources',
-        'runtime',
-        clothingCatalogAssets.root,
-        relative
-      );
-      const bytes = await readFile(assetPath).catch(() => null);
-      if (!bytes) {
-        runtimeAssetIssues.push(`Missing Clothing Asset runtime file: ${relative}`);
-        continue;
-      }
-      const actualSha256 = createHash('sha256').update(bytes).digest('hex');
-      if (actualSha256 !== entry.sha256) {
-        runtimeAssetIssues.push(
-          `Clothing Asset runtime file hash mismatch: ${relative} (${actualSha256} != ${entry.sha256})`
-        );
-      }
-    }
-    if (!seenPaths.has(clothingCatalogAssets.definition)) {
-      runtimeAssetIssues.push(
-        'The clothing-catalog/v1 definition is absent from its runtime asset inventory.'
-      );
-    }
-  }
-
   const packagedRuntimeAuditRoot = join(realTarget, 'Contents', 'Resources', 'runtime');
   const managedRuntimeRoot = join(packagedRuntimeAuditRoot, 'vendor');
   const portability = await inspectManagedRuntimePortability(packagedRuntimeAuditRoot, {
@@ -4324,6 +4522,26 @@ async function packageAudit(packagePath) {
       `Info.plist must declare LSMinimumSystemVersion ${MAC_RUNTIME_MINIMUM_VERSION} to match the managed runtime portability contract.`
     );
   }
+  const plistString = (key) => {
+    const read = runCaptured('plutil', ['-extract', key, 'raw', '-o', '-', infoPlistPath], { timeoutMs: 5000 });
+    return read.ok ? read.stdout.trim() || null : null;
+  };
+  const plistBundleId = plistString('CFBundleIdentifier');
+  electronPackageIssues.push(
+    ...packageIdentityIssues({
+      bundleId: plistBundleId,
+      displayName: plistString('CFBundleDisplayName'),
+      bundleName: plistString('CFBundleName')
+    })
+  );
+  // The runtime supervisor reads the bundle id without plutil (`packagedBundleIdentifier`); a plist it
+  // cannot read makes the packaged app refuse to run, so the build must fail here instead.
+  const supervisorReads = readInfoPlistBundleIdentifier(infoPlist);
+  if (supervisorReads !== plistBundleId) {
+    electronPackageIssues.push(
+      `The runtime supervisor reads bundle id ${supervisorReads ?? '(none)'} from Info.plist, but plutil reads ${plistBundleId ?? '(none)'}: Info.plist must stay XML with a plain CFBundleIdentifier.`
+    );
+  }
   electronPackageIssues.push(...(await auditElectronPackage(realTarget)));
 
   return {
@@ -4352,8 +4570,82 @@ async function packageAudit(packagePath) {
   };
 }
 
+const MAC_BUNDLE_ID = 'ai.batshit.mac';
+const MAC_FOLDER_ENV_KEYS = ['BATSHIT_MAC_DATA_DIR', 'BATSHIT_MAC_LOG_DIR', 'BATSHIT_MAC_CACHE_DIR'];
+
+// BL-72: a test package (built with `--artifact-suffix`, bundle id `ai.batshit.mac.<label>`) must be
+// told its folders. Its main process always names them (`macShellFolderEnv`), and so do the lane
+// launchers; run by hand without them, this supervisor's defaults are the real app's folders, pid
+// files, and Redis data. Returns the refusal, or null to go on.
+// `bundleId` is `undefined` in a source checkout (no package), null when a package's Info.plist
+// could not be read (it cannot tell whether it is the real app, so it refuses too; BL-72 review).
+function testPackageFolderRefusal({ bundleId, env = process.env }) {
+  if (bundleId === undefined || bundleId === MAC_BUNDLE_ID) return null;
+  const missing = MAC_FOLDER_ENV_KEYS.filter((key) => !env[key]);
+  if (!missing.length) return null;
+  if (bundleId === null) {
+    return `This Batshit package's Info.plist could not be read, so it cannot tell whether it is the real app, and nothing named its folders (${missing.join(', ')}). Start it from the app or its lane launcher.`;
+  }
+  return `This is a Batshit test package (${bundleId}), and nothing named its folders (${missing.join(', ')}). Start it from the app or its lane launcher; on its own it would use the real Batshit app's data.`;
+}
+
+// The CFBundleIdentifier of an XML Info.plist, as packaging writes it, or null when it cannot be read
+// as one (a binary plist, no such key, or a value no bundle id can have). Plain JavaScript: this runs
+// on every supervisor call of the real app, so no child process (BL-72 review).
+function readInfoPlistBundleIdentifier(text) {
+  const match = /<key>\s*CFBundleIdentifier\s*<\/key>\s*<string>([^<]*)<\/string>/.exec(String(text ?? ''));
+  const value = match?.[1]?.trim() ?? '';
+  return /^[A-Za-z0-9][A-Za-z0-9.-]*$/.test(value) ? value : null;
+}
+
+// The bundle id of the package this supervisor runs from: `undefined` in a source checkout, null when
+// the package's Info.plist cannot be read. The package audit checks this reader agrees with plutil.
+function packagedBundleIdentifier() {
+  if (!usePackagedRuntime) return undefined;
+  try {
+    return readInfoPlistBundleIdentifier(readFileSync(resolve(__dirname, '..', '..', 'Info.plist'), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+// BL-72/BL-226: the display name identifies the separate test app, but CFBundleName stays
+// "Batshit" because Electron uses it to find the fixed Batshit Helper binary before running JS.
+function packageIdentityIssues({ bundleId, displayName, bundleName }) {
+  if (!bundleId || !displayName || !bundleName) {
+    return ['Info.plist bundle id or names could not be read (CFBundleIdentifier, CFBundleDisplayName, CFBundleName).'];
+  }
+  const expectation =
+    bundleId === MAC_BUNDLE_ID
+      ? 'the real app must be named "Batshit"'
+      : 'a test package must display "Batshit <Label>" for its bundle id and keep CFBundleName "Batshit" for helper lookup';
+  const testLabel = displayName.startsWith('Batshit ') ? displayName.slice('Batshit '.length) : '';
+  const matches =
+    bundleName === 'Batshit' &&
+    (bundleId === MAC_BUNDLE_ID
+      ? displayName === 'Batshit'
+      : bundleId.startsWith(`${MAC_BUNDLE_ID}.`) &&
+        /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(testLabel) &&
+        `${MAC_BUNDLE_ID}.${testLabel.toLowerCase().replace(/_/g, '-')}` === bundleId);
+  return matches
+    ? []
+    : [
+        `Info.plist names do not match its bundle id ${bundleId} (CFBundleDisplayName "${displayName}", CFBundleName "${bundleName}"): ${expectation}.`
+      ];
+}
+
 async function main() {
   const action = process.argv[2] || 'status';
+  // Before anything else, the error path included: a failed `stop` records its completion in the
+  // data folder, which here would be the real app's.
+  if (action !== 'package-audit' && MAC_FOLDER_ENV_KEYS.some((key) => !process.env[key])) {
+    const refusal = testPackageFolderRefusal({ bundleId: packagedBundleIdentifier(), env: process.env });
+    if (refusal) {
+      jsonResponse({ success: false, ok: false, error: refusal });
+      process.exitCode = 1;
+      return;
+    }
+  }
   try {
     if (action === 'status') {
       jsonResponse({ success: true, ...(await status()) });
@@ -4414,13 +4706,26 @@ async function main() {
   }
 }
 
-const invokedPath = process.argv[1] ? resolve(process.argv[1]) : null;
-if (invokedPath === fileURLToPath(import.meta.url)) {
+// Run only when started directly, not when imported. Node gives this module its REAL path, so the
+// start path is compared as a real path too: a start through a link (or macOS's /var, a link to
+// /private/var) used to exit 0 having done nothing (BL-148).
+function startedDirectly() {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+if (startedDirectly()) {
   await main();
 }
 
 export {
   auditElectronPackage,
+  batshitAppIsDown,
+  classifyAppleContainerStatus,
+  doctorAdvice,
   heldStdinSpawnArgs,
   parseDockerMcpGatewayProcess,
   dockerMcpGatewayGroupMatchesMetadata,
@@ -4431,6 +4736,8 @@ export {
   dockerMcpGatewayStatus,
   dockerMcpGatewayListenerProcess,
   dockerMcpGatewayLogFile,
+  dockerMcpGatewayMetadataIsCurrent,
+  dockerMcpGatewayRunArgs,
   dockerMcpGatewayPidFile,
   auditManagedNodeRuntime,
   attemptSafeRedisShutdown,
@@ -4444,6 +4751,12 @@ export {
   parseRedisInfo,
   publishJsonAtomically,
   redisStatusProvesStopped,
+  startAppleContainer,
   stopManagedLocalRuntimes,
-  stopSbxDaemonStartedByThisApp
+  stopSbxDaemonStartedByThisApp,
+  stopAppleContainerSystemStartedByThisApp,
+  stopService,
+  packageIdentityIssues,
+  readInfoPlistBundleIdentifier,
+  testPackageFolderRefusal
 };

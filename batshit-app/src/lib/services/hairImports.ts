@@ -74,7 +74,7 @@ export class HairImportApiError extends Error {
       responseBody?: unknown;
     },
   ) {
-    super(input.code ? `${message} (${input.code})` : message);
+    super(input.code && input.code !== "ASSET_IN_USE" ? `${message} (${input.code})` : message);
     this.name = "HairImportApiError";
     this.status = input.status;
     this.code = input.code ?? null;
@@ -312,6 +312,11 @@ function parseProposals(value: unknown): HairImportProposalSet {
     follower: parseProposal(raw.follower, "Hair import follower proposal"),
     physics: parseProposal(raw.physics, "Hair import physics proposal"),
     motionReview: {
+      ...(motionReview.rootSelectionNotice === undefined ? {} : {
+        rootSelectionNotice: motionReview.rootSelectionNotice === null
+          ? null
+          : text(motionReview.rootSelectionNotice, "Hair import motion rootSelectionNotice"),
+      }),
       anchoredLength: finite(motionReview.anchoredLength, "Hair import motion anchoredLength"),
       weightCurve: (() => {
         const value = text(motionReview.weightCurve, "Hair import motion weightCurve");

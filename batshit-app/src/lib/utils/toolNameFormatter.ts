@@ -107,6 +107,16 @@ const BATSHIT_TOOL_REF_FAMILIES = new Set(['mcp', 'cli', 'artifact', 'fabric', '
  * derived name is wrong, never to make a new family visible — it already is.
  */
 const FABRIC_CONTROL_DISPLAY_ALIASES: Record<string, string> = {
+  'sys.ui.settings_open': 'Open Settings',
+  'sys.ui.settings_close': 'Close Settings',
+  'sys.ui.goon_show': 'Show Goon Dock',
+  'sys.ui.goon_hide': 'Hide Goon Dock',
+  'sys.ui.execution_open': 'Open Execution Viewer',
+  'sys.ui.settings_inspect': 'Inspect masked Settings',
+  'sys.ui.settings_agent_memory_read': 'Read own Agent Memory settings',
+  'sys.ui.settings_agent_memory_update': 'Change own Agent Memory settings',
+  'sys.ui.settings_agent_identity_read': 'Read own agent display name',
+  'sys.ui.settings_agent_identity_update': 'Change own agent display name',
   // "Read", not "Get"; "Edit", not "Apply Patch"; the shorter word the cards use.
   'sys.artifact.get': 'Artifact Read',
   'sys.artifact.run_logs.list': 'Artifact Logs',
@@ -129,11 +139,12 @@ const FABRIC_CONTROL_DISPLAY_ALIASES: Record<string, string> = {
   // SA-115's Schedules family: `formatControlWords` renders `update` as "Edit", which is
   // right for an artifact and wrong for a schedule.
   'sys.schedule.update': 'Schedule Update',
-  // SA-120 P2: the derived "Jev Juice Ask" reads backwards; the card says what you do.
-  'sys.judge.ask': 'Ask Jev Juice'
+  // SA-120 P2: the derived "Judge Juice Ask" reads backwards; the card says what you do.
+  'sys.judge.ask': 'Ask Judge Juice'
 }
 
 const FABRIC_CONTROL_PREFIX_LABELS: Record<string, string> = {
+  'sys.ui.': 'App Actions',
   'sys.artifact.': 'Artifact',
   'sys.model_catalog.': 'Model Catalog',
   'sys.cli_tool.': 'CLI Tool',
@@ -152,7 +163,7 @@ const FABRIC_CONTROL_PREFIX_LABELS: Record<string, string> = {
   'sys.dm.': 'Agent DM',
   'sys.schedule.': 'Schedule',
   // SA-120 P2: the product name, two words (DL-120-13).
-  'sys.judge.': 'Jev Juice'
+  'sys.judge.': 'Judge Juice'
 }
 
 function normalizeDisplayAliasKey(rawName: string): string {

@@ -8,6 +8,9 @@
  */
 import { beforeAll, describe, expect, it } from 'vitest'
 import { getToolRenderer } from '../toolRendererRegistry'
+import { normalizeCompactTool } from '$lib/utils/toolActivityContract'
+import { CLI_HELPER_MCP_SERVER_NAME } from '$lib/utils/cliHelperToolNames'
+import { CLI_HELPER_STEP_CASES, LEGACY_CLI_HELPER_SERVER } from '$lib/test-utils/cli-helper-steps'
 
 const load = async (importer: Promise<any>) => (await importer).default
 
@@ -16,6 +19,7 @@ const renderers = {
   genericMcp: () => load(import('../generic/GenericMCPRenderer.svelte')),
   readFile: () => load(import('../file/ReadFileRenderer.svelte')),
   bash: () => load(import('../command/BashRenderer.svelte')),
+  toolFind: () => load(import('../generic/ToolFindRenderer.svelte')),
   subagent: () => load(import('../subagent/CallSubagentRenderer.svelte')),
   workers: () => load(import('../workers/WorkersRenderer.svelte')),
   dm: () => load(import('../dm/DmRenderer.svelte')),
@@ -167,5 +171,49 @@ describe('getToolRenderer — brute-force batshit_server_* prefix loop pins', ()
         toolProvider: 'batshit-server'
       } as any)
     ).toBe(await renderers.generic())
+  })
+})
+
+/* -------------------------------------------------------------------------------------------- *
+ * BL-5 — the helper bridge's server was renamed to `batshit_helpers`. A card for a managed CLI
+ * helper step is chosen the way `CoolToolRenderer.svelte` chooses it: the step is normalized,
+ * and its family picks the renderer. A step under either server name must get the same card,
+ * and it must be the helper's real card, not the generic MCP card an unrecognized server gets.
+ * -------------------------------------------------------------------------------------------- */
+describe('getToolRenderer — BL-5: a helper step keeps its card under the new server name', () => {
+  const rendererFor = async (step: Record<string, any>) =>
+    getToolRenderer(step.toolName, {
+      toolProvider: step.toolProvider,
+      toolSource: step.toolSource,
+      mcpServerName: step.mcpServerName,
+      rendererFamily: normalizeCompactTool(step as any).rendererFamily
+    } as any)
+
+  const byLabel = (label: string) => {
+    const found = CLI_HELPER_STEP_CASES.find((testCase) => testCase.label === label)
+    if (!found) throw new Error(`no helper step case "${label}"`)
+    return found
+  }
+
+  it('renders a helper Bash call as the Bash card under either name', async () => {
+    const testCase = byLabel('batshit_server_bash_execute (Codex wrapper)')
+    expect(await rendererFor(testCase.build(LEGACY_CLI_HELPER_SERVER))).toBe(await renderers.bash())
+    expect(await rendererFor(testCase.build(CLI_HELPER_MCP_SERVER_NAME))).toBe(await renderers.bash())
+  })
+
+  it('renders a helper tool search as the Tool Find card under either name', async () => {
+    const testCase = byLabel('batshit_tool_search (Codex wrapper)')
+    expect(await rendererFor(testCase.build(LEGACY_CLI_HELPER_SERVER))).toBe(await renderers.toolFind())
+    expect(await rendererFor(testCase.build(CLI_HELPER_MCP_SERVER_NAME))).toBe(
+      await renderers.toolFind()
+    )
+  })
+
+  it('renders every helper step case with the same card under either name', async () => {
+    for (const testCase of CLI_HELPER_STEP_CASES) {
+      expect(await rendererFor(testCase.build(CLI_HELPER_MCP_SERVER_NAME)), testCase.label).toBe(
+        await rendererFor(testCase.build(LEGACY_CLI_HELPER_SERVER))
+      )
+    }
   })
 })

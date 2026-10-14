@@ -1,7 +1,9 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { normalizeUsageLike, withHonestLocalCacheUsage } from '../apiProviderUsage'
 import { resolveLocalPromptCacheReporting } from '$lib/data/localAiServers'
 import {
+  clearLocalRuntimeContextCache,
+  readLocalRuntimeContext,
   resolveEffectiveContextLimit,
   localRuntimeReportsLoadedContext
 } from '../localRuntimeContext'
@@ -138,7 +140,7 @@ describe('SA-102 effective context limit', () => {
     expect(result.mismatch).toBe(false)
   })
 
-  it('keeps the preset and says why when the model is not loaded', () => {
+  it('leaves the limit unknown when the model is not loaded', () => {
     const result = resolveEffectiveContextLimit({
       presetContextWindow: 262144,
       reading: {
@@ -148,7 +150,7 @@ describe('SA-102 effective context limit', () => {
         remainingTtlSeconds: null
       }
     })
-    expect(result.contextLimit).toBe(262144)
+    expect(result.contextLimit).toBeNull()
     expect(result.source).toBe('unknown-until-loaded')
     expect(result.mismatch).toBe(false)
   })
@@ -162,8 +164,8 @@ describe('SA-102 effective context limit', () => {
     expect(result.source).toBe('preset')
   })
 
-  it('trusts a loaded context that is LARGER than the preset', () => {
-    // The preset is the guess; the program is the fact.
+  it('keeps a smaller positive preset as a planning cap below the real allocation', () => {
+    // The loaded allocation is a fact; a smaller preset still caps prompt planning.
     const result = resolveEffectiveContextLimit({
       presetContextWindow: 4096,
       reading: {
@@ -173,13 +175,16 @@ describe('SA-102 effective context limit', () => {
         remainingTtlSeconds: null
       }
     })
-    expect(result.contextLimit).toBe(131072)
+    expect(result.contextLimit).toBe(4096)
+    expect(result.loadedContextWindow).toBe(131072)
+    expect(result.source).toBe('loaded')
     expect(result.mismatch).toBe(true)
   })
 
   it('knows which programs can report a loaded context at all', () => {
     expect(localRuntimeReportsLoadedContext('lmstudio')).toBe(true)
     expect(localRuntimeReportsLoadedContext('ollama')).toBe(true)
+    expect(localRuntimeReportsLoadedContext('koboldcpp')).toBe(true)
     expect(localRuntimeReportsLoadedContext('vllm')).toBe(false)
     expect(localRuntimeReportsLoadedContext('openai')).toBe(false)
   })
@@ -242,6 +247,15 @@ describe('SA-125 requested context outranks the loaded reading', () => {
     expect(result.mismatch).toBe(false)
   })
 
+  it('caps planning below the requested allocation without reviving the old loaded window', () => {
+    const result = resolveEffectiveContextLimit({ presetContextWindow: 4096,
+      reading: loadedAt(131072) as any, requestedContextWindow: 8192 })
+    expect(result.contextLimit).toBe(4096)
+    expect(result.loadedContextWindow).toBe(131072)
+    expect(result.source).toBe('requested')
+    expect(result.mismatch).toBe(false)
+  })
+
   it('leaves the loaded reading in charge when nothing is requested', () => {
     const result = resolveEffectiveContextLimit({
       presetContextWindow: 262144,
@@ -260,7 +274,65 @@ describe('SA-125 requested context outranks the loaded reading', () => {
         reading: loadedAt(8192) as any,
         requestedContextWindow: bad as any
       })
-      expect(result.contextLimit, String(bad)).toBe(8192)
+      expect(result.contextLimit, String(bad)).toBe(4096)
+      expect(result.loadedContextWindow).toBe(8192)
+      expect(result.source).toBe('loaded')
     }
+  })
+})
+
+/**
+ * BL-101 / SA-124 P4. KoboldCpp's real context comes from
+ * `/api/extra/true_max_context_length`. Measured 2026-09-22: one model switch
+ * from Batshit took it from 32768 to 12288 while the preset still said 32768.
+ */
+describe('BL-101 KoboldCpp context truth', () => {
+  let routes: Record<string, unknown>
+  beforeEach(() => {
+    clearLocalRuntimeContextCache()
+    routes = {}
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        const path = url.replace(/^https?:\/\/[^/]+/, '')
+        return path in routes
+          ? new Response(JSON.stringify(routes[path]), { status: 200 })
+          : new Response('not found', { status: 404 })
+      })
+    )
+  })
+  afterEach(() => vi.unstubAllGlobals())
+
+  const read = (modelId: string) =>
+    readLocalRuntimeContext({ providerId: 'koboldcpp', modelId, baseUrl: 'http://localhost:5001' })
+
+  it('applies the loaded size to whatever model id the preset names', async () => {
+    // KoboldCpp answers every request with its one loaded model.
+    routes['/api/extra/version'] = { llm: true, router: false }
+    routes['/api/extra/true_max_context_length'] = { value: 12288 }
+
+    const reading = await read('koboldcpp/Llama-3.2-3B-Instruct-Q4_K_M')
+    expect(reading).toMatchObject({ source: 'loaded', loadedContextWindow: 12288 })
+
+    const effective = resolveEffectiveContextLimit({ presetContextWindow: 32768, reading })
+    expect(effective.contextLimit).toBe(12288)
+    expect(effective.mismatch).toBe(true)
+  })
+
+  it('reports nothing in router mode, where a request can swap the model', async () => {
+    routes['/api/extra/version'] = { llm: true, router: true }
+    routes['/api/extra/true_max_context_length'] = { value: 12288 }
+    expect(await read('m')).toBeNull()
+  })
+
+  it('reports nothing when no text model is loaded', async () => {
+    routes['/api/extra/version'] = { llm: false, router: false }
+    routes['/api/extra/true_max_context_length'] = { value: 12288 }
+    expect(await read('m')).toBeNull()
+  })
+
+  it('reports nothing rather than a guess when the side door does not answer', async () => {
+    routes['/api/extra/version'] = { llm: true, router: false }
+    expect(await read('m')).toBeNull()
   })
 })

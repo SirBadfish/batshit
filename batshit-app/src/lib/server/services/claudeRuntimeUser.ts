@@ -1,4 +1,5 @@
-import { chown } from 'node:fs/promises'
+import { lchown } from 'node:fs/promises'
+import type { FileHandle } from 'node:fs/promises'
 
 export interface ClaudeRunAsIdentity {
   uid?: number
@@ -108,17 +109,38 @@ export function buildClaudeDockerExecOptions(
   return args.join(' ')
 }
 
-export async function applyClaudeRuntimeOwnership(filePath: string): Promise<void> {
+/** The owner the Claude CLI runs as, or null when Batshit runs it as itself. */
+function resolveClaudeRuntimeOwner(): { uid: number; gid: number } | null {
   const identity = resolveClaudeRunAsIdentity()
-  if (identity.uid === undefined && identity.gid === undefined) return
+  if (identity.uid === undefined && identity.gid === undefined) return null
 
   const currentProcess = process as NodeJS.Process & {
     getuid?: () => number
     getgid?: () => number
   }
-  await chown(
-    filePath,
-    identity.uid ?? currentProcess.getuid?.() ?? 0,
-    identity.gid ?? currentProcess.getgid?.() ?? 0
-  )
+  return {
+    uid: identity.uid ?? currentProcess.getuid?.() ?? 0,
+    gid: identity.gid ?? currentProcess.getgid?.() ?? 0
+  }
+}
+
+/**
+ * BL-7 review: hands a managed file to the run-as user through its OPEN handle (fchown). There
+ * is no path to follow, so a link swapped in by another process cannot redirect it: a path
+ * chown after the file was closed could have made root chown any file a link pointed at.
+ */
+export async function applyClaudeRuntimeOwnershipToHandle(handle: FileHandle): Promise<void> {
+  const owner = resolveClaudeRuntimeOwner()
+  if (!owner) return
+  await handle.chown(owner.uid, owner.gid)
+}
+
+/**
+ * BL-7 review: hands a folder Batshit made to the run-as user with `lchown`, which never
+ * follows a link (it would change the link itself, never what it points at).
+ */
+export async function applyClaudeRuntimeOwnershipWithoutFollowing(target: string): Promise<void> {
+  const owner = resolveClaudeRuntimeOwner()
+  if (!owner) return
+  await lchown(target, owner.uid, owner.gid)
 }

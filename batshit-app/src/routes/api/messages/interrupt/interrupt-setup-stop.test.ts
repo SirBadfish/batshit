@@ -68,7 +68,7 @@ describe('POST /api/messages/interrupt', () => {
     const answer = await stop()
 
     expect(answer).toMatchObject({ success: true, messageId: 'msg-1' })
-    expect(answer.reason).toBeUndefined()
+    expect(answer.reason).toBe('aborted')
     expect(stream.signal.reason).toBe('user')
     expect(getActiveStream('session-1')).not.toBeNull()
   })

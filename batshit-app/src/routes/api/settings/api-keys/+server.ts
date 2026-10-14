@@ -2,8 +2,10 @@ import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { env } from '$env/dynamic/private';
 import { apiKeyService } from '$lib/services/apiKey.server';
+import { deleteN8nInstanceToken, N8N_INSTANCE_TOKEN_SERVICE } from '$lib/server/services/n8nInstanceCredential';
 import { syncAgentCodexProfiles } from '$lib/server/services/codexProfileManager';
 import { syncAgentClaudeProfiles } from '$lib/server/services/claudeProfileManager';
+import { pausedPlanAddRefusal, pausedPlanStatuses } from '$lib/server/services/pausedPlans';
 
 function isContainerizedRuntime() {
   return env.BATSHIT_CONTAINERIZED === '1';
@@ -11,6 +13,10 @@ function isContainerizedRuntime() {
 
 function isMacAppRuntime() {
   return env.BATSHIT_RUNTIME_OWNER === 'mac-app';
+}
+
+function isPinokioRuntime() {
+  return !isContainerizedRuntime() && env.BATSHIT_RUNTIME_OWNER === 'pinokio';
 }
 
 function runtimeToken() {
@@ -24,6 +30,7 @@ function hasRuntimeManagedBatshitToken() {
 function runtimeName() {
   if (isMacAppRuntime()) return 'Mac runtime';
   if (isContainerizedRuntime()) return 'Docker runtime environment';
+  if (isPinokioRuntime()) return 'Pinokio launcher';
   return 'source runtime environment';
 }
 
@@ -79,7 +86,7 @@ function applyHostRuntimeManagedKeys(keys: Record<string, any>, request: Request
       updatedAt: '',
       status: 'ready',
       managedByRuntime: true,
-      runtimeLabel: 'Managed by Source Runtime'
+      runtimeLabel: isPinokioRuntime() ? 'Managed by the Pinokio launcher' : 'Managed by Source Runtime'
     };
   }
 
@@ -176,7 +183,9 @@ export const GET: RequestHandler = async ({ locals, request }) => {
 
     return json({
       success: true,
-      keys
+      keys,
+      // Plan pause: the words each paused plan's row shows on this copy.
+      pausedPlans: await pausedPlanStatuses()
     });
   } catch (error) {
     console.error('Failed to fetch API keys:', error);
@@ -226,8 +235,16 @@ export const POST: RequestHandler = async ({ request, locals }) => {
           ? 'BATSHIT_TOKEN is managed by the Mac runtime; restart the Mac app runtime after intentional rotation.'
           : dockerRuntime
             ? 'BATSHIT_TOKEN is managed by Docker Compose; update .env.docker and restart containers to change it.'
-            : 'BATSHIT_TOKEN is managed by the source runtime environment; update root .env and restart services to change it.'
+            : isPinokioRuntime()
+              ? 'BATSHIT_TOKEN is managed by the Pinokio launcher, in ~/.batshit/pinokio/batshit.env.'
+              : 'BATSHIT_TOKEN is managed by the source runtime environment; update root .env and restart services to change it.'
       });
+    }
+
+    // Plan pause: a paused plan's key cannot be added (a saved one stays).
+    const paused = await pausedPlanAddRefusal(service);
+    if (paused) {
+      return json({ success: false, error: paused.message, code: 'paused_plan' }, { status: 409 });
     }
 
     // Store the API key
@@ -272,6 +289,43 @@ export const DELETE: RequestHandler = async ({ request, locals }) => {
       }, { status: 400 });
     }
 
+    // The key service's own name rule (trimmed, lower case), so every spelling reaches this path.
+    if (String(service).trim().toLowerCase() === N8N_INSTANCE_TOKEN_SERVICE) {
+      // BL-1397: the saved key AND every legacy copy inside n8n Instance gateways, in one guarded
+      // step, so the next profile sync cannot put an old copy back. A newer save or a gateway
+      // that kept changing means nothing was deleted; a part-way failure keeps the saved key.
+      const deleted = await deleteN8nInstanceToken(userId);
+      if (deleted.outcome === 'key_changed') {
+        return json({
+          success: false,
+          error: 'The saved n8n Instance MCP token changed while deleting, so nothing was deleted. Try again.'
+        }, { status: 409 });
+      }
+      if (deleted.outcome === 'conflict') {
+        return json({
+          success: false,
+          error: 'The MCP gateways kept changing while deleting, so nothing was deleted. Try again.'
+        }, { status: 409 });
+      }
+      if (deleted.outcome === 'partial') {
+        console.error(
+          `Deleting the n8n Instance MCP token stopped part way: ${deleted.copiesCleared} old gateway copies removed, the saved token kept.`
+        );
+        return json({
+          success: false,
+          error: 'The n8n Instance MCP token was not deleted. Some old copies inside n8n gateways may already be removed. Delete it again.'
+        }, { status: 500 });
+      }
+      // The delete is done; a profile sync failure after it must not answer "failed to delete".
+      try {
+        await syncAgentCodexProfiles(userId);
+        await syncAgentClaudeProfiles(userId);
+      } catch (error) {
+        console.error('The n8n Instance MCP token was deleted, but the profile sync after it failed:', error);
+      }
+      return json({ success: true, service });
+    }
+
     await apiKeyService.delete(service, userId);
     if (service === 'batshit_token') {
       const macRuntime = isMacAppRuntime();
@@ -284,14 +338,11 @@ export const DELETE: RequestHandler = async ({ request, locals }) => {
           ? 'BATSHIT_TOKEN is managed by the Mac runtime and was not removed from the runtime environment.'
           : dockerRuntime
             ? 'BATSHIT_TOKEN is managed by Docker Compose and was not removed from the runtime environment.'
-            : 'BATSHIT_TOKEN is managed by the source runtime environment and was not removed from root .env.'
+            : isPinokioRuntime()
+              ? 'BATSHIT_TOKEN is managed by the Pinokio launcher and was not removed.'
+              : 'BATSHIT_TOKEN is managed by the source runtime environment and was not removed from root .env.'
       });
     }
-    if (service === 'n8n_instance_mcp_token') {
-      await syncAgentCodexProfiles(userId);
-      await syncAgentClaudeProfiles(userId);
-    }
-
     return json({
       success: true,
       service

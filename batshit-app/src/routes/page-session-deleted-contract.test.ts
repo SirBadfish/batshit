@@ -44,24 +44,16 @@ describe('the chat page forgets a chat deleted in another tab', () => {
 })
 
 /**
- * The page does not save a reply back into a chat that was deleted (bug sweep, 2026-09-18).
- * The server marks such a reply `chatDeleted` on its `end` and `complete` events
- * (`send-routed-session-delete-contract.test.ts`); saving it anyway was refused by the save route
- * and shown as a false "Failed to save message to database".
+ * The page does not save a reply at all (BL-775): the server owns every reply's record, so a reply
+ * stopped because its chat was deleted is not saved back either. The page's end and complete
+ * handlers only change what the tab shows (`page-reply-end-save-contract.test.ts`).
  */
 describe('the chat page and a reply stopped because its chat was deleted', () => {
-  it('skips the save at end', () => {
+  it('saves nothing at end or at complete', () => {
     const endHandler = page.indexOf("} else if (data.type === 'end') {")
-    const save = page.indexOf('await saveMessageToDatabase(targetMessageId)', endHandler)
-    expect(save).toBeGreaterThan(endHandler)
-    expect(page.slice(save - 120, save)).toContain('if (metadata?.chatDeleted !== true) {')
-  })
-
-  it('skips the save at complete', () => {
-    const completeHandler = page.indexOf("} else if (data.type === 'complete') {")
-    const save = page.indexOf('await saveMessageToDatabase(targetMessageId)', completeHandler)
-    expect(save).toBeGreaterThan(completeHandler)
-    expect(page.slice(completeHandler, save)).toContain("data?.metadata?.chatDeleted !== true")
+    const after = page.indexOf("} else if (data.type === 'stream_complete') {", endHandler)
+    expect(endHandler).toBeGreaterThan(-1)
+    expect(page.slice(endHandler, after)).not.toContain('saveMessage')
   })
 })
 
@@ -72,7 +64,11 @@ describe('the chat page and a send refused because its chat was deleted', () => 
     expect(branch).toBeGreaterThan(-1)
     expect(generic).toBeGreaterThan(branch)
     const body = page.slice(branch, page.indexOf('return false', branch))
-    expect(body).toContain("toast.info(message || 'This chat was deleted.')")
+    // BL-182: the details first. A send refused or cancelled because its chat was deleted
+    // answers `error: 'Session not found or unauthorized'` (the answer a send into a missing
+    // chat gets) with `details: 'This chat was deleted.'`, and the toast read the first. A reply
+    // stopped by the delete says so in `error` and has no details.
+    expect(body).toContain("\n\t        toast.info(details || message || 'This chat was deleted.')\n")
     expect(body).not.toContain('description')
   })
 })

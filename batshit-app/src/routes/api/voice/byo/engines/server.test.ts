@@ -3,16 +3,22 @@ import type { RequestEvent } from '@sveltejs/kit'
 
 vi.mock('$lib/server/services/voiceEngineRegistry', () => ({
   applyVoiceEnginePublicUpdates: vi.fn(),
-  listVoiceEngineSummaries: vi.fn(),
+  listVoiceEngineManagerView: vi.fn(),
+  listUnreadableVoiceEngines: vi.fn(),
   upsertVoiceEngineRecord: vi.fn()
 }))
 
-import { POST, PUT } from './+server'
+import { GET, POST, PUT } from './+server'
 import {
   applyVoiceEnginePublicUpdates,
-  listVoiceEngineSummaries,
+  listUnreadableVoiceEngines,
+  listVoiceEngineManagerView,
   upsertVoiceEngineRecord
 } from '$lib/server/services/voiceEngineRegistry'
+
+// A saved record the registry cannot read (a newer Batshit wrote it) is kept unchanged; every
+// answer that lists engines names it, so the Engine Manager can say so.
+const UNREADABLE = [{ id: 'dots-tts-mf', reason: 'has settings this Batshit does not know: futureOption' }]
 
 function buildEvent(body: Record<string, unknown>, userId: string | null = 'user-1'): RequestEvent {
   return {
@@ -42,18 +48,21 @@ describe('POST /api/voice/byo/engines', () => {
         hasAuthToken: false
       } as any
     })
-    vi.mocked(listVoiceEngineSummaries).mockResolvedValue([
-      {
-        id: 'kokoro-host',
-        providerId: 'byo:kokoro-host',
-        name: 'Kokoro Host',
-        enabled: false,
-        supportsTts: true,
-        supportsStt: false,
-        supportsClone: false,
-        hasAuthToken: false
-      } as any
-    ])
+    vi.mocked(listVoiceEngineManagerView).mockResolvedValue({
+      engines: [
+        {
+          id: 'kokoro-host',
+          providerId: 'byo:kokoro-host',
+          name: 'Kokoro Host',
+          enabled: false,
+          supportsTts: true,
+          supportsStt: false,
+          supportsClone: false,
+          hasAuthToken: false
+        } as any
+      ],
+      unreadableEngines: UNREADABLE
+    })
   })
 
   it('registers a manually connected existing engine disabled first', async () => {
@@ -97,7 +106,8 @@ describe('POST /api/voice/byo/engines', () => {
       success: true,
       created: true,
       engine: { id: 'kokoro-host' },
-      engines: [{ id: 'kokoro-host' }]
+      engines: [{ id: 'kokoro-host' }],
+      unreadableEngines: UNREADABLE
     })
   })
 
@@ -148,6 +158,13 @@ describe('PUT /api/voice/byo/engines', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     vi.mocked(applyVoiceEnginePublicUpdates).mockResolvedValue([])
+    vi.mocked(listUnreadableVoiceEngines).mockResolvedValue(UNREADABLE)
+  })
+
+  it('names the saved engines it cannot read beside the ones it saved', async () => {
+    const response = await PUT(buildPutEvent([{ id: 'whisper-cpp', enabled: true }]))
+
+    expect(await response.json()).toMatchObject({ success: true, engines: [], unreadableEngines: UNREADABLE })
   })
 
   it('passes both startup halves through to the registry', async () => {
@@ -189,5 +206,33 @@ describe('PUT /api/voice/byo/engines', () => {
     expect(applyVoiceEnginePublicUpdates).toHaveBeenCalledWith('user-1', [
       expect.objectContaining({ localRuntime: { startup: undefined } })
     ])
+  })
+})
+
+describe('GET /api/voice/byo/engines', () => {
+  const getEvent = (userId: string | null = 'user-1') =>
+    ({ locals: userId ? { user: { id: userId } } : { user: null } }) as unknown as RequestEvent
+
+  it('lists the engines it can read and names the ones it cannot', async () => {
+    vi.mocked(listVoiceEngineManagerView).mockResolvedValue({
+      engines: [{ id: 'kokoro', providerId: 'byo:kokoro', name: 'Kokoro' } as any],
+      unreadableEngines: UNREADABLE
+    })
+
+    const response = await GET(getEvent())
+
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({
+      engines: [{ id: 'kokoro', providerId: 'byo:kokoro', name: 'Kokoro' }],
+      unreadableEngines: UNREADABLE
+    })
+  })
+
+  it('a registry it cannot read at all is an error, not an empty list', async () => {
+    vi.mocked(listVoiceEngineManagerView).mockRejectedValue(new Error('connection lost'))
+
+    const response = await GET(getEvent())
+
+    expect(response.status).toBe(500)
   })
 })

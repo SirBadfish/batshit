@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { SavedModel } from '$lib/types/savedModels'
 import {
   mergePresetRuntimeSettings,
+  resolveAgentModelFallbacks,
   resolveRuntimeModelSelection,
 } from './modelPresetRuntime'
 
@@ -37,14 +38,22 @@ function buildPreset(overrides: Partial<SavedModel> = {}): SavedModel {
 }
 
 describe('modelPresetRuntime utilities', () => {
-  it('lets live preset settings override stale copied agent settings', () => {
+  it('builds settings from the live preset plus only the agent\'s own keys (BL-515)', () => {
     const settings = mergePresetRuntimeSettings(
       {
         includeThoughts: false,
+        // A copy of an older preset's value, taken when the agent picked it: no longer the preset's.
         maxTokens: 64000,
+        customKnob: 7,
         nativeTools: {
           discoverableToolIds: ['read-file'],
         },
+        codex_permission_mode: 'agent',
+        claude_permission_mode: 'plan',
+        batshit_tool_search: true,
+        batshitNativeTools: { bashEnabled: false },
+        bashEnabled: false,
+        nativeWebSearchProvider: 'exa',
       },
       {
         includeThoughts: true,
@@ -54,12 +63,45 @@ describe('modelPresetRuntime utilities', () => {
 
     expect(settings).toEqual({
       includeThoughts: true,
-      maxTokens: 64000,
+      thinkingBudget: 2000,
       nativeTools: {
         discoverableToolIds: ['read-file'],
       },
-      thinkingBudget: 2000,
+      codex_permission_mode: 'agent',
+      claude_permission_mode: 'plan',
+      batshit_tool_search: true,
+      batshitNativeTools: { bashEnabled: false },
+      bashEnabled: false,
+      nativeWebSearchProvider: 'exa',
     })
+  })
+
+  it('a preset value wins over the agent copy of the same key (unchanged precedence)', () => {
+    expect(
+      mergePresetRuntimeSettings(
+        { codex_permission_mode: 'agent', temperature: 1.2 },
+        { codex_permission_mode: 'chat', temperature: 0 },
+      ),
+    ).toEqual({ codex_permission_mode: 'chat', temperature: 0 })
+  })
+
+  it('a preset with no settings leaves only the agent\'s own keys, and nothing at all as null', () => {
+    const preset = buildPreset({ settings: undefined })
+    expect(
+      resolveRuntimeModelSelection({
+        preset,
+        settings: { temperature: 1.2, reasoningEffort: 'high', nativeTools: { bashAccessMode: 'plan' } },
+      }).settings,
+    ).toEqual({ nativeTools: { bashAccessMode: 'plan' } })
+    expect(resolveRuntimeModelSelection({ preset, settings: { temperature: 1.2 } }).settings).toBeNull()
+  })
+
+  it('a preset temperature of 0 is kept (zero is real)', () => {
+    const selection = resolveRuntimeModelSelection({
+      preset: buildPreset({ settings: { temperature: 0 } }),
+      settings: { temperature: 1.2 },
+    })
+    expect(selection.settings).toEqual({ temperature: 0 })
   })
 
   it('uses the selected live preset as the runtime model source of truth', () => {
@@ -95,6 +137,33 @@ describe('modelPresetRuntime utilities', () => {
       includeThoughts: true,
       thinkingBudget: 2000,
     })
+  })
+
+  it('the agent model fallbacks apply only when the agent names no preset (BL-515)', () => {
+    const agent = {
+      primary_model_temperature: 1.2,
+      primary_model_max_tokens: 4000,
+      primary_model_top_p: 0.9,
+      primary_model_top_k: 40,
+      primary_model_presence_penalty: 0.1,
+      primary_model_frequency_penalty: 0.2,
+      primary_model_seed: 7,
+      primary_model_stop_sequences: ['END'],
+    }
+    expect(resolveAgentModelFallbacks({ preset: buildPreset(), agent })).toBeUndefined()
+    expect(resolveAgentModelFallbacks({ preset: null, agent })).toEqual({
+      temperature: 1.2,
+      maxTokens: 4000,
+      topP: 0.9,
+      topK: 40,
+      presencePenalty: 0.1,
+      frequencyPenalty: 0.2,
+      seed: 7,
+      stopSequences: ['END'],
+    })
+    // A stored null (the picker's "blank") is absent, never a value; a stored 0 is real.
+    expect(resolveAgentModelFallbacks({ preset: null, agent: { primary_model_temperature: null } })).toEqual({})
+    expect(resolveAgentModelFallbacks({ preset: null, agent: { primary_model_temperature: 0 } })).toEqual({ temperature: 0 })
   })
 
   it('falls back to agent fields when no preset is selected', () => {

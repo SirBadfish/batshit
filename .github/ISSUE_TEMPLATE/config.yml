@@ -4,7 +4,7 @@ contact_links:
     url: https://docs.batshit.ai/
     about: Start here for install, setup, concepts, troubleshooting, and reference docs.
   - name: Community Discord
-    url: https://discord.gg/3saVHX5xn
+    url: https://discord.gg/8cgK2qaN2c
     about: Use Discord for informal community help and discussion.
   - name: Security vulnerability
     url: https://github.com/SirBadfish/batshit/security/advisories/new

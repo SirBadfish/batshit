@@ -5,11 +5,15 @@ import {
   type ToolOperationKind,
   type ToolRendererFamily
 } from './toolActivityContract'
+import type { DeadCopyReason } from './zipDeadCopies'
+import { classifyToolResultSize, resolveToolResultPromptTokens, type ToolResultSizeGuard } from './toolResultSizeGuard'
 
 type Numeric = number | string | null | undefined
 
 export interface ZipLikeMetadata {
   tokens?: Numeric
+  promptTokens?: Numeric
+  aiTokens?: Numeric
   bufferSize?: Numeric
   threshold?: Numeric
   metadata?: Record<string, any>
@@ -28,14 +32,27 @@ export interface ZipActivationOptions {
   toolName?: string
   fallbackTokens?: number
   isUnzipped?: boolean
+  /** Judge Juice opens are automatic, not explicit Holds; they never open a large result. */
+  isInferredUnzipped?: boolean
   isRezipped?: boolean
   /**
    * The owning assistant message failed mid-task or was interrupted with no
    * successful completion after it (see calculateRecoveryHoldByIndex). Blocks
    * automatic compression (auto-zip and buffer aging) so the agent can still
-   * see its in-flight work; manual unzip/rezip and forceCompress still win.
+   * see its in-flight work; explicit Holds, rezips and the size guard still win.
    */
   recoveryHold?: boolean
+  /**
+   * SA-129 P1 (DL-01): this zip is a dead copy of a file read (`findDeadCopies`), and how many of
+   * its author's replies had finished when it died. A dead copy compresses whatever the buffer or
+   * Auto/Normal setting says; only an `Off` row and a user unzip keep it open.
+   */
+  deadCopy?: { reason: DeadCopyReason; repliesUntilDead: number } | null
+  /**
+   * The unzip is the user's (a user lock). An agent's or Batshit's (`inferred`) unzip does not
+   * keep a dead copy open. Only read beside `deadCopy`.
+   */
+  isUserUnzipped?: boolean
 }
 
 export interface ZipActivationResult {
@@ -51,6 +68,17 @@ export interface ZipActivationResult {
   zipType: string
   messagesFromEnd: number
   recoveryHold: boolean
+  /** The size rule that won activation, based on the model-facing transcript. */
+  sizeGuard: ToolResultSizeGuard
+  /** Set when the dead-copy rule keeps this zip compressed (DL-01). */
+  deadCopy: DeadCopyReason | null
+  /**
+   * The compressed reference says why (`DEAD_COPY_REASON_TEXT`): the copy died while the
+   * automatic rules still kept it open. A copy that had already aged out of its buffer when it
+   * died keeps its plain reference, so an old history line never changes when the agent reads
+   * the file again much later (append-only history; cache forensics `historyStability`).
+   */
+  deadCopyNamed: boolean
 }
 
 function coerceNumber(value: Numeric): number | undefined {
@@ -218,6 +246,36 @@ function resolveToolIdentity(toolName?: string, zipData?: ZipLikeMetadata | null
 }
 
 /**
+ * SA-129 P1 (DL-03): what an expanded read says on the last reply it is open. P2 added the second
+ * way to keep it: hold the file (`zipHoldWords.ts`).
+ */
+export const READ_COMPRESS_HINT_LAST_REPLY = 'Compresses after this reply. Note what you need or hold the file.'
+
+/**
+ * SA-129 P1 (DL-03): the one line an expanded `read_file` or `skill_read` transcript carries, so
+ * the agent can always tell when the result compresses. Built at compile time from the activation,
+ * never stored in the zip. Null when nothing will compress it on its own: an `Off` row, a result
+ * below the size floor, or an unzip (a hold says who holds it instead: `describeHeldReadHint`).
+ *
+ * The line stays the same from one compile to the next until the last reply the result is open
+ * (`Compresses N replies after it was read.`, then `Compresses after this reply.`): a countdown would change
+ * an earlier history line on every send and break the prompt cache there each time, where a
+ * buffer compression changes it once.
+ */
+export function describeReadCompressHint(
+  activation: ZipActivationResult,
+  options: { isUnzipped: boolean }
+): string | null {
+  if (activation.shouldCompress || activation.zipDisabled || options.isUnzipped) return null
+  // An Auto result is open only through a recovery hold, which ends when this reply completes.
+  if (activation.autoZip) return activation.recoveryHold ? READ_COMPRESS_HINT_LAST_REPLY : null
+  if (!activation.meetsThreshold) return null
+  if (activation.messagesFromEnd + 1 >= activation.bufferSize) return READ_COMPRESS_HINT_LAST_REPLY
+  // Reached only with a buffer of 2 or more.
+  return `Compresses ${activation.bufferSize} replies after it was read.`
+}
+
+/**
  * Calculate whether a zip should be compressed (rendered as a placeholder)
  * based on buffer/threshold rules and token counts.
  */
@@ -231,8 +289,11 @@ export function calculateZipActivation(options: ZipActivationOptions): ZipActiva
     toolName,
     fallbackTokens,
     isUnzipped = false,
+    isInferredUnzipped = false,
     isRezipped = false,
-    recoveryHold = false
+    recoveryHold = false,
+    deadCopy = null,
+    isUserUnzipped = false
   } = options
 
   const resolvedIdentity = resolveToolIdentity(toolName, zipData)
@@ -261,15 +322,15 @@ export function calculateZipActivation(options: ZipActivationOptions): ZipActiva
   const autoZip = Boolean(typeSettings.autoZip)
   const zipDisabled = Boolean(typeSettings.zipDisabled)
 
-  const forceCompress = zipData?.metadata?.forceCompress === true
   if (!zipDisabled && autoZip) {
     bufferSize = 0
     zipThreshold = 0
   }
 
   const tokens =
-    coerceNumber(zipData?.metadata?.promptTokens) ??
-    coerceNumber(zipData?.metadata?.aiTokens) ??
+    (zipType === 'cool_tool'
+      ? resolveToolResultPromptTokens(zipData)
+      : coerceNumber(zipData?.metadata?.promptTokens) ?? coerceNumber(zipData?.metadata?.aiTokens)) ??
     coerceNumber(zipData?.tokens) ??
     coerceNumber(zipData?.metadata?.tokens) ??
     (fallbackTokens !== undefined ? fallbackTokens : 0)
@@ -278,15 +339,37 @@ export function calculateZipActivation(options: ZipActivationOptions): ZipActiva
   const exceedsBuffer = zipDisabled ? false : autoZip ? true : normalizedMessagesFromEnd >= bufferSize
   const meetsThreshold = zipDisabled ? false : autoZip ? true : tokens >= zipThreshold
 
+  // The guard applies to tool results, not image/error and other non-tool zip families.
+  // Old forceCompress stamps counted renderer JSON and cannot decide prompt exposure.
+  const size = zipType === 'cool_tool' ? classifyToolResultSize(tokens) : null
+  const tooLarge = size === 'too_large'
+  const large = size !== null
+  const explicitHold = isUnzipped && !isInferredUnzipped
   // Manual rezip overrides buffer/threshold to force compression.
   // Recovery hold blocks only the AUTOMATIC compression lanes (auto-zip and
   // buffer aging) — a run that died mid-task must not have its in-flight tool
   // results hidden from the agent on the next send.
+  // A dead copy (DL-01) is outdated or duplicated, so neither a recovery hold nor an
+  // agent's or Batshit's unzip keeps it open; an Off row and a user unzip do.
+  const deadCopyApplies = !tooLarge && Boolean(deadCopy) && !zipDisabled && !(isUnzipped && isUserUnzipped)
+  const sizeGuard: ToolResultSizeGuard = tooLarge
+    ? 'too_large'
+    : !zipDisabled && !isRezipped && !deadCopyApplies && !explicitHold && large
+      ? 'large'
+      : null
   const shouldCompress =
-    !zipDisabled &&
-    (forceCompress ||
+    tooLarge || (!zipDisabled &&
+    (
       isRezipped ||
-      (!isUnzipped && !recoveryHold && (autoZip || (exceedsBuffer && meetsThreshold))))
+      deadCopyApplies ||
+      (!explicitHold && large) ||
+      (!isUnzipped && !recoveryHold && (autoZip || (exceedsBuffer && meetsThreshold)))))
+  // Auto (buffer 0) always reads as already compressed here, so an Auto copy is never named.
+  const deadCopyNamed =
+    deadCopyApplies &&
+    !large &&
+    !isRezipped &&
+    !(meetsThreshold && (deadCopy?.repliesUntilDead ?? 0) >= bufferSize)
 
   return {
     shouldCompress,
@@ -300,6 +383,9 @@ export function calculateZipActivation(options: ZipActivationOptions): ZipActiva
     toolName: resolvedToolName,
     zipType,
     messagesFromEnd: normalizedMessagesFromEnd,
-    recoveryHold
+    recoveryHold,
+    sizeGuard,
+    deadCopy: deadCopyApplies && deadCopy ? deadCopy.reason : null,
+    deadCopyNamed
   }
 }

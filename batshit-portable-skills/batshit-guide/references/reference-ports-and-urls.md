@@ -98,6 +98,8 @@ Mac app saves write to the Mac-app-owned Redis process immediately. Redis runs w
 
 Docker core services are Batshit app, batshit-server, and internal Redis.
 
+Docker saves also write to Redis immediately. Its Redis keeps its data in the `batshit_redis_data` volume with append-only persistence, so a change reaches disk within about a second instead of waiting for the next snapshot.
+
 | Port | Purpose | Override |
 | --- | --- | --- |
 | `5620` | Browser-facing Batshit app host port | `BATSHIT_DOCKER_APP_PORT` |

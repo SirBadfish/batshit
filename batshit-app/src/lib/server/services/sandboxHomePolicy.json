@@ -1,0 +1,19 @@
+{
+  "mountVersion": 4,
+  "laneOwnedDirs": ["skills", "portable-skills", "voice-profiles"],
+  "writableDirs": [
+    "installs",
+    "tools",
+    "skills",
+    "portable-skills",
+    "voice-profiles",
+    "workspaces",
+    "ab-profile"
+  ],
+  "protectedDirs": [
+    "agents",
+    "runtime",
+    "pinokio",
+    "pinokio.admission"
+  ]
+}

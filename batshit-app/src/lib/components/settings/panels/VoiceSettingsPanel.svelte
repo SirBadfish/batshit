@@ -36,7 +36,9 @@
   import IconRenderer from '$lib/components/icons/IconRenderer.svelte'
   import { toast } from '$lib/components/ui/sonner/settings-toast'
   import { confirmDialog } from '$lib/stores/confirmDialog'
-  import { setUserSettings } from '$lib/stores/userSettings.svelte'
+  import { confirmUserSettings as setUserSettings } from '$lib/stores/userSettings.svelte'
+  import { buildVoiceLipSyncPatch, type VoiceSettingsPatch } from '$lib/utils/voiceSettingsSave'
+  import { readConfirmedVoiceSaveAnswer, readVoiceSettingsReadAnswer } from '$lib/services/voiceSettingsPersistence'
   import * as agentStore from '$lib/stores/agents.svelte'
   import type { UserSettingsRow } from '$lib/types/database'
   import type {
@@ -108,6 +110,7 @@
     Pencil,
     Plus,
     RefreshCcw,
+    RefreshCw,
     Settings2,
     Trash2,
     Play,
@@ -175,7 +178,7 @@
     voiceModeSubmitMode?: VoiceModeSubmitMode
     voiceModeAutoSubmitDelayMs?: number
     voiceModeEndOfTurnThreshold?: number
-    /** SA-120 P9 (LS-060): Jev Juice: Quick Actions, global, default OFF. */
+    /** SA-120 P9 (LS-060): Judge Juice: Quick Actions, global, default OFF. */
     voiceModeJevJuiceQuickActions?: boolean
     /** SA-120 P9b: the wake word gate (default required, "Yo"). */
     voiceModeJevJuiceQuickActionsWakeWordRequired?: boolean
@@ -273,13 +276,66 @@
 
   let settings = $state<VoiceSettingsForm>(normaliseSettings(null))
   let persistedSignature = $state(makeSignature(normaliseSettings(null)))
+  let persistedVoicePayload: VoiceSettings | null = null
+  let voiceSaveQueueGeneration = 0
+  let voiceSavesInFlight = 0
+  let pendingVoiceSaveGeneration: number | null = null
+  let voiceSaveDispatchSequence = 0
+  let latestVoiceSaveSettlement = 0
   let byoEngines = $state<VoiceEngineClientSummary[]>([])
   let persistedEngineSignature = $state(makeEngineSignature([]))
   let isLoading = $state(true)
+  // BL-962: `settings` holds saved voice values only after a real read of `/api/user/settings`
+  // succeeded. Until then it holds the page's older copy or the defaults, neither of which may
+  // ever be written back (the route replaces the whole `voice_settings` block), so the controls
+  // that hold voice values are not offered and the autosave refuses. The page's copy is the copy
+  // from when the page opened: it does not count as loaded, and it cannot tell "no record yet"
+  // from "the read failed". Once a read succeeded the copy stays, and a later failed refresh
+  // keeps it (it never swaps it for the page's copy).
+  let settingsLoaded = $state(false)
+  let settingsLoadError = $state<string | null>(null)
+  let settingsLoadBusy = $state(false)
   let settingsSaveState = $state<'idle' | 'saving' | 'saved' | 'error'>('idle')
   let settingsSaveError = $state<string | null>(null)
+  const settingsStatusState = $derived(
+    settingsSaveError || settingsLoadError ? 'error' : settingsSaveState
+  )
+  const settingsStatusError = $derived(settingsSaveError ?? settingsLoadError)
   let engineSaveState = $state<'idle' | 'saving' | 'saved' | 'error'>('idle')
   let engineSaveError = $state<string | null>(null)
+  // Saved engine records the server cannot read (a newer Batshit wrote them, say). It keeps them
+  // unchanged and names them beside the engines it lists (`scope: 'list'`: the whole list).
+  type UnreadableEngineNotice = { scope: 'list' | 'record'; id: string | null; reason: string }
+  let byoUnreadableEngines = $state<UnreadableEngineNotice[]>([])
+  const byoUnreadableNotice = $derived.by(() => {
+    if (byoUnreadableEngines.length === 0) return null
+    const wholeList = byoUnreadableEngines.find((entry) => entry.scope === 'list')
+    if (wholeList) {
+      return `The saved engine list can't be read (${wholeList.reason}). Batshit keeps it unchanged and won't change it.`
+    }
+    const one = byoUnreadableEngines.length === 1
+    const named = byoUnreadableEngines
+      .map((entry) => `${entry.id ?? 'an engine with no usable id'} (${entry.reason})`)
+      .join('; ')
+    return `${one ? 'A saved engine' : `${byoUnreadableEngines.length} saved engines`} can't be read: ${named}. Batshit keeps ${
+      one ? 'it' : 'them'
+    } unchanged and won't edit or delete ${one ? 'it' : 'them'}.`
+  })
+
+  function readUnreadableEngines(result: unknown): UnreadableEngineNotice[] {
+    const entries = (result as { unreadableEngines?: unknown } | null)?.unreadableEngines
+    if (!Array.isArray(entries)) return []
+    return entries
+      .filter(
+        (entry): entry is { scope: unknown; id: unknown; reason: unknown } =>
+          Boolean(entry) && typeof entry === 'object'
+      )
+      .map((entry) => ({
+        scope: entry.scope === 'list' ? ('list' as const) : ('record' as const),
+        id: typeof entry.id === 'string' ? entry.id : null,
+        reason: typeof entry.reason === 'string' ? entry.reason : 'unreadable'
+      }))
+  }
 
   let providerSummaries = $state<VoiceProviderSummary[]>([])
   let providersLoading = $state(false)
@@ -726,6 +782,7 @@
   let engineModelJobs = $state<Record<string, 'download' | 'use' | 'delete'>>({})
   let deleteLocalFilesByEngineId = $state<Record<string, boolean>>({})
   let liveKitRuntime = $state<LiveKitRuntimeManagerStatus | null>(null)
+  let liveKitShutdownPolicy = $state<'per-engine' | 'all-owned' | null>(null)
   let liveKitRuntimeLoading = $state(false)
   let liveKitRuntimeAction = $state<'start' | 'refresh' | 'install' | null>(null)
   let liveKitRuntimeError = $state<string | null>(null)
@@ -1257,12 +1314,22 @@
     }
   })
 
-  const debouncedSave = debounce(async (payload: VoiceSettings) => {
+  const debouncedSave = debounce(async (payload: VoiceSettings, patch: VoiceSettingsPatch, queueGeneration: number) => {
+    // A queued timer is revocable. A request that already started keeps its ownership.
+    if (queueGeneration !== voiceSaveQueueGeneration) return
+    pendingVoiceSaveGeneration = null
+    voiceSavesInFlight += 1
+    const saveSequence = ++voiceSaveDispatchSequence
     try {
+      if (!settingsLoaded || !persistedVoicePayload) throw new Error('Voice settings have not loaded.')
+      const { goonLipSync: _lipSync, ...voiceSettings } = payload
       const response = await fetch('/api/user/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ voice_settings: payload })
+        body: JSON.stringify({
+          voice_settings: voiceSettings,
+          ...(patch.goonLipSync ? { voice_settings_patch: patch } : {})
+        })
       })
 
       if (!response.ok) {
@@ -1271,24 +1338,55 @@
       }
 
       const result = await response.json()
-      const updated: UserSettingsRow | null = result?.settings ?? null
+      const updated = readConfirmedVoiceSaveAnswer(result)
+      // An old answer cannot replace a newer settled save's baseline/store or cancel its
+      // queued follow-up. Failed newer saves also keep their draft/error instead of retrying.
+      if (saveSequence < latestVoiceSaveSettlement) return
+      latestVoiceSaveSettlement = saveSequence
+      const confirmedLip = normalizeVoiceSettings(updated.voice_settings).goonLipSync
 
       untrack(() => {
-        persistedSignature = makeSignature(payload)
-        settingsSaveState = 'saved'
+        // Follow the real saved answer only where no later local lip choice replaced this one.
+        // The pair is one choice; the blend slider is independent. Other drafts stay untouched.
+        const submitted = payload.goonLipSync
+        const pairUntouched = settings.goonLipSyncMode === submitted?.mode &&
+          settings.goonLipSyncAnalyzerId === submitted?.analyzerId
+        const blendUntouched = settings.goonLipSyncBlendMs === submitted?.visemeBlendMs
+        settings = {
+          ...settings,
+          ...(pairUntouched ? {
+            goonLipSyncMode: confirmedLip?.mode,
+            goonLipSyncAnalyzerId: confirmedLip?.analyzerId
+          } : {}),
+          ...(blendUntouched ? { goonLipSyncBlendMs: confirmedLip?.visemeBlendMs } : {})
+        }
+        persistedVoicePayload = { ...payload, goonLipSync: confirmedLip }
+        persistedSignature = makeSignature(persistedVoicePayload)
+        settingsSaveState = voiceSavesInFlight > 1 || pendingVoiceSaveGeneration !== null ? 'saving' : 'saved'
         settingsSaveError = null
+        // A save that landed shows the store answers, so it also ends the standing failure of an
+        // earlier refresh (the copy the form holds is still the loaded one). A failed refresh
+        // stays on the status chip until a save lands or a read succeeds.
+        settingsLoadError = null
       })
 
-      if (updated) {
+      if (updated || result?.settings === null) {
         setUserSettings(updated)
       }
     } catch (error) {
+      latestVoiceSaveSettlement = Math.max(latestVoiceSaveSettlement, saveSequence)
       console.error('Voice settings save failed:', error)
       untrack(() => {
         settingsSaveState = 'error'
         settingsSaveError = error instanceof Error ? error.message : 'Failed to save voice settings'
       })
     } finally {
+      voiceSavesInFlight -= 1
+      untrack(() => {
+        if (voiceSavesInFlight === 0 && pendingVoiceSaveGeneration === null && settingsSaveState === 'saving') {
+          settingsSaveState = 'saved'
+        }
+      })
       setTimeout(() => {
         untrack(() => {
           if (settingsSaveState === 'saved') {
@@ -1317,6 +1415,7 @@
 
       untrack(() => {
         byoEngines = updated
+        byoUnreadableEngines = readUnreadableEngines(result)
         persistedEngineSignature = makeEngineSignature(updated)
         engineSaveState = 'saved'
         engineSaveError = null
@@ -1341,17 +1440,29 @@
   }, SAVE_DEBOUNCE_MS)
 
   $effect(() => {
-    if (isLoading) return
+    // BL-962: never a write built while no read of the saved voice settings succeeded. The
+    // controls are not offered then either; this line keeps the whole block from being sent if
+    // one ever is.
+    if (isLoading || !settingsLoaded) return
 
     const payload = buildVoiceSettingsPayload(settings)
     const signature = makeSignature(payload)
     if (signature === persistedSignature) {
+      voiceSaveQueueGeneration += 1
+      pendingVoiceSaveGeneration = null
+      untrack(() => {
+        if (voiceSavesInFlight === 0 && settingsSaveState === 'saving') settingsSaveState = 'idle'
+      })
       return
     }
 
     settingsSaveState = 'saving'
     settingsSaveError = null
-    debouncedSave(payload)
+    // Capture intent against the baseline this form actually read, before any later answer
+    // rebases an untouched lip choice. A delayed payload cannot infer new intent from it.
+    const patch = untrack(() => buildVoiceLipSyncPatch(payload, persistedVoicePayload!))
+    pendingVoiceSaveGeneration = ++voiceSaveQueueGeneration
+    debouncedSave(payload, patch, pendingVoiceSaveGeneration)
   })
 
   $effect(() => {
@@ -1984,6 +2095,7 @@
       const updated = Array.isArray(result?.engines) ? result.engines : []
       untrack(() => {
         byoEngines = updated
+        byoUnreadableEngines = readUnreadableEngines(result)
         persistedEngineSignature = makeEngineSignature(updated)
         existingEngineFormOpen = false
         resetExistingEngineForm()
@@ -2001,6 +2113,7 @@
   }
 
   async function loadSettings() {
+    settingsLoadBusy = true
     try {
       const response = await fetch('/api/user/settings')
       if (!response.ok) {
@@ -2009,27 +2122,36 @@
       }
 
       const result = await response.json()
-      const remoteSettings: UserSettingsRow | null = result?.settings ?? null
+      const remoteSettings = readVoiceSettingsReadAnswer(result)
       const next = normaliseSettings(remoteSettings?.voice_settings)
 
       untrack(() => {
         settings = { ...next }
+        persistedVoicePayload = buildVoiceSettingsPayload(next)
         persistedSignature = makeSignature(next)
+        // A successful (re)load clears the failure at once, in the same block that resets the
+        // signature: the autosave effect returns at its signature guard and would never reach
+        // code that clears it (BL-487's follow-up).
+        settingsLoaded = true
+        settingsLoadError = null
         isLoading = false
       })
 
-      if (remoteSettings) {
+      if (remoteSettings || result?.settings === null) {
         setUserSettings(remoteSettings)
       }
     } catch (error) {
       console.error('Failed to load voice settings:', error)
-      const fallback = normaliseSettings(data?.userSettings?.voice_settings)
+      // BL-962: a failed read changes nothing but the failure. `settings` and its baseline stay
+      // what they were (the page's copy or the defaults before a first good read, the loaded copy
+      // after one); they are never replaced by the page's copy.
       untrack(() => {
-        settings = { ...fallback }
-        persistedSignature = makeSignature(fallback)
+        settingsLoadError = error instanceof Error ? error.message : 'Failed to load voice settings'
         isLoading = false
-        settingsSaveState = 'error'
-        settingsSaveError = error instanceof Error ? error.message : 'Failed to load voice settings'
+      })
+    } finally {
+      untrack(() => {
+        settingsLoadBusy = false
       })
     }
   }
@@ -2047,6 +2169,7 @@
 
       untrack(() => {
         byoEngines = engines
+        byoUnreadableEngines = readUnreadableEngines(result)
         persistedEngineSignature = makeEngineSignature(engines)
       })
     } catch (error) {
@@ -2071,6 +2194,7 @@
 
       const result = await response.json()
       liveKitRuntime = result?.runtime ?? null
+      liveKitShutdownPolicy = readLiveKitShutdownPolicy(result)
     } catch (error) {
       console.error('Failed to load LiveKit runtime:', error)
       liveKitRuntimeError = error instanceof Error ? error.message : 'Failed to load LiveKit runtime'
@@ -2106,6 +2230,7 @@
 
       const result = await response.json()
       liveKitRuntime = result?.runtime ?? null
+      liveKitShutdownPolicy = readLiveKitShutdownPolicy(result)
       const started = liveKitRuntime?.started === true
       const restarted = liveKitRuntime?.restarted === true
       let successMessage = 'LiveKit runtime is already running'
@@ -2528,6 +2653,16 @@
 
   function canStopEngineWithBatshit(provider: VoiceEngineClientSummary) {
     return provider.localRuntime?.canStopOnShutdown === true
+  }
+
+  function mustStopEngineWithBatshit(provider: VoiceEngineClientSummary) {
+    return canStopEngineWithBatshit(provider) && provider.localRuntime?.shutdownStopPolicy === 'all-owned'
+  }
+
+  function readLiveKitShutdownPolicy(result: unknown): 'per-engine' | 'all-owned' | null {
+    const policy = (result as { runtimeContext?: { localVoiceEngineStopPolicy?: unknown } })
+      ?.runtimeContext?.localVoiceEngineStopPolicy
+    return policy === 'per-engine' || policy === 'all-owned' ? policy : null
   }
 
   function getEngineStopUnavailableReason(provider: VoiceEngineClientSummary) {
@@ -3274,6 +3409,29 @@
   }
 </script>
 
+{#snippet voiceSettingsLoadGate(hidden: string)}
+  <!-- BL-962: the controls that hold voice values wait for a real read of the saved settings. -->
+  {#if isLoading}
+    <div class="batshit-settings-group batshit-settings-caption flex items-center gap-2">
+      <Loader2 class="h-4 w-4 animate-spin" aria-hidden="true" />
+      <span>Loading Voice settings...</span>
+    </div>
+  {:else}
+    <div class="batshit-settings-inline-alert is-danger" data-testid="voice-settings-load-error">
+      <div class="flex items-center justify-between gap-2">
+        <span>
+          Voice settings could not load, so {hidden} are hidden. Press Retry to load them.
+          {#if settingsLoadError}Details: {settingsLoadError}{/if}
+        </span>
+        <Button variant="outline" size="sm" onclick={loadSettings} disabled={settingsLoadBusy}>
+          <RefreshCw class={settingsLoadBusy ? 'h-3.5 w-3.5 animate-spin' : 'h-3.5 w-3.5'} />
+          Retry
+        </Button>
+      </div>
+    </div>
+  {/if}
+{/snippet}
+
 <div class="space-y-6">
       <Tabs.Root bind:value={activeTab} class="w-full">
         <Tabs.List class="flex w-full flex-wrap gap-2">
@@ -3306,13 +3464,16 @@
               </SettingsInfoMenu>
             </div>
             <SettingsSaveStatus
-              state={settingsSaveState}
-              error={settingsSaveError}
+              state={settingsStatusState}
+              error={settingsStatusError}
               sticky={false}
               savedLabel="Saved"
             />
           </div>
 
+          {#if !settingsLoaded}
+            {@render voiceSettingsLoadGate('the Global Voice Settings controls')}
+          {:else}
           {#if currentAgentVoiceOverrideParts.length > 0}
             <div class="batshit-settings-inline-alert is-info">
               <span class="batshit-settings-inline-strong">
@@ -4255,19 +4416,21 @@
                               In Voice Mode, when what you just said is a small request to Batshit itself,
                               Batshit does it at once instead of sending it to your agent: stop talking,
                               hang up, show or hide the Goon, open Settings, or show the Execution
-                              Viewer. Jev, a model made by TypeSafe, judges each spoken turn; when the
+                              Viewer. The judge chosen in Settings → Admin → Judge Juice (Jev at TypeSafe
+                              unless you changed it) judges each spoken turn; when the
                               request was all you said, nothing goes to the agent, and when you also said
                               something for the agent, the rest is sent as usual.
                             </p>
                             <p>
-                              You always see a mark under what you said, with Jev's confidence, and the
-                              agent is told on its next turn. Jev can be wrong; every quick action is one
+                              You always see a mark under what you said, with the judge's confidence. These
+                              actions are not sent to the agent. The judge can be wrong; every quick action is one
                               click to undo. Nothing risky ever runs this way.
                             </p>
                             <p>
-                              What leaves this computer when it is on: the words of each turn you speak
+                              What is sent to the judge when it is on: the words of each turn you speak
                               in Voice Mode and the names of these actions. Never your chat history. Needs
-                              Allow Jev Juice on in Settings → Admin and a TypeSafe key.
+                              Allow Judge Juice on in Settings → Admin and, if your judge uses a key, that
+                              key in Settings → API Keys (a TypeSafe key for Jev).
                             </p>
                           </SettingsInfoMenu>
                         </div>
@@ -4299,8 +4462,8 @@
                               for nothing.
                             </p>
                             <p>
-                              Off: every spoken turn is checked. Jev still only acts when it is sure, but each
-                              turn waits for one Jev call first.
+                              Off: every spoken turn is checked. Batshit still only acts when the judge is sure,
+                              but each turn waits for one answer from the judge first.
                             </p>
                           </SettingsInfoMenu>
                         </div>
@@ -4668,6 +4831,7 @@
                 </div>
               {/if}
           </SettingsAccordionCard>
+          {/if}
         </div>
       {/if}
 
@@ -4761,8 +4925,8 @@
             </div>
             <div class="flex flex-wrap items-center justify-end gap-2">
               <SettingsSaveStatus
-                state={settingsSaveState}
-                error={settingsSaveError}
+                state={settingsStatusState}
+                error={settingsStatusError}
                 sticky={false}
                 savedLabel="Settings saved"
               />
@@ -4775,6 +4939,11 @@
             </div>
           </div>
 
+          {#if !settingsLoaded}
+            {@render voiceSettingsLoadGate(
+              'the Voice Runtimes, Text-to-Speech Engines, and Speech-to-Text Engines cards'
+            )}
+          {:else}
           <SettingsAccordionCard
             name="voice-engine-manager-sections"
             title="Voice Runtimes"
@@ -4879,8 +5048,19 @@
 
               <div class="flex flex-wrap items-center justify-between gap-3 batshit-settings-muted-panel">
                 <div class="flex min-w-0 items-center gap-2">
-                  <span class="batshit-settings-form-label">Stop with Batshit</span>
+                  <span class="batshit-settings-form-label">{liveKitShutdownPolicy === 'all-owned' ? 'Always Stop with Batshit' : 'Stop with Batshit'}</span>
                   <SettingsInfoMenu ariaLabel="About LiveKit Stop with Batshit" contentClass="w-80">
+                    {#if liveKitShutdownPolicy === 'all-owned'}
+                    <p>
+                      Windows-managed local voice processes run in Batshit's owned WSL environment
+                      and cannot stay running when that environment ends.
+                    </p>
+                    <p>
+                      Direct stop actions still require verified ownership; this does not promise
+                      that shared or unknown processes inside the environment survive its
+                      shutdown. Connected external runtimes are separate.
+                    </p>
+                    {:else}
                     <p>
                       When this is on, Batshit stops the managed local LiveKit server and sidecar
                       when Batshit shuts down.
@@ -4894,12 +5074,14 @@
                       In Docker, the LiveKit runtime add-on owns its own lifecycle, so this control
                       does not apply.
                     </p>
+                    {/if}
                   </SettingsInfoMenu>
                 </div>
                 <Switch.Root
-                  checked={settings.liveKitStopOnShutdown !== false}
+                  checked={liveKitShutdownPolicy === 'all-owned' || settings.liveKitStopOnShutdown !== false}
+                  disabled={liveKitShutdownPolicy !== 'per-engine'}
                   onCheckedChange={(value) =>
-                    handleSettingsChange({
+                    liveKitShutdownPolicy === 'per-engine' && handleSettingsChange({
                       liveKitStopOnShutdown: value === true
                     })}
                 />
@@ -5542,6 +5724,7 @@
               </div>
             {/if}
           </SettingsAccordionCard>
+          {/if}
 
           <SettingsAccordionCard
             name="voice-engine-manager-sections"
@@ -5572,6 +5755,9 @@
                 Connect Existing
               </Button>
             {/snippet}
+              {#if byoUnreadableNotice}
+                <p class="batshit-settings-inline-alert is-warning">{byoUnreadableNotice}</p>
+              {/if}
               {#if existingEngineFormOpen}
                 <div class="batshit-settings-muted-panel is-loose space-y-4">
                   <div class="flex flex-wrap items-center justify-between gap-3">
@@ -5998,8 +6184,20 @@
                             </div>
                             {#if canStopEngineWithBatshit(provider)}
                               <div class="batshit-settings-pill is-control">
-                                <span class="batshit-settings-form-label">Stop with Batshit</span>
+                                <span class="batshit-settings-form-label">{mustStopEngineWithBatshit(provider) ? 'Always Stop with Batshit' : 'Stop with Batshit'}</span>
                                 <SettingsInfoMenu ariaLabel="About Stop with Batshit" contentClass="w-80">
+                                  {#if mustStopEngineWithBatshit(provider)}
+                                  <p>
+                                    Windows-managed local voice processes run in Batshit's owned WSL
+                                    environment and cannot stay running when that environment ends.
+                                  </p>
+                                  <p>
+                                    Direct stop actions still require verified ownership; this does
+                                    not promise that shared or unknown processes inside the
+                                    environment survive its shutdown. Connected external runtimes
+                                    are separate.
+                                  </p>
+                                  {:else}
                                   <p>
                                     When this is on, Batshit stops this engine when Batshit shuts
                                     down, so it stops holding memory while you are not using it.
@@ -6017,11 +6215,13 @@
                                     When several engines share one running program, Batshit stops
                                     it only if every one of them has Stop with Batshit on.
                                   </p>
+                                  {/if}
                                 </SettingsInfoMenu>
                                 <Switch.Root
-                                  checked={isStopWithBatshitOn(provider)}
+                                  checked={mustStopEngineWithBatshit(provider) || isStopWithBatshitOn(provider)}
+                                  disabled={mustStopEngineWithBatshit(provider)}
                                   onCheckedChange={(value) =>
-                                    updateByoProvider(provider.id, (current) => ({
+                                    !mustStopEngineWithBatshit(provider) && updateByoProvider(provider.id, (current) => ({
                                       ...current,
                                       localRuntime: {
                                         ...(current.localRuntime ?? {}),

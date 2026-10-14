@@ -1,4 +1,5 @@
 import http from 'node:http'
+import { createHmac } from 'node:crypto'
 import type { AddressInfo } from 'node:net'
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -11,8 +12,14 @@ import {
 } from '../runtimeShutdown'
 import {
   registerHostVoiceRuntimeShutdown,
+  startHostVoiceRuntimeViaOperator,
   stopHostVoiceRuntimesAtShutdown
 } from '../voiceHostOperatorRuntime'
+import { redis } from '$lib/server/redis'
+import {
+  listVoiceEngineRecordsOfEveryUser,
+  registerDockerVoiceEngineShutdown
+} from '../voiceEngineRegistry'
 
 // "Stop with Batshit" in Docker: when the container shuts down, the app sends every engine's
 // choice to the host operator, which started the engines and is the only thing that can stop
@@ -56,11 +63,13 @@ describe('stopping host voice engines when the Docker app shuts down', () => {
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
     privateEnv.BATSHIT_RUNTIME_ADDON_OPERATOR_URL = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
     privateEnv.BATSHIT_RUNTIME_ADDON_OPERATOR_TOKEN = 'operator-test-token'
+    privateEnv.BATSHIT_HOST_VOICE_RECIPE_SIGNING_KEY = 'a'.repeat(64)
   })
 
   afterEach(async () => {
     delete privateEnv.BATSHIT_RUNTIME_ADDON_OPERATOR_URL
     delete privateEnv.BATSHIT_RUNTIME_ADDON_OPERATOR_TOKEN
+    delete privateEnv.BATSHIT_HOST_VOICE_RECIPE_SIGNING_KEY
     resetRuntimeShutdownTasksForTests()
     server.closeAllConnections()
     await new Promise<void>((resolve) => server.close(() => resolve()))
@@ -146,5 +155,205 @@ describe('stopping host voice engines when the Docker app shuts down', () => {
     await closeRegisteredRuntimeResources('SIGTERM')
 
     expect(requests.map((request) => request.url)).toEqual(['/v1/voice-engines/stop'])
+  })
+
+  // BL-18: several Docker Batshits can share one host operator. Each says who it is at every
+  // start and stop, so the operator stops only that Batshit's own launches.
+  describe('naming this Docker Batshit to a shared operator (BL-18)', () => {
+    const originalOwner = process.env.BATSHIT_VOICE_RUNTIME_OWNER
+
+    afterEach(() => {
+      if (originalOwner === undefined) delete process.env.BATSHIT_VOICE_RUNTIME_OWNER
+      else process.env.BATSHIT_VOICE_RUNTIME_OWNER = originalOwner
+    })
+
+    it('sends its name with the stop and with every start', async () => {
+      process.env.BATSHIT_VOICE_RUNTIME_OWNER = 'docker:batshit'
+      answer = (res) => {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, success: true, engineId: 'kokoro', pid: 4242, stopped: [], keptRunning: [], notStopped: [] }))
+      }
+
+      await stopHostVoiceRuntimesAtShutdown(async () => [engine('kokoro')], { log })
+      await startHostVoiceRuntimeViaOperator(engine('kokoro'))
+
+      expect(requests.map((request) => [request.url, request.body.owner])).toEqual([
+        ['/v1/voice-engines/stop', 'docker:batshit'],
+        ['/v1/voice-engines/start', 'docker:batshit']
+      ])
+      expect(requests[1].body.proof).toMatchObject({
+        issuedAt: expect.any(Number),
+        nonce: expect.any(String),
+        signature: expect.stringMatching(/^[a-f0-9]{64}$/)
+      })
+      const { proof, ...recipe } = requests[1].body
+      const expected = createHmac('sha256', Buffer.from('a'.repeat(64), 'hex'))
+        .update('batshit-host-voice-start-v1\0')
+        .update(`${proof.issuedAt}\0${proof.nonce}\0${JSON.stringify(recipe)}`)
+        .digest('hex')
+      expect(proof.signature).toBe(expected)
+    })
+
+    it('with no name set it sends none, and the operator gives it only unmarked launches', async () => {
+      delete process.env.BATSHIT_VOICE_RUNTIME_OWNER
+
+      await stopHostVoiceRuntimesAtShutdown(async () => [engine('kokoro')], { log })
+
+      expect(requests).toHaveLength(1)
+      expect(requests[0].body).not.toHaveProperty('owner')
+    })
+
+    it('a Compose that left the project name empty ("docker:") sends no name rather than one every Batshit shares', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      process.env.BATSHIT_VOICE_RUNTIME_OWNER = 'docker:'
+
+      await stopHostVoiceRuntimesAtShutdown(async () => [engine('kokoro')], { log })
+
+      expect(requests).toHaveLength(1)
+      expect(requests[0].body).not.toHaveProperty('owner')
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('no Compose project name'))
+      warn.mockRestore()
+    })
+  })
+})
+
+// BL-19: the Docker stop is registered when the server starts, not at the first signed-in page
+// load, so it reads the engines without a request (every registry: one user per instance) and must
+// never mistake a registry it could not read for "no engines", which the operator reads as "stop
+// every engine it started", keep-running ones included.
+describe('the Docker voice-engine stop registered when the server starts (BL-19)', () => {
+  let server: http.Server
+  let requests: Array<{ url: string | undefined; body: any }>
+  const originalContainerized = process.env.BATSHIT_CONTAINERIZED
+
+  const store = (records: Array<Record<string, unknown>>) => ({ version: 1, records })
+  const recipe = (id: string, port: number, stopOnShutdown?: boolean) => ({
+    id,
+    name: id,
+    enabled: true,
+    baseUrl: `http://127.0.0.1:${port}`,
+    localRuntime: {
+      installRoot: `/Users/example/.batshit/installs/${id}`,
+      launch: { command: `/Users/example/.batshit/installs/${id}/serve` },
+      ...(stopOnShutdown === undefined ? {} : { startup: { stopOnShutdown } })
+    }
+  })
+
+  beforeEach(async () => {
+    requests = []
+    server = http.createServer((req, res) => {
+      let raw = ''
+      req.on('data', (chunk) => (raw += chunk))
+      req.on('end', () => {
+        requests.push({ url: req.url, body: raw ? JSON.parse(raw) : null })
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, stopped: [], keptRunning: [], notStopped: [] }))
+      })
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    privateEnv.BATSHIT_RUNTIME_ADDON_OPERATOR_URL = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+    privateEnv.BATSHIT_RUNTIME_ADDON_OPERATOR_TOKEN = 'operator-test-token'
+    process.env.BATSHIT_CONTAINERIZED = '1'
+    for (const key of ['users:all', 'voice_engine_registry:josh', 'voice_engine_registry:someone-else', 'voice_engine_registry:old-id']) {
+      await redis.del(key)
+    }
+    // The instance's user, as creating it records.
+    await redis.sAdd('users:all', 'josh')
+  })
+
+  afterEach(async () => {
+    vi.restoreAllMocks()
+    if (originalContainerized === undefined) delete process.env.BATSHIT_CONTAINERIZED
+    else process.env.BATSHIT_CONTAINERIZED = originalContainerized
+    delete privateEnv.BATSHIT_RUNTIME_ADDON_OPERATOR_URL
+    delete privateEnv.BATSHIT_RUNTIME_ADDON_OPERATOR_TOKEN
+    resetRuntimeShutdownTasksForTests()
+    for (const key of ['users:all', 'voice_engine_registry:josh', 'voice_engine_registry:someone-else', 'voice_engine_registry:old-id']) {
+      await redis.del(key)
+    }
+    server.closeAllConnections()
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  })
+
+  it('sends every engine’s choice from Redis as it is at shutdown, with no page load or sign-in', async () => {
+    registerDockerVoiceEngineShutdown()
+    // Written after the server started: the choice at shutdown time is what counts.
+    await redis.json.set('voice_engine_registry:josh', '$', store([recipe('kokoro', 8010), recipe('whisper-cpp', 8077, false)]))
+
+    await closeRegisteredRuntimeResources('SIGTERM')
+
+    expect(requests).toEqual([
+      {
+        url: '/v1/voice-engines/stop',
+        body: {
+          engines: [
+            { engineId: 'kokoro', endpoint: 'http://127.0.0.1:8010', stopOnShutdown: true },
+            { engineId: 'whisper-cpp', endpoint: 'http://127.0.0.1:8077', stopOnShutdown: false }
+          ]
+        }
+      }
+    ])
+  })
+
+  it('reads the registry of every user the instance has, and none an old user id left behind', async () => {
+    await redis.sAdd('users:all', 'someone-else')
+    await redis.json.set('voice_engine_registry:josh', '$', store([recipe('kokoro', 8010)]))
+    await redis.json.set('voice_engine_registry:someone-else', '$', store([recipe('whisper-cpp', 8077, false)]))
+    // No user has this id any more; its choices must not overrule the real user's.
+    await redis.json.set('voice_engine_registry:old-id', '$', store([recipe('kokoro', 8010, false)]))
+
+    expect((await listVoiceEngineRecordsOfEveryUser()).map((record) => [record.id, record.localRuntime?.startup])).toEqual([
+      ['kokoro', undefined],
+      ['whisper-cpp', { stopOnShutdown: false }]
+    ])
+  })
+
+  it('a registry it cannot read sends nothing, so no engine set to keep running is stopped', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    await redis.json.set('voice_engine_registry:josh', '$', store([recipe('whisper-cpp', 8077, false)]))
+    registerDockerVoiceEngineShutdown()
+    // Redis goes first (Docker stopping every container at once): the read fails.
+    vi.spyOn(redis, 'execute').mockRejectedValueOnce(new Error('connection lost'))
+
+    await closeRegisteredRuntimeResources('SIGTERM')
+
+    expect(requests).toEqual([])
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('connection lost'))
+  })
+
+  it('a registry with one record it cannot read sends nothing: the operator would stop that engine', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    await redis.json.set(
+      'voice_engine_registry:josh',
+      '$',
+      store([recipe('kokoro', 8010), { ...recipe('whisper-cpp', 8077, false), futureOption: true }])
+    )
+    registerDockerVoiceEngineShutdown()
+
+    await closeRegisteredRuntimeResources('SIGTERM')
+
+    expect(requests).toEqual([])
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('whisper-cpp'))
+  })
+
+  it('a registry that does not parse sends nothing either', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    await redis.json.set('voice_engine_registry:josh', '$', { version: 99, records: [recipe('whisper-cpp', 8077, false)] })
+    registerDockerVoiceEngineShutdown()
+
+    await closeRegisteredRuntimeResources('SIGTERM')
+
+    expect(requests).toEqual([])
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('voice_engine_registry:josh does not parse'))
+  })
+
+  it('outside Docker nothing is registered: the launchers stop what they started', async () => {
+    delete process.env.BATSHIT_CONTAINERIZED
+    await redis.json.set('voice_engine_registry:josh', '$', store([recipe('kokoro', 8010)]))
+    registerDockerVoiceEngineShutdown()
+
+    await closeRegisteredRuntimeResources('SIGTERM')
+
+    expect(requests).toEqual([])
   })
 })
