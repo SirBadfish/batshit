@@ -1,5 +1,5 @@
 /**
- * BL-373 / BL-369: journal v3 recovery of skill and voice folders after a restore stopped
+ * BL-373 / BL-369: journal v4 recovery of skill and voice folders after a restore stopped
  * partway (a process that died, not a caught error). The journal records each replaced folder's
  * original and replacement identities; recovery puts the originals back only when every folder
  * is exactly where one of its two identities says, and keeps the journal otherwise.
@@ -88,7 +88,7 @@ afterEach(async () => {
 
 async function identity(target: string) {
   const stat = await fs.lstat(target, { bigint: true })
-  return { device: String(stat.dev), inode: String(stat.ino) }
+  return { device: String(stat.dev), inode: String(stat.ino), birthtimeNs: String(stat.birthtimeNs) }
 }
 
 /**
@@ -109,7 +109,7 @@ async function interruptedHostSwap(overrides: { rootPath?: string } = {}) {
   const rootPath = overrides.rootPath ?? SKILLS()
   const journalPath = path.join(staging, `${storageKey}.restore-journal.json`)
   await fs.writeFile(journalPath, JSON.stringify({
-    contract: 'batshit-backup-restore-journal/v3', stageId, userId: 'target',
+    contract: 'batshit-backup-restore-journal/v4', stageId, userId: 'target',
     phase: 'files-swapped', hadOriginalUploads: false, originalUploadEntries: [],
     hostEntries: [
       { root: 'skills', rootPath, name: 'zc_kept', original: await identity(path.join(oldDir, 'zc_kept')), replacement: await identity(path.join(SKILLS(), 'zc_kept')) },
@@ -120,7 +120,7 @@ async function interruptedHostSwap(overrides: { rootPath?: string } = {}) {
   return { oldDir, journalPath }
 }
 
-describe('skill and voice folder recovery (journal v3)', () => {
+describe('skill and voice folder recovery (journal v4)', () => {
   it('puts the originals back, removes the replacements, and leaves other folders alone', async () => {
     const { oldDir, journalPath } = await interruptedHostSwap()
     await ensureBackupRestoreRecovery()
@@ -160,6 +160,104 @@ describe('skill and voice folder recovery (journal v3)', () => {
     await ensureBackupRestoreRecovery()
     expect(await fs.readFile(path.join(SKILLS(), 'zc_new', 'SKILL.md'), 'utf8')).toBe('# someone else\n')
     expect(await fs.readFile(path.join(SKILLS(), 'zc_kept', 'SKILL.md'), 'utf8')).toBe('# original kept\n')
+    await expect(fs.stat(journalPath)).rejects.toThrow()
+  })
+
+  it('keeps a different creation even when the filesystem reuses the recorded device and inode', async () => {
+    const { journalPath } = await interruptedHostSwap()
+    const journal = JSON.parse(await fs.readFile(journalPath, 'utf8'))
+    const recorded = journal.hostEntries.find((entry: { name: string }) => entry.name === 'zc_new').replacement
+    const livePath = path.join(SKILLS(), 'zc_new')
+    await fs.rm(livePath, { recursive: true })
+    await fs.mkdir(livePath)
+    await fs.writeFile(path.join(livePath, 'SKILL.md'), '# different creation\n')
+    const lstat = fs.lstat.bind(fs)
+    vi.spyOn(fs, 'lstat').mockImplementation(async (target: any, options: any) => {
+      const stat = await lstat(target, options)
+      return String(target) === livePath && options?.bigint
+        ? Object.assign(stat, { dev: BigInt(recorded.device), ino: BigInt(recorded.inode), birthtimeNs: BigInt(recorded.birthtimeNs) + 1n })
+        : stat
+    })
+
+    await ensureBackupRestoreRecovery()
+    expect(await fs.readFile(path.join(livePath, 'SKILL.md'), 'utf8')).toBe('# different creation\n')
+    expect(await fs.readFile(path.join(SKILLS(), 'zc_kept', 'SKILL.md'), 'utf8')).toBe('# original kept\n')
+    await expect(fs.stat(journalPath)).rejects.toThrow()
+  })
+
+  it.each(['redis-replacing', 'redis-complete', 'rollback-complete'])('keeps every copy and journal for legacy host identities at %s', async (phase) => {
+    const { oldDir, journalPath } = await interruptedHostSwap()
+    const journal = JSON.parse(await fs.readFile(journalPath, 'utf8'))
+    journal.contract = 'batshit-backup-restore-journal/v3'
+    journal.phase = phase
+    for (const entry of journal.hostEntries) {
+      if (entry.original) delete entry.original.birthtimeNs
+      delete entry.replacement.birthtimeNs
+    }
+    await fs.writeFile(journalPath, JSON.stringify(journal))
+    const journalBefore = await fs.readFile(journalPath, 'utf8')
+    await redis.json.set('user:target:settings', '$', { marker: 'before' })
+    await fs.writeFile(path.join(uploads, 'unchanged.txt'), 'upload before')
+
+    await expect(ensureBackupRestoreRecovery()).rejects.toThrow(/creation identities.*manual recovery/)
+    expect(await fs.readFile(journalPath, 'utf8')).toBe(journalBefore)
+    expect(await fs.readFile(path.join(oldDir, 'zc_kept', 'SKILL.md'), 'utf8')).toBe('# original kept\n')
+    expect(await fs.readFile(path.join(SKILLS(), 'zc_kept', 'SKILL.md'), 'utf8')).toBe('# replacement kept\n')
+    expect(await fs.readFile(path.join(SKILLS(), 'zc_new', 'SKILL.md'), 'utf8')).toBe('# replacement new\n')
+    expect(await fs.readFile(path.join(uploads, 'unchanged.txt'), 'utf8')).toBe('upload before')
+    expect(await redis.json.get('user:target:settings')).toEqual({ marker: 'before' })
+  })
+
+  it.each([undefined, '0'])('refuses a journal without a positive creation timestamp (%s) before replay', async (birthtimeNs) => {
+    const { oldDir, journalPath } = await interruptedHostSwap()
+    const journal = JSON.parse(await fs.readFile(journalPath, 'utf8'))
+    if (birthtimeNs === undefined) delete journal.hostEntries[0].original.birthtimeNs
+    else journal.hostEntries[0].original.birthtimeNs = birthtimeNs
+    journal.phase = 'redis-replacing'
+    await fs.writeFile(journalPath, JSON.stringify(journal))
+    const before = await fs.readFile(journalPath, 'utf8')
+    await redis.json.set('user:target:settings', '$', { marker: 'before' })
+
+    await expect(ensureBackupRestoreRecovery()).rejects.toThrow(/creation inventory.*Manual recovery/)
+    expect(await fs.readFile(journalPath, 'utf8')).toBe(before)
+    expect(await fs.readFile(path.join(oldDir, 'zc_kept', 'SKILL.md'), 'utf8')).toBe('# original kept\n')
+    expect(await fs.readFile(path.join(SKILLS(), 'zc_kept', 'SKILL.md'), 'utf8')).toBe('# replacement kept\n')
+    expect(await fs.readFile(path.join(SKILLS(), 'zc_new', 'SKILL.md'), 'utf8')).toBe('# replacement new\n')
+    expect(await redis.json.get('user:target:settings')).toEqual({ marker: 'before' })
+  })
+
+  it.each([undefined, 0n])('refuses unavailable filesystem creation time (%s) before changing any copy', async (birthtimeNs) => {
+    const { oldDir, journalPath } = await interruptedHostSwap()
+    const journal = JSON.parse(await fs.readFile(journalPath, 'utf8'))
+    journal.phase = 'redis-replacing'
+    await fs.writeFile(journalPath, JSON.stringify(journal))
+    const before = await fs.readFile(journalPath, 'utf8')
+    await redis.json.set('user:target:settings', '$', { marker: 'before' })
+    const originalPath = path.join(oldDir, 'zc_kept')
+    const lstat = fs.lstat.bind(fs)
+    vi.spyOn(fs, 'lstat').mockImplementation(async (target: any, options: any) => {
+      const stat = await lstat(target, options)
+      return String(target) === originalPath && options?.bigint ? Object.assign(stat, { birthtimeNs }) : stat
+    })
+
+    await expect(ensureBackupRestoreRecovery()).rejects.toThrow(/cannot safely identify.*manual recovery/)
+    expect(await fs.readFile(journalPath, 'utf8')).toBe(before)
+    expect(await fs.readFile(path.join(originalPath, 'SKILL.md'), 'utf8')).toBe('# original kept\n')
+    expect(await fs.readFile(path.join(SKILLS(), 'zc_kept', 'SKILL.md'), 'utf8')).toBe('# replacement kept\n')
+    expect(await fs.readFile(path.join(SKILLS(), 'zc_new', 'SKILL.md'), 'utf8')).toBe('# replacement new\n')
+    expect(await redis.json.get('user:target:settings')).toEqual({ marker: 'before' })
+  })
+
+  it('accepts valid positive creation time equal to ctime and retains rename recovery', async () => {
+    const { journalPath } = await interruptedHostSwap()
+    const lstat = fs.lstat.bind(fs)
+    vi.spyOn(fs, 'lstat').mockImplementation(async (target: any, options: any) => {
+      const stat = await lstat(target, options)
+      return options?.bigint ? Object.assign(stat, { ctimeNs: (stat as any).birthtimeNs }) : stat
+    })
+    await ensureBackupRestoreRecovery()
+    expect(await fs.readFile(path.join(SKILLS(), 'zc_kept', 'SKILL.md'), 'utf8')).toBe('# original kept\n')
+    await expect(fs.stat(path.join(SKILLS(), 'zc_new'))).rejects.toThrow()
     await expect(fs.stat(journalPath)).rejects.toThrow()
   })
 
@@ -323,7 +421,7 @@ describe('skill and voice folder recovery (journal v3)', () => {
     const journals = (await fs.readdir(staging)).filter((name) => name.endsWith('.restore-journal.json'))
     expect(journals).toHaveLength(1)
     const journal = JSON.parse(await fs.readFile(path.join(staging, journals[0]), 'utf8'))
-    expect(journal.contract).toBe('batshit-backup-restore-journal/v3')
+    expect(journal.contract).toBe('batshit-backup-restore-journal/v4')
     expect(journal.hostEntries.map((entry: { name: string }) => entry.name)).toEqual(['zc_notes'])
 
     await ensureBackupRestoreRecovery()

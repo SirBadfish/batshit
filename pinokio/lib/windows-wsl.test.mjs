@@ -187,12 +187,14 @@ test('exact command-scoped source trust permits real Git clone/upload-pack and f
   success(invoke(argsFor(mounted, ['clone', '--no-local', '--no-hardlinks', '--no-checkout', mounted, cloned]), unowned));
   success(invoke(['-C', cloned, 'checkout', '--quiet', '--detach', 'v9.1.0']));
   assert.equal(readFileSync(join(cloned, 'release'), 'utf8'), 'first');
-  // Fetch keeps the owned destination under ordinary checks; only its real upload-pack
-  // child simulates DrvFS ownership, avoiding a fake destination-wide exception.
-  const uploadPack = '--upload-pack=env GIT_TEST_ASSUME_DIFFERENT_OWNER=1 git-upload-pack';
-  const oldFetch = invoke(['-c', `safe.directory=${source}`, '-C', cloned, 'fetch', '--tags', uploadPack, 'origin']);
-  assert.notEqual(oldFetch.status, 0);
-  assert.match(oldFetch.stderr, /dubious ownership/);
+  // Worktree trust alone must not admit a direct Git-directory read. Git 2.55's
+  // upload-pack permits any owner, so it cannot supply this negative assertion.
+  // https://github.com/git/git/blob/v2.55.0/builtin/upload-pack.c#L41
+  const untrustedGitDirectory = invoke(['-c', `safe.directory=${source}`, '-C', `${source}/.git`, 'rev-parse', '--git-dir'], unowned);
+  assert.notEqual(untrustedGitDirectory.status, 0);
+  assert.match(untrustedGitDirectory.stderr, /dubious ownership/);
+  // The actual product-built fetch still exercises its upload-pack child and
+  // exact quoting; destination ownership stays under ordinary checks.
   const childOwnerArgs = argsFor(cloned, ['fetch', '--tags', 'origin']).map(arg => arg.startsWith('--upload-pack=') ? arg.replace('--upload-pack=', '--upload-pack=env GIT_TEST_ASSUME_DIFFERENT_OWNER=1 ') : arg);
   success(invoke(childOwnerArgs));
   const other = join(root, 'foreign-source-trust');

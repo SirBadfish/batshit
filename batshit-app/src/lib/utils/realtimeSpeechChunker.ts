@@ -59,20 +59,90 @@ function hasUnclosedSingleEmphasis(text: string, marker: '*' | '_'): boolean {
   return open
 }
 
+const TAG_NAME = 1 << 0
+const ATTRIBUTE_NAME = 1 << 1
+const ATTRIBUTE_GAP = 1 << 2
+const ATTRIBUTE_EQUALS_GAP = 1 << 3
+const VALUE_START = 1 << 4
+const UNQUOTED_VALUE = 1 << 5
+const DOUBLE_QUOTED_VALUE = 1 << 6
+const SINGLE_QUOTED_VALUE = 1 << 7
+const VALUE_END = 1 << 8
+const TAG_END = 1 << 9
+
 /**
- * What the text after a last `<` looks like while a real tag is still being written (R5): a name,
- * then attributes as HTML writes them. Words after a name ("<batshit-memory tag and it's saved")
- * are not a tag in writing, so speech goes on.
+ * The suffix after a last `<` while a real tag is still being written (R5): a name, then HTML
+ * attributes, with unfinished values allowed. A fixed state set reads each character once
+ * (BL-1508); retrying the nested attribute regex can take exponential time on malformed text.
+ * Empty unquoted values make whitespace after `=` ambiguous: `<tag a= b=ok` can start `b` as
+ * another attribute. Keep both possibilities without rewinding. Every live state accepts EOF.
  */
-const TAG_STILL_BEING_WRITTEN =
-  /^<\/?(?:[A-Za-z][A-Za-z0-9:_-]*(?:\s+[A-Za-z_:][A-Za-z0-9_:.-]*(?:\s*=\s*(?:"[^"<>]*"?|'[^'<>]*'?|[^\s"'=<>`]*))?)*\s*\/?)?$/
+export function isTagStillBeingWritten(text: string): boolean {
+  if (text[0] !== '<') return false
+  let index = text[1] === '/' ? 2 : 1
+  if (index === text.length) return true
+  if (!/[A-Za-z]/.test(text[index])) return false
+
+  let states = TAG_NAME
+  for (index += 1; index < text.length; index += 1) {
+    const char = text[index]
+    const whitespace = /\s/.test(char)
+    const attributeStart = /[A-Za-z_:]/.test(char)
+    const unquotedValue = /[^\s"'=<>`]/.test(char)
+    let nextStates = 0
+
+    if (states & TAG_NAME) {
+      if (/[A-Za-z0-9:_-]/.test(char)) nextStates |= TAG_NAME
+      else if (whitespace) nextStates |= ATTRIBUTE_GAP
+      else if (char === '/') nextStates |= TAG_END
+    }
+    if (states & ATTRIBUTE_NAME) {
+      if (/[A-Za-z0-9_:.-]/.test(char)) nextStates |= ATTRIBUTE_NAME
+      else if (whitespace) nextStates |= ATTRIBUTE_EQUALS_GAP
+      else if (char === '=') nextStates |= VALUE_START
+      else if (char === '/') nextStates |= TAG_END
+    }
+    if (states & (ATTRIBUTE_GAP | ATTRIBUTE_EQUALS_GAP)) {
+      if (whitespace) nextStates |= states & (ATTRIBUTE_GAP | ATTRIBUTE_EQUALS_GAP)
+      else if (attributeStart) nextStates |= ATTRIBUTE_NAME
+      else if (char === '/') nextStates |= TAG_END
+      else if (char === '=' && states & ATTRIBUTE_EQUALS_GAP) nextStates |= VALUE_START
+    }
+    if (states & VALUE_START) {
+      if (whitespace) nextStates |= VALUE_START | ATTRIBUTE_GAP
+      else if (char === '"') nextStates |= DOUBLE_QUOTED_VALUE
+      else if (char === "'") nextStates |= SINGLE_QUOTED_VALUE
+      else if (unquotedValue) nextStates |= UNQUOTED_VALUE
+    }
+    if (states & UNQUOTED_VALUE) {
+      if (whitespace) nextStates |= ATTRIBUTE_GAP
+      else if (unquotedValue) nextStates |= UNQUOTED_VALUE
+    }
+    if (states & DOUBLE_QUOTED_VALUE) {
+      if (char === '"') nextStates |= VALUE_END
+      else if (char !== '<' && char !== '>') nextStates |= DOUBLE_QUOTED_VALUE
+    }
+    if (states & SINGLE_QUOTED_VALUE) {
+      if (char === "'") nextStates |= VALUE_END
+      else if (char !== '<' && char !== '>') nextStates |= SINGLE_QUOTED_VALUE
+    }
+    if (states & VALUE_END) {
+      if (whitespace) nextStates |= ATTRIBUTE_GAP
+      else if (char === '/') nextStates |= TAG_END
+    }
+    if (nextStates === 0) return false
+    states = nextStates
+  }
+
+  return true
+}
 
 function hasUnstableSpeechMarkup(text: string, options?: SpeakableTextOptions): boolean {
   const lastOpenTag = text.lastIndexOf('<')
   const lastCloseTag = text.lastIndexOf('>')
   // BL-477: only a `<` that can still become a real tag waits for more text; a lone `<` in a
   // sentence ("if the count is < 5") is spoken now instead of holding speech to the reply's end.
-  if (lastOpenTag > lastCloseTag && TAG_STILL_BEING_WRITTEN.test(text.slice(lastOpenTag))) return true
+  if (lastOpenTag > lastCloseTag && isTagStillBeingWritten(text.slice(lastOpenTag))) return true
 
   const lastOpenZip = text.lastIndexOf('{{')
   const lastCloseZip = text.lastIndexOf('}}')

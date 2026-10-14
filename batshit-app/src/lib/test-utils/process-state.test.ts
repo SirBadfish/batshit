@@ -33,6 +33,7 @@ describe.runIf(process.platform === 'linux')('Linux test process observation', (
     // The owned parent keeps waitpid behind the second input byte. EOF on any
     // failure path releases and reaps its child; nothing is handed to PID 1.
     fs.writeFileSync(source, `
+#include <errno.h>
 #include <stdio.h>
 #include <sys/prctl.h>
 #include <sys/wait.h>
@@ -45,19 +46,26 @@ int main(void) {
   if (!child) {
     close(gate[1]);
     char byte;
-    (void)read(gate[0], &byte, 1);
+    ssize_t received;
+    do {
+      received = read(gate[0], &byte, 1);
+    } while (received < 0 && errno == EINTR);
     close(gate[0]);
-    _exit(0);
+    _exit(received == 1 ? 0 : 6);
   }
   close(gate[0]);
   printf("%ld\\n", (long)child); fflush(stdout);
   int command = getchar();
-  (void)write(gate[1], "x", 1); close(gate[1]);
+  ssize_t released;
+  do {
+    released = write(gate[1], "x", 1);
+  } while (released < 0 && errno == EINTR);
+  close(gate[1]);
   if (command != EOF) (void)getchar();
   int status;
   if (waitpid(child, &status, 0) != child) return 4;
   puts("REAPED");
-  return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 5;
+  return released == 1 && WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 5;
 }
 `)
     try {

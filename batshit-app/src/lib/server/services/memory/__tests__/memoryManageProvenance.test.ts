@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { beforeEach, describe, expect, it } from 'vitest'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
+import { memorySearchLaneActive, useMemorySearchTestServer } from '$lib/test-utils/memory-search-server'
 import { redis } from '$lib/server/redis'
 import { getManagedMemoryDetail } from '../memoryManage'
 
@@ -8,10 +9,11 @@ import { getManagedMemoryDetail } from '../memoryManage'
  * BL-447: the Memory Panel's "Where It Came From" list prints "(original chat deleted)" for a
  * provenance entry with `source_deleted`, but nothing ever set it. The detail loader now works
  * it out from whether each entry's chat (`session:{id}`) still exists, and stores nothing.
- * Runs on the default fake and on the real-Redis lane; no search index is needed.
+ * Runs on the default fake, real-Redis test DB, or owned memory-lane DB0; no search index is needed.
  */
 
-useRedisTestServer()
+if (memorySearchLaneActive()) useMemorySearchTestServer()
+else useRedisTestServer()
 
 const USER = 'bl447-user'
 const AGENT = 'bl447-agent'

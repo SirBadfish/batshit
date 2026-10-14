@@ -4250,8 +4250,12 @@ interface RestoreFileNodeIdentity {
   inode: string
 }
 
+interface RestoreHostNodeIdentity extends RestoreFileNodeIdentity {
+  birthtimeNs: string
+}
+
 /**
- * BL-373/BL-369 (journal v3): one skill or voice folder a restore replaces. Only the folders
+ * BL-373/BL-369 (journal v4): one skill or voice folder a restore replaces. Only the folders
  * the backup carries are touched, never a whole root: `~/.batshit/skills` and
  * `~/.batshit/voice-profiles` are shared by every Batshit on the computer (BL-342). `original`
  * is the folder that was there (null when there was none); `replacement` is the one the
@@ -4262,12 +4266,12 @@ interface RestoreHostEntry {
   root: HostFileRootId
   rootPath: string
   name: string
-  original: RestoreFileNodeIdentity | null
-  replacement: RestoreFileNodeIdentity
+  original: RestoreHostNodeIdentity | null
+  replacement: RestoreHostNodeIdentity
 }
 
 interface RestoreJournal {
-  contract: 'batshit-backup-restore-journal/v1' | 'batshit-backup-restore-journal/v2' | 'batshit-backup-restore-journal/v3'
+  contract: 'batshit-backup-restore-journal/v1' | 'batshit-backup-restore-journal/v2' | 'batshit-backup-restore-journal/v3' | 'batshit-backup-restore-journal/v4'
   stageId: string
   userId: string
   phase: 'prepared' | 'files-old-moved' | 'files-swapped' | 'redis-replacing' | 'redis-complete' | 'rollback-complete'
@@ -4906,7 +4910,7 @@ async function captureOriginalUploadEntries(uploadRoot: string): Promise<Restore
 
 function requireOriginalUploadEntries(journal: RestoreJournal): RestoreUploadEntry[] {
   if (
-    (journal.contract !== 'batshit-backup-restore-journal/v2' && journal.contract !== 'batshit-backup-restore-journal/v3') ||
+    (journal.contract !== 'batshit-backup-restore-journal/v2' && journal.contract !== 'batshit-backup-restore-journal/v3' && journal.contract !== 'batshit-backup-restore-journal/v4') ||
     !Array.isArray(journal.originalUploadEntries)
   ) {
     throw new BackupRestoreError('This interrupted restore predates safe per-file recovery. Batshit kept its files and journal; manual recovery is required.', 500)
@@ -4990,6 +4994,37 @@ function sameFileNode(left: RestoreFileNodeIdentity | null, right: RestoreFileNo
   return left !== null && right !== null && left.device === right.device && left.inode === right.inode
 }
 
+function hostCreationIdentityError() {
+  return new BackupRestoreError(
+    'The filesystem cannot safely identify a skill or voice folder. Batshit kept its files; manual recovery is required.',
+    500
+  )
+}
+
+/** Host folders need creation identity too: a deleted directory's inode can be reused. */
+async function identifyHostNode(target: string): Promise<RestoreHostNodeIdentity | null> {
+  try {
+    const stat = await fs.lstat(target, { bigint: true })
+    if (!stat.isDirectory() || typeof stat.birthtimeNs !== 'bigint' || stat.birthtimeNs <= 0n) {
+      throw hostCreationIdentityError()
+    }
+    return { device: String(stat.dev), inode: String(stat.ino), birthtimeNs: String(stat.birthtimeNs) }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+    throw error
+  }
+}
+
+function sameHostNode(left: RestoreHostNodeIdentity | null, right: RestoreHostNodeIdentity | null) {
+  return left !== null && right !== null && sameFileNode(left, right) && left.birthtimeNs === right.birthtimeNs
+}
+
+async function assertHostNodeAfterRename(target: string, expected: RestoreHostNodeIdentity) {
+  // Node may report ctime as birthtime on an unsupported filesystem. Do not downgrade
+  // to device/inode when that value changes on rename: retain recovery evidence instead.
+  if (!sameHostNode(await identifyHostNode(target), expected)) throw hostCreationIdentityError()
+}
+
 /**
  * BL-373/BL-369: extract each placed skill or voice folder into `{root}/.restore-new-{key}/`
  * (the root's own volume, so moving it in is an atomic rename) and record the identity of the
@@ -5041,9 +5076,9 @@ async function extractStagedHostFolders(
     for (const key of Array.from(placed.keys()).sort()) {
       const { root, folder } = placed.get(key)![0]
       const rootPath = roots.get(root)!
-      const replacement = await identifyFileNode(path.join(hostTransactionDirs(rootPath, storageKey).newDir, folder))
+      const replacement = await identifyHostNode(path.join(hostTransactionDirs(rootPath, storageKey).newDir, folder))
       if (!replacement) throw new BackupRestoreError(`Extracted folder "${key}" is missing.`, 500)
-      entries.push({ root, rootPath, name: folder, original: await identifyFileNode(path.join(rootPath, folder)), replacement })
+      entries.push({ root, rootPath, name: folder, original: await identifyHostNode(path.join(rootPath, folder)), replacement })
     }
     return entries
   } catch (error) {
@@ -5067,12 +5102,12 @@ function hostFolderChangedError(entry: RestoreHostEntry) {
  * Checked for every folder before the restore changes anything, and again right before each move.
  */
 async function assertHostFolderUnchanged(entry: RestoreHostEntry, storageKey: string, stage: 'before-move' | 'before-move-in') {
-  const live = await identifyFileNode(path.join(entry.rootPath, entry.name))
-  const extracted = await identifyFileNode(path.join(hostTransactionDirs(entry.rootPath, storageKey).newDir, entry.name))
+  const live = await identifyHostNode(path.join(entry.rootPath, entry.name))
+  const extracted = await identifyHostNode(path.join(hostTransactionDirs(entry.rootPath, storageKey).newDir, entry.name))
   const liveAsRecorded = stage === 'before-move'
-    ? entry.original ? sameFileNode(live, entry.original) : live === null
+    ? entry.original ? sameHostNode(live, entry.original) : live === null
     : live === null
-  if (!liveAsRecorded || !sameFileNode(extracted, entry.replacement)) throw hostFolderChangedError(entry)
+  if (!liveAsRecorded || !sameHostNode(extracted, entry.replacement)) throw hostFolderChangedError(entry)
 }
 
 async function assertHostFoldersUnchanged(entries: RestoreHostEntry[], storageKey: string) {
@@ -5086,6 +5121,7 @@ async function moveHostOriginalsAside(entries: RestoreHostEntry[], storageKey: s
     const { oldDir } = hostTransactionDirs(entry.rootPath, storageKey)
     await fs.mkdir(oldDir, { recursive: true, mode: 0o700 })
     await fs.rename(path.join(entry.rootPath, entry.name), path.join(oldDir, entry.name))
+    await assertHostNodeAfterRename(path.join(oldDir, entry.name), entry.original)
   }
 }
 
@@ -5096,6 +5132,7 @@ async function moveHostReplacementsIn(entries: RestoreHostEntry[], storageKey: s
     await assertHostFolderUnchanged(entry, storageKey, 'before-move-in')
     const { newDir } = hostTransactionDirs(entry.rootPath, storageKey)
     await fs.rename(path.join(newDir, entry.name), path.join(entry.rootPath, entry.name))
+    await assertHostNodeAfterRename(path.join(entry.rootPath, entry.name), entry.replacement)
     roots.add(entry.rootPath)
   }
   for (const rootPath of roots) {
@@ -5114,8 +5151,13 @@ async function moveHostReplacementsIn(entries: RestoreHostEntry[], storageKey: s
  * in the rollback folder that is not the recorded one, or the replacement live while the
  * original is in neither place.
  */
-async function restoreHostFolders(entries: RestoreHostEntry[], storageKey: string) {
-  if (entries.length === 0) return
+interface HostRecoveryPlan {
+  remove: Array<{ path: string; identity: RestoreHostNodeIdentity }>
+  returnOriginal: Array<{ from: string; to: string; identity: RestoreHostNodeIdentity }>
+  roots: string[]
+}
+
+async function planHostFolderRecovery(entries: RestoreHostEntry[], storageKey: string): Promise<HostRecoveryPlan> {
   const namesWithOriginal = new Map<string, Set<string>>()
   for (const entry of entries) {
     const names = namesWithOriginal.get(entry.rootPath) ?? new Set<string>()
@@ -5129,17 +5171,17 @@ async function restoreHostFolders(entries: RestoreHostEntry[], storageKey: strin
     }
   }
 
-  const remove: string[] = []
-  const returnOriginal: Array<{ from: string; to: string }> = []
+  const remove: HostRecoveryPlan['remove'] = []
+  const returnOriginal: HostRecoveryPlan['returnOriginal'] = []
   for (const entry of entries) {
     const oldPath = path.join(hostTransactionDirs(entry.rootPath, storageKey).oldDir, entry.name)
     const livePath = path.join(entry.rootPath, entry.name)
-    const old = await identifyFileNode(oldPath)
-    const live = await identifyFileNode(livePath)
-    const liveIsReplacement = sameFileNode(live, entry.replacement)
+    const old = await identifyHostNode(oldPath)
+    const live = await identifyHostNode(livePath)
+    const liveIsReplacement = sameHostNode(live, entry.replacement)
     const verified = entry.original
       ? old
-        ? sameFileNode(old, entry.original) && (live === null || liveIsReplacement)
+        ? sameHostNode(old, entry.original) && (live === null || liveIsReplacement)
         : !liveIsReplacement
       : old === null
     if (!verified) {
@@ -5148,22 +5190,43 @@ async function restoreHostFolders(entries: RestoreHostEntry[], storageKey: strin
         500
       )
     }
-    if (liveIsReplacement) remove.push(livePath)
-    if (entry.original && old) returnOriginal.push({ from: oldPath, to: livePath })
+    if (liveIsReplacement) remove.push({ path: livePath, identity: entry.replacement })
+    if (entry.original && old) returnOriginal.push({ from: oldPath, to: livePath, identity: entry.original })
   }
-  for (const livePath of remove) await fs.rm(livePath, { recursive: true, force: true })
-  for (const move of returnOriginal) await fs.rename(move.from, move.to)
-  for (const rootPath of namesWithOriginal.keys()) await syncRestoreDirectory(rootPath)
+  return { remove, returnOriginal, roots: [...namesWithOriginal.keys()] }
+}
+
+async function restoreHostFolders(entries: RestoreHostEntry[], storageKey: string) {
+  const plan = await planHostFolderRecovery(entries, storageKey)
+  for (const removal of plan.remove) {
+    if (!sameHostNode(await identifyHostNode(removal.path), removal.identity)) throw hostCreationIdentityError()
+    await fs.rm(removal.path, { recursive: true, force: true })
+  }
+  for (const move of plan.returnOriginal) {
+    if (!sameHostNode(await identifyHostNode(move.from), move.identity) || await identifyHostNode(move.to) !== null) {
+      throw hostCreationIdentityError()
+    }
+    await fs.rename(move.from, move.to)
+    await assertHostNodeAfterRename(move.to, move.identity)
+  }
+  for (const rootPath of plan.roots) await syncRestoreDirectory(rootPath)
 }
 
 function requireHostEntries(journal: RestoreJournal): RestoreHostEntry[] {
-  if (journal.contract !== 'batshit-backup-restore-journal/v3') return []
+  if (journal.contract !== 'batshit-backup-restore-journal/v3' && journal.contract !== 'batshit-backup-restore-journal/v4') return []
   if (!Array.isArray(journal.hostEntries)) {
     throw new BackupRestoreError('The restore journal has no skill and voice folder inventory; no files were changed.', 500)
   }
-  const isIdentity = (value: unknown): value is RestoreFileNodeIdentity =>
+  if (journal.contract === 'batshit-backup-restore-journal/v3' && journal.hostEntries.length > 0) {
+    throw new BackupRestoreError(
+      'The interrupted restore has no reliable skill and voice folder creation identities. Batshit kept its files and journal; manual recovery is required.',
+      500
+    )
+  }
+  const isIdentity = (value: unknown): value is RestoreHostNodeIdentity =>
     isPlainObject(value) && typeof value.device === 'string' && /^\d+$/.test(value.device) &&
-    typeof value.inode === 'string' && /^\d+$/.test(value.inode)
+    typeof value.inode === 'string' && /^\d+$/.test(value.inode) &&
+    typeof value.birthtimeNs === 'string' && /^[1-9]\d*$/.test(value.birthtimeNs)
   const seen = new Set<string>()
   for (const entry of journal.hostEntries) {
     const valid =
@@ -5171,7 +5234,7 @@ function requireHostEntries(journal: RestoreJournal): RestoreHostEntry[] {
       typeof entry.rootPath === 'string' && (entry.original === null || isIdentity(entry.original)) &&
       isIdentity(entry.replacement) && !seen.has(hostFolderKey(entry.root, entry.name))
     if (!valid) {
-      throw new BackupRestoreError('The restore journal has an invalid skill and voice folder inventory; no files were changed.', 500)
+      throw new BackupRestoreError('The restore journal has an invalid skill and voice folder creation inventory; no files were changed. Manual recovery is required.', 500)
     }
     if (entry.rootPath !== resolveHostFileRoot(entry.root)) {
       throw new BackupRestoreError(
@@ -5208,6 +5271,20 @@ async function keepReplacedHostFolders(
   storageKey: string,
   createdAt: string
 ): Promise<KeptHostFolder[]> {
+  // A terminal retry may find originals in either location. Check every recorded
+  // creation identity before moving a rollback directory or deleting transaction files.
+  for (const entry of hostEntries) {
+    if (!entry.original) continue
+    const { oldDir } = hostTransactionDirs(entry.rootPath, storageKey)
+    const keptDir = hostReplacedDir(entry.rootPath, storageKey, createdAt)
+    const old = await identifyHostNode(path.join(oldDir, entry.name))
+    const alreadyKept = await identifyHostNode(path.join(keptDir, entry.name))
+    if (
+      (!old && !alreadyKept) ||
+      (old && !sameHostNode(old, entry.original)) ||
+      (alreadyKept && !sameHostNode(alreadyKept, entry.original))
+    ) throw hostCreationIdentityError()
+  }
   const kept: KeptHostFolder[] = []
   for (const rootPath of new Set(hostEntries.map((entry) => entry.rootPath))) {
     const { oldDir } = hostTransactionDirs(rootPath, storageKey)
@@ -5263,7 +5340,8 @@ async function recoverRestoreJournal(journalPath: string) {
     ![
       'batshit-backup-restore-journal/v1',
       'batshit-backup-restore-journal/v2',
-      'batshit-backup-restore-journal/v3'
+      'batshit-backup-restore-journal/v3',
+      'batshit-backup-restore-journal/v4'
     ].includes(raw.contract) ||
     typeof raw.userId !== 'string'
   ) {
@@ -5276,6 +5354,7 @@ async function recoverRestoreJournal(journalPath: string) {
 
   const hostEntries = requireHostEntries(raw)
   if (raw.phase === 'redis-complete' || raw.phase === 'rollback-complete') {
+    if (raw.phase === 'rollback-complete') await planHostFolderRecovery(hostEntries, paths.storageKey)
     const kept = await cleanupRestoreOperation(paths, raw.phase === 'redis-complete', hostEntries, raw.createdAt)
     for (const folder of kept) {
       console.warn(`[BackupRestore] The restore replaced ${folder.root}/${folder.folder}; Batshit kept the previous copy in ${folder.path}.`)
@@ -5287,6 +5366,9 @@ async function recoverRestoreJournal(journalPath: string) {
     throw new BackupRestoreError('The interrupted restore journal phase is invalid.', 500)
   }
   const entries = requireOriginalUploadEntries(raw)
+  // Admit every host folder before replay can mutate Redis or the upload tree. The
+  // host apply step repeats the census so an intervening change never borrows this look.
+  await planHostFolderRecovery(hostEntries, paths.storageKey)
   if (raw.phase === 'redis-replacing') {
     await restoreRedisFromRollback(paths.planPath, paths.rollbackPath, raw)
   }
@@ -5456,11 +5538,11 @@ async function restoreStagedBackupData(
       identifyRestoreFile(paths.planPath), identifyRestoreFile(paths.rollbackPath)
     ])
     const originalUploadEntries = await captureOriginalUploadEntries(paths.uploadRoot)
-    // BL-373/BL-369: the skill and voice folders, extracted beside their roots. Journal v3
-    // records them; an older Batshit meeting a v3 journal stops for manual recovery.
+    // Host journal v4 adds creation identities so an inode reused after deletion
+    // cannot authorize removing a new folder. Older readers refuse v4 safely.
     const hostEntries = await extractStagedHostFolders(bundle, placedHostFolders, paths.storageKey)
     const journal: RestoreJournal = {
-      contract: 'batshit-backup-restore-journal/v3',
+      contract: hostEntries.length > 0 ? 'batshit-backup-restore-journal/v4' : 'batshit-backup-restore-journal/v3',
       stageId,
       userId,
       phase: 'prepared',
@@ -5507,6 +5589,7 @@ async function restoreStagedBackupData(
       })
     } catch (error) {
       try {
+        await planHostFolderRecovery(hostEntries, paths.storageKey)
         if (journal.phase === 'redis-replacing') {
           await restoreRedisFromRollback(paths.planPath, paths.rollbackPath, journal)
         }

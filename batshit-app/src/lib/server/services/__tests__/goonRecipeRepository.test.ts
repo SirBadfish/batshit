@@ -128,23 +128,14 @@ function goon(name = 'Recipe CAS Goon', writeVersion = 1): GoonRecord {
   }
 }
 
-function sphericalEyelid(
-  method: 'original' | 'spherical',
-  outwardMM: number
-): NonNullable<GoonRecord['sphericalEyelid']> {
-  const side = {
-    fit: {
-      translationMM: [outwardMM, 0, 0] as [number, number, number],
-      rotationDegreesXYZ: [0, 0, 0] as [number, number, number]
-    },
-    opening: { width: 1.04, height: 0.92, slantDegrees: 2, cornerRise: 0.03 },
-    roundingRadiusMM: 0.42
-  }
+function hairState(baseColor: string): NonNullable<GoonRecord['hairState']> {
   return {
-    contract: 'spherical-eyelid-state/v1',
-    definitionSha256: sha('f'),
-    method,
-    spherical: { left: structuredClone(side), right: structuredClone(side) }
+    schemaVersion: 'hair-state/v2',
+    definitionSha256: null,
+    selected: null,
+    baseColor,
+    highlightColor: '#997755',
+    motionSettings: null
   }
 }
 
@@ -534,7 +525,6 @@ describe('Goon Recipe repository', () => {
       nailSurface: { marker: 'old' },
       skinAppearance: { marker: 'old' },
       hairState: { marker: 'old' },
-      sphericalEyelid: sphericalEyelid('original', 2.25),
       recipeFitReceipts: [{ receiptId: 'old-fit' }]
     })
     const next = {
@@ -547,7 +537,6 @@ describe('Goon Recipe repository', () => {
       nailSurface: { marker: 'new' },
       skinAppearance: { marker: 'new' },
       hairState: { marker: 'new' },
-      sphericalEyelid: sphericalEyelid('spherical', 2.5),
       recipeFitReceipts: [{ receiptId: 'new-fit', status: 'stale' }],
       updated_at: '2026-07-17T00:00:01.000Z'
     } as unknown as GoonRecord
@@ -567,16 +556,15 @@ describe('Goon Recipe repository', () => {
       nailSurface: { marker: 'new' },
       skinAppearance: { marker: 'new' },
       hairState: { marker: 'new' },
-      sphericalEyelid: sphericalEyelid('spherical', 2.5),
       recipeFitReceipts: [{ receiptId: 'new-fit', status: 'stale' }]
     })
   })
 
-  it.runIf(REAL_REDIS_LANE)('atomically sets, clears, and restores the spherical sibling projection', async () => {
-    const original = sphericalEyelid('original', 2.25)
+  it.runIf(REAL_REDIS_LANE)('atomically sets, clears, and restores the supported Hair sibling projection', async () => {
+    const original = hairState('#553322')
     await redis.json.set(`goon:${GOON_ID}`, '$', {
       ...goon(),
-      sphericalEyelid: original
+      hairState: original
     })
 
     const updated = await compareAndSwapRecipeState({
@@ -584,23 +572,23 @@ describe('Goon Recipe repository', () => {
       goonId: GOON_ID,
       expectedWriteVersion: 1,
       nextGoon: {
-        ...goon('Spherical Revision', 2),
-        sphericalEyelid: sphericalEyelid('spherical', 2.5),
+        ...goon('Hair Color Revision', 2),
+        hairState: hairState('#112233'),
         updated_at: '2026-07-17T00:00:01.000Z'
       }
     })
-    expect(updated.sphericalEyelid).toEqual(sphericalEyelid('spherical', 2.5))
+    expect(updated.hairState).toEqual(hairState('#112233'))
 
     const cleared = await compareAndSwapRecipeState({
       userId: USER_ID,
       goonId: GOON_ID,
       expectedWriteVersion: 2,
       nextGoon: {
-        ...goon('Original Without Sibling', 3),
+        ...goon('Without Hair Sibling', 3),
         updated_at: '2026-07-17T00:00:02.000Z'
       }
     })
-    expect(cleared).not.toHaveProperty('sphericalEyelid')
+    expect(cleared).not.toHaveProperty('hairState')
 
     const restored = await compareAndSwapRecipeState({
       userId: USER_ID,
@@ -608,11 +596,11 @@ describe('Goon Recipe repository', () => {
       expectedWriteVersion: 3,
       nextGoon: {
         ...goon('Rolled Back Revision', 4),
-        sphericalEyelid: original,
+        hairState: original,
         updated_at: '2026-07-17T00:00:03.000Z'
       }
     })
-    expect(restored.sphericalEyelid).toEqual(original)
+    expect(restored.hairState).toEqual(original)
   })
 
   it.runIf(REAL_REDIS_LANE)('preserves Anatomy Fit hashes through a nested RedisJSON round trip', async () => {
@@ -798,7 +786,7 @@ describe('Goon Recipe repository', () => {
     const owner = {
       ...goonWithPendingJob(1, 2),
       name: 'Concurrent unrelated name',
-      sphericalEyelid: sphericalEyelid('spherical', 2.5)
+      hairState: hairState('#112233')
     }
     const job = {
       ...bakingJob(1, 2),

@@ -1,5 +1,5 @@
 import { inflateSync } from 'node:zlib'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   createHairImportTexturePng,
@@ -22,13 +22,13 @@ function chunks(bytes: Uint8Array) {
 }
 
 describe('Hair import owned-file helpers', () => {
+  beforeEach(() => { vi.stubEnv('BATSHIT_TOKEN', 'synthetic-hair-file-test-token') })
   afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs() })
 
   it('publishes the importer owner with canonical bytes before any job CAS', async () => {
     const bytes = new TextEncoder().encode('{}\n')
     const { createHash } = await import('node:crypto')
     const sha256 = createHash('sha256').update(bytes).digest('hex')
-    vi.stubEnv('BATSHIT_TOKEN', 'synthetic-hair-file-test-token')
     const request = vi.fn(async (_url: unknown, options: any) => {
       const form = options.body as FormData
       expect(JSON.parse(String(form.get('hairImportOwner')))).toEqual({ contract: 'hair-import-upload/v1', userId: 'user', jobId: 'job' })

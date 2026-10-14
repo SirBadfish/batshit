@@ -23,7 +23,7 @@
 		"test:ui": "vitest --ui",
 		"test:coverage": "vitest --coverage",
 		"test:redis": "VITEST_REDIS_URL=redis://127.0.0.1:6379/15 VITEST_USE_REAL_REDIS=true vitest run --pool=threads --maxWorkers=1",
-		"test:memory": "VITEST_MEMORY_SEARCH=true VITEST_USE_REAL_REDIS=true vitest run --pool=threads --maxWorkers=1 src/lib/server/services/memory",
+		"test:memory": "VITEST_MEMORY_SEARCH=true VITEST_USE_REAL_REDIS=true vitest run --pool=forks --maxWorkers=1 src/lib/server/services/memory",
 		"generate:brand-icons": "tsx scripts/generate-brand-icons.ts",
 		"generate:file-icons": "tsx scripts/generate-file-icons.ts",
 		"compare:model-catalog-sources": "tsx scripts/compare-model-catalog-sources.ts",

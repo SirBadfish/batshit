@@ -1,7 +1,7 @@
 'use strict';
 
 // The helper's default runner is Jest; keep the real fixed-child/FS proof here.
-const { test, afterEach } = require('@jest/globals');
+const { test, beforeAll, afterAll, afterEach } = require('@jest/globals');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -9,7 +9,46 @@ const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 jest.setTimeout(30_000);
 const W = require('../localAiManagedProfileWriter.cjs');
-const S = require('../localAiManagedProfiles.js');
+let S;
+let runtimeRoot;
+let fixtureWriter;
+beforeAll(() => {
+  runtimeRoot = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'kobold-writer-runtime-')));
+  fs.chmodSync(runtimeRoot, 0o700);
+  const writerSource = fs.realpathSync.native(require.resolve('../localAiManagedProfileWriter.cjs'));
+  fixtureWriter = path.join(runtimeRoot, 'localAiManagedProfileWriter.cjs');
+  fs.copyFileSync(writerSource, fixtureWriter, fs.constants.COPYFILE_EXCL);
+  fs.chmodSync(fixtureWriter, 0o600);
+  assert.deepEqual(fs.readFileSync(fixtureWriter), fs.readFileSync(writerSource));
+  const hostNode = fs.realpathSync.native(process.execPath);
+  const nodeStat = fs.lstatSync(hostNode);
+  let fixtureNode = hostNode;
+  if (!nodeStat.isFile() || nodeStat.isSymbolicLink() || ![0, process.getuid()].includes(nodeStat.uid) || (nodeStat.mode & 0o022)) {
+    fixtureNode = path.join(runtimeRoot, 'node');
+    fs.copyFileSync(hostNode, fixtureNode, fs.constants.COPYFILE_EXCL);
+    fs.chmodSync(fixtureNode, 0o700);
+  }
+  // Select fixed test-owned inputs only while loading the actual service.
+  // All later FS, trust, spawn, environment and inherited-directory checks are real.
+  // Retain an already-trusted host Node (including Homebrew's linked Mac runtime).
+  jest.isolateModules(() => {
+    let selectingFixedInputs = true;
+    jest.doMock('node:fs', () => ({
+      ...fs,
+      realpathSync: Object.assign((...args) => fs.realpathSync(...args), {
+        native: (file, ...args) => {
+          const canonical = fs.realpathSync.native(file, ...args);
+          if (selectingFixedInputs && file === process.execPath) return fixtureNode;
+          if (selectingFixedInputs && canonical === writerSource) return fixtureWriter;
+          return canonical;
+        }
+      })
+    }));
+    try { S = require('../localAiManagedProfiles.js'); }
+    finally { selectingFixedInputs = false; jest.dontMock('node:fs'); }
+  });
+});
+afterAll(() => { if (runtimeRoot) fs.rmSync(runtimeRoot, { recursive: true, force: true }); });
 const roots = [];
 afterEach(() => { for (const r of roots.splice(0)) fs.rmSync(r, { recursive: true, force: true }); });
 function fixture() {
@@ -23,6 +62,20 @@ function fixture() {
   fs.writeFileSync(path.join(folder, baseName), bytes, { mode: 0o600 });
   return { root, folder, template, baseName, request: { operation: 'context', directory: S.directory(folder), id: randomUUID(), contextTokens: 60000, base: { name: baseName, hash: W.hash(bytes) } } };
 }
+test('fixed writer trust still refuses group-writable and symlinked fixture modules before publication', async () => {
+  const f = fixture();
+  const before = fs.readdirSync(f.folder);
+  fs.chmodSync(fixtureWriter, 0o620);
+  try { await assert.rejects(S.write(f.request), /fixed executable or module is not trusted/); }
+  finally { fs.chmodSync(fixtureWriter, 0o600); }
+  assert.deepEqual(fs.readdirSync(f.folder), before);
+  const retained = `${fixtureWriter}.retained`;
+  fs.renameSync(fixtureWriter, retained);
+  fs.symlinkSync(retained, fixtureWriter);
+  try { await assert.rejects(S.write(f.request), /fixed executable or module is not trusted/); }
+  finally { fs.unlinkSync(fixtureWriter); fs.renameSync(retained, fixtureWriter); }
+  assert.deepEqual(fs.readdirSync(f.folder), before);
+});
 test('real fixed child publishes exact 60000 override and preserves every full-base byte', async () => {
   const f = fixture();
   const before = fs.readFileSync(path.join(f.folder, f.baseName));

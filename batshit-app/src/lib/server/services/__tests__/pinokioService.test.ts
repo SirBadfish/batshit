@@ -1,7 +1,7 @@
 // @vitest-environment node
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { spawnSync } from 'node:child_process'
-import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs'
+import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync, existsSync, symlinkSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -324,9 +324,6 @@ function install(world: FakeWorld, extra: Partial<PinokioDeps> = {}) {
     isFile: async (file) => world.files.has(file),
     realpath: async (file) => file,
     tcpReachable: async () => world.reachable,
-    fetchJson: async () => {
-      throw new Error('no control plane lookup in this world')
-    },
     pathEnv: () => '',
     now: () => clock,
     sleep: async (ms) => {
@@ -374,6 +371,7 @@ function install(world: FakeWorld, extra: Partial<PinokioDeps> = {}) {
 
 afterEach(() => {
   __setPinokioDepsForTests(null)
+  vi.unstubAllGlobals()
 })
 
 describe('detection (DL-01: a specific, quiet answer)', () => {
@@ -418,18 +416,59 @@ describe('detection (DL-01: a specific, quiet answer)', () => {
     expect(await detectPinokio({ fresh: true })).toMatchObject({ available: false, reason: 'pterm_missing' })
   })
 
-  it('falls back to the control plane lookup, then PATH (DL-02 order)', async () => {
+  it('resolves both local managed npm paths before local PATH', async () => {
     const world = makeWorld()
+    world.files.set(`${HOME}/bin/npm/pterm`, '#!/usr/bin/env node')
+    install(world)
+    expect(await detectPinokio({ fresh: true })).toMatchObject({ available: true, ptermPath: PTERM })
+
     world.files.delete(PTERM)
-    world.files.set('/opt/pinokio/pterm', '#!/usr/bin/env node')
-    install(world, { fetchJson: async () => ({ path: '/opt/pinokio/pterm' }) })
-    expect(await detectPinokio({ fresh: true })).toMatchObject({ available: true, ptermPath: '/opt/pinokio/pterm' })
+    install(world)
+    expect(await detectPinokio({ fresh: true })).toMatchObject({ available: true, ptermPath: `${HOME}/bin/npm/pterm` })
 
     const second = makeWorld()
     second.files.delete(PTERM)
     second.files.set('/usr/local/bin/pterm', '#!/usr/bin/env node')
     install(second, { pathEnv: () => '/usr/bin:/usr/local/bin' })
     expect(await detectPinokio({ fresh: true })).toMatchObject({ available: true, ptermPath: '/usr/local/bin/pterm' })
+  })
+
+  it.each(['/outside/pterm-native', '/outside/pterm.cjs'])('does not let an HTTP answer select %s or start any process', async (hostilePath) => {
+    const world = makeWorld()
+    world.files.delete(PTERM)
+    world.files.set(hostilePath, '#!/usr/bin/env node')
+    const fetcher = vi.fn(async () => Response.json({ path: hostilePath }))
+    vi.stubGlobal('fetch', fetcher)
+    install(world)
+
+    expect(await detectPinokio({ fresh: true })).toMatchObject({ available: false, reason: 'pterm_missing' })
+    expect(fetcher).not.toHaveBeenCalled()
+    expect(world.calls).toEqual([])
+    expect(world.spawned).toEqual([])
+  })
+
+  it('reports an unreadable or unsupported local entrypoint as unavailable', async () => {
+    const world = makeWorld()
+    install(world, { runPterm: async () => { throw new Error('unsupported entrypoint') } })
+    expect(await detectPinokio({ fresh: true })).toMatchObject({ available: false, reason: 'pterm_missing' })
+    expect(world.spawned).toEqual([])
+  })
+
+  it('keeps a later command admission failure visible after successful detection', async () => {
+    const world = makeWorld()
+    install(world, { runPterm: async (_pterm, args) => {
+      if (args[0] === 'version') return ok(args[1] === 'pinokio' ? 'pinokio@8.2.0\n' : 'pterm@0.0.25\n')
+      throw new Error('entrypoint changed')
+    } })
+    expect(await searchPinokioApps()).toMatchObject({ ok: false, kind: 'error', message: expect.stringContaining('could not be started') })
+    expect(world.spawned).toEqual([])
+  })
+
+  it('keeps a run admission failure visible without a child or readiness claim', async () => {
+    const world = makeWorld()
+    install(world, { spawnPtermRun: async () => { throw new Error('entrypoint changed') } })
+    expect(await startPinokioApp({ appId: 'comfy.git' })).toMatchObject({ ok: false, kind: 'error', message: expect.stringContaining('could not be started') })
+    expect(world.spawned).toEqual([])
   })
 
   it('reports version, home, and pterm when Pinokio 8.2.0 runs', async () => {
@@ -639,6 +678,41 @@ describe('real pterm processes (a stand-in script)', () => {
       if (saved === undefined) delete process.env.BATSHIT_TOKEN
       else process.env.BATSHIT_TOKEN = saved
     }
+  })
+
+  it.each(['cjs', 'mjs'])('runs a locally selected .%s entrypoint with fixed Node', async (extension) => {
+    const script = path.join(dir, `pterm.${extension}`)
+    writeFileSync(script, 'process.stdout.write(JSON.stringify({ executable: process.execPath, argument: process.argv[2] }))\n')
+    const result = await realPinokioDepsForTests.runPterm(script, ['fixed-argument'], { cwd: dir, timeoutMs: 10_000 })
+    expect(result.exitCode).toBe(0)
+    expect(JSON.parse(result.stdout)).toEqual({ executable: process.execPath, argument: 'fixed-argument' })
+  })
+
+  it('supports the npm bin symlink to its Node entrypoint', async () => {
+    const script = path.join(dir, 'index.js')
+    const bin = path.join(dir, 'pterm')
+    writeFileSync(script, 'process.stdout.write(process.execPath)\n')
+    symlinkSync(script, bin)
+    const result = await realPinokioDepsForTests.runPterm(bin, [], { cwd: dir, timeoutMs: 10_000 })
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout).toBe(process.execPath)
+  })
+
+  it.each(['#!/bin/sh', '#!/bin/sh # node'])('refuses a non-Node entrypoint (%s) before short or long-lived spawn', async (shebang) => {
+    const script = path.join(dir, 'pterm')
+    const marker = path.join(dir, 'native-program-ran')
+    writeFileSync(script, `${shebang}\nprintf touched > "$1"\n`)
+    chmodSync(script, 0o755)
+    await expect(realPinokioDepsForTests.runPterm(script, [marker], { cwd: dir, timeoutMs: 10_000 })).rejects.toThrow('Node.js script')
+    await expect(realPinokioDepsForTests.spawnPtermRun(script, [marker], { cwd: dir })).rejects.toThrow('Node.js script')
+    const world = makeWorld()
+    world.files.delete(PTERM)
+    world.files.set(script, shebang)
+    install(world, { pathEnv: () => dir, runPterm: realPinokioDepsForTests.runPterm })
+    expect(await detectPinokio({ fresh: true })).toMatchObject({
+      available: false, reason: 'pterm_missing', message: expect.stringContaining('Node.js script')
+    })
+    expect(existsSync(marker)).toBe(false)
   })
 
   it('ends a hung pterm with SIGKILL at its timeout', async () => {

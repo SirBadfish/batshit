@@ -55,6 +55,17 @@ const RAW_EXCERPT_CHARS = 800
 const LOG_LINE_MAX_CHARS = 500
 const LOG_TOTAL_MAX_CHARS = 16_000
 const MAX_REQUIRES_DEPTH = 16
+const PTERM_SCRIPT_UNAVAILABLE_MESSAGE = "Pinokio's pterm command is not a readable Node.js script. Check its local installation."
+
+class PtermScriptAdmissionError extends Error {}
+
+function ptermStartFailure(error: unknown) {
+  return {
+    message: error instanceof PtermScriptAdmissionError
+      ? PTERM_SCRIPT_UNAVAILABLE_MESSAGE
+      : 'The local pterm command could not be started. Check its local installation.'
+  }
+}
 
 /** Environment keys `pterm` may inherit. Nothing else crosses (DL-06). */
 const PTERM_ENV_ALLOWLIST = ['PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TMPDIR', 'TZ'] as const
@@ -180,7 +191,6 @@ export interface PinokioDeps {
   isFile(file: string): Promise<boolean>
   realpath(file: string): Promise<string | null>
   tcpReachable(host: string, port: number, timeoutMs: number): Promise<boolean>
-  fetchJson(url: string, timeoutMs: number): Promise<unknown>
   pathEnv(): string
   runPterm(ptermPath: string, args: string[], options: { cwd: string; timeoutMs: number }): Promise<PtermResult>
   spawnPtermRun(ptermPath: string, args: string[], options: { cwd: string }): Promise<PinokioSpawnedRun>
@@ -227,9 +237,10 @@ export function ptermChildEnv(): Record<string, string> {
  * `pterm` is a Node script (`#!/usr/bin/env node`). Batshit runs it with its own Node, so a
  * packaged app whose PATH has no `node` still works.
  */
-async function ptermInvocation(ptermPath: string): Promise<{ command: string; args: string[] }> {
-  const resolved = (await fs.realpath(ptermPath).catch(() => null)) ?? ptermPath
-  if (/\.(c|m)?js$/.test(resolved)) return { command: process.execPath, args: [resolved] }
+async function ptermScriptPath(ptermPath: string): Promise<string> {
+  const resolved = await fs.realpath(ptermPath)
+  if (!(await fs.stat(resolved)).isFile()) throw new PtermScriptAdmissionError(PTERM_SCRIPT_UNAVAILABLE_MESSAGE)
+  if (/\.(c|m)?js$/.test(resolved)) return resolved
   const head = await fs
     .open(resolved, 'r')
     .then(async (handle) => {
@@ -242,10 +253,10 @@ async function ptermInvocation(ptermPath: string): Promise<{ command: string; ar
       }
     })
     .catch(() => '')
-  if (head.startsWith('#!') && /\bnode\b/.test(head.split('\n')[0] ?? '')) {
-    return { command: process.execPath, args: [resolved] }
+  if (/^#!\s*(?:\/usr\/bin\/env\s+node|(?:\/[^\s/]+)*\/node)\s*$/.test(head.split('\n')[0] ?? '')) {
+    return resolved
   }
-  return { command: resolved, args: [] }
+  throw new PtermScriptAdmissionError(PTERM_SCRIPT_UNAVAILABLE_MESSAGE)
 }
 
 function appendCapped(current: string, chunk: string, cap: number): string {
@@ -277,24 +288,20 @@ const realDeps: PinokioDeps = {
       socket.once('timeout', () => done(false))
       socket.once('error', () => done(false))
     }),
-  fetchJson: async (url, timeoutMs) => {
-    const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
-    if (!response.ok) throw new Error(`HTTP ${response.status}`)
-    return (await response.json()) as unknown
-  },
   pathEnv: () => process.env.PATH ?? '',
   runPterm: async (ptermPath, args, { cwd, timeoutMs }) => {
     ensureShutdownHooks()
-    const invocation = await ptermInvocation(ptermPath)
+    const script = await ptermScriptPath(ptermPath)
     const started = Date.now()
     return await new Promise<PtermResult>((resolve) => {
       let stdout = ''
       let stderr = ''
       let timedOut = false
-      const child = spawn(invocation.command, [...invocation.args, ...args], {
+      const child = spawn(process.execPath, [script, ...args], {
         cwd,
         env: ptermChildEnv(),
         detached: true,
+        shell: false,
         stdio: ['ignore', 'pipe', 'pipe']
       })
       const pid = child.pid ?? null
@@ -331,12 +338,13 @@ const realDeps: PinokioDeps = {
   },
   spawnPtermRun: async (ptermPath, args, { cwd }) => {
     ensureShutdownHooks()
-    const invocation = await ptermInvocation(ptermPath)
+    const script = await ptermScriptPath(ptermPath)
     let tail = ''
-    const child = spawn(invocation.command, [...invocation.args, ...args], {
+    const child = spawn(process.execPath, [script, ...args], {
       cwd,
       env: ptermChildEnv(),
       detached: true,
+      shell: false,
       stdio: ['ignore', 'pipe', 'pipe']
     })
     const pid = child.pid ?? null
@@ -654,21 +662,10 @@ async function readPinokioConfig(): Promise<PinokioConfig | 'missing' | 'unreada
   }
 }
 
-/** DL-02 order: `<home>/bin/npm/bin/pterm`, then the control plane's lookup, then `PATH`. */
-async function resolvePterm(home: string, controlPlaneReachable: boolean): Promise<string | null> {
-  const bundled = path.join(home, 'bin', 'npm', 'bin', 'pterm')
-  if (await deps.isFile(bundled)) return bundled
-  if (controlPlaneReachable) {
-    try {
-      const answer = (await deps.fetchJson(
-        `http://${PINOKIO_CONTROL_PLANE_HOST}:${PINOKIO_CONTROL_PLANE_PORT}/pinokio/path/pterm`,
-        1_500
-      )) as Record<string, unknown> | null
-      const found = answer && typeof answer.path === 'string' ? answer.path : null
-      if (found && path.isAbsolute(found) && (await deps.isFile(found))) return found
-    } catch {
-      // The skill's lookup is a fallback; PATH is next.
-    }
+/** Local installation authority only: Pinokio's two npm-prefix paths, then local `PATH`. */
+async function resolvePterm(home: string): Promise<string | null> {
+  for (const bundled of [path.join(home, 'bin', 'npm', 'bin', 'pterm'), path.join(home, 'bin', 'npm', 'pterm')]) {
+    if (await deps.isFile(bundled)) return bundled
   }
   for (const directory of deps.pathEnv().split(path.delimiter)) {
     if (!directory) continue
@@ -738,7 +735,7 @@ async function detectPinokioUncached(): Promise<PinokioDetection> {
     PINOKIO_CONTROL_PLANE_PORT,
     CONTROL_PLANE_CONNECT_TIMEOUT_MS
   )
-  const ptermPath = await resolvePterm(home, controlPlaneReachable)
+  const ptermPath = await resolvePterm(home)
   if (!ptermPath) {
     return unavailableDetection('pterm_missing', `Pinokio is installed at ${home}, but its pterm command was not found.`, {
       version: config.version,
@@ -754,7 +751,10 @@ async function detectPinokioUncached(): Promise<PinokioDetection> {
     })
   }
 
-  const versionRun = await deps.runPterm(ptermPath, ['version', 'pinokio'], { cwd: home, timeoutMs: PTERM_COMMAND_TIMEOUT_MS })
+  const versionRun = await deps.runPterm(ptermPath, ['version', 'pinokio'], { cwd: home, timeoutMs: PTERM_COMMAND_TIMEOUT_MS }).catch(ptermStartFailure)
+  if ('message' in versionRun) {
+    return unavailableDetection('pterm_missing', versionRun.message, { home, ptermPath, controlPlaneReachable })
+  }
   const version = versionRun.exitCode === 0 ? parsePtermVersion(versionRun.stdout, 'pinokio') : null
   if (!version) {
     // 0.0.25 prints nothing, exit 0, when the control plane went away between the checks.
@@ -771,7 +771,10 @@ async function detectPinokioUncached(): Promise<PinokioDetection> {
       { version, home, ptermPath, controlPlaneReachable }
     )
   }
-  const terminalRun = await deps.runPterm(ptermPath, ['version', 'terminal'], { cwd: home, timeoutMs: PTERM_COMMAND_TIMEOUT_MS })
+  const terminalRun = await deps.runPterm(ptermPath, ['version', 'terminal'], { cwd: home, timeoutMs: PTERM_COMMAND_TIMEOUT_MS }).catch(ptermStartFailure)
+  if ('message' in terminalRun) {
+    return unavailableDetection('pterm_missing', terminalRun.message, { version, home, ptermPath, controlPlaneReachable })
+  }
   const ptermVersion = terminalRun.exitCode === 0 ? parsePtermVersion(terminalRun.stdout, 'pterm') : null
 
   return {
@@ -814,7 +817,11 @@ async function requirePinokio(): Promise<{ ok: true; value: ReadyPinokio } | Pin
 }
 
 async function ptermJson(pinokio: ReadyPinokio, args: string[]): Promise<PinokioOutcome<Record<string, unknown>>> {
-  const result = await deps.runPterm(pinokio.ptermPath, args, { cwd: pinokio.home, timeoutMs: PTERM_COMMAND_TIMEOUT_MS })
+  const result = await deps.runPterm(pinokio.ptermPath, args, { cwd: pinokio.home, timeoutMs: PTERM_COMMAND_TIMEOUT_MS }).catch(ptermStartFailure)
+  if ('message' in result) {
+    detectionCache = null
+    return { ok: false, kind: 'error', message: result.message }
+  }
   const parsed = parsePtermJson(result)
   if (!parsed.ok && parsed.kind === 'unavailable') detectionCache = null
   return parsed
@@ -1053,7 +1060,11 @@ async function startPinokioAppOnce(input: {
   )
   const deadline = startedAt + waitSeconds * 1000
   console.info(`[pinokio] starting ${appId} through pterm run (wait up to ${waitSeconds}s)`)
-  const child = await deps.spawnPtermRun(pinokio.ptermPath, ['run', realApp as string], { cwd: pinokio.home })
+  const child = await deps.spawnPtermRun(pinokio.ptermPath, ['run', realApp as string], { cwd: pinokio.home }).catch(ptermStartFailure)
+  if ('message' in child) {
+    detectionCache = null
+    return { ok: false, kind: 'error', message: child.message }
+  }
   let childExited = false
   void child.exited.then(() => {
     childExited = true

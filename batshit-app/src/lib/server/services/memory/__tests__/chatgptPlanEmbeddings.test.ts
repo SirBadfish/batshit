@@ -5,9 +5,11 @@ vi.unmock('ai'); vi.unmock('@ai-sdk/openai')
 vi.mock('$lib/server/services/providers', () => ({ resolveProviderAccess: async () => ({ apiKeys: { openai: 'SYNTHETIC_PAID_KEY' } }) }))
 import { redis } from '$lib/server/redis'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
+import { memorySearchLaneActive, useMemorySearchTestServer } from '$lib/test-utils/memory-search-server'
 import { createMemoryEmbedder, resolvePresetEmbeddingTarget } from '../memoryEmbedder'
 import { PUT } from '../../../../../routes/api/memory/config/+server'
-useRedisTestServer()
+if (memorySearchLaneActive()) useMemorySearchTestServer()
+else useRedisTestServer()
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks() })
 const PRESET = 'plan-embedding-fixture', USER = 'plan-embedding-user'
 const connection = { id: 'chatgpt-plan:00000000-0000-0000-0000-000000000001', type: 'direct', service: 'chatgpt-plan' }

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { redis } from '$lib/server/redis'
 import { collectAllGoonUploadReferencesForClient, deleteGoonUploadAssetDisposition } from '../goonAssetCleanupService'
@@ -15,11 +15,13 @@ const borrowed = { ...shared, filename: 'borrowed.glb', ref: '/uploads/goon_hair
 describe('Hair shared cleanup ownership (default reference walk, not Lua or physical IO)', () => {
   useRedisTestServer()
   let restoreExecute: (() => void) | undefined
+  beforeEach(() => { vi.stubEnv('BATSHIT_TOKEN', 'synthetic-hair-file-test-token') })
   afterEach(() => {
     vi.restoreAllMocks()
     restoreExecute?.()
     restoreExecute = undefined
     vi.unstubAllGlobals()
+    vi.unstubAllEnvs()
   })
 
   it('refuses unknown completed ownership and releases its still-reserved claim before any DELETE', async () => {

@@ -6,6 +6,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
+import { memorySearchLaneActive, useMemorySearchTestServer } from '$lib/test-utils/memory-search-server'
 import { failRedisJsonGets, stopFailingRedisJsonGets } from '$lib/test-utils/failRedisJsonGets'
 import { saveLocalAiServers } from '$lib/server/services/localAiServers'
 import { redis } from '$lib/server/redis'
@@ -13,7 +14,8 @@ import { createMemoryEmbedder } from '../memoryEmbedder'
 
 vi.mock('$env/dynamic/private', () => ({ env: {} }))
 
-useRedisTestServer()
+if (memorySearchLaneActive()) useMemorySearchTestServer()
+else useRedisTestServer()
 
 const USER = 'bl977_memory_user'
 const PRESET_ID = 'preset_bl977'

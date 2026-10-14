@@ -58,9 +58,12 @@ function fileService(options: {
     calls.push('delete')
     await redis.execute((client) => claims.beginCustomRecipeDeletion(client, body.uploadType, body.filename, body.deletionToken))
     await options.afterDeleteClaim?.()
-    await redis.del(`upload:${body.uploadType}:${body.filename}`)
+    const redisKey = `upload:${body.uploadType}:${body.filename}`
+    const existed = await redis.exists(redisKey)
+    await redis.del(redisKey)
     await redis.execute((client) => claims.finishCustomRecipeDeletion(client, body.uploadType, body.filename, body.deletionToken))
-    return Response.json({ success: true })
+    // This Redis-authority fixture has no physical file IO.
+    return Response.json({ success: true, redisKey, existed, deletedFile: false })
   }))
   return calls
 }
@@ -127,7 +130,7 @@ describe.runIf(process.env.VITEST_USE_REAL_REDIS === 'true')('custom Goon deleti
     fileService()
     const result = await cleanupOrphanGoonUploadAssets('josh')
     expect(result.failed).toEqual([])
-    expect(result.deleted.map((entry) => entry.filename)).toContain(filename)
+    expect(result.missing.map((entry) => entry.filename)).toContain(filename)
     await expect(assertNoGoonAssetMaintenanceForRestore()).resolves.toBeUndefined()
   })
 

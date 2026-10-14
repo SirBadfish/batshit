@@ -166,9 +166,8 @@ describe('spawnWorkers (DL-111-09)', () => {
     subagentRedis.seed('agent:primary-agent', { id: 'primary-agent', user_id: 'USER-1' })
     workerMocks.prepareCodexProfile.mockResolvedValue({ profileId: 'batshit_agent_owned_worker_profile', resolvedGateways: [], gatewayToolMap: {} })
     const observedUsage = { completeness: 'partial', parts: [{ source: 'codex-app-server-progress', counts: { outputTokens: 0, cacheCreationInputTokens: 3 } }] }
-    let started = 0
     workerMocks.codexStreamNativeMode.mockImplementation(async (request: any) => {
-      const fails = started++ === 0
+      const fails = request.messages.some((message: any) => message.role === 'user' && message.content === 'Fails')
       if (fails) request.registerObservedUsageSource?.(() => observedUsage)
       return { stream: { async *[Symbol.asyncIterator]() {
         if (fails) throw new Error('owned Codex worker failure')

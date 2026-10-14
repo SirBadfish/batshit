@@ -366,6 +366,115 @@ describe('host files in the backup (BL-373, BL-369)', () => {
     expect((await listDir(SKILLS())).filter((name) => name.startsWith('.'))).toEqual([])
   })
 
+  it('refuses a new creation with the recorded inode before the first restore move', async () => {
+    await seedSkill('source', 'zc_a', { 'SKILL.md': '# from backup\n' })
+    const bundle = await createBackupBundle('source')
+    await writeFiles(path.join(SKILLS(), 'zc_a'), { 'SKILL.md': '# original here\n' })
+    await redis.json.set('user:target:settings', '$', { marker: 'before' })
+    await fs.writeFile(path.join(uploadRoot, 'unchanged.txt'), 'upload before')
+    const livePath = path.join(SKILLS(), 'zc_a')
+    const rename = fs.rename.bind(fs)
+    const lstat = fs.lstat.bind(fs)
+    const movedAside: string[] = []
+    let recorded: { device: string; inode: string; birthtimeNs: string } | undefined
+    vi.spyOn(fs, 'lstat').mockImplementation(async (target: any, options: any) => {
+      const stat = await lstat(target, options)
+      return recorded && String(target) === livePath && options?.bigint
+        ? Object.assign(stat, { dev: BigInt(recorded.device), ino: BigInt(recorded.inode), birthtimeNs: BigInt(recorded.birthtimeNs) + 1n })
+        : stat
+    })
+    vi.spyOn(fs, 'rename').mockImplementation(async (source, target) => {
+      if (String(target).includes('.restore-old-')) movedAside.push(String(target))
+      await rename(source, target)
+      if (!recorded && String(target).endsWith('.restore-journal.json')) {
+        const journal = JSON.parse(await fs.readFile(target, 'utf8'))
+        expect(journal.contract).toBe('batshit-backup-restore-journal/v4')
+        recorded = journal.hostEntries[0].original
+        await fs.rm(livePath, { recursive: true })
+        await writeFiles(livePath, { 'SKILL.md': '# new creation\n' })
+      }
+    })
+
+    await expect(restoreBackupBundle('target', bundle.bytes, { confirmReplace: true })).rejects.toMatchObject({
+      status: 409, message: expect.stringContaining('changed the skill folder "zc_a"')
+    })
+    expect(recorded).toBeDefined()
+    expect(movedAside).toEqual([])
+    expect(await fs.readFile(path.join(livePath, 'SKILL.md'), 'utf8')).toBe('# new creation\n')
+    expect(await fs.readFile(path.join(uploadRoot, 'unchanged.txt'), 'utf8')).toBe('upload before')
+    expect(await redis.json.get('user:target:settings')).toEqual({ marker: 'before' })
+  })
+
+  it.each([undefined, 0n])('refuses unavailable creation time (%s) before publishing host recovery authority', async (birthtimeNs) => {
+    await seedSkill('source', 'zc_a', { 'SKILL.md': '# from backup\n' })
+    const bundle = await createBackupBundle('source')
+    await writeFiles(path.join(SKILLS(), 'zc_a'), { 'SKILL.md': '# original here\n' })
+    await redis.json.set('user:target:settings', '$', { marker: 'before' })
+    await fs.writeFile(path.join(uploadRoot, 'unchanged.txt'), 'upload before')
+    const lstat = fs.lstat.bind(fs)
+    vi.spyOn(fs, 'lstat').mockImplementation(async (target: any, options: any) => {
+      const stat = await lstat(target, options)
+      return String(target) === path.join(SKILLS(), 'zc_a') && options?.bigint
+        ? Object.assign(stat, { birthtimeNs }) : stat
+    })
+
+    await expect(restoreBackupBundle('target', bundle.bytes, { confirmReplace: true }))
+      .rejects.toThrow(/cannot safely identify.*manual recovery/)
+    expect(await fs.readFile(path.join(SKILLS(), 'zc_a', 'SKILL.md'), 'utf8')).toBe('# original here\n')
+    expect(await fs.readFile(path.join(uploadRoot, 'unchanged.txt'), 'utf8')).toBe('upload before')
+    expect(await redis.json.get('user:target:settings')).toEqual({ marker: 'before' })
+    expect((await listDir(stagingRoot)).filter((name) => name.endsWith('.restore-journal.json'))).toEqual([])
+  })
+
+  it('keeps copies and the journal when creation time changes on rename, then retries with verified identity', async () => {
+    await seedSkill('source', 'zc_a', { 'SKILL.md': '# from backup\n' })
+    const bundle = await createBackupBundle('source')
+    await writeFiles(path.join(SKILLS(), 'zc_a'), { 'SKILL.md': '# original here\n' })
+    await redis.json.set('user:target:settings', '$', { marker: 'before' })
+    await fs.writeFile(path.join(uploadRoot, 'unchanged.txt'), 'upload before')
+    const rename = fs.rename.bind(fs)
+    const lstat = fs.lstat.bind(fs)
+    let changedPath = ''
+    const renameSpy = vi.spyOn(fs, 'rename').mockImplementation(async (source, target) => {
+      await rename(source, target)
+      if (String(target).startsWith(SKILLS() + path.sep) && String(target).includes('.restore-old-') && path.basename(String(target)) === 'zc_a') {
+        changedPath = String(target)
+      }
+    })
+    const statSpy = vi.spyOn(fs, 'lstat').mockImplementation(async (target: any, options: any) => {
+      const stat = await lstat(target, options)
+      return changedPath && String(target) === changedPath && options?.bigint
+        ? Object.assign(stat, { birthtimeNs: (stat as any).birthtimeNs + 1n }) : stat
+    })
+
+    await expect(restoreBackupBundle('target', bundle.bytes, { confirmReplace: true })).rejects.toMatchObject({
+      status: 500, message: expect.stringContaining('kept the recovery journal')
+    })
+    const journals = (await listDir(stagingRoot)).filter((name) => name.endsWith('.restore-journal.json'))
+    expect(journals).toHaveLength(1)
+    const key = journals[0].replace('.restore-journal.json', '')
+    const journalPath = path.join(stagingRoot, journals[0])
+    const journalBefore = await fs.readFile(journalPath, 'utf8')
+    expect(JSON.parse(journalBefore)).toMatchObject({ contract: 'batshit-backup-restore-journal/v4', phase: 'prepared' })
+    expect(await fs.readFile(path.join(SKILLS(), `.restore-old-${key}`, 'zc_a', 'SKILL.md'), 'utf8')).toBe('# original here\n')
+    expect(await fs.readFile(path.join(SKILLS(), `.restore-new-${key}`, 'zc_a', 'SKILL.md'), 'utf8')).toBe('# from backup\n')
+    expect(await fs.readFile(path.join(uploadRoot, `.restore-old-${key}`, 'unchanged.txt'), 'utf8')).toBe('upload before')
+    expect(await redis.json.get('user:target:settings')).toEqual({ marker: 'before' })
+    const { ensureBackupRestoreRecovery } = await import('../backupRestoreService')
+    await expect(ensureBackupRestoreRecovery()).rejects.toThrow(/could not be verified/)
+    expect(await fs.readFile(journalPath, 'utf8')).toBe(journalBefore)
+    expect(await fs.readFile(path.join(SKILLS(), `.restore-old-${key}`, 'zc_a', 'SKILL.md'), 'utf8')).toBe('# original here\n')
+    expect(await fs.readFile(path.join(SKILLS(), `.restore-new-${key}`, 'zc_a', 'SKILL.md'), 'utf8')).toBe('# from backup\n')
+
+    statSpy.mockRestore()
+    renameSpy.mockRestore()
+    await ensureBackupRestoreRecovery()
+    expect(await fs.readFile(path.join(SKILLS(), 'zc_a', 'SKILL.md'), 'utf8')).toBe('# original here\n')
+    expect(await fs.readFile(path.join(uploadRoot, 'unchanged.txt'), 'utf8')).toBe('upload before')
+    expect(await redis.json.get('user:target:settings')).toEqual({ marker: 'before' })
+    await expect(fs.stat(journalPath)).rejects.toThrow()
+  })
+
   it('a folder missing at export does not stop the backup, and the preflight names it', async () => {
     await seedSkill('source', 'zc_gone', null)
     await seedCloneVoice('source', 'voice_zc_silent', null)

@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
+import { memorySearchLaneActive, useMemorySearchTestServer } from '$lib/test-utils/memory-search-server'
 
 /** BL-788: exercise the real search op's date-to-filter boundary. The existing
  * default Redis fake holds the agent; only the index and embedder are injected.
@@ -21,7 +22,8 @@ import { redis } from '$lib/server/redis'
 import { hybridSearchMemories, hybridSearchSegments } from '../memoryIndex'
 import { MemoryToolError, searchMemoriesOp } from '../memoryTools'
 
-useRedisTestServer()
+if (memorySearchLaneActive()) useMemorySearchTestServer()
+else useRedisTestServer()
 const PREVIOUS_TZ = process.env.TZ
 const USER = 'bl788-user'
 const AGENT = 'bl788-agent'

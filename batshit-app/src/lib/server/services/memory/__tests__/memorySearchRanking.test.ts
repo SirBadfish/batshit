@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { MemoryRecord } from '../memoryTypes'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
+import { memorySearchLaneActive, useMemorySearchTestServer } from '$lib/test-utils/memory-search-server'
 
 /** BL-444: ranking arithmetic and the real search op over controlled index hits.
  * The default Redis fake stores full records; index/embedding boundaries are injected.
@@ -35,7 +36,8 @@ import { blendMemoryRanking } from '../memoryRecall'
 import { searchMemoriesOp } from '../memoryTools'
 import { hybridSearchMemories } from '../memoryIndex'
 
-useRedisTestServer()
+if (memorySearchLaneActive()) useMemorySearchTestServer()
+else useRedisTestServer()
 const NOW = Date.UTC(2026, 9, 6, 12)
 const DAY = 86_400_000
 const AGENT = 'bl444-agent'

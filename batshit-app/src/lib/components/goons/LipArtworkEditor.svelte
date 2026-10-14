@@ -368,7 +368,7 @@
   .lip-artwork-presence {
     justify-content: space-between;
     gap: 12px;
-    border: 1px solid hsl(var(--border) / 0.6);
+    border: 1px solid color-mix(in oklab, var(--border) 60%, transparent);
     border-radius: 8px;
     padding: 10px 12px;
   }
@@ -379,7 +379,7 @@
 
   .lip-artwork-presence p {
     margin: 2px 0 0;
-    color: hsl(var(--muted-foreground));
+    color: var(--muted-foreground);
     font-size: 0.625rem;
   }
 
