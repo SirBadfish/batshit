@@ -8,12 +8,6 @@ User-created chats, agents, prompts, workflows, artifacts, uploaded files, proje
 
 For contribution and security reporting expectations, see [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
 
-## Watch First
-
-[![Informal Alpha Release: Introduction to Batshit playlist card with the Batshit logo and six videos](docs/user-docs/images/batshit-youtube-intro-playlist.png)](https://www.youtube.com/watch?v=hS3NfNPgW70&list=PLeodpgBXojRy4Ssreao79TIX7PylhiI1D)
-
-New to Batshit? Start with the [intro playlist on YouTube](https://www.youtube.com/watch?v=hS3NfNPgW70&list=PLeodpgBXojRy4Ssreao79TIX7PylhiI1D), then keep the [Batshit YouTube channel](https://www.youtube.com/@batshit-ai/) handy for walkthroughs and alpha updates.
-
 ## Report Alpha Bugs
 
 Please use the [GitHub bug report form](https://github.com/SirBadfish/batshit/issues/new?template=bug_report.yml). If Batshit opens, click the bug icon under the chat bar or go to Settings -> Admin -> Diagnostics, review the preview, then attach the diagnostics zip if you are comfortable sharing it.
