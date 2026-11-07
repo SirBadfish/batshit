@@ -1,5 +1,5 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
-import { assertChatgptPlanManagement, chatgptPlanAccounts, chatgptPlanEligibility, getChatgptPlanRuntime } from '$lib/server/services/chatgptPlanHost'
+import { assertChatgptPlanManagement, chatgptPlanAccounts, getChatgptPlanRuntime } from '$lib/server/services/chatgptPlanHost'
 import { ChatgptPlanError } from '$lib/server/services/chatgptPlanVault'
 import { planDiagnostic } from '$lib/server/services/chatgptPlanOAuth'
 import { PLAN_CATALOG } from '$lib/server/services/chatgptPlanRuntime'
@@ -12,7 +12,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     const body = await request.json()
     const runtime = getChatgptPlanRuntime()
     switch (body.action) {
-      case 'status': return json({ ...chatgptPlanEligibility(), root: undefined, accounts: chatgptPlanAccounts(identity.userId), attempt: runtime.oauth.status(identity.userId) }, { headers })
+      case 'status': return json({ eligible: true, accounts: chatgptPlanAccounts(identity.userId), attempt: runtime.oauth.status(identity.userId) }, { headers })
       case 'start': {
         if (body.accountId !== undefined && typeof body.accountId !== 'string') throw new ChatgptPlanError('account_required', 'Select the ChatGPT account to reconnect.')
         return json({ authorizationUrl: await runtime.oauth.start(identity.userId, identity.sessionToken, body.accountId) }, { headers })

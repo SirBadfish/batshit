@@ -13,9 +13,20 @@ import { redis } from '$lib/server/redis'
 vi.mock('$lib/server/services/cliSubagentProfileSync', () => ({
   syncManagedCliSubagentProfile: vi.fn(async () => null)
 }))
-vi.mock('$lib/server/services/n8nParameterCompatibility', () => ({ runTrackedN8nCompatibilitySync: vi.fn() }))
-vi.mock('$lib/server/services/codexProfileManager', () => ({ syncAgentCodexProfiles: vi.fn(async () => {}) }))
 vi.mock('$lib/server/services/claudeProfileManager', () => ({ syncAgentClaudeProfiles: vi.fn(async () => {}) }))
+
+// The default fake deliberately has no EVAL. Route ID/ownership tests keep
+// those checks real and stub only the physical population boundary; actual
+// record/index/nonce/cross-kind Lua is proved by subjectPopulation.redis.test.ts.
+vi.mock('$lib/server/services/subjectPopulation', async importOriginal => {
+  const original = await importOriginal<typeof import('$lib/server/services/subjectPopulation')>()
+  if (process.env.VITEST_USE_REAL_REDIS === 'true') return original
+  return { ...original, createSubjectPopulation: vi.fn(async (client: any, subject: { userId: string; subjectId: string; kind: 'primary' | 'subagent'; record: unknown }) => {
+    await client.json.set(`${subject.kind === 'primary' ? 'agent' : 'subagent'}:${subject.subjectId}`, '$', subject.record)
+    await client.sAdd(`user:${subject.userId}:${subject.kind === 'primary' ? 'agents' : 'subagents'}`, subject.subjectId)
+    return { status: 'CREATED', record: subject.record }
+  }) }
+})
 
 useRedisTestServer()
 
@@ -122,7 +133,7 @@ describe('a Primary Agent id may not start with subagent_cli (BL-285)', () => {
 
       expect(response.status).toBe(400)
       expect(body.code).toBe('agent_id_reserved')
-      expect(body.error).toContain('kept for CLI Subagent and Worker runs')
+      expect(body.error).toContain('are reserved. Give this agent another name.')
       expect(await storedIds()).toEqual({ agents: [], subagents: [] })
     }
   )

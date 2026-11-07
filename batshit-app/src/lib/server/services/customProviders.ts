@@ -112,6 +112,25 @@ async function loadCustomProvider(userId: string, id: string): Promise<StoredCus
   })
 }
 
+/** One owned storage observation for selection. The decrypted value never leaves this owner. */
+export async function readStoredCustomProvider(userId: string, id: string) {
+  const key = providerKey(userId, id)
+  const indexKey = providerSetKey(userId)
+  const present = Boolean(await redis.sismember(indexKey, id))
+  const raw = await redis.json.getRaw(key, '$')
+  if (!present || raw === null) return null
+  const decoded = JSON.parse(raw)
+  const record = Array.isArray(decoded) && decoded.length === 1 ? decoded[0] as StoredCustomProvider : null
+  if (!record || typeof record !== 'object' || Array.isArray(record) || record.id !== id || typeof record.label !== 'string' || typeof record.baseUrl !== 'string') {
+    throw new Error('The saved custom provider is unreadable.')
+  }
+  const usable = readUsableApiKey(record) !== null
+  return { key, raw, membership: { key: indexKey, member: id, present: true as const }, summary: {
+    id, label: record.label, baseUrl: record.baseUrl, headers: record.headers,
+    maskedKey: '****', apiKeyUsable: usable, createdAt: record.createdAt, updatedAt: record.updatedAt
+  } satisfies CustomProviderSummary }
+}
+
 async function ensureUniqueProviderId(userId: string, label: string): Promise<string> {
   const baseSlug = sanitizeId(label)
   const baseId = `${CUSTOM_PROVIDER_ID_PREFIX}${baseSlug || 'provider'}`

@@ -5,6 +5,18 @@ import {
 } from './queuedSendHiddenIds'
 import { clearToolModelRetentionBudgetsForSession } from './toolModelRetentionTurnBudget'
 
+// Revocation-only passage in the EXISTING turn owner. Keep the risk gate's
+// registry dependency inert: it must not import native/profile/Jev owners.
+// Installation is required before the original owner creates any workflow.
+let originalWorkflowInvalidator: ((sessionId: string) => boolean) | undefined
+export function bindP5WorkflowInvalidation(invalidate: (sessionId: string) => boolean): void {
+  if (originalWorkflowInvalidator && originalWorkflowInvalidator !== invalidate) throw new Error('The original workflow revocation owner is already bound.')
+  originalWorkflowInvalidator = invalidate
+}
+function invalidateP5SessionWorkflow(sessionId: string): boolean {
+  return originalWorkflowInvalidator?.(sessionId) ?? false
+}
+
 type StreamAbortEntry = {
   messageId: string
   controller: AbortController
@@ -254,6 +266,9 @@ function createSessionTurnEntry(
   answersApproval: boolean,
   queuedUserMessageId?: string
 ): SessionTurnEntry {
+  // Approval routing defers invalidation only. The actual answer/decision
+  // owners still must claim the dormant original; this flag grants nothing.
+  if (!answersApproval) invalidateP5SessionWorkflow(sessionId)
   const now = Date.now()
   lastSessionTurnId += 1
   const entry: SessionTurnEntry = {
@@ -515,8 +530,8 @@ export function getActiveStream(sessionId: string) {
 
 /**
  * The Stop of the reply running in this chat, for a helper call that runs a command for it
- * (2026-09-18). A managed CLI reply's helper, and an n8n Workflow Subagent, reach Batshit over
- * HTTP, and that request cannot carry a Stop: SvelteKit aborts `request.signal` only when the
+ * (2026-09-18). A managed CLI reply's helper reaches Batshit over HTTP, and that request cannot
+ * carry a Stop: SvelteKit aborts `request.signal` only when the
  * caller leaves before the body is read. The reply's registered stream controller is what a Stop,
  * a voice barge-in, and a chat delete abort. `undefined` when no reply runs in the chat: the call
  * keeps its own time limit. The caller passes the session its lane is bound to.
@@ -546,31 +561,6 @@ export function getOriginatingReplyStopSignal(
   if (!id || !message) return undefined
   const entry = getActiveStream(id)
   return entry && entry.messageId === message ? entry.controller.signal : undefined
-}
-
-/** BL-1321: the reason on the Stop a retired run's call gets (see `getRunCredentialStopSignal`). */
-export const RETIRED_REPLY_STOP_REASON = 'retired_reply'
-
-/**
- * BL-1321 — the Stop a managed run's helper call hears, from its run credential's own ids
- * (`boundRunCredential`, never a body field). A primary run hears ONLY its own reply: while that
- * reply is the chat's running reply, its Stop; once that reply has ended or a newer reply
- * replaced it, an already-aborted signal, because the run's Stop has in effect fired and its late
- * calls must not run under a successor's Stop (or, after the chat's entry is cleared, with no
- * Stop at all). A Subagent or Worker run (`delegated`) has no reply of its own (its credential
- * names its run id), so it keeps the chat's running reply: its parent's. So does a credential
- * that names no reply. No bound chat: `undefined`, as before.
- */
-export function getRunCredentialStopSignal(run: {
-  sessionId?: string | null
-  messageId?: string | null
-  delegated?: boolean | null
-}): AbortSignal | undefined {
-  const id = typeof run.sessionId === 'string' ? run.sessionId.trim() : ''
-  if (!id) return undefined
-  const message = typeof run.messageId === 'string' ? run.messageId.trim() : ''
-  if (run.delegated === true || !message) return getRunningReplyStopSignal(id)
-  return getOriginatingReplyStopSignal(id, message) ?? AbortSignal.abort(RETIRED_REPLY_STOP_REASON)
 }
 
 /**
@@ -778,7 +768,8 @@ export function claimQueuedSessionTurn(sessionId: string, entry: SessionTurnEntr
 /**
  * BL-4 — a queued send's request is leaving without taking the chat: an early return or a throw
  * anywhere between joining the line and its claim. Still waiting, it leaves the line and its
- * message shows again. Handed and not taken, its registration is let go, so the chat goes on and
+ * message shows again (and a card hold goes with the last send that would have run, BL-903 d).
+ * Handed and not taken, its registration is let go, so the chat goes on and
  * a delete does not wait on a request that is gone. Taken, there is nothing to do: the request
  * lets go of its own lock.
  */
@@ -792,6 +783,11 @@ export function abandonQueuedSessionTurn(sessionId: string, queued: Pick<QueuedS
       queuedSessionTurns.delete(sessionId)
       queueCardHolds.delete(sessionId)
       stopQueueBackstop(sessionId)
+    } else if (countRunnableQueuedSessionTurns(sessionId) === 0) {
+      // BL-903 (d): a card hold is only for a send that will still run. That was the last one, so
+      // the kept sends left in the line (one over the cap) move now: the backstop hands them the
+      // chat within a tick, instead of the hold hiding their words until its 15-minute bound.
+      queueCardHolds.delete(sessionId)
     }
     return
   }
@@ -918,8 +914,9 @@ export function holdQueueForApprovalClick(sessionId: string): () => void {
  * (`stoppedAt`). `false` when nothing holds the chat.
  */
 export function stopSessionTurn(sessionId: string, reason: string): boolean {
+  const dormant = invalidateP5SessionWorkflow(sessionId)
   const turn = activeSessionTurns.get(sessionId)
-  if (!turn) return false
+  if (!turn) return dormant
   // A second Stop does not restart the grace.
   turn.stoppedAt ??= Date.now()
   turn.stop.abort(reason)
@@ -931,6 +928,7 @@ export function stopSessionTurn(sessionId: string, reason: string): boolean {
  * (`sessionDeleteTurnStop.ts`). Returns how many there were.
  */
 export function stopRunningRequests(sessionId: string, reason: string): number {
+  invalidateP5SessionWorkflow(sessionId)
   const running = runningRequests.get(sessionId)
   if (!running) return 0
   for (const entry of running.values()) entry.stop.abort(reason)
@@ -950,6 +948,7 @@ export function stopRunningRequests(sessionId: string, reason: string): number {
 export function beginSessionDelete(sessionId: string): boolean {
   if (deletingSessions.has(sessionId)) return false
   deletingSessions.add(sessionId)
+  invalidateP5SessionWorkflow(sessionId)
   // BL-4: sends waiting for this chat stay in its line while it is being deleted: the line holds
   // (`handOffSessionTurn`), and the delete tells them the chat is gone only once it has swept
   // (BL-194). Cancelled here, each answered "This chat was deleted." even when the delete was
@@ -1019,6 +1018,12 @@ export function __turnStartTraceCountForTests(): number {
  */
 export function hasRunningRequest(sessionId: string): boolean {
   return (runningRequests.get(sessionId)?.size ?? 0) > 0
+}
+
+/** Exact still-registered request, including cleanup after its lock went away.
+ * This is request custody only, never current reply/effect authority. */
+export function isRegisteredRunningRequest(sessionId: string, entry: SessionTurnEntry): boolean {
+  return runningRequests.get(sessionId)?.get(entry.turnId) === entry
 }
 
 /**

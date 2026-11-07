@@ -1,12 +1,17 @@
 import { iconRefKey, type AvatarIconFit, type IconRef } from '$lib/icons/iconTypes'
-import type { ClaudeAgentSettings } from '$lib/types/claude'
-import type { CodexAgentSettings } from '$lib/types/codex'
 import type { SubagentRow } from '$lib/types/database'
 import type { ModelConnectionInfo } from '$lib/types/savedModels'
-import type { AgentBlockSave, AgentDcmDisplaySettingsSave } from '$lib/utils/agentBlockFieldSettings'
+import type { AgentDcmDisplaySettingsSave } from '$lib/utils/agentBlockFieldSettings'
 import { providerSettingsKeyChanges, sameJsonValue } from '$lib/utils/agentSettingsSavePatch'
-import { isWorkflowBackedSubagentType, type StoredSubagentType, type SubagentType } from '$lib/utils/subagentType'
+import {
+  isRetiredSubagentType,
+  retiredSubagentTypeSentences,
+  type StoredSubagentType,
+  type SubagentType
+} from '$lib/utils/subagentType'
 import { normalizeSubagentTimeoutSeconds } from '$lib/utils/subagentTimeout'
+import { normalizeSubagentMaxToolSteps } from '$lib/utils/subagentToolSteps'
+import type { InstructionsRevisions } from '$lib/appActions/settings/instructionsBaseline'
 
 /**
  * BL-844: what the Subagent form in Agent Settings sends when it saves, the twin of
@@ -29,15 +34,18 @@ import { normalizeSubagentTimeoutSeconds } from '$lib/utils/subagentTimeout'
  * - a cleared prompt goes as `''` (BL-482: the route stores it as no prompt), a cleared model as
  *   empty strings and `null`s (BL-266).
  * The Subagent form never copies a preset's model settings into the block (the run reads the live
- * preset, BL-266), so a model pick changes only the model group and, for a CLI Subagent, the seeded
- * `codex_model` or `claude_model` key.
+ * preset, BL-266), so a model pick changes only the model group.
+ *
+ * SA-139 R5 (D14): the form holds the STORED type, so a leftover of a removed type (a CLI
+ * Subagent) is never shown or saved as an API Subagent. Such a leftover is delete-only: the panel
+ * refuses every save of it, and `buildSubagentPayload` throws for it (the Primary form's R4 rule).
  */
 
 export interface SubagentSaveForm {
   displayName: string
   subagentType: StoredSubagentType
+  /** The stored value, kept as read (`claude-code` is an old record's value; nothing offers it). */
   specialty: 'general' | 'n8n-specialist' | 'claude-code' | 'artifact'
-  webhook_url: string
   include_global_prompt: boolean
   system_prompt: string
   primary_model_provider: string
@@ -46,6 +54,8 @@ export interface SubagentSaveForm {
   primary_model_preset_id: string
   primary_model_connection: ModelConnectionInfo | null
   timeout_seconds: string
+  /** Delegation limits (2026-10-24): blank = no tool-step limit. */
+  max_tool_steps: string
   avatar: string | null
   avatar_icon_ref: IconRef
   avatar_icon_fit: AvatarIconFit
@@ -53,32 +63,33 @@ export interface SubagentSaveForm {
 }
 
 /**
- * What a Subagent save names. The four blocks the route writes key by key (BL-914) are typed as
- * the save names them: a key (or a `dcmDisplaySettings` map entry, or a `nativeTools` field) sent as
+ * What a Subagent save names. The blocks the route writes key by key (BL-914) are typed as the
+ * save names them: a key (or a `dcmDisplaySettings` map entry, or a `nativeTools` field) sent as
  * `null` is removed, one not sent stays (`provider_specific_settings` carries any value in its
- * keys, so it keeps the record's own type).
+ * keys, so it keeps the record's own type). SA-139 R5: no save names `claude_settings` (the CLI
+ * Subagent's block); a leftover's stored block stays as it is until the record is deleted.
  */
 export type LiveSubagentUpdate = Partial<
-  Omit<SubagentRow, 'subagentType' | 'timeout_seconds' | 'codex_settings' | 'claude_settings' | 'dcmDisplaySettings'>
+  Omit<SubagentRow, 'subagentType' | 'timeout_seconds' | 'max_tool_steps' | 'claude_settings' | 'dcmDisplaySettings'>
 > & {
   subagentType?: SubagentType
   timeout_seconds?: number | null
-  codex_settings?: AgentBlockSave<CodexAgentSettings> | null
-  claude_settings?: AgentBlockSave<ClaudeAgentSettings> | null
+  max_tool_steps?: number | null
   dcmDisplaySettings?: AgentDcmDisplaySettingsSave | null
+  expectedModelSelection?: string
+  expectedTypedFileTools?: string
+  expectedInstructions?: Partial<InstructionsRevisions>
 }
 
-/** The form's fields as the save names them. */
+/** The form's fields as the save names them. A leftover of a removed type is never saved (D14). */
 export function buildSubagentPayload(form: SubagentSaveForm): LiveSubagentUpdate {
-  if (form.subagentType === 'n8n-subnode') {
-    throw new Error('n8n Subnode Subagents were removed from Batshit. Delete this record from Agent Settings.')
+  if (isRetiredSubagentType(form.subagentType)) {
+    throw new Error(retiredSubagentTypeSentences(form.subagentType, form).details)
   }
   return {
     displayName: form.displayName.trim(),
     subagentType: form.subagentType,
     specialty: form.specialty,
-    webhook_url: isWorkflowBackedSubagentType(form.subagentType) ? form.webhook_url.trim() || undefined : undefined,
-    webhookUrl: isWorkflowBackedSubagentType(form.subagentType) ? form.webhook_url.trim() || undefined : undefined,
     include_global_prompt: form.include_global_prompt,
     // BL-482: sent even when empty. JSON drops `undefined` and the route keeps a field the body
     // does not name, so a cleared prompt would stay saved; the route stores `''` as no prompt.
@@ -91,6 +102,7 @@ export function buildSubagentPayload(form: SubagentSaveForm): LiveSubagentUpdate
     primary_model_preset_id: form.primary_model_preset_id || null,
     primary_model_connection: form.primary_model_preset_id ? form.primary_model_connection : null,
     timeout_seconds: normalizeSubagentTimeoutSeconds(form.timeout_seconds) ?? null,
+    max_tool_steps: normalizeSubagentMaxToolSteps(form.max_tool_steps) ?? null,
     avatar: form.avatar ?? null,
     avatar_icon_ref: form.avatar_icon_ref,
     avatar_icon_fit: form.avatar_icon_fit,
@@ -110,7 +122,6 @@ export function makeSubagentFormSignature(form: SubagentSaveForm): string {
     displayName: form.displayName.trim(),
     subagentType: form.subagentType,
     specialty: form.specialty,
-    webhook_url: form.webhook_url.trim(),
     include_global_prompt: form.include_global_prompt,
     system_prompt: form.system_prompt.trim(),
     primary_model_provider: form.primary_model_provider,
@@ -120,6 +131,8 @@ export function makeSubagentFormSignature(form: SubagentSaveForm): string {
     // The Call Timeout is a number input: `bind:value` gives a number (or `null` when emptied), not
     // the string the form type says, and `.trim()` on that threw in the autosave effect.
     timeout_seconds: String(form.timeout_seconds ?? '').trim(),
+    // Same number-input shape as the Call Timeout.
+    max_tool_steps: String(form.max_tool_steps ?? '').trim(),
     avatar: form.avatar ?? '',
     avatar_icon_ref: iconRefKey(form.avatar_icon_ref),
     avatar_icon_fit: form.avatar_icon_fit,
@@ -134,7 +147,6 @@ export function makeSubagentFormSignature(form: SubagentSaveForm): string {
  */
 export const SUBAGENT_SAVE_FIELD_GROUPS: readonly (readonly string[])[] = [
   ['primary_model_provider', 'primary_model_name', 'primary_model_preset_id', 'primary_model_connection'],
-  ['subagentType', 'webhook_url', 'webhookUrl'],
   ['avatar', 'avatar_icon_ref', 'avatar_icon_fit']
 ]
 

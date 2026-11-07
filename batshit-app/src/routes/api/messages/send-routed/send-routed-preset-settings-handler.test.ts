@@ -1,4 +1,5 @@
 // @vitest-environment node
+import { useSendHandlerFixture } from '$lib/test-utils/sendHandlerFixture'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { executionViewerService } from '$lib/server/services/executionViewerService'
@@ -8,6 +9,8 @@ import { redis } from '$lib/server/redis'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { __resetStreamAbortRegistryForTests } from '$lib/server/services/streamAbortRegistry'
 import { __resetSteerInboxRegistryForTests } from '$lib/server/services/steerInboxRegistry'
+import { reasoningOverrideKey } from '$lib/utils/modelReasoningControls'
+import { agentSetupCache } from '$lib/server/services/agentSetupCache'
 
 /**
  * BL-515 — what a send asks the model for comes from the preset the agent names, now.
@@ -33,7 +36,9 @@ const PRESET = 'preset-bl515'
 
 const mocks = vi.hoisted(() => ({
   requests: [] as any[],
-  compileContent: 'Hello from the compile.'
+  compileContent: 'Hello from the compile.',
+  refuseSetupBudget: false,
+  preparations: [] as any[]
 }))
 
 vi.mock('$lib/server/services/nativeTools', async (importOriginal) => ({
@@ -45,12 +50,14 @@ vi.mock('$lib/server/services/nativeTools', async (importOriginal) => ({
 
 vi.mock('$lib/services/databaseRedis.server', async (importOriginal) => {
   const actual = await importOriginal<Record<string, any>>()
+  const { ToolHintBudgetError } = await import('$lib/server/services/dynamicMcpIndex')
   class DatabaseService extends actual.DatabaseService {
     async buildFormattedChatInput() {
       return {
         primarySystemPrompt: 'You are a test agent.',
         structuredInput: { messages: [{ role: 'user', content: mocks.compileContent }], metadata: {} },
-        resolvedProjectPath: null
+        resolvedProjectPath: null,
+        ...(mocks.refuseSetupBudget ? { finalizeAgentSetup: async () => { throw new ToolHintBudgetError(500, 24000) } } : {})
       }
     }
   }
@@ -59,6 +66,12 @@ vi.mock('$lib/services/databaseRedis.server', async (importOriginal) => {
 
 vi.mock('$lib/server/services/vercelBrain', () => ({
   VercelAIBrain: class {
+    async prepareApiToolset(request: any) {
+      mocks.preparations.push(request)
+      const { captureApiUtilities } = await import('$lib/server/services/apiUtilityRuntime')
+      return { fingerprint: 'fixture-actual-definitions', brokerAvailable: true, toolsRegistered: true,
+        apiUtilityScope: captureApiUtilities({ identity: request, approvals: {} }).scope }
+    }
     async streamNativeMode(request: any) {
       mocks.requests.push(request)
       const text = 'A reply.'
@@ -83,6 +96,7 @@ useRedisTestServer()
 let POST: (event: any) => Promise<Response>
 let PREVIEW_POST: (event: any) => Promise<Response>
 let SESSION = ''
+useSendHandlerFixture({ sessionIds: () => [SESSION], postStartupMcpUsers: () => [USER] })
 let count = 0
 
 function send(messages = [{ id: `msg-user-${count}`, role: 'user', content: 'Hi' }]): Promise<Response> {
@@ -109,8 +123,8 @@ async function setUp(options: { preset: Record<string, unknown>; agent: Record<s
     id: PRESET,
     modelName: 'Claude test preset',
     provider: 'anthropic',
-    modelId: 'claude-sonnet-5',
-    effectiveModelId: 'claude-sonnet-5',
+    modelId: 'claude-sonnet-4-6',
+    effectiveModelId: 'claude-sonnet-4-6',
     connection: { id: 'direct:anthropic', type: 'direct', service: 'anthropic' },
     contextWindow: 200_000,
     capabilities: { vision: false, tools: true },
@@ -124,7 +138,7 @@ async function setUp(options: { preset: Record<string, unknown>; agent: Record<s
     agentType: 'api',
     primary_model_preset_id: PRESET,
     primary_model_provider: 'anthropic',
-    primary_model_name: 'claude-sonnet-5',
+    primary_model_name: 'claude-sonnet-4-6',
     primary_model_connection: { id: 'direct:anthropic', type: 'direct', service: 'anthropic' },
     ...options.agent
   } as any)
@@ -141,6 +155,9 @@ describe('send-routed: the send uses the preset the agent names, now (BL-515, th
     SESSION = `session-bl515-${count}`
     mocks.requests = []
     mocks.compileContent = 'Hello from the compile.'
+    mocks.refuseSetupBudget = false
+    mocks.preparations = []
+    agentSetupCache.clearAll()
     clearLocalRuntimeContextCache()
     __resetStreamAbortRegistryForTests()
     __resetSteerInboxRegistryForTests()
@@ -148,12 +165,91 @@ describe('send-routed: the send uses the preset the agent names, now (BL-515, th
     vi.spyOn(console, 'error').mockImplementation(() => {})
     vi.spyOn(console, 'warn').mockImplementation(() => {})
     await redis.createSession({ id: SESSION, user_id: USER, title: 'BL-515', agent_id: AGENT } as any)
+
   })
 
   afterEach(() => {
+    agentSetupCache.clearAll()
     vi.restoreAllMocks()
     vi.unstubAllGlobals()
   })
+
+  it('surfaces a compiler budget refusal before model dispatch or cache publication', async () => {
+    await setUp({ preset: {}, agent: {} })
+    const identity = { userId: USER, agentId: AGENT, sessionId: SESSION }
+    const live = { sources: [{ id: 'fixture', label: 'Fixture', available: true }], blocks: [{ key: 'fixture', source: 'fixture',
+      section: 'facts' as const, order: 0, text: 'existing setup', items: [{ key: 'fixture', label: 'Fixture', text: 'existing setup' }] }] }
+    const first = agentSetupCache.prepare({ identity, live, precedingBytes: 'unchanged', toolFingerprint: 'old-definitions' })
+    agentSetupCache.modelCalled(first)
+    const committed = vi.spyOn(agentSetupCache, 'commit')
+    const called = vi.spyOn(agentSetupCache, 'modelCalled')
+    const snapshots = vi.spyOn(executionViewerService, 'recordSnapshot')
+    mocks.refuseSetupBudget = true
+    const response = await send()
+    const body = await response.text()
+    expect(response.status).toBe(400)
+    expect(body).toContain('Total Hint Budget is 500')
+    expect(body).toContain('at least 24000')
+    expect(body).toContain('reduce/shorten enabled group metadata')
+    expect(mocks.preparations).toHaveLength(1)
+    expect(mocks.requests).toHaveLength(0)
+    expect(committed).not.toHaveBeenCalled()
+    expect(called).not.toHaveBeenCalled()
+    expect(snapshots).not.toHaveBeenCalled()
+    const retained = agentSetupCache.prepare({ identity, live, precedingBytes: 'unchanged', toolFingerprint: 'old-definitions', preview: true })
+    expect(retained.refresh).toBeNull()
+    expect(retained.text).toBe(first.text)
+  })
+
+  it('captures one exact local Thinking snapshot before primary selection and freezes the actual model tag into the request', async () => {
+    const connection = { type: 'direct' as const, id: 'direct:ollama', service: 'ollama' }, effectiveModelId = 'qwen3.5:9b-q4_K_M'
+    const key = reasoningOverrideKey({ presetId: PRESET, connection, effectiveModelId }, 'thinking')
+    await setUp({ preset: { provider: 'qwen', modelId: 'catalog/qwen-local', effectiveModelId, connection, contextWindow: 4096,
+      capabilities: { tools: false, reasoning: false }, settings: { temperature: 0, 'ollama.options.num_ctx': 4096 } },
+      agent: { model_reasoning_overrides: { [key]: { mode: 'value', value: true } } } })
+    await redis.set(`local_provider:${USER}:ollama`, { id: 'ollama', enabled: true, baseUrl: 'http://local-model.test', openaiPath: '/v1', imageTransport: 'auto' })
+    const http = vi.fn(async (input: any) => Response.json(String(input).endsWith('/api/version') ? { version: '0.40.3' }
+      : String(input).endsWith('/api/show') ? { capabilities: ['thinking'], thinking: { values: [false, true], default: true } }
+        : { models: [] }))
+    vi.stubGlobal('fetch', http)
+    const response = await send()
+    expect(response.status, await response.clone().text()).toBe(200)
+    await response.text()
+    const shows = http.mock.calls.filter(call => String(call[0]).endsWith('/api/show'))
+    expect(shows).toHaveLength(1)
+    expect(http.mock.calls.filter(call => String(call[0]).endsWith('/api/version'))).toHaveLength(1)
+    expect(JSON.parse(String((shows[0] as any)[1].body))).toEqual({ model: effectiveModelId, verbose: false })
+    expect(mocks.requests).toHaveLength(1)
+    const request = mocks.requests[0]
+    expect(request.model).toBe(effectiveModelId)
+    expect(request.providerOptions.ollama).toMatchObject({ think: true, options: { num_ctx: 4096 } })
+    expect(request.providerOptions.batshit_reasoning.ollama).toMatchObject({ modelId: effectiveModelId, mode: 'value', value: true })
+    expect(request.providerOptions.batshit_reasoning.ollama.connectionKey).toMatch(/^[a-f0-9]{64}$/)
+    expect((await redis.get(`model:${PRESET}`)).settings).toEqual({ temperature: 0, 'ollama.options.num_ctx': 4096 })
+  }, 30_000)
+
+  it('keeps inherited local requests free of reasoning metadata reads and refuses an unverified explicit choice before the model', async () => {
+    const connection = { type: 'direct' as const, id: 'direct:ollama', service: 'ollama' }, effectiveModelId = 'qwen3.5:9b-q4_K_M'
+    const key = reasoningOverrideKey({ presetId: PRESET, connection, effectiveModelId }, 'thinking')
+    await setUp({ preset: { provider: 'qwen', modelId: 'catalog/qwen-local', effectiveModelId, connection, contextWindow: 4096,
+      capabilities: { tools: false }, settings: { 'ollama.options.num_ctx': 4096 } }, agent: {} })
+    await redis.set(`local_provider:${USER}:ollama`, { id: 'ollama', enabled: true, baseUrl: 'http://local-model.test', openaiPath: '/v1' })
+    const http = vi.fn(async () => Response.json({ models: [] }))
+    vi.stubGlobal('fetch', http)
+    const inherited = await send()
+    expect(inherited.status).toBe(200); await inherited.text()
+    expect(http.mock.calls.some(call => /\/api\/(?:show|version)$/.test(String(call[0])))).toBe(false)
+    expect(mocks.requests[0].providerOptions).not.toHaveProperty('batshit_reasoning')
+    await redis.updateAgent(AGENT, { model_reasoning_overrides: { [key]: { mode: 'value', value: false } } } as any)
+    mocks.requests = []
+    const failure = await send()
+    const body = await failure.text()
+    expect(body).toMatch(/not verified|not supported/i)
+    expect(mocks.requests).toHaveLength(0)
+    expect(http.mock.calls.filter(call => String(call[0]).endsWith('/api/version'))).toHaveLength(1)
+    expect(http.mock.calls.some(call => String(call[0]).endsWith('/api/show'))).toBe(false)
+    expect((await redis.get(`agent:${AGENT}`))?.model_reasoning_overrides).toEqual({ [key]: { mode: 'value', value: false } })
+  }, 30_000)
 
   it.each(['koboldcpp', 'ollama'] as const)('uses the same %s effective context for real send and preview routes', async (provider) => {
     const modelId = provider === 'koboldcpp' ? 'koboldcpp/Qwen' : 'qwen:latest'
@@ -331,16 +427,16 @@ describe('send-routed: the send uses the preset the agent names, now (BL-515, th
     await redis.set('vercel:model_catalog:v1', {
       models: [
         {
-          id: 'anthropic/claude-sonnet-5',
-          canonicalId: 'anthropic/claude-sonnet-5',
+          id: 'anthropic/claude-sonnet-4-6',
+          canonicalId: 'anthropic/claude-sonnet-4-6',
           provider: 'anthropic',
-          name: 'claude-sonnet-5',
+          name: 'claude-sonnet-4-6',
           displayName: 'Claude Sonnet 5',
           tags: [],
           features: {},
           source: 'vercel',
           idVariants: {
-            'vercel-gateway': { developerId: 'anthropic', modelId: 'claude-sonnet-5', effectiveId: 'anthropic/claude-sonnet-5', source: 'vercel' }
+            'vercel-gateway': { developerId: 'anthropic', modelId: 'claude-sonnet-4-6', effectiveId: 'anthropic/claude-sonnet-4-6', source: 'vercel' }
           }
         }
       ],

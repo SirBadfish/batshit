@@ -1,16 +1,17 @@
 # Providers
 
-Providers are how Batshit gets access to AI models — the API keys or supported plan connections you save, the Model Presets you build on top of them, the Model Catalog that helps you create those presets, and the CLI providers (Codex and Claude Code) that run as their own managed agents. This page explains how those pieces fit together so the detail pages make sense.
+Providers are how Batshit gets access to AI models — the API keys or supported plan connections you save, the Model Presets you build on top of them, and the Model Catalog that helps you create those presets. This page explains how those pieces fit together so the detail pages make sense.
 
-In Batshit, "provider" mostly means a source of model intelligence. Most of the time that's a hosted AI provider you reach with an API key. But CLI tools and Local AI programs are also ways to bring models in, and it helps to know where each one lives.
+In Batshit, "provider" mostly means a source of model intelligence. Most of the time that's a hosted AI provider you reach with an API key. But plan connections and Local AI programs are also ways to bring models in, and it helps to know where each one lives.
 
 ## The pieces
 
 - **API keys** — the secrets that let Batshit talk to a hosted provider like OpenAI, Anthropic, Google, Groq, OpenRouter, or Vercel AI Gateway. Saved in Settings → API Keys and encrypted at rest.
-- **ChatGPT Plan** — sign in from Settings → API Keys in the local Mac app, then select an account-specific model preset for an ordinary API agent. See [the connection steps](api-keys-and-models.md#connect-a-chatgpt-plan-in-the-mac-app). Available models and usage limits belong to your ChatGPT account; [published model properties](model-catalog.md#chatgpt-plan-models) have their own source and verification date.
+- **ChatGPT Plan** — sign in from Settings → API Keys in the Mac app or supported local Mac/Windows Pinokio installation, then select an account-specific model preset for an ordinary agent. See [the connection steps](api-keys-and-models.md#connect-a-chatgpt-plan-in-a-local-installation). Available models and usage limits belong to your ChatGPT account; [published model properties](model-catalog.md#chatgpt-plan-models) have their own source and verification date.
+- **Claude Plan** — install and sign in to Claude Code from Settings → API Keys in the Mac app, then pick the Claude Plan connection for an agent or Subagent. Usage counts against your Claude plan. See [Claude plan](claude-plan.md).
 - **Model Presets** — saved, named model configurations (provider connection plus model ID plus options like tools, image transport, reasoning, and pricing). Built in Settings → Models. Agents pick a preset instead of repeating provider settings everywhere.
 - **Model Catalog** — a helper that knows about a lot of models across providers and can turn a catalog entry into a saved preset for you, so you don't have to hand-enter every model ID and capability.
-- **CLI providers** — Codex CLI and Claude Code CLI. These aren't hosted-key providers; they're command-line agents Batshit installs and manages, then you log into. They power `CLI` Primary Agents.
+- **Claude Code** — the command-line program behind the Claude Plan connection. Install it and sign in from Settings → API Keys → Claude Plan in the Mac app.
 
 ## How keys and presets work together
 
@@ -18,7 +19,7 @@ A provider key on its own doesn't tell Batshit which model to run or how to run 
 
 1. Save a provider key in Settings → API Keys.
 2. Create a saved Model Preset in Settings → Models that uses that provider connection and a specific model.
-3. Point an `API` Primary Agent (or Subagent) at that preset.
+3. Point a Primary Agent (or Subagent) at that preset.
 
 The payoff is reuse: set a model up once as a preset, then select it anywhere. Clear preset names help — things like `OpenAI - GPT daily`, `Anthropic - Writing`, or `Groq - Fast`.
 
@@ -33,14 +34,14 @@ These are two different ways to reach a model, and Batshit keeps them in separat
 
 If you want models that run on your own hardware, start with [Local AI](../local-ai/overview.md). For hosted models, start in Settings → API Keys with a provider key or, in the local Mac app, a supported ChatGPT Plan connection.
 
-## CLI providers (Codex and Claude Code)
+## Claude Code (for the Claude plan)
 
-`CLI` Primary Agents run a real command-line coding agent — Codex or Claude Code — inside Batshit. Setting one up is a two-part job:
+Claude Code is Anthropic's command-line coding program. Batshit uses it as the model behind the [Claude Plan](claude-plan.md) connection, for Primary Agents and Subagents alike, and Batshit runs every tool. Setting it up is a two-part job:
 
-1. **Install the CLI.** The easy path is the one-click managed install in Agent Settings: Batshit downloads an official, checksum-verified copy and manages it. You can also bring your own if you already have `codex` or `claude` installed.
-2. **Log in.** Installing isn't authenticating. After install, you run the CLI's login command (Batshit shows the exact one for your setup). Provider API keys saved in Batshit do **not** log the CLI in — they're separate auth paths.
+1. **Install it.** The easy path is the one-click managed install in Settings → API Keys → Claude Plan: Batshit downloads an official, checksum-verified copy and manages it. You can also bring your own if you already have `claude` installed.
+2. **Sign in.** Installing isn't signing in. After install, run Claude Code's sign-in command (the card shows the exact one for your setup). Provider API keys saved in Batshit do **not** sign Claude Code in — they're separate auth paths.
 
-The install cards and login steps are covered in the install guides: [Install Mac app](../installation/install-mac-app.md) and [Install Docker](../installation/install-docker.md).
+The install guides cover the details: [Install Mac app](../installation/install-mac-app.md) and [Install Docker](../installation/install-docker.md).
 
 ## In this section
 
@@ -50,5 +51,5 @@ The install cards and login steps are covered in the install guides: [Install Ma
 ## Related
 
 - [Local AI](../local-ai/overview.md) — run models on your own machine or network.
-- [Primary Agents](../primary-agents/overview.md) — how `API` and `CLI` agents use these providers, and how n8n Workflow Subagents keep their provider setup inside n8n.
-- [Connect n8n](../primary-agents/connect-n8n.md) — provider credentials for `n8n` agents live inside n8n, not Batshit's API Keys.
+- [Primary Agents](../primary-agents/overview.md) — how agents use these providers.
+- [Connect n8n](../primary-agents/connect-n8n.md) — provider credentials for n8n workflows live inside n8n, not Batshit's API Keys.

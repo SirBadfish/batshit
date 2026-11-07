@@ -6,10 +6,11 @@ import {
   resolveGatewayDisplayDefaults,
   resolveMcpToolDcmVisibility
 } from './dynamicMcpVisibility'
-import { mcpGatewayDiscovery } from './mcpGatewayDiscovery'
+import { mcpGatewayDiscovery, reserveInitialStdioObservations } from './mcpGatewayDiscovery'
 import { resolveDynamicMcpGatewayScope } from './mcpSelectionResolver'
 import { shouldHideInternalMcpTool } from './nativeToolConstants'
 import type { AgentDcmDisplaySettings } from '$lib/types/database'
+import { buildSchemaSummary, getDefaultSchemaHintCaps, getSchemaHintText } from './dynamicMcpSchema'
 
 export const MAX_DYNAMIC_MCP_RESULTS = 20
 export const DEFAULT_DYNAMIC_MCP_RESULTS = 5
@@ -138,6 +139,8 @@ function resolveToolKeyByName(options: {
 }
 
 async function loadGatewayToolsUncached(options: {
+  originalObservations?: ReadonlyMap<string, import('./mcpGatewayDiscovery').P5McpClientAdmission>
+  p5Owner?: import('./appActions/mcp/originalTask').P5ApiDiscoveryOwner
   userId: string
   agentId?: string | null
   agentMetadata?: Record<string, any> | null
@@ -160,6 +163,8 @@ async function loadGatewayToolsUncached(options: {
     undefined,
     {
       skipFiltering: true,
+      p5Owner: options.p5Owner,
+      originalObservations: options.originalObservations,
       projectPath: options.projectPath ?? null
     }
   )
@@ -200,6 +205,7 @@ async function loadGatewayToolsUncached(options: {
 }
 
 export async function loadDynamicMcpGatewayTools(options: {
+  p5Owner?: import('./appActions/mcp/originalTask').P5ApiDiscoveryOwner
   userId: string
   agentId?: string | null
   agentMetadata?: Record<string, any> | null
@@ -209,6 +215,14 @@ export async function loadDynamicMcpGatewayTools(options: {
   projectPath?: string | null
   cache?: GatewayToolsCache
 }): Promise<GatewayToolsLoadResult> {
+  const originalObservations = options.p5Owner ? reserveInitialStdioObservations(options.p5Owner, options.mcpGatewayScope ?? []) : undefined
+  if (options.p5Owner) {
+    const owner = await import('./appActions/mcp/originalTask')
+    for (const id of options.mcpGatewayScope ?? []) {
+      await owner.readP5ApiVerifiedMcpAuthority(options.p5Owner, id)
+      await owner.readP5ApiOriginalStdioAuthority(options.p5Owner, id)
+    }
+  }
   const cacheKey = options.cache
     ? JSON.stringify({
         userId: options.userId,
@@ -228,21 +242,21 @@ export async function loadDynamicMcpGatewayTools(options: {
     if (cached) return cached
   }
 
-  const loadPromise = loadGatewayToolsUncached(options)
+  const loadPromise = loadGatewayToolsUncached({ ...options, originalObservations })
   if (options.cache && cacheKey) {
-    options.cache.set(
-      cacheKey,
-      loadPromise.catch((error) => {
-        options.cache?.delete(cacheKey)
-        throw error
-      })
-    )
+    const cachedPromise = loadPromise.catch((error) => {
+      options.cache?.delete(cacheKey)
+      throw error
+    })
+    options.cache.set(cacheKey, cachedPromise)
+    return cachedPromise
   }
 
   return loadPromise
 }
 
 export async function executeDynamicMcpFind(input: {
+  p5ApiRun?: import('./appActions/mcp/originalTask').P5ApiOriginalRun
   userId: string
   agentId?: string | null
   agentMetadata?: Record<string, any> | null
@@ -270,6 +284,7 @@ export async function executeDynamicMcpFind(input: {
   const includeSchema = input.includeSchema === true
 
   const { tools, metadata } = await loadDynamicMcpGatewayTools({
+    p5Owner: input.p5ApiRun,
     userId: input.userId,
     agentId: input.agentId ?? null,
     agentMetadata: input.agentMetadata,
@@ -289,6 +304,7 @@ export async function executeDynamicMcpFind(input: {
           ? meta.originalToolName.trim()
           : null
       const description = (toolDef as any)?.description || ''
+      const inputSchema = includeSchema ? extractSchema(toolDef) : undefined
       const score = scoreDynamicMatch({
         query: targetTool || query,
         toolName,
@@ -305,7 +321,8 @@ export async function executeDynamicMcpFind(input: {
         gatewayId: meta?.gatewayId ?? null,
         gatewayName: meta?.gatewayName ?? null,
         score,
-        ...(includeSchema ? { inputSchema: extractSchema(toolDef) } : {})
+        ...(includeSchema ? { inputSchema,
+          schemaHint: getSchemaHintText(buildSchemaSummary(inputSchema, getDefaultSchemaHintCaps())) } : {})
       }
     })
     .filter((entry) => {
@@ -349,6 +366,7 @@ export async function executeDynamicMcpFind(input: {
 }
 
 export async function executeDynamicMcpUse(input: {
+  p5ApiRun?: import('./appActions/mcp/originalTask').P5ApiOriginalRun
   userId: string
   agentId?: string | null
   agentMetadata?: Record<string, any> | null
@@ -379,6 +397,7 @@ export async function executeDynamicMcpUse(input: {
 
   const startedAt = Date.now()
   const { tools, metadata } = await loadDynamicMcpGatewayTools({
+    p5Owner: input.p5ApiRun,
     userId: input.userId,
     agentId: input.agentId ?? null,
     agentMetadata: input.agentMetadata,
@@ -424,7 +443,7 @@ export async function executeDynamicMcpUse(input: {
   }
 
   // The AI SDK's tool-call options shape, so a wrapped gateway tool hears the Stop.
-  const result = await execute(params, { abortSignal: input.abortSignal ?? undefined })
+  const result = await execute(params, { abortSignal: input.abortSignal ?? undefined, p5ApiRun: input.p5ApiRun })
   const meta = metadata.get(resolvedToolName)
 
   return {

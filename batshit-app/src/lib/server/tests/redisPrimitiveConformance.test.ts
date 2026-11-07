@@ -28,6 +28,10 @@ vi.mock('$lib/server/redis', async () => {
 
 import { createClient, type RedisClientType } from 'redis'
 import { clearRedisTestDatabase } from '$lib/test-utils/redis-memory'
+import { lstat, readFile, realpath } from 'node:fs/promises'
+import { basename, dirname, isAbsolute, join } from 'node:path'
+import { execFileSync } from 'node:child_process'
+import { BATSHIT_RUNTIME_REDIS_PORTS } from '$lib/server/redisRuntimePorts'
 
 const REAL_REDIS_LANE = process.env.VITEST_USE_REAL_REDIS === 'true'
 
@@ -57,31 +61,185 @@ const mark = (command: (typeof EXPECTED_COMMAND_SURFACE)[number]) => exercised.a
 
 const K = 'sa101:conformance'
 
+type PrimitiveAllocation = Readonly<{
+  schemaVersion: 1
+  purpose: 'redis-primitive-conformance'
+  allocationId: string
+  createdAt: string
+  host: '127.0.0.1'
+  port: number
+  database: 15
+  version: '8.10.1'
+  runId: string
+  directory: string
+  localAddress: string
+  emptyAtAllocation: true
+  owner: Readonly<{
+    kind: 'local-supervised'; pid: number; startIdentity: string; tty: string
+    directoryDevice: string; directoryInode: string
+  }> | Readonly<{
+    kind: 'github-actions-service'; serviceId: string; githubRunId: string; githubRunAttempt: string
+  }>
+  allocationPath: string
+}>
+
+function refusal(reason: string): never {
+  throw new Error(`Redis primitive admin admission refused: ${reason}`)
+}
+function record(value: unknown): value is Record<string, any> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+function exact(value: unknown, fields: string[]): value is Record<string, any> {
+  return record(value) && Object.keys(value).length === fields.length && fields.every(field => Object.hasOwn(value, field))
+}
+function text(value: unknown, max: number): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= max && !/[\r\n\0]/.test(value)
+}
+
+// This private allocation comes from the held local foreground process or the
+// workflow's actual job-owned container capture. It is not derived from a target
+// URL here. Same-user malicious file/environment forgery is outside this guard.
+async function readPrimitiveAllocation(): Promise<PrimitiveAllocation> {
+  const path = process.env.BATSHIT_REDIS_ADMIN_ALLOCATION
+  if (!path || !isAbsolute(path) || basename(path) !== 'redis-primitive-allocation.json') refusal('an explicit private allocation file is required.')
+  const stat = await lstat(path, { bigint: true })
+  if (!stat.isFile() || stat.isSymbolicLink() || Number(stat.mode) & 0o077 ||
+      Number(stat.uid) !== process.getuid?.() || stat.size > 65536n || await realpath(path) !== path) refusal('allocation file ownership or shape is invalid.')
+  const value: unknown = JSON.parse(await readFile(path, 'utf8'))
+  if (!exact(value, ['schemaVersion', 'purpose', 'allocationId', 'createdAt', 'host', 'port', 'database',
+    'version', 'runId', 'directory', 'localAddress', 'emptyAtAllocation', 'owner']) ||
+    value.schemaVersion !== 1 || value.purpose !== 'redis-primitive-conformance' ||
+    typeof value.allocationId !== 'string' || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(value.allocationId) ||
+    value.host !== '127.0.0.1' || !Number.isInteger(value.port) || value.port < 1 || value.port > 65535 || value.database !== 15 ||
+    value.version !== '8.10.1' || typeof value.runId !== 'string' || !/^[a-f0-9]{40}$/.test(value.runId) ||
+    !text(value.directory, 4096) || !isAbsolute(value.directory) || !text(value.localAddress, 128) ||
+    value.emptyAtAllocation !== true || typeof value.createdAt !== 'string' ||
+    !Number.isFinite(Date.parse(value.createdAt)) || new Date(value.createdAt).toISOString() !== value.createdAt ||
+    Date.now() < Date.parse(value.createdAt)) refusal('allocation is malformed or from the future.')
+  if (value.owner?.kind === 'local-supervised') {
+    if (!exact(value.owner, ['kind', 'pid', 'startIdentity', 'tty', 'directoryDevice', 'directoryInode']) ||
+      !['darwin', 'linux'].includes(process.platform) || value.port < 49152 || BATSHIT_RUNTIME_REDIS_PORTS.has(value.port) ||
+      Date.now() - Date.parse(value.createdAt) > 30 * 60_000 ||
+      !Number.isSafeInteger(value.owner.pid) || value.owner.pid <= 1 || !text(value.owner.startIdentity, 128) ||
+      !text(value.owner.tty, 128) || value.owner.tty.includes('?') ||
+      typeof value.owner.directoryDevice !== 'string' || typeof value.owner.directoryInode !== 'string' ||
+      !/^[0-9]+$/.test(value.owner.directoryDevice) || !/^[1-9][0-9]*$/.test(value.owner.directoryInode) ||
+      value.directory !== join(dirname(path), 'redis') || value.localAddress !== `${value.host}:${value.port}`) refusal('local foreground allocation is invalid or stale.')
+    const parent = await lstat(dirname(path), { bigint: true })
+    if (!parent.isDirectory() || parent.isSymbolicLink() || Number(parent.uid) !== process.getuid?.() || Number(parent.mode) & 0o077 ||
+        await realpath(dirname(path)) !== dirname(path)) refusal('local allocation directory is not private.')
+  } else if (value.owner?.kind === 'github-actions-service') {
+    // Current-job/run-attempt binding owns CI lifetime; a fixed local TTL must
+    // not expire a valid retained service halfway through a long CI job.
+    if (!exact(value.owner, ['kind', 'serviceId', 'githubRunId', 'githubRunAttempt']) ||
+      process.env.GITHUB_ACTIONS !== 'true' || process.platform !== 'linux' ||
+      typeof value.owner.serviceId !== 'string' || typeof value.owner.githubRunId !== 'string' || typeof value.owner.githubRunAttempt !== 'string' ||
+      !/^[a-f0-9]{64}$/.test(value.owner.serviceId) || !/^[1-9][0-9]*$/.test(value.owner.githubRunId) || !/^[1-9][0-9]*$/.test(value.owner.githubRunAttempt) ||
+      value.owner.serviceId !== process.env.BATSHIT_REDIS_CI_SERVICE_ID ||
+      value.owner.githubRunId !== process.env.GITHUB_RUN_ID || value.owner.githubRunAttempt !== process.env.GITHUB_RUN_ATTEMPT ||
+      !process.env.RUNNER_TEMP || await realpath(dirname(path)) !== await realpath(process.env.RUNNER_TEMP)) refusal('allocation does not belong to this Actions service/run attempt.')
+  } else refusal('no supported dedicated-instance owner.')
+  for (const name of ['BATSHIT_REDIS_TEST_URL', 'VITEST_REDIS_URL', 'REDIS_URL']) {
+    const raw = process.env[name]
+    if (!raw) refusal('all three explicit Redis URLs are required.')
+    const url = new URL(raw)
+    if (url.protocol !== 'redis:' || url.username || url.password || url.search || url.hash ||
+        url.hostname !== value.host || url.port !== String(value.port) || url.pathname !== '/15') refusal('effective Redis URLs disagree with the owned endpoint/DB15.')
+  }
+  return Object.freeze({ ...value, owner: Object.freeze(value.owner), allocationPath: path }) as PrimitiveAllocation
+}
+
+function infoField(info: string, name: string): string {
+  const matches = info.split(/\r?\n/).filter(line => line.startsWith(`${name}:`))
+  if (matches.length !== 1) refusal('malformed server identity reply.')
+  return matches[0].slice(name.length + 1)
+}
+async function assertPrimitiveInstance(client: RedisClientType, allocation: PrimitiveAllocation, initial = false) {
+  if (!client.isOpen || !client.isReady) refusal('client is not ready.')
+  const connection = await client.clientInfo()
+  const server = await client.info('server')
+  const directory = await client.sendCommand(['CONFIG', 'GET', 'dir'])
+  const capabilities = await client.sendCommand(['COMMAND', 'INFO', 'JSON.GET', 'FT.SEARCH'])
+  if (connection.db !== 15 || connection.laddr !== allocation.localAddress ||
+      infoField(server, 'redis_version') !== allocation.version || infoField(server, 'run_id') !== allocation.runId ||
+      !Array.isArray(directory) || directory.length !== 2 || directory[0] !== 'dir' || directory[1] !== allocation.directory ||
+      !Array.isArray(capabilities) || capabilities.length !== 2 || capabilities.some((value, index) =>
+        !Array.isArray(value) || typeof value[0] !== 'string' || value[0].toLowerCase() !== ['json.get', 'ft.search'][index])) refusal('actual connection/server/directory/capability differs from allocation.')
+  if (allocation.owner.kind === 'local-supervised') {
+    const owner = allocation.owner
+    const stat = await lstat(allocation.directory, { bigint: true })
+    if (!stat.isDirectory() || stat.isSymbolicLink() || Number(stat.uid) !== process.getuid?.() || Number(stat.mode) & 0o077 ||
+      stat.dev.toString() !== owner.directoryDevice || stat.ino.toString() !== owner.directoryInode ||
+      await realpath(allocation.directory) !== allocation.directory || Number(infoField(server, 'process_id')) !== owner.pid ||
+      execFileSync('/bin/ps', ['-p', String(owner.pid), '-o', 'lstart='], { encoding: 'utf8', timeout: 1000 }).trim() !== owner.startIdentity ||
+      execFileSync('/bin/ps', ['-p', String(owner.pid), '-o', 'tty='], { encoding: 'utf8', timeout: 1000 }).trim() !== owner.tty) refusal('held foreground process or persistence directory changed.')
+    if (initial && [...(await client.info('keyspace')).matchAll(/^db\d+:keys=(\d+)/gm)].some(match => Number(match[1]) > 0)) refusal('local instance is not empty in every database.')
+  }
+  if (!client.isOpen || !client.isReady) refusal('connection ended during admission.')
+}
+
+async function closePrimitiveClient(client: RedisClientType | undefined) {
+  // All work has settled. Close directly: node-redis marks QUIT closed before
+  // awaiting its reply, so a failed QUIT can hide a still-ready socket.
+  if (client?.isOpen) await client.disconnect()
+  if (client?.isOpen || client?.isReady) refusal('client close could not be confirmed.')
+}
+
 describe.skipIf(!REAL_REDIS_LANE)('Redis primitive conformance (SA-101)', () => {
   let client: RedisClientType
+  let allocation: PrimitiveAllocation
+  let admitted = false
+  let closed = false
+  let connection: Promise<unknown> | undefined
+  let closure: Promise<void> | undefined
+
+  function closeClient() {
+    return closure ??= (async () => {
+      // connect() marks isOpen before awaiting socket creation. Wait for that
+      // existing attempt before disconnecting, including an early afterAll.
+      try { await connection } catch { /* beforeAll retains the connect failure. */ }
+      await closePrimitiveClient(client)
+    })()
+  }
 
   beforeAll(async () => {
-    const url =
-      process.env.BATSHIT_REDIS_TEST_URL ||
-      process.env.VITEST_REDIS_URL ||
-      process.env.REDIS_URL ||
-      'redis://127.0.0.1:6379/15'
-    const parsed = new URL(url)
-    const database = Number.parseInt(parsed.pathname.replace('/', '') || '15', 10)
-    // Never touch db 0: that is where a developer's real Batshit data lives.
-    expect(database, 'conformance suite must not run against database 0').toBeGreaterThan(0)
-    client = createClient({ url, database }) as RedisClientType
-    await client.connect()
-    // BL-135: never FLUSHDB; it drops every search index on the server, DB 0's included.
-    await clearRedisTestDatabase(client)
+    if (closed) refusal('suite already ended.')
+    allocation = await readPrimitiveAllocation()
+    if (closed) refusal('suite ended while reading allocation.')
+    const candidate = client = createClient({ url: process.env.BATSHIT_REDIS_TEST_URL, database: 15,
+      disableOfflineQueue: true, socket: { reconnectStrategy: false } }) as RedisClientType
+    candidate.on('error', () => {}) // The awaited command/connect keeps the real failure.
+    try {
+      connection = candidate.connect()
+      await connection
+      if (closed) refusal('suite ended while connecting.')
+      await assertPrimitiveInstance(candidate, allocation, true)
+      if (closed) refusal('suite ended during admission.')
+      await clearRedisTestDatabase(candidate)
+      admitted = true
+    } catch (error) {
+      try { await closeClient() }
+      catch (closeError) { throw new AggregateError([error, closeError], 'Primitive Redis admission and close failed.') }
+      throw error
+    }
   }, 30000)
 
   afterAll(async () => {
-    if (client?.isOpen) {
-      await clearRedisTestDatabase(client)
-      await client.quit()
-    }
+    closed = true
+    try {
+      if (admitted && client?.isOpen) {
+        await assertPrimitiveInstance(client, allocation)
+        await clearRedisTestDatabase(client)
+      }
+    } finally { admitted = false; await closeClient() }
   })
+
+  async function adminClient() {
+    if (!admitted || closed) refusal('admin work has no live admission.')
+    await assertPrimitiveInstance(client, allocation)
+    if (!admitted || closed) refusal('suite ended during admin assertion.')
+    return client
+  }
 
   it('handles keys, strings, expiry and cursor scanning', async () => {
     expect(await client.set(`${K}:s`, 'hello')).toBe('OK'); mark('SET')
@@ -254,6 +412,7 @@ describe.skipIf(!REAL_REDIS_LANE)('Redis primitive conformance (SA-101)', () => 
   })
 
   it('supports pub/sub and the admin reads the supervisor and upload service depend on', async () => {
+    await adminClient()
     expect(await client.publish(`${K}:chan`, 'hello')).toBe(0); mark('PUBLISH')
     expect(await client.ping()).toBe('PONG'); mark('PING')
 
@@ -282,9 +441,9 @@ describe.skipIf(!REAL_REDIS_LANE)('Redis primitive conformance (SA-101)', () => 
     mark('INFO persistence')
 
     // visualIndicatorService turns on keyspace notifications at runtime.
-    expect(await client.configSet('notify-keyspace-events', 'KEA')).toBe('OK'); mark('CONFIG SET')
+    expect(await (await adminClient()).configSet('notify-keyspace-events', 'KEA')).toBe('OK'); mark('CONFIG SET')
 
-    expect(await client.bgRewriteAof()).toMatch(/rewriting started|scheduled/i)
+    expect(await (await adminClient()).bgRewriteAof()).toMatch(/rewriting started|scheduled/i)
     mark('BGREWRITEAOF')
   })
 

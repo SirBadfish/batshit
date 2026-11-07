@@ -8,6 +8,14 @@
   } from '$lib/utils/controlApprovalPresentation'
   import { getDmBrief, requestDmBrief } from '$lib/stores/dmBriefs.svelte'
   import { wakeOriginText } from '$lib/utils/jevJuice'
+  import {
+    APP_ACTIONS_NATIVE_CHANGE_CONTROL_ID, isAppActionsApprovalPreviewForControl
+  } from '$lib/appActions/settings/managementContract'
+  import { formatAppActionsOutcomeReason } from '$lib/appActions/settings/outcomeReason'
+  import { isInstructionsReview, type InstructionsReview, type InstructionTextFact, type InstructionInclusionFact } from '$lib/appActions/settings/instructionReview'
+  import type { AppActionsOperationPreview, AppActionsOperationReview } from '$lib/appActions/settings/managementContract'
+  import { MODEL_PRESET_COPY_ID, modelSelectionFactText, type ModelSelectionReview, type ModelPresetCopyReview, type PresetParameterFact } from '$lib/appActions/settings/modelSelectionPreferences'
+  import { MCP_CONFIGURATION_ID, type McpConfigurationReview } from '$lib/appActions/settings/mcpConfiguration'
 
   interface Props {
     approvals: any[]
@@ -16,9 +24,12 @@
     describeApproval: (approval: any) => string
     formatApprovalInput: (input: any) => string
     getApprovalRemainingSeconds: (approval: any) => number | null
+    isRetiredApproval?: (approval: any) => boolean
     onApprovalAction: (approvalId: string, approved: boolean) => void | Promise<void>
     /** SA-120 P7: the DM whose wake started this turn, when a DM, a webhook, or a schedule did. */
     wakeDmId?: string | null
+    /** Authenticated portable review uses the same fixed text presentation as native Ask. */
+    settingsReview?: AppActionsOperationReview | null
   }
 
   /**
@@ -40,8 +51,10 @@
     describeApproval,
     formatApprovalInput,
     getApprovalRemainingSeconds,
+    isRetiredApproval = () => false,
     onApprovalAction,
-    wakeDmId = null
+    wakeDmId = null,
+    settingsReview = null
   }: Props = $props()
 
   /**
@@ -63,9 +76,151 @@
     requestDmBrief(wakeDmId)
   })
   const wakeOrigin = $derived(wakeDmId ? wakeOriginText(getDmBrief(wakeDmId)?.from) : null)
+  function previewTime(value: string) {
+    return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'long' }).format(new Date(value))
+  }
+  function subjectKind(kind: string) {
+    return ({ primary: 'Primary Agent', subagent: 'Subagent', group: 'Group', worker: 'Worker' } as Record<string, string>)[kind] ?? kind
+  }
+  function instructionsFor(preview: AppActionsOperationPreview): InstructionsReview | null {
+    const value = (preview as AppActionsOperationPreview & { instructions?: unknown }).instructions
+    return preview.semanticId === 'agent.instructions' && isInstructionsReview(value, preview.targets) ? value : null
+  }
+  function textFact(fact: InstructionTextFact, review: InstructionsReview) {
+    return fact.state === 'set' ? `Text ${review.texts.findIndex(row => row.id === fact.textId) + 1}`
+      : fact.state === 'absent' ? 'No stored prompt' : fact.state === 'null' ? 'Explicit null (no custom prompt)' : 'Delete stored prompt'
+  }
+  function inclusionFact(fact: InstructionInclusionFact) {
+    return fact.state === 'set' ? fact.value ? 'On' : 'Off' : fact.state === 'null' ? 'Explicit null' : 'Not stored'
+  }
+  function inclusionValue(value: boolean | 'unknown') { return value === 'unknown' ? 'Unknown' : value ? 'On' : 'Off' }
+  const portableInstructions = $derived(settingsReview ? instructionsFor(settingsReview.preview) : null)
+  const portableCopy = $derived(settingsReview?.preview.semanticId === MODEL_PRESET_COPY_ID ? settingsReview.preview.presetCopy : null)
+  function parameterFact(fact: PresetParameterFact) { return fact.state === 'set' ? JSON.stringify(fact.value) : fact.state === 'null' ? 'Explicit null (provider default)' : 'Not set (provider default)' }
+  const portableMcp = $derived(settingsReview?.preview.semanticId === MCP_CONFIGURATION_ID ? settingsReview.preview.resource : null)
+  const nativeFactLabels: Record<string, string> = { claudeModel: 'Stored Claude Model', claudeLegacyModel: 'Legacy Claude Model' }
+  function nativeAfter(review: ModelSelectionReview, name: string) {
+    const fact = Object.entries(review.native?.after ?? {}).find(([key]) => key === name)?.[1]
+    return fact ? modelSelectionFactText(fact) : 'Unavailable'
+  }
+  // SA-139 R3: one Primary concept, never an API/CLI type. SA-139 R4 removed the Claude Code CLI
+  // lane: `cli-primary` is kept only so a saved review of a leftover Primary still reads. SA-139
+  // R5 removed the CLI Subagent type: `cli-subagent` is kept only so a saved review still reads.
+  // SA-139 R6 (D16): one Subagent kind, so a live Subagent target is just "Subagent".
+  const selectionRoles: Record<string, string> = { 'api-primary': 'Primary Agent', 'api-subagent': 'Subagent', 'cli-primary': 'Primary Agent, removed Claude Code CLI lane', 'cli-subagent': 'Subagent, removed CLI Subagent type' }
 </script>
 
+{#snippet modelSelectionTable(review: ModelSelectionReview)}
+  <div data-testid="approval-model-selection-review">
+    <p class="message-approval-request">{review.intent === 'clear' ? 'Clear Saved Model Selection' : 'Select Saved Model'} ({selectionRoles[review.role]})</p>
+    <pre class="message-approval-input">Before: {modelSelectionFactText(review.presetBefore)}
+After: {modelSelectionFactText(review.presetAfter)}</pre>
+    <p class="message-approval-copy">Legacy model: {modelSelectionFactText(review.legacyModel)}. Preserved.</p>
+    {#if review.native}
+      {#each Object.entries(review.native.before) as [name, fact]}
+        <p class="message-approval-copy">{nativeFactLabels[name]}: {modelSelectionFactText(fact)} → {nativeAfter(review, name)}.</p>
+      {/each}
+      <p class="message-approval-copy">Clear does not change stored model, Fast, reasoning or permission controls, promote a native block, or stage a profile. No next-run program or model is promised.</p>
+    {/if}
+    <p class="message-approval-copy">{review.inheritance === 'parent-model-and-connection-at-run'
+      ? 'With no own or legacy model, this Subagent uses the parent model and connection supplied at run time.'
+      : review.inheritance === 'legacy-model-requires-selection' ? 'The retained legacy model prevents parent inheritance and needs a saved selection before running.'
+      : review.intent === 'clear' ? 'No replacement model, connection or runtime is promised.' : 'This configures the selected preset. Actual execution and readiness were not checked.'}</p>
+    {#if review.voice}
+      <p class="message-approval-tool">Next Connect: LiveKit Speech-to-speech</p>
+      <p class="message-approval-copy">Provider: {review.voice.providerId}. Adapter: {review.voice.adapterId}. Support: Supported. Voice-mode settings: {review.voice.locksVoiceModeSettings ? 'Locked by this preset' : 'Not locked by this preset'}.</p>
+      <p class="message-approval-copy">Primary Agent configuration only. Speech-to-speech is excluded for Subagents, Workers and Groups. No room start, stop, reconnect or readiness check.</p>
+    {/if}
+    <p class="message-approval-copy">Global Voice settings, the agent's Voice profile and any active room remain unchanged.</p>
+  </div>
+{/snippet}
+
+{#snippet presetCopyTable(review: ModelPresetCopyReview)}
+  <div data-testid="approval-preset-copy-review">
+    <p class="message-approval-request">Create saved model: {review.copyName}</p>
+    <p class="message-approval-copy">Original preset: {review.sourcePresetId}. Original unchanged.</p>
+    <p class="message-approval-copy">New preset: {review.copyPresetId}</p>
+    {#each review.parameters as parameter (parameter.name)}
+      <p class="message-approval-tool">{parameter.label}</p>
+      <pre class="message-approval-input">Before: {parameterFact(parameter.before)}
+After: {parameterFact(parameter.after)}</pre>
+    {/each}
+    <p class="message-approval-copy">The named copy remains saved if assignment is partial or blocked. Unknown creation stops assignment and will not be repeated automatically.</p>
+  </div>
+{/snippet}
+
+{#snippet mcpTable(review: McpConfigurationReview)}
+  <div data-testid="approval-mcp-review">
+    {#if review.variant === 'prerequisite'}
+      <p class="message-approval-request">{review.mode === 'remove' ? 'Remove MCP source selection' : 'Configure MCP source and Primary selection'}</p>
+      <p class="message-approval-copy">Gateway {review.resource.gatewayId}. {review.sourceAction === 'save' ? 'Save this exact source, then verify it.' : review.sourceAction === 'unchanged' ? 'Keep this exact saved source, then verify it.' : 'Do not contact or configure the source.'}</p>
+      {#if review.before || review.after}
+        <p class="message-approval-tool">Complete source configuration before and after</p>
+        <pre class="message-approval-input">Before: {JSON.stringify(review.before, null, 2)}
+After: {JSON.stringify(review.after, null, 2)}</pre>
+      {:else}
+        <p class="message-approval-copy">This is a structural removal. It does not require the source to exist or be reachable.</p>
+      {/if}
+      <p class="message-approval-request">{review.target.label} (Primary Agent)</p>
+      <p class="message-approval-copy">{review.target.subject.id}</p>
+      {#each review.target.changes as change (change.field)}
+        <p class="message-approval-tool">{change.label}</p>
+        <pre class="message-approval-input">Before: {JSON.stringify(change.before)}
+After: {JSON.stringify(change.after)}</pre>
+      {/each}
+      {#if review.intent.zip && review.target.effectiveZip}
+        <p class="message-approval-tool">Exact tool Zip request: {review.intent.zip.toolName}</p>
+        <p class="message-approval-copy">Tool Zip row: {review.target.settingsIdentity}</p>
+        <pre class="message-approval-input">Requested: {JSON.stringify(review.intent.zip, null, 2)}
+Effective before: {JSON.stringify(review.target.effectiveZip.before, null, 2)}
+Effective after: {JSON.stringify(review.target.effectiveZip.after, null, 2)}</pre>
+      {/if}
+      <p class="message-approval-copy">Saved-key names are references. A required key must resolve before any write or connection; this review never reveals its value.</p>
+      <p class="message-approval-copy">This decision covers only the complete source, verification and named Primary settings above. Setup consent grants no tool effect. An unavailable or unknown stage stops later work without automatic retry.</p>
+    {:else}
+    <p class="message-approval-request">MCP configuration: {review.after.name}</p>
+    <p class="message-approval-copy">{review.mode === 'create' ? 'Create' : 'Update'} gateway {review.resource.gatewayId}</p>
+    <p class="message-approval-tool">Complete configuration before and after</p>
+    <pre class="message-approval-input">Before: {JSON.stringify(review.before, null, 2)}
+After: {JSON.stringify(review.after, null, 2)}</pre>
+    <p class="message-approval-copy">Saved-key names are references. This review does not read their values or establish that they work.</p>
+    <p class="message-approval-copy">This saves the gateway record only. Installation, connection, profile setup, verification, discoverability, original-task use and Zip settings remain not started.</p>
+    {/if}
+  </div>
+{/snippet}
+
+{#snippet instructionsTable(review: InstructionsReview, preview: AppActionsOperationPreview)}
+  <div data-testid="approval-instructions-review">
+    {#each review.targets as target}
+      {@const label = preview.targets.find(row => row.subject.kind === target.subject.kind && row.subject.id === target.subject.id)?.label ?? target.subject.id}
+      <p class="message-approval-request">{label} ({subjectKind(target.subject.kind)})</p>
+      <p class="message-approval-copy">{target.subject.id}</p>
+      {#if target.customPrompt}
+        <p class="message-approval-tool">Custom System Prompt</p>
+        <pre class="message-approval-input">Before: {textFact(target.customPrompt.before, review)}
+After: {textFact(target.customPrompt.after, review)}</pre>
+      {/if}
+      {#if target.includeGlobalPrompt}
+        <p class="message-approval-tool">Include Global Custom Prompt</p>
+        <pre class="message-approval-input">Before: {inclusionFact(target.includeGlobalPrompt.before)} (effective: {inclusionValue(target.includeGlobalPrompt.effectiveBefore)})
+After: {inclusionFact(target.includeGlobalPrompt.after)} (effective: {inclusionValue(target.includeGlobalPrompt.effectiveAfter)})</pre>
+      {/if}
+    {/each}
+    {#each review.texts as row, index}
+      <p class="message-approval-tool">Text {index + 1}</p>
+      {#if row.text === ''}<p class="message-approval-copy">Empty text</p>{/if}
+      <pre class="message-approval-input" data-testid="approval-instructions-text">{row.text}</pre>
+    {/each}
+    {#if preview.excluded.length}
+      <p class="message-approval-tool">Excluded Agents</p>
+      {#each preview.excluded as subject}<p class="message-approval-copy">{subjectKind(subject.kind)}: {subject.id}</p>{/each}
+    {/if}
+    <p class="message-approval-copy">Changes apply on later prompt compilations. Global inclusion uses each target's existing global prompt source, including later edits to that global prompt.</p>
+  </div>
+{/snippet}
+
 <div class="message-approval-panel">
+  {#if approvals.length}
   <div class="message-approval-header">
     <div>
       <p class="message-approval-title">Approval required</p>
@@ -80,6 +235,27 @@
       <span class="message-approval-copy">Continuing...</span>
     {/if}
   </div>
+  {/if}
+
+  {#if settingsReview && portableInstructions}
+    {@render instructionsTable(portableInstructions, settingsReview.preview)}
+  {/if}
+  {#if portableCopy}{@render presetCopyTable(portableCopy)}{/if}
+  {#if settingsReview?.preview.semanticId === 'agent.model.selection'}
+    {#each settingsReview.preview.targets as target}
+      {#if target.modelSelection}<p class="message-approval-request">{target.label}</p>{@render modelSelectionTable(target.modelSelection)}{/if}
+    {/each}
+  {/if}
+  {#if settingsReview?.preview.semanticId === MODEL_PRESET_COPY_ID && settingsReview.presetCopyOutcome}
+    <div data-testid="approval-preset-copy-outcome">
+      <p class="message-approval-request">Saved model copy: {settingsReview.presetCopyOutcome.name}</p>
+      <p class="message-approval-copy">{settingsReview.presetCopyOutcome.presetId}</p>
+      <p class="message-approval-copy">Creation: {settingsReview.presetCopyOutcome.creation}. Assignment source: {settingsReview.presetCopyOutcome.source}. Target assignment: {settingsReview.presetCopyOutcome.assignment}.</p>
+      {#if settingsReview.presetCopyOutcome.creation === 'saved' && settingsReview.presetCopyOutcome.assignment !== 'finished'}<p class="message-approval-copy">This named copy remains in Models. It has not been rolled back or deleted.</p>{/if}
+      {#if settingsReview.presetCopyOutcome.creation === 'unknown'}<p class="message-approval-copy">Creation is unconfirmed. Do not repeat this request.</p>{/if}
+    </div>
+  {/if}
+  {#if portableMcp}{@render mcpTable(portableMcp)}{/if}
 
 
   <div class="message-approval-list">
@@ -87,6 +263,9 @@
       {@const remainingSeconds = getApprovalRemainingSeconds(approval)}
       {@const control = approval.control ?? null}
       {@const exactInput = control?.input && typeof control.input === 'object' ? control.input : null}
+      {@const settingsPreview = isAppActionsApprovalPreviewForControl(control?.settingsPreview, control) ? control.settingsPreview : null}
+      {@const settingsPreviewUnavailable = control?.controlId === APP_ACTIONS_NATIVE_CHANGE_CONTROL_ID && !settingsPreview}
+      {@const instructions = settingsPreview ? instructionsFor(settingsPreview.preview) : null}
       <div class="message-approval-card">
         <div class="message-approval-card-layout">
           <div class="message-approval-detail">
@@ -115,6 +294,51 @@
                 <p class="message-approval-deadline">Expiring in {remainingSeconds}s</p>
               {/if}
             {/if}
+            {#if settingsPreview}
+              <details class="message-approval-disclosure" open data-testid="approval-settings-preview">
+                <summary>Settings Changes</summary>
+                {#if settingsPreview.preview.semanticId === MODEL_PRESET_COPY_ID && settingsPreview.preview.presetCopy}
+                  {@render presetCopyTable(settingsPreview.preview.presetCopy)}
+                {/if}
+                {#if settingsPreview.preview.semanticId === MCP_CONFIGURATION_ID}
+                  {@render mcpTable(settingsPreview.preview.resource)}
+                {:else if instructions}
+                  {@render instructionsTable(instructions, settingsPreview.preview)}
+                {:else}
+                {#each settingsPreview.preview.targets as target}
+                  <p class="message-approval-request">{target.label} ({subjectKind(target.subject.kind)})</p>
+                  <p class="message-approval-copy">{target.subject.id}</p>
+                  {#each target.changes as change}
+                    <p class="message-approval-tool">{change.label}</p>
+                    <pre class="message-approval-input">Before: {JSON.stringify(change.before)}
+After: {JSON.stringify(change.after)}</pre>
+                  {/each}
+                  {#if target.modelSelection}{@render modelSelectionTable(target.modelSelection)}{/if}
+                {/each}
+                {/if}
+                {#if settingsPreview.initialOutcomes?.length}
+                  <p class="message-approval-tool">Targets With No Changes</p>
+                  {#each settingsPreview.initialOutcomes as outcome}
+                    <p class="message-approval-request">{subjectKind(outcome.subject.kind)}: {outcome.subject.id}</p>
+                    <p class="message-approval-copy">{outcome.status[0].toUpperCase() + outcome.status.slice(1)}{outcome.reason ? `: ${formatAppActionsOutcomeReason(outcome.reason)}` : ''}</p>
+                  {/each}
+                {/if}
+                {#if !instructions && settingsPreview.preview.excluded.length}
+                  <p class="message-approval-tool">Excluded Agents</p>
+                  {#each settingsPreview.preview.excluded as subject}
+                    <p class="message-approval-copy">{subjectKind(subject.kind)}: {subject.id}</p>
+                  {/each}
+                {/if}
+                {#each settingsPreview.preview.effects as effect}<p class="message-approval-copy">{effect}</p>{/each}
+                <p class="message-approval-copy">Review expires: {previewTime(settingsPreview.reviewExpiresAt)}</p>
+                <p class="message-approval-copy">Time limit: {settingsPreview.executionBudgetMs / 1000} seconds</p>
+                {#if settingsPreview.hardDeadlineAt}
+                  <p class="message-approval-copy">Request deadline: {previewTime(settingsPreview.hardDeadlineAt)}</p>
+                {/if}
+              </details>
+            {:else if settingsPreviewUnavailable}
+              <p class="message-approval-copy">Settings changes could not be confirmed. Refresh this request or ask for a new one before approving.</p>
+            {/if}
             {#if control}
               <details class="message-approval-disclosure">
                 <summary>{exactInput ? 'Exact input' : 'Input summary'}</summary>
@@ -142,6 +366,11 @@
               <span class="message-approval-status is-expired">
                 {describeApprovalExpiry(approval)}
               </span>
+            {:else if isRetiredApproval(approval)}
+              <Button size="sm" variant="outline" disabled={approvalSubmitting}
+                onclick={() => void onApprovalAction(approval.approvalId, false)}>
+                Clear expired approval
+              </Button>
             {:else}
               <Button
                 size="sm"
@@ -153,8 +382,8 @@
               </Button>
               <Button
                 size="sm"
-                disabled={approvalSubmitting}
-                onclick={() => void onApprovalAction(approval.approvalId, true)}
+                disabled={approvalSubmitting || settingsPreviewUnavailable}
+                onclick={() => { if (!settingsPreviewUnavailable) void onApprovalAction(approval.approvalId, true) }}
               >
                 Approve
               </Button>

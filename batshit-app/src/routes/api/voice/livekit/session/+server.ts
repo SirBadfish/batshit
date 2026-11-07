@@ -1,7 +1,8 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
 import {
   createLiveKitVoiceSession,
-  getLiveKitVoiceSetupHint
+  getLiveKitVoiceSetupHint,
+  LiveKitRetiredAgentError
 } from '$lib/server/services/liveKitVoiceRuntime'
 import type { LiveKitVoiceSessionError, LiveKitVoiceSessionRequest } from '$lib/types/voiceLiveKit'
 import { LIVEKIT_VOICE_RUNTIME_ID } from '$lib/types/voiceLiveKit'
@@ -44,6 +45,9 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       }
     })
   } catch (error) {
+    if (error instanceof LiveKitRetiredAgentError) {
+      return json({ ...buildErrorBody(error.message), code: error.code }, { status: 409 })
+    }
     const message = error instanceof Error ? error.message : 'Failed to create LiveKit voice session.'
     const setupHint = getLiveKitVoiceSetupHint(error)
     const body = buildErrorBody(message, setupHint)

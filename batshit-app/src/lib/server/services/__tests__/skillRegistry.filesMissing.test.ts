@@ -24,6 +24,7 @@ vi.mock('node:os', async (importOriginal) => {
   if (!testHome.current) {
     testHome.current = nodePath.join(real.tmpdir(), `batshit-skill-files-missing-home-${process.pid}-${Date.now()}`)
   }
+  vi.stubEnv('BATSHIT_HOME_DIR', nodePath.join(testHome.current, '.batshit'))
   const homedir = () => testHome.current
   return { ...real, homedir, default: { ...real, homedir } }
 })
@@ -38,6 +39,7 @@ import { ownNamesUnder } from '$lib/test-utils/realHomeSnapshot'
 import { redis } from '$lib/server/redis'
 import {
   SkillFilesMissingError,
+  ensureSkillFilesystemStartup,
   getSkill,
   runSkillFilesystemMigrationPass,
   upsertSkill
@@ -67,6 +69,7 @@ afterAll(async () => {
 beforeEach(async () => {
   // `systemSlashCommands.resolveUserSkillDir` reads `process.env.HOME`, not `os.homedir()`.
   vi.stubEnv('HOME', testHome.current)
+  vi.stubEnv('BATSHIT_HOME_DIR', path.join(testHome.current, '.batshit'))
   await fs.rm(path.join(testHome.current, '.batshit'), { recursive: true, force: true })
 })
 
@@ -105,11 +108,18 @@ describe('a user skill whose files are missing (BL-369)', () => {
     const before = await savedSkillWithMissingFolder()
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
 
-    await runSkillFilesystemMigrationPass()
+    await expect(runSkillFilesystemMigrationPass()).resolves.toEqual({ complete: false, failed: 1 })
 
     await expect(fs.stat(path.join(SKILLS(), 'zc_notes'))).rejects.toThrow()
     expect(await redis.json.get('skill:josh:zc_notes')).toEqual(before)
     expect(warn.mock.calls.some((call) => call.some((part) => String(part).includes('SKILL.md') || String(part).includes('zc_notes')))).toBe(true)
+    warn.mockRestore()
+  })
+
+  it('keeps startup nonfatal while reporting its incomplete file migration', async () => {
+    await savedSkillWithMissingFolder()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    await expect(ensureSkillFilesystemStartup()).resolves.toEqual({ complete: false, failed: 1 })
     warn.mockRestore()
   })
 

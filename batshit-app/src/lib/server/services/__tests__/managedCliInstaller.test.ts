@@ -13,10 +13,13 @@ import {
   getManagedCliInstallStatus,
   getManagedCliOperationStatus,
   installManagedCli,
+  isManagedCliRuntimeId,
   MANAGED_CLI_PINNED_VERSIONS,
   ManagedCliOperationInProgressError,
+  resolveManagedCliRoot,
   resolveManagedCliShimPath,
   resolveManagedCliTarget,
+  resolveManagedCliVersionRoot,
   uninstallManagedCli,
   verifySha512Integrity
 } from '../managedCliInstaller'
@@ -45,28 +48,13 @@ afterEach(async () => {
 
 describe('resolveManagedCliTarget', () => {
   it('pins the tested current model runtimes exactly', () => {
-    expect(MANAGED_CLI_PINNED_VERSIONS).toEqual({ codex: '0.160.0', claude: '2.1.296' })
+    expect(MANAGED_CLI_PINNED_VERSIONS).toEqual({ claude: '2.1.296' })
   })
 
-  it('maps codex platform keys onto npm alias versions and vendor triples', () => {
-    const version = MANAGED_CLI_PINNED_VERSIONS.codex
-
-    const darwinArm = resolveManagedCliTarget('codex', { platform: 'darwin', arch: 'arm64' })
-    expect(darwinArm.packageName).toBe('@openai/codex')
-    expect(darwinArm.packageVersion).toBe(`${version}-darwin-arm64`)
-    expect(darwinArm.executableRelativePath).toBe(
-      path.join('package', 'vendor', 'aarch64-apple-darwin', 'bin', 'codex')
-    )
-    expect(darwinArm.additionalExecutableRelativePaths).toContain(
-      path.join('package', 'vendor', 'aarch64-apple-darwin', 'codex-path', 'rg')
-    )
-
-    const linuxX64 = resolveManagedCliTarget('codex', { platform: 'linux', arch: 'x64' })
-    expect(linuxX64.packageVersion).toBe(`${version}-linux-x64`)
-    expect(linuxX64.executableRelativePath).toContain('x86_64-unknown-linux-musl')
-    expect(linuxX64.additionalExecutableRelativePaths).toContain(
-      path.join('package', 'vendor', 'x86_64-unknown-linux-musl', 'codex-resources', 'bwrap')
-    )
+  it('SA-139 R1: knows only Claude Code as a managed runtime; the removed Codex CLI is none', () => {
+    expect(isManagedCliRuntimeId('claude')).toBe(true)
+    expect(isManagedCliRuntimeId('codex')).toBe(false)
+    expect(Object.keys(MANAGED_CLI_PINNED_VERSIONS)).toEqual(['claude'])
   })
 
   it('maps claude platform keys onto real per-platform packages with musl variants', () => {
@@ -93,7 +81,7 @@ describe('resolveManagedCliTarget', () => {
   })
 
   it('fails loudly for unsupported platforms', () => {
-    expect(() => resolveManagedCliTarget('codex', { platform: 'win32', arch: 'x64' })).toThrow(
+    expect(() => resolveManagedCliTarget('claude', { platform: 'win32', arch: 'x64' })).toThrow(
       /macOS and Linux only/
     )
     expect(() =>
@@ -121,9 +109,9 @@ describe('resolveManagedCliTarget', () => {
   })
 
   it('builds version-specific registry metadata URLs', () => {
-    const target = resolveManagedCliTarget('codex', { platform: 'darwin', arch: 'arm64' })
+    const target = resolveManagedCliTarget('claude', { platform: 'darwin', arch: 'arm64' })
     expect(buildManagedCliRegistryMetadataUrl(target)).toBe(
-      `https://registry.npmjs.org/@openai/codex/${MANAGED_CLI_PINNED_VERSIONS.codex}-darwin-arm64`
+      `https://registry.npmjs.org/@anthropic-ai/claude-code-darwin-arm64/${MANAGED_CLI_PINNED_VERSIONS.claude}`
     )
   })
 })
@@ -217,57 +205,57 @@ describe('installManagedCli', () => {
     })
   })
 
-  platformInstallIt('installs a verified codex tarball, exposes status/resolution, and uninstalls cleanly', async () => {
-    const target = resolveManagedCliTarget('codex')
+  platformInstallIt('installs a verified claude tarball, exposes status/resolution, and uninstalls cleanly', async () => {
+    const target = resolveManagedCliTarget('claude')
     const tarball = await buildFixtureTarball({
       executableRelativePath: target.executableRelativePath,
-      versionOutput: `codex-cli ${MANAGED_CLI_PINNED_VERSIONS.codex}`
+      versionOutput: `${MANAGED_CLI_PINNED_VERSIONS.claude} (Claude Code)`
     })
     const integrity = `sha512-${createHash('sha512').update(tarball).digest('base64')}`
     const metadataUrl = buildManagedCliRegistryMetadataUrl(target)
-    const tarballUrl = `https://registry.example/codex.tgz`
+    const tarballUrl = `https://registry.example/claude.tgz`
     stubRegistryFetch({ metadataUrl, tarballUrl, tarball, integrity })
 
-    const result = await installManagedCli('codex')
+    const result = await installManagedCli('claude')
 
-    expect(result.installedVersion).toBe(MANAGED_CLI_PINNED_VERSIONS.codex)
+    expect(result.installedVersion).toBe(MANAGED_CLI_PINNED_VERSIONS.claude)
     expect(result.executablePath).toContain(
-      path.join(installsRoot, 'cli', 'codex', MANAGED_CLI_PINNED_VERSIONS.codex)
+      path.join(installsRoot, 'cli', 'claude', MANAGED_CLI_PINNED_VERSIONS.claude)
     )
     await expect(stat(result.executablePath)).resolves.toBeTruthy()
 
-    const status = await getManagedCliInstallStatus('codex')
+    const status = await getManagedCliInstallStatus('claude')
     expect(status.installed).toBe(true)
-    expect(status.version).toBe(MANAGED_CLI_PINNED_VERSIONS.codex)
+    expect(status.version).toBe(MANAGED_CLI_PINNED_VERSIONS.claude)
     expect(status.manifest?.checksumVerified).toBe(true)
     expect(status.manifest?.sourceUrl).toBe(tarballUrl)
 
-    const managed = getManagedCliExecutableSync('codex')
+    const managed = getManagedCliExecutableSync('claude')
     expect(managed?.executablePath).toBe(result.executablePath)
 
-    const second = await installManagedCli('codex')
+    const second = await installManagedCli('claude')
     expect(second.reused).toBe(true)
     expect(fetch).toHaveBeenCalledTimes(2)
 
     // Stable shim symlink resolves to the versioned executable.
-    const shim = resolveManagedCliShimPath('codex')
+    const shim = resolveManagedCliShimPath('claude')
     const { stdout } = await execFileAsync(shim, [])
-    expect(stdout).toContain('codex-cli')
+    expect(stdout).toContain('(Claude Code)')
 
-    const afterUninstall = await uninstallManagedCli('codex')
+    const afterUninstall = await uninstallManagedCli('claude')
     expect(afterUninstall.installed).toBe(false)
-    expect(getManagedCliExecutableSync('codex')).toBeNull()
+    expect(getManagedCliExecutableSync('claude')).toBeNull()
     await expect(stat(shim)).rejects.toThrow()
   })
 
   platformInstallIt('refuses to install when the download fails integrity verification', async () => {
-    const target = resolveManagedCliTarget('codex')
+    const target = resolveManagedCliTarget('claude')
     const tarball = await buildFixtureTarball({
       executableRelativePath: target.executableRelativePath,
-      versionOutput: 'codex-cli tampered'
+      versionOutput: 'claude tampered'
     })
     const metadataUrl = buildManagedCliRegistryMetadataUrl(target)
-    const tarballUrl = `https://registry.example/codex.tgz`
+    const tarballUrl = `https://registry.example/claude.tgz`
     stubRegistryFetch({
       metadataUrl,
       tarballUrl,
@@ -275,9 +263,9 @@ describe('installManagedCli', () => {
       integrity: `sha512-${createHash('sha512').update(Buffer.from('different bytes')).digest('base64')}`
     })
 
-    await expect(installManagedCli('codex')).rejects.toThrow(/integrity verification/)
-    expect(getManagedCliExecutableSync('codex')).toBeNull()
-    expect((await getManagedCliInstallStatus('codex')).installed).toBe(false)
+    await expect(installManagedCli('claude')).rejects.toThrow(/integrity verification/)
+    expect(getManagedCliExecutableSync('claude')).toBeNull()
+    expect((await getManagedCliInstallStatus('claude')).installed).toBe(false)
   })
 
   platformInstallIt('refuses to install when the registry metadata has no sha512 integrity', async () => {
@@ -317,14 +305,14 @@ describe('installManagedCli', () => {
   })
 
   platformInstallIt('serializes install and uninstall through a filesystem operation lock', async () => {
-    const target = resolveManagedCliTarget('codex')
+    const target = resolveManagedCliTarget('claude')
     const tarball = await buildFixtureTarball({
       executableRelativePath: target.executableRelativePath,
-      versionOutput: 'codex-cli locked',
+      versionOutput: 'claude locked',
     })
     const integrity = `sha512-${createHash('sha512').update(tarball).digest('base64')}`
     const metadataUrl = buildManagedCliRegistryMetadataUrl(target)
-    const tarballUrl = 'https://registry.example/codex-lock.tgz'
+    const tarballUrl = 'https://registry.example/claude-lock.tgz'
     let releaseMetadata!: () => void
     const metadataGate = new Promise<void>((resolve) => {
       releaseMetadata = resolve
@@ -345,19 +333,19 @@ describe('installManagedCli', () => {
       }),
     )
 
-    const first = installManagedCli('codex')
+    const first = installManagedCli('claude')
     await vi.waitFor(async () => {
-      expect((await getManagedCliOperationStatus('codex'))?.phase).toBe('metadata')
+      expect((await getManagedCliOperationStatus('claude'))?.phase).toBe('metadata')
     })
-    await expect(installManagedCli('codex')).rejects.toBeInstanceOf(
+    await expect(installManagedCli('claude')).rejects.toBeInstanceOf(
       ManagedCliOperationInProgressError,
     )
-    await expect(uninstallManagedCli('codex')).rejects.toBeInstanceOf(
+    await expect(uninstallManagedCli('claude')).rejects.toBeInstanceOf(
       ManagedCliOperationInProgressError,
     )
 
     releaseMetadata()
     await expect(first).resolves.toMatchObject({ reused: false })
-    await expect(getManagedCliOperationStatus('codex')).resolves.toBeNull()
+    await expect(getManagedCliOperationStatus('claude')).resolves.toBeNull()
   })
 })

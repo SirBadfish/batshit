@@ -1,31 +1,18 @@
-import { readFile } from 'node:fs/promises'
-import path from 'node:path'
 import { redis } from '$lib/server/redis'
-import { executionViewerService } from '$lib/server/services/executionViewerService'
-import { readCliContextReport } from '$lib/server/services/cliContextReportLookup'
 import { DatabaseService } from '$lib/services/databaseRedis.server'
 import type { Message } from '$lib/stores/messages.svelte'
-import type { ExecutionSnapshot } from '$lib/types/executionViewer'
+import { stringifyTokenCountableMessageContent } from '$lib/utils/tokenCounter'
 import {
-  countTotalTokens,
-  stringifyTokenCountableMessageContent
-} from '$lib/utils/tokenCounter'
-import {
-  CLI_WRAPPER_OVERHEAD_TOKENS,
   applyManualTrimToMessages,
   isMessageProtectedFromManualTrim
 } from '$lib/utils/tokenPanel'
-import {
-  isCliPrimaryAgentType,
-  normalizePrimaryAgentType
-} from '$lib/utils/primaryAgentType'
+import { normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
 import { isSubagentCompatibleWithPrimaryAgent } from '$lib/utils/subagentType'
 import { normalizeAssignedSubagent } from '$lib/server/services/assignedSubagentNormalization'
 import {
   listActiveClipIds,
   normalizeSessionClipState
 } from '$lib/server/services/sessionClipState'
-import { buildCodexRuntimeSettings } from '$lib/server/services/codexSettings'
 import {
   applyContextCompactionToMessages,
   getContextCompactionState,
@@ -40,17 +27,9 @@ import {
 import { resolveApiContextBudget } from './localApiContextBudget'
 import { buildRuntimeModelSettings } from '$lib/utils/modelSettingsMapper'
 import { resolveAgentModelFallbacks, resolveRuntimeModelSelection } from '$lib/utils/modelPresetRuntime'
-import {
-  claudeContextCappedByEnvironment, cliContextSettingsKey,
-  matchingCliContextReport,
-  resolveEffectiveAgentCliModel, resolveCliContextWindow
-} from '$lib/utils/cliContextWindow'
 import type { SavedModel } from '$lib/types/savedModels'
 
 export type AgentRow = Record<string, any>
-export type RuntimeFlavor = 'codex' | 'claude' | 'vercel'
-export const CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES = 32_000
-export const CODEX_NATIVE_BASE_OVERHEAD_TOKENS = 10_000
 
 export interface ContextProtections {
   protectedUnzippedZipIds: string[]
@@ -192,218 +171,6 @@ export async function loadContextProtections(sessionId: string): Promise<Context
   }
 }
 
-export function resolveRuntimeFlavor(agent: AgentRow, agentTypeHint?: string): RuntimeFlavor {
-  const primaryAgentType = normalizePrimaryAgentType({
-    ...agent,
-    ...(agentTypeHint ? { agentType: agentTypeHint } : {})
-  })
-
-  if (!isCliPrimaryAgentType(primaryAgentType)) return 'vercel'
-
-  const provider = String(agent.primary_model_provider ?? '').toLowerCase()
-  const connection = String(
-    agent.primary_model_connection?.service ??
-      agent.primary_model_connection?.id ??
-      agent.primary_model_connection?.type ??
-      ''
-  ).toLowerCase()
-
-  return provider.includes('claude') || connection.includes('claude') ? 'claude' : 'codex'
-}
-
-export function resolveCliWrapperOverhead(agent: AgentRow, agentTypeHint?: string): number {
-  const primaryAgentType = normalizePrimaryAgentType({
-    ...agent,
-    ...(agentTypeHint ? { agentType: agentTypeHint } : {})
-  })
-  return isCliPrimaryAgentType(primaryAgentType) ? CLI_WRAPPER_OVERHEAD_TOKENS : 0
-}
-
-function readTokenStatValue(stat: { value?: number | null } | null | undefined): number | null {
-  return typeof stat?.value === 'number' && Number.isFinite(stat.value)
-    ? stat.value
-    : null
-}
-
-function countSnapshotCompiledTokens(snapshot: ExecutionSnapshot): number | null {
-  const compiledMessages = snapshot.compiledMessages
-  if (!Array.isArray(compiledMessages) || compiledMessages.length === 0) return null
-
-  return countTotalTokens(
-    compiledMessages.map((message) => ({
-      role: typeof message?.role === 'string' ? message.role : 'user',
-      content: message?.content
-    }))
-  )
-}
-
-function readSnapshotInputTokens(snapshot: ExecutionSnapshot): number | null {
-  return (
-    readTokenStatValue(snapshot.responseSummary?.usage?.inputTokens) ??
-    readTokenStatValue(snapshot.llmSummary?.totalUsage?.inputTokens) ??
-    null
-  )
-}
-
-function snapshotHasCliToolActivity(snapshot: ExecutionSnapshot): boolean {
-  const toolCallsCount = readTokenStatValue(snapshot.responseSummary?.toolCallsCount)
-  if (toolCallsCount !== null && toolCallsCount > 0) return true
-  if (Array.isArray(snapshot.intermediateSteps) && snapshot.intermediateSteps.length > 0) return true
-
-  const eventLog = Array.isArray(snapshot.runtime?.eventLog)
-    ? snapshot.runtime?.eventLog
-    : []
-  return eventLog.some((event: any) => {
-    const itemType = typeof event?.item?.type === 'string' ? event.item.type : ''
-    return itemType.includes('command_execution') || itemType.includes('tool')
-  })
-}
-
-async function resolveObservedCliNativeOverheadTokens(params: {
-  sessionId: string
-  agentId?: string | null
-  runtimeFlavor: RuntimeFlavor
-}): Promise<number | null> {
-  if (params.runtimeFlavor !== 'codex' && params.runtimeFlavor !== 'claude') return null
-
-  const snapshots = await executionViewerService.getSnapshots(params.sessionId).catch(() => [])
-  for (const snapshot of snapshots) {
-    if (params.agentId && snapshot.agentId && snapshot.agentId !== params.agentId) continue
-    if (snapshotHasCliToolActivity(snapshot)) continue
-
-    const runtimeId = String(snapshot.runtime?.runtimeId ?? '').toLowerCase()
-    const usageSource = String(
-      snapshot.responseSummary?.usage?.inputTokens?.source ??
-        snapshot.llmSummary?.totalUsage?.inputTokens?.source ??
-        ''
-    ).toLowerCase()
-    if (
-      (runtimeId && runtimeId !== params.runtimeFlavor) ||
-      (usageSource && usageSource !== params.runtimeFlavor)
-    ) {
-      continue
-    }
-
-    const inputTokens = readSnapshotInputTokens(snapshot)
-    const compiledTokens = countSnapshotCompiledTokens(snapshot)
-    if (inputTokens === null || compiledTokens === null) continue
-
-    const overhead = inputTokens - compiledTokens
-    if (Number.isFinite(overhead) && overhead > 0) {
-      return Math.round(overhead)
-    }
-  }
-
-  return null
-}
-
-function parsePositiveInteger(value: unknown): number | null {
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    return Math.max(0, Math.floor(value))
-  }
-  if (typeof value !== 'string') return null
-  const trimmed = value.trim()
-  if (!trimmed) return null
-  const parsed = Number.parseInt(trimmed, 10)
-  return Number.isFinite(parsed) ? Math.max(0, parsed) : null
-}
-
-export function resolveCodexProjectDocMaxBytes(agent: AgentRow): number {
-  const settings = buildCodexRuntimeSettings(agent.codex_settings ?? agent.provider_specific_settings ?? null)
-  const override = settings.configOverrides.find((entry) => {
-    const key = entry.key.trim().toLowerCase()
-    return key === 'project_doc_max_bytes' || key === 'project.doc_max_bytes'
-  })
-  return parsePositiveInteger(override?.value) ?? CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES
-}
-
-async function readProjectInstructionsFile(projectPath: string): Promise<Buffer | null> {
-  const trimmed = projectPath.trim()
-  if (!trimmed || !path.isAbsolute(trimmed)) return null
-
-  for (const filename of ['AGENTS.md', 'agents.md', 'Agents.md']) {
-    try {
-      return await readFile(path.join(trimmed, filename))
-    } catch (error: any) {
-      if (error?.code !== 'ENOENT') return null
-    }
-  }
-
-  return null
-}
-
-export async function estimateCodexProjectInstructionTokens(params: {
-  agent: AgentRow
-  projectPath?: string | null
-}): Promise<number> {
-  const settings = buildCodexRuntimeSettings(params.agent.codex_settings ?? params.agent.provider_specific_settings ?? null)
-  if (settings.includeProjectInstructions === false) return 0
-
-  const maxBytes = resolveCodexProjectDocMaxBytes(params.agent)
-  if (maxBytes <= 0) return 0
-
-  const projectPath = params.projectPath?.trim()
-  if (!projectPath) return 0
-
-  const fileBuffer = await readProjectInstructionsFile(projectPath)
-  if (!fileBuffer) return 0
-
-  const selected = fileBuffer.byteLength > maxBytes ? fileBuffer.subarray(0, maxBytes) : fileBuffer
-  return countTotalTokens([
-    {
-      role: 'system',
-      content: selected.toString('utf8')
-    }
-  ])
-}
-
-export async function estimateCodexProjectInstructionChars(params: {
-  agent: AgentRow
-  projectPath?: string | null
-}): Promise<number> {
-  const settings = buildCodexRuntimeSettings(params.agent.codex_settings ?? params.agent.provider_specific_settings ?? null)
-  if (settings.includeProjectInstructions === false) return 0
-
-  const maxBytes = resolveCodexProjectDocMaxBytes(params.agent)
-  if (maxBytes <= 0) return 0
-
-  const projectPath = params.projectPath?.trim()
-  if (!projectPath) return 0
-
-  const fileBuffer = await readProjectInstructionsFile(projectPath)
-  if (!fileBuffer) return 0
-
-  const selected = fileBuffer.byteLength > maxBytes ? fileBuffer.subarray(0, maxBytes) : fileBuffer
-  return selected.toString('utf8').length
-}
-
-async function resolveCliNativeOverheadTokens(params: {
-  sessionId: string
-  agent: AgentRow
-  runtimeFlavor: RuntimeFlavor
-  projectPath?: string | null
-  wrapperOverheadTokens: number
-}): Promise<number> {
-  const observed = await resolveObservedCliNativeOverheadTokens({
-    sessionId: params.sessionId,
-    agentId: typeof params.agent.id === 'string' ? params.agent.id : null,
-    runtimeFlavor: params.runtimeFlavor
-  })
-  if (observed !== null) return observed
-
-  if (params.runtimeFlavor === 'codex') {
-    return (
-      CODEX_NATIVE_BASE_OVERHEAD_TOKENS +
-      (await estimateCodexProjectInstructionTokens({
-        agent: params.agent,
-        projectPath: params.projectPath
-      }))
-    )
-  }
-
-  return params.wrapperOverheadTokens
-}
-
 async function loadPrimarySavedModel(agent: AgentRow): Promise<SavedModel | null> {
   const presetId =
     typeof agent.primary_model_preset_id === 'string' && agent.primary_model_preset_id.trim()
@@ -415,7 +182,9 @@ async function loadPrimarySavedModel(agent: AgentRow): Promise<SavedModel | null
   return model && typeof model === 'object' ? model as SavedModel : null
 }
 
-export async function resolveAgentBudgetSettings(agent: AgentRow, sessionId?: string, userId = agent.user_id as string) {
+// `_sessionId` named the chat whose saved CLI context report the Claude Code CLI lane read (SA-139
+// R4 removed it); it stays in place so every positional caller still passes its `userId` third.
+export async function resolveAgentBudgetSettings(agent: AgentRow, _sessionId?: string, userId = agent.user_id as string) {
   const preset = await loadPrimarySavedModel(agent)
   const selection = resolveRuntimeModelSelection({
     preset,
@@ -438,39 +207,9 @@ export async function resolveAgentBudgetSettings(agent: AgentRow, sessionId?: st
       ? runtimeSettings.providerOptions?.ollama?.options?.num_ctx ?? null : null
   })
 
-  const service = selection.connection?.service ?? preset?.connection?.service ??
-    agent.primary_model_connection?.service ?? agent.primary_model_provider
-  const cliRuntime = service === 'openai-codex' || service === 'codex'
-    ? 'codex' : service === 'anthropic-claude-cli' || service === 'claude-cli'
-      ? 'claude' : null
-  const cliModel = cliRuntime
-    ? resolveEffectiveAgentCliModel(cliRuntime, agent, selection.settings, selection.modelId) : null
-  const claudeCap = cliRuntime === 'claude' ? claudeContextCappedByEnvironment(cliModel) : false
-  const contextLookup = cliRuntime && sessionId
-    ? await readCliContextReport(sessionId, agent.id, cliRuntime)
-    : { report: null, warning: null, checkedAt: undefined }
-  const savedReport = contextLookup.report
-  const matchedReport = cliRuntime ? matchingCliContextReport(savedReport,
-    cliContextSettingsKey(cliRuntime, agent, selection.contextWindow,
-      selection.settings, selection.modelId)) : null
-  const matchingReport = matchedReport &&
-    (cliRuntime !== 'claude' || Boolean(matchedReport.disableClaude1M) === claudeCap)
-      ? matchedReport : null
-  const contextLimit = contextLookup.warning ? null : cliRuntime
-    ? resolveCliContextWindow({
-        runtime: cliRuntime,
-        model: cliModel,
-        presetContextWindow: selection.contextWindow,
-        reported: matchingReport,
-        disableClaude1M: claudeCap
-      }).contextWindow
-    : apiContext.contextLimit
-
   return {
-    contextLimit,
+    contextLimit: apiContext.contextLimit,
     localContext: apiContext.evidence,
-    contextWindowWarning: contextLookup.warning,
-    contextWindowCheckedAt: contextLookup.checkedAt,
     maxOutputTokens: explicitMaxTokens,
     reasoningModel: Boolean(selection.capabilities?.reasoning)
   }
@@ -482,13 +221,10 @@ export async function estimateCompiledBudget(params: {
   agent: AgentRow
   userId: string
   assignedSubagents: any[]
-  runtimeFlavor: RuntimeFlavor
-  wrapperOverheadTokens: number
   eventFetch: typeof fetch
 }): Promise<{
   tokens: number
   budget: PromptBudgetReport
-  wrapperOverheadTokens: number
   compiledMessages: Array<{ role: string; content: unknown }>
 }> {
   const databaseService = new DatabaseService(params.eventFetch)
@@ -502,7 +238,6 @@ export async function estimateCompiledBudget(params: {
     params.userId,
     {
       fetch: params.eventFetch,
-      runtimeFlavor: params.runtimeFlavor,
       goonsSettings: userSettings?.goons_settings ?? null
     }
   )
@@ -521,28 +256,7 @@ export async function estimateCompiledBudget(params: {
     })
   }
 
-  const nativeOverheadTokens = await resolveCliNativeOverheadTokens({
-    sessionId: params.sessionId,
-    agent: params.agent,
-    runtimeFlavor: params.runtimeFlavor,
-    projectPath:
-      formatted.resolvedProjectPath ??
-      formatted.structuredInput?.metadata?.resolvedProjectPath ??
-      null,
-    wrapperOverheadTokens: params.wrapperOverheadTokens
-  })
-  const [budgetSettings, codexProjectInstructionChars] = await Promise.all([
-    resolveAgentBudgetSettings(params.agent, params.sessionId, params.userId),
-    params.runtimeFlavor === 'codex'
-      ? estimateCodexProjectInstructionChars({
-          agent: params.agent,
-          projectPath:
-            formatted.resolvedProjectPath ??
-            formatted.structuredInput?.metadata?.resolvedProjectPath ??
-            null
-        })
-      : Promise.resolve(0)
-  ])
+  const budgetSettings = await resolveAgentBudgetSettings(params.agent, params.sessionId, params.userId)
   const effectiveAutoCompactSettings = resolveEffectiveAutoCompactSettings({
     global: userSettings?.global_auto_compact_settings,
     agent: params.agent.auto_compact_settings
@@ -557,22 +271,17 @@ export async function estimateCompiledBudget(params: {
     reasoningModel: budgetSettings.reasoningModel
   })
   const budget = buildPromptBudgetReport({
-    runtime: params.runtimeFlavor,
+    runtime: 'vercel',
     messages: compiledMessages,
     contextLimit: budgetSettings.contextLimit,
-    nativeOverheadTokens,
     outputReserveTokens,
-    autoCompactTriggerTokens,
-    extraRuntimeInputChars: codexProjectInstructionChars
+    autoCompactTriggerTokens
   })
   budget.localContext = budgetSettings.localContext
-  budget.contextWindowWarning = budgetSettings.contextWindowWarning
-  budget.contextWindowCheckedAt = budgetSettings.contextWindowCheckedAt
 
   return {
     tokens: budget.estimatedRuntimeTokens,
     budget,
-    wrapperOverheadTokens: params.wrapperOverheadTokens,
     compiledMessages
   }
 }
@@ -583,8 +292,6 @@ export async function estimateCompiledTokens(params: {
   agent: AgentRow
   userId: string
   assignedSubagents: any[]
-  runtimeFlavor: RuntimeFlavor
-  wrapperOverheadTokens: number
   eventFetch: typeof fetch
 }) {
   const result = await estimateCompiledBudget(params)
@@ -596,7 +303,6 @@ export async function estimateCurrentContextTokens(params: {
   messages: Message[]
   agent: AgentRow
   userId: string
-  agentTypeHint?: string
   trimmedMessageIds?: string[]
   eventFetch: typeof fetch
 }) {
@@ -615,8 +321,6 @@ export async function estimateCurrentContextTokens(params: {
     const message = messagesById.get(id)
     return message && !isMessageProtectedFromManualTrim(message, protections)
   })
-  const runtimeFlavor = resolveRuntimeFlavor(params.agent, params.agentTypeHint)
-  const wrapperOverheadTokens = resolveCliWrapperOverhead(params.agent, params.agentTypeHint)
   const contextMessages = applyManualTrimToMessages(compactedMessages, trimmedMessageIds, {
     protections,
     sessionId: params.sessionId,
@@ -628,15 +332,12 @@ export async function estimateCurrentContextTokens(params: {
     agent: params.agent,
     userId: params.userId,
     assignedSubagents,
-    runtimeFlavor,
-    wrapperOverheadTokens,
     eventFetch: params.eventFetch
   })
 
   return {
     tokens: compiled.tokens,
     budget: compiled.budget,
-    wrapperOverheadTokens,
     trimmedMessageIds,
     trimmedMessageCount: trimmedMessageIds.length
   }

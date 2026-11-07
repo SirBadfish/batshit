@@ -15,10 +15,10 @@ const execFileAsync = promisify(execFile)
 /**
  * Batshit-managed CLI runtime installer.
  *
- * Batshit no longer bundles the Codex CLI binary inside its own builds, and it
- * never bundled Claude Code. This service gives users a one-click managed
- * install instead: it downloads the official pinned npm platform package,
- * verifies the registry sha512 integrity, extracts it under the managed
+ * Batshit does not bundle Claude Code inside its own builds. This service
+ * gives users a one-click managed install instead: it downloads the official
+ * pinned npm platform package, verifies the registry sha512 integrity,
+ * extracts it under the managed
  * installs root (`~/.batshit/installs/cli/<runtime>/<version>/`), and exposes a
  * stable executable path that the CLI status resolvers pick up automatically.
  *
@@ -26,21 +26,19 @@ const execFileAsync = promisify(execFile)
  * platforms, and broken extractions all throw with clear messages.
  */
 
-export type ManagedCliRuntimeId = 'codex' | 'claude'
+export type ManagedCliRuntimeId = 'claude'
 
-export const MANAGED_CLI_RUNTIME_IDS: ManagedCliRuntimeId[] = ['codex', 'claude']
+export const MANAGED_CLI_RUNTIME_IDS: ManagedCliRuntimeId[] = ['claude']
 
 /**
  * Pinned versions. Update deliberately (and re-verify the platform package
  * list) instead of floating to `latest`.
  */
 export const MANAGED_CLI_PINNED_VERSIONS: Record<ManagedCliRuntimeId, string> = {
-  codex: '0.160.0',
   claude: '2.1.296'
 }
 
 export const MANAGED_CLI_DISPLAY_NAMES: Record<ManagedCliRuntimeId, string> = {
-  codex: 'Codex CLI',
   claude: 'Claude Code CLI'
 }
 
@@ -126,7 +124,7 @@ export type ManagedCliTarget = {
 }
 
 export function isManagedCliRuntimeId(value: unknown): value is ManagedCliRuntimeId {
-  return value === 'codex' || value === 'claude'
+  return value === 'claude'
 }
 
 export function resolveManagedCliRoot(): string {
@@ -378,42 +376,7 @@ export function resolveManagedCliTarget(
     )
   }
 
-  if (runtime === 'codex') {
-    // Codex publishes platform builds as npm alias versions of @openai/codex
-    // (e.g. 0.157.1-darwin-arm64). The Linux builds are musl-static, so the
-    // same package works on glibc and musl distros.
-    //
-    // Layout note (verified against the live macOS 0.157.1 tarball): the binary
-    // lives at `package/vendor/<triple>/bin/codex`, with helper executables at
-    // `codex-path/rg`, `codex-resources/zsh/bin/zsh`, and Linux `bwrap`. Older versions
-    // (≤0.130.x) used `codex/codex` + `path/rg` — re-verify on any pin bump.
-    const key = `${platform}-${arch}`
-    const tripleByKey: Record<string, string> = {
-      'darwin-arm64': 'aarch64-apple-darwin',
-      'darwin-x64': 'x86_64-apple-darwin',
-      'linux-arm64': 'aarch64-unknown-linux-musl',
-      'linux-x64': 'x86_64-unknown-linux-musl'
-    }
-    const triple = tripleByKey[key]
-    if (!triple) {
-      throw new Error(`Codex CLI managed install has no build for ${key}.`)
-    }
-    return {
-      key,
-      packageName: '@openai/codex',
-      packageVersion: `${version}-${key}`,
-      executableRelativePath: path.join('package', 'vendor', triple, 'bin', 'codex'),
-      additionalExecutableRelativePaths: [
-        path.join('package', 'vendor', triple, 'codex-path', 'rg'),
-        ...(platform === 'linux'
-          ? [path.join('package', 'vendor', triple, 'codex-resources', 'bwrap')]
-          : []),
-        path.join('package', 'vendor', triple, 'codex-resources', 'zsh', 'bin', 'zsh')
-      ]
-    }
-  }
-
-  // Claude Code publishes real per-platform packages containing a native
+  // Claude Code publishes per-platform packages containing a native
   // `claude` binary at the package root. Linux needs the musl variants on
   // musl-based distros such as Alpine. Batshit's current Docker image is
   // Debian/glibc, but the public installer supports both libc families.

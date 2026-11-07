@@ -1,4 +1,4 @@
-const MANUAL_ENTRY_DIRECT_PROVIDER_IDS = new Set(['alibaba', 'stepfun'])
+const MANUAL_ENTRY_DIRECT_PROVIDER_IDS = new Set<string>()
 
 export function isManualEntryDirectProvider(providerId?: string | null): boolean {
   const normalized = providerId?.trim().toLowerCase() ?? ''

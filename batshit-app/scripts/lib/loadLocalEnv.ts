@@ -2,10 +2,11 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { parse as parseDotenv } from 'dotenv'
 
-export function loadLocalEnvFiles(options?: { cwd?: string; label?: string }) {
+export function loadLocalEnvFiles(options?: { cwd?: string; label?: string; allowedNames?: readonly string[] }) {
   const cwd = options?.cwd ?? process.cwd()
   const label = options?.label ?? 'env'
   const envFiles = ['.env.local', '.env']
+  const allowedNames = options?.allowedNames === undefined ? null : new Set(options.allowedNames)
   let loadedAny = false
 
   for (const filename of envFiles) {
@@ -15,7 +16,7 @@ export function loadLocalEnvFiles(options?: { cwd?: string; label?: string }) {
     try {
       const vars = parseDotenv(fs.readFileSync(fullPath, 'utf8'))
       for (const [key, value] of Object.entries(vars)) {
-        if (process.env[key] === undefined) {
+        if ((!allowedNames || allowedNames.has(key)) && process.env[key] === undefined) {
           process.env[key] = value
         }
       }

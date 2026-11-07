@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { RedisService, redis } from '$lib/server/redis'
+import * as presetReferences from '$lib/server/services/modelPresetReferenceGuard'
 import { POST } from './+server'
 
 /**
@@ -72,8 +73,10 @@ describe('global_chat_settings', () => {
 
     const stored = await redis.getUserSettings(USER)
     expect((stored as any)?.global_chat_settings).toEqual({ busy_send_mode: 'queue' })
+    // The route forwards explicit intent only: an unsent group is left to the lower writer's
+    // current root, never resent from the route's own earlier read (which could be stale).
     if (updateSpy.mock.calls.length > 0) {
-      expect(lastUpdateArgument().global_chat_settings).toEqual({ busy_send_mode: 'queue' })
+      expect(lastUpdateArgument()).not.toHaveProperty('global_chat_settings')
     }
   })
 
@@ -118,13 +121,17 @@ describe('legacy custom Goon references in settings', () => {
     await redis.json.set(uploadKey, '$', { filename: 'settings-shared.glb' })
 
     const service = new RedisService()
-    const getSettings = service.getUserSettings.bind(service)
-    const readSpy = vi.spyOn(service, 'getUserSettings').mockImplementation(async (userId) => {
-      const existing = await getSettings(userId)
-      await redis.execute((client) => client.set(markerKey, JSON.stringify({
-        contract: 'goon-asset-deletion/v1', phase: 'reserved'
-      })))
-      return existing
+    const readSnapshot = presetReferences.readPresetReferenceSnapshot
+    let reservationInstalled = false
+    const readSpy = vi.spyOn(presetReferences, 'readPresetReferenceSnapshot').mockImplementation(async (...args) => {
+      const snapshot = await readSnapshot(...args)
+      if (args[1] === `user:${USER}:settings`) {
+        await redis.execute((client) => client.set(markerKey, JSON.stringify({
+          contract: 'goon-asset-deletion/v1', phase: 'reserved'
+        })))
+        reservationInstalled = true
+      }
+      return snapshot
     })
     try {
       await expect(service.updateUserSettings(USER, {
@@ -134,6 +141,7 @@ describe('legacy custom Goon references in settings', () => {
     } finally {
       readSpy.mockRestore()
     }
+    expect(reservationInstalled).toBe(true)
     expect(await redis.getUserSettings(USER)).toBeNull()
 
     const refused = await post({ goons_settings: goonsSettings, upload_provider: 'local' })

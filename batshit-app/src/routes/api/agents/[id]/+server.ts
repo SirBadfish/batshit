@@ -1,7 +1,24 @@
+import { TYPED_FILE_TOOLS_REVISION_HEADER, makeTypedToolsSnapshot, namesTypedFileToolsWrite, requireTypedToolsExpected, typedToolsReadPaths } from '$lib/server/typedFileToolsSettingsGuard'
+import { MCP_SETTINGS_REVISION_HEADER, mcpSettingsLeaves } from '$lib/utils/agentSettingsSectionSaves'
+import { mcpSettingsReadPaths, makeMcpSettingsSnapshot, requireMcpSettingsExpected } from '$lib/server/agentRecordUpdate'
+import { AUTO_COMPACT_REVISION_HEADER } from '$lib/appActions/settings/autoCompactBaseline'
+import { CONFIGURED_TTS_REVISION_HEADER } from '$lib/appActions/settings/configuredTtsBaseline'
+import { CONFIGURED_TTS_READ_PATHS, configuredTtsSnapshotFromDetail, requireConfiguredTtsExpected } from '$lib/server/configuredTtsGuard'
+import { AUTO_COMPACT_READ_PATHS, AUTO_COMPACT_PATHS, autoCompactSnapshotFromDetail, requireAutoCompactExpected } from '$lib/server/autoCompactGuard'
+import { MODEL_SELECTION_REVISION_HEADER } from '$lib/appActions/settings/modelSelectionBaseline'
+import { INSTRUCTIONS_REVISION_HEADER } from '$lib/appActions/settings/instructionsBaseline'
+import { instructionsReadPaths, makeInstructionsSnapshot, requireInstructionsExpected, instructionLeaves } from '$lib/server/instructionsGuard'
+import { namesModelSelection, requireModelSelectionRevision, readModelSelectionSnapshot } from '$lib/server/modelSelectionGuard'
+import { captureSettingsLifecycle, assertSettingsLifecycle, SettingsLifecycleRefusal } from '$lib/server/services/appActions/settings/lifecycle'
+import { AgentArtifactCleanupError } from '$lib/server/services/artifactAgentDeletionCleanup'
+import { isSlashCommandMutationError } from '$lib/server/services/slashCommandRevisionProtocol'
+import { SubjectPopulationError } from '$lib/server/services/subjectPopulation'
 import { json, type RequestHandler } from '@sveltejs/kit'
+import { sameJsonValue } from '$lib/utils/agentBlockFieldSettings'
 import { redis } from '$lib/server/redis'
-import { syncAgentCodexProfiles, deleteAgentCodexConfig, buildAgentProfileId } from '$lib/server/services/codexProfileManager'
-import { syncAgentClaudeProfiles, deleteAgentClaudeConfig, agentClaudeProfileResource } from '$lib/server/services/claudeProfileManager'
+import { buildAgentProfileId } from '$lib/server/services/managedProfileIdentity'
+import { deleteManagedProfileFolder } from '$lib/server/services/managedProfileFolderDelete'
+import { deleteAgentClaudeConfig, agentClaudeProfileResource } from '$lib/server/services/claudeProfileManager'
 import { deleteAgentWorkerProfiles, planAgentWorkerProfileDeletion } from '$lib/server/services/cliSubagentProfileSync'
 import {
   HostCommandDeleteRefusedError,
@@ -11,15 +28,16 @@ import {
 } from '$lib/server/services/hostCommandOwnership'
 import { validateDmSenderFields } from '$lib/utils/dmControl'
 import { validateJevJuiceAgentFields } from '$lib/utils/jevJuiceControl'
-import { getCodexConfigOverrideValidationError } from '$lib/server/services/codexSettings'
-import { getClaudeConfigOverrideValidationError } from '$lib/server/services/claudeSettings'
+import { validateLiveFileReadsAgentField } from '$lib/utils/liveFileReads'
+import { CODEX_CLI_RETIRED_CODE, CODEX_CLI_RETIRED_DETAILS, CODEX_CLI_RETIRED_ERROR,
+  namesRetiredCodexCliModel, namesClaudeCliModel, CLAUDE_CLI_PRESET_REFUSAL } from '$lib/utils/cliRuntimeIdentity'
+import { planClaudePlanRawSamplingClears } from '$lib/server/services/claudePlanAdmission'
 import {
-  canonicalizePrimaryAgentRecord,
   hasLegacyPrimaryAgentFields,
+  canonicalizePrimaryAgentRecord,
   isApiPrimaryAgentType,
-  isCliPrimaryAgentType,
-  isManagedPrimaryAgentType,
-  normalizePrimaryAgentType
+  normalizePrimaryAgentType,
+  retiredPrimaryAgentRefusal
 } from '$lib/utils/primaryAgentType'
 import { normalizeOptionalIconRefInput } from '$lib/server/icons/iconRefInput'
 import { normalizeOptionalAvatarIconFitInput } from '$lib/server/icons/avatarIconFitInput'
@@ -32,9 +50,10 @@ import {
   deleteAgentAvatars
 } from '$lib/server/services/agentAvatarDeletion'
 import { SessionDeleteRefusedError } from '$lib/server/services/sessionDeleteTurnStop'
+import { endClaudePlanRuns } from '$lib/server/services/claudePlanRunRegistry'
 import { publishUserEvent } from '$lib/server/ssePublisher'
-import { buildAgentProviderSettingsPatch } from '$lib/utils/agentProviderSettings'
-import { assertAgentProviderSettingsBlock, namesAgentMemorySetting } from '$lib/server/agentRecordUpdate'
+import { applyAgentProviderSettingsUpdate, buildAgentProviderSettingsPatch } from '$lib/utils/agentProviderSettings'
+import { AGENT_KEPT_FIELDS, assertAgentProviderSettingsBlock, namesAgentMemorySetting, type AgentUpdateOptions } from '$lib/server/agentRecordUpdate'
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -47,28 +66,49 @@ export const GET: RequestHandler = async ({ params, locals }) => {
   }
   
   try {
-    const agent = await redis.get(`agent:${params.id}`)
-    if (!agent) {
-      return json({ error: 'Agent not found' }, { status: 404 })
-    }
-    
-    // Verify agent belongs to user
-    if (agent.user_id !== locals.user.id) {
-      return json({ error: 'Unauthorized' }, { status: 403 })
-    }
-
-    if (hasLegacyPrimaryAgentFields(agent as Record<string, any>)) {
-      const canonicalAgent = canonicalizePrimaryAgentRecord(agent as Record<string, any>)
-      // BL-770: by path, never the whole record read here. An empty update (review item 1): the
-      // script works the type out from the record as it is when it runs, never from this read
-      // (which wrote an old type back over a change made since), and removes the legacy fields.
+    const lifecycle = captureSettingsLifecycle([`agent:${params.id}`])
+    const read = () => redis.execute(async client => {
+      const instructionPaths = instructionsReadPaths('agent')
+      const compactPaths = [...AUTO_COMPACT_READ_PATHS, ...AUTO_COMPACT_PATHS]
+      // One atomic cut; `extraRaw` answers these lists in this order, so each reader slices its own.
+      const selection = await readModelSelectionSnapshot(client, params.id!, 'agent', lifecycle, [...instructionPaths, ...compactPaths, ...CONFIGURED_TTS_READ_PATHS, ...mcpSettingsReadPaths(), ...typedToolsReadPaths('agent')])
+      const compactOffset = instructionPaths.length
+      const ttsOffset = compactOffset + compactPaths.length
+      const mcpOffset = ttsOffset + CONFIGURED_TTS_READ_PATHS.length
+      const typedOffset = mcpOffset + mcpSettingsReadPaths().length
+      const instructions = makeInstructionsSnapshot(params.id!, 'agent', instructionPaths.map((path, index) => [path, selection.extraRaw[index]]), lifecycle)
+      const compact = autoCompactSnapshotFromDetail(params.id!, selection.record!, selection.extraRaw.slice(compactOffset, ttsOffset), lifecycle)
+      let ttsRevision: string | undefined
+      try { ttsRevision = configuredTtsSnapshotFromDetail(params.id!, selection.record!, selection.extraRaw.slice(ttsOffset, mcpOffset), lifecycle).revision } catch { /* Other human settings remain readable; Voice waits for a valid fixed base. */ }
+      let typedToolsRevision: string | undefined
+      try { typedToolsRevision = makeTypedToolsSnapshot(params.id!, 'agent', selection.extraRaw.slice(typedOffset), lifecycle).revision } catch { /* Missing explicit source blocks this one grant, not other readable settings. */ }
+      return { typedToolsRevision, mcpSettingsRevisions: makeMcpSettingsSnapshot(params.id!, mcpSettingsReadPaths(), selection.extraRaw.slice(mcpOffset, typedOffset), lifecycle).revisions, ttsRevision, autoCompactRevision: compact.revision, record: selection.record,
+        modelSelectionRevision: selection.revision, instructionsRevision: JSON.stringify(instructions.revisions) }
+    })
+    let snapshot = await read()
+    assertSettingsLifecycle(lifecycle)
+    const agent = snapshot.record!
+    if (agent.user_id !== locals.user.id) return json({ error: 'Unauthorized' }, { status: 403 })
+    if (hasLegacyPrimaryAgentFields(agent)) {
+      // The canonicalizer owns its fixed path writes. Re-read after its await;
+      // an old canonicalAgent must never be paired with a fresh header.
       await redis.updateAgent(params.id!, {})
-      return json(resolveUploadUrlsForBrowserInPayload(canonicalAgent))
+      assertSettingsLifecycle(lifecycle)
+      snapshot = await read()
     }
-    
-    return json(resolveUploadUrlsForBrowserInPayload(agent as Record<string, any>))
+    assertSettingsLifecycle(lifecycle)
+    if (!snapshot.record || snapshot.record.user_id !== locals.user.id) return json({ error: 'Unauthorized' }, { status: 403 })
+    const projected = canonicalizePrimaryAgentRecord(snapshot.record)
+    // A leftover retired record (`cli`, `n8n`) stays readable so Settings can offer its delete. It
+    // gets no model, instruction, Auto Compact or Voice base: every save of it is refused.
+    const headers = projected.agentType === 'api'
+      ? { [MODEL_SELECTION_REVISION_HEADER]: snapshot.modelSelectionRevision,
+        [INSTRUCTIONS_REVISION_HEADER]: snapshot.instructionsRevision, [AUTO_COMPACT_REVISION_HEADER]: snapshot.autoCompactRevision, ...(snapshot.ttsRevision ? { [CONFIGURED_TTS_REVISION_HEADER]: snapshot.ttsRevision } : {}) } : undefined
+    return json(resolveUploadUrlsForBrowserInPayload(projected), { headers: { ...headers, [MCP_SETTINGS_REVISION_HEADER]: JSON.stringify(snapshot.mcpSettingsRevisions), ...(snapshot.typedToolsRevision ? { [TYPED_FILE_TOOLS_REVISION_HEADER]: snapshot.typedToolsRevision } : {}) } })
   } catch (error) {
     console.error('Error getting agent:', error)
+    const status = (error as any)?.status
+    if (status === 404 || status === 409) return json({ error: error instanceof Error ? error.message : 'Agent settings changed while reading.', code: (error as any)?.code }, { status })
     return json({ error: 'Failed to get agent' }, { status: 500 })
   }
 }
@@ -79,16 +119,37 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
     return json({ error: 'Unauthorized' }, { status: 401 })
   }
   
+  let typedToolsAck: { revision: string; value: boolean } | undefined
+  let mcpSettingsAck: Parameters<NonNullable<AgentUpdateOptions['onMcpSettingsSaved']>>[0] | undefined
+  let samplingCleared: ReturnType<typeof planClaudePlanRawSamplingClears> = null
   try {
     const updates = await request.json()
-    const codexValidationError = getCodexConfigOverrideValidationError(updates.codex_settings ?? null)
-    if (codexValidationError) {
-      return json({ error: codexValidationError }, { status: 400 })
-    }
-    const claudeValidationError = getClaudeConfigOverrideValidationError(updates.claude_settings ?? null)
-    if (claudeValidationError) {
-      return json({ error: claudeValidationError }, { status: 400 })
-    }
+    const expectedTypedFileTools = updates.expectedTypedFileTools
+    delete updates.expectedTypedFileTools
+    if (expectedTypedFileTools !== undefined || namesTypedFileToolsWrite(updates)) requireTypedToolsExpected(expectedTypedFileTools)
+    const expectedMcpSettings = updates.expectedMcpSettings
+    delete updates.expectedMcpSettings
+    if (expectedMcpSettings !== undefined || mcpSettingsLeaves(updates).length) requireMcpSettingsExpected(expectedMcpSettings, mcpSettingsLeaves(updates))
+    const expectedTtsSelection = updates.expectedTtsSelection
+    delete updates.expectedTtsSelection
+    if (expectedTtsSelection !== undefined || updates.voice_profile !== undefined) requireConfiguredTtsExpected(expectedTtsSelection)
+    const expectedAutoCompact = updates.expectedAutoCompact
+    delete updates.expectedAutoCompact
+    if (expectedAutoCompact !== undefined || updates.auto_compact_settings !== undefined) requireAutoCompactExpected(expectedAutoCompact)
+    const expectedModelSelection = updates.expectedModelSelection
+    delete updates.expectedModelSelection
+    if (expectedModelSelection !== undefined) requireModelSelectionRevision(expectedModelSelection)
+    const expectedInstructions = updates.expectedInstructions
+    delete updates.expectedInstructions
+    if (expectedInstructions !== undefined || instructionLeaves(updates).length) requireInstructionsExpected(expectedInstructions, instructionLeaves(updates))
+    // SA-139 R4: the Claude Code CLI lane's request-only save checks are never stored. The record
+    // check below answers a leftover CLI agent first; a live agent sent one is refused after it.
+    const cliSaveChecks = ['expectedCliReasoning', 'expectedCliPromotion'].filter(field => Object.hasOwn(updates, field))
+    for (const field of cliSaveChecks) delete updates[field]
+    // The old CLI settings blocks are never stored (R1: Codex, R4: Claude Code). Dropping one leaves a
+    // stored block untouched, so a whole-record echo that carries it still saves.
+    delete updates.codex_settings
+    delete updates.claude_settings
     // SA-113 P2 (DL-113-01): refuse a bad sender policy rather than storing it. The read
     // side defaults an unrecognised value to "any agent", which is the permissive one.
     const dmSenderValidationError = validateDmSenderFields(updates)
@@ -99,6 +160,11 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
     const jevJuiceValidationError = validateJevJuiceAgentFields(updates)
     if (jevJuiceValidationError) {
       return json({ error: jevJuiceValidationError }, { status: 400 })
+    }
+    // SA-137 P4: the agent's Live File Reads override is true, false or null (null removes it).
+    const liveFileReadsValidationError = validateLiveFileReadsAgentField(updates)
+    if (liveFileReadsValidationError) {
+      return json({ error: liveFileReadsValidationError }, { status: 400 })
     }
     // BL-1294: the agent can change its own memory settings (App Actions), so a save of them says
     // which saved values it started from, and `updateAgent` refuses it (409) when they changed.
@@ -118,8 +184,8 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
       )
     }
     
-    // Verify agent exists and belongs to user
-    const agent = await redis.get(`agent:${params.id}`)
+    // BL-1519: failed storage reads must stop admission, not impersonate absence.
+    const agent = await redis.get(`agent:${params.id}`, { throwOnError: true })
     if (!agent) {
       return json({ error: 'Agent not found' }, { status: 404 })
     }
@@ -128,29 +194,38 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
       return json({ error: 'Unauthorized' }, { status: 403 })
     }
 
-    if (!isManagedPrimaryAgentType(normalizePrimaryAgentType(agent))) {
+    // SA-139 R4 (D14): a leftover record of a retired type (the Claude Code CLI lane, n8n) refuses
+    // every save; only its delete works.
+    const retired = retiredPrimaryAgentRefusal(agent)
+    if (retired) return json(retired, { status: 409 })
+    if (cliSaveChecks.length) {
       return json(
         {
-          error: 'This Primary Agent uses the retired n8n type and can only be deleted.',
-          code: 'primary_agent_type_retired'
+          error: `This save carries a Claude Code CLI check (${cliSaveChecks.join(', ')}), and the Claude Code CLI lane was removed from Batshit, so nothing was saved. Reload Settings and try again.`
         },
-        { status: 409 }
+        { status: 400 }
       )
+    }
+    if (Object.hasOwn(updates, 'app_action_policy')) {
+      // Older full-record human saves may echo the unchanged read-only field. Preserve it;
+      // a differing value is an attempted authority edit and belongs to the dedicated route.
+      if (!sameJsonValue(updates.app_action_policy ?? null, (agent as Record<string, unknown>).app_action_policy ?? null)) {
+        return json({ error: 'App Actions policy must be changed using its dedicated Access control.', code: 'app_actions_policy_user_only' }, { status: 400 })
+      }
+      delete updates.app_action_policy
     }
 
     const namesAgentType = Object.prototype.hasOwnProperty.call(updates, 'agentType')
     const requestedAgentType =
       typeof updates.agentType === 'string' ? updates.agentType.trim().toLowerCase() : ''
-    if (namesAgentType) {
-      if (requestedAgentType !== 'api' && requestedAgentType !== 'cli') {
-        return json(
-          {
-            error: 'Primary Agent type must be API or CLI.',
-            code: 'primary_agent_type_invalid'
-          },
-          { status: 400 }
-        )
-      }
+    if (namesAgentType && requestedAgentType !== 'api') {
+      return json(
+        {
+          error: 'The Primary Agent type must be API.',
+          code: 'primary_agent_type_invalid'
+        },
+        { status: 400 }
+      )
     }
 
     if (Object.prototype.hasOwnProperty.call(updates, 'goon_id') && updates.goon_id) {
@@ -170,6 +245,7 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
       ...(agent as Record<string, any>),
       ...(updates as Record<string, any>)
     })
+    if (namesModelSelection('agent', updates)) requireModelSelectionRevision(expectedModelSelection)
     const provider = (updates.primary_model_provider ?? agent.primary_model_provider ?? '')
       .toLowerCase()
       .trim()
@@ -178,28 +254,26 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
       .trim()
     const connection =
       updates.primary_model_connection ?? agent.primary_model_connection ?? null
-    const connectionHint = (connection?.id ?? connection?.service ?? '').toLowerCase()
-    const isCodexPreset =
-      provider.includes('codex') ||
-      modelName.includes('codex') ||
-      connectionHint.includes('codex')
-    const isClaudeCliPreset =
-      provider.includes('claude-cli') ||
-      modelName.includes('claude-cli') ||
-      connectionHint.includes('claude-cli')
-    const isCliPreset = isCodexPreset || isClaudeCliPreset
-    const hasModelSelection = Boolean(provider || modelName || connectionHint)
-
-    if (isCliPrimaryAgentType(resolvedAgentType) && hasModelSelection && !isCliPreset) {
+    // SA-139 R1: Codex CLI was removed, so an agent never names a Codex CLI model. Provider and
+    // connection ids only: an OpenAI model id containing "codex" is an API model.
+    if (namesRetiredCodexCliModel({ primary_model_provider: provider, primary_model_connection: connection })) {
       return json(
-        { error: 'CLI agents only support CLI model presets.' },
-        { status: 400 }
+        { error: CODEX_CLI_RETIRED_ERROR, code: CODEX_CLI_RETIRED_CODE, details: CODEX_CLI_RETIRED_DETAILS },
+        { status: 409 }
       )
     }
-
-    if (isApiPrimaryAgentType(resolvedAgentType) && isCliPreset) {
+    // SA-139 R4 and R5: nothing runs a Claude Code CLI preset any more, so no agent stores one.
+    if (namesClaudeCliModel({ primary_model_provider: provider, primary_model_name: modelName, primary_model_connection: connection })) {
+      return json({ error: CLAUDE_CLI_PRESET_REFUSAL }, { status: 400 })
+    }
+    // A record that predates `agentType` has its type worked out from its fields (a body's legacy
+    // type fields included); a save never works it out to a retired type.
+    if (!isApiPrimaryAgentType(resolvedAgentType)) {
       return json(
-        { error: 'CLI model presets are only available for CLI agents.' },
+        {
+          error: 'The Primary Agent type must be API.',
+          code: 'primary_agent_type_invalid'
+        },
         { status: 400 }
       )
     }
@@ -218,6 +292,8 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
         ? { avatar_icon_fit: normalizeOptionalAvatarIconFitInput(updates.avatar_icon_fit, 'avatar_icon_fit') }
         : {})
     }
+    // BL-1702: full-record human saves may echo read-only metadata. Keep it out of ordinary writes.
+    for (const field of AGENT_KEPT_FIELDS) delete canonicalUpdates[field]
     if (namesAgentType) canonicalUpdates.agentType = requestedAgentType
     // Review item 6: a block that is neither an object nor null is a 400, not a 500 from the merge.
     assertAgentProviderSettingsBlock(canonicalUpdates.provider_specific_settings)
@@ -234,22 +310,52 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
     )
     if (providerSettingsPatch === undefined) delete canonicalUpdates.provider_specific_settings
     else canonicalUpdates.provider_specific_settings = providerSettingsPatch
-    if (namesMemory) {
-      await redis.updateAgent(params.id!, canonicalUpdates, { expectedMemory: expectedMemory as Record<string, unknown> })
-    } else {
-      await redis.updateAgent(params.id!, canonicalUpdates)
+    // SA-139 (Faye S13): a model save that leaves the agent on the Claude plan with no preset removes what every run's
+    // admission would refuse (the sampling copies, the settings block's other model keys, an effort or Thinking value
+    // the model cannot take), and its answer says so. Never a silent drop at run time. The block is written key by
+    // key, so a removed key is a `null` beside the save's own patch.
+    samplingCleared = namesModelSelection('agent', updates)
+      ? planClaudePlanRawSamplingClears(agent as Record<string, unknown>, canonicalUpdates,
+        applyAgentProviderSettingsUpdate((agent as Record<string, any>).provider_specific_settings, updates.provider_specific_settings))
+      : null
+    if (samplingCleared) {
+      Object.assign(canonicalUpdates, samplingCleared.clears)
+      if (Object.keys(samplingCleared.blockClears).length) {
+        canonicalUpdates.provider_specific_settings = { ...(canonicalUpdates.provider_specific_settings ?? {}), ...samplingCleared.blockClears }
+      }
     }
-    try {
-      await syncAgentCodexProfiles(locals.user.id)
-    } catch (error) {
-      console.warn('[Agents API] Failed to sync Codex profiles after update:', error)
+    const options: AgentUpdateOptions = {
+      onTypedFileToolsSaved(ack) { typedToolsAck = ack },
+      ...(expectedTypedFileTools !== undefined ? { expectedTypedFileTools } : {}),
+      onMcpSettingsSaved(ack) { mcpSettingsAck = ack },
+      ...(expectedMcpSettings !== undefined ? { expectedMcpSettings } : {}),
+      ...(expectedTtsSelection !== undefined ? { expectedTtsSelection } : {}),
+      ...(expectedAutoCompact !== undefined ? { expectedAutoCompact } : {}),
+      ...(expectedModelSelection !== undefined ? { expectedModelSelection: expectedModelSelection as string } : {}),
+      ...(expectedInstructions !== undefined ? { expectedInstructions } : {}),
+      ...(namesMemory ? { expectedMemory: expectedMemory as Record<string, unknown> } : {})
     }
-    try {
-      await syncAgentClaudeProfiles(locals.user.id)
-    } catch (error) {
-      console.warn('[Agents API] Failed to sync Claude profiles after update:', error)
+    if (Object.keys(options).length) await redis.updateAgent(params.id!, canonicalUpdates, options)
+    else await redis.updateAgent(params.id!, canonicalUpdates)
+    if (canonicalUpdates.provider_specific_settings !== undefined) void publishUserEvent(locals.user.id, { type: 'agent_settings_changed', agentId: params.id!, family: 'provider-settings' })
+    if (mcpSettingsLeaves(canonicalUpdates).length) void publishUserEvent(locals.user.id, { type: 'agent_settings_changed', agentId: params.id!, family: 'mcp-settings' })
+    if (canonicalUpdates.voice_profile !== undefined) void publishUserEvent(locals.user.id, { type: 'agent_settings_changed', agentId: params.id!, family: 'voice-selection' })
+    if (canonicalUpdates.auto_compact_settings !== undefined) void publishUserEvent(locals.user.id, { type: 'agent_settings_changed', agentId: params.id!, family: 'auto-compact' })
+    if (instructionLeaves(canonicalUpdates).length) await publishUserEvent(locals.user.id, { type: 'agent_settings_changed', agentId: params.id!, family: 'instructions' })
+    if (['api_reasoning_retention', 'whiteboard_budget_tokens', 'show_whiteboard', 'show_reasoning', 'preserve_reasoning'].some((field) => field in canonicalUpdates)) {
+      await publishUserEvent(locals.user.id, { type: 'agent_settings_changed', agentId: params.id!, family: 'retention' })
     }
-    return json({ success: true })
+    if (canonicalUpdates.model_reasoning_overrides) {
+      const key = Object.keys(canonicalUpdates.model_reasoning_overrides)[0]
+      const acknowledged = await redis.json.get(`agent:${params.id}`) as Record<string, any> | null
+      if (!acknowledged || acknowledged.user_id !== locals.user.id) {
+        return json({ error: 'The reasoning save could not be confirmed. Reload Settings before sending.', ...(samplingCleared ? { samplingCleared: { fields: samplingCleared.fields, notice: samplingCleared.notice } } : {}) }, { status: 409 })
+      }
+      return json({ success: true, ...(typedToolsAck ? { typedFileTools: typedToolsAck } : {}), ...(mcpSettingsAck ? { mcpSettings: mcpSettingsAck } : {}), ...(samplingCleared ? { samplingCleared: { fields: samplingCleared.fields, notice: samplingCleared.notice } } : {}), model_reasoning_override: {
+        key, selection: acknowledged.model_reasoning_overrides?.[key] ?? null
+      } })
+    }
+    return json({ success: true, ...(typedToolsAck ? { typedFileTools: typedToolsAck } : {}), ...(mcpSettingsAck ? { mcpSettings: mcpSettingsAck } : {}), ...(samplingCleared ? { samplingCleared: { fields: samplingCleared.fields, notice: samplingCleared.notice } } : {}) })
   } catch (error) {
     // A save refused before anything was written (`AgentUpdateRejectedError`, review items 2 and
     // 6) carries status 400 and a message that says what to change; a type that kept changing
@@ -259,7 +365,7 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
     console.error('Error updating agent:', error)
     const code = typeof (error as any)?.code === 'string' ? (error as any).code : undefined
     return json(
-      { error: error instanceof Error ? error.message : 'Failed to update agent', ...(code ? { code } : {}) },
+      { error: error instanceof Error ? error.message : 'Failed to update agent', ...(typedToolsAck ? { typedFileToolsSaved: true, typedFileTools: typedToolsAck } : {}), ...(mcpSettingsAck ? { mcpSettingsSaved: true, mcpSettings: mcpSettingsAck } : {}), ...(code ? { code } : {}) },
       { status: (error as any)?.status ?? 500 }
     )
   }
@@ -275,12 +381,14 @@ export const DELETE: RequestHandler = async ({ params, locals, url }) => {
   const deleteChats = url.searchParams.get('chats') === '1'
 
   try {
-    // Verify agent exists and belongs to user
-    const agent = await redis.get(`agent:${params.id}`)
+    // Verify agent exists and belongs to user. BL-642: read with `redis.json.get`, which throws on
+    // a failed read; `redis.get` answers null for one, the same as a missing agent, and the user
+    // was told "Agent not found". A failed read is the catch's 500 and nothing is deleted.
+    const agent = await redis.json.get(`agent:${params.id}`)
     if (!agent) {
       return json({ error: 'Agent not found' }, { status: 404 })
     }
-    
+
     if (agent.user_id !== locals.user.id) {
       return json({ error: 'Unauthorized' }, { status: 403 })
     }
@@ -313,6 +421,20 @@ export const DELETE: RequestHandler = async ({ params, locals, url }) => {
           )
         }
         throw error
+      }
+
+      // SA-139 (D10): every Claude plan run of this agent (in its own chats, a group chat, or a
+      // Subagent or Worker run it started, which carry the parent's id) ends and its Claude Code exit
+      // is confirmed before anything is deleted; an unconfirmed exit keeps the agent (409).
+      const claudePlanRuns = await endClaudePlanRuns({ userId, agentId: params.id! }, 'This agent was deleted.')
+      if (claudePlanRuns.unsettled > 0) {
+        return json(
+          {
+            error: 'A Claude Code run of this agent is still stopping, so nothing was deleted. Try again in a moment; if this keeps happening, restart Batshit.',
+            code: 'claude_plan_run_still_stopping'
+          },
+          { status: 409 }
+        )
       }
 
       // Chats first, agent second: a chat whose reply is still stopping refuses the delete
@@ -381,23 +503,9 @@ export const DELETE: RequestHandler = async ({ params, locals, url }) => {
       await Promise.allSettled([
         (async () => {
           try {
-            await syncAgentCodexProfiles(userId)
+            await deleteManagedProfileFolder(params.id)
           } catch (error) {
-            console.warn('[Agents API] Failed to sync Codex profiles after delete:', error)
-          }
-        })(),
-        (async () => {
-          try {
-            await syncAgentClaudeProfiles(userId)
-          } catch (error) {
-            console.warn('[Agents API] Failed to sync Claude profiles after delete:', error)
-          }
-        })(),
-        (async () => {
-          try {
-            await deleteAgentCodexConfig(params.id)
-          } catch (error) {
-            console.warn('[Agents API] Failed to remove Codex config directory:', error)
+            console.warn('[Agents API] Failed to remove the managed profile folder:', error)
           }
         })(),
         (async () => {
@@ -407,7 +515,7 @@ export const DELETE: RequestHandler = async ({ params, locals, url }) => {
             console.warn('[Agents API] Failed to remove Claude config directory:', error)
           }
         })(),
-        // BL-393: its Workers' slot folders too (their Codex logs hold the Workers' prompts),
+        // BL-393: its Workers' slot folders too (their CLI logs hold the Workers' prompts),
         // never one another record also owns.
         (async () => {
           try {
@@ -430,7 +538,11 @@ export const DELETE: RequestHandler = async ({ params, locals, url }) => {
       ? deleteOwned([])
       : withHostCommandDeletion(resources, deleteOwned))
   } catch (error) {
+    if (error instanceof AgentArtifactCleanupError) return json({ error: error.message, code: error.code, outcome: error.outcome, subjectRetained: error.subjectRetained, cleanup: error.progress }, { status: error.status })
     console.error('Error deleting agent:', error)
+    if (error instanceof SettingsLifecycleRefusal) return json({ error: error.message, code: error.code }, { status: error.status })
+    if (error instanceof SubjectPopulationError) return json({ error: error.message, code: error.code }, { status: error.status })
+    if (isSlashCommandMutationError(error)) return json({ error: `The agent record was retained after skill reference cleanup stopped. Earlier cleanup may already have completed. ${error.message}`, code: error.code }, { status: error.status })
     if (error instanceof HostCommandDeleteRefusedError) {
       return json({ error: error.message, code: error.code }, { status: error.status })
     }

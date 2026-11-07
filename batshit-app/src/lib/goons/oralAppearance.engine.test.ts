@@ -59,6 +59,7 @@ describe('OralAppearanceEngineRuntime', () => {
     state.tongue.color = [0.25, 0.5, 0.75]
 
     const runtime = new OralAppearanceEngineRuntime(value.root, contract, state)
+    expect(new Set(runtime.getMotionMaterials())).toEqual(new Set([value.teeth, value.gums, value.tongue]))
     const expectedTeeth = new THREE.Color()
       .setRGB(0.5, 0.25, 1, THREE.SRGBColorSpace)
       .multiplyScalar(1.2)
@@ -74,6 +75,7 @@ describe('OralAppearanceEngineRuntime', () => {
     expect(value.teeth.roughness).toBeCloseTo(0.23)
     runtime.setState(state)
     runtime.dispose()
+    expect(runtime.getMotionMaterials()).toBeNull()
     expect(value.teeth.color.getHex()).toBe(0xffffff)
     expect(value.gums.color.getHex()).toBe(0xffffff)
     expect(value.tongue.color.getHex()).toBe(0xffffff)

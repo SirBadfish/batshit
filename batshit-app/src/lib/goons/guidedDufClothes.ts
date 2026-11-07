@@ -1,7 +1,7 @@
 import * as THREE from 'three'
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js'
 import { MToonMaterialLoaderPlugin, VRMLoaderPlugin } from '@pixiv/three-vrm'
-import { MToonNodeMaterial } from '@pixiv/three-vrm/nodes'
+import { GoonMToonNodeMaterial } from './goonMToonNodeMaterial'
 import {
   getDefaultClosetSlotLabel,
   isBodySkinClosetSlotMaterialName,
@@ -19,7 +19,7 @@ function createVrmSceneLoader() {
   const loader = new GLTFLoader()
   loader.register((parser: any) => {
     const mtoonMaterialPlugin = new MToonMaterialLoaderPlugin(parser, {
-      materialType: MToonNodeMaterial
+      materialType: GoonMToonNodeMaterial
     })
     return new VRMLoaderPlugin(parser, { mtoonMaterialPlugin })
   })

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 // BL-544: the real RedisService, even if other suites mocked the module earlier.
 vi.mock('$lib/server/redis', async () => {
@@ -25,8 +25,9 @@ import { GET as LIST } from '../+server'
  * Access one agent at a time. The skill routes that rewrite the whole command record (a Skills &
  * Prompts save, and the metadata refresh of the two GET routes) read the record first and wrote
  * that copy back whole, after awaiting the skill files in between; an agent turned on or off in
- * that gap was undone. They now keep the list as stored at the moment of the write (one Lua step),
- * unless the request itself sends a list.
+ * that gap was undone. The accepted P4 original-basis contract now refuses that concurrent
+ * change before stale metadata is published. An unchanged basis preserves an omitted access
+ * list; an explicit list still replaces it. A conflict never rebases or retries the write.
  *
  * Each case lands the Access change inside the gap (the skill registry mock writes it while the
  * route awaits it). Real Redis 8: it runs only under `npm run test:redis` and reports as skipped in
@@ -118,10 +119,14 @@ async function stored() {
   return (await redis.json.get(KEY)) as Record<string, any> | null
 }
 
-describe.runIf(REAL_REDIS_LANE)('the skill routes keep the per-agent list as stored (BL-544)', () => {
+describe.runIf(REAL_REDIS_LANE)('the skill routes preserve access and refuse a changed original basis (BL-544, P4)', () => {
   useRedisTestServer()
+  beforeEach(() => {
+    skillRegistry.getSkill.mockReset()
+    skillRegistry.upsertSkill.mockReset()
+  })
 
-  it('a Skills & Prompts Trust change keeps an agent that Access turned on while the save ran', async () => {
+  it('a Trust save refuses a concurrent Access change, retaining the current list and original metadata', async () => {
     await redis.json.set(KEY, '$', skillCommand() as any)
     skillRegistry.upsertSkill.mockImplementationOnce(async () => {
       await accessTurnsOn('ssacc_orla')
@@ -130,12 +135,13 @@ describe.runIf(REAL_REDIS_LANE)('the skill routes keep the per-agent list as sto
 
     const { status, body } = await put({ skill: { id: 'ssacc_notes', name: 'Ssacc Notes', trustLevel: 'trusted' } })
 
-    expect(status).toBe(200)
+    expect(status).toBe(409)
+    expect(body.code).toBe('SLASH_COMMAND_CONFLICT')
     const record = await stored()
-    expect(record?.trust_level).toBe('trusted')
+    expect(record?.trust_level).toBe('untrusted')
     expect(record?.enabled_agent_ids).toEqual(['ssacc_nova', 'ssacc_orla'])
     expect(record?.can_be_attached_to_agents).toBe(true)
-    expect(body.slashCommand.enabled_agent_ids).toEqual(['ssacc_nova', 'ssacc_orla'])
+    expect(skillRegistry.upsertSkill).toHaveBeenCalledTimes(1)
   })
 
   it('a save that sends a list still replaces the list (an explicit caller)', async () => {
@@ -160,20 +166,22 @@ describe.runIf(REAL_REDIS_LANE)('the skill routes keep the per-agent list as sto
     expect(Object.prototype.hasOwnProperty.call(record, 'enabled_agent_ids')).toBe(false)
   })
 
-  it('a save whose command was deleted while it ran answers 404 and does not make the command again', async () => {
+  it('a save whose original command was deleted refuses its stale basis and does not recreate or retry it', async () => {
     await redis.json.set(KEY, '$', skillCommand() as any)
     skillRegistry.upsertSkill.mockImplementationOnce(async () => {
       await redis.del(KEY)
       return skillRecord({ trust_level: 'trusted' })
     })
 
-    const { status } = await put({ skill: { id: 'ssacc_notes', name: 'Ssacc Notes', trustLevel: 'trusted' } })
+    const { status, body } = await put({ skill: { id: 'ssacc_notes', name: 'Ssacc Notes', trustLevel: 'trusted' } })
 
-    expect(status).toBe(404)
+    expect(status).toBe(409)
+    expect(body.code).toBe('SLASH_COMMAND_CONFLICT')
     expect(await stored()).toBeNull()
+    expect(skillRegistry.upsertSkill).toHaveBeenCalledTimes(1)
   })
 
-  it("the command GET's metadata refresh keeps an agent that Access turned on while it read the skill files", async () => {
+  it("the command GET refuses stale metadata after a concurrent Access change without rebasing", async () => {
     await redis.json.set(KEY, '$', skillCommand() as any)
     skillRegistry.getSkill.mockImplementationOnce(async () => {
       await accessTurnsOn('ssacc_orla')
@@ -182,13 +190,15 @@ describe.runIf(REAL_REDIS_LANE)('the skill routes keep the per-agent list as sto
 
     const response = (await (GET as any)({ params: { id: COMMAND }, locals: { user: { id: USER } } })) as Response
 
-    expect(response.status).toBe(200)
+    expect(response.status).toBe(409)
+    expect((await response.json()).code).toBe('SLASH_COMMAND_CONFLICT')
     const record = await stored()
-    expect(record?.skill_summary).toBe('Probe skill, described again on disk.')
+    expect(record?.skill_summary).toBe('Probe skill.')
     expect(record?.enabled_agent_ids).toEqual(['ssacc_nova', 'ssacc_orla'])
+    expect(skillRegistry.getSkill).toHaveBeenCalledTimes(1)
   })
 
-  it("the list GET's metadata refresh keeps it too", async () => {
+  it("the list GET also refuses stale metadata and keeps current Access without a retry", async () => {
     await redis.json.set(KEY, '$', skillCommand() as any)
     skillRegistry.getSkill.mockImplementationOnce(async () => {
       await accessTurnsOn('ssacc_orla')
@@ -197,9 +207,11 @@ describe.runIf(REAL_REDIS_LANE)('the skill routes keep the per-agent list as sto
 
     const response = (await (LIST as any)({ locals: { user: { id: USER } } })) as Response
 
-    expect(response.status).toBe(200)
+    expect(response.status).toBe(409)
+    expect((await response.json()).code).toBe('SLASH_COMMAND_CONFLICT')
     const record = await stored()
-    expect(record?.skill_summary).toBe('Probe skill, described again on disk.')
+    expect(record?.skill_summary).toBe('Probe skill.')
     expect(record?.enabled_agent_ids).toEqual(['ssacc_nova', 'ssacc_orla'])
+    expect(skillRegistry.getSkill).toHaveBeenCalledTimes(1)
   })
 })

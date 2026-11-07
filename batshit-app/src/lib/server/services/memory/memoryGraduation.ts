@@ -1,3 +1,6 @@
+import { normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
+import { resolveApiReasoningRetention } from '$lib/utils/reasoningRetention'
+import { readAgentWhiteboard } from '$lib/server/services/whiteboard'
 /**
  * SA-104 P6 — the graduation writer and the nap (DL-104-02 / -07 / -12 / -15 / -16).
  *
@@ -56,6 +59,7 @@ import {
   type EffectiveMemoryWindow
 } from '$lib/utils/memoryControl'
 import { isMessageProtectedFromManualTrim } from '$lib/utils/tokenPanel'
+import { normalizeId } from '$lib/utils/idNormalizer'
 import { calculateRecoveryHoldByIndex } from '$lib/utils/zipMessageAge'
 import {
   estimateCurrentContextTokens,
@@ -137,6 +141,13 @@ export const NAP_COMPACTION_SUMMARY_ONLY_PROMPT = [
   '',
   'Be explicit about uncertainty. Never invent results or hidden state.'
 ].join('\n')
+
+/** API naps preserve continuity in the summary that actually reaches the live window. */
+export const API_NAP_COMPACTION_PROMPT = NAP_COMPACTION_SUMMARY_ONLY_PROMPT.replace(
+  "The agent keeps its own episode whiteboard (shown below as context). It is the agent's to maintain and is NOT part of your output; do not return a WHITEBOARD section.",
+  'The agent alone maintains its continuous session Whiteboard across episode changes. The board, when shown below, is read-only context and is NOT part of your output; do not return a WHITEBOARD section.'
+) + '\n\n' +
+  'Retain the ongoing goal, necessary facts and decisions, constraints, current state, exact references and values, blockers, uncertainties, and next useful actions from the conversation being compacted. The Whiteboard is read-only context, not a substitute for this summary. Do not omit necessary information merely because it is currently on that mutable board. Do not copy the board wholesale or preserve a reasoning transcript. Do not produce or apply a WHITEBOARD section.'
 
 /**
  * The explicit summary-model choice (story: "configured model, cheap default,
@@ -1007,8 +1018,12 @@ export async function runFixedSessionNap(options: {
           if (recoveryHoldIds.has(message.id)) continue
           if (isMessageProtectedFromManualTrim(message, protections)) continue
           const zipIds = Array.isArray(message.metadata?.zipIds) ? message.metadata.zipIds : []
-          for (const zipId of zipIds) {
-            if (typeof zipId !== 'string' || !zipId.trim()) continue
+          for (const rawZipId of zipIds) {
+            if (typeof rawZipId !== 'string' || !rawZipId.trim()) continue
+            // BL-1515: the zip state is keyed on the state id, `normalizeId(<raw id>)` (BL-476),
+            // and the message names the raw id. Only the raw side is normalized, once: the sets
+            // hold state ids, and a second cut of one whose random part is all digits misses it.
+            const zipId = normalizeId(rawZipId)
             if (unzippedIds.has(zipId)) continue // manual unzips are pins
             if (rezippedIds.has(zipId)) continue
             // BL-749: this loop can span several Redis round trips, and the delete does not take
@@ -1078,13 +1093,19 @@ export async function runFixedSessionNap(options: {
       // when it is EMPTY (fills it) or when a nap wrote it last (refreshes it); a board the
       // agent wrote is never rewritten — the summary model then gets a summary-only call
       // with the agent's board as read-only context.
-      const currentWhiteboard = openEpisode?.whiteboard?.content?.trim()
+      const apiNap = normalizePrimaryAgentType(options.agent) === 'api'
+      const apiSettings = apiNap ? resolveApiReasoningRetention(options.agent) : null
+      const currentWhiteboard = apiNap
+        ? apiSettings?.whiteboardEnabled
+          ? (await readAgentWhiteboard({ userId: options.userId, sessionId, agentId }))?.content?.trim()
+          : undefined
+        : openEpisode?.whiteboard?.content?.trim()
       const boardAuthor = currentWhiteboard ? whiteboardAuthor(openEpisode?.whiteboard) : null
-      const napWritesBoard = Boolean(openEpisode) && boardAuthor !== 'agent'
+      const napWritesBoard = !apiNap && Boolean(openEpisode) && boardAuthor !== 'agent'
       const whiteboardOutcome: NonNullable<FixedSessionNapRecord['compaction']>['whiteboard'] =
         !openEpisode ? 'none' : !napWritesBoard ? 'kept' : currentWhiteboard ? 'refreshed' : 'filled'
       const prompt = [
-        napWritesBoard ? NAP_COMPACTION_PROMPT : NAP_COMPACTION_SUMMARY_ONLY_PROMPT,
+        apiNap ? API_NAP_COMPACTION_PROMPT : napWritesBoard ? NAP_COMPACTION_PROMPT : NAP_COMPACTION_SUMMARY_ONLY_PROMPT,
         '',
         'SUMMARY BUDGET:',
         `Aim for roughly ${budget.softTargetTokens.toLocaleString()} tokens for the SUMMARY section; do not exceed about ${budget.hardMaxTokens.toLocaleString()}.`,
@@ -1093,7 +1114,9 @@ export async function runFixedSessionNap(options: {
           ? currentWhiteboard
             ? `CURRENT EPISODE WHITEBOARD:\n${currentWhiteboard}`
             : 'CURRENT EPISODE WHITEBOARD: (empty — build it from the segment below)'
-          : `CURRENT EPISODE WHITEBOARD (kept by the agent; context only, not yours to change):\n${currentWhiteboard}`,
+          : apiNap
+            ? `CURRENT SESSION WHITEBOARD (read-only context, never change or refill it):\n${currentWhiteboard ?? '(empty)'}`
+            : `CURRENT EPISODE WHITEBOARD (kept by the agent; context only, not yours to change):\n${currentWhiteboard}`,
         '',
         'OLDER OPEN-EPISODE SEGMENT TO COMPACT:',
         await buildAgentTranscript(agentId, candidates)

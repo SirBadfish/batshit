@@ -4,13 +4,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 vi.unmock('ai'); vi.unmock('@ai-sdk/openai')
 const slot = vi.hoisted(() => ({ runtime: null as any }))
 vi.mock('$lib/server/services/chatgptPlanHost', () => ({ getChatgptPlanRuntime: () => slot.runtime }))
-vi.mock('$lib/server/services/codexBridge', () => ({ CodexBridge: vi.fn() }))
-vi.mock('$lib/server/services/claudeBridge', () => ({ ClaudeBridge: vi.fn() }))
+vi.mock('$lib/server/services/systemSlashCommands', async importOriginal => {
+  const actual = await importOriginal<typeof import('$lib/server/services/systemSlashCommands')>()
+  if (process.env.VITEST_USE_REAL_REDIS === 'true') return actual
+  const { assertInitializedBuiltinPlugin } = await import('$lib/test-utils/initialized-builtin-plugin')
+  const { redis } = await import('$lib/server/redis')
+  return { ...actual, ensureSystemSlashCommands: (userId: string) =>
+    assertInitializedBuiltinPlugin(userId, key => redis.json.get(key)) }
+})
 import { mkdtempSync, realpathSync, rmSync } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import { redis } from '$lib/server/redis'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
+import { initializedBuiltinPluginEntries } from '$lib/test-utils/initialized-builtin-plugin'
+import { buildDynamicOnlySelectionResetKey } from '$lib/server/services/mcpRuntimePolicy'
 import { ChatgptPlanVault } from '../chatgptPlanVault'
 import { ChatgptPlanOAuth } from '../chatgptPlanOAuth'
 import { ChatgptPlanRuntime, type PlanLease } from '../chatgptPlanRuntime'
@@ -27,6 +35,9 @@ beforeEach(async () => {
     // client through execute, whereas production exposes the private getClient.
     // Keep the real artifact listing/Fabric/scope code on the same fake client.
     vi.spyOn(ArtifactsService.prototype as any, 'client').mockImplementation(() => redis.execute(async client => client))
+    for (const [key, value] of initializedBuiltinPluginEntries(USER)) await redis.json.set(key, '$', value)
+    // Exact post-startup fixture input, after the fake reset and before actors.
+    await redis.execute(client => client.set(buildDynamicOnlySelectionResetKey(USER), '2026-10-27T00:00:00.000Z'))
   }
   root = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'sa130-delegate-'))); bodies = []; requests = []; leases = []
   vault = new ChatgptPlanVault(root, 'sa130-synthetic-delegate-key-0123456789')
@@ -45,6 +56,8 @@ beforeEach(async () => {
   await redis.set('batshit:sub_system_prompt', 'Fixture delegated identity.')
   const connection = { id: `chatgpt-plan:${row.id}`, type: 'direct', service: 'chatgpt-plan' }
   await redis.set(`model:${PRESET}`, { id: PRESET, provider: 'openai', modelId: 'fixture-model', effectiveModelId: 'fixture-model', connection, settings: {} })
+  // A real owned preset includes its user's enumeration index before an Agent references it.
+  await redis.execute(client => client.sAdd(`user:${USER}:models`, PRESET))
   await redis.createAgent({ id: PARENT, user_id: USER, name: 'Parent', agentType: 'api', primary_model_preset_id: PRESET } as any)
   await redis.createSession({ id: SESSION, user_id: USER, title: 'Fixture delegation', agent_id: PARENT } as any)
   subagent = { id: SUB, user_id: USER, displayName: 'Plan Fixture', slug: 'plan_fixture', subagentType: 'api', primary_model_provider: 'openai', primary_model_name: 'fixture-model', primary_model_preset_id: PRESET, primary_model_connection: connection, defaultMCPGateways: [], defaultMCPToolSelections: [], defaultTools: [], provider_specific_settings: { nativeTools: { bashEnabled: false } }, skills_commands: [] }

@@ -42,7 +42,7 @@ describe('send-routed group chat contracts', () => {
     expect(drain).toBeGreaterThan(speakerStreamEnd)
     // In the member's run the record waits for its compile and the setup Stop checkpoint, beside
     // the single-agent spend.
-    const compile = handlerSource.indexOf('const formattedInput = await databaseService.buildFormattedChatInput(')
+    const compile = handlerSource.indexOf('let formattedInput = await databaseService.buildFormattedChatInput(')
     const setupCheckpoint = handlerSource.indexOf('const abortedDuringSetup = Boolean(streamAbortSignal.aborted)', compile)
     const singleSpend = handlerSource.indexOf(
       '\n  if (consumeSessionClips && !isApprovalResumeWithoutUserTurn) {\n',
@@ -94,7 +94,7 @@ describe('send-routed group chat contracts', () => {
     const post = source.indexOf('\nexport const POST')
     const clickDecision = source.indexOf('\n    const approvalClick = isApprovalClick({\n', post)
     const refusal = source.indexOf(
-      '\n    if (refusesGroupApprovalClick({ groupSession: groupRunnerSession, approvalClick })) {\n      return json(GROUP_APPROVAL_CLICK_REFUSAL, { status: 409 })\n    }\n',
+      '\n    if (refusesGroupApprovalClick({ groupSession: groupRunnerSession, approvalClick: approvalClick && !verifiedGroupRetirement })) {\n      return json(GROUP_APPROVAL_CLICK_REFUSAL, { status: 409 })\n    }\n',
       post,
     )
     const groupTest = source.indexOf(
@@ -112,7 +112,8 @@ describe('send-routed group chat contracts', () => {
     expect(clickDecision).toBeGreaterThan(post)
     expect(groupTest).toBeGreaterThan(clickDecision)
     expect(refusal).toBeGreaterThan(groupTest)
-    // The refusal's test is the dispatch's own, so every click that would reach the runner is refused.
+    // Actual approval responses stay refused; only a stored-source-verified retirement reaches
+    // the locked settlement, which returns before the group runner.
     expect(dispatchTest).toBeGreaterThan(refusal)
     expect(clickWait).toBeGreaterThan(refusal)
     expect(answerRecord).toBeGreaterThan(refusal)

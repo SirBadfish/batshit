@@ -44,7 +44,7 @@
   import { requestAvatarPictureTidy, shouldTidyAvatarPictures } from '$lib/utils/avatarPictureTidy'
   import type { GroupChatGroupRow } from '$lib/types/database'
   import type { GroupChatAgentSettings, GroupChatSpeakPolicy } from '$lib/types/groupChat'
-  import { isManagedPrimaryAgentType, normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
+  import { isApiPrimaryAgentType, normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
   import {
     GROUP_CHAT_MAX_FOLLOWUPS_TOTAL,
     GROUP_CHAT_SESSION_DEFAULTS,
@@ -168,7 +168,7 @@
 
   const managedAgents = $derived(
     agentStore.getAgents().filter((agent) => {
-      if (!isManagedPrimaryAgentType(normalizePrimaryAgentType(agent))) return false
+      if (!isApiPrimaryAgentType(normalizePrimaryAgentType(agent))) return false
       return true
     })
   )
@@ -1255,8 +1255,8 @@
             {#snippet info()}
                 <SettingsInfoMenu ariaLabel="About Group Agents">
                   <p>
-                    Groups currently work with Batshit-managed API and CLI agents. Add at least
-                    two agents to make group chat available in the chat bar.
+                    Groups work with your Primary Agents. Add at least two agents to make group
+                    chat available in the chat bar.
                   </p>
                 </SettingsInfoMenu>
             {/snippet}
@@ -1270,7 +1270,7 @@
               />
             {/snippet}
               {#if managedAgents.length === 0}
-                <div class="batshit-settings-caption">Add an API or CLI agent first.</div>
+                <div class="batshit-settings-caption">Create a Primary Agent first.</div>
               {:else}
                 <div class="space-y-2">
                   {#each managedAgents as agent (agent.id)}

@@ -2,6 +2,7 @@
   import { Button } from '$lib/components/ui/button'
   import * as Tooltip from '$lib/components/ui/tooltip'
   import { CHATGPT_PLAN_USAGE_URL } from '$lib/utils/chatgptPlanConnection'
+  import { CLAUDE_PLAN_USAGE_URL } from '$lib/utils/claudePlanConnection'
   import {
     Archive,
     Bug,
@@ -28,6 +29,7 @@
     costDetail = 'Cost is unavailable.',
     costState = 'unknown',
     chatgptPlan = false,
+    claudePlan = false,
     delegatedDetail = null,
     trimAvailable = false,
     trimUnavailableReason = 'Manual trim is unavailable.',
@@ -77,6 +79,7 @@
     costDetail?: string
     costState?: 'exact' | 'estimated' | 'unknown'
     chatgptPlan?: boolean
+    claudePlan?: boolean
     delegatedDetail?: string | null
     trimAvailable?: boolean
     trimUnavailableReason?: string
@@ -285,6 +288,10 @@
       {#if chatgptPlan}
         <a class="token-panel-trigger" href={CHATGPT_PLAN_USAGE_URL} target="_blank" rel="noopener noreferrer" aria-label="ChatGPT plan — manage usage" data-ab-control="token-chatgpt-plan">
           <Coins class="token-panel-trigger-icon" /><span>ChatGPT Plan</span>
+        </a>
+      {:else if claudePlan}
+        <a class="token-panel-trigger" href={CLAUDE_PLAN_USAGE_URL} target="_blank" rel="noopener noreferrer" aria-label="Claude plan — check usage" data-ab-control="token-claude-plan">
+          <Coins class="token-panel-trigger-icon" /><span>Claude Plan</span>
         </a>
       {:else}
       <Tooltip.Root>

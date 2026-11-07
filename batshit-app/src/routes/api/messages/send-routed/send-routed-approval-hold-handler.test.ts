@@ -1,4 +1,5 @@
 // @vitest-environment node
+import { useSendHandlerFixture } from '$lib/test-utils/sendHandlerFixture'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { redis } from '$lib/server/redis'
@@ -7,6 +8,7 @@ import { __resetStreamAbortRegistryForTests } from '$lib/server/services/streamA
 import { __resetSteerInboxRegistryForTests, enqueueSteer } from '$lib/server/services/steerInboxRegistry'
 import { createPendingApproval } from '$lib/server/services/controlApprovals'
 import { keepAnsweredApprovals } from '$lib/server/services/toolApprovalState'
+import { HELD_CARD_EXPIRED_SENTENCE, resolveHeldMessageReceipt } from '$lib/utils/heldForApproval'
 
 /**
  * BL-455 (with BL-524) — words that wait when a reply stops at an approval card, through the real
@@ -33,7 +35,14 @@ const CARD = 'msg-card'
 const APPROVAL = 'aitxt-bl455'
 const HELD = 'msg-held'
 
-type ModelRun = 'reply' | 'card' | 'stopped' | 'reply-then-lock-cleared' | 'words-then-error' | 'stopped-stream'
+type ModelRun =
+  | 'reply'
+  | 'card'
+  | 'stopped'
+  | 'reply-then-lock-cleared'
+  | 'words-then-error'
+  | 'stopped-stream'
+  | 'context-exhausted'
 
 const mocks = vi.hoisted(() => ({
   /** What each model run does, by run number (1-based); the rest reply. */
@@ -87,7 +96,7 @@ vi.mock('$lib/services/databaseRedis.server', async (importOriginal) => {
       current: unknown,
       _subagents: unknown,
       _userId: unknown,
-      options?: { currentMessageFrom?: unknown; projectPath?: unknown; voiceState?: { tts?: unknown } }
+      options?: { currentMessageFrom?: unknown; projectPath?: unknown; voiceState?: { tts?: unknown }; whiteboardContextSnapshot?: any; whiteboardMessageId?: string }
     ) {
       mocks.compiledCurrent.push(current)
       mocks.compiledHistory.push(_history)
@@ -97,6 +106,8 @@ vi.mock('$lib/services/databaseRedis.server', async (importOriginal) => {
       const empty = mocks.emptyCompiles.has(mocks.compiledCurrent.length)
       return {
         primarySystemPrompt: empty ? '' : 'You are a test agent.',
+        whiteboardContextSnapshot: options?.whiteboardContextSnapshot ?? { schema_version: 1, userId: _userId, sessionId: _sessionId, agentId: (_agent as any).id, messageId: options?.whiteboardMessageId,
+          settings: { mode: 'neither', whiteboardEnabled: false, preserveReasoning: false, whiteboardBudgetTokens: 1500, showWhiteboard: true }, dcmLines: [] },
         structuredInput: { messages: empty ? [] : [{ role: 'user', content: 'Hello from the compile.' }], metadata: {} },
         resolvedProjectPath: null
       }
@@ -161,6 +172,18 @@ vi.mock('$lib/server/services/vercelBrain', () => ({
           response: Promise.resolve({ messages: [{ role: 'assistant', content: parts }] })
         }
       }
+      if (plan === 'context-exhausted') {
+        // Words, then the model's context-limit error: the handler continues the reply once.
+        async function* outOfRoom() {
+          yield { type: 'start' }
+          yield { type: 'start-step', request: {}, warnings: [] }
+          yield { type: 'text-start', id: 't1' }
+          yield { type: 'text-delta', id: 't1', text: 'Partial words before the limit.' }
+          yield { type: 'text-end', id: 't1' }
+          yield { type: 'error', error: new Error("This model's maximum context length is 200000 tokens.") }
+        }
+        return { stream: outOfRoom(), steps: Promise.resolve([]), response: Promise.resolve({ messages: [] }) }
+      }
       if (plan === 'words-then-error') {
         async function* cutShort() {
           yield { type: 'start' }
@@ -199,7 +222,9 @@ vi.mock('$lib/server/services/vercelBrain', () => ({
         if (clearsLock) {
           // A Stop pressed as the reply ends: the interrupt route clears a finishing turn's lock.
           const registry = await import('$lib/server/services/streamAbortRegistry')
-          registry.clearSessionTurn(mocks.session, request.messageId)
+          // The lock names the message its request registered (a click's names the card), which
+          // a follow-up reply in the same request does not share.
+          registry.clearSessionTurn(mocks.session, registry.getActiveSessionTurn(mocks.session)?.messageId ?? request.messageId)
         }
         yield { type: 'finish', finishReason: 'stop', totalUsage: usage }
       }
@@ -237,6 +262,7 @@ function installTrustedCardSaveMerge() {
 
 let POST: (event: any) => Promise<Response>
 let SESSION = ''
+useSendHandlerFixture({ sessionIds: () => [SESSION], postStartupMcpUsers: () => [USER] })
 let count = 0
 let forwards: Array<Record<string, any>> = []
 let warnSpy: ReturnType<typeof vi.spyOn>
@@ -312,6 +338,8 @@ const cardMessage = (overrides: Record<string, unknown> = {}) => ({
   metadata: {
     model: 'claude-sonnet-5',
     agentType: 'api',
+    whiteboardContextSnapshot: { schema_version: 1, userId: USER, sessionId: SESSION, agentId: AGENT, messageId: CARD,
+      settings: { mode: 'neither', whiteboardEnabled: false, preserveReasoning: false, whiteboardBudgetTokens: 1500, showWhiteboard: true }, dcmLines: [] },
     providerMessages: [
       {
         role: 'assistant',
@@ -450,6 +478,20 @@ describe('send-routed: words that wait at an approval card (BL-455, the real han
     vi.unstubAllGlobals()
   })
 
+  it('a stale tab sending words never restores a settled card or rewrites saved reply metadata (BL-1998)', async () => {
+    const stored = cardMessage({ toolApprovals: null, zipIds: ['current-zip'], notes: ['current-note'],
+      steers: [{ id: 'current-steer', text: 'keep' }], imageOriginExpectedVersion: 7,
+      futureLiveSnapshot: { value: 'current' } })
+    await redis.saveMessage(userMessage() as any)
+    await redis.saveMessage(stored as any)
+    const before = await redis.json.getRaw(`message:${SESSION}:${CARD}`, '$')
+    const response = await post({ content: 'Next question.', messageId: 'msg-next-reply',
+      messages: [userMessage(), cardMessage({ zipIds: ['stale-zip'], notes: ['stale-note'] })] })
+    expect(response.status).toBe(200)
+    expect(await redis.json.getRaw(`message:${SESSION}:${CARD}`, '$')).toBe(before)
+    expect(mocks.brainRuns).toEqual(['msg-next-reply'])
+  }, 30_000)
+
   describe('the reply stops at a card: the words are held, no turn runs', () => {
     it('control: with no card, a queued message is promoted and answered in a second turn', async () => {
       typeWhileItRuns('msg-queued-1', 'SECOND')
@@ -582,10 +624,125 @@ describe('send-routed: words that wait at an approval card (BL-455, the real han
       expect(warnSpy).not.toHaveBeenCalledWith(STALE_APPROVAL_WARNING, expect.anything())
     }, 30_000)
 
+    /**
+     * BL-921: a send the chat's line kept at the same card stands after the held words (it moved
+     * to the end, unanswered). The answer to the held words was saved after it, so the chat read
+     * held words, kept message (Not sent), answer. Now the kept message moves behind the answer,
+     * and every tab is told; the answer still reads only the history up to the held words.
+     */
+    it('Approve with a send the line kept after the held words: the answer comes before it in the chat (BL-921)', async () => {
+      const kept = {
+        id: 'msg-kept',
+        session_id: SESSION,
+        user_id: USER,
+        role: 'user',
+        content: 'Look at this file.',
+        created_at: '2026-09-27T01:01:00.000Z',
+        metadata: { keptSend: { reason: 'approval_wait' } }
+      }
+      const records = await seedPausedChat({ after: [kept] })
+      const response = await click({ messages: records })
+      expect(response.status).toBe(200)
+
+      expect(mocks.brainRuns).toHaveLength(2)
+      const followUp = mocks.brainRuns[1]
+      expect(mocks.compiledCurrent[1]).toBe('Then tell me which file is biggest.')
+      expect(mocks.compiledHistory[1]).not.toContain('msg-kept')
+      const { ids, byId } = await chat()
+      expect(ids).toEqual(['msg-user-1', CARD, HELD, followUp, 'msg-kept'])
+      expect(byId.get('msg-kept')).toMatchObject({ content: 'Look at this file.', metadata: { keptSend: { reason: 'approval_wait' } } })
+      const movedForward = forwards.find((body) => body.type === 'user_message' && body.message?.id === 'msg-kept')
+      expect(movedForward).toMatchObject({ movedToEnd: true })
+      expect(mocks.userEvents).toContainEqual(
+        expect.objectContaining({ type: 'session_messages_changed', sessionId: SESSION, reason: 'unanswered_moved_behind_held_answer' })
+      )
+    }, 30_000)
+
+    it('a Stop in the gap after the answer (its lock cleared) moves nothing: only a request that holds the chat moves (BL-921)', async () => {
+      const kept = {
+        id: 'msg-kept',
+        session_id: SESSION,
+        user_id: USER,
+        role: 'user',
+        content: 'Look at this file.',
+        created_at: '2026-09-27T01:01:00.000Z',
+        metadata: { keptSend: { reason: 'approval_wait' } }
+      }
+      const records = await seedPausedChat({ after: [kept] })
+      mocks.modelRuns.set(2, 'reply-then-lock-cleared')
+      expect((await click({ messages: records })).status).toBe(200)
+      expect(mocks.brainRuns).toHaveLength(2)
+      expect((await chat()).ids).toEqual(['msg-user-1', CARD, HELD, 'msg-kept', mocks.brainRuns[1]])
+      expect(forwards.some((body) => body.type === 'user_message' && body.movedToEnd === true)).toBe(false)
+    }, 30_000)
+
+    it('Send now on the held words: the kept send that stood with them moves behind their answer too (BL-921)', async () => {
+      const kept = {
+        id: 'msg-kept',
+        session_id: SESSION,
+        user_id: USER,
+        role: 'user',
+        content: 'Look at this file.',
+        created_at: '2026-09-27T01:01:00.000Z',
+        metadata: { keptSend: { reason: 'approval_wait' } }
+      }
+      const records = await seedPausedChat({ after: [kept] })
+      // The page's Send now: the held message by its id, last in its history.
+      const response = await post({
+        content: 'Then tell me which file is biggest.',
+        messageId: 'msg-answer-now',
+        userMessageId: HELD,
+        messages: [records[0], records[1], kept, records[2]]
+      })
+      expect(response.status).toBe(200)
+      const { ids } = await chat()
+      expect(ids).toEqual(['msg-user-1', CARD, HELD, 'msg-answer-now', 'msg-kept'])
+      expect(forwards.find((body) => body.type === 'user_message' && body.message?.id === 'msg-kept')).toMatchObject({
+        movedToEnd: true
+      })
+    }, 30_000)
+
+    /**
+     * BL-921: the answer to the held words ran out of room and the handler continued it in a
+     * second reply. The kept send moves behind both halves; the move used to look for the
+     * continuation's id, found the first half between the held words and it, and moved nothing.
+     */
+    it('Send now on the held words whose answer runs out of room and continues: the kept send moves behind both halves (BL-921)', async () => {
+      const kept = {
+        id: 'msg-kept',
+        session_id: SESSION,
+        user_id: USER,
+        role: 'user',
+        content: 'Look at this file.',
+        created_at: '2026-09-27T01:01:00.000Z',
+        metadata: { keptSend: { reason: 'approval_wait' } }
+      }
+      const records = await seedPausedChat({ after: [kept] })
+      mocks.modelRuns.set(1, 'context-exhausted')
+      const response = await post({
+        content: 'Then tell me which file is biggest.',
+        messageId: 'msg-answer-now',
+        userMessageId: HELD,
+        messages: [records[0], records[1], kept, records[2]]
+      })
+      expect(response.status).toBe(200)
+      expect(mocks.brainRuns).toHaveLength(2)
+      expect(mocks.brainRuns[0]).toBe('msg-answer-now')
+      const continuation = mocks.brainRuns[1]
+      const { ids, byId } = await chat()
+      expect(byId.get('msg-answer-now')?.metadata).toMatchObject({ failure_kind: 'context_exhausted' })
+      expect(byId.get(continuation)).toMatchObject({ role: 'assistant', content: `Reply for ${continuation}.` })
+      expect(ids).toEqual(['msg-user-1', CARD, HELD, 'msg-answer-now', continuation, 'msg-kept'])
+      expect(forwards.find((body) => body.type === 'user_message' && body.message?.id === 'msg-kept')).toMatchObject({
+        movedToEnd: true
+      })
+    }, 30_000)
+
     it('Deny on the API lane: the resume answers the denial, then the held words', async () => {
       await seedPausedChat()
       const response = await click({ approved: false })
       expect(response.status).toBe(200)
+      expect((await chat()).byId.get(CARD)?.metadata?.whiteboardContextSnapshot).toBeNull()
       expect(mocks.brainRuns).toHaveLength(2)
       expect(mocks.compiledCurrent[1]).toBe('Then tell me which file is biggest.')
       expect((await chat()).byId.get(mocks.brainRuns[1])?.metadata?.steerPromoted?.steerIds).toContain(HELD)
@@ -614,6 +771,7 @@ describe('send-routed: words that wait at an approval card (BL-455, the real han
       expect(ids).toEqual(['msg-user-1', CARD, HELD])
       expect(byId.get(HELD)?.metadata?.waitsForApproval).toEqual({ messageId: CARD })
       expect(byId.get(CARD)?.metadata?.toolApprovals?.approvals?.some((entry: any) => entry.status === 'pending')).toBe(true)
+      expect(byId.get(CARD)?.metadata?.whiteboardContextSnapshot).toEqual(cardMessage().metadata.whiteboardContextSnapshot)
     }, 30_000)
 
     it('a second card, with more words typed during the resume: they wait too, and the next click answers the last one', async () => {
@@ -731,6 +889,7 @@ describe('send-routed: words that wait at an approval card (BL-455, the real han
       // The resume ends the card (it says the command did not run), and nothing answers the words.
       expect(mocks.brainRuns).toEqual([CARD])
       const { ids, byId } = await chat()
+      expect(byId.get(CARD)?.metadata?.whiteboardContextSnapshot).toBeNull()
       expect(ids).toEqual(['msg-user-1', CARD, HELD])
       expect(byId.get(HELD)?.metadata?.approvalCardExpired).toBe(true)
       expect(byId.get(HELD)?.metadata?.steerPromoted).toMatchObject({ steerIds: [HELD], disposition: 'unanswered', reason: 'approval_expired' })
@@ -891,12 +1050,26 @@ describe('send-routed: words that wait at an approval card (BL-455, the real han
     it('a post-click card read failure writes visible failure and exact held refusal, rather than an empty-history run', async () => {
       await seedPausedChat()
       const resume = await import('$lib/server/services/approvalResumeMessage')
-      vi.spyOn(resume, 'readStoredAssistantRecord').mockRejectedValueOnce(new Error('card read unavailable after click'))
+      const readActual = resume.readStoredAssistantRecord
+      vi.spyOn(resume, 'readStoredAssistantRecord').mockImplementationOnce(readActual)
+        .mockRejectedValueOnce(new Error('card read unavailable after click'))
       const response = await click()
       expect(response.status).toBe(500)
       expect(mocks.brainRuns).toEqual([])
       expect((await chat()).byId.get(CARD)?.metadata.response_failed).toBe(true)
       expect((await chat()).byId.get(HELD)?.metadata.steerPromoted).toMatchObject({ disposition: 'unanswered', reason: 'reply_failed' })
+    }, 30_000)
+    it('a retired-card preflight read failure records no answer and leaves held words untouched', async () => {
+      await seedPausedChat()
+      const before = await chat()
+      const resume = await import('$lib/server/services/approvalResumeMessage')
+      vi.spyOn(resume, 'readStoredAssistantRecord').mockRejectedValueOnce(new Error('card read unavailable before click'))
+      const response = await click()
+      expect(response.status).toBe(500)
+      expect(mocks.brainRuns).toEqual([])
+      const after = await chat()
+      expect(after.byId.get(CARD)).toEqual(before.byId.get(CARD))
+      expect(after.byId.get(HELD)).toEqual(before.byId.get(HELD))
     }, 30_000)
   })
 
@@ -986,222 +1159,73 @@ describe('send-routed: words that wait at an approval card (BL-455, the real han
     }, 30_000)
   })
 
-  describe('a control card on a CLI lane (no in-place resume)', () => {
-    /** A Fabric control card on a managed CLI lane: its click starts a new turn, or none for a Deny. */
-    async function seedCliCard() {
-      const record = await createPendingApproval({
-        userId: USER,
-        agentId: AGENT,
-        sessionId: SESSION,
-        messageId: CARD,
-        controlId: 'sys.skill.import',
-        controlTitle: 'Skill Import',
-        riskLevel: 'confirm',
-        lane: 'cli',
-        input: { source: 'https://example.com/skill.zip' }
-      })
-      const card = cardMessage({
-        providerMessages: undefined,
-        toolApprovals: {
-          mode: 'all',
-          source: 'fabric',
-          approvals: [
-            {
-              approvalId: record.id,
-              status: 'pending',
-              requestedAt: record.requestedAt,
-              toolName: 'native_batshit_tool_use',
-              source: 'fabric',
-              control: {
-                approvalId: record.id,
-                controlId: record.controlId,
-                controlTitle: record.controlTitle,
-                riskLevel: record.riskLevel,
-                input: { source: 'https://example.com/skill.zip' },
-                inputSummary: record.inputSummary,
-                lane: 'cli'
-              }
-            }
-          ]
-        }
-      })
-      return { record, card }
-    }
-
-    it('Approve: the click\u2019s own resume turn comes after the held message and reads it; no second follow-up', async () => {
-      const { record, card } = await seedCliCard()
+  describe('a retired control card', () => {
+    it.each([true, false])('retires the card without running and marks held words unanswered (approved=%s)', async approved => {
+      const record = await createPendingApproval({ userId: USER, agentId: AGENT, sessionId: SESSION,
+        messageId: CARD, controlId: 'sys.skill.import', controlTitle: 'Skill Import', riskLevel: 'confirm',
+        lane: 'api', input: { source: 'https://example.test/skill' } })
+      await redis.json.set(`control_approval:${record.id}`, '$.lane', 'cli')
+      const card = cardMessage({ toolApprovals: { mode: 'all', source: 'fabric', approvals: [{
+        approvalId: record.id, status: 'pending', control: { approvalId: record.id, lane: 'cli' }
+      }] } })
       await seedPausedChat({ card })
-      const response = await click({ card, approvalId: record.id })
+      const before = await chat()
+      const response = await click({ card, approvalId: record.id, approved })
       expect(response.status).toBe(200)
-      // One turn: the resume turn, whose compile has the held message in its history.
-      expect(mocks.brainRuns).toHaveLength(1)
-      expect(String(mocks.compiledCurrent[0])).toContain('Approved: Skill Import')
-      const { ids, byId } = await chat()
-      expect(ids.slice(0, 3)).toEqual(['msg-user-1', CARD, HELD])
-      expect(ids).toHaveLength(5)
-      expect(byId.get(ids[3])).toMatchObject({ role: 'user', metadata: { approvalResume: { approvalIds: [record.id] } } })
-      expect(ids[4]).toBe(mocks.brainRuns[0])
-      expect(byId.get(ids[4])?.metadata?.steerPromoted?.steerIds).toContain(HELD)
-    }, 30_000)
-
-    it('Deny with words held for the card: the held words are answered now, as their own turn', async () => {
-      const { record, card } = await seedCliCard()
-      await seedPausedChat({ card, user: userMessage(PAGE_SEND_FACTS) })
-      const response = await click({ card, approvalId: record.id, approved: false })
-      expect(response.status).toBe(200)
-      expect(((await response.json()) as any).approvalResume).toBeUndefined()
-      expect(mocks.brainRuns).toHaveLength(1)
-      expect(mocks.compiledCurrent[0]).toBe('Then tell me which file is biggest.')
-      expect(mocks.compiledFrom[0]).toBe('user')
-      // In the paused send's project, and in its voice mode (BL-455 review D1).
-      expect(mocks.compiledProject[0]).toBe('/work/probe')
-      expect(mocks.compiledVoiceTts[0]).toBe(true)
-      const { ids, byId } = await chat()
-      expect(ids).toEqual(['msg-user-1', CARD, HELD, mocks.brainRuns[0]])
-      // An ordinary turn: it carries none of the click's approval answer.
-      expect(byId.get(mocks.brainRuns[0])).toMatchObject({ role: 'assistant' })
-      expect(warnSpy).not.toHaveBeenCalledWith(STALE_APPROVAL_WARNING, expect.anything())
-    }, 30_000)
-
-    it('a held turn after a Deny that fails before its stream opens fails in its own reply, not as a resume', async () => {
-      const { record, card } = await seedCliCard()
-      await seedPausedChat({ card })
-      mocks.emptyCompiles.add(1)
-      const response = await click({ card, approvalId: record.id, approved: false })
-      expect(response.ok).toBe(false)
+      expect(await response.json()).toMatchObject({ reason: 'retired', retiredApprovalIds: [record.id] })
+      const after = await chat()
+      expect(after.ids).toEqual(before.ids)
+      expect(after.byId.get(CARD)?.metadata.toolApprovals.approvals[0]).toMatchObject({ status: 'expired', expiryReason: 'run_ended' })
+      expect(after.byId.get(HELD)).toEqual(before.byId.get(HELD))
+      expect(after.byId.get(CARD)?.metadata.retiredApprovalSettled).toBe(true)
+      expect(resolveHeldMessageReceipt({ messages: after.ids.map(id => after.byId.get(id)), busy: false })).toMatchObject({
+        messageId: HELD, state: 'expired', label: HELD_CARD_EXPIRED_SENTENCE
+      })
       expect(mocks.brainRuns).toEqual([])
-      const { ids, byId } = await chat()
-      expect(ids.slice(0, 3)).toEqual(['msg-user-1', CARD, HELD])
-      expect(ids).toHaveLength(4)
-      expect(byId.get(ids[3])).toMatchObject({ role: 'assistant', status: 'error', metadata: { response_failed: true, steerPromoted: { steerIds: [HELD] } } })
-      // A new turn's failure, not an approval resume's: the card's message is untouched.
-      expect(byId.get(CARD)?.metadata?.response_failed).toBeUndefined()
-      const reasons = mocks.userEvents
-        .filter((event) => event.type === 'session_messages_changed')
-        .map((event) => event.reason)
-      expect(reasons).toContain('turn_failed')
-      expect(reasons).not.toContain('approval_resume')
     }, 30_000)
 
-    it('a Deny that carries only the expiry reason is not the user\u2019s click: nothing held is run', async () => {
-      // A CLI control card has no three-minute clock, so the page never sends this for one; the
-      // server still asks the answer itself, the same rule as on the API lane.
-      const { record, card } = await seedCliCard()
-      card.metadata.steerPromoted = { steerIds: ['spoken-card'], disposition: 'awaiting_approval', approvalResumeVersion: 10 }
-      card.metadata.steers = [{ steerId: 'delivered-card', source: 'user' }, { steerId: 'dm-card', source: 'dm' }]
+    it.each(['before-issue', 'partial-issue', 'after-issue'] as const)('preserves held words when retirement fails %s', async failure => {
+      const card = cardMessage({ toolApprovals: { mode: 'all', source: 'fabric', approvals: [{
+        approvalId: 'old-control', status: 'pending', control: { approvalId: 'apr_old', lane: 'cli' }
+      }] } })
       await seedPausedChat({ card })
-      const response = await post({
-        content: '',
-        messageId: CARD,
-        messages: [userMessage(), card, heldMessage()],
-        metadata: {
-          ...card.metadata,
-          toolApprovalResponse: [
-            { type: 'tool-approval-response', approvalId: record.id, approved: false, reason: 'Approval expired after 3 minutes' }
-          ]
+      const before = await chat()
+      const owner = await import('$lib/server/services/approvalExpiryCommit')
+      const commit = owner.commitApprovalExpiry
+      vi.spyOn(owner, 'commitApprovalExpiry').mockImplementationOnce(async input => {
+        if (failure === 'after-issue') await commit(input)
+        if (failure === 'partial-issue') {
+          input.onIssue?.()
+          await redis.json.set(`message:${SESSION}:${CARD}`, '$.metadata.retiredApprovalSettled', true)
         }
+        throw new Error('Retirement receipt unavailable')
       })
-      expect(response.status).toBe(200)
-      expect(((await response.json()) as any).approvalResume).toBe('denied')
+      const response = await post({ content: '', messageId: CARD, messages: [userMessage(), card, heldMessage()],
+        metadata: { retireSavedApprovalId: 'old-control' } })
+      const after = await chat()
+      expect(after.byId.get(HELD)).toEqual(before.byId.get(HELD))
       expect(mocks.brainRuns).toEqual([])
-      const { ids, byId } = await chat()
-      expect(ids).toEqual(['msg-user-1', CARD, HELD])
-      expect(byId.get(CARD)?.metadata.steerPromoted).toEqual({
-        steerIds: ['spoken-card', 'delivered-card'], disposition: 'unanswered', reason: 'approval_expired' })
-      expect(byId.get(HELD)?.metadata.steerPromoted).toMatchObject({ disposition: 'unanswered', reason: 'approval_expired' })
-      expect(forwards.some(body => body.type === 'complete_message' && body.message?.id === CARD &&
-        body.message.metadata.steerPromoted.reason === 'approval_expired')).toBe(true)
-    }, 30_000)
-
-    it('recorded CLI Deny without held words gives only its saved card steers an exact terminal', async () => {
-      const { record, card } = await seedCliCard()
-      card.metadata.steerPromoted = { steerIds: ['spoken-card'] }
-      for (const message of [userMessage(), card]) await redis.saveMessage(message as any)
-      const response = await click({ card, approvalId: record.id, approved: false, messages: [userMessage(), card] })
-      expect(response.status).toBe(200)
-      expect(mocks.brainRuns).toEqual([])
-      expect((await chat()).byId.get(CARD)?.metadata.steerPromoted).toEqual({
-        steerIds: ['spoken-card'], disposition: 'unanswered', reason: 'approval_denied' })
-      expect(forwards.some(body => body.type === 'complete_message' && body.message?.id === CARD)).toBe(true)
-    }, 30_000)
-
-    it('a strict held-history failure after a recorded CLI approval is visible and runs no model', async () => {
-      const { record, card } = await seedCliCard()
-      await seedPausedChat({ card })
-      const restoreSave = installTrustedCardSaveMerge()
-      const update = vi.mocked(redis.updateMessage)
-      // This facade method is already vi.fn: delegate to its implementation,
-      // not the mock dispatcher whose implementation we are replacing.
-      let armed = false
-      update.mockImplementation(async (...args: Parameters<typeof redis.updateMessage>) => {
-        const result = await originalUpdateMessage.apply(redis, args)
-        if (!armed && (args[2] as any)?.metadata?.answeredApprovalIds?.includes(record.id)) {
-          armed = true
-          vi.spyOn(redis, 'getRecentMessages').mockRejectedValueOnce(new Error('held history unavailable after click'))
-        }
-        return result
-      })
-      try {
-        const response = await click({ card, approvalId: record.id })
-        expect(armed).toBe(true)
+      if (failure === 'before-issue') {
         expect(response.status).toBe(500)
-        expect(await response.json()).toMatchObject({ details: 'held history unavailable after click' })
-        expect(mocks.brainRuns).toEqual([])
-        expect((await chat()).byId.get(CARD)?.metadata).toMatchObject({ response_failed: true, answeredApprovalIds: [record.id] })
-        expect((await chat()).byId.get(HELD)?.metadata.steerPromoted).toMatchObject({ disposition: 'unanswered', reason: 'reply_failed' })
-      } finally {
-        // spyOn an existing vi.fn is not a new registered spy. Restore its
-        // implementation/once queue explicitly, even if an assertion fails.
-        update.mockRestore()
-        vi.mocked(redis.getRecentMessages).mockRestore()
-        restoreSave()
-      }
-    }, 30_000)
-
-    it.each(['reply-id', 'user-save'] as const)('a recorded CLI approval whose %s preparation fails terminates the exact card and held waits', async failure => {
-      const { record, card } = await seedCliCard()
-      card.metadata.steerPromoted = { steerIds: ['spoken-card'], disposition: 'awaiting_approval', approvalResumeVersion: 0 }
-      card.metadata.imageOriginExpected = true
-      card.metadata.imageOriginExpectedVersion = 53
-      card.content = 'May I? ![Prior picture](https://example.com/prior.png)'
-      await seedPausedChat({ card })
-      const restoreSave = installTrustedCardSaveMerge()
-      if (failure === 'reply-id') {
-        const ids = await import('$lib/utils/messageId')
-        vi.spyOn(ids, 'generateMessageId').mockResolvedValueOnce('resume-user').mockResolvedValueOnce(null)
+        expect(after.byId.get(CARD)).toEqual(before.byId.get(CARD))
+        expect(resolveHeldMessageReceipt({ messages: after.ids.map(id => after.byId.get(id)), busy: false })).toMatchObject({ state: 'waiting' })
       } else {
-        const save = vi.mocked(redis.saveMessage)
-        // The local merge adapter above has no once queue and must stay inside this wrapper.
-        const originalSave = save.getMockImplementation()!
-        save.mockImplementation(async (...args: Parameters<typeof redis.saveMessage>) => {
-          if ((args[0] as any)?.metadata?.approvalResume?.approvalIds?.includes(record.id)) {
-            throw new Error('resume user save unavailable')
-          }
-          return originalSave.apply(redis, args)
-        })
+        expect(response.status).toBe(503)
+        expect(await response.json()).toMatchObject({ code: 'retired_approval_unconfirmed', error: expect.stringContaining('Reload the chat') })
+        expect(after.byId.get(CARD)?.metadata.retiredApprovalSettled).toBe(true)
+        if (failure === 'partial-issue') {
+          expect(resolveHeldMessageReceipt({ messages: after.ids.map(id => after.byId.get(id)), busy: false })).toMatchObject({ state: 'waiting' })
+          const retried = await post({ content: '', messageId: CARD, messages: [userMessage(), card, heldMessage()],
+            metadata: { retireSavedApprovalId: 'old-control' } })
+          expect(retried.status).toBe(200)
+          const recovered = await chat()
+          expect(resolveHeldMessageReceipt({ messages: recovered.ids.map(id => recovered.byId.get(id)), busy: false })).toMatchObject({ state: 'expired' })
+        } else {
+          expect(resolveHeldMessageReceipt({ messages: after.ids.map(id => after.byId.get(id)), busy: false })).toMatchObject({
+            messageId: HELD, state: 'expired', label: HELD_CARD_EXPIRED_SENTENCE
+          })
+        }
       }
-      try {
-        expect((await click({ card, approvalId: record.id })).status).toBe(500)
-        expect(mocks.brainRuns).toEqual([])
-        const { byId } = await chat()
-        expect(byId.get(CARD)).toMatchObject({ role: 'assistant', status: 'error', metadata: {
-          response_failed: true, steerPromoted: { steerIds: ['spoken-card'] },
-          imageOriginExpectedVersion: 53 } })
-        expect(byId.get(CARD)?.content).toBe(card.content)
-        expect(byId.get(HELD)?.metadata.steerPromoted).toMatchObject({ disposition: 'unanswered', reason: 'reply_failed' })
-        expect(mocks.userEvents.some(event => event.type === 'session_messages_changed' && event.reason === 'approval_resume')).toBe(true)
-      } finally {
-        restoreSave()
-      }
-    }, 30_000)
-
-    it('control: Deny with nothing held starts no turn, as before', async () => {
-      const { record, card } = await seedCliCard()
-      for (const message of [userMessage(), card]) await redis.saveMessage(message as any)
-      const response = await click({ card, approvalId: record.id, approved: false, messages: [userMessage(), card] })
-      expect(response.status).toBe(200)
-      expect(((await response.json()) as any).approvalResume).toBe('denied')
-      expect(mocks.brainRuns).toEqual([])
     }, 30_000)
   })
 })

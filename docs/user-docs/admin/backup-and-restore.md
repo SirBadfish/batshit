@@ -59,11 +59,26 @@ Batshit backups don't silently copy external systems. They do not include:
 - Project source files on disk
 - Docker volumes outside the Batshit-owned app export
 - ChatGPT plan logins, OAuth tokens and host registration, including in **With Secrets** exports. Model presets travel, but their account selectors grant no access on another instance. Sign in there and select that Mac's account connection.
-- The one-run credentials Batshit mints for a Codex or Claude run
 
 Back up those systems with their own tools.
 
-That last one is deliberate and costs you nothing. A run credential names a single agent run that has already ended, so a restored one could only ever prove an agent's identity for a turn nobody is taking. Batshit makes a fresh one for every run. A wake-up webhook's token is the opposite case — it belongs to a hook you created and means to keep — so its fingerprint *is* backed up, and your hooks still work after a restore.
+A wake-up webhook's token belongs to a hook you created and mean to keep, so its fingerprint *is* backed up, and your hooks still work after a restore.
+
+## Automatic backups
+
+Open **Settings → Admin → Backup and Restore**, turn on **Automatic Backups**, choose **Daily** or **Weekly**, then save. Batshit starts with automatic backups off and Daily selected. It runs backups while the app is running. If a backup became due while Batshit was closed or asleep, it makes one catch-up backup after successful startup.
+
+Batshit keeps the latest **two verified automatic backups** in the selected folder. After the first backup, only one exists until the next success. It creates and verifies the new copy before removing the oldest, so the folder temporarily needs room for a third archive. A failed backup keeps the existing recovery copies. If cleanup fails, the card explains which extra files remain.
+
+The default folder is in this installation's persistent Batshit data. To change it, enter an existing absolute folder path on the computer running Batshit and save. In Docker, this is a path inside the container; mount a host folder first if you want the files stored there. If the chosen folder disappears or cannot be written, the card shows a failure. Batshit does not choose a different folder.
+
+Changing the folder leaves earlier copies where they were and shows their location. The new folder starts a new managed pair. Remove old-folder copies yourself only when you no longer need them. Store copies on another drive or computer for protection from loss of this computer or its disk.
+
+Optionally turn on **Back up after successful app updates**. After the new build's startup and data checks succeed, Batshit backs up the migrated data and retains the most recent earlier copy. Failed or unfinished checks do not replace it. A scheduled backup due at the same time uses the same new copy.
+
+The card shows the last successful backup, its path, the next scheduled time and any failure. Automatic backups exclude saved secrets and contain supported Batshit data and assets. They do not include the app itself, model weights, project files or external runtime installations. A backup that cannot carry a supported skill or voice folder fails and keeps the previous copies. Use the existing **Inspect** and confirmed **Restore** workflow to recover an archive; restore replaces the current Batshit data.
+
+If Batshit cannot check required data, it stops with an error before accepting a new recovery copy or beginning replacement. Follow the reported problem and retry once its cause is resolved.
 
 ## Normal export
 
@@ -108,6 +123,8 @@ Restore is a replace operation, not a merge. Always inspect first.
 
 Inspect validates the bundle before Batshit changes the instance. Large file assets stream to private disk staging rather than being loaded into browser or app memory. The disk row includes the new upload tree, validated Redis plan, and a rollback copy of current restorable Redis data; Restore stays disabled when available space is insufficient.
 
+A backup from an older release may carry the removed CLI Primary Agent System Prompt. Inspect explains that Batshit leaves it out while restoring the rest. Old CLI agents and Subagents restore as unavailable, delete-only records rather than being converted.
+
 ## Restore
 
 Restore replaces current Batshit-owned data with the backup data.
@@ -128,6 +145,8 @@ Batshit reuses the exact content-hashed file that Inspect validated. It prepares
 When restore starts, Batshit briefly pauses new app requests while already-running work finishes. If a chat send or another long-running task does not finish within 30 seconds, restore stops before changing data and asks you to stop that task and try again.
 
 ## After restore
+
+If a completed restore warns that built-in skills could not initialize safely, your restored data is kept. Check the app logs and resolve that problem before using skills. Do not repeat the restore or reset your data to clear this warning.
 
 Check these after every restore:
 
@@ -162,7 +181,7 @@ Mac app backups include Batshit-owned uploads when those uploads are in the conf
 - n8n's database or credentials
 - Host-installed Local AI or voice runtimes
 - Host project source folders
-- Host Codex or Claude Code credentials
+- Host Claude Code credentials
 
 Back those up with normal host backup tools. Advanced source-checkout repair setups follow the same host-backup boundary.
 
@@ -190,9 +209,9 @@ The file may not be a Batshit backup zip, may be corrupt, may be missing `manife
 
 Normal backups exclude keys — re-enter them in Settings → API Keys. If you used With Secrets, confirm the target instance has the same `ENCRYPTION_KEY`.
 
-### Restored n8n Workflow Subagents don't work
+### Restored n8n workflows don't work
 
-Check n8n separately: workflows still exist and are active, n8n credentials still exist, current templates still forward `x-batshit-native-tool-token`, and webhook URLs are reachable from the caller.
+Check n8n separately: workflows still exist and are active, n8n credentials still exist, and webhook URLs are reachable from the caller.
 
 ### Restored project paths are wrong
 

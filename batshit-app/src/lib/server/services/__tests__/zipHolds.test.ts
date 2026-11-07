@@ -5,7 +5,6 @@ import { redis } from '$lib/server/redis'
 import {
   advanceZipCountdowns,
   applyAgentHoldChanges,
-  applyLegacyAgentZipActions,
   markAgentBeingDeleted,
   releaseDeletedAgentHolds,
   type ReplyForHolds
@@ -19,8 +18,8 @@ import { normalizeId } from '$lib/utils/idNormalizer'
 const REAL_REDIS_LANE = process.env.VITEST_USE_REAL_REDIS === 'true'
 
 /**
- * SA-129 P2 (DL-02, DL-06, DL-08): the server's writer for an agent's holds and releases, the
- * parked zip actions, and the countdown. Same keys and shapes as the `/api/unzipping` routes and
+ * SA-129 P2 (DL-02, DL-08): the server's writer for an agent's holds and releases and the
+ * countdown. Same keys and shapes as the `/api/unzipping` routes and
  * `zipStateInferred.ts`, so deletion, backup, the compiler, and the badges need nothing new. Runs
  * on the fake and, under `npm run test:redis` (CI's real-Redis list), on real RedisJSON.
  */
@@ -308,6 +307,41 @@ describe('hold (DL-02)', () => {
   })
 })
 
+describe('a typed read proven whole (SA-136 P2b)', () => {
+  /** A typed `read_file` of 2,500 lines, with or without the descriptor the zip adapter writes from a sealed proof. */
+  async function typedRead(path: string, withSource: boolean) {
+    const id = zipId()
+    const payload = {
+      schemaVersion: 1, operationKind: 'read_file', toolName: 'read_file',
+      toolArgs: { path, filePath: path },
+      toolResult: { filePath: path, content: 'x', lineCount: 2_500 }
+    }
+    const fileReadSource = {
+      version: 1,
+      owner: { userId: 'user-1', agentId: AGENT, sessionId: SESSION, messageId: 'msg_typed', toolCallId: 'call_typed' },
+      backend: 'local', workspaceRoot: PROJECT, rootIdentity: '1:2', cwd: PROJECT, locator: path,
+      view: { kind: 'typed', startLine: 1, endLine: null }
+    }
+    await redis.execute((client: any) =>
+      client.json.set(`zip:${id}`, '$', {
+        id, type: 'cool_tool', content: JSON.stringify(payload), description: `read_file: ${path} - 2500 lines`, tokens: 42,
+        metadata: { operationKind: 'read_file', toolName: 'read_file', sessionId: SESSION, ...(withSource ? { fileReadSource } : {}) }
+      })
+    )
+    return id
+  }
+
+  it('is held through its descriptor; the same read without one stays a part', async () => {
+    const without = await typedRead('src/long.ts', false)
+    await reply([without])
+    expect((await apply(['src/long.ts'])).held).toEqual([])
+    const proven = await typedRead('src/long.ts', true)
+    await reply([proven])
+    const changes = await apply(['src/long.ts'])
+    expect(changes.held).toEqual([{ path: 'src/long.ts', zipId: normalizeId(proven) }])
+  })
+})
+
 describe('the hold follows the file (DL-02)', () => {
   it('keeps the old Hold when a newer whole read is too large, then moves to a later small read', async () => {
     const first = await wholeRead('src/app.ts')
@@ -550,12 +584,19 @@ describe('approval resume (BL-350: the reply continues a stored message with the
  */
 describe('a user click while a reply ends (BL-352: one zip state writer at a time)', () => {
   let restore: (() => void) | null = null
-  afterEach(() => {
+  const pending: Promise<unknown>[] = []
+  function track<T>(operation: Promise<T>): Promise<T> {
+    pending.push(operation.then(() => undefined, () => undefined))
+    return operation
+  }
+  afterEach(async () => {
     restore?.()
     restore = null
+    await Promise.all(pending)
+    pending.length = 0
   })
 
-  /** Pauses the first `redis.get` of `key`, AFTER it read the value, until `open()`. */
+  /** Pauses the strict hold owner's first `redis.json.get`, AFTER its read, until `open()`. */
   function pauseAfterFirstRead(key: string) {
     let open!: () => void
     const gate = new Promise<void>((resolve) => {
@@ -565,10 +606,10 @@ describe('a user click while a reply ends (BL-352: one zip state writer at a tim
     const readDone = new Promise<void>((resolve) => {
       reached = resolve
     })
-    const original = (redis.get as any).getMockImplementation?.() ?? redis.get.bind(redis)
+    const original = (redis.json.get as any).getMockImplementation?.() ?? redis.json.get.bind(redis.json)
     let paused = false
-    const spy = vi.spyOn(redis, 'get').mockImplementation(async (k: string) => {
-      const value = await original(k)
+    const spy = vi.spyOn(redis.json, 'get').mockImplementation(async (k: any, ...args: any[]) => {
+      const value = await original(k, ...args)
       if (!paused && k === key) {
         paused = true
         reached()
@@ -576,7 +617,7 @@ describe('a user click while a reply ends (BL-352: one zip state writer at a tim
       }
       return value
     })
-    restore = () => spy.mockRestore()
+    restore = () => { open(); spy.mockRestore() }
     return { open, readDone }
   }
 
@@ -602,10 +643,13 @@ describe('a user click while a reply ends (BL-352: one zip state writer at a tim
     await redis.set(`unzipped_item:${SESSION}:zip_temp`, { zipId: 'zip_temp', sessionId: SESSION, permanent: false, duration: 5, messageCount: 0, unzippedAt: 1, source: 'user' })
     const pause = pauseAfterFirstRead(`unzipped_item:${SESSION}:zip_temp`)
 
-    const countdown = advanceZipCountdowns(SESSION)
+    const countdown = track(advanceZipCountdowns(SESSION))
     await pause.readDone
-    const release = clickRelease('zip_temp')
+    let released = false
+    const release = track(clickRelease('zip_temp').then(result => { released = true; return result }))
     await tick()
+    expect(isZipStateLockBusy(SESSION)).toBe(true)
+    expect(released).toBe(false)
     pause.open()
     await countdown
     expect((await release).status).toBe(200)
@@ -622,10 +666,13 @@ describe('a user click while a reply ends (BL-352: one zip state writer at a tim
     await redis.set(`unzipped_item:${SESSION}:zip_temp`, { zipId: 'zip_temp', sessionId: SESSION, permanent: false, duration: 5, messageCount: 0, unzippedAt: 1, source: 'user' })
     const pause = pauseAfterFirstRead(`unzipped_item:${SESSION}:zip_temp`)
 
-    const countdown = advanceZipCountdowns(SESSION)
+    const countdown = track(advanceZipCountdowns(SESSION))
     await pause.readDone
-    const hold = clickHold('zip_temp')
+    let held = false
+    const hold = track(clickHold('zip_temp').then(result => { held = true; return result }))
     await tick()
+    expect(isZipStateLockBusy(SESSION)).toBe(true)
+    expect(held).toBe(false)
     pause.open()
     await countdown
     expect((await hold).status).toBe(200)
@@ -640,10 +687,13 @@ describe('a user click while a reply ends (BL-352: one zip state writer at a tim
     const newer = await wholeRead('src/app.ts')
     const pause = pauseAfterFirstRead(`unzipped_item:${SESSION}:${older}`)
 
-    const move = apply([], [], current([newer]))
+    const move = track(apply([], [], current([newer])))
     await pause.readDone
-    const hold = clickHold(newer)
+    let held = false
+    const hold = track(clickHold(newer).then(result => { held = true; return result }))
     await tick()
+    expect(isZipStateLockBusy(SESSION)).toBe(true)
+    expect(held).toBe(false)
     pause.open()
     await move
     expect((await hold).status).toBe(200)
@@ -710,11 +760,14 @@ describe('deleting a chat whose id carries glob characters (BL-541)', () => {
     `episode:${id}:ep_1`,
     `session_clip:${id}:clip_1`,
     `subagent_sessions:${id}:subagent:helper`,
-    `subagent_thread:${id}:helper`,
     `subagent_lock:${id}:helper`,
-    `n8n:sse-callback:${id}:msg_1`,
     `unzipped_item:${id}:zip_1`,
     `rezipped_item:${id}:zip_2`
+  ]
+  // SA-139 retired these writers and left their already-expiring records to their TTL.
+  const retiredFamilies = (id: string) => [
+    `subagent_thread:${id}:helper`,
+    `n8n:sse-callback:${id}:msg_1`
   ]
 
   for (const [glob, other] of [
@@ -730,11 +783,21 @@ describe('deleting a chat whose id carries glob characters (BL-541)', () => {
       await redis.createSession({ id: deleted, user_id: 'user-1', title: 'Glob' } as any)
       await redis.createSession({ id: kept, user_id: 'user-1', title: 'Kept' } as any)
       for (const key of [...families(deleted), ...families(kept)]) await redis.set(key, { owner: key })
+      for (const key of [...retiredFamilies(deleted), ...retiredFamilies(kept)]) {
+        await redis.set(key, { owner: key })
+        await redis.execute(client => client.expire(key, 30))
+      }
 
       await redis.deleteSession(deleted)
 
       for (const key of families(kept)) expect(await redis.get(key), key).toEqual({ owner: key })
       for (const key of families(deleted)) expect(await redis.get(key), key).toBeNull()
+      for (const key of [...retiredFamilies(deleted), ...retiredFamilies(kept)]) {
+        expect(await redis.get(key), key).toEqual({ owner: key })
+        const ttl = await redis.execute(client => client.ttl(key))
+        expect(ttl, key).toBeGreaterThan(0)
+        expect(ttl, key).toBeLessThanOrEqual(30)
+      }
       expect(await redis.getSession(kept)).not.toBeNull()
     })
   }
@@ -772,19 +835,14 @@ describe('deleting an agent (BL-351)', () => {
     expect((await redis.sMembers(`unzipped:${SESSION}`)).sort()).toEqual(['zip_other_agent', 'zip_user'])
   })
 
-  it('releases the parked zip-control unzip too: it now carries the agent (BL-539)', async () => {
+  // Old data: an agent unzip written before agent zip control was retired carries the agent but
+  // no path. Nothing writes one now, so the record is seeded directly.
+  it('releases an old agent unzip record that carries the agent but no path too (BL-539)', async () => {
     await redis.createAgent({ id: AGENT, user_id: 'user-1', name: 'Holder', displayName: 'Holder' } as any)
     const a = await wholeRead('a.ts')
-    const outcome = await applyLegacyAgentZipActions({
-      sessionId: SESSION,
-      agentId: AGENT,
-      unzip: ['tool_result_1'],
-      zip: [],
-      currentReply: current([a]),
-      currentToolZipIds: [a]
-    })
-    expect(outcome.unzipped).toEqual([a])
-    expect(await item(a)).toMatchObject({ source: 'agent', agentId: AGENT, permanent: true })
+    await redis.sAdd(`unzipped:${SESSION}`, a)
+    await redis.set(`unzipped_item:${SESSION}:${a}`, { zipId: a, sessionId: SESSION, permanent: true, unzippedAt: 1, source: 'agent', agentId: AGENT })
+    expect(await item(a)).not.toHaveProperty('path')
 
     expect(await releaseDeletedAgentHolds(AGENT)).toEqual([{ sessionId: SESSION, zipId: a }])
     expect(await item(a)).toBeNull()
@@ -849,178 +907,6 @@ describe('the countdown (DL-08)', () => {
   })
 })
 
-describe('the parked zip-control actions (DL-06)', () => {
-  it('refuses a too-large legacy unzip with a control error', async () => {
-    const read = await tooLargeWholeRead('huge.ts')
-    const outcome = await applyLegacyAgentZipActions({
-      sessionId: SESSION,
-      agentId: AGENT,
-      unzip: ['tool_result_1'],
-      zip: [],
-      currentReply: current([read]),
-      currentToolZipIds: [read]
-    })
-    expect(outcome.unzipped).toEqual([])
-    expect(outcome.errors?.[0]).toMatchObject({ tag: 'batshit-zip-control' })
-    expect(outcome.errors?.[0].error).toContain('25,000 tokens')
-    expect(await item(read)).toBeNull()
-
-    await userHold(read)
-    const repeated = await applyLegacyAgentZipActions({
-      sessionId: SESSION,
-      agentId: AGENT,
-      unzip: ['tool_result_1'],
-      zip: [],
-      currentReply: current([read]),
-      currentToolZipIds: [read]
-    })
-    expect(repeated.errors?.[0].error).toContain('too large to open')
-    expect(await item(read)).toMatchObject({ source: 'user' })
-  })
-
-  it('unzips by tool_result_N alias and zips by id, never touching the user\'s lock', async () => {
-    const a = await wholeRead('a.ts')
-    const b = await wholeRead('b.ts')
-    await reply([b])
-    await userHold(b)
-    const reply1 = current([a])
-    const outcome = await applyLegacyAgentZipActions({
-      sessionId: SESSION,
-      agentId: AGENT,
-      unzip: ['tool_result_1'],
-      zip: [b],
-      currentReply: reply1,
-      currentToolZipIds: [a]
-    })
-    expect(outcome.unzipped).toEqual([a])
-    expect(outcome.zipped).toEqual([])
-    // BL-360: the refused zip is a loud line, never a silent skip.
-    expect(outcome.errors?.map((error) => error.error)).toEqual([
-      `The user holds ${b}, so it stays open; only the user can zip it.`
-    ])
-    expect(outcome.errors?.[0]).toMatchObject({ tag: 'batshit-zip-control' })
-    expect(await item(a)).toMatchObject({ source: 'agent', permanent: true })
-    expect(await item(a)).not.toHaveProperty('path')
-    expect(await item(b)).toMatchObject({ source: 'user' })
-  })
-
-  it("never re-unzips over the user's own hold (it would turn the user's lock into the agent's)", async () => {
-    const a = await wholeRead('a.ts')
-    await userHold(a, { permanent: false, duration: 10, messageCount: 2 })
-    const outcome = await applyLegacyAgentZipActions({
-      sessionId: SESSION,
-      agentId: AGENT,
-      unzip: ['tool_result_1'],
-      zip: [],
-      currentReply: current([a]),
-      currentToolZipIds: [a]
-    })
-    expect(outcome.unzipped).toEqual([])
-    expect(outcome.zipped).toEqual([])
-    expect(outcome.errors?.map((error) => error.error)).toEqual([
-      `The user already holds ${a}; your unzip was not needed.`
-    ])
-    expect(await item(a)).toMatchObject({ source: 'user', duration: 10, messageCount: 2 })
-  })
-
-  /** The user's "Zip now", as `DELETE /api/unzipping/[zipId]` writes it. */
-  async function userZipNow(zip: string) {
-    await redis.sAdd(`rezipped:${SESSION}`, zip)
-    await redis.set(`rezipped_item:${SESSION}:${zip}`, { zipId: zip, sessionId: SESSION, source: 'user', rezippedAt: 1 })
-  }
-
-  const legacy = (unzip: string[], zip: string[], zipIds: string[]) =>
-    applyLegacyAgentZipActions({
-      sessionId: SESSION,
-      agentId: AGENT,
-      unzip,
-      zip,
-      currentReply: current(zipIds),
-      currentToolZipIds: zipIds
-    })
-
-  // BL-360: `writeUnzippedItem` deletes the rezip marker, and the parked path checked only the
-  // user's holds, so a legacy unzip undid the user's "Zip now" without a word.
-  it('never undoes the user\'s "Zip now", and says so (BL-360)', async () => {
-    const a = await wholeRead('a.ts')
-    await userZipNow(a)
-
-    const outcome = await legacy(['tool_result_1'], [], [a])
-
-    expect(outcome.unzipped).toEqual([])
-    expect(outcome.errors?.map((error) => error.error)).toEqual([
-      `The user zipped ${a} by hand, so it stays compressed; ask the user if you need it open.`
-    ])
-    expect(await item(a)).toBeNull()
-    expect(await redis.sMembers(`unzipped:${SESSION}`)).toEqual([])
-    expect(await redis.sMembers(`rezipped:${SESSION}`)).toEqual([a])
-    expect(await redis.get(`rezipped_item:${SESSION}:${a}`)).toMatchObject({ source: 'user' })
-  })
-
-  it('a legacy zip of what the user zipped keeps the marker the user\'s, and says so (BL-360)', async () => {
-    const a = await wholeRead('a.ts')
-    await reply([a])
-    await userZipNow(a)
-
-    const outcome = await legacy([], [a], [])
-
-    expect(outcome.zipped).toEqual([])
-    expect(outcome.errors?.map((error) => error.error)).toEqual([
-      `The user already zipped ${a} by hand; your zip was not needed.`
-    ])
-    expect(await redis.get(`rezipped_item:${SESSION}:${a}`)).toMatchObject({ source: 'user', rezippedAt: 1 })
-  })
-
-  it('an id that matches nothing in this chat is a loud line, not a silent drop (BL-360)', async () => {
-    const a = await wholeRead('a.ts')
-
-    const outcome = await legacy(['tool_result_4'], ['cool_tool_1790500000000_nothere'], [a])
-
-    expect(outcome).toMatchObject({ unzipped: [], zipped: [] })
-    expect(outcome.errors?.map((error) => error.error)).toEqual([
-      'Nothing in this chat matches tool_result_4, so nothing was unzipped.',
-      'Nothing in this chat matches cool_tool_1790500000000_nothere, so nothing was zipped.'
-    ])
-  })
-
-  it('an unzip of a result an agent already holds open changes nothing and is no refusal', async () => {
-    const a = await wholeRead('a.ts')
-    await reply([a])
-    await apply(['a.ts'])
-
-    const outcome = await legacy([a], [], [])
-
-    expect(outcome).toEqual({ unzipped: [], zipped: [] })
-    expect(await item(a)).toMatchObject({ source: 'agent', path: expect.any(String) })
-  })
-
-  it('reads the user\'s "Zip now" under the chat\'s zip state lock: a click queued first wins (BL-352, BL-360)', async () => {
-    const a = await wholeRead('a.ts')
-    let open!: () => void
-    const gate = new Promise<void>((resolve) => {
-      open = resolve
-    })
-    const holder = withZipStateLock(SESSION, () => gate)
-    const click = userReleaseRoute({
-      params: { zipId: a },
-      url: new URL(`http://batshit.test/api/unzipping/${a}?sessionId=${SESSION}`),
-      locals: { user: { id: 'user-1' } }
-    } as any)
-    await new Promise((resolve) => setTimeout(resolve, 5))
-    const step = legacy(['tool_result_1'], [], [a])
-    await new Promise((resolve) => setTimeout(resolve, 5))
-    open()
-    await holder
-    expect((await click).status).toBe(200)
-    const outcome = await step
-
-    expect(outcome.unzipped).toEqual([])
-    expect(outcome.errors?.[0].error).toContain('The user zipped')
-    expect(await redis.sMembers(`rezipped:${SESSION}`)).toEqual([a])
-    expect(await item(a)).toBeNull()
-  })
-})
-
 /**
  * BL-537: a Release was four separate Redis writes, and so was a Hold. When Redis failed after the
  * first, the step's lists said nothing was written, yet the chat's state was half changed: a Release
@@ -1064,31 +950,6 @@ describe('a Release or a Hold that fails lands whole or not at all (BL-537)', ()
     restore = null
     expect(await redis.sMembers(`unzipped:${SESSION}`)).toEqual([])
     expect(await item(read)).toBeNull()
-  })
-
-  it('a parked zip action that fails leaves no half-written rezip', async () => {
-    const a = await wholeRead('a.ts')
-    await redis.sAdd(`unzipped:${SESSION}`, a)
-    await redis.set(`unzipped_item:${SESSION}:${a}`, { zipId: a, sessionId: SESSION, permanent: true, source: 'agent', agentId: AGENT })
-    restore = failRedisWritesTouching((key) => key === `rezipped_item:${SESSION}:${a}`)
-
-    const outcome = await applyLegacyAgentZipActions({
-      sessionId: SESSION,
-      agentId: AGENT,
-      unzip: [],
-      zip: ['tool_result_1'],
-      currentReply: current([a]),
-      currentToolZipIds: [a]
-    })
-
-    expect(outcome.failure).toBe('Redis connection lost')
-    expect(outcome.zipped).toEqual([])
-    restore()
-    restore = null
-    // Nothing of the rezip landed: the agent's unzip is still whole.
-    expect(await redis.sMembers(`unzipped:${SESSION}`)).toEqual([a])
-    expect(await item(a)).toMatchObject({ source: 'agent' })
-    expect(await redis.sMembers(`rezipped:${SESSION}`)).toEqual([])
   })
 })
 
@@ -1179,26 +1040,6 @@ describe('a turn of an agent being deleted writes no hold (BL-606)', () => {
     done()
 
     expect((await apply(['src/app.ts'])).held).toEqual([{ path: 'src/app.ts', zipId: read }])
-  })
-
-  it('the parked zip actions of an agent being deleted write nothing, and fail loudly', async () => {
-    const a = await wholeRead('a.ts')
-    const done = markAgentBeingDeleted(AGENT)
-    try {
-      const outcome = await applyLegacyAgentZipActions({
-        sessionId: SESSION,
-        agentId: AGENT,
-        unzip: ['tool_result_1'],
-        zip: [],
-        currentReply: current([a]),
-        currentToolZipIds: [a]
-      })
-      expect(outcome.unzipped).toEqual([])
-      expect(outcome.failure).toBe('This agent is being deleted, so its holds and releases were not applied.')
-    } finally {
-      done()
-    }
-    expect(await item(a)).toBeNull()
   })
 
   it.runIf(REAL_REDIS_LANE)('through redis.deleteAgent: a reply that ends after the release passed its chat holds nothing', async () => {

@@ -9,6 +9,12 @@ import { APP_ACTION_MAX_BYTES } from '../../../appActions/protocol'
 import { AppActionRefusal } from '../../../appActions/catalog'
 
 describe('App Actions actual Request stream bounds', () => {
+  it('permits only an explicit bounded larger management body while ordinary callers keep their bound', async () => {
+    const management = ' '.repeat(131070) + '{}'
+    assert.deepEqual(await readAppActionBody(new Request('http://localhost/actions', { method: 'POST', body: management }), 131072), {})
+    await assert.rejects(readAppActionBody(new Request('http://localhost/actions', { method: 'POST', body: management })), /payload_too_large/)
+    await assert.rejects(readAppActionBody(new Request('http://localhost/actions', { method: 'POST', body: '{}' }), 131073), /invalid_request/)
+  })
   it('accepts an exact byte bound including multibyte UTF-8 split between chunks', async () => {
     const input = new TextEncoder().encode(JSON.stringify({ name: 'é' }))
     const split = input.indexOf(0xc3) + 1

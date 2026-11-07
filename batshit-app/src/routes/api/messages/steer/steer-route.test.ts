@@ -8,8 +8,6 @@ import {
   registerStreamAbort
 } from '$lib/server/services/streamAbortRegistry'
 import {
-  attachSteerTransport,
-  listInFlightSteers,
   listPendingSteers,
   registerSteerRun,
   __resetSteerInboxRegistryForTests
@@ -67,7 +65,7 @@ function activeTurn(
     kind?: 'single' | 'group'
     steerable?: boolean
     reason?: string | null
-    lane?: 'api' | 'codex' | 'claude' | null
+    lane?: 'api' | 'claude' | null
     registerRun?: boolean
   } = {}
 ) {
@@ -207,14 +205,14 @@ describe('POST /api/messages/steer', () => {
     await seed({ agentType: 'cli' })
     activeTurn(MESSAGE, {
       steerable: false,
-      reason: 'This Codex agent runs on the one-shot exec transport. Your message interrupts instead.'
+      reason: 'This agent runs from your own CLI profile, which Batshit does not drive, so it cannot be steered mid-reply.'
     })
 
     const response = await call(goodBody())
     expect(response.status).toBe(409)
     const payload = await response.json()
     expect(payload.code).toBe('not_steerable')
-    expect(payload.reason).toContain('exec transport')
+    expect(payload.reason).toContain('own CLI profile')
     expect(listPendingSteers(SESSION)).toHaveLength(0)
   })
 
@@ -257,57 +255,13 @@ describe('POST /api/messages/steer', () => {
     expect((await response.json()).lane).toBe('claude')
   })
 
-  /**
-   * P2 (DL-114-06, DL-114-08): a managed CLI turn has no `prepareStep` to pull at its next
-   * step, so the route pushes the text onto the running transport itself. It is deliberately
-   * not awaited — a Codex `turn/steer` is a round trip with a 120-second ceiling and the
-   * send button must not hang on it — so the assertion waits for the microtask instead.
-   */
-  it('pushes a steer to a managed CLI transport (DL-114-06, DL-114-08)', async () => {
-    await seed({ agentType: 'cli' })
-    activeTurn(MESSAGE, { lane: 'codex' })
-    const sent: Array<{ steerIds: string[]; text: string }> = []
-    attachSteerTransport(SESSION, MESSAGE, 'codex', async (payload) => {
-      sent.push(payload)
-      return true
-    })
-
-    expect((await call(goodBody())).status).toBe(202)
-    await new Promise((resolve) => setTimeout(resolve, 0))
-
-    expect(sent).toHaveLength(1)
-    expect(sent[0].steerIds).toEqual(['steer_abc123'])
-    // SA-118 (DL-118-07): one wrapper, and it is the one the guidance teaches.
-    expect(sent[0].text).toContain('[The user said, mid-reply:')
-    expect(sent[0].text).not.toContain('[Steer —')
-    expect(sent[0].text).toContain('also check the tests')
-    // Written, not yet echoed: it has left Batshit but the model has not read it.
-    expect(listPendingSteers(SESSION)).toHaveLength(0)
-    expect(listInFlightSteers(SESSION).map((row) => row.steerId)).toEqual(['steer_abc123'])
-  })
-
-  it('returns a refused CLI steer to the inbox so the turn can promote it', async () => {
-    await seed({ agentType: 'cli' })
-    activeTurn(MESSAGE, { lane: 'codex' })
-    attachSteerTransport(SESSION, MESSAGE, 'codex', async () => {
-      throw new Error('Codex app-server turn/steer failed: {"code":-32600,"message":"no active turn to steer"}')
-    })
-
-    expect((await call(goodBody())).status).toBe(202)
-    await new Promise((resolve) => setTimeout(resolve, 0))
-
-    expect(listInFlightSteers(SESSION)).toHaveLength(0)
-    expect(listPendingSteers(SESSION).map((row) => row.steerId)).toEqual(['steer_abc123'])
-  })
-
-  it('leaves an API steer waiting for the hook to pull it (no transport)', async () => {
+  it('leaves an API steer waiting for the hook to pull it (nothing is pushed)', async () => {
     await seed()
     activeTurn()
 
     expect((await call(goodBody())).status).toBe(202)
     await new Promise((resolve) => setTimeout(resolve, 0))
 
-    expect(listInFlightSteers(SESSION)).toHaveLength(0)
     expect(listPendingSteers(SESSION)).toHaveLength(1)
   })
 
@@ -530,46 +484,6 @@ describe('POST /api/messages/steer — deliver (DL-119-05)', () => {
 
     await call(goodBody())
     expect(sseBodies[0]).toMatchObject({ type: 'steer_queued', deliver: 'now' })
-  })
-
-  /**
-   * The load-bearing one. A queued message must never be pushed onto a managed CLI's wire:
-   * the CLI would hold it until its own next tool boundary and hand it to the model inside
-   * the reply the user asked it to WAIT for.
-   */
-  it('never pushes a queued message to a managed CLI transport (DL-119-05)', async () => {
-    await seed({ agentType: 'cli' })
-    activeTurn(MESSAGE, { lane: 'codex' })
-    const sent: any[] = []
-    attachSteerTransport(SESSION, MESSAGE, 'codex', async (payload) => {
-      sent.push(payload)
-      return true
-    })
-
-    expect((await call(goodBody({ deliver: 'end' }))).status).toBe(202)
-    await new Promise((resolve) => setTimeout(resolve, 10))
-
-    expect(sent).toEqual([])
-    expect(listInFlightSteers(SESSION)).toEqual([])
-    expect(listPendingSteers(SESSION).map((row) => row.steerId)).toEqual(['steer_abc123'])
-  })
-
-  it('still pushes an ordinary steer accepted beside a queued one', async () => {
-    await seed({ agentType: 'cli' })
-    activeTurn(MESSAGE, { lane: 'codex' })
-    const sent: any[] = []
-    attachSteerTransport(SESSION, MESSAGE, 'codex', async (payload) => {
-      sent.push(payload)
-      return true
-    })
-
-    await call(goodBody({ steerId: 'steer_queued_one', deliver: 'end' }))
-    await call(goodBody({ steerId: 'steer_now_one', text: 'use the other file' }))
-    await new Promise((resolve) => setTimeout(resolve, 10))
-
-    expect(sent).toHaveLength(1)
-    expect(sent[0].steerIds).toEqual(['steer_now_one'])
-    expect(listPendingSteers(SESSION).map((row) => row.steerId)).toEqual(['steer_queued_one'])
   })
 
   it('counts a queued message against the cap', async () => {

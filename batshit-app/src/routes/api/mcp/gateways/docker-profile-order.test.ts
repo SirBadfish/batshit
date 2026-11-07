@@ -11,7 +11,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const profileSync = vi.hoisted(() => ({
-  codex: vi.fn(async () => undefined),
   claude: vi.fn(async () => ({}))
 }))
 /** What the stand-in writer left in "the file", and every profile it was asked to write. */
@@ -21,7 +20,6 @@ const writer = vi.hoisted(() =>
     profileFile.content = profile
   })
 )
-vi.mock('$lib/server/services/codexProfileManager', () => ({ syncAgentCodexProfiles: profileSync.codex }))
 vi.mock('$lib/server/services/claudeProfileManager', () => ({ syncAgentClaudeProfiles: profileSync.claude }))
 vi.mock('$lib/server/services/workflowDiscovery', () => ({
   workflowDiscovery: { discoverDirectMCPClients: vi.fn(async () => []) }
@@ -36,13 +34,18 @@ import { redis } from '$lib/server/redis'
 import { mcpGatewayService } from '$lib/server/services/mcpGatewayService'
 import { normalizeDockerMcpProfile, runDockerMcpProfileWrite } from '$lib/server/services/dockerGatewayProfileConfig'
 import { POST as createRoute } from './+server'
-import { PUT as putRoute } from './[id]/+server'
+import { GET as getRoute, PUT as putRoute } from './[id]/+server'
 
 const USER = 'bl1386_user'
 const REGISTRY = `mcp_gateways:${USER}`
 const DOCKER_URL = 'http://localhost:8080/mcp'
 const FILE_NOT_FINISHED =
   'The Docker MCP Gateway settings were saved, but Batshit could not finish writing the Docker profile file. Change the profile, or another Gateway Setting, to write it again.'
+const savedUpdateFailure = (id: string) => ({
+  error: FILE_NOT_FINISHED, gatewaySaved: true, gatewayId: id,
+  sourceAcknowledgement: expect.objectContaining({ id, sourceRevision: expect.stringMatching(/^source1:[a-f0-9]{64}$/),
+    metadata: expect.objectContaining({ dockerProfile: 'work' }) })
+})
 
 const json = redis.json as unknown as Record<string, any>
 const originalSetIfUnchanged = json.setIfUnchanged.getMockImplementation()
@@ -61,13 +64,20 @@ function docker(id: string, profile = 'default') {
   }
 }
 
-const put = (id: string, body: Record<string, unknown>) =>
-  putRoute({
+const put = async (id: string, body: Record<string, unknown>) => {
+  // Each deliberate source save starts with the same genuine read token as the browser.
+  if (!Object.hasOwn(body, 'expectedGatewaySource')) {
+    const read = await getRoute({ locals: { user: { id: USER } }, params: { id } } as any)
+    expect(read.status).toBe(200)
+    body = { ...body, expectedGatewaySource: (await read.json()).gateway.sourceRevision }
+  }
+  return putRoute({
     request: new Request(`http://localhost/api/mcp/gateways/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
     locals: { user: { id: USER } },
     params: { id },
     url: new URL(`http://localhost/api/mcp/gateways/${id}`)
   } as any) as Promise<Response>
+}
 
 const post = (body: Record<string, unknown>) =>
   createRoute({
@@ -103,7 +113,6 @@ describe.runIf(process.env.VITEST_USE_REAL_REDIS !== 'true')('BL-1386: the Docke
     json.setIfUnchanged.mockImplementation(originalSetIfUnchanged)
     errorSpy.mockRestore()
     for (const spy of quietSpies) spy.mockRestore()
-    profileSync.codex.mockReset().mockImplementation(async () => undefined)
     profileSync.claude.mockReset().mockImplementation(async () => ({}))
   })
 
@@ -122,7 +131,11 @@ describe.runIf(process.env.VITEST_USE_REAL_REDIS !== 'true')('BL-1386: the Docke
   })
 
   it('changes: a save of a gateway that is gone (404) writes no profile file', async () => {
-    const response = await put('gw-gone', { type: 'docker-catalog', metadata: { dockerProfile: 'work' } })
+    await mcpGatewayService.create(USER, docker('gw-gone') as any)
+    const read = await getRoute({ locals: { user: { id: USER } }, params: { id: 'gw-gone' } } as any)
+    const expectedGatewaySource = (await read.json()).gateway.sourceRevision
+    await mcpGatewayService.delete(USER, 'gw-gone')
+    const response = await put('gw-gone', { expectedGatewaySource, type: 'docker-catalog', metadata: { dockerProfile: 'work' } })
 
     expect(response.status).toBe(404)
     expect(writer).not.toHaveBeenCalled()
@@ -154,7 +167,7 @@ describe.runIf(process.env.VITEST_USE_REAL_REDIS !== 'true')('BL-1386: the Docke
     expect(response.status).toBe(500)
     expect((await response.json()).error).toBe('Failed to update gateway')
     expect(writer).not.toHaveBeenCalled()
-    expect(profileSync.codex).not.toHaveBeenCalled()
+    expect(profileSync.claude).not.toHaveBeenCalled()
   })
 
   it('changes: a containerized save of a profile is refused before any Redis write, with no file', async () => {
@@ -284,7 +297,7 @@ describe.runIf(process.env.VITEST_USE_REAL_REDIS !== 'true')('BL-1386: the Docke
       const response = await put('gw-d', { metadata: { dockerProfile: 'work' } })
 
       expect(response.status).toBe(500)
-      expect(await response.json()).toEqual({ error: FILE_NOT_FINISHED, gatewaySaved: true, gatewayId: 'gw-d' })
+      expect(await response.json()).toEqual(savedUpdateFailure('gw-d'))
       expect(profileFile.content).toBeNull()
     } finally {
       invalid.mockRestore()
@@ -299,12 +312,11 @@ describe.runIf(process.env.VITEST_USE_REAL_REDIS !== 'true')('BL-1386: the Docke
     const response = await put('gw-d', { metadata: { dockerProfile: 'work' } })
 
     expect(response.status).toBe(500)
-    expect(await response.json()).toEqual({ error: FILE_NOT_FINISHED, gatewaySaved: true, gatewayId: 'gw-d' })
+    expect(await response.json()).toEqual(savedUpdateFailure('gw-d'))
     expect(writer).toHaveBeenCalledTimes(1)
     expect(profileFile.content).toBeNull()
     expect(await storedProfile('gw-d')).toBe('work')
-    expect(profileSync.codex).toHaveBeenCalledTimes(1)
-    expect(profileSync.claude).toHaveBeenCalledTimes(1)
+    expect(profileSync.claude).not.toHaveBeenCalled()
     // The cause is kept for diagnosis.
     expect(errorSpy.mock.calls.flat().some((arg: unknown) => arg instanceof Error && (arg as any).code === 'EACCES')).toBe(true)
   })
@@ -318,7 +330,7 @@ describe.runIf(process.env.VITEST_USE_REAL_REDIS !== 'true')('BL-1386: the Docke
     const response = await put('gw-d', { metadata: { dockerProfile: 'work' } })
 
     expect(response.status).toBe(500)
-    expect(await response.json()).toEqual({ error: FILE_NOT_FINISHED, gatewaySaved: true, gatewayId: 'gw-d' })
+    expect(await response.json()).toEqual(savedUpdateFailure('gw-d'))
     // Never written back to the old profile, never written again by the route.
     expect(writer.mock.calls).toEqual([['work']])
     expect(profileFile.content).toBe('work')
@@ -402,7 +414,11 @@ describe.runIf(process.env.VITEST_USE_REAL_REDIS !== 'true')('BL-1386: the Docke
     json.setIfUnchanged.mockImplementation(async () => false)
     const conflict = await (await put('gw-d', { metadata: { dockerProfile: 'work' } })).json()
     json.setIfUnchanged.mockImplementation(originalSetIfUnchanged)
-    const gone = await (await put('gw-gone', { type: 'docker-catalog', metadata: { dockerProfile: 'work' } })).json()
+    await mcpGatewayService.create(USER, docker('gw-gone') as any)
+    const read = await getRoute({ locals: { user: { id: USER } }, params: { id: 'gw-gone' } } as any)
+    const expectedGatewaySource = (await read.json()).gateway.sourceRevision
+    await mcpGatewayService.delete(USER, 'gw-gone')
+    const gone = await (await put('gw-gone', { expectedGatewaySource, type: 'docker-catalog', metadata: { dockerProfile: 'work' } })).json()
     const invalid = await (await put('gw-d', { metadata: { dockerProfile: 'bad profile!' } })).json()
     json.setIfUnchanged.mockRejectedValueOnce(new Error('socket closed before the answer'))
     const unknown = await (await put('gw-d', { metadata: { dockerProfile: 'work' } })).json()
@@ -430,18 +446,20 @@ describe.runIf(process.env.VITEST_USE_REAL_REDIS !== 'true')('BL-1386: the Docke
     const removed = afterTheSave('create', (registry) => {
       registry.gateways = registry.gateways.filter((gateway) => gateway.id !== 'gw-r')
     })
-    profileSync.codex.mockRejectedValueOnce(new Error('sync down'))
+    // SA-139 R4: the profile sync that failed here after the create is gone. The failure after
+    // the create is now the profile file's own read of the stored gateway (the create path's only
+    // `get`), so nothing after the create can name an id but the one the create answered.
+    const fileRead = vi.spyOn(mcpGatewayService, 'get').mockRejectedValueOnce(new Error('read down'))
     try {
-      const response = await post({ id: 'gw-r', name: 'Removed', type: 'docker-catalog', url: DOCKER_URL })
+      const response = await post({ id: 'gw-r', name: 'Removed', type: 'docker-catalog', url: DOCKER_URL, metadata: { dockerProfile: 'work' } })
 
+      expect(fileRead).toHaveBeenCalledTimes(1)
       expect(response.status).toBe(500)
-      expect(await response.json()).toEqual({
-        error: expect.stringMatching(/^The gateway settings were saved, but /),
-        gatewaySaved: true,
-        gatewayId: 'gw-r'
-      })
+      expect(await response.json()).toEqual({ error: FILE_NOT_FINISHED, gatewaySaved: true, gatewayId: 'gw-r' })
+      expect(writer).not.toHaveBeenCalled()
       expect(await mcpGatewayService.get(USER, 'gw-r')).toBeNull()
     } finally {
+      fileRead.mockRestore()
       removed.mockRestore()
     }
   })

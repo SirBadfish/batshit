@@ -67,6 +67,12 @@ export function watchSelectedSessionLoad(handlers: SelectedSessionLoadHandlers) 
 }
 
 /**
+ * What the page's read of a chat came to (BL-814). `loaded`: the store holds the server's answer.
+ * `failed`: the read failed and the store keeps what the tab had. `missing`: the chat is gone.
+ */
+export type ChatLoadOutcome = 'loaded' | 'failed' | 'missing'
+
+/**
  * One load at a time per chat, and never a dropped request.
  *
  * The old in-flight guard simply RETURNED while a chat was loading, which was safe only
@@ -74,28 +80,37 @@ export function watchSelectedSessionLoad(handlers: SelectedSessionLoadHandlers) 
  * something the answer in flight cannot (a woken turn finished, the server settled an
  * approval card), so it is remembered and runs exactly once when that load lands — one
  * catch-up load, never a queue of them.
+ *
+ * A request answers what the load that read the store LAST answered (BL-814): the follow-up's
+ * outcome when one ran, so a caller that awaits its request (the reconnect catch-up) knows
+ * whether the store it is about to read holds the server's answer or what the tab had before.
  */
-export function createChatLoadQueue(load: (sessionId: string) => Promise<void>) {
+export function createChatLoadQueue<T = void>(load: (sessionId: string) => Promise<T>) {
   /** Each chat's running load, chained to the follow-up load it owes (BL-382). */
-  const inFlight = new Map<string, Promise<void>>()
+  const inFlight = new Map<string, Promise<T>>()
   const wantedAgain = new Set<string>()
 
   // A request made while a load runs gets that load's promise, which settles only after the
   // follow-up load (the running answer was read before the request): a caller that awaits its
   // request (the reconnect catch-up) never reads the store the old answer left.
-  const request = (sessionId: string): Promise<void> => {
+  const request = (sessionId: string): Promise<T> => {
     const running = inFlight.get(sessionId)
     if (running) {
       wantedAgain.add(sessionId)
       return running
     }
-    const chain = (async () => {
+    const chain = (async (): Promise<T> => {
+      let outcome: { ok: true; value: T } | { ok: false; error: unknown }
       try {
-        await load(sessionId)
-      } finally {
-        inFlight.delete(sessionId)
-        if (wantedAgain.delete(sessionId)) await request(sessionId)
+        outcome = { ok: true, value: await load(sessionId) }
+      } catch (error) {
+        outcome = { ok: false, error }
       }
+      inFlight.delete(sessionId)
+      // The follow-up read the store after this load did: its answer is the one that counts.
+      if (wantedAgain.delete(sessionId)) return request(sessionId)
+      if (!outcome.ok) throw outcome.error
+      return outcome.value
     })()
     inFlight.set(sessionId, chain)
     return chain

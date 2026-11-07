@@ -187,7 +187,11 @@ describe('/api/unzipping with inferred state', () => {
 
   it('reports whose rezip each marker is, inferred included', async () => {
     const sessionId = await ownedSession()
-    await writeInferredRezips(sessionId, [{ zipId: 'zip_closed', done: 0.9, again: 0.1 }])
+    await setZip({ id: 'zip_closed', type: 'cool_tool', tokens: 2, description: '',
+      content: JSON.stringify({ schemaVersion: 1, operationKind: 'read_file', toolName: 'read_file',
+        toolArgs: { filePath: 'src/app.ts' }, toolResult: { content: 'small' } }),
+      metadata: { sessionId, toolName: 'read_file', operationKind: 'read_file' } })
+    expect(await writeInferredRezips(sessionId, [{ zipId: 'zip_closed', done: 0.9, again: 0.1 }])).toEqual(['zip_closed'])
     await redis.sAdd(`rezipped:${sessionId}`, 'zip_hand')
     await redis.set(`rezipped_item:${sessionId}:zip_hand`, { zipId: 'zip_hand', sessionId, source: 'agent', rezippedAt: 1 })
     await redis.sAdd(`rezipped:${sessionId}`, 'zip_legacy')

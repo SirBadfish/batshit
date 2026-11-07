@@ -248,7 +248,14 @@ describe('ExecutionViewerSheet: what a CLI adds on top of the request (BL-108)',
     expect(screen.queryByTestId('execution-viewer-group-speaker-selection')).toBeNull()
     expect(document.body.textContent).toContain(receipt === 'unconfirmed' ? 'without running an agent' : receipt === 'stopped' ? 'turn was stopped' : 'refused to save')
   })
-  it('tells a Codex run that Codex adds instructions, tools, and AGENTS.md Batshit cannot see', async () => {
+  it('labels the runtime of a snapshot saved before Codex CLI was removed honestly, never as the Vercel AI SDK', async () => {
+    await openSheetOn(CODEX_RUN)
+    await fireEvent.click(screen.getByRole('button', { name: /^Runtime/ }))
+    expect(await screen.findByText('Codex CLI (removed)')).toBeTruthy()
+    expect(screen.queryByText('Vercel AI SDK')).toBeNull()
+  })
+
+  it('tells a Codex run (saved before Codex CLI was removed) that Codex adds instructions, tools, and AGENTS.md Batshit cannot see', async () => {
     await openSheetOn(CODEX_RUN)
 
     const note = screen.getByTestId(NOTE_TEST_ID)
@@ -268,6 +275,24 @@ describe('ExecutionViewerSheet: what a CLI adds on top of the request (BL-108)',
     expect(note.textContent).not.toContain('instructions')
   })
 
+  it('SA-139: a Claude plan run reads as the Claude plan on an API run, and its delegated rows too', async () => {
+    const run = { kind: 'subagent', name: 'Plan helper', type: 'api', model: 'opus', provider: 'claude-plan', durationMs: 1000, status: 'completed', thread: 'fresh', usage: { inputTokens: 20, outputTokens: 2, totalTokens: 22 } }
+    await openSheetOn(snapshot({ agentName: 'Plan agent', agentType: 'api',
+      runtime: { runtimeId: 'vercel', providerId: 'claude-plan', connectionId: 'claude-plan:local', transport: 'vercel-sdk', modelName: 'opus', status: 'succeeded' },
+      delegated: { runs: [run], totals: { runs: 1, completed: 1, failed: 0, timedOut: 0, usageKnownRuns: 1, usageUnknownRuns: 0, usage: { totalTokens: 22 } } } }))
+    expect(screen.queryByText(/Claude Code CLI/)).toBeNull()
+    expect(screen.queryByText('claude-plan')).toBeNull()
+    expect(screen.getAllByText(/Claude Plan/).length).toBeGreaterThan(0)
+    await fireEvent.click(screen.getByRole('button', { name: /Delegated runs/ }))
+    expect(await screen.findByText('Plan helper')).toBeTruthy()
+    expect(screen.queryByText('claude-plan')).toBeNull()
+  })
+  it('SA-139: a run whose connection names the Claude plan reads as the plan even when its provider says anthropic', async () => {
+    await openSheetOn(snapshot({ agentName: 'Plan by connection', agentType: 'api',
+      runtime: { runtimeId: 'vercel', providerId: 'anthropic', connectionId: 'claude-plan:local', transport: 'vercel-sdk', modelName: 'opus', status: 'succeeded' } }))
+    expect(screen.getAllByText(/Claude Plan/).length).toBeGreaterThan(0)
+    expect(screen.queryByText('anthropic')).toBeNull()
+  })
   it('says nothing of the kind on an API run, where the sheet shows the request the provider got', async () => {
     await openSheetOn(API_RUN)
 

@@ -5,23 +5,21 @@ import { redis } from '$lib/server/redis'
 import * as agentStore from '$lib/stores/agents.svelte'
 import { buildPickedPresetModelFields } from '$lib/utils/modelPresetPick'
 import { resolveSavedModelConnection } from '$lib/utils/modelConnections'
+import { loadAgentRoute } from '$lib/test-utils/agentPutRoute'
 
 /**
  * BL-835: opening Agent Settings erased a saved Exa or Perplexity web search choice when its key
- * was not ready. `clearInvalidWebSearchProviderOverrideIfNeeded` removed `webSearchProvider` from
- * the form on open (also when the key status could not be loaded at all), and the autosave sent
- * the removal (BL-517's class: a load must not change what is saved). Now the picker shows the
- * saved choice as unavailable ("Missing API key", the words the model picker uses for a locked
- * connection) and the form keeps it; the choice changes only when the user changes it.
+ * was not ready. Those agent-level provider/default controls are now retired: operational
+ * Web Search choices belong to the strict global Admin owner. Opening this panel, delayed or
+ * failed key reads and edits of still-supported fields must not erase retained legacy data
+ * or revive the removed provider picker. The per-agent Web Search Enable grant remains live.
  *
  * Renders the REAL panel. `/api/agents/<id>` goes to the REAL route handler on the default
  * lane's Redis fake.
  */
 
-vi.mock('$lib/server/services/codexProfileManager', () => ({
-  syncAgentCodexProfiles: vi.fn(async () => {}),
-  deleteAgentCodexConfig: vi.fn(async () => {}),
-  buildAgentProfileId: (id: string) => `batshit_agent_${id}`
+vi.mock('$lib/server/services/managedProfileFolderDelete', () => ({
+  deleteManagedProfileFolder: vi.fn(async () => {})
 }))
 vi.mock('$lib/server/services/claudeProfileManager', () => ({
   syncAgentClaudeProfiles: vi.fn(async () => {}),
@@ -79,10 +77,12 @@ function ensureBrowserStubs() {
   }
 }
 
-let agentRoute: typeof import('../../../../routes/api/agents/[id]/+server')
+let agentRoute: Awaited<ReturnType<typeof loadAgentRoute>>
 
+// 3f6b10c8b moved the agent GET onto Lua reads the default lane's fake cannot run; loadAgentRoute
+// installs its read twins, and afterEach's restoreAllMocks removes them, so each case reinstalls them.
 beforeAll(async () => {
-  agentRoute = await import('../../../../routes/api/agents/[id]/+server')
+  agentRoute = await loadAgentRoute()
 }, 60_000)
 
 /** What `/api/settings/api-keys` answers: which web search keys are saved (or that it fails). */
@@ -115,7 +115,7 @@ function installRoutes() {
     if (path === '/api/user/saved-models') return jsonResponse({ models: [PRESET] })
     if (path === '/api/models') return jsonResponse({ data: { connections: [] } })
     if (path === '/api/settings/api-keys') return apiKeysAnswer()
-    if (path === '/api/goons') return jsonResponse({ goons: [] })
+    if (path === '/api/goons') return jsonResponse({ ownerId: 'josh', goons: [] })
     if (path === '/api/icons/library') return jsonResponse({ icons: [], prefs: { favorites: [], recents: [] } })
     return jsonResponse({ error: `not routed in this test: ${method} ${path}` }, 404)
   })
@@ -151,15 +151,15 @@ async function openPanel() {
   await pause(1500)
 }
 
-/** Tools tab, then the Web Search Defaults disclosure, so the provider picker is on screen. */
-async function openWebSearchDefaults() {
+/** The live Tool Grid still opens, without the retired provider/default disclosure. */
+async function openTools() {
   const tab = screen.getAllByRole('tab').find((element) => /Tools/.test(element.textContent ?? ''))
   expect(tab).toBeTruthy()
   await fireEvent.mouseDown(tab as HTMLElement)
   await fireEvent.click(tab as HTMLElement)
-  const trigger = (await screen.findAllByText('Web Search Defaults'))[0]
-  await fireEvent.click(trigger.closest('button') as HTMLElement)
-  await screen.findByText('Default Web Search Provider')
+  await screen.findByRole('button', { name: 'Batshit Tool: Web Search', exact: true })
+  expect(screen.queryByText('Web Search Defaults')).toBeNull()
+  expect(screen.queryByText('Default Web Search Provider')).toBeNull()
 }
 
 async function editDisplayName(value: string) {
@@ -167,10 +167,11 @@ async function editDisplayName(value: string) {
   await fireEvent.input(input, { target: { value } })
 }
 
-describe('Agent Settings keeps a saved web search choice whose key is not ready (BL-835)', () => {
+describe('Agent Settings preserves retired web search metadata without offering retired controls (BL-835)', () => {
   const originalFetch = global.fetch
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    agentRoute = await loadAgentRoute()
     ensureBrowserStubs()
     installRoutes()
     vi.spyOn(console, 'error').mockImplementation(() => {})
@@ -183,7 +184,7 @@ describe('Agent Settings keeps a saved web search choice whose key is not ready 
     agentStore.setAgents([])
   })
 
-  it('a saved Exa choice with no Exa key: opening saves nothing, the picker shows it unavailable, the form keeps it', async () => {
+  it('retained Exa metadata with no key: opening Tools saves nothing and offers no retired picker', async () => {
     await redis.createAgent(agentWithNativeTools({ webSearchProvider: 'exa', webSearchExaType: 'fast' }) as any)
     const before = await stored()
     await openPanel()
@@ -191,10 +192,9 @@ describe('Agent Settings keeps a saved web search choice whose key is not ready 
     expect(puts).toEqual([])
     expect(await stored()).toEqual(before)
 
-    await openWebSearchDefaults()
-    expect(await screen.findByText('Exa (Missing API key)')).toBeTruthy()
-    // It no longer reads as "Use Global Default", which is a different choice.
-    expect(screen.queryByText(/^Use Global Default \(DuckDuckGo/)).toBeNull()
+    await openTools()
+    expect(puts).toEqual([])
+    expect(await stored()).toEqual(before)
   }, 90_000)
 
   it('a saved Exa choice with no Exa key: an edit of another field sends only that edit and the choice stays saved', async () => {
@@ -237,11 +237,12 @@ describe('Agent Settings keeps a saved web search choice whose key is not ready 
 
     expect(puts).toEqual([])
     expect(await stored()).toEqual(before)
-    await openWebSearchDefaults()
-    expect(await screen.findByText('Exa (Missing API key)')).toBeTruthy()
+    await openTools()
+    expect(await stored()).toEqual(before)
+    expect(puts).toEqual([])
   }, 90_000)
 
-  it('a saved Perplexity choice with no Perplexity key: opening saves nothing and the choice stays saved', async () => {
+  it('retained Perplexity metadata with no key: opening saves nothing and offers no retired picker', async () => {
     apiKeysAnswer = () => jsonResponse({ keys: { exa: { status: 'ready' } } })
     await redis.createAgent(agentWithNativeTools({ webSearchProvider: 'perplexity' }) as any)
     const before = await stored()
@@ -249,11 +250,12 @@ describe('Agent Settings keeps a saved web search choice whose key is not ready 
 
     expect(puts).toEqual([])
     expect(await stored()).toEqual(before)
-    await openWebSearchDefaults()
-    expect(await screen.findByText('Perplexity (Missing API key)')).toBeTruthy()
+    await openTools()
+    expect(await stored()).toEqual(before)
+    expect(puts).toEqual([])
   }, 90_000)
 
-  it('the key status cannot be loaded: opening saves nothing, the choice stays saved and is not called unavailable', async () => {
+  it('failed key status cannot erase retained metadata or revive the retired provider control', async () => {
     apiKeysAnswer = () => jsonResponse({ error: 'Failed to fetch API keys' }, 500)
     await redis.createAgent(agentWithNativeTools({ webSearchProvider: 'exa' }) as any)
     const before = await stored()
@@ -261,14 +263,14 @@ describe('Agent Settings keeps a saved web search choice whose key is not ready 
 
     expect(puts).toEqual([])
     expect(await stored()).toEqual(before)
-    await openWebSearchDefaults()
-    // Not known to be unavailable: the panel names the load failure instead of guessing.
-    expect(await screen.findByText('Exa')).toBeTruthy()
+    await openTools()
+    // Missing provider information cannot erase retained data or create a provider control.
     expect(screen.queryByText('Exa (Missing API key)')).toBeNull()
-    expect(await screen.findByText(/Failed to fetch API keys/)).toBeTruthy()
+    expect(await stored()).toEqual(before)
+    expect(puts).toEqual([])
   }, 90_000)
 
-  it('with the Exa key saved the choice shows plainly and opening saves nothing', async () => {
+  it('a ready Exa key does not revive a per-agent provider picker or save on open', async () => {
     apiKeysAnswer = () => jsonResponse({ keys: { exa: { status: 'ready' } } })
     await redis.createAgent(agentWithNativeTools({ webSearchProvider: 'exa' }) as any)
     const before = await stored()
@@ -276,31 +278,23 @@ describe('Agent Settings keeps a saved web search choice whose key is not ready 
 
     expect(puts).toEqual([])
     expect(await stored()).toEqual(before)
-    await openWebSearchDefaults()
-    expect(await screen.findByText('Exa')).toBeTruthy()
+    await openTools()
     expect(screen.queryByText('Exa (Missing API key)')).toBeNull()
+    expect(await stored()).toEqual(before)
+    expect(puts).toEqual([])
   }, 90_000)
 
-  it('the choice changes only when the user changes it: picking DuckDuckGo sends that one field', async () => {
-    await redis.createAgent(agentWithNativeTools({ webSearchProvider: 'exa', webSearchExaType: 'fast' }) as any)
+  it('an explicit Web Search Enable change sends only the live grant and preserves retired provider metadata', async () => {
+    await redis.createAgent(agentWithNativeTools({ webSearchEnabled: true, webSearchProvider: 'exa', webSearchExaType: 'fast' }) as any)
     await openPanel()
-    await openWebSearchDefaults()
-
-    const trigger = (await screen.findByText('Exa (Missing API key)')).closest('button') as HTMLElement
-    await fireEvent.keyDown(trigger, { key: 'ArrowDown' })
-    // The popper stays `visibility: hidden` in jsdom (no layout), so an option has no accessible
-    // name here: find the hidden options and pick by their text.
-    await waitFor(() => expect(screen.queryAllByRole('option', { hidden: true }).length).toBeGreaterThan(0))
-    const option = screen
-      .getAllByRole('option', { hidden: true })
-      .find((element) => /^DuckDuckGo/.test(element.textContent?.trim() ?? ''))
-    expect(option).toBeTruthy()
-    await fireEvent.pointerUp(option as HTMLElement, { pointerType: 'mouse' })
+    await openTools()
+    await fireEvent.click(screen.getByRole('switch', { name: 'Enable Web Search', exact: true }))
 
     await waitFor(() => expect(puts.length).toBe(1), { timeout: 5_000 })
-    expect(puts[0].body).toEqual({ provider_specific_settings: { nativeTools: { webSearchProvider: 'duckduckgo-html' } } })
+    expect(puts[0].body).toEqual({ provider_specific_settings: { nativeTools: { webSearchEnabled: false } } })
     await waitFor(async () => expect((await stored()).provider_specific_settings.nativeTools).toEqual({
-      webSearchProvider: 'duckduckgo-html',
+      webSearchEnabled: false,
+      webSearchProvider: 'exa',
       webSearchExaType: 'fast'
     }), { timeout: 5_000 })
   }, 90_000)

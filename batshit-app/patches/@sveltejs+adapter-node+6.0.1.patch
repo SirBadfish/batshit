@@ -1,0 +1,74 @@
+diff --git a/node_modules/@sveltejs/adapter-node/src/handler.js b/node_modules/@sveltejs/adapter-node/src/handler.js
+--- a/node_modules/@sveltejs/adapter-node/src/handler.js
++++ b/node_modules/@sveltejs/adapter-node/src/handler.js
+@@ -13,6 +13,7 @@
+ 	prerendered_assets
+ } from '#@sveltejs/adapter-node';
+ import { env } from './env.js';
++import { resolve_origin } from './origin.js';
+ import { parse_as_bytes } from './utils.js';
+ import { create_file_map, serve_static } from './static.js';
+ 
+@@ -34,6 +35,10 @@
+ 
+ const asset_dir = `${dir}/client${base}`;
+ 
++// Bind one validated deployment origin before Kit initializes application env.
++const configured_origin = resolve_origin(origin, env('ORIGIN'), process.env.ORIGIN);
++if (configured_origin !== undefined) process.env.ORIGIN = configured_origin;
++
+ await server.init({
+ 	env: process.env,
+ 	read: (file) => createReadableStream(`${asset_dir}/${file}`)
+@@ -43,7 +48,7 @@
+ const ssr = async (req, res) => {
+ 	/** @type {Request} */
+ 	let request;
+-	let request_origin = origin;
++	let request_origin = configured_origin;
+ 
+ 	if (!request_origin) {
+ 		try {
+diff --git a/node_modules/@sveltejs/adapter-node/src/env.js b/node_modules/@sveltejs/adapter-node/src/env.js
+--- a/node_modules/@sveltejs/adapter-node/src/env.js
++++ b/node_modules/@sveltejs/adapter-node/src/env.js
+@@ -5,6 +5,7 @@
+ 	'SOCKET_PATH',
+ 	'HOST',
+ 	'PORT',
++	'ORIGIN',
+ 	'XFF_DEPTH',
+ 	'ADDRESS_HEADER',
+ 	'PROTOCOL_HEADER',
+diff --git a/node_modules/@sveltejs/adapter-node/src/origin.js b/node_modules/@sveltejs/adapter-node/src/origin.js
+new file mode 100644
+--- /dev/null
++++ b/node_modules/@sveltejs/adapter-node/src/origin.js
+@@ -0,0 +1,27 @@
++/**
++ * Batshit portable Node runtime contract. Deployment configuration is authority;
++ * request Host/forwarded headers never select a configured canonical origin.
++ */
++function parse_origin(value, label) {
++	if (value === undefined) return undefined;
++	const fail = () => { throw new Error(`${label} must be an absolute HTTP(S) origin without credentials, path, query, fragment, whitespace or backslashes`); };
++	if (typeof value !== 'string' || !value || value !== value.trim() || /[\u0000-\u0020\u007f\\]/.test(value)) fail();
++	const authority = /^https?:\/\/([^/?#]+)\/?$/i.exec(value)?.[1];
++	if (!authority || authority.includes('@') || authority.endsWith(':')) fail();
++	let url;
++	try { url = new URL(value); } catch { fail(); }
++	if (!['http:', 'https:'].includes(url.protocol) || !url.hostname || url.username || url.password || url.pathname !== '/' || url.search || url.hash || url.port === '0') fail();
++	return url.origin;
++}
++
++/** Preserve explicit build authority and refuse split application/adapter config. */
++export function resolve_origin(build_origin, runtime_origin, application_origin) {
++	const configured = parse_origin(build_origin, 'paths.origin');
++	const runtime = parse_origin(runtime_origin, 'ORIGIN');
++	const application = parse_origin(application_origin, 'Application ORIGIN');
++	const selected = configured ?? runtime ?? application;
++	if ([configured, runtime, application].some((value) => value !== undefined && value !== selected)) {
++		throw new Error('paths.origin and runtime/application ORIGIN conflict; configure one canonical origin');
++	}
++	return selected;
++}

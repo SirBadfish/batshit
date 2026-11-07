@@ -3,7 +3,7 @@ import { redis } from '$lib/server/redis'
 import { listAllDms, reapExpired } from '$lib/server/services/dm/dmStore'
 import { getWokenRunForSession } from '$lib/server/services/dm/dmTools'
 import { resolveAgentDmsEnabled } from '$lib/utils/dmControl'
-import { normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
+import { isApiPrimaryAgentType, normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
 import { listActiveSessionTurns } from '$lib/server/services/streamAbortRegistry'
 import { findWakeRunForAgent } from '$lib/server/services/wakeRunRegistry'
 import { isOpenDmStatus, type DmRecord } from '$lib/types/dm'
@@ -46,10 +46,7 @@ async function listAgentPresence(userId: string, needsUserAgentIds: Set<string>)
 
   return agents
     .map((agent) => agent as unknown as Record<string, any>)
-    .filter((agent) => {
-      const type = normalizePrimaryAgentType(agent as any)
-      return type === 'api' || type === 'cli'
-    })
+    .filter((agent) => isApiPrimaryAgentType(normalizePrimaryAgentType(agent as any)))
     .map((agent) => {
       const runningSessionId =
         runningByAgent.get(agent.id) ?? findWakeRunForAgent(agent.id)?.sessionId ?? null

@@ -1,19 +1,10 @@
-import { commandModelCaptureResponse } from '$lib/server/services/commandModelCaptureResponse'
 import { json, type RequestHandler } from '@sveltejs/kit'
 import { apiFailure } from '$lib/server/services/apiResponses'
 
 import { redis } from '$lib/server/redis'
 import { resolveNativeToolUser } from '$lib/server/services/nativeToolAuth'
-import {
-  bindActingAgentId,
-  bindActingSessionId,
-  boundRunCredential
-} from '$lib/server/services/actingAgentIdentity'
 import { nativeToolService, resolveNativeToolSettings } from '$lib/server/services/nativeTools'
-import {
-  getRunCredentialStopSignal,
-  getRunningReplyStopSignal
-} from '$lib/server/services/streamAbortRegistry'
+import { getRunningReplyStopSignal } from '$lib/server/services/streamAbortRegistry'
 
 interface AgentBrowserRequest {
   userId?: string
@@ -27,19 +18,7 @@ interface AgentBrowserRequest {
 }
 
 function buildAgentBrowserSettings(providerSettings: Record<string, any> | null) {
-  const settings = resolveNativeToolSettings(providerSettings)
-  return {
-    enabled: settings.agentBrowserEnabled,
-    runtime: {
-      liveViewEnabled: settings.agentBrowserLiveViewEnabled,
-      runtimeMode: settings.agentBrowserRuntimeMode,
-      cdpPort: settings.agentBrowserCdpPort,
-      provider: settings.agentBrowserProvider,
-      executablePath: settings.agentBrowserExecutablePath,
-      extraFlags: settings.agentBrowserExtraFlags,
-      timeoutMs: settings.agentBrowserTimeoutMs
-    }
-  }
+  return { enabled: resolveNativeToolSettings(providerSettings).agentBrowserEnabled }
 }
 
 export const POST: RequestHandler = async ({ request, locals }) => {
@@ -59,22 +38,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       return apiFailure('Unauthorized', 401)
     }
 
-    /**
-     * SA-117 DL-117-04 — bound first, then the pre-existing ownership check.
-     *
-     * This was the one route in Part 2.2 that already checked the named agent EXISTS and
-     * belongs to the caller's user. It never checked that the caller IS that agent, which is
-     * a different question: every one of a user's agents passed. The binding answers it on
-     * the agent lane, and the ownership check below still covers every other lane.
-     */
-    const agentBinding = bindActingAgentId(auth, body.agentId)
-    if (!agentBinding.ok) {
-      return json(
-        { success: false, error: agentBinding.message, code: agentBinding.code },
-        { status: 400 }
-      )
-    }
-    const agentId = agentBinding.agentId ?? ''
+    const agentId = typeof body.agentId === 'string' ? body.agentId.trim() : ''
     if (!agentId) {
       return json({ success: false, error: 'agentId is required.' }, { status: 400 })
     }
@@ -101,8 +65,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       const result = await nativeToolService.nativeAgentBrowserFind({
         userId: auth.userId,
         query: typeof body.query === 'string' ? body.query : undefined,
-        limit: typeof body.limit === 'number' ? body.limit : undefined,
-        settings: resolved.runtime
+        limit: typeof body.limit === 'number' ? body.limit : undefined
       })
       return json(result, { status: result.dockerUnsupported === true ? 503 : 200 })
     }
@@ -113,7 +76,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
         return json({ success: false, error: 'toolName is required.' }, { status: 400 })
       }
 
-      const sessionId = bindActingSessionId(auth, body.sessionId)
+      const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() || undefined : undefined
       const result = await nativeToolService.nativeAgentBrowserUse({
         userId: auth.userId,
         sessionId,
@@ -122,17 +85,10 @@ export const POST: RequestHandler = async ({ request, locals }) => {
           body.params && typeof body.params === 'object' && !Array.isArray(body.params)
             ? body.params
             : undefined,
-        settings: resolved.runtime,
-        // A Stop of the reply running in this chat ends the call (2026-09-18); no reply running,
-        // no signal, as before (`getRunningReplyStopSignal` says why the request cannot carry it).
-        // BL-1321: on the agent lane the run credential decides, so a primary run hears only its
-        // own reply's Stop (already aborted once that reply has ended or been replaced); the
-        // session and n8n lanes keep the chat the body names.
-        abortSignal: auth.auth === 'agent'
-          ? getRunCredentialStopSignal(boundRunCredential(auth))
-          : getRunningReplyStopSignal(sessionId)
+        // The running reply's Stop still governs the named chat.
+        abortSignal: getRunningReplyStopSignal(sessionId)
       })
-      return commandModelCaptureResponse(result, auth.auth === 'agent', result.dockerUnsupported === true ? 503 : 200)
+      return json(result, { status: result.dockerUnsupported === true ? 503 : 200 })
     }
 
     return json({ success: false, error: 'action must be `find` or `use`.' }, { status: 400 })

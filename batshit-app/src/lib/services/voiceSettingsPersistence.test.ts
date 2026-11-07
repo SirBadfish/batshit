@@ -40,7 +40,10 @@ describe('Voice lip sync persistence boundary (BL-976)', () => {
       byo: { id: 'retained', rawMarker: 'unreadable-fallback' },
       extension: { keep: true }
     }
-    await redis.updateUserSettings(USER, { displayName: 'Probe', voice_settings: voice })
+    // Deliberate pre-existing raw state, including server-owned/unknown leaves.
+    await redis.json.set(`user:${USER}:settings`, '$', {
+      id: `settings_${USER}`, user_id: USER, displayName: 'Probe', voice_settings: voice
+    })
     const read = await GET({ locals: { user: { id: USER } } } as any)
     confirmUserSettings((await read.json()).settings)
     const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => POST({

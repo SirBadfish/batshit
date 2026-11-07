@@ -8,6 +8,8 @@ export type CatalogSyncSourceStatus = {
   usedFallback: boolean
   skipped?: boolean
   fetchedCount: number
+  /** Public same-endpoint metadata provenance; never a runtime credential alias or independent recheck. */
+  metadataSourceConnectionId?: string
   /** Missing upstream IDs retained pending retirement evidence; not published deletions. */
   pendingRemovalIds?: string[]
   confirmedRemovalIds?: string[]

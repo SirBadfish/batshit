@@ -18,7 +18,7 @@ describe('send-routed Judge Juice smart zip contracts', () => {
   const zipTurn = source.indexOf('const jevJuiceSmartZip = jevJuiceGroupSelection', collector)
   const seam = source.indexOf('const jevJuiceHintProvider = jevJuiceGroupSelection', zipTurn)
   const compile = source.indexOf('await databaseService.buildFormattedChatInput(', seam)
-  const compileEnd = source.indexOf("throw new Error('Failed to build formatted chat input for API or CLI agent')", compile)
+  const compileEnd = source.indexOf("throw new Error('Failed to build formatted chat input for the agent')", compile)
 
   it('builds one smart zip turn per send, gated on this send\'s own global zip settings, and never for a group speaker', () => {
     expect(streamStart).toBeGreaterThan(-1)
@@ -95,14 +95,14 @@ describe('send-routed Judge Juice smart zip contracts', () => {
     // while the reply waits at an approval card (rezipping on half a reply), never for a reply cut
     // at the output limit; a run that finishes an earlier run's reply brings its own step.
     const postTurnGate = source.indexOf(
-      '      !silentResponse &&\n      !replyAwaitsApproval &&\n      !replyOutputLimitFailure &&\n      (afterReplySmartZip || afterReplyCheck)\n',
+      '      !silentResponse &&\n      !replyAwaitsApproval &&\n      !replyOutputLimitFailure &&\n      !(mcpApiRun && p5ApiRunMustPause(mcpApiRun)) &&\n      (afterReplySmartZip || afterReplyCheck || resolveAgentJevSkillSessionsEnabled(agent))\n',
       snapshot
     )
     const postTurn = source.indexOf(
       '? afterReplySmartZip.runPostTurn({ messageId, reply: finishedReply, newZipIds, earlierParts })',
       postTurnGate
     )
-    const awaited = source.indexOf('await Promise.all([smartZipStep, postTurnCheckStep])', postTurn)
+    const awaited = source.indexOf('await Promise.all([smartZipStep, postTurnCheckStep, skillSessionStep])', postTurn)
     const responseBuilt = source.indexOf('const response = json({', postTurn)
 
     expect(finalize).toBeGreaterThan(compileEnd)
@@ -119,7 +119,10 @@ describe('send-routed Judge Juice smart zip contracts', () => {
     // SA-129 P2: the reply as the model wrote it (the stored text is cleaned at the reply end).
     expect(body).toContain("const finishedReply = rawFinishedReply ?? (finishSummary.content || finishSummary.text || '')")
     expect(body).toContain('const newZipIds = (finishSummary.zipReferences ?? [])')
-    expect(source).toContain('const afterReplySmartZip = jevJuiceSmartZip ?? jevJuiceContinuedReply?.smartZip')
+    // SA-139 removed managed CLI resumes. API continuation retains the original reply's step.
+    expect(source).toContain(
+      'const afterReplySmartZip = jevJuiceSmartZip ?? jevJuiceContinuedReply?.smartZip\n'
+    )
     // ONE site: never on the error, abort, or interrupted paths.
     expect(source.split('afterReplySmartZip.runPostTurn(').length - 1).toBe(1)
     expect(source).not.toContain('jevJuiceSmartZip.runPostTurn(')

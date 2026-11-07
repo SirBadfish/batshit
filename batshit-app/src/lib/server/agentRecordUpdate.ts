@@ -1,3 +1,14 @@
+import type { TypedToolsRawGuard } from './typedFileToolsSettingsGuard'
+import { explicitTypedFileToolsWriteIssue, retiredOperationalToolWrite } from '$lib/utils/toolSettingsWriteRules'
+import { isRetiredSkillReadField, withoutSkillReadRows } from '$lib/utils/skillSessions'
+import { createHash } from 'node:crypto'
+import { MCP_SETTINGS_FIELDS, type ExpectedMcpSettings, type McpSettingsField } from '$lib/utils/agentSettingsSectionSaves'
+import { assertSettingsLifecycle, captureSettingsLifecycle, type SettingsLifecycleSnapshot } from './services/appActions/settings/lifecycle'
+import type { AutoCompactMutation, AutoCompactRawGuard } from './autoCompactGuard'
+import type { ConfiguredTtsMutation, ConfiguredTtsRawGuard } from './configuredTtsGuard'
+import type { ModelSelectionRawGuard, ModelSelectionMutation } from './modelSelectionGuard'
+import type { InstructionsRawGuard, InstructionsMutation } from './instructionsGuard'
+import type { InstructionsRevisions } from '$lib/appActions/settings/instructionsBaseline'
 import { normalizeUploadUrlsForStorageInPayload } from '$lib/server/services/batshitServerUrls'
 import {
   AgentBlockShapeError,
@@ -8,7 +19,7 @@ import {
   type AgentFieldByFieldBlock
 } from '$lib/utils/agentBlockFieldSettings'
 import { buildAgentMemoryRecordFields, resolveAgentMemorySettingsDraft } from '$lib/utils/memoryControl'
-import { AGENT_MEMORY_STORED_FIELDS } from '$lib/utils/agentSettingsSavePatch'
+import { AGENT_MEMORY_STORED_FIELDS, AGENT_MODEL_FIELDS } from '$lib/utils/agentSettingsSavePatch'
 import { NATIVE_TOOLS_SETTING_KEY } from '$lib/utils/agentProviderSettings'
 import {
   LEGACY_PRIMARY_AGENT_FIELDS,
@@ -28,6 +39,8 @@ import {
  *
  * The rules, the same as the old whole-record write for every field a caller passes:
  * - each passed top-level field is written at `$.<field>`; `undefined` is skipped;
+ * - `id`, `user_id` and `created_at` stay with creation/replacement/restore; an ordinary save
+ *   ignores those read-only metadata fields, including full-record echoes (BL-1702);
  * - `null` on a field of `NULLABLE_AGENT_FIELDS` removes the field (any other field stores null),
  *   and a nullable field already stored as null is removed too;
  * - `agentType` (review of wave 2, item 1) is written only when the caller passes it or the type
@@ -45,7 +58,7 @@ import {
  *   (made an object first when a field is set); a field passed as `null` is removed, a field not
  *   passed stays, so a save of one field never writes back an older copy of the others;
  *   `nativeTools: null` removes the block, and one that is neither an object nor null is refused;
- * - `codex_settings` and `claude_settings` (BL-848) are written KEY BY KEY under `$.<field>`, and
+ * - `claude_settings` (BL-848) is written KEY BY KEY under `$.<field>`, and
  *   `dcmDisplaySettings` (BL-855) key by key with each ENTRY of its maps under
  *   `$.dcmDisplaySettings["<map>"]["<id>"]` (`planAgentBlockWrite`, `agentBlockFieldSettings.ts`
  *   owns the rules): the block, and a map, are made objects first only when something in them is
@@ -63,17 +76,24 @@ import {
  * the ops loop of the script; its plan is `planSubagentRecordUpdate` (`subagentRecordUpdate.ts`).
  */
 
+import { validateReasoningRetentionSave } from '$lib/utils/reasoningRetention'
+
 export const AGENT_PROVIDER_SETTINGS_FIELD = 'provider_specific_settings'
+
+/** Ordinary saves cannot change record identity, ownership or creation incarnation (BL-1702). */
+export const AGENT_KEPT_FIELDS: ReadonlySet<string> = new Set(['id', 'user_id', 'created_at'])
 
 /** Fields a `null` removes (the old whole-record write deleted them the same way). */
 export const NULLABLE_AGENT_FIELDS: ReadonlySet<string> = new Set([
+  'api_reasoning_retention',
+  'whiteboard_budget_tokens',
+  'show_whiteboard',
   'buffer_size',
   'buffer_size_image',
-  // BL-1484: the parked permission's hidden key can be cleared with null; the retired
-  // zip_control_mode and zip_agent_control_enabled are removed by the startup sweep instead.
-  'zip_agent_control_experiment',
   'zip_ai_view_mode',
   'zip_tool_notes_enabled',
+  // SA-137 P4a: null removes the agent's own value, so it inherits the global Tool Grid value again.
+  'live_file_reads',
   'zip_threshold_error',
   'zip_threshold_image',
   'zip_threshold_subagent',
@@ -177,7 +197,22 @@ export const AGENT_MEMORY_SOURCE_PATHS: readonly string[] = AGENT_MEMORY_SOURCE_
 
 /** `redis.updateAgent`'s options. `expectedMemory`: the memory settings a save of them started from. */
 export interface AgentUpdateOptions {
+  expectedTtsSelection?: string
+  configuredTtsMutation?: ConfiguredTtsMutation
+  /** Engine-delete owner only: corresponding atomic raw voice source; never a body option. */
+  voiceEngineClearBasis?: import('./configuredTtsGuard').VoiceEngineClearBasis
+  expectedAutoCompact?: string
+  autoCompactMutation?: AutoCompactMutation
   expectedMemory?: Record<string, unknown>
+  expectedModelSelection?: string
+  expectedTypedFileTools?: string
+  onTypedFileToolsSaved?(ack: { revision: string; value: boolean }): void
+  expectedMcpSettings?: ExpectedMcpSettings
+  onMcpSettingsSaved?(ack: { revisions: ExpectedMcpSettings; values: Record<string, unknown> }): void
+  expectedInstructions?: Partial<InstructionsRevisions>
+  instructionsMutation?: InstructionsMutation
+  /** Server-only exact preset/authority proof; never accepted from a human body. */
+  modelSelectionMutation?: ModelSelectionMutation
 }
 
 /** Whether a save names a memory setting, by any of its stored names. */
@@ -306,7 +341,7 @@ function planNativeToolsOps(field: string, value: unknown): AgentRecordOp[] {
 }
 
 /**
- * BL-848, BL-855: the by-path writes of a `codex_settings`, `claude_settings` or `dcmDisplaySettings`
+ * BL-848, BL-855: the by-path writes of a `claude_settings` or `dcmDisplaySettings`
  * a save sent: the steps `planAgentBlockWrite` gives, each checked the way a settings key is (names
  * with a broken character, a value with one or nested too deep) before anything is written.
  */
@@ -344,15 +379,19 @@ export function assertAgentProviderSettingsBlock(value: unknown): void {
  * `planSubagentRecordUpdate` in `subagentRecordUpdate.ts`); the caller skips `undefined` and
  * checks the field name:
  * - `provider_specific_settings` key by key (`nativeTools` field by field): a key passed as `null`
- *   is removed, a key not passed stays, the whole block passed as `null` removes the block, and a
- *   block that is neither an object nor null is refused;
- * - `codex_settings`, `claude_settings` and `dcmDisplaySettings` key by key (`planAgentBlockWrite`);
+ *   is removed and a key not passed stays. Provider/native ancestors cannot be removed wholesale
+ *   because they retain explicit tool choices; malformed provider blocks are refused;
+ * - `claude_settings` and `dcmDisplaySettings` key by key (`planAgentBlockWrite`);
  * - any other field is written whole, and removed when it is passed as `null` and named in
  *   `removesOnNull` (every other field stores the null).
  * Throws `AgentUpdateRejectedError` before anything is written.
  */
 export function planRecordFieldOps(field: string, value: unknown, removesOnNull: ReadonlySet<string>): AgentRecordOp[] {
+  if (isRetiredSkillReadField(field)) return [{ op: 'delete', field }]
+  if (field === 'custom_tool_settings') value = withoutSkillReadRows(value)
   if (field === AGENT_PROVIDER_SETTINGS_FIELD) {
+    const issue = retiredOperationalToolWrite(value) ?? explicitTypedFileToolsWriteIssue(value)
+    if (issue) throw new AgentUpdateRejectedError(issue)
     if (value === null) return [{ op: 'delete', field }]
     assertAgentProviderSettingsBlock(value)
     const keyOps: AgentRecordOp[] = []
@@ -402,6 +441,9 @@ export function planAgentRecordUpdate({
   updates: Record<string, unknown>
   now: string
 }): AgentRecordPlan {
+  if (Object.hasOwn(updates, 'app_action_policy')) throw new AgentUpdateRejectedError('App Actions policy can only be changed through its dedicated human Settings control.')
+  const retentionError = validateReasoningRetentionSave(updates)
+  if (retentionError) throw new AgentUpdateRejectedError(retentionError)
   const ops: AgentRecordOp[] = []
   const passedSources: Record<string, unknown> = {}
   const legacy = new Set<string>(LEGACY_PRIMARY_AGENT_FIELDS)
@@ -409,7 +451,7 @@ export function planAgentRecordUpdate({
 
   for (const [field, value] of Object.entries(updates)) {
     if (!AGENT_FIELD_NAME.test(field)) throw new AgentUpdateRejectedError(`Not an agent field name: ${field}`)
-    if (value === undefined) continue
+    if (value === undefined || AGENT_KEPT_FIELDS.has(field)) continue
     if (typeSourceNames.has(field)) passedSources[field] = value
     if (field === 'updated_at' || field === 'agentType' || legacy.has(field)) continue
     ops.push(...planRecordFieldOps(field, value, NULLABLE_AGENT_FIELDS))
@@ -469,14 +511,29 @@ export function parseAgentTypeSnapshot(snapshot: string): AgentTypeSourceFields 
 export function agentUpdateScriptArguments(
   plan: AgentRecordPlan,
   snapshot: string,
-  memorySnapshot: string | null = null
+  memorySnapshot: string | null = null,
+  modelSelection?: ModelSelectionRawGuard,
+  presetReferences?: string,
+  instructions?: InstructionsRawGuard,
+  autoCompact?: AutoCompactRawGuard,
+  ttsSelection?: ConfiguredTtsRawGuard,
+  mcpSettings?: McpSettingsRawGuard,
+  typedTools?: TypedToolsRawGuard
 ): string[] {
   const type =
     plan.type.mode === 'set'
       ? plan.type.value
       : normalizePrimaryAgentType({ ...parseAgentTypeSnapshot(snapshot), ...plan.type.passedSources } as PrimaryAgentLike)
-  const memoryGuard =
-    memorySnapshot === null ? '' : JSON.stringify({ paths: AGENT_MEMORY_SOURCE_PATHS, snapshot: memorySnapshot })
+  const memoryGuard = memorySnapshot === null && !modelSelection && !presetReferences && !instructions && !autoCompact && !ttsSelection && !mcpSettings && !typedTools ? '' : JSON.stringify({
+    paths: memorySnapshot === null ? [] : AGENT_MEMORY_SOURCE_PATHS, snapshot: memorySnapshot ?? '',
+    ...(modelSelection ? { modelSelection } : {}),
+    ...(presetReferences ? { presetReferences } : {}),
+    ...(instructions ? { instructions } : {}),
+    ...(autoCompact ? { autoCompact } : {}),
+    ...(ttsSelection ? { ttsSelection } : {}),
+    ...(mcpSettings ? { mcpSettings } : {}),
+    ...(typedTools ? { typedTools } : {})
+  })
   return [serializeAgentRecordPlan(plan.ops), plan.type.mode, JSON.stringify(type), snapshot, memoryGuard, ...AGENT_TYPE_SOURCE_PATHS]
 }
 
@@ -498,3 +555,93 @@ export function serializeAgentRecordPlan(ops: AgentRecordOp[]): string {
     })
   )
 }
+
+/** Only the fixed Voice/model identities consumed by the human TTS lock.
+ * Read the exact serialized operations that will be issued, never the caller's later object. */
+export function capturedAgentVoicePostimage(serializedOps: string) {
+  const fields = new Set(['voice_profile', 'primary_model_preset_id', 'primary_model_provider', 'primary_model_name', 'primary_model_connection'])
+  const result: Record<string, unknown> = Object.create(null)
+  for (const [kind, path, raw] of JSON.parse(serializedOps) as string[][]) {
+    const field = path.startsWith('$.') ? path.slice(2) : ''
+    if (!fields.has(field)) continue
+    if (kind === 'set') result[field] = JSON.parse(raw)
+    else if (kind === 'del') result[field] = null
+  }
+  return Object.freeze(result)
+}
+
+/** Fixed model/native request projection of the SAME emitted ops used by every owning guard.
+ * It is not a second serializer and never reads a mutable caller payload after an await. */
+export function capturedModelSelectionUpdates(serializedOps: string): Readonly<Record<string, unknown>> {
+  const fields = new Set<string>([...AGENT_MODEL_FIELDS, 'agentType', 'subagentType', 'provider_specific_settings', 'claude_settings'])
+  const result: Record<string, any> = Object.create(null)
+  const put = (owner: Record<string, any>, key: string, value: unknown) =>
+    Object.defineProperty(owner, key, { value, enumerable: true, writable: true, configurable: true })
+  for (const [op, path, raw] of JSON.parse(serializedOps) as string[][]) {
+    const match = path.match(/^\$\.([A-Za-z_][A-Za-z0-9_]*)(?:\[("(?:[^"\\]|\\["\\])*")\])?(?:\[("(?:[^"\\]|\\["\\])*")\])?$/)
+    if (!match || !fields.has(match[1]) || !['set', 'del', 'ensure'].includes(op)) continue
+    // These are agentRecordOpPath's RedisJSON members, not JSON string literals:
+    // only quote/backslash are escaped; literal control characters are retained.
+    const names = [match[1], ...match.slice(2).filter(name => name !== undefined)
+      .map(name => name.slice(1, -1).replace(/\\(["\\])/g, '$1'))]
+    let owner = result
+    for (const name of names.slice(0, -1)) {
+      if (!Object.hasOwn(owner, name) || owner[name] == null || typeof owner[name] !== 'object' || Array.isArray(owner[name])) {
+        put(owner, name, Object.create(null))
+      }
+      owner = owner[name]
+    }
+    const key = names.at(-1)!
+    if (op === 'set') put(owner, key, JSON.parse(raw))
+    else if (op === 'del') put(owner, key, null)
+    else if (!Object.hasOwn(owner, key) || owner[key] == null || typeof owner[key] !== 'object' || Array.isArray(owner[key])) {
+      put(owner, key, Object.create(null))
+    }
+  }
+  const freeze = (value: unknown): void => { if (value && typeof value === 'object') { for (const child of Object.values(value)) freeze(child); Object.freeze(value) } }
+  freeze(result)
+  return result
+}
+
+
+export class McpSettingsBaseRequiredError extends Error { readonly status = 400; readonly code = 'mcp_settings_base_required'; constructor() { super('Read Saved Tool Settings before changing these values. Nothing was saved.') } }
+export class McpSettingsConflictError extends Error { readonly status = 409; readonly code = 'mcp_settings_changed'; constructor() { super('Saved Tool Settings changed. Your draft is kept; use the saved values before making a new choice. Nothing was saved.') } }
+export class McpSettingsSaveUnconfirmedError extends Error { readonly status = 503; readonly code = 'mcp_settings_save_unconfirmed'; constructor() { super('The Tool Settings save was issued but its outcome is unconfirmed. Check saved values; do not repeat it automatically.') } }
+export type McpSettingsRawGuard = { paths: readonly string[]; raw: readonly string[] }
+export function mcpSettingsReadPaths(leaves: readonly McpSettingsField[] = MCP_SETTINGS_FIELDS) {
+  return [...new Set(['id', 'user_id', 'created_at', ...PRIMARY_AGENT_TYPE_SOURCE_FIELDS, ...leaves])].map(field => `$.${field}`)
+}
+export function requireMcpSettingsExpected(value: unknown, leaves: readonly McpSettingsField[] = []): asserts value is ExpectedMcpSettings {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => !MCP_SETTINGS_FIELDS.includes(key as McpSettingsField)) ||
+    Object.values(value).some(token => typeof token !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(token)) || leaves.some(field => !Object.hasOwn(value, field))) throw new McpSettingsBaseRequiredError()
+}
+export function makeMcpSettingsSnapshot(id: string, paths: readonly string[], raw: readonly string[], lifecycle: SettingsLifecycleSnapshot,
+  leaves: readonly McpSettingsField[] = MCP_SETTINGS_FIELDS, knownAck = false) {
+  if (!knownAck) assertSettingsLifecycle(lifecycle)
+  if (paths.length !== raw.length || raw.some(value => typeof value !== 'string')) throw new McpSettingsConflictError()
+  const values = new Map(paths.map((path, index) => [path, raw[index]]))
+  const identity = mcpSettingsReadPaths([]).map(path => [path, values.get(path)])
+  if (identity.some(([, value]) => value === undefined) || leaves.some(field => !values.has(`$.${field}`))) throw new McpSettingsConflictError()
+  const stored = (path: string) => { const value = JSON.parse(values.get(path) || '[]'); if (!Array.isArray(value) || value.length > 1) throw new McpSettingsConflictError(); return value[0] }
+  if (stored('$.id') !== id || typeof stored('$.user_id') !== 'string') throw new McpSettingsConflictError()
+  const revisions: ExpectedMcpSettings = Object.fromEntries(leaves.map(field => [field, `sha256:${createHash('sha256').update(JSON.stringify({ id, identity, field, raw: values.get(`$.${field}`), lifecycle })).digest('hex')}`]))
+  return { paths, raw, lifecycle, revisions, values: Object.fromEntries(leaves.filter(field => values.get(`$.${field}`) !== '[]').map(field => [field, stored(`$.${field}`)])) }
+}
+export function mcpSettingsWriteGuard(snapshot: ReturnType<typeof makeMcpSettingsSnapshot>, expected: unknown, leaves: readonly McpSettingsField[]): McpSettingsRawGuard {
+  requireMcpSettingsExpected(expected, leaves)
+  assertSettingsLifecycle(snapshot.lifecycle)
+  if (leaves.some(field => snapshot.revisions[field] !== expected[field])) throw new McpSettingsConflictError()
+  return { paths: snapshot.paths, raw: snapshot.raw }
+}
+export const CHECK_MCP_SETTINGS_LUA = `
+local namesMcp = false
+for _, op in ipairs(cjson.decode(ARGV[1])) do
+  if op[1] ~= 'delnull' and (op[2] == '$.defaultMCPGateways' or op[2] == '$.defaultMCPToolSelections' or op[2] == '$.custom_tool_settings') then namesMcp = true end
+end
+if namesMcp and not guard.mcpSettings then return 'MCP_SETTINGS_BASE_REQUIRED' end
+if guard.mcpSettings then
+  for index, path in ipairs(guard.mcpSettings.paths) do
+    if (redis.call('JSON.GET', KEYS[1], path) or '') ~= guard.mcpSettings.raw[index] then return 'MCP_SETTINGS_CHANGED' end
+  end
+end
+`

@@ -128,19 +128,6 @@ curl http://localhost:5678/healthz
 
 If you changed `BATSHIT_DOCKER_N8N_PORT`, use that port in the browser. The n8n container still uses `http://n8n:5678` internally. If you run two n8n instances in one browser, don't open both as `localhost` — cookies collide across ports. Use `127.0.0.1` for one of them.
 
-## n8n callbacks fail auth
-
-Symptoms: the n8n workflow executes but Batshit doesn't stream, n8n logs show unauthorized callback errors, or Batshit receives nothing.
-
-Fix:
-
-1. Confirm the workflow was imported from the current official template.
-2. Confirm Batshit Tools sends `x-batshit-native-tool-token` from `batshit_native_tool_token`.
-3. Confirm the Batshit Tools URL is reachable from the n8n process.
-4. Retest a small workflow.
-
-The n8n profile receives the Docker token automatically at the service level, but your workflow credentials still need to be configured correctly.
-
 ## Docker Sandbox says `Operator Required`
 
 Docker Sandbox uses a host-side operator. The core app container doesn't control the host Docker daemon directly.
@@ -192,19 +179,6 @@ BATSHIT_WORKSPACE_MOUNT=/absolute/path/on/host
 
 Inside Batshit/Docker, that appears as `/workspace`. Recreate containers after changing the mount, then create/update the Batshit Project path to use `/workspace/...`. Backup/restore stores Project references, not the source files themselves.
 
-## Codex CLI agent returns `401 Unauthorized`
-
-Provider API keys saved in Batshit don't log the Codex CLI into the app container. Run a container-side Codex login using the exact command Batshit shows in Agent Settings. For a Batshit-managed install:
-
-```sh
-docker compose --env-file .env.docker exec app /home/batshit-cli/.batshit/installs/cli/bin/codex login --device-auth
-```
-
-If you normally start with `--profile n8n`, include that profile in the command. Then retry the `CLI` agent.
-
-## CLI agent says the CLI isn't installed
-
-The Docker image doesn't ship the Codex or Claude Code CLI. Open the `CLI` agent in Settings and use the one-click install card in the model section. The install is saved in a persistent Docker volume and survives container restarts and upgrades.
 
 ## Docker MCP Gateway tools are missing
 

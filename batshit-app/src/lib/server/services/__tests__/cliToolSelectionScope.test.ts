@@ -21,7 +21,7 @@ vi.mock('$lib/server/redis', () => ({
   }
 }))
 
-import { resolveCliToolSelectionScope, resolveRunCredentialCliToolScope } from '../cliToolRegistry'
+import { resolveCliToolSelectionScope } from '../cliToolRegistry'
 
 const agents: Record<string, Record<string, unknown>> = {
   'agent:agent_a': { id: 'agent_a', user_id: 'user-1', defaultTools: ['a_tool', 'shared_tool'] },
@@ -122,35 +122,5 @@ describe('resolveCliToolSelectionScope (BL-686)', () => {
       selectedToolIds: ['x_tool']
     })
     expect(scope.toolIds).toEqual([])
-  })
-})
-
-describe('resolveRunCredentialCliToolScope (BL-686): what a run credential is minted with', () => {
-  beforeEach(() => {
-    vi.clearAllMocks()
-    redisMocks.get.mockImplementation(async (key: string) => agents[key] ?? null)
-    redisMocks.getUserSettings.mockResolvedValue({
-      global_tool_grid_settings: { cli: { discoverableToolIds: ['global_tool'] } }
-    })
-  })
-
-  it("a primary run: the turn's list, else its agent's saved list, else the Tool Grid list", async () => {
-    expect(await resolveRunCredentialCliToolScope({
-      userId: 'user-1', agentId: 'agent_a', selectedCliToolIds: ['a_tool']
-    })).toEqual(['a_tool'])
-    expect(await resolveRunCredentialCliToolScope({ userId: 'user-1', agentId: 'agent_a' }))
-      .toEqual(['a_tool', 'shared_tool'])
-    expect(await resolveRunCredentialCliToolScope({ userId: 'user-1', agentId: 'agent_open' }))
-      .toEqual(['global_tool'])
-  })
-
-  it("a delegated run: its runner's list only, and none without one", async () => {
-    expect(await resolveRunCredentialCliToolScope({
-      userId: 'user-1', agentId: 'agent_a', delegatedRun: true, selectedCliToolIds: ['sub_tool']
-    })).toEqual(['sub_tool'])
-    expect(await resolveRunCredentialCliToolScope({
-      userId: 'user-1', agentId: 'agent_a', delegatedRun: true
-    })).toEqual([])
-    expect(redisMocks.get).not.toHaveBeenCalled()
   })
 })

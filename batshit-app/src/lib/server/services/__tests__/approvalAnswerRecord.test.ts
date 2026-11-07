@@ -1,8 +1,9 @@
-import { describe, expect, it } from 'vitest'
+import { afterAll, describe, expect, it, vi } from 'vitest'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { redis } from '$lib/server/redis'
-import { answerApprovalsOnce } from '../approvalAnswerRecord'
+import { answerApprovalsOnce, observeP5ApprovalAnswerWrite, readP5ApprovalAnswerWrite, consumeP5ApprovalAnswerWrite } from '../approvalAnswerRecord'
 import { ANSWERED_APPROVAL_IDS_KEY } from '../toolApprovalState'
+import { createSettingsRedisAdmission } from '$lib/test-utils/settingsRedisAdmission'
 
 /**
  * An approval click is answered ONCE (bug sweep, 2026-09-18).
@@ -19,7 +20,9 @@ import { ANSWERED_APPROVAL_IDS_KEY } from '../toolApprovalState'
  * this file is on CI's real-Redis list.
  */
 
-useRedisTestServer()
+const strictAdmission = createSettingsRedisAdmission(redis)
+useRedisTestServer({ beforeCleanupAdmission: strictAdmission.beforeCleanupAdmission })
+afterAll(() => strictAdmission.close())
 
 const USER = 'user-answer-once'
 const SESSION = 'session-answer-once'
@@ -66,6 +69,53 @@ async function storedCard(): Promise<any> {
 const now = () => new Date('2026-09-18T18:00:00.000Z')
 
 describe('answerApprovalsOnce', () => {
+  it.each(['later touch failure', 'JSON write failure'] as const)(
+    'observes only the actual message JSON acknowledgement through %s', async boundary => {
+      await seedCard()
+      const { RedisService } = await vi.importActual<typeof import('$lib/server/redis')>('$lib/server/redis')
+      const failure = new Error(boundary)
+      let writes = 0
+      const receiver = { execute: (operation: any) => redis.execute(async client => operation({ json: {
+        get: client.json.get.bind(client.json), set: async (...args: unknown[]) => {
+          writes++
+          if (boundary === 'JSON write failure') throw failure
+          return (client.json.set as any)(...args)
+        } } })), touchSession: async () => { throw failure } }
+      const update = vi.spyOn(redis, 'updateMessage').mockImplementation((...args) =>
+        RedisService.prototype.updateMessage.apply(receiver as any, args))
+      try {
+        const outcome = await answerApprovalsOnce({ userId: USER, sessionId: SESSION, messageId: CARD,
+          responses: [{ approvalId: 'aitxt-1', approved: true }], now })
+        expect(outcome).toMatchObject({ ok: false, reason: 'record_failed', error: failure })
+        expect(writes).toBe(1)
+        const receipt = observeP5ApprovalAnswerWrite(outcome)
+        if (boundary === 'later touch failure') {
+          expect(receipt).toBeDefined()
+          expect(readP5ApprovalAnswerWrite(receipt!).approvalIds).toEqual(['aitxt-1'])
+          expect((await storedCard()).metadata[ANSWERED_APPROVAL_IDS_KEY]).toEqual(['aitxt-1'])
+          expect(await answerApprovalsOnce({ userId: USER, sessionId: SESSION, messageId: CARD,
+            responses: [{ approvalId: 'aitxt-1', approved: true }] })).toMatchObject({ ok: false, reason: 'already_answered' })
+          expect(writes).toBe(1)
+        } else {
+          expect(receipt).toBeUndefined()
+          expect((await storedCard()).metadata[ANSWERED_APPROVAL_IDS_KEY]).toBeUndefined()
+        }
+      } finally { update.mockRestore() }
+    })
+  it('retains the actual answer acknowledgement through later failure, without turning a DTO/duplicate into a one-use receipt', async () => {
+    await seedCard()
+    const outcome = await answerApprovalsOnce({ userId: USER, sessionId: SESSION, messageId: CARD,
+      responses: [{ approvalId: 'aitxt-1', approved: true }], now,
+      mutate: async write => { await write(); throw new Error('later account fence failed') } })
+    expect(outcome).toMatchObject({ ok: false, reason: 'record_failed' })
+    const receipt = observeP5ApprovalAnswerWrite(outcome)!
+    expect(readP5ApprovalAnswerWrite(receipt)).toEqual({ userId: USER, sessionId: SESSION, messageId: CARD, approvalIds: ['aitxt-1'] })
+    expect(observeP5ApprovalAnswerWrite(structuredClone(outcome))).toBeUndefined()
+    expect(() => readP5ApprovalAnswerWrite(structuredClone(receipt))).toThrow('unavailable')
+    consumeP5ApprovalAnswerWrite(receipt)
+    expect(() => readP5ApprovalAnswerWrite(receipt)).toThrow('already claimed')
+    expect((await storedCard()).metadata.toolApprovals.approvals[0].status).toBe('approved')
+  })
   it('refuses a changed ChatGPT provenance before recording or spending the approval', async () => {
     await seedCard({ providerMessageSource: { connectionId: 'chatgpt-plan:fixture', planBinding: 'old-binding' } })
     await expect(answerApprovalsOnce({ userId: USER, sessionId: SESSION, messageId: CARD, responses: [{ approvalId: 'aitxt-1', approved: true }], beforeRecord: stored => {

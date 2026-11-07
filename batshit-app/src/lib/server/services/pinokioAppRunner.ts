@@ -22,8 +22,12 @@ import {
   pinokioEndpointAgentMessage,
   resolvePinokioAppEndpoint,
   type PinokioAppEndpoint,
+  type PinokioEndpointOptions,
   type PinokioAppEndpointCode
 } from './pinokioAppEndpoint'
+import net from 'node:net'
+import { Agent } from 'undici'
+import { guardedLookup, isBlockedAddress } from './skillImportNetworkGuard'
 import { detectPromptShape } from '$lib/server/artifacts/comfyuiProxyRules'
 import { getInternalBatshitServerUrl, getPublicBatshitServerUrl } from './batshitServerUrls'
 import { loadClipRow } from './clipService'
@@ -46,6 +50,9 @@ const MAX_OUTPUT_FILES = 8
 const MAX_OUTPUT_FILE_BYTES = 25 * 1024 * 1024
 const MAX_INPUT_FILE_BYTES = 25 * 1024 * 1024
 const ERROR_BODY_CHARS = 600
+// Public file inputs use the existing socket-time DNS/address guard. Owned uploads
+// remain a distinct exact-origin path; app IO uses the endpoint's separate bound reader.
+const publicFileDispatcher = new Agent({ connect: { lookup: guardedLookup as never, timeout: REQUEST_TIMEOUT_MS } })
 
 export type PinokioRunErrorCode =
   | PinokioAppEndpointCode
@@ -88,6 +95,8 @@ export interface PinokioRunInput {
   /** The user the run is for (the artifact's owner); a file field's Clip id is read from their Clips. */
   userId?: string
   signal?: AbortSignal
+  /** Server-owned saved binding/actor admission for each unsent app request. */
+  admitFetch?: () => Promise<void>
 }
 
 export interface PinokioRunResult {
@@ -98,7 +107,9 @@ export interface PinokioRunResult {
 
 export interface PinokioRunnerDeps {
   fetch: typeof fetch
-  resolveEndpoint(appId: string): Promise<PinokioAppEndpoint>
+  /** Separate from file input reads, which resolve bytes on Batshit. */
+  appFetch?: typeof fetch
+  resolveEndpoint(appId: string, options?: PinokioEndpointOptions): Promise<PinokioAppEndpoint>
   sleep(ms: number): Promise<void>
   now(): number
   randomSeed(): number
@@ -148,14 +159,20 @@ async function appFetch(
   deps: PinokioRunnerDeps,
   title: string,
   url: string,
-  init: RequestInit & { signal?: AbortSignal } = {}
+  init: RequestInit & { signal?: AbortSignal } = {},
+  timeoutMs = REQUEST_TIMEOUT_MS
 ): Promise<Response> {
-  const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+  const timeout = AbortSignal.timeout(timeoutMs)
   const signal = init.signal ? AbortSignal.any([init.signal, timeout]) : timeout
   try {
-    return await deps.fetch(url, { ...init, signal })
+    return await (deps.appFetch ?? deps.fetch)(url, { ...init, signal })
   } catch (error) {
     if (init.signal?.aborted) throw new PinokioAppRunError('timed_out', 'The run was cancelled.')
+    if (deps.appFetch && error && typeof error === 'object' && ('status' in error || 'code' in error)) {
+      const refusal = error as { message?: unknown; body?: { message?: unknown } }
+      const message = typeof refusal.message === 'string' ? refusal.message : typeof refusal.body?.message === 'string' ? refusal.body.message : 'The saved Pinokio app request lost its admission.'
+      throw new PinokioAppRunError('app_refused', message)
+    }
     throw new PinokioAppRunError(
       'app_unreachable',
       `${title} did not answer at ${new URL(url).origin}: ${error instanceof Error ? error.message : 'unknown error'}. It may have stopped; check it with fabric:sys.pinokio.app_status.`
@@ -163,16 +180,34 @@ async function appFetch(
   }
 }
 
-async function readBytes(response: Response, limit: number, what: string): Promise<Uint8Array> {
+/** Retain at most the allowed bytes, and close the response on every refusal. */
+export async function readBytes(response: Response, limit: number, what: string): Promise<Uint8Array> {
   const length = Number(response.headers.get('content-length'))
   if (Number.isFinite(length) && length > limit) {
+    await response.body?.cancel().catch(() => {})
     throw new PinokioAppRunError('app_error', `${what} is ${length} bytes, over the ${limit}-byte limit.`)
   }
-  const bytes = new Uint8Array(await response.arrayBuffer())
-  if (bytes.byteLength > limit) {
-    throw new PinokioAppRunError('app_error', `${what} is ${bytes.byteLength} bytes, over the ${limit}-byte limit.`)
+  if (!response.body) return new Uint8Array()
+  const reader = response.body.getReader()
+  const chunks: Uint8Array[] = []
+  let size = 0
+  let complete = false
+  try {
+    while (true) {
+      const part = await reader.read()
+      if (part.done) { complete = true; break }
+      size += part.value.byteLength
+      if (size > limit) throw new PinokioAppRunError('app_error', `${what} is over the ${limit}-byte limit.`)
+      chunks.push(part.value)
+    }
+    const bytes = new Uint8Array(size)
+    let offset = 0
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength }
+    return bytes
+  } finally {
+    if (!complete) await reader.cancel().catch(() => {})
+    reader.releaseLock()
   }
-  return bytes
 }
 
 function toDataUrl(bytes: Uint8Array, mediaType: string): string {
@@ -373,14 +408,9 @@ async function runComfy(
  * ------------------------------------------------------------------ */
 
 function isPrivateOrLoopbackHost(hostname: string): boolean {
-  const host = hostname.toLowerCase().replace(/^\[|\]$/g, '')
-  if (host === 'localhost' || host === '::1' || host.endsWith('.local') || host.endsWith('.internal')) return true
-  const parts = host.split('.').map(Number)
-  if (parts.length === 4 && parts.every((part) => Number.isInteger(part) && part >= 0 && part <= 255)) {
-    return parts[0] === 10 || parts[0] === 127 || parts[0] === 0 || (parts[0] === 169 && parts[1] === 254) ||
-      (parts[0] === 192 && parts[1] === 168) || (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31)
-  }
-  return host.startsWith('fc') || host.startsWith('fd') || host.startsWith('fe80')
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.+$/, '')
+  if (!host || host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.internal')) return true
+  return net.isIP(host) !== 0 && isBlockedAddress(host)
 }
 
 /**
@@ -392,8 +422,10 @@ export async function readFileArgument(
   deps: PinokioRunnerDeps,
   value: unknown,
   label: string,
-  userId?: string
+  userId?: string,
+  signal?: AbortSignal
 ): Promise<{ bytes: Uint8Array; mediaType: string; name: string }> {
+  throwIfAborted(signal)
   if (typeof value !== 'string' || !value.trim()) {
     throw new PinokioAppRunError(
       'input_invalid',
@@ -404,10 +436,11 @@ export async function readFileArgument(
   // An agent knows an attached picture by its Clip id (the DCM Clips roster), never by its URL.
   if (PINOKIO_CLIP_ID_PATTERN.test(text)) {
     const clip = userId ? await deps.readClip(userId, text) : null
+    throwIfAborted(signal)
     if (!clip) {
       throw new PinokioAppRunError('input_invalid', `${label}: Clip "${text}" was not found, or it has no stored file.`)
     }
-    const file = await readFileArgument(deps, clip.dataUrl, label)
+    const file = await readFileArgument(deps, clip.dataUrl, label, userId, signal)
     return clip.filename ? { ...file, name: clip.filename } : file
   }
   const dataMatch = /^data:([^;,]+)?(;base64)?,(.*)$/s.exec(text)
@@ -426,7 +459,7 @@ export async function readFileArgument(
   } catch {
     throw new PinokioAppRunError('input_invalid', `${label} is not a URL or a data: URL.`)
   }
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+  if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.username || url.password) {
     throw new PinokioAppRunError('input_invalid', `${label} must be an http(s) or data: URL.`)
   }
   const batshitUpload = deps.batshitUploadOrigins().includes(url.origin) && url.pathname.startsWith('/uploads/')
@@ -438,8 +471,9 @@ export async function readFileArgument(
   }
   let response: Response
   try {
-    response = await deps.fetch(url.toString(), { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS), redirect: 'error' })
+    response = await deps.fetch(url.toString(), { signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]) : AbortSignal.timeout(REQUEST_TIMEOUT_MS), redirect: 'error', credentials: 'omit', ...(!batshitUpload ? { dispatcher: publicFileDispatcher } : {}) } as RequestInit)
   } catch (error) {
+    throwIfAborted(signal)
     // undici puts the real reason (DNS, refused, a redirect) in `cause`.
     const cause = error instanceof Error && error.cause instanceof Error ? error.cause.message : null
     const reason = cause ?? (error instanceof Error ? error.message : 'unknown error')
@@ -449,12 +483,14 @@ export async function readFileArgument(
     )
   }
   if (!response.ok) {
+    await response.body?.cancel().catch(() => {})
     throw new PinokioAppRunError(
       'input_invalid',
       `${label}: ${url.host} answered ${response.status} when Batshit downloaded the link, so the link is wrong or that site refuses downloads. Check it, or pass a Batshit Clip URL or a data: URL.`
     )
   }
   const bytes = await readBytes(response, MAX_INPUT_FILE_BYTES, label)
+  throwIfAborted(signal)
   const mediaType = (response.headers.get('content-type') || 'application/octet-stream').split(';')[0].trim()
   const name = decodeURIComponent(url.pathname.split('/').pop() || 'input') || 'input'
   return { bytes, mediaType, name }
@@ -481,9 +517,10 @@ async function gradioParameterDefaults(
   apiName: string,
   signal?: AbortSignal
 ): Promise<Map<number, unknown> | null> {
-  const response = await deps
-    .fetch(`${base}${prefix}/info`, { signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]) : AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
-    .catch(() => null)
+  const response = await appFetch(deps, 'Gradio', `${base}${prefix}/info`, { signal }).catch((error) => {
+    if (deps.appFetch || signal?.aborted) throw error
+    return null
+  })
   if (!response?.ok) return null
   const info = (await response.json().catch(() => null)) as Record<string, any> | null
   const parameters = info?.named_endpoints?.[apiName]?.parameters
@@ -527,18 +564,19 @@ export function parseGradioEventStream(text: string): { event: 'complete' | 'err
   return result
 }
 
-function gradioFileUrl(value: Record<string, any>, base: string, prefix: string): string | null {
+/** Normalize only this app's recognized Gradio file route, never arbitrary returned URLs. */
+export function gradioFileUrl(value: Record<string, any>, base: string, prefix: string, aliases: string[] = []): string | null {
+  const fileRoot = `${prefix}/file=`
   if (typeof value.url === 'string' && value.url) {
     try {
       const url = new URL(value.url, base)
-      // The app's own file route only: rewrite its host to the address Batshit resolved.
-      const resolved = new URL(url.pathname + url.search, base)
-      return resolved.toString()
-    } catch {
-      return null
-    }
+      if (url.username || url.password || url.hash || (url.origin !== base && !aliases.includes(url.origin))) return null
+      if (!url.pathname.startsWith(fileRoot) || url.pathname.length <= fileRoot.length) return null
+      return new URL(url.pathname + url.search, base).toString()
+    } catch { return null }
   }
-  if (typeof value.path === 'string' && value.path) return `${base}${prefix}/file=${value.path}`
+  // A native FileData path is an app-owned parameter, never a Batshit filesystem read.
+  if (typeof value.path === 'string' && value.path) return `${base}${fileRoot}${encodeURIComponent(value.path)}`
   return null
 }
 
@@ -576,7 +614,7 @@ async function runGradio(
       }
       continue
     }
-    const file = await readFileArgument(deps, value, `"${argument.field}"`, input.userId)
+    const file = await readFileArgument(deps, value, `"${argument.field}"`, input.userId, input.signal)
     const form = new FormData()
     form.append('files', new Blob([Buffer.from(file.bytes)], { type: file.mediaType }), file.name)
     const uploaded = await appFetch(deps, title, `${base}${prefix}/upload`, { method: 'POST', body: form, signal: input.signal })
@@ -607,11 +645,7 @@ async function runGradio(
     throw new PinokioAppRunError('app_error', `${title} refused the call to ${apiName} (${called.status}): ${bodyExcerpt(calledText)}`)
   }
 
-  const streamed = await deps.fetch(`${base}${prefix}/call${apiName}/${encodeURIComponent(eventId)}`, {
-    signal: input.signal ? AbortSignal.any([input.signal, AbortSignal.timeout(RUN_CEILING_MS)]) : AbortSignal.timeout(RUN_CEILING_MS)
-  }).catch((error) => {
-    throw new PinokioAppRunError('app_unreachable', `${title} stopped answering during the run: ${error instanceof Error ? error.message : 'unknown error'}.`)
-  })
+  const streamed = await appFetch(deps, title, `${base}${prefix}/call${apiName}/${encodeURIComponent(eventId)}`, { signal: input.signal }, RUN_CEILING_MS)
   const outcome = parseGradioEventStream(await streamed.text())
   if (outcome.event !== 'complete') {
     const detail = outcome.event === 'error' && outcome.data ? `: ${typeof outcome.data === 'string' ? outcome.data : JSON.stringify(outcome.data)}` : ''
@@ -635,7 +669,7 @@ async function runGradio(
       continue
     }
     if (isRecord(output) && (typeof output.url === 'string' || typeof output.path === 'string')) {
-      const fileUrl = gradioFileUrl(output, base, prefix)
+      const fileUrl = gradioFileUrl(output, base, prefix, endpoint.nativeReadyOrigins)
       const mediaType = typeof output.mime_type === 'string' ? output.mime_type : ''
       if (fileUrl && fileIndex < MAX_OUTPUT_FILES) {
         const response = await appFetch(deps, title, fileUrl, { signal: input.signal })
@@ -725,24 +759,33 @@ export async function runPinokioAppArtifact(
     throw new PinokioAppRunError('recipe_invalid', `This Pinokio app artifact cannot run yet: ${problems.join(' ')}`)
   }
 
-  const endpoint = await deps.resolveEndpoint(input.binding.appId)
+  throwIfAborted(input.signal)
+  const endpoint = await deps.resolveEndpoint(input.binding.appId, { userId: input.userId, machineId: input.binding.machineId, signal: input.signal, admitFetch: input.admitFetch })
+  throwIfAborted(input.signal)
   if (!endpoint.ok) {
     throw new PinokioAppRunError(endpoint.code, pinokioEndpointAgentMessage(endpoint), {
       appId: endpoint.appId,
       title: endpoint.title,
       state: endpoint.state ?? null,
+      ...(endpoint.machineId ? { machineId: endpoint.machineId, machineRevision: endpoint.machineRevision } : {}),
       ...(endpoint.reason ? { reason: endpoint.reason } : {})
     })
   }
 
+  if (input.binding.machineId && !endpoint.fetch) throw new PinokioAppRunError('app_refused', 'The remote app has no bound request policy.')
+  const appDeps = endpoint.fetch ? { ...deps, appFetch: endpoint.fetch } : deps
+  const boundEmit: PinokioRunEmitter = endpoint.machineId ? {
+    chunk: text => emit.chunk(text),
+    file: (file, index) => emit.file({ ...file, metadata: { ...file.metadata, machineId: endpoint.machineId, machineRevision: endpoint.machineRevision } }, index)
+  } : emit
   try {
     const kind = input.binding.kind
     const result =
       kind === 'comfyui'
-        ? await runComfy(deps, input, endpoint, emit)
+        ? await runComfy(appDeps, input, endpoint, boundEmit)
         : kind === 'gradio'
-          ? await runGradio(deps, input, endpoint, emit)
-          : await runCustom(deps, input, endpoint, emit)
+          ? await runGradio(appDeps, input, endpoint, boundEmit)
+          : await runCustom(appDeps, input, endpoint, boundEmit)
     return {
       ...result,
       metadata: {
@@ -750,6 +793,7 @@ export async function runPinokioAppArtifact(
         runtimeManager: 'pinokio',
         appId: input.binding.appId,
         appTitle: endpoint.title,
+        ...(endpoint.machineId ? { machineId: endpoint.machineId, machineRevision: endpoint.machineRevision } : {}),
         kind,
         kindLabel: `${PINOKIO_ARTIFACT_KIND_LABELS[kind]} via Pinokio`,
         ...result.metadata

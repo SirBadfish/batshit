@@ -1,16 +1,20 @@
+import { TYPED_FILE_TOOLS_REVISION_HEADER, makeTypedToolsSnapshot, namesTypedFileToolsWrite, requireTypedToolsExpected, typedToolsReadPaths } from '$lib/server/typedFileToolsSettingsGuard'
 import { json } from '@sveltejs/kit'
+import { publishUserEvent } from '$lib/server/ssePublisher'
+import { MODEL_SELECTION_REVISION_HEADER } from '$lib/appActions/settings/modelSelectionBaseline'
+import { INSTRUCTIONS_REVISION_HEADER } from '$lib/appActions/settings/instructionsBaseline'
+import { instructionsReadPaths, makeInstructionsSnapshot, requireInstructionsExpected, instructionLeaves } from '$lib/server/instructionsGuard'
+import { namesModelSelection, readModelSelectionSnapshot, requireModelSelectionRevision } from '$lib/server/modelSelectionGuard'
 import type { RequestHandler } from './$types'
-import {
-  getClaudeConfigOverrideValidationError,
-} from '$lib/server/services/claudeSettings'
-import {
-  getCodexConfigOverrideValidationError,
-} from '$lib/server/services/codexSettings'
+import { withSettingsRecordReplacement, acquireSettingsReplacementMutation, SettingsLifecycleRefusal } from '$lib/server/services/appActions/settings/lifecycle'
+import { AgentArtifactCleanupError, removeRequiredArtifactAgentReferences } from '$lib/server/services/artifactAgentDeletionCleanup'
+import { CODEX_CLI_RETIRED_CODE, CODEX_CLI_RETIRED_ERROR, CODEX_CLI_SUBAGENT_RETIRED_DETAILS,
+  CLAUDE_CLI_PRESET_REFUSAL, namesClaudeCliModel, namesRetiredCodexCliModel } from '$lib/utils/cliRuntimeIdentity'
+// The delete-only owners of a leftover CLI Subagent's managed profile folder (SA-139 R5 keeps them).
 import {
 	deleteManagedCliSubagentProfile,
 	holdManagedCliSubagentProfileFolder,
-	planManagedCliSubagentProfileDeletion,
-	syncManagedCliSubagentProfile
+	planManagedCliSubagentProfileDeletion
 } from '$lib/server/services/cliSubagentProfileSync'
 import {
 	HostCommandDeleteRefusedError,
@@ -18,7 +22,6 @@ import {
 	hostProfileResource,
 	withHostCommandDeletion
 } from '$lib/server/services/hostCommandOwnership'
-import { runTrackedN8nCompatibilitySync } from '$lib/server/services/n8nParameterCompatibility'
 import {
 	AgentAvatarDeletionError,
 	checkBatshitServerCanDeleteAvatars,
@@ -30,25 +33,28 @@ import {
 	stopSubagentRunsForDelete
 } from '$lib/server/services/subagentRunRegistry'
 import {
-	buildSubagentN8nThreadIdKey,
 	buildSubagentRunLockKey,
 	buildSubagentThreadKey
 } from '$lib/server/services/subagentThreads'
 import { buildCliSubagentRuntimeId, resolveSubagentSlug } from '$lib/utils/subagentSlug'
-import { syncAgentCodexProfiles } from '$lib/server/services/codexProfileManager'
-import { agentClaudeProfileResource, syncAgentClaudeProfiles } from '$lib/server/services/claudeProfileManager'
+import { agentClaudeProfileResource } from '$lib/server/services/claudeProfileManager'
 import { buildSubagentWrites } from '$lib/server/subagentRecordUpdate'
 import { redis } from '$lib/server/redis'
+import { beginSlashCommandWrite, currentSlashCommandWriteRevision, captureSlashCommandWriteBasis, captureSkillSourceWriteBasis, removeExplicitSkillSourceAgentAccess, isSlashCommandMutationError, type SlashCommandWritePreparation } from '$lib/server/services/slashCommandRevision'
+import { removeExplicitSlashCommandAgentAccess } from '$lib/server/services/agentAccessLists'
+import { deleteSubagentPopulation, SubjectPopulationError } from '$lib/server/services/subjectPopulation'
 import type { SubagentRow } from '$lib/types/database'
 import { resolveUploadUrlsForBrowserInPayload } from '$lib/server/services/batshitServerUrls'
 import {
   canonicalizeSubagentRecord,
-  isCliSubagentType,
-  isN8nSubnodeSubagentType,
-  isWorkflowBackedSubagentType,
+  isRetiredN8nSubagentType,
+  isRetiredSubagentType,
   normalizeSubagentType,
+  retiredSubagentRefusal,
+  retiredSubagentTypeMessage,
 } from '$lib/utils/subagentType'
 import { getSubagentTimeoutValidationError } from '$lib/utils/subagentTimeout'
+import { getSubagentMaxToolStepsValidationError } from '$lib/utils/subagentToolSteps'
 
 // GET /api/subagents/[id] - Get a specific subagent
 export const GET: RequestHandler = async ({ params, locals }) => {
@@ -58,7 +64,12 @@ export const GET: RequestHandler = async ({ params, locals }) => {
 
 	try {
 		const service = redis
-		const subagentData = await service.json.get(`subagent:${params.id}`)
+		const instructionPaths = instructionsReadPaths('subagent')
+		const selection = await service.execute(client => readModelSelectionSnapshot(client, params.id!, 'subagent', undefined, [...instructionPaths, ...typedToolsReadPaths('subagent')]))
+		const instructions = makeInstructionsSnapshot(params.id!, 'subagent', instructionPaths.map((path, index) => [path, selection.extraRaw[index]]), selection.lifecycle)
+		let typedToolsRevision: string | undefined
+    try { typedToolsRevision = makeTypedToolsSnapshot(params.id!, 'subagent', selection.extraRaw.slice(instructionPaths.length), selection.lifecycle).revision } catch { /* Only this grant waits for a valid explicit source. */ }
+		const subagentData = selection.record
 		
 		if (!subagentData) {
 			return json({ error: 'Subagent not found' }, { status: 404 })
@@ -72,11 +83,19 @@ export const GET: RequestHandler = async ({ params, locals }) => {
 		if (subagent.user_id !== locals.user.id) {
 			return json({ error: 'Unauthorized' }, { status: 403 })
 		}
+		// SA-139 R2 (D14): a record of a removed n8n Subagent type is never read for editing (the
+		// list hides it too); only DELETE still acts on it. A leftover CLI Subagent (R5) is read so
+		// its panel can show it with its Delete; every save, run and assignment refuses it.
+		if (isRetiredN8nSubagentType(normalizeSubagentType(subagent, subagent.subagentType))) {
+			return json({ error: retiredSubagentTypeMessage(subagent), code: 'subagent_type_retired' }, { status: 410 })
+		}
 
-		return json({ subagent: resolveUploadUrlsForBrowserInPayload(subagent) })
+		return json({ subagent: resolveUploadUrlsForBrowserInPayload(subagent) }, { headers: { ...(typedToolsRevision ? { [TYPED_FILE_TOOLS_REVISION_HEADER]: typedToolsRevision } : {}), [MODEL_SELECTION_REVISION_HEADER]: selection.revision,
+      [INSTRUCTIONS_REVISION_HEADER]: JSON.stringify(instructions.revisions) } })
 	} catch (error) {
 		console.error('Failed to get subagent:', error)
-		return json({ error: 'Failed to get subagent' }, { status: 500 })
+		return json({ error: error instanceof Error ? error.message : 'Failed to get subagent',
+			...((error as any)?.code ? { code: (error as any).code } : {}) }, { status: (error as any)?.status ?? 500 })
 	}
 }
 
@@ -86,6 +105,7 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
 		return json({ error: 'Unauthorized' }, { status: 401 })
 	}
 
+  let typedToolsAck: { revision: string; value: boolean } | undefined
 	try {
 		const service = redis
 		const existingData = await service.json.get(`subagent:${params.id}`)
@@ -104,68 +124,94 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
 		}
 
 		const updates = await request.json()
-		if (isN8nSubnodeSubagentType(existing.subagentType)) {
+		const expectedModelSelection = updates.expectedModelSelection
+		delete updates.expectedModelSelection
+		if (expectedModelSelection !== undefined) requireModelSelectionRevision(expectedModelSelection)
+    const expectedTypedFileTools = updates.expectedTypedFileTools
+    delete updates.expectedTypedFileTools
+    if (expectedTypedFileTools !== undefined || namesTypedFileToolsWrite(updates)) requireTypedToolsExpected(expectedTypedFileTools)
+		const expectedInstructions = updates.expectedInstructions
+		delete updates.expectedInstructions
+		if (expectedInstructions !== undefined || instructionLeaves(updates).length) requireInstructionsExpected(expectedInstructions, instructionLeaves(updates))
+		// SA-139 R2/R5 (D14): a record of a removed Subagent type (n8n, or the CLI Subagent) is never
+		// edited or turned into a live type, and a request for one is refused, before anything of
+		// the save is read or written. Only DELETE still acts on a leftover.
+		if (isRetiredN8nSubagentType(normalizeSubagentType(existing, existing.subagentType))) {
 			return json(
 				{
-					error: 'This Subagent uses the retired n8n Subnode type and can only be deleted.',
+					error: `${retiredSubagentTypeMessage(existing)} It cannot be changed.`,
 					code: 'subagent_type_retired'
 				},
 				{ status: 409 }
 			)
 		}
+		const storedRetired = retiredSubagentRefusal(existing)
+		if (storedRetired) return json(storedRetired, { status: 409 })
 		if (Object.prototype.hasOwnProperty.call(updates, 'subagentType')) {
 			const requestedSubagentType =
 				typeof updates.subagentType === 'string'
 					? updates.subagentType.trim().toLowerCase()
 					: ''
-			if (!['n8n-workflow', 'api', 'cli'].includes(requestedSubagentType)) {
+			if (isRetiredN8nSubagentType(normalizeSubagentType(undefined, requestedSubagentType))) {
 				return json(
-					{ error: 'Subagent type must be n8n Workflow, API, or CLI.', code: 'subagent_type_invalid' },
+					{
+						error: 'n8n Workflow Subagents were removed from Batshit. n8n workflows still work as tools.',
+						code: 'subagent_type_retired'
+					},
+					{ status: 400 }
+				)
+			}
+			const requestedRetired = retiredSubagentRefusal(existing, requestedSubagentType)
+			if (requestedRetired) return json(requestedRetired, { status: 409 })
+			if (requestedSubagentType !== 'api') {
+				return json(
+					{ error: 'The Subagent type must be API.', code: 'subagent_type_invalid' },
 					{ status: 400 }
 				)
 			}
 		}
-		const nextType = normalizeSubagentType(existing, updates.subagentType)
-		if (isN8nSubnodeSubagentType(nextType)) {
+		// The removed CLI lanes' presets and settings blocks are never stored on a Subagent.
+		if (['primary_model_provider', 'primary_model_name', 'primary_model_connection'].some(field => Object.hasOwn(updates, field))) {
+			if (namesRetiredCodexCliModel(updates)) {
+				return json(
+					{ error: CODEX_CLI_RETIRED_ERROR, code: CODEX_CLI_RETIRED_CODE, details: CODEX_CLI_SUBAGENT_RETIRED_DETAILS },
+					{ status: 409 }
+				)
+			}
+			if (namesClaudeCliModel(updates)) return json({ error: CLAUDE_CLI_PRESET_REFUSAL }, { status: 400 })
+		}
+		delete updates.claude_settings
+		delete updates.codex_settings
+		// SA-139 R5: the Claude Code CLI Subagent's request-only save check is never stored, and a
+		// save that still carries one is refused (the R4 Primary shape).
+		if (Object.hasOwn(updates, 'expectedCliPromotion')) {
+			delete updates.expectedCliPromotion
 			return json(
 				{
-					error: 'n8n Subnode Subagents were removed from Batshit.',
-					code: 'subagent_type_retired'
+					error: 'This save carries a Claude Code CLI check (expectedCliPromotion), and the Claude Code CLI Subagent was removed from Batshit, so nothing was saved. Reload Settings and try again.'
 				},
 				{ status: 400 }
 			)
 		}
-		const webhookUrl =
-			typeof updates.webhook_url === 'string'
-				? updates.webhook_url.trim()
-				: typeof updates.webhookUrl === 'string'
-					? updates.webhookUrl.trim()
-					: existing.webhook_url?.trim() || existing.webhookUrl?.trim() || ''
-
-		if (isWorkflowBackedSubagentType(nextType) && !webhookUrl) {
-			return json(
-				{ error: 'Production webhook URL is required for n8n Workflow Subagents.' },
-				{ status: 400 }
-			)
+		const storedType = normalizeSubagentType(existing, existing.subagentType)
+		const nextType = normalizeSubagentType(existing, updates.subagentType)
+		if (isRetiredSubagentType(storedType) || isRetiredSubagentType(nextType)) {
+			throw new Error('A removed Subagent type reached the Subagent save.')
 		}
-
-		const codexValidationError = getCodexConfigOverrideValidationError(updates.codex_settings ?? null)
-		if (codexValidationError) {
-			return json({ error: codexValidationError }, { status: 400 })
-		}
-
-		const claudeValidationError = getClaudeConfigOverrideValidationError(updates.claude_settings ?? null)
-		if (claudeValidationError) {
-			return json({ error: claudeValidationError }, { status: 400 })
-		}
+		if (namesModelSelection('subagent', updates)) requireModelSelectionRevision(expectedModelSelection)
 
 		const timeoutValidationError = getSubagentTimeoutValidationError(updates.timeout_seconds)
 		if (timeoutValidationError) {
 			return json({ error: timeoutValidationError }, { status: 400 })
 		}
+
+		const maxToolStepsValidationError = getSubagentMaxToolStepsValidationError(updates.max_tool_steps)
+		if (maxToolStepsValidationError) {
+			return json({ error: maxToolStepsValidationError }, { status: 400 })
+		}
 		
 		// BL-914: the save writes only what the request names, each field (and each key of the
-		// Codex, Claude, provider and Tool Grid blocks) at its own path, in one step inside Redis
+		// provider and Tool Grid blocks) at its own path, in one step inside Redis
 		// (`redis.updateSubagent`). It used to lay the body over the record it had read and write
 		// that whole copy, so a partial block erased the keys it did not name, and two saves of
 		// different fields that overlapped in time took back each other's field. The type fields
@@ -174,48 +220,42 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
 		// then adds no custom prompt block). BL-762: `slug`, like `id`, `user_id` and `created_at`,
 		// is never written: changing it renames the Subagent's managed CLI profile folder
 		// (`resolveSubagentSlug` reads it ahead of `id`/`displayName`).
-		const writes = buildSubagentWrites({ body: updates, nextType, webhookUrl })
+		const writes = buildSubagentWrites({ body: updates, nextType })
 
 		// BL-753: only over the record that is there, since a write landing after the Subagent's
 		// delete would make it again, outside the user's Subagent list.
 		const deletedMeanwhile = { error: 'Subagent not found: it was deleted while this edit was saved.' }
-		if (!(await service.updateSubagent(params.id!, writes))) {
+		const modelOptions = expectedModelSelection !== undefined ? { expectedModelSelection: expectedModelSelection as string } : {}
+		const written = await service.updateSubagent(params.id!, writes, {
+      onTypedFileToolsSaved(ack) { typedToolsAck = ack },
+      ...(expectedTypedFileTools !== undefined ? { expectedTypedFileTools } : {}),
+			...modelOptions,
+      ...(expectedInstructions !== undefined ? { expectedInstructions } : {}) })
+		if (!written) {
 			return json(deletedMeanwhile, { status: 404 })
 		}
-		// The record as it is now, after this save AND any other that landed: the answer, the
-		// profile sync and the n8n check all go on from it, never from the body over an older read.
+    if (Object.hasOwn(writes, 'provider_specific_settings')) void publishUserEvent(locals.user.id, { type: 'subagent_settings_changed', agentId: params.id!, family: 'provider-settings' })
+		if (instructionLeaves(writes).length) await publishUserEvent(locals.user.id, { type: 'subagent_settings_changed', agentId: params.id!, family: 'instructions' })
+		// The record as it is now, after this save AND any other that landed: the answer goes on
+		// from it, never from the body over an older read.
 		const savedData = await service.json.get(`subagent:${params.id}`)
-		if (!savedData) return json(deletedMeanwhile, { status: 404 })
+		if (!savedData) {
+      if (typedToolsAck) return json({ success: true, typedFileToolsSaved: true, typedFileTools: typedToolsAck, readback: 'unavailable' })
+      return json(deletedMeanwhile, { status: 404 })
+    }
 		const storageUpdated = canonicalizeSubagentRecord(savedData as Record<string, any>) as SubagentRow
-
-		if (isCliSubagentType(storageUpdated.subagentType)) {
-			// Writes nothing when the delete removed the record before the sync's turn (BL-753).
-			const synced = await syncManagedCliSubagentProfile(locals.user.id, storageUpdated)
-			if (synced && !synced.written) return json(deletedMeanwhile, { status: 404 })
-		}
-
-		let compatibilityWarning: string | null = null
-		if (isWorkflowBackedSubagentType(storageUpdated.subagentType)) {
-			try {
-				await runTrackedN8nCompatibilitySync({
-					userId: locals.user.id,
-					trigger: 'workflow-subagent-save'
-				})
-			} catch (error) {
-				compatibilityWarning =
-					error instanceof Error ? error.message : 'Failed to sync n8n parameter support'
-				console.warn('[subagents] updated workflow subagent but parameter sync failed', error)
-			}
-		}
 
 		return json({
 			subagent: resolveUploadUrlsForBrowserInPayload(storageUpdated),
-			compatibilityWarning
+      ...(typedToolsAck ? { typedFileTools: typedToolsAck } : {})
 		})
 	} catch (error) {
+    if ((error as any)?.code === 'typed_file_tools_save_unconfirmed') void publishUserEvent(locals.user.id, { type: 'subagent_settings_changed', agentId: params.id!, family: 'provider-settings' })
 		console.error('Failed to update subagent:', error)
 		return json(
-			{ error: error instanceof Error ? error.message : 'Failed to update subagent' },
+			{ error: error instanceof Error ? error.message : 'Failed to update subagent',
+        ...(typedToolsAck ? { typedFileToolsSaved: true, typedFileTools: typedToolsAck } : {}),
+				...((error as any)?.code ? { code: (error as any).code } : {}) },
 			{ status: (error as any)?.status ?? 500 }
 		)
 	}
@@ -253,6 +293,8 @@ export const DELETE: RequestHandler = async ({ params, locals }) => {
 	const subagentId = params.id
 
 	try {
+		const preparation = beginSlashCommandWrite(userId)
+		await captureSlashCommandWriteBasis(preparation, [])
 		const service = redis
 		const existingData = await service.json.get(`subagent:${subagentId}`)
 
@@ -312,7 +354,11 @@ export const DELETE: RequestHandler = async ({ params, locals }) => {
 					agentClaudeProfileResource(buildCliSubagentRuntimeId(resolveSubagentSlug(existing)))
 				] : [])
 			]
-			const deleteStopped = (notices: string[]) => deleteStoppedSubagent(userId, subagentId, existing, notices)
+			const deleteStopped = (notices: string[]) => withSettingsRecordReplacement(`subagent:${subagentId}`, async () => {
+				const { sweepAppActionsSubjectReferences } = await import('$lib/server/services/appActions/settings/authority')
+				await sweepAppActionsSubjectReferences(userId, { kind: 'subagent', id: subagentId! })
+				return deleteStoppedSubagent(userId, subagentId, existing, notices, preparation)
+			})
 			// The profile, pictures, reference sweeps, and record are all inside this reservation.
 			return await (process.platform === 'win32'
 				? deleteStopped([])
@@ -322,6 +368,11 @@ export const DELETE: RequestHandler = async ({ params, locals }) => {
 		}
 	} catch (error) {
 		console.error('Failed to delete subagent:', error)
+		if (error instanceof AgentArtifactCleanupError) return json({ error: error.message, code: error.code,
+			outcome: error.outcome, subjectRetained: error.subjectRetained, cleanup: error.progress }, { status: error.status })
+		if (isSlashCommandMutationError(error)) return json({ error: error.message, code: error.code }, { status: error.status })
+		if (error instanceof SettingsLifecycleRefusal) return json({ error: error.message, code: error.code }, { status: error.status })
+		if (error instanceof SubjectPopulationError) return json({ error: error.message, code: error.code }, { status: error.status })
 		if (error instanceof HostCommandDeleteRefusedError) {
 			const code = error.message.startsWith('Another deletion is still running')
 				? 'subagent_delete_in_progress'
@@ -333,24 +384,15 @@ export const DELETE: RequestHandler = async ({ params, locals }) => {
 }
 
 /** Everything of the Subagent, once none of its runs is running (BL-287). */
-async function deleteStoppedSubagent(userId: string, subagentId: string, existing: SubagentRow, notices: string[]) {
+async function deleteStoppedSubagent(userId: string, subagentId: string, existing: SubagentRow, notices: string[], preparation: SlashCommandWritePreparation) {
 	// BL-753: the profile folder goes before the record (below), so the folder's turn is held
 	// until the record is gone. An edit's profile sync queued meanwhile then finds no record and
 	// writes nothing; one that ran before is removed by the folder removal behind it.
 	const removed = await holdManagedCliSubagentProfileFolder(existing, () =>
-		removeStoppedSubagent(userId, subagentId, existing)
+		removeStoppedSubagent(userId, subagentId, existing, preparation)
 	)
 	if (removed instanceof Response) return removed
 	const profileFolder = removed
-
-	// Keep the primaries' managed Codex/Claude profiles in step with their assignments, as
-	// the assignment route does.
-	try {
-		await syncAgentCodexProfiles(userId)
-		await syncAgentClaudeProfiles(userId)
-	} catch (syncError) {
-		console.warn('[subagents] Subagent deleted but the primary profile sync failed:', syncError)
-	}
 
 	return json({
 		success: true,
@@ -373,10 +415,11 @@ async function deleteStoppedSubagent(userId: string, subagentId: string, existin
 async function removeStoppedSubagent(
 	userId: string,
 	subagentId: string,
-	existing: SubagentRow
+	existing: SubagentRow,
+	preparation: SlashCommandWritePreparation
 ): Promise<Response | Awaited<ReturnType<typeof deleteManagedCliSubagentProfile>>> {
 	const service = redis
-	// BL-157: the managed CLI profile folder (config, and Codex's `logs_2.sqlite` with the
+	// BL-157: the managed CLI profile folder (config, and the CLI's logs with the
 	// Subagent's prompts). First, because it is the likelier to fail on the Mac and the
 	// cheaper to lose: a Subagent that stays after a later failure gets it back at its next run.
 	let profileFolder: Awaited<ReturnType<typeof deleteManagedCliSubagentProfile>>
@@ -430,8 +473,20 @@ async function removeStoppedSubagent(
 		try {
 			await service.execute(step)
 		} catch (error) {
+			if (isSlashCommandMutationError(error)) throw error
 			console.error(`[subagents] Could not remove ${subagentId} from ${label}:`, error)
 			failedSteps.push(`${label} (${error instanceof Error ? error.message : String(error)})`)
+		}
+	}
+
+	// This actual subject replacement retains its own custody only for an issued unknown.
+	const runAliasCleanup = async (write: () => Promise<unknown>) => {
+		const lease = acquireSettingsReplacementMutation(`subagent:${subagentId}`)
+		try { await write(); lease.settle() }
+		catch (error) {
+			if (isSlashCommandMutationError(error) && error.outcome === 'unknown') lease.unknown()
+			else lease.settle()
+			throw error
 		}
 	}
 
@@ -466,27 +521,33 @@ async function removeStoppedSubagent(
 			`[subagents] Primary Agent ${subagentId} has the same id as the Subagent being deleted, so its skill and artifact access lists were left as they are`
 		)
 	} else if (failedSteps.length === 0) {
+		await runStep('plugin access lists', async () => {
+			const { removeAgentPluginAgentReferences } = await import('$lib/server/services/agentPlugins')
+			await removeAgentPluginAgentReferences(userId, subagentId, 'subagent')
+		})
 		await runStep('skill access lists', async (client) => {
 			for (const key of (await client.keys(`slash_command:${userId}:*`)) as string[]) {
-				await removeIdFromList(client, key, 'enabled_agent_ids', subagentId)
+				const id = key.slice(`slash_command:${userId}:`.length)
+				const basis = await captureSlashCommandWriteBasis(preparation, [id])
+				await runAliasCleanup(() => removeExplicitSlashCommandAgentAccess(userId, id, subagentId, basis))
 			}
 		})
 		// BL-392: a skill SOURCE's list too. Each rescan copies it onto every skill the source
 		// provides, so the id left there gave those skills back to a same-name agent.
 		await runStep('skill source access lists', async (client) => {
 			for (const key of (await client.keys(`skill_source:${userId}:*`)) as string[]) {
-				await removeIdFromList(client, key, 'enabled_agent_ids', subagentId)
+				const id = key.slice(`skill_source:${userId}:`.length)
+				const basis = await captureSkillSourceWriteBasis(preparation, id)
+				await runAliasCleanup(() => removeExplicitSkillSourceAgentAccess(userId, id, subagentId, basis))
 			}
 		})
-		await runStep('artifact access lists', async (client) => {
-			for (const artifactId of (await client.sMembers(`user:${userId}:artifacts`)) as string[]) {
-				await removeIdFromList(client, `artifact:${artifactId}`, 'agent_allowlist', subagentId)
-			}
+		await removeRequiredArtifactAgentReferences({ userId, id: subagentId, kind: 'subagent' }, () => {
+			currentSlashCommandWriteRevision(preparation)
 		})
 	}
 
-	// BL-391: its threads in the user's chats, all named for its SLUG: the stored exchanges of an
-	// API or CLI Subagent, an n8n Workflow Subagent's thread id, and a run lock. Ids (and so slugs)
+	// BL-391: its threads in the user's chats, all named for its SLUG: the stored exchanges and a
+	// run lock. Ids (and so slugs)
 	// come from display names, so a new Subagent with the deleted one's name found them and a
 	// `resume` handed it the deleted one's exchanges. Another of the user's Subagents with the same
 	// slug shares them, so then they stay. Its runs were stopped above and have ended, and no new
@@ -513,7 +574,6 @@ async function removeStoppedSubagent(
 			for (const sessionId of (await client.sMembers(`user:${userId}:sessions`)) as string[]) {
 				await client.del([
 					buildSubagentThreadKey(sessionId, threadSlug),
-					buildSubagentN8nThreadIdKey(sessionId, threadSlug),
 					buildSubagentRunLockKey(sessionId, threadSlug)
 				])
 			}
@@ -530,11 +590,9 @@ async function removeStoppedSubagent(
 		)
 	}
 
-	// Remove from user's subagent set
-	await service.sRem(`user:${userId}:subagents`, subagentId)
-
-	// Delete the subagent data
-	await service.del(`subagent:${subagentId}`)
+	// One admitted physical population boundary, after the existing reference/profile cleanup.
+	await service.execute(client => deleteSubagentPopulation(client, { userId, subjectId: subagentId,
+		expectedCatalogueRevision: currentSlashCommandWriteRevision(preparation) }))
 
 	return profileFolder
 }

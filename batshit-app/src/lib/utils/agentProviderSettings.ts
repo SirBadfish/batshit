@@ -14,7 +14,7 @@ import { isAgentRuntimeSettingKey } from '$lib/utils/modelSettingsMapper'
  * and the agents store and Agent Settings lay a save over their own copies the same way.
  *
  * BL-833: a block that names only own keys leaves the model keys alone, so a control that changes
- * one own key (the chat bar's Codex and Claude mode, Work mode and reasoning controls) sends that
+ * one own key (the chat bar's Claude mode, Work mode and reasoning controls) sends that
  * key only. BL-841: `nativeTools` is written field by field (`updateAgent` writes each named field
  * at `$.provider_specific_settings["nativeTools"]["<field>"]`), so a save of one of its fields
  * never carries an older copy of the others.

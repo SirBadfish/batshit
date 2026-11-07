@@ -8,7 +8,7 @@ import {
   buildOmittedImageNote,
   buildToolResultImageContentOutput,
   buildEphemeralImageUserMessage,
-  createEphemeralImageRegistry,
+  createEphemeralImageRegistry, takeCompletedToolImages, restoreCompletedToolImages,
   buildToolResultImageDeliveryPayload,
   isSupportedToolResultImageMimeType,
   resolveToolResultImageDelivery,
@@ -24,6 +24,14 @@ import {
  * canonical "red, green, blue, yellow" guess instead.
  */
 describe('resolveToolResultImageDelivery', () => {
+  it('puts the Claude plan connection on the tool-result lane: the image rides inside the MCP result (SA-139 D5)', () => {
+    // `vercelBrain` passes the connection's service as the provider id.
+    for (const providerId of ['claude-plan', 'claude-plan:local']) {
+      expect(resolveToolResultImageDelivery({ providerId, modelId: 'claude-haiku-5-5' })).toEqual({ lane: 'tool_result', reason: 'claude_plan_mcp_image_content' })
+    }
+    expect(resolveToolResultImageDelivery({ providerId: 'claude-plan', modelId: 'claude-haiku-5-5', capabilities: { vision: false } as any }).lane).toBe('none')
+  })
+
   it('puts direct Anthropic on the native tool-result lane', () => {
     expect(resolveToolResultImageDelivery({ providerId: 'anthropic' })).toEqual({
       lane: 'tool_result',
@@ -137,7 +145,7 @@ describe('resolveToolResultImageDelivery', () => {
     )
   })
 
-  it('splits the two managed CLI runtimes: Codex delivers in-turn, Claude never does', () => {
+  it('never delivers in-turn to the managed Claude CLI runtime', () => {
     // Claude is blocked upstream, not by us — Claude Code stores MCP
     // ImageContent as text at 10-20x the token cost
     // (anthropic/claude-code#31208, closed not-planned 2026-03).
@@ -145,10 +153,11 @@ describe('resolveToolResultImageDelivery', () => {
       lane: 'none',
       reason: 'claude_cli_stores_mcp_images_as_text'
     })
-    // Codex renders MCP image blocks (openai/codex#4819, closed by PR #5600).
-    expect(resolveToolResultImageDelivery({ providerId: 'openai', runtime: 'codex' })).toEqual({
-      lane: 'tool_result',
-      reason: 'codex_cli_mcp_image_content'
+    // SA-139 R1: the removed Codex CLI runtime has no in-turn lane any more; a stale
+    // 'codex' value is no managed runtime and takes the text-safe unknown-provider default.
+    expect(resolveToolResultImageDelivery({ runtime: 'codex' as never })).toEqual({
+      lane: 'synthetic_user',
+      reason: 'provider_unknown_defaults_text_safe'
     })
   })
 
@@ -156,21 +165,19 @@ describe('resolveToolResultImageDelivery', () => {
     // A managed CLI run has no Batshit provider preset; the runtime alone
     // decides. Proving this both ways stops a future edit from accidentally
     // making a CLI lane inherit an API provider's answer.
-    expect(resolveToolResultImageDelivery({ providerId: 'alibaba', runtime: 'codex' }).lane).toBe(
-      'tool_result'
-    )
     expect(resolveToolResultImageDelivery({ providerId: 'anthropic', runtime: 'claude' }).lane).toBe(
       'none'
     )
-    expect(resolveToolResultImageDelivery({ runtime: 'codex' }).lane).toBe('tool_result')
+    expect(resolveToolResultImageDelivery({ providerId: 'openai', runtime: 'claude' }).lane).toBe('none')
+    expect(resolveToolResultImageDelivery({ runtime: 'claude' }).lane).toBe('none')
   })
 
   it('still refuses a CLI runtime when capabilities say the model is text-only', () => {
     // The capability gate runs before the runtime split, so an explicitly
-    // text-only model cannot be handed images by either CLI.
+    // text-only model cannot be handed images by a CLI.
     expect(
       resolveToolResultImageDelivery({
-        runtime: 'codex',
+        runtime: 'claude',
         capabilities: { vision: false } as any
       })
     ).toEqual({ lane: 'none', reason: 'model_capabilities_vision_false' })
@@ -549,5 +556,35 @@ describe('SA-102 local runtimes keep the synthetic-user image lane', () => {
       runtime: 'api'
     })
     expect(decision.lane).toBe('synthetic_user')
+  })
+})
+
+
+describe('original-owned undelivered tool media handoff', () => {
+  it('moves only actual completed unconsumed native/synthetic entries once and keeps source/purpose', () => {
+    const source = createEphemeralImageRegistry(), destination = createEphemeralImageRegistry()
+    const image = { mediaType: 'image/png', data: 'c3ludGhldGlj' }
+    source.register('native', 'native_bash_execute', [image], 'Agent Browser screenshot', 'tool_result')
+    source.register('synthetic', 'memory', [image], 'recalled memory media')
+    source.register('already', 'memory', [image]); source.take('already')
+    source.register('pending', 'memory', [image])
+    const moved = takeCompletedToolImages(source, ['native', 'synthetic', 'already'])
+    expect(moved.map(([id]) => id)).toEqual(['native', 'synthetic'])
+    expect(source.pending()).toBe(1)
+    expect(takeCompletedToolImages(source, ['native', 'synthetic'])).toEqual([])
+    expect(restoreCompletedToolImages(destination, moved, 'tool_result')).toEqual({ ids: ['native', 'synthetic'], deferred: [] })
+    expect(destination.take('native')).toMatchObject({ source: 'native_bash_execute', purpose: 'Agent Browser screenshot', deliveryLane: 'synthetic_user' })
+    expect(destination.take('native')).toBeUndefined()
+  })
+  it('defers at an unsupported destination without injecting bytes or rebuilding a Clip', () => {
+    const source = createEphemeralImageRegistry(), destination = createEphemeralImageRegistry()
+    source.register('one', 'memory', [{ mediaType: 'image/png', data: 'c3ludGhldGlj' }])
+    const answer = restoreCompletedToolImages(destination, takeCompletedToolImages(source, ['one']), 'none')
+    expect(answer.ids).toEqual([]); expect(answer.deferred).toEqual([expect.stringContaining('lane_none')])
+    expect(destination.pending()).toBe(0); expect(source.pending()).toBe(0)
+    expect(JSON.stringify(answer)).not.toContain('c3ludGhldGlj')
+  })
+  it('refuses structural registry substitutes rather than accepting caller-carried images', () => {
+    expect(() => Reflect.apply(takeCompletedToolImages, undefined, [{ take: () => ({ images: [] }) }, ['one']])).toThrow()
   })
 })

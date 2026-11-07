@@ -237,6 +237,11 @@ export class NailSurfaceEngineRuntime {
     return structuredClone(this.state)
   }
 
+  /** Actual meshes whose morphs/presentation this owner can write. */
+  getMotionMeshes(): readonly THREE.Mesh[] | null {
+    return this.disposed ? null : Object.freeze(NAIL_FAMILY_ORDER.map(family => this.families[family].mesh))
+  }
+
   private syncVisibility() {
     for (const family of NAIL_FAMILY_ORDER) {
       const runtime = this.families[family]

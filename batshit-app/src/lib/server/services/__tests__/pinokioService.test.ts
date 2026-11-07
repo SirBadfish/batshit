@@ -321,6 +321,7 @@ function install(world: FakeWorld, extra: Partial<PinokioDeps> = {}) {
     containerized: () => false,
     homedir: () => '/Users/tester',
     readFile: async (file) => world.files.get(file) ?? null,
+    readEnvironmentFile: async (file) => world.files.get(file) ?? null,
     isFile: async (file) => world.files.has(file),
     realpath: async (file) => file,
     tcpReachable: async () => world.reachable,
@@ -544,6 +545,39 @@ describe('the read controls', () => {
 })
 
 describe('starting an app (the P1 run rules)', () => {
+  it('BL-1574: a failed requirements read refuses preview and start before any spawn', async () => {
+    const world = makeWorld()
+    install(world, { readEnvironmentFile: async () => { throw Object.assign(new Error('private diagnostic'), { code: 'EACCES' }) } })
+    const { previewPinokioAppStart } = await import('../pinokioService')
+    for (const result of [await previewPinokioAppStart({ appId: 'comfy.git' }), await startPinokioApp({ appId: 'comfy.git' })]) {
+      expect(result).toMatchObject({ ok: false, kind: 'refused', message: expect.stringContaining('could not read') })
+      expect(JSON.stringify(result)).not.toContain('private diagnostic')
+    }
+    expect(world.spawned).toEqual([])
+  })
+
+  it('BL-1574: a failed nested requirements read cannot become an empty dependency list', async () => {
+    const world = makeWorld()
+    install(world, { readEnvironmentFile: async (file) => {
+      if (file === `${HOME}/api/comfy.git/ENVIRONMENT`) return 'PINOKIO_SCRIPT_REQUIRES=dep.git'
+      throw Object.assign(new Error('cannot read dependency'), { code: 'EIO' })
+    } })
+    expect(await startPinokioApp({ appId: 'comfy.git', alsoStarts: ['dep.git'] })).toMatchObject({ ok: false, kind: 'refused', message: expect.stringContaining('dep.git') })
+    expect(world.spawned).toEqual([])
+  })
+
+  it('BL-1574: the actual reader treats only missing files as empty and exposes a real read error', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'pinokio-requires-'))
+    try {
+      expect(await realPinokioDepsForTests.readEnvironmentFile(path.join(dir, 'missing'))).toBeNull()
+      writeFileSync(path.join(dir, 'ENVIRONMENT'), 'PINOKIO_SCRIPT_REQUIRES=dep.git\n')
+      expect(await realPinokioDepsForTests.readEnvironmentFile(path.join(dir, 'ENVIRONMENT'))).toContain('dep.git')
+      await expect(realPinokioDepsForTests.readEnvironmentFile(dir)).rejects.toThrow()
+      // The unrelated config-reader semantics were deliberately not changed.
+      expect(await realPinokioDepsForTests.readFile(dir)).toBeNull()
+    } finally { rmSync(dir, { recursive: true, force: true }) }
+  })
+
   it('rule 1: never runs pterm run on an app that is online and ready', async () => {
     const world = makeWorld({ statusSequence: [{ state: 'online', running: true, ready: true, ready_url: 'http://localhost:8188' }] })
     install(world)

@@ -1,10 +1,11 @@
+import { parseReasoningBudget } from '$lib/utils/modelReasoningBudget'
 import type { ParameterDefinition } from '$lib/data/parameter-schemas'
 import {
   getProviderIconEntry,
   needsDarkModeInvert
 } from '$lib/utils/brandingIcons'
 import type { CatalogConnectionOption, CatalogModel } from '$lib/types/modelCatalog'
-import type { ModelCapabilities, ModelCompatibility } from '$lib/types/savedModels'
+import type { ModelCapabilities } from '$lib/types/savedModels'
 import type { ThemeMode } from '$lib/types/theme'
 import { canonicalizeCatalogDeveloperId } from '$lib/utils/catalogDeveloperIdentity'
 import { LOCAL_AI_SERVER_DEFINITIONS } from '$lib/data/localAiServers'
@@ -85,19 +86,6 @@ const CONNECTION_ICON_OVERRIDES: Record<string, string> = {
   'direct:dmr': 'dmr'
 }
 
-export function formatCompatibilityLabel(compat: ModelCompatibility | null) {
-  if (!compat) return 'Unknown'
-  if (compat.label === 'both') return 'Works with n8n + batshit'
-  if (compat.label === 'n8n_only') return 'n8n only'
-  return 'Batshit only (direct mode)'
-}
-
-export function parameterSupportLabel(supportedInN8N: boolean) {
-  return supportedInN8N
-    ? 'Available in API and in n8n Chat Model nodes'
-    : 'Available in API only'
-}
-
 export function formatDeveloperLabel(developerId?: string | null) {
   if (!developerId) return 'Unknown'
   const normalized = canonicalizeCatalogDeveloperId(developerId)
@@ -171,12 +159,6 @@ export function matchesCatalogRole(model: CatalogModel, role: CatalogRoleFilter)
     return hasVision && normalizeCatalogRole(model.purpose ?? null) === 'chat'
   }
   return normalizeCatalogRole(model.purpose ?? null) === role
-}
-
-export function formatN8NStatus(status?: CatalogConnectionOption['n8nStatus']) {
-  if (status === 'ready') return 'Ready'
-  if (status === 'locked') return 'Missing'
-  return 'Unknown'
 }
 
 export function almostEqual(a?: number, b?: number) {
@@ -281,6 +263,9 @@ function getParameterMaximumFractionDigits(definition: ParameterDefinition) {
 
 export function formatParameterDisplayValue(definition: ParameterDefinition, value: string) {
   if (!value.trim().length) return ''
+  if (definition.reviewedBudget) {
+    try { return formatGroupedIntegerDisplay(parseReasoningBudget(value, definition.reviewedBudget)) } catch { return value }
+  }
 
   switch (definition.inputType) {
     case 'integer':

@@ -132,7 +132,9 @@ describe('send-routed steer contracts (SA-114 P1)', () => {
   })
 
   it('writes the marker after the whole tool step, before the next chunk (DL-114-04, F-P1-3)', () => {
-    const loopStart = source.indexOf('for await (const chunk of result.stream) {')
+    const loopStart = source.indexOf('for await (const chunk of withToolResultsOnStop(result.stream, streamAbortSignal, {\n')
+    expect(loopStart).toBeGreaterThan(-1)
+    expect(source.slice(loopStart, source.indexOf('})) {', loopStart))).toContain('onEarlyEnd: () => resolveOnFinish?.(),')
     const drainInLoop = source.indexOf('await drainSteersIntoTranscript()', loopStart)
     const switchStart = source.indexOf('switch (chunk.type) {', loopStart)
 
@@ -160,44 +162,6 @@ describe('send-routed steer contracts (SA-114 P1)', () => {
   })
 
   /**
-   * SA-114 P2, F-P1-3's rule turned around for a stream with no steps.
-   *
-   * The API lane's gate holds a delivered steer until the loop has consumed the
-   * `finish-step` of the step it was read after, because the SDK runs ahead of the loop. A
-   * CLI stream emits no `finish-step` chunks at all, so there is no count for such a gate
-   * to consume — and it needs none: the echo arrives IN the stream at the position the
-   * marker belongs at. Marking delivered in the ADAPTER with a step the gate could never
-   * reach would leave the marker waiting for the forced finish drain and land it at the
-   * very end of the reply.
-   */
-  it('marks a CLI delivery in its own case, then drains unbounded (P2, F-P1-3)', () => {
-    const loopStart = source.indexOf('for await (const chunk of result.stream) {')
-    const steerCase = source.indexOf("case 'steer': {", loopStart)
-    expect(steerCase).toBeGreaterThan(loopStart)
-
-    const caseBody = source.slice(steerCase, source.indexOf("case 'finish-step': {", steerCase))
-    expect(caseBody).toMatch(/^\s*confirmSteerDelivery\(sessionId, messageId, \{$/m)
-    expect(caseBody).toMatch(/^\s*await drainSteersIntoTranscript\(true\)$/m)
-    // The gate the API lane needs must not be applied here: a CLI stream never reaches it.
-    expect(caseBody).not.toContain('upToStep')
-    // Groups deliver nothing, on every lane.
-    expect(caseBody).toContain('steerDeliveryEnabled')
-  })
-
-  it('never marks a CLI delivery from an adapter (P2)', () => {
-    for (const adapter of [
-      'src/lib/server/services/codexEventAdapter.ts',
-      'src/lib/server/services/claudeEventAdapter.ts'
-    ]) {
-      const adapterSource = readFileSync(adapter, 'utf8')
-      expect(adapterSource).not.toContain('confirmSteerDelivery')
-      expect(adapterSource).not.toContain('steerInboxRegistry')
-      // It only forwards the ids; the words stay in Batshit's own inbox.
-      expect(adapterSource).toContain('steerIds')
-    }
-  })
-
-  /**
    * P2 (DL-114-09): the verdict is resolved ONCE, above the once-per-accepted-send
    * boundary, and registered with the run. The steer route reads it there rather than
    * re-deriving it — a second derivation is how the route would come to promise a steer the
@@ -218,7 +182,8 @@ describe('send-routed steer contracts (SA-114 P1)', () => {
     expect(source.split('resolveSteerability(').length - 1).toBe(1)
 
     const verdictBody = source.slice(resolve, registerRun)
-    expect(verdictBody).toContain('resolveCodexTransportLane(')
+    // SA-139 R4: only the type and the group decide; the CLI runtime input went with the lane.
+    expect(verdictBody).toContain('    primaryAgentType,\n')
     expect(verdictBody).toContain("isGroupSession: Boolean(groupContext) || streamMetadata?.groupChat === true")
   })
 
@@ -228,18 +193,7 @@ describe('send-routed steer contracts (SA-114 P1)', () => {
     expect(source.slice(publish, publish + 400)).toContain('messageId,')
   })
 
-  it('attaches the CLI steer channel only once the child exists, and clears it with the turn (P2)', () => {
-    const streamCall = source.indexOf('streamResult = await nativeRuntime.streamNativeMode(')
-    const attach = source.indexOf('attachSteerTransport(sessionId, messageId,', streamCall)
-    expect(attach).toBeGreaterThan(streamCall)
-
-    // Guarded: a group run, a run the server refused to steer, and the API lane (which sets
-    // no `__steer` at all) must all register no channel.
-    const guard = source.slice(source.lastIndexOf('const steerChannel =', attach), attach)
-    expect(guard).toContain('steerDeliveryEnabled')
-    expect(guard).toContain('steerVerdict.steerable')
-    expect(guard).toContain("steerChannelLane === 'codex' || steerChannelLane === 'claude'")
-
+  it('clears the steer run registration with the turn (P2)', () => {
     const clear = source.indexOf('if (steerRunRegistered) clearSteerRun(sessionId, messageId)')
     expect(clear).toBeGreaterThan(-1)
     // In the same `finally` that clears the stream abort, scoped by message id.
@@ -247,15 +201,20 @@ describe('send-routed steer contracts (SA-114 P1)', () => {
   })
 
   it('drains once more, unconditionally, before the finish path reads the streamed content (DL-114-04)', () => {
-    const finishStart = source.indexOf('const measuredFinishedAt = Date.now()')
+    // SA-139 R4: anchored on the finish callback itself (the CLI lane's measured-timing line that
+    // anchored it before went with the lane).
+    const finishStart = source.indexOf('    onFinish: async ({\n      text,\n')
     const drainInFinish = source.indexOf('await drainSteersIntoTranscript(true)', finishStart)
     const readsContent = source.indexOf('const finishZipInput = selectFinishZipInput({', finishStart)
 
+    expect(finishStart).toBeGreaterThan(-1)
     expect(drainInFinish).toBeGreaterThan(finishStart)
     expect(drainInFinish).toBeLessThan(readsContent)
 
     // And the loop's tail forces the last boundary out too, for whichever finishes first.
-    const loopStart = source.indexOf('for await (const chunk of result.stream) {')
+    const loopStart = source.indexOf('for await (const chunk of withToolResultsOnStop(result.stream, streamAbortSignal, {\n')
+    expect(loopStart).toBeGreaterThan(-1)
+    expect(source.slice(loopStart, source.indexOf('})) {', loopStart))).toContain('onEarlyEnd: () => resolveOnFinish?.(),')
     const loopEnd = source.indexOf('await flushRawReasoningFallback()', source.indexOf('if (shouldBreakStream) {', loopStart))
     expect(source.slice(loopStart, loopEnd)).toContain('await drainSteersIntoTranscript(true)')
   })
@@ -263,7 +222,7 @@ describe('send-routed steer contracts (SA-114 P1)', () => {
   it('records the delivered steers in the SAME single write as their placeholders (DL-114-04)', () => {
     const finalize = source.indexOf('const finalizeAssistantMessage = async (')
     const stamp = source.indexOf('endMetadataBase.steers = deliveredSteers.map(', finalize)
-    const save = source.indexOf('await redis.saveMessage(finalMessage)', stamp)
+    const save = source.indexOf('await persistCanonicalReply(finalMessage, mcpOriginalPreparation, mcpApiPart)', stamp)
 
     expect(stamp).toBeGreaterThan(finalize)
     expect(save).toBeGreaterThan(stamp)
@@ -296,16 +255,33 @@ describe('send-routed steer contracts (SA-114 P1)', () => {
   })
 
   it('runs promotion after the context-exhaustion auto-continue, not inside it', () => {
-    const autoContinue = source.indexOf('while (\n            streamResult.contextExhausted === true')
+    const autoContinue = source.indexOf('while (request.signal?.aborted !== true && !requestStopped) {', source.indexOf('let continuationAttempt = 0'))
     const promotion = source.indexOf('while (steerPromotions < MAX_STEER_PROMOTIONS) {')
 
     expect(autoContinue).toBeGreaterThan(-1)
     expect(promotion).toBeGreaterThan(autoContinue)
+    const continuation = source.slice(autoContinue, promotion)
+    expect(continuation).toContain('const contextContinuation = streamResult.p5ManagementPause !== true && streamResult.contextExhausted === true && streamResult.failureHandled === true && continuationAttempt < MAX_CONTEXT_CONTINUATIONS')
+    const eligible = continuation.indexOf('if (!prerequisite && !contextContinuation) break')
+    const fresh = continuation.indexOf('await assertP5ApiFreshSegment(originalPreparation)')
+    const child = continuation.indexOf('streamResult = await handleBatshitAgentStream({')
+    const finished = continuation.indexOf('runFinished(streamResult)', child)
+    const seal = continuation.indexOf('if (p5OriginalRequestForPreparation(originalPreparation)) await sealP5OriginalPreparation(originalPreparation)', finished)
+    const retire = continuation.indexOf('retireP5OriginalPreparation(originalPreparation)', seal)
+    expect(eligible).toBeGreaterThan(-1)
+    // The same canonical/consumer/physical barrier precedes the child; sealing follows it.
+    expect(fresh).toBeGreaterThan(eligible)
+    expect(child).toBeGreaterThan(fresh)
+    expect(finished).toBeGreaterThan(child)
+    expect(seal).toBeGreaterThan(finished)
+    expect(retire).toBeGreaterThan(seal)
   })
 
   it('a context-exhaustion continuation carries on the steers its predecessor never delivered (BL-137)', () => {
-    const loop = source.indexOf('while (\n            streamResult.contextExhausted === true')
+    const loop = source.indexOf('while (request.signal?.aborted !== true && !requestStopped) {', source.indexOf('let continuationAttempt = 0'))
     const call = source.indexOf('            streamResult = await handleBatshitAgentStream({\n', loop)
+    expect(loop).toBeGreaterThan(-1)
+    expect(call).toBeGreaterThan(loop)
     const between = source.slice(loop, call)
     // The continuation's id exists before its run does, and the steers move to it first.
     expect(between).toContain('\n            const continuationMessageId = await generateMessageId(sessionId)\n')
@@ -316,6 +292,15 @@ describe('send-routed steer contracts (SA-114 P1)', () => {
       between.indexOf('const continuationMessageId = await generateMessageId(sessionId)')
     )
     expect(source.slice(call, call + 400)).toContain('\n              messageId: continuationMessageId,\n')
+    const finished = source.indexOf('\n            runFinished(streamResult)\n', call)
+    expect(finished).toBeGreaterThan(call)
+    const continuationCall = source.slice(call, finished)
+    expect(continuationCall).toContain("content: ''")
+    expect(continuationCall).toContain('messages: persistedHistory,')
+    expect(continuationCall).toContain('...(!prerequisite ? { contextContinuation: {')
+    expect(continuationCall).toContain('consumeSessionClips: false,')
+    expect(continuationCall).toContain('mcpOriginalPreparation: originalPreparation,')
+    expect(continuationCall).toContain('onP5ApiPart(part) { continuationRunOwner.apiPart = part },')
   })
 
   it('saves stranded text rather than dropping it if the chain bound ever fires', () => {
@@ -331,14 +316,14 @@ describe('send-routed steer contracts (SA-114 P1)', () => {
 })
 
 /**
- * SA-119 P1 (DL-119-05) — a queued message must never be injected mid-reply, on ANY lane.
+ * SA-119 P1 (DL-119-05) — a queued message must never be injected mid-reply.
  *
- * The behaviour is proved live in `steerInboxRegistry.test.ts`: both take-for-delivery
- * functions skip a `deliver: 'end'` entry. What is pinned HERE is that send-routed has no
- * OTHER door — that every boundary injection on all three lanes goes through one of those
- * two functions, so the skip cannot be bypassed by a path that reads the inbox its own way.
- * A held entry handed to the model mid-reply is the user's NEXT message arriving inside the
- * answer it was meant to follow, on the one lane nobody re-checked.
+ * The behaviour is proved live in `steerInboxRegistry.test.ts`: the take-for-delivery
+ * function skips a `deliver: 'end'` entry. What is pinned HERE is that send-routed has no
+ * OTHER door — that every boundary injection goes through that one function, so the skip
+ * cannot be bypassed by a path that reads the inbox its own way. SA-139 R4 removed the
+ * managed CLI Primary's transport push, the second door. A held entry handed to the model
+ * mid-reply is the user's NEXT message arriving inside the answer it was meant to follow.
  */
 describe('a queued steer never reaches a tool boundary (SA-119 DL-119-05)', () => {
   it('the API lane injects only what its boundary hook takes', () => {
@@ -353,25 +338,36 @@ describe('a queued steer never reaches a tool boundary (SA-119 DL-119-05)', () =
     expect(source.split('takePendingSteersForDelivery(').length - 1).toBe(1)
   })
 
-  it('both CLI lanes push only through the transport flush', () => {
-    // send-routed never takes for a transport itself: the route and `attachSteerTransport`
-    // both go through `flushPendingSteersToTransport`, which takes through
-    // `takePendingSteersForTransport` — the other function that skips held entries.
-    expect(source).not.toContain('takePendingSteersForTransport(')
-    expect(registrySource.split('takePendingSteersForTransport(sessionId, messageId)').length - 1).toBe(1)
-    const flush = registrySource.indexOf('export async function flushPendingSteersToTransport(')
-    expect(flush).toBeGreaterThan(-1)
-    expect(registrySource.slice(flush)).toContain('takePendingSteersForTransport(sessionId, messageId)')
+  it('has no transport push left, so no second door to a tool boundary (SA-139 R4)', () => {
+    const steerRouteSource = readFileSync('src/routes/api/messages/steer/+server.ts', 'utf8')
+    for (const removed of [
+      'takePendingSteersForTransport',
+      'flushPendingSteersToTransport',
+      'attachSteerTransport',
+      'confirmSteerDelivery'
+    ]) {
+      expect(registrySource).not.toContain(removed)
+      expect(source).not.toContain(removed)
+      expect(steerRouteSource).not.toContain(removed)
+    }
+    // The registration carries the verdict only: nothing it holds can be called to push.
+    const registration = registrySource.slice(
+      registrySource.indexOf('export interface SteerRunRegistration {'),
+      registrySource.indexOf('\n}', registrySource.indexOf('export interface SteerRunRegistration {'))
+    )
+    expect(registration).toContain('lane: SteerLane | null')
+    expect(registration).not.toMatch(/^\s*send\??:/m)
   })
 
-  it('both boundary takes skip a held entry, and say so', () => {
-    for (const fn of ['takePendingSteersForDelivery', 'takePendingSteersForTransport']) {
-      const start = registrySource.indexOf(`export function ${fn}(`)
-      expect(start).toBeGreaterThan(-1)
-      const body = registrySource.slice(start, registrySource.indexOf('\n}', start))
-      // The same predicate in both, so the two lanes cannot drift apart on what "held" means.
-      expect(body).toContain('isHeldForEndOfTurn(entry)')
-    }
+  it('the one boundary take skips a held entry through the one predicate', () => {
+    // ONE definition, so a door added later reads the same rule about what "held" means.
+    expect(registrySource.split('function isHeldForEndOfTurn(').length - 1).toBe(1)
+    const start = registrySource.indexOf('export function takePendingSteersForDelivery(')
+    expect(start).toBeGreaterThan(-1)
+    const body = registrySource.slice(start, registrySource.indexOf('\n}', start))
+    expect(body).toContain('isHeldForEndOfTurn(entry)')
+    // Every boundary injection still goes through this take (the API lane's `prepareStep`).
+    expect(source.split('takePendingSteersForDelivery(').length - 1).toBe(1)
   })
 
   it('the end-of-turn take does NOT skip them — that is the whole point', () => {

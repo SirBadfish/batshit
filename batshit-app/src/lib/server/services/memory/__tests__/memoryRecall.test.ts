@@ -101,6 +101,7 @@ async function seedMemory(
   overrides: Partial<CreateMemoryInput> & { content?: string } = {}
 ): Promise<string> {
   memoryCounter += 1
+  const fixtureId = overrides.id ?? `mem_recall_fixture_${memoryCounter}`
   const record = await createMemory({
     agent_id: AGENT,
     user_id: USER,
@@ -108,7 +109,9 @@ async function seedMemory(
     content: overrides.content ?? `Fixture memory number ${memoryCounter}`,
     importance: 5,
     provenance: [{ session_id: SESSION, source: 'agent' }],
-    ...overrides
+    ...overrides,
+    id: fixtureId,
+    ...(overrides.media ? { media: overrides.media.map(media => ({ ...media, filename: `${AGENT}/${fixtureId}/${media.filename.split('/').pop()}` })) } : {})
   })
   return record.id
 }
@@ -142,6 +145,7 @@ describe.runIf(memorySearchLaneActive())('memory recall engine (dedicated Redis 
     })
     await ensureMemoryIndexes()
     await seedAgent(AGENT)
+    await redis.createSession({ id: SESSION, user_id: USER, agent_id: AGENT, name: 'Memory recall fixture' })
   })
 
   describe('trigger matching', () => {

@@ -1,14 +1,14 @@
 /**
  * SA-129 P2 (DL-08, closes BL-234): the reply-end control step, on the server, once per reply.
  *
- * `send-routed` calls this for every finished reply of every lane (API, managed Codex, managed
- * Claude) and every caller (an open chat page, a woken or scheduled turn, isolated test driver, the benchmark
+ * `send-routed` calls this for every finished reply of every lane (API, managed Claude) and every
+ * caller (an open chat page, a woken or scheduled turn, isolated test driver, the benchmark
  * driver), BEFORE it emits `end` and saves the message:
  *
  *   1. the Tool Notes block: the notes (kept when Tool Notes are on for the agent), and the files
  *      the agent holds or releases (DL-02, `zipHolds.ts`);
  *   2. the memory save blocks, through the same op as `sys.memory.save` (SA-104 P3);
- *   3. the parked zip-control block, applied only when the hidden permission is ON (DL-06);
+ *   3. a zip-control block, always ignored with a control error (agent zip control is retired, 2026-10-23);
  *   4. the countdown of temporary holds: this reply is one more message in the chat;
  *   5. every malformed or refused part as a `controlErrors` record (DL-104-05).
  *
@@ -32,12 +32,9 @@ import {
   extractReplyControl,
   resolveZipToolNotesEnabled
 } from '$lib/utils/replyControl'
-import { resolveZipAgentControlPermission } from '$lib/utils/zipAgentControlPermission'
-import { scanLooseZipReferences } from '$lib/utils/zipReferenceSafety'
 import {
   advanceZipCountdowns,
   applyAgentHoldChanges,
-  applyLegacyAgentZipActions,
   type AgentHoldChanges
 } from './zipHolds'
 
@@ -59,6 +56,10 @@ export interface ReplyControlFinalizeInput {
   projectPath: string | null
   /** False for an approval resume, which continues a message the chat already counted. */
   countsAsMessage: boolean
+  /** The compile offered this agent the Whiteboard (BL-1785: named in the dropped-notes line). */
+  whiteboardAvailable?: boolean
+  skillSessionErrors?: string[]
+  skillSessionChanged?: boolean
 }
 
 export interface ReplyControlFinalizeResult {
@@ -69,22 +70,6 @@ export interface ReplyControlFinalizeResult {
   zipStateChanged: 'agent' | 'countdown' | null
   /** The reply carried at least one memory save block (the Judge Juice after-reply check asks). */
   hadMemoryBlock: boolean
-}
-
-/**
- * The reply's own zip ids, then every `cool_tool_` zip its words reference, in order. The words
- * are read once (BL-707): the old pattern searched to the first `}` again from every opener, at
- * the reply end, so a reply of openers that never close held the one Node process for seconds.
- */
-function currentToolZipIds(replyZipIds: string[], content: string): string[] {
-  const ids: string[] = []
-  const add = (value: string | undefined) => {
-    const id = typeof value === 'string' ? value.trim() : ''
-    if (id && id.toLowerCase().startsWith('cool_tool_') && !ids.includes(id)) ids.push(id)
-  }
-  replyZipIds.forEach(add)
-  for (const reference of scanLooseZipReferences(content)) add(reference.id)
-  return ids
 }
 
 async function processMemoryBlocks(
@@ -176,11 +161,14 @@ export async function finalizeReplyControl(input: ReplyControlFinalizeInput): Pr
   const content = typeof input.content === 'string' ? input.content : ''
   const extraction = extractReplyControl(content)
   const toolNotesEnabled = resolveZipToolNotesEnabled(input.agent, input.globalZipSettings)
-  const replyMetadata = buildReplyControlMetadata(extraction, { toolNotesEnabled })
+  const replyMetadata = buildReplyControlMetadata(extraction, { toolNotesEnabled, whiteboardAvailable: input.whiteboardAvailable === true })
   const errors: ControlErrorRecord[] = [...replyMetadata.controlErrors]
+  for (const error of input.skillSessionErrors ?? []) errors.push(buildControlErrorRecord(
+    'batshit-tool-notes', error, 'Check open_skills before continuing; the skill may not be held open.'
+  ))
   const metadata: Record<string, any> = { [REPLY_CONTROL_FINALIZED_FLAG]: true }
   if (replyMetadata.zipControl) metadata.zipControl = replyMetadata.zipControl
-  let zipStateChanged: ReplyControlFinalizeResult['zipStateChanged'] = null
+  let zipStateChanged: ReplyControlFinalizeResult['zipStateChanged'] = input.skillSessionChanged ? 'agent' : null
   const currentReply = { messageId: input.messageId, content, zipIds: input.replyZipIds }
 
   // Hold and release (DL-02); the hold follows the file at every reply end, asked or not.
@@ -189,7 +177,8 @@ export async function finalizeReplyControl(input: ReplyControlFinalizeInput): Pr
     agentId: input.agent.id,
     projectPath: input.projectPath,
     blocks: extraction.holdBlocks,
-    currentReply
+    currentReply,
+    toolNotesEnabled
   })
   errors.push(...holdChanges.errors)
   if (holdChanges.failure) {
@@ -201,7 +190,7 @@ export async function finalizeReplyControl(input: ReplyControlFinalizeInput): Pr
       buildControlErrorRecord(
         'batshit-tool-notes',
         `Batshit could not finish this reply's holds and releases (${holdChanges.failure}). ${describeAppliedHolds(holdChanges)}`,
-        'Check Current Zip State, then hold or release again in your next reply what is still not the way you want it.'
+        'Check the Zip Index, then hold or release again in your next reply what is still not the way you want it.'
       )
     )
   }
@@ -214,45 +203,16 @@ export async function finalizeReplyControl(input: ReplyControlFinalizeInput): Pr
     }
   }
 
-  // The parked zip-control actions (DL-06): only with the hidden permission ON, and never silent.
+  // Decision 7 (Josh, 2026-10-23): agent zip control is retired. A reply's `unzip` / `zip`
+  // actions are ignored, never silently: the agent is told how to keep a file open instead.
   if (extraction.unzip.length > 0 || extraction.zip.length > 0) {
-    if (resolveZipAgentControlPermission(input.agent, input.globalZipSettings)) {
-      const outcome = await applyLegacyAgentZipActions({
-        sessionId: input.sessionId,
-        agentId: input.agent.id,
-        unzip: extraction.unzip,
-        zip: extraction.zip,
-        currentReply,
-        currentToolZipIds: currentToolZipIds(input.replyZipIds, content)
-      })
-      if (outcome.errors) errors.push(...outcome.errors)
-      if (outcome.unzipped.length > 0 || outcome.zipped.length > 0) zipStateChanged = 'agent'
-      if (outcome.failure) {
-        zipStateChanged = 'agent'
-        console.error('[ReplyControl] The zip-control step stopped part way:', outcome.failure)
-        const applied = [
-          outcome.unzipped.length > 0 ? `unzipped ${outcome.unzipped.join(', ')}` : '',
-          outcome.zipped.length > 0 ? `zipped ${outcome.zipped.join(', ')}` : ''
-        ].filter(Boolean)
-        errors.push(
-          buildControlErrorRecord(
-            'batshit-zip-control',
-            `Batshit could not finish this reply's zip actions (${outcome.failure}). ${
-              applied.length > 0 ? `Applied before it stopped: ${applied.join('; ')}.` : 'Nothing was applied.'
-            }`,
-            'Check Current Zip State before you ask again.'
-          )
-        )
-      }
-    } else {
-      errors.push(
-        buildControlErrorRecord(
-          'batshit-zip-control',
-          'Zip control is off for you, so the unzip and zip actions were ignored.',
-          'To keep a file you read open, hold it: <batshit-tool-notes>{"hold":["path/to/file"]}</batshit-tool-notes>. Use Fetch Zip to read an earlier result.'
-        )
+    errors.push(
+      buildControlErrorRecord(
+        'batshit-zip-control',
+        'Agents cannot unzip or zip results, so the unzip and zip actions were ignored.',
+        'To keep a file you read open, hold it: <batshit-tool-notes>{"hold":["path/to/file"]}</batshit-tool-notes>. Use Fetch Zip to read an earlier result.'
       )
-    }
+    )
   }
 
   let hadMemoryBlock = false

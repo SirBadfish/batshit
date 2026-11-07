@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { calculateZipActivation, describeReadCompressHint, READ_COMPRESS_HINT_LAST_REPLY } from './zipActivation'
+import { calculateZipActivation, describeReadCompressHint, READ_COMPRESS_HINT_LAST_REPLY, READ_COMPRESS_HINT_LAST_REPLY_NO_TOOL_NOTES } from './zipActivation'
 import { getToolSettings } from './toolRenderMap'
 
 describe('calculateZipActivation', () => {
@@ -562,7 +562,8 @@ describe('calculateZipActivation', () => {
       },
       agentSettings: {
         buffer_size_execute_command: 99,
-        zip_threshold_execute_command: 9999
+        zip_threshold_execute_command: 9999,
+        auto_zip_execute_command: false
       }
     })
 
@@ -631,16 +632,29 @@ describe('describeReadCompressHint (SA-129 DL-03)', () => {
     expect(describeReadCompressHint(activate(0, normal), { isUnzipped: false })).toBe('Compresses 3 replies after it was read.')
     expect(describeReadCompressHint(activate(1, normal), { isUnzipped: false })).toBe('Compresses 3 replies after it was read.')
     expect(describeReadCompressHint(activate(2, normal), { isUnzipped: false })).toBe(READ_COMPRESS_HINT_LAST_REPLY)
-    // SA-129 P2 added the second way to keep a read open (DL-03: "P2 adds `or hold the file`").
-    expect(READ_COMPRESS_HINT_LAST_REPLY).toBe('Compresses after this reply. Note what you need or hold the file.')
+    // SA-129 P2 added the second way to keep a read open (DL-03: "P2 adds `or hold the file`");
+    // BL-1756 names where to save what you need (Josh, 2026-10-18).
+    expect(READ_COMPRESS_HINT_LAST_REPLY).toBe('Compresses after this reply. Save what you need in Tool Notes, or Hold the file.')
     expect(describeReadCompressHint(activate(0, { ...normal, buffer_size_read_file: 1 }), { isUnzipped: false })).toBe(READ_COMPRESS_HINT_LAST_REPLY)
   })
 
-  it('stays about twelve tokens or fewer (the last-reply line, with P2\'s hold, about fifteen)', () => {
+  it('names Tool Notes only for an agent that has them, and stays steady per setting (BL-1785)', () => {
+    const off = { isUnzipped: false, toolNotesEnabled: false }
+    expect(READ_COMPRESS_HINT_LAST_REPLY_NO_TOOL_NOTES).toBe('Compresses after this reply. Hold the file if you still need it.')
+    expect(describeReadCompressHint(activate(0, normal), off)).toBe('Compresses 3 replies after it was read.')
+    expect(describeReadCompressHint(activate(2, normal), off)).toBe(READ_COMPRESS_HINT_LAST_REPLY_NO_TOOL_NOTES)
+    expect(describeReadCompressHint(activate(0, { ...normal, auto_zip_read_file: true }, { recoveryHold: true }), off)).toBe(READ_COMPRESS_HINT_LAST_REPLY_NO_TOOL_NOTES)
+    // On, or not said: byte for byte the line it always was.
+    expect(describeReadCompressHint(activate(2, normal), { isUnzipped: false, toolNotesEnabled: true })).toBe(READ_COMPRESS_HINT_LAST_REPLY)
+    expect(describeReadCompressHint(activate(2, normal), { isUnzipped: false })).toBe(READ_COMPRESS_HINT_LAST_REPLY)
+    expect(Math.ceil(READ_COMPRESS_HINT_LAST_REPLY_NO_TOOL_NOTES.length / 4)).toBeLessThanOrEqual(20)
+  })
+
+  it('stays about twelve tokens or fewer (the last-reply line, which names both tools, about twenty)', () => {
     expect(Math.ceil('Compresses 12 replies after it was read.'.length / 4)).toBeLessThanOrEqual(12)
     // It appears on one reply per result, then the result compresses; P2's "or hold the file" is
-    // the lock's own wording (DL-03).
-    expect(Math.ceil(READ_COMPRESS_HINT_LAST_REPLY.length / 4)).toBeLessThanOrEqual(17)
+    // the lock's own wording (DL-03), and BL-1756 names Tool Notes (Josh, 2026-10-18).
+    expect(Math.ceil(READ_COMPRESS_HINT_LAST_REPLY.length / 4)).toBeLessThanOrEqual(20)
   })
 
   it('an Auto result open only through a recovery hold compresses after this reply', () => {
@@ -682,21 +696,17 @@ describe('getToolSettings', () => {
     expect(settings.auto_zip).toBe(true)
   })
 
-  it('can inherit read_file settings when no skill_read override exists', () => {
-    const settings = getToolSettings(
-      'skill_read',
-      {
-        buffer_size_read_file: 11,
-        zip_threshold_read_file: 654
-      },
-      {}
-    )
-
-    expect(settings.buffer_size).toBe(11)
-    expect(settings.zip_threshold).toBe(654)
+  it('ignores all former Skill Read rows and never borrows Read File settings', () => {
+    const readFileRow = { buffer_size_read_file: 11, zip_threshold_read_file: 654, auto_zip_read_file: true }
+    expect(getToolSettings('skill_read', readFileRow, {})).toMatchObject({ buffer_size: 0, zip_threshold: 0, auto_zip: true })
+    expect(getToolSettings('skill_read', {}, readFileRow)).toMatchObject({ buffer_size: 0, zip_threshold: 0, auto_zip: true })
+    // A stale global row is ignored too; only a lifecycle hold opens the read.
+    expect(
+      getToolSettings('skill_read', readFileRow, { custom_tool_settings: [{ tool_name: 'skill_read', buffer_size: 5 }] })
+    ).toMatchObject({ buffer_size: 0, zip_threshold: 0, auto_zip: true })
   })
 
-  it('prefers an explicit skill_read custom override over read_file defaults', () => {
+  it('ignores an explicit retired skill_read override', () => {
     const settings = getToolSettings(
       'skill_read',
       {
@@ -709,9 +719,40 @@ describe('getToolSettings', () => {
       {}
     )
 
-    expect(settings.buffer_size).toBe(4)
-    expect(settings.zip_threshold).toBe(222)
+    expect(settings.buffer_size).toBe(0)
+    expect(settings.zip_threshold).toBe(0)
     expect(settings.auto_zip).toBe(true)
+  })
+
+  it.each(['agent', 'global'] as const)('skips malformed %s custom rows without changing valid siblings', source => {
+    const rows = Object.freeze([
+      null, undefined, false, 7, 'not a setting', [], {}, { tool_name: 7 },
+      Object.freeze({ tool_name: 'another_tool', buffer_size: 9 }),
+      Object.freeze({ tool_name: 'cli_tool_find', buffer_size: 0, zip_threshold: 13, auto_zip: false, extra: 'keep' }),
+      null,
+      Object.freeze({ tool_name: 'my_custom_tool', buffer_size: 5, zip_disabled: true })
+    ])
+    const before = structuredClone(rows)
+    const settings = Object.freeze({ custom_tool_settings: rows })
+    const agent = source === 'agent' ? settings : {}
+    const global = source === 'global' ? settings : {}
+
+    expect(getToolSettings('tool_find', agent, global)).toEqual({
+      buffer_size: 0, zip_threshold: 13, auto_zip: false, zip_disabled: false
+    })
+    expect(getToolSettings('my_custom_tool', agent, global)).toEqual({
+      buffer_size: 5, zip_threshold: 0, auto_zip: false, zip_disabled: true
+    })
+    expect(getToolSettings('missing_tool', agent, global)).toEqual(getToolSettings('missing_tool', {}, {}))
+    expect(rows).toEqual(before)
+  })
+
+  it('keeps agent-over-global custom field precedence across malformed rows', () => {
+    expect(getToolSettings('my_custom_tool', {
+      custom_tool_settings: [null, { tool_name: 'my_custom_tool', buffer_size: 0, auto_zip: false }]
+    }, {
+      custom_tool_settings: [null, { tool_name: 'my_custom_tool', buffer_size: 8, zip_threshold: 21, auto_zip: true }]
+    })).toEqual({ buffer_size: 0, zip_threshold: 21, auto_zip: false, zip_disabled: false })
   })
 
   it('resolves explicit custom tool zip-off settings', () => {
@@ -800,16 +841,29 @@ describe('getToolSettings', () => {
     expect(settings.zip_threshold).toBe(0)
   })
 
-  it('uses the new aggressive defaults when no settings are saved', () => {
+  it('uses the SA-126 C6 defaults when no settings are saved (Josh, 2026-10-19)', () => {
     expect(getToolSettings('read_file', {}, {})).toMatchObject({
-      buffer_size: 8,
+      buffer_size: 2,
+      zip_threshold: 0,
+      auto_zip: false
+    })
+    expect(getToolSettings('skill_read', {}, {})).toMatchObject({
+      buffer_size: 0,
+      zip_threshold: 0,
+      auto_zip: true
+    })
+    for (const tool of ['bash', 'execute_command', 'write_file', 'edit_file', 'fetch_zip']) {
+      expect([tool, getToolSettings(tool, {}, {}).auto_zip]).toEqual([tool, true])
+    }
+    expect(getToolSettings('subagent', {}, {})).toMatchObject({
+      buffer_size: 2,
       zip_threshold: 0,
       auto_zip: false
     })
     expect(getToolSettings('bash', {}, {})).toMatchObject({
       buffer_size: 1,
       zip_threshold: 0,
-      auto_zip: false
+      auto_zip: true
     })
     expect(getToolSettings('web_search', {}, {})).toMatchObject({
       buffer_size: 1,

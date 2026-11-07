@@ -12,7 +12,7 @@ import { redis } from '$lib/server/redis'
 import {
   decideRiskGate,
   type ControlApprovalGrant,
-  type ControlApprovalLane,
+  type LiveControlApprovalLane,
   type ControlApprovalRequest
 } from '$lib/server/services/controlApprovals'
 import type { ControlActorType } from '$lib/server/services/fabricRegistry'
@@ -47,6 +47,7 @@ import type {
 } from '$lib/types/database'
 import { normalizeCliToolGridSettings } from '$lib/utils/toolGridCli'
 import { stripHostOperatorAuthorityFromChildEnv } from '$lib/server/services/cliChildEnv'
+import { formatCliSchemaHint } from './dynamicMcpSchema'
 
 export const CLI_TOOL_REGISTRY_SCHEMA_VERSION = 1 as const
 
@@ -238,14 +239,7 @@ export type CliToolExecutionParams = {
   allowRisky?: boolean
   /** The assistant message the card belongs to (DL-116-07), verified by the route. */
   messageId?: string | null
-  /**
-   * PR #106 review F-5 — which lane the caller authenticated on. The in-process API broker
-   * passes `'in-process'` and gets the SDK card (`lane: 'api'`); the managed CLI helper is on
-   * the `agent` lane with a verified `messageId` and gets the chat card (`lane: 'cli'`);
-   * everything else has no chat to click in (`lane: 'service'`). Derived from the ACTOR, the
-   * way `useControl` derives it — inferring it from `messageId` alone turned a helper call
-   * that arrived without an id into an `api` pause that persisted no card anywhere.
-   */
+  /** In-process runs raise API cards; other callers use the service lane. */
   actorType?: ControlActorType
   /**
    * A server-owned approval, set ONLY by send-routed's resume paths — never from model
@@ -968,12 +962,7 @@ export function compileCliToolArgs(
 }
 
 function buildSchemaHint(inputSchema: CliToolInputSchema): string {
-  const parts = Object.entries(inputSchema.properties).map(([fieldName, field]) => {
-    const suffix = field.type === 'array' ? `array<${field.items?.type ?? 'string'}>` : field.type
-    const required = field.required === true || inputSchema.required?.includes(fieldName) ? 'required' : 'optional'
-    return `${fieldName}:${suffix} (${required})`
-  })
-  return parts.join(', ')
+  return formatCliSchemaHint(inputSchema)
 }
 
 function searchScore(record: CliToolRecord, query: string): number {
@@ -1019,8 +1008,8 @@ function normalizeCliToolIdList(value: unknown[]): string[] {
  *
  * Two inputs, and they are not the same kind of thing:
  *
- * - `cliToolScope` is the server's answer for this run: the in-process turn's list, a managed
- *   CLI run's credential, a Subagent's own saved list. When it is present it IS the scope, and
+ * - `cliToolScope` is the server's answer for this run, such as an in-process turn's list.
+ *   When present it IS the scope, and
  *   `null` or a malformed value is an empty one, so neither the caller's list nor the agent's
  *   saved list can turn it back into permission.
  * - `selectedToolIds` is the caller's list: a route body or a model's tool input. It only
@@ -1094,30 +1083,6 @@ export async function resolveCliToolSelectionScope(params: {
     toolIds: [],
     source: 'none'
   }
-}
-
-/**
- * BL-686 — the saved CLI tools a managed run's credential carries, resolved the way the run's
- * helper profile was: the list the run started with (the turn's list, or a Subagent's own list
- * resolved by its runner), else the primary agent's saved list, else the user's Tool Grid list.
- * A delegated run's id names no agent record, so it has only its runner's list, and none when
- * the runner gave none. Both bridges mint this; the CLI tool routes and the dispatch read it.
- */
-export async function resolveRunCredentialCliToolScope(run: {
-  userId?: string | null
-  agentId?: string | null
-  delegatedRun?: boolean | null
-  selectedCliToolIds?: string[] | null
-}): Promise<string[]> {
-  const userId = typeof run.userId === 'string' ? run.userId.trim() : ''
-  if (!userId) return []
-  if (run.delegatedRun === true && !Array.isArray(run.selectedCliToolIds)) return []
-  const scope = await resolveCliToolSelectionScope({
-    userId,
-    agentId: run.delegatedRun === true ? null : run.agentId ?? null,
-    cliToolScope: run.selectedCliToolIds ?? undefined
-  })
-  return scope.toolIds
 }
 
 export async function findCliTools(params: CliToolFindParams): Promise<{
@@ -1349,18 +1314,18 @@ export type CliToolProcessRunParams = {
 
 function pinCliToolOwner(params: Pick<CliToolExecutionParams, 'userId' | 'agentId' | 'actorType' | 'processOwner'>): HostCommandPin | undefined | null {
   const agentId = typeof params.agentId === 'string' ? params.agentId.trim() : ''
-  const agentLane = params.actorType === 'agent' || params.actorType === 'in-process'
+  const inProcess = params.actorType === 'in-process'
   let owner: HostCommandOwner
   if (params.processOwner) {
     // Internal dispatch validates the context owner even for session/service callers.
-    // The public execute route only supplies this field from an agent run credential.
+    // The public execute route never accepts an owner from the body.
     if (params.processOwner.userId !== params.userId ||
       !['agent', 'subagent'].includes(params.processOwner.kind) || !params.processOwner.id) return null
     owner = params.processOwner
-  } else if (agentLane && agentId.startsWith('subagent_cli')) {
+  } else if (inProcess && agentId.startsWith('subagent_cli')) {
     // The virtual runtime id cannot stand in for the real Subagent or Worker owner.
     return null
-  } else if (agentLane && agentId) {
+  } else if (inProcess && agentId) {
     owner = { userId: params.userId, kind: 'agent', id: agentId }
   } else {
     owner = { userId: params.userId, kind: 'host', id: 'administration' }
@@ -1653,13 +1618,12 @@ export async function validateCliTool(
 
 /**
  * PR #106 review F-5 — the approval lane, from the actor. Mirrors `useControl`'s
- * `resolveApprovalLane`: the in-process broker is `api` (the SDK pause renders the card), a
- * verified message id is the managed CLI helper's signature (`cli`, the chat card and the
- * resume turn), and everything else has no chat to click in (`service`).
+ * `resolveApprovalLane`: the in-process broker is `api` (the SDK pause renders the card), and
+ * everything else has no chat to click in (`service`). SA-139 R4 removed the `cli` answer for a
+ * verified message id with the CLI Primary, its only source.
  */
-function resolveCliToolApprovalLane(params: CliToolExecutionParams): ControlApprovalLane {
+function resolveCliToolApprovalLane(params: CliToolExecutionParams): LiveControlApprovalLane {
   if (params.actorType === 'in-process') return 'api'
-  if (typeof params.messageId === 'string' && params.messageId.trim().length > 0) return 'cli'
   return 'service'
 }
 
@@ -1672,6 +1636,10 @@ export async function executeCliTool(
   params: CliToolExecutionParams,
   options: CliToolExecutionOptions = {}
 ): Promise<CliToolExecutionResult> {
+  if ((params.actorType as string | undefined) === 'agent') return {
+    success: false, toolId: params.toolId, blocked: true, code: 'OWNER_UNAVAILABLE',
+    error: 'The retired agent credential lane is not available.'
+  }
   const ownerPin = pinCliToolOwner(params)
   if (ownerPin === null) return {
     success: false, toolId: params.toolId, blocked: true, code: 'OWNER_UNAVAILABLE',
@@ -1744,11 +1712,6 @@ export async function executeCliTool(
 
   if (record.riskLevel !== 'safe') {
     const lane = resolveCliToolApprovalLane(params)
-    if (lane === 'service' && params.actorType === 'agent') {
-      console.warn(
-        `[CLI tools] A managed CLI run called risky tool "${record.toolId}" with no message id, so no approval card can render. The managed CLI profiles forward BATSHIT_MESSAGE_ID — regenerate them if this persists.`
-      )
-    }
     const decision = await decideRiskGate({
       userId: params.userId,
       agentId: params.agentId,

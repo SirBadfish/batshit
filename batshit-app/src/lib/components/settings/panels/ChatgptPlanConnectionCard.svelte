@@ -76,7 +76,7 @@
       <IconRenderer ref={{ kind: 'brand', slug: 'openai-mono' }} iconClass="h-4 w-4" label="OpenAI" />
       <h4 class="batshit-settings-section-title">ChatGPT Plan</h4>
       <SettingsInfoMenu ariaLabel="About ChatGPT Plan" contentClass="w-80">
-        <p>Connect your ChatGPT plan to normal API agents and Compact. Available models and app limits come from your ChatGPT account. OpenAI API keys remain a separate paid connection.</p>
+        <p>Connect your ChatGPT plan to your agents and Compact. Available models and app limits come from your ChatGPT account. OpenAI API keys remain a separate paid connection.</p>
       </SettingsInfoMenu>
     </div>
   </Card.Header>
@@ -93,9 +93,9 @@
       </div>
     {/each}
     <div class="flex flex-wrap items-center gap-3">
-      {#if waiting}<p class="batshit-settings-note">Finish sign-in in your browser.</p>{#if authorizationUrl}<a class="batshit-settings-link" href={authorizationUrl} target="_blank" rel="noopener noreferrer">Open ChatGPT Sign-In</a>{/if}<Button variant="outline" size="sm" disabled={busy} onclick={cancel}>Cancel Sign-In</Button>
+      {#if waiting}<p class="batshit-settings-note">Finish sign-in in your browser.</p>{#if authorizationUrl}<Button variant="outline" size="sm" href={authorizationUrl} target="_blank" rel="noopener noreferrer">Open ChatGPT Sign-In</Button>{/if}<Button variant="outline" size="sm" disabled={busy} onclick={cancel}>Cancel Sign-In</Button>
       {:else}<Button variant="outline" size="sm" disabled={busy || loading || !eligible} onclick={() => start()}>Continue with ChatGPT</Button>{/if}
-      <a class="batshit-settings-link" href={CHATGPT_PLAN_USAGE_URL} target="_blank" rel="noopener noreferrer">Manage ChatGPT Usage</a>
+      <Button variant="outline" size="sm" href={CHATGPT_PLAN_USAGE_URL} target="_blank" rel="noopener noreferrer">Manage ChatGPT Usage</Button>
       {#if error && !waiting}<Button variant="ghost" size="sm" disabled={busy} onclick={load}>Retry Status</Button>{/if}
     </div>
   </Card.Content>
@@ -105,10 +105,10 @@
   <Dialog.Content class="sm:max-w-md">
     <Dialog.Header>
       <Dialog.Title>You’re using your ChatGPT plan</Dialog.Title>
-      <Dialog.Description>Eligible AI requests in Batshit use your ChatGPT plan. Select ChatGPT Plan in Models, then choose that preset for an API agent. Review usage and app limits in ChatGPT settings.</Dialog.Description>
+      <Dialog.Description>Eligible AI requests in Batshit use your ChatGPT plan. Select ChatGPT Plan in Models, then choose that preset for an agent. Review usage and app limits in ChatGPT settings.</Dialog.Description>
     </Dialog.Header>
     <Dialog.Footer class="gap-2">
-      <a class="batshit-settings-link" href={CHATGPT_PLAN_USAGE_URL} target="_blank" rel="noopener noreferrer">Manage ChatGPT Usage</a>
+      <Button variant="outline" href={CHATGPT_PLAN_USAGE_URL} target="_blank" rel="noopener noreferrer">Manage ChatGPT Usage</Button>
       <Button variant="outline" onclick={() => welcome = false}>Got It</Button>
     </Dialog.Footer>
   </Dialog.Content>

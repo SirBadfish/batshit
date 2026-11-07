@@ -24,6 +24,16 @@ function form(overrides: { displayName?: string; budgets?: Partial<Record<'on_my
 }
 
 describe('rebaseAgentWritableFields (BL-1294)', () => {
+  it('A8 keeps a dirty custom Memory floor choice together when the agent selects automatic modes', () => {
+    const base = form(), draft = form(), server = form()
+    base.memory_settings.window.floorMode = 'custom'; base.memory_settings.window.floorTokens = 64000
+    draft.memory_settings.window = { ...base.memory_settings.window, floorTokens: 65000 }
+    server.memory_settings.window = { ...base.memory_settings.window, floorMode: 'auto' }
+    const result = rebaseAgentWritableFields(draft, base, server, base)
+    expect(result.draft.memory_settings.window).toMatchObject({ floorMode: 'custom', floorTokens: 65000 })
+    expect(result.base.memory_settings.window).toMatchObject({ floorMode: 'auto', floorTokens: 64000 })
+    expect(agentWritableConflictLabels(result.conflicts)).toEqual(['Infinite Session Window'])
+  })
   it('the user edited Recalled, the agent changed Awareness: both survive, no conflict', () => {
     const base = form()
     const draft = form({ budgets: { recalled: 350 } })
@@ -108,5 +118,22 @@ describe('rebaseAgentWritableFields (BL-1294)', () => {
         'memory_settings.recallLingerTurns'
       ])
     ).toEqual(['Display Name', 'Infinite Session Window', 'Recall Linger'])
+  })
+})
+
+describe('reasoning display fields stay with their owner', () => {
+  // SA-139 R4: the CLI Primary's reasoning-pair rebase left with that lane. An API agent's
+  // reasoning display and retention fields were never this rebase's to change.
+  const api = (show: boolean | null, preserve: boolean | null) => ({
+    ...form(), agentType: 'api', show_reasoning: show, preserve_reasoning: preserve
+  })
+
+  it('leaves the API reasoning display and retention group with its existing owner', () => {
+    const base = api(true, false)
+    const server = api(false, true)
+    const result = rebaseAgentWritableFields(base, base, server, base)
+    expect(result.draft).toEqual(base)
+    expect(result.base).toEqual(base)
+    expect(result.baseChanged).toBe(false)
   })
 })

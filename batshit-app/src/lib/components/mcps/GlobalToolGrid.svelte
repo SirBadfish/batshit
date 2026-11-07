@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte'
+  import { onDestroy, onMount } from 'svelte'
+  import { onUserChannelEvent } from '$lib/services/userChannel'
   import * as Switch from '$lib/components/ui/switch'
   import * as Collapsible from '$lib/components/ui/collapsible'
   import * as Select from '$lib/components/ui/select'
@@ -8,6 +9,7 @@
   import SettingsInfoMenu from '$lib/components/settings/SettingsInfoMenu.svelte'
   import SettingsSaveStatus from '$lib/components/settings/SettingsSaveStatus.svelte'
   import GlobalZipControlStrip from '$lib/components/mcps/GlobalZipControlStrip.svelte'
+  import ToolGridSection from '$lib/components/mcps/ToolGridSection.svelte'
   import NonMcpZipRowsSection from '$lib/components/mcps/NonMcpZipRowsSection.svelte'
   import BatshitIcon from '$lib/components/icons/BatshitIcon.svelte'
   import ToolGridIdentityIcon from '$lib/components/tools/ToolGridIdentityIcon.svelte'
@@ -39,7 +41,10 @@
   } from '@lucide/svelte'
   import { debounce } from '$lib/utils/debounce'
   import { GLOBAL_JEV_SMART_ZIP_FIELD, resolveJevSmartZipEnabled } from '$lib/utils/jevJuiceControl'
+  import { resolveZipAiViewModeOf, type RefreshedFileReadsHost } from '$lib/utils/liveFileReads'
+  import { fetchToolsHostFacts, globalRefreshedFileReadsAvailability } from '$lib/utils/refreshedFileReadsSettings'
   import { confirmUserSettings as setUserSettings } from '$lib/stores/userSettings.svelte'
+  import { refreshAllDeadCopies } from '$lib/stores/zipDeadCopies.svelte'
   import {
     formatToolGridInheritedZipBehaviorLabel,
     formatToolGridZipBehaviorLabel,
@@ -64,6 +69,7 @@
 	    createDefaultArtifactToolGridSettings,
 	    createDefaultFabricToolGridSettings,
 	    FABRIC_TOOL_GRID_GROUP_NAME,
+	    FABRIC_TOOL_GRID_DISPLAY_NAME,
 	    FABRIC_TOOL_GRID_INFO_PARAGRAPHS,
 	    normalizeArtifactToolGridSettings,
 	    normalizeFabricToolGridSettings,
@@ -105,6 +111,10 @@
   type GroupRow = ToolGridGroupRow
 
   interface GatewayRow {
+    sourceRevision?: string
+    savedSignature?: string
+    recoveryHold?: 'conflict' | 'unknown'
+    unavailable?: boolean
     id: string
     name: string
     iconRef: IconRef
@@ -219,6 +229,7 @@
   const MIN_IMAGE_BUFFER = 0
   const MAX_BUFFER = 50
   const BATSHIT_ROWS_KEY = '__batshit_rows__'
+  const MCP_ROWS_KEY = '__mcp_tool_rows__'
   const OTHER_ROWS_KEY = '__other_rows__'
   const TOOL_GRID_TABLE_CLASS = 'w-full min-w-[820px] table-fixed text-xs'
   const TOOL_GRID_FIRST_COLUMN_CLASS = 'w-[35%]'
@@ -252,6 +263,7 @@
   let saveResetTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
   let openTopLevelAccordionItemKey = $state<string | null>(null)
+  let openSourceAccordionItemKey = $state<string | null>(null)
   let openNestedAccordionItemKey = $state<string | null>(null)
   let groupRestoreModes = $state<Record<string, DcmGroupDisplayMode>>({})
   let toolRestoreModes = $state<Record<string, DcmToolDisplayMode>>({})
@@ -266,6 +278,23 @@
   let zipToolNotesEnabled = $state(true)
   // SA-120 P5 (LS-054): "Judge Juice: Smart Zip", the one global switch. Absent means OFF.
   let jevSmartZipEnabled = $state(false)
+  // SA-137 P4a: the global Refreshed File Reads value as saved (null = absent, the factory value: ON since 2026-11-04, `DEFAULT_LIVE_FILE_READS_ENABLED`).
+  // It rides inside `global_zip_settings`, which every save below replaces whole (BL-487).
+  let liveFileReadsValue = $state<boolean | null>(null)
+  // Round 2 (R2-2): what this computer is, read once from the sandbox-status response, so the
+  // switch can say when Refreshed File Reads cannot run here. It only drives the switch's
+  // availability; nothing here is saved, and a failed read never blocks the switch.
+  let refreshedFileReadsHost = $state<RefreshedFileReadsHost | null>(null)
+  let refreshedFileReadsHostCheckFailed = $state(false)
+  const refreshedFileReadsAvailability = $derived(
+    globalRefreshedFileReadsAvailability({
+      zipViewMode: zipAiViewMode,
+      host: refreshedFileReadsHost,
+      hostCheckFailed: refreshedFileReadsHostCheckFailed
+    })
+  )
+  // SA-136 D1: the typed file tools' global grant as saved (null = the factory value). It rides
+  // inside `global_tool_grid_settings`, which every save below replaces whole (BL-487).
   let zipSaveState = $state<SaveState>('idle')
   let zipSaveError = $state<string | null>(null)
   let zipResetTimer: ReturnType<typeof setTimeout> | null = null
@@ -351,6 +380,23 @@
     return next.sort((left, right) => left.tool_name.localeCompare(right.tool_name))
   }
 
+  /** The Zip view a stored block resolves to: only `inline` is inline, absent reads as appended. */
+  function zipViewOf(settings: GlobalZipSettings): 'inline' | 'appended' {
+    return resolveZipAiViewModeOf({ zip_ai_view_mode: settings.zip_ai_view_mode }, null)
+  }
+
+  async function loadRefreshedFileReadsHost() {
+    try {
+      // Host facts only: this read starts no sandbox probe (the route's `hostOnly` mode).
+      const host = await fetchToolsHostFacts()
+      refreshedFileReadsHost = { platform: host.platform, containerized: host.containerized }
+      refreshedFileReadsHostCheckFailed = false
+    } catch (error) {
+      console.warn('[GlobalToolGrid] Could not read the host facts for Refreshed File Reads; its switch stays usable:', error)
+      refreshedFileReadsHostCheckFailed = true
+    }
+  }
+
   async function loadZipSettings() {
     if (!userId) return
 
@@ -387,6 +433,7 @@
           ? global.zip_tool_notes_enabled
           : DEFAULT_GLOBAL_ZIP_TOOL_NOTES_ENABLED
       jevSmartZipEnabled = resolveJevSmartZipEnabled(global)
+      liveFileReadsValue = typeof global.live_file_reads === 'boolean' ? global.live_file_reads : null
       zipSettingsLoaded = true
       // A successful (re)load clears any earlier "cannot be saved yet" refusal (BL-487):
       // that message is now stale, and the values it warned about are gone.
@@ -402,12 +449,17 @@
     }
   }
 
-  async function loadGateways() {
+  let gatewayReadGeneration = 0
+  const gatewayWriteGenerations = new Map<string, number>()
+  const advanceGatewayWrite = (id: string) => gatewayWriteGenerations.set(id, (gatewayWriteGenerations.get(id) ?? 0) + 1)
+  const gatewayRowSignature = (row: GatewayRow) => JSON.stringify({ enabled: row.enabled, defaults: normalizeForSave(row.defaults) })
+  async function loadGateways(discardDrafts = false) {
     if (!userId) {
       gateways = []
       return
     }
 
+    const generation = ++gatewayReadGeneration, readUser = userId, writesAtRead = new Map(gatewayWriteGenerations)
     loading = true
     loadError = null
 
@@ -418,9 +470,16 @@
       }
 
       const payload = await response.json()
-      const allGateways = Array.isArray(payload?.gateways)
-        ? (payload.gateways as MCPGateway[])
-        : []
+      if (!payload || typeof payload !== 'object' || !Array.isArray(payload.gateways) ||
+        payload.gateways.some((row: unknown) => !row || typeof row !== 'object' || Array.isArray(row) ||
+          typeof (row as MCPGateway).id !== 'string' || !(row as MCPGateway).id.trim() ||
+          typeof (row as MCPGateway).name !== 'string' || !(row as MCPGateway).name.trim() ||
+          typeof (row as MCPGateway).type !== 'string' || !(row as MCPGateway).type.trim() || typeof (row as MCPGateway).enabled !== 'boolean' ||
+          ('sourceRevision' in row && !/^source1:[a-f0-9]{64}$/.test(String(row.sourceRevision)))) ||
+        new Set(payload.gateways.map((row: MCPGateway) => row.id)).size !== payload.gateways.length) {
+        throw new Error('Saved MCP sources could not be read. Your drafts are kept; retry Refresh.')
+      }
+      const allGateways = payload.gateways as MCPGateway[]
 
       const interactiveGateways = allGateways
         .filter((gateway) => gateway.type !== 'n8n-mcp-client')
@@ -430,6 +489,7 @@
         interactiveGateways.map(async (gateway) => {
           if (!gateway.enabled) {
             return {
+              sourceRevision: (gateway as MCPGateway & { sourceRevision?: string }).sourceRevision,
               id: gateway.id,
               name: gateway.name,
               iconRef: normalizeIconRef(gateway.icon_ref, DEFAULT_MCP_GATEWAY_ICON_REF),
@@ -448,6 +508,7 @@
             const toolsPayload = (await toolsResponse.json()) as GatewayToolsResponse
 
             return {
+              sourceRevision: (gateway as MCPGateway & { sourceRevision?: string }).sourceRevision,
               id: gateway.id,
               name: gateway.name,
               iconRef: normalizeIconRef(gateway.icon_ref, DEFAULT_MCP_GATEWAY_ICON_REF),
@@ -458,6 +519,7 @@
           } catch (error) {
             console.warn('[GlobalToolGrid] Failed loading gateway tools', gateway.id, error)
             return {
+              sourceRevision: (gateway as MCPGateway & { sourceRevision?: string }).sourceRevision,
               id: gateway.id,
               name: gateway.name,
               iconRef: normalizeIconRef(gateway.icon_ref, DEFAULT_MCP_GATEWAY_ICON_REF),
@@ -499,11 +561,38 @@
             .sort((left, right) => left.toolId.localeCompare(right.toolId))
         : []
 
-      gateways = rows
+      if (generation !== gatewayReadGeneration || userId !== readUser) return
+      const previous = gateways
+      // Recovery may discard an owned draft only with this SAME read's source base.
+      // Initial display-only rows without a base still refuse at the write boundary.
+      if (discardDrafts && rows.some(row => {
+        const before = previous.find(value => value.id === row.id)
+        return before && (before.unavailable || before.recoveryHold || saveStateByGateway[row.id] === 'error' ||
+          gatewayRowSignature(before) !== before.savedSignature) && !/^source1:[a-f0-9]{64}$/.test(row.sourceRevision ?? '')
+      })) throw new Error('Saved MCP sources could not be read. Your drafts are kept; retry Refresh.')
+      const next: GatewayRow[] = rows.map(row => {
+        const before = previous.find(value => value.id === row.id)
+        if (before && (writesAtRead.get(row.id) !== gatewayWriteGenerations.get(row.id) || saveTimers.has(row.id) || saveStateByGateway[row.id] === 'saving' || !discardDrafts && (before.unavailable || before.recoveryHold || saveStateByGateway[row.id] === 'error' || gatewayRowSignature(before) !== before.savedSignature))) return before
+        if (discardDrafts) setGatewaySaveState(row.id, 'idle')
+        return { ...row, savedSignature: gatewayRowSignature(row) }
+      })
+      for (const before of previous) {
+        if (rows.some(row => row.id === before.id)) continue
+        const pending = saveTimers.has(before.id) || saveStateByGateway[before.id] === 'saving' || writesAtRead.get(before.id) !== gatewayWriteGenerations.get(before.id)
+        if (pending || !discardDrafts && (before.unavailable || before.recoveryHold || gatewayRowSignature(before) !== before.savedSignature || saveStateByGateway[before.id] === 'error')) {
+          // A missing source is not authority to recreate it. Retain the draft/custody,
+          // retire only an unissued timer, and wait for deliberate saved-source recovery.
+          clearSaveTimer(before.id)
+          next.push({ ...before, unavailable: true })
+          if (saveStateByGateway[before.id] !== 'saving') setGatewaySaveState(before.id, 'error', 'This source is unavailable. Your draft is kept; use Refresh to review saved sources.')
+        } else if (discardDrafts) setGatewaySaveState(before.id, 'idle')
+      }
+      gateways = next
+      if (discardDrafts && !next.some(row => row.unavailable || row.recoveryHold)) setGatewaySaveState(GLOBAL_RESET_SAVE_KEY, 'idle')
     } catch (error) {
-      loadError = error instanceof Error ? error.message : 'Failed to load global tool grid'
+      if (generation === gatewayReadGeneration && userId === readUser) loadError = error instanceof Error ? error.message : 'Failed to load global tool grid'
     } finally {
-      loading = false
+      if (generation === gatewayReadGeneration && userId === readUser) loading = false
     }
   }
 
@@ -543,31 +632,46 @@
     }
   }
 
-  async function saveGatewayDefaults(gatewayId: string) {
-    const row = gateways.find((entry) => entry.id === gatewayId)
+  async function saveGatewayDefaults(gatewayId: string, captured?: GatewayRow) {
+    const row = captured ?? gateways.find((entry) => entry.id === gatewayId)
     if (!row) return
+    const current = gateways.find(value => value.id === gatewayId)
+    if (!current || current.unavailable || current.recoveryHold) {
+      setGatewaySaveState(gatewayId, 'error', 'Your source draft is kept. Use Refresh before another choice.')
+      return
+    }
 
+    if (!/^source1:[a-f0-9]{64}$/.test(row.sourceRevision ?? '')) {
+      gateways = gateways.map((value): GatewayRow => value.id === gatewayId ? { ...value, recoveryHold: 'conflict' } : value)
+      setGatewaySaveState(gatewayId, 'error', 'Read the saved gateway source before another choice.')
+      return
+    }
     setGatewaySaveState(gatewayId, 'saving')
     clearSaveResetTimer(gatewayId)
 
+    let acknowledged = false
+    let knownRefusal = false
     try {
       const response = await fetch(`/api/mcp/gateways/${gatewayId}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          expectedGatewaySource: row.sourceRevision,
           enabled: row.enabled,
           dcmDisplayDefaults: normalizeForSave(row.defaults)
         })
       })
-      if (!response.ok) {
-        const payload = await response.json().catch(() => ({}))
-        const message =
-          typeof payload?.error === 'string' && payload.error.trim().length > 0
-            ? payload.error
-            : 'Failed to save Global Tool Grid defaults'
-        throw new Error(message)
+      const answer = await response.json().catch(() => null)
+      const ack = answer?.sourceAcknowledgement
+      acknowledged = ack?.id === row.id && /^source1:[a-f0-9]{64}$/.test(ack?.sourceRevision ?? '')
+      if (acknowledged) gateways = gateways.map(value => value.id !== row.id || value.sourceRevision !== row.sourceRevision || saveTimers.has(gatewayId) || gatewayRowSignature(value) !== gatewayRowSignature(row) ? value : { ...value, sourceRevision: ack.sourceRevision, savedSignature: gatewayRowSignature(row) })
+      knownRefusal = [400, 409].includes(response.status) && ['gateway_source_base_required', 'gateway_source_changed'].includes(answer?.code)
+      if (!response.ok) throw new Error(typeof answer?.error === 'string' ? answer.error : 'Failed to save Global Tool Grid defaults')
+      if (!acknowledged) throw new Error('The gateway source save acknowledgement is unconfirmed. Your draft is kept; read saved sources before another choice.')
+      if (saveTimers.has(gatewayId) || gatewayRowSignature(gateways.find(value => value.id === gatewayId) ?? row) !== gatewayRowSignature(row)) {
+        setGatewaySaveState(gatewayId, saveTimers.has(gatewayId) ? 'saving' : 'idle')
+        return
       }
-
       setGatewaySaveState(gatewayId, 'saved')
       const resetTimer = setTimeout(() => {
         setGatewaySaveState(gatewayId, 'idle')
@@ -575,17 +679,30 @@
       }, 1400)
       saveResetTimers.set(gatewayId, resetTimer)
     } catch (error) {
+      if (!acknowledged) {
+        clearSaveTimer(gatewayId)
+        gateways = gateways.map((value): GatewayRow => value.id === gatewayId ? { ...value, recoveryHold: knownRefusal ? 'conflict' : 'unknown' } : value)
+      }
       const message =
         error instanceof Error ? error.message : 'Failed to save Global Tool Grid defaults'
       setGatewaySaveState(gatewayId, 'error', message)
-    }
+    } finally { advanceGatewayWrite(gatewayId) }
   }
 
   function queueSaveGateway(gatewayId: string) {
+    const current = gateways.find(value => value.id === gatewayId)
+    if (!current || current.unavailable || current.recoveryHold) {
+      setGatewaySaveState(gatewayId, 'error', 'Your source draft is kept. Use Refresh before another choice.')
+      return
+    }
     clearSaveTimer(gatewayId)
+    advanceGatewayWrite(gatewayId)
+    const row = gateways.find(value => value.id === gatewayId)
+    if (!row) return
+    const captured = structuredClone($state.snapshot(row))
     const timer = setTimeout(() => {
       saveTimers.delete(gatewayId)
-      void saveGatewayDefaults(gatewayId)
+      void saveGatewayDefaults(gatewayId, captured)
     }, 420)
     saveTimers.set(gatewayId, timer)
   }
@@ -606,8 +723,8 @@
     debouncedSaveZipSettings()
   }
 
-  // The reset replaces the whole block, so it writes neither the parked experiment key (absent is
-  // OFF) nor the ignored legacy keys (BL-1484): a reset also sweeps those dead values.
+  // The reset replaces the whole block, so it writes none of the retired zip control keys
+  // (BL-1484, 2026-10-23): a reset also sweeps those dead values, as the startup pass does.
   function createDefaultGlobalToolGridZipSettings(): GlobalZipSettings {
     return {
       zip_ai_view_mode: DEFAULT_GLOBAL_ZIP_AI_VIEW_MODE,
@@ -677,12 +794,17 @@
     queueSaveZipSettings()
   }
 
+  function updateLiveFileReadsValue(value: boolean | null) {
+    liveFileReadsValue = value
+    queueSaveZipSettings()
+  }
+
   const debouncedSaveZipSettings = debounce(async () => {
     if (!userId) return
 
     try {
       // The block is saved whole (BL-487), so every key this grid does not own rides through as
-      // stored: the parked experiment key and the ignored legacy zip control keys (BL-1484) too.
+      // stored: the retired zip control keys too, until the startup pass removes them (BL-1484).
       const nextGlobalZipSettings: GlobalZipSettings = {
         ...globalZipSettingsRaw,
         zip_ai_view_mode: zipAiViewMode,
@@ -695,14 +817,25 @@
       } else {
         delete nextGlobalZipSettings[GLOBAL_JEV_SMART_ZIP_FIELD]
       }
+      // SA-137 P4a: "Default" is stored as absent, so the factory value can still move.
+      if (liveFileReadsValue === null) {
+        delete nextGlobalZipSettings.live_file_reads
+      } else {
+        nextGlobalZipSettings.live_file_reads = liveFileReadsValue
+      }
 
       const settings = await saveUserToolGridDefaults(
         nextGlobalZipSettings,
         globalCliToolGridSettings
       )
+      const liveFileReadsChanged = globalZipSettingsRaw.live_file_reads !== nextGlobalZipSettings.live_file_reads
+      // Round 2: and on the Zip view (an input of the availability rule); absent reads as appended.
+      const zipViewChanged = zipViewOf(globalZipSettingsRaw) !== zipViewOf(nextGlobalZipSettings)
       globalZipSettingsRaw = nextGlobalZipSettings
       zipSaveState = 'saved'
       zipSaveError = null
+      // SA-137 P4 (D11): the badges' live-read facts depend on this value.
+      if (liveFileReadsChanged || zipViewChanged) void refreshAllDeadCopies()
 
       if (settings) {
         setUserSettings(settings)
@@ -720,6 +853,8 @@
 
   async function resetGlobalToolGridDefaults() {
     if (!userId || globalResetBusy) return
+    if (gateways.some(row => row.unavailable || row.recoveryHold)) { setGatewaySaveState(GLOBAL_RESET_SAVE_KEY, 'error', 'A source draft needs Refresh before reset. No gateway or global Zip reset was sent.'); return }
+    if (saveTimers.size || Object.values(saveStateByGateway).includes('saving')) { setGatewaySaveState(GLOBAL_RESET_SAVE_KEY, 'error', 'A gateway save is still pending. Wait for its outcome before reset.'); return }
 
     // BL-487 follow-up: the Reset button is already disabled while unloaded, but this writes
     // to EVERY gateway on the server (one PUT per row) before the guarded
@@ -739,6 +874,10 @@
       return
     }
 
+    if (gateways.some(row => !/^source1:[a-f0-9]{64}$/.test(row.sourceRevision ?? ''))) {
+      setGatewaySaveState(GLOBAL_RESET_SAVE_KEY, 'error', 'Read all saved gateway sources with Refresh before reset. Nothing was sent.')
+      return
+    }
     globalResetBusy = true
     clearZipResetTimer()
     setGatewaySaveState(GLOBAL_RESET_SAVE_KEY, 'saving')
@@ -754,33 +893,49 @@
         defaults: createDefaultGatewayDcmDisplayDefaults()
       }))
 
-      await Promise.all(
+      const resetResults = await Promise.allSettled(
         nextGateways.map(async (gateway) => {
-          const response = await fetch(`/api/mcp/gateways/${gateway.id}`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              enabled: gateway.enabled,
-              dcmDisplayDefaults: gateway.defaults
+          advanceGatewayWrite(gateway.id)
+          const resetGeneration = gatewayWriteGenerations.get(gateway.id)
+          if (!/^source1:[a-f0-9]{64}$/.test(gateway.sourceRevision ?? '')) throw new Error(`Read the saved source for ${gateway.name} before reset.`)
+          let acknowledged = false
+          let knownRefusal = false
+          try {
+            const response = await fetch(`/api/mcp/gateways/${gateway.id}`, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                expectedGatewaySource: gateway.sourceRevision,
+                enabled: gateway.enabled,
+                dcmDisplayDefaults: gateway.defaults
+              })
             })
-          })
-          if (!response.ok) {
-            const payload = await response.json().catch(() => ({}))
-            const message =
-              typeof payload?.error === 'string' && payload.error.trim().length > 0
-                ? payload.error
-                : `Failed to reset ${gateway.name}`
-            throw new Error(message)
+            const payload = await response.json().catch(() => null)
+            const ack = payload?.sourceAcknowledgement
+            acknowledged = ack?.id === gateway.id && /^source1:[a-f0-9]{64}$/.test(ack?.sourceRevision ?? '')
+            if (acknowledged) gateways = gateways.map(row => row.id !== gateway.id || row.sourceRevision !== gateway.sourceRevision || gatewayWriteGenerations.get(gateway.id) !== resetGeneration ? row : { ...gateway, sourceRevision: ack.sourceRevision, savedSignature: gatewayRowSignature(gateway) })
+            knownRefusal = [400, 409].includes(response.status) && ['gateway_source_base_required', 'gateway_source_changed'].includes(payload?.code)
+            if (!response.ok) throw Object.assign(new Error(typeof payload?.error === 'string' ? payload.error : `Failed to reset ${gateway.name}`), { sourceSaved: acknowledged })
+            if (!acknowledged) throw new Error(`The source reset for ${gateway.name} is unconfirmed.`)
+          } catch (error) {
+            if (!acknowledged) gateways = gateways.map((row): GatewayRow => row.id === gateway.id ? { ...row, recoveryHold: knownRefusal ? 'conflict' : 'unknown' } : row)
+            throw error
           }
         })
       )
+      nextGateways.forEach(gateway => advanceGatewayWrite(gateway.id))
+      const resetFailures = resetResults.filter(result => result.status === 'rejected')
+      const savedFollowupFailures = resetFailures.filter(result => result.reason?.sourceSaved === true).length
+      if (resetFailures.length) throw new Error(`${resetResults.length - resetFailures.length + savedFollowupFailures} gateway resets saved; ${savedFollowupFailures} follow-ups failed; ${resetFailures.length - savedFollowupFailures} refused or unconfirmed. Your remaining drafts are kept. Read saved sources before another choice.`)
 
       const settings = await saveUserToolGridDefaults(
         nextGlobalZipSettings,
         nextCliToolGridSettings
       )
 
-      gateways = nextGateways
+      const hadLiveFileReads = typeof globalZipSettingsRaw.live_file_reads === 'boolean'
+      // Round 2: a reset that moves the Zip view changes the availability rule's input too.
+      const zipViewReset = zipViewOf(globalZipSettingsRaw) !== zipViewOf(nextGlobalZipSettings)
       globalZipSettingsRaw = nextGlobalZipSettings
       globalCliToolGridSettings = nextCliToolGridSettings
       customToolSettings = []
@@ -789,6 +944,10 @@
       zipToolNotesEnabled = DEFAULT_GLOBAL_ZIP_TOOL_NOTES_ENABLED
       // The reset writes product defaults, and this switch's default is OFF (absent).
       jevSmartZipEnabled = false
+      // Refreshed File Reads is absent in the reset block (the product default: off), like Smart Zip.
+      liveFileReadsValue = null
+      // SA-137 P4 (D11): a reset that cleared a saved value changes the badges' live-read facts.
+      if (hadLiveFileReads || zipViewReset) void refreshAllDeadCopies()
       saveErrorByGateway = {}
       saveStateByGateway = { [GLOBAL_RESET_SAVE_KEY]: 'saved' }
       zipSaveState = 'saved'
@@ -818,6 +977,11 @@
   }
 
   function updateGatewayRow(gatewayId: string, mutate: (next: GatewayRow) => void) {
+    const current = gateways.find(row => row.id === gatewayId)
+    if (!current || current.unavailable || current.recoveryHold) {
+      setGatewaySaveState(gatewayId, 'error', 'Your source draft is kept. Use Refresh before another choice.')
+      return
+    }
     gateways = gateways.map((gateway) => {
       if (gateway.id !== gatewayId) return gateway
       const nextGateway: GatewayRow = {
@@ -962,16 +1126,16 @@
 
   /**
    * SA-096: the Discoverable + Display Detail pair for a broker family, rendered on the
-   * existing `Fabric Controls` / `Artifact Tools` rows inside the `Batshit Tools`
+   * existing `Fabric & Utilities` / `Artifact Tools` rows inside the `Batshit Tools`
    * accordion. Global defaults always show zip columns, so those rows are the family's
    * only home here and the name never appears twice in the grid.
    */
   function buildBrokerFamilyControls(key: BrokerFamilyToolGridKey): BrokerFamilyRowControls {
-    const groupName = getBrokerFamilyGroupName(key)
+    const displayName = key === 'fabric' ? FABRIC_TOOL_GRID_DISPLAY_NAME : ARTIFACT_TOOL_GRID_GROUP_NAME
     const mode = getBrokerFamilyGroupMode(key)
 
     return {
-      label: groupName,
+      label: displayName,
       iconRef: key === 'fabric' ? TOOL_GRID_FABRIC_ICON_REF : TOOL_GRID_ARTIFACT_ICON_REF,
       visible: mode !== 'hidden',
       value: mode,
@@ -989,8 +1153,8 @@
   function getBrokerFamilyControlsForRow(
     rowId: SharedNonMcpToolGridRowId
   ): BrokerFamilyRowControls | null {
-    if (rowId === 'fabric_find') return buildBrokerFamilyControls('fabric')
-    if (rowId === 'artifact_find') return buildBrokerFamilyControls('artifact')
+    if (rowId === 'fabric_find') return null // Fabric has one enabled line; presentation is no longer configurable.
+    if (rowId === 'artifact_find') return { ...buildBrokerFamilyControls('artifact'), visible: true }
     return null
   }
 
@@ -1597,7 +1761,17 @@
   function toggleTopLevelAccordionItem(itemKey: string) {
     openTopLevelAccordionItemKey =
       openTopLevelAccordionItemKey === itemKey ? null : itemKey
+    openSourceAccordionItemKey = null
     openNestedAccordionItemKey = null
+  }
+
+  function toggleSourceAccordionItem(itemKey: string) {
+    openSourceAccordionItemKey = openSourceAccordionItemKey === itemKey ? null : itemKey
+    openNestedAccordionItemKey = null
+  }
+
+  function handleSourceHeaderClick(event: MouseEvent, itemKey: string) {
+    if (!isInteractiveHeaderElement(event.target)) toggleSourceAccordionItem(itemKey)
   }
 
   function toggleNestedAccordionItem(itemKey: string) {
@@ -1681,7 +1855,11 @@
     if (!userId) return
     void loadGateways()
     void loadZipSettings()
+    void loadRefreshedFileReadsHost()
   })
+
+
+  onMount(() => onUserChannelEvent(event => { if (event.type === 'reconnected' || event.type === 'mcp_gateway_source_changed') void loadGateways() }))
 
   onDestroy(() => {
     for (const timer of saveTimers.values()) {
@@ -1721,7 +1899,7 @@
 
   {#snippet actions()}
     <div class="flex items-center justify-end gap-2">
-      <Button variant="outline" size="sm" onclick={loadGateways} disabled={loading || !userId}>
+      <Button variant="outline" size="sm" onclick={() => void loadGateways(true)} disabled={loading || !userId || globalResetBusy || Object.values(saveStateByGateway).includes('saving')}>
         <RefreshCw class={`${loading ? 'animate-spin' : ''}`} />
         Refresh
       </Button>
@@ -1755,24 +1933,33 @@
     {/if}
 
     <GlobalZipControlStrip
+      showSmartZip={false}
       {zipAiViewMode}
       {zipToolNotesEnabled}
       {jevSmartZipEnabled}
+      {liveFileReadsValue}
+      liveFileReadsUnavailableReason={refreshedFileReadsAvailability.unavailableReason}
+      liveFileReadsNotes={refreshedFileReadsAvailability.notes}
       onZipAiViewModeChange={updateZipAiViewMode}
       onZipToolNotesEnabledChange={updateZipToolNotesEnabled}
       onJevSmartZipEnabledChange={updateJevSmartZipEnabled}
+      onLiveFileReadsValueChange={updateLiveFileReadsValue}
     />
+
+
 
     {#if loading}
       <div class="flex items-center gap-2 batshit-settings-inline-alert">
         <Loader2 class="h-3.5 w-3.5 animate-spin" />
         Loading gateway tool metadata...
       </div>
-    {:else if loadError}
+    {/if}
+    {#if loadError}
       <div class="batshit-settings-inline-alert is-danger">
         {loadError}
       </div>
-    {:else if gateways.length === 0 && cliToolCatalog.length === 0 && BATSHIT_ROW_ORDER.length === 0 && OTHER_ROW_ORDER.length === 0}
+    {/if}
+    {#if gateways.length === 0 && cliToolCatalog.length === 0 && BATSHIT_ROW_ORDER.length === 0 && OTHER_ROW_ORDER.length === 0}
       <div class="batshit-settings-inline-alert is-dashed">
         No Global Tool Grid rows found yet. Add or enable gateways in MCP Sources, or create CLI tools.
       </div>
@@ -1790,7 +1977,7 @@
           <thead class="batshit-settings-table-head">
             <tr>
               <th class="batshit-settings-table-head-cell">Item</th>
-              <th class="batshit-settings-table-head-cell">Discoverable</th>
+              <th class="batshit-settings-table-head-cell">Enable</th>
               <th class="batshit-settings-table-head-cell">Display Detail</th>
               <th class="batshit-settings-table-head-cell">Zip Buffer</th>
               <th class="batshit-settings-table-head-cell">Zip Threshold</th>
@@ -1813,13 +2000,14 @@
               getRowOverride={getOtherZipRowOverride}
               onUpdateRowOverride={updateOtherZipRowOverride}
               getBrokerFamilyControls={getBrokerFamilyControlsForRow}
+              showBrokerDiscoverable={false}
               onHeaderClick={handleTopLevelHeaderClick}
               onToggle={toggleTopLevelAccordionItem}
               showBulkZipApply
               bulkZipApplyLabel="Batshit Tools"
             />
 
-            {#if cliToolCatalog.length > 0}
+            {#if userId}
               {@const cliGroupMode = getCliGroupMode()}
               {@const cliGroupVisible = cliGroupMode !== 'hidden'}
               {@const cliRowKey = CLI_TOOL_GRID_ID}
@@ -1973,6 +2161,9 @@
                           <col class={TOOL_GRID_OTHER_COLUMN_CLASS} />
                         </colgroup>
                         <tbody>
+                          {#if cliToolCatalog.length === 0}
+                            <tr class="batshit-settings-table-row"><td colspan={6} class="batshit-settings-table-cell is-muted is-empty">No saved CLI tools yet.</td></tr>
+                          {/if}
                           {#each cliToolCatalog as tool (tool.toolId)}
                             {@const toolVisible = isCliToolVisible(tool.toolId)}
                             {@const toolMode = getCliToolMode(tool.toolId)}
@@ -2164,22 +2355,38 @@
               </Collapsible.Root>
             {/if}
 
+            <ToolGridSection
+              title="MCP Tools"
+              iconRef={{ kind: 'brand', slug: 'mcp-mono' }}
+              open={openTopLevelAccordionItemKey === MCP_ROWS_KEY}
+              tableClass={`${TOOL_GRID_TABLE_CLASS} batshit-settings-tool-grid-mcp-sources`}
+              firstColumnClass={TOOL_GRID_FIRST_COLUMN_CLASS}
+              otherColumnClass={TOOL_GRID_OTHER_COLUMN_CLASS}
+              onHeaderClick={(event) => handleTopLevelHeaderClick(event, MCP_ROWS_KEY)}
+              onToggle={() => toggleTopLevelAccordionItem(MCP_ROWS_KEY)}
+            >
+              {#if gateways.length === 0}
+                <tr class="batshit-settings-table-row"><td colspan={6} class="batshit-settings-table-cell is-muted is-empty">No MCP sources discovered yet.</td></tr>
+              {/if}
             {#each gateways as gateway (gateway.id)}
               {@const sourceKey = buildSourceKey(gateway.id)}
-              {@const sourceExpanded = openTopLevelAccordionItemKey === sourceKey}
+              {@const sourceExpanded = openSourceAccordionItemKey === sourceKey}
               <Collapsible.Root open={sourceExpanded}>
                 <tr
-                  class={`${topLevelAccordionRowClass} cursor-pointer ${!gateway.enabled ? 'opacity-70' : ''}`}
-                  onclick={(event) => handleTopLevelHeaderClick(event, sourceKey)}
+                  class={`${nestedAccordionRowClass} cursor-pointer ${!gateway.enabled ? 'opacity-70' : ''}`}
+                  onclick={(event) => handleSourceHeaderClick(event, sourceKey)}
                 >
                   <td class="batshit-settings-table-cell is-strong">
-                    <div class="batshit-settings-tool-grid-label">
+                    <div class="batshit-settings-tool-grid-label is-source">
                       <ToolGridIdentityIcon
                         ref={gateway.iconRef}
                         typeLabel="MCP Source"
                         name={gateway.name}
                       />
                       <span class="batshit-settings-tool-grid-name block truncate" title={`MCP Source: ${gateway.name}`}>{gateway.name}</span>
+                      {#if gateway.unavailable}
+                        <span class="shrink-0 batshit-settings-pill">Source unavailable · draft kept</span>
+                      {/if}
                       {#if !gateway.enabled}
                         <span class="shrink-0 batshit-settings-pill">
                           Disabled Globally
@@ -2190,6 +2397,7 @@
                   <td class="batshit-settings-table-cell">
                     <Switch.Root
                       checked={gateway.enabled}
+                      disabled={gateway.unavailable || Boolean(gateway.recoveryHold)}
                       onCheckedChange={(checked) => handleGatewayEnabledChange(gateway.id, checked === true)}
                     />
                   </td>
@@ -2201,7 +2409,7 @@
                       class="ml-auto flex items-center justify-end"
                       aria-expanded={sourceExpanded}
                       aria-label={`Toggle groups for MCP Source ${gateway.name}`}
-                      onclick={() => toggleTopLevelAccordionItem(sourceKey)}
+                      onclick={() => toggleSourceAccordionItem(sourceKey)}
                     >
                       <ChevronDown class={`h-3.5 w-3.5 transition-transform ${sourceExpanded ? 'rotate-180' : ''}`} />
                     </Collapsible.Trigger>
@@ -2577,9 +2785,11 @@
               </Collapsible.Root>
             {/each}
 
+            </ToolGridSection>
+
             <NonMcpZipRowsSection
               sectionKey={OTHER_ROWS_KEY}
-              title="Other"
+              title="All Other Tools"
               sectionIconRef={TOOL_GRID_OTHER_SECTION_ICON_REF}
               typeLabel="Other Tool"
               rowIds={OTHER_ROW_ORDER}
@@ -2606,7 +2816,7 @@
           variant="outline"
           size="sm"
           onclick={resetGlobalToolGridDefaults}
-          disabled={!userId || loading || globalResetBusy || !zipSettingsLoaded}
+          disabled={!userId || loading || globalResetBusy || !zipSettingsLoaded || Object.values(saveStateByGateway).includes('saving')}
         >
           <RotateCcw aria-hidden="true" />
           Reset to defaults

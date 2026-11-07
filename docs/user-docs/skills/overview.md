@@ -2,7 +2,7 @@
 
 Skills and Prompts are the two ways you shape *how* an agent works rather than *which model* it runs. Skills are reusable, loadable capabilities an agent can pull in when a request calls for them. Prompts are the standing instructions — system prompts and custom prompts — that define an agent's behavior on every message. This page teaches both concepts from zero and points to the detail pages.
 
-Settings → Skills & Prompts is where all of this lives, organized into Skills, Skill Sources, and Prompts.
+Open **Settings → Plugins & shit**. Its Plugins tab manages complete skill packages; Skills, Skill Sources, Prompts and Portable Skills provide the related controls.
 
 ## What a Skill is
 
@@ -16,28 +16,38 @@ That's why Skill enablement is a trust decision. An enabled Skill is one the age
 
 Skills are session-free: they don't carry conversation state between uses. Each time a Skill runs, it runs fresh from its saved instructions.
 
-## Built-in Skills
+## The Batshit plugin
 
-Batshit ships with a few system Skills. On a new install, **Batshit Guide** and **Artifact Creator** start on for all agents, so a fresh agent can answer Batshit questions and build an Artifact when you ask. The others start off; turn any of them on in Settings → Skills & Prompts (for all agents) or per agent in Settings → Agents → Access. If you installed an earlier alpha, your existing choices stay as they were, so switch these two on yourself if you want them.
+Batshit ships one protected **Batshit** plugin containing eight skills:
 
-An agent can only load a Skill that is on for it. A Subagent follows its own Access list, not its parent's. If you ask for something a Skill handles and that Skill is off, the agent tells you which Skill to switch on and where. Only you change who may use a Skill: when an agent saves a new Skill for you, it is on for that agent alone until you turn it on for others. An agent can change only a Skill that is on for it.
+- **Batshit Guide** (`/batshit:batshit-guide`) — official product help; reading it needs no token.
+- **App Actions** (`/batshit:app-actions`) — supported app operations under your explicit access and approval policies. See [App Actions](../fabric/app-actions.md).
+- **Goon Guide** (`/batshit:goon-guide`) — supported Goon setup and use; informational only.
+- **Artifact Creator** (`/batshit:artifact-creator`) — build panels and Artifact tools.
+- **CLI Tool Creator** (`/batshit:cli-tool-creator`) — create saved CLI Tools.
+- **Goon Scene Creator** (`/batshit:goon-scene-creator`) — plan rooms, textures, skyboxes, props and animated panorama backgrounds.
+- **Skill Creator** (`/batshit:skill-creator`) — create reusable Skills and Prompts.
+- **TTS/STT Engine Installer** (`/batshit:voice-engine-installer`) — install and register voice engines.
 
-The built-in Skills:
+The package has one access setting for all its skills. Enable it for all agents in **Plugins**, or choose its access for one agent in **Agent Settings → Access**. On upgrade, earlier active built-in skill access is combined into package access: everyone if any active skill was global, otherwise the named agents from those active skills. An all-off setup stays off. Review the package access if you want to narrow it. A Subagent follows its own access; installing a package grants no tools or token permissions.
 
-- **Batshit Guide** (`/batshit-guide`) — turns any agent into a Batshit expert. Its references are the official Batshit docs (the same pages as the public docs site), kept in sync automatically, so an enabled agent can answer "how does X work in Batshit?" and walk you through features accurately. Enable it and just ask — the agent pulls in the guide on its own.
-- **Artifact Creator** (`/artifact-creator`) — builds Artifacts with the Builder Kit and Fabric structure Batshit requires, so an agent can go from "build me a tip calculator" to a working panel.
-- **CLI Tool Creator** (`/cli-tool-creator`) — helps set up saved CLI Tools.
-- **Goon Scene Creator** (`/goon-scene-creator`) — helps plan and generate Goon scenes, including Room Builder or Uploaded GLB placement, one coherent Ground Level or Elevated placement, projection-safe skyboxes with the 50% Ground Projection Line rule, one Scene Atmosphere layer, props, markers, and 4K vs 8K texture choices.
-- **Skill Creator** (`/skill-creator`) — helps create reusable Skills and Prompts.
-- **TTS/STT Engine Installer** (`/voice-engine-installer`) — helps install and connect local voice engines.
+Use the namespaced slash command shown in Settings. Bare aliases work when unambiguous; Batshit asks you to choose when another package uses the same name. An agent can load a skill only when the package is enabled for it.
 
-These are first-party and keep their core identity read-only, but you still control their status, trust, and which agents may use them.
+### Import and recover a plugin
 
-The Goon Scene Creator bundle also includes local ComfyUI workflow definitions for Batshit's Qwen 360 skybox path. The workflow files are instructions for ComfyUI, not bundled model weights.
+In **Plugins → Import a Plugin**, choose a trusted skills-only Agent Plugins ZIP, no larger than 32 MB, and import it. Claude-compatible plugin metadata can be included. Packages containing executable plugin components are refused. Imported packages start off; review them before enabling access.
+
+If import is incomplete, the package stays off. Remove that incomplete import before trying again. If removal is incomplete, finish removal to clear its remaining files. Refresh saved state after an unconfirmed result; do not keep importing the same package because a response was lost.
+
+### Use the plugin outside Batshit
+
+Open **Plugins → Batshit → Download Plugin**. This downloads the complete current package, including its reference files and supported outside-agent instructions. Install the ZIP through your assistant’s supported plugin installer, or give it the extracted skill folder with its references. See [Outside-agent setup](portable-skills.md).
+
+The Goon Scene Creator includes ComfyUI workflow definitions, not model weights.
 
 ## Skill sources
 
-Beyond the built-ins, you can add your own Skills by pointing Batshit at a folder of Skill bundles. Settings → Skills & Prompts → Skill Sources manages those folders: you give a source a label and a path, set its trust and access, then Batshit scans it and lists the Skills it found under your Skills. This is how you bring a library of your own playbooks into Batshit.
+Beyond the built-ins, you can add your own Skills by pointing Batshit at a folder of Skill bundles. Settings → Plugins & shit → Skill Sources manages those folders: you give a source a label and a path, set its trust and access, then Batshit scans it and lists the Skills it found under your Skills. This is how you bring a library of your own playbooks into Batshit.
 
 Only add Skill sources you trust. A Skill is instructions an agent will follow, so treat an untrusted Skill the same way you'd treat untrusted code.
 
@@ -45,20 +55,16 @@ Only add Skill sources you trust. A Skill is instructions an agent will follow, 
 
 Prompts are the instructions that shape an agent's behavior on every message, not just when a workflow comes up. In Batshit there are two layers most users touch:
 
-- **System prompts** — the core behavioral instructions for an agent. Each agent has its own, and Batshit also compiles in a base prompt for the agent's type.
+- **System prompts** — the core behavioral instructions for an agent. Each agent has its own, and Batshit also supplies its base agent instructions.
 - **A global custom prompt** — your own standing instructions that apply across agents when enabled (for example, a tone or formatting preference you want everywhere). This one lives in your User settings; see [the User area](../user/overview.md).
 
-The Prompts tab in Settings → Skills & Prompts is where you create and edit saved prompt templates. Core Batshit system prompts — the foundational prompts that keep tools, Skills, zips, and voice working — are managed separately in Settings → Admin, because editing them can change how the whole product behaves; see [the Admin area](../admin/overview.md).
+The Prompts tab in Settings → Plugins & shit is where you create and edit saved prompt templates. Core Batshit system prompts — the foundational prompts that keep tools, Skills, zips, and voice working — are managed separately in Settings → Admin, because editing them can change how the whole product behaves; see [the Admin area](../admin/overview.md).
 
 ## Portable Skills
 
-Portable Skills are a special kind of Skill that runs **outside** Batshit. Instead of an in-app agent loading the Skill, you install the Skill bundle into your own coding agent — Claude Code, Codex, or another local assistant — and it operates your local Batshit instance through a narrow, scoped Portable Skill Token. No Batshit password, no internal service token.
+Use the complete Batshit plugin with an outside assistant such as Claude Code, Codex or another supported local agent. Batshit Guide and Goon Guide are informational and need no token. Operational skills use a scoped Portable Skill Token; App Actions additionally needs its explicitly saved subject, effect and expiry grant.
 
-They're useful when you'd rather have an outside agent you already pay for do longer local setup work, like installing a local voice engine, building a CLI Tool, or planning a Goon scene while still following Batshit's own guidance.
-
-The Goon Scene Creator also has a Portable Skill bundle for outside-agent scene planning, skybox prompting, Scene Atmosphere choices, and ComfyUI workflow handoff. It is honest about the current boundary: scene records are still saved through the Scene Editor unless Batshit adds dedicated Goons/Scenes Fabric controls.
-
-Full details — tokens, scopes, install paths, and the current bundles — are in [Portable Skills](portable-skills.md).
+Keep tokens out of the downloaded package. [Outside-agent setup](portable-skills.md) covers download, installation, private env files and permissions. The old separate per-skill downloads are retained only as older-version archives.
 
 ## In this section
 

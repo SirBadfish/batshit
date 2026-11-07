@@ -1,4 +1,6 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
+import { beginSlashCommandWrite, isSlashCommandMutationError } from '$lib/server/services/slashCommandRevision'
+import { normalizeAccessAgentId } from '$lib/server/services/agentAccessLists'
 
 import {
   listSkillSources,
@@ -12,6 +14,7 @@ function toErrorResponse(error: unknown) {
       error && typeof error === 'object' && 'status' in error
         ? Number((error as { status?: number }).status) || 500
         : 500,
+    ...(isSlashCommandMutationError(error) ? { code: error.code } : {}),
     message: error instanceof Error ? error.message : 'Skill source request failed.'
   }
 }
@@ -36,10 +39,14 @@ export const POST: RequestHandler = async ({ request, locals }) => {
   }
 
   try {
+    const preparation = beginSlashCommandWrite(locals.user.id)
     const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
     const rootPath = typeof body.rootPath === 'string' ? body.rootPath.trim() : ''
     if (!rootPath) {
       return json({ error: 'Folder path is required.' }, { status: 400 })
+    }
+    if (body.attachAgentId !== undefined && body.attachAgentId !== null && !normalizeAccessAgentId(body.attachAgentId)) {
+      return json({ error: 'The attached agent ID is invalid.' }, { status: 400 })
     }
 
     const source = await upsertSkillSource({
@@ -50,9 +57,9 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       scope: body.scope === 'project' ? 'project' : 'global',
       trustLevel: body.trustLevel === 'trusted' ? 'trusted' : 'untrusted',
       enabledForAllAgents: body.enabledForAllAgents === true,
-      enabledAgentIds: Array.isArray(body.enabledAgentIds) ? body.enabledAgentIds.map(String) : undefined,
+      enabledAgentIds: body.enabledAgentIds,
       projectPath: typeof body.projectPath === 'string' ? body.projectPath : undefined
-    })
+    }, preparation)
 
     const shouldScan = body.scan !== false
     if (!shouldScan) {
@@ -63,7 +70,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       userId: locals.user.id,
       sourceId: source.id,
       attachAgentId: typeof body.attachAgentId === 'string' ? body.attachAgentId : undefined
-    })
+    }, preparation)
 
     return json({
       skillSource: scan.source,
@@ -75,7 +82,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
   } catch (error) {
     console.error('[skill-sources] Failed to create/scan skill source:', error)
     const response = toErrorResponse(error)
-    return json({ error: response.message }, { status: response.status })
+    return json({ error: response.message, ...(response.code ? { code: response.code } : {}) }, { status: response.status })
   }
 }
 

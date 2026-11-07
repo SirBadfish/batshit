@@ -1,10 +1,19 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import os from 'node:os'
 import path from 'node:path'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { nativeToolService } from '../nativeTools'
 import { stripNativeCommandAuthorityFromChildEnv } from '../cliChildEnv'
+import { __setAgentBrowserCliTestSpawner, __setAgentBrowserTestShell } from '../agentBrowserCliProcess'
+
+// Consumer fixture only: the actual strict/raw operational owner is qualified separately.
+vi.mock('$lib/server/toolOperationalSettingsOwner', async () => {
+  const { redis } = await import('$lib/server/redis')
+  const { resolveToolOperationalSettings } = await import('$lib/utils/toolOperationalSettings')
+  return { readToolOperationalSettings: async (userId: string) =>
+    resolveToolOperationalSettings(await redis.getUserSettings(userId)) }
+})
 
 const PROTECTED_NAMES = [
   'BATSHIT_TOKEN',
@@ -34,12 +43,16 @@ let workspace: string | null = null
 let previousEnv: Record<string, string | undefined> = {}
 
 beforeEach(() => {
+  __setAgentBrowserCliTestSpawner(null)
+  __setAgentBrowserTestShell(null)
   previousEnv = Object.fromEntries(TEST_ENV_NAMES.map((name) => [name, process.env[name]]))
   for (const name of PROTECTED_NAMES) process.env[name] = `bl420-sentinel-${name}`
   process.env.BL420_CUSTOM_TOOL_ENV = 'bl420-custom-sentinel'
 })
 
 afterEach(async () => {
+  __setAgentBrowserCliTestSpawner(null)
+  __setAgentBrowserTestShell(null)
   for (const name of TEST_ENV_NAMES) {
     const previous = previousEnv[name]
     if (previous === undefined) delete process.env[name]
@@ -109,12 +122,15 @@ describe('BL-420 local native command child environments', () => {
     await chmod(bin, 0o755)
     process.env.BATSHIT_AGENT_BROWSER_BIN = bin
     process.env.BL420_REPORT_PATH = reportPath
+    __setAgentBrowserCliTestSpawner((command, args, options) => {
+      if (command !== bin) throw new Error('Child environment proof admits only its exact owned fake executable.')
+      return spawn(command, args, options)
+    })
 
     const result = await nativeToolService.nativeAgentBrowserUse({
       userId: 'josh',
       toolName: 'get title',
-      params: {},
-      settings: { liveViewEnabled: false }
+      params: { liveView: false }
     } as any)
 
     expect(result.success).toBe(true)

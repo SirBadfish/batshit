@@ -4,7 +4,8 @@ import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import type { HostProcessIdentity } from './hostProcessIdentity'
 
-/** Diagnostic receipts only. A persisted PID or group never grants signal authority. */
+/** Diagnostic receipts only. A persisted PID or group never grants signal authority. Only
+ * guardians are written now; `codex` rows left by the retired Codex CLI lane are still read. */
 export interface HostCommandRecord {
   version: 1
   runId: string
@@ -23,6 +24,43 @@ export interface HostCommandRecord {
   processes: HostProcessIdentity[]
   guardianGroup?: number
 }
+
+/** Receipt of the retired Codex-parent MCP request owner, never a process or restored
+ * permission. Nothing writes one any more; old rows are still validated so a profile or
+ * owner deletion can retire them (`retireOriginalRequest`). */
+export interface HostOriginalRequestRecord {
+  version: 1
+  kind: 'p5-original-request'
+  runId: string
+  resources: string[]
+  bootId: string
+  namespaceId: string
+  instanceId: string
+  lane: string
+  owner: { userId: string; kind: 'agent'; id: string }
+  profileId: string
+  sessionId: string
+  messageId: string
+  requestId: string
+  phase: 'active' | 'unresolved'
+  children: string[]
+  journal: {
+    outer: 'open' | 'sealed'
+    continuation: 'open' | 'closed'
+    replies: Array<{ id: string; save: 'expected' | 'issued' | 'saved' | 'unknown' }>
+    nativeRuns: Array<{ id: string; result: 'pending' | 'known' | 'unknown' }>
+    management: Array<{ id: string; result: 'pending' | 'saved' | 'refused' | 'unknown' }>
+    /** Present only on receipts that reserved private generations. No restored start authority. */
+    generations?: Array<{ index: number; relativePath: string;
+      directory: 'not_started' | 'issued' | 'known' | 'unknown'; config: 'not_started' | 'issued' | 'known' | 'unknown';
+      assets: 'not_started' | 'issued' | 'known' | 'unknown'; auth: 'not_started' | 'issued' | 'known' | 'unknown';
+      native: 'not_started' | 'issued' | 'known' | 'unknown';
+      cleanup: 'not_started' | 'issued' | 'known' | 'unknown' }>
+  }
+  processes?: never
+  program?: never
+}
+export type HostRecordedRun = HostCommandRecord | HostOriginalRequestRecord
 
 export interface HostDeleteHolder {
   instanceId: string
@@ -91,6 +129,42 @@ function validateRecord(value: unknown): HostCommandRecord {
   const identities = row.processes.map((process) => `${process.pid}:${process.started}`)
   if (new Set(identities).size !== identities.length) throw new Error('Duplicate host process identity.')
   return { ...row, resources } as HostCommandRecord
+}
+
+function validateOriginalRequest(value: unknown): HostOriginalRequestRecord {
+  if (!value || typeof value !== 'object') throw new Error('Malformed original-request receipt.')
+  const row = value as Partial<HostOriginalRequestRecord>, owner = row.owner, journal = row.journal
+  const resources = resourcesOf(row.resources)
+  const entries = (items: unknown, field: 'save' | 'result', states: readonly string[]): boolean => Array.isArray(items) && items.length <= 64 &&
+    items.every(item => item && typeof item === 'object' && onlyKeys(item, ['id', field]) &&
+      textField(item.id) && states.includes(item[field])) && new Set(items.map(item => item.id)).size === items.length
+  if (!onlyKeys(row, ['version', 'kind', 'runId', 'resources', 'bootId', 'namespaceId', 'instanceId', 'lane',
+    'owner', 'profileId', 'sessionId', 'messageId', 'requestId', 'phase', 'children', 'journal']) || row.version !== 1 ||
+    row.kind !== 'p5-original-request' || !textField(row.runId) || !textField(row.bootId) || !textField(row.namespaceId) ||
+    !textField(row.instanceId) || !textField(row.lane) || !owner || !onlyKeys(owner, ['userId', 'kind', 'id']) ||
+    owner.kind !== 'agent' || !textField(owner.userId) || !textField(owner.id) || !textField(row.profileId) ||
+    !textField(row.sessionId) || !textField(row.messageId) || !textField(row.requestId) || !['active', 'unresolved'].includes(row.phase ?? '') ||
+    !Array.isArray(row.children) || row.children.length > 64 || !row.children.every(id => textField(id)) ||
+    new Set(row.children).size !== row.children.length || !journal || !onlyKeys(journal, ['outer', 'continuation', 'replies', 'nativeRuns', 'management', 'generations']) ||
+    !['open', 'sealed'].includes(journal.outer) || !['open', 'closed'].includes(journal.continuation) ||
+    !entries(journal.replies, 'save', ['expected', 'issued', 'saved', 'unknown']) ||
+    !entries(journal.nativeRuns, 'result', ['pending', 'known', 'unknown']) || !entries(journal.management, 'result', ['pending', 'saved', 'refused', 'unknown'])) {
+    throw new Error('Malformed original-request receipt.')
+  }
+  // History: the private-generation path grammar of receipts written by the removed Codex-parent arm.
+  if (journal.generations !== undefined && (!Array.isArray(journal.generations) || journal.generations.length > 4 ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(row.requestId!) ||
+    journal.generations.some((entry, index) => !entry || !onlyKeys(entry, ['index', 'relativePath', 'directory', 'config', 'assets', 'auth', 'native', 'cleanup']) ||
+      entry.index !== index || entry.relativePath !== `runtime/mcp-workflow/${row.requestId}/codex-${index}/home` ||
+      !['not_started', 'issued', 'known', 'unknown'].includes(entry.directory) ||
+      ['config', 'assets', 'auth', 'native', 'cleanup'].some(key => !['not_started', 'issued', 'known', 'unknown'].includes(entry[key as 'config']))))) {
+    throw new Error('Malformed private generation custody.')
+  }
+  return { ...row, resources } as HostOriginalRequestRecord
+}
+function validateStoredRun(value: unknown): HostRecordedRun {
+  return value && typeof value === 'object' && (value as { kind?: unknown }).kind === 'p5-original-request'
+    ? validateOriginalRequest(value) : validateRecord(value)
 }
 
 function validateMarker(value: unknown): HostDeleteMarker {
@@ -279,7 +353,7 @@ export class HostCommandRecordStore {
         for (const row of db.prepare(`SELECT run_id,record FROM ${entry.alias === 'r0' ? 'main' : entry.alias}.runs`).all() as
           Array<{ run_id: string; record: string }>) {
           if (typeof row.record !== 'string') throw new Error('Malformed host run row.')
-          const record = validateRecord(JSON.parse(row.record))
+          const record = validateStoredRun(JSON.parse(row.record))
           if (row.run_id !== record.runId || !record.resources.includes(entry.resource)) throw new Error('Misfiled host run record.')
         }
       }
@@ -323,6 +397,33 @@ export class HostCommandRecordStore {
         if (meta.deletion || meta.generation !== generations[resource]) throw new Error(`Stale or deleting host resource: ${resource}`)
         db.prepare(`INSERT INTO ${schema}.runs(run_id,record) VALUES (?,?)`).run(record.runId, JSON.stringify(record))
       }
+    })
+  }
+
+  private originalCopies(db: DatabaseSync, aliases: ResourceConnection[], expected: HostOriginalRequestRecord): void {
+    for (const { alias } of aliases) {
+      const schema = alias === 'r0' ? 'main' : alias
+      const row = db.prepare(`SELECT record FROM ${schema}.runs WHERE run_id=?`).get(expected.runId) as { record?: unknown } | undefined
+      if (typeof row?.record !== 'string' || JSON.stringify(validateOriginalRequest(JSON.parse(row.record))) !== JSON.stringify(expected)) {
+        throw new Error('Stale or inconsistent original-request receipt.')
+      }
+    }
+  }
+
+  /** Retire one leftover receipt of the retired Codex-parent MCP request owner. Its custody
+   * lived in the memory of the app process that wrote it; only an associated child run that is
+   * still recorded keeps it. Every copy must match exactly. Nothing it recorded is replayed. */
+  retireOriginalRequest(input: HostOriginalRequestRecord): void {
+    const record = validateOriginalRequest(input)
+    this.transaction(record.resources, (db, aliases) => {
+      this.originalCopies(db, aliases, record)
+      for (const { alias } of aliases) {
+        const schema = alias === 'r0' ? 'main' : alias
+        for (const child of record.children) {
+          if (db.prepare(`SELECT 1 FROM ${schema}.runs WHERE run_id=?`).get(child)) throw new Error('Associated child custody is unsettled.')
+        }
+      }
+      for (const { alias } of aliases) db.prepare(`DELETE FROM ${alias === 'r0' ? 'main' : alias}.runs WHERE run_id=?`).run(record.runId)
     })
   }
 
@@ -417,15 +518,15 @@ export class HostCommandRecordStore {
     })
   }
 
-  records(resources: string[]): HostCommandRecord[] {
+  records(resources: string[]): HostRecordedRun[] {
     return this.transaction(resources, (db, aliases) => {
-      const byRun = new Map<string, { record: HostCommandRecord; seen: Set<string> }>()
+      const byRun = new Map<string, { record: HostRecordedRun; seen: Set<string> }>()
       for (const { alias, resource } of aliases) {
         const schema = alias === 'r0' ? 'main' : alias
         const rows = db.prepare(`SELECT run_id,record FROM ${schema}.runs`).all() as Array<{ run_id: string; record: string }>
         for (const row of rows) {
           if (typeof row.record !== 'string') throw new Error('Malformed host run row.')
-          const record = validateRecord(JSON.parse(row.record))
+          const record = validateStoredRun(JSON.parse(row.record))
           if (row.run_id !== record.runId || !record.resources.includes(resource)) throw new Error('Misfiled host run record.')
           const existing = byRun.get(record.runId)
           if (existing) {

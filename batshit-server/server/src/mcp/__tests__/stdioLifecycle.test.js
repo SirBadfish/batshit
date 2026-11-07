@@ -215,7 +215,7 @@ describe('the stdio MCP helper process', () => {
     const result = await helper.reply(3);
     expect(result.result.isError).toBe(true);
     expect(result.result.content[0].text).toContain('fabric:sys.zip.fetch');
-    expect(result.result.content[0].text).toContain('Fetch Zip tool in batshit_helpers');
+    expect(result.result.content[0].text).toContain('Agents use fabric:sys.zip.fetch through Batshit Tool Use.');
     helper.child.stdin.end();
     expect(await within(helper.exited, 5000)).toEqual({ code: 0, signal: null });
   }, 30000);

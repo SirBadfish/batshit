@@ -10,6 +10,8 @@ import {
   HAIR_REFIT_SOURCE_CONTRACT,
   collectHairAssetFileRefs,
   createHairState,
+  hairAssetMatchesRecipeFit,
+  hairAssetStyleFitKey,
   hairAssetRevisionSha256,
   hairFitReceiptSha256,
   parseHairAsset,
@@ -321,6 +323,26 @@ describe('hair-state/v2', () => {
         }
       })
     ).resolves.toEqual({ asset: value, state })
+  })
+
+  test('uses all six fit dimensions independently of material and style tags', async () => {
+    const value = await asset()
+    const source = { baseId: value.compatibility.baseId, fitFamily: value.compatibility.fitFamily,
+      definitionSha256: value.attachment.fitReceipt.appearanceDefinitionSha256,
+      physicalBasisSha256: value.attachment.fitReceipt.physicalBasisSha256,
+      topologySha256: value.attachment.fitReceipt.topologySha256,
+      skeletonHierarchySha256: value.attachment.fitReceipt.skeletonHierarchySha256 }
+    expect(hairAssetMatchesRecipeFit(value, source)).toBe(true)
+    for (const key of Object.keys(source) as Array<keyof typeof source>) {
+      expect(hairAssetMatchesRecipeFit(value, { ...source, [key]: 'f'.repeat(64) })).toBe(false)
+    }
+    const altered = structuredClone(value)
+    altered.display.tags = ['feminine']
+    altered.material.status = 'pending'
+    expect(hairAssetMatchesRecipeFit(altered, source)).toBe(true)
+    expect(hairAssetStyleFitKey(altered)).toBe(hairAssetStyleFitKey(value))
+    altered.assetId = 'another-style'
+    expect(hairAssetStyleFitKey(altered)).not.toBe(hairAssetStyleFitKey(value))
   })
 
   test('fails loudly for missing, stale, or incompatible selection evidence', async () => {

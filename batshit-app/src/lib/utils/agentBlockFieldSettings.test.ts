@@ -6,7 +6,6 @@ import {
   AGENT_SETTINGS_KEY_GROUPS,
   AgentBlockShapeError,
   CLAUDE_THINKING_GROUP,
-  CODEX_PERMISSION_GROUP,
   applyAgentBlockUpdate,
   diffAgentBlock,
   diffAgentBlockWithGroups,
@@ -17,14 +16,15 @@ import {
 } from './agentBlockFieldSettings'
 
 /**
- * BL-848, BL-855: the one place that knows how a save of `codex_settings`, `claude_settings` and
+ * BL-848, BL-855: the one place that knows how a save of `claude_settings` and
  * `dcmDisplaySettings` is written field by field. The server plan (`planAgentRecordUpdate`), the
  * agents store's copy (`applyAgentBlockUpdate`) and every control that sends one of these blocks
  * (`diffAgentBlock`) agree by construction; the cases below run through the server plan and the
  * default lane's twin of the real script too, so a rule that drifts fails here.
  */
 
-const CODEX = { model: 'gpt-5', permissionMode: 'chat', sandbox: 'workspace-write', addDirs: ['/a', '/b'], configOverrides: [{ key: 'model_verbosity', value: 'low' }] }
+/** A fuller Claude block: the generic block rules are proven on it (a list, a list of rows, a flag). */
+const CLAUDE_FULL = { model: 'sonnet', permissionMode: 'default', chrome: false, addDirs: ['/a', '/b'], configOverrides: [{ key: 'env.FOO', value: 'bar' }] }
 const CLAUDE = { model: 'sonnet', permissionMode: 'default', alwaysThinkingEnabled: false, addDirs: ['/a'] }
 const DCM = {
   version: 1,
@@ -34,24 +34,25 @@ const DCM = {
   toolDisplayPreferences: { 'gw_a::read': 'name+hint' }
 }
 
-describe('the three field-by-field blocks', () => {
-  it('names codex_settings, claude_settings and dcmDisplaySettings, and nothing else', () => {
-    expect([...AGENT_FIELD_BY_FIELD_BLOCKS]).toEqual(['codex_settings', 'claude_settings', 'dcmDisplaySettings'])
+describe('the field-by-field blocks', () => {
+  it('names the CLI, display and scoped reasoning blocks, and nothing else', () => {
+    expect([...AGENT_FIELD_BY_FIELD_BLOCKS]).toEqual(['claude_settings', 'dcmDisplaySettings', 'model_reasoning_overrides'])
     for (const field of AGENT_FIELD_BY_FIELD_BLOCKS) expect(isAgentFieldByFieldBlock(field)).toBe(true)
-    for (const other of ['provider_specific_settings', 'defaultMCPGateways', 'defaultTools', 'defaultMCPToolSelections', 'custom_tool_settings']) {
+    // SA-139 R1: the removed Codex CLI block is no longer one of them.
+    for (const other of ['codex_settings', 'provider_specific_settings', 'defaultMCPGateways', 'defaultTools', 'defaultMCPToolSelections', 'custom_tool_settings']) {
       expect(isAgentFieldByFieldBlock(other)).toBe(false)
     }
   })
 })
 
 describe('planAgentBlockWrite: the steps of a save', () => {
-  it('a codex or claude save: the block made an object, each key set, a null key removed, an undefined key skipped', () => {
-    expect(planAgentBlockWrite('codex_settings', { model: 'gpt-6', sandbox: null, search: undefined, addDirs: ['/c'] })).toEqual({
+  it('a claude save: the block made an object, each key set, a null key removed, an undefined key skipped', () => {
+    expect(planAgentBlockWrite('claude_settings', { model: 'opus', chrome: null, systemPrompt: undefined, addDirs: ['/c'] })).toEqual({
       kind: 'steps',
       steps: [
         { step: 'ensure', path: [] },
-        { step: 'set', path: ['model'], value: 'gpt-6' },
-        { step: 'delete', path: ['sandbox'] },
+        { step: 'set', path: ['model'], value: 'opus' },
+        { step: 'delete', path: ['chrome'] },
         { step: 'set', path: ['addDirs'], value: ['/c'] }
       ]
     })
@@ -65,19 +66,20 @@ describe('planAgentBlockWrite: the steps of a save', () => {
   })
 
   it('removals alone, {} and no block make nothing (the block is never created by a save that sets nothing)', () => {
-    expect(planAgentBlockWrite('codex_settings', { model: null, sandbox: null })).toEqual({
+    expect(planAgentBlockWrite('claude_settings', { model: null, chrome: null })).toEqual({
       kind: 'steps',
       steps: [
         { step: 'delete', path: ['model'] },
-        { step: 'delete', path: ['sandbox'] }
+        { step: 'delete', path: ['chrome'] }
       ]
     })
-    expect(planAgentBlockWrite('codex_settings', {})).toEqual({ kind: 'steps', steps: [] })
-    expect(planAgentBlockWrite('codex_settings', undefined)).toEqual({ kind: 'steps', steps: [] })
+    expect(planAgentBlockWrite('claude_settings', {})).toEqual({ kind: 'steps', steps: [] })
+    expect(planAgentBlockWrite('claude_settings', undefined)).toEqual({ kind: 'steps', steps: [] })
   })
 
   it('the block sent as null is a whole write of null', () => {
-    for (const field of AGENT_FIELD_BY_FIELD_BLOCKS) expect(planAgentBlockWrite(field, null)).toEqual({ kind: 'whole', value: null })
+    for (const field of ['claude_settings', 'dcmDisplaySettings'] as const) expect(planAgentBlockWrite(field, null)).toEqual({ kind: 'whole', value: null })
+    expect(() => planAgentBlockWrite('model_reasoning_overrides', null)).toThrow(/Save one reasoning control/)
   })
 
   it('dcmDisplaySettings: version, then each map made an object right before its own entries', () => {
@@ -127,7 +129,9 @@ describe('planAgentBlockWrite: the steps of a save', () => {
     for (const field of AGENT_FIELD_BY_FIELD_BLOCKS) {
       for (const bad of ['oops', ['a'], 5, true]) {
         expect(() => planAgentBlockWrite(field, bad)).toThrow(AgentBlockShapeError)
-        expect(() => planAgentBlockWrite(field, bad)).toThrow(new RegExp(`"${field}"[\\s\\S]*must be an object or null`))
+        expect(() => planAgentBlockWrite(field, bad)).toThrow(field === 'model_reasoning_overrides'
+          ? /"model_reasoning_overrides"[\s\S]*Save one reasoning control/
+          : new RegExp(`"${field}"[\\s\\S]*must be an object or null`))
       }
     }
     for (const bad of ['oops', ['a'], 5, true]) {
@@ -140,27 +144,27 @@ describe('planAgentBlockWrite: the steps of a save', () => {
 type Case = [AgentFieldByFieldBlock, unknown, unknown, unknown]
 
 const APPLY_CASES: Record<string, Case> = {
-  'codex: named keys are written, a null key is removed, the rest stays, a list is whole': [
-    'codex_settings',
-    CODEX,
-    { model: 'gpt-6', sandbox: null, addDirs: ['/c'], search: true },
-    { model: 'gpt-6', permissionMode: 'chat', addDirs: ['/c'], configOverrides: CODEX.configOverrides, search: true }
+  'claude: named keys are written, a null key is removed, the rest stays, a list is whole': [
+    'claude_settings',
+    CLAUDE_FULL,
+    { model: 'opus', chrome: null, addDirs: ['/c'], includeProjectInstructions: true },
+    { model: 'opus', permissionMode: 'default', addDirs: ['/c'], configOverrides: CLAUDE_FULL.configOverrides, includeProjectInstructions: true }
   ],
   'claude: a partial save over a full copy': ['claude_settings', CLAUDE, { permissionMode: 'plan' }, { ...CLAUDE, permissionMode: 'plan' }],
   'a copy with no block takes the named keys': [
-    'codex_settings',
+    'claude_settings',
     undefined,
-    { model: 'gpt-6' },
-    { model: 'gpt-6' }
+    { model: 'opus' },
+    { model: 'opus' }
   ],
-  'a copy that is null takes the named keys': ['codex_settings', null, { model: 'gpt-6' }, { model: 'gpt-6' }],
+  'a copy that is null takes the named keys': ['claude_settings', null, { model: 'opus' }, { model: 'opus' }],
   'a copy that is not an object is replaced by an object of the named keys': ['claude_settings', 'garbage', { model: 'opus' }, { model: 'opus' }],
-  'removals alone leave a copy with no block as it is': ['codex_settings', undefined, { model: null }, undefined],
-  'removals alone leave a null copy as it is': ['codex_settings', null, { model: null }, null],
-  'removals alone leave a copy that is not an object as it is': ['codex_settings', 'garbage', { model: null }, 'garbage'],
-  '{} writes nothing': ['codex_settings', CODEX, {}, CODEX],
-  'no block sent writes nothing': ['codex_settings', CODEX, undefined, CODEX],
-  'the block sent as null is null': ['codex_settings', CODEX, null, null],
+  'removals alone leave a copy with no block as it is': ['claude_settings', undefined, { model: null }, undefined],
+  'removals alone leave a null copy as it is': ['claude_settings', null, { model: null }, null],
+  'removals alone leave a copy that is not an object as it is': ['claude_settings', 'garbage', { model: null }, 'garbage'],
+  '{} writes nothing': ['claude_settings', CLAUDE_FULL, {}, CLAUDE_FULL],
+  'no block sent writes nothing': ['claude_settings', CLAUDE_FULL, undefined, CLAUDE_FULL],
+  'the block sent as null is null': ['claude_settings', CLAUDE_FULL, null, null],
   'removing the last key leaves an empty block': ['claude_settings', { model: 'sonnet' }, { model: null }, {}],
   'dcm: entries are written by map, an entry named null is removed, version and the other maps stay': [
     'dcmDisplaySettings',
@@ -228,17 +232,17 @@ describe('applyAgentBlockUpdate: the copy after a save', () => {
   })
 
   it('a save that writes nothing answers the copy itself', () => {
-    expect(applyAgentBlockUpdate('codex_settings', CODEX, {})).toBe(CODEX)
-    expect(applyAgentBlockUpdate('codex_settings', CODEX, undefined)).toBe(CODEX)
+    expect(applyAgentBlockUpdate('claude_settings', CLAUDE_FULL, {})).toBe(CLAUDE_FULL)
+    expect(applyAgentBlockUpdate('claude_settings', CLAUDE_FULL, undefined)).toBe(CLAUDE_FULL)
   })
 
   it('reads a copy held in a proxy (the agents store keeps its agents in $state)', () => {
-    const stored = new Proxy(structuredClone(CODEX), {})
-    expect(applyAgentBlockUpdate('codex_settings', stored, { sandbox: 'read-only' })).toEqual({ ...CODEX, sandbox: 'read-only' })
+    const stored = new Proxy(structuredClone(CLAUDE_FULL), {})
+    expect(applyAgentBlockUpdate('claude_settings', stored, { permissionMode: 'plan' })).toEqual({ ...CLAUDE_FULL, permissionMode: 'plan' })
   })
 
   it('refuses a block the server would refuse, before anything is laid over', () => {
-    expect(() => applyAgentBlockUpdate('codex_settings', CODEX, 'gpt-6')).toThrow(AgentBlockShapeError)
+    expect(() => applyAgentBlockUpdate('claude_settings', CLAUDE_FULL, 'opus')).toThrow(AgentBlockShapeError)
     expect(() => applyAgentBlockUpdate('dcmDisplaySettings', DCM, { groups: ['a'] })).toThrow(AgentBlockShapeError)
   })
 })
@@ -262,18 +266,18 @@ describe("applyAgentBlockUpdate and the server's write agree (the plan, run by t
 
 describe('diffAgentBlock: only what differs', () => {
   it('nothing changed (order of keys ignored, undefined and null as absent) is undefined', () => {
-    expect(diffAgentBlock('codex_settings', CODEX, { ...CODEX })).toBeUndefined()
-    expect(diffAgentBlock('codex_settings', { a: 1, b: [1, { c: 2 }] }, { b: [1, { c: 2 }], a: 1, d: undefined, e: null })).toBeUndefined()
-    expect(diffAgentBlock('codex_settings', null, {})).toBeUndefined()
-    expect(diffAgentBlock('codex_settings', undefined, { model: null })).toBeUndefined()
+    expect(diffAgentBlock('claude_settings', CLAUDE_FULL, { ...CLAUDE_FULL })).toBeUndefined()
+    expect(diffAgentBlock('claude_settings', { a: 1, b: [1, { c: 2 }] }, { b: [1, { c: 2 }], a: 1, d: undefined, e: null })).toBeUndefined()
+    expect(diffAgentBlock('claude_settings', null, {})).toBeUndefined()
+    expect(diffAgentBlock('claude_settings', undefined, { model: null })).toBeUndefined()
     expect(diffAgentBlock('claude_settings', { model: null }, {})).toBeUndefined()
   })
 
   it('names only the keys that differ; a removed key is null; a list is compared whole', () => {
-    expect(diffAgentBlock('codex_settings', CODEX, { ...CODEX, model: 'gpt-6', sandbox: undefined, search: true, addDirs: ['/a', '/b', '/c'] })).toEqual({
-      model: 'gpt-6',
-      sandbox: null,
-      search: true,
+    expect(diffAgentBlock('claude_settings', CLAUDE_FULL, { ...CLAUDE_FULL, model: 'opus', chrome: undefined, includeProjectInstructions: true, addDirs: ['/a', '/b', '/c'] })).toEqual({
+      model: 'opus',
+      chrome: null,
+      includeProjectInstructions: true,
       addDirs: ['/a', '/b', '/c']
     })
     expect(diffAgentBlock('claude_settings', CLAUDE, { ...CLAUDE, addDirs: ['/a'] })).toBeUndefined()
@@ -281,16 +285,16 @@ describe('diffAgentBlock: only what differs', () => {
   })
 
   it('a block with no copy: every key of the next block', () => {
-    expect(diffAgentBlock('codex_settings', undefined, { model: 'gpt-6', sandbox: 'read-only' })).toEqual({ model: 'gpt-6', sandbox: 'read-only' })
-    expect(diffAgentBlock('codex_settings', null, { model: 'gpt-6' })).toEqual({ model: 'gpt-6' })
+    expect(diffAgentBlock('claude_settings', undefined, { model: 'opus', permissionMode: 'plan' })).toEqual({ model: 'opus', permissionMode: 'plan' })
+    expect(diffAgentBlock('claude_settings', null, { model: 'opus' })).toEqual({ model: 'opus' })
   })
 
   it('the next block null clears a block that is an object (null), and changes nothing over one that is not', () => {
-    expect(diffAgentBlock('codex_settings', CODEX, null)).toBeNull()
-    expect(diffAgentBlock('codex_settings', {}, null)).toBeNull()
-    expect(diffAgentBlock('codex_settings', null, null)).toBeUndefined()
-    expect(diffAgentBlock('codex_settings', undefined, null)).toBeUndefined()
-    expect(diffAgentBlock('codex_settings', CODEX, undefined)).toBeUndefined()
+    expect(diffAgentBlock('claude_settings', CLAUDE_FULL, null)).toBeNull()
+    expect(diffAgentBlock('claude_settings', {}, null)).toBeNull()
+    expect(diffAgentBlock('claude_settings', null, null)).toBeUndefined()
+    expect(diffAgentBlock('claude_settings', undefined, null)).toBeUndefined()
+    expect(diffAgentBlock('claude_settings', CLAUDE_FULL, undefined)).toBeUndefined()
   })
 
   it('dcmDisplaySettings: the entries that differ under their map, a removed entry as null, a map that is the same not named', () => {
@@ -320,13 +324,13 @@ describe('diffAgentBlock: only what differs', () => {
   })
 
   it('refuses a next block, or a dcmDisplaySettings map of it, that is neither an object nor null', () => {
-    expect(() => diffAgentBlock('codex_settings', CODEX, 'oops')).toThrow(AgentBlockShapeError)
+    expect(() => diffAgentBlock('claude_settings', CLAUDE_FULL, 'oops')).toThrow(AgentBlockShapeError)
     expect(() => diffAgentBlock('dcmDisplaySettings', DCM, { ...DCM, groups: ['a'] })).toThrow(AgentBlockShapeError)
   })
 
   it('a key named like a prototype property is an ordinary name', () => {
-    const next = JSON.parse('{"__proto__":"x","model":"gpt-5"}')
-    const patch = diffAgentBlock('codex_settings', { model: 'gpt-5' }, next)
+    const next = JSON.parse('{"__proto__":"x","model":"sonnet"}')
+    const patch = diffAgentBlock('claude_settings', { model: 'sonnet' }, next)
     expect(Object.keys(patch as object)).toEqual(['__proto__'])
     expect(Object.getPrototypeOf(patch)).toBe(Object.prototype)
   })
@@ -334,11 +338,11 @@ describe('diffAgentBlock: only what differs', () => {
 
 describe('diffAgentBlock and applyAgentBlockUpdate: the patch turns the copy into the next block', () => {
   const ROUND_TRIPS: Record<string, [AgentFieldByFieldBlock, unknown, unknown]> = {
-    'codex: a model pick, a removed sandbox, a longer list': ['codex_settings', CODEX, { ...CODEX, model: 'gpt-6', sandbox: undefined, addDirs: ['/a', '/b', '/c'] }],
+    'claude: a model pick, a removed flag, a longer list': ['claude_settings', CLAUDE_FULL, { ...CLAUDE_FULL, model: 'opus', chrome: undefined, addDirs: ['/a', '/b', '/c'] }],
     'claude: mode and model': ['claude_settings', CLAUDE, { ...CLAUDE, permissionMode: 'plan', model: 'opus' }],
-    'codex: from no block': ['codex_settings', undefined, CODEX],
-    'codex: from a null block': ['codex_settings', null, CODEX],
-    'codex: emptied key by key': ['codex_settings', CODEX, {}],
+    'claude: from no block': ['claude_settings', undefined, CLAUDE_FULL],
+    'claude: from a null block': ['claude_settings', null, CLAUDE_FULL],
+    'claude: emptied key by key': ['claude_settings', CLAUDE_FULL, {}],
     'dcm: groups, tools and preferences change': [
       'dcmDisplaySettings',
       DCM,
@@ -378,44 +382,40 @@ describe('diffAgentBlock and applyAgentBlockUpdate: the patch turns the copy int
 })
 
 /**
- * BL-919: a control or form that sets a GROUP of keys as one choice (a Codex permission mode is a
- * mode, a sandbox and an approval; Claude's thinking is a switch and a budget) must send the whole
- * group when any key of it differs from the copy it started from. The copy may be older than the
- * record, and a key that equals it is then left out of the save while the record holds another
- * window's value of it: a MIX of two picks. Keys outside the groups still go by difference.
+ * BL-919: a control or form that sets a GROUP of keys as one choice (Claude's thinking is a switch
+ * and a budget) must send the whole group when any key of it differs from the copy it started
+ * from. The copy may be older than the record, and a key that equals it is then left out of the
+ * save while the record holds another window's value of it: a MIX of two picks. Keys outside the
+ * groups still go by difference.
  */
 describe('diffAgentBlockWithGroups: a group goes whole when any key of it differs (BL-919)', () => {
-  const TRIO = { permissionMode: 'chat', sandbox: 'read-only', approval: 'never' }
-  const CODEX_COPY = { model: 'gpt-6-astra', reasoningEffort: 'high', ...TRIO, addDirs: [] as string[] }
+  const THINKING_ON = { ...CLAUDE, alwaysThinkingEnabled: true, maxThinkingTokens: 4000 }
 
-  it('names the groups once: the Codex permission trio and the Claude thinking pair', () => {
-    expect([...CODEX_PERMISSION_GROUP]).toEqual(['permissionMode', 'sandbox', 'approval'])
+  it('names the groups once: the Claude thinking pair', () => {
     expect([...CLAUDE_THINKING_GROUP]).toEqual(['alwaysThinkingEnabled', 'maxThinkingTokens'])
     expect(AGENT_SETTINGS_KEY_GROUPS).toEqual({
-      codex_settings: [CODEX_PERMISSION_GROUP],
       claude_settings: [CLAUDE_THINKING_GROUP],
-      dcmDisplaySettings: []
+      dcmDisplaySettings: [],
+      model_reasoning_overrides: []
     })
   })
 
   for (const [key, value] of [
-    ['permissionMode', 'agent'],
-    ['sandbox', 'workspace-write'],
-    ['approval', 'on-request']
+    ['alwaysThinkingEnabled', false],
+    ['maxThinkingTokens', 8000]
   ] as const) {
-    it(`a changed ${key} brings the other two keys of the trio with it, with the values of the next block`, () => {
-      const next = { ...CODEX_COPY, [key]: value }
-      expect(diffAgentBlockWithGroups('codex_settings', CODEX_COPY, next)).toEqual({
-        permissionMode: next.permissionMode,
-        sandbox: next.sandbox,
-        approval: next.approval
+    it(`a changed ${key} brings the other key of the pair with it, with the value of the next block`, () => {
+      const next = { ...THINKING_ON, [key]: value }
+      expect(diffAgentBlockWithGroups('claude_settings', THINKING_ON, next)).toEqual({
+        alwaysThinkingEnabled: next.alwaysThinkingEnabled,
+        maxThinkingTokens: next.maxThinkingTokens
       })
     })
   }
 
   it('a key outside the groups still goes alone, and does not bring the group', () => {
-    expect(diffAgentBlockWithGroups('codex_settings', CODEX_COPY, { ...CODEX_COPY, reasoningEffort: 'low' })).toEqual({
-      reasoningEffort: 'low'
+    expect(diffAgentBlockWithGroups('claude_settings', THINKING_ON, { ...THINKING_ON, model: 'opus' })).toEqual({
+      model: 'opus'
     })
     expect(diffAgentBlockWithGroups('claude_settings', CLAUDE, { ...CLAUDE, permissionMode: 'plan' })).toEqual({
       permissionMode: 'plan'
@@ -424,22 +424,22 @@ describe('diffAgentBlockWithGroups: a group goes whole when any key of it differ
 
   it('a change in the group and a change outside it go together, each by its rule', () => {
     expect(
-      diffAgentBlockWithGroups('codex_settings', CODEX_COPY, { ...CODEX_COPY, approval: 'on-request', model: 'gpt-6-sol' })
-    ).toEqual({ model: 'gpt-6-sol', permissionMode: 'chat', sandbox: 'read-only', approval: 'on-request' })
+      diffAgentBlockWithGroups('claude_settings', THINKING_ON, { ...THINKING_ON, maxThinkingTokens: 6000, model: 'opus' })
+    ).toEqual({ model: 'opus', alwaysThinkingEnabled: true, maxThinkingTokens: 6000 })
   })
 
   it('nothing changed is undefined, as diffAgentBlock says: an unchanged group is not sent', () => {
-    expect(diffAgentBlockWithGroups('codex_settings', CODEX_COPY, { ...CODEX_COPY })).toBeUndefined()
-    expect(diffAgentBlockWithGroups('codex_settings', CODEX_COPY, undefined)).toBeUndefined()
-    expect(diffAgentBlockWithGroups('codex_settings', null, null)).toBeUndefined()
+    expect(diffAgentBlockWithGroups('claude_settings', THINKING_ON, { ...THINKING_ON })).toBeUndefined()
+    expect(diffAgentBlockWithGroups('claude_settings', THINKING_ON, undefined)).toBeUndefined()
+    expect(diffAgentBlockWithGroups('claude_settings', null, null)).toBeUndefined()
   })
 
   it('the next block null clears a block that is an object (null), exactly as diffAgentBlock does', () => {
-    expect(diffAgentBlockWithGroups('codex_settings', CODEX_COPY, null)).toBeNull()
+    expect(diffAgentBlockWithGroups('claude_settings', THINKING_ON, null)).toBeNull()
   })
 
   it('a group key the next block leaves out is sent as null, a removal (Claude: the budget with the switch)', () => {
-    const on = { ...CLAUDE, alwaysThinkingEnabled: true, maxThinkingTokens: 4000 }
+    const on = THINKING_ON
     // Thinking turned Off: the form drops the budget; both keys go, the budget as null.
     expect(diffAgentBlockWithGroups('claude_settings', on, { ...CLAUDE, alwaysThinkingEnabled: false })).toEqual({
       alwaysThinkingEnabled: false,
@@ -462,52 +462,52 @@ describe('diffAgentBlockWithGroups: a group goes whole when any key of it differ
       alwaysThinkingEnabled: false,
       maxThinkingTokens: null
     })
-    expect(diffAgentBlockWithGroups('codex_settings', undefined, { ...CODEX_COPY })).toEqual(CODEX_COPY)
+    expect(diffAgentBlockWithGroups('claude_settings', undefined, { ...THINKING_ON })).toEqual(THINKING_ON)
   })
 
   it('takes the groups as an argument; dcmDisplaySettings has none', () => {
-    const next = { ...CODEX_COPY, model: 'gpt-6-sol' }
-    expect(diffAgentBlockWithGroups('codex_settings', CODEX_COPY, next, [['model', 'reasoningEffort']])).toEqual({
-      model: 'gpt-6-sol',
-      reasoningEffort: 'high'
+    const next = { ...THINKING_ON, model: 'opus' }
+    expect(diffAgentBlockWithGroups('claude_settings', THINKING_ON, next, [['model', 'permissionMode']])).toEqual({
+      model: 'opus',
+      permissionMode: 'default'
     })
-    expect(diffAgentBlockWithGroups('codex_settings', CODEX_COPY, next, [])).toEqual({ model: 'gpt-6-sol' })
+    expect(diffAgentBlockWithGroups('claude_settings', THINKING_ON, next, [])).toEqual({ model: 'opus' })
     expect(diffAgentBlockWithGroups('dcmDisplaySettings', DCM, { ...DCM, groups: { gw_a: 'hidden' } })).toEqual(
       diffAgentBlock('dcmDisplaySettings', DCM, { ...DCM, groups: { gw_a: 'hidden' } })
     )
   })
 
   it('a group key named like a prototype property is an ordinary name', () => {
-    const copy = JSON.parse('{"__proto__":"x","model":"gpt-5","a":1}')
-    const next = JSON.parse('{"__proto__":"x","model":"gpt-5","a":2}')
+    const copy = JSON.parse('{"__proto__":"x","model":"sonnet","a":1}')
+    const next = JSON.parse('{"__proto__":"x","model":"sonnet","a":2}')
     // `a` differs; `__proto__` equals the copy and comes in with it as the group's own key.
-    const patch = diffAgentBlockWithGroups('codex_settings', copy, next, [['a', '__proto__']])
+    const patch = diffAgentBlockWithGroups('claude_settings', copy, next, [['a', '__proto__']])
     expect(Object.keys(patch as object).sort()).toEqual(['__proto__', 'a'])
     expect(Object.getPrototypeOf(patch)).toBe(Object.prototype)
   })
 
-  it("the server's write of an older copy's pick leaves ONE mode when another window picked another mode meanwhile", () => {
-    // The copy: Chat. Another window (the chat bar) wrote Agent since. The older Settings picks Agent (full).
-    const stored = { ...CODEX_COPY, permissionMode: 'agent', sandbox: 'workspace-write', approval: 'on-request' }
-    const next = { ...CODEX_COPY, permissionMode: 'agent_full', sandbox: 'danger-full-access', approval: 'never' }
-    const patch = diffAgentBlockWithGroups('codex_settings', CODEX_COPY, next)
-    const record = { id: 'agent_probe', user_id: 'user_probe', agentType: 'api', codex_settings: structuredClone(stored) }
-    const plan = planAgentRecordUpdate({ updates: { codex_settings: patch }, now: '2026-09-28T12:00:00.000Z' })
+  it("the server's write of an older copy's pick leaves ONE thinking choice when another window turned Thinking off meanwhile", () => {
+    // The copy: Thinking On with a 4,000 budget. Another window (the chat bar) turned Thinking Off
+    // since. The older Settings edits the budget to 5,000, its switch still On.
+    const stored = { ...CLAUDE, alwaysThinkingEnabled: false }
+    const next = { ...THINKING_ON, maxThinkingTokens: 5000 }
+    const patch = diffAgentBlockWithGroups('claude_settings', THINKING_ON, next)
+    const record = { id: 'agent_probe', user_id: 'user_probe', agentType: 'api', claude_settings: structuredClone(stored) }
+    const plan = planAgentRecordUpdate({ updates: { claude_settings: patch }, now: '2026-09-28T12:00:00.000Z' })
     const twin = runAgentUpdateScriptTwin(record, agentUpdateScriptArguments(plan, agentTypeSnapshotOf(record)))
-    const written = twin.record.codex_settings as Record<string, unknown>
-    expect({ permissionMode: written.permissionMode, sandbox: written.sandbox, approval: written.approval }).toEqual({
-      permissionMode: 'agent_full',
-      sandbox: 'danger-full-access',
-      approval: 'never'
+    const written = twin.record.claude_settings as Record<string, unknown>
+    expect({ alwaysThinkingEnabled: written.alwaysThinkingEnabled, maxThinkingTokens: written.maxThinkingTokens }).toEqual({
+      alwaysThinkingEnabled: true,
+      maxThinkingTokens: 5000
     })
-    // The plain difference leaves the mix behind (the bug this rule closes).
+    // The plain difference leaves the mix behind (the bug this rule closes): Off with a budget.
     const plain = planAgentRecordUpdate({
-      updates: { codex_settings: diffAgentBlock('codex_settings', CODEX_COPY, next) },
+      updates: { claude_settings: diffAgentBlock('claude_settings', THINKING_ON, next) },
       now: '2026-09-28T12:00:00.000Z'
     })
     const mixed = runAgentUpdateScriptTwin(record, agentUpdateScriptArguments(plain, agentTypeSnapshotOf(record))).record
-      .codex_settings as Record<string, unknown>
-    expect(mixed.approval).toBe('on-request')
+      .claude_settings as Record<string, unknown>
+    expect(mixed).toMatchObject({ alwaysThinkingEnabled: false, maxThinkingTokens: 5000 })
   })
 })
 

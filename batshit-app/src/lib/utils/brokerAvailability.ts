@@ -5,9 +5,8 @@
  *
  *   - `api`  — `buildMode3NativeTools` registers `native_batshit_tool_search` /
  *              `native_batshit_tool_use` when at least one family is allowed.
- *   - `cli`  — `resolveEnabledMode4InternalHelperTools` exposes `batshit_tool_search` /
- *              `batshit_tool_use` over the managed STDIO bridge.
- *   - `n8n`  — the Batshit Tools automation pack advertises the same action pair in DCM.
+ *   - `cli`  — the managed STDIO helper bridge exposed `batshit_tool_search` /
+ *              `batshit_tool_use` (removed with the CLI Subagent in SA-139 R5).
  *
  * Before this module, the compiled system prompt gated its broker guidance on the Dynamic
  * MCP toggle alone. An agent with Dynamic MCP off but a live Fabric or artifact family got
@@ -23,32 +22,33 @@
  * Grid reaches this module from the browser (`toolGridConfig.ts`, `GlobalToolGrid.svelte`,
  * `AgentMcpDefaultsCard.svelte`). Adding a server import here breaks the client bundle.
  *
- * SA-106 note: `BROKER_RUNTIMES` still has three members. `n8n` is no longer a PRIMARY
- * agent type, but it is still a live TOOL HOST — `AgentMcpDefaultsCard` derives
- * `runtime: 'n8n'` for Category 2 `n8n Workflow Subagent` tool grids, whose tools really
- * are advertised by the Batshit Tools node inside n8n. Do not narrow this union.
+ * SA-139: `BROKER_RUNTIMES` is `api` alone. Its `n8n` member served only the n8n Workflow
+ * Subagent's Tool Grid and went with that type (R2); its `cli` member served the managed CLI
+ * lanes, which went in R4 and R5, and was removed in P7. (The `cli` broker FAMILY below is
+ * Batshit's saved CLI Tools, a live feature, not that lane.)
  */
 
-import { isApiSubagentType } from '$lib/utils/subagentType'
+import { API_UTILITY_CONTROL_IDS } from '$lib/utils/apiUtilityControls'
 
 export const BROKER_TOOL_FAMILIES = [
   'mcp',
   'cli',
   'artifact',
   'fabric',
+  'batshit',
   'agent_browser'
 ] as const
 
 export type BrokerToolFamily = (typeof BROKER_TOOL_FAMILIES)[number]
 
-/** Which runtime's registration rules to apply. Matches `PromptRuntimeScope`. */
-export const TOOL_HOST_SCOPES = ['api', 'cli', 'n8n'] as const
-
 /**
- * Runtime boundary for Tool Grid and model-compatibility decisions. This deliberately
- * includes n8n because Category 2 workflow subagents are still live even though n8n is
- * no longer a Primary Agent type.
+ * Which runtime's registration rules to apply: `api`, the one live lane (SA-139 P7 removed
+ * `cli`; see the header). Stored `runtime:cli` prompt sections are parsed by
+ * `promptRuntimeScope.ts`, not here.
  */
+export const TOOL_HOST_SCOPES = ['api'] as const
+
+/** Runtime boundary for Tool Grid and model-compatibility decisions. */
 export type ToolHostScope = (typeof TOOL_HOST_SCOPES)[number]
 
 export const BROKER_RUNTIMES = TOOL_HOST_SCOPES
@@ -127,6 +127,18 @@ export function resolveBrokerToolToggles(providerSettings?: unknown): BrokerTool
   }
 }
 
+/**
+ * THE rule for "is this agent's Fabric & Utilities switch on?" — the Settings switch saved as
+ * `provider_specific_settings.nativeTools.batshitToolsEnabled` (default ON). The DM, schedule
+ * and Judge Juice judgment tools are Fabric controls served only with it on, so their own
+ * switches resolve through this too (`resolveAgentDmsEnabled`, `resolveAgentJevJudgeToolEnabled`;
+ * Josh, 2026-10-24): an agent with it off is never taught tools it cannot call.
+ */
+export function resolveAgentFabricUtilitiesEnabled(agent: unknown): boolean {
+  const record = agent && typeof agent === 'object' ? (agent as Record<string, unknown>) : null
+  return resolveBrokerToolToggles(record?.provider_specific_settings).batshitToolsEnabled
+}
+
 export interface BrokerAvailabilityInput {
   runtime: BrokerRuntime
   toggles: BrokerToolToggles
@@ -149,6 +161,8 @@ export interface BrokerAvailabilityInput {
    * API/CLI Primary Agents. Default false: memory is opt-in.
    */
   memoryControlsEnabled?: boolean
+  /** SA-133: exact API-primary whiteboard allowance, independent of Memory. */
+  whiteboardControlsEnabled?: boolean
   /**
    * SA-113 P2 (DL-113-03): true only for PRIMARY actors whose agent has `dms_enabled`.
    * Same shape as `memoryControlsEnabled`, and default false for the same reason — DMs
@@ -177,57 +191,29 @@ export interface BrokerAvailabilityInput {
 export function resolveBrokerFamilies(input: BrokerAvailabilityInput): BrokerToolFamily[] {
   const { toggles } = input
   const allowArtifact = input.allowArtifactRuntimeTools !== false
-  const allowFabric = input.allowFabricControlTools !== false
   const cliReachable = toggles.cliToolsEnabled && input.hasCliTools !== false
-  // Memory controls ride the Batshit Tools toggle but not the broad-control-plane gate.
-  const memoryReachable = toggles.batshitToolsEnabled && input.memoryControlsEnabled === true
-  // SA-113 P2: DM controls follow exactly the same rule as memory controls.
-  const dmReachable = toggles.batshitToolsEnabled && input.dmControlsEnabled === true
-  // SA-115 P2: schedule controls, same rule again.
-  const scheduleReachable = toggles.batshitToolsEnabled && input.scheduleControlsEnabled === true
-  // SA-120 P2: the Judge Juice judgment tool, same rule again.
-  const judgeReachable = toggles.batshitToolsEnabled && input.judgeControlsEnabled === true
+  // Classify only the control scope this runtime already grants.
+  const controlFamilies = resolveBrokerControlFamilies(resolveBrokerRuntimeAllowedControlIds(input))
 
   const families: BrokerToolFamily[] = []
-
-  if (input.runtime === 'n8n') {
-    // Mirrors the Batshit Tools automation pack DCM. n8n advertises the CLI family from
-    // the toggle alone; the pack resolves selections server-side at call time.
-    if (toggles.dynamicMcpEnabled) families.push('mcp')
-    if (toggles.cliToolsEnabled) families.push('cli')
-    if (toggles.artifactRuntimeEnabled) families.push('artifact')
-    if (toggles.agentBrowserEnabled) families.push('agent_browser')
-    if (toggles.fetchZipEnabled || memoryReachable || dmReachable || scheduleReachable || judgeReachable) families.push('fabric')
-    return families
-  }
-
-  if (input.runtime === 'cli') {
-    // Mirrors resolveEnabledMode4InternalHelperTools. Fetch-zip is its own helper tool on
-    // this lane (`batshit_server_fetch_zip`), so it does not open the Fabric family.
-    if (toggles.dynamicMcpEnabled) families.push('mcp')
-    if (cliReachable) families.push('cli')
-    if (toggles.artifactRuntimeEnabled) families.push('artifact')
-    if (toggles.agentBrowserEnabled) families.push('agent_browser')
-    if (toggles.batshitToolsEnabled) families.push('fabric')
-    return families
-  }
 
   // Mirrors buildMode3NativeTools' apiBrokerAllowedFamilies. Agent Browser is a separate
   // native tool on this lane, not a broker family.
   if (toggles.dynamicMcpEnabled) families.push('mcp')
   if (cliReachable) families.push('cli')
   if (toggles.artifactRuntimeEnabled && allowArtifact) families.push('artifact')
-  if (
-    toggles.fetchZipEnabled ||
-    (toggles.batshitToolsEnabled && allowFabric) ||
-    memoryReachable ||
-    dmReachable ||
-    scheduleReachable ||
-    judgeReachable
-  ) {
-    families.push('fabric')
-  }
+  families.push(...controlFamilies)
   return families
+}
+
+/** The existing control scope after tool-host restrictions, shared with discovery. */
+export function resolveBrokerRuntimeAllowedControlIds(input: BrokerAvailabilityInput): string[] {
+  return resolveBrokerFabricAllowedControlIds({
+    ...input,
+    allowFabricControlTools: input.allowFabricControlTools !== false,
+    allowFetchZip: true,
+    whiteboardControlsEnabled: input.whiteboardControlsEnabled === true
+  })
 }
 
 /** True when the broker tool pair is registered for this agent on this runtime. */
@@ -244,6 +230,8 @@ export const BROKER_FABRIC_FETCH_ZIP_CONTROL_ID = 'sys.zip.fetch'
  */
 export const BROKER_FABRIC_BATSHIT_TOOLS_CONTROL_IDS = [
   'sys.ui.*',
+  'sys.app_settings.native.report',
+  'sys.app_settings.native.change',
   'sys.comfyui.*',
   'sys.artifact.*',
   'artifact.*',
@@ -265,7 +253,7 @@ export const BROKER_FABRIC_BATSHIT_TOOLS_CONTROL_IDS = [
 
 /**
  * SA-104 P3: the memory tool family. A scoped first-party allowance for PRIMARY actors on
- * every runtime (n8n included) when the agent has memory enabled — deliberately outside
+ * every runtime when the agent has memory enabled — deliberately outside
  * the broad-control-plane gate, like `sys.zip.fetch`. Subagents never receive these
  * (subagent memory access is a deferred product decision; memory is PA-owned state).
  */
@@ -293,7 +281,7 @@ export const BROKER_FABRIC_SCHEDULE_CONTROL_IDS = ['sys.schedule.*'] as const
  * registration sites and passed explicit `false` from every subagent and Worker scope. A
  * delegated run never judges through Jev on the user's key; the primary decides for it.
  */
-export const BROKER_FABRIC_JUDGE_CONTROL_IDS = ['sys.judge.*'] as const
+export const BROKER_FABRIC_JUDGE_CONTROL_IDS = ['sys.judge.ask'] as const
 
 export interface BrokerFabricScopeInput {
   toggles: BrokerToolToggles
@@ -309,6 +297,7 @@ export interface BrokerFabricScopeInput {
   allowFetchZip?: boolean
   /** SA-104 P3: PRIMARY actor + agent `memory_enabled`. Default false (opt-in). */
   memoryControlsEnabled?: boolean
+  whiteboardControlsEnabled?: boolean
   /** SA-113 P2: PRIMARY actor + agent `dms_enabled`. Default false (opt-in). */
   dmControlsEnabled?: boolean
   /** SA-115 P2: PRIMARY actor + agent `dms_enabled`. Default false (opt-in). */
@@ -344,11 +333,14 @@ export function resolveBrokerFabricAllowedControlIds(input: BrokerFabricScopeInp
   }
 
   // SA-104 P3: memory controls follow the Batshit Tools toggle plus per-agent memory
-  // enablement, independent of the broad-control-plane gate (n8n primaries included).
+  // enablement, independent of the broad-control-plane gate.
   if (input.toggles.batshitToolsEnabled && input.memoryControlsEnabled === true) {
     for (const controlId of BROKER_FABRIC_MEMORY_CONTROL_IDS) {
       allowed.add(controlId)
     }
+  }
+  if (input.toggles.batshitToolsEnabled && input.whiteboardControlsEnabled === true) {
+    allowed.add('sys.whiteboard.update')
   }
 
   // SA-113 P2: DM controls, same rule.
@@ -375,6 +367,32 @@ export function resolveBrokerFabricAllowedControlIds(input: BrokerFabricScopeInp
   return Array.from(allowed)
 }
 
+/** Generic utilities share the control executor, but do not operate Batshit itself. */
+export const BROKER_BATSHIT_UTILITY_CONTROL_IDS = [
+  ...Object.values(API_UTILITY_CONTROL_IDS),
+  'sys.judge.ask',
+  'sys.mcp.dynamic.find',
+  'sys.mcp.dynamic.use'
+] as const
+
+export function isBatshitUtilityControlId(controlId: string): boolean {
+  return (BROKER_BATSHIT_UTILITY_CONTROL_IDS as readonly string[]).includes(controlId)
+}
+
+export function brokerControlRef(controlId: string): string {
+  return `${isBatshitUtilityControlId(controlId) ? 'batshit' : 'fabric'}:${controlId}`
+}
+
+/** Partition the already actor/runtime-resolved allowlist, never rebuild its gates. */
+export function resolveBrokerControlFamilies(allowedControlIds: readonly string[]): Array<'fabric' | 'batshit'> {
+  const families: Array<'fabric' | 'batshit'> = []
+  if (allowedControlIds.some((id) => !isBatshitUtilityControlId(id))) families.push('fabric')
+  if (BROKER_BATSHIT_UTILITY_CONTROL_IDS.some((id) =>
+    isControlIdAllowedByList(id, [...allowedControlIds])
+  )) families.push('batshit')
+  return families
+}
+
 /** The artifact family's control-id scope. Typed invoke aliases only. */
 export const BROKER_ARTIFACT_ALLOWED_CONTROL_IDS = ['use.artifact.*'] as const
 
@@ -382,33 +400,34 @@ export const BROKER_ARTIFACT_ALLOWED_CONTROL_IDS = ['use.artifact.*'] as const
  * The flags every Subagent and Worker scope passes to the two functions above: the published
  * artifact tools stay, the broad Fabric control plane is primary-only (SA-064), and each
  * agent-owned family is primary-only too (memory SA-104, DMs SA-113, schedules SA-115, the
- * judgment tool SA-120). One constant, so the Subagent DCM index and a delegated run's control
- * scope (BL-81) cannot drift apart.
+ * judgment tool SA-120). One constant, read by the Subagent DCM index and the Settings DCM
+ * preview, so they cannot drift apart.
  */
 export const DELEGATED_RUN_BROKER_SCOPE = {
   allowArtifactRuntimeTools: true,
   allowFabricControlTools: false,
   memoryControlsEnabled: false,
+  whiteboardControlsEnabled: false,
   dmControlsEnabled: false,
   scheduleControlsEnabled: false,
   judgeControlsEnabled: false
 } as const
 
 /**
- * BL-81 — the broker inputs a Subagent or Worker run is offered through: its runtime, from its
- * Subagent type, and the six toggles, off its resolved native tool settings.
+ * BL-81 — the broker inputs a Subagent or Worker run is offered through: the API runtime
+ * and the six toggles from its resolved native tool settings.
  *
- * The Subagent DCM index (`buildManagedSubagentDynamicInfo`) and the control scope minted onto a
- * delegated CLI run's credential (`subagentRunner.ts`) both read the run this way, from the same
- * resolved scope, so what the model is shown and what the server enforces come from one reading.
+ * The Subagent DCM index (`buildManagedSubagentDynamicInfo`) reads the run this way, from the
+ * resolved scope its in-process broker registers from. (Its other reader, the control scope
+ * minted onto a delegated CLI run's credential, went with the CLI Subagent in SA-139 R5.)
  */
 export function resolveDelegatedRunBrokerInputs(scope: {
-  subagentType: unknown
   nativeToolSettings: BrokerToolToggles
 }): { runtime: BrokerRuntime; toggles: BrokerToolToggles } {
   const settings = scope.nativeToolSettings
   return {
-    runtime: isApiSubagentType(scope.subagentType) ? 'api' : 'cli',
+    // A retired Subagent type never runs (SA-139 R2, R5), so every delegated run is on `api`.
+    runtime: 'api',
     toggles: {
       fetchZipEnabled: settings.fetchZipEnabled,
       dynamicMcpEnabled: settings.dynamicMcpEnabled,
@@ -418,50 +437,6 @@ export function resolveDelegatedRunBrokerInputs(scope: {
       agentBrowserEnabled: settings.agentBrowserEnabled
     }
   }
-}
-
-/**
- * BL-81 — the control ids a Subagent or Worker run may use through the control routes: exactly
- * the two broker groups its DCM index offers it, Fabric and Artifact Tools, and nothing more.
- *
- * Computed with the same two functions and the same flags the index uses, so for a Subagent it
- * can only ever be Fetch Zip (`sys.zip.fetch`, when its toggle is on and the runtime's Fabric
- * rule opens the family) and the published artifact tools (`use.artifact.*`, when theirs is).
- * `buildMode3NativeTools` enforces the same list on the API lane through its broker; the managed
- * CLI helper serves every family on request, so a CLI run carries this list on its credential
- * and `useControl` refuses everything else. Before BL-81 nothing did, and a CLI Subagent could
- * call any Fabric control, `sys.skill.save` included.
- *
- * A CLI run's inputs come from its CLI profile's settings (`buildCliSubagentProviderSettings`:
- * Fetch Zip and Batshit Tools off, read by `resolveManagedSubagentScope`), so its list is the
- * published artifact tools or nothing; Fetch Zip reaches only an API Subagent whose toggle is on.
- */
-export function resolveDelegatedRunAllowedControlIds(inputs: {
-  runtime: BrokerRuntime
-  toggles: BrokerToolToggles
-}): string[] {
-  const families = resolveBrokerFamilies({
-    runtime: inputs.runtime,
-    toggles: inputs.toggles,
-    ...DELEGATED_RUN_BROKER_SCOPE
-  })
-  const allowed: string[] = []
-  if (families.includes('fabric')) {
-    allowed.push(
-      ...resolveBrokerFabricAllowedControlIds({
-        toggles: inputs.toggles,
-        allowFabricControlTools: DELEGATED_RUN_BROKER_SCOPE.allowFabricControlTools,
-        memoryControlsEnabled: DELEGATED_RUN_BROKER_SCOPE.memoryControlsEnabled,
-        dmControlsEnabled: DELEGATED_RUN_BROKER_SCOPE.dmControlsEnabled,
-        scheduleControlsEnabled: DELEGATED_RUN_BROKER_SCOPE.scheduleControlsEnabled,
-        judgeControlsEnabled: DELEGATED_RUN_BROKER_SCOPE.judgeControlsEnabled
-      })
-    )
-  }
-  if (families.includes('artifact')) {
-    allowed.push(...BROKER_ARTIFACT_ALLOWED_CONTROL_IDS)
-  }
-  return allowed
 }
 
 /** Matches one control id against one allowlist entry, which may contain `*` wildcards. */

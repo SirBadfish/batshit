@@ -13,6 +13,7 @@ import {
   normalizeSkillReadOffset,
   partialSkillReadFields,
   readSkillTextWindow,
+  skillSourceSha256,
   skillReadOffsetPastEndError,
   type SkillReadWindow
 } from './skillReadWindow'
@@ -292,6 +293,10 @@ export async function executeSkillRuntimeAction(input: {
         scripts
       },
       skillMarkdown,
+      sourceSha256: skillSourceSha256(skillMarkdown),
+      offset: 0,
+      originalChars: skillMarkdown.length,
+      returnedChars: skillMarkdown.length,
       warnings,
       dependencyStatuses
     }
@@ -352,6 +357,7 @@ export async function executeSkillRuntimeAction(input: {
         contentTruncated: window.truncated,
         originalChars: window.originalChars,
         returnedChars: window.content.length,
+        sourceSha256: window.sourceSha256,
         ...partialSkillReadFields({
           skillId: skill.id,
           action: 'read',
@@ -386,6 +392,7 @@ export async function executeSkillRuntimeAction(input: {
       contentTruncated: decoded.truncated,
       originalChars: decoded.originalChars,
       returnedChars: decoded.content.length,
+      sourceSha256: decoded.sourceSha256,
       ...partialSkillReadFields({
         skillId: skill.id,
         action: 'read',

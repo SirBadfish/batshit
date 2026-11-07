@@ -70,6 +70,25 @@ describe('first-party Goon product readiness', () => {
     expect(resolveRecipeProductReadiness(imported)).toBe('preparing')
   })
 
+  it('requires a Male first preparation, including when the durable Source outlives a stale summary', () => {
+    const male = goon({ customAvatar: { ...goon().customAvatar!,
+      manifestSummary: { baseId: 'batshit-base-m-v1', recipeReady: true } } })
+    expect(isRecipePreparationRequired(male)).toBe(true)
+    expect(isGoonRuntimeReady(male)).toBe(false)
+    const oldSummary = { ...male, customAvatar: { ...male.customAvatar!,
+      manifestSummary: { baseId: 'batshit-base-m-v1', recipeReady: false } } }
+    expect(isRecipePreparationRequired(oldSummary)).toBe(true)
+    expect(isGoonRuntimeReady(oldSummary)).toBe(false)
+    const initialized = { ...male, customAvatar: { ...male.customAvatar!,
+      manifestSummary: { baseId: 'independent-avatar', recipeReady: false } },
+      recipe: { ...owner(false), authoringRevision: { source: { identities: {
+        baseId: 'batshit-base-m-v1', fitFamily: 'batshit-base-m-v1'
+      } } } } as unknown as GoonRecord['recipe'] }
+    expect(isRecipePreparationRequired(initialized)).toBe(true)
+    expect(isGoonRuntimeReady(initialized)).toBe(false)
+    expect(resolveRecipeProductReadiness(initialized)).toBe('preparing')
+  })
+
   it('reports a recoverable failed preparation when no active version exists', () => {
     const failed = goon({ recipe: owner(false, 'failed') })
     expect(isGoonRuntimeReady(failed)).toBe(false)

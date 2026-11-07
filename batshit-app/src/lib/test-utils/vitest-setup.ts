@@ -90,6 +90,12 @@ vi.mock('@ai-sdk/mistral', () => ({
 
 let redisMockInstance: any | undefined
 
+vi.mock('$lib/server/services/approvalExpiryCommit', async (importOriginal) => {
+  if (process.env.VITEST_USE_REAL_REDIS === 'true') return importOriginal()
+  const { redis } = await import('$lib/server/redis')
+  return { commitApprovalExpiry: (input: unknown) => (redis as any).__commitApprovalExpiry(input) }
+})
+
 vi.mock('$lib/server/redis', async () => {
   if (process.env.VITEST_USE_REAL_REDIS === 'true') {
     const actual = await vi.importActual<typeof import('$lib/server/redis')>('$lib/server/redis')
@@ -97,10 +103,35 @@ vi.mock('$lib/server/redis', async () => {
     return actual
   }
 
+  const instructionGuard: typeof import('$lib/server/instructionsGuard') = await import('$lib/server/instructionsGuard')
+  const { captureSettingsLifecycle } = await import('$lib/server/services/appActions/settings/lifecycle')
+
   const redisStore = new Map<string, { type: string; value: any }>()
   const expireStore = new Map<string, number>() // unix seconds
 
   const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value))
+  // Same refusal as the real writer (SA-139 R5, `modelSelectionWriteBasis`): a save that names a new
+  // preset refuses a leftover Claude Code CLI one; a record that only keeps an old one is left alone.
+  const refuseNamedClaudeCliPreset = async (key: string, writes: any) => {
+    if (!writes || !Object.hasOwn(writes, 'primary_model_preset_id')) return
+    const selected = writes.primary_model_preset_id
+    if (typeof selected !== 'string' || !selected || selected === redisStore.get(key)?.value?.primary_model_preset_id) return
+    const preset = redisStore.get(`model:${selected}`)
+    if (preset?.type !== 'json' || !preset.value) return
+    const { assertNotClaudeCliPreset } = await import('$lib/server/services/modelPresetSelectionOwner')
+    assertNotClaudeCliPreset(preset.value)
+  }
+  const { createApprovalExpiryCommitTwin } = await import('$lib/test-utils/approvalExpiryCommitTwin')
+  const commitApprovalExpiry = createApprovalExpiryCommitTwin({
+    read: key => {
+      const entry = redisStore.get(key)
+      if (!entry) return undefined
+      if (entry.type !== 'json') throw new Error('WRONGTYPE Operation against a key holding the wrong kind of value')
+      return entry.value
+    },
+    write: (key, document) => { redisStore.set(key, { type: 'json', value: clone(document) }) },
+    remove: key => { redisStore.delete(key) }
+  })
 
   const resolveMatch = (pattern: string) => {
     const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
@@ -309,7 +340,13 @@ vi.mock('$lib/server/redis', async () => {
       return true
     }),
     getRaw: vi.fn(jsonCompareAndWrite.getRaw),
-    setIfUnchanged: vi.fn(jsonCompareAndWrite.setIfUnchanged),
+    setIfUnchanged: vi.fn(async (key: string, path: string, expectedRaw: string, value: unknown, issue?: { beforeIssue(): void }) => {
+      if (!issue) return jsonCompareAndWrite.setIfUnchanged(key, path, expectedRaw, value)
+      const { jsonTextOf } = await import('$lib/server/redisJsonCompareAndWrite')
+      const storedValue = JSON.parse(jsonTextOf(value))
+      issue.beforeIssue()
+      return jsonCompareAndWrite.setIfUnchanged(key, path, expectedRaw, storedValue)
+    }),
     delIfUnchanged: vi.fn(jsonCompareAndWrite.delIfUnchanged),
     moveLegacyN8nToken: vi.fn(n8nCredentialScripts.moveLegacyN8nToken),
     deleteN8nToken: vi.fn(n8nCredentialScripts.deleteN8nToken),
@@ -329,6 +366,7 @@ vi.mock('$lib/server/redis', async () => {
   }
 
   const redisMock = {
+    __commitApprovalExpiry: vi.fn(commitApprovalExpiry),
     json: redisJsonMock,
     __resetTestStore: vi.fn(() => {
       redisStore.clear()
@@ -379,54 +417,149 @@ vi.mock('$lib/server/redis', async () => {
     // wrong-type error.
     // BL-1294: a save of the memory settings (`options.expectedMemory`) is compared with the stored
     // ones first, by the real `agentMemoryBaseMatches`, and its guard goes to the twin.
-    updateAgent: vi.fn(async (id: string, updates: any, options?: { expectedMemory?: Record<string, unknown> }) => {
+    updateAgent: vi.fn(async (id: string, updates: any, options?: import('$lib/server/agentRecordUpdate').AgentUpdateOptions) => {
+      // Same refusal as the real writer (SA-139 R4/R5): a retired Primary type is never stored.
+      if (updates && Object.hasOwn(updates, 'agentType')) {
+        const { isRetiredPrimaryAgentType, normalizePrimaryAgentType } = await import('$lib/utils/primaryAgentType')
+        if (isRetiredPrimaryAgentType(normalizePrimaryAgentType(undefined, updates.agentType))) {
+          const { AgentUpdateRejectedError } = await import('$lib/server/agentRecordUpdate')
+          throw new AgentUpdateRejectedError('A retired Primary Agent type (Claude Code CLI, Codex CLI or n8n) cannot be saved. Nothing was saved.')
+        }
+      }
+      await refuseNamedClaudeCliPreset(`agent:${id}`, updates)
+      const voiceGuard: typeof import('$lib/server/configuredTtsGuard') = await import('$lib/server/configuredTtsGuard')
+      const namesVoice = updates?.voice_profile !== undefined || options?.configuredTtsMutation !== undefined
+      if (namesVoice || options?.expectedTtsSelection !== undefined) voiceGuard.requireConfiguredTtsExpected(options?.expectedTtsSelection)
+      if (options?.configuredTtsMutation && updates?.voice_profile !== undefined) throw new voiceGuard.ConfiguredTtsConflictError()
+      if (options?.voiceEngineClearBasis && (updates?.voice_profile === undefined || options?.configuredTtsMutation)) throw new voiceGuard.ConfiguredTtsConflictError()
+      const voiceLifecycle = namesVoice ? captureSettingsLifecycle([`agent:${id}`]) : undefined
+      const instructionFields = instructionGuard.instructionLeaves(updates ?? {})
+      const instructionLifecycle = instructionFields.length ? captureSettingsLifecycle([`agent:${id}`]) : undefined
+      if (options?.expectedInstructions !== undefined || instructionFields.length) instructionGuard.requireInstructionsExpected(options?.expectedInstructions, instructionFields)
       const {
         AGENT_MEMORY_SOURCE_PATHS,
         AgentMemorySettingsConflictError,
         agentMemoryBaseMatches,
         planAgentRecordUpdate,
-        agentUpdateScriptArguments
+        agentUpdateScriptArguments,
+        serializeAgentRecordPlan,
+        capturedAgentVoicePostimage
       } = await import('$lib/server/agentRecordUpdate')
-      const { REDISJSON_WRONG_TYPE_MESSAGE, agentTypeSnapshotOf, runAgentUpdateScriptTwin } = await import(
+      const { REDISJSON_WRONG_TYPE_MESSAGE, agentTypeSnapshotOf, runAgentUpdateScriptTwin, readInstructionsSnapshotTwin, readAgentVoiceModelLockSourceTwin } = await import(
         '$lib/test-utils/agentUpdateScriptTwin'
       )
       const plan = planAgentRecordUpdate({ updates: clone(updates ?? {}), now: new Date().toISOString() })
+      if (options?.configuredTtsMutation) plan.ops.push(...voiceGuard.planConfiguredTtsOps(options.configuredTtsMutation.target, options.configuredTtsMutation.selection))
+      const issuedOps = serializeAgentRecordPlan(plan.ops), voicePostimage = capturedAgentVoicePostimage(issuedOps)
       const existingEntry = redisStore.get(`agent:${id}`)
       if (!existingEntry) throw new Error('Agent not found')
       if (existingEntry.type !== 'json') throw new Error(REDISJSON_WRONG_TYPE_MESSAGE)
+      const instructions = instructionLifecycle ? readInstructionsSnapshotTwin(id, 'agent', existingEntry.value, instructionLifecycle, instructionFields) : undefined
+      if (instructions) instructionGuard.instructionsWriteBasis(instructions, options?.expectedInstructions, instructionFields, options?.instructionsMutation)
+      const instructionKeys = [`agent:${id}`]
+      const instructionsRaw = instructions ? instructionGuard.instructionsIssueGuard(instructions, instructionKeys, options?.instructionsMutation) : undefined
+      const voice = voiceLifecycle ? voiceGuard.configuredTtsSnapshotFromDetail(id, existingEntry.value,
+        voiceGuard.CONFIGURED_TTS_READ_PATHS.map(path => agentTypeSnapshotOf(existingEntry.value, [path])), voiceLifecycle) : undefined
+      if (voice && voice.revision !== options?.expectedTtsSelection) throw new voiceGuard.ConfiguredTtsConflictError()
+      const sourceRecords = () => Object.fromEntries([...redisStore].map(([key, entry]) => [key, entry.type === 'set' ? { __members: [...entry.value] } : entry.value]))
+      const voiceModel = voice && !options?.configuredTtsMutation && !options?.voiceEngineClearBasis && voiceGuard.configuredTtsTupleChanges(voice, voicePostimage.voice_profile)
+        ? await readAgentVoiceModelLockSourceTwin(String(voice.record.user_id), id, sourceRecords(), voicePostimage) : undefined
+      if (voiceModel?.locked) throw new voiceGuard.ConfiguredTtsModelLockedError()
+      const voiceRaw = voice ? voiceGuard.configuredTtsIssueGuard(voice, options?.expectedTtsSelection, instructionKeys, options?.configuredTtsMutation,
+        [...(voiceModel?.guards ?? []), ...(options?.voiceEngineClearBasis ? [voiceGuard.voiceEngineClearSource(voice, options.voiceEngineClearBasis)] : [])]) : undefined
+      const mcp = await import('$lib/server/agentRecordUpdate')
+      const { mcpSettingsLeaves } = await import('$lib/utils/agentSettingsSectionSaves')
+      const mcpLeaves = mcpSettingsLeaves(updates)
+      const mcpLifecycle = mcpLeaves.length ? captureSettingsLifecycle([`agent:${id}`]) : undefined
+      const mcpPaths = mcp.mcpSettingsReadPaths(mcpLeaves)
+      const mcpSnapshot = mcpLifecycle ? mcp.makeMcpSettingsSnapshot(id, mcpPaths, mcpPaths.map(path => agentTypeSnapshotOf(existingEntry.value, [path])), mcpLifecycle, mcpLeaves) : undefined
+      const mcpRaw = mcpSnapshot ? mcp.mcpSettingsWriteGuard(mcpSnapshot, options?.expectedMcpSettings, mcpLeaves) : undefined
       const guardsMemory = options?.expectedMemory !== undefined
       if (guardsMemory && !agentMemoryBaseMatches(existingEntry.value, options!.expectedMemory)) {
         throw new AgentMemorySettingsConflictError()
       }
-      const { answer, record } = runAgentUpdateScriptTwin(
-        existingEntry.value,
-        agentUpdateScriptArguments(
+      // Lua applies its ops to the record at EVAL, after every awaited source read.
+      // Keep the original guard snapshots above; only the mutation target is current.
+      const current = redisStore.get(`agent:${id}`)
+      if (!current) throw new Error('Agent not found')
+      if (current.type !== 'json') throw new Error(REDISJSON_WRONG_TYPE_MESSAGE)
+      const issuedArguments = agentUpdateScriptArguments(
           plan,
           agentTypeSnapshotOf(existingEntry.value),
-          guardsMemory ? agentTypeSnapshotOf(existingEntry.value, AGENT_MEMORY_SOURCE_PATHS) : null
+          guardsMemory ? agentTypeSnapshotOf(existingEntry.value, AGENT_MEMORY_SOURCE_PATHS) : null,
+          undefined, undefined, instructionsRaw, undefined, voiceRaw, mcpRaw
         )
+      issuedArguments[0] = issuedOps
+      const { answer, record } = runAgentUpdateScriptTwin(
+        current.value,
+        issuedArguments,
+        undefined,
+        Object.fromEntries(instructionKeys.map((key, index) => {
+          const entry = redisStore.get(key)
+          return [index + 1, entry?.type === 'set' ? { __members: [...entry.value] } : entry?.value]
+        }))
       )
       // One step here, so the type fields cannot change between the read and the script.
+      if (answer === 'MCP_SETTINGS_BASE_REQUIRED') throw new mcp.McpSettingsBaseRequiredError()
+      if (answer === 'MCP_SETTINGS_CHANGED') throw new mcp.McpSettingsConflictError()
+      if (answer === 'INSTRUCTIONS_BASE_REQUIRED') throw new instructionGuard.InstructionsBaseRequiredError()
+      if (answer === 'INSTRUCTIONS_CHANGED' || answer === 'INSTRUCTIONS_EXPIRED') throw new instructionGuard.InstructionsConflictError()
+      if (answer === 'TTS_SELECTION_BASE_REQUIRED') throw new voiceGuard.ConfiguredTtsBaseRequiredError()
+      if (answer === 'TTS_SELECTION_CHANGED') throw new voiceGuard.ConfiguredTtsConflictError()
       if (answer !== 'OK') throw new Error(`The update of agent ${id} answered ${answer}.`)
       redisStore.set(`agent:${id}`, { type: 'json', value: record })
+      if (mcpSnapshot) {
+        const acknowledged = redisStore.get(`agent:${id}`)!.value
+        const ack = mcp.makeMcpSettingsSnapshot(id, mcpPaths, mcpPaths.map(path => agentTypeSnapshotOf(acknowledged, [path])), mcpSnapshot.lifecycle, mcpLeaves, true)
+        options?.onMcpSettingsSaved?.({ revisions: ack.revisions, values: ack.values })
+      }
+      options?.instructionsMutation?.onSaved?.()
+      options?.configuredTtsMutation?.onSaved?.()
     }),
     // BL-914: the Subagent's twin of the above. The real one plans `planSubagentRecordUpdate`'s
     // by-path writes and runs them in `UPDATE_SUBAGENT_FIELDS_SCRIPT`; this twin makes the SAME
     // script argument and applies it by its path strings. A refused save throws before anything
     // (a 400), a gone Subagent answers `false` and is not recreated, a key of another type throws
     // RedisJSON's wrong-type error.
-    updateSubagent: vi.fn(async (id: string, writes: any) => {
+    updateSubagent: vi.fn(async (id: string, writes: any, options?: Pick<import('$lib/server/agentRecordUpdate').AgentUpdateOptions, 'expectedInstructions' | 'instructionsMutation'>) => {
+      // Same refusal as the real writer (SA-139 R2/R5): a retired Subagent type is never stored.
+      if (writes && Object.hasOwn(writes, 'subagentType')) {
+        const { isRetiredSubagentType, normalizeSubagentType } = await import('$lib/utils/subagentType')
+        if (isRetiredSubagentType(normalizeSubagentType(undefined, writes.subagentType))) {
+          const { AgentUpdateRejectedError } = await import('$lib/server/agentRecordUpdate')
+          throw new AgentUpdateRejectedError('A retired Subagent type (Claude Code CLI, Codex CLI or n8n) cannot be saved. Nothing was saved.')
+        }
+      }
+      await refuseNamedClaudeCliPreset(`subagent:${id}`, writes)
+      const instructionFields = instructionGuard.instructionLeaves(writes ?? {})
+      const instructionLifecycle = instructionFields.length ? captureSettingsLifecycle([`subagent:${id}`]) : undefined
+      if (options?.expectedInstructions !== undefined || instructionFields.length) instructionGuard.requireInstructionsExpected(options?.expectedInstructions, instructionFields)
       const { serializeAgentRecordPlan } = await import('$lib/server/agentRecordUpdate')
       const { planSubagentRecordUpdate } = await import('$lib/server/subagentRecordUpdate')
-      const { REDISJSON_WRONG_TYPE_MESSAGE, runSubagentUpdateScriptTwin } = await import(
+      const { REDISJSON_WRONG_TYPE_MESSAGE, runSubagentUpdateScriptTwin, readInstructionsSnapshotTwin } = await import(
         '$lib/test-utils/agentUpdateScriptTwin'
       )
       const plan = planSubagentRecordUpdate({ writes: clone(writes ?? {}), now: new Date().toISOString() })
       const existingEntry = redisStore.get(`subagent:${id}`)
       if (!existingEntry) return false
       if (existingEntry.type !== 'json') throw new Error(REDISJSON_WRONG_TYPE_MESSAGE)
-      const { record } = runSubagentUpdateScriptTwin(existingEntry.value, [serializeAgentRecordPlan(plan.ops)])
+      const instructions = instructionLifecycle ? readInstructionsSnapshotTwin(id, 'subagent', existingEntry.value, instructionLifecycle, instructionFields) : undefined
+      if (instructions) instructionGuard.instructionsWriteBasis(instructions, options?.expectedInstructions, instructionFields, options?.instructionsMutation)
+      const instructionKeys = [`subagent:${id}`]
+      const instructionsRaw = instructions ? instructionGuard.instructionsIssueGuard(instructions, instructionKeys, options?.instructionsMutation) : undefined
+      // Lua applies its ops to the record at EVAL, after the awaited guard reads; a Subagent
+      // deleted meanwhile answers `false`, as the real one's `MISSING` does.
+      const current = instructions ? redisStore.get(`subagent:${id}`) : existingEntry
+      if (!current) return false
+      if (current.type !== 'json') throw new Error(REDISJSON_WRONG_TYPE_MESSAGE)
+      // The real script's positional arguments: ops, model selection guard, instructions guard.
+      const { record, answer } = runSubagentUpdateScriptTwin(current.value,
+        [serializeAgentRecordPlan(plan.ops), '', instructionsRaw ? JSON.stringify(instructionsRaw) : ''],
+        Object.fromEntries(instructionKeys.map((key, index) => [index + 1, redisStore.get(key)?.value])))
+      if (answer === 'INSTRUCTIONS_BASE_REQUIRED') throw new instructionGuard.InstructionsBaseRequiredError()
+      if (answer === 'INSTRUCTIONS_CHANGED' || answer === 'INSTRUCTIONS_EXPIRED') throw new instructionGuard.InstructionsConflictError()
       redisStore.set(`subagent:${id}`, { type: 'json', value: record })
+      options?.instructionsMutation?.onSaved?.()
       return true
     }),
     // BL-770: twins of the `/fix` route's two helpers (the real ones read TYPE, and replace a string
@@ -469,9 +602,15 @@ vi.mock('$lib/server/redis', async () => {
         user_id: userId
       }
 
+      const { goons_settings_patch, voice_settings_patch, ...storedUpdates } = clone(updates)
       const merged = {
         ...existing,
-        ...clone(updates)
+        ...storedUpdates,
+        ...(goons_settings_patch !== undefined ? { goons_settings: (await import('$lib/goons/resolve')).mergeGoonsSettingsPatch(existing.goons_settings, goons_settings_patch) } : {}),
+        ...(updates.voice_settings !== undefined || voice_settings_patch !== undefined
+          ? { voice_settings: (await import('$lib/utils/voiceSettingsSave')).mergeVoiceSettingsSave(
+            existing.voice_settings, storedUpdates.voice_settings, voice_settings_patch) }
+          : {})
       }
 
       redisStore.set(`user:${userId}:settings`, { type: 'json', value: clone(merged) })
@@ -634,6 +773,15 @@ vi.mock('$lib/server/redis', async () => {
       session.metadata = metadata
       session.last_modified_at = new Date().toISOString()
       redisStore.set(`session:${id}`, { type: 'json', value: clone(session) })
+      return true
+    }),
+    // SA-137: the real one is a Lua script; this twin keeps its contract: clear the replay field
+    // only while its pauseId is the one given, with nothing awaited between the check and the write.
+    retireLiveFileReadReplay: vi.fn(async (sessionId: string, messageId: string, pauseId: string) => {
+      const entry = redisStore.get(`message:${sessionId}:${messageId}`)
+      const replay = entry?.type === 'json' ? (entry.value as any)?.metadata?.liveFileReadSnapshot : undefined
+      if (!replay || typeof replay !== 'object' || replay.pauseId !== pauseId) return false
+      ;(entry!.value as any).metadata.liveFileReadSnapshot = null
       return true
     }),
     // BL-474 step 2: the real one is a Lua script; this twin keeps its contract: the chat and its
@@ -846,7 +994,11 @@ vi.mock('$lib/server/redis', async () => {
     // the time a resent message's tab sent it). BL-195: the real one is one Lua script, so
     // this one never awaits between its check and its writes: nothing can land in between.
     moveMessageToEnd: vi.fn(
-      async (sessionId: string, messageId: string, options: { createdAt?: string | null } = {}) => {
+      async (
+        sessionId: string,
+        messageId: string,
+        options: { createdAt?: string | null; keptSend?: { reason: string; sendFacts?: Record<string, unknown> | null } | null } = {}
+      ) => {
       if (!sessionId || !messageId) return null
       const messageKey = `message:${sessionId}:${messageId}`
       const entry = redisStore.get(messageKey)
@@ -854,6 +1006,19 @@ vi.mock('$lib/server/redis', async () => {
       if (entry.type !== 'json') throw new Error(`WRONGTYPE ${messageKey} is not a JSON record`)
       const createdAt = options.createdAt ?? new Date().toISOString()
       if (entry.value && typeof entry.value === 'object') entry.value.created_at = createdAt
+      // BL-903 (a): the real script writes a kept send's mark in the same step.
+      if (options.keptSend && entry.value && typeof entry.value === 'object') {
+        const metadata = entry.value.metadata
+        entry.value.metadata = {
+          ...(metadata && typeof metadata === 'object' && !Array.isArray(metadata) ? metadata : {}),
+          keptSend: clone({
+            reason: options.keptSend.reason,
+            ...(options.keptSend.sendFacts && Object.keys(options.keptSend.sendFacts).length > 0
+              ? { sendFacts: options.keptSend.sendFacts }
+              : {})
+          })
+        }
+      }
       const list = ensureList(`messages:${sessionId}`)
       const kept = list.filter((id) => id !== messageId)
       list.splice(0, list.length, ...kept, messageId)

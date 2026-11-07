@@ -1,3 +1,4 @@
+import { readMemoryObservation } from '../memoryOwnership'
 /**
  * SA-105 — the shared recall-media finalizer.
  *
@@ -8,12 +9,39 @@
  * is the point, and these tests pin the contract they share.
  */
 
-import { describe, it, expect, vi } from 'vitest'
+import { beforeEach, afterEach, describe, it, expect, vi } from 'vitest'
+import { redis } from '$lib/server/redis'
+import { captureSettingsLifecycle, withSettingsRecordReplacement } from '../../appActions/settings/lifecycle'
 import {
-  applyRecallMediaDelivery,
+  applyRecallMediaDelivery as applyRecallMediaDeliveryBound,
   isRecallOutputWithMedia,
-  MEMORY_RECALL_CONTROL_ID
+  MEMORY_RECALL_CONTROL_ID,
+  createRecallMediaPermit,
+  requireRecallMediaPermit
 } from '../memoryRecallDelivery'
+
+let restoreExecute: (() => void) | undefined
+beforeEach(() => {
+  const original = vi.mocked(redis.execute).getMockImplementation()!
+  const spy = vi.spyOn(redis, 'execute').mockImplementation(operation => original(async client => operation(new Proxy(client, {
+    get(target, key) {
+      if (key !== 'eval') return Reflect.get(target, key)
+      return async (script: string, options: { keys: string[] }) => {
+        if (!script.includes('BATSHIT_MEMORY_OBSERVATION_V1')) throw new Error('This delivery fixture accepts only an opaque ownership read.')
+        const readOwner = async (owner: string) => {
+          if (!owner) return ['none', '']
+          const kind = await client.type(owner)
+          if (kind === 'none') return ['none', '']
+          return kind === 'string' ? ['string', await client.get(owner)] : ['ReJSON-RL', JSON.stringify(await client.json.get(owner))]
+        }
+        const [agent, session, ...keys] = options.keys
+        return [String(Math.floor(Date.now() / 1000)), String(Date.now() % 1000 * 1000), ...await readOwner(agent), ...await readOwner(session), await Promise.all(keys.map(async recordKey => [recordKey, (await client.json.get(recordKey)) == null ? '' : JSON.stringify(await client.json.get(recordKey))]))]
+      }
+    }
+  }))))
+  restoreExecute = () => spy.mockRestore()
+})
+afterEach(() => { restoreExecute?.(); restoreExecute = undefined })
 
 function recallPayload(options?: {
   media?: Array<{ media_id: string; filename?: string; mime_type?: string; bytes?: number }>
@@ -46,9 +74,38 @@ function recallPayload(options?: {
   } as any
 }
 
+const USER = 'recall_delivery_user', AGENT = 'recall_delivery_agent', SESSION = 'recall_delivery_session'
+const ACTOR = { userId: USER, agentId: AGENT, sessionId: SESSION }
+
+/** Actual typed producer admission over the existing fake Redis owner; byte loading stays injected. */
+async function admittedPayload(options?: Parameters<typeof recallPayload>[0] & { expired?: boolean; includeExpired?: boolean }) {
+  const payload = recallPayload(options)
+  const expiryTs = Date.now() - 1000
+  await redis.json.set(`agent:${AGENT}`, '$', { id: AGENT, user_id: USER, memory_enabled: true } as never)
+  await redis.json.set(`session:${SESSION}`, '$', { id: SESSION, user_id: USER, agent_id: AGENT, created_at: 'original-chat' } as never)
+  for (const row of payload.result.recalled) {
+    await redis.json.set(`memory:${AGENT}:${row.id}`, '$', {
+      id: row.id, agent_id: AGENT, user_id: USER, lane: row.lane, content: row.content,
+      ...(options?.expired ? { expires_ts: expiryTs, expires_at: new Date(expiryTs).toISOString() } : {}),
+      media: (row.media ?? []).map((media: any) => ({ id: media.media_id, filename: `${AGENT}/${row.id}/${media.media_id}.png`, display_name: media.filename, mime_type: media.mime_type, bytes: media.bytes }))
+    } as never)
+  }
+  const ownership = await readMemoryObservation({ userId: USER, agentId: AGENT, sessionId: SESSION })
+  payload.result.recall_media_token = createRecallMediaPermit({
+    userId: USER, agentId: AGENT, sessionId: SESSION,
+    lifecycle: captureSettingsLifecycle([`agent:${AGENT}`, `session:${SESSION}`]),
+    agentOwner: ownership.agentOwner, sessionOwner: ownership.sessionOwner!,
+    includeExpired: options?.includeExpired === true,
+    records: payload.result.recalled.map((row: any) => ({ ...row, expired: options?.expired === true }))
+  })
+  return payload
+}
+
+const applyRecallMediaDelivery = (output: any, options: Parameters<typeof applyRecallMediaDeliveryBound>[1]) => applyRecallMediaDeliveryBound(output, { actor: ACTOR, ...options })
+
 const loadOk = async () => ({ bytes: new Uint8Array([1, 2, 3, 4]) })
 
-describe('isRecallOutputWithMedia', () => {
+describe.runIf(process.env.VITEST_USE_REAL_REDIS !== 'true')('isRecallOutputWithMedia', () => {
   it('matches a recall carrying media through either id field', () => {
     expect(isRecallOutputWithMedia(recallPayload())).toBe(true)
     expect(isRecallOutputWithMedia(recallPayload({ idKey: 'controlId' }))).toBe(true)
@@ -68,7 +125,7 @@ describe('isRecallOutputWithMedia', () => {
   })
 })
 
-describe('applyRecallMediaDelivery', () => {
+describe.runIf(process.env.VITEST_USE_REAL_REDIS !== 'true')('applyRecallMediaDelivery', () => {
   it('returns null for a recall with no media so the payload stays byte-identical (DL-105-13)', async () => {
     const output = { target: MEMORY_RECALL_CONTROL_ID, result: { recalled: [{ id: 'mem-1' }] } }
     const loadBytes = vi.fn(loadOk)
@@ -78,7 +135,7 @@ describe('applyRecallMediaDelivery', () => {
   })
 
   it('delivers in-turn on a tool_result lane and says so in the note', async () => {
-    const payload = recallPayload({ extraMemoryWithoutMedia: true })
+    const payload = await admittedPayload({ extraMemoryWithoutMedia: true })
     const result = await applyRecallMediaDelivery(payload, {
       lane: 'tool_result',
       loadBytes: loadOk
@@ -105,7 +162,7 @@ describe('applyRecallMediaDelivery', () => {
 
   it('defers everything with lane_none on the Claude CLI lane and never loads bytes', async () => {
     const loadBytes = vi.fn(loadOk)
-    const result = await applyRecallMediaDelivery(recallPayload(), { lane: 'none', loadBytes })
+    const result = await applyRecallMediaDelivery(await admittedPayload(), { lane: 'none', loadBytes })
 
     expect(result).not.toBeNull()
     expect(result!.images).toEqual([])
@@ -124,7 +181,7 @@ describe('applyRecallMediaDelivery', () => {
   })
 
   it('never mutates the payload it was handed, because that object gets persisted', async () => {
-    const payload = recallPayload()
+    const payload = await admittedPayload()
     const before = JSON.stringify(payload)
 
     await applyRecallMediaDelivery(payload, { lane: 'tool_result', loadBytes: loadOk })
@@ -132,8 +189,8 @@ describe('applyRecallMediaDelivery', () => {
     expect(JSON.stringify(payload)).toBe(before)
   })
 
-  it('degrades one unloadable image to next_message instead of failing the turn', async () => {
-    const payload = recallPayload({
+  it('marks an unloadable image unavailable without promising next-message delivery', async () => {
+    const payload = await admittedPayload({
       media: [
         { media_id: 'media-1' },
         { media_id: 'media-2' }
@@ -149,12 +206,12 @@ describe('applyRecallMediaDelivery', () => {
     expect(result!.images).toHaveLength(1)
     const media = result!.output.result.recalled[0].media
     expect(media[0].delivery).toBe('in_turn')
-    expect(media[1]).toMatchObject({ delivery: 'next_message', reason: 'source_unavailable' })
+    expect(media[1]).toMatchObject({ delivery: 'unavailable', reason: 'source_unavailable' })
     expect(result!.output.result.recalled[0].media_note).toContain('source_unavailable')
   })
 
   it('applies the shared caps: unsupported MIME and over-count both defer with a reason', async () => {
-    const payload = recallPayload({
+    const payload = await admittedPayload({
       media: [
         { media_id: 'm1' },
         { media_id: 'm2' },
@@ -181,7 +238,7 @@ describe('applyRecallMediaDelivery', () => {
   })
 
   it('records the byte-free Execution Viewer truth (DL-105-12)', async () => {
-    const result = await applyRecallMediaDelivery(recallPayload(), {
+    const result = await applyRecallMediaDelivery(await admittedPayload(), {
       lane: 'tool_result',
       loadBytes: loadOk
     })
@@ -195,4 +252,92 @@ describe('applyRecallMediaDelivery', () => {
       Buffer.from([1, 2, 3, 4]).toString('base64')
     )
   })
+
+  it('refuses a fabricated result flag without the original typed admission', async () => {
+    const payload = recallPayload()
+    payload.result.include_expired = true
+    const loadBytes = vi.fn(loadOk)
+    await expect(applyRecallMediaDelivery(payload, { lane: 'tool_result', loadBytes })).rejects.toThrow(/no current recall admission/)
+    expect(loadBytes).not.toHaveBeenCalled()
+  })
+
+  it('binds a valid admission to the current actor', async () => {
+    const payload = await admittedPayload()
+    const loadBytes = vi.fn(loadOk)
+    await expect(applyRecallMediaDelivery(payload, { lane: 'tool_result', loadBytes, actor: { userId: 'other', agentId: AGENT, sessionId: SESSION } })).rejects.toThrow(/no current recall admission/)
+    expect(loadBytes).not.toHaveBeenCalled()
+  })
+
+  it.each(['tool_result', 'none'] as const)('does not deliver or promise a stale trashed record on %s', async lane => {
+    const payload = await admittedPayload()
+    await redis.json.set(`memory:${AGENT}:mem-1`, '$.deleted_ts', Date.now())
+    const loadBytes = vi.fn(loadOk)
+    const result = await applyRecallMediaDelivery(payload, { lane, loadBytes })
+    expect(result!.images).toEqual([])
+    expect(loadBytes).not.toHaveBeenCalled()
+    expect(result!.output.result.recalled[0].media[0].delivery).toBe('unavailable')
+    expect(result!.output.result.recalled[0].media_note).not.toContain('with the next message')
+  })
+
+  it('cannot widen an ordinary admission by forging an expired-result flag', async () => {
+    const payload = await admittedPayload()
+    await redis.json.set(`memory:${AGENT}:mem-1`, '$.expires_ts', Date.now() - 1)
+    payload.result.recalled[0].expired = true
+    payload.result.include_expired = true
+    const loadBytes = vi.fn(loadOk)
+    const result = await applyRecallMediaDelivery(payload, { lane: 'tool_result', loadBytes })
+    expect(result!.images).toEqual([])
+    expect(loadBytes).not.toHaveBeenCalled()
+    expect(result!.output.result.recalled[0].media[0].delivery).toBe('unavailable')
+  })
+
+  it('delivers explicit expired photos now but never promises a deferred expired photo later', async () => {
+    const payload = await admittedPayload({ expired: true, includeExpired: true })
+    expect((await applyRecallMediaDelivery(payload, { lane: 'tool_result', loadBytes: loadOk }))!.images).toHaveLength(1)
+    const deferred = await applyRecallMediaDelivery(payload, { lane: 'none', loadBytes: vi.fn(loadOk) })
+    expect(deferred!.images).toEqual([])
+    expect(deferred!.output.result.recalled[0].media[0].delivery).toBe('unavailable')
+    expect(deferred!.output.result.recalled[0].media_note).not.toContain('with the next message')
+  })
+
+
+  it('retains only typed admission metadata, never recalled text, vectors or media bytes', async () => {
+    const originalMedia = { media_id: 'media-minimal', filename: 'photo.png', mime_type: 'image/png', bytes: 4, data: 'private_image_bytes' }
+    const record = { id: 'mem-minimal', expired: false, content: 'private_recalled_content', embedding: [0.12345, 0.6789], media: [originalMedia] }
+    const authority = requireRecallMediaPermit(await admittedPayload(), ACTOR)
+    const input = { userId: USER, agentId: AGENT, sessionId: SESSION, agentOwner: authority.agentOwner, sessionOwner: authority.sessionOwner, lifecycle: captureSettingsLifecycle([`agent:${AGENT}`]), includeExpired: false, records: [record], extraText: 'private_top_level_text' }
+    const token = createRecallMediaPermit(input)
+    originalMedia.filename = 'changed-after-admission.png'
+    const permit = requireRecallMediaPermit({ result: { recall_media_token: token } }, ACTOR)
+    expect(permit.records).toEqual([{ id: 'mem-minimal', expired: false, media: [{ media_id: 'media-minimal', filename: 'photo.png', mime_type: 'image/png', bytes: 4 }] }])
+    expect(permit).not.toHaveProperty('extraText')
+    expect(permit.records[0]).not.toHaveProperty('content')
+    expect(permit.records[0]).not.toHaveProperty('embedding')
+    expect(permit.records[0].media?.[0]).not.toHaveProperty('data')
+    expect(JSON.stringify(permit)).not.toContain('private_')
+  })
+
+
+  it('refuses a same-agent token in a different server-bound chat', async () => {
+    const payload = await admittedPayload()
+    payload.result.sessionId = 'chat-from-untrusted-result'
+    await expect(applyRecallMediaDelivery(payload, { lane: 'tool_result', loadBytes: loadOk, actor: { ...ACTOR, sessionId: 'another-chat' } })).rejects.toThrow(/no current recall admission/)
+  })
+
+  it('refuses a deleted and byte-identically recreated originating chat', async () => {
+    const payload = await admittedPayload()
+    const original = await redis.json.get(`session:${SESSION}`)
+    await withSettingsRecordReplacement(`session:${SESSION}`, async () => {
+      await redis.del(`session:${SESSION}`)
+      await redis.json.set(`session:${SESSION}`, '$', original as never)
+    })
+    await expect(applyRecallMediaDelivery(payload, { lane: 'tool_result', loadBytes: loadOk })).rejects.toThrow(/identity changed|being replaced/)
+  })
+
+  it('keeps a regular multi-agent chat valid for its user', async () => {
+    const payload = await admittedPayload()
+    await redis.json.set(`session:${SESSION}`, '$.agent_id', 'another-primary-in-the-same-chat')
+    expect((await applyRecallMediaDelivery(payload, { lane: 'tool_result', loadBytes: loadOk }))!.images).toHaveLength(1)
+  })
+
 })

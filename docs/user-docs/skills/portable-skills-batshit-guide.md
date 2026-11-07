@@ -12,14 +12,14 @@ If an outside agent using this bundle ever asks you for a token, password, or an
 
 ## What you need
 
-- The downloaded `batshit-guide` Portable Skill bundle.
+- The `batshit-guide` skill from the current complete Batshit plugin.
 - That's it. Batshit doesn't even have to be running to ask questions about it.
 
-Download links are listed in [Portable Skill downloads](../reference/portable-skills.md).
+Download the current package from **Settings → Plugins & shit → Plugins → Batshit → Download Plugin**; see [outside-agent setup](portable-skills.md).
 
 ## What it's good for
 
-- Asking your outside agent Batshit questions in plain language: "how do Zips work?", "which Primary Agent type should I use?", "how do I connect n8n?"
+- Asking your outside agent Batshit questions in plain language: "how do Zips work?", "which model connection should I use?", "how do I connect n8n?"
 - Getting accurate Settings walkthroughs while you work in Batshit side by side.
 - Giving an outside agent real Batshit context while it works alongside the operational Portable Skills (for example, understanding what an Artifact or a Goon scene *is* while another bundle builds one).
 - Troubleshooting with the official docs instead of guesses.

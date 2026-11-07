@@ -1,3 +1,5 @@
+import { assertBuiltinVoiceCatalogModel } from './builtinVoiceCatalog'
+import { VoiceCatalogCompatibilityError } from './builtinVoiceCatalogErrors'
 import { env } from '$env/dynamic/private'
 import { redis } from '$lib/server/redis'
 import { getVoiceEngineRecordByProviderId } from '$lib/server/services/voiceEngineRegistry'
@@ -72,7 +74,7 @@ function normalizeRequestedProvider(provider?: VoiceProviderId | string | null):
   return normalizeVoiceProviderId(provider) ?? null
 }
 
-async function resolveApiKey(userId: string, service: string, envKeys: string[]): Promise<boolean> {
+async function resolveApiKey(userId: string, service: string, envKeys: readonly (keyof typeof env)[]): Promise<boolean> {
   const stored = await resolveApiKeyValue(userId, service, envKeys)
   return Boolean(stored)
 }
@@ -80,7 +82,7 @@ async function resolveApiKey(userId: string, service: string, envKeys: string[])
 async function resolveApiKeyValue(
   userId: string,
   service: string,
-  envKeys: string[]
+  envKeys: readonly (keyof typeof env)[]
 ): Promise<string | null> {
   const stored = await apiKeyService.retrieve(service, userId).catch(() => null)
   if (stored?.trim()) return stored.trim()
@@ -310,11 +312,16 @@ async function deepgramContract(
   provider: VoiceProviderId,
   request: VoiceRealtimeSttSessionRequest
 ): Promise<VoiceRealtimeSttSessionContract> {
+  const model = resolveDeepgramFluxModel(request)
+  try { await assertBuiltinVoiceCatalogModel(provider, 'stt-direct-realtime', model) }
+  catch (error) {
+    if (error instanceof VoiceCatalogCompatibilityError) throw new RealtimeSttSessionSetupError(error.message, { status: 412, setupHint: error.setupHint })
+    throw error
+  }
   const hasKey = await resolveApiKey(userId, 'deepgram', ['DEEPGRAM_API_KEY'])
   if (!hasKey) throw missingKeyError('Deepgram', 'DEEPGRAM_API_KEY')
 
   const language = cleanString(request.language)
-  const model = resolveDeepgramFluxModel(request)
   const turnSettings = normalizeVoiceModeTurnSettings(request.voiceMode)
   const audio = withAudioDefaults(request, {
     encoding: 'linear16',

@@ -104,7 +104,7 @@ describe('saved CLI Stop signal forwarding', () => {
         actor_type: 'primary'
       },
       projectPath: '/tmp',
-      actorType: 'agent',
+      actorType: 'in-process',
       abortSignal: controller.signal
     })
 

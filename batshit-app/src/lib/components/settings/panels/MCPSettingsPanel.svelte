@@ -2,6 +2,7 @@
   import { refuse, type SettingsTarget } from '$lib/appActions/catalog'
   import { appActionsHaveDrafts, type ActionContext } from '$lib/appActions/owners'
   import { onMount } from 'svelte'
+  import { onUserChannelEvent } from '$lib/services/userChannel'
 
   /**
    * MCP Gateways Management Panel (Svelte 5)
@@ -413,6 +414,10 @@
   // the held copy was installed is the server's answer (a restore can put back an older stamp). A
   // read of a gateway the panel does not list yet waits for the list read.
   onMount(() => {
+    const stopSourceEvents = onUserChannelEvent(event => {
+      if (event.type === 'reconnected') void loadGateways()
+      else if (event.type === 'mcp_gateway_source_changed' && typeof event.gatewayId === 'string') void requestGatewayRead(data?.user?.id ?? null, event.gatewayId)
+    })
     const unsubscribe = subscribeGatewaySaveEvents((event) => {
       if (event.kind === 'save-settled') {
         // Every landing reaches the open panel, whichever card sent it or is shown now (the card
@@ -434,7 +439,7 @@
       // A save whose card outlived this panel still calls it; a closed panel shows nothing, so it
       // neither installs nor reads (the panel open now hears that copy from its own card).
       panelMounted = false
-      unsubscribe()
+      unsubscribe(); stopSourceEvents()
     }
   })
 

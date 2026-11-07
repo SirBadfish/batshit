@@ -16,8 +16,25 @@ describe('send-routed: abort relays are taken back when the turn ends', () => {
   const group = source.indexOf('\nasync function handleGroupChatStream({')
   const groupSource = source.slice(group, source.indexOf('\nfunction sessionDeletedResponse(', group))
 
-  it('has no inline abort listener anywhere in the file', () => {
-    expect(source).not.toMatch(/\.addEventListener\(\s*'abort'/)
+  // App Actions waits briefly for an already-running SDK segment to settle after a context
+  // error. This listens to the turn's OWN signal and removes its listener locally, unlike
+  // the long-lived outside signals whose unremoved listeners caused BL-246.
+  const waitStart = source.indexOf('\n              let timer: ReturnType<typeof setTimeout> | undefined\n', handler)
+  const waitEnd = source.indexOf('\n            }\n            if (!streamAbortSignal.aborted && performance.now() < deadline', waitStart)
+  const settlementWait = source.slice(waitStart, waitEnd)
+
+  it('has no inline abort listener outside the bounded MCP settlement wait', () => {
+    expect(waitStart).toBeGreaterThan(handler)
+    expect(waitEnd).toBeGreaterThan(waitStart)
+    expect(source.slice(0, waitStart) + source.slice(waitEnd)).not.toMatch(/\.addEventListener\(\s*'abort'/)
+    expect([...settlementWait.matchAll(/\.addEventListener\(\s*'abort'/g)]).toHaveLength(1)
+  })
+
+  it('takes the settlement listener and timer back in finally on every exit from the wait', () => {
+    expect(settlementWait).toContain('await Promise.race([')
+    expect(settlementWait).toContain('timer = setTimeout(stopped, Math.max(0, deadline - performance.now()))')
+    expect(settlementWait).toContain("if (streamAbortSignal.aborted) stopped()\n                    else streamAbortSignal.addEventListener('abort', stopped, { once: true })")
+    expect(settlementWait).toMatch(/\} finally \{\s*if \(timer\) clearTimeout\(timer\)\s*if \(stopped\) streamAbortSignal\.removeEventListener\('abort', stopped\)\s*\}$/)
   })
 
   it('relays the four outside signals of a single-agent turn through relayAbort, until the turn ends', () => {

@@ -15,7 +15,12 @@
  */
 
 import { redis } from '$lib/server/redis'
+import { admitPresetReferences, completePresetReferenceWrite, preparePresetReferences, readPresetReferenceSnapshot,
+  PresetReferenceWriteError, PRESET_REFERENCE_GUARD_LUA, type PresetReferencePreparation } from '../modelPresetReferenceGuard'
+import type { OwnedModelPresetDependency } from '../modelPresetSelectionOwner'
 import type { RedisClientType } from 'redis'
+import { captureSettingsLifecycle } from '../appActions/settings/lifecycle'
+import { MemoryMutationError, commitMemoryMutation, readMemoryMutationSnapshot } from './memoryMutation'
 import {
   MEMORY_CONFIG_KEY,
   MEMORY_INDEX_META_KEY,
@@ -81,6 +86,18 @@ export function anyWordTextQuery(text: string): string {
 // Config + meta records
 // ---------------------------------------------------------------------------
 
+const WRITE_MEMORY_CONFIG_SCRIPT = `
+${PRESET_REFERENCE_GUARD_LUA}
+if not presetReferencesAvailable(ARGV[4]) then return 'PRESET_REFERENCE_CHANGED' end
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  redis.call('JSON.SET', KEYS[1], '$', ARGV[1])
+else
+  redis.call('JSON.SET', KEYS[1], '$.embedding', ARGV[2])
+  redis.call('JSON.SET', KEYS[1], '$.schema_version', ARGV[3])
+end
+return 'SAVED'
+`
+
 export async function getMemoryConfig(): Promise<MemoryConfigRecord> {
   const stored = (await redis.json.get(MEMORY_CONFIG_KEY)) as MemoryConfigRecord | null
   if (stored?.embedding?.lane && stored.embedding.modelId) {
@@ -89,11 +106,31 @@ export async function getMemoryConfig(): Promise<MemoryConfigRecord> {
   return { embedding: DEFAULT_MEMORY_EMBEDDING_CONFIG, schema_version: MEMORY_SCHEMA_VERSION }
 }
 
-export async function setMemoryConfig(embedding: MemoryEmbeddingConfig): Promise<MemoryConfigRecord> {
+export async function setMemoryConfig(embedding: MemoryEmbeddingConfig, options: {
+  userId?: string; preparation?: PresetReferencePreparation; dependency?: OwnedModelPresetDependency
+} = {}): Promise<MemoryConfigRecord> {
   // Validates lane requirements (and known builtin ids) before anything is stored.
-  canonicalEmbeddingModelId(embedding.lane === 'builtin' ? embedding : embedding)
-  const record: MemoryConfigRecord = { embedding, schema_version: MEMORY_SCHEMA_VERSION }
-  await redis.json.set(MEMORY_CONFIG_KEY, '$', record as never)
+  const record: MemoryConfigRecord = { embedding: structuredClone(embedding), schema_version: MEMORY_SCHEMA_VERSION }
+  canonicalEmbeddingModelId(record.embedding)
+  const preparation = options.preparation ?? preparePresetReferences('memory', record)
+  const encoded = JSON.stringify(record)
+  const encodedEmbedding = JSON.stringify(record.embedding)
+  if (record.embedding.lane === 'preset' && !options.userId) throw new PresetReferenceWriteError('invalid')
+  await redis.execute(async client => {
+    const before = await readPresetReferenceSnapshot(client, MEMORY_CONFIG_KEY, 'memory')
+    const lease = await admitPresetReferences(options.userId ?? '', 'memory', before, record, preparation, options.dependency)
+    let issued = false
+    let answer: unknown
+    try {
+      lease.check(); issued = true
+      answer = await client.eval(WRITE_MEMORY_CONFIG_SCRIPT, { keys: [MEMORY_CONFIG_KEY],
+        arguments: [encoded, encodedEmbedding, String(MEMORY_SCHEMA_VERSION), lease.guard] })
+    } catch (error) {
+      if (issued) { lease.unknown(); throw new PresetReferenceWriteError('unknown') }
+      lease.settle(); throw error
+    }
+    completePresetReferenceWrite(lease, answer, ['SAVED'])
+  })
   return record
 }
 
@@ -200,6 +237,8 @@ async function createMemoryIndex(client: RedisClientType, dims: number): Promise
     '$.event_ts', 'AS', 'event_ts', 'NUMERIC', 'SORTABLE',
     '$.saved_ts', 'AS', 'saved_ts', 'NUMERIC', 'SORTABLE',
     '$.last_recalled_ts', 'AS', 'recalled_ts', 'NUMERIC', 'SORTABLE',
+    '$.expires_ts', 'AS', 'expires_ts', 'NUMERIC',
+    '$.deleted_ts', 'AS', 'deleted_ts', 'NUMERIC',
     '$.embedding', 'AS', 'embedding', 'VECTOR', 'HNSW', '6',
     'TYPE', 'FLOAT32', 'DIM', String(dims), 'DISTANCE_METRIC', 'COSINE'
   ])
@@ -218,6 +257,40 @@ async function createMemorySegmentIndex(client: RedisClientType, dims: number): 
     '$.embedding', 'AS', 'embedding', 'VECTOR', 'HNSW', '6',
     'TYPE', 'FLOAT32', 'DIM', String(dims), 'DISTANCE_METRIC', 'COSINE'
   ])
+}
+
+function hasCurrentMemorySchema(info: unknown): boolean {
+  const fields = readInfoField(info, 'attributes')
+  if (!Array.isArray(fields)) return false
+  return [['expires_ts', '$.expires_ts'], ['deleted_ts', '$.deleted_ts']].every(([name, path]) =>
+    fields.some(field => readInfoField(field, 'attribute') === name && readInfoField(field, 'identifier') === path && readInfoField(field, 'type') === 'NUMERIC'))
+}
+
+/** Legacy dual-timestamp backfill is raw-CAS guarded and never embeds or changes a date. */
+async function backfillMemoryStateTimestamps(): Promise<void> {
+  const keys = await redis.execute(client => client.keys(`${MEMORY_KEY_PREFIX}*`))
+  for (const key of keys) {
+    const raw = await redis.execute(client => client.sendCommand<string | null>(['JSON.GET', key]))
+    if (raw === null) continue
+    if (typeof raw !== 'string') throw new Error('Memory state backfill found unreadable JSON.')
+    const record = JSON.parse(raw)
+    if (!record || typeof record !== 'object') throw new Error('Memory state backfill found an unreadable record.')
+    let changed = false
+    for (const [text, numeric] of [['expires_at', 'expires_ts'], ['deleted_at', 'deleted_ts']]) {
+      if (record[text] != null) {
+        if (typeof record[text] !== 'string' || !Number.isFinite(Date.parse(record[text]))) throw new Error('Memory state timestamp is malformed.')
+        if (record[numeric] == null) { record[numeric] = Date.parse(record[text]); changed = true }
+        else if (typeof record[numeric] !== 'number' || !Number.isFinite(record[numeric]) || record[numeric] !== Date.parse(record[text])) throw new Error('Memory state timestamps disagree.')
+      } else if (record[numeric] != null) throw new Error('Memory state timestamp is missing its matching date.')
+    }
+    if (!changed) continue
+    // This is fresh normal mutation authority, never a restored disposal grant. A
+    // restore owning a genuinely legacy backfill leaves reconciliation unavailable
+    // rather than borrow the destructive owner's authority.
+    const snapshot = await readMemoryMutationSnapshot(record.agent_id, { targetIds: [record.id] })
+    if (snapshot.raw.get(key) !== raw) throw new MemoryMutationError('Memory changed during state backfill. Index upgrade did not complete.')
+    await commitMemoryMutation(snapshot, new Map([[key, record]]))
+  }
 }
 
 export interface MemoryIndexBootstrapResult {
@@ -256,9 +329,14 @@ export async function ensureMemoryIndexes(): Promise<MemoryIndexBootstrapResult>
       indexExists(client, memorySegmentIndexName())
     ])
 
-    if (meta && memoryExists && segmentExists) {
+    await backfillMemoryStateTimestamps()
+    if (meta && memoryExists && segmentExists && meta.index_schema_version === MEMORY_INDEX_SCHEMA_VERSION && hasCurrentMemorySchema(await client.sendCommand(['FT.INFO', memoryIndexName()]))) {
+      await assertIndexHealthy(client, memoryIndexName())
+      await assertIndexHealthy(client, memorySegmentIndexName())
       return { status: 'ready', embeddingModel, dims }
     }
+    const schemaChanged = Boolean(meta && memoryExists && (meta.index_schema_version !== MEMORY_INDEX_SCHEMA_VERSION || !hasCurrentMemorySchema(await client.sendCommand(['FT.INFO', memoryIndexName()]))))
+    if (schemaChanged) await client.sendCommand(['FT.DROPINDEX', memoryIndexName()])
 
     // Without a meta record an existing index is unverifiable drift (e.g. a restore of a
     // backup that predates the memory system over an instance that had indexes). Indexes
@@ -266,7 +344,7 @@ export async function ensureMemoryIndexes(): Promise<MemoryIndexBootstrapResult>
     if (!meta && memoryExists) await client.sendCommand(['FT.DROPINDEX', memoryIndexName()])
     if (!meta && segmentExists) await client.sendCommand(['FT.DROPINDEX', memorySegmentIndexName()])
 
-    if (!meta || !memoryExists) await createMemoryIndex(client, dims)
+    if (!meta || !memoryExists || schemaChanged) await createMemoryIndex(client, dims)
     if (!meta || !segmentExists) await createMemorySegmentIndex(client, dims)
     await writeMemoryIndexMeta(embeddingModel, dims)
     await assertIndexHealthy(client, memoryIndexName())
@@ -302,6 +380,12 @@ export async function requireReadyMemoryIndexes(): Promise<MemoryIndexMetaRecord
         'Run the explicit memory re-index path first.'
     )
   }
+  if (meta.index_schema_version !== MEMORY_INDEX_SCHEMA_VERSION) throw new Error('Memory index state schema is not ready; restart to finish its derived upgrade.')
+  await redis.execute(async client => {
+    if (!hasCurrentMemorySchema(await client.sendCommand(['FT.INFO', memoryIndexName()]))) throw new Error('Memory index state schema is incomplete; rebuild the derived index.')
+    await assertIndexHealthy(client, memoryIndexName())
+    await assertIndexHealthy(client, memorySegmentIndexName())
+  })
   return meta
 }
 
@@ -311,6 +395,8 @@ export async function requireReadyMemoryIndexes(): Promise<MemoryIndexMetaRecord
 
 export interface MemorySearchFilters {
   lane?: string
+  includeExpired?: boolean
+  nowTs?: number
   /** 'n' | 'y'; omit for both. */
   superseded?: string
   eventTsMin?: number
@@ -326,9 +412,16 @@ export interface MemorySearchHit {
 }
 
 function buildFilterClauses(filters: MemorySearchFilters | undefined): string {
-  if (!filters) return ''
-  const clauses: string[] = []
-  if (filters.lane) clauses.push(`@lane:{${escapeTagValue(filters.lane)}}`)
+  filters ??= {}
+  const now = filters.nowTs ?? Date.now()
+  const expired = `@expires_ts:[-inf ${now}]`
+  const clauses: string[] = ['-@deleted_ts:[-inf +inf]']
+  if (!filters.includeExpired) clauses.push(`-${expired}`)
+  if (filters.lane === 'ltm' && filters.includeExpired) clauses.push(`(@lane:{ltm} | ${expired})`)
+  else if (filters.lane) {
+    clauses.push(`@lane:{${escapeTagValue(filters.lane)}}`)
+    if (filters.includeExpired) clauses.push(`-${expired}`)
+  }
   if (filters.superseded) clauses.push(`@superseded:{${escapeTagValue(filters.superseded)}}`)
   if (filters.eventTsMin !== undefined || filters.eventTsMax !== undefined) {
     clauses.push(`@event_ts:[${filters.eventTsMin ?? '-inf'} ${filters.eventTsMax ?? '+inf'}]`)
@@ -606,6 +699,7 @@ export async function rebuildMemoryIndexes(options: {
     )
   }
 
+  await backfillMemoryStateTimestamps()
   let reembeddedMemories = 0
   let reembeddedSegments = 0
   let dims = resolveConfiguredDims(config)
@@ -657,32 +751,32 @@ async function reembedByPattern(
   embeddingModelId: string,
   embedBatch: (texts: string[]) => Promise<number[][]>
 ): Promise<number> {
-  return redis.execute(async (client) => {
-    const keys = await client.keys(pattern)
-    let updated = 0
-    for (let start = 0; start < keys.length; start += REEMBED_BATCH_SIZE) {
-      const batchKeys = keys.slice(start, start + REEMBED_BATCH_SIZE)
-      const texts: string[] = []
-      const validKeys: string[] = []
-      for (const key of batchKeys) {
-        const raw = await client.sendCommand(['JSON.GET', key, textJsonPath])
-        if (typeof raw !== 'string') continue
-        const parsed = JSON.parse(raw) as unknown
-        const text = Array.isArray(parsed) ? parsed[0] : parsed
-        if (typeof text !== 'string') continue
-        texts.push(text)
-        validKeys.push(key)
-      }
-      if (texts.length === 0) continue
-      const vectors = await embedBatch(texts)
-      for (let i = 0; i < validKeys.length; i++) {
-        await client.sendCommand(['JSON.SET', validKeys[i], '$.embedding', JSON.stringify(vectors[i])])
-        await client.sendCommand([
-          'JSON.SET', validKeys[i], '$.embedding_model', JSON.stringify(embeddingModelId)
-        ])
-        updated++
-      }
+  const keys = await redis.execute(client => client.keys(pattern))
+  const groups = new Map<string, string[]>()
+  for (const key of keys) {
+    const agentId = key.split(':')[1]
+    if (!agentId) throw new Error('Memory re-index found an invalid owner key.')
+    groups.set(agentId, [...(groups.get(agentId) ?? []), key])
+  }
+  const lifecycle = captureSettingsLifecycle([...groups.keys()].map(id => `agent:${id}`))
+  let updated = 0
+  for (const [agentId, ownedKeys] of groups) {
+    for (let start = 0; start < ownedKeys.length; start += REEMBED_BATCH_SIZE) {
+      const batchKeys = ownedKeys.slice(start, start + REEMBED_BATCH_SIZE)
+      const snapshot = await readMemoryMutationSnapshot(agentId, { lifecycle, extraKeys: batchKeys, targetIds: textJsonPath === '$.content' ? batchKeys.map(key => key.slice(`memory:${agentId}:`.length)) : [] })
+      const rows = batchKeys.map(key => {
+        const raw = snapshot.raw.get(key)
+        if (!raw) throw new MemoryMutationError('Memory disappeared during re-index preparation.')
+        const value = JSON.parse(raw)
+        const text = value[textJsonPath === '$.content' ? 'content' : 'summary']
+        if (typeof text !== 'string' || value.agent_id !== agentId) throw new Error('Memory re-index found an unreadable owner record.')
+        return { key, value, text }
+      })
+      const vectors = await embedBatch(rows.map(row => row.text))
+      if (vectors.length !== rows.length) throw new Error('Memory re-index received an incomplete embedding batch.')
+      await commitMemoryMutation(snapshot, new Map(rows.map((row, index) => [row.key, { ...row.value, embedding: vectors[index], embedding_model: embeddingModelId }])))
+      updated += rows.length
     }
-    return updated
-  })
+  }
+  return updated
 }

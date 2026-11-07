@@ -3,6 +3,25 @@ import { describe, expect, it } from 'vitest'
 import { normalizeToolArgs, parseJsonLike } from '../sseToolNormalization'
 
 describe('sseToolNormalization', () => {
+  it('keeps exact API utility envelopes nested and prevents inner ref/identity fields replacing the executed target', () => {
+    const input = { ref: 'batshit:sys.web_search.search', input: { query: 'fixture', ref: 'batshit:sys.workers.spawn',
+      subagent: { id: 'forged-child', name: 'Forged' } } }
+    expect(normalizeToolArgs(input, 'native_batshit_tool_use')).toEqual(input)
+    expect(normalizeToolArgs(JSON.stringify(input), 'native_batshit_tool_use')).toEqual(input)
+    expect(normalizeToolArgs(input, 'native_batshit_tool_use')).not.toHaveProperty('subagentId')
+  })
+
+  it.each(['batshit_tool_use', 'mcp.batshit_helpers.batshit_tool_use', undefined])('keeps legacy/direct normalization unchanged for %s', owner => {
+    expect(normalizeToolArgs({ ref: 'batshit:sys.web_search.search', input: { query: 'fixture' } }, owner))
+      .toEqual({ ref: 'batshit:sys.web_search.search', query: 'fixture' })
+  })
+
+  it('does not generalize canonical utility envelopes to unknown refs or ambiguous arrays', () => {
+    expect(normalizeToolArgs({ ref: 'batshit:sys.web_search.custom', input: { query: 'fixture' } }, 'native_batshit_tool_use'))
+      .toEqual({ ref: 'batshit:sys.web_search.custom', query: 'fixture' })
+    expect(normalizeToolArgs([{ ref: 'batshit:sys.web_search.search', input: { query: 'fixture' } }], 'native_batshit_tool_use'))
+      .toEqual({})
+  })
   it('parses nested JSON-looking strings without touching plain text', () => {
     expect(parseJsonLike('{"path":"/tmp/file.txt"}')).toEqual({ path: '/tmp/file.txt' })
     expect(parseJsonLike('"[1,2]"')).toEqual([1, 2])

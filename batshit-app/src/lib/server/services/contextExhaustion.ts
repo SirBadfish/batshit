@@ -3,14 +3,12 @@
 // automatic continuation (a fresh run recompiled from persisted history, where
 // tool results live as compact zip refs).
 //
-// Codex CLI, OpenAI-compatible APIs, Anthropic, and Google each word this
+// OpenAI-compatible APIs, Anthropic, and Google each word this
 // differently; keep patterns tight enough to avoid classifying unrelated
 // failures as continuable — a wrong match would auto-retry an error that can
 // never succeed.
 
 export const CONTEXT_EXHAUSTION_PATTERNS: RegExp[] = [
-  /batshit context guard/i, // proactive guard stop from the managed CLI lanes
-  /ran out of room in the model[’']?s context window/i, // Codex CLI turn.failed
   /context[_\s-]?length[_\s-]?exceeded/i, // OpenAI error code
   /maximum context length/i, // OpenAI message text
   /prompt is too long/i, // Anthropic

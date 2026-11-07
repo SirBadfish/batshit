@@ -1,4 +1,5 @@
 // @vitest-environment node
+import { useSendHandlerFixture } from '$lib/test-utils/sendHandlerFixture'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { env } from '$env/dynamic/private'
@@ -206,6 +207,7 @@ const envRecord = env as Record<string, string | undefined>
 let previousToken: string | undefined
 let POST: (event: any) => Promise<Response>
 let SESSION = ''
+useSendHandlerFixture({ sessionIds: () => [SESSION], postStartupMcpUsers: () => [USER] })
 let count = 0
 
 /** One Clip for the next message only, one for the next two, and one clipped until removed. */

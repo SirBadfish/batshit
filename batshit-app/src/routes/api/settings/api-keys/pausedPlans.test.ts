@@ -15,7 +15,6 @@ const testEnv = vi.hoisted(() => ({}) as Record<string, string | undefined>)
 
 vi.mock('$lib/services/apiKey.server', () => ({ apiKeyService }))
 vi.mock('$env/dynamic/private', () => ({ env: testEnv }))
-vi.mock('$lib/server/services/codexProfileManager', () => ({ syncAgentCodexProfiles: vi.fn() }))
 vi.mock('$lib/server/services/claudeProfileManager', () => ({ syncAgentClaudeProfiles: vi.fn() }))
 vi.mock('$lib/server/redis', () => ({
   redis: {

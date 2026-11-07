@@ -26,7 +26,7 @@ async function settled(oauth: ChatgptPlanOAuth) {
   }
   throw new Error('fixture callback did not settle')
 }
-async function fixture() {
+async function fixture(appCallbackOrigin?: string) {
   const folder = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'sa130-oauth-')))
   cleanup.push(() => rmSync(folder, { recursive: true, force: true }))
   const vault = new ChatgptPlanVault(folder, 'sa130-synthetic-instance-encryption-key')
@@ -60,7 +60,7 @@ async function fixture() {
       .setAudience('oaiapp_Fixture').setIssuedAt().setExpirationTime('1h').sign(privateKey)
     return Response.json({ access_token: 'ACCESS_SECRET_SENTINEL', refresh_token: 'REFRESH_SECRET_SENTINEL', id_token: idToken, scope: 'openid profile email offline_access resource.invoke chatgpt.tokens.use.direct', token_type: 'Bearer', expires_in: 3600, ...payloadPatch })
   }) as typeof fetch
-  const oauth = new ChatgptPlanOAuth(vault, async (token, user) => sessionValid && token === 'local-session-fixture' && user === 'user-fixture', http)
+  const oauth = new ChatgptPlanOAuth(vault, async (token, user) => sessionValid && token === 'local-session-fixture' && user === 'user-fixture', http, appCallbackOrigin)
   cleanup.push(() => oauth.close())
   const start = async (accountId?: string) => { authorization = new URL(await oauth.start('user-fixture', 'local-session-fixture', accountId)); return authorization }
   const callbackUrl = (changes: Record<string, string> = {}) => {
@@ -149,6 +149,58 @@ describe('ChatGPT OAuth on a real loopback listener with synthetic OpenAI identi
     await expect(f.oauth.refresh(refresh.registration, refresh.tokens, AbortSignal.timeout(5000))).rejects.toMatchObject({ cleanupConfirmed: true })
     const revoke = vi.mocked(f.http).mock.calls.filter(call => String(call[0]).endsWith('oauth/revoke'))
     expect(new URLSearchParams(String(revoke[0][1]?.body)).get('token')).toBe('ROTATED_FIXTURE')
+  })
+})
+
+describe('local app-port callback uses the same OAuth owner', () => {
+  it.each(['http://127.0.0.1:5650', 'http://127.0.0.1:5620', 'http://127.0.0.1:5613'])('retains exact redirect and validates signed identity on %s', async origin => {
+    const f = await fixture(origin), authorization = await f.start()
+    expect(authorization.searchParams.get('redirect_uri')).toBe(`${origin}/auth/callback`)
+    // Simulate adapter-node's localhost ORIGIN independently of raw callback Host.
+    const target = new URL(f.callbackUrl()); target.hostname = 'localhost'
+    const input = (url = target.href, host = new URL(origin).host, method = 'GET') => new Request(url, { method, headers: { Host: host, 'X-Forwarded-Host': 'untrusted.example' } })
+    for (const request of [input(target.href, 'localhost:' + target.port), input(target.href, '127.0.0.1:4567'), input(target.href, new URL(origin).host, 'POST'), input(target.href.replace('/auth/callback', '/wrong')), input(target.href + '&state=duplicate')]) {
+      const response = f.oauth.receiveAppCallback(request)
+      expect(response.status).toBe(400); expect(await response.text()).not.toContain('code-fixture')
+    }
+    expect(f.oauth.status('user-fixture').state).toBe('waiting'); expect(f.http).not.toHaveBeenCalled()
+    const response = f.oauth.receiveAppCallback(input())
+    expect(response.status).toBe(303); expect(response.headers.get('location')).toBe('/auth/callback')
+    expect(response.headers.get('cache-control')).toBe('no-store'); expect(response.headers.get('referrer-policy')).toBe('no-referrer')
+    expect(f.oauth.receiveAppCallback(input()).status).toBe(400)
+    expect((await settled(f.oauth)).state).toBe('complete')
+    expect(f.vault.list('user-fixture')[0].subject).toBe('Subject-A')
+    expect(f.bodies[0].get('redirect_uri')).toBe(`${origin}/auth/callback`)
+    const clean = f.oauth.receiveAppCallback(input(`${origin}/auth/callback`))
+    expect(clean.status).toBe(200); expect(await clean.text()).not.toContain('SECRET_SENTINEL')
+  })
+  it('keeps logout, expiry, cancellation and closed-owner refusal', async () => {
+    const origin = 'http://127.0.0.1:5650', f = await fixture(origin)
+    await f.start()
+    const input = () => new Request(f.callbackUrl(), { headers: { Host: new URL(origin).host } })
+    f.logout(); expect(f.oauth.receiveAppCallback(input()).status).toBe(303)
+    expect((await settled(f.oauth)).code).toBe('session_expired'); expect(f.bodies).toHaveLength(0)
+    const expired = await fixture(origin); await expired.start()
+    const request = new Request(expired.callbackUrl(), { headers: { Host: new URL(origin).host } })
+    const now = Date.now(); const clock = vi.spyOn(Date, 'now').mockReturnValue(now + 6 * 60_000)
+    expect(expired.oauth.receiveAppCallback(request).status).toBe(400); clock.mockRestore()
+    expired.oauth.cancel('user-fixture'); expect(expired.oauth.receiveAppCallback(request).status).toBe(400)
+    expired.oauth.close(); expect(expired.oauth.receiveAppCallback(new Request(`${origin}/auth/callback`, { headers: { Host: new URL(origin).host } })).status).toBe(400)
+    expect(expired.http).not.toHaveBeenCalled()
+  })
+  it('bounds callback targets, fixed-length state and vendor parameters without consuming the pending attempt', async () => {
+    const origin = 'http://127.0.0.1:5650', f = await fixture(origin)
+    await f.start()
+    const bad = [f.callbackUrl({ state: 'x'.repeat(44) }), f.callbackUrl({ code: 'x'.repeat(16_385) }),
+      f.callbackUrl({ client_id: 'x'.repeat(1025) }), f.callbackUrl({ error: 'x'.repeat(1025) }),
+      f.callbackUrl() + '&extra=' + 'x'.repeat(25_000), f.callbackUrl() + Array.from({ length: 33 }, (_, i) => `&extra${i}=x`).join('')]
+    for (const url of bad) {
+      const response = f.oauth.receiveAppCallback(new Request(url, { headers: { Host: new URL(origin).host } }))
+      expect(response.status).toBe(400); expect((await response.text()).length).toBeLessThan(100)
+    }
+    expect(f.oauth.status('user-fixture').state).toBe('waiting'); expect(f.http).not.toHaveBeenCalled()
+    expect(f.oauth.receiveAppCallback(new Request(f.callbackUrl(), { headers: { Host: new URL(origin).host } })).status).toBe(303)
+    expect((await settled(f.oauth)).state).toBe('complete')
   })
 })
 

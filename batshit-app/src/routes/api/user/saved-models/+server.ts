@@ -1,17 +1,23 @@
+import { readStoredModelPresetPage } from '$lib/server/services/modelPresetSelectionOwner'
 import { pausedPlanAddRefusal } from '$lib/server/services/pausedPlans'
 import { normaliseChatgptPlanPreset } from '$lib/server/services/chatgptPlanPreset'
 import { withChatgptPlanPublishedMetadata } from '$lib/data/chatgpt-plan-published-metadata'
 import { chatgptPlanAccounts } from '$lib/server/services/chatgptPlanHost'
 import { ChatgptPlanError } from '$lib/server/services/chatgptPlanVault'
 import { chatgptPlanAccountId, isChatgptPlanConnection } from '$lib/utils/chatgptPlanConnection'
+import { isClaudePlanSelection } from '$lib/utils/claudePlanConnection'
+import { normaliseClaudePlanPreset } from '$lib/server/services/claudePlanPreset'
+import { ClaudePlanError, type ClaudePlanReadiness } from '$lib/server/services/claudePlanAdmission'
+import { readClaudePlanDisplayStatus } from '$lib/server/services/claudePlanReadiness'
+import { CLAUDE_CLI_PRESET_REFUSAL, namesClaudeCliModel } from '$lib/utils/cliRuntimeIdentity'
 import { json } from '@sveltejs/kit'
 import type { RequestHandler } from './$types'
 import { redis } from '$lib/server/redis'
 import { type SavedModel, type PricingTier, isTieredPricing, type ModelConnectionInfo, type ImageTransport, type ModelPurpose } from '$lib/types/savedModels'
-import { sanitizeId } from '$lib/utils/idSanitizer'
 import { determineModelCompatibility } from '$lib/data/model-compatibility-registry'
 import { ProviderManager, type ModelInfo } from '$lib/server/services/providers'
 import {
+  buildModelPresetId,
   providerFeaturesToCapabilities,
   mergeCapabilities,
   normaliseModelSettings
@@ -28,6 +34,7 @@ import {
 import { inferModelPurpose } from '$lib/utils/modelPurpose'
 import { resolveCatalogIds, resolveModelIds } from '$lib/utils/modelIdResolver'
 import { resolveSavedModelConnection } from '$lib/utils/modelConnections'
+import { projectCatalogReasoningEvidence } from '$lib/utils/catalogReasoningEvidence'
 import { LOCAL_AI_SERVER_IDS } from '$lib/data/localAiServers'
 import {
   GATEWAY_UNLISTED_PRESET_REASON,
@@ -40,6 +47,9 @@ import {
   findModelPresetReferences,
   formatModelPresetReferenceMessage
 } from '$lib/server/services/modelPresetReferences'
+
+import { readModelPresetStorage, mutateModelPresetStorage, ModelPresetStorageError } from '$lib/server/services/modelPresetSelectionOwner'
+import { withSettingsRecordReplacement, SettingsLifecycleRefusal, captureSettingsLifecycle, assertSettingsLifecycle, type SettingsLifecycleSnapshot } from '$lib/server/services/appActions/settings/lifecycle'
 
 class ModelPresetValidationError extends Error {
   constructor(message: string) {
@@ -139,18 +149,11 @@ function isLocalAiConnection(connection: ModelConnectionInfo): boolean {
   )
 }
 
-/** The managed Codex CLI and Claude Code CLI connections, which the user's plan pays for. */
-const SUBSCRIPTION_CLI_SERVICES: ReadonlySet<string> = new Set(['openai-codex', 'anthropic-claude-cli'])
-
-function isSubscriptionCliConnection(connection: ModelConnectionInfo): boolean {
-  return SUBSCRIPTION_CLI_SERVICES.has(connection.service ?? '')
-}
-
 /**
  * BL-67: blank sends nothing, zero is real. A price the payload does not carry stays
  * ABSENT so the Token Panel says Unknown instead of an exact $0.00. The derived zeros
  * are the presets whose per-token price really is nothing: a Local AI program on the
- * user's own machine, and a Codex CLI or Claude Code CLI run that the user's plan covers.
+ * user's own machine.
  */
 function normalizePresetPricing(
   raw: Partial<SavedModel['pricing']> | null | undefined,
@@ -296,10 +299,7 @@ async function normaliseSavedModel(payload: SavedModel, manager: ProviderManager
     purpose,
     purposeOverride: purposeOverride ?? undefined,
     contextWindow: toPositiveNumber(payload.contextWindow),
-    pricing: normalizePresetPricing(
-      payload.pricing,
-      isLocalAiConnection(resolvedConnection) || isSubscriptionCliConnection(resolvedConnection)
-    ),
+    pricing: normalizePresetPricing(payload.pricing, isLocalAiConnection(resolvedConnection)),
     settings: stripInternalModelSettings(payload.settings) ?? {},
     isVercelImport,
     vercelSourceId,
@@ -379,49 +379,26 @@ function normalizeConnection(
   }
 }
 
-function buildModelPresetId(options: {
-  displayName?: string
-  modelId?: string
-  provider?: string
-  connection?: ModelConnectionInfo | null
-}): string {
-  const displayName = options.displayName?.trim() || ''
-  const modelId = options.modelId?.trim() || ''
-  const provider = options.provider?.trim() || ''
-  const connection = options.connection ?? null
-
-  const namePart = sanitizeId(displayName || modelId)
-  const connectionType = connection?.type || ''
-  const connectionService = connection?.service || ''
-  const identityPart = sanitizeId(
-    [provider, modelId, connectionType, connectionService].filter(Boolean).join('_')
-  )
-
-  if (namePart && identityPart && namePart !== identityPart) {
-    return `${namePart}_${identityPart}`
-  }
-  return namePart || identityPart
-}
 
 /**
  * The user's saved presets, newest first. BL-517: a read never deletes. A preset whose model a
  * connection stopped listing stays stored (with its settings, and for the agents that name it);
  * the GET marks it unavailable in its answer instead.
  */
-async function loadUserModels(userId: string): Promise<SavedModel[]> {
+async function loadUserModels(userId: string): Promise<Array<{ model: SavedModel; raw: string; lifecycle: SettingsLifecycleSnapshot }>> {
   const modelIds = await redis.sMembers(`user:${userId}:models`)
-  const models: SavedModel[] = []
+  const models: Array<{ model: SavedModel; raw: string; lifecycle: SettingsLifecycleSnapshot }> = []
   for (const modelId of modelIds) {
-    const record = (await redis.get(`model:${modelId}`)) as SavedModel | null
-    if (record) {
-      models.push(record)
-    }
+    const lifecycle = captureSettingsLifecycle([`model:${modelId}`])
+    const stored = await readModelPresetStorage(userId, modelId)
+    assertSettingsLifecycle(lifecycle)
+    if (stored.present && stored.preset) models.push({ model: stored.preset, raw: stored.raw, lifecycle })
   }
 
   models.sort(
     (a, b) =>
-      new Date(b.createdAt || b.updatedAt || 0).getTime() -
-      new Date(a.createdAt || a.updatedAt || 0).getTime()
+      new Date(b.model.createdAt || b.model.updatedAt || 0).getTime() -
+      new Date(a.model.createdAt || a.model.updatedAt || 0).getTime()
   )
 
   return models
@@ -512,12 +489,19 @@ function repairSavedModelPurpose(
 }
 
 // GET /api/user/saved-models
-export const GET: RequestHandler = async ({ locals }) => {
+export const GET: RequestHandler = async ({ locals, url }) => {
   if (!locals.user) {
     return json({ error: 'Unauthorized' }, { status: 401 })
   }
 
   try {
+    if (url?.searchParams.has('projection')) {
+      if (url.searchParams.get('projection') !== 'stored' || [...url.searchParams.keys()].some(key => !['projection', 'offset'].includes(key))) return json({ error: 'Invalid stored projection query.' }, { status: 400 })
+      const offset = url.searchParams.get('offset') ?? '0'
+      if (!/^(?:0|[1-9][0-9]{0,4})$/.test(offset)) return json({ error: 'Invalid stored projection offset.' }, { status: 400 })
+      try { return json(await readStoredModelPresetPage(locals.user.id, Number(offset))) }
+      catch { return json({ projection: 'stored', available: false, code: 'STORED_MODEL_PRESETS_UNAVAILABLE', error: 'The stored model list is unavailable. The last good list can be kept.' }, { status: 503 }) }
+    }
     const catalog = await fetchVercelModelCatalog()
     const models = await loadUserModels(locals.user.id)
     // BL-68: a preset saved on a row that later merged into or was renamed to another still
@@ -528,10 +512,20 @@ export const GET: RequestHandler = async ({ locals }) => {
     let identityBackfilledCount = 0
     const unlisted: { id: string; modelName: string }[] = []
     const answered: SavedModel[] = []
-    for (const model of models) {
+    let claudePlanReadiness: ClaudePlanReadiness | null = null
+    for (const { model, raw, lifecycle } of models) {
+      // SA-139: a Claude plan preset has no catalog row to repair; the answer says whether it can
+      // run now and the stored preset is never rewritten by this read.
+      if (isClaudePlanSelection(model.connection)) {
+        claudePlanReadiness ??= await readClaudePlanDisplayStatus()
+        const projected = { ...model, reasoningEvidence: { status: 'unknown' as const, reason: 'Claude Code reasoning controls use local qualification.' } }
+        answered.push(claudePlanReadiness.state === 'ready' ? projected : { ...projected, unavailableReason: claudePlanReadiness.reason })
+        continue
+      }
       if (isChatgptPlanConnection(model.connection?.id) || model.connection?.service === 'chatgpt-plan') {
         const ready = chatgptPlanAccounts(locals.user.id).some(account => account.id === chatgptPlanAccountId(model.connection?.id) && account.state === 'ready')
-        const projected = withChatgptPlanPublishedMetadata(model)
+        const projected = { ...withChatgptPlanPublishedMetadata(model), reasoningEvidence: { status: 'unknown' as const,
+          reason: 'Account-specific reasoning controls use local qualification.' } }
         answered.push(ready ? projected : { ...projected, unavailableReason: 'Reconnect this ChatGPT account in Settings → API Keys on this Mac.' })
         continue
       }
@@ -546,16 +540,21 @@ export const GET: RequestHandler = async ({ locals }) => {
       }
       // Written only while the preset still exists: a preset deleted since this load read it is
       // not made again as a key no list names (review of BL-517), and it leaves the answer.
-      if ((identityChanged || purposeChanged) && !(await redis.json.setIfExists(`model:${model.id}`, '$', model))) {
-        continue
+      if (identityChanged || purposeChanged) {
+        assertSettingsLifecycle(lifecycle)
+        const outcome = await withSettingsRecordReplacement(`model:${model.id}`, () =>
+          mutateModelPresetStorage(locals.user!.id, model.id, raw, 'backfill', model))
+        if (outcome !== 'SAVED') continue
       }
       // BL-517: a gateway preset the gateway no longer lists stays; the answer (never the stored
       // preset) says so, and the pickers show it as unavailable. The send says the same.
       if (isGatewayCatalogPreset(model) && !gatewayListsCatalogRow(match)) {
         unlisted.push({ id: model.id, modelName: model.modelName })
-        answered.push({ ...model, unavailableReason: GATEWAY_UNLISTED_PRESET_REASON })
+        answered.push({ ...model, unavailableReason: GATEWAY_UNLISTED_PRESET_REASON,
+          reasoningEvidence: projectCatalogReasoningEvidence(match, resolveCatalogConnectionId(resolveSavedModelConnection(model)), model.effectiveModelId) })
       } else {
-        answered.push(model)
+        answered.push({ ...model, reasoningEvidence: projectCatalogReasoningEvidence(match,
+          resolveCatalogConnectionId(resolveSavedModelConnection(model)), model.effectiveModelId) })
       }
     }
 
@@ -569,6 +568,7 @@ export const GET: RequestHandler = async ({ locals }) => {
       }
     })
   } catch (error) {
+    if (error instanceof ModelPresetStorageError || error instanceof SettingsLifecycleRefusal) return json({ error: error.message, code: error.code }, { status: error.status })
     console.error('Failed to load saved models:', error)
     return json({ error: 'Failed to load saved models' }, { status: 500 })
   }
@@ -587,6 +587,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
   try {
     const payload = (await request.json()) as SavedModel
+    const isUpdate = typeof payload?.id === 'string' && payload.id.trim().length > 0
     // Plan pause: a model of a paused plan cannot be added or saved.
     const paused = await pausedPlanAddRefusal(
       payload?.connection?.service ?? payload?.connection?.id ?? null
@@ -594,18 +595,26 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     if (paused) {
       return json({ error: paused.message, code: 'paused_plan' }, { status: 409 })
     }
+    // SA-139 R5: Claude Code CLI presets were removed, so none is saved, new or edited. A leftover
+    // one stays readable (GET) and deletable (DELETE).
+    if (namesClaudeCliModel({ primary_model_provider: payload?.provider, primary_model_name: payload?.modelId, primary_model_connection: payload?.connection })) {
+      return json({ error: CLAUDE_CLI_PRESET_REFUSAL }, { status: 400 })
+    }
+    const originalLifecycle = isUpdate ? captureSettingsLifecycle([`model:${payload.id.trim()}`]) : null
+    const original = isUpdate ? await readModelPresetStorage(locals.user.id, payload.id.trim()) : null
     // BL-516: a create sends no id (the id is built from the name, model, and connection); an
     // update names its id. A create never replaces a saved preset, and an update never makes one.
-    const isUpdate = typeof payload?.id === 'string' && payload.id.trim().length > 0
     const model = isChatgptPlanConnection(payload.connection?.id) || payload.connection?.service === 'chatgpt-plan'
       ? await normaliseChatgptPlanPreset(payload, locals.user.id)
+      : isClaudePlanSelection(payload.connection) ? normaliseClaudePlanPreset(payload)
       : await normaliseSavedModel(payload, await ProviderManager.createForUser(locals.user.id))
+    // This is a response-only catalog projection, never user settings or an imported baseline.
+    delete model.reasoningEvidence
 
     const now = new Date().toISOString()
     model.createdAt = model.createdAt || now
     model.updatedAt = now
 
-    const setKey = `user:${locals.user.id}:models`
     const modelKey = `model:${model.id}`
     const missing = json(
       {
@@ -615,35 +624,22 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       { status: 404 }
     )
 
-    if (isUpdate) {
-      if (!(await redis.sismember(setKey, model.id))) {
-        return missing
-      }
-      // Written only while the preset is still there, so a delete that lands first wins.
-      if (!(await redis.json.setIfExists(modelKey, '$', model))) {
-        return missing
-      }
-    } else {
-      // Made in one step only while no preset has that id (`JSON.SET … NX`), so two creates of
-      // one id at the same moment cannot both write.
-      if (!(await redis.json.setIfAbsent(modelKey, '$', model))) {
-        const existing = (await redis.get(modelKey)) as SavedModel | null
-        const isOwned = await redis.sismember(setKey, model.id)
-        const existingName = isOwned && existing?.modelName?.trim() ? `: "${existing.modelName.trim()}"` : ''
-        return json(
-          {
-            error: `A model preset with that name already exists${existingName}. Choose a different display name.`,
-            code: 'model_preset_exists'
-          },
-          { status: 409 }
-        )
-      }
-      await redis.sAdd(setKey, model.id)
+    if (isUpdate && (!original?.present || !original.preset)) return missing
+    if (originalLifecycle) assertSettingsLifecycle(originalLifecycle)
+    const outcome = await withSettingsRecordReplacement(modelKey, () =>
+      mutateModelPresetStorage(locals.user!.id, model.id, original?.raw ?? '', isUpdate ? 'update' : 'create', model))
+    if (outcome === 'MISSING') return missing
+    if (outcome === 'CONFLICT') return json({ error: 'This model preset changed while the save was pending. Reload Settings → Models.', code: 'model_preset_changed' }, { status: 409 })
+    if (outcome === 'EXISTS') {
+      const existing = await readModelPresetStorage(locals.user.id, model.id)
+      const existingName = existing.present && existing.preset?.modelName?.trim() ? `: "${existing.preset.modelName.trim()}"` : ''
+      return json({ error: `A model preset with that name already exists${existingName}. Choose a different display name.`, code: 'model_preset_exists' }, { status: 409 })
     }
 
     return json({ success: true, model })
   } catch (error) {
-    if (error instanceof ChatgptPlanError) return json({ error: error.message, code: error.code }, { status: 409 })
+    if (error instanceof ModelPresetStorageError || error instanceof SettingsLifecycleRefusal) return json({ error: error.message, code: error.code }, { status: error.status })
+    if (error instanceof ChatgptPlanError || error instanceof ClaudePlanError) return json({ error: error.message, code: error.code }, { status: 409 })
     console.error('Failed to save model:', error)
     if (error instanceof ModelPresetValidationError) {
       return json({ error: error.message, code: 'invalid_model_identity' }, { status: 400 })
@@ -664,24 +660,22 @@ export const DELETE: RequestHandler = async ({ url, locals }) => {
   }
 
   try {
-    // BL-483: every place a preset id is stored, each named in the refusal.
-    const references = await findModelPresetReferences(locals.user.id, modelId)
-    if (references.length > 0) {
-      return json(
-        {
-          error: formatModelPresetReferenceMessage(references),
-          code: 'model_preset_in_use',
-          dependencies: { references }
-        },
-        { status: 409 }
-      )
-    }
-
-    await redis.del(`model:${modelId}`)
-    await redis.sRem(`user:${locals.user.id}:models`, modelId)
-
-    return json({ success: true })
+    // Capture BEFORE replacement starts/drains: a newer same-ID record is never adopted.
+    const originalLifecycle = captureSettingsLifecycle([`model:${modelId}`])
+    const original = await readModelPresetStorage(locals.user.id, modelId)
+    assertSettingsLifecycle(originalLifecycle)
+    if (!original.present || !original.preset) return json({ error: 'This model preset is no longer in your saved models.', code: 'model_preset_missing' }, { status: 404 })
+    return await withSettingsRecordReplacement(`model:${modelId}`, async () => {
+      // New model assignments join this fence; existing writes settle before the scan.
+      const references = await findModelPresetReferences(locals.user!.id, modelId)
+      if (references.length > 0) return json({ error: formatModelPresetReferenceMessage(references), code: 'model_preset_in_use', dependencies: { references } }, { status: 409 })
+      const outcome = await mutateModelPresetStorage(locals.user!.id, modelId, original.raw, 'delete')
+      if (outcome === 'MISSING') return json({ error: 'This model preset is no longer in your saved models.', code: 'model_preset_missing' }, { status: 404 })
+      if (outcome !== 'DELETED') return json({ error: 'This model preset changed while deletion was pending. Reload Settings → Models.', code: 'model_preset_changed' }, { status: 409 })
+      return json({ success: true })
+    })
   } catch (error) {
+    if (error instanceof ModelPresetStorageError || error instanceof SettingsLifecycleRefusal) return json({ error: error.message, code: error.code }, { status: error.status })
     console.error('Failed to delete model:', error)
     return json({ error: 'Failed to delete model' }, { status: 500 })
   }

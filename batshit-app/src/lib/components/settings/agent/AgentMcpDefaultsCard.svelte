@@ -1,4 +1,7 @@
 <script lang="ts">
+  import { cliGroupEnablePatch, assertCliGlobalSettingsRead } from '$lib/utils/cliToolGridEnable'
+  import ToolGridEnableCell, { type ToolGridEnableControl } from '$lib/components/tools/ToolGridEnableCell.svelte'
+  import BrokerFamilyDiscoverabilityCells from '$lib/components/tools/BrokerFamilyDiscoverabilityCells.svelte'
   import { Button } from '$lib/components/ui/button'
   import * as Collapsible from '$lib/components/ui/collapsible'
   import * as Select from '$lib/components/ui/select'
@@ -6,6 +9,7 @@
   import SettingsAccordionCard from '$lib/components/settings/SettingsAccordionCard.svelte'
   import SettingsInfoMenu from '$lib/components/settings/SettingsInfoMenu.svelte'
   import SettingsSaveStatus from '$lib/components/settings/SettingsSaveStatus.svelte'
+  import ToolGridSection from '$lib/components/mcps/ToolGridSection.svelte'
   import NonMcpZipRowsSection from '$lib/components/mcps/NonMcpZipRowsSection.svelte'
   import BatshitIcon from '$lib/components/icons/BatshitIcon.svelte'
   import ToolGridIdentityIcon from '$lib/components/tools/ToolGridIdentityIcon.svelte'
@@ -23,6 +27,9 @@
     type ToolGridGroupRow
   } from '$lib/components/mcps/gatewayToolCatalog'
   import { debounce } from '$lib/utils/debounce'
+  import { getUserSettings, getUserSettingsReadState } from '$lib/stores/userSettings.svelte'
+  import { LIVE_FILE_READS_HELP, LIVE_FILE_READS_LABEL, resolveLiveFileReadsEnabled, resolveZipAiViewModeOf } from '$lib/utils/liveFileReads'
+  import { resolveZipToolNotesEnabled } from '$lib/utils/replyControl'
   import {
     MAX_ZIP_THRESHOLD,
     normalizeZipBufferInputValue,
@@ -42,6 +49,7 @@
 	    createDefaultArtifactToolGridSettings,
 	    createDefaultFabricToolGridSettings,
 	    FABRIC_TOOL_GRID_GROUP_NAME,
+	    FABRIC_TOOL_GRID_DISPLAY_NAME,
 	    FABRIC_TOOL_GRID_ID,
 	    FABRIC_TOOL_GRID_INFO_PARAGRAPHS,
 	    normalizeArtifactToolGridSettings,
@@ -118,9 +126,15 @@
   }
 
   interface PreviewPayload {
+    apiUtilityProjection?: 'registered' | 'unprepared' | 'not-applicable'
     text?: string
     tokenEstimates?: PreviewTokenEstimates
     counts?: PreviewCounts
+    hintBudget?: {
+      limit: number
+      budgetedTokens: number
+      featureTokens: number
+    }
   }
 
   interface CliToolCatalogRow {
@@ -205,6 +219,7 @@
 
   interface Props {
     agentId?: string | null
+    subjectKind?: 'primary' | 'subagent'
     toolHostScope?: ToolHostScope
     userId?: string | null
     defaultMCPGateways: string[]
@@ -213,6 +228,8 @@
     cliToolIdsExplicit?: boolean
     dcmDisplaySettings: AgentDcmDisplaySettings
     mcpSaveState: 'idle' | 'saving' | 'saved'
+    enableSaveState?: 'idle' | 'saving' | 'saved'
+    enableSaveError?: string | null
     mcpSaveError?: string | null
     mcpLastSaved?: Date | null
     mcpRenderNonce: number
@@ -224,7 +241,8 @@
      * so the grid's idea of a reachable family cannot drift from registration's.
      */
     nativeToolSettings?: Record<string, unknown> | null
-    isCodexMode?: boolean
+    discoveryReadOnly?: boolean
+    getEnableControl?: (id: SharedNonMcpToolGridRowId | 'mcp_tools' | 'cli_tools') => ToolGridEnableControl | null
     onGatewaysChange: (gateways: string[]) => void
     onDcmDisplaySettingsChange: (settings: AgentDcmDisplaySettings) => void
     onCliToolIdsChange?: (toolIds: string[]) => void
@@ -240,11 +258,24 @@
     toolGridTitle?: string
     zipAiViewMode?: string
     zipToolNotesEnabled?: string
+    /** SA-137 P4a: this agent's own Refreshed File Reads choice ('__inherit__', 'enabled' or 'disabled'). */
+    liveFileReads?: string
+    /**
+     * Round 2 (R2-2): why Refreshed File Reads cannot run for this agent now
+     * (`refreshedFileReadsUnavailableReason`), or null. The switch shows as unavailable with this
+     * sentence; the saved choice is never changed or saved because of it.
+     */
+    liveFileReadsUnavailableReason?: string | null
+    /** Draw that reason in the warning tone: the setting resolves ON, is unavailable, and the check is done. */
+    liveFileReadsWarn?: boolean
+    /** A plain note under the switch that does not lock it (the host could not be read). */
+    liveFileReadsNote?: string | null
     nonMcpZipRows?: NonMcpZipRow[]
     getNonMcpZipOverride: (rowId: string) => NonMcpZipOverrideSnapshot
     onNonMcpZipOverrideChange: (rowId: string, patch: NonMcpZipOverridePatch) => void
     onZipAiViewModeChange: (value: string) => void
     onZipToolNotesChange?: (value: string) => void
+    onLiveFileReadsChange?: (value: string) => void
     onResetToGlobalSettings?: () => void
     zipSaveState?: 'idle' | 'saving' | 'saved'
     zipSaveError?: string | null
@@ -257,6 +288,7 @@
 
   let {
     agentId = null,
+    subjectKind,
     toolHostScope = 'api',
     userId = null,
     defaultMCPGateways = [],
@@ -265,13 +297,16 @@
     cliToolIdsExplicit = true,
     dcmDisplaySettings = { version: 1, groups: {}, tools: {} },
     mcpSaveState = 'idle',
+    enableSaveState = 'idle',
+    enableSaveError = null,
     mcpSaveError = null,
     mcpLastSaved = null,
     mcpRenderNonce = 0,
     nativeDynamicMcpEnabled = null,
     nativeCliToolsEnabled = null,
     nativeToolSettings = null,
-    isCodexMode = false,
+    discoveryReadOnly = false,
+    getEnableControl = () => null,
     onGatewaysChange,
     onDcmDisplaySettingsChange,
     onCliToolIdsChange = () => {},
@@ -291,6 +326,10 @@
     toolGridTitle = 'Tool Settings Grid',
     zipAiViewMode = '__inherit__',
     zipToolNotesEnabled = '__inherit__',
+    liveFileReads = '__inherit__',
+    liveFileReadsUnavailableReason = null,
+    liveFileReadsWarn = false,
+    liveFileReadsNote = null,
     nonMcpZipRows = [],
     getNonMcpZipOverride = () => ({
       buffer_size: '',
@@ -301,6 +340,7 @@
     onNonMcpZipOverrideChange = () => {},
     onZipAiViewModeChange = () => {},
     onZipToolNotesChange = () => {},
+    onLiveFileReadsChange = () => {},
     onResetToGlobalSettings = () => {},
     zipSaveState = 'idle',
     zipSaveError = null,
@@ -317,6 +357,20 @@
   // removes the retired keys.
   const ZIP_LAYOUT_INHERIT = '__inherit__'
   const ZIP_NOTES_INHERIT = '__inherit__'
+  const LIVE_READS_INHERIT = '__inherit__'
+  // The reason and the note are the switch's description for assistive technology; ids are per
+  // mounted card, so two cards on a page never share one.
+  const uid = $props.id()
+  const liveReadsReasonId = `${uid}-live-reads-reason`
+  const liveReadsNoteId = `${uid}-live-reads-note`
+  const liveReadsDescribedBy = $derived(
+    [liveFileReadsUnavailableReason ? liveReadsReasonId : null, liveFileReadsNote ? liveReadsNoteId : null]
+      .filter(Boolean)
+      .join(' ') || undefined
+  )
+  // SA-137 P4a: Refreshed File Reads refresh an API Primary agent's open Read File results; a Subagent's
+  // delegated run and a CLI agent never do, so only an API Primary agent gets the control.
+  const showLiveFileReads = $derived(subjectKind === 'primary' && toolHostScope === 'api')
 
   function normalizeZipBufferInput(
     event: Event,
@@ -431,22 +485,27 @@
   let previewError = $state<string | null>(null)
   let previewData = $state<PreviewPayload | null>(null)
   let previewSignature = $state<string | null>(null)
+  let previewOwnerIdentity = ''
+  let previewOwnerGeneration = 0
 
   let dcmCatalogLoading = $state(false)
   let dcmCatalogError = $state<string | null>(null)
   let dcmCatalog = $state<DcmGatewayRow[]>([])
   let cliToolCatalog = $state<CliToolCatalogRow[]>([])
+  let globalCliSettingsReady = $state(false)
   let globalCliToolGridSettings = $state(createDefaultCliToolGridSettings())
   let globalFabricToolGridSettings = $state(createDefaultFabricToolGridSettings())
   let globalArtifactToolGridSettings = $state(createDefaultArtifactToolGridSettings())
   let dcmCatalogSignature = $state<string | null>(null)
   let openTopLevelAccordionItemKey = $state<string | null>(null)
+  let openSourceAccordionItemKey = $state<string | null>(null)
   let openNestedAccordionItemKey = $state<string | null>(null)
   let bulkZipDrafts = $state<Record<string, BulkZipDraft>>({})
 
   const topLevelAccordionRowClass = 'batshit-settings-accordion-row'
   const nestedAccordionRowClass = 'batshit-settings-accordion-row is-nested'
   const BATSHIT_ROWS_KEY = '__batshit_tool_rows__'
+  const MCP_ROWS_KEY = '__mcp_tool_rows__'
   const OTHER_ROWS_KEY = '__other_tool_rows__'
   const nonMcpRowConfig = SHARED_NON_MCP_TOOL_GRID_CONFIG as Record<
     SharedNonMcpToolGridRowId,
@@ -485,7 +544,7 @@
   // SA-096 P3: which broker families this agent can actually reach. Derived from the one
   // shared rule set, never restated here, so the grid cannot offer a row for a family the
   // broker would refuse on this runtime.
-  const brokerRuntime = $derived(isCodexMode ? 'cli' : toolHostScope)
+  const brokerRuntime = $derived(toolHostScope)
   const brokerFamilies = $derived.by(() =>
     resolveBrokerFamilies({
       runtime: brokerRuntime,
@@ -497,7 +556,7 @@
       hasCliTools: effectiveCliToolIds.length > 0
     })
   )
-  const fabricFamilyEnabled = $derived(brokerFamilies.includes('fabric'))
+  const fabricFamilyEnabled = $derived(brokerFamilies.includes('fabric') || brokerFamilies.includes('batshit'))
   const artifactFamilyEnabled = $derived(brokerFamilies.includes('artifact'))
 
   const columnCount = $derived(showZipControls ? 6 : 3)
@@ -521,15 +580,16 @@
   const batshitRowIdSet = new Set<string>(SHARED_NON_MCP_TOOL_GRID_BATSHIT_ROW_IDS)
   const otherRowIdSet = new Set<string>(SHARED_NON_MCP_TOOL_GRID_OTHER_ROW_IDS)
 
-  const batshitNonMcpRows = $derived.by(() =>
-    nonMcpZipRows.filter((row) => batshitRowIdSet.has(row.id))
-  )
+  const batshitNonMcpRows = $derived.by(() => {
+    const rows = nonMcpZipRows.filter((row) => batshitRowIdSet.has(row.id))
+    return getEnableControl('typed_file_tools') ? [{ ...SHARED_NON_MCP_TOOL_GRID_CONFIG.typed_file_tools }, ...rows] : rows
+  })
 
   const otherNonMcpRows = $derived.by(() =>
     nonMcpZipRows.filter((row) => otherRowIdSet.has(row.id))
   )
   const hasToolGridRows = $derived(
-    dcmCatalog.length > 0 ||
+    getEnableControl('bash') !== null || dcmCatalog.length > 0 ||
       cliToolCatalog.length > 0 ||
       fabricFamilyEnabled ||
       artifactFamilyEnabled ||
@@ -545,8 +605,8 @@
 
   const toolGridInfoText = $derived(
     showZipControls
-      ? 'Configure discoverability, display-detail preferences, and zip behavior in one grid for MCP tools, CLI tools, and zip-enabled rows. Discoverability and display-detail settings control what appears in the DCM (Dynamic Current Message). Zip columns set per-row overrides, blank fields inherit defaults, and these controls do not execute tools directly. Chat Bar toggles use the same saved state, and hiding rows does not erase the last display-detail preference.'
-      : 'Configure discoverability and display-detail preferences in one grid for MCP tools and CLI tools. These controls affect what appears in the DCM (Dynamic Current Message) and which tools the current agent or subagent can discover. Hiding rows does not erase the last display-detail preference.'
+      ? 'Configure discoverability, display-detail preferences, and zip behavior in one grid for MCP tools, CLI tools, and zip-enabled rows. Discoverability and display-detail settings control the tool index in Agent Setup. Zip columns set per-row overrides, blank fields inherit defaults, and these controls do not execute tools directly. Chat Bar toggles use the same saved state, and hiding rows does not erase the last display-detail preference.'
+      : 'Configure discoverability and display-detail preferences in one grid for MCP tools and CLI tools. These controls affect the tool index in Agent Setup and which tools the current agent or subagent can discover. Hiding rows does not erase the last display-detail preference.'
   )
 
   const effectiveCliToolIdSet = $derived(new Set(effectiveCliToolIds))
@@ -676,7 +736,7 @@
 
   /**
    * SA-096: one description of a broker family's Discoverable + Display Detail controls,
-   * used by both placements — the `Fabric Controls` / `Artifact Tools` rows inside the
+   * used by both placements — the `Fabric & Utilities` / `Artifact Tools` rows inside the
    * `Batshit Tools` accordion where zip columns exist, and the standalone top-level row
    * on the discoverability-only surfaces. Building it once is what keeps a family from
    * ever rendering twice with two behaviors.
@@ -686,13 +746,15 @@
     groupName: string,
     iconRef: IconRef,
     globalDefaults: GatewayDcmDisplaySettings,
-    infoParagraphs: string[]
+    infoParagraphs: string[],
+    displayName: string = groupName
   ): BrokerFamilyRowControls {
     const gateway = buildBrokerFamilyGatewayRow(gatewayId, groupName, iconRef, globalDefaults)
     const preference = getGroupPreference(gatewayId, groupName)
 
     return {
-      label: groupName,
+      label: displayName,
+      disabled: discoveryReadOnly,
       iconRef,
       visible: isGroupVisible(gatewayId, groupName),
       value: preference,
@@ -705,7 +767,10 @@
       options: GROUP_DISPLAY_OPTIONS,
       optionIconMode: (value) => brokerFamilyOptionIconMode(gateway, groupName, value),
       modeLabel: (value) => getGroupModeLabel(value as AgentDcmGroupDisplayPreference),
-      infoParagraphs,
+      infoParagraphs: [
+        ...infoParagraphs,
+        'The Agent Tool Grid Enable choice controls Artifact tools. Display Detail chooses the group, names or input hints. Artifact access and permission checks still apply.'
+      ],
       triggerClass: (value) => inheritTriggerClass(value === 'use-global'),
       toneClass: (value) => iconToneClass(value === 'use-global'),
       onVisibleChange: (visible) => handleGroupVisibilityToggle(gatewayId, groupName, visible),
@@ -719,7 +784,8 @@
       FABRIC_TOOL_GRID_GROUP_NAME,
       TOOL_GRID_FABRIC_ICON_REF,
       globalFabricToolGridSettings.dcmDisplayDefaults,
-      FABRIC_TOOL_GRID_INFO_PARAGRAPHS
+      FABRIC_TOOL_GRID_INFO_PARAGRAPHS,
+      FABRIC_TOOL_GRID_DISPLAY_NAME
     )
   }
 
@@ -741,11 +807,9 @@
   function getBrokerFamilyControlsForRow(
     rowId: SharedNonMcpToolGridRowId
   ): BrokerFamilyRowControls | null {
-    if (rowId === 'fabric_find') {
-      return fabricFamilyEnabled ? getFabricFamilyControls() : null
-    }
+    if (rowId === 'fabric_find') return null
     if (rowId === 'artifact_find') {
-      return artifactFamilyEnabled ? getArtifactFamilyControls() : null
+      return artifactFamilyEnabled || getEnableControl('artifact_find') ? { ...getArtifactFamilyControls(), visible: true } : null
     }
     return null
   }
@@ -902,6 +966,7 @@
     gatewayEnabled: boolean,
     groupMode: DcmGroupDisplayMode
   ): string | null {
+    if (discoveryReadOnly) return 'Read the saved CLI Tools choice before editing discovery.'
     if (!dynamicMcpEnabled) return 'Dynamic MCP disabled'
     if (!gatewayEnabled) return 'Gateway is hidden'
     if (groupMode === 'hidden' || groupMode === 'group-only') return 'Group mode hides tools'
@@ -911,7 +976,17 @@
   function toggleTopLevelAccordionItem(itemKey: string) {
     openTopLevelAccordionItemKey =
       openTopLevelAccordionItemKey === itemKey ? null : itemKey
+    openSourceAccordionItemKey = null
     openNestedAccordionItemKey = null
+  }
+
+  function toggleSourceAccordionItem(itemKey: string) {
+    openSourceAccordionItemKey = openSourceAccordionItemKey === itemKey ? null : itemKey
+    openNestedAccordionItemKey = null
+  }
+
+  function handleSourceHeaderClick(event: MouseEvent, itemKey: string) {
+    if (!isInteractiveHeaderElement(event.target)) toggleSourceAccordionItem(itemKey)
   }
 
   function toggleNestedAccordionItem(itemKey: string) {
@@ -949,13 +1024,22 @@
   function getZipLayoutLabel(value: string): string {
     if (value === 'inline') return 'Inline'
     if (value === 'appended') return 'Appended (Recommended)'
-    return 'Use Global Default'
+    if (getUserSettingsReadState() !== 'confirmed') return 'Use Global Default'
+    return `Use Global Default (${resolveZipAiViewModeOf(null, getUserSettings()?.global_zip_settings) === 'inline' ? 'Inline' : 'Appended'})`
   }
 
   function getZipNotesLabel(value: string): string {
     if (value === 'enabled') return 'Enabled (Recommended)'
     if (value === 'disabled') return 'Disabled'
-    return 'Use Global Default'
+    if (getUserSettingsReadState() !== 'confirmed') return 'Use Global Default'
+    return `Use Global Default (${resolveZipToolNotesEnabled(null, getUserSettings()?.global_zip_settings) ? 'Enabled' : 'Disabled'})`
+  }
+
+  function getLiveFileReadsLabel(value: string): string {
+    if (value === 'enabled') return 'Enabled'
+    if (value === 'disabled') return 'Disabled'
+    if (getUserSettingsReadState() !== 'confirmed') return 'Use Global Default'
+    return `Use Global Default (${resolveLiveFileReadsEnabled(null, getUserSettings()?.global_zip_settings) ? 'Enabled' : 'Disabled'})`
   }
 
   function normalizeGroupIconMode(mode: DcmGroupDisplayMode): GroupIconMode {
@@ -1124,16 +1208,29 @@
   }
 
   function buildPreviewSignature() {
+    const settingsReadState = getUserSettingsReadState()
+    const admin = settingsReadState === 'confirmed' ? getUserSettings()?.admin_settings : null
     return JSON.stringify({
+      userId,
       agentId,
+      subjectKind: subjectKind ?? null,
       defaultMCPGateways,
       defaultMCPToolSelections,
       effectiveCliToolIds,
       nativeDynamicMcpEnabled,
       nativeCliToolsEnabled,
       dcmDisplaySettings: normalizedDcmDisplaySettings,
-      isCodexMode,
-      brokerRuntime
+      brokerRuntime,
+      // A confirmed Admin save refreshes the preview without touching the Tool Grid draft.
+      // A value-only or failed initial read cannot certify default hint settings.
+      adminHintSettings: settingsReadState === 'confirmed' ? {
+        readState: settingsReadState,
+        requiredLimit: admin?.dcm_schema_hint_required_limit ?? null,
+        optionalLimit: admin?.dcm_schema_hint_optional_limit ?? null,
+        maxChars: admin?.dcm_schema_hint_max_chars ?? null,
+        toolNameThreshold: admin?.dcm_tool_name_threshold ?? null,
+        totalTokens: admin?.dcm_schema_hint_total_tokens ?? null
+      } : { readState: settingsReadState }
     })
   }
 
@@ -1145,7 +1242,10 @@
   }
 
   async function loadPreview(signature: string) {
-    if (!agentId) return
+    if (!agentId || buildPreviewSignature() !== signature) return
+    const ownerGeneration = previewOwnerGeneration
+    const isCurrent = () => previewOwnerGeneration === ownerGeneration &&
+      previewSignature === signature && buildPreviewSignature() === signature
 
     previewLoading = true
     previewError = null
@@ -1156,13 +1256,13 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           agentId,
+          subjectKind,
           selectedGateways: defaultMCPGateways,
           toolSelections: defaultMCPToolSelections,
           selectedCliToolIds: effectiveCliToolIds,
           nativeDynamicMcpEnabled,
           nativeCliToolsEnabled,
           dcmDisplaySettings: normalizedDcmDisplaySettings,
-          isCodexMode: isCodexMode === true,
           // SA-096 P4: the preview has to use this agent's own broker rules, otherwise it
           // shows a Fabric or Artifact group the agent's runtime would never serve.
           runtime: brokerRuntime
@@ -1170,18 +1270,25 @@
       })
 
       if (!response.ok) {
-        const message = await response.text()
-        throw new Error(message || 'Failed to load DCM preview')
+        const text = await response.text()
+        let message = text
+        try {
+          const failure = JSON.parse(text)
+          if (typeof failure?.error === 'string') message = failure.error
+        } catch {
+          // Non-JSON failures keep their existing readable response text.
+        }
+        throw new Error(message || 'Failed to load Agent Setup tool preview')
       }
 
       const result = (await response.json()) as PreviewPayload
-      if (previewSignature !== signature) return
+      if (!isCurrent()) return
       previewData = result
     } catch (error) {
-      if (previewSignature !== signature) return
-      previewError = error instanceof Error ? error.message : 'Failed to load DCM preview'
+      if (!isCurrent()) return
+      previewError = error instanceof Error ? error.message : 'Failed to load Agent Setup tool preview'
     } finally {
-      if (previewSignature === signature) {
+      if (isCurrent()) {
         previewLoading = false
       }
     }
@@ -1192,6 +1299,7 @@
 
     dcmCatalogLoading = true
     dcmCatalogError = null
+    globalCliSettingsReady = false
 
     try {
       const settingsResponse = await fetch('/api/user/settings')
@@ -1207,6 +1315,7 @@
           } | null
         } | null
       }
+      assertCliGlobalSettingsRead(settingsPayload)
       const nextGlobalCliSettings = normalizeCliToolGridSettings(
         settingsPayload?.settings?.global_tool_grid_settings?.cli ?? null
       )
@@ -1296,6 +1405,7 @@
         : []
 
       if (dcmCatalogSignature !== signature) return
+      globalCliSettingsReady = true
       globalCliToolGridSettings = nextGlobalCliSettings
       globalFabricToolGridSettings = nextGlobalFabricSettings
       globalArtifactToolGridSettings = nextGlobalArtifactSettings
@@ -1323,6 +1433,17 @@
   }
 
   $effect(() => {
+    const identity = JSON.stringify([userId, agentId, subjectKind ?? null])
+    if (identity === previewOwnerIdentity) return
+    previewOwnerIdentity = identity
+    previewOwnerGeneration += 1
+    previewSignature = null
+    previewData = null
+    previewError = null
+    previewLoading = false
+  })
+
+  $effect(() => {
     if (!previewOpen) return
     if (!agentId) return
 
@@ -1330,6 +1451,9 @@
     if (signature === previewSignature) return
 
     previewSignature = signature
+    previewData = null
+    previewError = null
+    previewLoading = true
     debouncedLoadPreview(signature)
   })
 
@@ -1353,7 +1477,42 @@
   const tokenEstimates = $derived(previewData?.tokenEstimates ?? {})
   const previewCounts = $derived(previewData?.counts ?? {})
   const previewText = $derived(previewData?.text ?? '')
+  const previewHintBudget = $derived.by(() => {
+    const budget = previewData?.hintBudget
+    if (!budget || typeof budget !== 'object' || Array.isArray(budget)) return null
+    return Number.isFinite(budget.limit) && budget.limit > 0 &&
+      Number.isFinite(budget.budgetedTokens) && budget.budgetedTokens >= 0 &&
+      Number.isFinite(budget.featureTokens) && budget.featureTokens >= 0
+      ? budget
+      : null
+  })
 </script>
+
+{#snippet independentEnableRows(showDisplay: boolean, includeSections = false)}
+
+              {#each ['bash', 'typed_file_tools', 'web_search', 'agent_browser_actions', 'artifact_find', 'fabric_find', ...(includeSections ? ['mcp_tools', 'cli_tools'] : [])] as id}
+                {@const rowId = id as SharedNonMcpToolGridRowId}
+                {@const config = id === 'mcp_tools' ? { label: 'MCP Tools', iconRef: { kind: 'brand', slug: 'mcp-mono' } as IconRef } : id === 'cli_tools' ? { label: 'CLI Tools', iconRef: DEFAULT_CLI_TOOL_ICON_REF } : nonMcpRowConfig[rowId]}
+                {@const enable = getEnableControl(id as SharedNonMcpToolGridRowId | 'mcp_tools' | 'cli_tools')}
+                {#if enable}
+                  <tr class={topLevelAccordionRowClass}>
+                    <td class="batshit-settings-table-cell is-strong is-nested">
+                      <div class="batshit-settings-tool-grid-label">
+                        <ToolGridIdentityIcon ref={config.iconRef} typeLabel="Batshit Tool" name={config.label} />
+                        <span class="batshit-settings-tool-grid-name block truncate">{config.label}</span>
+                        {#if subjectKind === 'subagent' && rowId === 'fabric_find' && enable.notice}
+                          <SettingsInfoMenu ariaLabel={`About ${config.label}`} contentClass="w-80"><p>{enable.notice}</p></SettingsInfoMenu>
+                        {/if}
+                      </div>
+                    </td>
+                    <ToolGridEnableCell control={id === 'cli_tools' && dcmCatalogError ? { ...enable, disabled: enable.disabled || !enable.checked, notice: [enable.notice, 'Read global CLI Tools defaults before enabling.'].filter(Boolean).join(' ') } : subjectKind === 'subagent' && rowId === 'fabric_find' ? { ...enable, notice: null } : enable} label={config.label} />
+                    {#if showDisplay && rowId === 'artifact_find'}<BrokerFamilyDiscoverabilityCells controls={{ ...getArtifactFamilyControls(), visible: true }} showDiscoverable={false} />
+                    {:else}<td class="batshit-settings-table-cell"></td>{/if}
+                  </tr>
+                {/if}
+              {/each}
+
+{/snippet}
 
 <SettingsAccordionCard
   name={accordionName}
@@ -1377,6 +1536,10 @@
           <RefreshCcw class={`${dcmCatalogLoading ? 'animate-spin' : ''}`} />
           Refresh
         </Button>
+        {#if enableSaveState !== 'idle' || enableSaveError}
+          <SettingsSaveStatus state={enableSaveError ? 'error' : enableSaveState} error={enableSaveError}
+            savingLabel="Saving tool choices..." savedLabel="Tool choices saved" sticky={false} />
+        {/if}
         {#if showZipControls}
           <SettingsSaveStatus
             state={zipSaveError || zipValidationError ? 'error' : zipSaveState}
@@ -1409,19 +1572,13 @@
 
     {#if !dynamicMcpEnabled}
       <div class="batshit-settings-inline-alert is-warning">
-        {#if toolHostScope !== 'n8n' && typeof nativeDynamicMcpEnabled === 'boolean'}
-          Dynamic MCP is disabled for this agent. MCP rows stay read-only until you turn it on in Agent Settings <code>Batshit Tools</code>, but CLI tool rows can still be managed here.
-        {:else if toolHostScope !== 'n8n' && isCodexMode}
-          Dynamic MCP is disabled for this agent. MCP rows stay read-only until you turn it on in Agent Settings <code>Batshit Tools</code>, but CLI tool rows can still be managed here.
-        {:else}
-          Dynamic MCP is disabled for this agent. Enable the native Dynamic MCP toggle in Agent Settings to edit MCP discoverability controls; CLI tool rows can still be managed here.
-        {/if}
+        MCP Tools are disabled for this agent. Enable MCP Tools in the agent's Tool Grid to edit MCP discovery.
       </div>
     {/if}
 
     {#if !cliToolsEnabled}
       <div class="batshit-settings-inline-alert is-warning">
-        CLI Tools are disabled for this agent. CLI tool rows stay read-only until you turn them on in Agent Settings <code>Batshit Tools</code>.
+        CLI Tools are disabled for this agent. Enable CLI Tools in the agent's Tool Grid to edit CLI discovery.
       </div>
     {/if}
 
@@ -1455,7 +1612,7 @@
     {#if showZipModeControls}
       {#if showZipControls}
         <div class="grid gap-3 md:grid-cols-3">
-          <label class="space-y-1">
+                  <label class="space-y-1">
             <span class="batshit-settings-form-label-line"><span class="batshit-settings-form-label">AI Zip Layout</span>
               <SettingsInfoMenu ariaLabel="About AI Zip Layout">
                 Controls how unzipped content is delivered back to the AI. Inline expands content where the zip reference appears. Appended keeps the chat clean and adds an organized unzip index plus unzipped-content block at the end.
@@ -1473,8 +1630,8 @@
                 {getZipLayoutLabel(zipAiViewMode)}
               </Select.Trigger>
               <Select.Content>
-                <Select.Item value={ZIP_LAYOUT_INHERIT} label="Use Global Default">
-                  Use Global Default
+                <Select.Item value={ZIP_LAYOUT_INHERIT} label={getZipLayoutLabel(ZIP_LAYOUT_INHERIT)}>
+                  {getZipLayoutLabel(ZIP_LAYOUT_INHERIT)}
                 </Select.Item>
                 <Select.Item value="inline" label="Inline">Inline</Select.Item>
                 <Select.Item value="appended" label="Appended (Recommended)">Appended (Recommended)</Select.Item>
@@ -1500,18 +1657,58 @@
                 {getZipNotesLabel(zipToolNotesEnabled)}
               </Select.Trigger>
               <Select.Content>
-                <Select.Item value={ZIP_NOTES_INHERIT} label="Use Global Default">
-                  Use Global Default
+                <Select.Item value={ZIP_NOTES_INHERIT} label={getZipNotesLabel(ZIP_NOTES_INHERIT)}>
+                  {getZipNotesLabel(ZIP_NOTES_INHERIT)}
                 </Select.Item>
                 <Select.Item value="enabled" label="Enabled (Recommended)">Enabled (Recommended)</Select.Item>
                 <Select.Item value="disabled" label="Disabled">Disabled</Select.Item>
               </Select.Content>
             </Select.Root>
           </label>
-        </div>
-      {:else}
-        <div class="batshit-settings-inline-alert is-dashed">
-          Zip overrides are managed by the native n8n AI Agent node for this agent type.
+
+          {#if showLiveFileReads}
+            <div class="space-y-1">
+              <label class="space-y-1">
+                <span class="batshit-settings-form-label-line"><span class="batshit-settings-form-label">{LIVE_FILE_READS_LABEL}</span>
+                  <SettingsInfoMenu ariaLabel={`About ${LIVE_FILE_READS_LABEL}`}>
+                    {LIVE_FILE_READS_HELP}
+                  </SettingsInfoMenu>
+                </span>
+                <Select.Root
+                  type="single"
+                  value={liveFileReads}
+                  disabled={Boolean(liveFileReadsUnavailableReason)}
+                  onValueChange={(value) => onLiveFileReadsChange(value ?? LIVE_READS_INHERIT)}
+                >
+                  <Select.Trigger
+                    class={`batshit-settings-select-compact w-full ${inheritTriggerClass(liveFileReads === LIVE_READS_INHERIT)}`}
+                    size="sm"
+                    data-testid="agent-live-file-reads-select"
+                    aria-describedby={liveReadsDescribedBy}
+                  >
+                    {getLiveFileReadsLabel(liveFileReads)}
+                  </Select.Trigger>
+                  <Select.Content>
+                    <Select.Item value={LIVE_READS_INHERIT} label={getLiveFileReadsLabel(LIVE_READS_INHERIT)}>
+                      {getLiveFileReadsLabel(LIVE_READS_INHERIT)}
+                    </Select.Item>
+                    <Select.Item value="enabled" label="Enabled">Enabled</Select.Item>
+                    <Select.Item value="disabled" label="Disabled">Disabled</Select.Item>
+                  </Select.Content>
+                </Select.Root>
+              </label>
+              {#if liveFileReadsUnavailableReason}
+                <p
+                  id={liveReadsReasonId}
+                  class={`batshit-settings-form-help${liveFileReadsWarn ? ' is-warning' : ''}`}
+                  data-testid="agent-live-file-reads-unavailable"
+                >{liveFileReadsUnavailableReason}</p>
+              {/if}
+              {#if liveFileReadsNote}
+                <p id={liveReadsNoteId} class="batshit-settings-form-help" data-testid="agent-live-file-reads-note">{liveFileReadsNote}</p>
+              {/if}
+            </div>
+          {/if}
         </div>
       {/if}
     {/if}
@@ -1544,7 +1741,7 @@
         <thead class="batshit-settings-table-head">
           <tr>
             <th class="batshit-settings-table-head-cell">Item</th>
-            <th class="batshit-settings-table-head-cell">Discoverable</th>
+            <th class="batshit-settings-table-head-cell">Enable</th>
             <th class="batshit-settings-table-head-cell">Display Detail</th>
             {#if showZipControls}
               <th class="batshit-settings-table-head-cell">Zip Buffer</th>
@@ -1554,6 +1751,10 @@
           </tr>
         </thead>
         <tbody>
+          {#if dcmCatalogError && getEnableControl('bash')}
+            <tr class={topLevelAccordionRowClass}><td colspan={columnCount} class="batshit-settings-table-cell is-strong"><span class="batshit-settings-tool-grid-name">Batshit Tools</span></td></tr>
+            {@render independentEnableRows(false, true)}
+          {/if}
           {#if (dcmCatalogLoading && !hasToolGridRows) || initialCompactCatalogLoad}
             <tr class="batshit-settings-table-row">
               <td colspan={columnCount} class="batshit-settings-table-cell is-empty">
@@ -1596,6 +1797,8 @@
                 getRowOverride={getSectionNonMcpZipOverride}
                 onUpdateRowOverride={updateSectionNonMcpZipOverride}
                 getBrokerFamilyControls={getBrokerFamilyControlsForRow}
+                {getEnableControl}
+                showBrokerDiscoverable={false}
                 onHeaderClick={handleTopLevelHeaderClick}
                 onToggle={toggleTopLevelAccordionItem}
                 showBulkZipApply
@@ -1603,7 +1806,25 @@
               />
             {/if}
 
-            {#if cliToolCatalog.length > 0}
+            {#if !showZipControls && getEnableControl('bash')}
+              <ToolGridSection
+                title="Batshit Tools"
+                iconRef={TOOL_GRID_BATSHIT_SECTION_ICON_REF}
+                open={openTopLevelAccordionItemKey === BATSHIT_ROWS_KEY}
+                tableClass={toolGridTableClass}
+                firstColumnClass={toolGridItemColumnClass}
+                otherColumnClass="w-[100px]"
+                {showZipControls}
+                onHeaderClick={(event) => handleTopLevelHeaderClick(event, BATSHIT_ROWS_KEY)}
+                onToggle={() => toggleTopLevelAccordionItem(BATSHIT_ROWS_KEY)}
+              >
+                {@render independentEnableRows(true)}
+              </ToolGridSection>
+            {:else if !showZipControls && artifactFamilyEnabled}
+              <BrokerFamilyToolGridRow controls={{ ...getArtifactFamilyControls(), visible: true }} rowClass={topLevelAccordionRowClass} showDiscoverable={false} />
+            {/if}
+
+            {#if cliToolCatalog.length > 0 || getEnableControl('cli_tools')}
               {@const cliGateway = buildCliGatewayRow()}
               {@const cliGroupName = CLI_TOOL_GRID_GROUP_NAME}
               {@const cliGroupKey = buildGroupKey(CLI_TOOL_GRID_ID, cliGroupName)}
@@ -1634,10 +1855,19 @@
                       <span class="batshit-settings-tool-grid-name block truncate" title={cliGroupName}>{cliGroupName}</span>
                     </div>
                   </td>
+                  {#if getEnableControl('cli_tools')}
+                    {@const enable = getEnableControl('cli_tools')!}
+                    <ToolGridEnableCell control={{
+                      ...enable,
+                      checked: enable.draftChecked ?? (enable.checked && cliEffectiveGroupMode !== 'hidden'),
+                      disabled: enable.disabled || !globalCliSettingsReady && !(enable.draftChecked ?? (enable.checked && cliEffectiveGroupMode !== 'hidden')),
+                      onChange: (checked) => enable.onChange(checked, checked ? cliGroupEnablePatch(normalizedDcmDisplaySettings, getGlobalGroupMode(cliGateway, cliGroupName)) : undefined)
+                    }} label="CLI Tools" />
+                  {:else}
                   <td class="batshit-settings-table-cell">
                     <Switch.Root
                       checked={cliGroupVisible}
-                    disabled={!cliToolsEnabled}
+                    disabled={!cliToolsEnabled || discoveryReadOnly}
                     onCheckedChange={(checked) =>
                         {
                           const nextVisible = checked === true
@@ -1648,13 +1878,14 @@
                         }}
                   />
                   </td>
+                  {/if}
                   <td class="batshit-settings-table-cell">
                     <div class={`flex items-center gap-2 ${showZipControls ? '' : 'justify-between'}`}>
                       {#if cliGroupVisible}
                         <Select.Root
                           type="single"
                           value={cliGroupPreference}
-                          disabled={!cliToolsEnabled}
+                          disabled={!cliToolsEnabled || discoveryReadOnly}
                           onValueChange={(value) =>
                             value && handleGroupModeChange(CLI_TOOL_GRID_ID, cliGroupName, value)}
                         >
@@ -1793,6 +2024,9 @@
                           {/if}
                         </colgroup>
                         <tbody>
+                          {#if cliToolCatalog.length === 0}
+                            <tr class="batshit-settings-table-row"><td colspan={columnCount} class="batshit-settings-table-cell is-muted is-empty">No saved CLI tools yet.</td></tr>
+                          {/if}
                           {#each cliToolCatalog as tool (tool.toolId)}
                             {@const toolVisible = isCliToolVisible(tool.toolId)}
                             {@const toolPreference = getToolPreference(CLI_TOOL_GRID_ID, tool.toolId)}
@@ -1805,7 +2039,7 @@
                             {@const toolZipDisabled = isEffectiveZipDisabled(toolZipOverride.auto_zip, toolZipOverride.inherited_zip_disabled)}
                             {@const toolZipInputsDisabled = toolAutoZipActive || toolZipDisabled}
                             {@const toolZipBehaviorLabel = getZipBehaviorLabel(toolAutoZip, toolZipOverride.inherited_auto_zip, toolZipOverride.inherited_zip_disabled)}
-                            {@const disableReason = !cliToolsEnabled
+                            {@const disableReason = discoveryReadOnly ? 'Read the saved CLI Tools choice before editing discovery.' : !cliToolsEnabled
                               ? 'CLI Tools disabled'
                               : cliEffectiveGroupMode === 'hidden' || cliEffectiveGroupMode === 'group-only'
                                 ? 'Group mode hides tools'
@@ -2011,31 +2245,32 @@
               </Collapsible.Root>
             {/if}
 
-            {#if !showZipControls && fabricFamilyEnabled}
-              <BrokerFamilyToolGridRow
-                controls={getFabricFamilyControls()}
-                rowClass={topLevelAccordionRowClass}
-              />
-            {/if}
-
-            {#if !showZipControls && artifactFamilyEnabled}
-              <BrokerFamilyToolGridRow
-                controls={getArtifactFamilyControls()}
-                rowClass={topLevelAccordionRowClass}
-              />
-            {/if}
-
+            <ToolGridSection
+              title="MCP Tools"
+              iconRef={{ kind: 'brand', slug: 'mcp-mono' }}
+              open={openTopLevelAccordionItemKey === MCP_ROWS_KEY}
+              tableClass={`${toolGridTableClass} batshit-settings-tool-grid-mcp-sources`}
+              firstColumnClass={toolGridItemColumnClass}
+              otherColumnClass="w-[100px]"
+              {showZipControls}
+              enableControl={getEnableControl('mcp_tools')}
+              onHeaderClick={(event) => handleTopLevelHeaderClick(event, MCP_ROWS_KEY)}
+              onToggle={() => toggleTopLevelAccordionItem(MCP_ROWS_KEY)}
+            >
+              {#if dcmCatalog.length === 0}
+                <tr class="batshit-settings-table-row"><td colspan={columnCount} class="batshit-settings-table-cell is-muted is-empty">No MCP sources discovered yet.</td></tr>
+              {/if}
             {#each dcmCatalog as gateway}
               {@const gatewayEnabled = isGatewayEnabled(gateway.id)}
               {@const sourceKey = buildSourceKey(gateway.id)}
-              {@const sourceExpanded = openTopLevelAccordionItemKey === sourceKey}
+              {@const sourceExpanded = openSourceAccordionItemKey === sourceKey}
               <Collapsible.Root open={sourceExpanded}>
                 <tr
-                  class={`${topLevelAccordionRowClass} cursor-pointer ${!dynamicMcpEnabled ? 'opacity-60' : ''}`}
-                  onclick={(event) => handleTopLevelHeaderClick(event, sourceKey)}
+                  class={`${nestedAccordionRowClass} cursor-pointer ${!dynamicMcpEnabled ? 'opacity-60' : ''}`}
+                  onclick={(event) => handleSourceHeaderClick(event, sourceKey)}
                 >
                   <td class="batshit-settings-table-cell is-strong">
-                    <div class="batshit-settings-tool-grid-label">
+                    <div class="batshit-settings-tool-grid-label is-source">
                       <ToolGridIdentityIcon
                         ref={gateway.iconRef}
                         typeLabel="MCP Source"
@@ -2049,7 +2284,7 @@
                   <td class="batshit-settings-table-cell">
                     <Switch.Root
                       checked={gatewayEnabled}
-                      disabled={!dynamicMcpEnabled}
+                      disabled={!dynamicMcpEnabled || discoveryReadOnly}
                       onCheckedChange={(checked) => handleGatewayToggle(gateway.id, checked === true)}
                     />
                   </td>
@@ -2060,7 +2295,7 @@
                           class="flex items-center justify-end shrink-0"
                           aria-expanded={sourceExpanded}
                           aria-label={`Toggle groups for MCP Source ${gateway.name}`}
-                          onclick={() => toggleTopLevelAccordionItem(sourceKey)}
+                          onclick={() => toggleSourceAccordionItem(sourceKey)}
                         >
                           <ChevronDown class={`h-3.5 w-3.5 transition-transform ${sourceExpanded ? 'rotate-180' : ''}`} />
                         </Collapsible.Trigger>
@@ -2075,7 +2310,7 @@
                         class="ml-auto flex items-center justify-end"
                         aria-expanded={sourceExpanded}
                         aria-label={`Toggle groups for MCP Source ${gateway.name}`}
-                        onclick={() => toggleTopLevelAccordionItem(sourceKey)}
+                        onclick={() => toggleSourceAccordionItem(sourceKey)}
                       >
                         <ChevronDown class={`h-3.5 w-3.5 transition-transform ${sourceExpanded ? 'rotate-180' : ''}`} />
                       </Collapsible.Trigger>
@@ -2112,7 +2347,7 @@
                             {@const groupVisible = isGroupVisible(gateway.id, group.name)}
                             {@const groupPreference = getGroupPreference(gateway.id, group.name)}
                             {@const effectiveGroupMode = resolveEffectiveGroupMode(gateway, group.name, groupMode)}
-                            {@const groupToggleDisabled = !dynamicMcpEnabled || !gatewayEnabled}
+                            {@const groupToggleDisabled = discoveryReadOnly || !dynamicMcpEnabled || !gatewayEnabled}
                             {@const groupExpanded = openNestedAccordionItemKey === groupKey}
                             {@const groupIconMode = getGroupIconModeForPreference(
                               gateway,
@@ -2501,10 +2736,12 @@
               </Collapsible.Root>
             {/each}
 
+            </ToolGridSection>
+
             {#if showZipControls && otherNonMcpRows.length > 0}
               <NonMcpZipRowsSection
                 sectionKey={OTHER_ROWS_KEY}
-                title="Other"
+                title="All Other Tools"
                 sectionIconRef={TOOL_GRID_OTHER_SECTION_ICON_REF}
                 typeLabel="Other Tool"
                 rowIds={getNonMcpRowIds(otherNonMcpRows)}
@@ -2530,7 +2767,7 @@
 
     {#if showPostTableControls}
       <div class="flex flex-wrap items-center gap-2">
-        <Button variant="outline" size="sm" onclick={onResetToGlobalSettings}>
+        <Button variant="outline" size="sm" onclick={onResetToGlobalSettings} disabled={discoveryReadOnly}>
           <RotateCcw aria-hidden="true" />
           Reset to global settings
         </Button>
@@ -2542,7 +2779,7 @@
           disabled={!agentId}
         >
           <Eye  />
-          {previewOpen ? 'Hide DCM preview' : 'Preview Tool DCM'}
+          {previewOpen ? 'Hide Agent Setup Preview' : 'Preview Agent Setup Tools'}
         </Button>
         <div class="ml-auto flex max-w-full flex-wrap items-center justify-end gap-2">
           {#if showZipControls}
@@ -2567,7 +2804,7 @@
       {#if previewOpen}
         <div class="batshit-settings-muted-panel space-y-3">
           <div class="flex items-center justify-between gap-2">
-            <div class="batshit-settings-form-label">Tool DCM preview</div>
+            <div class="batshit-settings-form-label">Agent Setup Tool Preview</div>
             {#if previewLoading}
               <div class="batshit-settings-caption flex items-center gap-2">
                 <Loader2 class="h-3 w-3 animate-spin" />
@@ -2588,25 +2825,40 @@
             <div class="space-y-3 text-xs text-muted-foreground">
               <div class="flex flex-wrap gap-3">
                 <span>Enabled tools: {previewCounts.enabledTools ?? 0}</span>
-                <span>DCM tools: {previewCounts.dcmTools ?? 0}</span>
+                <span>Listed tools: {previewCounts.dcmTools ?? 0}</span>
                 <span>Available tools: {previewCounts.availableTools ?? 0}</span>
               </div>
               <div class="flex flex-wrap gap-3">
-                <span>Enabled tokens: {tokenEstimates.enabled ?? 0}</span>
-                <span>DCM tokens: {tokenEstimates.dcm ?? 0}</span>
-                <span>Total Tool DCM footprint: {tokenEstimates.total ?? 0}</span>
+                <span>Enabled tool token estimate: {tokenEstimates.enabled ?? 'Unknown'}</span>
+                <span>Tool index token estimate: {tokenEstimates.dcm ?? 'Unknown'}</span>
+                <span>Combined tool token estimate: {tokenEstimates.total ?? 'Unknown'}</span>
               </div>
+              {#if previewHintBudget}
+                <div class="flex flex-wrap gap-3">
+                  <span>Scalable tool hint token estimate: {previewHintBudget.budgetedTokens} / {previewHintBudget.limit}</span>
+                  <span>Fixed feature hint token estimate: {previewHintBudget.featureTokens}</span>
+                </div>
+              {/if}
 
-              <pre class="whitespace-pre-wrap text-xs text-foreground">{previewText || 'No discoverable tools left to list.'}</pre>
+              {#if brokerRuntime === 'api' && previewData.apiUtilityProjection !== 'registered'}
+                <div class="batshit-settings-caption is-warning">
+                  Runtime utility hints are not computed by this preview. These estimates cover
+                  the listed metadata; the actual message can include more.
+                </div>
+              {/if}
+
+              <pre class="whitespace-pre-wrap text-xs text-foreground">{previewText || (brokerRuntime === 'api' ? 'No computed tool groups in this preview.' : 'No discoverable tools left to list.')}</pre>
 
               <div class="batshit-settings-muted-panel">
-                This preview shows what the Tool Grid will surface in the DCM for this agent after
-                gateway/group/tool discoverability filters and display-detail rules are applied.
+                This previews the tool portion of Agent Setup after discoverability filters and
+                display-detail rules. Token estimates use characters divided by four, rounded up.
+                The separate enabled skills catalog is outside this preview and its tool hint budget.
               </div>
               <div class="batshit-settings-muted-panel">
                 Preview updates are based on the agent’s current MCP and CLI discoverability plus
-                display-detail settings. Inherited/default large groups may collapse, while explicit
-                group display choices are shown as selected.
+                display-detail settings. Inherited/default large groups may collapse. Explicit
+                group display choices can show more tools, within the total tool hint budget. Fixed
+                feature hints are separate from that budget, so total Agent Setup can be larger.
               </div>
             </div>
           {:else}

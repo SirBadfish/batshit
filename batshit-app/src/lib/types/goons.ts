@@ -185,6 +185,14 @@ export type GoonPostureDefinition = {
 
 export type GoonPostureMap = Record<string, GoonPostureDefinition>;
 
+export type GoonCompatibilityOwner = {
+  contract: "goon-compatibility-owner/v1";
+  // Hashes the stored runtime identity; legacy file URLs are not byte hashes.
+  modelIdentitySha256: string;
+  motionSourcesSha256: string;
+  motionPlanSha256: string;
+};
+
 export type GoonCompatibilityReport = {
   tier: GoonCompatibilityTier;
   issues?: string[];
@@ -195,6 +203,8 @@ export type GoonCompatibilityReport = {
   boneCoverage?: { present: number; total: number };
   animationNames?: string[];
   updated_at?: string;
+  /** Server-verified producer inputs; older reports may not have an owner. */
+  owner?: GoonCompatibilityOwner;
 };
 
 export type GoonVrmUpdateReport = {

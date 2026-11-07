@@ -5,6 +5,7 @@ import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
+import { fileURLToPath } from 'node:url'
 
 const execFileAsync = promisify(execFile)
 
@@ -29,9 +30,9 @@ const HUMANOID_BONE_MAPPING = {
   'mixamorig:LeftArm': 'leftUpperArm',
   'mixamorig:LeftForeArm': 'leftLowerArm',
   'mixamorig:LeftHand': 'leftHand',
+  'mixamorig:LeftHandThumb1': 'leftThumbMetacarpal',
   'mixamorig:LeftHandThumb2': 'leftThumbProximal',
-  'mixamorig:LeftHandThumb3': 'leftThumbIntermediate',
-  'mixamorig:LeftHandThumb4': 'leftThumbDistal',
+  'mixamorig:LeftHandThumb3': 'leftThumbDistal',
   'mixamorig:LeftHandIndex1': 'leftIndexProximal',
   'mixamorig:LeftHandIndex2': 'leftIndexIntermediate',
   'mixamorig:LeftHandIndex3': 'leftIndexDistal',
@@ -48,9 +49,9 @@ const HUMANOID_BONE_MAPPING = {
   'mixamorig:RightArm': 'rightUpperArm',
   'mixamorig:RightForeArm': 'rightLowerArm',
   'mixamorig:RightHand': 'rightHand',
+  'mixamorig:RightHandThumb1': 'rightThumbMetacarpal',
   'mixamorig:RightHandThumb2': 'rightThumbProximal',
-  'mixamorig:RightHandThumb3': 'rightThumbIntermediate',
-  'mixamorig:RightHandThumb4': 'rightThumbDistal',
+  'mixamorig:RightHandThumb3': 'rightThumbDistal',
   'mixamorig:RightHandIndex1': 'rightIndexProximal',
   'mixamorig:RightHandIndex2': 'rightIndexIntermediate',
   'mixamorig:RightHandIndex3': 'rightIndexDistal',
@@ -91,10 +92,10 @@ const HUMANOID_BONE_MAPPING = {
   l_elbow: 'leftLowerArm',
   L_Wrist: 'leftHand',
   l_wrist: 'leftHand',
-  L_Thumb1: 'leftThumbProximal',
-  l_thumb1: 'leftThumbProximal',
-  L_Thumb2: 'leftThumbIntermediate',
-  l_thumb2: 'leftThumbIntermediate',
+  L_Thumb1: 'leftThumbMetacarpal',
+  l_thumb1: 'leftThumbMetacarpal',
+  L_Thumb2: 'leftThumbProximal',
+  l_thumb2: 'leftThumbProximal',
   L_Thumb3: 'leftThumbDistal',
   l_thumb3: 'leftThumbDistal',
   L_Index1: 'leftIndexProximal',
@@ -129,10 +130,10 @@ const HUMANOID_BONE_MAPPING = {
   r_elbow: 'rightLowerArm',
   R_Wrist: 'rightHand',
   r_wrist: 'rightHand',
-  R_Thumb1: 'rightThumbProximal',
-  r_thumb1: 'rightThumbProximal',
-  R_Thumb2: 'rightThumbIntermediate',
-  r_thumb2: 'rightThumbIntermediate',
+  R_Thumb1: 'rightThumbMetacarpal',
+  r_thumb1: 'rightThumbMetacarpal',
+  R_Thumb2: 'rightThumbProximal',
+  r_thumb2: 'rightThumbProximal',
   R_Thumb3: 'rightThumbDistal',
   r_thumb3: 'rightThumbDistal',
   R_Index1: 'rightIndexProximal',
@@ -374,7 +375,7 @@ function processAnimationsWithTiming(animations, duration) {
   }))
 }
 
-function convertToVrmaWithTiming(gltfData) {
+export function convertToVrmaWithTiming(gltfData) {
   const duration = gltfData.extras?.animationMetadata?.maxDuration || 5.0
   const vrmaData = {
     asset: gltfData.asset,
@@ -493,8 +494,9 @@ const server = http.createServer(async (req, res) => {
   }
 })
 
-await fs.mkdir(WORK_DIR, { recursive: true })
-
-server.listen(PORT, HOST, () => {
-  console.log(`[fbx2vrma-worker] listening on ${HOST}:${PORT}`)
-})
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  await fs.mkdir(WORK_DIR, { recursive: true })
+  server.listen(PORT, HOST, () => {
+    console.log(`[fbx2vrma-worker] listening on ${HOST}:${PORT}`)
+  })
+}

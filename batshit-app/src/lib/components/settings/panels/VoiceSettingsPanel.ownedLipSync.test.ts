@@ -8,8 +8,9 @@ import {
   loadUserSettingsRoute,
   storedUserSettings
 } from '$lib/test-utils/userSettingsRoute'
-import { resetUserSettings } from '$lib/stores/userSettings.svelte'
+import { getUserSettings, resetUserSettings } from '$lib/stores/userSettings.svelte'
 import VoiceSettingsPanel from './VoiceSettingsPanel.svelte'
+import { dispatchVoiceEnginesUpdated } from '$lib/utils/voiceEngineEvents'
 
 /**
  * BL-976: Goon lip-sync mode/analyzer and blend have different save ownership. A narration or
@@ -112,6 +113,9 @@ let holdNextPanelResponse: Promise<void> | null = null
 let panelResponseHoldReached: (() => void) | null = null
 let panelPostResponses = 0
 let queuedSettingsGetBodies: unknown[] = []
+let holdNextGetResponse: Promise<void> | null = null
+let getResponseHeld: (() => void) | null = null
+let failPanelPosts = false
 const originalFetch = global.fetch
 
 beforeAll(async () => {
@@ -119,7 +123,9 @@ beforeAll(async () => {
 }, 60_000)
 
 async function seedStored(voice: Record<string, unknown>) {
-  await redis.updateUserSettings(USER, { displayName: 'Lip Sync Probe', voice_settings: structuredClone(voice) })
+  await redis.json.set(`user:${USER}:settings`, '$', {
+    id: `settings_${USER}`, user_id: USER, displayName: 'Lip Sync Probe', voice_settings: structuredClone(voice)
+  })
 }
 
 async function storedVoice() {
@@ -127,6 +133,9 @@ async function storedVoice() {
 }
 
 function installRoutes(options: { firstGetBodies?: unknown[] } = {}) {
+  holdNextGetResponse = null
+  getResponseHeld = null
+  failPanelPosts = false
   holdNextPanelPost = null
   holdNextPanelResponse = null
   panelResponseHoldReached = null
@@ -135,9 +144,18 @@ function installRoutes(options: { firstGetBodies?: unknown[] } = {}) {
   const panelRoute = {
     GET: async (event: any) => {
       if (queuedSettingsGetBodies.length > 0) return jsonResponse(queuedSettingsGetBodies.shift())
-      return route.GET(event)
+      const response = await route.GET(event)
+      const gate = holdNextGetResponse
+      if (gate) {
+        holdNextGetResponse = null
+        getResponseHeld?.()
+        getResponseHeld = null
+        await gate
+      }
+      return response
     },
     POST: async (event: any) => {
+      if (failPanelPosts) return new Response(JSON.stringify({ error: 'Save outcome unavailable' }), { status: 503 })
       const gate = holdNextPanelPost
       if (gate) {
         holdNextPanelPost = null
@@ -240,6 +258,9 @@ function startWithBatshitSwitch() {
 
 beforeEach(() => {
   ensureBrowserStubs()
+  holdNextGetResponse = null
+  getResponseHeld = null
+  failPanelPosts = false
   holdNextPanelPost = null
   holdNextPanelResponse = null
   panelResponseHoldReached = null
@@ -256,6 +277,143 @@ afterEach(() => {
 })
 
 describe('Voice Settings keeps Goon lip-sync ownership separate from unrelated and blend edits (BL-976)', () => {
+  it('BL-978(k): a held old GET cannot replace an admitted edit or cause an old-value resend', async () => {
+    await seedStored(LOADED_AMPLITUDE)
+    installRoutes()
+    renderPanel()
+    const narration = await screen.findByText('Italic narration')
+    const toggle = within(narration.closest('.batshit-settings-form-row') as HTMLElement).getByRole('switch')
+    await pause(SAVE_DEBOUNCE_PAST)
+    let releaseGet = () => {}
+    let releasePost = () => {}
+    const getHeld = new Promise<void>(resolve => { getResponseHeld = resolve })
+    holdNextGetResponse = new Promise<void>(resolve => { releaseGet = resolve })
+    dispatchVoiceEnginesUpdated()
+    await getHeld
+    const postHeld = new Promise<void>(resolve => { panelResponseHoldReached = resolve })
+    holdNextPanelResponse = new Promise<void>(resolve => { releasePost = resolve })
+    try {
+      await fireEvent.click(toggle)
+      await waitForPanelPost(1)
+      await postHeld
+      releaseGet()
+      await pause(100)
+      expect(toggleStillShowsSilent()).toBe(false)
+    } finally { releaseGet(); releasePost() }
+    await pause(SAVE_DEBOUNCE_PAST)
+    expect(posts).toHaveLength(1)
+    expect((await storedVoice()).tts.narration.italicBehavior).toBe('speak')
+    expect(toggleStillShowsSilent()).toBe(false)
+  }, 60_000)
+
+  it('BL-978(k): an equal serialized model with raw unfinished text remains a draft during refresh', async () => {
+    await seedStored(LOADED_AMPLITUDE)
+    installRoutes()
+    renderPanel()
+    await screen.findByText('Italic narration')
+    await fireEvent.click(screen.getAllByRole('button', { name: 'Enter manually', exact: true }).find(button => button.classList.contains('batshit-button-shrink-0'))!)
+    const model = document.querySelector('#tts-model') as HTMLInputElement
+    expect(model).toBeTruthy()
+    await fireEvent.input(model, { target: { value: ' tts-1-hd ' } })
+    await pause(SAVE_DEBOUNCE_PAST)
+    expect(posts).toEqual([])
+    const before = counts.reads
+    dispatchVoiceEnginesUpdated()
+    await pause(500)
+    expect(model.value).toBe(' tts-1-hd ')
+    expect(counts.reads).toBe(before)
+    await fireEvent.input(model, { target: { value: 'tts-1-hd' } })
+    await waitFor(() => expect(counts.reads).toBeGreaterThan(before))
+    expect(posts).toEqual([])
+  }, 60_000)
+
+  it('BL-978(k): a failed save is not replayed by an external refresh or metadata wake', async () => {
+    await seedStored(LOADED_AMPLITUDE)
+    installRoutes()
+    renderPanel()
+    const narration = await screen.findByText('Italic narration')
+    failPanelPosts = true
+    await fireEvent.click(within(narration.closest('.batshit-settings-form-row') as HTMLElement).getByRole('switch'))
+    await waitForPanelPost(1)
+    await pause(100)
+    dispatchVoiceEnginesUpdated()
+    await pause(SAVE_DEBOUNCE_PAST)
+    expect(posts).toHaveLength(1)
+    expect(toggleStillShowsSilent()).toBe(false)
+    expect(document.querySelector('.batshit-settings-save-status.is-error')).toBeTruthy()
+  }, 60_000)
+
+  it('BL-978(k): unmount revokes an unadmitted Voice timer', async () => {
+    await seedStored(LOADED_AMPLITUDE)
+    installRoutes()
+    const panel = renderPanel()
+    const narration = await screen.findByText('Italic narration')
+    await fireEvent.click(within(narration.closest('.batshit-settings-form-row') as HTMLElement).getByRole('switch'))
+    panel.unmount()
+    await pause(SAVE_DEBOUNCE_PAST)
+    expect(posts).toEqual([])
+    expect((await storedVoice()).tts.narration.italicBehavior).toBe('silent')
+  }, 60_000)
+
+  it('BL-978(k): remount waits for an admitted predecessor and its late answer cannot publish stale shared settings', async () => {
+    await seedStored(LOADED_AMPLITUDE)
+    installRoutes()
+    const first = renderPanel()
+    const narration = await screen.findByText('Italic narration')
+    let releasePost = () => {}
+    let releaseGet = () => {}
+    const postHeld = new Promise<void>(resolve => { panelResponseHoldReached = resolve })
+    holdNextPanelResponse = new Promise<void>(resolve => { releasePost = resolve })
+    try {
+      await fireEvent.click(within(narration.closest('.batshit-settings-form-row') as HTMLElement).getByRole('switch'))
+      await postHeld
+      await saveFromAnotherWindow(LOADED_AMPLITUDE)
+      first.unmount()
+      const before = counts.reads
+      renderPanel()
+      await pause(100)
+      expect(counts.reads).toBe(before)
+      expect(screen.getByText('Loading Voice settings...')).toBeTruthy()
+      const getHeld = new Promise<void>(resolve => { getResponseHeld = resolve })
+      holdNextGetResponse = new Promise<void>(resolve => { releaseGet = resolve })
+      releasePost()
+      await getHeld
+      expect(getUserSettings()?.voice_settings?.tts?.narration?.italicBehavior).toBe('silent')
+      releaseGet()
+      await screen.findByText('Italic narration')
+      expect(toggleStillShowsSilent()).toBe(true)
+      await pause(700)
+      expect(posts).toHaveLength(1)
+      expect((await storedVoice()).tts.narration.italicBehavior).toBe('silent')
+    } finally { releasePost(); releaseGet() }
+  }, 60_000)
+
+  it('BL-978(k): a concurrent view is visibly gated without stealing the first draft, then takes custody after unmount', async () => {
+    await seedStored(LOADED_AMPLITUDE)
+    installRoutes()
+    const first = renderPanel()
+    const narration = await within(first.container).findByText('Italic narration')
+    const second = renderPanel()
+    await within(second.container).findByTestId('voice-settings-other-view')
+    expect(within(second.container).queryByText('Italic narration')).toBeNull()
+    let release = () => {}
+    const held = new Promise<void>(resolve => { panelResponseHoldReached = resolve })
+    holdNextPanelResponse = new Promise<void>(resolve => { release = resolve })
+    try {
+      await fireEvent.click(within(narration.closest('.batshit-settings-form-row') as HTMLElement).getByRole('switch'))
+      await held
+      const before = counts.reads
+      first.unmount()
+      await pause(100)
+      expect(counts.reads).toBe(before)
+      expect(within(second.container).queryByTestId('voice-settings-other-view')).toBeNull()
+      release()
+      await within(second.container).findByText('Italic narration')
+      expect(toggleStillShowsSilent()).toBe(false)
+      expect(posts).toHaveLength(1)
+    } finally { release() }
+  }, 60_000)
+
   it('an older A=L1 answer cannot rebase or cancel newer B=L2 then C=L1 intent', async () => {
     await seedStored(LOADED_AMPLITUDE)
     installRoutes()

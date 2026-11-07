@@ -408,7 +408,7 @@ describe('a queued message leaves the box (SA-119 P3b, AMD-119-05)', () => {
     // rebuilt by the session replay on the next resubscribe. And only while the bubble is
     // still `dropped`: the button was drawn for that state.
     expect(body).toContain("if (steerInbox.getSteer(steerId)?.state !== 'dropped') return")
-    expect(body).toContain('steerInbox.clearDroppedSteer(steerId)')
+    expect(body).toContain('steerInbox.clearDroppedSteer(steerId, { byUser: true })')
     expect(body).not.toContain('steerInbox.forgetSteer(')
     // Review F-P3b-1: a replay, so the send path leaves the chat's OTHER receipts alone.
     // BL-4: a queued send's receipt also names the message it saved, which Send now reuses.
@@ -417,7 +417,7 @@ describe('a queued message leaves the box (SA-119 P3b, AMD-119-05)', () => {
     )
     expect(body).toContain('\n      existingUserMessageId: payload.userMessageId\n')
     // The bubble goes BEFORE the send, or the words show twice for the length of a turn.
-    expect(body.indexOf('steerInbox.clearDroppedSteer(steerId)')).toBeLessThan(
+    expect(body.indexOf('steerInbox.clearDroppedSteer(steerId, { byUser: true })')).toBeLessThan(
       body.indexOf('void handleSendMessage(')
     )
     // Never the display text.
@@ -451,8 +451,9 @@ describe('a queued message leaves the box (SA-119 P3b, AMD-119-05)', () => {
   it('retires ONE receipt from its own button and keeps the others (review F-P3b-1, F-P3b-3)', () => {
     const dismiss = page.indexOf('function dismissDroppedSteer(steerId: string) {')
     expect(dismiss).toBeGreaterThan(-1)
-    expect(page.slice(dismiss, dismiss + 400)).toContain('steerInbox.clearDroppedSteer(steerId)')
-    expect(page.match(/steerInbox\.clearDroppedSteer\(steerId\)/g)?.length ?? 0).toBe(2)
+    expect(page.slice(dismiss, dismiss + 400)).toContain('steerInbox.clearDroppedSteer(steerId, { byUser: true })')
+    // BL-903 (a): the two buttons retire the receipt as the user's own act (`byUser`).
+    expect(page.match(/steerInbox\.clearDroppedSteer\(steerId, \{ byUser: true \}\)/g)?.length ?? 0).toBe(2)
     // The per-send clear of the chat's dropped receipts (DL-118-08) is skipped for a
     // replay — pinned as the whole guard with its body on the next line, from the line
     // start, because `void 0 &&` in front of a call still contains the call.
@@ -658,7 +659,10 @@ describe('Steer keeps the clips (DL-119-04)', () => {
   it('still resets the TEXT, which is all `resetComposer` ever did', () => {
     const reset = chatInput.indexOf('function resetComposer() {')
     const body = chatInput.slice(reset, reset + 500)
-    expect(body).toContain("message = ''")
+    expect(body).toContain("setComposerMessage('')")
+    const setter = chatInput.indexOf('function setComposerMessage(text: string) {')
+    expect(setter).toBeGreaterThan(-1)
+    expect(chatInput.slice(setter, setter + 160)).toContain('message = text')
     expect(body).not.toContain('clipsManager')
   })
 })

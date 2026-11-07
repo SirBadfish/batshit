@@ -1,6 +1,7 @@
 <script lang="ts">
-  import { onDestroy, tick } from 'svelte'
+  import { onDestroy, tick, untrack } from 'svelte'
   import { toast } from '$lib/components/ui/sonner/settings-toast'
+  import { createRecipePreviewAttempt, type RecipePreviewAttempt } from '$lib/goons/recipe/recipePreviewAttempt'
   import {
     canonicalRecipeString,
     classifyRecipeAuthorUpdatePlan,
@@ -59,22 +60,23 @@
   import type { GoonRecord } from '$lib/types/goons'
   import { pickGoonPackageFile } from '$lib/goons/goonPackageFilePicker'
   import RecipeWorkflowPanel from './RecipeWorkflowPanel.svelte'
+  import type { GoonOperationState } from '../GoonOperationOverlay.svelte'
+  import {
+    recipeBuildCanCancel,
+    recipeWorkflowProgressPhase
+  } from './recipeWorkflowOperation'
   import type {
     RecipeAuthorizedPreviewControl,
     RecipeFileTechnicalDetails,
     RecipeLifecycleBusyAction,
     RecipePreviewSide,
     RecipeFittedPreviewState,
+    RecipeEditorPreviewTarget,
     RecipeWorkflowActions,
     RecipeWorkflowViewModel
   } from './types'
 
-  type RecipePreviewTarget = {
-    goon: GoonRecord
-    state: RecipeStateSnapshot
-    preview: RecipeFittedPreviewState
-    side: RecipePreviewSide
-  }
+  type RecipePreviewTarget = RecipeEditorPreviewTarget
 
   type RecipeAnalysisBoundary = {
     goonId: string
@@ -101,13 +103,20 @@
     onSaveEditorDraft: () => Promise<boolean>
     onDiscardEditorDraft: () => void | Promise<void>
     onRecipeGoonChanged?: (goon: GoonRecord) => void | Promise<void>
+    onLoadSavedPreview?: (goon: GoonRecord) => Promise<void>
+    onRetryBegin?: (reviewed: RecipeStateSnapshot) => ((committed: GoonRecord) => void) | null
     onDraftPreviewStateChange?: (
       preview: RecipeFittedPreviewState | null
     ) => void | Promise<void>
-    onPreviewTargetChange?: (target: RecipePreviewTarget | null) => void | Promise<void>
-    onPreviewLiveCandidate: (staged: RecipeStageResponse) => Promise<void>
+    onDraftPreviewErrorChange?: (error: string | null) => void
+    onRecipeDraftStateChange?: (
+      state: RecipeStateSnapshot | null
+    ) => void | Promise<void>
+    onPreviewTargetChange?: (target: RecipePreviewTarget | null, options?: { signal?: AbortSignal }) => void | Promise<void>
+    onPreviewLiveCandidate: (staged: RecipeStageResponse, options: { signal?: AbortSignal }) => Promise<void>
     fileTechnicalDetails?: RecipeFileTechnicalDetails | null
     autoPrepare?: boolean
+    onWorkflowOperationChange?: (operation: GoonOperationState | null) => void
     onWorkflowBusyChange?: (busy: boolean) => void
   }
 
@@ -126,11 +135,16 @@
     onSaveEditorDraft,
     onDiscardEditorDraft,
     onRecipeGoonChanged,
+    onLoadSavedPreview,
+    onRetryBegin,
     onDraftPreviewStateChange,
+    onDraftPreviewErrorChange,
+    onRecipeDraftStateChange,
     onPreviewTargetChange,
     onPreviewLiveCandidate,
     fileTechnicalDetails = null,
     autoPrepare = false,
+    onWorkflowOperationChange,
     onWorkflowBusyChange
   }: Props = $props()
 
@@ -158,10 +172,13 @@
   let restoreOpen = $state(false)
   let confirmationBusy = $state<'clean-reset' | 'restore' | null>(null)
   let rollbackPreview = $state<RecipeRollbackPreviewResponse | null>(null)
+  let restorePreviewAttempt = $state.raw<RecipePreviewAttempt | null>(null)
+  let restorePreviewCancelPending = $state(false)
   let pendingAnalysisIntent: RecipeAnalysisIntent | null = null
   let buildAbortController: AbortController | null = null
   let previewFitAbortController: AbortController | null = null
   let previewFitPromise: Promise<RecipeStateSnapshot> | null = null
+  let loadingSavedPreview = $state(false)
   let draftToken = 0
   let hydrationToken = 0
   let automaticPreparationAttemptKey = ''
@@ -196,16 +213,123 @@
       reviewBusy !== null ||
       confirmationBusy !== null ||
       jobBusy !== null ||
-      previewFitBusy
+      previewFitBusy || loadingSavedPreview
   )
 
+  const workflowOperation = $derived.by<GoonOperationState | null>(() => {
+    if (loadingSavedPreview) {
+      return { title: 'Saving Goon', phase: 'Loading the saved Goon' }
+    }
+    const cancelPending = jobBusy === 'canceling'
+    const canCancelBuild = recipeBuildCanCancel(
+      workflowProgress,
+      buildAbortController !== null,
+      cancelPending
+    )
+    const buildTitle = lifecycleBusy === 'first-bake'
+      ? 'Preparing Goon'
+      : lifecycleBusy === 'rebake'
+        ? 'Saving Goon'
+        : reviewBusy === 'updating' || reviewBusy === 'resetting'
+          ? 'Updating Goon File'
+          : jobBusy === 'retrying'
+            ? 'Retrying Goon Update'
+            : jobBusy === 'resuming'
+              ? 'Finishing Goon Update'
+              : 'Updating Goon'
+
+    if (cancelPending) {
+      return {
+        title: buildTitle,
+        phase: 'Canceling the Goon operation',
+        detail: 'Stopping the build and checking saved state.',
+        cancelPending: true
+      }
+    }
+
+    const progressPhase = recipeWorkflowProgressPhase(workflowProgress)
+    if (progressPhase) {
+      return {
+        title: buildTitle,
+        phase: progressPhase,
+        detail: workflowProgress === 'committing'
+          ? 'Finishing the save. Cancellation is no longer available.'
+          : undefined,
+        onCancel: canCancelBuild ? cancelBuild : null
+      }
+    }
+
+    if (lifecycleBusy === 'first-bake') {
+      return {
+        title: 'Preparing Goon',
+        phase: 'Checking the source files and saved appearance'
+      }
+    }
+    if (lifecycleBusy === 'rebake') {
+      return {
+        title: 'Saving Goon',
+        phase: 'Preparing the saved appearance changes'
+      }
+    }
+    if (lifecycleBusy === 'analyze') {
+      return {
+        title: 'Checking Goon File',
+        phase: 'Uploading and verifying the new Goon file'
+      }
+    }
+    if (lifecycleBusy === 'restore') {
+      const attempt = restorePreviewAttempt
+      return {
+        title: 'Preparing Previous Goon',
+        phase: restorePreviewCancelPending ? 'Restoring the current Goon preview' : 'Loading the previous Goon version for review',
+        cancelPending: restorePreviewCancelPending,
+        onCancel: attempt && !restorePreviewCancelPending ? () => {
+          if (restorePreviewAttempt !== attempt) return
+          restorePreviewCancelPending = true
+          attempt.cancel()
+        } : null
+      }
+    }
+    if (previewFitBusy) {
+      return {
+        title: 'Building Goon Preview',
+        phase: 'Building the updated appearance preview'
+      }
+    }
+    if (reviewBusy || confirmationBusy || jobBusy) {
+      return {
+        title: buildTitle,
+        phase: confirmationBusy === 'restore'
+          ? 'Restoring the previous Goon version'
+          : jobBusy === 'discarding'
+            ? 'Discarding the unfinished Goon update'
+            : 'Preparing the Goon update'
+      }
+    }
+    return null
+  })
+
   $effect(() => {
+    onWorkflowOperationChange?.(workflowOperation)
     onWorkflowBusyChange?.(workflowBusy)
   })
 
+  $effect(() => {
+    // A failed replacement keeps the last valid fitted geometry visible, but
+    // its controls must remain visibly invalid until a new draft succeeds.
+    onDraftPreviewErrorChange?.(draftStateError)
+  })
+
   onDestroy(() => {
+    draftToken += 1
+    const restoreAttempt = restorePreviewAttempt
+    restorePreviewAttempt = null
+    restoreAttempt?.cancel()
     previewFitAbortController?.abort()
     void onDraftPreviewStateChange?.(null)
+    untrack(() => { void onRecipeDraftStateChange?.(null) })
+    onDraftPreviewErrorChange?.(null)
+    onWorkflowOperationChange?.(null)
     onWorkflowBusyChange?.(false)
   })
 
@@ -231,7 +355,10 @@
     }
   }
 
-  function buildPreviewGoon(source: RecipeSource, state: RecipeStateSnapshot): GoonRecord {
+  function buildPreviewGoon(
+    source: RecipeSource,
+    state: RecipeStateSnapshot
+  ): GoonRecord {
     return projectGoonRecipeSource(goon, { source, state })
   }
 
@@ -258,16 +385,21 @@
     if (!appearanceDials) {
       throw new Error('Appearance controls are still loading for this Goon.')
     }
+    // Detach the complete input before any fetch/fit wait. Later edits own a
+    // new token and cannot be mixed into this draft's fit or sibling state.
+    const capturedGoon = cloneJson(draftGoon())
+    const capturedAppearance = cloneJson(appearanceDials)
+    const capturedOwner = capturedGoon.recipe?.contract === 'goon-recipe/v2' ? capturedGoon.recipe : null
     let anatomyFitState: RecipeSiblingStateDraft | null | undefined = undefined
     const hasManagedAnatomyFit = Boolean(
-      goon.customAvatar?.manifestSummary?.anatomyFitReady ||
-      owner?.authoringRevision?.state?.siblings?.some(
+      capturedGoon.customAvatar?.manifestSummary?.anatomyFitReady ||
+      capturedOwner?.authoringRevision?.state?.siblings?.some(
         (entry) => entry.id === 'anatomy-fit' || entry.contract === 'anatomy-fit-state/v2'
       )
     )
     if (recomputeAnatomyFit) anatomyFitState = null
     if (recomputeAnatomyFit && hasManagedAnatomyFit) {
-      const authoringGoon = owner ? projectGoonRecipeSource(goon) : goon
+      const authoringGoon = capturedOwner ? projectGoonRecipeSource(capturedGoon) : capturedGoon
       const manifest = await loadCustomAvatarManifest(authoringGoon.customAvatar?.manifest)
       if (manifest.anatomyFit === undefined || manifest.anatomyFit === null) {
         throw new Error('The Recipe state requires Anatomy Fit but its authoring definition is missing.')
@@ -281,16 +413,16 @@
         throw new Error(`Failed to load the Anatomy Fit authoring model (${response.status}).`)
       }
       const modelBytes = new Uint8Array(await response.arrayBuffer())
-      const source = owner?.authoringRevision.source.identities
+      const source = capturedOwner?.authoringRevision.source.identities
         ?? (await verifyRecipePackageMetadata(manifest, await sha256Hex(modelBytes))).source
-      const previousSibling = owner?.authoringRevision.state.siblings.find(
+      const previousSibling = capturedOwner?.authoringRevision.state.siblings.find(
         (entry) => entry.id === 'anatomy-fit' || entry.contract === 'anatomy-fit-state/v2'
       ) ?? null
       const sibling = await computeAnatomyFitRecipeSiblingInWorker({
         manifest,
         modelBytes,
         source,
-        appearanceDials: cloneJson(appearanceDials),
+        appearanceDials: capturedAppearance,
         previousSibling: previousSibling ? cloneJson(previousSibling) : null
       }, signal)
       if (!sibling) {
@@ -304,17 +436,20 @@
       }
     }
     return buildRecipeStateSnapshot({
-      goon: draftGoon(),
-      appearanceDials: cloneJson(appearanceDials),
+      goon: capturedGoon,
+      appearanceDials: capturedAppearance,
       anatomyFitState
     })
   }
 
   $effect(() => {
-    goon.id
-    owner?.writeVersion
-    draftInputSignature
+    const inputSignature = draftInputSignature
+    const ownerSignature = canonicalRecipeString({ userId: goon.user_id, goonId: goon.id,
+      ownerWriteVersion: owner?.writeVersion ?? null, authoringRevision: owner?.authoringRevision ?? null })
     const token = ++draftToken
+    untrack(() => {
+      void onRecipeDraftStateChange?.(null)
+    })
     const abortController = new AbortController()
     const appearanceChanged =
       !owner ||
@@ -339,15 +474,21 @@
           preview: await fittedPreviewState(state)
         }))
         .then(({ state, preview }) => {
-          if (token !== draftToken) return
+          if (token !== draftToken || abortController.signal.aborted || draftInputSignature !== inputSignature ||
+            canonicalRecipeString({ userId: goon.user_id, goonId: goon.id,
+              ownerWriteVersion: owner?.writeVersion ?? null, authoringRevision: owner?.authoringRevision ?? null }) !== ownerSignature ||
+            preview.stateSha256 !== state.stateSha256 ||
+            canonicalRecipeString(preview.appearanceDials) !== canonicalRecipeString(state.appearanceDials)) return
           draftState = state
           draftStateError = null
+          void onRecipeDraftStateChange?.(cloneJson(state))
           void onDraftPreviewStateChange?.(preview)
         })
         .catch((error) => {
           if (token !== draftToken || abortController.signal.aborted) return
           draftState = null
           draftStateError = errorMessage(error)
+          void onRecipeDraftStateChange?.(null)
         })
     }
     // Slider input can emit many intermediate values. Keep the last valid
@@ -373,6 +514,7 @@
       : previewState
     await onPreviewTargetChange?.({
       goon: buildPreviewGoon(source, state),
+      source,
       state,
       preview: await fittedPreviewState(state),
       side: previewSide
@@ -516,6 +658,21 @@
     return next
   }
 
+
+  async function finishSavedPreview(next: GoonRecord, successMessage: string) {
+    loadingSavedPreview = true
+    try {
+      await onLoadSavedPreview?.(next)
+      toast.success(successMessage)
+    } catch (error) {
+      // Commit already succeeded. A display failure must not enter build
+      // recovery, retry the write, or describe the saved Goon as lost.
+      toast.error(`The Goon was saved, but its preview could not reopen: ${errorMessage(error)}`)
+    } finally {
+      loadingSavedPreview = false
+    }
+  }
+
   async function recoverPendingJob(nextGoon: GoonRecord) {
     const nextOwner = nextGoon.recipe?.contract === 'goon-recipe/v2' ? nextGoon.recipe : null
     if (!nextOwner?.pendingJob) {
@@ -568,7 +725,7 @@
       return 'validating'
     }
     if (progress === 'evaluating-recipe') return 'planning'
-    if (progress === 'rewriting-model' || progress === 'auditing-model') return 'baking'
+    if (progress === 'server-building' || progress === 'rewriting-model' || progress === 'auditing-model') return 'baking'
     if (progress === 'packaging-live-goon' || progress === 'uploading-candidate' || progress === 'registering-candidate') {
       return 'packaging'
     }
@@ -597,7 +754,7 @@
       jobReviewedState = null
       await clearAnalysisPreview()
       const next = await refreshGoon(result.committed.goon)
-      toast.success(owner?.activeRevision ? 'Goon updated' : 'Goon is ready')
+      await finishSavedPreview(next, owner?.activeRevision ? 'Goon updated' : 'Goon is ready')
       return next
     } catch (error) {
       let recoveryError: unknown = null
@@ -636,7 +793,7 @@
       jobReviewedState = null
       await clearAnalysisPreview()
       const next = await refreshGoon(committed.goon)
-      toast.success(owner?.activeRevision ? 'Goon updated' : 'Goon is ready')
+      await finishSavedPreview(next, owner?.activeRevision ? 'Goon updated' : 'Goon is ready')
       return next
     } catch (error) {
       let recoveryError: unknown = null
@@ -713,6 +870,7 @@
       const currentDraftState = await buildCurrentDraftState(undefined, appearanceChanged)
       draftState = currentDraftState
       draftStateError = null
+      void onRecipeDraftStateChange?.(cloneJson(currentDraftState))
       if (activeOwner?.pendingAnalysis) {
         toast.error('Finish or discard the current Goon file update before saving new appearance edits.')
         return false
@@ -745,16 +903,14 @@
         savedState: activeOwner?.authoringRevision.state ?? null,
         draftState: currentDraftState
       })
-      if (!currentDecision.requiresBuild) {
-        if (activeOwner?.liveStatus !== 'needs_bake') return true
-        return runBake(
-          activeOwner.activeRevision ? 'rebake' : 'first-bake',
-          currentDraftState,
-          activeOwner
-        )
-      }
+      if (!currentDecision.requiresBuild && activeOwner?.liveStatus !== 'needs_bake') return true
+      // A discarded build can leave the current authoring state needing a bake.
+      // Its freshly mounted exact preview has the same eligibility rules as a
+      // changed draft; Retry and package migration still use their own paths.
       return runBake(
-        currentDecision.action === 'prepare' ? 'first-bake' : 'rebake',
+        !currentDecision.requiresBuild
+          ? activeOwner?.activeRevision ? 'rebake' : 'first-bake'
+          : currentDecision.action === 'prepare' ? 'first-bake' : 'rebake',
         currentDraftState,
         activeOwner
       )
@@ -983,7 +1139,6 @@
     const confirmedControlIds = plan.controlRows
       .filter((row) => row.requiresConfirmation)
       .map((row) => row.ledgerId)
-      .sort((left, right) => left.localeCompare(right))
     const reviewed = await client.reviewAnalysisState({
       expectedWriteVersion: nextHydration.owner.writeVersion,
       analysisId: nextHydration.pendingAnalysis.analysisId,
@@ -1056,22 +1211,41 @@
   }
 
   async function requestRestore() {
+    if (lifecycleBusy) return
+    const attempt = createRecipePreviewAttempt({ label: 'previous Goon' })
+    restorePreviewAttempt = attempt
+    restorePreviewCancelPending = false
     lifecycleBusy = 'restore'
     try {
-      const preview = await client.previewRollback()
+      const preview = await attempt.run(client.previewRollback({ signal: attempt.signal }))
+      attempt.signal.throwIfAborted()
+      const fitted = await attempt.run(fittedPreviewState(preview.previous.revision.state))
+      attempt.signal.throwIfAborted()
+      // The panel observes this signal and bounds restoration before returning.
+      // Keep the modal owned until that recovery has finished.
       await onPreviewTargetChange?.({
         goon: buildPreviewGoon(preview.previous.revision.source, preview.previous.revision.state),
+        liveEnvelope: preview.previous,
         state: preview.previous.revision.state,
-        preview: await fittedPreviewState(preview.previous.revision.state),
+        preview: fitted,
         side: 'updated'
-      })
+      }, { signal: attempt.signal })
+      attempt.signal.throwIfAborted()
+      if (restorePreviewAttempt !== attempt) return
       rollbackPreview = preview
       restoreOpen = true
       toast.success('Previewing the previous Goon version')
     } catch (error) {
-      toast.error(errorMessage(error))
+      if (restorePreviewAttempt !== attempt) return
+      if (!(error instanceof AggregateError) && attempt.signal.reason?.name === 'AbortError') return
+      toast.error(errorMessage(attempt.signal.reason?.name === 'TimeoutError' ? attempt.signal.reason : error))
     } finally {
-      lifecycleBusy = null
+      attempt.finish()
+      if (restorePreviewAttempt === attempt) {
+        restorePreviewAttempt = null
+        restorePreviewCancelPending = false
+        lifecycleBusy = null
+      }
     }
   }
 
@@ -1089,8 +1263,8 @@
       restoreOpen = false
       rollbackPreview = null
       await clearAnalysisPreview()
-      await refreshGoon(result.goon)
-      toast.success('Previous Goon version restored')
+      const next = await refreshGoon(result.goon)
+      await finishSavedPreview(next, 'Previous Goon version restored')
     } catch (error) {
       toast.error(errorMessage(error))
     } finally {
@@ -1102,10 +1276,25 @@
     if (!jobView || !jobReviewedState) return
     jobBusy = 'retrying'
     try {
+      // Capture the reviewed state and mounted editor ownership before any
+      // asynchronous retry work can replace either one.
+      const reviewed = cloneJson(jobReviewedState)
+      const settle = jobView.job.operation === 'rebake' ? onRetryBegin?.(reviewed) : null
+      const settleCommitted = (committed: GoonRecord | null) => {
+        if (!committed || !settle) return
+        try {
+          settle(committed)
+        } catch (error) {
+          // The commit already succeeded; keep the draft rather than report a
+          // successful write as a failed Retry or attempt another write.
+          console.warn('[RecipeWorkflow] Could not reconcile the saved editor draft:', error)
+        }
+      }
       const retried = await client.retryJob(jobView)
       jobView = retried
       if (retried.job.status === 'ready') {
-        await resumeReadyBuild(await client.recoverJob(retried.job.jobId))
+        const committed = await resumeReadyBuild(await client.recoverJob(retried.job.jobId))
+        settleCommitted(committed)
         return
       }
       const operation = retried.job.operation
@@ -1122,14 +1311,15 @@
           }
         })
       } else {
-        await runBuild({
+        const committed = await runBuild({
           kind: 'bake',
           request: {
             expectedWriteVersion: retried.owner.writeVersion,
             idempotencyKey: retried.job.idempotencyKey,
-            state: jobReviewedState
+            state: reviewed
           }
         })
+        settleCommitted(committed)
       }
     } catch (error) {
       toast.error(errorMessage(error))
@@ -1165,9 +1355,10 @@
   }
 
   function cancelBuild() {
-    if (!buildAbortController) return
+    const abortController = buildAbortController
+    if (!recipeBuildCanCancel(workflowProgress, abortController !== null, jobBusy === 'canceling') || !abortController) return
     jobBusy = 'canceling'
-    buildAbortController.abort(new DOMException('Goon update canceled by the user.', 'AbortError'))
+    abortController.abort(new DOMException('Goon update canceled by the user.', 'AbortError'))
   }
 
   const selectedPlan = $derived.by(() => hydration ? parseRecipeMigrationPlan(hydration.plan) : null)
@@ -1248,7 +1439,11 @@
           failureReason: jobView?.job.failure?.reason ?? owner?.lastFailure?.reason ?? null,
           retryable: displayedJobStatus === 'failed' || displayedJobStatus === 'interrupted',
           resumable: displayedJobStatus === 'ready' && !buildAbortController,
-          cancelable: Boolean(buildAbortController),
+          cancelable: recipeBuildCanCancel(
+            workflowProgress,
+            buildAbortController !== null,
+            jobBusy === 'canceling'
+          ),
           busyAction: jobBusy
         }
       : null,

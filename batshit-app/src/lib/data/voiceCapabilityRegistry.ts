@@ -244,6 +244,16 @@ export const ELEVENLABS_STT_CAPABILITIES: VoiceSttCapabilityProfile = {
   ]
 }
 
+export const ASYNC_STT_CAPABILITIES: VoiceSttCapabilityProfile = {
+  recorded: true, realtime: false, turnDetection: false, vad: false,
+  partialResults: false, finalResults: true, wordTimestamps: false, diarization: false,
+  languageDetection: false, keyterms: false, transport: 'http-upload',
+  runtimeSupport: 'supported', cost: 'paid', privacy: 'cloud', setupWeight: 'light',
+  runtimeLabel: 'Recorded Async transcription',
+  unsupportedReason: 'Async transcription is available for uploaded audio, not a realtime microphone session.',
+  notes: ['Returns the transcript for an uploaded recording.']
+}
+
 export const MISTRAL_STT_CAPABILITIES: VoiceSttCapabilityProfile = {
   recorded: true,
   realtime: false,
@@ -757,7 +767,7 @@ const mimoFields: VoiceCapabilityField[] = [
     type: 'string',
     path: 'common.instructions',
     label: 'Instructions',
-    help: 'Natural-language style guidance sent as the optional MiMo user message.'
+    help: 'MiMo user-message instructions: optional style guidance for preset/clone models; required voice description for Voice Design.'
   },
   {
     id: 'format',
@@ -783,6 +793,10 @@ const mimoFields: VoiceCapabilityField[] = [
 ]
 
 const alibabaFields: VoiceCapabilityField[] = [
+  {
+    id: 'endpoint', scope: 'tts', surface: 'both', type: 'string', path: 'common.endpoint',
+    label: 'Workspace endpoint', help: 'For Qwen Audio, enter the complete HTTPS workspace endpoint for the region of your API key.'
+  },
   {
     id: 'language',
     scope: 'tts',
@@ -926,6 +940,7 @@ const cartesiaFields: VoiceCapabilityField[] = [
 ]
 
 const asyncFields: VoiceCapabilityField[] = [
+  { id: 'sttLanguage', scope: 'stt', surface: 'both', type: 'string', path: 'language', label: 'Language', help: 'Optional language hint for uploaded audio.' },
   {
     id: 'container',
     scope: 'tts',
@@ -1313,11 +1328,12 @@ const baseRegistry: VoiceProviderCapability[] = [
     label: 'Async Voice',
     supports: {
       tts: true,
-      stt: false,
+      stt: true,
       listVoices: true,
       clone: false,
       streaming: false
     },
+    sttCapabilities: ASYNC_STT_CAPABILITIES,
     modelSource: 'static',
     voiceSource: 'remote',
     fields: asyncFields

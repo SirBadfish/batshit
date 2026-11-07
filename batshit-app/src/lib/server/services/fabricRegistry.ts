@@ -1,3 +1,9 @@
+import { refusePluginMemberWrite } from './agentPlugins'
+import { serializeArtifactGrantFailure } from '$lib/server/artifacts/artifactGrantLifecycle'
+import { isBatshitUtilityControlId, resolveBrokerToolToggles } from '$lib/utils/brokerAvailability'
+import { resolveAgentJevJudgeToolEnabled } from '$lib/utils/jevJuiceControl'
+import { normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
+import { readArtifactAgentAccess } from '$lib/utils/agentAccessIds'
 import { z } from 'zod'
 import { APP_ACTIONS_VERSION, P1_APP_ACTION_DESCRIPTORS, parseActionRequest } from '$lib/appActions/catalog'
 import { executeAgentAppAction } from './appActions/runtime'
@@ -5,11 +11,20 @@ import { SETTINGS_ACTION_DESCRIPTORS } from '$lib/appActions/settings/fields'
 import { SETTINGS_FABRIC_CONTROLS, parseSettingsAction, type SettingsActionId } from '$lib/appActions/settingsContract'
 import { executeAgentSettingsAction } from './appActions/settingsAdapter'
 import { settingsControlAdmission } from './appActions/settingsAdmission'
+import { MANAGED_SETTINGS_REPORT_SCHEMA, MANAGED_SETTINGS_CHANGE_SCHEMA, API_MANAGED_SETTINGS_REPORT_SCHEMA, API_MANAGED_SETTINGS_CHANGE_SCHEMA, parseManagedSettingsReportInput, parseManagedSettingsChangeInput } from '$lib/appActions/settings/managementInput'
+import { prepareSettingsControl, executeSettingsManagement, settingsControlsVisible, type PreparedSettingsControl } from './appActions/settings/managementRuntime'
+import { SETTINGS_MANAGEMENT_CONTROL_IDS, admitSettingsManagementActor, nativeSettingsSignal } from './appActions/settings/managementActor'
+import { AppActionsManagementRefusal } from './appActions/settings/authority'
 import { redis } from '$lib/server/redis'
+import { buildApiUtilityControls, type ApiUtilityScope, type ApiUtilityInvocation } from './apiUtilityRuntime'
+import { isApiUtilityControlId } from '$lib/utils/apiUtilityControls'
+import { ZIP_FETCH_SCHEMA_HINT } from './nativeFabricHelperCatalog'
+import { buildSchemaSummary, getSchemaHintText } from './dynamicMcpSchema'
+import { resolveAgentDmsEnabled } from '$lib/utils/dmControl'
 import { fetchZipForModel, MAX_FETCH_ZIP_CHARS } from './fetchZipForModel'
 import { buildControlApprovalPauseGuidance } from '$lib/utils/controlApprovalPresentation'
 import { requireActingAgentIdentity } from '$lib/server/services/actingAgentIdentity'
-import { getOriginatingReplyStopSignal } from './streamAbortRegistry'
+import { getActiveStream, getOriginatingReplyStopSignal } from './streamAbortRegistry'
 import {
   DEFAULT_DYNAMIC_MCP_RESULTS,
   MAX_DYNAMIC_MCP_RESULTS,
@@ -18,13 +33,15 @@ import {
 } from './dynamicMcpTools'
 import { ArtifactsService, type ArtifactRecord } from '$lib/server/artifacts/artifactsService'
 import { hasNoBatshitCompletionRuntime, isArtifactAgentUseEligible } from '$lib/artifacts/agentUseEligibility'
-import { PINOKIO_FILE_FIELD_HINT, pinokioFileFieldIds } from '$lib/artifacts/pinokioArtifact'
+import { PINOKIO_FILE_FIELD_HINT, pinokioFileFieldIds, readPinokioArtifactBinding } from '$lib/artifacts/pinokioArtifact'
 import { ARTIFACT_INVOKE_RESERVED_KEYS } from '$lib/artifacts/reservedFabricIds'
 import { importSkillDefinition, toImportErrorResponse, type SkillImportInput } from './skillImport'
 import { buildSkillScreenWarning, screenImportedSkill } from './skillImportScreen'
 import { buildUntrustedTextAdvisory } from './untrustedText.jev'
 import { normalizeSkillId, skillRecordExists, upsertSkill } from './skillRegistry'
 import { commandEnabledForAgent } from './slashCommandCapabilities'
+import { saveSlashCommandRecord, captureSlashCommandWriteBasis, COMMAND_ACCESS_FIELDS } from './slashCommandRevision'
+import { beginSlashCommandWrite, type SlashCommandWritePreparation } from './slashCommandRevisionProtocol'
 import { env } from '$env/dynamic/private'
 import { apiKeyService } from '$lib/services/apiKey.server'
 import {
@@ -41,6 +58,8 @@ import {
   PINOKIO_RUN_DEFAULT_WAIT_SECONDS,
   PINOKIO_RUN_MAX_WAIT_SECONDS,
   detectPinokio,
+  getPinokioTargetStatus,
+  previewPinokioAppStart,
   getPinokioAppLogs,
   getPinokioAppStatus,
   pinokioAppIdProblem,
@@ -48,7 +67,10 @@ import {
   startPinokioApp,
   type PinokioOutcome
 } from '$lib/server/services/pinokioService'
-import { describePinokioAppApi, pinokioReadyUrlToBase } from '$lib/server/services/pinokioAppEndpoint'
+import { describePinokioAppApi, pinokioReadyUrlToBase, resolvePinokioAppEndpoint, forgetPinokioAppEndpoint } from '$lib/server/services/pinokioAppEndpoint'
+import { pinokioMachineService } from './pinokioMachineService'
+import { isPinokioRemoteMachineId } from '$lib/pinokio/machines'
+import { ownPinokioOperation, PinokioAdmissionError } from './pinokioAdmission'
 import {
   deleteVoiceEngineModel,
   downloadVoiceEngineModel,
@@ -87,7 +109,6 @@ import {
   supersedeMemoryOp,
   unsupersedeMemoryOp,
   updateMemoryOp,
-  updateWhiteboardOp,
   type MemoryToolContext
 } from '$lib/server/services/memory/memoryTools'
 import {
@@ -116,9 +137,11 @@ import {
 } from '$lib/utils/scheduleControl'
 import {
   decideRiskGate,
+  getControlApproval,
+  hashControlInput,
   type ControlApprovalAudit,
   type ControlApprovalGrant,
-  type ControlApprovalLane
+  type LiveControlApprovalLane
 } from '$lib/server/services/controlApprovals'
 import {
   DEFAULT_SKILL_ICON_REF
@@ -273,11 +296,20 @@ type ControlRegistryRecord = z.infer<typeof controlRegistryRecordSchema>
 type ControlRegistryStore = z.infer<typeof controlRegistryStoreSchema>
 
 type ControlExecutionContext = {
+  apiUtilityInvocation?: ApiUtilityInvocation
+  scopeAgentId?: string | null
+  p5ApiRun?: import('./appActions/mcp/originalTask').P5ApiOriginalRun
+  delegatedRun?: boolean
+  portableSettingsActor?: { tokenId: string; authorityGeneration: number }
+  settingsNativeGate?: () => void
+  settingsAuthorityFence?: { key: string; paths: Array<[string, string]> }
+  settingsAuthorityCheck?: () => void
   userId: string
   agentId?: string | null
   sessionId?: string | null
   messageId?: string | null
   actorType?: ControlActorType
+  whiteboardSettingsSnapshot?: import('$lib/utils/reasoningRetention').ResolvedReasoningRetention
   /** Server-resolved run scope; never a control input. */
   mcpGatewayScope?: string[] | null
   selectedGateways?: string[]
@@ -287,6 +319,10 @@ type ControlExecutionContext = {
    * helper dispatch; no request body or control input reaches it.
    */
   abortSignal?: AbortSignal
+  /** Created after the existing consume-once gate; never a control/body field. */
+  pinokioNativeAdmission?: () => Promise<void>
+  pinokioArtifactAdmission?: (artifact: ArtifactRecord) => Promise<void>
+  pinokioOriginalStop?: AbortSignal
 }
 
 type ControlHandler = (
@@ -332,6 +368,12 @@ const MAX_ZIP_CHARS = MAX_FETCH_ZIP_CHARS
 const DEFAULT_MODEL_CATALOG_RESULTS = 8
 const MAX_MODEL_CATALOG_RESULTS = 25
 const DYNAMIC_ARTIFACT_CONTROL_PREFIX = 'artifact.'
+
+function controlFieldsHint(schema: Record<string, any>): string {
+  return getSchemaHintText(buildSchemaSummary(schema, {
+    requiredLimit: Number.MAX_SAFE_INTEGER, optionalLimit: Number.MAX_SAFE_INTEGER, maxChars: 0
+  })) ?? 'no input'
+}
 
 const zipFetchInputSchema = z.object({
   zipId: z.string().trim().min(1),
@@ -806,42 +848,42 @@ const pinokioAppIdSchema = z
     if (problem) ctx.addIssue({ code: z.ZodIssueCode.custom, message: problem })
   })
 
-const pinokioStatusInputSchema = z.object({}).passthrough()
-
-const pinokioSearchInputSchema = z
-  .object({
-    query: z.string().trim().max(200).optional(),
-    limit: z.number().int().min(1).max(50).optional()
+const pinokioTargetShape = {
+  machineId: z.string().refine((value) => value === 'local' || isPinokioRemoteMachineId(value), 'Choose a saved Pinokio computer.').optional(),
+  revision: z.number().int().nonnegative().optional()
+}
+function pinokioTargetSchema(shape: z.ZodRawShape, run = false) {
+  return z.object({ ...shape, ...pinokioTargetShape }).passthrough().superRefine((input, ctx) => {
+    const remote = input.machineId !== undefined && input.machineId !== 'local'
+    if ((input.machineId === undefined && input.revision !== undefined) ||
+      (input.machineId === 'local' && input.revision !== undefined && input.revision !== 0) ||
+      (remote && input.revision === 0)) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'The target revision must belong to the selected Pinokio computer.' })
+    if (run && remote && (!Number.isSafeInteger(input.revision) || !(input.revision! > 0) ||
+      typeof input.launchFingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(input.launchFingerprint))) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Read sys.pinokio.app_status with previewStart:true, then pass that saved machine revision, launchFingerprint and exact alsoStarts.' })
+    }
   })
-  .passthrough()
-
-const pinokioAppStatusInputSchema = z
-  .object({
-    appId: pinokioAppIdSchema,
-    probe: z.boolean().optional(),
-    describeApi: z.boolean().optional()
-  })
-  .passthrough()
-
-const pinokioLogsInputSchema = z
-  .object({
-    appId: pinokioAppIdSchema,
-    tail: z.number().int().min(1).max(500).optional()
-  })
-  .passthrough()
-
-const pinokioRunInputSchema = z
-  .object({
-    appId: pinokioAppIdSchema,
-    alsoStarts: z.array(pinokioAppIdSchema).max(20).optional(),
-    waitSeconds: z.number().int().min(5).max(PINOKIO_RUN_MAX_WAIT_SECONDS).optional()
-  })
-  .passthrough()
+}
+const pinokioStatusInputSchema = pinokioTargetSchema({})
+const pinokioSearchInputSchema = pinokioTargetSchema({
+  query: z.string().trim().max(200).optional(), limit: z.number().int().min(1).max(50).optional()
+})
+const pinokioAppStatusInputSchema = pinokioTargetSchema({
+  appId: pinokioAppIdSchema, probe: z.boolean().optional(), describeApi: z.boolean().optional(), previewStart: z.boolean().optional()
+})
+const pinokioLogsInputSchema = pinokioTargetSchema({
+  appId: pinokioAppIdSchema, tail: z.number().int().min(1).max(500).optional()
+})
+const pinokioRunInputSchema = pinokioTargetSchema({
+  appId: pinokioAppIdSchema, alsoStarts: z.array(pinokioAppIdSchema).max(64).optional(),
+  launchFingerprint: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  waitSeconds: z.number().int().min(5).max(PINOKIO_RUN_MAX_WAIT_SECONDS).optional()
+}, true)
 
 const goonSceneCreatorInfoInputSchema = z.object({}).passthrough()
 
 const RUNTIME_ADDON_ID_OPTIONS = [...RUNTIME_ADDON_IDS]
-const RUNTIME_ADDON_SCHEMA_HINT = `addonId (${RUNTIME_ADDON_ID_OPTIONS.join(', ')})`
+const RUNTIME_ADDON_SCHEMA_HINT = `required: \`addonId\` (${RUNTIME_ADDON_ID_OPTIONS.join(' | ')})`
 
 type ArtifactControlSeed = {
   controlId: string
@@ -858,12 +900,16 @@ type ArtifactControlSeed = {
 const ARTIFACT_ICON_REF_DESCRIPTION =
   'Structured icon picker reference from the Batshit catalog. Do not invent Lucide IDs. Safe examples: { "kind": "lucide", "id": "image" }, { "kind": "lucide", "id": "palette" }, { "kind": "lucide", "id": "sparkles" }, { "kind": "brand", "slug": "huggingface-color" }, { "kind": "brand", "slug": "comfyui-color" }, { "kind": "brand", "slug": "n8n-color" }.'
 
+const ARTIFACT_MODEL_CONFIG_HINT = 'model_config:{mode:"basic",primary:{source:"manual",modelId:"<exact modelIdForArtifact>"}} or primary:{source:"preset",presetId:"<existing owned preset>"}; primary source:"auto" uses automatic selection, source:"none" disables its model; mode:"advanced" also accepts visual/audio/utility role objects with the same sources plus source:"primary" to inherit primary; omit model_config to leave an update unchanged; null resets its config through the existing model/default resolver, not an invented fallback'
+const CLI_MANIFEST_NESTED_HINT = 'argsTemplate is a nonempty array of {kind:"literal",value:string} | {kind:"input",field:string,required?:boolean} | {kind:"option",flag:string,field:string,required?:boolean} | {kind:"flag",flag:string,field:string} | {kind:"repeat",field:string,flag?:string,required?:boolean}; each nonliteral field must exist in inputSchema.properties; arrays require repeat and repeat requires an array · inputSchema:{type:"object",properties:{<field>:{type:"string"|"number"|"boolean"|"array",items?:{type:"string"|"number"|"boolean"},required?:boolean,description?:string,enum?:(string|number|boolean)[],format?:"plain"|"path"}},required?:string[]}; array items default to string · envRefs:[{envVar:string,savedKeyRef:string}] · parseMode:"json" cannot use outputMode:"text"'
+const VOICE_ENGINE_NESTED_HINT = 'supports:{tts?:boolean,stt?:boolean,clone?:boolean}; ttsDefaults:{modelId?:string,voiceId?:string,common?:{speed?:number,volume?:number,language?:string,instructions?:string},providerOptions?:object}; sttDefaults:{modelId?:string,language?:string,providerOptions?:object}; sttModelCatalog:{models:[{id:string,label?:string,description?:string,capability?:"stt"|"tts",language?:string,filename?:string,requestModel?:string,url?:string,sizeBytes?:integer,sha256?:string,installed?:boolean,failedReason?:string,recommended?:boolean,tags?:string[]}],kind?:"file-download"|"whisper.cpp"|"custom",capability?:"stt"|"tts",modelDir?:string,activeModelId?:string,requiresRestartOnModelChange?:boolean}'
+
 const ARTIFACT_CONTROL_SEEDS: ArtifactControlSeed[] = [
   {
     controlId: 'sys.artifact.create',
     title: 'Artifact Create',
     description: 'Create a new artifact with content, metadata, zone, and structured icon_ref. For built-in AI artifacts, include model_config only when the artifact purpose clearly identifies the provider/model; prefer source "manual" with an exact modelId unless the user named an existing saved preset. Do not silently choose a fallback model.',
-    schemaHint: 'name/content + optional mode/zone/icon_ref/metadata/model_config manual modelId',
+    schemaHint: 'optional: `name`, `content`, `mode` (`edit` | `published`), `zone`, `icon_ref`, `metadata`, `model_config` (role envelope described below), `type`, `description`, `tags`, `sessionId`, `slug`, `brain_type` (`built_in` | `webhook` | `n8n_workflow` | `custom_webhook` | `pinokio_app` | `none`), `ai_enabled`, `webhook_url`, `model`, `system_prompt`, `custom_prompt`, `iconRef`, `icon`, `blueprint`' + ' · ' + ARTIFACT_MODEL_CONFIG_HINT,
     riskLevel: 'safe',
     tags: ['artifact', 'create', 'builder'],
     inputSchema: artifactCreateInputSchema,
@@ -890,7 +936,7 @@ const ARTIFACT_CONTROL_SEEDS: ArtifactControlSeed[] = [
     controlId: 'sys.artifact.list',
     title: 'Artifact List',
     description: 'List artifacts available to the current user.',
-    schemaHint: 'optional filters',
+    schemaHint: 'no input',
     riskLevel: 'safe',
     tags: ['artifact', 'list', 'discovery'],
     inputSchema: z.object({}).passthrough(),
@@ -904,7 +950,7 @@ const ARTIFACT_CONTROL_SEEDS: ArtifactControlSeed[] = [
     controlId: 'sys.artifact.get',
     title: 'Artifact Get',
     description: 'Fetch one artifact by ID.',
-    schemaHint: 'artifactId (required)',
+    schemaHint: 'required: `artifactId` · optional: `includeContent`, `includeVersions`, `includeVersionContents`',
     riskLevel: 'safe',
     tags: ['artifact', 'read'],
     inputSchema: artifactByIdInputSchema,
@@ -924,7 +970,7 @@ const ARTIFACT_CONTROL_SEEDS: ArtifactControlSeed[] = [
     controlId: 'sys.artifact.run_logs.list',
     title: 'Artifact Run Logs List',
     description: 'List recent scrubbed run logs for one artifact, including status, resolved model, transport, output counts, and last error.',
-    schemaHint: 'artifactId (required), optional limit',
+    schemaHint: 'required: `artifactId` · optional: `limit` (1 to 75)',
     riskLevel: 'safe',
     tags: ['artifact', 'logs', 'debug', 'runs'],
     inputSchema: artifactRunLogsListInputSchema,
@@ -942,7 +988,7 @@ const ARTIFACT_CONTROL_SEEDS: ArtifactControlSeed[] = [
     controlId: 'sys.artifact.run_logs.get',
     title: 'Artifact Run Logs Get',
     description: 'Fetch one scrubbed artifact run log by artifactId and runId. Logs never include API keys or raw base64 image/audio bytes.',
-    schemaHint: 'artifactId + runId',
+    schemaHint: 'required: `artifactId`, `runId`',
     riskLevel: 'safe',
     tags: ['artifact', 'logs', 'debug', 'runs'],
     inputSchema: artifactRunLogsGetInputSchema,
@@ -960,7 +1006,7 @@ const ARTIFACT_CONTROL_SEEDS: ArtifactControlSeed[] = [
     controlId: 'sys.artifact.update',
     title: 'Artifact Update',
     description: 'Update artifact metadata/content, including structured icon_ref when changing the artifact icon. Sending `content` replaces the whole page, so it must carry `expectedVersion`: the `version` of your last result that loaded the whole page or wrote your own whole content (sys.artifact.get with content, create, a content update, or add_version; your own write returns the next version to use), never an apply_patch, publish, zone, webhook, metadata, field, or rollback result, which shows the stored version of a page you may not have read in full (load the artifact again with sys.artifact.get before your next full-content write, update or add_version). If the artifact was saved after that (by the user or another agent), the update is refused and nothing is saved: load it again with sys.artifact.get, redo your edit on that content, and update with the `version` sys.artifact.get shows. An update without `content` needs no version. Existing Agent Use and agent access settings are user-owned; agents must ask the user to change them in Settings. For built-in AI artifacts, set model_config only with an exact manual modelId or a known existing preset; ask before substituting a fallback model.',
-    schemaHint: 'artifactId + content with expectedVersion (the version your last get (with content)/create/content update/add_version showed, never apply_patch)/metadata/mode/icon_ref/model_config manual modelId',
+    schemaHint: 'required: `artifactId` · with `content`, also required: `expectedVersion` (the version your last get (with content)/create/content update/add_version showed, never apply_patch) · optional: `content`, `versionDescription`, `name`, `slug`, `type`, `description`, `tags`, `metadata`, `mode` (`edit` | `published`), `zone`, `icon_ref`, `iconRef`, `icon`, `model_config` (role envelope described below), `model`, `brain_type` (`built_in` | `webhook` | `n8n_workflow` | `custom_webhook` | `pinokio_app` | `none`), `ai_enabled`, `webhook_url`, `system_prompt`, `custom_prompt`, `blueprint`, `sessionId` · agent access fields are user-owned and refused' + ' · ' + ARTIFACT_MODEL_CONFIG_HINT,
     riskLevel: 'safe',
     tags: ['artifact', 'update', 'builder'],
     inputSchema: artifactUpdateInputSchema,
@@ -995,7 +1041,7 @@ const ARTIFACT_CONTROL_SEEDS: ArtifactControlSeed[] = [
     controlId: 'sys.artifact.validate_structure',
     title: 'Artifact Validate Structure',
     description: 'Dry-run the save checks (Builder Kit, Fabric contract, field names, script syntax) without saving. Saves run the same checks and list what to fix, so use this only to test a risky edit.',
-    schemaHint: 'artifactId/content + optional metadata/mode',
+    schemaHint: 'required: `artifactId` or `content` · optional: `metadata`, `mode` (`edit` | `published`)',
     riskLevel: 'safe',
     tags: ['artifact', 'validation', 'builder', 'fabric'],
     inputSchema: artifactValidateStructureInputSchema,
@@ -1015,7 +1061,7 @@ const ARTIFACT_CONTROL_SEEDS: ArtifactControlSeed[] = [
     controlId: 'sys.artifact.apply_patch',
     title: 'Artifact Apply Patch',
     description: 'Apply an apply_patch-style diff to existing artifact content.',
-    schemaHint: 'artifactId + patch',
+    schemaHint: 'required: `artifactId`, `patch` · optional: `versionDescription`, `sessionId`',
     riskLevel: 'safe',
     tags: ['artifact', 'update', 'patch', 'builder'],
     inputSchema: artifactApplyPatchInputSchema,
@@ -1034,7 +1080,7 @@ const ARTIFACT_CONTROL_SEEDS: ArtifactControlSeed[] = [
     controlId: 'sys.artifact.publish',
     title: 'Artifact Publish',
     description: 'Publish or unpublish an artifact.',
-    schemaHint: 'artifactId + publish fields',
+    schemaHint: 'required: `artifactId` · optional: `publish` (true by default), `zone` (header | panel | trigger; null clears)',
     riskLevel: 'safe',
     tags: ['artifact', 'publish', 'zones'],
     inputSchema: artifactPublishInputSchema,
@@ -1053,7 +1099,7 @@ const ARTIFACT_CONTROL_SEEDS: ArtifactControlSeed[] = [
     controlId: 'sys.artifact.add_version',
     title: 'Artifact Add Version',
     description: 'Save `content` as a new artifact version and make it the current page. It replaces the whole page, so it must carry `expectedVersion`: the `version` of your last result that loaded the whole page or wrote your own whole content (sys.artifact.get with content, create, a content update, or add_version), never an apply_patch, publish, zone, webhook, metadata, field, or rollback result, which shows the stored version of a page you may not have read in full (load the artifact again with sys.artifact.get before your next full-content write, update or add_version). If the artifact was saved after that (by the user or another agent), nothing is saved: load it again with sys.artifact.get, redo your edit on that content, and save again with the `version` sys.artifact.get shows.',
-    schemaHint: 'artifactId + content + expectedVersion (the version your last get (with content)/create/content update/add_version showed, never apply_patch), optional description',
+    schemaHint: 'required: `artifactId`, `content`, `expectedVersion` (the version your last get (with content)/create/content update/add_version showed, never apply_patch) · optional: `description`',
     riskLevel: 'safe',
     tags: ['artifact', 'versioning'],
     inputSchema: artifactAddVersionInputSchema,
@@ -1077,7 +1123,7 @@ const ARTIFACT_CONTROL_SEEDS: ArtifactControlSeed[] = [
     controlId: 'sys.artifact.rollback',
     title: 'Artifact Rollback',
     description: 'Rollback artifact content to a previous version.',
-    schemaHint: 'artifactId + version target',
+    schemaHint: 'required: `artifactId`, `targetVersion` (integer 1 or more)',
     riskLevel: 'restricted',
     tags: ['artifact', 'versioning', 'rollback'],
     inputSchema: artifactRollbackInputSchema,
@@ -1095,7 +1141,7 @@ const ARTIFACT_CONTROL_SEEDS: ArtifactControlSeed[] = [
     controlId: 'sys.artifact.delete_version',
     title: 'Artifact Delete Version',
     description: 'Delete a stored artifact version.',
-    schemaHint: 'artifactId + version target',
+    schemaHint: 'required: `artifactId`, `version` (integer 1 or more)',
     riskLevel: 'restricted',
     tags: ['artifact', 'versioning', 'delete'],
     inputSchema: artifactDeleteVersionInputSchema,
@@ -1113,7 +1159,7 @@ const ARTIFACT_CONTROL_SEEDS: ArtifactControlSeed[] = [
     controlId: 'sys.artifact.set_webhook',
     title: 'Artifact Set Webhook',
     description: 'Set or clear the artifact webhook endpoint.',
-    schemaHint: 'artifactId + webhookUrl',
+    schemaHint: 'required: `artifactId` · optional: `webhook_url` (null clears), `ai_enabled`, `brain_type` (`built_in` | `webhook` | `n8n_workflow` | `custom_webhook` | `pinokio_app` | `none`)',
     riskLevel: 'safe',
     tags: ['artifact', 'webhook', 'brain'],
     inputSchema: artifactSetWebhookInputSchema,
@@ -1133,7 +1179,7 @@ const ARTIFACT_CONTROL_SEEDS: ArtifactControlSeed[] = [
     controlId: 'sys.artifact.set_zone',
     title: 'Artifact Set Zone',
     description: 'Set artifact workspace zone placement.',
-    schemaHint: 'artifactId + zone',
+    schemaHint: 'required: `artifactId` · optional: `zone` (`header` | `panel` | `trigger`; null clears)',
     riskLevel: 'safe',
     tags: ['artifact', 'zones', 'ui'],
     inputSchema: artifactSetZoneInputSchema,
@@ -1151,7 +1197,7 @@ const ARTIFACT_CONTROL_SEEDS: ArtifactControlSeed[] = [
     controlId: 'sys.artifact.analyze_url',
     title: 'Artifact Analyze URL',
     description: 'Analyze an external source for artifact integration planning.',
-    schemaHint: 'url (+ optional analysis flags)',
+    schemaHint: 'required: `url` (URI) · optional: `hfToken`, `githubToken`',
     riskLevel: 'safe',
     tags: ['artifact', 'analysis', 'discovery'],
     inputSchema: artifactAnalyzeUrlInputSchema,
@@ -1170,7 +1216,7 @@ const ARTIFACT_CONTROL_SEEDS: ArtifactControlSeed[] = [
     controlId: 'sys.artifact.check_requirements',
     title: 'Artifact Check Requirements',
     description: 'Check local dependency requirements for artifact builds.',
-    schemaHint: 'path/projectRoot (+ optional flags)',
+    schemaHint: 'required: `path` or `url`',
     riskLevel: 'safe',
     tags: ['artifact', 'analysis', 'dependencies'],
     inputSchema: artifactCheckRequirementsInputSchema,
@@ -1270,57 +1316,151 @@ function pinokioFailure(outcome: Extract<PinokioOutcome<unknown>, { ok: false }>
     error: outcome.message,
     kind: outcome.kind,
     ...(outcome.reason ? { reason: outcome.reason } : {}),
+    ...(outcome.code ? { code: outcome.code } : {}),
     ...(outcome.raw ? { raw: outcome.raw } : {})
   }
 }
 
-async function executePinokioStatus() {
-  return { pinokio: await detectPinokio({ fresh: true }) }
+type PinokioOrigin = { sessionId: string; messageId: string; registryStop?: AbortSignal; signal?: AbortSignal }
+function capturePinokioOrigin(options: ControlUseOptions): PinokioOrigin {
+  const sessionId = options.sessionId ?? ''
+  const messageId = options.messageId ?? getActiveStream(sessionId)?.messageId ?? ''
+  const registryStop = getOriginatingReplyStopSignal(sessionId, messageId)
+  const supplied = options.abortSignal instanceof AbortSignal ? options.abortSignal : undefined
+  return { sessionId, messageId, registryStop,
+    signal: supplied && registryStop ? AbortSignal.any([supplied, registryStop]) : supplied }
 }
 
-async function executePinokioSearch(_context: ControlExecutionContext, input: Record<string, any>) {
-  const outcome = await searchPinokioApps({ query: input.query, limit: input.limit })
-  if (!outcome.ok) return pinokioFailure(outcome)
-  return {
-    ...outcome.value,
-    ...(outcome.value.skippedRemote > 0
-      ? {
-          note: `${outcome.value.skippedRemote} app(s) from another Pinokio machine were left out: Batshit drives only the Pinokio on this computer.`
-        }
-      : {})
+async function assertPinokioActor(options: ControlUseOptions, origin: PinokioOrigin, control: ControlDefinition,
+  artifact: ArtifactRecord | null, approval: ControlApprovalAudit | null, inputHash: string): Promise<void> {
+  const binding = artifact ? readPinokioArtifactBinding(artifact) : null
+  if (artifact && !binding) throw new PinokioAdmissionError('pinokio_binding_changed', 'This artifact no longer has its saved Pinokio binding.', 403)
+  const remote = !artifact || (binding?.machineId !== undefined && binding.machineId !== 'local')
+  // Local legacy callers retain their admitted scope. The original signal, when present,
+  // still ends computation; remote execution cannot borrow that compatibility lane.
+  if (!remote) {
+    if (origin.signal?.aborted) throw new PinokioAdmissionError('pinokio_operation_cancelled', 'This reply stopped.')
+    return
+  }
+  const deny = (message = 'This Pinokio operation lost its originating actor, scope or Stop.'): never => {
+    throw new PinokioAdmissionError('pinokio_origin_changed', message, 403)
+  }
+  const checkStop = () => {
+    if (options.actorType !== 'in-process' ||
+      !(options.abortSignal instanceof AbortSignal) || !origin.registryStop || !origin.signal || origin.signal.aborted ||
+      getOriginatingReplyStopSignal(origin.sessionId, origin.messageId) !== origin.registryStop || origin.registryStop.aborted) deny()
+  }
+  checkStop()
+  if (!artifact && options.delegatedRun === true) deny('Pinokio starts belong to the Primary Agent’s approved call.')
+  const [userId, session] = await Promise.all([
+    redis.json.get(`user:${options.userId}:data`, '$.id'),
+    redis.json.get(`session:${origin.sessionId}`)
+  ])
+  if (!Array.isArray(userId) || userId.length !== 1 || userId[0] !== options.userId || !session || session.user_id !== options.userId) deny()
+  const scopeId = options.delegatedRun === true ? options.scopeAgentId : options.agentId
+  if (!scopeId) return deny()
+  // A Primary and Subagent may share an ID; use the run's own stored namespace.
+  // A deleted ordinary Subagent must not acquire the unstored built-in Worker exception.
+  const subject = await redis.json.get(`${options.delegatedRun === true ? 'subagent' : 'agent'}:${scopeId}`)
+  if (subject) {
+    if (subject.id !== scopeId || subject.user_id !== options.userId) deny()
+    const toggles = resolveBrokerToolToggles(subject.provider_specific_settings)
+    if (artifact ? !toggles.artifactRuntimeEnabled : !toggles.batshitToolsEnabled) deny('This agent’s Pinokio tool scope changed.')
+  } else if (options.delegatedRun !== true || !scopeId.startsWith('worker_')) deny()
+  // A delegated virtual Worker may have no stored subject. Its server-vouched run ceiling
+  // remains mandatory, and fresh Artifact allowlists below are evaluated by its scope id.
+  if (options.delegatedRun === true && !controlIdMatchesAllowedEntries(control.controlId, options.delegatedAllowedControlIds ?? [])) deny()
+  if (options.delegatedRun !== true && typeof session.agent_id === 'string' && session.agent_id !== options.agentId) deny()
+  if (artifact) {
+    const fresh = await new ArtifactsService().getAccessible(artifact.id, options.userId)
+    if (!fresh || fresh.user_id !== options.userId) deny()
+    const record = buildArtifactDynamicRecords(fresh!).find((entry) => entry.controlId === control.controlId)
+    if (!record || !isControlVisibleForContext({ ...control, scope: record.scope }, {
+      agentId: scopeId, runtimeMode: options.runtimeMode, forFind: false
+    })) deny('This artifact’s agent access changed.')
+  } else {
+    if (session.metadata?.group_chat?.group_id) deny('Pinokio start approval cannot be moved into a group reply.')
+    if (!approval?.approvalId || (approval.kind !== 'sdk' && approval.kind !== 'resume')) deny('This start needs its consumed server approval.')
+    const record = await getControlApproval(approval!.approvalId!)
+    if (!record || record.status !== 'consumed' || record.userId !== options.userId || record.agentId !== options.agentId ||
+      record.sessionId !== origin.sessionId || record.controlId !== control.controlId || record.inputHash !== inputHash) deny('This start no longer matches its consumed approval.')
+  }
+  checkStop()
+}
+
+function pinokioTarget(context: ControlExecutionContext, input: Record<string, any>) {
+  return { userId: context.userId,
+    ...(input.machineId !== undefined ? { machineId: input.machineId } : {}),
+    ...(input.revision !== undefined ? { revision: input.revision } : {}),
+    ...(context.abortSignal ? { signal: context.abortSignal } : {}) }
+}
+async function pinokioMachineSummaries(userId: string) {
+  try {
+    return { machines: (await pinokioMachineService.list(userId)).map(({ id, label, revision, bindingState }) => ({ id, label, revision, bindingState })) }
+  } catch {
+    return { machines: null, machinesError: { code: 'pinokio_machine_registry_unavailable', message: 'Batshit could not read the saved Pinokio computers. Retry.' } }
   }
 }
+async function executePinokioStatus(context: ControlExecutionContext, input: Record<string, any>) {
+  const summaries = await pinokioMachineSummaries(context.userId)
+  if (input.machineId === undefined) return { pinokio: await detectPinokio({ fresh: true }), ...summaries }
+  const result = await getPinokioTargetStatus(pinokioTarget(context, input))
+  return { pinokio: result.ok ? result.value : { available: false, machineId: input.machineId, machineRevision: input.revision, code: result.code, message: result.message }, ...summaries }
+}
 
-async function executePinokioAppStatus(_context: ControlExecutionContext, input: Record<string, any>) {
-  const outcome = await getPinokioAppStatus({ appId: input.appId, probe: input.probe })
+async function executePinokioSearch(context: ControlExecutionContext, input: Record<string, any>) {
+  const outcome = await searchPinokioApps({ ...pinokioTarget(context, input), query: input.query, limit: input.limit })
   if (!outcome.ok) return pinokioFailure(outcome)
-  if (input.describeApi !== true) return { app: outcome.value }
-  // SA-072 P2: what the app's own API looks like, for writing a Pinokio app artifact's recipe.
-  const baseUrl = outcome.value.state === 'online' && outcome.value.probe !== false ? pinokioReadyUrlToBase(outcome.value.readyUrl) : null
-  if (!baseUrl) {
-    return {
-      app: outcome.value,
-      api: null,
-      apiNote: `${outcome.value.title} must be running (and answer at a local address) to describe its API. Start it with sys.pinokio.run.`
+  return { ...outcome.value, ...(outcome.value.skippedRemote > 0
+    ? { note: `${outcome.value.skippedRemote} peer app(s) were left out; choose an app installed on the selected saved computer.` } : {}) }
+}
+
+async function executePinokioAppStatus(context: ControlExecutionContext, input: Record<string, any>) {
+  const requestedTarget = pinokioTarget(context, input)
+  const outcome = await getPinokioAppStatus({ ...requestedTarget, appId: input.appId, probe: input.probe })
+  if (!outcome.ok) return pinokioFailure(outcome)
+  const target = { ...requestedTarget, ...(outcome.value.machineId ? { machineId: outcome.value.machineId, revision: outcome.value.machineRevision } : {}) }
+  const result: Record<string, any> = { app: outcome.value }
+  if (input.previewStart === true) {
+    const startPreview = await previewPinokioAppStart({ ...target, appId: input.appId })
+    if (startPreview.ok) result.startPreview = startPreview.value
+    else result.startPreviewError = { code: startPreview.code ?? startPreview.kind, message: startPreview.message }
+  }
+  if (input.describeApi !== true) return result
+  if (input.machineId !== undefined && input.machineId !== 'local') {
+    const endpoint = await resolvePinokioAppEndpoint(input.appId, target)
+    if (!endpoint.ok) return { ...result, api: null, apiNote: endpoint.message }
+    if (!endpoint.fetch || endpoint.machineId !== target.machineId || endpoint.machineRevision !== target.revision) {
+      return { ...result, api: null, apiNote: 'The remote app did not return its bound computer reader. Nothing was retargeted.' }
     }
+    return { ...result, api: await describePinokioAppApi(endpoint.baseUrl, endpoint.fetch, { machineId: endpoint.machineId }) }
   }
-  return { app: outcome.value, api: await describePinokioAppApi(baseUrl) }
+  const baseUrl = outcome.value.state === 'online' && outcome.value.probe !== false ? pinokioReadyUrlToBase(outcome.value.readyUrl) : null
+  if (!baseUrl) return { ...result, api: null, apiNote: `${outcome.value.title} must be running (and answer at a local address) to describe its API. Start it with sys.pinokio.run.` }
+  return { ...result, api: await describePinokioAppApi(baseUrl) }
 }
 
-async function executePinokioLogs(_context: ControlExecutionContext, input: Record<string, any>) {
-  const outcome = await getPinokioAppLogs({ appId: input.appId, tail: input.tail })
-  if (!outcome.ok) return pinokioFailure(outcome)
-  return { logs: outcome.value }
+async function executePinokioLogs(context: ControlExecutionContext, input: Record<string, any>) {
+  const outcome = await getPinokioAppLogs({ ...pinokioTarget(context, input), appId: input.appId, tail: input.tail })
+  return outcome.ok ? { logs: outcome.value } : pinokioFailure(outcome)
 }
 
-async function executePinokioRun(_context: ControlExecutionContext, input: Record<string, any>) {
-  const outcome = await startPinokioApp({
-    appId: input.appId,
-    alsoStarts: input.alsoStarts,
-    waitSeconds: input.waitSeconds
-  })
-  if (!outcome.ok) return pinokioFailure(outcome)
-  return { run: outcome.value }
+async function executePinokioRun(context: ControlExecutionContext, input: Record<string, any>) {
+  if (input.machineId === undefined || input.machineId === 'local') {
+    const outcome = await startPinokioApp({ appId: input.appId, alsoStarts: input.alsoStarts, waitSeconds: input.waitSeconds })
+    return outcome.ok ? { run: outcome.value } : pinokioFailure(outcome)
+  }
+  if (!context.pinokioNativeAdmission) throw new PinokioAdmissionError('pinokio_admission_required', 'Remote starts need their server-owned actor and consumed approval.', 403)
+  const operation = ownPinokioOperation({ signal: context.pinokioOriginalStop, admit: context.pinokioNativeAdmission })
+  try {
+    await operation.assert()
+    const outcome = await startPinokioApp({ ...pinokioTarget(context, input), appId: input.appId, alsoStarts: input.alsoStarts,
+      waitSeconds: input.waitSeconds, launchFingerprint: input.launchFingerprint, signal: operation.signal,
+      admitStart: async () => { try { await operation.assert(); return true } catch { return false } } })
+    if (!outcome.ok) return pinokioFailure(outcome)
+    forgetPinokioAppEndpoint()
+    return { run: outcome.value }
+  } finally { operation.close() }
 }
 
 // ---------------------------------------------------------------------------
@@ -1369,6 +1509,7 @@ const memorySearchControlSchema = z
     query: z.string().trim().min(2),
     lane: z.string().optional(),
     include_superseded: z.boolean().optional(),
+    include_expired: z.boolean().optional(),
     event_from: z.string().optional(),
     event_to: z.string().optional(),
     saved_from: z.string().optional(),
@@ -1381,6 +1522,7 @@ const memoryListControlSchema = z
   .object({
     lane: z.string().optional(),
     include_superseded: z.boolean().optional(),
+    include_expired: z.boolean().optional(),
     limit: z.number().int().min(1).max(100).optional()
   })
   .passthrough()
@@ -1407,7 +1549,8 @@ const memoryMoveLaneControlSchema = z
 
 const memoryRecallControlSchema = z
   .object({
-    memoryIds: z.array(z.string().trim().min(1)).min(1).max(8)
+    memoryIds: z.array(z.string().trim().min(1)).min(1).max(8),
+    include_expired: z.boolean().optional()
   })
   .passthrough()
 
@@ -1439,7 +1582,7 @@ const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
         linger: { type: ['integer', 'string'], description: 'stm only: turns this memory stays inserted after its last trigger mention (0-30), or "episode" to hold for the rest of the current episode. Omit to use the agent\'s trigger linger default.' },
         importance: { type: 'number', minimum: 1, maximum: 10, description: 'Placement + ranking weight (default 5).' },
         event_at: { type: 'string', description: 'ISO timestamp of when the fact was true (if different from now).' },
-        expires_at: { type: 'string', description: 'ISO timestamp when this memory should stop being inserted (it demotes, never erases).' },
+        expires_at: { type: 'string', description: 'ISO timestamp when this memory expires. Expired records remain available only through explicit include_expired lookup.' },
         links: { type: 'array', items: { type: 'string' }, description: 'Related memory ids.' },
         clip_ids: { type: 'array', items: { type: 'string' }, description: 'Clip ids to copy into memory-owned images at save time.' },
         media_mode: { type: 'string', enum: ['on_recall', 'always'], description: 'Image delivery: on_recall (default), or always for Awareness only.' },
@@ -1448,7 +1591,7 @@ const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
       required: ['lane', 'content']
     },
     outputSchema: null,
-    schemaHint: 'lane + content (required); stm needs trigger_terms; optional importance/expiry/supersedes',
+    schemaHint: "required: `lane` (`awareness` | `stm` | `ltm`), `content` · `stm` also needs: `trigger_terms` · optional: the save block's other fields · returns the new id and warns about near-duplicates",
     riskLevel: 'safe',
     actsAsAgent: true,
     status: 'published',
@@ -1470,6 +1613,7 @@ const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
         query: { type: 'string' },
         lane: { type: 'string', enum: ['awareness', 'stm', 'ltm'] },
         include_superseded: { type: 'boolean', description: 'Default true (superseded results are flagged and demoted, never hidden).' },
+        include_expired: { type: 'boolean', default: false, description: 'Include expired memories for explicit historical lookup. Deleted Memories remain hidden.' },
         event_from: { type: 'string', description: 'ISO lower bound on when the remembered fact was true.' },
         event_to: { type: 'string' },
         saved_from: { type: 'string', description: 'ISO lower bound on when the memory was saved.' },
@@ -1479,7 +1623,7 @@ const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
       required: ['query']
     },
     outputSchema: null,
-    schemaHint: 'query (required) + optional lane/time-range/limit filters',
+    schemaHint: "required: `query` (2 or more characters) · optional: `lane`, `include_superseded` (`true` by default), `include_expired` (`false` by default), `event_from` / `event_to` (when the fact was true), `saved_from` / `saved_to` (when it was saved), `limit` (1 to 25) · dates are ISO; a bare date means that whole day",
     riskLevel: 'safe',
     actsAsAgent: true,
     status: 'published',
@@ -1499,11 +1643,12 @@ const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
       properties: {
         lane: { type: 'string', enum: ['awareness', 'stm', 'ltm'] },
         include_superseded: { type: 'boolean' },
+        include_expired: { type: 'boolean', default: false, description: 'Include expired memories for explicit historical lookup. Deleted Memories remain hidden.' },
         limit: { type: 'integer', minimum: 1, maximum: 100 }
       }
     },
     outputSchema: null,
-    schemaHint: 'optional lane/include_superseded/limit',
+    schemaHint: "optional: `lane`, `include_superseded` (`true` by default), `include_expired` (`false` by default), `limit` (1 to 100) · newest first",
     riskLevel: 'safe',
     actsAsAgent: true,
     status: 'published',
@@ -1537,7 +1682,7 @@ const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
       required: ['memoryId']
     },
     outputSchema: null,
-    schemaHint: 'memoryId (required) + fields to change',
+    schemaHint: "required: `memoryId` · optional: any save field to change except `lane` (use move_lane) and `supersedes` (use supersede); null clears any of them except `content` and `importance`",
     riskLevel: 'safe',
     actsAsAgent: true,
     status: 'published',
@@ -1562,7 +1707,7 @@ const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
       required: ['memoryId', 'supersedes']
     },
     outputSchema: null,
-    schemaHint: 'memoryId + supersedes[] (both required)',
+    schemaHint: "required: `memoryId` (the one that stays current), `supersedes` (the ids it replaces)",
     riskLevel: 'safe',
     actsAsAgent: true,
     status: 'published',
@@ -1585,7 +1730,7 @@ const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
       required: ['memoryId']
     },
     outputSchema: null,
-    schemaHint: 'memoryId (required)',
+    schemaHint: "required: `memoryId`",
     riskLevel: 'safe',
     actsAsAgent: true,
     status: 'published',
@@ -1610,7 +1755,7 @@ const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
       required: ['memoryId', 'lane']
     },
     outputSchema: null,
-    schemaHint: 'memoryId + lane (both required)',
+    schemaHint: "required: `memoryId`, `lane` (`awareness` | `stm` | `ltm`; moving to `stm` needs trigger terms)",
     riskLevel: 'safe',
     actsAsAgent: true,
     status: 'published',
@@ -1624,17 +1769,18 @@ const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
     executorType: 'internal_handler',
     title: 'Memory Recall',
     description:
-      'Read chosen memories in full: the complete content returns immediately in this tool result (which never enters chat history), and the same memories then ride your Memory context from the next message onward, lingering per the linger settings. Supported API models and Codex CLI receive recalled images during this same reply, either in the tool result or in a follow-up model input within this reply — look at them now. Claude CLI and other deferred images use the next-message remembered_media path. Each row\'s media_note says which happened. Search hits alone are just references; recall is the read.',
+      'Read chosen memories in full now; this tool result never enters chat history. Eligible non-expired memories can linger in Memory context on later messages. Set include_expired=true only for explicit historical lookup: expired memories never enter later context. Supported API models can receive recalled images during this reply; delivery depends on the model/runtime and each row\'s media_note. Expired images are never deferred to a later message.',
     inputSchema: memoryRecallControlSchema,
     inputSchemaJson: {
       type: 'object',
       properties: {
-        memoryIds: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 8 }
+        memoryIds: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 8 },
+        include_expired: { type: 'boolean', default: false, description: 'Read expired memories now without queuing them for later context.' }
       },
       required: ['memoryIds']
     },
     outputSchema: null,
-    schemaHint: 'memoryIds[] (1-8, required)',
+    schemaHint: "required: `memoryIds` (1 to 8) · optional: `include_expired` (`false` by default)",
     riskLevel: 'safe',
     actsAsAgent: true,
     status: 'published',
@@ -1648,7 +1794,7 @@ const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
     executorType: 'internal_handler',
     title: 'Memory Delete',
     description:
-      'Permanently delete one memory. This is the only true delete in the memory system — prefer supersede (keeps history) unless the memory is wrong or unwanted outright.',
+      'Move one memory to Deleted Memories. The user can restore it or permanently empty that section in Settings → Memory.',
     inputSchema: memoryByIdControlSchema,
     inputSchemaJson: {
       type: 'object',
@@ -1658,8 +1804,8 @@ const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
       required: ['memoryId']
     },
     outputSchema: null,
-    schemaHint: 'memoryId (required)',
-    riskLevel: 'confirm',
+    schemaHint: "required: `memoryId` · moves it to the user's Deleted Memories",
+    riskLevel: 'safe',
     actsAsAgent: true,
     status: 'published',
     tags: ['memory', 'delete'],
@@ -1705,43 +1851,13 @@ const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
       }
     },
     outputSchema: null,
-    schemaHint: 'hold_until (ISO timestamp or null)',
+    schemaHint: "required to hold: `hold_until` (an ISO time) · null or leaving it out clears the hold",
     riskLevel: 'safe',
     actsAsAgent: true,
     status: 'published',
     tags: ['memory', 'episode', 'fixed-session'],
     handler: async (context, input) =>
       runMemoryControl(() => holdEpisodeOp(memoryControlContext(context), input as never))
-  },
-  {
-    controlId: 'sys.memory.whiteboard',
-    sourceType: 'core',
-    executorType: 'internal_handler',
-    title: 'Episode Whiteboard',
-    description:
-      'Infinite Sessions only: rewrite the episode whiteboard — the working-facts block (current goal, key decisions, live state, open items) that arrives with every current message until the episode closes. Pass the complete new content (it replaces the whole whiteboard), or null to clear it. When the episode closes, the whiteboard dissolves but its final content is kept on the episode record.',
-    inputSchema: z
-      .object({
-        content: z.string().nullable().optional()
-      })
-      .passthrough(),
-    inputSchemaJson: {
-      type: 'object',
-      properties: {
-        content: {
-          type: ['string', 'null'],
-          description: 'The complete new whiteboard content; null clears the whiteboard.'
-        }
-      }
-    },
-    outputSchema: null,
-    schemaHint: 'content (full replacement text, or null to clear)',
-    riskLevel: 'safe',
-    actsAsAgent: true,
-    status: 'published',
-    tags: ['memory', 'episode', 'whiteboard', 'fixed-session'],
-    handler: async (context, input) =>
-      runMemoryControl(() => updateWhiteboardOp(memoryControlContext(context), input as never))
   }
 ]
 
@@ -1817,7 +1933,7 @@ const DM_CONTROL_DEFINITIONS: ControlDefinition[] = [
         requested_outcome: { type: 'string', description: 'Required for assignment: what "done" looks like.' },
         scope: { type: 'string', description: 'Required for assignment: what is in and out of bounds.' },
         report_back_to: { type: 'string', description: 'Required for assignment: the agent id that gets the result.' },
-        deliver: { type: 'string', enum: ['wait', 'wake', 'steer'], description: 'wait (default behaviour) leaves it in their inbox; wake asks Batshit to start a turn now; steer lands it inside the reply they are writing right now.' },
+        deliver: { type: 'string', enum: ['wait', 'wake', 'steer'], description: 'Required. wait leaves it in their inbox (right for almost every DM); wake asks Batshit to start a turn now; steer lands it inside the reply they are writing right now.' },
         steer_fallback: { type: 'string', enum: ['wait', 'wake'], description: 'deliver "steer" only: what to do when they are not mid-reply. Default wait.' },
         result_delivery: { type: 'string', enum: ['wait', 'wake'], description: 'assignment only: how the eventual result reaches you. Default wait.' },
         related_dm_id: { type: 'string', description: 'Required for result: the assignment this answers.' },
@@ -1826,8 +1942,7 @@ const DM_CONTROL_DEFINITIONS: ControlDefinition[] = [
       required: ['to', 'kind', 'subject', 'body', 'deliver']
     },
     outputSchema: null,
-    schemaHint:
-      'to + kind + subject + body + deliver (wait | wake | steer); assignment also needs requested_outcome, scope, report_back_to',
+    schemaHint: "required: `to` (an agent id, or `\"all\"` for an info note to every agent that takes one from you, wait only), `kind` (`info` | `assignment` | `result`), `subject` (one line), `body` (text; name a clip id or a path instead of attaching), `deliver` (`wait` | `wake` | `steer`) · an assignment also needs: `requested_outcome` (what done looks like), `scope` (what is in and out of bounds), `report_back_to` (who gets the result) · a result also needs: `related_dm_id` · optional: `steer_fallback` (`wait` | `wake`), `result_delivery` (`wait` | `wake`), `priority` (`normal` | `urgent`), `expires_in_hours` (1 to 720)",
     riskLevel: 'safe',
     actsAsAgent: true,
     status: 'published',
@@ -1850,7 +1965,7 @@ const DM_CONTROL_DEFINITIONS: ControlDefinition[] = [
       }
     },
     outputSchema: null,
-    schemaHint: 'optional include_done',
+    schemaHint: "optional: `include_done` (also closed and expired items)",
     riskLevel: 'safe',
     actsAsAgent: true,
     status: 'published',
@@ -1872,7 +1987,7 @@ const DM_CONTROL_DEFINITIONS: ControlDefinition[] = [
       required: ['dm_id']
     },
     outputSchema: null,
-    schemaHint: 'dm_id',
+    schemaHint: "required: `dm_id` · reading an info note also closes it",
     riskLevel: 'safe',
     actsAsAgent: true,
     status: 'published',
@@ -1894,7 +2009,7 @@ const DM_CONTROL_DEFINITIONS: ControlDefinition[] = [
       required: ['dm_id']
     },
     outputSchema: null,
-    schemaHint: 'dm_id',
+    schemaHint: "required: `dm_id` · takes an assignment; one at a time",
     riskLevel: 'safe',
     actsAsAgent: true,
     status: 'published',
@@ -1919,7 +2034,7 @@ const DM_CONTROL_DEFINITIONS: ControlDefinition[] = [
       required: ['dm_id', 'result']
     },
     outputSchema: null,
-    schemaHint: 'dm_id + result',
+    schemaHint: "required: `dm_id`, `result` · for an assignment, `result` IS the answer sent back",
     riskLevel: 'safe',
     actsAsAgent: true,
     status: 'published',
@@ -1944,7 +2059,7 @@ const DM_CONTROL_DEFINITIONS: ControlDefinition[] = [
       required: ['dm_id', 'result']
     },
     outputSchema: null,
-    schemaHint: 'dm_id + result',
+    schemaHint: "required: `dm_id`, `result` · what stopped you and what would unblock it",
     riskLevel: 'safe',
     actsAsAgent: true,
     status: 'published',
@@ -1962,7 +2077,7 @@ const DM_CONTROL_DEFINITIONS: ControlDefinition[] = [
     inputSchema: z.object({}).passthrough(),
     inputSchemaJson: { type: 'object', properties: {} },
     outputSchema: null,
-    schemaHint: 'no input',
+    schemaHint: "no input · shows who is idle, running, or waiting on approval.",
     riskLevel: 'safe',
     actsAsAgent: true,
     status: 'published',
@@ -2102,7 +2217,7 @@ const JUDGE_CONTROL_DEFINITIONS: ControlDefinition[] = [
       required: ['state', 'questions']
     },
     outputSchema: null,
-    schemaHint: 'state (string | object | array) + questions {id: {type: noul | choice | score, instructions, criteria}}; optional model',
+    schemaHint: 'required: `state` (string | object | array), `questions` (map of ids to {type: noul | choice | score, instructions, criteria}) · choice needs criteria options; score needs criteria levels; noul criteria is optional · optional: `model` (configured judge model id; omit to use it)',
     riskLevel: 'safe',
     actsAsAgent: false,
     status: 'published',
@@ -2132,7 +2247,7 @@ const SCHEDULE_CONTROL_DEFINITIONS: ControlDefinition[] = [
     inputSchema: z.object({}).passthrough(),
     inputSchemaJson: { type: 'object', properties: {} },
     outputSchema: null,
-    schemaHint: 'no input',
+    schemaHint: "no input",
     riskLevel: 'safe',
     actsAsAgent: true,
     status: 'published',
@@ -2180,7 +2295,7 @@ const SCHEDULE_CONTROL_DEFINITIONS: ControlDefinition[] = [
       required: ['name', 'cadence', 'message']
     },
     outputSchema: null,
-    schemaHint: 'name + cadence + message; optional time_zone, kind, deliver',
+    schemaHint: "required: `name`, `cadence`, `message` (written to your future self) · optional: `time_zone`, `kind` (`info` by default | `assignment`), `deliver` (`wake` by default | `wait`)",
     riskLevel: 'confirm',
     actsAsAgent: true,
     status: 'published',
@@ -2216,7 +2331,7 @@ const SCHEDULE_CONTROL_DEFINITIONS: ControlDefinition[] = [
       required: ['schedule_id']
     },
     outputSchema: null,
-    schemaHint: 'schedule_id + whatever you are changing',
+    schemaHint: "required: `schedule_id` · optional: any create field, `enabled` (`false` pauses it, `true` restarts it from now)",
     riskLevel: 'confirm',
     actsAsAgent: true,
     status: 'published',
@@ -2240,7 +2355,7 @@ const SCHEDULE_CONTROL_DEFINITIONS: ControlDefinition[] = [
       required: ['schedule_id']
     },
     outputSchema: null,
-    schemaHint: 'schedule_id',
+    schemaHint: "required: `schedule_id`",
     riskLevel: 'confirm',
     actsAsAgent: true,
     status: 'published',
@@ -2257,6 +2372,11 @@ const PINOKIO_APP_ID_PROPERTY = {
   description: 'The installed app folder id from sys.pinokio.search, for example comfy.git. Not a URL, a pinokio:// ref, or id@host.'
 } as const
 
+const PINOKIO_TARGET_PROPERTIES = {
+  machineId: { type: 'string', description: 'Saved computer id from sys.pinokio.status; omit for This computer. Never a host/address.' },
+  revision: { type: 'integer', description: 'The selected machineRevision returned by a fresh read; required for remote run.' }
+} as const
+
 /**
  * SA-072 P1 (DL-08): five controls, broad Batshit Tools scope (`sys.pinokio.*` in
  * `BROKER_FABRIC_BATSHIT_TOOLS_CONTROL_IDS`), so Subagents and Workers never get them. They act for
@@ -2270,16 +2390,16 @@ const PINOKIO_CONTROL_DEFINITIONS: ControlDefinition[] = [
     executorType: 'internal_handler',
     title: 'Pinokio Status',
     description:
-      'Report whether Pinokio, the optional local app launcher, is installed and running on this computer: its version (8.2.0 or newer is required), its home folder, and its pterm command. Pinokio is optional; when it is not detected, say so and carry on without it.',
+      'Report whether Pinokio, the optional local app launcher, is installed and running on the selected saved computer (omit machineId for This computer): its version (8.2.0 or newer is required), its home folder, and its pterm command. Also returns saved machine IDs/labels/revisions so you can select a remote computer without guessing. Remote mode needs Pinokio only on that server. Local Pinokio is optional.',
     inputSchema: pinokioStatusInputSchema,
-    inputSchemaJson: { type: 'object', properties: {} },
+    inputSchemaJson: { type: 'object', properties: { ...PINOKIO_TARGET_PROPERTIES } },
     outputSchema: null,
-    schemaHint: 'no input',
+    schemaHint: 'optional: `machineId` (saved id; omitted means This computer), `revision` (saved machine revision)',
     riskLevel: 'safe',
     actsAsAgent: false,
     status: 'published',
     tags: ['pinokio', 'local', 'apps', 'launcher', 'status'],
-    handler: async () => await executePinokioStatus()
+    handler: async (context, input) => await executePinokioStatus(context, input)
   },
   {
     controlId: 'sys.pinokio.search',
@@ -2287,17 +2407,18 @@ const PINOKIO_CONTROL_DEFINITIONS: ControlDefinition[] = [
     executorType: 'internal_handler',
     title: 'Pinokio Search',
     description:
-      'List the apps installed in Pinokio on this computer, optionally filtered by words (for example "comfyui" or "speech"). Returns each app\'s folder id (appId), title, and state (offline, starting, online) with its ready URL. Never installs or downloads anything.',
+      'List the apps installed in Pinokio on the selected saved computer (omit machineId for This computer), optionally filtered by words (for example "comfyui" or "speech"). Returns each app\'s folder id (appId), title, and state (offline, starting, online) with its ready URL. Never installs or downloads anything.',
     inputSchema: pinokioSearchInputSchema,
     inputSchemaJson: {
       type: 'object',
       properties: {
+        ...PINOKIO_TARGET_PROPERTIES,
         query: { type: 'string', description: 'Optional words to match; leave out to list every installed app.' },
         limit: { type: 'number', description: 'Optional, 1-50.' }
       }
     },
     outputSchema: null,
-    schemaHint: 'optional query, optional limit (1-50)',
+    schemaHint: 'optional: `machineId` (saved id), `revision`, `query` (up to 200 characters), `limit` (1 to 50)',
     riskLevel: 'safe',
     actsAsAgent: false,
     status: 'published',
@@ -2315,14 +2436,16 @@ const PINOKIO_CONTROL_DEFINITIONS: ControlDefinition[] = [
     inputSchemaJson: {
       type: 'object',
       properties: {
+        ...PINOKIO_TARGET_PROPERTIES,
         appId: PINOKIO_APP_ID_PROPERTY,
         probe: { type: 'boolean', description: 'Check that the app answers at its URL (default true).' },
+        previewStart: { type: 'boolean', description: 'Return startPreview: exact observed alsoStarts, machineRevision and launchFingerprint for an approved remote run.' },
         describeApi: { type: 'boolean', description: 'Also describe the running app\'s own API (Gradio endpoints, or ComfyUI).' }
       },
       required: ['appId']
     },
     outputSchema: null,
-    schemaHint: 'appId (from sys.pinokio.search), optional probe, optional describeApi',
+    schemaHint: 'required: `appId` (installed folder id) · optional: `machineId` (saved id), `revision`, `probe` (true by default), `describeApi` (false by default), `previewStart` (true returns exact remote run approval fields)',
     riskLevel: 'safe',
     actsAsAgent: false,
     status: 'published',
@@ -2340,13 +2463,14 @@ const PINOKIO_CONTROL_DEFINITIONS: ControlDefinition[] = [
     inputSchemaJson: {
       type: 'object',
       properties: {
+        ...PINOKIO_TARGET_PROPERTIES,
         appId: PINOKIO_APP_ID_PROPERTY,
         tail: { type: 'number', description: 'How many lines, 1-500 (default 50).' }
       },
       required: ['appId']
     },
     outputSchema: null,
-    schemaHint: 'appId (from sys.pinokio.search), optional tail (1-500)',
+    schemaHint: 'required: `appId` (installed folder id) · optional: `machineId` (saved id), `revision`, `tail` (1 to 500; 50 by default)',
     riskLevel: 'safe',
     actsAsAgent: false,
     status: 'published',
@@ -2358,23 +2482,25 @@ const PINOKIO_CONTROL_DEFINITIONS: ControlDefinition[] = [
     sourceType: 'core',
     executorType: 'internal_handler',
     title: 'Pinokio Run',
-    description: `Start one installed Pinokio app on this computer; the user approves every start. It waits up to ${PINOKIO_RUN_DEFAULT_WAIT_SECONDS} s (waitSeconds, 5-${PINOKIO_RUN_MAX_WAIT_SECONDS}) for the app to answer at its URL. An app still starting after that keeps starting in Pinokio: check it with sys.pinokio.app_status. An app that is already running is left alone. If the app's launcher also starts other apps (PINOKIO_SCRIPT_REQUIRES), name them in alsoStarts so the approval shows them. Never installs, downloads, stops, or deletes anything.`,
+    description: `Start one installed Pinokio app on the selected saved computer (omit machineId for This computer); the user approves every start. It waits up to ${PINOKIO_RUN_DEFAULT_WAIT_SECONDS} s (waitSeconds, 5-${PINOKIO_RUN_MAX_WAIT_SECONDS}) for the app to answer at its URL. An app still starting after that keeps starting in Pinokio: check it with sys.pinokio.app_status. An app that is already running is left alone. If the app's launcher also starts other apps (PINOKIO_SCRIPT_REQUIRES), name them in alsoStarts so the approval shows them. Never installs, downloads, stops, or deletes anything.`,
     inputSchema: pinokioRunInputSchema,
     inputSchemaJson: {
       type: 'object',
       properties: {
+        ...PINOKIO_TARGET_PROPERTIES,
         appId: PINOKIO_APP_ID_PROPERTY,
         alsoStarts: {
           type: 'array',
           items: { type: 'string' },
           description: 'Only when the app requires other apps: every app folder id its start also starts.'
         },
+        launchFingerprint: { type: 'string', description: 'For remote run: copy the fresh app_status previewStart launchFingerprint exactly; do not invent it.' },
         waitSeconds: { type: 'number', description: `Optional, 5-${PINOKIO_RUN_MAX_WAIT_SECONDS} (default ${PINOKIO_RUN_DEFAULT_WAIT_SECONDS}).` }
       },
       required: ['appId']
     },
     outputSchema: null,
-    schemaHint: `appId (from sys.pinokio.search); alsoStarts only when the app requires others; optional waitSeconds (5-${PINOKIO_RUN_MAX_WAIT_SECONDS})`,
+    schemaHint: `required: \`appId\` (installed folder id) · remote run also needs: \`machineId\`, \`revision\`, \`launchFingerprint\` from app_status previewStart and exact \`alsoStarts\` · optional: \`alsoStarts\` (up to 64 installed folder ids), \`waitSeconds\` (5 to ${PINOKIO_RUN_MAX_WAIT_SECONDS}; ${PINOKIO_RUN_DEFAULT_WAIT_SECONDS} by default)`,
     riskLevel: 'confirm',
     actsAsAgent: false,
     status: 'published',
@@ -2402,9 +2528,8 @@ const APP_ACTION_CONTROL_DEFINITIONS: ControlDefinition[] = P1_APP_ACTION_DESCRI
       requestId: { type: 'string', maxLength: 128, description: 'Unique request ID; identical retries retrieve the receipt and never repeat effects.' },
       targetDocumentId: { type: 'string', maxLength: 128, description: 'Exact registrationId from an ambiguous_target documents entry; omit only for a unique eligible tab.' },
       args: action.inputSchema
-    } }, outputSchema: null, schemaHint: action.id === 'settings.open'
-      ? 'requestId, args.tab; own/specific Agents require args.agentId=the requested Primary ID; omit only for generic Agents view. Optional targetDocumentId selects the window, not the agent.'
-      : 'requestId, args; optional targetDocumentId for exact targeting',
+    } }, outputSchema: null,
+    schemaHint: `required: \`requestId\` (up to 128 characters), \`args\` (${controlFieldsHint(action.inputSchema)}) · optional: \`targetDocumentId\` (exact window registrationId, up to 128 characters)${action.id === 'settings.open' ? ' · args.tab=agents accepts args.agentId (requested Primary ID; omit only for generic Agents view); tab=models accepts modelId; tab=artifacts accepts artifactId; tab=tools accepts toolsTab; each target field is valid only with its matching tab' : ''}`,
     riskLevel: 'safe', actsAsAgent: true, status: 'published', tags: ['App Actions', 'ui', ...action.effects],
     handler: (context, input) => executeAgentAppAction(context, { requestId: input.requestId, actionId: action.id,
       args: input.args, ...(input.targetDocumentId ? { targetDocumentId: input.targetDocumentId } : {}) })
@@ -2426,17 +2551,54 @@ const SETTINGS_APP_ACTION_CONTROL_DEFINITIONS: ControlDefinition[] = SETTINGS_AC
       try { parseSettingsAction(id, args) }
       catch { context.addIssue({ code: 'custom', message: 'Arguments do not match this fixed Settings action.' }) }
     }), inputSchemaJson: action.inputSchema, outputSchema: null,
-    schemaHint: id === 'settings.inspect' ? 'tab; subjectAgentId only for agents or memory'
-      : id.endsWith('.update') ? 'subjectAgentId, expectedRevision from read, exact changes'
-        : 'subjectAgentId: the acting Primary Agent only',
+    schemaHint: `${id.endsWith('.update') ? 'required: `subjectAgentId`, `expectedRevision`, `changes`' : controlFieldsHint(action.inputSchema)} · subjectAgentId names the acting Primary only${id === 'settings.inspect' ? ' (only for agents or memory)' : id === 'settings.agent.identity.update' ? '; expectedRevision comes from the latest read; changes:{displayName:string1..200}' : id === 'settings.agent.memory.update' ? '; expectedRevision comes from the latest read; changes is a nonempty subset of {onMyMind:integer0..20000,triggers:integer0..20000,recalled:integer0..20000,triggerLingerTurns:integer0..8,recallLingerTurns:integer0..8}' : ''}`,
     riskLevel: action.risk, actsAsAgent: true, status: 'published', tags: ['App Actions', 'ui', 'settings'],
     handler: (context, input) => executeAgentSettingsAction(context, id, input)
   }
 })
 
+const SETTINGS_REPORT_HINT = 'optional: `domain` ("agent-settings" by default | "skill-access" | "runtime-inspection"), `targets`:{subjects:[{kind:"primary"|"subagent"|"group"|"worker",id:string}]} OR {allAgents:true,except?:[{kind,id}]}, `focus`:[' + MANAGED_SETTINGS_REPORT_SCHEMA.properties.focus.items.enum.join(' | ') + '], `detail` ("summary" | "values" | "choices") · runtime-inspection accepts ONLY {domain:"runtime-inspection"} · held continuation accepts ONLY {reportId,cursor} · skill-access uses query:{skillIds?:string[1..32]} and no focus · model choices: focus:["agent.model.selection"],detail:"choices",query:{presetText?:string<=128,presetOffset?:integer0..10000} · named copy choices: focus:["agent.model.preset-copy"],detail:"choices",query:{sourcePresetId:string} · reply-voice choices: focus:["agent.voice.tts-selection"],detail:"choices",query:{ttsProviderId?:string,ttsModelId?:string,ttsProfileId?:string,ttsOffset?:integer0..10000}; local configured choices only unless explicitly query:{ttsCatalog:"account",ttsProviderId:"fish",ttsModelId?:string} with exactly one explicit Primary subject · full instructions: focus:["agent.instructions"],detail:"values",query:{instructionText:true},exactly one explicit granted subject; default reports show metadata only'
+const SETTINGS_CHANGE_HINT = 'required: `op` ("change" | "outcome" | "cancel") · change also needs `requestId` (returned bootNamespace + ":" + unique 1..128-character request ID), `reportId`, `semanticId`, `changes`; preserve the held report subjects/exclusions and copy offered choice IDs; omit unchanged fields, use only the selected semantic branch · agent.identity:{displayName:string1..200} · agent.memory.preferences:nonempty subset of {enabled:boolean,windowMode:"auto",onMyMind:integer0..20000,triggers:integer0..20000,recalled:integer0..20000,triggerLingerTurns:integer0..8,recallLingerTurns:integer0..8} · agent.reasoning.presentation:nonempty subset of {displayReasoning:boolean|null,displayWhiteboard:boolean|null} · agent.reasoning.retention:nonempty subset of {mode:"whiteboard"|"preserve"|"both"|"neither"|null,whiteboardBudgetTokens:integer250..16000|null} · agent.instructions:nonempty subset of {customPrompt:string<=16KiB|null,includeGlobalPrompt:boolean|null}; null removes an override · agent.model.selection:{presetId:string} OR {clear:true} · agent.model.preset-copy:{sourcePresetId:string,copyName:string1..200UTF8bytes,parameters:[{name:string,op:"unset"}|{name:string,op:"set",value:string|number|boolean|string[]|number[]}]}; 1..32 unique parameter names and only fields/types/ranges offered by held original-copy choices · agent.voice.tts-selection:{selection:"inherit"} OR {selection:"provider",providerId:string,modelId:string|null,voiceId:string|null} OR {selection:"profile",profileId:string} · agent.context.auto-compact:nonempty subset of {mode:"inherit"|"off"|"ask"|"auto",triggerMode:"inherit"|"smart"|"remaining_tokens",remainingTokens:integer1000..1000000|null} · agent.skills.access:{assignments:[{skillId:string,enabled:boolean}],universalConversion?:"preserve-current-population"}; 1..32 distinct skills · optional change hardDeadlineAt:Unix milliseconds · outcome/cancel ONLY {op,operationId}, with optional outcomeOffset:integer0..256 for outcome; inspect unknown outcomes instead of repeating changes'
+const MCP_SETTINGS_TARGET_HINT = 'target:{subject:{kind:"primary",id:string},gatewayId:string,membership:"enable"|"disable",zip?:{toolName:string,mode:"inherit"|"normal"|"auto"|"off",bufferSize?:integer>=1|null,zipThreshold?:integer>=0|null}}; alternatively zip:{toolName,bufferSize?,zipThreshold?,autoZip?:boolean|null,zipDisabled?:boolean|null} with at least one override; never mix mode with booleans, inherit with numbers, or disable with non-removal Zip choices; explicit null removes only that override'
+const MCP_SETTINGS_REPORT_HINT = 'additional original-Primary-only MCP report: {domain:"mcp-configuration",query:{kind:"sources"}} OR query:{kind:"details",gatewayId:string} OR query:{kind:"prerequisite",target}; for a new HTTP source use query:{kind:"prerequisite",candidate:{kind:"http",name:string,url:string,savedKeyRef?:string,evidence:{kind:"supplied"|"researched",uri:string,version?:string}},target:{subject:{kind:"primary",id:string},membership:"enable",zip?:<same Zip shape>}}; new-source target has no caller gatewayId; URL is HTTP(S) with no credentials/query/fragment; savedKeyRef is an existing key reference, never its value · ' + MCP_SETTINGS_TARGET_HINT + ' · optional detail:"summary"|"values"|"choices"; saved installed STDIO uses sources/details and target.gatewayId with unchanged saved executable/local entry, none/fixed cwd and saved env refs; no new STDIO command, package runner, install or account activation; copy all returned assigned IDs'
+const MCP_SETTINGS_CHANGE_HINT = 'additional original-Primary-only MCP change: {op:"change",requestId,reportId,semanticId:"mcp.workflow.configure",changes:{source?:{candidateId:<returned candidateId>},target:<exact held target with assigned gatewayId>},hardDeadlineAt?:Unix milliseconds} · ' + MCP_SETTINGS_TARGET_HINT + ' · preserve exact held source/target/Zip intent and actual approval; new HTTP source requires its returned candidateId; saved/verified/selected/Zip/use remain separate; inspect unknown outcomes, wait for server-owned continuation, then Search/Find and use the exact returned ref'
+
+const SETTINGS_MANAGEMENT_DEFINITIONS: ControlDefinition[] = Object.entries(SETTINGS_MANAGEMENT_CONTROL_IDS).map(([kind, controlId]) => {
+  const report = kind.endsWith('Report')
+  const native = kind.startsWith('native')
+  return {
+    controlId, sourceType: 'core', executorType: 'internal_handler', title: report ? 'Agent Settings Report' : 'Change Agent Settings',
+    description: report ? 'Read a bounded App Actions report: scoped agent name, existing saved-model choices, configured reply voice, named preset-copy sources, Memory preferences, API display/retention or existing skill access; runtime-inspection reads this instance without subjects. Continue held subject reports with reportId/cursor. Current user grants apply to each domain.' :
+      'Apply supported Settings changes to the exact held subjects, including offered saved-model selection or clearing, named preset copies, configured reply voice and existing-skill access; or read/cancel the returned operation. Use the exact fields and choices in the held report. Current user scope, exact consent, preimages and cancellation are server enforced. Check unknown outcomes without repeating the write; runtime inspection grants no mutation.',
+    inputSchema: z.record(z.string(), z.unknown()).superRefine((value, ctx) => {
+      try { report ? parseManagedSettingsReportInput(value) : parseManagedSettingsChangeInput(value) }
+      catch { ctx.addIssue({ code: 'custom', message: 'Invalid scoped Settings operation.' }) }
+    }),
+    inputSchemaJson: report ? MANAGED_SETTINGS_REPORT_SCHEMA : MANAGED_SETTINGS_CHANGE_SCHEMA,
+    outputSchema: null, schemaHint: report ? SETTINGS_REPORT_HINT : SETTINGS_CHANGE_HINT,
+    riskLevel: !report && native ? 'confirm' : 'safe', actsAsAgent: native, status: 'published', tags: ['App Actions', 'settings', 'agent-settings'],
+    handler: (context, input) => executeSettingsManagement(context, controlId, input)
+  }
+})
+
 const CONTROL_DEFINITIONS: ControlDefinition[] = [
+  {
+    controlId: 'sys.whiteboard.update', sourceType: 'core', executorType: 'internal_handler',
+    title: 'Update Whiteboard',
+    description: 'Replace your current chat whiteboard with complete working notes, or clear it with content:null. expectedVersion must match the current board. Reconcile conflict evidence before retrying. Naps and dreaming never write this board.',
+    inputSchema: z.object({ content: z.string().nullable(), expectedVersion: z.number().int().min(0) }).strict(),
+    inputSchemaJson: { type: 'object', properties: { content: { type: ['string', 'null'] }, expectedVersion: { type: 'integer', minimum: 0 } }, required: ['content', 'expectedVersion'], additionalProperties: false },
+    outputSchema: null, schemaHint: 'required: `content` (complete replacement, or null to clear), `expectedVersion` (current version, integer 0 or more)',
+    riskLevel: 'safe', actsAsAgent: true, status: 'published', tags: ['whiteboard', 'working context'],
+    scope: { modeAllowList: ['mode3'] },
+    handler: async (context, input) => {
+      const { updateAgentWhiteboard } = await import('$lib/server/services/whiteboard')
+      return updateAgentWhiteboard(context, input as { content: string | null; expectedVersion: number })
+    }
+  },
   ...APP_ACTION_CONTROL_DEFINITIONS,
   ...SETTINGS_APP_ACTION_CONTROL_DEFINITIONS,
+  ...SETTINGS_MANAGEMENT_DEFINITIONS,
   ...MEMORY_CONTROL_DEFINITIONS,
   ...DM_CONTROL_DEFINITIONS,
   ...SCHEDULE_CONTROL_DEFINITIONS,
@@ -2481,7 +2643,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
         guidance: { type: 'object' }
       }
     },
-    schemaHint: 'query/provider/developer/modelId/purpose + optional limit',
+    schemaHint: 'optional: `query`, `provider`, `connection`, `developer`, `modelId`, `purpose` (`chat` | `visual` | `audio` | `utility`), `limit` (1 to 25; 8 by default), `includePricing`, `forceRefresh`',
     riskLevel: 'safe',
     actsAsAgent: false,
     status: 'published',
@@ -2513,7 +2675,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
         content: { type: 'string' }
       }
     },
-    schemaHint: 'zipId (required), includeContent?, maxChars?, offset?',
+    schemaHint: ZIP_FETCH_SCHEMA_HINT,
     riskLevel: 'safe',
     actsAsAgent: false,
     status: 'published',
@@ -2580,7 +2742,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
         totalMatches: { type: 'integer' }
       }
     },
-    schemaHint: 'query/tool/group + optional exact/limit/includeSchema',
+    schemaHint: `optional: \`query\`, \`tool\`, \`group\` (string | string array), \`exact\`, \`limit\` (1 to ${MAX_DYNAMIC_RESULTS}; ${DEFAULT_DYNAMIC_RESULTS} by default), \`includeSchema\`, \`selectedGateways\` (narrows current scope), \`projectPath\``,
     riskLevel: 'safe',
     actsAsAgent: false,
     status: 'published',
@@ -2612,7 +2774,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
         result: {}
       }
     },
-    schemaHint: 'toolName (required), params?, selectedGateways?',
+    schemaHint: 'required: `toolName` · optional: `params` (object), `selectedGateways` (narrows current scope), `projectPath`',
     riskLevel: 'safe',
     actsAsAgent: false,
     status: 'published',
@@ -2647,7 +2809,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
       required: ['commandName', 'skill']
     },
     outputSchema: null,
-    schemaHint: 'commandName + skill.markdown (required), optional command metadata + skill metadata',
+    schemaHint: 'required: `commandName`, `skill` (object with required `markdown`) · optional: `commandId`, `commandDisplayName`, `commandDescription`, `invocation`, `instructions`, `icon_ref`, `iconRef`, `icon`, `category`, `isActive` · optional skill fields: `id`, `name`, `displayName`, `description`, `source` (`system` | `custom` | `github` | `git` | `local` | `url`), `sourceRef`, `dependencies`, `license`, `compatibility`, `metadata`, `allowedTools`, `standardsStatus` (`full` | `degraded`), `standardsIssues`, `trustLevel` (`trusted` | `untrusted`), `hasScripts`, `hasReferences`, `hasAssets`, `bundleManifest`, `bundleFiles`, `isSystem`, `isActive` · skill.dependencies:[{id:string,label?:string,required?:boolean}]; skill.bundleFiles:[{path:"<relative path without ..>",kind:"script"|"reference"|"asset",content:string,encoding?:"utf8"|"base64",sha256?:string,size?:number}] (digest/size may be derived) · enabledForAllAgents/enabledAgentIds are accepted but never change who may use a skill',
     riskLevel: 'safe',
     actsAsAgent: false,
     status: 'published',
@@ -2675,7 +2837,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
       anyOf: [{ required: ['installCommand'] }, { required: ['source'] }]
     },
     outputSchema: null,
-    schemaHint: 'installCommand OR source/sourceType (+ optional command save fields)',
+    schemaHint: 'required: `installCommand` or `source` · optional: `sourceType` (`github` | `url` | `git` | `local`), `skillPath`, `trustLevel` (`trusted` | `untrusted`), `saveAsCommand`, `commandId`, `commandName`, `commandDisplayName`, `commandDescription`, `invocation`, `instructions`, `icon_ref`, `iconRef`, `icon`, `category`, `isActive` · enabledForAllAgents/enabledAgentIds are accepted but never change who may use a skill',
     riskLevel: 'confirm',
     actsAsAgent: false,
     status: 'published',
@@ -2698,7 +2860,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
       additionalProperties: true
     },
     outputSchema: null,
-    schemaHint: 'optional includeStatus',
+    schemaHint: 'optional: `includeStatus`',
     riskLevel: 'safe',
     actsAsAgent: false,
     status: 'published',
@@ -2817,7 +2979,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
       additionalProperties: true
     },
     outputSchema: null,
-    schemaHint: 'optional status/includeArchived filters',
+    schemaHint: 'optional: `status` (`active` | `disabled` | `archived`), `includeArchived`',
     riskLevel: 'safe',
     actsAsAgent: false,
     status: 'published',
@@ -2839,7 +3001,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
       required: ['toolId']
     },
     outputSchema: null,
-    schemaHint: 'toolId (required)',
+    schemaHint: 'required: `toolId`',
     riskLevel: 'safe',
     actsAsAgent: false,
     status: 'published',
@@ -2870,7 +3032,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
     },
     outputSchema: null,
     schemaHint:
-      'title/description/executable + manifest fields; toolId may be inferred from title; origin/status default to generated/active',
+      'required: `title`, `description`, `executable`, `inputSchema` (object with `properties`), `argsTemplate` (nonempty array), `outputMode` (`text` | `json` | `mixed`), `parseMode` (`text` | `json` | `json_in_text`), `cwdPolicy` (`none` | `project` | `fixed`), `allowNetwork` (boolean), `allowWrite` (boolean) · fixed cwd also needs: `cwdValue` (absolute path); allowWrite:true also needs: `allowedPaths` (nonempty array) · optional: `toolId` (inferred from title), `cwdValue`, `timeoutMs` (1000 to 300000; 60000 by default), `envRefs`, `riskLevel` (`safe` by default | `confirm` | `restricted`), `allowedPaths`, `helpCommand`, `validationInput`, `examples`, `iconRef`, `iconHint`, `tags`, `origin` (`manual` | `imported` | `generated`; generated by default), `status` (`active` | `disabled` | `archived`; active by default) · ' + CLI_MANIFEST_NESTED_HINT,
     riskLevel: 'safe',
     actsAsAgent: false,
     status: 'published',
@@ -2897,7 +3059,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
       additionalProperties: true
     },
     outputSchema: null,
-    schemaHint: 'toolId (required) + fields to change',
+    schemaHint: 'required: `toolId` · optional: any create field to change; omitted fields inherit the existing record, supplied nested fields replace that field and must satisfy the create contract · ' + CLI_MANIFEST_NESTED_HINT,
     riskLevel: 'safe',
     actsAsAgent: false,
     status: 'published',
@@ -2921,7 +3083,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
       required: ['toolId']
     },
     outputSchema: null,
-    schemaHint: 'toolId (required), optional projectPath',
+    schemaHint: 'required: `toolId` · optional: `projectPath`',
     riskLevel: 'confirm',
     actsAsAgent: false,
     status: 'published',
@@ -2944,7 +3106,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
       required: ['toolId']
     },
     outputSchema: null,
-    schemaHint: 'toolId (required), optional status (defaults to archived)',
+    schemaHint: 'required: `toolId` · optional: `status` (`active` | `disabled` | `archived`; archived by default)',
     riskLevel: 'safe',
     actsAsAgent: false,
     status: 'published',
@@ -2966,7 +3128,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
       required: ['toolId']
     },
     outputSchema: null,
-    schemaHint: 'toolId (required)',
+    schemaHint: 'required: `toolId`',
     riskLevel: 'restricted',
     actsAsAgent: false,
     status: 'published',
@@ -2990,7 +3152,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
       required: ['engineId']
     },
     outputSchema: null,
-    schemaHint: 'engineId (required), payload?',
+    schemaHint: 'required: `engineId` · optional: `payload` (optional engine fields: name, enabled, supports, adapterId, endpointId, baseUrl, ttsPath, sttPath, healthPath, voicesPath, requestFormat [batshit-byo | openai-compatible], authMode [none | bearer | header], authHeader, authToken, authSavedKeyRef, timeoutMs [500 to 120000], tags, iconRef, ttsDefaults, sttDefaults, sttModelCatalog, uiSchema) · ' + VOICE_ENGINE_NESTED_HINT,
     riskLevel: 'confirm',
     actsAsAgent: false,
     status: 'published',
@@ -3013,7 +3175,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
       required: ['engineId']
     },
     outputSchema: null,
-    schemaHint: 'engineId (required), payload?',
+    schemaHint: 'required: `engineId` · optional: `payload` (optional engine fields: name, enabled, supports, adapterId, endpointId, baseUrl, ttsPath, sttPath, healthPath, voicesPath, requestFormat [batshit-byo | openai-compatible], authMode [none | bearer | header], authHeader, authToken, authSavedKeyRef, timeoutMs [500 to 120000], tags, iconRef, ttsDefaults, sttDefaults, sttModelCatalog, uiSchema) · ' + VOICE_ENGINE_NESTED_HINT,
     riskLevel: 'confirm',
     actsAsAgent: false,
     status: 'published',
@@ -3035,7 +3197,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
       required: ['engineId']
     },
     outputSchema: null,
-    schemaHint: 'engineId (required)',
+    schemaHint: 'required: `engineId`',
     riskLevel: 'safe',
     actsAsAgent: false,
     status: 'published',
@@ -3109,7 +3271,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
         blocker: { type: 'string' }
       }
     },
-    schemaHint: 'engineId, installRoot, launch, payload (+ optional TTS/STT smoke/poll settings)',
+    schemaHint: 'required: `engineId`, `installRoot`, `launch`:{command:string,args?:string[],cwd?:string,env?:Record<string,string>,unsetEnv?:string[],envFromApiKeys?:Record<envVar,savedKeyRef>,logPath?:string}, `payload`:{name:string,baseUrl:string,...engine fields} · optional: `installOwnership` (`batshit-managed` | `user-managed`), `readinessTimeoutMs` (5000 to 900000), `pollIntervalMs` (250 to 30000), `smoke`:{mode?:"tts"|"stt",text?:string,model?:string,voiceId?:string|null,profileId?:string|null,options?:object,audioBase64?:string,audioContentType?:string,expectedText?:string,language?:string}; STT smoke requires real audioBase64; TTS uses text or the built-in test sentence · OpenAI-compatible payload must save ttsDefaults.modelId and/or sttDefaults.modelId for EVERY supported speech capability even if smoke.model succeeded · ' + VOICE_ENGINE_NESTED_HINT,
     riskLevel: 'confirm',
     actsAsAgent: false,
     status: 'published',
@@ -3133,7 +3295,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
       required: ['engineId', 'modelId']
     },
     outputSchema: null,
-    schemaHint: 'engineId (required), modelId (required)',
+    schemaHint: 'required: `engineId`, `modelId`',
     riskLevel: 'confirm',
     actsAsAgent: false,
     status: 'published',
@@ -3157,7 +3319,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
       required: ['engineId', 'modelId']
     },
     outputSchema: null,
-    schemaHint: 'engineId (required), modelId (required)',
+    schemaHint: 'required: `engineId`, `modelId`',
     riskLevel: 'confirm',
     actsAsAgent: false,
     status: 'published',
@@ -3180,7 +3342,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
       required: ['engineId', 'modelId']
     },
     outputSchema: null,
-    schemaHint: 'engineId (required), modelId (required)',
+    schemaHint: 'required: `engineId`, `modelId`',
     riskLevel: 'confirm',
     actsAsAgent: false,
     status: 'published',
@@ -3203,7 +3365,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
       required: ['engineId', 'enabled']
     },
     outputSchema: null,
-    schemaHint: 'engineId (required), enabled (required)',
+    schemaHint: 'required: `engineId`, `enabled` (boolean)',
     riskLevel: 'confirm',
     actsAsAgent: false,
     status: 'published',
@@ -3227,7 +3389,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
       required: ['engineId']
     },
     outputSchema: null,
-    schemaHint: 'engineId (required), deleteLocalFiles?',
+    schemaHint: 'required: `engineId` · optional: `deleteLocalFiles` (true only for a user-requested Batshit-managed install deletion)',
     riskLevel: 'confirm',
     actsAsAgent: false,
     status: 'published',
@@ -3239,6 +3401,20 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
 const STATIC_CONTROL_MAP = new Map(CONTROL_DEFINITIONS.map((definition) => [definition.controlId, definition]))
 
 export interface ControlFindOptions {
+  /** Private final API registrations; never accepted from a request body. */
+  apiUtilityScope?: ApiUtilityScope
+  /** Genuine original API run/preparation, never control/find JSON or readiness flags. */
+  p5McpOwner?: import('./appActions/mcp/originalTask').P5ApiDiscoveryOwner
+  /** Server-owned actor lane; never accepted from control/find JSON. */
+  actorType?: ControlActorType
+  /** Verified typed owned-Primary human preview; discovery only, never execution authority. */
+  ownedPrimaryPreview?: boolean
+  portableSettingsActor?: { tokenId: string; authorityGeneration: number }
+  domain?: 'agent-settings'
+  /** Optional narrowing of the shared registry's capability namespaces; [] means none. */
+  brokerFamilies?: Array<'fabric' | 'batshit'>
+  /** Internal broker deduplication of code-defined helper entries. */
+  excludedControlIds?: string[]
   userId?: string
   agentId?: string
   query?: string
@@ -3251,7 +3427,7 @@ export interface ControlFindOptions {
   limit?: number
   allowedControlIds?: string[]
   /**
-   * BL-81 — the search comes from a Subagent or Worker run's credential. It then lists only
+   * BL-81 — an in-process Subagent or Worker search lists only
    * `delegatedAllowedControlIds` (absent means nothing), so a delegated run is shown exactly
    * what `useControl` will run for it, the way its DCM index already is.
    */
@@ -3280,6 +3456,14 @@ export interface ControlFindResult {
 }
 
 export interface ControlUseOptions {
+  apiUtilityScope?: ApiUtilityScope
+  apiUtilityInvocation?: ApiUtilityInvocation
+  /** Actual in-process Primary API owner; never accepted from a body. */
+  p5ApiRun?: import('./appActions/mcp/originalTask').P5ApiOriginalRun
+  /** Captured only from validated Portable Skill Token authentication. */
+  portableSettingsActor?: { tokenId: string; authorityGeneration: number }
+  /** In-process API reply snapshot; never accepted from an HTTP control body. */
+  whiteboardSettingsSnapshot?: import('$lib/utils/reasoningRetention').ResolvedReasoningRetention
   userId: string
   controlId: string
   /**
@@ -3287,15 +3471,6 @@ export interface ControlUseOptions {
    * (`sys.mcp.dynamic.use`, BL-454 review). In-process callers only; never read from a body.
    */
   abortSignal?: AbortSignal
-  /**
-   * BL-1314 — on a request lane, the chat and the reply the caller's run credential was minted
-   * for. Only `/api/controls/use` sets it, from the credential (never the body). A Settings
-   * write from any lane but `in-process` is admitted only on the Stop of that exact reply, read
-   * at admission (`getOriginatingReplyStopSignal`), never on `abortSignal`: there that is the
-   * chat's running reply, which a still-valid credential of an earlier run would share with a
-   * newer reply, and which the route read before its own awaited work.
-   */
-  originatingReply?: { sessionId: string; messageId: string | null }
   agentId?: string
   sessionId?: string
   /**
@@ -3333,38 +3508,11 @@ export interface ControlUseOptions {
    * (PR #106 review, F-1).
    */
   actorType?: ControlActorType
-  /**
-   * SA-117 DL-117-10 — the run credential this call arrived on, on the `agent` lane only.
-   *
-   * Recorded, never checked here: `resolveNativeToolUser` already validated it, and the
-   * `agentId` above is the bound one that came off the same record.
-   */
-  credentialId?: string
-  /**
-   * SA-117 P2 (F-P2-1) — the call arrived on a Subagent or Worker run's credential.
-   *
-   * Forwarded by `/api/controls/use` from `resolveNativeToolUser`. It is the one case where
-   * a valid `agent`-lane credential still cannot act as an agent, because the agent it names
-   * is a per-run runtime id rather than one of the user's agents.
-   */
+  /** Server-owned flag for an in-process Subagent or Worker run. */
   delegatedRun?: boolean
-  /**
-   * BL-81 — what that delegated run may use: the control ids its DCM index offered it, off its
-   * credential (`resolveDelegatedRunAllowedControlIds`). **Read only beside `delegatedRun:
-   * true`**, and there a missing list is an empty one: a delegated call with no list is refused
-   * every control, so nothing can reach this function as a delegated run and fail open.
-   */
+  /** The server-owned DCM allowlist; absent means nothing for a delegated run. */
   delegatedAllowedControlIds?: string[] | null
-  /**
-   * BL-81 — that delegated run's Subagent or Worker (the credential's `scopeAgentId`, BL-75),
-   * the id a control's agent ALLOWLIST is judged by (Settings -> Agents -> Access writes it
-   * there). **Honoured only beside `delegatedRun: true`**, so a stray value can never re-scope a
-   * primary's own call.
-   *
-   * It does not replace `agentId`. The identity gate, the risk gate, the handler and the audit's
-   * `agentId` keep the per-run id, because a Subagent's id can equal a primary's and a delegated
-   * run must never borrow that primary's inbox, consent or record.
-   */
+  /** The delegated run's own id for Artifact allowlists, never a Primary identity. */
   scopeAgentId?: string | null
   /** Server-resolved run scope; never a control input. */
   mcpGatewayScope?: string[] | null
@@ -3382,17 +3530,11 @@ export interface ControlUseOptions {
  * `'unknown'` is NOT vouched for by the identity gate (PR #106 review, F-1): it used to be the
  * silent default and a vouched lane at once, so forgetting the parameter meant being trusted.
  *
- * `'agent'` is new: a Batshit-minted run credential, so the acting agent on the entry was bound
- * by the server rather than named by the body. `'internal'` is GONE — no lane ever produced it,
- * so every entry that looked like it might have been an internal caller was really `'unknown'`,
- * and keeping an unreachable value in a security-relevant union invites a future reader to
- * "restore" a meaning it never had.
+ * The retired run-token `agent` actor is not an authenticated lane.
  */
 export type ControlActorType =
-  | 'agent'
   | 'service'
   | 'session'
-  | 'n8n-callback'
   | 'portable-skill'
   | 'in-process'
   | 'unknown'
@@ -3495,19 +3637,10 @@ type ControlAuditEntry = {
    * is `null` for anything that did not need one; `paused` records the pauses, which are
    * the entries that show a card was raised. No reader page is built here (deferred).
    *
-   * SA-117 DL-117-10 adds `credentialId`, and with it the answer to "was that `agentId` the
-   * caller's word or the server's?". On `actorType: 'agent'` it names the run credential the
-   * server minted and validated, so the `agentId` beside it is bound; it is `null` on every
-   * other lane, where `agentId` is server-owned (the in-process API broker) or body text (the
-   * service lane, which after DL-117-05 can no longer act AS an agent at all).
+   * `credentialId` remains null on new entries; old records retain their historical field.
    */
   agentId: string | null
-  /**
-   * BL-81 — on a delegated run, the Subagent or Worker whose artifact allowlists applied,
-   * beside the per-run id in `agentId` that its credential authenticated. `null` on every
-   * other call, where `agentId` alone governs. Once the run's credential is revoked this is the
-   * only record of which Subagent a delegated call was judged as.
-   */
+  /** Server-owned Subagent or Worker scope for a delegated run. */
   scopeAgentId: string | null
   sessionId: string | null
   credentialId: string | null
@@ -3643,7 +3776,7 @@ function normalizeEnabledAgentIdsForCommand(
 }
 
 async function executeZipFetch(context: ControlExecutionContext, input: Record<string, any>) {
-  if (context.actorType !== 'agent' && context.actorType !== 'in-process') {
+  if (context.actorType !== 'in-process') {
     return {
       found: false,
       zipId: typeof input.zipId === 'string' ? input.zipId : '',
@@ -3668,6 +3801,7 @@ function narrowMcpGatewayFilters(outer?: string[], inner?: string[]): string[] |
 
 async function executeDynamicMcpFind(context: ControlExecutionContext, input: Record<string, any>) {
   return executeSharedDynamicMcpFind({
+    p5ApiRun: context.p5ApiRun,
     userId: context.userId,
     agentId: context.agentId ?? null,
     query: typeof input.query === 'string' ? input.query : undefined,
@@ -3692,6 +3826,7 @@ async function executeDynamicMcpUse(context: ControlExecutionContext, input: Rec
     mcpGatewayScope: context.mcpGatewayScope,
     selectedGateways: narrowMcpGatewayFilters(context.selectedGateways, normalizeStringArray(input.selectedGateways)),
     projectPath: typeof input.projectPath === 'string' ? input.projectPath : null,
+    p5ApiRun: context.p5ApiRun,
     internalToolError: `Tool "${toolName}" is internal-only and not callable via sys.mcp.dynamic.use.`,
     abortSignal: context.abortSignal ?? null
   })
@@ -3699,9 +3834,9 @@ async function executeDynamicMcpUse(context: ControlExecutionContext, input: Rec
 
 /** BL-80: a new skill saved with no agent (a portable-skill save) is on for nobody; say so. */
 const NEW_SKILL_ON_FOR_NOBODY_NOTE =
-  'Saved, but no agent can use it yet. Turn it on in Settings -> Agents -> Access (one agent) or Settings -> Skills & Prompts (all agents).'
+  'Saved, but no agent can use it yet. Turn it on in Settings -> Agents -> Access (one agent) or Settings -> Plugins & shit (all agents).'
 
-async function executeSkillSave(context: ControlExecutionContext, input: Record<string, any>) {
+async function executeSkillSave(context: ControlExecutionContext, input: Record<string, any>, preparation: SlashCommandWritePreparation = beginSlashCommandWrite(context.userId)) {
   const parsed = skillSaveInputSchema.parse(input)
 
   const commandName = parsed.commandName.trim()
@@ -3710,6 +3845,7 @@ async function executeSkillSave(context: ControlExecutionContext, input: Record<
     throw new Error('commandId/commandName must resolve to a valid slash command id.')
   }
 
+  const basis = await captureSlashCommandWriteBasis(preparation, [commandId])
   const commandKey = buildSlashCommandKey(context.userId, commandId)
   const existing = (await redis.json.get(commandKey)) as SlashCommandRow | null
   const nowIso = new Date().toISOString()
@@ -3721,7 +3857,7 @@ async function executeSkillSave(context: ControlExecutionContext, input: Record<
 
   if (existing?.is_system === true || parsed.skill.isSystem === true || parsed.skill.source === 'system') {
     throw new Error(
-      'System skills are repo-backed and cannot be saved from live Batshit. Update files under batshit-app/src/lib/server/system-skills/ from the external coding workspace instead.'
+      'System skills are repo-backed and cannot be saved from live Batshit. Update the canonical package under batshit-app/src/lib/server/system-plugins/batshit/ from the external coding workspace instead.'
     )
   }
 
@@ -3734,10 +3870,12 @@ async function executeSkillSave(context: ControlExecutionContext, input: Record<
    * checked is the skill written.
    */
   const targetSkillId = normalizeSkillId(parsed.skill.id, parsed.skill.name ?? commandName)
+  await refusePluginMemberWrite(context.userId, existing ?? { id: commandId, skill_id: targetSkillId })
+  await refusePluginMemberWrite(context.userId, { id: commandId, skill_id: targetSkillId })
   const commandOwnsTargetSkill = existing?.type === 'skill' && existing.skill_id === targetSkillId
   if (!commandOwnsTargetSkill && (await skillRecordExists(context.userId, targetSkillId))) {
     throw new Error(
-      `Skill "${targetSkillId}" already exists and belongs to another command. Update it through its own command, or save this one under a new skill id. Who may use a skill is set in Settings -> Agents -> Access or Settings -> Skills & Prompts, never by saving it.`
+      `Skill "${targetSkillId}" already exists and belongs to another command. Update it through its own command, or save this one under a new skill id. Who may use a skill is set in Settings -> Agents -> Access or Settings -> Plugins & shit, never by saving it.`
     )
   }
 
@@ -3753,7 +3891,7 @@ async function executeSkillSave(context: ControlExecutionContext, input: Record<
   if (existing && savingAgentId && !commandEnabledForAgent(existing, savingAgentId)) {
     const label = existing.displayName || existing.name || commandId
     throw new Error(
-      `Skill "${label}" is not on for you, so you cannot change it. Ask the user to turn it on for you in Settings -> Agents -> Access, or to edit it in Settings -> Skills & Prompts.`
+      `Skill "${label}" is not on for you, so you cannot change it. Ask the user to turn it on for you in Settings -> Agents -> Access, or to edit it in Settings -> Plugins & shit.`
     )
   }
 
@@ -3787,9 +3925,9 @@ async function executeSkillSave(context: ControlExecutionContext, input: Record<
   const accessNote =
     accessRequested || reactivationRequested
       ? existing
-        ? 'Access unchanged: who may use an existing skill, and whether it is on, is the user\'s setting. Ask the user to change it in Settings -> Agents -> Access (one agent) or Settings -> Skills & Prompts (all agents).'
+        ? 'Access unchanged: who may use an existing skill, and whether it is on, is the user\'s setting. Ask the user to change it in Settings -> Agents -> Access (one agent) or Settings -> Plugins & shit (all agents).'
         : savingAgentId
-          ? 'Saved for you only. Who else may use it is the user\'s setting: ask the user to turn it on for other agents in Settings -> Agents -> Access, or for all agents in Settings -> Skills & Prompts.'
+          ? 'Saved for you only. Who else may use it is the user\'s setting: ask the user to turn it on for other agents in Settings -> Agents -> Access, or for all agents in Settings -> Plugins & shit.'
           : NEW_SKILL_ON_FOR_NOBODY_NOTE
       : !existing && !savingAgentId
         ? NEW_SKILL_ON_FOR_NOBODY_NOTE
@@ -3885,19 +4023,21 @@ async function executeSkillSave(context: ControlExecutionContext, input: Record<
     delete slashCommand.enabled_agent_ids
   }
 
-  await redis.json.set(commandKey, '$', slashCommand)
+  const savedCommand = await saveSlashCommandRecord(context.userId, { record: slashCommand, mode: existing ? 'update' : 'create',
+    ...(existing ? { preserveAccess: COMMAND_ACCESS_FIELDS } : {}) }, basis)
+  if (!savedCommand) throw new Error('The skill command changed before it could be saved. Check the saved skill and command before another request.')
 
   return {
     saved: true,
     command: {
-      id: slashCommand.id,
-      name: slashCommand.name,
-      displayName: slashCommand.displayName,
-      invocation: slashCommand.invocation_pattern,
-      icon_ref: slashCommand.icon_ref ?? null,
-      enabledForAllAgents: slashCommand.enabled_for_all_agents === true,
-      enabledAgentIds: slashCommand.enabled_agent_ids ?? [],
-      updatedAt: slashCommand.updated_at
+      id: savedCommand.id,
+      name: savedCommand.name,
+      displayName: savedCommand.displayName,
+      invocation: savedCommand.invocation_pattern,
+      icon_ref: savedCommand.icon_ref ?? null,
+      enabledForAllAgents: savedCommand.enabled_for_all_agents === true,
+      enabledAgentIds: savedCommand.enabled_agent_ids ?? [],
+      updatedAt: savedCommand.updated_at
     },
     ...(accessNote ? { accessNote } : {}),
     skill: {
@@ -3911,6 +4051,7 @@ async function executeSkillSave(context: ControlExecutionContext, input: Record<
 }
 
 async function executeSkillImport(context: ControlExecutionContext, input: Record<string, any>) {
+  const preparation = beginSlashCommandWrite(context.userId)
   const parsed = skillImportControlInputSchema.parse(input)
 
   const importInput: SkillImportInput = {
@@ -3943,6 +4084,7 @@ async function executeSkillImport(context: ControlExecutionContext, input: Recor
   const saveAsCommand = parsed.saveAsCommand !== false
   if (!saveAsCommand) {
     const nowIso = new Date().toISOString()
+    await refusePluginMemberWrite(context.userId, { id: sanitizeId(parsed.commandId ?? imported.skill.id ?? imported.skill.name) || 'imported_skill', skill_id: normalizeSkillId(imported.skill.id, imported.skill.name) })
     const savedSkill = await upsertSkill({
       userId: context.userId,
       commandId: sanitizeId(parsed.commandId ?? imported.skill.id ?? imported.skill.name) || 'imported_skill',
@@ -4022,7 +4164,7 @@ async function executeSkillImport(context: ControlExecutionContext, input: Recor
       bundleManifest: imported.skill.bundleManifest,
       bundleFiles: imported.skill.bundleFiles
     }
-  })
+  }, preparation)
 
   return {
     imported: true,
@@ -4227,7 +4369,7 @@ function serializeControlError(error: unknown): { message: string; status: numbe
 // off instead of learning the structure (BL-69), so the AGENT path adds the skill step and keeps
 // the code and issues it would otherwise lose.
 export const ARTIFACT_STRUCTURE_AGENT_NEXT_STEP =
-  'Agent next step: load the Artifact Creator skill with `native_skill` (skillId `artifact_creator`) if it is listed in your skills, then rebuild the artifact with its Builder Kit and Fabric steps. If it is not listed, you cannot load it: ask the user to turn on Artifact Creator for you in Settings -> Agents -> Access (or for every agent in Settings -> Skills & Prompts). Suggest turning enforcement off only if the user asked for a raw, hand-written artifact.'
+  'Agent next step: load the Artifact Creator skill with `native_skill` (skillId `artifact_creator`) if it is listed in your skills, then rebuild the artifact with its Builder Kit and Fabric steps. If it is not listed, you cannot load it: ask the user to turn on the Batshit plugin for you in Settings -> Agents -> Access (or for every agent in Settings -> Plugins & shit -> Plugins). Suggest turning enforcement off only if the user asked for a raw, hand-written artifact.'
 
 // Review of BL-89: a save refused only for unnamed fields gets its own code and a step that fits
 // it. Loading the skill to "rebuild the artifact", or switching enforcement off, is not the fix
@@ -4269,6 +4411,8 @@ function controlErrorCodeForHandlerRefusal(controlId: string, code: unknown): Co
 }
 
 function toArtifactExecutionError(error: unknown) {
+  const grantFailure = serializeArtifactGrantFailure(error)
+  if (grantFailure) return grantFailure
   const normalized = serializeControlError(error)
   const code = error && typeof error === 'object' ? (error as { code?: unknown }).code : undefined
   if (code === 'ARTIFACT_VERSION_CONFLICT') {
@@ -5552,9 +5696,14 @@ async function executeArtifactUpdate(
   input: Record<string, any>
 ): Promise<Record<string, any>> {
   // Access is owned by the user. Check presence before any read or partial save;
-  // false, null, and an empty allowlist are still access changes.
+  // false, null, and an empty allowlist are still access changes, including the
+  // metadata aliases used by legacy records.
+  const metadata = input.metadata && typeof input.metadata === 'object' && !Array.isArray(input.metadata)
+    ? input.metadata : null
   const changesAccess = ['agent_use_enabled', 'agent_access_scope', 'agent_allowlist'].some((key) =>
     Object.prototype.hasOwnProperty.call(input, key)
+  ) || metadata !== null && ['agent_allowlist', 'agentAllowlist', 'assigned_agent_ids', 'assignedAgentIds'].some((key) =>
+    Object.prototype.hasOwnProperty.call(metadata, key)
   )
   if (changesAccess && context.actorType !== 'session' && context.actorType !== 'service') {
     return {
@@ -5868,6 +6017,50 @@ async function executeArtifactSetZone(
   }
 }
 
+type ArtifactRunPayload = Record<string, unknown> & {
+  artifactId: string
+  prompt: string
+  context: unknown
+  mode: string
+  sessionId: string
+  fields?: Record<string, unknown>
+}
+
+/** Both Artifact run entry points use the saved transport and its server-owned deadline. */
+async function requestArtifactRunResponse(
+  context: ControlExecutionContext,
+  artifact: ArtifactRecord,
+  payload: ArtifactRunPayload,
+  completeUrl: string,
+  token: string
+): Promise<Response> {
+  const deadline = AbortSignal.timeout(resolveArtifactRunTimeoutMs(artifact))
+  if (artifact.brain_type === 'pinokio_app') {
+    const originalStop = context.pinokioOriginalStop ?? context.abortSignal
+    return await (await import('$lib/server/artifacts/pinokioAppCompletion')).completePinokioAppArtifact({
+      artifact, userId: context.userId, prompt: payload.prompt, sessionId: payload.sessionId,
+      mode: payload.mode, fields: payload.fields, context: payload.context,
+      signal: originalStop ? AbortSignal.any([originalStop, deadline]) : deadline,
+      admit: async () => {
+        if (!context.pinokioArtifactAdmission) throw new PinokioAdmissionError('pinokio_admission_required', 'This artifact needs its originating server scope.', 403)
+        await context.pinokioArtifactAdmission(artifact)
+      }
+    })
+  }
+  return await fetch(completeUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-batshit-token': token,
+      // Narrow this HTTP hop if the saved Artifact changes before the route reloads it.
+      // Pinokio must retain this call's in-process admission and originating Stop.
+      'x-batshit-artifact-http-only': '1'
+    },
+    body: JSON.stringify(payload),
+    signal: deadline
+  })
+}
+
 async function executeArtifactUse(
   context: ControlExecutionContext,
   input: Record<string, any>
@@ -5880,6 +6073,16 @@ async function executeArtifactUse(
         success: false,
         error: 'prompt is required',
         status: 400
+      }
+    }
+
+    const artifactsService = new ArtifactsService()
+    const artifact = await artifactsService.getAccessible(artifactId, context.userId)
+    if (!artifact) {
+      return {
+        success: false,
+        error: 'Artifact not found or access denied.',
+        status: 404
       }
     }
 
@@ -5896,24 +6099,16 @@ async function executeArtifactUse(
       }
     }
 
-    const response = await fetch(completeUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-batshit-token': token
-      },
-      body: JSON.stringify({
-        artifactId,
-        prompt,
-        context: input.context ?? null,
-        mode: typeof input.mode === 'string' && input.mode.trim().length > 0 ? input.mode : 'complete',
-        sessionId: resolvedSessionId,
-        model: typeof input.model === 'string' ? input.model : null,
-        webhookUrl: toNullableString(input.webhook_url),
-        userId: context.userId
-      }),
-      signal: AbortSignal.timeout(120_000)
-    })
+    const response = await requestArtifactRunResponse(context, artifact, {
+      artifactId,
+      prompt,
+      context: input.context ?? null,
+      mode: typeof input.mode === 'string' && input.mode.trim().length > 0 ? input.mode : 'complete',
+      sessionId: resolvedSessionId,
+      model: typeof input.model === 'string' ? input.model : null,
+      webhookUrl: toNullableString(input.webhook_url),
+      userId: context.userId
+    }, completeUrl, token)
 
     if (!response.ok) {
       const bodyText = await response.text().catch(() => '')
@@ -6106,42 +6301,12 @@ function parseDynamicArtifactId(controlId: string): string | null {
 }
 
 function normalizeDynamicArtifactAllowlist(artifact: ArtifactRecord): string[] | undefined {
-  const direct = Array.isArray(artifact.agent_allowlist) ? artifact.agent_allowlist : null
-  const metadata = artifact.metadata && typeof artifact.metadata === 'object' ? artifact.metadata : {}
-  const fallback =
-    (metadata as Record<string, any>).agent_allowlist ??
-    (metadata as Record<string, any>).agentAllowlist ??
-    (metadata as Record<string, any>).assigned_agent_ids ??
-    (metadata as Record<string, any>).assignedAgentIds
-
-  const source = Array.isArray(direct) ? direct : Array.isArray(fallback) ? fallback : []
-  const normalized = source
-    .map((entry) => (typeof entry === 'string' ? entry.trim() : ''))
-    .filter(Boolean)
-
-  if (normalized.length === 0) return undefined
-  return Array.from(new Set(normalized))
+  const { ids } = readArtifactAgentAccess(artifact)
+  return ids.length > 0 ? [...ids] : undefined
 }
 
 function resolveDynamicArtifactAccessScope(artifact: ArtifactRecord): 'all' | 'selected' {
-  const direct =
-    typeof (artifact as any).agent_access_scope === 'string'
-      ? String((artifact as any).agent_access_scope).trim().toLowerCase()
-      : ''
-  if (direct === 'all' || direct === 'selected') {
-    return direct
-  }
-
-  const allowlist = normalizeDynamicArtifactAllowlist(artifact)
-  if (Array.isArray(allowlist) && allowlist.length > 0) {
-    return 'selected'
-  }
-
-  if (artifact.agent_use_enabled === true) {
-    return 'selected'
-  }
-
-  return 'all'
+  return readArtifactAgentAccess(artifact).scope
 }
 
 function resolveArtifactMetadata(artifact: ArtifactRecord): Record<string, any> {
@@ -6571,7 +6736,7 @@ function buildArtifactDynamicRecords(artifact: ArtifactRecord): ControlRegistryR
       suffix: 'field.model.set',
       title: `${artifact.name}: set model`,
       description: 'Set or clear the AI model selected for this artifact. Prefer sys.model_catalog.search first, then pass the chosen result modelIdForArtifact. This stores a manual artifact model, not a saved preset. Pass null or omit to clear the selection; built-in AI calls then fail with a model-required error until a model is selected.',
-      schemaHint: 'model: exact current model ID string, or null to clear the artifact model selection',
+      schemaHint: 'optional: `model` (exact current model id or null to clear), `value` (alias); omitted clears selection',
       riskLevel: 'safe',
       inputSchema: {
         type: 'object',
@@ -6587,7 +6752,7 @@ function buildArtifactDynamicRecords(artifact: ArtifactRecord): ControlRegistryR
       suffix: 'field.system_prompt.set',
       title: `${artifact.name}: set system prompt`,
       description: 'Set or clear this artifact system prompt.',
-      schemaHint: 'system_prompt (string|null)',
+      schemaHint: 'optional: `system_prompt` (string | null), `prompt`, `value` (aliases); omitted clears',
       riskLevel: 'confirm',
       inputSchema: {
         type: 'object',
@@ -6603,7 +6768,7 @@ function buildArtifactDynamicRecords(artifact: ArtifactRecord): ControlRegistryR
       suffix: 'field.zone.set',
       title: `${artifact.name}: set zone`,
       description: 'Set this artifact zone while honoring compatibility rules.',
-      schemaHint: 'zone required (header/panel/trigger)',
+      schemaHint: 'required: `zone` (`header` | `panel` | `trigger`)',
       riskLevel: 'confirm',
       inputSchema: {
         type: 'object',
@@ -6630,7 +6795,7 @@ function buildArtifactDynamicRecords(artifact: ArtifactRecord): ControlRegistryR
       suffix: 'action.publish.run',
       title: `${artifact.name}: publish`,
       description: 'Publish artifact (zone required and validated).',
-      schemaHint: 'zone optional (uses current zone by default)',
+      schemaHint: 'optional: `zone` (`header` | `panel` | `trigger`; current zone by default)',
       riskLevel: 'confirm',
       inputSchema: {
         type: 'object',
@@ -6657,7 +6822,7 @@ function buildArtifactDynamicRecords(artifact: ArtifactRecord): ControlRegistryR
       suffix: 'action.run.run',
       title: `${artifact.name}: run`,
       description: 'Execute this artifact with a prompt.',
-      schemaHint: 'prompt required',
+      schemaHint: 'required: `prompt` · optional: `mode`',
       riskLevel: 'safe',
       inputSchema: {
         type: 'object',
@@ -6690,6 +6855,7 @@ function buildArtifactDynamicRecords(artifact: ArtifactRecord): ControlRegistryR
   if (runnable && artifact.mode === 'published' && artifact.slug && (hasTypedFields || runOnly)) {
     // Build input schema from fabric_fields
     const fieldProperties: Record<string, any> = {}
+    const promptPairHints: string[] = []
     // SA-072 P2: a Pinokio app artifact's file fields take a Clip id, which is how an agent
     // knows an attached picture; say so where the agent reads the field.
     const fileFieldIds = pinokioFileFieldIds(artifact)
@@ -6722,6 +6888,7 @@ function buildArtifactDynamicRecords(artifact: ArtifactRecord): ControlRegistryR
           }
           break
         case 'promptPair':
+          promptPairHints.push(`${JSON.stringify(field.fabricId)}:{prompt?:string,negativePrompt?:string}`)
           prop.type = 'object'
           prop.properties = {
             prompt: { type: 'string' },
@@ -6753,12 +6920,7 @@ function buildArtifactDynamicRecords(artifact: ArtifactRecord): ControlRegistryR
       description: runOnly
         ? `${artifact.description || artifact.name} — invoke run-only artifact trigger.`
         : `${artifact.description || artifact.name} — invoke with typed field parameters.`,
-      schemaHint: hasTypedFields
-        ? fabricFields
-            .filter((field: any) => typeof field?.fabricId === 'string' && field.fabricId.trim().length > 0)
-            .map((f: any) => (fileFieldIds.has(f.fabricId) ? `${f.fabricId} (${PINOKIO_FILE_FIELD_HINT})` : `${f.fabricId} (${f.type})`))
-            .join(', ')
-        : 'run-only trigger (no input fields)',
+      schemaHint: `${controlFieldsHint({ properties: fieldProperties })}${hasTypedFields && !runOnly ? ' · at least one field is required' : ''}${promptPairHints.length && !runOnly ? ` · prompt pairs: ${promptPairHints.join('; ')}` : ''}${fileFieldIds.size ? ` · file fields (${[...fileFieldIds].join(', ')}): ${PINOKIO_FILE_FIELD_HINT}` : ''}`,
       riskLevel: 'safe',
       inputSchema: {
         type: 'object',
@@ -7170,7 +7332,7 @@ async function executeDynamicArtifactRunAction(
 
 // SA-042: Typed invoke handler — accepts typed field parameters and passes them to the completion endpoint
 /**
- * How long an agent's `use.artifact` run may take. A Pinokio app runs a model on this computer
+ * How long either Artifact run entry point may take. A Pinokio app runs a model on this computer
  * (SA-072 P2): a local Flux image measured 60-125 s on an M-series Mac, over the 120 s cloud
  * default, so its runs wait up to 10 minutes. The runner has its own 30-minute ceiling.
  */
@@ -7249,30 +7411,22 @@ async function executeDynamicArtifactTypedInvoke(
       }
     }
 
-    const response = await fetch(completeUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-batshit-token': token
-      },
-      body: JSON.stringify({
-        artifactId,
-        prompt: resolvedPrompt,
-        context: input.context ?? null,
-        mode: typeof input.mode === 'string' && input.mode.trim().length > 0 ? input.mode : 'complete',
-        sessionId: resolvedSessionId,
-        model: typeof input.model === 'string' ? input.model : null,
-        webhookUrl: toNullableString(input.webhook_url),
-        userId: context.userId,
-        fields: typedPayload.fieldsForPrompt,
-        ...(typedPayload.images ? { images: typedPayload.images } : {}),
-        ...(typedPayload.n !== undefined ? { n: typedPayload.n } : {}),
-        ...(typedPayload.size ? { size: typedPayload.size } : {}),
-        ...(typedPayload.aspectRatio ? { aspectRatio: typedPayload.aspectRatio } : {}),
-        ...(typedPayload.providerOptions ? { providerOptions: typedPayload.providerOptions } : {})
-      }),
-      signal: AbortSignal.timeout(resolveArtifactRunTimeoutMs(artifact))
-    })
+    const response = await requestArtifactRunResponse(context, artifact, {
+      artifactId,
+      prompt: resolvedPrompt,
+      context: input.context ?? null,
+      mode: typeof input.mode === 'string' && input.mode.trim().length > 0 ? input.mode : 'complete',
+      sessionId: resolvedSessionId,
+      model: typeof input.model === 'string' ? input.model : null,
+      webhookUrl: toNullableString(input.webhook_url),
+      userId: context.userId,
+      fields: typedPayload.fieldsForPrompt,
+      ...(typedPayload.images ? { images: typedPayload.images } : {}),
+      ...(typedPayload.n !== undefined ? { n: typedPayload.n } : {}),
+      ...(typedPayload.size ? { size: typedPayload.size } : {}),
+      ...(typedPayload.aspectRatio ? { aspectRatio: typedPayload.aspectRatio } : {}),
+      ...(typedPayload.providerOptions ? { providerOptions: typedPayload.providerOptions } : {})
+    }, completeUrl, token)
 
     if (!response.ok) {
       const bodyText = await response.text().catch(() => '')
@@ -7664,6 +7818,11 @@ function normalizeControlListFilter<T extends string>(value: T | T[] | undefined
 }
 
 async function resolveVisibleControls(options: {
+  apiUtilityScope?: ApiUtilityScope
+  p5McpOwner?: import('./appActions/mcp/originalTask').P5ApiDiscoveryOwner
+  actorType?: ControlActorType
+  ownedPrimaryPreview?: boolean
+  portableSettingsActor?: { tokenId: string; authorityGeneration: number }
   userId?: string | null
   agentId?: string | null
   runtimeMode?: ControlRuntimeMode | null
@@ -7681,9 +7840,55 @@ async function resolveVisibleControls(options: {
         ? options.delegatedAllowedControlIds
         : []
       : null
-  const controls = await loadControlDefinitionsForUser(options.userId)
+  const owner = options.p5McpOwner !== undefined ? await import('./appActions/mcp/originalTask') : undefined
+  const assertOwner = () => {
+    if (!owner) return
+    const identity = owner.readP5ApiManagementIdentity(options.p5McpOwner!)
+    if (identity.userId !== options.userId || identity.agentId !== options.agentId) throw new Error('The original API discovery identity changed.')
+  }
+  assertOwner()
+  const utilityControls = buildApiUtilityControls(options.apiUtilityScope, options)
+  const utilityOnly = !!allowedIds?.length && allowedIds.every(isApiUtilityControlId)
+  const controls = [...(utilityOnly ? [] : await loadControlDefinitionsForUser(options.userId)).filter(control => !isApiUtilityControlId(control.controlId)), ...utilityControls]; assertOwner()
+  const managementIds = new Set<string>(Object.values(SETTINGS_MANAGEMENT_CONTROL_IDS))
+  const settingsRequested = !allowedIds || [...managementIds].some(id => controlIdMatchesAllowedEntries(id, allowedIds))
+  // BL-1572: managed helpers query the registry without the API broker's native
+  // allowlist. Apply the Judgment Tool rule here, shared with DCM listing; the resolver
+  // includes Fabric & Utilities (Josh, 2026-10-24).
+  // An allowlist can only narrow this; it never grants a delegated/portable actor
+  // the Primary utility. Master/provider readiness remains the execution gate.
+  let judgeVisible = false, dmVisible = false
+  let primarySnapshot: { agentId: string; record: Record<string, any> | null } | undefined
+  const primaryFamilyRequested = !allowedIds || [
+    'sys.judge.ask', ...DM_CONTROL_DEFINITIONS.map(control => control.controlId),
+    ...SCHEDULE_CONTROL_DEFINITIONS.map(control => control.controlId)
+  ].some(id => controlIdMatchesAllowedEntries(id, allowedIds))
+  // A saved agent ID narrows scope; only a verified Primary lane can advertise
+  // its identity-bearing features. Service/body/omitted identity is not a grant.
+  const vouchedPrimaryDiscovery = options.actorType === 'in-process' || options.actorType === 'session'
+  const nativeSettingsDiscovery = options.actorType === 'in-process' ||
+    options.actorType === 'session' && options.ownedPrimaryPreview === true
+  if (options.delegatedRun !== true &&
+      (vouchedPrimaryDiscovery && primaryFamilyRequested || nativeSettingsDiscovery && settingsRequested) &&
+      options.userId && options.agentId) {
+    const agent = await redis.get(`agent:${options.agentId}`, { throwOnError: true }) as Record<string, any> | null
+    assertOwner()
+    if (agent != null && (typeof agent !== 'object' || Array.isArray(agent) || agent.id !== options.agentId || typeof agent.user_id !== 'string')) {
+      throw new Error('The current agent discovery record is malformed.')
+    }
+    primarySnapshot = { agentId: options.agentId, record: agent ?? null }
+    const ownedPrimary = agent?.user_id === options.userId && normalizePrimaryAgentType(agent) !== 'n8n'
+    judgeVisible = ownedPrimary && resolveAgentJevJudgeToolEnabled(agent)
+    dmVisible = ownedPrimary && resolveAgentDmsEnabled(agent)
+  }
+  const settingsVisible = settingsRequested ? await settingsControlsVisible(options, primarySnapshot) : new Set<string>()
+  assertOwner()
+  const apiMetadata = !!owner && options.actorType === 'in-process' && options.runtimeMode === 'mode3' && options.delegatedRun !== true
 
   return controls.filter((definition) => {
+    if (definition.controlId === 'sys.judge.ask' && !judgeVisible) return false
+    if ((definition.controlId.startsWith('sys.dm.') || definition.controlId.startsWith('sys.schedule.')) && !dmVisible) return false
+    if (managementIds.has(definition.controlId) && !settingsVisible.has(definition.controlId)) return false
     if (!options.includeDraft && definition.status !== 'published') return false
     if (
       allowedSet &&
@@ -7704,6 +7909,17 @@ async function resolveVisibleControls(options: {
       return false
     }
     return true
+  }).map(definition => {
+    if (!apiMetadata || definition.controlId !== SETTINGS_MANAGEMENT_CONTROL_IDS.nativeReport && definition.controlId !== SETTINGS_MANAGEMENT_CONTROL_IDS.nativeChange) return definition
+    const report = definition.controlId === SETTINGS_MANAGEMENT_CONTROL_IDS.nativeReport
+    // Same visible pair, same admission/effect owners. Project BEFORE search
+    // scoring/count/output so MCP intent and DCM hints share one truthful source.
+    return { ...definition,
+      description: `${definition.description} Original API MCP prerequisite: custom HTTP or already-installed saved STDIO source using unchanged saved launch/ref mappings (none/fixed cwd, no package runner or install), exact owned Primary selection and explicit tool Zip intent; no installation, account or CLI/native activation. ${report ? 'Request one complete report with the listed fields and copy its returned candidate/assigned IDs into change.' : 'Use the exact held report, complete target and one actual approval. Unknown outcomes are inspected, never reissued. Only the server can continue this same original task; then use an exact returned Search/Find ref.'}`,
+      schemaHint: `${definition.schemaHint} · ${report ? MCP_SETTINGS_REPORT_HINT : MCP_SETTINGS_CHANGE_HINT}`,
+      tags: [...definition.tags, 'MCP', 'HTTP', 'prerequisite', 'Zip'],
+      inputSchemaJson: report ? API_MANAGED_SETTINGS_REPORT_SCHEMA : API_MANAGED_SETTINGS_CHANGE_SCHEMA
+    }
   })
 }
 
@@ -7728,18 +7944,32 @@ export interface VisibleControlSummary {
 }
 
 export async function listVisibleControls(options: {
+  apiUtilityScope?: ApiUtilityScope
+  p5McpOwner?: import('./appActions/mcp/originalTask').P5ApiDiscoveryOwner
+  actorType?: ControlActorType
+  ownedPrimaryPreview?: boolean
+  portableSettingsActor?: { tokenId: string; authorityGeneration: number }
   userId?: string | null
   agentId?: string | null
   runtimeMode?: ControlRuntimeMode | null
   allowedControlIds?: string[]
+  delegatedRun?: boolean
+  delegatedAllowedControlIds?: string[] | null
   includeDraft?: boolean
 }): Promise<VisibleControlSummary[]> {
   const controls = await resolveVisibleControls({
+    apiUtilityScope: options.apiUtilityScope,
+    p5McpOwner: options.p5McpOwner,
+    actorType: options.actorType,
+    ownedPrimaryPreview: options.ownedPrimaryPreview,
+    portableSettingsActor: options.portableSettingsActor,
     userId: options.userId ?? null,
     agentId: options.agentId ?? null,
     runtimeMode: options.runtimeMode ?? null,
     includeDraft: options.includeDraft === true,
-    allowedControlIds: options.allowedControlIds
+    allowedControlIds: options.allowedControlIds,
+    delegatedRun: options.delegatedRun,
+    delegatedAllowedControlIds: options.delegatedAllowedControlIds
   })
 
   return controls
@@ -7763,6 +7993,10 @@ export async function listVisibleControls(options: {
 }
 
 export async function findControls(options: ControlFindOptions): Promise<ControlFindResult> {
+  if (options.brokerFamilies !== undefined && (!Array.isArray(options.brokerFamilies) ||
+    options.brokerFamilies.some((family) => family !== 'fabric' && family !== 'batshit'))) {
+    throw new Error('Invalid control brokerFamilies: expected fabric and/or batshit.')
+  }
   const query = typeof options.query === 'string' ? options.query.trim().toLowerCase() : ''
   const queryTokens = buildControlQueryTokens(query)
   const filterTags = (options.tags ?? [])
@@ -7775,6 +8009,11 @@ export async function findControls(options: ControlFindOptions): Promise<Control
   const artifactUseIntent = isArtifactUseIntent(queryTokens)
 
   const rows = (await resolveVisibleControls({
+    apiUtilityScope: options.apiUtilityScope,
+    p5McpOwner: options.p5McpOwner,
+    actorType: options.actorType,
+    ownedPrimaryPreview: options.ownedPrimaryPreview,
+    portableSettingsActor: options.portableSettingsActor,
     userId: options.userId ?? null,
     agentId: options.agentId ?? null,
     runtimeMode: options.runtimeMode ?? null,
@@ -7783,6 +8022,10 @@ export async function findControls(options: ControlFindOptions): Promise<Control
     delegatedRun: options.delegatedRun === true,
     delegatedAllowedControlIds: options.delegatedAllowedControlIds
   }))
+    .filter(definition => options.domain !== 'agent-settings' || Object.values(SETTINGS_MANAGEMENT_CONTROL_IDS).includes(definition.controlId as any))
+    .filter((definition) => !options.excludedControlIds?.includes(definition.controlId))
+    .filter((definition) => options.brokerFamilies === undefined ||
+      options.brokerFamilies.includes(isBatshitUtilityControlId(definition.controlId) ? 'batshit' : 'fabric'))
     .map((definition) => {
       if (sourceFilter && !sourceFilter.has(definition.sourceType)) return false
       if (riskFilter && !riskFilter.has(definition.riskLevel)) return false
@@ -7843,15 +8086,14 @@ export async function findControls(options: ControlFindOptions): Promise<Control
 /**
  * Which surface raised a card, derived from what the server can observe.
  *
- * A presentation and diagnostics label only — nothing in `decideRiskGate` branches on it,
- * so a wrong answer here cannot weaken a gate. `mode3` is the API broker's own runtime
- * mode; a verified `messageId` is the managed CLI helper's signature (DL-116-07: it is the
- * only caller that forwards `BATSHIT_MESSAGE_ID`); everything else is a service-token
- * caller with no chat to render a card in.
+ * `mode3` is the API broker's own runtime
+ * mode; everything else is a service-token or delegated caller with no chat to render a card
+ * in. SA-139 R4: a verified `messageId` no longer means `cli` — only the CLI Primary's helper
+ * forwarded one (DL-116-07), and a Subagent's synthetic id never verifies. Saved `cli` cards
+ * stay readable through `ControlApprovalLane`.
  */
-function resolveApprovalLane(options: ControlUseOptions): ControlApprovalLane {
+function resolveApprovalLane(options: ControlUseOptions): LiveControlApprovalLane {
   if (options.runtimeMode === 'mode3') return 'api'
-  if (typeof options.messageId === 'string' && options.messageId.trim().length > 0) return 'cli'
   return 'service'
 }
 
@@ -7886,6 +8128,7 @@ export interface ControlRiskProfile {
 }
 
 export async function resolveControlRiskProfile(options: {
+  apiUtilityScope?: ApiUtilityScope
   userId: string
   agentId?: string | null
   runtimeMode?: ControlRuntimeMode | null
@@ -7903,7 +8146,9 @@ export async function resolveControlRiskProfile(options: {
 
   let control: ControlDefinition | undefined
   try {
-    const controlDefinitions = await loadControlDefinitionsForUser(options.userId)
+    const controlDefinitions = isApiUtilityControlId(requestedControlId)
+      ? buildApiUtilityControls(options.apiUtilityScope, options)
+      : await loadControlDefinitionsForUser(options.userId)
     control =
       STATIC_CONTROL_MAP.get(requestedControlId) ||
       controlDefinitions.find((definition) => definition.controlId === requestedControlId)
@@ -7950,16 +8195,30 @@ export async function resolveControlRiskProfile(options: {
   if (control.status !== 'published') return null
   if (control.riskLevel === 'safe') return null
 
+  let controlTitle = control.title
+  if (control.controlId === 'sys.pinokio.run' && typeof inputPayload.machineId === 'string' && inputPayload.machineId !== 'local') {
+    try {
+      const machine = await pinokioMachineService.resolve(options.userId, { machineId: inputPayload.machineId, revision: inputPayload.revision })
+      controlTitle = `${control.title} — ${machine.label}`
+    } catch { return null } // the real invocation refuses invalid targets before its risk gate
+  }
+
   return {
     controlId: control.controlId,
-    controlTitle: control.title,
+    controlTitle,
     riskLevel: control.riskLevel,
     scopeKey: resolveControlRiskScopeKey(control.controlId, inputPayload) ?? null
   }
 }
 
 export async function useControl(options: ControlUseOptions): Promise<ControlUseResult> {
+  // A stale or forged internal lane name is not a server-vouched actor.
+  if ((options.actorType as string | undefined) === 'agent') return {
+    success: false, controlId: options.controlId,
+    error: { code: 'CONTROL_NOT_ALLOWED', message: 'The retired agent credential lane is not available.' }
+  }
   const startedAt = Date.now()
+  const pinokioOrigin = capturePinokioOrigin(options)
   // `'unknown'` is recorded on the audit entry and refused by the identity gate below; it is
   // never a vouched lane (PR #106 review, F-1).
   const actorType: ControlActorType = options.actorType ?? 'unknown'
@@ -7983,7 +8242,9 @@ export async function useControl(options: ControlUseOptions): Promise<ControlUse
       : null
   const allowlistAgentId =
     scopeAgentId ?? (typeof options.agentId === 'string' ? options.agentId.trim() || null : null)
-  const controlDefinitions = await loadControlDefinitionsForUser(options.userId)
+  const controlDefinitions = isApiUtilityControlId(requestedControlId)
+    ? buildApiUtilityControls(options.apiUtilityScope, options)
+    : await loadControlDefinitionsForUser(options.userId)
   let control =
     STATIC_CONTROL_MAP.get(requestedControlId) ||
     controlDefinitions.find((definition) => definition.controlId === requestedControlId)
@@ -8021,8 +8282,7 @@ export async function useControl(options: ControlUseOptions): Promise<ControlUse
       agentId: typeof options.agentId === 'string' ? options.agentId.trim() || null : null,
       scopeAgentId,
       sessionId: typeof options.sessionId === 'string' ? options.sessionId.trim() || null : null,
-      credentialId:
-        typeof options.credentialId === 'string' ? options.credentialId.trim() || null : null,
+      credentialId: null,
       approval: riskApproval,
       paused: riskApprovalPaused,
       controlId: definition?.controlId ?? requestedControlId,
@@ -8110,19 +8370,8 @@ export async function useControl(options: ControlUseOptions): Promise<ControlUse
     )
   }
 
-  /**
-   * SA-117 DL-117-05 — a control that acts as an agent needs an identity the server minted.
-   *
-   * It sits here, after scope and visibility and before everything that costs work, because
-   * it is an authorization answer rather than a validation one. `requireActingAgentIdentity`
-   * is the whole rule and it is never restated inline: a `service`-lane caller holds the
-   * instance token and then NAMES an agent, which is exactly the claim this story stopped
-   * believing. The in-process callers (`in-process`) and the `agent` lane pass, because on
-   * both the `agentId` reaching the handler was set by the server. A caller that declared
-   * no lane at all (`unknown`) is refused: the default fails closed (PR #106 review, F-1).
-   *
-   * It is audited like any other refusal, so "who tried to read whose inbox" is recorded.
-   */
+  // Identity-bearing controls accept only a signed-in user or a server-owned in-process
+  // Primary turn. Service, portable, unknown and delegated actors fail closed.
   if (control && controlActsAsAgent(control.controlId)) {
     const identity = requireActingAgentIdentity(actorType, {
       delegated: options.delegatedRun === true
@@ -8142,24 +8391,7 @@ export async function useControl(options: ControlUseOptions): Promise<ControlUse
     }
   }
 
-  /**
-   * BL-81 — a Subagent or Worker run uses exactly what its DCM index offered it, and nothing more.
-   *
-   * SA-064 keeps the Fabric control plane primary-only. The API lane enforces it by registering
-   * only those refs in its broker; the managed CLI helper serves every family on request, so
-   * until BL-81 a CLI Subagent could call any Fabric control here (`sys.skill.save` made a skill
-   * on for its runtime id: nobody). Its credential now carries the list its DCM offered it
-   * (`resolveDelegatedRunAllowedControlIds`: on a CLI lane, the published artifact tools allowed
-   * for it or nothing, because its CLI profile keeps Fetch Zip off; Fetch Zip reaches only an API
-   * Subagent whose toggle is on, through its broker), and every other control is refused with
-   * `CONTROL_NOT_ALLOWED`.
-   *
-   * **The order is pinned.** The identity gate above answers first, so an acting-agent control
-   * keeps its `AGENT_IDENTITY_REQUIRED` (SA-117 F-P2-1) whatever a list names. Everything below
-   * comes after: status, input validation, the dry run, the risk gate and the handler, so a
-   * control outside the list never raises an approval card and never runs. A delegated call
-   * with no list (a credential minted before BL-81) is allowed nothing.
-   */
+  // A delegated in-process run may use only its server-owned offered list.
   if (
     options.delegatedRun === true &&
     !controlIdMatchesAllowedEntries(
@@ -8210,6 +8442,18 @@ export async function useControl(options: ControlUseOptions): Promise<ControlUse
     )
   }
 
+  if ((Object.values(SETTINGS_MANAGEMENT_CONTROL_IDS) as string[]).includes(effectiveControlId)) {
+    try {
+      await admitSettingsManagementActor({ userId: options.userId, agentId: options.agentId, sessionId: options.sessionId, messageId: options.messageId,
+        p5ApiRun: actorType === 'in-process' && !options.delegatedRun ? options.p5ApiRun : undefined,
+        actorType, delegatedRun: options.delegatedRun, abortSignal: options.abortSignal,
+        portableSettingsActor: options.portableSettingsActor }, effectiveControlId.includes('.portable.') ? 'portable' : 'native')
+    } catch (error) {
+      return finalize({ success: false, controlId: effectiveControlId, error: { code: 'CONTROL_NOT_ALLOWED',
+        message: error instanceof Error ? error.message : 'This Settings actor is not admitted.' } }, control)
+    }
+  }
+
   /**
    * SA-116 F-P1-2 — a dry run must not cost a click.
    *
@@ -8243,42 +8487,28 @@ export async function useControl(options: ControlUseOptions): Promise<ControlUse
     )
   }
 
-  // BL-1322 (with BL-1321): a primary managed run whose own reply has stopped, ended or been
-  // replaced does nothing. Its run credential's Stop is already aborted then (the routes read it
-  // with `getRunCredentialStopSignal`), and the call is refused here: after the identity gate,
-  // the allow lists, input validation and the dry run, and BEFORE the Settings choice and the
-  // risk gate, so no approval record or card is ever made for it and no handler runs. Stop means
-  // stop, for safe controls too. It sees only a Stop it is handed: `/api/controls/use` hands it;
-  // `/api/cli-tools/execute` and `/api/native-tools/dispatch` refuse such a call themselves
-  // first. Not this rule: a Subagent or Worker run (`delegatedRun`, whose
-  // Stop is its parent's), the API lane's in-process broker (its SDK never executes a stopped
-  // call), and the session, n8n, service and portable lanes, which keep what they had.
-  if (actorType === 'agent' && options.delegatedRun !== true && options.abortSignal?.aborted === true) {
-    return await finalize({
-      success: false,
-      controlId: effectiveControlId,
-      error: {
-        code: 'CONTROL_CANCELLATION_REQUIRED',
-        message: 'This reply has already stopped or ended, so nothing was done. Do not retry it.'
-      }
-    }, control)
-  }
-
   // The two Settings writers must hear this reply's real Stop until Redis socket
   // handoff. Reads and dry runs do not mutate and keep their normal admission behavior.
-  // BL-1314: only the API lane's in-process broker hands its own SDK turn signal as
-  // `abortSignal`. On every other lane that field is the chat's running reply (or, on the
-  // dispatch route's session and n8n lanes, the reply of a chat the body names), so a write
-  // there is admitted only on the Stop of the exact reply its run credential names, read now:
-  // a reply that ended after the route read its Stop (ended normally, so never aborted) is gone.
+  // Only an in-process API turn supplies the Stop that admits a Settings write.
   const settingsControl = (Object.values(SETTINGS_FABRIC_CONTROLS) as string[]).includes(effectiveControlId)
-  const settingsStop = !settingsControl || actorType === 'in-process'
-    ? options.abortSignal
-    : getOriginatingReplyStopSignal(options.originatingReply?.sessionId, options.originatingReply?.messageId)
+  const settingsStop = !settingsControl || actorType === 'in-process' ? options.abortSignal : undefined
   const settingsRefusal = settingsControlAdmission({ controlId: effectiveControlId,
     input: parsedInput.data, abortSignal: settingsStop })
   if (settingsRefusal) {
     return await finalize({ success: false, controlId: effectiveControlId, error: settingsRefusal }, control)
+  }
+
+  let preparedSettings: PreparedSettingsControl | null = null
+  const settingsContext = { userId: options.userId, agentId: options.agentId, sessionId: options.sessionId, messageId: options.messageId,
+        p5ApiRun: actorType === 'in-process' && !options.delegatedRun ? options.p5ApiRun : undefined,
+    actorType, delegatedRun: options.delegatedRun, abortSignal: options.abortSignal,
+    portableSettingsActor: options.portableSettingsActor }
+  try { preparedSettings = await prepareSettingsControl(settingsContext, effectiveControlId, inputPayload) }
+  catch (error) {
+    return finalize({ success: false, controlId: effectiveControlId, error: {
+      code: error instanceof AppActionsManagementRefusal && error.status !== 400 ? 'CONTROL_NOT_ALLOWED' : 'CONTROL_INPUT_INVALID',
+      message: error instanceof Error ? error.message : 'The Settings operation was refused.'
+    } }, control)
   }
 
   /* ---------------------------------------------------------------- *
@@ -8305,20 +8535,50 @@ export async function useControl(options: ControlUseOptions): Promise<ControlUse
    * bytes the model actually sends rather than on whatever defaults a schema fills in —
    * which keeps "the same call" true even if a schema gains a default later.
    * ---------------------------------------------------------------- */
-  if (control.riskLevel !== 'safe') {
+  let controlTitle = control.title
+  // The generic control schema exposes unknown; use this control's schema as the
+  // runtime/type proof before reading the saved target, never a cast or local fallback.
+  const pinokioRun = effectiveControlId === 'sys.pinokio.run' ? pinokioRunInputSchema.safeParse(parsedInput.data) : null
+  if (pinokioRun && !pinokioRun.success) {
+    return await finalize({ success: false, controlId: effectiveControlId, error: {
+      code: 'CONTROL_INPUT_INVALID', message: `Invalid input for "${effectiveControlId}".`, details: pinokioRun.error.flatten()
+    } }, control)
+  }
+  if (pinokioRun?.success && pinokioRun.data.machineId !== undefined && pinokioRun.data.machineId !== 'local') {
+    if (actorType !== 'in-process' || options.delegatedRun === true ||
+      !pinokioOrigin.signal || pinokioOrigin.signal.aborted || !pinokioOrigin.registryStop ||
+      getOriginatingReplyStopSignal(pinokioOrigin.sessionId, pinokioOrigin.messageId) !== pinokioOrigin.registryStop) {
+      return await finalize({ success: false, controlId: effectiveControlId, error: {
+        code: 'CONTROL_CANCELLATION_REQUIRED', message: 'A remote Pinokio start requires its originating Primary reply and real Stop signal.'
+      } }, control)
+    }
+    try {
+      if (typeof pinokioRun.data.revision !== 'number') {
+        throw new PinokioAdmissionError('pinokio_machine_invalid', 'A remote Pinokio start needs its preview’s target revision.', 400)
+      }
+      const machine = await pinokioMachineService.resolve(options.userId, { machineId: pinokioRun.data.machineId, revision: pinokioRun.data.revision })
+      controlTitle = `${control.title} — ${machine.label}`
+    } catch (error) {
+      return await finalize({ success: false, controlId: effectiveControlId, error: {
+        code: 'CONTROL_EXECUTION_FAILED', message: error instanceof Error ? error.message : 'The saved Pinokio computer could not be read.'
+      } }, control)
+    }
+  }
+  if (control.riskLevel !== 'safe' && !preparedSettings?.noEffect) {
     const decision = await decideRiskGate({
       userId: options.userId,
       agentId: options.agentId,
       sessionId: options.sessionId,
       messageId: options.messageId,
       controlId: effectiveControlId,
-      controlTitle: control.title,
+      controlTitle,
       riskLevel: control.riskLevel,
       lane: resolveApprovalLane(options),
       input: inputPayload,
       scopeKey: resolveControlRiskScopeKey(effectiveControlId, inputPayload),
       grant: options.approval ?? null,
-      portableSkillScope: actorType === 'portable-skill' && options.allowRisky === true
+      portableSkillScope: actorType === 'portable-skill' && options.allowRisky === true,
+      settingsPolicyConsent: preparedSettings?.standingConsent
     })
 
     if (decision.kind === 'refuse-group') {
@@ -8337,6 +8597,7 @@ export async function useControl(options: ControlUseOptions): Promise<ControlUse
     }
 
     if (decision.kind === 'pause') {
+      if (preparedSettings?.approvalPreview) decision.request.settingsPreview = preparedSettings.approvalPreview
       riskApprovalPaused = true
       return await finalize(
         {
@@ -8392,13 +8653,28 @@ export async function useControl(options: ControlUseOptions): Promise<ControlUse
     const result = await control.handler(
       {
         userId: options.userId,
+        apiUtilityInvocation: options.apiUtilityInvocation,
+        scopeAgentId,
         agentId: options.agentId ?? null,
         sessionId: options.sessionId ?? null,
         messageId: options.messageId ?? null,
         actorType,
-        mcpGatewayScope: options.actorType === 'agent' ? options.mcpGatewayScope ?? [] : options.mcpGatewayScope,
+        p5ApiRun: actorType === 'in-process' && !options.delegatedRun ? options.p5ApiRun : undefined,
+        delegatedRun: options.delegatedRun,
+        portableSettingsActor: options.portableSettingsActor,
+        settingsAuthorityFence: preparedSettings?.authorityFence,
+        settingsAuthorityCheck: preparedSettings?.authorityFence ? () => { nativeSettingsSignal(settingsContext) } : undefined,
+        settingsNativeGate: () => {
+          if (effectiveControlId !== SETTINGS_MANAGEMENT_CONTROL_IDS.nativeChange || !preparedSettings || !preparedSettings.noEffect && !riskApproval) throw new AppActionsManagementRefusal('NATIVE_APPROVAL_REQUIRED', 'The exact native approval gate did not run.')
+          nativeSettingsSignal(settingsContext)
+        },
+        whiteboardSettingsSnapshot: options.whiteboardSettingsSnapshot,
+        mcpGatewayScope: options.mcpGatewayScope,
         selectedGateways: selectedGateways ?? undefined,
-        abortSignal: options.abortSignal instanceof AbortSignal ? options.abortSignal : undefined
+        abortSignal: options.abortSignal instanceof AbortSignal ? options.abortSignal : undefined,
+        pinokioOriginalStop: pinokioOrigin.signal,
+        pinokioNativeAdmission: () => assertPinokioActor(options, pinokioOrigin, control!, null, riskApproval, hashControlInput(inputPayload)),
+        pinokioArtifactAdmission: (artifact) => assertPinokioActor(options, pinokioOrigin, control!, artifact, null, '')
       },
       parsedInput.data as Record<string, any>
     )

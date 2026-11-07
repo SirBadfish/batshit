@@ -7,15 +7,17 @@ import { validateInspection, validateOwnRead, validateOwnUpdate } from '$lib/app
 import { inspectSettings, ownAgentSettings } from './settings/server'
 import { publishUserEvent } from '$lib/server/ssePublisher'
 
-type AgentContext = { userId: string; agentId?: string | null; abortSignal?: AbortSignal }
+type AgentContext = { userId: string; agentId?: string | null; abortSignal?: AbortSignal; settingsAuthorityFence?: SettingsOwnerContext['authorityFence']; settingsAuthorityCheck?: () => void }
 function ownerContext(context: AgentContext): SettingsOwnerContext {
   if (!context.agentId) refuse('agent_identity_required')
   const deadlineAt = Date.now() + APP_ACTION_DEADLINE_MS
   // These two fields are the reviewed V2 owner seam. Never accepted as tool args.
   const owner: SettingsOwnerContext = {
     actor: { kind: 'agent', userId: context.userId, actingAgentId: context.agentId },
+    authorityFence: context.settingsAuthorityFence,
     ...(context.abortSignal instanceof AbortSignal ? { signal: context.abortSignal } : {}), deadlineAt,
     check() {
+      context.settingsAuthorityCheck?.()
       if (context.abortSignal?.aborted) refuse('caller_stopped')
       if (Date.now() >= deadlineAt) refuse('expired_request')
     }

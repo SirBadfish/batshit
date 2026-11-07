@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/svelte'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import AdminPinokioRuntimeRow from './AdminPinokioRuntimeRow.svelte'
+import { LOCAL_PINOKIO_MACHINE } from '$lib/pinokio/machines'
 
 /**
  * SA-072 P1 (DL-01): Settings → Admin → Runtimes shows one read-only Pinokio line and nothing
@@ -11,6 +12,9 @@ function installFetch(pinokio: Record<string, unknown>) {
   const urls: string[] = []
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input.toString()
+    if (url === '/api/pinokio/machines') {
+      return { ok: true, status: 200, json: async () => ({ machines: [LOCAL_PINOKIO_MACHINE] }) }
+    }
     urls.push(url)
     expect(init?.method ?? 'GET').toBe('GET')
     return { ok: true, status: 200, json: async () => ({ pinokio }) }
@@ -34,11 +38,12 @@ describe('AdminPinokioRuntimeRow', () => {
       versionFloor: '8.2.0'
     })
     render(AdminPinokioRuntimeRow, { props: { open: true, onToggle: () => {} } })
-    expect(await screen.findByText('Detected')).toBeTruthy()
+    expect(await screen.findByText('This computer: Detected')).toBeTruthy()
     expect((await screen.findByTestId('pinokio-runtime-line')).textContent?.trim()).toBe(
       'Pinokio 8.2.0 detected at /Users/fixture/pinokio.'
     )
     expect(urls).toEqual(['/api/pinokio/status'])
+    expect(await screen.findByLabelText('Pinokio Address')).toBeTruthy()
   })
 
   it('says Not Detected when Pinokio is absent, and Refresh asks again for a fresh answer', async () => {
@@ -50,9 +55,10 @@ describe('AdminPinokioRuntimeRow', () => {
       versionFloor: '8.2.0'
     })
     render(AdminPinokioRuntimeRow, { props: { open: true, onToggle: () => {} } })
-    expect(await screen.findByText('Not Detected')).toBeTruthy()
+    expect(await screen.findByText('This computer: Not Detected')).toBeTruthy()
     expect((await screen.findByTestId('pinokio-runtime-line')).textContent?.trim()).toBe('Pinokio not detected.')
-    await fireEvent.click(screen.getByRole('button', { name: /Refresh/ }))
+    expect(await screen.findByLabelText('Pinokio Address')).toBeTruthy()
+    await fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
     await waitFor(() => expect(urls).toEqual(['/api/pinokio/status', '/api/pinokio/status?fresh=1']))
   })
 
@@ -65,6 +71,6 @@ describe('AdminPinokioRuntimeRow', () => {
       versionFloor: '8.2.0'
     })
     render(AdminPinokioRuntimeRow, { props: { open: false, onToggle: () => {} } })
-    expect(await screen.findByText('Not Running')).toBeTruthy()
+    expect(await screen.findByText('This computer: Not Running')).toBeTruthy()
   })
 })

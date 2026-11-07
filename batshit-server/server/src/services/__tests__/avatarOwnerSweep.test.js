@@ -4,6 +4,7 @@ const path = require('node:path');
 
 const {
   AvatarOwnerDeleteRequestError,
+  TIDY_RECENT_UPLOAD_GRACE_MS,
   parseAvatarOwnerDeleteRequest,
   sweepOwnedAvatars
 } = require('../avatarOwnerSweep');
@@ -493,6 +494,81 @@ describe('a tidy never deletes a picture that may still be on its way to a save 
     expect(await exists(`avatars/${newerFileOnly}`)).toBe(true);
   });
 
+  test.each(['agent', 'subagent', 'group', 'user'])(
+    'a save for %s keeps another tab’s recent earlier upload under both key forms and as a file alone',
+    async (entityType) => {
+      const nowMs = 1_780_000_000_000;
+      const shown = `${entityType}_bob_${nowMs - 30_000}.jpg`;
+      const pending = `${entityType}_bob_${nowMs - 60_000}.jpg`;
+      const pendingFileOnly = `${entityType}_bob_${nowMs - 90_000}.jpg`;
+      const expired = `${entityType}_bob_${nowMs - 11 * 60_000}.jpg`;
+      const neighbour = `${entityType}_bob_2_${nowMs - 12 * 60_000}.jpg`;
+      const owner = { entityType, entityId: 'bob' };
+      const client = createFakeRedis({
+        [`upload:avatars:${entityType}:${shown}`]: avatarRecord(shown, owner),
+        [`upload:avatars:${entityType}:${pending}`]: avatarRecord(pending, owner),
+        [`upload:avatars:${pending}`]: avatarRecord(pending, owner),
+        [`upload:avatars:${entityType}:${expired}`]: avatarRecord(expired, owner),
+        [`upload:avatars:${entityType}:${neighbour}`]: avatarRecord(neighbour, { entityType, entityId: 'bob_2' })
+      });
+      for (const filename of [shown, pending, pendingFileOnly, expired, neighbour]) {
+        await writeUpload(`avatars/${filename}`);
+      }
+
+      const result = await sweepOwnedAvatars({
+        client, uploadRoot, ...owner, keepFilenames: [shown], tidy: true, nowMs
+      });
+
+      expect(result).toEqual({
+        deletedRecords: [`upload:avatars:${entityType}:${expired}`],
+        deletedFiles: [`avatars/${expired}`]
+      });
+      expect(client.store.has(`upload:avatars:${entityType}:${pending}`)).toBe(true);
+      expect(client.store.has(`upload:avatars:${pending}`)).toBe(true);
+      expect(client.store.has(`upload:avatars:${entityType}:${neighbour}`)).toBe(true);
+      for (const filename of [shown, pending, pendingFileOnly, neighbour]) {
+        expect(await exists(`avatars/${filename}`)).toBe(true);
+      }
+    }
+  );
+
+  test.each([false, true])('the exact ten-minute boundary stays, then expires (file only: %s)', async (fileOnly) => {
+    const uploadedAt = 1_780_000_000_000;
+    const pending = `user_josh_${uploadedAt}.jpg`;
+    const shown = `user_josh_${uploadedAt + 30_000}.jpg`;
+    const key = `upload:avatars:user:${pending}`;
+    const client = createFakeRedis(fileOnly ? {} : {
+      [key]: avatarRecord(pending, { entityType: 'user', entityId: 'josh' })
+    });
+    await writeUpload(`avatars/${pending}`);
+    const request = { client, uploadRoot, entityType: 'user', entityId: 'josh', keepFilenames: [shown], tidy: true };
+
+    await expect(sweepOwnedAvatars({ ...request, nowMs: uploadedAt + TIDY_RECENT_UPLOAD_GRACE_MS }))
+      .resolves.toEqual({ deletedRecords: [], deletedFiles: [] });
+    expect(await exists(`avatars/${pending}`)).toBe(true);
+    const result = await sweepOwnedAvatars({ ...request, nowMs: uploadedAt + TIDY_RECENT_UPLOAD_GRACE_MS + 1 });
+
+    expect(result).toEqual({ deletedRecords: fileOnly ? [] : [key], deletedFiles: [`avatars/${pending}`] });
+    expect(await exists(`avatars/${pending}`)).toBe(false);
+  });
+
+  test('expiry does not make pictures newer than the saved picture eligible', async () => {
+    const nowMs = 1_780_000_000_000;
+    const shown = `group_crew_${nowMs - 20 * 60_000}.jpg`;
+    const newer = `group_crew_${nowMs - 15 * 60_000}.jpg`;
+    const newerFileOnly = `group_crew_${nowMs - 14 * 60_000}.jpg`;
+    const client = createFakeRedis({
+      [`upload:avatars:group:${newer}`]: avatarRecord(newer, { entityType: 'group', entityId: 'crew' })
+    });
+    for (const filename of [shown, newer, newerFileOnly]) await writeUpload(`avatars/${filename}`);
+
+    await expect(sweepOwnedAvatars({
+      client, uploadRoot, entityType: 'group', entityId: 'crew', keepFilenames: [shown], tidy: true, nowMs
+    })).resolves.toEqual({ deletedRecords: [], deletedFiles: [] });
+    expect(client.store.has(`upload:avatars:group:${newer}`)).toBe(true);
+    for (const filename of [shown, newer, newerFileOnly]) expect(await exists(`avatars/${filename}`)).toBe(true);
+  });
+
   test('with no kept picture (cleared, or an icon): only pictures older than ten minutes go', async () => {
     const nowMs = 1_780_000_000_000;
     const old = `user_josh_${nowMs - 11 * 60_000}.jpg`;
@@ -520,19 +596,19 @@ describe('a tidy never deletes a picture that may still be on its way to a save 
     expect(await exists(`avatars/${recentFileOnly}`)).toBe(true);
   });
 
-  // The save that cleared the picture names the picture it replaced: that one and every older
-  // one go at once, and only a picture uploaded after it (on its way to a save) stays.
-  test('with no kept picture but the replaced one named: it and every older one go, a newer one stays', async () => {
+  test('a cleared picture deletes its exact replacement and expired predecessors, preserving every other recent upload', async () => {
     const nowMs = 1_780_000_000_000;
+    const expired = `agent_bob_${nowMs - 11 * 60_000}.jpg`;
     const older = `agent_bob_${nowMs - 90_000}.jpg`;
     const replaced = `agent_bob_${nowMs - 60_000}.jpg`;
     const newer = `agent_bob_${nowMs - 1_000}.jpg`;
     const client = createFakeRedis({
+      [`upload:avatars:agent:${expired}`]: avatarRecord(expired, { entityId: 'bob' }),
       [`upload:avatars:agent:${older}`]: avatarRecord(older, { entityId: 'bob' }),
       [`upload:avatars:agent:${replaced}`]: avatarRecord(replaced, { entityId: 'bob' }),
       [`upload:avatars:agent:${newer}`]: avatarRecord(newer, { entityId: 'bob' })
     });
-    for (const filename of [older, replaced, newer]) await writeUpload(`avatars/${filename}`);
+    for (const filename of [expired, older, replaced, newer]) await writeUpload(`avatars/${filename}`);
 
     const result = await sweepOwnedAvatars({
       client,
@@ -546,12 +622,100 @@ describe('a tidy never deletes a picture that may still be on its way to a save 
     });
 
     expect(result).toEqual({
-      deletedRecords: [`upload:avatars:agent:${older}`, `upload:avatars:agent:${replaced}`].sort(),
-      deletedFiles: [`avatars/${older}`, `avatars/${replaced}`].sort()
+      deletedRecords: [`upload:avatars:agent:${expired}`, `upload:avatars:agent:${replaced}`].sort(),
+      deletedFiles: [`avatars/${expired}`, `avatars/${replaced}`].sort()
     });
+    expect(client.store.has(`upload:avatars:agent:${older}`)).toBe(true);
+    expect(await exists(`avatars/${older}`)).toBe(true);
     expect(client.store.has(`upload:avatars:agent:${newer}`)).toBe(true);
     expect(await exists(`avatars/${newer}`)).toBe(true);
   });
+
+  test.each([[false, false], [false, true], [true, false], [true, true]])(
+    'an exact replacement newer than kept is removed unless also kept (overlap: %s, file only: %s)', async (overlap, fileOnly) => {
+      const nowMs = 1_780_000_000_000;
+      const shown = `agent_bob_${nowMs - 90_000}.jpg`;
+      const replaced = `agent_bob_${nowMs - 30_000}.jpg`;
+      const pending = `agent_bob_${nowMs - 60_000}.jpg`;
+      const neighbour = `agent_bob_2_${nowMs - 30_000}.jpg`;
+      const otherType = `group_bob_${nowMs - 30_000}.jpg`;
+      const filenames = [shown, replaced, pending, neighbour, otherType];
+      const recorded = fileOnly ? filenames.filter((filename) => filename !== replaced) : filenames;
+      const client = createFakeRedis(Object.fromEntries(recorded.map((filename) => [
+        `upload:avatars:${filename}`, avatarRecord(filename)
+      ])));
+      for (const filename of filenames) await writeUpload(`avatars/${filename}`);
+
+      const result = await sweepOwnedAvatars({
+        client, uploadRoot, entityType: 'agent', entityId: 'bob',
+        keepFilenames: overlap ? [shown, replaced] : [shown], replacedFilename: replaced, tidy: true, nowMs
+      });
+
+      expect(result).toEqual({
+        deletedRecords: overlap || fileOnly ? [] : [`upload:avatars:${replaced}`],
+        deletedFiles: overlap ? [] : [`avatars/${replaced}`]
+      });
+      for (const filename of [shown, pending, neighbour, otherType]) {
+        expect(client.store.has(`upload:avatars:${filename}`)).toBe(true);
+        expect(await exists(`avatars/${filename}`)).toBe(true);
+      }
+      expect(await exists(`avatars/${replaced}`)).toBe(overlap);
+    }
+  );
+
+  test.each(['agent_bob_2', 'group_bob'])(
+    'an exact replacement name cannot reach another owner (%s)', async (otherOwner) => {
+      const nowMs = 1_780_000_000_000;
+      const shown = `agent_bob_${nowMs - 30_000}.jpg`;
+      const replaced = `${otherOwner}_${nowMs - 60_000}.jpg`;
+      const key = `upload:avatars:${replaced}`;
+      const client = createFakeRedis({ [key]: avatarRecord(replaced) });
+      await writeUpload(`avatars/${replaced}`);
+
+      await expect(sweepOwnedAvatars({
+        client, uploadRoot, entityType: 'agent', entityId: 'bob', keepFilenames: [shown],
+        replacedFilename: replaced, tidy: true, nowMs
+      })).resolves.toEqual({ deletedRecords: [], deletedFiles: [] });
+      expect(client.json.get).not.toHaveBeenCalled();
+      expect(await exists(`avatars/${replaced}`)).toBe(true);
+    }
+  );
+
+  test('the exact replacement exception cannot bypass record validation or cause a partial sweep', async () => {
+    const nowMs = 1_780_000_000_000;
+    const expired = `agent_bob_${nowMs - 11 * 60_000}.jpg`;
+    const replaced = `agent_bob_${nowMs - 30_000}.jpg`;
+    const other = `user_josh_${nowMs - 30_000}.jpg`;
+    const client = createFakeRedis({
+      [`upload:avatars:agent:${expired}`]: avatarRecord(expired),
+      [`upload:avatars:agent:${replaced}`]: {
+        ...avatarRecord(replaced), relativePath: `avatars/${other}`, filePath: path.join(uploadRoot, 'avatars', other)
+      }
+    });
+    for (const filename of [expired, replaced, other]) await writeUpload(`avatars/${filename}`);
+
+    await expect(sweepOwnedAvatars({
+      client, uploadRoot, entityType: 'agent', entityId: 'bob', replacedFilename: replaced, tidy: true, nowMs
+    })).rejects.toThrow(/nothing was deleted/i);
+    expect(client.del).not.toHaveBeenCalled();
+    expect(client.store.size).toBe(2);
+    for (const filename of [expired, replaced, other]) expect(await exists(`avatars/${filename}`)).toBe(true);
+  });
+
+  test.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+    'an invalid clock cannot expire ordinary pending uploads (%s)', async (nowMs) => {
+      const pending = 'agent_bob_1780000000000.jpg';
+      const shown = 'agent_bob_1780000030000.jpg';
+      const client = createFakeRedis({ [`upload:avatars:agent:${pending}`]: avatarRecord(pending) });
+      await writeUpload(`avatars/${pending}`);
+
+      await expect(sweepOwnedAvatars({
+        client, uploadRoot, entityType: 'agent', entityId: 'bob', keepFilenames: [shown], tidy: true, nowMs
+      })).resolves.toEqual({ deletedRecords: [], deletedFiles: [] });
+      expect(client.json.get).not.toHaveBeenCalled();
+      expect(await exists(`avatars/${pending}`)).toBe(true);
+    }
+  );
 
   test('an owner delete (no tidy) still sweeps every picture, the newest included', async () => {
     const nowMs = 1_780_000_000_000;

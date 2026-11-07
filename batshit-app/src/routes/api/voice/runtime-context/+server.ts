@@ -55,7 +55,8 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       guidance = await buildVoiceRuntimeGuidanceForProvider(
         locals.user.id,
         provider,
-        userSettings?.voice_settings
+        userSettings?.voice_settings,
+        resolvedVoiceConfig.model
       )
     }
 

@@ -59,7 +59,7 @@ beforeEach(() => {
     if (path === '/api/subagents') return json({ subagents: [] })
     if (path === '/api/folders' || path === '/api/projects') return json([])
     if (path === '/api/sessions') return json([])
-    if (path === '/api/goons') return json({ goons: [] })
+    if (path === '/api/goons') return json({ ownerId: 'josh', goons: [] })
     if (path === '/api/user/saved-models') return json({ models: [] })
     if (path === '/api/models') return json({ data: { connections: [] } })
     if (path === '/api/settings/api-keys') return json({ keys: {} })

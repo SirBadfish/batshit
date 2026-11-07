@@ -1,16 +1,17 @@
 import type { GoonRecord } from '$lib/types/goons'
-import { isSupportedFirstPartyRecipeBase } from './recipeAuthorUpdatePolicy'
+import { requiresFirstPartyRecipePreparation, isRecognizedFirstPartyRecipeSourcePair } from './recipeAuthorUpdatePolicy'
 import { recipeOwnerV2 } from './recipeRuntimeProjection'
 
 export type RecipeProductReadiness = 'not-required' | 'preparing' | 'ready' | 'failed'
 
 export function isRecipePreparationRequired(
-  goon: Pick<GoonRecord, 'sourceProfile' | 'customAvatar'> | null | undefined
+  goon: Pick<GoonRecord, 'sourceProfile' | 'customAvatar' | 'recipe'> | null | undefined
 ) {
+  const source = recipeOwnerV2(goon)?.authoringRevision?.source?.identities
+  if (isRecognizedFirstPartyRecipeSourcePair(source)) return true
   return Boolean(
     goon?.sourceProfile === 'expert-custom-glb' &&
-      goon.customAvatar?.manifestSummary?.recipeReady === true &&
-      isSupportedFirstPartyRecipeBase(goon.customAvatar.manifestSummary.baseId)
+      requiresFirstPartyRecipePreparation(goon.customAvatar?.manifestSummary)
   )
 }
 

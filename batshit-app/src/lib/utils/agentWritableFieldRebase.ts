@@ -54,7 +54,8 @@ function rebaseNode(draft: unknown, base: unknown, server: unknown, path: string
 /**
  * Rebases the name and the memory settings of `draft` onto `server` (the record, read again), from
  * `base`: the baseline the conflicting save was worked out from (Ashe's refinement e), or the
- * form's baseline for a read. Every other field of both forms is returned as it was given.
+ * form's baseline for a read. Every other field stays with its existing owner. No saved value is
+ * normalized here.
  */
 export function rebaseAgentWritableFields<F extends AgentWritableBasicFields>(
   draft: F,
@@ -64,6 +65,16 @@ export function rebaseAgentWritableFields<F extends AgentWritableBasicFields>(
 ): AgentWritableRebase<F> {
   const name = rebaseNode(draft.displayName, base.displayName, server.displayName, 'displayName')
   const memory = rebaseNode(draft.memory_settings, base.memory_settings, server.memory_settings, 'memory_settings')
+  // Mode and its number are one human choice. A remote auto pick must not hide
+  // a dirty custom number or combine it with a mode the user did not choose.
+  for (const pair of [['floorMode', 'floorTokens'], ['ceilingHeadroomMode', 'ceilingHeadroomTokens']] as const) {
+    const select = (value: AgentMemorySettingsDraft) => Object.fromEntries(pair.map(key => [key, value.window[key]]))
+    const before = select(base.memory_settings), typed = select(draft.memory_settings), saved = select(server.memory_settings)
+    if (sameJsonValue(typed, before)) continue
+    const target = memory.draft as AgentMemorySettingsDraft
+    target.window = { ...target.window, ...typed }
+    if (!sameJsonValue(saved, before) && !sameJsonValue(saved, typed)) memory.conflicts.push(`memory_settings.window.${pair[0]}`)
+  }
   return {
     draft: { ...draft, displayName: name.draft as string, memory_settings: memory.draft as AgentMemorySettingsDraft },
     base: { ...currentBase, displayName: name.base as string, memory_settings: memory.base as AgentMemorySettingsDraft },

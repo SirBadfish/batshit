@@ -9,7 +9,7 @@ One theme runs through all of it: Batshit was designed around the cost-and-clari
 - [Context, caching, and token optimization](context-caching-tokens.md) — how Batshit shapes a request so the stable parts stay reusable, and how provider caching builds on that.
 - [Tools without prompt bloat](tools-without-bloat.md) — why Batshit doesn't stuff every tool schema into every request.
 - [Zips and Clips under the hood](zips-and-clips.md) — the two views of a message, and how files and images stay out of prompt text.
-- [Agents and runtime paths](agents-and-runtime-paths.md) — the two live Primary Agent runtimes (`API` and `CLI`), plus n8n workflow tools and Workflow Subagents.
+- [Agents and runtime paths](agents-and-runtime-paths.md) — one kind of Primary Agent on any model connection, plus n8n workflow tools.
 - [Artifacts and Fabric](artifacts-and-fabric.md) — how a published Artifact becomes a capability an agent can operate.
 - [Streaming, recovery, and transparency](streaming-and-recovery.md) — how live output, failure recovery, and the Execution Viewer fit together.
 - [Local-first runtime boundaries](local-first-boundaries.md) — what runs where, and what stays on your machine.

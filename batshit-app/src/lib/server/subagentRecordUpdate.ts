@@ -6,24 +6,25 @@ import {
 } from '$lib/server/agentRecordUpdate'
 import { normalizeOptionalAvatarIconFitInput } from '$lib/server/icons/avatarIconFitInput'
 import { normalizeOptionalIconRefInput } from '$lib/server/icons/iconRefInput'
-import { isWorkflowBackedSubagentType, type StoredSubagentType } from '$lib/utils/subagentType'
+import type { SubagentType } from '$lib/utils/subagentType'
 import { normalizeSubagentTimeoutSeconds } from '$lib/utils/subagentTimeout'
+import { normalizeSubagentMaxToolSteps } from '$lib/utils/subagentToolSteps'
 
 /**
  * BL-914: a Subagent record update is a list of by-path writes, run in one step inside Redis
  * (`UPDATE_SUBAGENT_FIELDS_SCRIPT` in `redis.ts`; the default lane's twin runs the same
  * arguments, `test-utils/agentUpdateScriptTwin.ts`). `PUT /api/subagents/[id]` used to read the
  * record, wait for the request body, lay the body over the record it had read
- * (`{ ...existing, ...body }`) and write the WHOLE record back, so a partial `codex_settings`,
- * `claude_settings`, `provider_specific_settings` or `dcmDisplaySettings` erased the keys it did
+ * (`{ ...existing, ...body }`) and write the WHOLE record back, so a partial `claude_settings`,
+ * `provider_specific_settings` or `dcmDisplaySettings` erased the keys it did
  * not name, and two saves of different fields that overlapped in time (the core autosave and the
  * Tool Grid save of one panel) took back each other's field, both answering success.
  *
  * The rules are the agent update's (`agentRecordUpdate.ts`, BL-768, and `planRecordFieldOps`, the
  * one place that knows them), for every field a save names:
  * - each named field is written at `$.<field>` whole; `undefined` is skipped;
- * - `provider_specific_settings` key by key (`nativeTools` field by field), `codex_settings`,
- *   `claude_settings` and `dcmDisplaySettings` key by key (each map entry on its own): a key or
+ * - `provider_specific_settings` key by key (`nativeTools` field by field), `claude_settings`
+ *   and `dcmDisplaySettings` key by key (each map entry on its own): a key or
  *   entry passed as `null` is removed, one not passed stays, the block passed as `null` removes
  *   `provider_specific_settings` and is a write of `null` for the other three; a block that is
  *   neither an object nor null is refused (400) before the script;
@@ -32,9 +33,10 @@ import { normalizeSubagentTimeoutSeconds } from '$lib/utils/subagentTimeout'
  * - `updated_at` is stamped by the plan, last; `id`, `user_id`, `slug` and `created_at` are never
  *   written (`SUBAGENT_KEPT_FIELDS`).
  *
- * The type fields (`subagentType`, the webhook pair, `workflowName`) are DERIVED from the type:
- * they are written only when the request names one of them (`deriveSubagentTypeWrites`), never on
- * every save, or a save of another field would put a stale type over another save's type change.
+ * The type fields (`subagentType`, and the webhook pair and `workflowName` of the removed n8n
+ * Workflow Subagent) are DERIVED: they are written only when the request names one of them
+ * (`deriveSubagentTypeWrites`), never on every save, or a save of another field would put a stale
+ * type over another save's type change.
  * Names, broken characters and depth (64) are checked before the script, because a Lua script does
  * not roll back.
  */
@@ -53,12 +55,14 @@ export const SUBAGENT_TYPE_FIELDS: ReadonlySet<string> = new Set([
 
 /**
  * Fields a `null` removes: an emptied Custom System Prompt is no prompt (BL-482), a blank or null
- * Call Timeout is no override, and the type rule removes the webhook pair, the workflow name and
- * the legacy `subagent_type` this way. Every other field stores the null a save passes.
+ * Call Timeout or Max Tool Steps is no limit, and the type rule removes the webhook pair, the
+ * workflow name and the legacy `subagent_type` this way. Every other field stores the null a save
+ * passes.
  */
 export const SUBAGENT_REMOVES_ON_NULL: ReadonlySet<string> = new Set([
   'system_prompt',
   'timeout_seconds',
+  'max_tool_steps',
   'webhook_url',
   'webhookUrl',
   'workflowName',
@@ -76,29 +80,18 @@ function setOwn(target: Record<string, unknown>, name: string, value: unknown): 
 
 /**
  * The type fields a save writes, as `null` for a removal. Nothing when the request names none of
- * `subagentType`, `webhook_url`/`webhookUrl` or `workflowName`. Otherwise, with `nextType` the type
- * the save resolves to (the named one, else the stored one) and `webhookUrl` the trimmed URL the
- * route resolved (the named one, else the stored one):
- * - a type that is not workflow-backed removes the webhook pair and the workflow name;
- * - a workflow-backed type writes the webhook pair (both names, one trimmed value) only when the
- *   request names a webhook, and the workflow name only when it names a string (trimmed; blank
- *   removes it);
- * - `subagentType` is written, and the legacy `subagent_type` removed, only when the request
- *   names `subagentType`.
- * The route resolves `nextType` and `webhookUrl` from the request and the record it read before
- * the save. The stored type decides which of these fields a named webhook or workflow name writes
- * or removes, and the values written are only the ones the request named (`subagentType` only as
- * the request named it, the webhook only as it named it), so a save of other fields never puts a
- * stale type over another save's change. One limit remains: a body that names a webhook or a
- * workflow name WITHOUT `subagentType`, racing another save's type change, follows the type read
- * before its body arrived (no shipped sender does this: the panel names the type with the webhook).
+ * `subagentType`, `webhook_url`/`webhookUrl` or `workflowName`. Otherwise `subagentType` is written
+ * (as `nextType`, the named type else the stored one), and the legacy `subagent_type` removed,
+ * only when the request names `subagentType`; the webhook pair and the workflow name are always
+ * removed, because no live type keeps them since the n8n Workflow Subagent was removed (SA-139 R2).
+ * A save of other fields never writes them, so it cannot put a stale type over another save's
+ * type change.
  */
 export function deriveSubagentTypeWrites(input: {
   body: Record<string, unknown>
-  nextType: StoredSubagentType
-  webhookUrl: string
+  nextType: SubagentType
 }): Record<string, unknown> {
-  const { body, nextType, webhookUrl } = input
+  const { body, nextType } = input
   const namesType = hasOwn(body, 'subagentType')
   const namesWebhook = hasOwn(body, 'webhook_url') || hasOwn(body, 'webhookUrl')
   const namesWorkflowName = hasOwn(body, 'workflowName')
@@ -109,17 +102,9 @@ export function deriveSubagentTypeWrites(input: {
     writes.subagentType = nextType
     writes.subagent_type = null
   }
-  if (!isWorkflowBackedSubagentType(nextType)) {
-    writes.webhook_url = null
-    writes.webhookUrl = null
-    writes.workflowName = null
-    return writes
-  }
-  if (typeof body.webhook_url === 'string' || typeof body.webhookUrl === 'string') {
-    writes.webhook_url = webhookUrl
-    writes.webhookUrl = webhookUrl
-  }
-  if (typeof body.workflowName === 'string') writes.workflowName = body.workflowName.trim() || null
+  writes.webhook_url = null
+  writes.webhookUrl = null
+  writes.workflowName = null
   return writes
 }
 
@@ -133,10 +118,10 @@ export function deriveSubagentTypeWrites(input: {
  */
 export function buildSubagentWrites(input: {
   body: Record<string, unknown>
-  nextType: StoredSubagentType
-  webhookUrl: string
+  nextType: SubagentType
 }): Record<string, unknown> {
   const { body } = input
+  if (Object.hasOwn(body, 'app_action_policy')) throw new AgentUpdateRejectedError('Subagents cannot hold or change a Primary Agent App Actions policy.')
   const writes: Record<string, unknown> = {}
   for (const [field, value] of Object.entries(body)) {
     if (SUBAGENT_KEPT_FIELDS.has(field) || SUBAGENT_TYPE_FIELDS.has(field)) continue
@@ -148,6 +133,9 @@ export function buildSubagentWrites(input: {
   }
   if (hasOwn(body, 'timeout_seconds')) {
     writes.timeout_seconds = normalizeSubagentTimeoutSeconds(body.timeout_seconds) ?? null
+  }
+  if (hasOwn(body, 'max_tool_steps')) {
+    writes.max_tool_steps = normalizeSubagentMaxToolSteps(body.max_tool_steps) ?? null
   }
   if (hasOwn(body, 'avatar_icon_ref')) {
     writes.avatar_icon_ref = normalizeOptionalIconRefInput(body.avatar_icon_ref, 'avatar_icon_ref')
@@ -162,8 +150,8 @@ export function buildSubagentWrites(input: {
 /**
  * The by-path writes of a Subagent update (`writes` is what `buildSubagentWrites` gives) and the
  * stamp, `now`, last. Throws `AgentUpdateRejectedError`, before anything is written, for a field
- * name that is not a field name, a `provider_specific_settings`, `codex_settings`,
- * `claude_settings` or `dcmDisplaySettings` (or a `dcmDisplaySettings` map) that is neither an
+ * name that is not a field name, a `provider_specific_settings`, `claude_settings` or
+ * `dcmDisplaySettings` (or a `dcmDisplaySettings` map) that is neither an
  * object nor null, a key or value with a broken character (a lone half of a surrogate pair), or a
  * value nested deeper than `MAX_AGENT_VALUE_DEPTH`.
  */
@@ -174,6 +162,7 @@ export function planSubagentRecordUpdate({
   writes: Record<string, unknown>
   now: string
 }): { ops: AgentRecordOp[] } {
+  if (Object.hasOwn(writes, 'app_action_policy')) throw new AgentUpdateRejectedError('Subagents cannot hold or change a Primary Agent App Actions policy.')
   const ops: AgentRecordOp[] = []
   for (const [field, value] of Object.entries(writes)) {
     if (!AGENT_FIELD_NAME.test(field)) throw new AgentUpdateRejectedError(`Not a Subagent field name: ${field}`)

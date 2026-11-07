@@ -1,9 +1,11 @@
 <script lang="ts">
   import { Loader2 } from '@lucide/svelte'
   import { Badge } from '$lib/components/ui/badge'
+  import { Button } from '$lib/components/ui/button'
   import * as Switch from '$lib/components/ui/switch'
   import SettingsAccordionCard from '$lib/components/settings/SettingsAccordionCard.svelte'
   import SettingsInfoMenu from '$lib/components/settings/SettingsInfoMenu.svelte'
+  import PluginAccessAssignments from './PluginAccessAssignments.svelte'
   import SettingsSaveStatus from '$lib/components/settings/SettingsSaveStatus.svelte'
   import type { SubagentRow, SlashCommandRow } from '$lib/types/database'
   import type { ArtifactRow } from '$lib/services/artifactService'
@@ -17,14 +19,11 @@
     subagents: SubagentRow[]
     selectedSubagentIds: string[]
     selectedAgentId: string | null
-    primaryAgentLabel: string
-    compatibleSubagentTypesLabel: string
     assignmentSaveState: SaveState
     assignmentSaveError: string | null
     /** SA-111 P4 (DL-111-11): may this Primary Agent spawn Workers? */
     workersEnabled: boolean
     workersMaxConcurrent: number
-    workersMaxRunsPerTurn: number
     onWorkersEnabledChange: (enabled: boolean) => void
     accessSaveState: SaveState
     accessSaveError: string | null
@@ -32,9 +31,11 @@
     accessResourcesLoading: boolean
     accessResourcesLoaded: boolean
     accessResourcesError: string | null
+    onAccessRetry: () => void
     accessSlashCommands: SlashCommandRow[]
     accessArtifacts: ArtifactRow[]
     isSubagentCompatible: (subagent: SubagentRow) => boolean
+    /** A short badge for the row, or '' for none (SA-139 R6: only a leftover of a removed type has one). */
     formatSubagentBadge: (subagent: SubagentRow) => string
     getSlashCommandEnabledForEntity: (command: SlashCommandRow, entityId: string | null) => boolean
     getArtifactEnabledForEntity: (artifact: ArtifactRow, entityId: string | null) => boolean
@@ -62,13 +63,10 @@
     subagents,
     selectedSubagentIds,
     selectedAgentId,
-    primaryAgentLabel,
-    compatibleSubagentTypesLabel,
     assignmentSaveState,
     assignmentSaveError,
     workersEnabled,
     workersMaxConcurrent,
-    workersMaxRunsPerTurn,
     onWorkersEnabledChange,
     accessSaveState,
     accessSaveError,
@@ -76,6 +74,7 @@
     accessResourcesLoading,
     accessResourcesLoaded,
     accessResourcesError,
+    onAccessRetry,
     accessSlashCommands,
     accessArtifacts,
     isSubagentCompatible,
@@ -128,7 +127,8 @@
           Workers are throwaway helpers this agent can start on its own for one task, then
           read the result. They borrow this agent's model and tools, remember nothing, and
           cannot start more workers. It can also run a fresh copy of an assigned Subagent.
-          Limits: {workersMaxConcurrent} at a time, {workersMaxRunsPerTurn} per response.
+          Up to {workersMaxConcurrent} at a time, with no time limit (a copied Subagent keeps its
+          own limits).
         </SettingsInfoMenu>
       </div>
       <Switch.Root
@@ -169,24 +169,20 @@
                   onSubagentToggle(subagent.id, checked === true)
                 }}
               />
-              <Badge variant="outline" class="batshit-settings-spine-badge">
-                {formatSubagentBadge(subagent)}
-              </Badge>
+              {#if formatSubagentBadge(subagent)}
+                <Badge variant="outline" class="batshit-settings-spine-badge">
+                  {formatSubagentBadge(subagent)}
+                </Badge>
+              {/if}
             </div>
           </div>
         {/each}
       </div>
-
-      <div class="batshit-settings-form-label-line">
-        <span class="batshit-settings-form-label">Compatibility Rules</span>
-        <SettingsInfoMenu ariaLabel="About Subagent Compatibility Rules">
-          {primaryAgentLabel} Primary Agents can only call {` ${compatibleSubagentTypesLabel}.`}
-          Incompatible Subagents stay visible for awareness but their toggles are disabled.
-        </SettingsInfoMenu>
-      </div>
     </div>
   {/if}
 </SettingsAccordionCard>
+
+<PluginAccessAssignments entityId={selectedAgentId} {sectionClass} />
 
 <SettingsAccordionCard
   name="agent-access-cards"
@@ -198,7 +194,7 @@
   {#snippet info()}
     <SettingsInfoMenu ariaLabel="About Agent Skills And Prompts">
       Manage which reusable skills and prompts this agent can use. Global “All agents” stays in
-      Skills &amp; Prompts settings. Individual access lives here.
+      Plugins &amp; shit settings. Individual access lives here.
     </SettingsInfoMenu>
   {/snippet}
   {#snippet actions()}
@@ -214,12 +210,17 @@
   {#if accessResourcesLoading && !accessResourcesLoaded}
     <div class="batshit-settings-inline-alert is-dashed">Loading skills and prompts…</div>
   {:else if accessResourcesError}
-    <div class="batshit-settings-inline-alert is-danger">{accessResourcesError}</div>
-  {:else if accessSlashCommands.length === 0}
+    <div class="batshit-settings-inline-alert is-danger">
+      <div class="flex items-center justify-between gap-2">
+        <span>{accessResourcesError}</span>
+        <Button variant="outline" size="sm" disabled={accessResourcesLoading || accessSaveState === 'saving'} onclick={onAccessRetry}>Retry</Button>
+      </div>
+    </div>
+  {:else if accessSlashCommands.filter(command => !command.plugin_id).length === 0}
     <div class="batshit-settings-inline-alert is-dashed">No skills or prompts found yet.</div>
   {:else}
     <div class="batshit-settings-form-stack">
-      {#each accessSlashCommands as command (command.id)}
+      {#each accessSlashCommands.filter(command => !command.plugin_id) as command (command.id)}
         <div class="batshit-settings-toggle-row is-spine-with-badges">
           <div class="batshit-settings-form-label-line">
             <span class="batshit-settings-parent-label truncate">
@@ -289,7 +290,12 @@
   {#if accessResourcesLoading && !accessResourcesLoaded}
     <div class="batshit-settings-inline-alert is-dashed">Loading artifacts…</div>
   {:else if accessResourcesError}
-    <div class="batshit-settings-inline-alert is-danger">{accessResourcesError}</div>
+    <div class="batshit-settings-inline-alert is-danger">
+      <div class="flex items-center justify-between gap-2">
+        <span>{accessResourcesError}</span>
+        <Button variant="outline" size="sm" disabled={accessResourcesLoading || accessSaveState === 'saving'} onclick={onAccessRetry}>Retry</Button>
+      </div>
+    </div>
   {:else if accessArtifacts.length === 0}
     <div class="batshit-settings-inline-alert is-dashed">No agent-usable artifacts found yet.</div>
   {:else}

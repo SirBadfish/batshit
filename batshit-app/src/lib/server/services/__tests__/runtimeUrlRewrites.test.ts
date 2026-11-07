@@ -2,12 +2,10 @@ import { describe, expect, it } from 'vitest'
 
 import {
   resolveRuntimeN8nBaseUrl,
-  rewriteBatshitCallbackUrlsForN8nRuntime,
   rewriteLoopbackUrlToDockerHostForRuntime,
   rewriteLoopbackUrlForRuntimeBase,
   rewriteN8nGatewayUrlForRuntime,
-  rewriteN8nWebhookUrlForRuntime,
-  shouldUseInternalBatshitCallbacksForN8n
+  rewriteN8nWebhookUrlForRuntime
 } from '../runtimeUrlRewrites'
 import type { MCPGateway } from '$lib/types/database'
 
@@ -159,81 +157,5 @@ describe('runtimeUrlRewrites', () => {
         BATSHIT_CONTAINERIZED: '1'
       })
     ).toBe(gateway)
-  })
-
-  it('uses internal Batshit callbacks when containerized Batshit targets bundled n8n', () => {
-    expect(
-      shouldUseInternalBatshitCallbacksForN8n('http://n8n:5678', {
-        BATSHIT_CONTAINERIZED: '1'
-      })
-    ).toBe(true)
-
-    const rewritten = rewriteBatshitCallbackUrlsForN8nRuntime(
-      {
-        batshit_frontend_url: 'http://localhost:5613',
-        batshit_sse_endpoint: 'http://localhost:5613/api/sse',
-        batshit_artifact_complete_url: 'http://localhost:5613/api/artifacts/complete',
-        other: 'kept'
-      },
-      'http://n8n:5678',
-      { BATSHIT_CONTAINERIZED: '1' }
-    )
-
-    expect(rewritten).toMatchObject({
-      batshit_frontend_url: 'http://app:3000',
-      batshitFrontendUrl: 'http://app:3000',
-      batshit_sse_endpoint: 'http://app:3000/api/sse',
-      batshitSseEndpoint: 'http://app:3000/api/sse',
-      batshit_artifact_complete_url: 'http://app:3000/api/artifacts/complete',
-      batshitArtifactCompleteUrl: 'http://app:3000/api/artifacts/complete',
-      other: 'kept'
-    })
-  })
-
-  it('canonicalizes local Batshit callbacks to IPv4 loopback for host-managed n8n', () => {
-    const payload = {
-      batshit_frontend_url: 'http://localhost:5613',
-      batshitFrontendUrl: 'http://[::1]:5613',
-      batshit_sse_endpoint: 'http://localhost:5613/api/sse',
-      batshitSseEndpoint: 'http://[::1]:5613/api/sse',
-      batshit_artifact_complete_url: 'http://localhost:5613/api/artifacts/complete',
-      batshitArtifactCompleteUrl: 'http://[::1]:5613/api/artifacts/complete',
-      external: 'https://batshit.example.test/api/sse'
-    }
-
-    const rewritten = rewriteBatshitCallbackUrlsForN8nRuntime(
-      payload,
-      'http://host.docker.internal:5678',
-      {
-        BATSHIT_CONTAINERIZED: '1'
-      }
-    )
-
-    expect(rewritten).toMatchObject({
-      batshit_frontend_url: 'http://127.0.0.1:5613',
-      batshitFrontendUrl: 'http://127.0.0.1:5613',
-      batshit_sse_endpoint: 'http://127.0.0.1:5613/api/sse',
-      batshitSseEndpoint: 'http://127.0.0.1:5613/api/sse',
-      batshit_artifact_complete_url: 'http://127.0.0.1:5613/api/artifacts/complete',
-      batshitArtifactCompleteUrl: 'http://127.0.0.1:5613/api/artifacts/complete',
-      external: 'https://batshit.example.test/api/sse'
-    })
-    expect(payload.batshit_sse_endpoint).toBe('http://localhost:5613/api/sse')
-  })
-
-  it('canonicalizes local Batshit callbacks for native n8n too', () => {
-    expect(
-      rewriteBatshitCallbackUrlsForN8nRuntime(
-        {
-          batshit_frontend_url: 'http://localhost:5620',
-          batshit_sse_endpoint: 'http://localhost:5620/api/sse'
-        },
-        'http://localhost:5678',
-        {}
-      )
-    ).toMatchObject({
-      batshit_frontend_url: 'http://127.0.0.1:5620',
-      batshit_sse_endpoint: 'http://127.0.0.1:5620/api/sse'
-    })
   })
 })

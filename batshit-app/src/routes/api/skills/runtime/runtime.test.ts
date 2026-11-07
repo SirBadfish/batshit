@@ -39,17 +39,11 @@ describe('POST /api/skills/runtime', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     redisRecords.clear()
+    redisRecords.set('agent:agent-1', { id: 'agent-1', user_id: 'user-1' })
   })
 
   it('returns the shared skill runtime payload for authorized callers', async () => {
-    vi.mocked(resolveNativeToolUser).mockResolvedValue({
-      userId: 'user-1',
-      auth: 'agent',
-      agentId: 'agent-1',
-      sessionId: 'session-1',
-      credentialId: 'arc_test',
-      delegated: false
-    })
+    vi.mocked(resolveNativeToolUser).mockResolvedValue({ userId: 'user-1', auth: 'session' })
     vi.mocked(executeSkillRuntimeAction).mockResolvedValue({
       success: true,
       action: 'invoke',
@@ -69,6 +63,7 @@ describe('POST /api/skills/runtime', () => {
       buildEvent({
         userId: 'user-1',
         skillId: 'speech_setup',
+        agentId: 'agent-1',
         action: 'invoke'
       })
     )
@@ -85,19 +80,12 @@ describe('POST /api/skills/runtime', () => {
       path: undefined,
       maxChars: undefined
     })
-    expect(payload.auth).toBe('agent')
+    expect(payload.auth).toBe('session')
     expect(payload.skill.id).toBe('speech_setup')
   })
 
   it('forwards offset, and returns the sizes and next call of a partial read (find 1)', async () => {
-    vi.mocked(resolveNativeToolUser).mockResolvedValue({
-      userId: 'user-1',
-      auth: 'agent',
-      agentId: 'agent-1',
-      sessionId: 'session-1',
-      credentialId: 'arc_test',
-      delegated: false
-    })
+    vi.mocked(resolveNativeToolUser).mockResolvedValue({ userId: 'user-1', auth: 'session' })
     const readMore =
       'Showing characters 12,001 to 24,000 of 38,635. To read on, call native_skill again with skillId "speech_setup", action "read", path "references/big.md", and offset 24000.'
     vi.mocked(executeSkillRuntimeAction).mockResolvedValue({
@@ -116,7 +104,7 @@ describe('POST /api/skills/runtime', () => {
     } as any)
 
     const response = await POST(
-      buildEvent({ skillId: 'speech_setup', action: 'read', path: 'references/big.md', offset: 12_000 })
+      buildEvent({ skillId: 'speech_setup', agentId: 'agent-1', action: 'read', path: 'references/big.md', offset: 12_000 })
     )
 
     expect(response.status).toBe(200)
@@ -154,26 +142,7 @@ describe('POST /api/skills/runtime', () => {
       return { response, actor: call?.actor }
     }
 
-    it('uses the Subagent a delegated credential names, not its runtime id', async () => {
-      const { actor } = await actorFor({
-        auth: 'agent',
-        agentId: 'subagent_cli_research',
-        delegated: true,
-        scopeAgentId: 'research_bot'
-      })
-      expect(actor).toEqual({ kind: 'agent', agentId: 'research_bot', delegated: true })
-    })
-
-    it('gives a delegated credential with no scope no skill access', async () => {
-      const { actor } = await actorFor({
-        auth: 'agent',
-        agentId: 'subagent_cli_research',
-        delegated: true
-      })
-      expect(actor).toEqual({ kind: 'none', lane: 'agent-unscoped-delegated' })
-    })
-
-    it.each(['service', 'portable-skill', 'n8n-callback'])(
+    it.each(['service', 'portable-skill'])(
       'gives the %s lane no agent identity, and answers the refusal with 403',
       async (lane) => {
         vi.mocked(resolveNativeToolUser).mockResolvedValue({ userId: 'user-1', auth: lane } as any)
@@ -190,7 +159,7 @@ describe('POST /api/skills/runtime', () => {
     )
 
     it('answers an access refusal with 403, not 400', async () => {
-      const { response } = await actorFor({ auth: 'agent', agentId: 'agent-1', delegated: false })
+      const { response } = await actorFor({ auth: 'session' }, { agentId: 'agent-1' })
       expect(response.status).toBe(403)
       expect((await response.json()).errorCode).toBe('SKILL_NOT_ENABLED')
     })

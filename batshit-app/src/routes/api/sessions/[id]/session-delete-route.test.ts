@@ -15,6 +15,7 @@ vi.mock('$lib/server/services/sessionDeleteTurnStop', async (importOriginal) => 
 }))
 
 import { SessionDeleteRefusedError } from '$lib/server/services/sessionDeleteTurnStop'
+import { SessionSweepReadError } from '$lib/server/sessionSweepReadError'
 
 /**
  * The session route deletes a chat through `deleteSessionStoppingItsTurn`, which stops a reply
@@ -62,6 +63,22 @@ describe('DELETE /api/sessions/[id]', () => {
 
     expect(status).toBe(409)
     expect(payload.code).toBe('session_delete_in_progress')
+  })
+
+  // Re-review of BL-1798: the sweep reads everything before its first write and throws when a
+  // read fails, so nothing was deleted; the user is told that, and so that a retry is safe.
+  it('answers the sweep\'s own sentence when a failed read deleted nothing', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    gateMock.mockRejectedValue(new SessionSweepReadError(new Error('connection lost')))
+
+    const { status, payload } = await callDelete()
+
+    expect(status).toBe(500)
+    expect(payload).toEqual({
+      error: "This chat's messages or zips could not be read, so nothing was deleted. Try again in a moment.",
+      code: 'session_delete_read_failed'
+    })
+    error.mockRestore()
   })
 
   it('keeps answering 500 for any other failure', async () => {

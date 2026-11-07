@@ -70,6 +70,26 @@ describe.each(CONTROL_TAGS.map((spec) => [spec.tag, spec] as const))('findContro
     expect(read(`The ${sentence} closes it.`, final)).toEqual([['paired', sentence]])
   })
 
+  it('BL-767: holds a bad-payload block from its opening tag while its closing tag is still being written', () => {
+    const closing = close(spec)
+    for (const partial of [...Array.from({ length: closing.length - 1 }, (_, n) => closing.slice(0, n + 1)), `</ ${spec.tag} `]) {
+      const tail = `${open(spec)}not a payload${partial}`
+      expect(read(`Words ${tail}`, false)).toEqual([['held-start', tail]])
+      // At the end a cut closing tag closes nothing: the mention and its words are text.
+      expect(read(`Words ${tail}`, true)).toEqual([])
+    }
+    // Before the closing tag's `<` arrives it is a mention, as in a finished reply.
+    expect(read(`Words ${open(spec)}not a payload`, false)).toEqual([])
+  })
+
+  it('BL-767: lets the next chunk decide a `<` that did not become its closing tag, and never holds one in code', () => {
+    expect(read(`The ${open(spec)} tag is <b>great</b`, false)).toEqual([['held-start', `${open(spec)} tag is <b>great</b`]])
+    expect(read(`The ${open(spec)} tag is <b>great</b>`, false)).toEqual([])
+    expect(read(`The ${open(spec)} tag.\n\n\`\`\`\n${close(spec).slice(0, 6)}`, false)).toEqual([])
+    // A later opening tag of its kind stands between: the earlier mention never claims the end.
+    expect(read(`The ${open(spec)} tag and the ${open(spec)} tag, then </`, false)).toEqual([['held-start', `${open(spec)} tag, then </`]])
+  })
+
   it.each(BOTH)('R2 (b): a mention never pairs across another opening tag of its kind (final %s)', (final) => {
     // The later opening tag stands between: the mention is text, and the real block is read.
     expect(read(`The ${open(spec)} tag. ${block}`, final)).toEqual([['paired', block]])
@@ -281,6 +301,16 @@ describe('findControlBlocks: cost (BL-640)', () => {
       expect(elapsed).toBeLessThan(3_000)
     }
   )
+
+  it('reads 50,000 mentions and a long tail with a closing tag still being written in one pass (BL-767)', () => {
+    const text = `${'the <batshit-memory> tag '.repeat(50_000)}${'x'.repeat(500_000)} </batshit-mem`
+    const started = performance.now()
+    const blocks = findControlBlocks(text, { final: false })
+    const elapsed = performance.now() - started
+    expect(blocks).toHaveLength(1)
+    expect(blocks[0].kind).toBe('held-start')
+    expect(elapsed).toBeLessThan(3_000)
+  })
 
   it('reads 50,000 mentions and 50,000 complete blocks in one pass', () => {
     const text = 'the <batshit-memory> tag and <batshit-memory>{"a":1}</batshit-memory> '.repeat(50_000)

@@ -1,7 +1,10 @@
+import './presetStorageScriptDouble'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const redisMock = vi.hoisted(() => ({
   getAgents: vi.fn(),
+  get: vi.fn(async (key: string) => ({ id: key.slice('model:'.length), modelName: 'Owned preset' })),
+  sismember: vi.fn(async () => true),
   sMembers: vi.fn(async () => []),
   getUserSettings: vi.fn(async () => null),
   json: { get: vi.fn(async () => null) },

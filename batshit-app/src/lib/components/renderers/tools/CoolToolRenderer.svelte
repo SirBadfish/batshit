@@ -57,7 +57,7 @@ const pickDynamicInput = (candidate: any): any | null => {
   return candidate
 }
 
-// Extract a likely tool name from various argument shapes (direct, params, Codex `arguments` wrapper)
+// Extract a likely tool name from various argument shapes (direct, params, the `arguments` wrapper of saved Codex CLI steps)
 const extractToolNameFromArgs = (args: any): string | undefined => {
   if (!args || typeof args !== 'object') return undefined
 
@@ -164,7 +164,7 @@ function resolveDisplayToolName(baseName: string, result: any, gatewayName?: str
 
   const parsedResult = maybeParse(result)
 
-  // Try to extract executed tool name from loose text/arrays (Codex often returns text blocks)
+  // Try to extract executed tool name from loose text/arrays (saved Codex CLI steps often hold text blocks)
   const extractFromText = (val: string | undefined): string | null => {
     if (!val) return null
     const match = val.match(/toolName\s*[:=]\s*"?([A-Za-z0-9._-]+)"?/i)
@@ -450,7 +450,7 @@ function resolveDisplayToolName(baseName: string, result: any, gatewayName?: str
 				...(!detectionResult.isSubagent ? { subagentName: undefined, subagentId: undefined } : {})
 			}
 
-			// Codex sometimes tags batshit-server tool calls as toolProvider: 'codex' — force batshit-server renderer when the name matches
+			// Saved Codex CLI steps may tag batshit-server tool calls as toolProvider: 'codex' — force batshit-server renderer when the name matches
 			if (
 				typeof merged.toolName === 'string' &&
 				merged.toolProvider === 'codex' &&

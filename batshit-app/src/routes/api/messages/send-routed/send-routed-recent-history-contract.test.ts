@@ -28,9 +28,13 @@ describe('send-routed: every history window is the newest messages', () => {
 
   it('the three-minute card check reads the newest messages', () => {
     const start = source.indexOf('persistedMessages = await redis.getRecentMessages(sessionId, 300)')
-    const analyze = source.indexOf('const approvalState = analyzeApprovalState(approvalHistoryMessages)')
+    const analyze = source.indexOf('const approvalState = await sweepApprovalState({', start)
     expect(start).toBeGreaterThan(-1)
     expect(analyze).toBeGreaterThan(start)
+    const sweep = source.slice(analyze, source.indexOf('\n        })', analyze))
+    expect(sweep).toContain('\n          userId: resolvedUserId,\n          sessionId,\n          persistedMessages,\n          requestMessages: turnMessages,\n')
+    expect(sweep).toContain('cardMessageId: hasApprovalResponse ? requestedMessageId : undefined')
+    expect(sweep).toContain('signal: turnStopSignal')
   })
 
   it('a context-exhaustion auto-continue compiles the newest messages', () => {

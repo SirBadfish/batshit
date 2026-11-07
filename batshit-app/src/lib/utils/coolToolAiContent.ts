@@ -1,4 +1,7 @@
-import { describeCommandPreview, describeOutputCut, failedCommandExitCode, toolOutputCut, type ToolOutputCut } from './toolActivityContract'
+import { commandCutShort, describeCommandPreview, describeOutputCut, failedCommandExitCode, resolveApiUtilityPresentation, toolOutputCut, type ToolOutputCut } from './toolActivityContract'
+import { describeTypedReadRange, readTypedFileReadFacts } from './typedFileFacts'
+import { API_UTILITY_CONTROL_IDS, formatApiSkillReadMore } from './apiUtilityControls'
+import { describeSkillReadVersion } from './skillSessions'
 
 export const FULL_FIDELITY_AI_EXPANSION_LANES = new Set([
   'read_file',
@@ -80,6 +83,16 @@ function getCoolToolArgs(payload: Record<string, any> | null): Record<string, an
   return args && typeof args === 'object' && !Array.isArray(args) ? args as Record<string, any> : {}
 }
 
+function savedApiSkill(payload: Record<string, any>) {
+  if (payload.type !== 'tool_raw' || payload.originalToolName !== 'native_batshit_tool_use' ||
+      payload.toolProvider !== 'batshit-server' || payload.toolSource !== 'native-tool') return null
+  const presentation = resolveApiUtilityPresentation({
+    toolName: payload.originalToolName, toolProvider: payload.toolProvider,
+    toolArgs: getCoolToolArgs(payload), toolResult: getCoolToolResult(payload)
+  })
+  return presentation?.kind === 'skill' ? presentation : null
+}
+
 function asObject(value: unknown): Record<string, any> | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, any> : null
 }
@@ -125,13 +138,13 @@ function joinSourceSections(sections: CoolToolAiContentPart[][], separator = '\n
   ])
 }
 
-function fenceForAiParts(content: string, language = 'text', contentSource: CoolToolAiContentPart['source'] = 'tool_result'): CoolToolAiContentPart[] {
+function fenceForAiParts(content: string, language = 'text', contentSource: CoolToolAiContentPart['source'] = 'tool_result', preserveWhitespace = false): CoolToolAiContentPart[] {
   const ticks = content.match(/`+/g) ?? []
   const longest = ticks.reduce((max, entry) => Math.max(max, entry.length), 0)
   const fence = '`'.repeat(Math.max(3, longest + 1))
   return [
     ...sourcePart('agent_words', `${fence}${language || 'text'}\n`),
-    ...sourcePart(contentSource, content.trimEnd()),
+    ...sourcePart(contentSource, preserveWhitespace ? content : content.trimEnd()),
     ...sourcePart('agent_words', `\n${fence}`)
   ]
 }
@@ -146,7 +159,8 @@ function buildFullFidelityToolAiContent(
   contentLabel: string,
   content: string,
   language: string,
-  contentSource: CoolToolAiContentPart['source']
+  contentSource: CoolToolAiContentPart['source'],
+  preserveWhitespace = false
 ): CoolToolAiContentPart[] {
   const result = asObject(getCoolToolResult(payload))
   const args = getCoolToolArgs(payload)
@@ -160,7 +174,11 @@ function buildFullFidelityToolAiContent(
   const skill = firstScalarString(result?.skillName, result?.skillId, args.skillId)
   // A shell command read as a file stores an exit code only when it failed (F-P6-5).
   const exitCode = failedCommandExitCode(result)
-  const lineCount = firstScalarString(result?.lineCount, result?.numLines, result?.totalLines)
+  // SA-136: a typed read says which lines it showed of how many (`Lines: 4–6 of 10`).
+  const typedRead = readTypedFileReadFacts(result?.typedFileRead)
+  const lineCount = typedRead
+    ? describeTypedReadRange(typedRead)
+    : firstScalarString(result?.lineCount, result?.numLines, result?.totalLines)
   const size = firstScalarString(result?.size, result?.bytes, result?.contentChars, result?.diffChars)
   const header = formatAiToolHeader(toolName, [
     path ? `Path: ${path}` : '',
@@ -172,7 +190,7 @@ function buildFullFidelityToolAiContent(
 
   return [
     ...sourcePart('agent_words', `${header}\n${contentLabel}:\n`),
-    ...fenceForAiParts(content, language, contentSource)
+    ...fenceForAiParts(content, language, contentSource, preserveWhitespace)
   ]
 }
 
@@ -216,9 +234,12 @@ function buildFailedFileChangeAiContent(toolName: string, payload: Record<string
   const args = getCoolToolArgs(payload)
   const path = firstScalarString(result?.filePath, result?.path, result?.absolutePath, args.filePath, args.path)
   const exitCode = failedCommandExitCode(result)
+  // BL-1979: a command cut before it finished may have changed the file first.
+  const cut = commandCutShort(result)
   const header = formatAiToolHeader(toolName, [
     path ? `Path: ${path}` : '',
-    exitCode !== undefined ? `Exit code: ${exitCode}` : ''
+    exitCode !== undefined ? `Exit code: ${exitCode}` : '',
+    cut ? `Outcome: unknown; it was ${cut === 'timed-out' ? 'cut by its time limit' : 'stopped'} before it finished, so the file may or may not have changed (read it before relying on it)` : ''
   ])
   return joinSourceSections([
     sourcePart('agent_words', header),
@@ -403,9 +424,31 @@ export function buildCoolToolAiContentWithSources(
     return { text: sourceText(parts), parts }
   }
 
-  const operationKind = getCoolToolOperationKind(payload)
+  const apiSkill = savedApiSkill(payload)
+  const savedArgs = getCoolToolArgs(payload)
+  const envelope = asObject(getCoolToolResult(payload))
+  // A malformed Skill claim stays opaque, including an envelope whose result is a string.
+  // Only the existing strict resolver above may turn its nested RAW into reference content.
+  if (!apiSkill && payload.type === 'tool_raw' &&
+      (payload.originalToolName === 'native_batshit_tool_use' && savedArgs.ref === `batshit:${API_UTILITY_CONTROL_IDS.skill}` ||
+        envelope?.ref === `batshit:${API_UTILITY_CONTROL_IDS.skill}`)) {
+    parts = buildGenericToolAiContent(firstScalarString(payload.toolName) || 'tool', payload)
+    return { text: sourceText(parts), parts }
+  }
+  if (apiSkill) {
+    const { readMore: _savedPointer, ...raw } = apiSkill.raw
+    const readMore = formatApiSkillReadMore(raw)
+    // Projection only: stored RAW, source text and window facts remain byte-for-byte intact.
+    payload = { ...payload, toolArgs: apiSkill.args, toolResult: {
+      ...raw,
+      ...(typeof raw.skillId !== 'string' && typeof raw.skill?.id === 'string' ? { skillId: raw.skill.id } : {}),
+      ...(typeof raw.skillName !== 'string' && typeof raw.skill?.name === 'string' ? { skillName: raw.skill.name } : {}),
+      ...(readMore ? { readMore } : {})
+    } }
+  }
+  const operationKind = apiSkill?.operationKind ?? getCoolToolOperationKind(payload)
   const toolName =
-    firstScalarString(payload.toolName, payload.displayToolName, payload.originalToolName, operationKind) || 'tool'
+    apiSkill?.displayName ?? firstScalarString(payload.toolName, payload.displayToolName, payload.originalToolName, operationKind) ?? 'tool'
   const result = asObject(getCoolToolResult(payload))
   const language = firstScalarString(result?.language, payload.metadata?.language) || 'text'
 
@@ -431,10 +474,11 @@ export function buildCoolToolAiContentWithSources(
         result?.data
       )
       if (content !== null) {
-        const transcript = buildFullFidelityToolAiContent(toolName, payload, 'Content', content, language, 'tool_result')
+        const transcript = buildFullFidelityToolAiContent(toolName, payload, 'Content', content, language, 'tool_result', Boolean(apiSkill))
         const error = firstScalarString(payload.error)
         // A read's content is what it printed; one that printed nothing and has no exit code
-        // (a command Codex declined) explains its failure only through the error.
+        // (a declined command, as saved Codex steps recorded one) explains its failure only
+        // through the error.
         if (error && !content.trim() && failedCommandExitCode(result) === undefined) {
           parts = [
             ...transcript,
@@ -445,9 +489,22 @@ export function buildCoolToolAiContentWithSources(
         }
         // Find 1: a partial skill read keeps its sizes and next call on later turns too.
         const readMore = typeof result?.readMore === 'string' ? result.readMore.trim() : ''
+        const apiFacts: CoolToolAiContentPart[] = []
+        const version = operationKind === 'skill_read' && result ? describeSkillReadVersion(result) : null
+        if (version) apiFacts.push(...sourcePart('agent_words', `\n${version}`))
+        if (apiSkill) {
+          for (const [label, values] of [
+            ['Skill references', result?.skill?.references],
+            ['Skill scripts', result?.skill?.scripts],
+            ['Skill warnings', result?.warnings]
+          ] as const) {
+            const lines = Array.isArray(values) ? values.filter((value): value is string => typeof value === 'string') : []
+            if (lines.length) apiFacts.push(...sourcePart('agent_words', `\n${label}:\n`), ...fenceForAiParts(lines.join('\n'), 'text'))
+          }
+        }
         parts = readMore
-          ? [...transcript, ...sourcePart('agent_words', `\n${readMore}`)]
-          : transcript
+          ? [...transcript, ...apiFacts, ...sourcePart('agent_words', `\n${readMore}`)]
+          : [...transcript, ...apiFacts]
         return { text: sourceText(parts), parts }
       }
       break
@@ -573,6 +630,13 @@ export function shouldPreferRawSidecarForAiExpansion(payload: Record<string, any
   const hasRawSidecar =
     typeof payload.rawSidecar?.zipId === 'string' ||
     typeof payload.metadata?.rawSidecarZipId === 'string'
+  // Compact Skill summaries omit window, warning and reference facts even when their
+  // preview fits. Select retained RAW from saved producer metadata; its envelope must
+  // still pass savedApiSkill's full strict resolver before any result is unwrapped.
+  if (hasRawSidecar && payload.type === 'tool' && operationKind === 'skill_read' && rendererFamily === 'skill_read' &&
+      payload.originalToolName === 'native_batshit_tool_use' && payload.toolProvider === 'batshit-server' &&
+      payload.toolSource === 'native-tool' && payload.metadata?.apiUtilityControlId === API_UTILITY_CONTROL_IDS.skill &&
+      payload.metadata?.apiUtilityRef === `batshit:${API_UTILITY_CONTROL_IDS.skill}`) return true
   if (hasRawSidecar && directContent !== null && directContent.trim().length === 0) return true
 
   return (

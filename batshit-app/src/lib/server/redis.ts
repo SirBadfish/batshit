@@ -1,16 +1,45 @@
+import { mergeGoonsSettingsPatch } from '$lib/goons/resolve'
+import { mergeVoiceSettingsSave } from '$lib/utils/voiceSettingsSave'
+import { ToolOperationsRefusal } from './toolOperationalSettingsOwner'
+import { acquireToolOperationsPreservation, CHECK_TOOL_OPERATIONS_PRESERVATION_LUA, CHECK_USER_SETTINGS_ROOT_LUA, prepareToolOperationsPreservation, refuseWholeToolOperationsWrite, toolOperationsPreservationArgument, TOOL_OPERATIONS_PRESERVATION_PATHS, UserSettingsSourceChanged } from './toolOperationalSettingsPreservation'
+import { CHECK_TYPED_TOOLS_LUA, makeTypedToolsSnapshot, namesTypedFileToolsWrite, readTypedToolsSnapshot, requireTypedToolsExpected, typedToolsWriteGuard, TypedToolsBaseRequiredError, TypedToolsConflictError, TypedToolsSaveUnconfirmedError } from './typedFileToolsSettingsGuard'
+import { withoutSkillReadSettings } from '$lib/utils/skillSessions'
+import { mcpSettingsLeaves } from '$lib/utils/agentSettingsSectionSaves'
+import { mcpSettingsReadPaths, makeMcpSettingsSnapshot, requireMcpSettingsExpected, mcpSettingsWriteGuard, CHECK_MCP_SETTINGS_LUA, McpSettingsBaseRequiredError, McpSettingsConflictError, McpSettingsSaveUnconfirmedError } from './agentRecordUpdate'
+import { AUTO_COMPACT_COMMON_FIELDS, validateAutoCompactChanges } from '$lib/appActions/settings/autoCompactPreferences'
+import { CHECK_CONFIGURED_TTS_LUA, readConfiguredTtsSnapshot, configuredTtsIssueGuard, checkConfiguredTtsIssue, planConfiguredTtsOps, requireConfiguredTtsExpected, configuredTtsTupleChanges, voiceEngineClearSource, ConfiguredTtsBaseRequiredError, ConfiguredTtsConflictError, ConfiguredTtsSaveUnconfirmedError, ConfiguredTtsModelLockedError } from './configuredTtsGuard'
+import { readAgentVoiceModelLockSource } from './modelVoiceSelectionSource'
+import { CHECK_AUTO_COMPACT_LUA, readAutoCompactSnapshot, autoCompactIssueGuard, checkAutoCompactIssue, requireAutoCompactExpected, AutoCompactBaseRequiredError, AutoCompactConflictError, AutoCompactSaveUnconfirmedError } from './autoCompactGuard'
+import { CHECK_MODEL_SELECTION_LUA, MODEL_SETTING_KEY_LUA, READ_CLEAR_PRESET_STATE_SCRIPT, ModelSelectionBaseRequiredError, ModelSelectionConflictError, ModelSelectionSaveUnconfirmedError, modelSelectionIssueGuard, namesModelSelection, readModelSelectionSnapshot, requireModelSelectionRevision, assertModelSelectionClear, assertModelSelectionClearOwner, prepareModelSelectionClear, type SelectionDependency, type SelectionSourceProof, type ModelSelectionClear, type ModelSelectionMutation, type ModelSelectionSnapshot } from './modelSelectionGuard'
+import { isCompleteEmptyModelSelection } from '$lib/utils/modelPresetPick'
+import { isAgentRuntimeSettingKey } from '$lib/utils/modelSettingsMapper'
+import { CHECK_INSTRUCTIONS_LUA, instructionLeaves, readInstructionsSnapshot, requireInstructionsExpected, instructionsWriteBasis,
+  instructionsIssueGuard, checkInstructionsIssue, InstructionsBaseRequiredError, InstructionsConflictError, InstructionsSaveUnconfirmedError } from './instructionsGuard'
 // Direct Redis service for SvelteKit server-side operations
 // Replaces batshit-server proxy with direct Redis 8 JSON support
 
 import { logger } from '$lib/utils/logger'
+import { agentSetupCache } from './services/agentSetupCache'
+import { withSettingsRecordReplacement, captureSettingsLifecycle, assertSettingsLifecycle, acquireSettingsReplacementMutation, acquireSettingsMutation, type SettingsLifecycleSnapshot } from '$lib/server/services/appActions/settings/lifecycle'
+import { beginSlashCommandWrite, currentSlashCommandWriteRevision, isSlashCommandMutationError } from '$lib/server/services/slashCommandRevisionProtocol'
 import { escapeRedisGlob } from '$lib/utils/redisGlob'
+import { validateReasoningRetentionSave } from '$lib/utils/reasoningRetention'
+import { createSubjectPopulation, deletePrimaryPopulation } from '$lib/server/services/subjectPopulation'
+import { admitPresetReferences, preparePresetReferences, readPresetReferenceSnapshot, completePresetReferenceWrite,
+  PresetReferenceWriteError, PRESET_REFERENCE_GUARD_LUA, type PresetReferencePreparation, type PresetReferenceSnapshot } from '$lib/server/services/modelPresetReferenceGuard'
 import { replaceBracedTokens } from '$lib/utils/braceScan'
 import {
   firstJsonPathMatch,
   unclaimedZipsMadeByMessage,
+  ZIP_RECORD_CHAT_PATHS,
+  zipCandidatesOfDeletedMessage,
   zipClaimsOfMessage,
+  zipRecordChat,
+  zipsOfDeletedChat,
   zipsOwnedOnlyByMessage
 } from '$lib/utils/messageDeletionZips'
 import { MessageStillRunningError } from '$lib/server/messageStillRunningError'
+import { SessionSweepReadError } from '$lib/server/sessionSweepReadError'
 import { BrowserMessageMutationError, type BrowserMessageMutationPolicy } from '$lib/server/browserMessageMutation'
 import { withZipStateLock } from '$lib/server/services/zipStateLock'
 import {
@@ -20,7 +49,7 @@ import {
   selectFolderChats
 } from '$lib/server/services/folderChatsForDelete'
 import type { FixedSessionMetadata } from '$lib/utils/fixedSession'
-import { createClient, type RedisClientType } from 'redis'
+import { AbortError, createClient, type RedisClientType } from 'redis'
 import type { 
   ChatSessionRow, 
   ChatMemoryRow, 
@@ -42,30 +71,35 @@ import {
 import {
   canonicalizePrimaryAgentRecord,
   hasLegacyPrimaryAgentFields,
+  isRetiredPrimaryAgentType,
   normalizePrimaryAgentType,
   shouldShowReasoningByDefaultForPrimaryAgent
 } from '$lib/utils/primaryAgentType'
+import { isRetiredSubagentType, normalizeSubagentType } from '$lib/utils/subagentType'
 import {
   AGENT_MEMORY_SOURCE_PATHS,
   AGENT_TYPE_SOURCE_PATHS,
   AgentMemorySettingsConflictError,
   AgentUpdateConflictError,
+  AgentUpdateRejectedError,
   agentMemoryBaseMatches,
   agentMemoryFieldsFromAnswers,
   agentUpdateScriptArguments,
   planAgentRecordUpdate,
   serializeAgentRecordPlan,
+  capturedAgentVoicePostimage,
+  capturedModelSelectionUpdates,
   type AgentUpdateOptions
 } from '$lib/server/agentRecordUpdate'
 import { planSubagentRecordUpdate } from '$lib/server/subagentRecordUpdate'
 import {
   collectTrustedClipIdsFromMetadata,
-  scanDeletionSweepZipReferences,
   neutralizeAllZipReferenceSyntax,
   neutralizeUntrustedClipReferenceSyntax
 } from '$lib/utils/zipReferenceSafety'
 import { getRuntimeEnv } from '$lib/server/services/runtimeEnv'
 import { resolveRedisConnectionUrl } from '$lib/server/redisConnection'
+import { BATSHIT_RUNTIME_REDIS_PORTS } from '$lib/server/redisRuntimePorts'
 import {
   JSON_COMPARE_AND_WRITE_SCRIPT,
   jsonTextOf,
@@ -91,11 +125,20 @@ import {
   collectGoonGuardedReferences,
   CUSTOM_GOON_UPLOAD_GUARD_LUA
 } from '$lib/server/services/goonCustomAssetOwnership.server'
+import { serializeUserSettingsReservedLiterals } from './userSettingsLiteralSerialization'
+
+const PUBLIC_SETTINGS_PRESERVATION_PATHS = Object.freeze([...TOOL_OPERATIONS_PRESERVATION_PATHS, '$.goons_settings.globalCloset'])
 
 const STORE_SETTINGS_WITH_CUSTOM_GOON_REFS_SCRIPT = `${CUSTOM_GOON_UPLOAD_GUARD_LUA}
+${PRESET_REFERENCE_GUARD_LUA}
+${CHECK_TOOL_OPERATIONS_PRESERVATION_LUA}
+local toolNext = cjson.decode(ARGV[1])
+if type(toolNext.global_tool_grid_settings) == 'table' and toolNext.global_tool_grid_settings.typed_file_tools ~= nil then return 'TOOL_OPERATIONS_CHANGED' end
+if not presetReferencesAvailable(ARGV[3]) then return 'PRESET_REFERENCE_CHANGED' end
 if not customGoonUploadsAvailable(ARGV[2]) then
   return 'ASSET_UNAVAILABLE'
 end
+${CHECK_USER_SETTINGS_ROOT_LUA}
 redis.call('JSON.SET', KEYS[1], '$', ARGV[1])
 return 'STORED'
 `
@@ -187,13 +230,33 @@ return 'OK'
  * message deleted between the read and the MULTI left its id on the list with no record. The
  * date is written first, so a record of the wrong type fails before the list is touched.
  * KEYS: the session, the message record, the chat's message list. ARGV: the message id, then
- * the new `created_at` as JSON. Answers the moved record as JSON.
+ * the new `created_at` as JSON, then (BL-903 a, only for a kept send) its `keptSend` mark as
+ * JSON, written in the same step. Answers the moved record as JSON.
  */
+/** BL-903 (a): a kept send's mark, `metadata.keptSend`: why it was not sent, and its send facts. */
+export type KeptSendMark = { reason: string; sendFacts?: Record<string, unknown> | null }
+
+/** Only the mark's two fields are saved, and `sendFacts` only when the send had any. */
+export function keptSendMarkToSave(mark: KeptSendMark): KeptSendMark {
+  const sendFacts = mark.sendFacts && typeof mark.sendFacts === 'object' && Object.keys(mark.sendFacts).length > 0
+    ? mark.sendFacts
+    : null
+  return { reason: mark.reason, ...(sendFacts ? { sendFacts } : {}) }
+}
+
 const MOVE_MESSAGE_TO_END_SCRIPT = `
 if redis.call('EXISTS', KEYS[1]) == 0 or redis.call('EXISTS', KEYS[2]) == 0 then
   return false
 end
 redis.call('JSON.SET', KEYS[2], '$.created_at', ARGV[2])
+if ARGV[3] then
+  local metadataType = redis.call('JSON.TYPE', KEYS[2], '$.metadata')
+  if metadataType[1] == 'object' then
+    redis.call('JSON.SET', KEYS[2], '$.metadata.keptSend', ARGV[3])
+  else
+    redis.call('JSON.SET', KEYS[2], '$.metadata', '{"keptSend":' .. ARGV[3] .. '}')
+  end
+end
 redis.call('LREM', KEYS[3], 0, ARGV[1])
 redis.call('RPUSH', KEYS[3], ARGV[1])
 return redis.call('JSON.GET', KEYS[2])
@@ -317,11 +380,48 @@ end`
  * its first command. Answers `MISSING`, `MEMORY_CHANGED`, `TYPE_CHANGED` or `OK`.
  */
 const UPDATE_AGENT_FIELDS_SCRIPT = `
+${PRESET_REFERENCE_GUARD_LUA}
 if redis.call('EXISTS', KEYS[1]) == 0 then
   return 'MISSING'
 end
+local guard = ARGV[5] ~= '' and cjson.decode(ARGV[5]) or {}
+${CHECK_MCP_SETTINGS_LUA}
+local typedTools = guard.typedTools
+${CHECK_TYPED_TOOLS_LUA}
+local namesVoice = false
+for _, op in ipairs(cjson.decode(ARGV[1])) do if (op[2] == '$.voice_profile' and op[1] ~= 'delnull') or string.sub(op[2], 1, 16) == '$.voice_profile[' then namesVoice = true end end
+if namesVoice and not guard.ttsSelection then return 'TTS_SELECTION_BASE_REQUIRED' end
+if guard.ttsSelection then local tts = guard.ttsSelection; ${CHECK_CONFIGURED_TTS_LUA} end
+if not presetReferencesAvailable(guard.presetReferences) then return 'PRESET_REFERENCE_CHANGED' end
+local namesAutoCompact = false
+for _, op in ipairs(cjson.decode(ARGV[1])) do
+  if op[2] == '$.auto_compact_settings' or string.sub(op[2], 1, 24) == '$.auto_compact_settings[' then namesAutoCompact = true end
+end
+if namesAutoCompact and not guard.autoCompact then return 'AUTO_COMPACT_BASE_REQUIRED' end
+if guard.autoCompact then local compact = guard.autoCompact; ${CHECK_AUTO_COMPACT_LUA} end
+local namesInstructions = false
+for _, op in ipairs(cjson.decode(ARGV[1])) do
+  if op[2] == '$.system_prompt' or op[2] == '$.include_global_prompt' then namesInstructions = true end
+end
+if namesInstructions and not guard.instructions then return 'INSTRUCTIONS_BASE_REQUIRED' end
+if guard.instructions then
+  local instructions = guard.instructions
+  ${CHECK_INSTRUCTIONS_LUA}
+end
+${MODEL_SETTING_KEY_LUA}
+local currentType = cjson.decode(redis.call('JSON.GET', KEYS[1], '$.agentType') or '[]')[1]
+local resultingType = currentType
+if ARGV[2] == 'set' or ARGV[2] == 'derive' or (currentType ~= 'api' and currentType ~= 'cli' and currentType ~= 'n8n') then resultingType = cjson.decode(ARGV[3]) end
+local function checkModelSelection(modelSelection)
+  local needsBase = currentType == 'api' or modelSelection.currentType == 'api' or resultingType == 'api'
+  if needsBase and not modelSelection.clientBase then return 'MODEL_SELECTION_BASE_REQUIRED' end
+  ${CHECK_MODEL_SELECTION_LUA}
+end
+if guard.modelSelection then
+  local refusal = checkModelSelection(guard.modelSelection)
+  if refusal then return refusal end
+end
 if ARGV[5] ~= '' then
-  local guard = cjson.decode(ARGV[5])
   local memory = {}
   for _, path in ipairs(guard.paths) do
     memory[#memory + 1] = redis.call('JSON.GET', KEYS[1], path)
@@ -347,26 +447,110 @@ end
 if writeType then
   redis.call('JSON.SET', KEYS[1], '$.agentType', ARGV[3])
 end
+if guard.ttsSelection and guard.ttsSelection.removeFishAlias then redis.call('JSON.DEL', KEYS[1], '$.voice_profile.tts.providerOptions.fish.reference_id') end
 ${APPLY_RECORD_OPS_LUA}
+if typedTools then
+  local typedRaw, mcpRaw = {}, {}
+  for _, path in ipairs(typedTools.paths) do typedRaw[#typedRaw + 1] = redis.call('JSON.GET', KEYS[1], path) or '' end
+  if guard.mcpSettings then for _, path in ipairs(guard.mcpSettings.paths) do mcpRaw[#mcpRaw + 1] = redis.call('JSON.GET', KEYS[1], path) or '' end end
+  return {'TYPED_TOOLS_SAVED', typedRaw, mcpRaw}
+end
+if guard.mcpSettings then
+  local out = {'MCP_SETTINGS_SAVED'}
+  for _, path in ipairs(guard.mcpSettings.paths) do out[#out + 1] = redis.call('JSON.GET', KEYS[1], path) or '' end
+  return out
+end
 return 'OK'
 `
 
 /** How many times `updateAgent` works a changing type out again before it gives up (writing nothing). */
 const AGENT_UPDATE_TYPE_TRIES = 3
 
+class SubjectSaveUnconfirmedError extends Error {
+  readonly status = 503
+  readonly code = 'subject_save_unconfirmed'
+  constructor() { super('The save was issued but its outcome is unconfirmed. Reload before trying again.') }
+}
+
+async function modelSelectionWriteBasis(client: RedisClientType, target: ModelSelectionSnapshot, updates: Record<string, unknown>, kind: 'agent' | 'subagent', mutation?: ModelSelectionMutation, ordinaryClear?: ModelSelectionClear) {
+  const selected = Object.hasOwn(updates, 'primary_model_preset_id') ? updates.primary_model_preset_id : target.record.primary_model_preset_id
+  const old = target.record.primary_model_preset_id
+  const original = captureSettingsLifecycle(typeof old === 'string' && old ? [`model:${old}`] : [])
+  const extraChecks: SelectionDependency[] = []
+  const clear = mutation?.clear ?? ordinaryClear
+  if (clear && kind === 'agent' && target.record.claude_settings == null && typeof old === 'string' && old.trim()) {
+    if (old !== old.trim()) throw new ModelSelectionConflictError()
+    assertModelSelectionClearOwner(clear, kind, String(target.record.id), String(target.record.user_id), old)
+    const state = await client.eval(READ_CLEAR_PRESET_STATE_SCRIPT, { keys: [`model:${old}`, `user:${target.record.user_id}:models`], arguments: [old] })
+    if (state === 'ABSENT') extraChecks.push({ key: `model:${old}`, paths: [['$', '']] })
+    else if (state !== 'PRESENT') throw new ModelSelectionConflictError()
+  }
+  let source: SelectionSourceProof | undefined = typeof selected === 'string' && selected ? mutation?.source : undefined
+  if (!source && typeof selected === 'string' && selected) {
+    const owner = await import('$lib/server/services/modelPresetSelectionOwner')
+    const dependency = await owner.readOwnedModelPresetDependency(String(target.record.user_id), selected)
+    // SA-139 R5: a save that names a new preset refuses a leftover Claude Code CLI one, as the
+    // selection read does (`mutation.source` already passed it). A record that only keeps an old
+    // one is refused when it runs (`resolveApiSubagentModel`).
+    if (Object.hasOwn(updates, 'primary_model_preset_id') && selected !== old) owner.assertNotClaudeCliPreset(dependency.preset)
+    source = dependency
+  }
+  if (mutation?.clear) assertModelSelectionClear(mutation.clear, target, updates, kind)
+  else if (mutation && (!source || source.membership.member !== selected)) throw new ModelSelectionConflictError()
+  for (const lifecycle of [target.lifecycle, original, source?.lifecycle, mutation?.authority?.lifecycle]) if (lifecycle) assertSettingsLifecycle(lifecycle)
+  return { source, extraChecks, issueTarget: target, expectedRevision: target.revision, lifecycle: { epoch: target.lifecycle.epoch, records: [...target.lifecycle.records, ...original.records,
+    ...(source?.lifecycle.records ?? []), ...(mutation?.authority?.lifecycle?.records ?? [])] } }
+}
+function checkModelSelectionIssue(mutation?: ModelSelectionMutation) {
+  mutation?.check()
+  if (mutation?.signal?.aborted || mutation?.deadlineAt !== undefined && Date.now() >= mutation.deadlineAt) throw new ModelSelectionConflictError()
+}
+
 /**
- * BL-914: a Subagent update's by-path writes, in one step inside Redis. KEYS: the Subagent record.
- * ARGV[1]: the plan's ops as JSON (`planSubagentRecordUpdate`, `serializeAgentRecordPlan`), run by
- * `APPLY_RECORD_OPS_LUA`. There is no type rule: the type fields are written only as ops, when the
- * request names them. The existence check comes before the first write, so `MISSING` writes
+ * BL-914: a Subagent update's by-path writes, in one step inside Redis. KEYS: the Subagent record,
+ * then the keys the model selection guard names. ARGV (positional): [1] the plan's ops as JSON
+ * (`planSubagentRecordUpdate`, `serializeAgentRecordPlan`), run by `APPLY_RECORD_OPS_LUA`; [2] the
+ * model selection guard, `''` or JSON; [3] the instructions guard, `''` or JSON; [4] the Typed File
+ * Tools guard, `''` or JSON. There is no type rule: the type fields are written only as ops, when
+ * the request names them. The existence check comes before the first write, so `MISSING` writes
  * nothing and a Subagent deleted meanwhile is not made again; a key that is not JSON fails on its
- * first command. Answers `MISSING` or `OK`.
+ * first command. Answers `MISSING`, a guard's refusal, `OK`, or the Typed File Tools receipt.
  */
 const UPDATE_SUBAGENT_FIELDS_SCRIPT = `
 if redis.call('EXISTS', KEYS[1]) == 0 then
   return 'MISSING'
 end
+local shape = redis.pcall('JSON.TYPE', KEYS[1], '$')
+if type(shape) ~= 'table' or shape.err or shape[1] ~= 'object' then return 'INVALID_RECORD' end
+local typedTools = ARGV[4] and ARGV[4] ~= '' and cjson.decode(ARGV[4]) or nil
+${CHECK_TYPED_TOOLS_LUA}
+local namesInstructions = false
+for _, op in ipairs(cjson.decode(ARGV[1])) do
+  if op[2] == '$.system_prompt' or op[2] == '$.include_global_prompt' then namesInstructions = true end
+end
+if namesInstructions and (not ARGV[3] or ARGV[3] == '') then return 'INSTRUCTIONS_BASE_REQUIRED' end
+if ARGV[3] and ARGV[3] ~= '' then
+  local instructions = cjson.decode(ARGV[3])
+  ${CHECK_INSTRUCTIONS_LUA}
+end
+${MODEL_SETTING_KEY_LUA}
+if ARGV[2] and ARGV[2] ~= '' then
+  local modelSelection = cjson.decode(ARGV[2])
+  local currentType = cjson.decode(redis.call('JSON.GET', KEYS[1], '$.subagentType') or '[]')[1]
+  local resultingType = currentType
+  for _, op in ipairs(cjson.decode(ARGV[1])) do
+    if op[2] == '$.subagentType' and op[1] == 'set' then resultingType = cjson.decode(op[3]) end
+  end
+  local needsBase = currentType == 'api' or modelSelection.currentType == 'api' or resultingType == 'api'
+  if needsBase and not modelSelection.clientBase then return 'MODEL_SELECTION_BASE_REQUIRED' end
+  ${CHECK_MODEL_SELECTION_LUA}
+end
 ${APPLY_RECORD_OPS_LUA}
+if typedTools then
+  local raw = {}
+  for _, path in ipairs(typedTools.paths) do raw[#raw + 1] = redis.call('JSON.GET', KEYS[1], path) or '' end
+  return {'TYPED_TOOLS_SAVED', raw}
+end
 return 'OK'
 `
 
@@ -696,25 +880,59 @@ export type ContextCompactionEventWrite =
   | { ok: false; reason: 'missing' }
   | { ok: false; reason: 'changed'; lastEventId: string | null }
 
+/** Public native Closet edits use the existing named Goon-settings patch. Other writes
+ * carry its captured storage literal, never an older whole-form copy. The existing
+ * full-root CAS guards this same original snapshot through final publication. */
+function publicClosetLiteral(source: PresetReferenceSnapshot, settings: UserSettingsRow, explicit: boolean): string | undefined {
+  const encoded = source.exists ? new Map(source.extraRawPaths ?? []).get('$.goons_settings.globalCloset') : '[]'
+  if (typeof encoded !== 'string') throw new UserSettingsSourceChanged()
+  const current: unknown = JSON.parse(encoded)
+  if (!Array.isArray(current) || current.length > 1) throw new UserSettingsSourceChanged()
+  if (explicit) return undefined
+  const goons = settings.goons_settings
+  const present = !!goons && typeof goons === 'object' && Object.hasOwn(goons, 'globalCloset')
+  if ((current.length === 1) !== present ||
+    JSON.stringify(current[0]) !== JSON.stringify(goons?.globalCloset)) throw new UserSettingsSourceChanged()
+  return current.length ? encoded.trim().slice(1, -1) : undefined
+}
+
 async function storeUserSettingsForClient(
   client: RedisClientType,
   userId: string,
-  settings: UserSettingsRow
+  settings: UserSettingsRow,
+  references: { snapshot: PresetReferenceSnapshot; preparation: PresetReferencePreparation; toolLifecycle: SettingsLifecycleSnapshot; adminExplicit: boolean; closetExplicit: boolean }
 ) {
   const settingsKey = `user:${userId}:settings`
+  refuseWholeToolOperationsWrite({ global_tool_grid_settings: references.snapshot.record.global_tool_grid_settings })
+  refuseWholeToolOperationsWrite({ global_tool_grid_settings: settings.global_tool_grid_settings })
+  const tools = prepareToolOperationsPreservation(userId, settings, references.snapshot, references.toolLifecycle, references.adminExplicit)
+  const closetLiteral = publicClosetLiteral(references.snapshot, settings, references.closetExplicit)
+  const serialized = serializeUserSettingsReservedLiterals(settings as unknown as Record<string, unknown>, { admin: tools.literal, legacyCloset: closetLiteral })
   // A legacy Goons settings object can carry custom upload refs at any depth.
   // Check their metadata and deletion/restore claims in the same EVAL that
   // publishes the final settings value, so a reservation cannot slip between
   // a preflight check and this whole-record write.
   const customUploadKeys = await collectGoonGuardedReferences(settings.goons_settings, userId)
-  if (customUploadKeys.length === 0) {
-    await client.json.set(settingsKey, '$', settings as any)
-    return
+  const lease = await admitPresetReferences(userId, 'settings', references.snapshot, settings, references.preparation)
+  let result: unknown
+  let issued = false
+  let toolLease: ReturnType<typeof acquireToolOperationsPreservation> | undefined
+  try {
+    toolLease = acquireToolOperationsPreservation(tools.snapshot)
+    lease.check(); toolLease.check(); issued = true
+    result = await client.eval(STORE_SETTINGS_WITH_CUSTOM_GOON_REFS_SCRIPT, {
+      keys: [settingsKey],
+      // Positions 4/5 stay reserved: the shared unchanged tool/root guards own ARGV[6].
+      arguments: [serialized, JSON.stringify(customUploadKeys), lease.guard, '', '', toolOperationsPreservationArgument(tools.snapshot, tools.adminRaw, tools.rootRaw)]
+    })
+  } catch (error) {
+    if (issued) { toolLease?.unknown(); lease.unknown(); throw new PresetReferenceWriteError('unknown') }
+    toolLease?.settle(); lease.settle(); throw error
   }
-  const result = await client.eval(STORE_SETTINGS_WITH_CUSTOM_GOON_REFS_SCRIPT, {
-    keys: [settingsKey],
-    arguments: [JSON.stringify(settings), JSON.stringify(customUploadKeys)]
-  })
+  if (typeof result === 'string' && ['STORED', 'ASSET_UNAVAILABLE', 'PRESET_REFERENCE_CHANGED', 'TOOL_OPERATIONS_CHANGED', 'USER_SETTINGS_CHANGED'].includes(result)) toolLease?.settle(); else toolLease?.unknown()
+  completePresetReferenceWrite(lease, result, ['STORED', 'ASSET_UNAVAILABLE', 'TOOL_OPERATIONS_CHANGED', 'USER_SETTINGS_CHANGED'])
+  if (result === 'USER_SETTINGS_CHANGED') throw new UserSettingsSourceChanged()
+  if (result === 'TOOL_OPERATIONS_CHANGED') throw new ToolOperationsRefusal()
   if (result === 'ASSET_UNAVAILABLE') {
     throw Object.assign(new Error('Custom Goon asset is unavailable'), {
       code: 'ASSET_UNAVAILABLE', status: 409
@@ -732,18 +950,14 @@ async function resolveRuntimeRedisUrl(): Promise<string> {
   })
 }
 
-// Every port a real Batshit Redis can listen on across install types (developer
-// default, Mac app, Pinokio, and isolated smoke/first-run test instances). The
-// memory-search test escape below must never match them.
-const BATSHIT_KNOWN_RUNTIME_REDIS_PORTS = new Set(['6379', '5639', '5659', '6380', '5649'])
-
+// The memory-search test escape below must never match a real Batshit Redis port
+// (`BATSHIT_RUNTIME_REDIS_PORTS`).
 function isDesignatedMemorySearchTestUrl(redisUrl: string): boolean {
   if (process.env.VITEST_MEMORY_SEARCH !== 'true') return false
   const designated = process.env.MEMORY_TEST_REDIS_URL?.trim()
   if (!designated || redisUrl !== designated) return false
   try {
-    const port = new URL(redisUrl).port || '6379'
-    return !BATSHIT_KNOWN_RUNTIME_REDIS_PORTS.has(port)
+    return !BATSHIT_RUNTIME_REDIS_PORTS.has(Number(new URL(redisUrl).port || '6379'))
   } catch {
     return false
   }
@@ -760,17 +974,27 @@ function isProjectPreferences(value: unknown): value is ProjectPreferences {
 }
 
 /**
+ * The chat delete's reading of a message key that exists but is not JSON (BL-1798 re-review):
+ * it claims no zip, and `onUnreadable` names it, so a broken record never leaves its chat
+ * undeletable. The chat delete also reads the page-saved `zipMetadata`.
+ */
+type ChatDeleteClaimRead = { chatDelete: { onUnreadable: (key: string) => void } }
+
+/**
  * The fields a zip claim can live in (`zipClaimsOfMessage`), read for each message id with
  * `JSON.MGET` in batches of 200, never the whole record. JSON.MGET answers null for a missing key
- * AND for a key that is not JSON: a missing message claims nothing; one that exists but cannot be
- * read might claim a zip, so the caller stops with `unreadable` and writes nothing (BL-390).
+ * AND for a key that is not JSON, without throwing: a missing message claims nothing. One that
+ * exists but cannot be read might claim a zip, so the message delete and the unclaimed-zip removal
+ * stop with `unreadable` and write nothing (BL-390); the chat delete reads it as claiming nothing
+ * (`ChatDeleteClaimRead`), since it deletes that key with the chat. A failed read throws for all.
  */
 async function readZipClaimFieldsOfMessages(
   client: RedisClientType,
   sessionId: string,
   ids: string[],
-  unreadable: string
+  unreadable: string | ChatDeleteClaimRead
 ): Promise<unknown[]> {
+  const chatDelete = typeof unreadable === 'string' ? null : unreadable.chatDelete
   const messages: unknown[] = []
   for (let index = 0; index < ids.length; index += 200) {
     const batch = ids.slice(index, index + 200)
@@ -779,14 +1003,19 @@ async function readZipClaimFieldsOfMessages(
     const zipIds = await client.json.mGet(keys, '$.metadata.zipIds')
     const zipIdsSnake = await client.json.mGet(keys, '$.metadata.zip_ids')
     const zipReferences = await client.json.mGet(keys, '$.metadata.zipReferences')
+    const zipMetadata = chatDelete ? await client.json.mGet(keys, '$.zipMetadata') : null
     for (let offset = 0; offset < batch.length; offset += 1) {
       if (contents[offset] == null) {
-        if ((await client.exists(keys[offset])) > 0) throw new Error(unreadable)
+        if ((await client.exists(keys[offset])) > 0) {
+          if (!chatDelete) throw new Error(unreadable as string)
+          chatDelete.onUnreadable(keys[offset])
+        }
         messages.push(null)
         continue
       }
       messages.push({
         content: firstJsonPathMatch(contents[offset]),
+        ...(zipMetadata ? { zipMetadata: firstJsonPathMatch(zipMetadata[offset]) } : {}),
         metadata: {
           zipIds: firstJsonPathMatch(zipIds[offset]),
           zip_ids: firstJsonPathMatch(zipIdsSnake[offset]),
@@ -798,6 +1027,31 @@ async function readZipClaimFieldsOfMessages(
   return messages
 }
 
+/**
+ * BL-1798: the chat each zip record names (`zipRecordChat`), read by path with `JSON.MGET` in
+ * batches of 200, never the whole record (a tool result can be large). A missing key, or one that
+ * is not JSON, names no chat (`null`).
+ */
+async function readZipRecordChats(
+  client: RedisClientType,
+  zipIds: string[]
+): Promise<Array<{ zipId: string; recordedSessionId: string | null }>> {
+  const zips: Array<{ zipId: string; recordedSessionId: string | null }> = []
+  for (let index = 0; index < zipIds.length; index += 200) {
+    const batch = zipIds.slice(index, index + 200)
+    const keys = batch.map((zipId) => `zip:${zipId}`)
+    const answers: unknown[][] = []
+    for (const path of ZIP_RECORD_CHAT_PATHS) answers.push(await client.json.mGet(keys, path))
+    batch.forEach((zipId, offset) => {
+      zips.push({
+        zipId,
+        recordedSessionId: zipRecordChat(answers.map((answer) => firstJsonPathMatch(answer[offset])))
+      })
+    })
+  }
+  return zips
+}
+
 /** One zip and its zip state, queued on a MULTI (BL-390, BL-537: a lost connection applies none). */
 function queueZipRemoval(multi: ReturnType<RedisClientType['multi']>, sessionId: string, zipId: string) {
   multi.del(`zip:${zipId}`)
@@ -807,6 +1061,16 @@ function queueZipRemoval(multi: ReturnType<RedisClientType['multi']>, sessionId:
   multi.del(`rezipped_item:${sessionId}:${zipId}`)
   multi.sRem(`rezipped:${sessionId}`, zipId)
 }
+
+/** SA-137: clear `metadata.liveFileReadSnapshot` only while its `pauseId` is ARGV[1]. */
+const RETIRE_LIVE_FILE_READ_REPLAY_SCRIPT = `
+local raw = redis.call('JSON.GET', KEYS[1], '$.metadata.liveFileReadSnapshot.pauseId')
+if not raw then return 0 end
+local ids = cjson.decode(raw)
+if type(ids) ~= 'table' or ids[1] ~= ARGV[1] then return 0 end
+redis.call('JSON.SET', KEYS[1], '$.metadata.liveFileReadSnapshot', 'null')
+return 1
+`
 
 export class RedisService {
   private static instances = new Set<RedisService>()
@@ -927,7 +1191,8 @@ export class RedisService {
         try {
           const envModule = await import('$env/dynamic/private')
           if (envModule?.env) {
-            envModule.env.REDIS_URL = redisUrl
+            // Only Vitest's mutable env-mock alias is updated; the real Kit namespace is readonly.
+            Object.assign(envModule.env, { REDIS_URL: redisUrl })
           }
         } catch {
           // ignore if env module not available yet
@@ -1036,6 +1301,27 @@ export class RedisService {
     })
   }
 
+  /**
+   * The compiler's session read (BL-2217, decision 11 confirm review M1). `null` only when the
+   * record is absent; a failed read throws `SESSION_UNAVAILABLE`, so a compile never treats an
+   * unreadable Infinite Session as a regular chat and sends it different memory guidance.
+   * `getSession` stays tolerant for its other readers.
+   */
+  async getSessionForCompile(sessionId: string): Promise<ChatSessionRow | null> {
+    try {
+      return await this.execute(async (client) => {
+        const sessionData = await client.json.get(`session:${sessionId}`)
+        return sessionData ? (sessionData as unknown as ChatSessionRow) : null
+      })
+    } catch (error) {
+      throw new Error(
+        `SESSION_UNAVAILABLE: failed to read session:${sessionId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      )
+    }
+  }
+
   async getSession(sessionId: string): Promise<ChatSessionRow | null> {
     return this.execute(async (client) => {
       try {
@@ -1051,7 +1337,8 @@ export class RedisService {
   }
 
   async createSession(session: Partial<ChatSessionRow>): Promise<ChatSessionRow> {
-    return this.execute(async (client) => {
+    return withSettingsRecordReplacement(`session:${session.id}`, () => this.execute(async (client) => {
+      if (session.id) agentSetupCache.clearSessionRecord(session.id)
       // If no folder_id provided, get or create default folder
       let folderId = session.folder_id
       
@@ -1117,7 +1404,7 @@ export class RedisService {
       await client.del(`messages:${sessionData.id}`)
       
       return sessionData
-    })
+    }))
   }
 
   /**
@@ -1297,6 +1584,21 @@ export class RedisService {
    * BL-474 step 2: write a reply's image-origin record (pending at its run's start, decided at its
    * end) by `WRITE_IMAGE_ORIGIN_SCRIPT`'s rules. Only `imageAddressOrigins.ts` calls it.
    */
+  /**
+   * SA-137 (D7, P0 settle 2026-10-21): clears one paused reply's live-file-read replay field, only
+   * while it is still the same pause (its `pauseId`). One script, so a newer pause of the same reply
+   * written in between is never cleared. True when it cleared the field.
+   */
+  async retireLiveFileReadReplay(sessionId: string, messageId: string, pauseId: string): Promise<boolean> {
+    return this.execute(async (client) => {
+      const answer = await client.eval(RETIRE_LIVE_FILE_READ_REPLAY_SCRIPT, {
+        keys: [`message:${sessionId}:${messageId}`],
+        arguments: [pauseId]
+      })
+      return Number(answer) === 1
+    })
+  }
+
   async writeImageOriginRecord(input: {
     userId: string
     sessionId: string
@@ -1532,7 +1834,8 @@ export class RedisService {
    * and Execution Viewer log into a chat that no longer existed.
    */
   async deleteSession(id: string): Promise<void> {
-    return this.execute(async (client) => {
+    return withSettingsRecordReplacement(`session:${id}`, () => this.execute(async (client) => {
+      agentSetupCache.clearSessionRecord(id)
       try {
         logger.debug(`[deleteSession] Starting deletion for session ${id}`)
         // BL-541: every KEYS pattern below is built from this id, and Redis reads `*`, `?`, `[`,
@@ -1549,77 +1852,82 @@ export class RedisService {
         if (sessionObj?.locked) {
           throw new Error('Session is locked and cannot be deleted until unlocked')
         }
-        
-        // Delete all messages in this session and collect zip IDs
-        const messageIds = await client.lRange(`messages:${id}`, 0, -1)
-        logger.debug(`[deleteSession] Found ${messageIds.length} messages to delete`)
-        const zipIdsToDelete = new Set<string>()
-        
-        // FIRST: Get all zips associated with this session from the session's zip set
+
+        // Every read the zip sweep needs comes BEFORE the first write, and a failed one throws
+        // with nothing deleted (review of BL-1798, S1: the rule of BL-390's message delete and
+        // BL-608's agent delete). Read after the messages and the chat's set were gone, a failed
+        // read left every zip of the chat with nothing that could find it again.
+        // The candidates are the chat's set and every zip a message names: its claims as a
+        // message delete reads them (metadata `zipIds`, `zip_ids`, `zipReferences`, and every
+        // reference in its words, an empty description and the older `{{batshit|id:…|` form
+        // included; BL-1513), plus the page-saved `zipMetadata`. Only this chat's go (BL-1798): a
+        // message's words and metadata can name another chat's zip (the older form and a voice
+        // transcript are saved as written, and a tab posts `zipMetadata` and `zipIds`), so a zip
+        // goes when its record names this chat, or names no chat and this chat's set lists it
+        // (`zipsOfDeletedChat`).
+        // Messages are read by path (`readZipClaimFieldsOfMessages`), and a message key that
+        // exists but is not JSON claims nothing and goes with the chat (logged): refused, it left
+        // the chat undeletable (BL-1798 re-review). Only a failed read stops the delete.
+        let messageIds: string[]
+        let zipIdsToDelete: string[]
+        let zipCandidateCount: number
+        const unreadableMessageKeys: string[] = []
         try {
-          const sessionZips = await client.sMembers(`session:${id}:zips`)
-          if (sessionZips && sessionZips.length > 0) {
-            logger.debug(`[deleteSession] Found ${sessionZips.length} zips in session zip set`)
-            sessionZips.forEach(zipId => zipIdsToDelete.add(zipId))
+          messageIds = (await client.lRange(`messages:${id}`, 0, -1)) ?? []
+          const sessionZips = (await client.sMembers(`session:${id}:zips`)) ?? []
+          const zipCandidates = new Set<string>(sessionZips)
+          const messages = await readZipClaimFieldsOfMessages(client, id, messageIds, {
+            chatDelete: { onUnreadable: (key) => unreadableMessageKeys.push(key) }
+          })
+          for (const message of messages) {
+            for (const zipId of zipCandidatesOfDeletedMessage(message)) zipCandidates.add(zipId)
           }
-        } catch (error) {
-          console.error(`[deleteSession] Error getting session zips:`, error)
+          zipCandidateCount = zipCandidates.size
+          zipIdsToDelete = zipCandidates.size === 0
+            ? []
+            : zipsOfDeletedChat({
+                sessionId: id,
+                setMembers: sessionZips,
+                zips: await readZipRecordChats(client, [...zipCandidates].sort())
+              })
+        } catch (readError) {
+          throw new SessionSweepReadError(readError)
         }
-        
+        if (unreadableMessageKeys.length > 0) {
+          console.warn(
+            `[deleteSession] ${unreadableMessageKeys.length} message record(s) of chat ${id} are not JSON, so they name no zip; they are deleted with the chat:`,
+            unreadableMessageKeys
+          )
+        }
+        logger.debug(`[deleteSession] Found ${messageIds.length} messages and ${zipIdsToDelete.length} of ${zipCandidateCount} named zips to delete`)
+
+        // SA-133: session-owned boards outlive messages/episodes, never their chat.
+        const whiteboardKeys = await client.keys(`whiteboard:${idPattern}:*`)
+        if (whiteboardKeys.length > 0) await client.del(whiteboardKeys)
+        // SA-137 P4 (D10): the chat's live file read receipt (it carries a TTL; a chat ends it first).
+        await client.del(`live_file_reads:${id}`)
+
         for (const msgId of messageIds) {
           try {
-            // Get message to extract zip IDs before deleting
-            const messageKey = `message:${id}:${msgId}`
-            const message = await client.json.get(messageKey)
-            if (message) {
-              // Extract zip IDs from zipMetadata
-              const messageObj = message as any
-              if (messageObj.zipMetadata && Array.isArray(messageObj.zipMetadata)) {
-                for (const zipMeta of messageObj.zipMetadata) {
-                  if (zipMeta.zipId) {
-                    zipIdsToDelete.add(zipMeta.zipId)
-                  }
-                }
-              }
-              
-              // Check for new format zips: {{batshit-zip:id}} or {{batshit-zip:id:::description}},
-              // read once (BL-707: the pattern searched to the first `}` again from every opener).
-              for (const reference of scanDeletionSweepZipReferences(String(messageObj.content || ''))) {
-                zipIdsToDelete.add(reference.id)
-              }
-              
-              // Also check for old format (backward compatibility during transition). Linear: its
-              // id stops at the next `|`, and every opener holds one.
-              let match
-              const oldZipPattern = /\{\{batshit\|id:([^|]+)\|/g
-              while ((match = oldZipPattern.exec(messageObj.content || '')) !== null) {
-                zipIdsToDelete.add(match[1])
-              }
-            }
-            
-            await client.del(messageKey)
+            await client.del(`message:${id}:${msgId}`)
           } catch (msgError) {
-            console.error(`[deleteSession] Error processing message ${msgId}:`, msgError)
+            console.error(`[deleteSession] Error deleting message ${msgId}:`, msgError)
             // Continue with other messages
           }
         }
-        
+
         // Delete the session's zip set
         try {
           await client.del(`session:${id}:zips`)
         } catch (error) {
           console.error(`[deleteSession] Error deleting session zip set:`, error)
         }
-      
-        // Delete all collected zips
-        if (zipIdsToDelete.size > 0) {
-          logger.debug(`[deleteSession] Deleting ${zipIdsToDelete.size} zips for session ${id}`)
-          for (const zipId of zipIdsToDelete) {
-            try {
-              await client.del(`zip:${zipId}`)
-            } catch (zipError) {
-              console.error(`[deleteSession] Error deleting zip ${zipId}:`, zipError)
-            }
+
+        for (const zipId of zipIdsToDelete) {
+          try {
+            await client.del(`zip:${zipId}`)
+          } catch (zipError) {
+            console.error(`[deleteSession] Error deleting zip ${zipId}:`, zipError)
           }
         }
         
@@ -1680,25 +1988,19 @@ export class RedisService {
           console.error(`[deleteSession] Error scanning/deleting subagent keys:`, subagentError)
         }
 
-        // SA-111 P2: the Batshit-issued n8n Workflow Subagent thread ids
-        // (`subagent_thread:{sessionId}:{slug}`, DL-111-06) and the in-flight run locks
-        // (`subagent_lock:{sessionId}:{slug}`, DL-111-05). Both carry a TTL, but the
-        // Session Key Cleanup rule is enumerate-don't-assume: a key that expires "soon"
-        // still outlives its session until it does.
+        // SA-111 P2: the in-flight run locks (`subagent_lock:{sessionId}:{slug}`, DL-111-05).
+        // They carry a TTL, but the Session Key Cleanup rule is enumerate-don't-assume: a key
+        // that expires "soon" still outlives its session until it does. (SA-139 R2 removed the
+        // n8n Workflow Subagent's `subagent_thread:` ids with their only writer; a leftover id
+        // ends on its own 7-day TTL.)
         try {
-          const threadIdKeys = await client.keys(`subagent_thread:${idPattern}:*`)
-          if (threadIdKeys && threadIdKeys.length > 0) {
-            await client.del(threadIdKeys as [string, ...string[]])
-            logger.debug(`[deleteSession] Deleted ${threadIdKeys.length} subagent thread ids`)
-          }
-
           const subagentLockKeys = await client.keys(`subagent_lock:${idPattern}:*`)
           if (subagentLockKeys && subagentLockKeys.length > 0) {
             await client.del(subagentLockKeys as [string, ...string[]])
             logger.debug(`[deleteSession] Deleted ${subagentLockKeys.length} subagent run locks`)
           }
         } catch (threadError) {
-          console.error(`[deleteSession] Error deleting subagent thread/lock keys:`, threadError)
+          console.error(`[deleteSession] Error deleting subagent run locks:`, threadError)
         }
 
         // SA-116 P1 (DL-116-15): the risk-approval records raised in this chat, plus their
@@ -1715,22 +2017,8 @@ export class RedisService {
           console.error(`[deleteSession] Error deleting control approvals:`, approvalError)
         }
 
-        // SA-111 AMD-111-02: scoped per-message n8n callback tokens. TTL-bounded (~30 min)
-        // and deliberately NOT part of backup — they are short-lived credentials, not data —
-        // but they are session-scoped state and belong in this sweep.
-        try {
-          const callbackKeys = await client.keys(`n8n:sse-callback:${idPattern}:*`)
-          if (callbackKeys && callbackKeys.length > 0) {
-            await client.del(callbackKeys as [string, ...string[]])
-            logger.debug(`[deleteSession] Deleted ${callbackKeys.length} n8n callback tokens`)
-          }
-        } catch (callbackError) {
-          console.error(`[deleteSession] Error deleting n8n callback tokens:`, callbackError)
-        }
-        
-        // Note: We don't delete upload:images:* keys because they might be shared across sessions
-        // The session-specific upload references are handled as zips with pattern: {sessionId}-upload-*
-        // These are already deleted above when we delete all zips from messages
+        // Upload and Clip records are not this chat's to sweep: a Clip, a memory image, or
+        // another chat can use the same upload. The chat's own zips went above (BL-1798).
         
         // Delete message list
         try {
@@ -1780,6 +2068,9 @@ export class RedisService {
           }
         }
 
+        // Skill lifecycle metadata belongs to this chat (holds use the existing sweep above).
+        await client.del(`skill_sessions:${id}`)
+
         // SA-120 P6: what the Judge Juice after-reply check noticed about this chat's replies
         // (`jev_post_turn:{id}` + `jev_post_turn_item:{id}:*`). Session-scoped, no TTL, so this
         // sweep is the only thing that ever removes them.
@@ -1790,9 +2081,14 @@ export class RedisService {
           console.error(`[deleteSession] Error deleting Judge Juice after-reply records:`, postTurnError)
         }
 
+        // SA-139 R1: a stopped Codex CLI reply's cleanup warnings (`codex_cleanup_warnings:{id}` +
+        // `codex_cleanup_warning:{id}:*`), left from before Codex CLI was removed. No TTL and nothing
+        // writes them any more, so this sweep is the only thing that ever removes them. The items
+        // are swept by pattern: one can sit outside the set.
         try {
-          const { sweepCodexCleanupWarnings } = await import('$lib/server/services/codexCleanupWarnings')
-          await sweepCodexCleanupWarnings(id)
+          const warningKeys = await client.keys(`codex_cleanup_warning:${idPattern}:*`)
+          if (warningKeys.length > 0) await client.del(warningKeys)
+          await client.del(`codex_cleanup_warnings:${id}`)
         } catch (cleanupWarningError) {
           console.error(`[deleteSession] Error deleting Codex cleanup warnings:`, cleanupWarningError)
         }
@@ -1846,7 +2142,7 @@ export class RedisService {
         console.error(`[deleteSession] Critical error deleting session ${id}:`, error)
         throw error
       }
-    })
+    }))
   }
 
   async archiveSession(id: string): Promise<void> {
@@ -2202,18 +2498,6 @@ export class RedisService {
         }
       }
     })
-    // A stopped Codex command may report cleanup failure before this final reply save.
-    // The warning is a separate server-owned record, flushed only after the reply exists.
-    if ((message as any).role === 'assistant' && (message as any).session_id && message.id) {
-      try {
-        const { flushPendingCodexCleanupWarning } = await import('$lib/server/services/codexCleanupWarnings')
-        await flushPendingCodexCleanupWarning((message as any).session_id, message.id)
-      } catch (error) {
-        // The reply itself is saved. A warning write failure must not turn its finalizer into
-        // a second failure; the pending entry remains for a later save until its short expiry.
-        console.error('[Codex cleanup] Could not flush pending warning after reply save:', error)
-      }
-    }
   }
 
   /**
@@ -2229,18 +2513,25 @@ export class RedisService {
    * (`resentMessageCreatedAt`), so the reply that tab adds next sorts after it. The record
    * itself is never rewritten: one message, one copy. Answers `null`, touching nothing, for a
    * message or a chat that is gone.
+   * BL-903 (a): a kept send passes `keptSend` (why it was not sent, and the send facts its
+   * request carried), saved on the record in the same step as the move, so every tab, after a
+   * reload too, draws its "Not sent" receipt, and its Send now runs the send as it was made.
    */
   async moveMessageToEnd(
     sessionId: string,
     messageId: string,
-    options: { createdAt?: string | null } = {}
+    options: { createdAt?: string | null; keptSend?: KeptSendMark | null } = {}
   ): Promise<ChatMemoryRow | null> {
     return this.execute(async (client) => {
       if (!sessionId || !messageId) return null
       const createdAt = options.createdAt ?? new Date().toISOString()
       const moved = await client.eval(MOVE_MESSAGE_TO_END_SCRIPT, {
         keys: [`session:${sessionId}`, `message:${sessionId}:${messageId}`, `messages:${sessionId}`],
-        arguments: [messageId, JSON.stringify(createdAt)]
+        arguments: [
+          messageId,
+          JSON.stringify(createdAt),
+          ...(options.keptSend ? [JSON.stringify(keptSendMarkToSave(options.keptSend))] : [])
+        ]
       })
       // A script answers JSON.GET's raw JSON text; nil when the message or chat is gone.
       return typeof moved === 'string' ? (JSON.parse(moved) as ChatMemoryRow) : null
@@ -2248,7 +2539,7 @@ export class RedisService {
   }
 
   async updateMessage(messageId: string, sessionId: string, updates: Partial<ChatMemoryRow>, userId: string,
-    options: { browserMutation?: BrowserMessageMutationPolicy } = {}): Promise<void> {
+    options: { browserMutation?: BrowserMessageMutationPolicy; onJsonWriteAcknowledged?: () => void } = {}): Promise<void> {
     return this.execute(async (client) => {
       // Verify session belongs to user
       const session = await client.json.get(`session:${sessionId}`)
@@ -2301,7 +2592,10 @@ export class RedisService {
         })
         if (writeResult !== 'OK') throw new BrowserMessageMutationError(writeResult as BrowserMessageMutationError['code'])
       } else {
-        await client.json.set(`message:${sessionId}:${messageId}`, '$', updated)
+        const acknowledgement = await client.json.set(`message:${sessionId}:${messageId}`, '$', updated)
+        // Internal actual-write observation, before unrelated session touching.
+        // No body field/readback can supply this same JSON.SET acknowledgement.
+        if (acknowledgement === 'OK') options.onJsonWriteAcknowledged?.()
       }
       
       // Touch session to update last activity
@@ -2366,6 +2660,10 @@ export class RedisService {
           otherMessages
         })
 
+        const { readSkillSessionRecord, withoutSkillSessionReads } = await import('$lib/utils/skillSessions')
+        const skillRecord = readSkillSessionRecord(await client.json.get(`skill_sessions:${sessionId}`), sessionId, userId)
+        const keptSkillRecord = skillRecord ? withoutSkillSessionReads(skillRecord, new Set(zipIdsToDelete)) : null
+
         // BL-381: the route's running check, again right before the write, inside the lock: a
         // turn that started on this message since the route checked refuses it the same way.
         if (options.stillRunning?.()) throw new MessageStillRunningError()
@@ -2373,6 +2671,7 @@ export class RedisService {
         // One MULTI (the BL-537 rule for zip state): a lost connection applies none of it.
         const multi = client.multi()
         multi.del(messageKey)
+        if (keptSkillRecord) multi.json.set(`skill_sessions:${sessionId}`, '$', keptSkillRecord as any)
         multi.lRem(`messages:${sessionId}`, 0, messageId)
         for (const zipId of zipIdsToDelete) queueZipRemoval(multi, sessionId, zipId)
         await multi.exec()
@@ -2381,8 +2680,9 @@ export class RedisService {
       // SA-120 P6: a Judge Juice after-reply record annotates exactly one reply and goes with it.
       const { deletePostTurnRecord } = await import('$lib/server/services/postTurnCheckState')
       await deletePostTurnRecord(sessionId, messageId)
-      const { deleteCodexCleanupWarning } = await import('$lib/server/services/codexCleanupWarnings')
-      await deleteCodexCleanupWarning(sessionId, messageId)
+      // SA-139 R1: a leftover Codex CLI cleanup warning of this reply goes with it.
+      await client.del(`codex_cleanup_warning:${sessionId}:${messageId}`)
+      await client.sRem(`codex_cleanup_warnings:${sessionId}`, messageId)
       // BL-474 step 2: the record of where the reply's pictures came from goes with the reply.
       const { deleteImageOrigin } = await import('$lib/server/services/imageAddressOrigins')
       await deleteImageOrigin(sessionId, messageId)
@@ -2494,40 +2794,17 @@ export class RedisService {
   }
 
   async createAgent(agent: Partial<AgentRow>): Promise<AgentRow> {
-    return this.execute(async (client) => {
-      // Add default granular settings for common tools
-      const defaultGranularSettings = {
-        // File reading - keep visible longer for reference
-        buffer_size_read_file: 8,
-        zip_threshold_read_file: 0,
-        auto_zip_read_file: false,
-        
-        // File writing - moderate visibility
-        buffer_size_write_file: 2,
-        zip_threshold_write_file: 0,
-        auto_zip_write_file: false,
-
-        // File edit/diff operations
-        buffer_size_edit_file: 2,
-        zip_threshold_edit_file: 0,
-        auto_zip_edit_file: false,
-
-        // Command execution - compress quickly
-        buffer_size_execute_command: 1,
-        zip_threshold_execute_command: 0,
-        auto_zip_execute_command: false,
-        
-        // Listing operations - compress immediately by default
-        buffer_size_list_files: 1,
-        zip_threshold_list_files: 0,
-        auto_zip_list_files: true,
-        
-        // Fallback for all other tools
-        buffer_size_all_other_tools: 1,
-        zip_threshold_all_other_tools: 0,
-        auto_zip_all_other_tools: true
-      }
-
+    // A human duplicate may carry its source's read-only policy. New agents start without
+    // authority; only the dedicated human policy owner can enable it after creation.
+    agent = withoutSkillReadSettings(agent) as Partial<AgentRow>
+    delete agent.app_action_policy
+    const retentionError = validateReasoningRetentionSave(agent)
+    if (retentionError) throw new Error(retentionError)
+    return withSettingsRecordReplacement(`agent:${agent.id}`, () => this.execute(async (client) => {
+      if (agent.id) agentSetupCache.clearAgentRecord(agent.id)
+      // A new agent stores no zip row: an absent row inherits the global Tool Grid, then the
+      // factory defaults (`toolGridConfig.ts`, `toolRenderMap.ts`). Stamping the defaults here
+      // froze every agent at the values of its creation day (SA-126, 2026-10-19).
       const resolvedAgentType = normalizePrimaryAgentType(agent)
 
       const show_reasoning =
@@ -2541,26 +2818,21 @@ export class RedisService {
           : false
       
       const agentData = canonicalizePrimaryAgentRecord({
-        ...defaultGranularSettings,  // Apply defaults first
-        ...agent,  // Then override with any provided values
+        ...agent,
         agentType: resolvedAgentType,
         show_reasoning,
-        preserve_reasoning: show_reasoning ? preserve_reasoning : false,
+        preserve_reasoning: resolvedAgentType === 'api' ? preserve_reasoning : show_reasoning ? preserve_reasoning : false,
         id: agent.id!,
         user_id: agent.user_id!,
         displayName: agent.displayName!,
         created_at: agent.created_at || new Date().toISOString(),
         updated_at: new Date().toISOString()
       }) as AgentRow
-      const storageAgentData = normalizeUploadUrlsForStorageInPayload(agentData)
+      const proposedAgentData = normalizeUploadUrlsForStorageInPayload(agentData)
       
-      // Store agent using RedisJSON for native JSON storage
-      await client.json.set(`agent:${agent.id}`, '$', storageAgentData as any)
-      
-      // Add to user's agent list
-      if (agentData.user_id) {
-        await client.sAdd(`user:${agentData.user_id}:agents`, agentData.id)
-      }
+      // Prepared defaults stay unchanged; record/index/catalogue revision move together.
+      const { record: storageAgentData } = await createSubjectPopulation(client, { userId: agentData.user_id, subjectId: agentData.id, kind: 'primary',
+        mode: 'replace-owned', record: proposedAgentData })
       
       // Map database fields to frontend format
       return {
@@ -2568,7 +2840,7 @@ export class RedisService {
         displayName: storageAgentData.displayName || '',
         avatar_url: storageAgentData.avatar || storageAgentData.avatar_url || undefined
       }
-    })
+    }))
   }
 
   /**
@@ -2589,28 +2861,112 @@ export class RedisService {
    * 409, `memory_settings_changed`) and writes nothing. The script then checks the same raw answers
    * again before its first write (`MEMORY_CHANGED`: read and compare again, the type rule's tries).
    */
-  async updateAgent(id: string, updates: Partial<AgentRow>, options: AgentUpdateOptions = {}): Promise<void> {
-    return this.execute(async (client) => this.writeAgentUpdate(client, id, updates as Record<string, unknown>, options))
+  async updateAgent(id: string, updates: Omit<Partial<AgentRow>, 'system_prompt' | 'include_global_prompt'> & { system_prompt?: string | null; include_global_prompt?: boolean | null }, options: AgentUpdateOptions = {}): Promise<void> {
+    updates = structuredClone(updates)
+    // SA-139 R4/R5 (D14): the routes refuse a retired Primary type first; the lower writer never
+    // stores one either, so no caller can turn a record into a leftover.
+    if (Object.hasOwn(updates, 'agentType') && isRetiredPrimaryAgentType(normalizePrimaryAgentType(undefined, (updates as Record<string, unknown>).agentType))) {
+      throw new AgentUpdateRejectedError('A retired Primary Agent type (Claude Code CLI, Codex CLI or n8n) cannot be saved. Nothing was saved.')
+    }
+    const namesTypedTools = namesTypedFileToolsWrite(updates as Record<string, unknown>)
+    if (namesTypedTools || options.expectedTypedFileTools !== undefined) requireTypedToolsExpected(options.expectedTypedFileTools)
+    const humanMcpLeaves = mcpSettingsLeaves(updates)
+    if (humanMcpLeaves.length || options.expectedMcpSettings !== undefined) { requireMcpSettingsExpected(options.expectedMcpSettings, humanMcpLeaves); options = { ...options, expectedMcpSettings: { ...options.expectedMcpSettings } } }
+    const namesVoice = updates.voice_profile !== undefined || options.configuredTtsMutation !== undefined
+    if (namesVoice || options.expectedTtsSelection !== undefined) requireConfiguredTtsExpected(options.expectedTtsSelection)
+    if (options.configuredTtsMutation && updates.voice_profile !== undefined) throw new ConfiguredTtsConflictError()
+    if (options.voiceEngineClearBasis && (updates.voice_profile === undefined || options.configuredTtsMutation)) throw new ConfiguredTtsConflictError()
+    const namesCompact = updates.auto_compact_settings !== undefined || options.autoCompactMutation !== undefined
+    if (namesCompact || options.expectedAutoCompact !== undefined) requireAutoCompactExpected(options.expectedAutoCompact)
+    if (options.autoCompactMutation) {
+      if (updates.auto_compact_settings !== undefined) throw new AutoCompactConflictError()
+      validateAutoCompactChanges(options.autoCompactMutation.changes)
+    }
+    const instructions = instructionLeaves(updates as Record<string, unknown>)
+    if (options.expectedInstructions !== undefined) requireInstructionsExpected(options.expectedInstructions)
+    if (instructions.length) {
+      requireInstructionsExpected(options.expectedInstructions, instructions)
+      updates = { ...updates }
+      options = { ...options, expectedInstructions: { ...options.expectedInstructions } }
+    }
+    const namesReferences = ['auto_compact_settings', 'memory_window', 'memoryWindow'].some(field => (updates as Record<string, unknown>)[field] !== undefined)
+    // Every sparse save retains its actual target incarnation without profile-folder custody.
+    const lifecycle = captureSettingsLifecycle([`agent:${id}`])
+    const references = namesReferences ? preparePresetReferences('primary', updates, lifecycle) : undefined
+    return this.execute(async (client) => {
+      let ordinaryClear: ModelSelectionClear | undefined
+      if (!options.modelSelectionMutation && isCompleteEmptyModelSelection(updates as Record<string, unknown>)) {
+        requireModelSelectionRevision(options.expectedModelSelection)
+        const original = await readModelSelectionSnapshot(client, id, 'agent', lifecycle)
+        if (original.revision !== options.expectedModelSelection) throw new ModelSelectionConflictError()
+        // A combined type change keeps its ordinary owner. This passage only
+        // detaches the held selection while preserving the actual existing transport.
+        if (normalizePrimaryAgentType(original.record, updates.agentType) === normalizePrimaryAgentType(original.record)) {
+          ordinaryClear = prepareModelSelectionClear(original, 'agent').clear
+          const sent = updates.provider_specific_settings
+          if (sent && typeof sent === 'object' && !Array.isArray(sent)) {
+            const stored = original.record.provider_specific_settings
+            const patch = Object.fromEntries(Object.entries(sent).filter(([key, value]) => isAgentRuntimeSettingKey(key) || value != null ||
+              !!stored && typeof stored === 'object' && Object.hasOwn(stored, key)))
+            updates = { ...updates }
+            if (Object.keys(patch).length) updates.provider_specific_settings = patch
+            else delete updates.provider_specific_settings
+          }
+          const type = normalizePrimaryAgentType(original.record)
+          if (original.record.agentType !== type) updates = { ...updates, agentType: type }
+        }
+      }
+      return this.writeAgentUpdate(client, id, updates as Record<string, unknown>, options, lifecycle, references, ordinaryClear)
+    })
   }
 
   private async writeAgentUpdate(
     client: RedisClientType,
     id: string,
     updates: Record<string, unknown>,
-    options: AgentUpdateOptions
+    options: AgentUpdateOptions,
+    pairLifecycle: SettingsLifecycleSnapshot = captureSettingsLifecycle([`agent:${id}`]),
+    referencePreparation?: PresetReferencePreparation,
+    ordinaryClear?: ModelSelectionClear
   ): Promise<void> {
     const key = `agent:${id}`
+    updates = structuredClone(updates)
     const plan = planAgentRecordUpdate({ updates, now: new Date().toISOString() })
+    // Server-owned model operations touch only their requested leaves. The ordinary
+    // human planner's historical null cleanup must not mutate unrelated Voice/Goon state.
+    if (options.modelSelectionMutation || ordinaryClear) plan.ops = plan.ops.filter(op => op.op !== 'deleteIfNull' || Object.hasOwn(updates, op.field))
+    const namesVoice = updates.voice_profile !== undefined || options.configuredTtsMutation !== undefined
+    if (options.configuredTtsMutation) plan.ops.push(...planConfiguredTtsOps(options.configuredTtsMutation.target, options.configuredTtsMutation.selection))
+    const namesCompact = updates.auto_compact_settings !== undefined || options.autoCompactMutation !== undefined
+    if (options.autoCompactMutation) {
+      const changes = validateAutoCompactChanges(options.autoCompactMutation.changes)
+      plan.ops.push({ op: 'ensureObject', field: 'auto_compact_settings' }, ...Object.entries(changes).map(([key, value]) => ({ op: 'set' as const, field: 'auto_compact_settings', key, value })))
+    }
+    const issuedOps = serializeAgentRecordPlan(plan.ops), voicePostimage = capturedAgentVoicePostimage(issuedOps), modelPostimage = capturedModelSelectionUpdates(issuedOps)
     const guardsMemory = options.expectedMemory !== undefined
+    const namesModel = namesModelSelection('agent', modelPostimage)
+    const typedSnapshot = namesTypedFileToolsWrite(updates) ? await readTypedToolsSnapshot(client, id, 'agent', pairLifecycle) : undefined
+    const typedGuard = typedSnapshot ? typedToolsWriteGuard(typedSnapshot, options.expectedTypedFileTools) : undefined
+    const mcpLeaves = mcpSettingsLeaves(updates)
+    const instructionFields = instructionLeaves(updates)
+    const referenceFields = ['auto_compact_settings', 'memory_window', 'memoryWindow'].filter(field => updates[field] !== undefined)
+    if (referenceFields.includes('memory_window') && !referenceFields.includes('memoryWindow')) referenceFields.push('memoryWindow')
+    if (referenceFields.includes('memoryWindow') && !referenceFields.includes('memory_window')) referenceFields.push('memory_window')
+    if (options.expectedModelSelection !== undefined) requireModelSelectionRevision(options.expectedModelSelection)
     const readPaths = (paths: readonly string[]) =>
       Promise.all(paths.map((path) => client.sendCommand<string | null>(['JSON.GET', key, path])))
     let lastAnswer: unknown = null
     for (let attempt = 0; attempt < AGENT_UPDATE_TYPE_TRIES; attempt += 1) {
+      const referenceSnapshot = referenceFields.length ? await readPresetReferenceSnapshot(client, key, 'primary', referenceFields) : undefined
       // Each path's raw answer, so the script can compare the very text it reads again. Separate
       // commands in one round trip; a mix of old and new answers cannot match the record as it is.
-      const [fields, memory] = await Promise.all([
+      const [fields, memory, model, instructions, compact, tts] = await Promise.all([
         readPaths(AGENT_TYPE_SOURCE_PATHS),
-        guardsMemory ? readPaths(AGENT_MEMORY_SOURCE_PATHS) : Promise.resolve(null)
+        guardsMemory ? readPaths(AGENT_MEMORY_SOURCE_PATHS) : Promise.resolve(null),
+        namesModel ? readModelSelectionSnapshot(client, id, 'agent', pairLifecycle) : Promise.resolve(undefined),
+        instructionFields.length ? readInstructionsSnapshot(client, id, 'agent', pairLifecycle, instructionFields) : Promise.resolve(undefined),
+        namesCompact ? readAutoCompactSnapshot(client, id, String(options.autoCompactMutation?.target.record.user_id ?? ''), pairLifecycle, !!options.autoCompactMutation) : Promise.resolve(undefined),
+        namesVoice ? readConfiguredTtsSnapshot(client, id, pairLifecycle) : Promise.resolve(undefined)
       ])
       if (fields.some((field) => field === null) || memory?.some((answer) => answer === null)) {
         throw new Error('Agent not found')
@@ -2618,11 +2974,145 @@ export class RedisService {
       if (memory && !agentMemoryBaseMatches(agentMemoryFieldsFromAnswers(memory as string[]), options.expectedMemory)) {
         throw new AgentMemorySettingsConflictError()
       }
-      lastAnswer = await client.eval(UPDATE_AGENT_FIELDS_SCRIPT, {
-        keys: [key],
-        arguments: agentUpdateScriptArguments(plan, fields.join('\n'), memory ? memory.join('\n') : null)
-      })
-      if (lastAnswer === 'OK') return
+      const initialArguments = agentUpdateScriptArguments(plan, fields.join('\n'), memory ? memory.join('\n') : null)
+      initialArguments[0] = issuedOps
+      const resultingType = JSON.parse(initialArguments[2])
+      if (model && (normalizePrimaryAgentType(model.record) === 'api' || resultingType === 'api')) requireModelSelectionRevision(options.expectedModelSelection)
+      const modelBasis = model ? await modelSelectionWriteBasis(client, model, Object.freeze({ ...modelPostimage, agentType: resultingType }), 'agent', options.modelSelectionMutation, ordinaryClear) : undefined
+      if (modelBasis?.expectedRevision !== undefined && options.expectedModelSelection !== undefined && modelBasis.expectedRevision !== options.expectedModelSelection) throw new ModelSelectionConflictError()
+      const mcpRead = mcpLeaves.length ? await readModelSelectionSnapshot(client, id, 'agent', pairLifecycle, mcpSettingsReadPaths(mcpLeaves), { typeFenceOnly: true, reportProjection: true }) : undefined
+      const mcpSnapshot = mcpRead ? makeMcpSettingsSnapshot(id, mcpSettingsReadPaths(mcpLeaves), mcpRead.extraRaw, pairLifecycle!, mcpLeaves) : undefined
+      const mcpGuard = mcpSnapshot ? mcpSettingsWriteGuard(mcpSnapshot, options.expectedMcpSettings, mcpLeaves) : undefined
+      const instructionBasis = instructions ? instructionsWriteBasis(instructions, options.expectedInstructions, instructionFields, options.instructionsMutation) : undefined
+      const issueKeys = [key]
+      const modelGuard = modelBasis ? modelSelectionIssueGuard(modelBasis.issueTarget, modelBasis.source, issueKeys, options.modelSelectionMutation, modelBasis.extraChecks) : undefined
+      const instructionGuard = instructions ? instructionsIssueGuard(instructions, issueKeys, options.instructionsMutation) : undefined
+      const compactGuard = compact ? autoCompactIssueGuard(compact, options.expectedAutoCompact, issueKeys, options.autoCompactMutation) : undefined
+      if (tts && tts.revision !== options.expectedTtsSelection) throw new ConfiguredTtsConflictError()
+      const voiceModelSource = tts && !options.configuredTtsMutation && !options.voiceEngineClearBasis && configuredTtsTupleChanges(tts, voicePostimage.voice_profile)
+        ? await readAgentVoiceModelLockSource(client, String(tts.record.user_id), id, voicePostimage) : undefined
+      if (voiceModelSource?.locked) throw new ConfiguredTtsModelLockedError()
+      const voiceSources = [...(voiceModelSource?.guards ?? []), ...(tts && options.voiceEngineClearBasis ? [voiceEngineClearSource(tts, options.voiceEngineClearBasis)] : [])]
+      const ttsGuard = tts ? configuredTtsIssueGuard(tts, options.expectedTtsSelection, issueKeys, options.configuredTtsMutation, voiceSources) : undefined
+      if (modelGuard && model) { modelGuard.clientBase = modelBasis?.expectedRevision !== undefined && options.expectedModelSelection !== undefined; modelGuard.currentType = normalizePrimaryAgentType(model.record) }
+      let lease: ReturnType<typeof acquireSettingsMutation> | undefined
+      let referenceLease: Awaited<ReturnType<typeof admitPresetReferences>> | undefined
+      let instructionLease: ReturnType<typeof acquireSettingsMutation> | undefined
+      let compactLease: ReturnType<typeof acquireSettingsMutation> | undefined
+      let ttsLease: ReturnType<typeof acquireSettingsMutation> | undefined
+      let typedLease: ReturnType<typeof acquireSettingsMutation> | undefined
+      let typedAck: ReturnType<typeof makeTypedToolsSnapshot> | undefined
+      let mcpLease: ReturnType<typeof acquireSettingsMutation> | undefined
+      let mcpAck: ReturnType<typeof makeMcpSettingsSnapshot> | undefined
+      let targetLease: ReturnType<typeof acquireSettingsMutation> | undefined
+      let issued = false
+      try {
+        targetLease = acquireSettingsMutation(pairLifecycle)
+        if (typedSnapshot) typedLease = acquireSettingsMutation(typedSnapshot.lifecycle)
+        if (mcpSnapshot) mcpLease = acquireSettingsMutation(mcpSnapshot.lifecycle)
+        if (referenceSnapshot) {
+          const persistedReferences = { ...referenceSnapshot.record }
+          for (const op of plan.ops) {
+            if (!referenceFields.includes(op.field) || 'key' in op && op.key !== undefined) continue
+            if (op.op === 'set') persistedReferences[op.field] = JSON.parse(JSON.stringify(op.value))
+            else if (op.op === 'delete' || op.op === 'deleteIfNull' && persistedReferences[op.field] === null) delete persistedReferences[op.field]
+          }
+          referenceLease = await admitPresetReferences(String(referenceSnapshot.record.user_id), 'primary', referenceSnapshot,
+            persistedReferences, referencePreparation!)
+        }
+        if (modelBasis) lease = acquireSettingsMutation(modelBasis.lifecycle)
+        if (instructionBasis) instructionLease = acquireSettingsMutation(instructionBasis)
+        if (compact) compactLease = acquireSettingsMutation({ epoch: compact.lifecycle.epoch, records: [...compact.lifecycle.records, ...(options.autoCompactMutation?.authority.lifecycle?.records ?? [])] })
+        if (tts) ttsLease = acquireSettingsMutation({ epoch: tts.lifecycle.epoch, records: [...tts.lifecycle.records, ...(options.configuredTtsMutation?.sourceLifecycle.records ?? []), ...(options.configuredTtsMutation?.authority.lifecycle?.records ?? []), ...(voiceModelSource?.lifecycle.records ?? []), ...(options.voiceEngineClearBasis?.target.lifecycle.records ?? [])] })
+        if (model) checkModelSelectionIssue(options.modelSelectionMutation)
+        if (instructions) checkInstructionsIssue(options.instructionsMutation)
+        if (compact) checkAutoCompactIssue(options.autoCompactMutation)
+        if (tts) checkConfiguredTtsIssue(options.configuredTtsMutation)
+        lease?.check()
+        referenceLease?.check()
+        instructionLease?.check()
+        compactLease?.check()
+        ttsLease?.check()
+        mcpLease?.check()
+        targetLease.check()
+        const signal = options.modelSelectionMutation?.signal ?? options.instructionsMutation?.signal ?? options.autoCompactMutation?.signal ?? options.configuredTtsMutation?.signal
+        const command = signal ? client.withAbortSignal(signal) : client
+        const issuedArguments = agentUpdateScriptArguments(plan, fields.join('\n'), memory ? memory.join('\n') : null, modelGuard, referenceLease?.guard, instructionGuard, compactGuard, ttsGuard, mcpGuard, typedGuard)
+        issuedArguments[0] = issuedOps
+        typedLease?.check()
+        issued = true
+        lastAnswer = await command.eval(UPDATE_AGENT_FIELDS_SCRIPT, {
+          keys: issueKeys,
+          arguments: issuedArguments
+        })
+        if (Array.isArray(lastAnswer) && lastAnswer.length === 3 && lastAnswer[0] === 'TYPED_TOOLS_SAVED' && typedSnapshot) {
+          if (!Array.isArray(lastAnswer[1]) || !Array.isArray(lastAnswer[2])) throw new Error('The saved Typed File Tools receipt is unavailable.')
+          typedAck = makeTypedToolsSnapshot(id, 'agent', lastAnswer[1] as string[], typedSnapshot.lifecycle, true)
+          if (mcpSnapshot) mcpAck = makeMcpSettingsSnapshot(id, mcpSnapshot.paths, lastAnswer[2] as string[], mcpSnapshot.lifecycle, mcpLeaves, true)
+          lastAnswer = 'OK'
+        }
+        if (Array.isArray(lastAnswer) && lastAnswer[0] === 'MCP_SETTINGS_SAVED' && mcpSnapshot) {
+          mcpAck = makeMcpSettingsSnapshot(id, mcpSnapshot.paths, lastAnswer.slice(1) as string[], mcpSnapshot.lifecycle, mcpLeaves, true)
+          lastAnswer = 'OK'
+        }
+        if (typedSnapshot && lastAnswer === 'OK' && !typedAck) throw new Error('The promised Typed File Tools save receipt is missing.')
+      } catch (error) {
+        if ((options.modelSelectionMutation?.signal?.aborted || options.instructionsMutation?.signal?.aborted || options.autoCompactMutation?.signal?.aborted || options.configuredTtsMutation?.signal?.aborted) && error instanceof AbortError) {
+          targetLease?.settle(); typedLease?.settle(); mcpLease?.settle(); lease?.settle(); referenceLease?.settle(); instructionLease?.settle(); compactLease?.settle(); ttsLease?.settle(); if (tts) throw new ConfiguredTtsConflictError(); if (compact) throw new AutoCompactConflictError(); throw instructions ? new InstructionsConflictError() : new ModelSelectionConflictError()
+        }
+        if (issued) {
+          targetLease?.unknown()
+          if (typedLease) { typedLease.unknown(); mcpLease?.unknown(); lease?.unknown(); referenceLease?.unknown(); instructionLease?.unknown(); compactLease?.unknown(); ttsLease?.unknown(); throw new TypedToolsSaveUnconfirmedError() }
+          if (mcpLease) { mcpLease.unknown(); lease?.unknown(); referenceLease?.unknown(); instructionLease?.unknown(); compactLease?.unknown(); ttsLease?.unknown(); throw new McpSettingsSaveUnconfirmedError() }
+          ttsLease?.unknown()
+          if (tts) { lease?.unknown(); referenceLease?.unknown(); instructionLease?.unknown(); compactLease?.unknown(); throw new ConfiguredTtsSaveUnconfirmedError() }
+          compactLease?.unknown()
+          if (compact) { lease?.unknown(); referenceLease?.unknown(); instructionLease?.unknown(); throw new AutoCompactSaveUnconfirmedError() }
+          referenceLease?.unknown()
+          instructionLease?.unknown()
+          if (instructions) { lease?.unknown(); throw new InstructionsSaveUnconfirmedError() }
+          if (lease) { lease.unknown(); throw new ModelSelectionSaveUnconfirmedError() }
+          if (referenceLease) throw new PresetReferenceWriteError('unknown')
+          throw new SubjectSaveUnconfirmedError()
+        }
+        targetLease?.settle(); typedLease?.settle(); mcpLease?.settle()
+        lease?.settle()
+        referenceLease?.settle()
+        instructionLease?.settle()
+        compactLease?.settle()
+        ttsLease?.settle()
+        throw error
+      }
+      const known = typeof lastAnswer === 'string' && ['TYPED_TOOLS_BASE_REQUIRED', 'TYPED_TOOLS_CHANGED', 'MCP_SETTINGS_BASE_REQUIRED', 'MCP_SETTINGS_CHANGED', 'OK', 'MISSING', 'TYPE_CHANGED', 'MEMORY_CHANGED', 'MODEL_SELECTION_CHANGED', 'MODEL_SELECTION_EXPIRED', 'MODEL_SELECTION_BASE_REQUIRED', 'PRESET_REFERENCE_CHANGED', 'INSTRUCTIONS_BASE_REQUIRED', 'INSTRUCTIONS_CHANGED', 'INSTRUCTIONS_EXPIRED', 'AUTO_COMPACT_BASE_REQUIRED', 'AUTO_COMPACT_CHANGED', 'AUTO_COMPACT_EXPIRED', 'TTS_SELECTION_BASE_REQUIRED', 'TTS_SELECTION_CHANGED'].includes(lastAnswer)
+      if (known) targetLease?.settle(); else targetLease?.unknown()
+      if (known) { typedLease?.settle(); mcpLease?.settle() } else { typedLease?.unknown(); mcpLease?.unknown() }
+      if (known) lease?.settle(); else lease?.unknown()
+      if (known) referenceLease?.settle(); else referenceLease?.unknown()
+      if (known) instructionLease?.settle(); else instructionLease?.unknown()
+      if (known) compactLease?.settle(); else compactLease?.unknown()
+      if (known) ttsLease?.settle(); else ttsLease?.unknown()
+      if (lastAnswer === 'TYPED_TOOLS_BASE_REQUIRED') throw new TypedToolsBaseRequiredError()
+      if (lastAnswer === 'TYPED_TOOLS_CHANGED') throw new TypedToolsConflictError()
+      if (lastAnswer === 'MCP_SETTINGS_BASE_REQUIRED') throw new McpSettingsBaseRequiredError()
+      if (lastAnswer === 'MCP_SETTINGS_CHANGED') throw new McpSettingsConflictError()
+      if (!known && typedLease) throw new TypedToolsSaveUnconfirmedError()
+      if (!known && mcpLease) throw new McpSettingsSaveUnconfirmedError()
+      if (lastAnswer === 'TTS_SELECTION_BASE_REQUIRED') throw new ConfiguredTtsBaseRequiredError()
+      if (lastAnswer === 'TTS_SELECTION_CHANGED') throw new ConfiguredTtsConflictError()
+      if (!known && ttsLease) throw new ConfiguredTtsSaveUnconfirmedError()
+      if (lastAnswer === 'AUTO_COMPACT_BASE_REQUIRED') throw new AutoCompactBaseRequiredError()
+      if (lastAnswer === 'AUTO_COMPACT_CHANGED' || lastAnswer === 'AUTO_COMPACT_EXPIRED') throw new AutoCompactConflictError()
+      if (!known && compactLease) throw new AutoCompactSaveUnconfirmedError()
+      if (lastAnswer === 'INSTRUCTIONS_BASE_REQUIRED') throw new InstructionsBaseRequiredError()
+      if (lastAnswer === 'INSTRUCTIONS_CHANGED' || lastAnswer === 'INSTRUCTIONS_EXPIRED') throw new InstructionsConflictError()
+      if (!known && instructionLease) throw new InstructionsSaveUnconfirmedError()
+      if (lastAnswer === 'PRESET_REFERENCE_CHANGED') throw new PresetReferenceWriteError('changed')
+      if (lastAnswer === 'MODEL_SELECTION_CHANGED' || lastAnswer === 'MODEL_SELECTION_EXPIRED') throw new ModelSelectionConflictError()
+      if (lastAnswer === 'MODEL_SELECTION_BASE_REQUIRED') throw new ModelSelectionBaseRequiredError()
+      if (!known && lease) throw new ModelSelectionSaveUnconfirmedError()
+      if (!known && referenceLease) throw new PresetReferenceWriteError('unknown')
+      if (!known) throw new SubjectSaveUnconfirmedError()
+      if (lastAnswer === 'OK') { if (typedAck) options.onTypedFileToolsSaved?.({ revision: typedAck.revision, value: typedAck.value }); if (mcpAck) options.onMcpSettingsSaved?.({ revisions: mcpAck.revisions, values: mcpAck.values }); options.configuredTtsMutation?.onSaved?.(); options.autoCompactMutation?.onSaved?.(); options.instructionsMutation?.onSaved?.(); options.modelSelectionMutation?.onSaved?.(); return }
       if (lastAnswer === 'MISSING') throw new Error('Agent not found')
       if (lastAnswer !== 'TYPE_CHANGED' && lastAnswer !== 'MEMORY_CHANGED') {
         throw new Error(`The update of agent ${id} answered ${String(lastAnswer)}.`)
@@ -2645,15 +3135,93 @@ export class RedisService {
    * (a 400) and writes nothing. Answers `false`, writing nothing, when the Subagent is gone (a
    * delete landed first): it is not made again.
    */
-  async updateSubagent(id: string, writes: Record<string, unknown>): Promise<boolean> {
+  async updateSubagent(id: string, writes: Record<string, unknown>, options: Pick<AgentUpdateOptions, 'expectedModelSelection' | 'modelSelectionMutation' | 'expectedInstructions' | 'instructionsMutation' | 'expectedTypedFileTools' | 'onTypedFileToolsSaved'> = {}): Promise<boolean> {
+    writes = structuredClone(writes)
+    // SA-139 R2/R5 (D14): the routes refuse a retired Subagent type first; the lower writer never
+    // stores one either.
+    if (Object.hasOwn(writes, 'subagentType') && isRetiredSubagentType(normalizeSubagentType(undefined, writes.subagentType))) {
+      throw new AgentUpdateRejectedError('A retired Subagent type (Claude Code CLI, Codex CLI or n8n) cannot be saved. Nothing was saved.')
+    }
+    const namesTypedTools = namesTypedFileToolsWrite(writes)
+    if (namesTypedTools || options.expectedTypedFileTools !== undefined) requireTypedToolsExpected(options.expectedTypedFileTools)
+    const instructionFields = instructionLeaves(writes)
+    if (options.expectedInstructions !== undefined) requireInstructionsExpected(options.expectedInstructions)
+    if (instructionFields.length) {
+      requireInstructionsExpected(options.expectedInstructions, instructionFields)
+      writes = { ...writes }
+      options = { ...options, expectedInstructions: { ...options.expectedInstructions } }
+    }
     const plan = planSubagentRecordUpdate({ writes, now: new Date().toISOString() })
+    const issuedOps = serializeAgentRecordPlan(plan.ops)
+    const modelPostimage = capturedModelSelectionUpdates(issuedOps)
+    const namesModel = namesModelSelection('subagent', modelPostimage)
+    const lifecycle = captureSettingsLifecycle([`subagent:${id}`])
     return this.execute(async (client) => {
-      const answer = await client.eval(UPDATE_SUBAGENT_FIELDS_SCRIPT, {
-        keys: [`subagent:${id}`],
-        arguments: [serializeAgentRecordPlan(plan.ops)]
-      })
-      if (answer === 'OK') return true
+      const key = `subagent:${id}`
+      const model = namesModel ? await readModelSelectionSnapshot(client, id, 'subagent', lifecycle) : undefined
+      const typedSnapshot = namesTypedTools ? await readTypedToolsSnapshot(client, id, 'subagent', lifecycle) : undefined
+      const typedGuard = typedSnapshot ? typedToolsWriteGuard(typedSnapshot, options.expectedTypedFileTools) : undefined
+      const instructions = instructionFields.length ? await readInstructionsSnapshot(client, id, 'subagent', lifecycle, instructionFields) : undefined
+      if (model && (normalizeSubagentType(model.record) === 'api' || normalizeSubagentType(model.record, writes.subagentType) === 'api')) requireModelSelectionRevision(options.expectedModelSelection)
+      if (options.expectedModelSelection !== undefined) {
+        requireModelSelectionRevision(options.expectedModelSelection)
+        if (!model) throw new ModelSelectionConflictError()
+      }
+      let typedLease: ReturnType<typeof acquireSettingsMutation> | undefined
+      let typedAck: ReturnType<typeof makeTypedToolsSnapshot> | undefined
+      let lease: ReturnType<typeof acquireSettingsMutation> | undefined
+      let instructionLease: ReturnType<typeof acquireSettingsMutation> | undefined
+      let targetLease: ReturnType<typeof acquireSettingsMutation> | undefined
+      let answer: unknown
+      let issued = false
+      const modelBasis = model ? await modelSelectionWriteBasis(client, model, modelPostimage, 'subagent', options.modelSelectionMutation) : undefined
+      if (modelBasis?.expectedRevision !== undefined && options.expectedModelSelection !== undefined && modelBasis.expectedRevision !== options.expectedModelSelection) throw new ModelSelectionConflictError()
+      const instructionBasis = instructions ? instructionsWriteBasis(instructions, options.expectedInstructions, instructionFields, options.instructionsMutation) : undefined
+      const issueKeys = [key]
+      const modelGuard = modelBasis ? modelSelectionIssueGuard(modelBasis.issueTarget, modelBasis.source, issueKeys, options.modelSelectionMutation) : undefined
+      const instructionGuard = instructions ? instructionsIssueGuard(instructions, issueKeys, options.instructionsMutation) : undefined
+      if (modelGuard && model) { modelGuard.clientBase = modelBasis?.expectedRevision !== undefined && options.expectedModelSelection !== undefined; modelGuard.currentType = normalizeSubagentType(model.record) }
+      try {
+      targetLease = acquireSettingsMutation(lifecycle)
+      if (typedSnapshot) typedLease = acquireSettingsMutation(typedSnapshot.lifecycle)
+      if (modelBasis) lease = acquireSettingsMutation(modelBasis.lifecycle)
+      if (instructionBasis) instructionLease = acquireSettingsMutation(instructionBasis)
+      if (model) checkModelSelectionIssue(options.modelSelectionMutation)
+      if (instructions) checkInstructionsIssue(options.instructionsMutation)
+      lease?.check()
+      instructionLease?.check()
+      targetLease.check()
+      const signal = options.modelSelectionMutation?.signal ?? options.instructionsMutation?.signal
+      const command = signal ? client.withAbortSignal(signal) : client
+      // Positional, as `UPDATE_SUBAGENT_FIELDS_SCRIPT` reads them: ops, model, instructions, Typed File Tools.
+      const issuedArguments = [issuedOps, modelGuard ? JSON.stringify(modelGuard) : '', instructionGuard ? JSON.stringify(instructionGuard) : '', typedGuard ? JSON.stringify(typedGuard) : '']
+      typedLease?.check()
+      issued = true
+      answer = await command.eval(UPDATE_SUBAGENT_FIELDS_SCRIPT, { keys: issueKeys, arguments: issuedArguments })
+      if (Array.isArray(answer) && answer.length === 2 && answer[0] === 'TYPED_TOOLS_SAVED' && typedSnapshot) {
+        if (!Array.isArray(answer[1])) throw new Error('The saved Typed File Tools receipt is unavailable.')
+        typedAck = makeTypedToolsSnapshot(id, 'subagent', answer[1] as string[], typedSnapshot.lifecycle, true)
+        answer = 'OK'
+      }
+      if (typedSnapshot && answer === 'OK' && !typedAck) throw new Error('The promised Typed File Tools save receipt is missing.')
+      } catch (error) {
+        if (!issued || (options.modelSelectionMutation?.signal?.aborted || options.instructionsMutation?.signal?.aborted) && error instanceof AbortError) { targetLease?.settle(); typedLease?.settle(); lease?.settle(); instructionLease?.settle(); throw error }
+        targetLease?.unknown()
+        if (typedLease) { typedLease.unknown(); instructionLease?.unknown(); lease?.unknown(); throw new TypedToolsSaveUnconfirmedError() }
+        if (instructionLease) { instructionLease.unknown(); lease?.unknown(); throw new InstructionsSaveUnconfirmedError() }
+        if (lease) { lease.unknown(); throw new ModelSelectionSaveUnconfirmedError() } throw new SubjectSaveUnconfirmedError()
+      }
+      if (typeof answer === 'string' && ['TYPED_TOOLS_BASE_REQUIRED', 'TYPED_TOOLS_CHANGED', 'OK', 'MISSING', 'INVALID_RECORD', 'MODEL_SELECTION_CHANGED', 'MODEL_SELECTION_EXPIRED', 'MODEL_SELECTION_BASE_REQUIRED', 'INSTRUCTIONS_BASE_REQUIRED', 'INSTRUCTIONS_CHANGED', 'INSTRUCTIONS_EXPIRED'].includes(answer)) { targetLease?.settle(); typedLease?.settle(); lease?.settle(); instructionLease?.settle() }
+      else { targetLease?.unknown(); typedLease?.unknown(); lease?.unknown(); instructionLease?.unknown(); if (typedLease) throw new TypedToolsSaveUnconfirmedError(); if (instructionLease) throw new InstructionsSaveUnconfirmedError(); if (lease) throw new ModelSelectionSaveUnconfirmedError(); throw new SubjectSaveUnconfirmedError() }
+      if (answer === 'TYPED_TOOLS_BASE_REQUIRED') throw new TypedToolsBaseRequiredError()
+      if (answer === 'TYPED_TOOLS_CHANGED') throw new TypedToolsConflictError()
+      if (answer === 'INSTRUCTIONS_BASE_REQUIRED') throw new InstructionsBaseRequiredError()
+      if (answer === 'INSTRUCTIONS_CHANGED' || answer === 'INSTRUCTIONS_EXPIRED') throw new InstructionsConflictError()
+      if (answer === 'MODEL_SELECTION_CHANGED' || answer === 'MODEL_SELECTION_EXPIRED') throw new ModelSelectionConflictError()
+      if (answer === 'MODEL_SELECTION_BASE_REQUIRED') throw new ModelSelectionBaseRequiredError()
+      if (answer === 'OK') { if (typedAck) options.onTypedFileToolsSaved?.({ revision: typedAck.revision, value: typedAck.value }); options.instructionsMutation?.onSaved?.(); options.modelSelectionMutation?.onSaved?.(); return true }
       if (answer === 'MISSING') return false
+      if (answer === 'INVALID_RECORD') throw new Error('Existing key has wrong Redis type or is not an object.')
       throw new Error(`The update of Subagent ${id} answered ${String(answer)}.`)
     })
   }
@@ -2696,13 +3264,22 @@ export class RedisService {
    * those chats; this module stays free of the publisher.
    */
   async deleteAgent(id: string): Promise<{ releasedHolds: Array<{ sessionId: string; zipId: string }> }> {
+    const originalCatalogueEpoch = captureSettingsLifecycle([])
+    return withSettingsRecordReplacement(`agent:${id}`, async () => {
+    agentSetupCache.clearAgentRecord(id)
     // BL-608: three sweeps below (wake hooks, schedules, zip holds) find the agent's records
     // through `agent.user_id`, and each reads the record strictly, so a failed read stops the
     // delete there. Read it once here too, before anything is deleted, so a read that fails
     // from the start costs nothing: before, `redis.get` answered a failed read with null, those
     // sweeps found nothing, and the agent was deleted anyway with its hooks, schedules, and
     // holds left behind.
-    await this.json.get(`agent:${id}`)
+    const settingsOwner = await this.json.get(`agent:${id}`) as AgentRow | null
+    assertSettingsLifecycle(originalCatalogueEpoch)
+    const commandPreparation = settingsOwner?.user_id ? beginSlashCommandWrite(settingsOwner.user_id) : undefined
+    if (settingsOwner?.user_id) {
+      const { sweepAppActionsSubjectReferences } = await import('$lib/server/services/appActions/settings/authority')
+      await sweepAppActionsSubjectReferences(settingsOwner.user_id, { kind: 'primary', id })
+    }
     // Dynamic import avoids a redis.ts <-> memoryMedia.ts module cycle. Media cleanup
     // is part of the destructive contract: fail before deleting the agent if it fails.
     const { sweepAgentMemoryMedia } = await import('$lib/server/services/memory/memoryMedia')
@@ -2748,14 +3325,65 @@ export class RedisService {
     const agentDeleteDone = markAgentBeingDeleted(id)
     let releasedHolds: Array<{ sessionId: string; zipId: string }>
     try {
-      releasedHolds = await releaseDeletedAgentHolds(id)
+      const { deleteAgentSkillSessions } = await import('$lib/server/services/skillSessions')
+      releasedHolds = await deleteAgentSkillSessions(id, settingsOwner!.user_id)
+      releasedHolds.push(...await releaseDeletedAgentHolds(id))
       await this.execute(async (client) => {
         // Get agent to find user_id
         const agent = await client.json.get(`agent:${id}`)
 
-        // Delete agent
-        await client.del(`agent:${id}`)
-        await client.del(`agent:${id}:subagents`)
+        // Preserve the existing full Whiteboard preflight, with atomic population removal.
+        if (agent !== null) {
+          if (!agent || Array.isArray(agent) || typeof agent !== 'object' || typeof (agent as any).user_id !== 'string') {
+            throw new Error('The agent deletion owner is unreadable.')
+          }
+          const userId = (agent as any).user_id as string
+          if (!commandPreparation || userId !== settingsOwner?.user_id || (agent as any).id !== id) {
+            throw new Error('The agent owner changed before final deletion. The record was retained; earlier cleanup may already have completed.')
+          }
+          // BL-1621/BL-392: required skill references go before final identity removal.
+          // A known refusal leaves a recoverable owner. Only an actual unknown issued
+          // command holds its exact replacement lease after this request ends.
+          const skillLease = acquireSettingsReplacementMutation(`agent:${id}`)
+          try {
+            const { captureSlashCommandWriteBasis, captureSkillSourceWriteBasis, removeExplicitSkillSourceAgentAccess } = await import('$lib/server/services/slashCommandRevision')
+            const { removeExplicitSlashCommandAgentAccess } = await import('$lib/server/services/agentAccessLists')
+            assertSettingsLifecycle(originalCatalogueEpoch)
+            // Capture BEFORE the cross-kind read. A concurrent deletion cannot
+            // make this request adopt its new catalogue nonce and lose access.
+            await captureSlashCommandWriteBasis(commandPreparation, [])
+            const sharedWithSubagent = await client.exists(`subagent:${id}`)
+            if (!sharedWithSubagent) {
+              const { removeAgentPluginAgentReferences } = await import('$lib/server/services/agentPlugins')
+              await removeAgentPluginAgentReferences(userId, id, 'primary')
+              for (const key of await client.keys(`slash_command:${userId}:*`)) {
+                const commandId = key.slice(`slash_command:${userId}:`.length)
+                const basis = await captureSlashCommandWriteBasis(commandPreparation, [commandId])
+                await removeExplicitSlashCommandAgentAccess(userId, commandId, id, basis)
+              }
+              for (const key of await client.keys(`skill_source:${userId}:*`)) {
+                const sourceId = key.slice(`skill_source:${userId}:`.length)
+                const basis = await captureSkillSourceWriteBasis(commandPreparation, sourceId)
+                await removeExplicitSkillSourceAgentAccess(userId, sourceId, id, basis)
+              }
+              const { removeRequiredArtifactAgentReferences } = await import('$lib/server/services/artifactAgentDeletionCleanup')
+              await removeRequiredArtifactAgentReferences({ userId, id, kind: 'primary' }, () => {
+                skillLease.check()
+                assertSettingsLifecycle(originalCatalogueEpoch)
+                currentSlashCommandWriteRevision(commandPreparation)
+              })
+            }
+          } catch (error) {
+            if (isSlashCommandMutationError(error) && error.outcome === 'unknown') skillLease.unknown()
+            else skillLease.settle()
+            throw error
+          }
+          skillLease.settle()
+          await deletePrimaryPopulation(client, { subjectId: id, userId, expectedCatalogueRevision: currentSlashCommandWriteRevision(commandPreparation) })
+        } else if (await client.exists(`agent:${id}`)) {
+          throw new Error('The agent deletion owner is unreadable.')
+        }
+
 
         // Delete the agent's memory store (SA-104, DL-104-13). Memories, graduated
         // segments, and the dreaming log are agent-scoped and survive session deletion;
@@ -2782,46 +3410,18 @@ export class RedisService {
         } catch (foldError) {
           console.error(`[deleteAgent] Error deleting awareness fold:`, foldError)
         }
+        // SA-137 P4 (D10): this agent's live file read receipts, in every chat (chats can outlive it).
+        try {
+          const { deleteLiveFileReadOutcomesOfAgent } = await import('$lib/server/services/liveFileReadOutcome.server')
+          await deleteLiveFileReadOutcomesOfAgent(client, id)
+        } catch (liveReadError) {
+          console.error(`[deleteAgent] Error deleting live file read receipts:`, liveReadError)
+        }
 
         // Remove from user's agent list
         const agentObj = agent as any
         if (agentObj?.user_id) {
           const userId = agentObj.user_id as string
-          await client.sRem(`user:${userId}:agents`, id)
-
-          // 2026-09-19 (Josh: "when you delete an agent, it should delete everything about that
-          // agent"): the agent's id also sits inside two per-user lists that are not the agent's
-          // own records — a skill's `enabled_agent_ids` (Settings → Skills, enabled for chosen
-          // agents) and an artifact's `agent_allowlist` (Artifacts → Agent use). Each scrub is
-          // a path-scoped write of that ONE field: a whole-record write here would race the
-          // skill registry and the artifacts service, which own those records.
-          const scrubAgentIdList = async (key: string, path: string) => {
-            const raw = await client.json.get(key, { path: `$${path}` })
-            const list = Array.isArray(raw) && raw.length > 0 && Array.isArray(raw[0]) ? raw[0] : null
-            if (!list || !list.includes(id)) return false
-            await client.json.set(key, `$${path}`, list.filter((value) => value !== id) as any)
-            return true
-          }
-          try {
-            const skillKeys = await client.keys(`slash_command:${userId}:*`)
-            let scrubbed = 0
-            for (const key of skillKeys) {
-              if (await scrubAgentIdList(key, '.enabled_agent_ids')) scrubbed += 1
-            }
-            if (scrubbed > 0) logger.debug(`[deleteAgent] Removed ${id} from ${scrubbed} skill enable-list(s)`)
-          } catch (skillError) {
-            console.error(`[deleteAgent] Error scrubbing skill enable-lists:`, skillError)
-          }
-          try {
-            const artifactIds = await client.sMembers(`user:${userId}:artifacts`)
-            let scrubbed = 0
-            for (const artifactId of artifactIds) {
-              if (await scrubAgentIdList(`artifact:${artifactId}`, '.agent_allowlist')) scrubbed += 1
-            }
-            if (scrubbed > 0) logger.debug(`[deleteAgent] Removed ${id} from ${scrubbed} artifact allow-list(s)`)
-          } catch (artifactError) {
-            console.error(`[deleteAgent] Error scrubbing artifact allow-lists:`, artifactError)
-          }
 
           const groupIds = await client.sMembers(`user:${userId}:groups`)
           for (const groupId of groupIds) {
@@ -2881,6 +3481,7 @@ export class RedisService {
       agentDeleteDone()
     }
     return { releasedHolds }
+    })
   }
 
   // ===== GROUPS =====
@@ -3120,17 +3721,34 @@ export class RedisService {
   }
 
   async createVoiceProfile(profile: VoiceProfileRecord): Promise<VoiceProfileRecord> {
-    return this.execute(async (client) => {
-      await client.json.set(`voice_profile:${profile.id}`, '$', profile as any)
-      await client.sAdd(`user:${profile.user_id}:voice_profiles`, profile.id)
-      return profile
-    })
+    const payload = JSON.stringify(profile), saved = JSON.parse(payload) as VoiceProfileRecord
+    const id = saved.id, userId = saved.user_id, key = `voice_profile:${id}`
+    return withSettingsRecordReplacement(key, () => this.execute(async (client) => {
+      const lease = acquireSettingsReplacementMutation(key)
+      try {
+        lease.check()
+        const answer = await client.eval(`redis.call('JSON.SET', KEYS[1], '$', ARGV[1]); redis.call('SADD', KEYS[2], ARGV[2]); return 'OK'`,
+          { keys: [key, `user:${userId}:voice_profiles`], arguments: [payload, id] })
+        if (answer !== 'OK') { lease.unknown(); throw new Error('Voice profile save outcome is unconfirmed.') }
+        lease.settle(); return saved
+      } catch (error) { lease.unknown(); throw error }
+    }))
   }
 
-  async deleteVoiceProfile(id: string, userId: string): Promise<void> {
-    return this.execute(async (client) => {
-      await client.del(`voice_profile:${id}`)
-      await client.sRem(`user:${userId}:voice_profiles`, id)
+  async deleteVoiceProfile(id: string, userId: string, beforeDelete?: () => Promise<void>): Promise<void> {
+    const key = `voice_profile:${id}`
+    return withSettingsRecordReplacement(key, async () => {
+      await beforeDelete?.()
+      await this.execute(async client => {
+        const lease = acquireSettingsReplacementMutation(key)
+        try {
+          lease.check()
+          const answer = await client.eval(`redis.call('DEL', KEYS[1]); redis.call('SREM', KEYS[2], ARGV[1]); return 'OK'`,
+            { keys: [key, `user:${userId}:voice_profiles`], arguments: [id] })
+          if (answer !== 'OK') { lease.unknown(); throw new Error('Voice profile deletion outcome is unconfirmed.') }
+          lease.settle()
+        } catch (error) { lease.unknown(); throw error }
+      })
     })
   }
 
@@ -3139,9 +3757,19 @@ export class RedisService {
   async getUserSettings(userId: string): Promise<UserSettingsRow | null> {
     try {
       const settings = await this.json.get(`user:${userId}:settings`, '$')
-      return settings
-        ? resolveUploadUrlsForBrowserInPayload(settings as UserSettingsRow)
-        : null
+      if (settings == null) return null
+      if (typeof settings !== 'object' || Array.isArray(settings)) {
+        throw new Error('Invalid saved user settings: expected an object.')
+      }
+      // One public projection serves layout, API reads and whole-settings senders.
+      // Retired global values remain inert in Redis; never echo them into a new save.
+      const { global_api_reasoning_retention: _retired, ...current } = settings as UserSettingsRow & { global_api_reasoning_retention?: unknown }
+      const grid = current.global_tool_grid_settings
+      if (grid && typeof grid === 'object' && !Array.isArray(grid)) {
+        const { typed_file_tools: _retiredTypedGrant, ...kept } = grid
+        return resolveUploadUrlsForBrowserInPayload({ ...current, global_tool_grid_settings: kept })
+      }
+      return resolveUploadUrlsForBrowserInPayload(current)
     } catch (error) {
       // Null strictly means "no settings saved yet". Redis failures rethrow so callers
       // fail loudly instead of treating an outage as an empty profile — a swallowed read
@@ -3172,18 +3800,26 @@ export class RedisService {
     global_auto_compact_settings?: any,
     global_tool_grid_settings?: any,
     global_chat_settings?: any,
+    appearance_settings?: any,
     ui_settings?: any,
     admin_settings?: any,
     global_custom_system_prompt?: string,
     upload_settings?: any,
     upload_provider?: string,
     voice_settings?: VoiceSettings,
+    voice_settings_patch?: unknown,
+    goons_settings_patch?: unknown,
     goons_settings?: GoonsSettings,
     onboarding_settings?: UserSettingsRow['onboarding_settings']
   }): Promise<UserSettingsRow> {
+    refuseWholeToolOperationsWrite(updates)
+    const adminExplicit = updates.admin_settings !== undefined
+    const toolLifecycle = captureSettingsLifecycle([`user:${userId}:settings`])
+    const referencePreparation = preparePresetReferences('settings', updates, toolLifecycle)
     return this.execute(async (client) => {
       // Get existing or create new with defaults
-      const existing = await this.getUserSettings(userId)
+      const referenceSnapshot = await readPresetReferenceSnapshot(client, `user:${userId}:settings`, 'settings', undefined, undefined, PUBLIC_SETTINGS_PRESERVATION_PATHS)
+      const existing = resolveUploadUrlsForBrowserInPayload(referenceSnapshot.record) as UserSettingsRow
       
       const settingsData: UserSettingsRow = {
         id: existing?.id || `settings_${userId}`,
@@ -3217,13 +3853,20 @@ export class RedisService {
           updates.global_chat_settings !== undefined
             ? updates.global_chat_settings
             : (existing as any)?.global_chat_settings,
+        // The app's look (2026-10-29); the route stores only {look} with a named look.
+        appearance_settings:
+          updates.appearance_settings !== undefined
+            ? updates.appearance_settings
+            : (existing as any)?.appearance_settings,
         ui_settings: updates.ui_settings !== undefined ? updates.ui_settings : existing?.ui_settings,
         admin_settings: updates.admin_settings !== undefined ? updates.admin_settings : (existing as any)?.admin_settings,
         global_custom_system_prompt: updates.global_custom_system_prompt !== undefined ? updates.global_custom_system_prompt : existing?.global_custom_system_prompt,
         upload_settings: updates.upload_settings !== undefined ? updates.upload_settings : existing?.upload_settings,
         upload_provider: updates.upload_provider !== undefined ? updates.upload_provider : existing?.upload_provider,
-        voice_settings: updates.voice_settings !== undefined ? updates.voice_settings : existing?.voice_settings,
-        goons_settings: updates.goons_settings !== undefined ? updates.goons_settings : (existing as any)?.goons_settings,
+        voice_settings: updates.voice_settings !== undefined || updates.voice_settings_patch !== undefined
+          ? mergeVoiceSettingsSave(existing?.voice_settings, updates.voice_settings, updates.voice_settings_patch) : existing?.voice_settings,
+        goons_settings: updates.goons_settings_patch !== undefined ? mergeGoonsSettingsPatch((existing as any)?.goons_settings, updates.goons_settings_patch)
+          : updates.goons_settings !== undefined ? updates.goons_settings : (existing as any)?.goons_settings,
         onboarding_settings:
           updates.onboarding_settings !== undefined
             ? updates.onboarding_settings
@@ -3239,15 +3882,19 @@ export class RedisService {
       }
       
       const storageSettingsData = normalizeUploadUrlsForStorageInPayload(settingsData)
-      await storeUserSettingsForClient(client, userId, storageSettingsData)
+      await storeUserSettingsForClient(client, userId, storageSettingsData, { snapshot: referenceSnapshot, preparation: referencePreparation, toolLifecycle, adminExplicit,
+        closetExplicit: !!updates.goons_settings_patch && typeof updates.goons_settings_patch === 'object' && !Array.isArray(updates.goons_settings_patch) && Object.hasOwn(updates.goons_settings_patch, 'globalCloset') })
       
       return resolveUploadUrlsForBrowserInPayload(storageSettingsData)
     })
   }
 
   async saveUserSettings(userId: string, completeSettings: any): Promise<UserSettingsRow> {
+    const toolLifecycle = captureSettingsLifecycle([`user:${userId}:settings`])
+    const referencePreparation = preparePresetReferences('settings', {}, toolLifecycle)
     return this.execute(async (client) => {
-      const user = await this.getUserSettings(userId)
+      const referenceSnapshot = await readPresetReferenceSnapshot(client, `user:${userId}:settings`, 'settings', undefined, undefined, PUBLIC_SETTINGS_PRESERVATION_PATHS)
+      const user = resolveUploadUrlsForBrowserInPayload(referenceSnapshot.record) as UserSettingsRow
       const updated: UserSettingsRow = {
         id: user?.id || `settings_${userId}`,
         user_id: userId,
@@ -3269,7 +3916,7 @@ export class RedisService {
       }
       
       const storageUpdated = normalizeUploadUrlsForStorageInPayload(updated)
-      await storeUserSettingsForClient(client, userId, storageUpdated)
+      await storeUserSettingsForClient(client, userId, storageUpdated, { snapshot: referenceSnapshot, preparation: referencePreparation, toolLifecycle, adminExplicit: false, closetExplicit: false })
       return resolveUploadUrlsForBrowserInPayload(storageUpdated)
     })
   }
@@ -3319,7 +3966,7 @@ export class RedisService {
       
       // Get existing project
       const existing = await client.json.get(key)
-      if (!existing) throw new Error('Project not found')
+      if (!existing) throw Object.assign(new Error('Project not found'), { status: 404 })
       
       // Merge updates
       const updated = {
@@ -3328,8 +3975,11 @@ export class RedisService {
         updated_at: new Date().toISOString()
       }
       
-      // Save back
-      await client.json.set(key, '$', updated as any)
+      // Save back, only while the record still exists (`JSON.SET … XX`, BL-2387): a delete that
+      // lands between the read and this write must not be undone by the update making the
+      // project again.
+      const written = await client.json.set(key, '$', updated as any, { condition: 'XX' })
+      if (written !== 'OK') throw Object.assign(new Error('Project not found'), { status: 404 })
       
       return updated as ProjectRow
     })
@@ -3383,7 +4033,9 @@ export class RedisService {
   // ===== REDIS OPERATIONS =====
 
   // Generic Redis operations for system prompts and other data
-  async get(key: string): Promise<any> {
+  // Owner admission must distinguish a failed read from absence while retaining
+  // the mixed RedisJSON/legacy-string decoding used by existing callers.
+  async get(key: string, options: { throwOnError?: boolean } = {}): Promise<any> {
     return this.execute(async (client) => {
       try {
         // First check if the key exists and what type it is
@@ -3403,6 +4055,7 @@ export class RedisService {
           return this.safeJsonParse(value)
         }
       } catch (error) {
+        if (options.throwOnError) throw error
         console.error('Error getting key:', key, error)
         return null
       }
@@ -4129,11 +4782,15 @@ export class RedisService {
      * text changed, so the caller reads again. The value is sent as `JSON.stringify(value)`, the
      * bytes `json.set` sends.
      */
-    setIfUnchanged: async (key: string, path: string, expectedRaw: string, value: any): Promise<boolean> => {
+    setIfUnchanged: async (key: string, path: string, expectedRaw: string, value: any, issue?: { beforeIssue(): void }): Promise<boolean> => {
       return this.execute(async (client) => {
+        const serialized = jsonTextOf(value)
+        // Fixed server owner check, after actual client acquisition/serialization.
+        // No await separates refusal/issue marking from the SAME existing EVAL.
+        issue?.beforeIssue()
         const answer = await client.eval(JSON_COMPARE_AND_WRITE_SCRIPT, {
           keys: [key],
-          arguments: ['SET', path, expectedRaw, jsonTextOf(value)]
+          arguments: ['SET', path, expectedRaw, serialized]
         })
         return readJsonCompareAndWriteAnswer(answer, 'SET', key, path)
       })

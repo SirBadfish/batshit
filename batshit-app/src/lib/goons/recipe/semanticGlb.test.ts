@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { Mesh } from "three";
+import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import {
   decodeSemanticGlbAccessor,
   getSemanticGlbMesh,
@@ -191,6 +193,43 @@ function visitorFixture(): {
 }
 
 describe("semantic GLB", () => {
+  it("refuses a buffer URI that makes Three load geometry different from the embedded BIN", async () => {
+    const encodedPositions = (firstX: number) => {
+      const bytes = new Uint8Array(36);
+      const view = new DataView(bytes.buffer);
+      [firstX, 0, 0, 0, 1, 0, 0, 0, 1].forEach((value, index) => view.setFloat32(index * 4, value, true));
+      return bytes;
+    };
+    const embedded = encodedPositions(1);
+    const external = encodedPositions(9);
+    const dataUri = `data:application/octet-stream;base64,${btoa(String.fromCharCode(...external))}`;
+    const gltf = (uri?: unknown): JsonRecord => ({
+      asset: { version: "2.0" },
+      scene: 0,
+      scenes: [{ nodes: [0] }],
+      nodes: [{ name: "Probe", mesh: 0 }],
+      meshes: [{ primitives: [{ attributes: { POSITION: 0 } }] }],
+      buffers: [{ byteLength: embedded.byteLength, ...(uri === undefined ? {} : { uri }) }],
+      bufferViews: [{ buffer: 0, byteOffset: 0, byteLength: embedded.byteLength }],
+      accessors: [{ bufferView: 0, componentType: 5126, count: 3, type: "VEC3", min: [0, 0, 0], max: [uri === undefined ? 1 : 9, 1, 1] }],
+    });
+    const loadFirstX = async (bytes: Uint8Array) => {
+      const loaded = await new GLTFLoader().parseAsync(bytes.buffer as ArrayBuffer, "");
+      const mesh = loaded.scene.getObjectByName("Probe");
+      if (!(mesh instanceof Mesh)) throw new Error("Expected the probe mesh.");
+      return mesh.geometry.getAttribute("position").getX(0);
+    };
+
+    const normal = makeGlb(gltf(), embedded);
+    expect(decodeSemanticGlbAccessor(parseSemanticGlb(normal), 0).values[0]).toBe(1);
+    expect(await loadFirstX(normal)).toBe(1);
+    const withUri = makeGlb(gltf(dataUri), embedded);
+    expect(await loadFirstX(withUri)).toBe(9);
+    expect(() => parseSemanticGlb(withUri)).toThrow(/embedded buffer must not declare a URI/);
+    expect(() => parseSemanticGlb(makeGlb(gltf("external.bin"), embedded))).toThrow(/embedded buffer must not declare a URI/);
+    expect(() => parseSemanticGlb(makeGlb(gltf(null), embedded))).toThrow(/embedded buffer must not declare a URI/);
+  });
+
   it("exposes bounded semantic access, stable names, and raw transform representation", () => {
     const parsed = parseSemanticGlb(fixture());
 
@@ -259,6 +298,31 @@ describe("semantic GLB", () => {
     expect(collect(packed.interleaved).values).toEqual(dense.values);
     expect(collect(packed.sparse).values).toEqual(dense.values);
     expect(collect(packed.sparse).values).toEqual(dense.values);
+  });
+
+  it("preserves immutable Float32 endpoint bits only on explicit dense, interleaved and sparse decoding", () => {
+    const builder = new AccessorFixtureBuilder();
+    const values = [0, 0, 0, .123456789, -0, 1e-10, -0, 1.7, -0];
+    const accessors = [builder.addFloatVec3(values), builder.addFloatVec3(values, 16),
+      builder.addSparseFloatVec3(3, [1, 2], values.slice(3))];
+    const parsed = parseSemanticGlb(builder.glb());
+    const bits = (values: ArrayLike<number>) => {
+      const floats = Float32Array.from(values);
+      return Array.from(new Uint32Array(floats.buffer));
+    };
+    for (const index of accessors) {
+      expect(bits(decodeSemanticGlbAccessor(parsed, index, { preserveSignedZero: true }).values)).toEqual(bits(values));
+      expect(Array.from(decodeSemanticGlbAccessor(parsed, index).values)).toEqual(Array.from(Float32Array.from(values),
+        value => Object.is(value, -0) ? 0 : value));
+      expect(decodeSemanticGlbAccessor(parsed, index, { preserveSignedZero: false }))
+        .toEqual(decodeSemanticGlbAccessor(parsed, index));
+    }
+    const invalid = new AccessorFixtureBuilder();
+    const index = invalid.addFloatVec3([NaN, -0, 0]);
+    const malformed = parseSemanticGlb(invalid.glb());
+    for (const preserveSignedZero of [false, true]) {
+      expect(() => decodeSemanticGlbAccessor(malformed, index, { preserveSignedZero })).toThrow("finite");
+    }
   });
 
   it("visits normalized scalars in deterministic row-major order", () => {

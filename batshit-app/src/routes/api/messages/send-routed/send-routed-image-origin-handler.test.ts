@@ -1,13 +1,11 @@
 // @vitest-environment node
+import { useSendHandlerFixture } from '$lib/test-utils/sendHandlerFixture'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { env } from '$env/dynamic/private'
 import { redis } from '$lib/server/redis'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
-import { claudeApiErrorResult, claudeSessionCrashResult } from '$lib/test-utils/claude-stream-error-results'
 import { executionViewerService } from '$lib/server/services/executionViewerService'
-import { buildTokenUsage } from '$lib/server/services/executionViewerLlmCapture'
-import { mergeResumedTokenUsage, mergeResumedUsage } from '$lib/server/services/approvalResumeMessage'
 import { __resetStreamAbortRegistryForTests, abortStream } from '$lib/server/services/streamAbortRegistry'
 import { __resetSteerInboxRegistryForTests, enqueueSteer } from '$lib/server/services/steerInboxRegistry'
 import { __resetWakeRunRegistryForTests, registerWakeRun } from '$lib/server/services/wakeRunRegistry'
@@ -22,11 +20,6 @@ import {
   startReplyRecord
 } from '$lib/server/services/replyStreamRecord'
 import { scanZipReferences } from '$lib/utils/zipReferenceSafety'
-import {
-  __resetClaudeApprovalRegistryForTests,
-  recordClaudeApprovalCard,
-  settleClaudeApproval
-} from '$lib/server/services/claudeApprovalRegistry'
 import type { SavedModel } from '$lib/types/savedModels'
 
 /**
@@ -60,6 +53,9 @@ const PRESET = 'preset-bl474'
 const REPLY = 'msg-reply-bl775'
 const CARD = 'msg-card-bl775'
 const APPROVAL = 'aitxt-bl775'
+/** What an API card saves for its resume since a26ea0697 (Whiteboard): without it the resume refuses. */
+const cardWhiteboardSnapshot = () => ({ schema_version: 1, userId: USER, sessionId: SESSION, agentId: AGENT, messageId: CARD,
+  settings: { mode: 'neither', whiteboardEnabled: false, preserveReasoning: false, whiteboardBudgetTokens: 1500, showWhiteboard: true }, dcmLines: [] })
 const GROUP = 'group-bl474-image-origin'
 const GROUP_MEMBER = 'agent-bl474-image-origin-member'
 const PAUSE_USAGE = { inputTokens: 10_000, outputTokens: 1_000, totalTokens: 11_000 }
@@ -135,14 +131,7 @@ const mocks = vi.hoisted(() => ({
   /** The compile's labelled pieces (landing 1's `addressSources`). */
   compiledPieces: [] as Array<{ source: string; text: string; messageId?: string }>,
   /** The options send-routed handed the compile. */
-  compileOptions: null as any,
-  /** The CLI bridge is fake; its event adapter and the route's result callback are real. */
-  managedEvents: [] as any[],
-  managedObservedUsage: null as Record<string, number> | null,
-  managedRequest: null as any,
-  managedSteerIds: [] as string[],
-  managedSteerPayloads: [] as Array<{ steerIds: string[]; text: string }>,
-  runManaged: null as null | ((lane: 'codex' | 'claude', request: any) => Promise<any>)
+  compileOptions: null as any
 }))
 
 vi.mock('$lib/server/services/nativeTools', async (importOriginal) => ({
@@ -166,6 +155,10 @@ vi.mock('$lib/services/databaseRedis.server', async (importOriginal) => {
       if (mocks.compileFails) throw new Error('Compiler refused the prompt (test).')
       return {
         primarySystemPrompt: 'You are a test agent.',
+        // Shaped like the real compiler's snapshot, as in the sibling handler tests (a26ea0697): an API card
+        // saves it and its resume needs it. The per-agent snapshot contract is databaseRedis.compileContract.test.ts.
+        whiteboardContextSnapshot: args[6]?.whiteboardContextSnapshot ?? { schema_version: 1, userId: args[5], sessionId: args[0], agentId: (args[2] as any).id, messageId: args[6]?.whiteboardMessageId,
+          settings: { mode: 'neither', whiteboardEnabled: false, preserveReasoning: false, whiteboardBudgetTokens: 1500, showWhiteboard: true }, dcmLines: [] },
         structuredInput: { messages: [{ role: 'user', content: 'Say two parts.' }], metadata: {} },
         resolvedProjectPath: null,
         addressSources: {
@@ -345,42 +338,6 @@ vi.mock('$lib/server/services/vercelBrain', () => ({
   }
 }))
 
-vi.mock('$lib/server/services/codexBridge', async (importOriginal) => ({
-  ...(await importOriginal<Record<string, any>>()),
-  CodexBridge: class {
-    async streamNativeMode(request: any) { return mocks.runManaged!('codex', request) }
-  }
-}))
-
-vi.mock('$lib/server/services/claudeBridge', async (importOriginal) => ({
-  ...(await importOriginal<Record<string, any>>()),
-  ClaudeBridge: class {
-    async streamNativeMode(request: any) { return mocks.runManaged!('claude', request) }
-  }
-}))
-
-mocks.runManaged = async (lane, request) => {
-  mocks.managedRequest = request
-  const onFinish = async (payload: any) => {
-    mocks.onFinishCalls++
-    await request.onFinish?.(payload)
-  }
-  const adapter = lane === 'codex'
-    ? new (await import('$lib/server/services/codexEventAdapter')).CodexEventAdapter({ request, transport: 'cli', onFinish, getObservedUsage: () => mocks.managedObservedUsage })
-    : new (await import('$lib/server/services/claudeEventAdapter')).ClaudeEventAdapter({ request, transport: 'cli', onFinish })
-  async function* events() {
-    for (const event of mocks.managedEvents) yield event
-  }
-  return {
-    stream: adapter.stream(events() as any),
-    __steerLane: lane,
-    __steer: async (payload: { steerIds: string[]; text: string }) => {
-      mocks.managedSteerPayloads.push(payload)
-      return lane === 'codex' ? { accepted: true } : true
-    }
-  }
-}
-
 vi.mock('$lib/server/ssePublisher', async (importOriginal) => {
   const actual = await importOriginal<Record<string, any>>()
   return {
@@ -396,6 +353,7 @@ useRedisTestServer()
 let POST: (event: any) => Promise<Response>
 let GETImageOrigins: (event: any) => Promise<Response>
 let SESSION = ''
+useSendHandlerFixture({ sessionIds: () => [SESSION], postStartupMcpUsers: () => [USER] })
 let count = 0
 let previousServiceToken: string | undefined
 
@@ -518,6 +476,7 @@ function createImageOriginApprovalFixture() {
   const cardMetadata = {
     imageOriginExpected: true,
     imageOriginExpectedVersion: 1,
+    whiteboardContextSnapshot: cardWhiteboardSnapshot(),
     approvalResumeVersion: 1,
     model: 'claude-sonnet-5',
     agentType: 'api',
@@ -605,49 +564,6 @@ const PAUSED_READ = 'https://paused.example.org/p.png'
 const UNOBSERVED_STEER = 'https://missed-steer.example/x.png'
 const PARALLEL_RESULT_TWO = 'https://parallel-two.example.org/second.png'
 
-async function useManagedAgent(lane: 'codex' | 'claude') {
-  const provider = lane === 'codex' ? 'codex' : 'claude-cli'
-  const modelId = lane === 'codex' ? 'gpt-6-astra' : 'sonnet'
-  await redis.set(`model:${PRESET}`, { ...model, provider, modelId, modelName: modelId })
-  await redis.createAgent({
-    id: AGENT, user_id: USER, name: 'Managed probe', displayName: 'Managed probe', agentType: 'cli',
-    primary_model_provider: provider, primary_model_name: modelId, primary_model_preset_id: PRESET,
-    ...(lane === 'codex'
-      ? { codex_settings: { permissionMode: 'chat', model: modelId, sandbox: 'read-only', approval: 'never', search: true } }
-      : { claude_settings: { permissionMode: 'chat', model: modelId, addDirs: [], allowedTools: [], disallowedTools: [] } })
-  } as any)
-}
-
-function managedReplyEvents(lane: 'codex' | 'claude', text: string, result?: { text: string; displayOnly: string }) {
-  const events: any[] = []
-  if (result) {
-    if (lane === 'codex') {
-      events.push(
-        { type: 'item.started', item: { id: 'raw-lookup', type: 'mcp_tool_call', server: 'docs', tool: 'lookup', arguments: {} } },
-        { type: 'item.completed', item: { id: 'raw-lookup', type: 'mcp_tool_call', server: 'docs', tool: 'lookup', arguments: {}, status: 'completed', result: { content: [{ type: 'text', text: result.text }], structured_content: { image: result.displayOnly } } } }
-      )
-    } else {
-      events.push(
-        { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'raw-lookup', name: 'mcp__docs__lookup', input: {} }] } },
-        { type: 'user', tool_use_result: { stdout: result.displayOnly }, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'raw-lookup', content: [{ type: 'text', text: result.text }] }] } }
-      )
-    }
-  }
-  if (mocks.managedSteerIds.length > 0) events.push(lane === 'codex'
-    ? { type: 'steer.delivered', steer_ids: [...mocks.managedSteerIds] }
-    : { type: 'batshit_steer_delivered', steer_ids: [...mocks.managedSteerIds] })
-  events.push(...(lane === 'codex'
-    ? [
-        { type: 'item.completed', item: { id: 'answer', type: 'agent_message', text } },
-        { type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 2 } }
-      ]
-    : [
-        { type: 'assistant', message: { content: [{ type: 'text', text }] } },
-        { type: 'result', result: text, usage: { input_tokens: 10, output_tokens: 2 } }
-      ]))
-  return events
-}
-
 describe('send-routed: where each picture of a reply came from (BL-474 step 2, the real handler)', () => {
   beforeAll(async () => {
     ;({ POST } = await import('./+server'))
@@ -696,16 +612,10 @@ describe('send-routed: where each picture of a reply came from (BL-474 step 2, t
     mocks.finishTextOverride = null
     mocks.groupReplies = false
     mocks.compiledPieces = [{ source: 'user', text: 'Show me the cat you find.' }]
-    mocks.managedEvents = []
-    mocks.managedObservedUsage = null
-    mocks.managedRequest = null
-    mocks.managedSteerIds = []
-    mocks.managedSteerPayloads = []
     sseForward.mockClear()
     __resetStreamAbortRegistryForTests()
     __resetSteerInboxRegistryForTests()
     __resetReplyRecordsForTests()
-    __resetClaudeApprovalRegistryForTests()
     __resetWakeRunRegistryForTests()
     vi.spyOn(console, 'error').mockImplementation(() => {})
     vi.spyOn(console, 'warn').mockImplementation(() => {})
@@ -729,187 +639,6 @@ describe('send-routed: where each picture of a reply came from (BL-474 step 2, t
     if (previousServiceToken === undefined) delete envRecord.BATSHIT_TOKEN
     else envRecord.BATSHIT_TOKEN = previousServiceToken
   })
-
-  // Real adapters, send handler, Redis persistence and reply-event recorder; only the CLI
-  // bridge/events and compiler are stand-ins. This closes the combined usage gap without
-  // starting a CLI. Resume assertions consume the actual saved half through the shared merge
-  // rules; the in-place resume handler itself has its separate accounting suite.
-  it.each([true, false])('BL-1361 saves and reloads partial observed usage once after a failure (streamed words: %s)', async (hasWords) => {
-    await useManagedAgent('codex')
-    mocks.managedObservedUsage = { input_tokens: 100, output_tokens: 10, cached_input_tokens: 20, cache_write_input_tokens: 30 }
-    mocks.managedEvents = [
-      ...(hasWords ? [{ type: 'item.completed', item: { id: 'observed-answer', type: 'agent_message', text: 'Partial observed reply.' } }] : []),
-      { type: 'turn.failed', error: { message: 'Synthetic failure after observed work.' } },
-    ]
-    const writes = vi.spyOn(executionViewerService, 'updateSnapshot')
-    const response = await send(undefined, REPLY, 'cli')
-    expect(response.status).toBe(500)
-    expect(mocks.onFinishCalls).toBe(1)
-    const saved = await stored(REPLY)
-    const expected = { completeness: 'partial', parts: [{ source: 'codex-app-server-progress', counts: { inputTokens: 100, outputTokens: 10, totalTokens: 110, cachedInputTokens: 20, cacheCreationInputTokens: 30 } }] }
-    expect(saved.metadata.observedUsage).toEqual(expected)
-    expect(saved.metadata.usage).toBeNull()
-    expect(saved.metadata.response_failed).toBe(true)
-    expect(saved.metadata.performance?.outputTokensPerSecond ?? null).toBeNull()
-    const snapshot = await executionViewerService.getSnapshot(SESSION, REPLY)
-    expect(snapshot?.responseSummary?.observedUsage).toEqual(expected)
-    expect(snapshot?.responseSummary?.usage.totalTokens.value).toBeNull()
-    expect(snapshot?.llmSummary?.totalUsage.totalTokens.value).toBeNull()
-    expect(writes.mock.calls.filter(([, id, patch]) => id === REPLY && Array.isArray(patch.llmCalls))).toHaveLength(1)
-    expect(mocks.forwards.filter((event) => event.type === 'finish')).toHaveLength(0)
-    const ends = mocks.forwards.filter((event) => event.type === 'end' && event.messageId === REPLY)
-    expect(ends).toHaveLength(hasWords ? 1 : 0)
-    if (hasWords) {
-      expect(saved.content).toBe('Partial observed reply.')
-      expect(ends[0].metadata.observedUsage).toEqual(saved.metadata.observedUsage)
-      expect(mocks.storedAtEnd.metadata.observedUsage).toEqual(expected)
-    }
-    const { GET } = await import('../../sessions/[sessionId]/execution-log/+server')
-    const reload = await GET({ params: { sessionId: SESSION }, locals: { user: { id: USER } } } as any)
-    const entries = (await reload.json()).entries
-    expect(entries.find((entry: any) => entry.id === REPLY).responseSummary.observedUsage).toEqual(expected)
-  }, 30_000)
-
-  it.each([
-    { name: 'Codex absent usage', lane: 'codex' as const, usage: undefined, input: null, output: null, total: null, cacheWrite: null, confidence: 'estimated', failed: false },
-    { name: 'Codex partial usage', lane: 'codex' as const, usage: { input_tokens: 10 }, input: 10, output: null, total: null, cacheWrite: null, confidence: 'exact', failed: false },
-    { name: 'Codex reported zeros', lane: 'codex' as const, usage: { input_tokens: 0, cached_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0 }, input: 0, output: 0, total: 0, cacheWrite: 0, confidence: 'exact', failed: false },
-    { name: 'Codex inclusive input with cache writes (BL-1383)', lane: 'codex' as const, usage: { input_tokens: 100, cached_input_tokens: 20, cache_write_input_tokens: 30, output_tokens: 10, reasoning_output_tokens: 0 }, input: 100, output: 10, total: 110, cacheWrite: 30, confidence: 'exact', failed: false },
-    { name: 'Claude failed result with reported usage', lane: 'claude' as const, result: claudeApiErrorResult('Usage probe failed after accounted calls.', 503), input: 2566, output: 40, total: 2606, cacheWrite: 512, confidence: 'exact', failed: true },
-    { name: 'Claude crash-template zeros stay unknown', lane: 'claude' as const, result: claudeSessionCrashResult(['Usage probe crashed.']), input: null, output: null, total: null, cacheWrite: null, confidence: 'estimated', failed: true }
-  ])('$name preserves usage across its one evidence writer, save, end and resume merge', async (probe) => {
-    await useManagedAgent(probe.lane)
-    const text = 'A measured reply.'
-    mocks.managedEvents = probe.lane === 'codex'
-      ? [
-          { type: 'item.completed', item: { id: 'usage-answer', type: 'agent_message', text } },
-          { type: 'turn.completed', usage: probe.usage }
-        ]
-      : [
-          { type: 'assistant', message: { content: [{ type: 'text', text }] } },
-          probe.result
-        ]
-    const writes = vi.spyOn(executionViewerService, 'updateSnapshot')
-
-    const response = await send(undefined, REPLY, 'cli')
-    expect(response.status, await response.clone().text()).toBe(probe.failed ? 500 : 200)
-    expect(mocks.onFinishCalls).toBe(1)
-    const captureWrites = writes.mock.calls.filter(([, id, patch]) => id === REPLY && Array.isArray(patch.llmCalls))
-    expect(captureWrites).toHaveLength(1)
-    const saved = await stored(REPLY)
-    const snapshot = await executionViewerService.getSnapshot(SESSION, REPLY)
-    expect(saved.content).toBe(text)
-    expect(snapshot?.llmCalls).toHaveLength(1)
-    for (const usage of [snapshot?.responseSummary?.usage, snapshot?.llmSummary?.totalUsage]) {
-      for (const [field, value] of [['inputTokens', probe.input], ['outputTokens', probe.output], ['totalTokens', probe.total]] as const) {
-        expect(usage?.[field].value).toBe(value)
-        if (value !== null) expect(usage?.[field].confidence).toBe('exact')
-        else if (probe.confidence === 'estimated') expect(usage?.[field].confidence).toBe('estimated')
-      }
-      expect(usage?.cacheCreationInputTokens?.value ?? null).toBe(probe.cacheWrite)
-      if (probe.cacheWrite !== null) expect(usage?.cacheCreationInputTokens?.confidence).toBe('exact')
-    }
-    if (probe.input === null) {
-      expect(saved.metadata?.usage).toBeUndefined()
-    } else {
-      expect(saved.metadata.usage.inputTokens).toBe(probe.input)
-      if (probe.output === null) expect(saved.metadata.usage.outputTokens).toBeUndefined()
-      else expect(saved.metadata.usage.outputTokens).toBe(probe.output)
-      if (probe.total === null) expect(saved.metadata.usage.totalTokens).toBeUndefined()
-      else expect(saved.metadata.usage.totalTokens).toBe(probe.total)
-      if (probe.cacheWrite === null) expect(saved.metadata.usage.cacheCreationInputTokens).toBeUndefined()
-      else expect(saved.metadata.usage.cacheCreationInputTokens).toBe(probe.cacheWrite)
-    }
-    const ends = mocks.forwards.filter((event) => event.type === 'end' && event.messageId === REPLY)
-    expect(ends).toHaveLength(1)
-    expect(ends[0].savedRecord).toBe(true)
-    expect(ends[0].metadata.usage).toEqual(saved.metadata?.usage)
-    expect(mocks.storedAtEnd.content).toBe(saved.content)
-    expect(mocks.storedAtEnd.metadata.usage).toEqual(saved.metadata?.usage)
-    expect(mocks.forwards.filter((event) => event.type === 'finish')).toHaveLength(probe.failed || probe.input === null ? 0 : 1)
-    if (probe.failed) {
-      expect(saved.metadata.response_failed).toBe(true)
-      expect(saved.metadata.error_message).toContain(probe.input === null ? 'Usage probe crashed.' : 'Usage probe failed after accounted calls.')
-      expect(mocks.storedAtError?.metadata.response_failed).toBe(true)
-    } else {
-      expect(saved.metadata.response_failed).not.toBe(true)
-    }
-
-    const prior = { inputTokens: 3, outputTokens: 2, totalTokens: 5, cacheCreationInputTokens: 2 }
-    const resumedUsage = mergeResumedUsage(prior, saved.metadata?.usage)
-    const resumedTokens = mergeResumedTokenUsage(buildTokenUsage(prior, 'exact', 'prior'), snapshot?.responseSummary?.usage)
-    const summed = { inputTokens: probe.input === null ? null : probe.input + 3, outputTokens: probe.output === null ? null : probe.output + 2, totalTokens: probe.total === null ? null : probe.total + 5 }
-    for (const field of ['inputTokens', 'outputTokens', 'totalTokens'] as const) {
-      expect(resumedTokens?.[field].value).toBe(summed[field])
-      if (summed[field] === null) expect(resumedUsage?.[field] ?? null).toBeNull()
-      else expect(resumedUsage?.[field]).toBe(summed[field])
-    }
-    const resumedCacheWrite = probe.cacheWrite === null ? null : probe.cacheWrite + 2
-    expect(resumedTokens?.cacheCreationInputTokens?.value ?? null).toBe(resumedCacheWrite)
-    expect(resumedUsage?.cacheCreationInputTokens ?? null).toBe(resumedCacheWrite)
-  }, 30_000)
-
-  it.each(['codex', 'claude'] as const)('%s raw result callbacks store the right lane, exact as-read evidence, and incomplete unknowns (BL-1024)', async (lane) => {
-    await useManagedAgent(lane)
-    const absent = 'https://absent-input.example/a.png'
-    const displayOnly = 'https://display-only.example/d.png'
-    mocks.managedEvents = managedReplyEvents(lane, `<img src="${READ}"><img src="${absent}"><img src="${displayOnly}">`, {
-      text: `Fetched ${READ}`, displayOnly
-    })
-    const response = await send(undefined, REPLY, 'cli')
-    expect(response.status, await response.clone().text()).toBe(200)
-    expect(mocks.managedRequest.onCliModelResult).toEqual(expect.any(Function))
-    expect(mocks.managedRequest.onApiModelInput).toBeUndefined()
-    const record = await originOf(REPLY)
-    expect(record).toMatchObject({ state: 'decided', lane, complete: false })
-    expect(record.addresses[READ]).toEqual({ state: 'as_read', rule: 1, evidence: { inRecord: true, startInRecord: false, sharesChatRun: false, complete: false } })
-    for (const address of [absent, displayOnly]) {
-      expect(record.addresses[address]).toEqual({ state: 'unknown', rule: 5, evidence: { inRecord: false, startInRecord: false, sharesChatRun: false, complete: false } })
-    }
-    expect(record.textHashes).toContain(sha256Hex((await stored(REPLY)).content))
-    expect(mocks.originAtEnd).toEqual(record)
-  }, 30_000)
-
-  it.each(['codex', 'claude'] as const)('%s with no raw result never invents read evidence from a display or API transcript (BL-1024)', async (lane) => {
-    await useManagedAgent(lane)
-    mocks.managedEvents = managedReplyEvents(lane, `<img src="${READ}">`)
-    const response = await send(undefined, REPLY, 'cli')
-    expect(response.status, await response.clone().text()).toBe(200)
-    const record = await originOf(REPLY)
-    expect(record).toMatchObject({ state: 'decided', lane, complete: false })
-    expect(record.addresses[READ]).toMatchObject({ state: 'unknown', rule: 5, evidence: { inRecord: false, complete: false } })
-  }, 30_000)
-
-  it.each(['codex', 'claude'] as const)('%s delivered steers preserve user read provenance and agent-note source boundaries (BL-1024)', async (lane) => {
-    await useManagedAgent(lane)
-    vi.stubEnv('BATSHIT_CODEX_TRANSPORT', 'app-server')
-    const userAddress = 'https://user-steer.example/u.png'
-    const dmAddress = 'https://dm-steer.example/d.png'
-    const secret = 'private-mark-12345'
-    const carriesDmText = `https://data-steer.example/p.png?d=${secret}`
-    const steers = [
-      { steerId: 'managed-user', messageId: REPLY, source: 'user' as const, text: `Show ${userAddress}`, at: new Date().toISOString(), deliver: 'steer' as const },
-      { steerId: 'managed-dm', messageId: REPLY, source: 'dm' as const, text: `See ${dmAddress}; code ${secret}`, agentName: 'Mira', at: new Date().toISOString(), deliver: 'steer' as const }
-    ]
-    for (const steer of steers) expect(enqueueSteer(SESSION, steer).ok).toBe(true)
-    mocks.managedSteerIds = steers.map((steer) => steer.steerId)
-    mocks.managedEvents = managedReplyEvents(lane, `<img src="${userAddress}"><img src="${dmAddress}"><img src="${carriesDmText}">`)
-    try {
-      const response = await send(undefined, REPLY, 'cli')
-      expect(response.status, await response.clone().text()).toBe(200)
-      expect(mocks.managedSteerPayloads).toHaveLength(1)
-      expect(mocks.managedSteerPayloads[0].steerIds).toEqual(mocks.managedSteerIds)
-      const saved = await stored(REPLY)
-      expect(saved.metadata.steers).toEqual(expect.arrayContaining(steers.map((steer) => expect.objectContaining({ steerId: steer.steerId, source: steer.source, text: steer.text }))))
-      const record = await originOf(REPLY)
-      expect(record).toMatchObject({ state: 'decided', lane, complete: false })
-      expect(record.addresses[userAddress]).toMatchObject({ state: 'as_read', rule: 1, evidence: { inRecord: true, complete: false } })
-      expect(record.addresses[dmAddress]).toMatchObject({ state: 'unknown', rule: 5, evidence: { inRecord: false, complete: false } })
-      expect(record.addresses[carriesDmText]).toMatchObject({ state: 'blocked', rule: 3, evidence: { inRecord: false, sharesChatRun: true, complete: false } })
-    } finally {
-      vi.unstubAllEnvs()
-    }
-  }, 30_000)
 
   it('is pending before the reply streams, and decided before `end`, bound to the saved text', async () => {
     const response = await send()
@@ -1209,6 +938,7 @@ describe('send-routed: where each picture of a reply came from (BL-474 step 2, t
     }
     const cardMetadata = {
       imageOriginExpected: true,
+      whiteboardContextSnapshot: cardWhiteboardSnapshot(),
       model: 'claude-sonnet-5',
       agentType: 'api',
       zipIds: [],

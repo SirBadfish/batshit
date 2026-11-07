@@ -1,4 +1,30 @@
 import type { SavedModel, ModelVoiceSessionConfig } from '$lib/types/savedModels'
+import type { ModelConnectionInfo } from '$lib/types/savedModels'
+import { resolveSavedModelConnection } from './modelConnections'
+
+export type AgentVoicePresetSelection = { primary_model_provider?: string | null; primary_model_name?: string | null; primary_model_connection?: ModelConnectionInfo | null }
+/** The existing Settings fallback. Order, connection and stored effective-ID behavior stay exact. */
+export function findSettingsVoicePresetFallback(models: readonly SavedModel[], agent: AgentVoicePresetSelection): SavedModel | null {
+  return models.find(model => {
+    if (model.provider !== agent.primary_model_provider || model.modelId !== agent.primary_model_name && model.effectiveModelId !== agent.primary_model_name) return false
+    const connection = resolveSavedModelConnection(model), agentConnection = agent.primary_model_connection
+    if (!agentConnection) return true
+    if (connection.type !== agentConnection.type) return false
+    return !agentConnection.service || connection.service === agentConnection.service
+  }) ?? null
+}
+/** The existing ChatInput fallback; deliberately retains its different prefix/connection rules. */
+export function findChatVoicePresetFallback(models: readonly SavedModel[], agent: AgentVoicePresetSelection): SavedModel | null {
+  const rawProvider = agent.primary_model_provider?.trim() ?? '', rawModelId = agent.primary_model_name?.trim() ?? ''
+  if (!rawProvider && !rawModelId) return null
+  let developerId = rawProvider, modelId = rawModelId
+  if (rawModelId.includes('/')) {
+    const [parsedDeveloperId, ...rest] = rawModelId.split('/'), parsedModelId = rest.join('/').trim()
+    if (!developerId && parsedDeveloperId.trim()) developerId = parsedDeveloperId.trim()
+    if (parsedModelId) modelId = parsedModelId
+  }
+  return models.find(model => model.provider === developerId && model.modelId === modelId) ?? null
+}
 
 type VoiceSessionInput = Partial<ModelVoiceSessionConfig> | null | undefined
 

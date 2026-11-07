@@ -58,6 +58,17 @@ describe('first-admin setup action', () => {
     expect(input.cookies.set).not.toHaveBeenCalled()
   })
 
+  it('keeps the known-created account distinct from a later sign-in initialization failure', async () => {
+    fixture.createSession.mockRejectedValue(new Error('synthetic-private-initialization-detail'))
+    const input = event()
+    const result = await actions.setup(input)
+    expect(result).toMatchObject({ status: 500, data: { error: expect.stringContaining('Your account was created and kept') } })
+    expect(JSON.stringify(result)).not.toContain('synthetic-private-initialization-detail')
+    expect(JSON.stringify(result)).not.toContain('synthetic-password')
+    expect(fixture.createAdminUser).toHaveBeenCalledTimes(1)
+    expect(input.cookies.set).not.toHaveBeenCalled()
+  })
+
   it.each([
     { password: '' }, { email: '' }, { displayName: '' },
     { confirmPassword: 'different-password' }, { password: 'short', confirmPassword: 'short' },

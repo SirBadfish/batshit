@@ -9,11 +9,6 @@ const ZIP_ID_RUN = /[^:{}\r\n]{1,161}/y
 const ZIP_ID_MAX_LENGTH = 160
 /** A clip id: anything but `:`, `}`, and whitespace, of any length. */
 const CLIP_ID_RUN = /[^:}\s]+/y
-/**
- * BL-707: the older id several readers still keep (BL-609 moves them onto the shared shapes):
- * anything but `:` and `}`, of any length, so `{`, spaces, and line breaks are id characters.
- */
-const LOOSE_ID_RUN = /[^:}]+/y
 
 interface ReferenceShape {
   open: string
@@ -21,8 +16,6 @@ interface ReferenceShape {
   idRun: RegExp
   /** A longer id is not a reference. */
   maxIdLength: number
-  /** The fewest characters a `:::` description may have (0 for `[^}]*`, 1 for `[^}]+`). */
-  minDescriptionLength?: number
 }
 
 const ZIP_REFERENCE: ReferenceShape = {
@@ -34,23 +27,6 @@ const CLIP_REFERENCE: ReferenceShape = {
   open: CLIP_REFERENCE_OPEN,
   idRun: CLIP_ID_RUN,
   maxIdLength: Number.POSITIVE_INFINITY
-}
-const LOOSE_ZIP_REFERENCE: ReferenceShape = {
-  open: ZIP_REFERENCE_OPEN,
-  idRun: LOOSE_ID_RUN,
-  maxIdLength: Number.POSITIVE_INFINITY
-}
-const LOOSE_CLIP_REFERENCE: ReferenceShape = {
-  open: CLIP_REFERENCE_OPEN,
-  idRun: LOOSE_ID_RUN,
-  maxIdLength: Number.POSITIVE_INFINITY
-}
-/** BL-707: the chat deletion sweep's own shape: the clip id's rule (no whitespace), a described one never empty. */
-const DELETION_SWEEP_ZIP_REFERENCE: ReferenceShape = {
-  open: ZIP_REFERENCE_OPEN,
-  idRun: CLIP_ID_RUN,
-  maxIdLength: Number.POSITIVE_INFINITY,
-  minDescriptionLength: 1
 }
 
 export interface ReferenceMatch {
@@ -81,18 +57,17 @@ export interface ReferenceMatch {
  * openers whose description never closes cost (openers) x (reply length), measured on the one
  * Node process: about 20 s for 20,000 in 620 KB and 40 s in 1 MB, at the reply's end, in each
  * trust, strip, and extract pass, and on every compile. The scan keeps the next `}` until an
- * opener's description starts past it. An id of any length (the clip id, the older shape) costs
+ * opener's description starts past it. An id of any length (the clip id) costs
  * no more: an id run ends at a `:`, and every opener holds one, so two openers' runs never overlap.
  *
- * The same scan serves the older shape (`scanLooseZipReferences`, BL-707) with its own id rule,
- * and stops after `limit` references for a reader that wants only the first.
+ * It stops after `limit` references for a reader that wants only the first.
  */
 function scanReferences(
   content: string,
   shape: ReferenceShape,
   limit = Number.POSITIVE_INFINITY
 ): ReferenceMatch[] {
-  const { open, idRun, maxIdLength, minDescriptionLength = 0 } = shape
+  const { open, idRun, maxIdLength } = shape
   const found: ReferenceMatch[] = []
   if (!content || !content.includes(open)) return found
 
@@ -121,10 +96,7 @@ function scanReferences(
         braceAt = content.indexOf('}', descriptionStart)
         if (braceAt < 0) braceAt = content.length
       }
-      if (
-        content.charCodeAt(braceAt + 1) === CLOSE_BRACE_CODE &&
-        braceAt - descriptionStart >= minDescriptionLength
-      ) {
+      if (content.charCodeAt(braceAt + 1) === CLOSE_BRACE_CODE) {
         description = content.slice(descriptionStart, braceAt)
         end = braceAt + 2
       }
@@ -166,61 +138,56 @@ export function scanClipReferences(content: string): ReferenceMatch[] {
 }
 
 /**
- * BL-707: every zip reference of the older shape several readers still keep, in order, read
- * once: exactly what `/\{\{batshit-zip:([^:}]+)(?::::([^}]*))?\}\}/g` found (compared over
- * thousands of generated texts in `zipReferenceSafety.test.ts`). Its id is any run of characters
- * other than `:` and `}`, so it may hold `{`, spaces, and line breaks, which the shared shape
- * (`scanZipReferences`) refuses; the description rule is the shared one. The pattern searched to
- * the first `}` again from every opener, seconds to minutes of the one Node process for a text of
- * openers that never close. Its readers keep their own rules until BL-609 moves each onto the
- * shared shape: the reply-end step's current tool zips (`replyControlFinalize.ts`), Judge Juice
- * (`jevJuiceTurn.ts`), manual trim protection (`tokenPanel.ts`), and `extractZipIdFromReference`.
- */
-export function scanLooseZipReferences(content: string): ReferenceMatch[] {
-  return scanReferences(content, LOOSE_ZIP_REFERENCE)
-}
-
-/** `content` with each zip reference of the older shape replaced by `replacer(reference, id, description)`. */
-export function replaceLooseZipReferences(
-  content: string,
-  replacer: (match: string, id: string, description: string | undefined) => string
-): string {
-  return replaceFound(content, scanLooseZipReferences(content), (reference) =>
-    replacer(reference.match, reference.id, reference.description)
-  )
-}
-
-/** The clip form of `scanLooseZipReferences`: `/\{\{batshit-clip:([^:}]+)(?::::([^}]*))?\}\}/g`. */
-export function scanLooseClipReferences(content: string): ReferenceMatch[] {
-  return scanReferences(content, LOOSE_CLIP_REFERENCE)
-}
-
-/**
- * BL-707: the zip references the chat deletion sweep reads in each stored message
- * (`redis.deleteSession`), read once: exactly what
- * `/\{\{batshit-zip:([^:}\s]+)(?::::[^}]+)?\}\}/g` found, an id with no whitespace and a
- * description of at least one character. The pattern searched to the first `}` again from every
- * opener, seconds of the one Node process per message inside the delete.
- */
-export function scanDeletionSweepZipReferences(content: string): ReferenceMatch[] {
-  return scanReferences(content, DELETION_SWEEP_ZIP_REFERENCE)
-}
-
-/**
- * The zip id of the first reference (the older shape) in one `zipReferences` entry's text, or
- * null: what `/api/sse`, `send-routed`, and `collectTrustedZipIdsFromMetadata` read from each
- * entry. An entry is not only server-written (a resumed reply's stored metadata is the browser's),
- * so it is read once like a reply (BL-707). A non-string reads as no id.
+ * The zip id of the first reference in one `zipReferences` entry's text, or null: what `/api/sse`,
+ * `send-routed`, the finalize's rebuild (`replyStreamRecord.ts`), and
+ * `collectTrustedZipIdsFromMetadata` read from each entry. BL-609: read with the trust reader's
+ * shape (`scanZipReferences`), so an entry names the zip the neutralizer and the chat view read
+ * there; every id Batshit writes reads the same as before. An entry is not only server-written (a
+ * resumed reply's stored metadata is the browser's), so it is read once like a reply (BL-707). A
+ * non-string reads as no id.
  */
 export function extractZipIdFromReference(reference: string): string | null {
   if (typeof reference !== 'string' || !reference) return null
-  return scanReferences(reference, LOOSE_ZIP_REFERENCE, 1)[0]?.id ?? null
+  return scanReferences(reference, ZIP_REFERENCE, 1)[0]?.id ?? null
 }
 
-/** The clip form of `extractZipIdFromReference`, for `collectTrustedClipIdsFromMetadata`. */
+/**
+ * The clip form of `extractZipIdFromReference`, for `collectTrustedClipIdsFromMetadata`: the
+ * first reference of the clip trust reader's shape (`scanClipReferences`, BL-609).
+ */
 function extractClipIdFromReference(reference: string): string | null {
   if (!reference) return null
-  return scanReferences(reference, LOOSE_CLIP_REFERENCE, 1)[0]?.id ?? null
+  return scanReferences(reference, CLIP_REFERENCE, 1)[0]?.id ?? null
+}
+
+export type TypedReferenceMatch = ReferenceMatch & { type: 'zip' | 'clip' }
+
+/**
+ * BL-609: every zip and clip reference in `content`, in order, as ONE left-to-right reading of
+ * the two trust reader shapes: what `/\{\{batshit-(?:zip:([^:{}\r\n]{1,160})|clip:([^:}\s]+))(?::::([^}]*))?\}\}/g`
+ * finds (compared over thousands of generated texts in `universalResolver.test.ts`). The two scans
+ * run separately and merge by position: a reference that starts inside an earlier one (only ever
+ * inside its description, because an id holds no `:`) is part of it and is dropped. Two such
+ * references end at the same `}}` (a description ends at its first `}`), so dropping it never
+ * hides a later reference either scan read. The compile's resolver (`extractAllReferences`) reads it.
+ */
+export function scanZipAndClipReferences(content: string): TypedReferenceMatch[] {
+  const zips = scanZipReferences(content)
+  const clips = scanClipReferences(content)
+  const found: TypedReferenceMatch[] = []
+  let zipAt = 0
+  let clipAt = 0
+  let end = 0
+  while (zipAt < zips.length || clipAt < clips.length) {
+    const takeZip = clipAt >= clips.length || (zipAt < zips.length && zips[zipAt].start < clips[clipAt].start)
+    const next: TypedReferenceMatch = takeZip
+      ? { ...zips[zipAt++], type: 'zip' }
+      : { ...clips[clipAt++], type: 'clip' }
+    if (next.start < end) continue
+    found.push(next)
+    end = next.end
+  }
+  return found
 }
 
 function replaceFound<T extends { start: number; end: number }>(

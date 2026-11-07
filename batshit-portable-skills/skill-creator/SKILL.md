@@ -143,3 +143,7 @@ End with:
 - any user action still needed
 
 Do not call the work done until Batshit confirms the save or import succeeded.
+
+## Capability naming in authored skills
+
+Classify Batshit capabilities by purpose: `fabric:` means app/feature control; the three neutral utilities are `batshit:sys.judge.ask`, `batshit:sys.mcp.dynamic.find`, and `batshit:sys.mcp.dynamic.use`. Actual connected gateway tools use `mcp:`. Fabric & Utilities is a display group, not a transport or permission grant. Artifact authoring, model catalog, Fetch Zip, and ComfyUI workflow/schema helpers remain Fabric. This naming rule adds no Portable Skill Token scope; use only the capability families your token and this portable skill already authorize.

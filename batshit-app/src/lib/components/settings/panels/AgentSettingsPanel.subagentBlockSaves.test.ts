@@ -1,23 +1,22 @@
+import { useOwnedRedisTestServer } from '$lib/test-utils/ownedRedisTestServer'
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/svelte'
 import { tick } from 'svelte'
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
-import { useRedisTestServer } from '$lib/test-utils/redis-memory'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { redis } from '$lib/server/redis'
-import { buildCodexRuntimeSettings } from '$lib/server/services/codexSettings'
 import * as agentStore from '$lib/stores/agents.svelte'
-import { jsonResponse } from '$lib/test-utils/agentPutRoute'
-import { CODEX_PERMISSION_PRESETS, CODEX_SANDBOX_LABELS } from '$lib/utils/codexRunAccess'
+import { jsonResponse, loadAgentRoute } from '$lib/test-utils/agentPutRoute'
+import { TYPED_FILE_TOOLS_REVISION_HEADER } from '$lib/utils/typedFileToolsSave'
 
 /**
- * BL-914, the panel half. The Subagent PUT writes `codex_settings`, `claude_settings`,
- * `provider_specific_settings` and `dcmDisplaySettings` KEY BY KEY now (a key or entry sent as
- * `null` is removed; one not sent stays), so every Subagent sender of Agent Settings sends only
- * what changed against a copy it keeps, a dropped key as `null`, the way the Primary Agent's
- * senders do (BL-514, BL-848, BL-855, BL-919):
+ * BL-914, the panel half. The Subagent PUT writes `provider_specific_settings` and
+ * `dcmDisplaySettings` KEY BY KEY now (a key or entry sent as `null` is removed; one not sent
+ * stays), so every Subagent sender of Agent Settings sends only what changed against a copy it
+ * keeps, a dropped key as `null`, the way the Primary Agent's senders do (BL-514, BL-848, BL-855,
+ * BL-919):
  * - the core save (`subagentSettingsSavePatch.ts`): `provider_specific_settings` key by key;
- * - the Tool Grid save: `diffMcpSection` against `subagentMcpPersistedValues`;
- * - the Codex and Claude sections of a CLI Subagent: `diffAgentBlockWithGroups` against
- *   `subagentCodexPersistedBlock` and `subagentClaudePersistedBlock`.
+ * - the Tool Grid save: `diffMcpSection` against `subagentMcpPersistedValues`.
+ * SA-139 R5: the CLI Subagent's Claude section (and its BL-1542 first-form and BL-941 Part S
+ * cases) left with that type. A leftover CLI Subagent is still opened below: it writes nothing.
  *
  * Renders the REAL panel. `fetch` sends `/api/subagents/<id>` and `/api/agents/<id>` to the REAL
  * route handlers on the default lane's Redis fake (its twin of the by-path script), so each test
@@ -25,17 +24,14 @@ import { CODEX_PERMISSION_PRESETS, CODEX_SANDBOX_LABELS } from '$lib/utils/codex
  * through the real Subagent route with the body a second Settings window would send.
  */
 
-vi.mock('$lib/server/services/codexProfileManager', () => ({
-  syncAgentCodexProfiles: vi.fn(async () => {}),
-  deleteAgentCodexConfig: vi.fn(async () => {}),
-  buildAgentProfileId: (id: string) => `batshit_agent_${id}`
+vi.mock('$lib/server/services/managedProfileFolderDelete', () => ({
+  deleteManagedProfileFolder: vi.fn(async () => {})
 }))
 vi.mock('$lib/server/services/claudeProfileManager', () => ({
   syncAgentClaudeProfiles: vi.fn(async () => {}),
   deleteAgentClaudeConfig: vi.fn(async () => {}),
   agentClaudeProfileResource: (id: string) => JSON.stringify(['profile', `claude:${id}`])
 }))
-vi.mock('$lib/server/services/n8nParameterCompatibility', () => ({ runTrackedN8nCompatibilitySync: vi.fn() }))
 // A CLI Subagent's save writes its managed profile folder under the real home: not in a test.
 vi.mock('$lib/server/services/cliSubagentProfileSync', () => ({
   syncManagedCliSubagentProfile: vi.fn(async () => ({ written: true })),
@@ -47,7 +43,11 @@ vi.mock('$lib/components/settings/agent/AgentMcpDefaultsCard.svelte', async () =
   default: (await import('../../mcps/__tests__/AgentMcpDefaultsCardStub.test.svelte')).default
 }))
 
-useRedisTestServer()
+const admission = useOwnedRedisTestServer(redis)
+afterAll(async () => {
+  // Ordinary CI owns this file's lazy facade too; the packet helper owns its admitted teardown.
+  if (process.env.VITEST_USE_REAL_REDIS === 'true' && !admission.ownedLane) await redis.disconnect()
+})
 
 const USER = 'ss914p_user'
 const AGENT = 'ss914p_agent'
@@ -56,25 +56,6 @@ const SUB_NAME = 'Ss914p Panel Sub'
 // A second Subagent, for a save that lands after another Subagent was picked.
 const SUB2 = 'ss914p_sub2'
 const SUB2_NAME = 'Ss914p Second Sub'
-
-/** A Codex block as the panel's own defaults leave it: nothing for a save to fill in. */
-const CODEX_BASE = {
-  permissionMode: 'chat',
-  includeProjectInstructions: true,
-  model: 'gpt-6-astra',
-  streamingEffect: true,
-  unifiedExec: true,
-  search: true,
-  sandbox: 'read-only',
-  approval: 'never',
-  configScope: 'managed',
-  addDirs: [] as string[],
-  enableFeatures: [] as string[],
-  disableFeatures: [] as string[],
-  configOverrides: [] as unknown[],
-  workingDirectoryMode: 'project',
-  historyPersistence: 'none'
-}
 
 const CLAUDE_BASE = {
   permissionMode: 'acceptEdits',
@@ -100,45 +81,12 @@ const DCM_EMPTY = {
   toolDisplayPreferences: {}
 }
 
-type Provider = 'codex' | 'claude'
-
-const CLI_SUBAGENT = {
-  codex: {
-    block: 'codex_settings',
-    fields: {
-      primary_model_provider: 'codex',
-      primary_model_name: 'gpt-6-astra',
-      primary_model_connection: { type: 'cli', service: 'codex' }
-    }
-  },
-  claude: {
-    block: 'claude_settings',
-    fields: {
-      primary_model_provider: 'claude-cli',
-      primary_model_name: 'claude-cli',
-      primary_model_connection: { type: 'cli', service: 'claude-cli' }
-    }
-  }
+/** A CLI Claude Subagent's model fields. */
+const CLAUDE_CLI_FIELDS = {
+  primary_model_provider: 'claude-cli',
+  primary_model_name: 'claude-cli',
+  primary_model_connection: { type: 'cli', service: 'claude-cli' }
 } as const
-
-const PRESET_ASTRA = {
-  id: 'ss914p_preset_astra',
-  provider: 'codex',
-  modelId: 'gpt-6-astra',
-  modelName: 'Probe Codex Astra',
-  purpose: 'chat',
-  connection: { type: 'cli', service: 'codex' },
-  settings: { codex_model: 'gpt-6-astra' }
-}
-const PRESET_LUNA = {
-  id: 'ss914p_preset_luna',
-  provider: 'codex',
-  modelId: 'gpt-6-luna',
-  modelName: 'Probe Codex Luna',
-  purpose: 'chat',
-  connection: { type: 'cli', service: 'codex' },
-  settings: { codex_model: 'gpt-6-luna' }
-}
 
 function ensureBrowserStubs() {
   if (typeof Element !== 'undefined' && typeof Element.prototype.animate !== 'function') {
@@ -168,7 +116,7 @@ function ensureBrowserStubs() {
   }
 }
 
-let agentRoute: typeof import('../../../../routes/api/agents/[id]/+server')
+let agentRoute: Awaited<ReturnType<typeof loadAgentRoute>>
 let subagentRoute: typeof import('../../../../routes/api/subagents/[id]/+server')
 /** Every Subagent PUT body the panel sent, in order. */
 let subagentPuts: Array<{ body: Record<string, any> }> = []
@@ -181,18 +129,24 @@ let failNextSubagentPut = false
 /** While set, the next Subagent PUT's BODY is held inside the route, after it read the record. */
 let holdNextSubagentBody: Promise<void> | null = null
 let savedModels: Record<string, unknown>[] = []
+let typedHostFacts = false
 const originalFetch = global.fetch
 
 beforeAll(async () => {
-  agentRoute = await import('../../../../routes/api/agents/[id]/+server')
+  agentRoute = await loadAgentRoute()
   subagentRoute = await import('../../../../routes/api/subagents/[id]/+server')
 }, 60_000)
 
-beforeEach(() => {
+beforeEach(async () => {
+  // 3f6b10c8b moved the agent and Subagent GETs onto Lua reads the default lane's fake cannot run
+  // (the GET answered 500). loadAgentRoute installs their read twins as spies, and afterEach's
+  // restoreAllMocks removes them, so each case reinstalls them.
+  agentRoute = await loadAgentRoute()
   ensureBrowserStubs()
   subagentPuts = []
   secondSubagentPuts = []
   writeLog = []
+  typedHostFacts = false
   failNextSubagentPut = false
   holdNextSubagentBody = null
   savedModels = []
@@ -279,10 +233,13 @@ function installRoutes() {
     if (path === '/api/user/saved-models') return jsonResponse({ models: savedModels })
     if (path === '/api/models') return jsonResponse({ data: { connections: [] } })
     if (path === '/api/settings/api-keys') return jsonResponse({ keys: {} })
-    if (path === '/api/goons') return jsonResponse({ goons: [] })
+    if (path === '/api/goons') return jsonResponse({ ownerId: 'josh', goons: [] })
     if (path === '/api/icons/library') return jsonResponse({ icons: [], prefs: { favorites: [], recents: [] } })
     if (path === '/api/mcp/gateways') return jsonResponse({ gateways: [] })
     if (path === '/api/cli-tools') return jsonResponse({ tools: [] })
+    if (typedHostFacts && path === '/api/native-tools/sandbox/status' && url.includes('hostOnly=1')) {
+      return jsonResponse({ typedFileToolsHost: { platform: 'darwin', containerized: false, linuxKernel: null } })
+    }
     return jsonResponse({ error: `not routed in this test: ${method} ${path}` }, 404)
   })
   // @ts-expect-error test override
@@ -303,9 +260,8 @@ function subagentRecord(extra: Record<string, unknown> = {}) {
   }
 }
 
-function cliSubagentRecord(provider: Provider, block: Record<string, unknown> | null, extra: Record<string, unknown> = {}) {
-  const { block: field, fields } = CLI_SUBAGENT[provider]
-  return subagentRecord({ subagentType: 'cli', ...fields, ...(block ? { [field]: block } : {}), ...extra })
+function cliSubagentRecord(block: Record<string, unknown> | null, extra: Record<string, unknown> = {}) {
+  return subagentRecord({ subagentType: 'cli', ...CLAUDE_CLI_FIELDS, ...(block ? { claude_settings: block } : {}), ...extra })
 }
 
 async function storedSubagent() {
@@ -323,11 +279,14 @@ async function anotherWindowSaves(body: Record<string, unknown>) {
 }
 
 /** Seeds the Subagent (`record`) beside an API probe agent, renders the panel and selects the Subagent. */
-async function openSubagent(record: Record<string, unknown>, options: { toolsTab?: boolean } = {}) {
+async function openSubagent(record: Record<string, unknown>, options: { toolsTab?: boolean; reopen?: boolean } = {}) {
   installRoutes()
-  await redis.json.set(`subagent:${SUB}`, '$', record as any)
-  await redis.sAdd(`user:${USER}:subagents`, SUB)
-  await redis.createAgent({ id: AGENT, user_id: USER, displayName: 'Block probe', agentType: 'api' } as any)
+  if (!options.reopen) {
+    await redis.json.set(`subagent:${SUB}`, '$', record as any)
+    await redis.sAdd(`user:${USER}:subagents`, SUB)
+    await redis.createAgent({ id: AGENT, user_id: USER, displayName: 'Block probe', agentType: 'api',
+      provider_specific_settings: { claude_max_thinking_tokens: 17 } } as any)
+  }
   render((await import('./AgentSettingsPanel.svelte')).default, {
     props: { data: { user: { id: USER } } as any, initialAgentId: AGENT }
   })
@@ -373,257 +332,9 @@ async function waitForPuts(count: number) {
   await pause(400)
 }
 
-/** The Subagent's `permissions mode` toggle of a section (an item by its visible label). */
-async function pickPermissionMode(provider: Provider, label: RegExp) {
-  const group = screen.getByRole('group', {
-    name: provider === 'codex' ? 'Subagent Codex permissions mode' : 'Subagent Claude permissions mode'
-  })
-  await fireEvent.click(within(group).getByRole('radio', { name: label }))
-}
-
-/**
- * Picks an option of the select whose visible value contains `current`. The popper stays
- * `visibility: hidden` in jsdom (no layout), so its options have no accessible name: they are
- * found hidden and picked by their text.
- */
-async function pickSelectOption(current: string, optionText: RegExp) {
-  const trigger = screen
-    .getAllByRole('button', { hidden: true })
-    .find((element) => element.hasAttribute('data-select-trigger') && (element.textContent ?? '').includes(current))
-  expect(trigger, `the select showing "${current}"`).toBeTruthy()
-  await fireEvent.keyDown(trigger as HTMLElement, { key: 'ArrowDown' })
-  await waitFor(() => expect(screen.queryAllByRole('option', { hidden: true }).length).toBeGreaterThan(0))
-  const option = screen
-    .getAllByRole('option', { hidden: true })
-    .find((element) => optionText.test((element.textContent ?? '').trim()))
-  expect(option, `an option matching ${optionText}`).toBeTruthy()
-  await fireEvent.pointerUp(option as HTMLElement, { pointerType: 'mouse' })
-}
-
-/** The switch in the row that carries `label` (the nearest ancestor of the text that holds a switch). */
-function switchOf(label: string) {
-  for (let element = screen.getByText(label) as HTMLElement | null; element; element = element.parentElement) {
-    const found = element.querySelector('[role="switch"]')
-    if (found) return found as HTMLElement
-  }
-  throw new Error(`no switch beside "${label}"`)
-}
-
 function isInFlightLocked(element: HTMLElement | null) {
   return Boolean(element && (element.matches(':disabled') || element.closest('fieldset:disabled, [inert]')))
 }
-
-function sandboxSelectTrigger() {
-  const label = screen.getByText('Sandbox Level')
-  const trigger = label.closest('.batshit-settings-form-row')?.querySelector('[data-select-trigger]')
-  expect(trigger, 'the Subagent Sandbox Level select').toBeTruthy()
-  return trigger as HTMLElement
-}
-
-function isDisabledControl(element: HTMLElement) {
-  return Boolean(
-    element.matches(':disabled, [aria-disabled="true"], [data-disabled]') ||
-      element.closest('fieldset:disabled, [inert]')
-  )
-}
-
-function expectCodexFullModeSelected() {
-  const group = screen.getByRole('group', { name: 'Subagent Codex permissions mode' })
-  const fullMode = within(group).getByRole('radio', { name: /Agent \(full access\)|Batshit Crazy/ })
-  expect(fullMode).toHaveAttribute('aria-checked', 'true')
-}
-
-/** The three keys of a Codex permission choice, as the record holds them. */
-async function storedCodexTrio() {
-  const { permissionMode, sandbox, approval } = (await storedSubagent()).codex_settings
-  return { permissionMode, sandbox, approval }
-}
-
-describe('a CLI Subagent\'s Codex section sends only the keys that changed (BL-914)', () => {
-  it('a reasoning pick sends only the reasoning; a model another window chose since survives', async () => {
-    await openSubagent(cliSubagentRecord('codex', CODEX_BASE))
-    // Another window picked another model after this panel loaded.
-    await anotherWindowSaves({ codex_settings: { model: 'gpt-6-sol' } })
-
-    await pickSelectOption('Auto', /^High/)
-
-    await waitForPuts(1)
-    expect(subagentPuts[0].body).toEqual({ codex_settings: { reasoningEffort: 'high' } })
-    const stored = (await storedSubagent()).codex_settings
-    expect(stored.reasoningEffort).toBe('high')
-    expect(stored.model).toBe('gpt-6-sol')
-  }, 120_000)
-
-  it('a key the form dropped goes as null and is gone from the record: reasoning back to Auto', async () => {
-    await openSubagent(cliSubagentRecord('codex', { ...CODEX_BASE, reasoningEffort: 'high' }))
-
-    await pickSelectOption('High', /^Auto/)
-
-    await waitForPuts(1)
-    expect(subagentPuts[0].body).toEqual({ codex_settings: { reasoningEffort: null } })
-    const stored = (await storedSubagent()).codex_settings
-    expect('reasoningEffort' in stored).toBe(false)
-    expect(stored.model).toBe('gpt-6-astra')
-  }, 120_000)
-
-  it('a mode pick from an older copy sends the whole permission group: no looser sandbox than the screen shows (BL-919)', async () => {
-    // Chat mode with the Workspace write sandbox chosen by hand.
-    await openSubagent(cliSubagentRecord('codex', { ...CODEX_BASE, sandbox: 'workspace-write' }))
-    await anotherWindowSaves({ codex_settings: { permissionMode: 'agent_full', sandbox: 'danger-full-access' } })
-    expect(await storedCodexTrio()).toEqual({
-      permissionMode: 'agent_full',
-      sandbox: 'danger-full-access',
-      approval: 'never'
-    })
-
-    await pickPermissionMode('codex', /^Agent$/)
-
-    await waitForPuts(1)
-    // Settings shows Agent with Workspace write.
-    expect(subagentPuts[0].body).toEqual({
-      codex_settings: { permissionMode: 'agent', sandbox: 'workspace-write', approval: 'never' }
-    })
-    expect(await storedCodexTrio()).toEqual({ permissionMode: 'agent', sandbox: 'workspace-write', approval: 'never' })
-  }, 120_000)
-
-  it('a mode pick sends the Subagent\'s approval too (always never: a Subagent has no approval tie), so an approval another writer left is not kept', async () => {
-    await openSubagent(cliSubagentRecord('codex', CODEX_BASE))
-    // A writer other than this panel left the record in Agent mode with an approval prompt.
-    await anotherWindowSaves({
-      codex_settings: { permissionMode: 'agent', sandbox: 'workspace-write', approval: 'on-request' }
-    })
-
-    await pickPermissionMode('codex', /^Agent \(full access\)/)
-
-    await waitForPuts(1)
-    expect(subagentPuts[0].body).toEqual({
-      codex_settings: { permissionMode: 'agent_full', sandbox: 'danger-full-access', approval: 'never' }
-    })
-    expect(await storedCodexTrio()).toEqual({
-      permissionMode: 'agent_full',
-      sandbox: 'danger-full-access',
-      approval: 'never'
-    })
-  }, 120_000)
-
-  it('a change outside the group still goes alone: a reasoning pick leaves another window\'s mode as it is', async () => {
-    await openSubagent(cliSubagentRecord('codex', CODEX_BASE))
-    await anotherWindowSaves({ codex_settings: { permissionMode: 'agent_full', sandbox: 'danger-full-access' } })
-
-    await pickSelectOption('Auto', /^High/)
-
-    await waitForPuts(1)
-    expect(subagentPuts[0].body).toEqual({ codex_settings: { reasoningEffort: 'high' } })
-    expect(await storedCodexTrio()).toEqual({
-      permissionMode: 'agent_full',
-      sandbox: 'danger-full-access',
-      approval: 'never'
-    })
-  }, 120_000)
-
-  it('each later edit sends only its own key: the baseline moves to what the last save sent', async () => {
-    await openSubagent(cliSubagentRecord('codex', CODEX_BASE))
-
-    await pickSelectOption('Auto', /^High/)
-    await waitForPuts(1)
-    await fireEvent.click(switchOf('Allow Codex Web Search'))
-    await waitForPuts(2)
-
-    expect(subagentPuts[0].body).toEqual({ codex_settings: { reasoningEffort: 'high' } })
-    expect(subagentPuts[1].body).toEqual({ codex_settings: { search: false } })
-    expect(await storedSubagent()).toMatchObject({ codex_settings: { reasoningEffort: 'high', search: false } })
-  }, 120_000)
-
-  it('a failed save leaves the baseline as it was: the next edit sends the failed change again, with its own', async () => {
-    await openSubagent(cliSubagentRecord('codex', CODEX_BASE))
-
-    failNextSubagentPut = true
-    await pickSelectOption('Auto', /^High/)
-    await waitForPuts(1)
-    expect((await storedSubagent()).codex_settings.reasoningEffort).toBeUndefined()
-
-    await fireEvent.click(switchOf('Allow Codex Web Search'))
-    await waitForPuts(2)
-    expect(subagentPuts[1].body).toEqual({ codex_settings: { reasoningEffort: 'high', search: false } })
-  }, 120_000)
-
-  it('a Subagent with no Codex block yet gets the whole block on its first edit', async () => {
-    await openSubagent(cliSubagentRecord('codex', null, { provider_specific_settings: { codex_model: 'gpt-6-luna' } }))
-
-    await pickSelectOption('Auto', /^High/)
-
-    await waitForPuts(1)
-    expect(subagentPuts[0].body.codex_settings).toMatchObject({
-      model: 'gpt-6-luna',
-      reasoningEffort: 'high',
-      permissionMode: 'chat',
-      configScope: 'managed'
-    })
-    expect(Object.keys(subagentPuts[0].body.codex_settings).length).toBeGreaterThan(10)
-  }, 120_000)
-})
-
-describe('a CLI Subagent\'s Claude section sends only the keys that changed (BL-914)', () => {
-  it('the thinking budget edited in an older copy sends the switch and the budget together (BL-919)', async () => {
-    await openSubagent(cliSubagentRecord('claude', { ...CLAUDE_BASE, alwaysThinkingEnabled: true, maxThinkingTokens: 4000 }))
-    // Another window turned thinking Off: the switch and a removed budget.
-    await anotherWindowSaves({ claude_settings: { alwaysThinkingEnabled: false, maxThinkingTokens: null } })
-    const before = (await storedSubagent()).claude_settings
-    expect(before.alwaysThinkingEnabled).toBe(false)
-    expect('maxThinkingTokens' in before).toBe(false)
-
-    await fireEvent.input(screen.getByPlaceholderText('1024'), { target: { value: '5000' } })
-
-    await waitForPuts(1)
-    // Settings shows thinking On with a budget of 5000: the record must not hold Off with a budget.
-    expect(subagentPuts[0].body).toEqual({ claude_settings: { alwaysThinkingEnabled: true, maxThinkingTokens: 5000 } })
-    const stored = (await storedSubagent()).claude_settings
-    expect({ alwaysThinkingEnabled: stored.alwaysThinkingEnabled, maxThinkingTokens: stored.maxThinkingTokens }).toEqual({
-      alwaysThinkingEnabled: true,
-      maxThinkingTokens: 5000
-    })
-  }, 120_000)
-
-  it('a change outside the thinking pair still goes alone: a mode pick leaves another window\'s thinking Off', async () => {
-    await openSubagent(cliSubagentRecord('claude', { ...CLAUDE_BASE, alwaysThinkingEnabled: true, maxThinkingTokens: 4000 }))
-    await anotherWindowSaves({ claude_settings: { alwaysThinkingEnabled: false, maxThinkingTokens: null } })
-
-    await pickPermissionMode('claude', /Plan/i)
-
-    await waitForPuts(1)
-    expect(subagentPuts[0].body).toEqual({ claude_settings: { permissionMode: 'plan' } })
-    const stored = (await storedSubagent()).claude_settings
-    expect(stored.alwaysThinkingEnabled).toBe(false)
-    expect('maxThinkingTokens' in stored).toBe(false)
-  }, 120_000)
-
-  it('turning thinking off removes the budget (a dropped key goes as null)', async () => {
-    await openSubagent(cliSubagentRecord('claude', { ...CLAUDE_BASE, alwaysThinkingEnabled: true, maxThinkingTokens: 4000 }))
-
-    await fireEvent.click(switchOf('Always Enable Extended Thinking'))
-
-    await waitForPuts(1)
-    expect(subagentPuts[0].body).toEqual({ claude_settings: { alwaysThinkingEnabled: false, maxThinkingTokens: null } })
-    const stored = (await storedSubagent()).claude_settings
-    expect(stored.alwaysThinkingEnabled).toBe(false)
-    expect('maxThinkingTokens' in stored).toBe(false)
-    expect(stored.model).toBe('sonnet')
-  }, 120_000)
-
-  it('a Subagent with no Claude block yet gets the whole block on its first edit', async () => {
-    await openSubagent(cliSubagentRecord('claude', null, { provider_specific_settings: { claude_model: 'opus' } }))
-
-    await pickPermissionMode('claude', /Plan/i)
-
-    await waitForPuts(1)
-    expect(subagentPuts[0].body.claude_settings).toMatchObject({
-      model: 'opus',
-      permissionMode: 'plan',
-      includeProjectInstructions: true,
-      configScope: 'managed'
-    })
-  }, 120_000)
-})
 
 describe('a Subagent\'s Tool Grid save sends only what changed (BL-914)', () => {
   const OPENED = { defaultMCPGateways: ['gw_a'], defaultMCPToolSelections: ['tool_one'], dcmDisplaySettings: DCM_EMPTY }
@@ -790,39 +501,6 @@ describe('a Subagent\'s core save sends provider_specific_settings key by key (B
     expect(nativeTools.bashAccessMode).toBe('plan')
     expect(nativeTools.bashNeverAllowList).toEqual(['sudo *'])
   }, 120_000)
-
-  it('a model pick on a CLI Subagent sends the model choice and its own seeded key only; another window\'s native-tool settings survive', async () => {
-    savedModels = [PRESET_ASTRA, PRESET_LUNA]
-    await openSubagent(
-      cliSubagentRecord('codex', CODEX_BASE, {
-        primary_model_preset_id: PRESET_ASTRA.id,
-        provider_specific_settings: { codex_model: 'gpt-6-astra', nativeTools: { bashNeverAllowList: ['rm -rf *'] } }
-      })
-    )
-    await anotherWindowSaves({ provider_specific_settings: { nativeTools: { bashNeverAllowList: ['sudo *'] } } })
-
-    await pickSelectOption('Probe Codex Astra', /Probe Codex Luna/)
-
-    await waitFor(() => expect(subagentPuts.length).toBeGreaterThanOrEqual(2), { timeout: 8_000 })
-    await pause(1500)
-    const core = subagentPuts.find((put) => 'primary_model_preset_id' in put.body)
-    expect(core?.body).toMatchObject({
-      primary_model_preset_id: PRESET_LUNA.id,
-      primary_model_provider: 'codex',
-      provider_specific_settings: { codex_model: 'gpt-6-luna' }
-    })
-    // Nothing of the block but the seeded key: the native-tool list the other window saved is not named.
-    expect(Object.keys(core!.body.provider_specific_settings)).toEqual(['codex_model'])
-    const codex = subagentPuts.find((put) => 'codex_settings' in put.body)
-    expect(codex?.body).toEqual({ codex_settings: { model: 'gpt-6-luna' } })
-    const record = await storedSubagent()
-    expect(record.provider_specific_settings).toEqual({
-      codex_model: 'gpt-6-luna',
-      nativeTools: { bashNeverAllowList: ['sudo *'] }
-    })
-    expect(record.codex_settings.model).toBe('gpt-6-luna')
-    expect(record.primary_model_preset_id).toBe(PRESET_LUNA.id)
-  }, 120_000)
 })
 
 describe('two saves of one Subagent panel at the same moment both stay (BL-914)', () => {
@@ -863,33 +541,6 @@ describe('two saves of one Subagent panel at the same moment both stay (BL-914)'
 })
 
 describe('a save that lands after another Subagent was picked leaves the newer Subagent alone (BL-914)', () => {
-  it('a Codex save: the second Subagent\'s copy of the block is not replaced by the first one\'s', async () => {
-    await seedSecondSubagent(cliSubagentRecord('codex', { ...CODEX_BASE, reasoningEffort: 'low' }, { id: SUB2, slug: SUB2, displayName: SUB2_NAME }))
-    await openSubagent(cliSubagentRecord('codex', CODEX_BASE))
-    let release: () => void = () => {}
-    holdNextSubagentBody = new Promise<void>((resolve) => {
-      release = resolve
-    })
-
-    await pickSelectOption('Auto', /^High/)
-    await waitFor(() => expect(subagentPuts.length).toBe(1), { timeout: 8_000 })
-    // The second Subagent is picked while the first one's save is still on its way.
-    await pickSecondSubagent()
-    await pause(300)
-    release()
-    await waitFor(async () => expect((await storedSubagent()).codex_settings.reasoningEffort).toBe('high'), { timeout: 8_000 })
-    await pause(2500)
-
-    // The first save landed; nothing was sent for the second Subagent because of it.
-    expect(secondSubagentPuts).toEqual([])
-    const second = (await redis.json.get(`subagent:${SUB2}`)) as Record<string, any>
-    expect(second.codex_settings.reasoningEffort).toBe('low')
-    // And the second Subagent's own edit is worked out against its own copy: only its change goes.
-    await pickSelectOption('Low', /^High/)
-    await waitFor(() => expect(secondSubagentPuts.length).toBe(1), { timeout: 8_000 })
-    expect(secondSubagentPuts[0].body).toEqual({ codex_settings: { reasoningEffort: 'high' } })
-  }, 120_000)
-
   it('a Tool Grid save: the second Subagent is not saved because the first one\'s save landed', async () => {
     await seedSecondSubagent({ defaultMCPGateways: ['gw_z'], defaultMCPToolSelections: [], dcmDisplaySettings: DCM_EMPTY })
     await openSubagent(
@@ -915,47 +566,56 @@ describe('a save that lands after another Subagent was picked leaves the newer S
 })
 
 describe('text edited while a section save is in flight is not marked saved with it (BL-914)', () => {
-  it('a Codex control is blocked during its save, then a deliberate next edit sends its own key', async () => {
-    await openSubagent(cliSubagentRecord('codex', CODEX_BASE))
+  // SA-139 R5: the Claude section of the CLI Subagent left with that type; the rule is held on the
+  // API Subagent's Batshit Work mode (a core-form control, saved key by key in `nativeTools`).
+  it('a Work mode control is blocked during its save, then a deliberate next edit sends its own key', async () => {
+    await openSubagent(
+      subagentRecord({ provider_specific_settings: { nativeTools: { bashAccessMode: 'agent', executionBackend: 'apple_container' } } })
+    )
     let release: () => void = () => {}
     holdNextSubagentBody = new Promise<void>((resolve) => {
       release = resolve
     })
+    const workMode = (label: RegExp) =>
+      within(screen.getByRole('group', { name: 'Subagent Batshit permissions mode' })).getByRole('radio', { name: label })
 
-    await pickSelectOption('Auto', /^High/)
+    await fireEvent.click(workMode(/^Plan$/))
     await waitFor(() => expect(subagentPuts.length).toBe(1), { timeout: 8_000 })
-    expect(subagentPuts[0].body).toEqual({ codex_settings: { reasoningEffort: 'high' } })
-    const searchSwitch = switchOf('Allow Codex Web Search')
-    await waitFor(() => expect(isInFlightLocked(searchSwitch)).toBe(true), { timeout: 8_000 })
+    expect(Object.keys(subagentPuts[0].body)).toEqual(['provider_specific_settings'])
+    expect(subagentPuts[0].body.provider_specific_settings.nativeTools.bashAccessMode).toBe('plan')
+    const agentChoice = workMode(/^Agent$/)
+    await waitFor(() => expect(isInFlightLocked(agentChoice)).toBe(true), { timeout: 8_000 })
     // Native activation honors the disabled fieldset, unlike a manually dispatched event.
-    searchSwitch.click()
+    agentChoice.click()
     await pause(50)
-    expect(searchSwitch.getAttribute('aria-checked')).toBe('true')
+    expect(workMode(/^Plan$/).getAttribute('aria-checked')).toBe('true')
     expect(subagentPuts).toHaveLength(1)
 
     release()
-    await waitFor(async () => expect((await storedSubagent()).codex_settings.reasoningEffort).toBe('high'), { timeout: 8_000 })
-    await waitFor(() => expect(isInFlightLocked(searchSwitch)).toBe(false), { timeout: 8_000 })
+    await waitFor(async () => expect((await storedSubagent()).provider_specific_settings.nativeTools.bashAccessMode).toBe('plan'), { timeout: 8_000 })
+    await waitFor(() => expect(isInFlightLocked(agentChoice)).toBe(false), { timeout: 8_000 })
 
-    await fireEvent.click(searchSwitch)
+    await fireEvent.click(workMode(/^Agent$/))
     await waitFor(() => expect(subagentPuts.length).toBe(2), { timeout: 8_000 })
-    expect(subagentPuts[1].body).toEqual({ codex_settings: { search: false } })
+    expect(Object.keys(subagentPuts[1].body)).toEqual(['provider_specific_settings'])
+    expect(subagentPuts[1].body.provider_specific_settings.nativeTools.bashAccessMode).toBe('agent')
+    expect('bashNeverAllowList' in subagentPuts[1].body.provider_specific_settings.nativeTools).toBe(false)
     await pause(600)
-    expect(await storedSubagent()).toMatchObject({ codex_settings: { reasoningEffort: 'high', search: false } })
+    expect((await storedSubagent()).provider_specific_settings.nativeTools.bashAccessMode).toBe('agent')
     await pause(1500)
     expect(subagentPuts.length).toBe(2)
   }, 120_000)
 })
 
 describe('opening a Subagent saves nothing (BL-914: the new baselines are set, never sent)', () => {
-  it('a CLI Codex Subagent with a block, a Tool Grid and older keys', async () => {
+  it('a CLI Claude Subagent with a block, a Tool Grid and older keys', async () => {
     await openSubagent(
-      cliSubagentRecord('codex', { ...CODEX_BASE, reasoningEffort: 'high', addDirs: ['/tmp/a'] }, {
+      cliSubagentRecord({ ...CLAUDE_BASE, permissionMode: 'plan', addDirs: ['/tmp/a'] }, {
         defaultMCPGateways: ['gw_a'],
         defaultMCPToolSelections: ['tool_one'],
         defaultTools: ['cli_x'],
         dcmDisplaySettings: { ...DCM_EMPTY, groups: { 'gw_a::Files': 'hidden' }, groupDisplayPreferences: { 'gw_a::Files': 'use-global' } },
-        provider_specific_settings: { codex_model: 'gpt-6-astra', nativeTools: { bashNeverAllowList: ['rm -rf *'] } }
+        provider_specific_settings: { claude_model: 'sonnet', nativeTools: { bashNeverAllowList: ['rm -rf *'] } }
       })
     )
     await pause(1500)
@@ -963,8 +623,8 @@ describe('opening a Subagent saves nothing (BL-914: the new baselines are set, n
     expect(writeLog).toEqual([])
   }, 120_000)
 
-  it('a CLI Codex Subagent with no block yet (only the older provider keys)', async () => {
-    await openSubagent(cliSubagentRecord('codex', null, { provider_specific_settings: { codex_model: 'gpt-6-luna' } }))
+  it('a CLI Claude Subagent with no block yet (only the older provider keys)', async () => {
+    await openSubagent(cliSubagentRecord(null, { provider_specific_settings: { claude_model: 'opus' } }))
     await pause(1500)
     expect(subagentPuts).toEqual([])
     expect(writeLog).toEqual([])
@@ -972,7 +632,7 @@ describe('opening a Subagent saves nothing (BL-914: the new baselines are set, n
 
   it('a CLI Claude Subagent with a block', async () => {
     await openSubagent(
-      cliSubagentRecord('claude', { ...CLAUDE_BASE, alwaysThinkingEnabled: true, maxThinkingTokens: 4000 })
+      cliSubagentRecord({ ...CLAUDE_BASE, alwaysThinkingEnabled: true, maxThinkingTokens: 4000 })
     )
     await pause(1500)
     expect(subagentPuts).toEqual([])
@@ -996,149 +656,52 @@ describe('opening a Subagent saves nothing (BL-914: the new baselines are set, n
   }, 120_000)
 })
 
-describe('BL-941 Part S: a CLI Subagent shows its saved Codex and Claude access without widening it', () => {
-  for (const permissionMode of Object.keys(CODEX_PERMISSION_PRESETS) as Array<keyof typeof CODEX_PERMISSION_PRESETS>) {
-    it(`Codex ${permissionMode} with no saved sandbox shows the shared preset and does not fill the record`, async () => {
-      await openSubagent(cliSubagentRecord('codex', { permissionMode, model: CODEX_BASE.model }))
-
-      expect(sandboxSelectTrigger().textContent?.trim()).toBe(
-        CODEX_SANDBOX_LABELS[CODEX_PERMISSION_PRESETS[permissionMode].sandbox]
-      )
-      const stored = (await storedSubagent()).codex_settings
-      expect(stored.permissionMode).toBe(permissionMode)
-      expect(stored).not.toHaveProperty('sandbox')
-      expect(buildCodexRuntimeSettings(stored).sandbox).toBe(CODEX_PERMISSION_PRESETS[permissionMode].sandbox)
-      expect(subagentPuts).toEqual([])
-
-      if (permissionMode === 'agent_full') {
-        expectCodexFullModeSelected()
-        expect(isDisabledControl(sandboxSelectTrigger())).toBe(true)
-        expect(screen.getByText(/limit the sandbox.*pick Agent/i)).toBeTruthy()
-      }
-    }, 120_000)
-  }
-
-  for (const sandbox of ['read-only', 'workspace-write'] as const) {
-    it(`Codex Agent (full) retains its older ${sandbox} sandbox, disables the control, and preserves it on another edit`, async () => {
-      await openSubagent(cliSubagentRecord('codex', { permissionMode: 'agent_full', model: CODEX_BASE.model, sandbox }))
-
-      expect(sandboxSelectTrigger().textContent?.trim()).toBe(CODEX_SANDBOX_LABELS[sandbox])
-      expectCodexFullModeSelected()
-      expect(isDisabledControl(sandboxSelectTrigger())).toBe(true)
-      expect(screen.getByTestId('subagent-codex-full-sandbox-note')).toHaveTextContent(
-        `This Subagent keeps its saved ${CODEX_SANDBOX_LABELS[sandbox]} Sandbox Level.`
-      )
-      expect(screen.getByText(/limit the sandbox.*pick Agent/i)).toBeTruthy()
-      const stored = (await storedSubagent()).codex_settings
-      expect(stored).toMatchObject({ permissionMode: 'agent_full', model: CODEX_BASE.model, sandbox })
-      const runtime = buildCodexRuntimeSettings(stored)
-      expect(runtime.permissionMode).toBe('agent')
-      expect(runtime.sandbox).toBe(sandbox)
-      expect(subagentPuts).toEqual([])
-
-      await pickSelectOption('Auto', /^High/)
-      await waitForPuts(1)
-
-      expect(subagentPuts[0].body).toEqual({ codex_settings: { reasoningEffort: 'high' } })
-      expect((await storedSubagent()).codex_settings).toMatchObject({
-        permissionMode: 'agent_full',
-        sandbox,
-        reasoningEffort: 'high'
-      })
-    }, 120_000)
-  }
-
-  it('an older full-mode legacy Codex sandbox stays visible and does not downgrade the mode or write on open', async () => {
+describe('SA-136 D1: the Subagent\'s own Typed File Tools row (LS-083)', () => {
+  // Like the owning typed-choice suite, this guarded save needs the actual conditional-save
+  // receipt. The default fake deliberately models no typed acknowledgement or EVAL capability.
+  it.runIf(process.env.VITEST_USE_REAL_REDIS === 'true')('saves the Subagent\'s explicit true/false choice, preserves siblings, and refuses the retired inherit intent', async () => {
+    typedHostFacts = true
+    const siblings = { bashEnabled: true, executionBackend: 'local', artifactRuntimeEnabled: true }
     await openSubagent(
-      cliSubagentRecord('codex', null, {
-        provider_specific_settings: {
-          codex_permission_mode: 'agent_full',
-          codex_model: 'gpt-6-astra',
-          codex_sandbox: 'workspace-write'
-        }
-      })
+      subagentRecord({ provider_specific_settings: { nativeTools: { ...siblings, typedFileToolsEnabled: false } } }),
+      { toolsTab: true }
     )
-
-    expect(sandboxSelectTrigger().textContent?.trim()).toBe(CODEX_SANDBOX_LABELS['workspace-write'])
-    expectCodexFullModeSelected()
-    expect(isDisabledControl(sandboxSelectTrigger())).toBe(true)
-    expect(screen.getByText(/limit the sandbox.*pick Agent/i)).toBeTruthy()
-    const stored = await storedSubagent()
-    expect(stored).not.toHaveProperty('codex_settings')
-    expect(stored.provider_specific_settings).toMatchObject({
-      codex_permission_mode: 'agent_full',
-      codex_model: 'gpt-6-astra',
-      codex_sandbox: 'workspace-write'
-    })
-    const runtime = buildCodexRuntimeSettings(stored.provider_specific_settings)
-    expect(runtime.permissionMode).toBe('agent')
-    expect(runtime.sandbox).toBe('workspace-write')
-    expect(subagentPuts).toEqual([])
-  }, 120_000)
-
-  for (const permissionMode of ['default', 'chat'] as const) {
-    it(`Claude saved ${permissionMode} displays Ask before edits without rewriting the record`, async () => {
-      await openSubagent(cliSubagentRecord('claude', { ...CLAUDE_BASE, permissionMode }))
-
-      const group = screen.getByRole('group', { name: 'Subagent Claude permissions mode' })
-      expect(within(group).getByRole('radio', { name: 'Ask before edits' })).toHaveAttribute('aria-checked', 'true')
-      expect((await storedSubagent()).claude_settings.permissionMode).toBe(permissionMode)
-      expect(subagentPuts).toEqual([])
-    }, 120_000)
-  }
-
-  it('an explicit Claude Plan to Ask before edits choice saves the canonical default value', async () => {
-    await openSubagent(cliSubagentRecord('claude', { ...CLAUDE_BASE, permissionMode: 'plan' }))
-
-    await pickPermissionMode('claude', /^Ask before edits$/)
+    expect(card().subjectKind).toBe('subagent')
+    expect(card().agentId).toBe(SUB)
+    const detail = await subagentRoute.GET({ params: { id: SUB }, locals: { user: { id: USER } } } as any) as Response
+    const original = detail.headers.get(TYPED_FILE_TOOLS_REVISION_HEADER)
+    expect(original).toMatch(/^sha256:[a-f0-9]{64}$/)
+    expect(card().getEnableControl('typed_file_tools')).toMatchObject({ checked: false, disabled: false })
+    await fire(() => card().getEnableControl('typed_file_tools').onChange(true))
     await waitForPuts(1)
+    await waitFor(() => expect(card().mcpSaveState).toBe('saved'), { timeout: 8_000 })
+    expect(subagentPuts[0].body.provider_specific_settings).toEqual({ nativeTools: { typedFileToolsEnabled: true } })
+    expect(subagentPuts[0].body.expectedTypedFileTools).toBe(original)
+    expect((await storedSubagent()).provider_specific_settings.nativeTools).toEqual({ ...siblings, typedFileToolsEnabled: true })
+    const savedDetail = await subagentRoute.GET({ params: { id: SUB }, locals: { user: { id: USER } } } as any) as Response
+    const saved = savedDetail.headers.get(TYPED_FILE_TOOLS_REVISION_HEADER)
+    expect(saved).toMatch(/^sha256:[a-f0-9]{64}$/)
+    expect(saved).not.toBe(original)
+    expect(card().getEnableControl('typed_file_tools')).toMatchObject({ checked: true, disabled: false })
+    await fire(() => card().getEnableControl('typed_file_tools').onChange(false))
+    await waitForPuts(2)
+    await waitFor(() => expect(card().mcpSaveState).toBe('saved'), { timeout: 8_000 })
+    expect(subagentPuts[1].body.provider_specific_settings).toEqual({ nativeTools: { typedFileToolsEnabled: false } })
+    expect(subagentPuts[1].body.expectedTypedFileTools).toBe(saved)
+    expect((await storedSubagent()).provider_specific_settings.nativeTools).toEqual({ ...siblings, typedFileToolsEnabled: false })
+    expect(writeLog).toEqual([`PUT /api/subagents/${SUB}`, `PUT /api/subagents/${SUB}`])
 
-    expect(subagentPuts[0].body).toMatchObject({ claude_settings: { permissionMode: 'default' } })
-    expect((await storedSubagent()).claude_settings.permissionMode).toBe('default')
-  }, 120_000)
-
-  it.each([
-    { name: 'null', sandbox: null, expected: CODEX_PERMISSION_PRESETS.agent.sandbox },
-    { name: 'invalid', sandbox: 'future-sandbox-value', expected: 'read-only' as const }
-  ])('Codex agent with a $name saved sandbox displays the safe resolved value without rewriting it', async ({ sandbox, expected }) => {
-    await openSubagent(cliSubagentRecord('codex', {
-      permissionMode: 'agent',
-      model: CODEX_BASE.model,
-      sandbox
-    }))
-
-    expect(sandboxSelectTrigger().textContent?.trim()).toBe(CODEX_SANDBOX_LABELS[expected])
-    const stored = (await storedSubagent()).codex_settings
-    expect(stored.sandbox).toBe(sandbox)
-    const runtime = buildCodexRuntimeSettings(stored)
-    expect(runtime.permissionMode).toBe('agent')
-    expect(runtime.sandbox).toBe(expected)
-    expect(subagentPuts).toEqual([])
-  }, 120_000)
-
-  it('a valid structured Codex block takes precedence over a conflicting legacy settings bag', async () => {
-    await openSubagent(cliSubagentRecord('codex', {
-      permissionMode: 'agent',
-      model: CODEX_BASE.model
-    }, {
-      provider_specific_settings: {
-        codex_permission_mode: 'agent_full',
-        codex_model: 'gpt-6-luna',
-        codex_sandbox: 'danger-full-access'
-      }
-    }))
-
-    expect(sandboxSelectTrigger().textContent?.trim()).toBe(CODEX_SANDBOX_LABELS[CODEX_PERMISSION_PRESETS.agent.sandbox])
-    const stored = await storedSubagent()
-    expect(stored.codex_settings).toMatchObject({ permissionMode: 'agent', model: CODEX_BASE.model })
-    expect(stored.codex_settings).not.toHaveProperty('sandbox')
-    expect(stored.provider_specific_settings).toMatchObject({
-      codex_permission_mode: 'agent_full',
-      codex_sandbox: 'danger-full-access'
-    })
-    const runtime = buildCodexRuntimeSettings(stored.codex_settings)
-    expect(runtime.permissionMode).toBe('agent')
-    expect(runtime.sandbox).toBe(CODEX_PERMISSION_PRESETS.agent.sandbox)
-    expect(subagentPuts).toEqual([])
+    const before = await storedSubagent()
+    const current = await subagentRoute.GET({ params: { id: SUB }, locals: { user: { id: USER } } } as any) as Response
+    const refusal = await subagentRoute.PUT({ params: { id: SUB }, locals: { user: { id: USER } },
+      request: new Request(`http://localhost/api/subagents/${SUB}`, { method: 'PUT', body: JSON.stringify({
+        displayName: 'Must not land', provider_specific_settings: { nativeTools: { typedFileToolsEnabled: null } },
+        expectedTypedFileTools: current.headers.get(TYPED_FILE_TOOLS_REVISION_HEADER)
+      }) }) } as any) as Response
+    expect(refusal.status).toBe(400)
+    expect((await refusal.json()).error).toBe('Typed File Tools must be explicitly on or off. Nothing was saved.')
+    expect(await storedSubagent()).toEqual(before)
+    expect(secondSubagentPuts).toEqual([])
+    expect(subagentPuts).toHaveLength(2)
   }, 120_000)
 })

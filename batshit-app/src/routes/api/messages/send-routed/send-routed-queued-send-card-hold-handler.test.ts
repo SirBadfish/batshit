@@ -1,4 +1,5 @@
 // @vitest-environment node
+import { useSendHandlerFixture } from '$lib/test-utils/sendHandlerFixture'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { redis } from '$lib/server/redis'
@@ -62,10 +63,29 @@ vi.mock('$lib/server/services/nativeTools', async (importOriginal) => ({
 vi.mock('$lib/services/databaseRedis.server', async (importOriginal) => {
   const actual = await importOriginal<Record<string, any>>()
   class DatabaseService extends actual.DatabaseService {
-    async buildFormattedChatInput(_sessionId: string, _history: unknown, _agent: unknown, current: unknown) {
+    async buildFormattedChatInput(
+      _sessionId: string,
+      _history: unknown,
+      _agent: unknown,
+      current: unknown,
+      _subagents: unknown,
+      _userId: unknown,
+      options?: { whiteboardContextSnapshot?: any; whiteboardMessageId?: string }
+    ) {
       mocks.compiledCurrent.push(current)
       return {
         primarySystemPrompt: 'You are a test agent.',
+        // BL-1771 (BL-1597's fixture repair): the real compile freezes this context for an API
+        // reply, its pause keeps it on the card, and the resume is refused without it.
+        whiteboardContextSnapshot: options?.whiteboardContextSnapshot ?? {
+          schema_version: 1,
+          userId: _userId,
+          sessionId: _sessionId,
+          agentId: (_agent as any).id,
+          messageId: options?.whiteboardMessageId,
+          settings: { mode: 'neither', whiteboardEnabled: false, preserveReasoning: false, whiteboardBudgetTokens: 1500, showWhiteboard: true },
+          dcmLines: []
+        },
         structuredInput: { messages: [{ role: 'user', content: 'Hello from the compile.' }], metadata: {} },
         resolvedProjectPath: null
       }
@@ -136,6 +156,7 @@ useRedisTestServer()
 
 let POST: (event: any) => Promise<Response>
 let SESSION = ''
+useSendHandlerFixture({ sessionIds: () => [SESSION], postStartupMcpUsers: () => [USER] })
 let count = 0
 let forwards: Array<Record<string, any>> = []
 /** Every request a test started, until it has finished (its final answer, when answered early). */
@@ -255,11 +276,11 @@ async function chatIds() {
 }
 
 /** The first reply stops at a card while B waits in the line. */
-async function replyStopsAtCardWithBWaiting() {
+async function replyStopsAtCardWithBWaiting(extra: Record<string, unknown> = {}) {
   let sentB: Sent | null = null
   mocks.modelRuns.set(1, 'card')
   mocks.duringRun.set(1, async () => {
-    sentB = await sendWhileBusy(B, 'And summarise the file I attached.')
+    sentB = await sendWhileBusy(B, 'And summarise the file I attached.', extra)
   })
   const first = await sendFirst()
   expect(first.status).toBe(200)
@@ -425,6 +446,24 @@ describe('send-routed: a message waiting in the chat’s line at an approval car
     expect(back).toBeGreaterThan(dropped)
   }, 30_000)
 
+  it('retiring a saved CLI card releases the queue as unanswered without a model run', async () => {
+    const b = await replyStopsAtCardWithBWaiting()
+    const { card, approvalId } = await storedCard()
+    const approvals = card.metadata.toolApprovals.approvals.map((entry: any) => entry.approvalId === approvalId
+      ? { ...entry, source: 'fabric', control: { lane: 'cli', approvalId: 'apr_historical' } } : entry)
+    await redis.json.set(`message:${SESSION}:${FIRST_REPLY}`, '$.metadata.toolApprovals.approvals', approvals)
+    const result = await request({ content: '', messageId: FIRST_REPLY, messages: [card], metadata: { retireSavedApprovalId: approvalId } })
+    expect(result.status).toBe(200)
+    expect(await result.json()).toMatchObject({ reason: 'retired', retiredApprovalIds: [approvalId] })
+    const final = await b.outcome
+    expect(final.status).toBe(409)
+    expect(JSON.parse(final.body)).toMatchObject({ code: 'queued_send_kept', reason: 'approval_expired' })
+    expect(mocks.brainRuns).toEqual([FIRST_REPLY])
+    expect((await chatIds()).at(-1)).toBe(B)
+    expect(getQueueCardHold(SESSION)).toBeNull()
+    expect(forwards.some(body => body.type === 'queued_send_dropped' && body.reason === 'approval_expired')).toBe(true)
+  }, 30_000)
+
   it('Send now works for a message whose bubble shows no words (a Clip alone): the server needs only its id (review)', async () => {
     const b = await replyStopsAtCardWithBWaiting()
     expect(await waitUntil(() => mocks.brainRuns.length > 1, 300)).toBe(false)
@@ -481,7 +520,18 @@ describe('send-routed: a message waiting in the chat’s line at an approval car
   }, 30_000)
 
   it('the bound: a card nobody answers keeps the waiting message after the limit, unanswered', async () => {
-    const b = await replyStopsAtCardWithBWaiting()
+    // BL-903 (a): the send facts its request carried, which the page's own message does not keep.
+    const b = await replyStopsAtCardWithBWaiting({
+      metadata: {
+        clipIds: ['clip_20260928_bl713'],
+        fileReferences: [{ path: '/work/probe/notes.md', status: 'ok' }],
+        projectPath: '/work/probe',
+        tts: true,
+        voiceMode: 'voice',
+        claudePermissionMode: 'bypassPermissions',
+        agent: { id: AGENT }
+      }
+    })
     const realNow = Date.now.bind(Date)
     const later = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + QUEUE_CARD_HOLD_LIMIT_MS + 1)
     const final = await b.outcome
@@ -491,6 +541,12 @@ describe('send-routed: a message waiting in the chat’s line at an approval car
     expect(JSON.parse(final.body)).toMatchObject({ code: 'queued_send_kept', reason: 'approval_wait' })
     expect(mocks.brainRuns).toEqual([FIRST_REPLY])
     expect((await chatIds()).at(-1)).toBe(B)
+    // The mark carries why, and the send facts its request carried (never its Clips or the agent).
+    const keptB = ((await redis.getMessages(SESSION)) as any[]).find((message) => message.id === B)
+    expect(keptB?.metadata?.keptSend).toEqual({
+      reason: 'approval_wait',
+      sendFacts: { projectPath: '/work/probe', tts: true, voiceMode: 'voice', claudePermissionMode: 'bypassPermissions' }
+    })
     expect(forwards.some((body) => body.type === 'queued_send_dropped' && body.reason === 'approval_wait')).toBe(true)
   }, 30_000)
 })

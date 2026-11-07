@@ -11,7 +11,8 @@ import {
   markApprovalCardWithoutAnswer,
   saveSteersWithoutAnswer,
   promoteSteersToNextTurn,
-  readHeldMessageToAnswer
+  readHeldMessageToAnswer,
+  moveUnansweredBehindHeldAnswer
 } from '$lib/server/services/steerPromotion'
 import { keepQueuedSendAtEnd } from '$lib/server/services/queuedSendKeeper'
 import type { SteerEntry } from '$lib/utils/steerControl'
@@ -277,6 +278,7 @@ describe('held words with a kept send after them (BL-905)', () => {
       sessionId: SESSION,
       userId: USER,
       userMessageId: 'msg-w',
+      reason: 'approval_wait',
       entry: { turnId: 999_001 },
       forwardSessionEvent: async () => {}
     })
@@ -323,6 +325,45 @@ describe('held words with a kept send after them (BL-905)', () => {
         request
       })
     ).toBe(false)
+  })
+
+  /** BL-921: the answer is saved at the end, after the kept send; the kept send moves behind it. */
+  const moveBehind = (heldMessageId: string, answerMessageId: string) =>
+    moveUnansweredBehindHeldAnswer({
+      sessionId: SESSION,
+      userId: USER,
+      heldMessageId,
+      answerMessageId,
+      eventFetch: eventFetch as unknown as typeof fetch,
+      request
+    })
+
+  it('once the answer is saved, the kept send moves behind it, and every tab is told (BL-921)', async () => {
+    await seedHeldAndKept()
+    const answer = await readHeldMessageToAnswer({ sessionId: SESSION, cardMessageId: 'msg-card' })
+    expect(answer?.heldMessageId).toBe('msg-held')
+    await redis.saveMessage(message(answer!.assistantMessageId, 'assistant', 'Tidied.', 8) as any)
+    sseBodies = []
+
+    expect(await moveBehind('msg-held', answer!.assistantMessageId)).toEqual(['msg-w'])
+
+    const ids = (await redis.getRecentMessages(SESSION, 10)).map((row: any) => row.id)
+    expect(ids).toEqual(['msg-q', 'msg-card', 'msg-held', answer!.assistantMessageId, 'msg-w'])
+    expect(sseBodies).toEqual([
+      expect.objectContaining({ type: 'user_message', sessionId: SESSION, movedToEnd: true, message: expect.objectContaining({ id: 'msg-w' }) })
+    ])
+    // The held words have their answer now; the kept send is the chat's last, unanswered message.
+    expect(await readHeldMessageToAnswer({ sessionId: SESSION, cardMessageId: 'msg-card' })).toBeNull()
+  })
+
+  it('moves nothing past a reply, nothing for an answer not stored after the words, and never held words (BL-921)', async () => {
+    await seedHeldAndKept()
+    await redis.saveMessage(message('msg-w-reply', 'assistant', 'Nice Clip.', 9) as any)
+    await redis.saveMessage(message('msg-late-answer', 'assistant', 'Tidied.', 10) as any)
+    expect(await moveBehind('msg-held', 'msg-late-answer')).toEqual([])
+    expect(await moveBehind('msg-held', 'msg-not-stored')).toEqual([])
+    const ids = (await redis.getRecentMessages(SESSION, 10)).map((row: any) => row.id)
+    expect(ids).toEqual(['msg-q', 'msg-card', 'msg-held', 'msg-w', 'msg-w-reply', 'msg-late-answer'])
   })
 
   it('today’s case stays: held words alone at the end are answered with the whole history', async () => {
@@ -421,8 +462,13 @@ describe('exact held-history and no-resume boundary (V2)', () => {
   it.each(['approval_denied', 'approval_expired'] as const)("a recorded no-resume %s marks only the card's server-known user steers, survives reload, and schedules no run", async (reason) => {
     await redis.saveMessage({ id: 'card', session_id: SESSION, user_id: USER, role: 'assistant', status: 'complete',
       content: 'May I?', metadata: { answeredApprovalIds: ['ap'],
-        steerPromoted: { steerIds: ['promoted'] }, steers: [{ steerId: 'delivered', source: 'user' }, { steerId: 'dm', source: 'dm' }] } } as any)
+        steerPromoted: { steerIds: ['promoted'] }, steers: [{ steerId: 'delivered', source: 'user' }, { steerId: 'dm', source: 'dm' }],
+        whiteboardContextSnapshot: { dcmLines: ['board'] }, liveFileReadSnapshot: { schema_version: 1, pauseId: 'pause-1' } } } as any)
     await markApprovalCardWithoutAnswer({ ...params, cardMessageId: 'card', reason })
+    // SA-137: the card's end retires the paused replay fields, and no tab receives them.
+    expect((await redis.get(`message:${SESSION}:card`) as any).metadata).toMatchObject({
+      whiteboardContextSnapshot: null, liveFileReadSnapshot: null })
+    expect(JSON.stringify(sseBodies.at(-1))).not.toMatch(/liveFileReadSnapshot|whiteboardContextSnapshot/)
     expect((await redis.get(`message:${SESSION}:card`) as any).metadata.steerPromoted).toEqual({
       steerIds: ['promoted', 'delivered'], disposition: 'unanswered', reason })
     expect(sseBodies.at(-1)).toMatchObject({ type: 'complete_message', message: { id: 'card', role: 'assistant' } })

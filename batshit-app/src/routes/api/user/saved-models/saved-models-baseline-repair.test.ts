@@ -1,3 +1,4 @@
+import './presetStorageScriptDouble'
 /**
  * Review finding 2 (2026-09-25 bug batch): BL-241 gave the MiMo Token Plan
  * fallback Xiaomi's own developer namespace, so its rows merged into the
@@ -16,6 +17,15 @@ const clone = (value: unknown) => (value === undefined ? null : JSON.parse(JSON.
 
 vi.mock('$lib/server/redis', () => ({
   redis: {
+    execute: vi.fn(async (operation: (client: any) => Promise<any>) => operation({
+      type: async (key: string) => store.has(key) ? 'ReJSON-RL' : 'none',
+      sendCommand: async ([, key]: string[]) => store.has(key) ? JSON.stringify([store.get(key)]) : null,
+      eval: async (_script: string, { keys, arguments: args }: { keys: string[]; arguments: string[] }) => {
+        if (args[2] !== 'PERSIST') throw new Error('This fixture admits only cache retention, never refresh writes.')
+        return store.has(keys[0]) && JSON.stringify([store.get(keys[0])]) === args[1] ? 'OK' : 'CHANGED'
+      },
+      json: { get: async (key: string) => store.has(key) ? clone(store.get(key)) : null }
+    })),
     get: vi.fn(async (key: string) => (store.has(key) ? clone(store.get(key)) : null)),
     set: vi.fn(async (key: string, value: unknown) => {
       store.set(key, clone(value))

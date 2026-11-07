@@ -28,8 +28,11 @@ import {
 } from './memoryTypes'
 import { createMemoryEmbedderAsync, type MemoryEmbedder } from './memoryEmbedder'
 import { getMemoryConfig, requireReadyMemoryIndexes } from './memoryIndex'
-import { deleteMemoryMedia, MEMORY_STANDING_MEDIA_CAP } from './memoryMedia'
+import { deleteMemoryMedia, loadMemoryMedia, MEMORY_STANDING_MEDIA_CAP } from './memoryMedia'
 import { normalizeEventAtInput, normalizeExpiryInput } from '$lib/utils/memoryExpiry'
+import { effectiveMemoryRecord, memoryIsDeleted, memoryIsEligible, memoryIsExpired, requireActiveMemory, standingMemoryTransition } from './memoryState'
+import { commitMemoryMutation, readMemoryMutationSnapshot, MemoryMutationError, type MemoryMutationSnapshot, touchMemoryRecallRecord } from './memoryMutation'
+import { acquireSettingsMutation, type SettingsLifecycleSnapshot } from '../appActions/settings/lifecycle'
 
 function randomIdSuffix(): string {
   return Math.random().toString(36).slice(2, 8)
@@ -47,6 +50,7 @@ function nowStamps(): { iso: string; ts: number } {
 /** A current, unexpired Awareness record whose images ride every message (the standing set). */
 function countsTowardStandingMedia(record: MemoryRecord, nowTs: number): boolean {
   return (
+    !memoryIsDeleted(record) &&
     record.lane === 'awareness' &&
     record.media_mode === 'always' &&
     record.is_superseded !== 'y' &&
@@ -104,6 +108,9 @@ async function assertStoreStandingMediaCapacity(options: {
 /** Batch contexts (graduation, dreaming, tests) may supply one embedder for many writes. */
 export interface MemoryWriteOptions {
   embedder?: MemoryEmbedder
+  lifecycle?: SettingsLifecycleSnapshot
+  deliberateLaneMove?: boolean
+  snapshot?: MemoryMutationSnapshot
 }
 
 async function resolveWriteEmbedder(override?: MemoryEmbedder): Promise<MemoryEmbedder> {
@@ -159,12 +166,15 @@ export interface CreateMemoryInput {
   media?: MemoryMediaRecord[]
   media_mode?: MemoryMediaMode
   provenance: MemoryProvenanceEntry[]
+  supersedes?: string[]
 }
 
 export async function createMemory(
   input: CreateMemoryInput,
   options?: MemoryWriteOptions
 ): Promise<MemoryRecord> {
+  const snapshot = options?.snapshot ?? await readMemoryMutationSnapshot(input.agent_id, { lifecycle: options?.lifecycle, targetIds: input.supersedes ?? [] })
+  if (input.id && snapshot.records.some(record => record.id === input.id)) throw new MemoryMutationError('A memory with this id already exists.')
   assertLane(input.lane)
   assertImportance(input.importance)
   if (
@@ -184,11 +194,7 @@ export async function createMemory(
   if (!Array.isArray(input.provenance) || input.provenance.length === 0) {
     throw new Error('Memory records require at least one provenance entry (DL-104-08).')
   }
-  await assertStoreStandingMediaCapacity({
-    agentId: input.agent_id,
-    media: input.media,
-    mediaMode: input.media_mode
-  })
+
 
   // BL-825: refuse invalid dates before resolving or spending an embedding call.
   // BL-817: a bare day means the START of that local day (the day search reads it as); a full
@@ -205,6 +211,10 @@ export async function createMemory(
   if (expiresAt && !Number.isFinite(expiresTs)) {
     throw new Error(`Memory expires_at is not a valid timestamp: '${expiresAt}'.`)
   }
+
+  const candidate = effectiveMemoryRecord({ ...input, id: input.id ?? 'pending_memory', expires_at: expiresAt, expires_ts: expiresTs, is_superseded: 'n' } as MemoryRecord, snapshot.observedTs)
+  const admission = standingMemoryTransition(snapshot.records, [...snapshot.records, candidate], snapshot.observedTs)
+  if (!admission.allowed) throw new MemoryMutationError('Always-on Awareness media is capped at 4 images per agent; this save would add over-cap standing images.')
 
   const embedder = await resolveWriteEmbedder(options?.embedder)
   const [embedding] = await embedder.embedDocuments([input.content])
@@ -237,8 +247,19 @@ export async function createMemory(
     schema_version: MEMORY_SCHEMA_VERSION
   }
 
-  await redis.json.set(memoryKey(record.agent_id, record.id), '$', record as never)
-  return record
+  const published = effectiveMemoryRecord(record)
+  const changes = new Map<string, MemoryRecord>([[memoryKey(record.agent_id, record.id), published]])
+  if (input.supersedes?.length) {
+    const targets = [...new Set(input.supersedes)]
+    for (const id of targets) {
+      const old = snapshot.records.find(entry => entry.id === id)
+      if (!old || memoryIsDeleted(old) || id === record.id) throw new MemoryMutationError('A supersession target is missing or deleted.')
+      changes.set(memoryKey(record.agent_id, id), { ...old, superseded_by: record.id, is_superseded: 'y', updated_at: iso })
+    }
+    published.supersedes = targets
+  }
+  await commitMemoryMutation(snapshot, changes)
+  return published
 }
 
 export async function getMemory(agentId: string, memoryId: string): Promise<MemoryRecord | null> {
@@ -297,8 +318,10 @@ export async function updateMemory(
   updates: UpdateMemoryInput,
   options?: MemoryWriteOptions
 ): Promise<MemoryRecord> {
-  const existing = await getMemory(agentId, memoryId)
+  const snapshot = options?.snapshot ?? await readMemoryMutationSnapshot(agentId, { lifecycle: options?.lifecycle, targetIds: [memoryId] })
+  const existing = snapshot.records.find(record => record.id === memoryId)
   if (!existing) throw new Error(`Memory ${memoryId} not found for agent ${agentId}.`)
+  requireActiveMemory(existing)
 
   if (updates.lane !== undefined) assertLane(updates.lane)
   if (updates.importance !== undefined) assertImportance(updates.importance)
@@ -314,13 +337,13 @@ export async function updateMemory(
     throw new Error('Memory content cannot be updated to empty; delete the memory explicitly instead.')
   }
 
-  const next: MemoryRecord = { ...existing }
+  const next: MemoryRecord = { ...effectiveMemoryRecord(existing, snapshot.observedTs) }
   if (updates.content !== undefined) next.content = updates.content
   if (updates.gist !== undefined) {
     if (updates.gist === null) delete next.gist
     else next.gist = updates.gist
   }
-  if (updates.lane !== undefined) next.lane = updates.lane
+  if (updates.lane !== undefined && (!memoryIsExpired(existing, snapshot.observedTs) || options?.deliberateLaneMove)) next.lane = updates.lane
   if (updates.trigger_terms !== undefined) {
     if (updates.trigger_terms === null || updates.trigger_terms.length === 0) delete next.trigger_terms
     else next.trigger_terms = updates.trigger_terms
@@ -347,6 +370,8 @@ export async function updateMemory(
     }
   }
   if (updates.expires_at !== undefined) {
+    delete next.expiry_processed_at
+    delete next.expired_demoted_to
     if (updates.expires_at === null) {
       delete next.expires_at
       delete next.expires_ts
@@ -380,12 +405,7 @@ export async function updateMemory(
   if (next.media_mode === 'always' && next.lane !== 'awareness') {
     throw new Error('Always-on memory media is only valid in the awareness lane.')
   }
-  await assertStoreStandingMediaCapacity({
-    agentId,
-    media: next.media,
-    mediaMode: next.media_mode,
-    excludeMemoryId: memoryId
-  })
+
 
   // A Trigger Memory without trigger words can never fire — refuse the dead state
   // loudly instead of storing it (2026-08-28; matches save + move_lane validation).
@@ -395,6 +415,9 @@ export async function updateMemory(
     )
   }
 
+  const admission = standingMemoryTransition(snapshot.records, [...snapshot.records.filter(record => record.id !== memoryId), effectiveMemoryRecord(next, snapshot.observedTs)], snapshot.observedTs)
+  if (!admission.allowed) throw new MemoryMutationError('Always-on Awareness media is capped at 4 images per agent; this update would add over-cap standing images.')
+
   if (updates.content !== undefined && updates.content !== existing.content) {
     const embedder = await resolveWriteEmbedder(options?.embedder)
     const [embedding] = await embedder.embedDocuments([next.content])
@@ -403,21 +426,87 @@ export async function updateMemory(
   }
 
   next.updated_at = nowStamps().iso
-  await redis.json.set(memoryKey(agentId, memoryId), '$', next as never)
-  return next
+  await commitMemoryMutation(snapshot, new Map([[memoryKey(agentId, memoryId), effectiveMemoryRecord(next)]]))
+  return effectiveMemoryRecord(next)
 }
 
-/** The only true delete (DL-104-02) — explicit user/agent action, never housekeeping. */
-export async function deleteMemory(agentId: string, memoryId: string): Promise<boolean> {
-  const record = await getMemory(agentId, memoryId)
+const activePurgeClaims = new Set<string>()
+
+/** Delete is recoverable. Only the user-owned empty-trash/agent lifecycle purges bytes. */
+export async function deleteMemory(agentId: string, memoryId: string, options?: MemoryWriteOptions): Promise<boolean> {
+  const snapshot = options?.snapshot ?? await readMemoryMutationSnapshot(agentId, { lifecycle: options?.lifecycle, targetIds: [memoryId] })
+  const record = snapshot.records.find(entry => entry.id === memoryId)
   if (!record) return false
-  const removed = await redis.execute(async (client) => client.del(memoryKey(agentId, memoryId)))
-  if (removed > 0) {
-    for (const media of record.media ?? []) {
-      await deleteMemoryMedia(media)
+  if (memoryIsDeleted(record)) return true
+  const { iso, ts } = nowStamps()
+  await commitMemoryMutation(snapshot, new Map([[memoryKey(agentId, memoryId), {
+    ...record, deleted_at: iso, deleted_ts: ts, updated_at: iso
+  }]]))
+  return true
+}
+
+export async function restoreMemory(agentId: string, memoryId: string, options?: MemoryWriteOptions): Promise<MemoryRecord> {
+  const snapshot = await readMemoryMutationSnapshot(agentId, { lifecycle: options?.lifecycle, targetIds: [memoryId] })
+  const original = snapshot.records.find(record => record.id === memoryId)
+  if (!original || !memoryIsDeleted(original)) throw new MemoryMutationError('This memory is not in Deleted Memories.')
+  const claimKey = memoryKey(agentId, memoryId)
+  if (activePurgeClaims.has(claimKey)) throw new MemoryMutationError('Permanent removal has begun and is still settling. Wait for it to finish before restoring.')
+  const preservation = acquireSettingsMutation(snapshot.lifecycle)
+  try {
+    if (original.purge_pending) for (const media of original.media ?? []) {
+      preservation.check()
+      await loadMemoryMedia(agentId, memoryId, media, { audience: 'user' })
     }
+    const record = { ...effectiveMemoryRecord(original, snapshot.observedTs) }
+    delete record.deleted_at; delete record.deleted_ts; delete record.purge_pending
+    record.updated_at = nowStamps().iso
+    await commitMemoryMutation(snapshot, new Map([[memoryKey(agentId, memoryId), record]]))
+    return record
+  } finally { preservation.settle() }
+}
+
+/** Server-selected complete trash set, not the Panel's limited page. */
+export async function emptyDeletedMemories(agentId: string, options?: MemoryWriteOptions): Promise<{ purged: number; remaining: number }> {
+  const initial = await readMemoryMutationSnapshot(agentId, { lifecycle: options?.lifecycle, targetIds: [] })
+  const selected = initial.records.filter(memoryIsDeleted)
+  let purged = 0
+  for (const selectedRecord of selected) {
+    const snapshot = await readMemoryMutationSnapshot(agentId, { lifecycle: initial.lifecycle, targetIds: [selectedRecord.id] })
+    const record = snapshot.records.find(entry => entry.id === selectedRecord.id)
+    if (!record || !memoryIsDeleted(record) || record.deleted_ts !== selectedRecord.deleted_ts) continue
+    // A fresh process-local lease owns actual disposal. The saved progress bit never grants it.
+    const claimKey = memoryKey(agentId, record.id)
+    if (activePurgeClaims.has(claimKey)) throw new MemoryMutationError('This memory removal is still settling.')
+    const disposal = acquireSettingsMutation(initial.lifecycle)
+    activePurgeClaims.add(claimKey)
+    try {
+      await commitMemoryMutation(snapshot, new Map([[memoryKey(agentId, record.id), { ...record, purge_pending: true }]]))
+      for (const media of record.media ?? []) {
+        disposal.check()
+        // Ownership reads are strict; unknown references conserve the file. New app writers
+        // cannot acquire another memory's filename (the physical publisher validates it).
+        const referenced = await redis.execute(async client => {
+          for (const key of await client.keys('memory:*')) {
+            if (key === memoryKey(agentId, record.id)) continue
+            const other = await client.json.get(key) as unknown as MemoryRecord | null
+            if (!other || !Array.isArray(other.media ?? [])) throw new Error('Memory media references could not be checked.')
+            if (other.media?.some(entry => entry.filename === media.filename)) return true
+          }
+          return false
+        })
+        disposal.check()
+        if (!referenced) await deleteMemoryMedia(media)
+      }
+      const final = await readMemoryMutationSnapshot(agentId, { lifecycle: initial.lifecycle, targetIds: [record.id] })
+      const current = final.records.find(entry => entry.id === record.id)
+      if (!current?.purge_pending || current.deleted_ts !== record.deleted_ts) throw new MemoryMutationError('Deleted memory changed during disposal.')
+      await commitMemoryMutation(final, new Map([[memoryKey(agentId, record.id), null]]))
+      purged++
+    } catch (error) {
+      throw new Error(`Empty Deleted Memories stopped after removing ${purged} memories. Remaining trash is retained for retry. ${error instanceof Error ? error.message : String(error)}`, { cause: error })
+    } finally { activePurgeClaims.delete(claimKey); disposal.settle() }
   }
-  return removed > 0
+  return { purged, remaining: (await listMemories(agentId)).filter(memoryIsDeleted).length }
 }
 
 // ---------------------------------------------------------------------------
@@ -427,7 +516,8 @@ export async function deleteMemory(agentId: string, memoryId: string): Promise<b
 export async function supersedeMemory(
   agentId: string,
   newMemoryId: string,
-  supersededIds: string[]
+  supersededIds: string[],
+  options?: MemoryWriteOptions
 ): Promise<MemoryRecord> {
   if (supersededIds.length === 0) {
     throw new Error('supersedeMemory requires at least one memory id to supersede.')
@@ -435,23 +525,26 @@ export async function supersedeMemory(
   if (supersededIds.includes(newMemoryId)) {
     throw new Error('A memory cannot supersede itself.')
   }
-  const successor = await getMemory(agentId, newMemoryId)
+  const snapshot = await readMemoryMutationSnapshot(agentId, { lifecycle: options?.lifecycle, targetIds: [newMemoryId, ...supersededIds] })
+  const byId = new Map(snapshot.records.map(record => [record.id, record]))
+  const successor = byId.get(newMemoryId)
   if (!successor) throw new Error(`Memory ${newMemoryId} not found for agent ${agentId}.`)
-
+  requireActiveMemory(successor)
   // Validate the complete operation before the first write. The selected winner may be
   // older or newer than the records it replaces, but it cannot already point through a
   // supersession chain to one of them: reversing that live edge would create a cycle in
   // which every record is simultaneously current and superseded.
   const targets: MemoryRecord[] = []
   for (const oldId of supersededIds) {
-    const old = await getMemory(agentId, oldId)
+    const old = byId.get(oldId)
     if (!old) throw new Error(`Cannot supersede missing memory ${oldId} (agent ${agentId}).`)
+    requireActiveMemory(old)
     targets.push(old)
 
     const seen = new Set<string>([newMemoryId])
     let cursor: MemoryRecord | null = successor
     while (cursor?.superseded_by) {
-      const nextId = cursor.superseded_by
+      const nextId: string = cursor.superseded_by
       if (nextId === oldId) {
         throw new Error(
           `Cannot make memory ${newMemoryId} supersede ${oldId}: this would create a supersession cycle. ` +
@@ -464,30 +557,39 @@ export async function supersedeMemory(
         )
       }
       seen.add(nextId)
-      cursor = await getMemory(agentId, nextId)
+      cursor = byId.get(nextId) ?? null
     }
   }
 
+  const changes = new Map<string, MemoryRecord>()
   for (const old of targets) {
     old.superseded_by = newMemoryId
     old.is_superseded = 'y'
     old.updated_at = nowStamps().iso
-    await redis.json.set(memoryKey(agentId, old.id), '$', old as never)
+    changes.set(memoryKey(agentId, old.id), old)
   }
 
   const merged = new Set([...(successor.supersedes ?? []), ...targets.map((record) => record.id)])
   successor.supersedes = Array.from(merged)
   successor.updated_at = nowStamps().iso
-  await redis.json.set(memoryKey(agentId, newMemoryId), '$', successor as never)
+  changes.set(memoryKey(agentId, newMemoryId), successor)
+  await commitMemoryMutation(snapshot, changes)
   return successor
 }
 
 /** Undo for a mistaken supersession — restores the record to current status. */
-export async function unsupersedeMemory(agentId: string, memoryId: string): Promise<MemoryRecord> {
-  const record = await getMemory(agentId, memoryId)
+export async function unsupersedeMemory(agentId: string, memoryId: string, options?: MemoryWriteOptions): Promise<MemoryRecord> {
+  let snapshot = await readMemoryMutationSnapshot(agentId, { lifecycle: options?.lifecycle, targetIds: [memoryId] })
+  let record = snapshot.records.find(entry => entry.id === memoryId)
   if (!record) throw new Error(`Memory ${memoryId} not found for agent ${agentId}.`)
+  requireActiveMemory(record)
   const supersederId = record.superseded_by
   if (!supersederId) return record
+  const complete = await readMemoryMutationSnapshot(agentId, { lifecycle: snapshot.lifecycle, targetIds: [memoryId, supersederId] })
+  if (complete.revisionRaw !== snapshot.revisionRaw) throw new MemoryMutationError('Memory graph changed before undoing supersession.')
+  snapshot = complete
+  record = snapshot.records.find(entry => entry.id === memoryId)!
+
 
   // BL-438: a superseded record's always-on images stop counting, so the agent may have filled
   // the slots since. Restoring it past the cap would fail every send of the agent at the compile;
@@ -508,15 +610,16 @@ export async function unsupersedeMemory(agentId: string, memoryId: string): Prom
   record.superseded_by = null
   record.is_superseded = 'n'
   record.updated_at = nowStamps().iso
-  await redis.json.set(memoryKey(agentId, memoryId), '$', record as never)
+  const changes = new Map<string, MemoryRecord>([[memoryKey(agentId, memoryId), record]])
 
-  const superseder = await getMemory(agentId, supersederId)
-  if (superseder?.supersedes?.length) {
+  const superseder = snapshot.records.find(entry => entry.id === supersederId)
+  if (superseder && !memoryIsDeleted(superseder) && superseder.supersedes?.length) {
     superseder.supersedes = superseder.supersedes.filter((id) => id !== memoryId)
     if (superseder.supersedes.length === 0) delete superseder.supersedes
     superseder.updated_at = nowStamps().iso
-    await redis.json.set(memoryKey(agentId, supersederId), '$', superseder as never)
+    changes.set(memoryKey(agentId, supersederId), superseder)
   }
+  await commitMemoryMutation(snapshot, changes)
   return record
 }
 
@@ -564,43 +667,19 @@ export async function getSupersessionChain(agentId: string, memoryId: string): P
  * Recall-refresh (DL-104-09): bump last-recalled stamps + count when a memory is actually
  * delivered toward context (the recall op / P4 insert lanes) — never on mere search hits.
  */
-export async function touchMemoryRecall(agentId: string, memoryId: string): Promise<MemoryRecord> {
-  const record = await getMemory(agentId, memoryId)
-  if (!record) throw new Error(`Memory ${memoryId} not found for agent ${agentId}.`)
-  const { iso, ts } = nowStamps()
-  record.last_recalled_at = iso
-  record.last_recalled_ts = ts
-  record.recall_count = (record.recall_count ?? 0) + 1
-  await redis.json.set(memoryKey(agentId, memoryId), '$', record as never)
-  return record
+export async function touchMemoryRecall(agentId: string, memoryId: string, options?: MemoryWriteOptions): Promise<MemoryRecord> {
+  return touchMemoryRecallRecord(agentId, memoryId, options?.lifecycle)
 }
 
-/**
- * Expiry demotes (records the demotion and moves the lane) — never erases (DL-104-02).
- *
- * BL-786: only Awareness may show its images every message, so a record that leaves Awareness
- * here keeps its images on recall (`media_mode: 'on_recall'`); left `always`, every later save of
- * it was refused and the panel hides that switch outside Awareness. Calling this again with the
- * record's current lane settles one an older demotion left `always`. The caller logs the change
- * (dreaming's `expire_demote` action).
- */
-export async function markExpiredDemotion(
-  agentId: string,
-  memoryId: string,
-  demotedTo: MemoryLane
-): Promise<MemoryRecord> {
-  assertLane(demotedTo)
-  const record = await getMemory(agentId, memoryId)
-  if (!record) throw new Error(`Memory ${memoryId} not found for agent ${agentId}.`)
-  if (!record.expires_ts) {
-    throw new Error(`Memory ${memoryId} has no expiry; demotion is an expiry-processing act.`)
-  }
-  record.expired_demoted_to = demotedTo
-  record.lane = demotedTo
-  if (demotedTo !== 'awareness' && record.media_mode === 'always') record.media_mode = 'on_recall'
-  record.updated_at = nowStamps().iso
-  await redis.json.set(memoryKey(agentId, memoryId), '$', record as never)
-  return record
+/** Settle expiry as hidden LTM; no trigger-lane demotion or content loss. */
+export async function markExpiredDemotion(agentId: string, memoryId: string, _legacyTarget?: MemoryLane, options?: MemoryWriteOptions): Promise<MemoryRecord> {
+  const snapshot = await readMemoryMutationSnapshot(agentId, { lifecycle: options?.lifecycle, targetIds: [memoryId] })
+  const record = snapshot.records.find(entry => entry.id === memoryId)
+  if (!record || memoryIsDeleted(record) || !memoryIsExpired(record)) throw new MemoryMutationError('Only an expired, non-deleted memory can be settled.')
+  const next = { ...effectiveMemoryRecord(record), expiry_processed_at: nowStamps().iso }
+  delete next.expired_demoted_to
+  await commitMemoryMutation(snapshot, new Map([[memoryKey(agentId, memoryId), next]]))
+  return next
 }
 
 // ---------------------------------------------------------------------------
@@ -707,18 +786,8 @@ export async function fetchMemorySegmentsByIds(
 }
 
 /** SA-104 P6 — recall-refresh for recalled segments (delivery-time, never search-time). */
-export async function touchMemorySegmentRecall(
-  agentId: string,
-  segmentId: string
-): Promise<MemorySegmentRecord> {
-  const record = await getMemorySegment(agentId, segmentId)
-  if (!record) throw new Error(`Memory segment ${segmentId} not found for agent ${agentId}.`)
-  const { iso, ts } = nowStamps()
-  record.last_recalled_at = iso
-  record.last_recalled_ts = ts
-  record.recall_count = (record.recall_count ?? 0) + 1
-  await redis.json.set(memorySegmentKey(agentId, segmentId), '$', record as never)
-  return record
+export async function touchMemorySegmentRecall(agentId: string, segmentId: string, options?: MemoryWriteOptions): Promise<MemorySegmentRecord> {
+  return await touchMemoryRecallRecord(agentId, segmentId, options?.lifecycle, 'segment') as unknown as MemorySegmentRecord
 }
 
 /**

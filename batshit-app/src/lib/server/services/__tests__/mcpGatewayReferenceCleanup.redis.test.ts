@@ -109,7 +109,9 @@ describe.runIf(OWNED_FIXTURE_LANE)('BL-889 owned actual RedisJSON conformance', 
     await client.sAdd(`user:${userId}:${prefix}s`, userId)
     await client.json.set(recordKey(prefix), '$', {
       defaultMCPGateways: [DEAD, LIVE], defaultMCPToolSelections: ['dead_tool', 'shared'],
-      codex_settings: { model: 'old' }, claude_settings: { model: 'old' },
+      // SA-139 R5: the sibling nested field is a provider setting (it was the removed Claude Code
+      // CLI block's model).
+      provider_specific_settings: { temperature: 0.1 },
       dcmDisplaySettings: { groups: { 'dead::gone': 'hidden', 'live::kept': 'hidden' } }
     })
   }
@@ -119,8 +121,7 @@ describe.runIf(OWNED_FIXTURE_LANE)('BL-889 owned actual RedisJSON conformance', 
       it(`${prefix}: deterministic old/new ${race} race`, async () => {
         const edit = async () => {
           if (race === 'settings') {
-            await writer.json.set(recordKey(prefix), '$.codex_settings.model', 'new')
-            await writer.json.set(recordKey(prefix), '$.claude_settings.model', 'new')
+            await writer.json.set(recordKey(prefix), '$.provider_specific_settings.temperature', 0.9)
             await writer.json.set(recordKey(prefix), '$.dcmDisplaySettings.groups["live::kept"]', 'group-only')
           } else if (race === 'selections') {
             await writer.json.set(registryKey(), '$.gateways', [gateway(LIVE), gateway('new', ['shared'])])
@@ -151,8 +152,7 @@ describe.runIf(OWNED_FIXTURE_LANE)('BL-889 owned actual RedisJSON conformance', 
         } else {
           expect(actual!.defaultMCPGateways).toEqual(race === 'selections' ? [LIVE, 'new'] : [LIVE])
           if (race === 'settings') {
-            expect(actual!.codex_settings.model).toBe('new')
-            expect(actual!.claude_settings.model).toBe('new')
+            expect(actual!.provider_specific_settings.temperature).toBe(0.9)
             expect(actual!.dcmDisplaySettings.groups['live::kept']).toBe('group-only')
           } else {
             expect(actual!.defaultMCPToolSelections).toEqual(['new_tool', 'shared'])

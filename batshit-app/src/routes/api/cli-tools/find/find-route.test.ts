@@ -40,31 +40,6 @@ describe('/api/cli-tools/find — the saved CLI tools a caller may reach (BL-686
     mocks.findCliTools.mockResolvedValue({ results: [], totalMatches: 0, query: '' })
   })
 
-  it('bounds an agent credential by its own list, whatever list the body names', async () => {
-    mocks.resolveNativeToolUser.mockResolvedValue({
-      auth: 'agent', userId: 'user-1', agentId: 'agent_a', sessionId: 'session-1',
-      cliToolScope: ['a_tool']
-    })
-    const response = await run({ query: 'b', selectedToolIds: ['b_tool'], cliToolScope: ['b_tool'] })
-    expect(response.status).toBe(200)
-    expect(mocks.findCliTools).toHaveBeenCalledWith(
-      expect.objectContaining({
-        userId: 'user-1',
-        agentId: 'agent_a',
-        cliToolScope: ['a_tool'],
-        selectedToolIds: ['b_tool']
-      })
-    )
-  })
-
-  it('gives an older agent credential with no list an empty one', async () => {
-    mocks.resolveNativeToolUser.mockResolvedValue({
-      auth: 'agent', userId: 'user-1', agentId: 'agent_a', sessionId: 'session-1'
-    })
-    await run({ query: 'a' })
-    expect(mocks.findCliTools.mock.calls[0][0].cliToolScope).toEqual([])
-  })
-
   it("leaves the signed-in lane on the named agent's saved list", async () => {
     mocks.resolveNativeToolUser.mockResolvedValue({ auth: 'session', userId: 'user-1' })
     await run({ query: 'a', agentId: 'agent_a', selectedToolIds: ['a_tool'], cliToolScope: ['b_tool'] })
@@ -72,14 +47,5 @@ describe('/api/cli-tools/find — the saved CLI tools a caller may reach (BL-686
     expect(params).not.toHaveProperty('cliToolScope')
     expect(params.agentId).toBe('agent_a')
     expect(params.selectedToolIds).toEqual(['a_tool'])
-  })
-
-  it('refuses a body agentId that differs from the bound one', async () => {
-    mocks.resolveNativeToolUser.mockResolvedValue({
-      auth: 'agent', userId: 'user-1', agentId: 'agent_a', cliToolScope: ['a_tool']
-    })
-    const response = await run({ query: 'b', agentId: 'agent_b' })
-    expect(response.status).toBe(400)
-    expect(mocks.findCliTools).not.toHaveBeenCalled()
   })
 })

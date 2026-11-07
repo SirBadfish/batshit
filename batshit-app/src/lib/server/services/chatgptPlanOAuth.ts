@@ -9,11 +9,13 @@ const TOKEN = `${ISSUER}/api/accounts/oauth/token`
 const RESOURCE = 'https://api.openai.com/v1'
 const SCOPES = 'openid profile email offline_access resource.invoke chatgpt.tokens.use.direct'
 const ATTEMPT_TIMEOUT_MS = 5 * 60_000
+const CALLBACK_TARGET_LIMIT = 24_576
+const CALLBACK_STATE_LENGTH = 43 // randomBytes(32), base64url
 type Discovery = { issuer: string; jwks_uri: string; revocation_endpoint: string }
 type Pending = {
   userId: string; sessionToken: string; state: string; nonce: string; verifier: string; redirect: string
-  epoch: string; selected?: PlanRegistration; server: Server; timer: ReturnType<typeof setTimeout>
-  controller: AbortController; consumed: boolean
+  epoch: string; selected?: PlanRegistration; server?: Server; timer: ReturnType<typeof setTimeout>
+  controller: AbortController; consumed: boolean; expiresAt: number
 }
 export type PlanAttemptStatus = { state: 'idle' | 'waiting' | 'complete' | 'error'; code?: string; accountId?: string; cleanup?: 'confirmed' | 'unconfirmed' }
 export class PlanRenewalError extends ChatgptPlanError {
@@ -37,6 +39,17 @@ function equalSecret(left: string, right: string) {
 function boundedString(value: unknown, limit = 16_384): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= limit
 }
+function boundedCallback(target: string, base: string): URL | undefined {
+  if (target.length > CALLBACK_TARGET_LIMIT) return
+  let callback: URL
+  try { callback = new URL(target, base) } catch { return }
+  if (callback.search.length > CALLBACK_TARGET_LIMIT || [...callback.searchParams].length > 32) return
+  for (const [key, value] of callback.searchParams) {
+    if (key.length > 128 || value.length > (key === 'code' ? 16_384 : key === 'state' ? CALLBACK_STATE_LENGTH : 1024)) return
+  }
+  if (callback.searchParams.get('state')?.length !== CALLBACK_STATE_LENGTH) return
+  return callback
+}
 
 /** Public OpenAI endpoints only. Injectable fetch exists for fixture proof. */
 export class ChatgptPlanOAuth {
@@ -48,8 +61,14 @@ export class ChatgptPlanOAuth {
   constructor(
     private vault: ChatgptPlanVault,
     private sessionIsValid: (token: string, userId: string) => Promise<boolean>,
-    private http: typeof fetch = fetch
-  ) {}
+    private http: typeof fetch = fetch,
+    private appCallbackOrigin?: string
+  ) {
+    if (appCallbackOrigin) {
+      const url = new URL(appCallbackOrigin)
+      if (url.origin !== appCallbackOrigin || url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port) throw new ChatgptPlanError('callback_unavailable', 'The local ChatGPT callback configuration is invalid.')
+    }
+  }
 
   private async json(url: string, init: RequestInit): Promise<Record<string, unknown>> {
     let response: Response
@@ -116,8 +135,45 @@ export class ChatgptPlanOAuth {
     this.statuses.set(userId, { state: 'idle' })
   }
   private dispose(attempt: Pending) {
-    clearTimeout(attempt.timer); attempt.server.close(); attempt.server.closeAllConnections()
+    clearTimeout(attempt.timer); attempt.server?.close(); attempt.server?.closeAllConnections()
     if (this.pending.get(attempt.userId) === attempt) this.pending.delete(attempt.userId)
+  }
+
+  /** One validator/consumer for the existing Mac listener and local app-port route. */
+  private consumeCallback(active: Pending | undefined, method: string | undefined, rawHost: string | undefined, target: string): boolean {
+    if (!active) return false
+    const callback = boundedCallback(target, active.redirect)
+    if (!callback) return false
+    if (this.closed || active.consumed || active.controller.signal.aborted || active.expiresAt <= Date.now() ||
+        this.pending.get(active.userId) !== active || method !== 'GET' || rawHost !== new URL(active.redirect).host ||
+        callback.origin !== new URL(active.redirect).origin || callback.pathname !== '/auth/callback' || callback.hash ||
+        ['state', 'code', 'client_id', 'error'].some(key => callback.searchParams.getAll(key).length > 1) ||
+        !equalSecret(callback.searchParams.get('state') ?? '', active.state)) return false
+    active.consumed = true
+    void this.complete(active, callback).catch(() => {
+      this.unconfirmedCleanup(active.userId)
+      if (this.pending.get(active.userId) === active) this.statuses.set(active.userId, { state: 'error', code: 'connection_failed', cleanup: 'unconfirmed' })
+    }).finally(() => this.dispose(active))
+    return true
+  }
+
+  receiveAppCallback(request: Request): Response {
+    const headers = { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store',
+      'Referrer-Policy': 'no-referrer', 'Content-Security-Policy': "default-src 'none'; sandbox", 'X-Content-Type-Options': 'nosniff' }
+    const refused = () => new Response('This callback is not a pending Batshit sign-in.', { status: 400, headers })
+    if (!this.appCallbackOrigin || this.closed) return refused()
+    let url: URL
+    try { if (request.url.length > CALLBACK_TARGET_LIMIT) return refused(); url = new URL(request.url) } catch { return refused() }
+    // adapter-node's configured ORIGIN may be localhost. Only its raw Host and
+    // path/query are compared to the retained literal127 callback authority.
+    if (request.method !== 'GET' || request.headers.get('host') !== new URL(this.appCallbackOrigin).host || url.pathname !== '/auth/callback' || url.hash) return refused()
+    if (!url.search) return new Response('Return to Batshit to see the connection status.', { headers })
+    if (!boundedCallback(url.pathname + url.search, this.appCallbackOrigin)) return refused()
+    const state = url.searchParams.get('state') ?? ''
+    const matches = [...this.pending.values()].filter(attempt => equalSecret(state, attempt.state))
+    if (matches.length !== 1 || !this.consumeCallback(matches[0], request.method, request.headers.get('host') ?? undefined, url.pathname + url.search)) return refused()
+    // Clean the final page URL without script, parameter echo or frontend hydration.
+    return new Response(null, { status: 303, headers: { ...headers, Location: '/auth/callback' } })
   }
   async start(userId: string, sessionToken: string, accountId?: string): Promise<string> {
     if (this.closed) throw new ChatgptPlanError('request_stopped', 'Batshit is stopping. Restart it before connecting ChatGPT.')
@@ -133,40 +189,29 @@ export class ChatgptPlanOAuth {
     this.starts.set(userId, controller)
     const state = randomBytes(32).toString('base64url'), nonce = randomBytes(32).toString('base64url'), verifier = randomBytes(48).toString('base64url')
     let attempt: Pending | undefined
-    const server = createServer((request, response) => {
+    const server = this.appCallbackOrigin ? undefined : createServer((request, response) => {
       response.setHeader('Content-Type', 'text/plain; charset=utf-8')
       response.setHeader('Cache-Control', 'no-store')
       response.setHeader('Content-Security-Policy', "default-src 'none'; sandbox")
       response.setHeader('X-Content-Type-Options', 'nosniff')
-      const active = attempt
-      let callback: URL | null = null
-      try { callback = active ? new URL(request.url ?? '/', active.redirect) : null } catch {
+      if (!this.consumeCallback(attempt, request.method, request.headers.host, request.url ?? '/')) {
         response.statusCode = 400; response.end('This callback is not a pending Batshit sign-in.'); return
       }
-      const invalid = !active || active.consumed || request.method !== 'GET' || request.headers.host !== new URL(active.redirect).host ||
-        callback?.origin !== new URL(active.redirect).origin || callback?.pathname !== '/auth/callback' || ['state', 'code', 'client_id', 'error'].some(key => callback!.searchParams.getAll(key).length > 1) ||
-        !equalSecret(callback!.searchParams.get('state') ?? '', active.state)
-      if (invalid) { response.statusCode = 400; response.end('This callback is not a pending Batshit sign-in.'); return }
-      active.consumed = true
       // Keep the response inert and generic. Never echo any callback parameter.
       response.end('Return to Batshit to see the connection status.')
-      void this.complete(active, callback!).catch(() => {
-        this.unconfirmedCleanup(active.userId)
-        if (this.pending.get(active.userId) === active) this.statuses.set(active.userId, { state: 'error', code: 'connection_failed', cleanup: 'unconfirmed' })
-      }).finally(() => this.dispose(active))
     })
     try {
-      await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve) })
+      if (server) await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve) })
       if (controller.signal.aborted || this.starts.get(userId) !== controller) throw authError('attempt_stale')
-      const address = server.address()
-      if (!address || typeof address === 'string') throw authError('listener')
-      const redirect = `http://127.0.0.1:${address.port}/auth/callback`
+      const address = server?.address()
+      if (server && (!address || typeof address === 'string')) throw authError('listener')
+      const redirect = `${this.appCallbackOrigin ?? `http://127.0.0.1:${(address as { port: number }).port}`}/auth/callback`
       const timer = setTimeout(() => {
         if (!attempt) return
         controller.abort(); this.dispose(attempt); this.statuses.set(userId, { state: 'error', code: 'sign_in_expired' })
       }, ATTEMPT_TIMEOUT_MS)
       timer.unref()
-      attempt = { userId, sessionToken, state, nonce, verifier, redirect, epoch, selected, server, timer, controller, consumed: false }
+      attempt = { userId, sessionToken, state, nonce, verifier, redirect, epoch, selected, server, timer, controller, consumed: false, expiresAt: Date.now() + ATTEMPT_TIMEOUT_MS }
       this.pending.set(userId, attempt); this.statuses.set(userId, { state: 'waiting' })
       this.starts.delete(userId)
       const url = new URL(AUTHORIZE)
@@ -177,7 +222,7 @@ export class ChatgptPlanOAuth {
       if (!selected) url.searchParams.set('agent_name_hint', 'Batshit')
       return url.href
     } catch {
-      server.close(); server.closeAllConnections()
+      server?.close(); server?.closeAllConnections()
       if (this.starts.get(userId) === controller) this.starts.delete(userId)
       throw new ChatgptPlanError('callback_unavailable', 'Batshit could not open its local sign-in callback. Try again.')
     }

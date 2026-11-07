@@ -107,6 +107,16 @@ export function sbxPolicyListArgs() {
   return ['policy', 'ls']
 }
 
+/** Exact expanded workspace mounts used by create, shared with strict pre-admission. */
+export function sbxWorkspaceMounts(options: { workspaceRoot: string; extraWorkspaces?: string[] }): string[] {
+  const home = getBatshitHomeDir()
+  const isHome = (root: string) => path.basename(root) === '.batshit' || path.resolve(root) === home
+  const extraWorkspaces = (options.extraWorkspaces ?? []).flatMap((workspace) =>
+    isHome(workspace) ? batshitHomeSandboxMountPaths(workspace, path.resolve(workspace) === home ? getDefaultBatshitHomeDir() : workspace) : [workspace]
+  )
+  return [options.workspaceRoot, ...extraWorkspaces]
+}
+
 export function sbxCreateArgs(options: {
   sandboxName: string
   workspaceRoot: string
@@ -114,15 +124,13 @@ export function sbxCreateArgs(options: {
 }) {
   const home = getBatshitHomeDir()
   const isHome = (root: string) => path.basename(root) === '.batshit' || path.resolve(root) === home
-  const extraWorkspaces = (options.extraWorkspaces ?? []).flatMap((workspace) =>
-    isHome(workspace) ? batshitHomeSandboxMountPaths(workspace, path.resolve(workspace) === home ? getDefaultBatshitHomeDir() : workspace) : [workspace]
-  )
+  const mounts = sbxWorkspaceMounts(options)
   const protectedRoots = sandboxProtectedHomeRoots()
   for (const workspace of options.extraWorkspaces ?? []) {
     if (isHome(workspace)) protectedRoots.push(...SANDBOX_BATSHIT_PROTECTED_DIRS.map((name) => path.join(workspace, name)))
     if (SANDBOX_BATSHIT_PROTECTED_DIRS.includes(path.basename(workspace)) && path.basename(path.dirname(workspace)) === '.batshit') protectedRoots.push(workspace)
   }
-  for (const workspace of [options.workspaceRoot, ...extraWorkspaces]) {
+  for (const workspace of mounts) {
     if (protectedRoots.some((agents) => overlapsProtectedHome(workspace, agents))) {
       throw new Error('Sandbox workspace exposes managed agent homes or protected runtime/Pinokio data.')
     }
@@ -134,8 +142,7 @@ export function sbxCreateArgs(options: {
     '--deny-network',
     SBX_ALL_HOSTS,
     SBX_SANDBOX_KIT,
-    options.workspaceRoot,
-    ...extraWorkspaces
+    ...mounts
   ]
 }
 

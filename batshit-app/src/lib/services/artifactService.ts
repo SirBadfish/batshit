@@ -87,12 +87,14 @@ export class ArtifactService {
   }
   
   // Get all user artifacts
-  async getArtifacts(userId: string): Promise<ArtifactRow[]> {
+  async getArtifacts(userId: string, options: { required?: boolean } = {}): Promise<ArtifactRow[]> {
     try {
       const artifacts = await this.apiCall(`?userId=${userId}`)
+      if (options.required && !Array.isArray(artifacts)) throw new Error('The saved artifact list is unreadable.')
       return artifacts as ArtifactRow[]
     } catch (error) {
       console.error('Failed to get artifacts:', error)
+      if (options.required) throw error
       return []
     }
   }

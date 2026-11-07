@@ -195,7 +195,7 @@ describe.runIf(memorySearchLaneActive())('memory manage ops + episode controls',
     expect(oldDetail.record.is_superseded).toBe('y')
   })
 
-  it('update edits fields (content change re-embeds) and delete removes explicitly', async () => {
+  it('update edits fields (content change re-embeds) and delete retains recoverable trash', async () => {
     const record = await seedMemory(AGENT, 'The original fact')
     const updated = await updateManagedMemory({ userId: USER, agentId: AGENT }, record.id, {
       content: 'The corrected fact',
@@ -208,10 +208,10 @@ describe.runIf(memorySearchLaneActive())('memory manage ops + episode controls',
 
     const deleted = await deleteManagedMemory({ userId: USER, agentId: AGENT }, record.id)
     expect(deleted.deleted).toBe(true)
-    expect(await getMemory(AGENT, record.id)).toBeNull()
+    expect(await getMemory(AGENT, record.id)).toMatchObject({ content: 'The corrected fact', deleted_ts: expect.any(Number) })
   })
 
-  it('awareness returns entries in the compile order with expiry flags', async () => {
+  it('awareness returns only unexpired entries in compile order', async () => {
     await seedMemory(AGENT, 'Low importance thought', { lane: 'awareness', importance: 3 })
     await seedMemory(AGENT, 'Critical standing fact', { lane: 'awareness', importance: 9 })
     await seedMemory(AGENT, 'Expired reminder', {
@@ -222,9 +222,9 @@ describe.runIf(memorySearchLaneActive())('memory manage ops + episode controls',
     await seedMemory(AGENT, 'Not awareness', { lane: 'ltm', importance: 10 })
 
     const result = await getManagedAwareness({ userId: USER, agentId: AGENT })
-    expect(result.entries).toHaveLength(3)
+    expect(result.entries).toHaveLength(2)
     expect(result.entries[0].content).toBe('Critical standing fact')
-    expect(result.entries.map((entry) => entry.expired)).toEqual([false, true, false])
+    expect(result.entries.map((entry) => entry.expired)).toEqual([false, false])
     expect((result.entries[0] as any).embedding).toBeUndefined()
   })
 

@@ -10,8 +10,8 @@
  *   compresses as a dead copy (DL-01). `release` clears it, exactly like the Zip Manager's return
  *   to automatic. The user wins: an agent never releases, overrides, or re-holds what the user
  *   holds or zipped by hand.
- * - **The parked zip-control actions (DL-06).** `unzip` / `zip` by zip id, applied only when the
- *   hidden zip-control permission is ON, with the chat page's old rules.
+ * - **Agent zip control is retired** (decision 7, Josh 2026-10-23): a reply's `unzip` / `zip` actions
+ *   are refused at the reply end (`replyControlFinalize.ts`), so nothing here applies them.
  * - **The countdown (DL-08).** One count per message the chat gains (`advanceZipCountdowns`).
  *
  * It writes the very keys the `/api/unzipping` routes and `zipStateInferred.ts` write, in the
@@ -32,7 +32,7 @@ import { countOneMoreMessage, isZipStateSource, type UnzippedItem, type ZipState
 import { buildControlErrorRecord, type ControlErrorRecord } from '$lib/utils/controlTags'
 import { parseCoolToolPayload } from '$lib/utils/coolToolAiContent'
 import { normalizeId } from '$lib/utils/idNormalizer'
-import { TOOL_NOTES_BLOCK_HINT } from '$lib/utils/replyControl'
+import { toolNotesBlockHint } from '$lib/utils/replyControl'
 import type { ToolNotesHoldBlock } from '$lib/utils/zipControl'
 import {
   describeHeldPath,
@@ -40,9 +40,12 @@ import {
   holdPathKeys,
   type DeadCopyToolResult
 } from '$lib/utils/zipDeadCopies'
-import { resolveZipControlZipIds } from '$lib/utils/zipControl'
-import { collectTrustedZipIdsFromMetadata } from '$lib/utils/zipReferenceSafety'
+import { readFileReadSource } from '$lib/utils/fileReadSource'
 import { withZipStateLock } from './zipStateLock'
+import { agentMayWriteZipState } from './zipHoldAgentState'
+export { markAgentBeingDeleted } from './zipHoldAgentState'
+import { closeSkillSession, retainSkillSessionRead, closeSkillSessionFromZipAction } from './skillSessions'
+import { isBareSkillId } from '$lib/utils/skillSessions'
 import { tooLargeCoolToolHoldTokens } from './toolResultHoldAdmission'
 import { resolveSessionZipForHold } from './resolveSessionZipForHold'
 
@@ -55,7 +58,7 @@ async function loadUnzippedItems(sessionId: string): Promise<UnzippedItem[]> {
   const ids = (await redis.sMembers(`unzipped:${sessionId}`)) ?? []
   const items: UnzippedItem[] = []
   for (const zipId of ids) {
-    const raw = (await redis.get(`unzipped_item:${sessionId}:${zipId}`)) as Record<string, unknown> | null
+    const raw = (await redis.json.get(`unzipped_item:${sessionId}:${zipId}`)) as Record<string, unknown> | null
     if (!raw || typeof raw !== 'object') continue
     items.push({ permanent: false, unzippedAt: 0, ...(raw as any), zipId, sessionId })
   }
@@ -63,7 +66,7 @@ async function loadUnzippedItems(sessionId: string): Promise<UnzippedItem[]> {
 }
 
 async function readRezipSource(sessionId: string, zipId: string): Promise<ZipStateSource | null> {
-  const raw = (await redis.get(`rezipped_item:${sessionId}:${zipId}`)) as { source?: unknown } | null
+  const raw = (await redis.json.get(`rezipped_item:${sessionId}:${zipId}`)) as { source?: unknown } | null
   if (!raw) {
     const marked = ((await redis.sMembers(`rezipped:${sessionId}`)) ?? []).includes(zipId)
     return marked ? 'user' : null
@@ -140,32 +143,6 @@ function isUserOwned(source: unknown): boolean {
  * In-process, like the zip state lock the check runs under: Batshit is one app process per
  * instance, and a turn can only run in the process that deletes its agent.
  */
-const agentsBeingDeleted = new Map<string, number>()
-
-/** Marks an agent as being deleted until the returned function is called (once). */
-export function markAgentBeingDeleted(agentId: string): () => void {
-  agentsBeingDeleted.set(agentId, (agentsBeingDeleted.get(agentId) ?? 0) + 1)
-  let released = false
-  return () => {
-    if (released) return
-    released = true
-    const left = (agentsBeingDeleted.get(agentId) ?? 1) - 1
-    if (left > 0) agentsBeingDeleted.set(agentId, left)
-    else agentsBeingDeleted.delete(agentId)
-  }
-}
-
-/**
- * May this agent write zip state (a hold, a release, a parked zip action)? Not while its delete is
- * under way, and not once its record is gone (a turn that outlived the delete). Read under the
- * chat's zip state lock, which the release takes chat by chat too, so a step either lands before
- * the release reaches its chat (and is released there) or sees the mark.
- */
-async function agentMayWriteZipState(agentId: string): Promise<boolean> {
-  if (agentsBeingDeleted.has(agentId)) return false
-  return redis.exists(`agent:${agentId}`)
-}
-
 const DELETED_AGENT_HOLD_ERROR =
   'This agent is being deleted, so its holds and releases were not applied.'
 
@@ -236,7 +213,7 @@ class AuthorReads {
     if (!this.zips.has(zipId)) {
       this.zips.set(
         zipId,
-        redis.getZip(zipId).catch(() => null)
+        redis.json.get(`zip:${zipId}`)
       )
     }
     return this.zips.get(zipId)!
@@ -253,9 +230,10 @@ class AuthorReads {
         const zipId = refs[refIndex].id
         const zipData = await this.zip(zipId)
         if (!zipData || zipData.type !== 'cool_tool') continue
-        const result: Pick<DeadCopyToolResult, 'operationKind' | 'payload'> = {
+        const result: Pick<DeadCopyToolResult, 'operationKind' | 'payload' | 'fileReadSource'> = {
           operationKind: typeof zipData.metadata?.operationKind === 'string' ? zipData.metadata.operationKind : null,
-          payload: parseCoolToolPayload(zipData.content)
+          payload: parseCoolToolPayload(zipData.content),
+          fileReadSource: readFileReadSource(zipData.metadata?.fileReadSource)
         }
         const effect = describeToolResultFiles(result, { projectPath: this.projectPath })
         if (effect.kind !== 'read') continue
@@ -283,8 +261,10 @@ export interface AgentHoldChanges {
   failure?: string
 }
 
-function holdError(error: string): ControlErrorRecord {
-  return buildControlErrorRecord(HOLD_TAG, error, TOOL_NOTES_BLOCK_HINT)
+/** BL-1785: the fix line names notes only for an agent that has Tool Notes on. */
+function holdErrorFor(input: AgentHoldInput): (error: string) => ControlErrorRecord {
+  const hint = toolNotesBlockHint(input.toolNotesEnabled !== false)
+  return (error) => buildControlErrorRecord(HOLD_TAG, error, hint)
 }
 
 interface AgentHoldInput {
@@ -298,6 +278,8 @@ interface AgentHoldInput {
    */
   blocks: ToolNotesHoldBlock[]
   currentReply: ReplyForHolds | null
+  /** The agent's Tool Notes setting (absent reads as on): the refusals' fix line follows it. */
+  toolNotesEnabled?: boolean
 }
 
 /**
@@ -322,6 +304,7 @@ export async function applyAgentHoldChanges(input: AgentHoldInput): Promise<Agen
 }
 
 async function applyAgentHoldChangesLocked(input: AgentHoldInput, changes: AgentHoldChanges): Promise<void> {
+  const holdError = holdErrorFor(input)
   const { sessionId, agentId, projectPath } = input
   const items = await loadUnzippedItems(sessionId)
   // Set members already are state IDs. normalizeId is not idempotent for all-digit zip tails.
@@ -342,9 +325,25 @@ async function applyAgentHoldChangesLocked(input: AgentHoldInput, changes: Agent
 
   for (const block of input.blocks) {
     for (const path of block.release) {
+      if (isBareSkillId(path)) {
+        const agent = await redis.json.get(`agent:${agentId}`) as any
+        const closed = await closeSkillSession({ userId: agent.user_id, sessionId, agentId, skillId: path, provenance: 'agent' })
+        if (closed.status === 'closed') {
+          for (const zipId of closed.changedZipIds) changes.released.push({ path, zipId })
+          myHolds = myHolds.filter((hold) => !closed.changedZipIds.includes(hold.zipId))
+          for (const zipId of closed.changedZipIds) itemsByZip.delete(zipId)
+          continue
+        }
+        if (closed.status === 'refused') { changes.errors.push(holdError(closed.reason!)); continue }
+      }
       const keys = keysOf(path)
       const mine = myHolds.filter((hold) => keys.includes(hold.path as string))
       if (mine.length > 0) {
+        const skill = mine.find((hold) => hold.skillSession)?.skillSession?.skillId
+        if (skill) {
+          changes.errors.push(holdError(`This read belongs to open skill ${skill}. Close the skill with its bare id in release: ["${skill}"].`))
+          continue
+        }
         for (const hold of mine) {
           await returnToAutomatic(sessionId, hold.zipId)
           itemsByZip.delete(hold.zipId)
@@ -372,7 +371,7 @@ async function applyAgentHoldChangesLocked(input: AgentHoldInput, changes: Agent
       }
       const alreadyHeld = myHolds.find((hold) => keys.includes(hold.path as string))
       if (alreadyHeld) {
-        const resolved = await resolveSessionZipForHold(sessionId, alreadyHeld.zipId)
+        const resolved = await resolveSessionZipForHold(sessionId, alreadyHeld.zipId, { strict: true })
         if (resolved.status !== 'found') {
           changes.errors.push(holdError(`Cannot verify the existing Hold of ${path}: its zip is ${resolved.status}; nothing was changed.`))
           continue
@@ -382,6 +381,10 @@ async function applyAgentHoldChangesLocked(input: AgentHoldInput, changes: Agent
           changes.errors.push(
             holdError(`Cannot hold ${path}: this result is about ${Math.ceil(tooLargeTokens).toLocaleString('en-US')} tokens and is too large to open. Fetch it in parts.`)
           )
+        } else if (alreadyHeld.skillSession) {
+          const agent = await redis.json.get(`agent:${agentId}`) as any
+          const retained = await retainSkillSessionRead({ userId: agent.user_id, sessionId, agentId, zipId: alreadyHeld.zipId })
+          changes.held.push(...retained.map((zipId) => ({ path, zipId })))
         }
         continue
       }
@@ -392,7 +395,7 @@ async function applyAgentHoldChangesLocked(input: AgentHoldInput, changes: Agent
         )
         continue
       }
-      const resolved = await resolveSessionZipForHold(sessionId, newest.rawZipId)
+      const resolved = await resolveSessionZipForHold(sessionId, newest.rawZipId, { strict: true })
       if (resolved.status !== 'found') {
         changes.errors.push(holdError(`Cannot hold ${path}: its zip is ${resolved.status}; nothing was changed.`))
         continue
@@ -433,6 +436,9 @@ async function applyAgentHoldChangesLocked(input: AgentHoldInput, changes: Agent
   // The hold follows the file: a newer whole read takes it, and the older copy compresses as a
   // dead copy (DL-01). A newer copy the user holds or zipped keeps the user's state.
   for (const hold of myHolds) {
+    // Skill lifecycle owns every admitted window. Its whole-read replacement is decided by
+    // the ordinary dead-copy ledger, never by moving a window's hold onto another window.
+    if (hold.skillSession) continue
     const newest = await reads.newestWholeRead([hold.path as string])
     const from = hold.zipId
     if (!newest || newest.zipId === from) continue
@@ -447,7 +453,7 @@ async function applyAgentHoldChangesLocked(input: AgentHoldInput, changes: Agent
       }
       continue
     }
-    const resolved = await resolveSessionZipForHold(sessionId, newest.rawZipId)
+    const resolved = await resolveSessionZipForHold(sessionId, newest.rawZipId, { strict: true })
     if (resolved.status !== 'found') {
       if (input.currentReply?.zipIds.includes(newest.rawZipId)) {
         changes.errors.push(holdError(`Your hold of ${describeHeldPath(hold.path as string)} stayed on the earlier read: the newer zip is ${resolved.status}.`))
@@ -477,9 +483,9 @@ async function applyAgentHoldChangesLocked(input: AgentHoldInput, changes: Agent
  * would otherwise stay open for good against Josh's rule that deleting an agent deletes
  * everything about it (2026-09-19). Each hold returns to the automatic rules, exactly like a
  * Release (all four key families of that zip). A hold of an agent that is only no longer the
- * chat's agent is NOT this: it stays until the user releases it. The parked zip-control unzip
- * carries the agent too since BL-539, so it goes as well (one written before BL-539 has no
- * `agentId` and stays until the user releases it).
+ * chat's agent is NOT this: it stays until the user releases it. A stored unzip from the retired
+ * agent zip control carries the agent too since BL-539, so it goes as well (one written before
+ * BL-539 has no `agentId` and stays until the user releases it); nothing writes one any more.
  *
  * It reads the chats of the agent's user (`user:{userId}:sessions`, the list every chat is
  * created into, archived ones included) and each chat's held set, the set every reader of zip
@@ -516,176 +522,6 @@ export async function releaseDeletedAgentHolds(agentId: string): Promise<Array<{
 }
 
 // ---------------------------------------------------------------------------------------------
-// The parked zip-control actions (DL-06)
-
-export interface LegacyZipActionOutcome {
-  unzipped: string[]
-  zipped: string[]
-  /** Refused unzip actions that must reach the reply's visible controlErrors. */
-  errors?: ControlErrorRecord[]
-  /** Set when an error stopped the step part way (BL-353); the lists are what WAS written. */
-  failure?: string
-}
-
-const ZIP_CONTROL_TAG = 'batshit-zip-control'
-const ZIP_CONTROL_REFUSED_HINT = 'Check Current Zip State; only the user changes what the user holds or zipped.'
-
-function zipControlError(error: string, hint = ZIP_CONTROL_REFUSED_HINT): ControlErrorRecord {
-  return buildControlErrorRecord(ZIP_CONTROL_TAG, error, hint)
-}
-
-/**
- * The legacy `unzip` / `zip` actions of a `<batshit-zip-control>` block, with the rules the chat
- * page applied: ids resolve through `tool_result_N` aliases and the chat's trusted zip ids; a
- * user's unzip is a lock the agent can neither zip nor re-unzip; an agent's unzip is permanent.
- * Called only when the hidden zip-control permission is ON. Never throws: an error part way
- * returns what was written before it, with `failure` set (BL-353).
- *
- * BL-360: the user wins here exactly as on the hold path. The user's "Zip now" (a rezip marker
- * with `source: 'user'`) is a lock too: an `unzip` would delete it (`writeUnzippedItem`) and a
- * `zip` would rewrite it as the agent's, so both are refused. Every refused action, an id that
- * matches nothing in this chat included, is a loud `controlErrors` line that names the reason;
- * none is skipped without a word. An `unzip` of a result an agent already holds open changes
- * nothing and asks for nothing, so it is not a refusal.
- */
-export async function applyLegacyAgentZipActions(input: {
-  sessionId: string
-  /** The agent that wrote the reply; its unzips carry it, so deleting it releases them (BL-539). */
-  agentId: string
-  unzip: string[]
-  zip: string[]
-  currentReply: ReplyForHolds
-  currentToolZipIds: string[]
-}): Promise<LegacyZipActionOutcome> {
-  const outcome: LegacyZipActionOutcome = { unzipped: [], zipped: [] }
-  if (input.unzip.length === 0 && input.zip.length === 0) return outcome
-  try {
-    await applyLegacyAgentZipActionsInto(input, outcome)
-  } catch (error) {
-    outcome.failure = error instanceof Error ? error.message : String(error)
-  }
-  if (outcome.errors?.length === 0) delete outcome.errors
-  return outcome
-}
-
-async function applyLegacyAgentZipActionsInto(
-  input: Parameters<typeof applyLegacyAgentZipActions>[0],
-  outcome: LegacyZipActionOutcome
-): Promise<void> {
-  const { sessionId } = input
-
-  const sessionZipIds = new Set<string>(input.currentReply.zipIds)
-  for (const message of (await redis.getSessionMessages(sessionId)) as any[]) {
-    for (const id of collectTrustedZipIdsFromMetadata(message?.metadata)) sessionZipIds.add(id)
-    if (typeof message?.content === 'string' && message.content.includes('{{batshit-zip:')) {
-      for (const zip of listCompilableZips(message.content, message)) sessionZipIds.add(zip.id)
-    }
-  }
-  const available = Array.from(sessionZipIds)
-  const resolveOptions = { currentToolZipIds: input.currentToolZipIds }
-  const unzipIds = resolveZipControlZipIds(input.unzip, available, resolveOptions)
-  const zipIds = resolveZipControlZipIds(input.zip, available, resolveOptions)
-  const errors = (outcome.errors ??= [])
-  // BL-360: an id that matches no result in this chat used to vanish without a word.
-  for (const [action, requested] of [['unzip', input.unzip], ['zip', input.zip]] as const) {
-    for (const id of requested) {
-      if (typeof id !== 'string' || !id.trim()) continue
-      if (resolveZipControlZipIds([id], available, resolveOptions).length > 0) continue
-      errors.push(
-        zipControlError(
-          `Nothing in this chat matches ${id.trim()}, so nothing was ${action === 'unzip' ? 'unzipped' : 'zipped'}.`,
-          'Use tool_result_N (from 1) for this reply\'s results, or a zip ID from <zip_index>.'
-        )
-      )
-    }
-  }
-
-  await withZipStateLock(sessionId, async () => {
-    // BL-606: an agent being deleted writes no zip state; the step's failure line says so.
-    if (!(await agentMayWriteZipState(input.agentId))) {
-      throw new Error(DELETED_AGENT_HOLD_ERROR)
-    }
-    const items = await loadUnzippedItems(sessionId)
-    const byZip = new Map(items.map((item) => [item.zipId, item]))
-
-    for (const raw of zipIds) {
-      const zipId = normalizeId(raw)
-      const current = byZip.get(zipId)
-      if (current && isUserOwned(current.source)) {
-        errors.push(zipControlError(`The user holds ${raw}, so it stays open; only the user can zip it.`))
-        continue
-      }
-      // The user's "Zip now" stays the user's: rewriting its marker as the agent's would let a
-      // later agent unzip undo it.
-      if ((await readRezipSource(sessionId, zipId)) === 'user') {
-        errors.push(zipControlError(`The user already zipped ${raw} by hand; your zip was not needed.`))
-        continue
-      }
-      // One MULTI, like a Release (BL-537).
-      await redis.execute(async (client) => {
-        await client
-          .multi()
-          .sRem(`unzipped:${sessionId}`, zipId)
-          .del(`unzipped_item:${sessionId}:${zipId}`)
-          .sAdd(`rezipped:${sessionId}`, zipId)
-          .json.set(`rezipped_item:${sessionId}:${zipId}`, '$', {
-            zipId,
-            sessionId,
-            source: 'agent',
-            rezippedAt: Date.now()
-          } as any)
-          .exec()
-      })
-      byZip.delete(zipId)
-      outcome.zipped.push(raw)
-    }
-
-    for (const raw of unzipIds) {
-      const zipId = normalizeId(raw)
-      const current = byZip.get(zipId)
-      const zipData = await redis.getZip(raw).catch(() => null)
-      const tooLargeTokens = await tooLargeCoolToolHoldTokens(zipData)
-      if (tooLargeTokens !== null) {
-        errors.push(
-          zipControlError(
-            `Cannot unzip ${raw}: this result is about ${Math.ceil(tooLargeTokens).toLocaleString('en-US')} tokens and is too large to open.`,
-            'Fetch the result in parts instead.'
-          )
-        )
-        continue
-      }
-      if (current && isUserOwned(current.source)) {
-        errors.push(zipControlError(`The user already holds ${raw}; your unzip was not needed.`))
-        continue
-      }
-      // Already open through an agent's hold: nothing changes and nothing was refused.
-      if (current && current.source === 'agent') continue
-      // BL-360: the user's "Zip now" is a lock. `writeUnzippedItem` deletes the rezip marker, so
-      // without this check a legacy unzip undid it.
-      if ((await readRezipSource(sessionId, zipId)) === 'user') {
-        errors.push(
-          zipControlError(`The user zipped ${raw} by hand, so it stays compressed; ask the user if you need it open.`)
-        )
-        continue
-      }
-      const item: UnzippedItem = {
-        zipId,
-        sessionId,
-        permanent: true,
-        unzippedAt: Date.now(),
-        messageCount: 0,
-        ...zipLabels(zipData),
-        source: 'agent',
-        agentId: input.agentId
-      }
-      await writeUnzippedItem(sessionId, item)
-      byZip.set(zipId, item)
-      outcome.unzipped.push(raw)
-    }
-  })
-}
-
-// ---------------------------------------------------------------------------------------------
 // The countdown (DL-08)
 
 /**
@@ -703,8 +539,18 @@ export async function advanceZipCountdowns(sessionId: string): Promise<{ counted
     const temporary = items.filter((item) => !item.permanent && typeof item.duration === 'number')
     if (temporary.length === 0) return { counted: [], ended: [] }
     const { kept, ended } = countOneMoreMessage(temporary)
-    for (const item of ended) await returnToAutomatic(sessionId, item.zipId)
-    for (const item of kept) await redis.set(`unzipped_item:${sessionId}:${item.zipId}`, item)
+    for (const item of ended) {
+      const session = item.skillSessionUserHold ? await redis.json.get(`session:${sessionId}`) as any : null
+      const closed = session?.user_id ? await closeSkillSessionFromZipAction({ userId: session.user_id, sessionId,
+        zipId: item.zipId, reason: 'expiry', expectedExpiry: item.skillSessionUserHold }) : null
+      if (!closed) await returnToAutomatic(sessionId, item.zipId)
+    }
+    for (const item of kept) {
+      // A first expired window may just have detached another explicit temporary hold.
+      // Count its CURRENT record; never resurrect stale lifecycle/expiry metadata.
+      const current = await redis.json.get(`unzipped_item:${sessionId}:${item.zipId}`) as UnzippedItem | null
+      if (current && !current.permanent) await redis.json.set(`unzipped_item:${sessionId}:${item.zipId}`, '$', { ...current, messageCount: item.messageCount } as any)
+    }
     return { counted: kept.map((item) => item.zipId), ended: ended.map((item) => item.zipId) }
   })
 }

@@ -31,6 +31,7 @@ export const SETTINGS_FIELDS = {
   tools: [
     { id: 'zipViewMode', label: 'AI zip layout', type: 'enum', access: 'read_only' },
     { id: 'toolNotes', label: 'Tool Notes', type: 'boolean', access: 'read_only' },
+    { id: 'liveFileReads', label: 'Refreshed File Reads', type: 'boolean', access: 'read_only' },
     { id: 'credentialsAndAccess', label: 'Gateway credentials and tool access', type: 'string', access: 'human_only' }
   ],
   artifacts: [{ id: 'entityCount', label: 'Saved artifacts', type: 'integer', access: 'read_only' }],
@@ -54,7 +55,7 @@ export const SETTINGS_FIELDS = {
     { id: 'providersAndDevices', label: 'Providers, engines and devices', type: 'string', access: 'masked' }
   ],
   icons: [{ id: 'library', label: 'Icon Library', type: 'string', access: 'unavailable', reason: 'Icon inspection requires its existing library owner.' }],
-  theme: [{ id: 'theme', label: 'Themes', type: 'string', access: 'unavailable', reason: 'Themes is a placeholder; theme modification is not implemented.' }],
+  theme: [{ id: 'theme', label: 'Themes', type: 'string', access: 'unavailable', reason: 'Themes holds the app look (Cave, Minimal or OG); only the user changes it in Settings.' }],
   clips: [
     { id: 'compressImages', label: 'Compress images', type: 'boolean', access: 'read_only' },
     { id: 'compressionQuality', label: 'Image quality', type: 'integer', access: 'read_only' },

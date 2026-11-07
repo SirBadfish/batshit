@@ -1,21 +1,27 @@
 import { describe, expect, it } from 'vitest'
 import { createReference, extractAllReferences } from './universalResolver'
+import { extractZips } from './messageCompiler'
+import { isConcreteZipId, scanClipReferences, scanZipReferences } from '$lib/utils/zipReferenceSafety'
 import { unclosedReferenceReplies } from '$lib/test-utils/unclosedReferenceReplies'
 
 /**
- * The literal pattern `extractAllReferences` used, kept here only as the oracle: the scan must
- * find exactly its references, types, ids, and contents, in order. Its lazy id and `[^}]+`
- * content searched the rest of the text again from every opener.
+ * BL-609: the compile's resolver reads zip and clip references with the trust reader's shapes
+ * (`scanZipReferences`, `scanClipReferences`), in one left-to-right pass: a reference inside an
+ * earlier reference's description is part of it. The two shared patterns joined into one are
+ * the oracle here: the scan must find exactly its references, types, ids, and contents, in order.
+ * (Its older pattern, `/\{\{(batshit-zip|batshit-clip):([^:]+?)(?::::([^}]+))?\}\}/g`, read an id
+ * with braces and line breaks and refused an empty description.)
  */
-const OLD_UNIVERSAL_REGEX = /\{\{(batshit-zip|batshit-clip):([^:]+?)(?::::([^}]+))?\}\}/g
+const SHARED_REFERENCE_REGEX =
+  /\{\{batshit-(?:zip:([^:{}\r\n]{1,160})|clip:([^:}\s]+))(?::::([^}]*))?\}\}/g
 
-function oldExtractAllReferences(text: string) {
-  return Array.from(text.matchAll(OLD_UNIVERSAL_REGEX), (match) => {
-    const [fullMatch, fullTypeStr, id, optionalContent] = match
+function sharedExtractAllReferences(text: string) {
+  return Array.from(text.matchAll(SHARED_REFERENCE_REGEX), (match) => {
+    const [fullMatch, zipId, clipId, optionalContent] = match
     return {
       fullMatch,
-      type: fullTypeStr.replace('batshit-', '') as 'zip' | 'clip',
-      id,
+      type: (zipId !== undefined ? 'zip' : 'clip') as 'zip' | 'clip',
+      id: zipId ?? clipId,
       optionalContent: optionalContent || undefined
     }
   })
@@ -103,12 +109,39 @@ const CASES = [
 ]
 
 describe('extractAllReferences', () => {
-  it('finds exactly the references the literal old pattern found', () => {
+  it('reads an odd reference exactly as the trust reader reads one', () => {
+    const ZIP = 'cool_tool_1790500000000_abcde'
+    const long = `cool_tool_${'1'.repeat(150)}_abcde`
+    // An empty description and a spaced id are references; a `{`, a line break, or more than 160
+    // characters in a zip id are not, and a clip id holds no whitespace.
+    expect(extractAllReferences(`{{batshit-zip:${ZIP}:::}}`)).toEqual([
+      { fullMatch: `{{batshit-zip:${ZIP}:::}}`, type: 'zip', id: ZIP, optionalContent: undefined }
+    ])
+    expect(extractAllReferences('{{batshit-zip:a b:::c}}').map((ref) => ref.id)).toEqual(['a b'])
+    for (const odd of ['{{batshit-zip:a{b:::c}}', '{{batshit-zip:a\nb}}', `{{batshit-zip:${long}}}`, '{{batshit-clip:a b}}']) {
+      expect(extractAllReferences(odd), JSON.stringify(odd)).toEqual([])
+    }
+    // One pass: a clip reference inside a zip reference's description is part of it.
+    const nested = `{{batshit-zip:${ZIP}:::see {{batshit-clip:clip_1}} then {{batshit-clip:clip_2}}`
+    expect(extractAllReferences(nested).map((ref) => [ref.type, ref.id])).toEqual([
+      ['zip', ZIP],
+      ['clip', 'clip_2']
+    ])
+  })
+
+  it('finds exactly the references the shared patterns find, and each one the shape reads', () => {
     const texts = [...CASES, ...generateTokenTexts(3_000, 17), ...generateReferenceTexts(6_000, 2172)]
     let withReferences = 0
     let openersOnly = 0
     for (const text of texts) {
-      const expected = oldExtractAllReferences(text)
+      const expected = sharedExtractAllReferences(text)
+      // With one kind only, the shape's own scan is the answer.
+      if (!text.includes('{{batshit-clip:')) {
+        expect(expected.map((ref) => ref.fullMatch), JSON.stringify(text)).toEqual(scanZipReferences(text).map((ref) => ref.match))
+      }
+      if (!text.includes('{{batshit-zip:')) {
+        expect(expected.map((ref) => ref.fullMatch), JSON.stringify(text)).toEqual(scanClipReferences(text).map((ref) => ref.match))
+      }
       expect(extractAllReferences(text), JSON.stringify(text)).toEqual(expected)
       if (expected.length > 0) withReferences++
       else if (text.includes('{{batshit-zip:') || text.includes('{{batshit-clip:')) openersOnly++
@@ -123,6 +156,19 @@ describe('extractAllReferences', () => {
       const started = performance.now()
       expect(extractAllReferences(text), shape).toEqual([])
       expect(performance.now() - started, shape).toBeLessThan(200)
+    }
+  })
+
+  it('the compile extracts each concrete zip the shape reads (extractZips)', () => {
+    const ZIP = 'cool_tool_1790500000000_abcde'
+    // A reference Batshit writes with an empty description (`zipService.ts`) is a zip in the
+    // compile, as in the chat view; the older resolver left it in the prompt as raw text.
+    expect(extractZips(`Read: {{batshit-zip:${ZIP}:::}}`).map((zip) => zip.id)).toEqual([ZIP])
+    for (const text of [...CASES, ...generateTokenTexts(1_000, 609), ...generateReferenceTexts(2_000, 6_090)]) {
+      if (text.includes('{{batshit-clip:')) continue
+      expect(extractZips(text).map((zip) => zip.id), JSON.stringify(text)).toEqual(
+        scanZipReferences(text).map((ref) => ref.id).filter((id) => isConcreteZipId(id))
+      )
     }
   })
 

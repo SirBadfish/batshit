@@ -26,6 +26,35 @@ import { redis } from '$lib/server/redis'
 import { isZipStateSource, type UnzippedItem, type ZipStateSource } from '$lib/services/zipping'
 import { normalizeId } from '$lib/utils/idNormalizer'
 import { withZipStateLock } from './zipStateLock'
+import { classifyStoredSkillReadZip } from '$lib/utils/skillReadZip'
+
+export type InferredZipWriteSkipReason = 'source_unavailable' | 'unknown_source' | 'skill_lifecycle' | 'explicit_state'
+export interface InferredZipWriteOptions {
+  /** Route-owned receipt collector: the EV row reports why a proposed change did not apply. */
+  onSkipped?: (skip: { zipId: string; reason: InferredZipWriteSkipReason }) => void
+}
+
+function reportSkipped(options: InferredZipWriteOptions | undefined, zipId: string, reason: InferredZipWriteSkipReason): void {
+  if (reason === 'source_unavailable' || reason === 'unknown_source') {
+    console.warn('[Judge Juice] Smart Zip left a result unchanged: its stored source could not be verified.', { zipId, reason })
+  }
+  try { options?.onSkipped?.({ zipId, reason }) } catch {
+    console.warn('[Judge Juice] Smart Zip could not attach a skipped-change receipt.', { zipId, reason })
+  }
+}
+
+/** A null-catching facade cannot prove non-skill identity. Read the source with the throwing owner. */
+async function admitsNonSkillSource(zipId: string, options?: InferredZipWriteOptions): Promise<boolean> {
+  let source: unknown
+  try { source = await redis.json.get(`zip:${zipId}`) } catch {
+    reportSkipped(options, zipId, 'source_unavailable')
+    return false
+  }
+  const kind = classifyStoredSkillReadZip(source)
+  if (kind === 'non_skill') return true
+  reportSkipped(options, zipId, kind === 'skill' ? 'skill_lifecycle' : 'unknown_source')
+  return false
+}
 
 export interface InferredUnzipInput {
   zipId: string
@@ -85,17 +114,24 @@ export async function loadRezippedSources(
  * unzipped by anyone, or that a user or an agent zipped by hand (only Jev's own earlier rezip
  * may be reopened by Jev). Returns the ids it really opened.
  */
-export async function writeInferredUnzips(sessionId: string, items: InferredUnzipInput[]): Promise<string[]> {
+export async function writeInferredUnzips(sessionId: string, items: InferredUnzipInput[], options?: InferredZipWriteOptions): Promise<string[]> {
   return withZipStateLock(sessionId, async () => {
     const written: string[] = []
     for (const item of items) {
       if (!item?.zipId) continue
+      if (!await admitsNonSkillSource(item.zipId, options)) continue
       const zipId = normalizeId(item.zipId)
       const unzippedKey = `unzipped_item:${sessionId}:${zipId}`
       const rezippedKey = `rezipped_item:${sessionId}:${zipId}`
-      if ((await readStateSource(unzippedKey)) !== null) continue
+      if ((await readStateSource(unzippedKey)) !== null) {
+        reportSkipped(options, item.zipId, 'explicit_state')
+        continue
+      }
       const rezippedBy = await readStateSource(rezippedKey)
-      if (rezippedBy !== null && rezippedBy !== 'inferred') continue
+      if (rezippedBy !== null && rezippedBy !== 'inferred') {
+        reportSkipped(options, item.zipId, 'explicit_state')
+        continue
+      }
 
       const record: UnzippedItem & { inferredProbability: number } = {
         zipId,
@@ -126,17 +162,24 @@ export async function writeInferredUnzips(sessionId: string, items: InferredUnzi
  * agent unzip is the agent's own explicit choice), and never replaces a hand-made rezip.
  * Jev's own temporary unzip is closed. Returns the ids it really zipped.
  */
-export async function writeInferredRezips(sessionId: string, items: InferredRezipInput[]): Promise<string[]> {
+export async function writeInferredRezips(sessionId: string, items: InferredRezipInput[], options?: InferredZipWriteOptions): Promise<string[]> {
   return withZipStateLock(sessionId, async () => {
     const written: string[] = []
     for (const item of items) {
       if (!item?.zipId) continue
+      if (!await admitsNonSkillSource(item.zipId, options)) continue
       const zipId = normalizeId(item.zipId)
       const unzippedKey = `unzipped_item:${sessionId}:${zipId}`
       const rezippedKey = `rezipped_item:${sessionId}:${zipId}`
       const unzippedBy = await readStateSource(unzippedKey)
-      if (unzippedBy !== null && unzippedBy !== 'inferred') continue
-      if ((await readStateSource(rezippedKey)) !== null) continue
+      if (unzippedBy !== null && unzippedBy !== 'inferred') {
+        reportSkipped(options, item.zipId, 'explicit_state')
+        continue
+      }
+      if ((await readStateSource(rezippedKey)) !== null) {
+        reportSkipped(options, item.zipId, 'explicit_state')
+        continue
+      }
 
       const marker: InferredRezipMarker = {
         zipId,
@@ -181,11 +224,16 @@ export async function loadUntoldInferredRezips(sessionId: string): Promise<Infer
   return markers.sort((a, b) => a.rezippedAt - b.rezippedAt)
 }
 
-/** Marks Jev's rezips as told, once the send that told the agent was accepted. A marker that changed hands meanwhile is left alone. */
+/**
+ * Marks Jev's rezips as told, once the send that told the agent was accepted. A marker that changed
+ * hands meanwhile is left alone. `zipIds` are the state ids `loadUntoldInferredRezips` listed (the
+ * `rezipped:` set's members), so they are used as they are: `normalizeId` cuts an all-digit tail
+ * again, which missed the marker and told the agent the same rezip every turn (BL-1515 class).
+ */
 export async function markInferredRezipsTold(sessionId: string, zipIds: string[]): Promise<void> {
   await withZipStateLock(sessionId, async () => {
-    for (const rawId of zipIds) {
-      const key = `rezipped_item:${sessionId}:${normalizeId(rawId)}`
+    for (const stateId of zipIds) {
+      const key = `rezipped_item:${sessionId}:${stateId}`
       const raw = (await redis.get(key)) as Record<string, unknown> | null
       if (!raw || raw.source !== 'inferred') continue
       await redis.set(key, { ...raw, toldAgent: true })

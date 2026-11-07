@@ -1,5 +1,7 @@
+import { buildPromptBudgetReport } from './contextBudgetPreflight'
+import { applySkillDcmUpdate, readSkillDcmUpdate, type SkillDcmUpdate } from './skillDcmUpdate'
+import type { P5ApiOriginalRun } from './appActions/mcp/originalTask'
 import { steerInputSource, type UserInputSource, type ApiInputObservation } from './imageAddressApiInput'
-import type { ObservedUsage } from '$lib/types/executionViewer'
 /**
  * Vercel AI SDK Brain Service - API runtime Native AI Orchestration
  * Story 5.7: Clean streaming architecture with direct provider access
@@ -27,41 +29,50 @@ import { createOpenAI } from '@ai-sdk/openai'
 import { createHash } from 'crypto'
 import { z } from 'zod'
 import { ProviderManager, resolveProviderAccess } from '$lib/server/services/providers'
+import { isOutputLimitFinish } from '$lib/server/services/outputLimitStop'
 import {
   buildEphemeralImageUserMessage,
   createEphemeralImageRegistry,
   resolveToolResultImageDelivery,
   type EphemeralImageRegistry,
-  type EphemeralImageRegistryEntry
+  type EphemeralImageRegistryEntry,
+  type ToolResultImageLane
 } from '$lib/server/services/toolResultImageDelivery'
 import type { ThinkRequest, ThoughtResponse } from '$lib/types/aiBrain'
 import type { AgentDcmDisplaySettings } from '$lib/types/database'
 import type { ModelCapabilities, ModelConnectionInfo } from '$lib/types/savedModels'
-import type { CodexRuntimeSettings } from '$lib/types/codex'
-import type { ClaudeRuntimeSettings } from '$lib/types/claude'
 import type { ToolApprovalMode } from '$lib/types/tool-approvals'
 import type { Mode4Style } from '$lib/constants/mode4'
 import { env } from '$env/dynamic/private'
 import { v4 as uuidv4 } from 'uuid'
 import type { GatewayMetadata, ToolMetadataMap } from './mcpGatewayTypes'
-import { getSubagentByWorkflowName } from './subagentRegistry' // Story 6.7c: Subagent registry lookup
 import { redis } from '$lib/server/redis' // Story 6.8: Load agent assigned workflows
 import { nativeToolService, type NativeToolApprovalPolicy } from './nativeTools'
 import { isNativeToolName } from './nativeToolConstants'
+import { runAbortSignalOf, trackToolExecution } from './lateToolResults'
 import { compileClipReferencesForAiView } from '$lib/utils/clipAiView'
 import { buildSteerInjectionText, type DeliveredSteer } from '$lib/utils/steerControl'
 import { toOwnedBytes } from '$lib/utils/binary'
+import { executeManagedSubagent } from '$lib/server/services/subagentRunner'
 import {
-  compileManagedSubagentSystemPrompt,
-  executeManagedSubagent
-} from '$lib/server/services/subagentRunner'
+  delegatedRunStopCondition,
+  reportDelegatedStreamPart,
+  type DelegatedRunProgress,
+} from './delegatedRunWatch'
 import {
   isSubagentBusyError,
   normalizeSubagentThreadMode
 } from '$lib/server/services/subagentThreads'
-import { normalizeSubagentType, type SubagentType } from '$lib/utils/subagentType'
+import { isRetiredSubagentType, normalizeSubagentType, type SubagentType } from '$lib/utils/subagentType'
+import { resolveSubagentSlug } from '$lib/utils/subagentSlug'
 import { isOpenAIReasoningParameterRestrictedModelId } from '$lib/utils/parameterFilter'
 import { collectReasoningTextFromFinish } from '$lib/utils/reasoningDisplay'
+import { fingerprintRegisteredTools } from './toolDefinitionFingerprint'
+import {
+  captureApiUtilities, isApiUtilityInnerExecution, isApiSkillUtilityFormatting, isGuardedApiUtilityOutput, markApiUtilityCandidate, markApiUtilityGuardedFormatter, pruneUnusedUtilityBrokers, readApiUtilities,
+  type ApiUtilityScope
+} from './apiUtilityRuntime'
+import { agentSetupCache, type PreparedAgentSetup } from './agentSetupCache'
 import {
   applyApiPromptCachePolicy,
   placeToolLoopTailMarker,
@@ -73,13 +84,18 @@ import { StreamStoppedError, isStopError, judgeStreamEnd } from '$lib/server/ser
 import { relayAbort } from '$lib/server/services/turnAbortRelay'
 import { providerStreamErrorFrom } from '$lib/server/services/streamFailureEvidence'
 import { stepContentReachedToolBoundary, toolErrorAsFailedToolResult } from './toolErrorPart'
-import { findCommandModelCapture } from './commandModelCaptureResponse'
+import { findCommandModelCapture } from './commandModelCaptureLookup'
 import { guardToolModelText, type ToolModelResultContext } from './toolModelResultGuard'
 import { estimateTokens } from '$lib/utils/tokens'
 import { TOOL_RESULT_TOO_LARGE_TOKENS } from '$lib/utils/toolResultSizeGuard'
 import type { PlanLease } from './chatgptPlanRuntime'
 import { isPlanSelection, planModelForLease, planClientTools, planProviderOptions, assertPlanSettings } from './chatgptPlanInference'
+import { isClaudePlanConnection, isClaudePlanSelection } from '$lib/utils/claudePlanConnection'
+import { ClaudePlanRunError } from './claudePlanProtocol'
+import { ClaudePlanError, admitClaudePlanSelection, claudePlanNotWiredError, type ClaudePlanConsumer } from './claudePlanAdmission'
+import type { ClaudePlanModel } from './claudePlanModel'
 import { guardResponsesTerminal } from './responsesTerminalGuard'
+import { createGatewayStreamFormatCheck } from './providers/gatewayStreamFormat'
 
 /**
  * BL-452: the error a delegated run's `error` stream part carries, as an Error with the
@@ -120,13 +136,20 @@ interface SubagentToolMetadata {
   model?: string | null
 }
 
+class ApiToolNameCollisionError extends Error {
+  readonly code = 'API_TOOL_NAME_COLLISION'
+  constructor(name: string) {
+    super(`The assigned Subagent SDK tool name "${name}" collides with an existing tool. Nothing was sent.`)
+    this.name = 'ApiToolNameCollisionError'
+  }
+}
+
 /**
  * Tool source metadata maps (Story 6.4, Story 6.7c, SA-005)
  * Cached during tool loading for O(1) detection performance
  * SA-005: Removed toolVaultTools (Tool Vault removed October 2025)
  */
 interface ToolSourceMaps {
-  workflowTools: Map<string, { webhookUrl: string }>
   gatewayTools: Map<string, GatewayMetadata>
   subagentTools: Map<string, SubagentToolMetadata>  // Story 6.7c: Subagent metadata
 }
@@ -260,27 +283,89 @@ async function guardReadableToolModelOutput(
   return { ...modelOutput, value: cutParts }
 }
 
+type ApiStreamCustody = { run: P5ApiOriginalRun; consumerConsumed: boolean; finishKnown: boolean;
+  owner: typeof import('./appActions/mcp/originalTask') }
+const p5ApiStreams = new WeakMap<object, ApiStreamCustody>(), p5ApiRuns = new WeakMap<object, ApiStreamCustody>()
+
+/**
+ * The App Actions P5 pictures held for this run. A resumed held Claude plan run already gave Claude these pictures
+ * inside the held step's MCP results (every tool picture rides there on that connection), so they are taken from the
+ * original task and never sent again; any other run gets them as first-step user messages (SA-139 D6, D8, P3 Part 4
+ * review B S1).
+ */
+export function moveP5ImagesForRun(
+  owner: Pick<typeof import('./appActions/mcp/originalTask'), 'moveP5ApiToolImages'>,
+  run: P5ApiOriginalRun, registry: EphemeralImageRegistry, lane: ToolResultImageLane, resumesHeldClaudePlanRun: boolean
+): { ids: string[]; deferred: string[] } {
+  if (!resumesHeldClaudePlanRun) return owner.moveP5ApiToolImages(run, registry, lane)
+  owner.moveP5ApiToolImages(run, createEphemeralImageRegistry(), lane)
+  return { ids: [], deferred: [] }
+}
+/** Actual route supplies the actual SDK result after consuming its finish/usage.
+ * A run handle/body/boolean cannot fabricate an SDK result association. */
+export function observeP5ApiConsumedStream(result: object): void {
+  const fact = p5ApiStreams.get(result)
+  if (!fact) throw new Error('The actual API SDK stream owner is unavailable.')
+  fact.consumerConsumed = true; fact.owner.notifyP5ApiStreamSettlement(fact.run)
+}
+export function readP5ApiStreamSettlement(run: P5ApiOriginalRun) {
+  const fact = p5ApiRuns.get(run)
+  return fact ? Object.freeze({ consumerConsumed: fact.consumerConsumed, finishKnown: fact.finishKnown }) : undefined
+}
+
+/** SA-137 Round 2 follow-up: the last check before a provider request, and its confirmation. */
+export interface ModelDispatchGate {
+  beforeRequest(): Promise<void>
+  requestSent(): void
+}
+
+export type PreparedApiToolset = Readonly<{ fingerprint: string; brokerAvailable: boolean; toolsRegistered: boolean; apiUtilityScope: ApiUtilityScope }>
+
 export interface NativeModeRequest extends ThinkRequest {
+  /** Actual Primary native read-to-model delivery owner; absent on delegated runs. */
+  skillReadDelivery?: import('./skillReadDelivery').SkillReadDelivery
+  refreshOpenSkills?: () => Promise<SkillDcmUpdate | undefined>
+  /** The route's existing resolved context/output reserve; never a new hint cap. */
+  skillContextBudget?: { contextLimit: number | null; outputReserveTokens: number }
+  /** Opaque server-prepared registration; no HTTP/model input can mint it. */
+  preparedApiToolset?: PreparedApiToolset
+  /** Prepared by the sole compiler from server-owned live setup. */
+  agentSetup?: PreparedAgentSetup
+  mcpOriginalPreparation?: import('./appActions/mcp/originalTask').P5OriginalPreparation
+  mcpApiPart?: import('./appActions/mcp/originalTask').P5ApiReplyPart
+  /** Fixed route receives an actual opaque association, not a readiness certificate. */
+  onP5ApiRun?: (run: P5ApiOriginalRun) => void
   /** Server-owned request capability; never accepted from an HTTP body. */
   chatgptPlanLease?: PlanLease
   /** Constructed by send-routed from its compile and persisted server replay, never body metadata. */
   imageOriginInput?: { compiledPrefixCount: number; userSources: UserInputSource[] }
   onApiModelInput?: (input: ApiInputObservation) => void
+  /**
+   * SA-137 Round 2 follow-up: `beforeRequest` is awaited right before each provider request leaves
+   * (innermost, before `onApiModelInput` observes it); a throw sends nothing and the stream fails
+   * with that error. `requestSent` runs once that request's `doStream` resolved, so an attempt the
+   * SDK retries after a failed send is checked again. Set by send-routed only, from its turn's
+   * `LiveFileReadTurn`.
+   */
+  modelDispatchGate?: ModelDispatchGate
 
-  /** CLI runtime evidence for this primary reply's context meter; API runs never call it. */
-  onCliContext?: (report: import('$lib/utils/cliContextWindow').CliContextWindowReport) => void
-  /** Ephemeral raw CLI result evidence, before display enrichment; never serialized. */
-  onCliModelResult?: (delivery: { callId: string; texts: readonly string[]; nonTextInputs: number; unaccountedInputs: number }) => void
-  /** Server-owned primary preflight selection, never read from request metadata. */
-  cliContextSelection?: import('$lib/utils/cliContextWindow').CliContextSelection
-  /** Internal delegated-run owner; a Worker belongs to its parent, not its virtual CLI id. */
+  /** Internal delegated-run owner; a Worker belongs to its parent, not its own virtual id. */
   processOwner?: { userId: string; kind: 'agent' | 'subagent'; id: string }
   /** Actual delegated record's Bash grant, before preset settings are merged. */
   delegatedBashEnabled?: boolean
-  /** Server-vouched stored parent agent for a delegated Native Bash command. */
-  commandParentAgentId?: string | null
-  /** Server-owned parent reply for a delegated Codex run's late cleanup warning. */
-  processCleanupMessageId?: string
+  /** The delegated record's materialized typed-file grant; missing/null is unavailable. */
+  delegatedTypedFileToolsValue?: boolean | null
+  /**
+   * Delegation limits (2026-10-24): `processNativeMode` only. The run's stall guard hears every
+   * stream part through this (`delegatedRunWatch.ts`); absent, nothing watches the run.
+   */
+  delegatedProgress?: DelegatedRunProgress
+  /**
+   * Delegation limits (2026-10-24): `processNativeMode` only. The Subagent's optional tool-step
+   * limit, counted in tool calls; null or absent runs until the model stops calling tools. The
+   * streaming path keeps `maxToolRounds`.
+   */
+  delegatedMaxToolSteps?: number | null
   /**
    * SA-105 P2 (DL-105-06): the saved model's capabilities, so the tool-result
    * image lane uses the same vision rule as attached clips. Optional and
@@ -288,17 +373,22 @@ export interface NativeModeRequest extends ThinkRequest {
    */
   modelCapabilities?: ModelCapabilities | null
   mode4Style?: Mode4Style
-  agentId?: string // Story 6.8: Agent ID for loading assigned workflows
-  agentSlug?: string | null
+  agentId?: string
   toolsEnabled?: boolean
   maxToolRounds?: number
-  availableWorkflows?: string[] // List of workflow IDs that can be called as tools
   selectedGateways?: string[] // Story 5.22: List of selected MCP Gateway IDs from chat bar
   toolSelections?: import('$lib/types/database').MCPToolSelections // Story 5.23: Per-tool selections from chat bar
   selectedCliToolIds?: string[]
   dcmDisplaySettings?: AgentDcmDisplaySettings | null
   allowArtifactRuntimeTools?: boolean
   allowFabricControlTools?: boolean
+  /** SA-133: admitted primary API reply settings; delegated runs leave these absent. */
+  whiteboardControlsEnabled?: boolean
+  whiteboardSettingsSnapshot?: import('$lib/utils/reasoningRetention').ResolvedReasoningRetention
+  /** SA-137: the API Primary's resolved `live_file_reads`; its Bash proves its reads for a later refresh. */
+  liveFileReadsEnabled?: boolean
+  /** This turn runs Refreshed File Reads (the compile's `refreshedFileReadsTurn`); it shapes `edit_file`'s text. */
+  refreshedFileReadsTurn?: boolean
   /** SA-104 P3: PRIMARY runs of memory-enabled agents; subagent runner leaves it false. */
   memoryControlsEnabled?: boolean
   /** SA-113 P2 (DL-113-03): PRIMARY actor + agent `dms_enabled`. */
@@ -324,30 +414,13 @@ export interface NativeModeRequest extends ThinkRequest {
   } | null
   groupMemberRun?: boolean
   /**
-   * SA-117 P2 (F-P2-1) — a Subagent or Worker run on a managed CLI lane.
-   *
-   * Set only by `subagentRunner.ts`, never by send-routed's primary turn. It tells the
-   * bridge that `agentId` is the per-run runtime id it derived from the subagent's slug
-   * (`subagent_cli_…`) rather than one of the user's stored agents, so the run credential is
-   * minted without an agent record to check and is marked as unable to act as an agent.
-   */
-  delegatedRun?: boolean
-  /**
    * BL-75 — whose skill access governs this run's `native_skill` loads, when that is not
    * `agentId`. Set only by `subagentRunner.ts`: to the Subagent's (or a `base` Worker's) record
    * id, or a built-in Worker's `worker_…` id. The same id builds the run's `skills_commands`
-   * list, so a skill it lists is a skill it can load, and nothing more. An API Subagent run
-   * passes the PARENT as `agentId`, and a CLI one a `subagent_cli_…` runtime id, so neither
-   * can stand in for it. The CLI bridges stamp it on the run credential.
+   * list, so a skill it lists is a skill it can load, and nothing more. A Subagent run passes
+   * the PARENT as `agentId`, so that cannot stand in for it.
    */
   scopeAgentId?: string | null
-  /**
-   * BL-81 — what a Subagent or Worker run may use through the control routes: the control ids
-   * its DCM index offers it (`resolveDelegatedRunAllowedControlIds`). Set only by
-   * `subagentRunner.ts`, beside `delegatedRun`. The CLI bridges mint it onto the run credential,
-   * and `/api/controls/use` and `/api/controls/find` answer that credential with it alone.
-   */
-  delegatedAllowedControlIds?: string[] | null
   /**
    * SA-114 P1 (DL-114-05): takes every steer waiting for this turn and marks it delivered.
    *
@@ -371,11 +444,28 @@ export interface NativeModeRequest extends ThinkRequest {
   stopSequences?: string[]
   providerOptions?: Record<string, Record<string, any>>
   connection?: ModelConnectionInfo | null
+  /**
+   * SA-139 (D11): the consumer a Claude plan selection runs as (`primary`, `subagent`, `worker`). A
+   * caller that names none is refused by central admission before any process starts.
+   */
+  claudePlanConsumer?: ClaudePlanConsumer | null
+  /** SA-139 (S4, BL-515): the sampling fields of a RAW selection only, never a preset-backed agent's leftovers. */
+  claudePlanSampling?: Readonly<object> | null
+  /**
+   * SA-139 D6: this reply's approval-resume version (send-routed's `approvalResumeVersion`, 0 for a
+   * first reply). With the session and message ids it keys the run held at a card; absent on paths that
+   * raise no card (delegated runs), which then never hold.
+   */
+  claudePlanApprovalVersion?: number | null
+  /** SA-139 D6: the held run the approval click claimed, continued by this reply. */
+  claudePlanHeld?: { run: import('./claudePlanRun').ClaudePlanRun; state: import('./claudePlanRunRegistry').ClaudePlanHeldState } | null
+  /**
+   * SA-139 D6, D8 (P3 Part 4 review B S1): this request continues a held Claude plan run (its click claimed one),
+   * known when the tools are prepared, before the claim reaches `claudePlanHeld`.
+   */
+  claudePlanResumesHeldRun?: boolean
   providerSettings?: Record<string, any> | null
-  codexSettings?: CodexRuntimeSettings | null
-  claudeSettings?: ClaudeRuntimeSettings | null
   projectPath?: string | null
-  simulateStreamingEffect?: boolean
   taggedReasoningTagName?: 'think' | null
   onFinish?: (params: {
     text: string
@@ -387,11 +477,7 @@ export interface NativeModeRequest extends ThinkRequest {
     apiUserSources?: UserInputSource[]
     /** BL-474 step 2: pictures handed to the model in a synthetic message during the run. */
     imageInputsRegistered?: number
-    /** Partial reported portions, never the whole-run usage or a successful call. */
-    observedUsage?: ObservedUsage
   }) => void | Promise<void>
-  /** In-process Codex delegation custody; registration never reads the running source. */
-  registerObservedUsageSource?: (source: () => ObservedUsage | undefined) => void
   onAbort?: (params: { steps?: any[] }) => void
 }
 
@@ -418,7 +504,8 @@ export class VercelAIBrain {
    */
   private wrapToolsWithReadableModelOutput(
     tools: Record<string, any>,
-    context: Omit<ToolModelResultContext, 'toolName'>
+    context: Omit<ToolModelResultContext, 'toolName'>,
+    skillReadDelivery?: import('./skillReadDelivery').SkillReadDelivery
   ): Record<string, any> {
     const wrappedTools: Record<string, any> = {}
     for (const [toolName, toolDefinition] of Object.entries(tools)) {
@@ -438,17 +525,57 @@ export class VercelAIBrain {
         continue
       }
 
-      wrappedTools[toolName] = {
+      const deliveredReads = new WeakMap<object, { key: string; value: unknown }>()
+      const formatKey = (params: { toolCallId: string; input: unknown; output: unknown }) =>
+        JSON.stringify([params.toolCallId, params.input, params.output])
+      const wrapped = {
         ...toolDefinition,
+        // BL-1959: a Stop during the call drops its result from the SDK's stream; send-routed's
+        // stream wrapper hands it on from here (`lateToolResults.ts`). The call itself is unchanged.
+        ...(typeof originalExecute === 'function'
+          ? {
+              execute: (input: unknown, options: { toolCallId?: string; abortSignal?: AbortSignal } | undefined) => {
+                const original = originalExecute.call(toolDefinition, input, options)
+                const inner = isApiUtilityInnerExecution(options)
+                // The SDK emits its raw tool-result before calling toModelOutput at finish-step.
+                // A native skill therefore finishes the SAME final formatter/guard/admission here,
+                // before execute resolves; its later SDK formatting reuses that exact result.
+                const value = skillReadDelivery && !inner ? Promise.resolve(original).then(async output => {
+                  if (skillReadDelivery.owns(output)) {
+                    if (!options?.toolCallId) throw new Error('The actual skill invocation id is unavailable. Nothing was delivered.')
+                    await wrapped.toModelOutput({ toolCallId: options.toolCallId, input, output })
+                  }
+                  return output
+                }) : original
+                if (!inner) trackToolExecution(runAbortSignalOf(options), options?.toolCallId, toolName, input, value)
+                return value
+              }
+            }
+          : {}),
         toModelOutput: async (params: {
           toolCallId: string
           input: unknown
           output: unknown
         }) => {
+          const receipt = params.output && typeof params.output === 'object' ? deliveredReads.get(params.output) : undefined
+          if (receipt) {
+            if (receipt.key !== formatKey(params)) throw new Error('The delivered skill result changed during SDK replay. Nothing was sent.')
+            return receipt.value
+          }
           const modelOutput =
             typeof originalToModelOutput === 'function'
               ? await originalToModelOutput.call(toolDefinition, params)
               : buildDefaultToolModelOutput(params.output)
+          const finish = async (before: unknown, after: unknown) => {
+            // Captured utility formatting is nested inside the broker's actual formatter.
+            // Only the outer SDK invocation names its real persisted producer/input.
+            if (!isApiSkillUtilityFormatting(params)) {
+              await skillReadDelivery?.delivered({ ...params, toolName, before, after })
+              if (skillReadDelivery?.owns(params.output)) deliveredReads.set(params.output as object, { key: formatKey(params), value: after })
+            }
+            return after
+          }
+          if (isGuardedApiUtilityOutput(modelOutput)) return finish(modelOutput, modelOutput)
 
           const memoryResult = toolName === 'native_batshit_tool_use' &&
             params.output !== null && typeof params.output === 'object' &&
@@ -461,17 +588,19 @@ export class VercelAIBrain {
             })
             const readable = toReadableToolModelOutput(modelOutput)
             if (readable?.type === 'content' && Array.isArray(readable.value)) {
-              return { ...readable, value: [{ type: 'text', text: cut }, ...readable.value.filter((part: any) =>
-                part?.type !== 'text' && !(part?.type === 'file' && part.data?.type === 'text'))] }
+              return finish(readable, { ...readable, value: [{ type: 'text', text: cut }, ...readable.value.filter((part: any) =>
+                part?.type !== 'text' && !(part?.type === 'file' && part.data?.type === 'text'))] })
             }
-            return { ...readable, type: readable?.type === 'error-text' ? 'error-text' : 'text', value: cut }
+            return finish(readable, { ...readable, type: readable?.type === 'error-text' ? 'error-text' : 'text', value: cut })
           }
-          return await guardReadableToolModelOutput(
-            toReadableToolModelOutput(modelOutput),
-            { ...context, toolName, ...(memoryResult ? { memoryResult: true } : {}) }
-          )
+          const before = toReadableToolModelOutput(modelOutput)
+          return finish(before, await guardReadableToolModelOutput(
+            before, { ...context, toolName, ...(memoryResult ? { memoryResult: true } : {}) }
+          ))
         }
       }
+      markApiUtilityGuardedFormatter(wrapped.toModelOutput)
+      wrappedTools[toolName] = wrapped
     }
 
     return wrappedTools
@@ -497,7 +626,10 @@ export class VercelAIBrain {
       stablePrefixParts: metadata.stablePrefixParts,
       applied: metadata.applied,
       preserved: metadata.preserved,
-      providerOptionKeys: metadata.providerOptionKeys
+      providerOptionKeys: metadata.providerOptionKeys,
+      // History cache blocks (2026-10-21) and BL-184's lifetime, for live diagnosis.
+      historyParts: metadata.historyParts,
+      cacheTtl: metadata.cacheTtl
     })
   }
 
@@ -508,12 +640,17 @@ export class VercelAIBrain {
    */
   async processNativeMode(request: NativeModeRequest): Promise<ThoughtResponse> {
     const startTime = Date.now()
+    const delegatedMaxToolSteps =
+      typeof request.delegatedMaxToolSteps === 'number' && request.delegatedMaxToolSteps > 0
+        ? request.delegatedMaxToolSteps
+        : null
     // The model loop's own signal: the runner's (Stop, the time limit) relayed in, plus the
     // run's own abort when it ends early on a failed model call, so the SDK's loop, the
     // provider request, and any running tool are cancelled rather than left suspended.
     // `runOver` removes the relay's listener when the run ends (BL-246).
     const runController = new AbortController()
     const runOver = new AbortController()
+    let claudePlan: ClaudePlanWiring | null = null
     relayAbort({
       from: request.chatgptPlanLease?.signal ?? request.abortSignal,
       to: runController,
@@ -524,9 +661,7 @@ export class VercelAIBrain {
     logger.debug('[VercelBrain API] Processing native mode request', {
       sessionId: request.sessionId,
       model: request.model,
-      messageCount: request.messages?.length,
-      hasTools: !!request.availableTools,
-      hasWorkflows: !!request.availableWorkflows
+      messageCount: request.messages?.length
     })
 
     try {
@@ -535,6 +670,7 @@ export class VercelAIBrain {
       if (!request.messages || request.messages.length === 0) {
         throw new Error('No messages provided to processNativeMode()')
       }
+      claudePlan = await this.prepareClaudePlanModel(request)
 
       // Get model instance from ProviderManager
       const model = await this.getModel(
@@ -544,6 +680,9 @@ export class VercelAIBrain {
         request.taggedReasoningTagName,
         undefined,
         request.chatgptPlanLease,
+        undefined,
+        undefined,
+        claudePlan?.model,
       )
 
       // Convert messages - uses existing compilation!
@@ -560,51 +699,9 @@ export class VercelAIBrain {
       )
       this.logGeminiPayloadSummary('process', messages, request, geminiFileUris)
 
-      // Build tools from both regular tools and workflows
+      // Build tools from the request's tool selection
       // Story 6.4: Also get metadata maps for tool source detection
-      // Story 6.8: Now includes agentId for loading assigned workflows
-      const { tools, maps: toolMaps, toolApprovals, ephemeralImages } = await this.buildToolsForMode3(
-        request.availableTools,
-        request.availableWorkflows,
-        request.sessionId,
-        request.userId,
-        request.selectedGateways,
-        request.toolSelections,
-        request.agentId,
-        {
-          assignedSubagents: request.assignedSubagents,
-          defaultGateways: request.defaultGateways ?? null
-        },
-        request.preloadedGatewayTools ?? null,
-        request.preloadedGatewayMetadata ?? null,
-        request.toolApprovalMode,
-        {
-          providerSettings: request.providerSettings ?? null,
-          processOwner: request.processOwner,
-          delegatedBashEnabled: request.delegatedBashEnabled,
-          projectPath: request.projectPath ?? null,
-          selectedCliToolIds: request.selectedCliToolIds,
-          memoryControlsEnabled: request.memoryControlsEnabled,
-          dmControlsEnabled: request.dmControlsEnabled,
-          scheduleControlsEnabled: request.scheduleControlsEnabled,
-          judgeControlsEnabled: request.judgeControlsEnabled,
-          workersEnabled: request.workersEnabled,
-          controlApprovals: request.controlApprovals ?? null,
-          groupMemberRun: request.groupMemberRun === true,
-          scopeAgentId: request.scopeAgentId ?? null,
-          parentModelId: request.model ?? null,
-          parentConnection: request.connection ?? null,
-          parentCapabilities: request.modelCapabilities ?? null,
-          parentMessageId: request.messageId ?? null,
-          abortSignal: request.abortSignal
-        }
-      )
-
-      let toolsForRequest = request.chatgptPlanLease ? planClientTools(tools, request.chatgptPlanLease)! : tools
-      const openaiTools = await this.buildOpenAITools(request)
-      if (openaiTools) {
-        toolsForRequest = this.mergeToolSets(toolsForRequest, openaiTools)
-      }
+      const { tools: toolsForRequest, maps: toolMaps, approvals: toolApprovals, images: ephemeralImages } = await this.consumeApiToolset(request)
 
       const runtimeProviderId = this.resolveRuntimeProviderId(
         request.model,
@@ -634,9 +731,10 @@ export class VercelAIBrain {
         // v7 system-in-messages guard is relaxed to preserve Batshit's prompt
         // order and provider cache anchoring on the compiled payload.
         allowSystemInMessages: true,
-        tools: cachePolicy.tools,
-        ...(Object.keys(toolApprovals).length > 0 ? { toolApproval: toolApprovals } : {}),
-        stopWhen: isStepCount(request.maxToolRounds || 10), // Multi-round tool execution
+        ...claudePlanToolOptions(claudePlan, cachePolicy.tools, toolApprovals, downloadGuard),
+        // Delegation limits (Josh, 2026-10-24, decision 3): a delegated run has no tool-step
+        // limit unless its Subagent sets one. It used to stop at 10 rounds (SA-062).
+        stopWhen: delegatedRunStopCondition(delegatedMaxToolSteps),
         ...this.buildGenerationSettings(request),
         providerOptions: request.chatgptPlanLease ? planProviderOptions(cachePolicy.providerOptions) : cachePolicy.providerOptions,
         // SA-107: per-session cache-affinity headers (xAI/Baseten/Fireworks direct lanes).
@@ -653,7 +751,8 @@ export class VercelAIBrain {
         // the hook was registered only on the image lane, so a delegated tool loop re-sent
         // its whole conversation at the full input price on every step. It returns
         // `undefined` whenever neither has anything to add, so a run with no images on a
-        // lane without Anthropic cache control sends byte-identical requests.
+        // lane without Anthropic cache control sends byte-identical requests. BL-1976: the
+        // cache point starts on the first model call.
         prepareStep: this.buildTurnPrepareStep({
           ephemeralImages: ephemeralImages ?? null,
           takeSteers: null,
@@ -672,9 +771,35 @@ export class VercelAIBrain {
       let streamRuntimeError: Error | null = null
       // The SDK can end an aborted stream normally, with its `abort` part (`streamStop.ts`).
       let sawAbortPart = false
+      // BL-1782: the same rule as send-routed's loop, from the one shared helper.
+      const gatewayStreamFormatCheck = createGatewayStreamFormatCheck()
+      // Delegation limits: the tool calls made so far, and how many tools Batshit runs that the
+      // last finished step called, so a run the step limit stopped is told apart from one that
+      // finished. The AI SDK keeps looping on exactly those calls, not on the finish reason,
+      // which some providers report as `stop` on a step that called tools.
+      let toolCallCount = 0
+      let stepClientToolCalls = 0
+      let lastStepClientToolCalls = 0
+      // BL-2356: why the last model call stopped (`length` is its output limit).
+      let lastStepFinishReason: unknown = null
 
       // Collect the full response (AI SDK 7: `stream` replaces `fullStream`)
       streamLoop: for await (const part of result.stream) {
+        if (request.delegatedProgress) reportDelegatedStreamPart(request.delegatedProgress, part)
+        if (part.type === 'start-step') stepClientToolCalls = 0
+        if (part.type === 'tool-call') {
+          toolCallCount += 1
+          if (part.providerExecuted !== true) stepClientToolCalls += 1
+        }
+        if (part.type === 'finish-step') { lastStepClientToolCalls = stepClientToolCalls; lastStepFinishReason = part.finishReason }
+        // A step that finished with no readable reason while a tool call Batshit runs got no
+        // result, error or card ends the run, as the first `error` part does below.
+        const streamFormatFailure = gatewayStreamFormatCheck.observe(part)
+        if (streamFormatFailure) {
+          streamRuntimeError = streamFormatFailure
+          runController.abort(streamRuntimeError)
+          break streamLoop
+        }
         switch (part.type) {
           case 'text-delta':
             content += part.text
@@ -741,6 +866,19 @@ export class VercelAIBrain {
       if (streamEnd.kind === 'stopped') throw new StreamStoppedError()
       if (streamEnd.kind === 'failed') throw streamEnd.error
 
+      // The step limit ended the loop when the step that reached it still called tools Batshit
+      // runs (so the SDK would have gone on); a model that answered on that step finished.
+      // BL-2356: the last model call stopped at its output limit, so the run's last words may be cut
+      // off; it comes back marked, as a Primary reply's does (BL-239), never as a finished run. The SDK
+      // runs no call of a `length` step (`isToolExecutionAllowedFinishReason`), so that step's calls
+      // never ran and the output limit, not the step limit, is what stopped the run.
+      const outputLimitReached = isOutputLimitFinish(lastStepFinishReason)
+      const stepLimitReached =
+        !outputLimitReached &&
+        delegatedMaxToolSteps !== null &&
+        toolCallCount >= delegatedMaxToolSteps &&
+        lastStepClientToolCalls > 0
+
       // Get usage information
       const localCacheReporting = resolveLocalPromptCacheReporting(runtimeProviderId)
       const sdkUsage = await result.usage
@@ -792,7 +930,11 @@ export class VercelAIBrain {
           cached: typeof usage?.cachedInputTokens === 'number' && usage.cachedInputTokens > 0,
           fallbackUsed: false,
           mode: 'native' // Mark as API runtime
-        }
+        },
+        ...(stepLimitReached && delegatedMaxToolSteps !== null
+          ? { delegatedStepLimitReached: { limit: delegatedMaxToolSteps, toolCalls: toolCallCount } }
+          : {}),
+        ...(outputLimitReached ? { delegatedOutputLimitReached: true as const } : {})
       }
 
       // Clean up MCP clients after streaming
@@ -834,6 +976,8 @@ export class VercelAIBrain {
 
       // A Stop (the parent's, or the Subagent time limit) stays a Stop, never a provider failure.
       if (stopped) throw error instanceof StreamStoppedError ? error : new StreamStoppedError()
+      // SA-139: a Claude plan refusal or run failure keeps its own code and words (review S2).
+      if (error instanceof ClaudePlanError || error instanceof ClaudePlanRunError) throw error
 
       // Handle specific error types. BL-452: thrown as Errors that keep the provider's own
       // sentence. The only caller (`subagentRunner.runApiSubagent`) reports `error.message` to
@@ -853,6 +997,8 @@ export class VercelAIBrain {
 
       throw error
     } finally {
+      // D10: a delegated run's Claude Code run ends with `processNativeMode`, whatever ended the loop.
+      claudePlan?.model.endReply()
       runOver.abort()
     }
   }
@@ -965,18 +1111,6 @@ export class VercelAIBrain {
     }
 
     logger.debug(`[API Runtime] ❌ Tool ${toolName} NOT found in subagentTools map`)
-
-    // Priority 4: Check if it's a Workflow tool
-    // AFTER subagent check - workflows are more general category
-    // Regular n8n workflows as tools (not subagents)
-    const workflowMetadata = toolMaps.workflowTools.get(toolName)
-    if (workflowMetadata) {
-      return {
-        toolProvider: 'n8n-workflow',
-        toolSource: 'workflow-webhook',
-        webhookUrl: workflowMetadata.webhookUrl
-      }
-    }
 
     // SA-005: Tool Vault check removed (Tool Vault removed October 2025)
 
@@ -1144,24 +1278,175 @@ export class VercelAIBrain {
   }
 
   /**
-   * Build tools for API runtime - combines MCP tools, workflows, and subagents
+   * Build tools for API runtime - combines MCP tools and subagents
    * Story 5.22: Now uses unified MCP Gateway Discovery
    * Story 5.23: Supports per-tool selection filtering
    * Story 6.4: Returns metadata maps for tool source detection
-   * Story 6.8: Loads assigned workflows from agent settings
    * SA-005: Tool Vault removed (October 2025)
-   * CRITICAL: Workflows become simple async functions
    * CRITICAL: Direct execution only
-   * CRITICAL: If regularTools is provided with names, it acts as a filter for which tools to include
    */
+  private readonly preparedApiToolsets = new WeakMap<PreparedApiToolset, {
+    binding: string; original: NativeModeRequest['mcpOriginalPreparation']; part: NativeModeRequest['mcpApiPart']; claimed: boolean
+    signal: NativeModeRequest['abortSignal']; lease: NativeModeRequest['chatgptPlanLease']
+    skillReadDelivery: NativeModeRequest['skillReadDelivery']
+    tools: Record<string, any> | undefined; maps: ToolSourceMaps
+    approvals: Record<string, NativeToolApprovalPolicy>; images: EphemeralImageRegistry | null
+    carried: string[]; deferred: string[]; p5ApiRun: P5ApiOriginalRun | undefined
+    p5Owner: typeof import('./appActions/mcp/originalTask') | undefined
+  }>()
+
+  private toolRegistrationBinding(request: NativeModeRequest): string {
+    const fields: Array<keyof NativeModeRequest> = [
+      'userId', 'agentId', 'sessionId', 'messageId', 'model', 'connection', 'toolsEnabled',
+      'providerSettings', 'selectedGateways', 'toolSelections',
+      'selectedCliToolIds', 'assignedSubagents', 'defaultGateways', 'toolApprovalMode', 'groupMemberRun',
+      'scopeAgentId', 'memoryControlsEnabled', 'whiteboardControlsEnabled', 'whiteboardSettingsSnapshot',
+      'liveFileReadsEnabled', 'refreshedFileReadsTurn', 'dmControlsEnabled', 'scheduleControlsEnabled',
+      'judgeControlsEnabled', 'workersEnabled', 'projectPath', 'dcmDisplaySettings',
+      'allowArtifactRuntimeTools', 'allowFabricControlTools', 'delegatedBashEnabled', 'delegatedTypedFileToolsValue',
+      'controlApprovals', 'processOwner', 'modelCapabilities'
+    ]
+    return createHash('sha256').update(JSON.stringify(fields.map(field => [field, request[field] ?? null]))).digest('hex')
+  }
+
+  /** Prepare the actual registrations before the sole compiler finalizes its cached setup. */
+  async prepareApiToolset(request: NativeModeRequest): Promise<PreparedApiToolset> {
+      const p5Owner = request.mcpApiPart ? await import('./appActions/mcp/originalTask') : undefined
+      const previousApiWork = p5Owner?.p5OriginalRequestForPreparation(request.mcpOriginalPreparation)
+      if (previousApiWork) await p5Owner!.refreshP5OriginalRequest(previousApiWork)
+      const p5ApiRun = p5Owner?.associateP5ApiOriginalRun(request.mcpOriginalPreparation, request.mcpApiPart, {
+        userId: request.userId, agentId: request.agentId, sessionId: request.sessionId, replyId: request.messageId,
+        signal: request.abortSignal, delegated: request.groupMemberRun === true || !!request.scopeAgentId
+      })
+      if (p5ApiRun) request.onP5ApiRun?.(p5ApiRun)
+      const toolsEnabled = request.toolsEnabled !== false
+      let toolsForRequest: Record<string, any> | undefined
+      let toolApprovalsForRequest: Record<string, NativeToolApprovalPolicy> = {}
+      let toolMaps: ToolSourceMaps = {
+        gatewayTools: new Map<string, GatewayMetadata>(),
+        subagentTools: new Map<string, SubagentToolMetadata>()
+      }
+      // SA-105 P2: this is the STREAMING path — the one real chat sends take.
+      // Wiring only the non-streaming `processNativeMode` left the synthetic
+      // lane dead in production, which is exactly what the live recall probe
+      // caught before this was fixed.
+      let ephemeralImagesForRequest: EphemeralImageRegistry | null = null
+      let initialImageToolIds: string[] = [], imageDeferrals: string[] = []
+      let bindApiUtilityScope: ((scope?: ApiUtilityScope) => void) | undefined
+      let utilityBrokerOnly = false
+
+      if (toolsEnabled) {
+        // Story 6.4: Get BOTH tools AND toolMaps for metadata injection
+        const { tools, maps, toolApprovals, ephemeralImages, initialImageToolIds: carried, imageDeferrals: deferredImages,
+          bindApiUtilityScope: bindUtilities, utilityBrokerOnly: utilitiesOnly } = await this.buildToolsForMode3(
+          request.sessionId,
+          request.userId,
+          request.selectedGateways,
+          request.toolSelections,
+          request.agentId,
+          {
+            assignedSubagents: request.assignedSubagents,
+            defaultGateways: request.defaultGateways ?? null
+          },
+          request.preloadedGatewayTools ?? null,
+          request.preloadedGatewayMetadata ?? null,
+          request.toolApprovalMode,
+          {
+            providerSettings: request.providerSettings ?? null,
+            processOwner: request.processOwner,
+            delegatedBashEnabled: request.delegatedBashEnabled,
+            delegatedTypedFileToolsValue: request.delegatedTypedFileToolsValue,
+            projectPath: request.projectPath ?? null,
+            selectedCliToolIds: request.selectedCliToolIds,
+            dcmDisplaySettings: request.dcmDisplaySettings ?? null,
+            allowArtifactRuntimeTools: request.allowArtifactRuntimeTools,
+            allowFabricControlTools: request.allowFabricControlTools,
+            memoryControlsEnabled: request.memoryControlsEnabled,
+            whiteboardControlsEnabled: request.whiteboardControlsEnabled,
+            whiteboardSettingsSnapshot: request.whiteboardSettingsSnapshot,
+            liveFileReadsEnabled: request.liveFileReadsEnabled === true,
+            refreshedFileReadsTurn: request.refreshedFileReadsTurn === true,
+            dmControlsEnabled: request.dmControlsEnabled,
+            scheduleControlsEnabled: request.scheduleControlsEnabled,
+            judgeControlsEnabled: request.judgeControlsEnabled,
+            workersEnabled: request.workersEnabled,
+            controlApprovals: request.controlApprovals ?? null,
+            groupMemberRun: request.groupMemberRun === true,
+            scopeAgentId: request.scopeAgentId ?? null,
+            parentModelId: request.model ?? null,
+            parentConnection: request.connection ?? null,
+            parentCapabilities: request.modelCapabilities ?? null,
+            parentMessageId: request.messageId ?? null,
+            p5ApiRun,
+            claudePlanResumesHeldRun: request.claudePlanResumesHeldRun === true,
+            skillReadDelivery: request.scopeAgentId ? undefined : request.skillReadDelivery,
+            abortSignal: request.abortSignal
+          }
+        )
+        toolMaps = maps
+        toolsForRequest = request.chatgptPlanLease ? planClientTools(tools, request.chatgptPlanLease) : tools
+        toolApprovalsForRequest = toolApprovals
+        ephemeralImagesForRequest = ephemeralImages
+        initialImageToolIds = carried; imageDeferrals = deferredImages
+        bindApiUtilityScope = bindUtilities; utilityBrokerOnly = utilitiesOnly === true
+
+        const openaiTools = await this.buildOpenAITools(request)
+        if (openaiTools) {
+          toolsForRequest = this.mergeToolSets(toolsForRequest, openaiTools)
+        }
+      } else {
+        logger.debug('[VercelBrain API] Tools disabled for this request')
+      }
+
+      const utilityIdentity = { userId: request.userId ?? '', agentId: request.agentId,
+        sessionId: request.sessionId, messageId: request.messageId, scopeAgentId: request.scopeAgentId, abortSignal: request.abortSignal }
+      const utilities = captureApiUtilities({ identity: utilityIdentity,
+        tools: toolsForRequest, approvals: toolApprovalsForRequest })
+      const utilityCount = readApiUtilities(utilities.scope, utilityIdentity).length
+      if (utilityCount && !bindApiUtilityScope) throw new Error('The native API utility binding is unavailable. Nothing was sent.')
+      if (utilityCount && (typeof utilities.tools?.native_batshit_tool_search?.execute !== 'function' ||
+          typeof utilities.tools?.native_batshit_tool_use?.execute !== 'function')) {
+        throw new Error('The eligible API utility broker is unavailable. Nothing was sent.')
+      }
+      bindApiUtilityScope?.(utilities.scope)
+      toolsForRequest = utilities.tools
+      if (utilityBrokerOnly && !utilityCount && toolsForRequest) {
+        const removed = pruneUnusedUtilityBrokers(toolsForRequest, utilityIdentity)
+        for (const name of removed) delete toolApprovalsForRequest[name]
+      }
+      const prepared = Object.freeze({ fingerprint: fingerprintRegisteredTools(toolsForRequest), apiUtilityScope: utilities.scope,
+        brokerAvailable: Boolean(toolsForRequest?.native_batshit_tool_search && toolsForRequest?.native_batshit_tool_use),
+        toolsRegistered: Object.keys(toolsForRequest ?? {}).length > 0 })
+      this.preparedApiToolsets.set(prepared, {
+        binding: this.toolRegistrationBinding(request), original: request.mcpOriginalPreparation,
+        signal: request.abortSignal, lease: request.chatgptPlanLease, skillReadDelivery: request.skillReadDelivery,
+        part: request.mcpApiPart, claimed: false, tools: toolsForRequest, maps: toolMaps,
+        approvals: toolApprovalsForRequest, images: ephemeralImagesForRequest,
+        carried: initialImageToolIds, deferred: imageDeferrals, p5ApiRun, p5Owner
+      })
+      return prepared
+  }
+
+  private async consumeApiToolset(request: NativeModeRequest) {
+    const prepared = request.preparedApiToolset ?? await this.prepareApiToolset(request)
+    const record = this.preparedApiToolsets.get(prepared)
+    if (!record || record.claimed || record.binding !== this.toolRegistrationBinding(request) ||
+        record.original !== request.mcpOriginalPreparation || record.part !== request.mcpApiPart ||
+        record.signal !== request.abortSignal || record.lease !== request.chatgptPlanLease || record.skillReadDelivery !== request.skillReadDelivery) {
+      throw new Error('The prepared API tool owner changed. Nothing was sent.')
+    }
+    if (fingerprintRegisteredTools(record.tools) !== prepared.fingerprint) throw new Error('The registered API tool definitions changed before dispatch. Nothing was sent.')
+    if (request.abortSignal?.aborted) throw request.abortSignal.reason ?? new Error('Stopped before API tool dispatch.')
+    record.claimed = true
+    return record
+  }
+
   private async buildToolsForMode3(
-    regularTools?: ThinkRequest['availableTools'],
-    workflows?: string[],
     sessionId?: string,
     userId?: string,
     selectedGateways?: string[],
     toolSelections?: import('$lib/types/database').MCPToolSelections,
-    agentId?: string, // Story 6.8: Agent ID for loading assigned workflows
+    agentId?: string,
     agentContext?: {
       assignedSubagents?: any[]
       defaultGateways?: string[] | null
@@ -1173,11 +1458,16 @@ export class VercelAIBrain {
       providerSettings?: Record<string, any> | null
       processOwner?: NativeModeRequest['processOwner']
       delegatedBashEnabled?: boolean
+      delegatedTypedFileToolsValue?: boolean | null
       projectPath?: string | null
       selectedCliToolIds?: string[]
       dcmDisplaySettings?: AgentDcmDisplaySettings | null
       allowArtifactRuntimeTools?: boolean
       allowFabricControlTools?: boolean
+      whiteboardControlsEnabled?: boolean
+      whiteboardSettingsSnapshot?: NativeModeRequest['whiteboardSettingsSnapshot']
+      liveFileReadsEnabled?: boolean
+      refreshedFileReadsTurn?: boolean
       memoryControlsEnabled?: boolean
       /** SA-113 P2 (DL-113-03): PRIMARY actor + agent `dms_enabled`. */
       dmControlsEnabled?: boolean
@@ -1197,27 +1487,37 @@ export class VercelAIBrain {
       parentCapabilities?: ModelCapabilities | null
       /** SA-093 P4: parent send's message id so subagent forensics can land on its snapshot. */
       parentMessageId?: string | null
+      p5ApiRun?: P5ApiOriginalRun
+      claudePlanResumesHeldRun?: boolean
+      skillReadDelivery?: NativeModeRequest['skillReadDelivery']
       abortSignal?: AbortSignal
     }
   ): Promise<{
+    bindApiUtilityScope?: (scope?: ApiUtilityScope) => void
+    utilityBrokerOnly?: boolean
     tools: Record<string, any> | undefined
     maps: ToolSourceMaps
     toolApprovals: Record<string, NativeToolApprovalPolicy>
     /** SA-105 P2: non-null only on `synthetic_user` lanes. */
     ephemeralImages: EphemeralImageRegistry | null
+    initialImageToolIds: string[]
+    imageDeferrals: string[]
   }> {
     const tools: Record<string, any> = {}
     const toolApprovals: Record<string, NativeToolApprovalPolicy> = {}
+    let bindApiUtilityScope: ((scope?: ApiUtilityScope) => void) | undefined
+    let utilityBrokerOnly = false
     // SA-105 P2: resolved below when native tools are built, then handed back to
     // the caller. SA-114 P1 (DL-114-05) made `prepareStep` unconditional, so this registry
     // no longer decides WHETHER the hook exists — only whether the image half of it has
     // anything to inject.
     let ephemeralImages: EphemeralImageRegistry | null = null
+    let initialImageToolIds: string[] = []
+    let imageDeferrals: string[] = []
     let fetchZipAllowed = false
 
     // Story 6.4, 6.7c, SA-005: Track metadata for O(1) detection
     const toolMaps: ToolSourceMaps = {
-      workflowTools: new Map<string, { webhookUrl: string }>(),
       gatewayTools: new Map<string, GatewayMetadata>(),
       subagentTools: new Map<string, SubagentToolMetadata>()  // Story 6.7c: Subagent metadata
     }
@@ -1251,16 +1551,25 @@ export class VercelAIBrain {
         // composed hook returns `undefined`, the SDK's own "change nothing" answer,
         // whenever neither images nor steers have anything pending, so a run with neither
         // still sends byte-identical requests.
-        if (imageDelivery.lane === 'synthetic_user') {
+        if (imageDelivery.lane === 'synthetic_user' || nativeContext?.p5ApiRun) {
           ephemeralImages = createEphemeralImageRegistry()
+          if (nativeContext?.p5ApiRun) {
+            const owner = await import('./appActions/mcp/originalTask')
+            owner.bindP5ApiToolImages(nativeContext.p5ApiRun, ephemeralImages)
+            const moved = moveP5ImagesForRun(owner, nativeContext.p5ApiRun, ephemeralImages, imageDelivery.lane, nativeContext.claudePlanResumesHeldRun === true)
+            initialImageToolIds = moved.ids; imageDeferrals = moved.deferred
+          }
         }
 
         const nativeToolSet = await nativeToolService.buildMode3NativeTools({
+          p5ApiRun: nativeContext?.p5ApiRun,
+          skillReadDelivery: nativeContext?.scopeAgentId ? undefined : nativeContext?.skillReadDelivery,
           abortSignal: nativeContext?.abortSignal,
           userId,
           agentId: agentId ?? null,
           processOwner: nativeContext?.processOwner,
           delegatedBashEnabled: nativeContext?.delegatedBashEnabled,
+          delegatedTypedFileToolsValue: nativeContext?.delegatedTypedFileToolsValue,
           sessionId,
           messageId: nativeContext?.parentMessageId ?? undefined,
           selectedGateways,
@@ -1270,6 +1579,10 @@ export class VercelAIBrain {
           allowArtifactRuntimeTools: nativeContext?.allowArtifactRuntimeTools,
           allowFabricControlTools: nativeContext?.allowFabricControlTools,
           memoryControlsEnabled: nativeContext?.memoryControlsEnabled,
+          whiteboardControlsEnabled: nativeContext?.whiteboardControlsEnabled,
+          whiteboardSettingsSnapshot: nativeContext?.whiteboardSettingsSnapshot,
+          liveFileReadsEnabled: nativeContext?.liveFileReadsEnabled === true,
+          refreshedFileReadsTurn: nativeContext?.refreshedFileReadsTurn === true,
           dmControlsEnabled: nativeContext?.dmControlsEnabled,
           scheduleControlsEnabled: nativeContext?.scheduleControlsEnabled,
           judgeControlsEnabled: nativeContext?.judgeControlsEnabled,
@@ -1300,8 +1613,11 @@ export class VercelAIBrain {
         Object.assign(tools, nativeToolSet.tools)
         Object.assign(toolApprovals, nativeToolSet.toolApprovals)
         fetchZipAllowed = nativeToolSet.fetchZipAvailable === true
+        bindApiUtilityScope = nativeToolSet.bindApiUtilityScope
+        utilityBrokerOnly = nativeToolSet.utilityBrokerOnly === true
       } catch (error) {
         console.error('[VercelBrain API] Failed to build native tools:', error)
+        throw error
       }
     }
 
@@ -1313,29 +1629,33 @@ export class VercelAIBrain {
         return
       }
 
-      const managedSubagents = candidates.filter((subagent) => {
-        const subagentType = normalizeSubagentType(subagent, subagent?.subagentType)
-        return subagentType !== 'n8n-subnode'
-      })
+      // SA-139 R2/R5 (D14): a removed Subagent type (n8n, or the CLI Subagent) is never offered as a tool.
+      const managedSubagents = candidates.filter((subagent) =>
+        !isRetiredSubagentType(normalizeSubagentType(subagent, subagent?.subagentType))
+      )
 
       if (managedSubagents.length !== candidates.length) {
-        const filtered = candidates.length - managedSubagents.length
-        if (filtered > 0) {
-          console.warn(`[API Runtime] Filtered ${filtered} retired n8n Subnode Subagent record(s).`)
-        }
+        console.warn(
+          `[API Runtime] Filtered ${candidates.length - managedSubagents.length} Subagent record(s) of a removed type.`
+        )
       }
 
       for (const subagent of managedSubagents) {
         try {
           const subagentType = normalizeSubagentType(subagent, subagent?.subagentType)
-          if (subagentType === 'n8n-subnode') continue
+          if (isRetiredSubagentType(subagentType)) continue
           const webhookUrl = subagent.webhookUrl || subagent.webhook_url || subagent.workflowName
 
           const baseName = subagent.id || subagent.name || subagent.displayName || 'subagent'
           const sanitizedName = normalizeToolKey(baseName)
+          if (!sanitizedName || Object.hasOwn(tools, sanitizedName)) {
+            throw new ApiToolNameCollisionError(sanitizedName)
+          }
 
-          const { description: compiledDescription } =
-            await compileManagedSubagentSystemPrompt(subagent, userId || 'default')
+          // BL-2190: the tool needs only the subagent's description. Compiling the run's whole
+          // prompt here read its base prompt and skills on every turn, and a base prompt that
+          // cannot be read now fails the CALL (a readable failed result), never this tool list.
+          const compiledDescription = typeof subagent.description === 'string' ? subagent.description : ''
 
           const workflowTool = dynamicTool({
             description: compiledDescription || subagent.description || `Execute ${subagent.displayName || baseName} subagent`,
@@ -1394,7 +1714,9 @@ export class VercelAIBrain {
 
                 return {
                   kind: 'subagent',
-                  success: result.status === 'completed',
+                  // Delegation limits: a run its step limit stopped did its work and is not a
+                  // failed call; `status` and the note at the top of its output say it is partial.
+                  success: result.status === 'completed' || result.status === 'partial',
                   subagentName: subagent.displayName || subagent.name || sanitizedName,
                   subagentType: result.subagentType,
                   output: result.output,
@@ -1435,8 +1757,6 @@ export class VercelAIBrain {
             }
           })
 
-          tools[sanitizedName] = workflowTool
-
           const subMeta: SubagentToolMetadata = {
             isSubagent: true,
             subagentName: subagent.displayName || subagent.name || sanitizedName,
@@ -1449,6 +1769,12 @@ export class VercelAIBrain {
             model: subagent.primary_model_name ?? subagent.settings?.primary_model_name ?? null
           }
 
+          tools[sanitizedName] = markApiUtilityCandidate(workflowTool, 'subagent', {
+            userId: userId ?? '', agentId, sessionId, messageId: nativeContext?.parentMessageId,
+            scopeAgentId: nativeContext?.scopeAgentId, abortSignal: nativeContext?.abortSignal
+          }, { slug: resolveSubagentSlug(subagent), isSubagent: true, subagentId: subMeta.subagentId,
+            subagentName: subMeta.subagentName, subagentType: subMeta.subagentType, subagentAvatar: subMeta.avatarUrl })
+
           toolMaps.subagentTools.set(sanitizedName, subMeta)
 
           logger.debug(
@@ -1456,6 +1782,7 @@ export class VercelAIBrain {
             { webhookUrl: webhookUrl || 'none', subagentId: subagent.id }
           )
         } catch (error) {
+          if (error instanceof ApiToolNameCollisionError) throw error
           console.error(
             `[API Runtime] Error loading subagent ${subagent.displayName || subagent.id}:`,
             error
@@ -1496,6 +1823,7 @@ export class VercelAIBrain {
           logger.debug(`[VercelBrain API] No assigned subagents found for agent ${agentId}`)
         }
       } catch (error) {
+        if (error instanceof ApiToolNameCollisionError) throw error
         console.error('[VercelBrain API] Failed to load assigned subagents:', error)
       }
     }
@@ -1506,95 +1834,6 @@ export class VercelAIBrain {
       Object.assign(tools, preloadedGatewayTools)
       if (preloadedGatewayMetadata) {
         toolMaps.gatewayTools = preloadedGatewayMetadata
-      }
-    }
-
-    // Regular tools are already filtered from frontend, no need to add more
-
-    // Add workflow tools if provided
-    // Story 5.11: Updated to use new signature with dynamic discovery
-    if (workflows && workflows.length > 0) {
-      const { loadWorkflowTools } = await import('./workflowTools')
-      const subagentToolNames = new Set<string>(toolMaps.subagentTools.keys())
-      const isSubagentToolName = (name: string) => {
-        if (subagentToolNames.has(name)) return true
-        const normalized = name.replace(/-/g, '_')
-        if (subagentToolNames.has(normalized)) return true
-        const hyphenated = name.replace(/_/g, '-')
-        if (subagentToolNames.has(hyphenated)) return true
-        return false
-      }
-
-      // If regularTools is provided, it's the explicit selection from chat bar
-      if (regularTools !== undefined) {
-        if (regularTools.length > 0) {
-          const selectedToolNames = regularTools.map(t => t.name)
-
-          const workflowTools = await loadWorkflowTools(
-            userId,
-            sessionId,
-            workflows
-          )
-
-          // Filter workflow tools based on selection
-          for (const [toolName, toolDef] of Object.entries(workflowTools)) {
-            if (isSubagentToolName(toolName)) {
-              continue
-            }
-            if (selectedToolNames.includes(toolName)) {
-              tools[toolName] = toolDef
-              // Story 6.4: Track workflow metadata (webhookUrl if available)
-              const webhookUrl = (toolDef as any).webhookUrl || (toolDef as any).metadata?.webhookUrl
-              if (webhookUrl) {
-                toolMaps.workflowTools.set(toolName, { webhookUrl })
-              }
-            }
-          }
-        } else {
-          // regularTools is empty array - NO tools selected, include NONE
-          logger.debug(`[VercelBrain API] No tools selected - excluding all workflow tools`)
-        }
-      } else {
-        // No filter provided - include all workflow tools
-        const workflowTools = await loadWorkflowTools(
-          userId,
-          sessionId,
-          workflows
-        )
-        // Story 6.4: Track all workflow metadata
-        for (const [toolName, toolDef] of Object.entries(workflowTools)) {
-          if (isSubagentToolName(toolName)) {
-            continue
-          }
-          tools[toolName] = toolDef
-          const webhookUrl = (toolDef as any).webhookUrl || (toolDef as any).metadata?.webhookUrl
-          if (webhookUrl) {
-            toolMaps.workflowTools.set(toolName, { webhookUrl })
-          }
-        }
-      }
-
-      // Story 6.7c: Check workflows against subagent registry
-      // CRITICAL: Only check if userId is available (session-scoped caching)
-      if (userId && toolMaps.workflowTools.size > 0) {
-        for (const [workflowName, workflowMeta] of toolMaps.workflowTools.entries()) {
-          // Check if this workflow is a registered subagent
-          const subagentMetadata = await getSubagentByWorkflowName(workflowName, userId)
-
-          if (subagentMetadata) {
-            // This workflow is a registered subagent - store enhanced metadata
-            toolMaps.subagentTools.set(workflowName, {
-              isSubagent: true,
-              subagentName: subagentMetadata.displayName,
-              subagentId: subagentMetadata.id,
-              subagentType: 'n8n-workflow',
-              workflowId: workflowName,  // Using workflow name as ID
-              webhookUrl: workflowMeta.webhookUrl
-            })
-
-            logger.debug(`[VercelBrain API] Subagent detected: ${workflowName} (${subagentMetadata.displayName})`)
-          }
-        }
       }
     }
 
@@ -1618,95 +1857,16 @@ export class VercelAIBrain {
       messageId: nativeContext?.parentMessageId ?? '',
       agentId: agentId ?? '',
       fetchZipAllowed
-    })
+    }, nativeContext?.skillReadDelivery)
 
     // Story 6.4: Return both tools and metadata maps for detection
     return {
       tools: Object.keys(wrappedTools).length > 0 ? wrappedTools : undefined,
       maps: toolMaps,
       toolApprovals,
-      ephemeralImages
+      bindApiUtilityScope, utilityBrokerOnly,
+      ephemeralImages, initialImageToolIds, imageDeferrals
     }
-  }
-
-  /**
-   * Convert regular n8n tools to Vercel format
-   * These are simple tools that don't need workflow execution
-   */
-  private convertRegularTools(
-    n8nTools: ThinkRequest['availableTools']
-  ): Record<string, any> {
-    const tools: Record<string, any> = {}
-
-    if (!n8nTools) return tools
-
-    for (const n8nTool of n8nTools) {
-      // Build a simple tool schema
-      const inputSchema = this.extractToolSchema(n8nTool)
-
-      // Use the tool() wrapper function from Vercel AI SDK
-      tools[n8nTool.name] = tool({
-        description: n8nTool.description || `Execute ${n8nTool.name}`,
-        inputSchema: inputSchema,
-        execute: async (args: any) => {
-          logger.debug(`[VercelBrain API] Executing tool ${n8nTool.name}`, {
-            argKeys: args && typeof args === 'object' ? Object.keys(args) : []
-          })
-
-          // Mock implementation - replace with actual tool execution
-          return {
-            success: true,
-            result: `Tool ${n8nTool.name} executed with args: ${JSON.stringify(args)}`,
-            timestamp: Date.now()
-          }
-        }
-      })
-    }
-
-    return tools
-  }
-
-  /**
-   * Extract tool schema from various formats
-   * Handles Zod, JSON Schema, and other formats
-   */
-  private extractToolSchema(tool: any): z.ZodSchema<any> {
-    // Try different schema formats
-    const sourceSchema = tool.schema || tool.parameters || tool.inputSchema || {}
-
-    // Build a simple Zod schema
-    const schemaProps: Record<string, z.ZodTypeAny> = {}
-
-    if (sourceSchema.properties && typeof sourceSchema.properties === 'object') {
-      // JSON Schema format
-      for (const [key, prop] of Object.entries(sourceSchema.properties as any)) {
-        const propSchema = prop as any
-        let zodType: z.ZodTypeAny = z.string() // default
-
-        if (propSchema.type === 'number') zodType = z.number()
-        else if (propSchema.type === 'boolean') zodType = z.boolean()
-        else if (propSchema.type === 'array') zodType = z.array(z.any())
-        else if (propSchema.type === 'object') zodType = z.object({})
-
-        if (propSchema.description) {
-          zodType = zodType.describe(propSchema.description)
-        }
-
-        // Check if optional
-        if (!sourceSchema.required?.includes(key)) {
-          zodType = zodType.optional()
-        }
-
-        schemaProps[key] = zodType
-      }
-    }
-
-    // If no properties extracted, create a simple schema
-    if (Object.keys(schemaProps).length === 0) {
-      return z.object({ input: z.string().optional() })
-    }
-
-    return z.object(schemaProps)
   }
 
   private async getProviderManagerForUser(userId?: string | null) {
@@ -1723,6 +1883,70 @@ export class VercelAIBrain {
   }
 
   /**
+   * SA-139 (D1, D3): a Claude plan selection runs on the user's own Claude Code. Central admission
+   * (P1) comes first, before any process or provider client; its output is all the run reads
+   * (`cliModel`, `effort`, `alwaysThinking`), so other saved keys never reach Claude Code. The
+   * modules load on demand, keeping Claude Code's status reader out of this module's import graph.
+   */
+  private async prepareClaudePlanModel(request: NativeModeRequest): Promise<ClaudePlanWiring | null> {
+    // D6: a held run the click claimed ends with any continuation that does not take it (review A S3).
+    try {
+      const wiring = await this.prepareClaudePlanModelUnguarded(request)
+      if (!wiring) request.claudePlanHeld?.run.stop()
+      return wiring
+    } catch (error) {
+      request.claudePlanHeld?.run.stop()
+      throw error
+    }
+  }
+
+  private async prepareClaudePlanModelUnguarded(request: NativeModeRequest): Promise<ClaudePlanWiring | null> {
+    if (!isClaudePlanSpelling(request.connection)) return null
+    // Faye S10: the named consumer and the run's kind must agree, since the owner kind, the sweeps
+    // and the delegated step cap key on it; a mislabelled caller never runs as the other kind.
+    const consumer = request.claudePlanConsumer
+    // A delegated run is one `subagentRunner.ts` started: it names the run's process owner;
+    // send-routed's Primary turn does not.
+    const delegated = request.processOwner != null
+    // Compact runs through its own summary path (`summaryGeneration.ts`, SA-139 P4), never this loop (review N5).
+    if (consumer === 'compact') throw new ClaudePlanError('consumer_unsupported', 'Compact does not run through the reply loop. Nothing ran.')
+    if ((consumer === 'primary' && delegated) || ((consumer === 'subagent' || consumer === 'worker') && !delegated)) {
+      throw new ClaudePlanError('consumer_unsupported', `This Claude plan run was named a ${consumer} run but ${delegated ? 'is' : 'is not'} a delegated run. Nothing ran.`)
+    }
+    const [{ readClaudePlanReadiness }, runtime] = await Promise.all([import('./claudePlanReadiness'), import('./claudePlanModel')])
+    return this.admitClaudePlanModel(request, delegated, readClaudePlanReadiness, runtime)
+  }
+
+  private async admitClaudePlanModel(
+    request: NativeModeRequest,
+    delegated: boolean,
+    readClaudePlanReadiness: typeof import('./claudePlanReadiness').readClaudePlanReadiness,
+    runtime: typeof import('./claudePlanModel')
+  ): Promise<ClaudePlanWiring> {
+    const admission = await admitClaudePlanSelection({
+      connection: request.connection,
+      modelId: request.model,
+      settings: request.providerSettings ?? null,
+      sampling: claudePlanSamplingToCheck(request.claudePlanSampling),
+      consumer: request.claudePlanConsumer ?? 'unnamed',
+      readiness: () => readClaudePlanReadiness()
+    })
+    const model = new runtime.ClaudePlanModel({
+      modelId: admission.modelId,
+      cliModel: admission.cliModel,
+      effort: admission.effort,
+      alwaysThinking: admission.alwaysThinking,
+      owner: { userId: request.userId ?? null, sessionId: request.sessionId ?? null, agentId: request.agentId ?? null, kind: delegated ? 'delegated' : 'primary' },
+      workingDirectory: await runtime.resolveClaudePlanWorkingDirectory({ userId: request.userId, projectPath: request.projectPath }),
+      // D6: a Primary reply can end at a card; its run is then held under (chat, reply, version).
+      ...(!delegated && request.sessionId && request.messageId && Number.isSafeInteger(request.claudePlanApprovalVersion)
+        ? { holdKey: { sessionId: request.sessionId, replyId: request.messageId, version: String(request.claudePlanApprovalVersion) } } : {}),
+      ...(request.claudePlanHeld ? { held: request.claudePlanHeld } : {})
+    })
+    return { model, runtime }
+  }
+
+  /**
    * Get model instance - delegates to ProviderManager
    * Includes fallback support and caching
    */
@@ -1733,29 +1957,54 @@ export class VercelAIBrain {
     taggedReasoningTagName?: NativeModeRequest['taggedReasoningTagName'],
     observeInput?: (params: { prompt: unknown; tools?: readonly any[] }) => void,
     planLease?: PlanLease,
+    dispatchGate?: ModelDispatchGate,
+    setup?: PreparedAgentSetup,
+    claudePlan?: ClaudePlanModel | null,
   ): Promise<LanguageModel> {
     const transport = connection?.type
     const service = connection?.service ?? undefined
-    let model: LanguageModel = isPlanSelection(connection) ? planModelForLease(planLease, userId, connection, modelName) : (await this.getProviderManagerForUser(userId)).getModel(modelName, {
+    // SA-139: any Claude plan spelling (id or service) runs only on its admitted model, never through
+    // ProviderManager (an id-only selection would otherwise reach the paid Anthropic key).
+    if (isClaudePlanSpelling(connection) && !claudePlan) throw claudePlanNotWiredError()
+    let model: LanguageModel = claudePlan ? claudePlan : isPlanSelection(connection) ? planModelForLease(planLease, userId, connection, modelName) : (await this.getProviderManagerForUser(userId)).getModel(modelName, {
       transport,
-      service
+      service,
+      connectionId: connection?.id
     })
-    if (!isPlanSelection(connection) && typeof model === 'object' && model.specificationVersion === 'v4') model = guardResponsesTerminal(model)
-    if (observeInput) {
+    if (!claudePlan && !isPlanSelection(connection) && typeof model === 'object' && model.specificationVersion === 'v4') model = guardResponsesTerminal(model)
+    if (observeInput || dispatchGate || setup) {
       if (typeof model === 'object' && model !== null && model.specificationVersion === 'v4') {
         // Innermost: observe the exact provider-call parameters, before output-only middleware.
+        // SA-137: the last authority check runs first, so a refused request is never sent or observed.
         model = wrapLanguageModel({ model, middleware: {
           specificationVersion: 'v4',
           wrapStream: async ({ params, doStream }) => {
-            try { observeInput(params) } catch {
-              console.error('[VercelBrain API] Picture input observer failed; no delivery evidence is available')
-              try { observeInput({ prompt: undefined }) } catch { /* Observation never fails the request. */ }
+            if (dispatchGate) await dispatchGate.beforeRequest()
+            if (setup) agentSetupCache.commit(setup)
+            if (observeInput) {
+              try { observeInput(params) } catch {
+                console.error('[VercelBrain API] Picture input observer failed; no delivery evidence is available')
+                try { observeInput({ prompt: undefined }) } catch { /* Observation never fails the request. */ }
+              }
             }
-            return doStream()
+            const calledAt = Date.now()
+            const streamed = await doStream()
+            dispatchGate?.requestSent()
+            if (setup) {
+              try { agentSetupCache.modelCalled(setup, calledAt) } catch {
+                // The request already left. A retired cache owner cannot publish
+                // activity, and cache bookkeeping cannot erase a delivered reply.
+              }
+            }
+            return streamed
           }
         } })
       } else {
-        observeInput({ prompt: undefined })
+        if (dispatchGate) {
+          // No middleware can hold this request back, so it is not sent at all.
+          throw new Error('Batshit could not check file sharing right before this model request, so it sent nothing. This model needs an AI SDK v4 provider.')
+        }
+        observeInput?.({ prompt: undefined })
         console.error('[VercelBrain API] Picture input observation requires a v4 model; its record stays incomplete')
       }
     }
@@ -1811,18 +2060,24 @@ export class VercelAIBrain {
    * in `response.messages` — so it cannot reach the persistence write on its own.
    * The strip in `send-routed` still covers it as defence in depth.
    */
-  private buildEphemeralImagePrepareStep(registry: EphemeralImageRegistry) {
+  private buildEphemeralImagePrepareStep(registry: EphemeralImageRegistry, initialToolIds: readonly string[] = [], deferrals: readonly string[] = []) {
+    let initial = true
     return ({ messages, steps }: { messages: any[]; steps: any[] }) => {
       const previous = steps[steps.length - 1]
-      if (!previous) return undefined
+      const initialIds = initial ? initialToolIds : []
+      const initialDeferrals = initial ? deferrals : []
+      initial = false
+      if (!previous && initialIds.length === 0 && initialDeferrals.length === 0) return undefined
 
       const pending: EphemeralImageRegistryEntry[] = []
-      for (const part of previous.content ?? []) {
-        if (part?.type !== 'tool-result') continue
-        const entry = registry.take(part.toolCallId)
-        if (entry) pending.push(entry)
+      const completed = (previous?.content ?? []).filter((part: any) => part?.type === 'tool-result').map((part: any) => part.toolCallId)
+      for (const id of new Set([...initialIds, ...completed])) {
+        const entry = registry.take(id)
+        // Native images already travel in that step's real tool result. Taking
+        // custody prevents a later original handoff from replaying them.
+        if (entry && entry.deliveryLane !== 'tool_result') pending.push(entry)
       }
-      if (pending.length === 0) return undefined
+      if (pending.length === 0 && initialDeferrals.length === 0) return undefined
 
       // Each entry names its own purpose (recalled memory media, an Agent
       // Browser screenshot, …): the hook is feature-neutral and must not
@@ -1836,6 +2091,7 @@ export class VercelAIBrain {
           })
         )
         .filter((message): message is NonNullable<typeof message> => message !== null)
+      if (initialDeferrals.length) injected.push({ role: 'user', content: [{ type: 'text', text: initialDeferrals.join('\n') }] })
       if (injected.length === 0) return undefined
 
       return { messages: [...messages, ...injected] }
@@ -1864,23 +2120,24 @@ export class VercelAIBrain {
    * this hook exactly once (with `steps` empty), which is why a steer typed during a
    * text-only reply can only be promoted (DL-114-07).
    *
-   * BL-77 adds the tool loop's cache point: from the turn's SECOND step on, the hook also
-   * returns `toolLoopProviderOptions` (the cache policy's `stepProviderOptions`) as that
-   * step's `providerOptions`. The SDK merges them into that one step's call options — unlike
+   * BL-77 adds the tool loop's cache point: on every step, the hook also returns
+   * `toolLoopProviderOptions` (the cache policy's `stepProviderOptions`) as that step's
+   * `providerOptions`. The SDK merges them into that one step's call options — unlike
    * returned messages, they are not carried forward — and the provider sends them as the
    * request-level cache point Anthropic places on the last block, so each step reads the
    * previous step's whole request from the cache instead of paying for it again. It is not
    * a message: nothing is added to, moved in, or removed from what the model reads, and a
-   * steer stays the last thing it reads. Step one never carries it, so a one-step reply never
-   * pays for a cache write nobody reads. Lanes without Anthropic cache control get no
+   * steer stays the last thing it reads. Lanes without Anthropic cache control get no
    * options, so their requests are unchanged.
    *
-   * The rule holds for an approval resume too (BL-200, measured 2026-09-25, when a resume
-   * recompiled the one user message with the paused reply moved into the conversation, so it
-   * could never read what the paused run wrote; a point on its first call made resume input 22%
-   * dearer). Since BL-322 (2026-09-26) a resume compiles the paused call again and replays its
-   * steps, so its prefix can match the paused run's; whether a first-call point pays now is
-   * BL-332's measurement, and until then the rule stands.
+   * BL-1976 (Josh, 2026-10-21): the point starts on the FIRST step. Until then it started on the
+   * second, so a one-step reply paid no write nobody reads, but every longer reply was billed the
+   * whole step-start message (history, open zips, the DCM) fresh on its first call and then wrote
+   * it on the second (SA-126's saved usage: 1,306 of 1,306 later calls read the call before
+   * from the third call on). Now the first call writes it and the second reads it; a one-step
+   * reply pays one write nobody reads. An approval resume follows the same rule (BL-200 kept
+   * it from the second call, because a resume then recompiled the one user message and its
+   * first-call point was read only inside the run): its first call writes, its second reads.
    *
    * BL-183: `processNativeMode` (API Subagents and Workers) registers this same hook with
    * `takeSteers: null`.
@@ -1891,10 +2148,15 @@ export class VercelAIBrain {
    * steer, so it lands on whatever the model reads last. Returned messages are carried to the
    * next step, so `placeToolLoopTailMarker` strips the previous step's marker first: a request
    * carries the system point and one tail point, and the SDK's own response objects, which
-   * send-routed saves and replays, are never marked (only copies are).
+   * send-routed saves and replays, are never marked (only copies are). On the first step there
+   * is no loop message yet, so a copy of the step-start message (the last one Batshit compiled,
+   * kept here as the first step received it) takes the marker, and the next step puts the
+   * original back (BL-1976).
    */
   private buildTurnPrepareStep(options: {
     ephemeralImages: EphemeralImageRegistry | null
+    initialImageToolIds?: readonly string[]
+    imageDeferrals?: readonly string[]
     /**
      * Takes every steer waiting for THIS turn and marks it delivered, or returns `[]`.
      * send-routed supplies it for primary API turns only: a subagent, a Worker, or an
@@ -1909,17 +2171,44 @@ export class VercelAIBrain {
      */
     toolLoopTailMarker: { marker: ToolLoopTailMarker; firstLoopIndex: number } | null
     registerUserSource?: (source: UserInputSource) => void
+    refreshOpenSkills?: () => Promise<SkillDcmUpdate | undefined>
+    registerDcmUpdate?: (update: SkillDcmUpdate) => void
+    checkSkillContext?: (messages: any[]) => void
+    /**
+     * SA-139 P3 Part 2 (D5, D9): the reply's Claude plan model. Once Claude Code holds the compiled
+     * opening, a skill update and the steers are handed to it explicitly (append-only, between steps),
+     * and the SDK prompt is left as Claude Code read it.
+     */
+    claudePlan?: ClaudePlanModel | null
   }) {
     const images = options.ephemeralImages
-      ? this.buildEphemeralImagePrepareStep(options.ephemeralImages)
+      ? this.buildEphemeralImagePrepareStep(options.ephemeralImages, options.initialImageToolIds, options.imageDeferrals)
       : null
     const toolLoopProviderOptions = options.toolLoopProviderOptions
     const toolLoopTailMarker = options.toolLoopTailMarker
+    // BL-1976: the last compiled message, as the first step received it (see the marker above).
+    let stepStart: any = null
 
-    return ({ messages, steps }: { messages: any[]; steps: any[] }) => {
+    return async ({ messages, steps }: { messages: any[]; steps: any[] }) => {
+      const update = await options.refreshOpenSkills?.()
+      const native = options.claudePlan?.holdsOpening ? options.claudePlan : null
+      if (update && native) {
+        // Not a prompt edit, so not registered as one (the picture-address record would expect the edited
+        // prompt); the note reaches that record as one of the run's native pieces (review B S1).
+        native.addSkillUpdate(readSkillDcmUpdate(update).context)
+      } else if (update) {
+        messages = applySkillDcmUpdate(messages, update)
+        if (stepStart) {
+          const content = typeof stepStart.content === 'string' ? stepStart.content : Array.isArray(stepStart.content)
+            ? stepStart.content.filter((part: any) => part?.type === 'text').map((part: any) => part.text).join('') : ''
+          if (content.includes(readSkillDcmUpdate(update).before)) stepStart = applySkillDcmUpdate([stepStart], update)[0]
+        }
+        options.registerDcmUpdate?.(update)
+      }
+      if (toolLoopTailMarker && steps.length === 0) stepStart = messages[toolLoopTailMarker.firstLoopIndex - 1] ?? null
       const base = images ? images({ messages, steps }) : undefined
       const injected: any[] = base ? [...base.messages] : [...messages]
-      let changed = Boolean(base)
+      let changed = Boolean(base) || (Boolean(update) && !native)
 
       const previous = steps[steps.length - 1]
       // A steer lands at a TOOL boundary and nowhere else — that is the promise the whole
@@ -1933,27 +2222,35 @@ export class VercelAIBrain {
         const steers = options.takeSteers(steps.length)
         if (steers.length > 0) {
           options.registerUserSource?.(steerInputSource(steers))
-          injected.push({
-            role: 'user',
-            content: [{ type: 'text', text: buildSteerInjectionText(steers) }]
-          })
-          changed = true
+          if (native) {
+            native.addSteers(steers)
+          } else {
+            injected.push({
+              role: 'user',
+              content: [{ type: 'text', text: buildSteerInjectionText(steers) }]
+            })
+            changed = true
+          }
         }
       }
 
+      // Complete newly-opened guidance is never silently cut to fit a later model call.
+      // Use the SAME resolved model limit/reserve as accepted-send preflight. On the Claude plan
+      // connection the check counts what the native run holds (D5): the prompt plus every addition.
+      options.checkSkillContext?.(native ? [...injected, ...native.nativeAdditionsForBudget()] : injected)
+
       // BL-77: a fresh copy per step, so the SDK's per-step merge never shares Batshit's object.
-      const providerOptions =
-        toolLoopProviderOptions && steps.length >= 1
-          ? structuredClone(toolLoopProviderOptions)
-          : undefined
+      // BL-1976: every step, the first included.
+      const providerOptions = toolLoopProviderOptions ? structuredClone(toolLoopProviderOptions) : undefined
 
       // BL-185: last, so the marker lands on whatever the model reads last (a steer included).
       let stepMessages = injected
-      if (toolLoopTailMarker && steps.length >= 1) {
+      if (toolLoopTailMarker) {
         stepMessages = placeToolLoopTailMarker(
           injected,
           toolLoopTailMarker.firstLoopIndex,
-          toolLoopTailMarker.marker
+          toolLoopTailMarker.marker,
+          stepStart
         )
         // It hands back the same array when it had nothing to mark.
         if (stepMessages !== injected) changed = true
@@ -2222,8 +2519,9 @@ export class VercelAIBrain {
 
   private buildGenerationSettings(request: NativeModeRequest): Record<string, unknown> {
     // Explicit user settings are checked at the owning selection boundary.
-    // Operational API defaults (including max output) are not plan wire fields.
-    if (request.chatgptPlanLease) return {}
+    // Operational API defaults (including max output) are not plan wire fields;
+    // the Claude plan (SA-139 D12) has no sampling or output-limit wire at all.
+    if (request.chatgptPlanLease || isClaudePlanSpelling(request.connection)) return {}
     const settings: Record<string, unknown> = {}
 
     if (typeof request.maxTokens === 'number') {
@@ -2949,8 +3247,12 @@ export class VercelAIBrain {
       hasAbortSignal: !!request.abortSignal
     })
 
+    // D10: a failure after the stream started never reaches the stream's own end hooks.
+    let claudePlanOnFailure: ClaudePlanModel | null = null
     try {
       if (request.chatgptPlanLease) assertPlanSettings(request.providerSettings)
+      const claudePlan = await this.prepareClaudePlanModel(request)
+      claudePlanOnFailure = claudePlan?.model ?? null
       let imageInputContext: Omit<ApiInputObservation, 'promptMessages' | 'toolDefinitions'> | null = null
       const model = await this.getModel(
         request.model,
@@ -2960,9 +3262,14 @@ export class VercelAIBrain {
         request.onApiModelInput ? (params) => request.onApiModelInput!({
           ...(imageInputContext ?? { compiledMessages: [], compiledPrefixCount: -1, initialSystem: null, userSources: [] }),
           promptMessages: params.prompt,
-          toolDefinitions: params.tools
+          toolDefinitions: params.tools,
+          // SA-139 D5: what a Claude plan run reads natively between steps (review B M2).
+          ...(claudePlan ? { nativeAdditions: claudePlan.model.nativeAdditionPieces() } : {})
         }) : undefined,
         request.chatgptPlanLease,
+        request.modelDispatchGate,
+        request.agentSetup,
+        claudePlan?.model,
       )
       // NEW (SA-002): Pass sessionId and userId for clip resolution
       const baseMessages = await this.convertMessages(
@@ -2976,84 +3283,21 @@ export class VercelAIBrain {
         request
       )
       this.logGeminiPayloadSummary('stream', messages, request, geminiFileUris)
-      const toolsEnabled = request.toolsEnabled !== false
-      let toolsForRequest: Record<string, any> | undefined
-      let toolApprovalsForRequest: Record<string, NativeToolApprovalPolicy> = {}
-      let toolMaps: ToolSourceMaps = {
-        workflowTools: new Map<string, { webhookUrl: string }>(),
-        gatewayTools: new Map<string, GatewayMetadata>(),
-        subagentTools: new Map<string, SubagentToolMetadata>()
-      }
-      // SA-105 P2: this is the STREAMING path — the one real chat sends take.
-      // Wiring only the non-streaming `processNativeMode` left the synthetic
-      // lane dead in production, which is exactly what the live recall probe
-      // caught before this was fixed.
-      let ephemeralImagesForRequest: EphemeralImageRegistry | null = null
-
-      if (toolsEnabled) {
-        // Story 6.4: Get BOTH tools AND toolMaps for metadata injection
-        // Story 6.8: Now includes agentId for loading assigned workflows
-        const { tools, maps, toolApprovals, ephemeralImages } = await this.buildToolsForMode3(
-          request.availableTools,
-          request.availableWorkflows,
-          request.sessionId,
-          request.userId,
-          request.selectedGateways,
-          request.toolSelections,
-          request.agentId,
-          {
-            assignedSubagents: request.assignedSubagents,
-            defaultGateways: request.defaultGateways ?? null
-          },
-          request.preloadedGatewayTools ?? null,
-          request.preloadedGatewayMetadata ?? null,
-          request.toolApprovalMode,
-          {
-            providerSettings: request.providerSettings ?? null,
-            processOwner: request.processOwner,
-            delegatedBashEnabled: request.delegatedBashEnabled,
-            projectPath: request.projectPath ?? null,
-            selectedCliToolIds: request.selectedCliToolIds,
-            dcmDisplaySettings: request.dcmDisplaySettings ?? null,
-            allowArtifactRuntimeTools: request.allowArtifactRuntimeTools,
-            allowFabricControlTools: request.allowFabricControlTools,
-            memoryControlsEnabled: request.memoryControlsEnabled,
-            dmControlsEnabled: request.dmControlsEnabled,
-            scheduleControlsEnabled: request.scheduleControlsEnabled,
-            judgeControlsEnabled: request.judgeControlsEnabled,
-            workersEnabled: request.workersEnabled,
-            controlApprovals: request.controlApprovals ?? null,
-            groupMemberRun: request.groupMemberRun === true,
-            scopeAgentId: request.scopeAgentId ?? null,
-            parentModelId: request.model ?? null,
-            parentConnection: request.connection ?? null,
-            parentCapabilities: request.modelCapabilities ?? null,
-            parentMessageId: request.messageId ?? null,
-            abortSignal: request.abortSignal
-          }
-        )
-        toolMaps = maps
-        toolsForRequest = request.chatgptPlanLease ? planClientTools(tools, request.chatgptPlanLease) : tools
-        toolApprovalsForRequest = toolApprovals
-        ephemeralImagesForRequest = ephemeralImages
-
-        const openaiTools = await this.buildOpenAITools(request)
-        if (openaiTools) {
-          toolsForRequest = this.mergeToolSets(toolsForRequest, openaiTools)
-        }
-      } else {
-        logger.debug('[VercelBrain API] Tools disabled for this request')
-      }
-
+      const preparedTools = await this.consumeApiToolset(request)
+      const { tools: toolsForRequest, maps: toolMaps, approvals: toolApprovalsForRequest,
+        images: ephemeralImagesForRequest, carried: initialImageToolIds, deferred: imageDeferrals,
+        p5ApiRun, p5Owner } = preparedTools
       // Story 6.4: Wrap the SDK onEnd callback to inject metadata into steps.
       // AI SDK 7 semantics: event.usage is the AGGREGATE across all steps (what
       // v6 called totalUsage); last-step numbers live on event.finalStep.usage.
       // Batshit's internal onFinish contract keeps totalUsage = run aggregate.
+      const skillDcmUpdates: SkillDcmUpdate[] = []
       const apiUserSources = [...(request.imageOriginInput?.userSources ?? [])]
       const registerUserSource = (source: UserInputSource) => {
         if (!apiUserSources.some((known) => known.textHash === source.textHash && JSON.stringify(known.spans) === JSON.stringify(source.spans))) apiUserSources.push(source)
       }
-      const wrappedOnEnd = request.onFinish ? async ({ text, steps, usage, totalUsage, responseMessages: eventResponseMessages, finalStep }: any) => {
+      const p5StreamCustody: ApiStreamCustody | undefined = p5ApiRun ? { run: p5ApiRun, owner: p5Owner!, consumerConsumed: false, finishKnown: false } : undefined
+      const wrappedOnEnd = request.onFinish || p5StreamCustody ? async ({ text, steps, usage, totalUsage, responseMessages: eventResponseMessages, finalStep }: any) => {
         const responseMessages =
           Array.isArray(eventResponseMessages) && eventResponseMessages.length > 0
             ? eventResponseMessages
@@ -3084,7 +3328,7 @@ export class VercelAIBrain {
           finalStep?.reasoningText ?? finalStep?.reasoning
         )
         const aggregateUsage = usage ?? totalUsage
-        await request.onFinish!({
+        if (request.onFinish) await request.onFinish({
           text,
           steps: enhancedSteps,
           totalUsage: aggregateUsage,
@@ -3094,6 +3338,7 @@ export class VercelAIBrain {
           apiUserSources,
           imageInputsRegistered: ephemeralImagesForRequest?.registered() ?? 0
         })
+        if (p5StreamCustody) { p5StreamCustody.finishKnown = true; p5StreamCustody.owner.notifyP5ApiStreamSettlement(p5StreamCustody.run) }
       } : undefined
 
       const runtimeProviderId = this.resolveRuntimeProviderId(
@@ -3128,9 +3373,14 @@ export class VercelAIBrain {
         compiledPrefixCount: cachePolicy.messages.length === request.messages.length
           ? request.imageOriginInput?.compiledPrefixCount ?? -1 : -1,
         initialSystem: compiledMessages.filter((message) => message.role === 'system'),
-        userSources: apiUserSources
+        userSources: apiUserSources,
+        skillDcmUpdates
       }
 
+      if (p5ApiRun) {
+        p5Owner!.assertP5ApiRunCurrent(p5ApiRun)
+        if (p5Owner!.p5ApiRunMustPause(p5ApiRun)) throw new Error('The original API management boundary ended before model dispatch.')
+      }
       const result = await streamText({
         model,
         messages: cachePolicy.messages,
@@ -3139,11 +3389,15 @@ export class VercelAIBrain {
         // v7 system-in-messages guard is relaxed to preserve Batshit's prompt
         // order and provider cache anchoring on the compiled payload.
         allowSystemInMessages: true,
-        tools: cachePolicy.tools,
-        ...(Object.keys(toolApprovalsForRequest).length > 0
-          ? { toolApproval: toolApprovalsForRequest }
-          : {}),
-        stopWhen: isStepCount(request.maxToolRounds || 10),
+        ...claudePlanToolOptions(claudePlan, cachePolicy.tools, toolApprovalsForRequest, downloadGuard),
+        // SDK evaluates ALL predicates concurrently. This private boolean NEVER awaits a flight.
+        stopWhen: p5ApiRun
+          ? [isStepCount(request.maxToolRounds || 10), () => {
+              const pause = p5Owner!.p5ApiRunMustPause(p5ApiRun)
+              if (pause) p5Owner!.holdP5ApiToolImages(p5ApiRun)
+              return pause
+            }]
+          : isStepCount(request.maxToolRounds || 10),
         ...this.buildGenerationSettings(request),
         providerOptions: request.chatgptPlanLease ? planProviderOptions(cachePolicy.providerOptions) : cachePolicy.providerOptions,
         // SA-107: per-session cache-affinity headers (xAI/Baseten/Fireworks direct lanes).
@@ -3154,6 +3408,7 @@ export class VercelAIBrain {
         include: { rawChunks: true, requestBody: true },
         ...(downloadGuard ? { experimental_download: downloadGuard } : {}),
         onStepEnd: ({ text, toolCalls, toolResults, finishReason }) => {
+          if (p5ApiRun) p5Owner!.observeP5ApiStepTools(p5ApiRun, (toolResults ?? []).map(item => item.toolCallId))
           logger.debug('[VercelBrain API] Step completed', {
             hasText: !!text,
             toolCallCount: toolCalls?.length || 0,
@@ -3176,17 +3431,39 @@ export class VercelAIBrain {
             })
           }
         },
-        onEnd: wrappedOnEnd,
-        onAbort: request.onAbort,
+        // D10: the Claude plan run ends with the reply's loop (a normal end, the step cap, a Stop or
+        // an error). A consumer that stops reading is SA-139 P2 Part 3's (send-routed's finalize,
+        // tested there); until then the idle backstop ends that run.
+        onEnd: claudePlan ? async (event: any) => {
+          try { await wrappedOnEnd?.(event) } finally { claudePlan.model.endReplyAtLoopEnd() }
+        } : wrappedOnEnd,
+        onAbort: claudePlan ? (event: any) => {
+          claudePlan.model.endReply()
+          request.onAbort?.(event)
+        } : request.onAbort,
+        ...(claudePlan ? { onError: ({ error }: { error: unknown }) => {
+          claudePlan.model.endReply()
+          console.error('[VercelBrain API] Claude plan stream error:', error)
+        } } : {}),
         // SA-114 P1 (DL-114-05): ONE composed hook, always registered — SA-105's synthetic
         // image lane first, then the steer. It returns `undefined` when neither has
         // anything pending, so a run with no images and no steers is unchanged. BL-77: on
         // lanes that take Anthropic cache control it also adds the tool loop's cache point
-        // from the second step on (not a message).
+        // on every step, the first included (BL-1976; not a message on direct Anthropic).
         prepareStep: this.buildTurnPrepareStep({
-          ephemeralImages: ephemeralImagesForRequest,
+          ephemeralImages: ephemeralImagesForRequest, initialImageToolIds, imageDeferrals,
           takeSteers: request.takeSteers ?? null,
           registerUserSource: request.onApiModelInput ? registerUserSource : undefined,
+          refreshOpenSkills: request.refreshOpenSkills,
+          registerDcmUpdate: update => { skillDcmUpdates.push(update) },
+          claudePlan: claudePlan?.model ?? null,
+          checkSkillContext: request.skillContextBudget && request.skillReadDelivery ? stepMessages => {
+            if (!request.skillReadDelivery!.hasReads()) return
+            const report = buildPromptBudgetReport({ runtime: 'vercel', messages: stepMessages,
+              contextLimit: request.skillContextBudget!.contextLimit,
+              outputReserveTokens: request.skillContextBudget!.outputReserveTokens })
+            if (!report.canSend) throw new Error(`The complete opened-skill guidance and tool reply do not fit this model context. ${report.reason}`)
+          } : undefined,
           toolLoopProviderOptions: cachePolicy.stepProviderOptions ?? null,
           toolLoopTailMarker: cachePolicy.toolLoopTailMarker
             ? { marker: cachePolicy.toolLoopTailMarker, firstLoopIndex: cachePolicy.messages.length }
@@ -3194,8 +3471,12 @@ export class VercelAIBrain {
         })
       })
 
+      if (p5StreamCustody) { p5ApiStreams.set(result, p5StreamCustody); p5ApiRuns.set(p5StreamCustody.run, p5StreamCustody) }
+
       // Return the full result for SSE conversion
       ;(result as any).__toolMaps = toolMaps
+      // SA-139 (D10): send-routed's request finalize ends this reply's Claude plan run as a backstop.
+      ;(result as any).__claudePlanModel = claudePlan?.model ?? null
       ;(result as any).__detectToolSource = (toolName: string) => this.detectMode3ToolSource(toolName, toolMaps)
       ;(result as any).__runtimeInfo = {
         runtimeId: 'vercel',
@@ -3210,6 +3491,7 @@ export class VercelAIBrain {
       }
       return result
     } catch (error: any) {
+      claudePlanOnFailure?.endReply()
       console.error('[VercelBrain API] Error in streamNativeMode:', error)
       throw error
     }
@@ -3240,4 +3522,47 @@ export class VercelAIBrain {
 
 function normalizeToolKey(name: string) {
   return normalizeToolNameForAiSdkKey(name);
+}
+
+type ClaudePlanWiring = { model: ClaudePlanModel; runtime: typeof import('./claudePlanModel') }
+
+/**
+ * The raw selection's sampling copies admission checks. An empty list (a stop-sequence list the user
+ * left empty) is blank: blank sends nothing, so it is never refused as a setting (review nit, Part 3).
+ */
+function claudePlanSamplingToCheck(sampling?: Readonly<object> | null): Record<string, unknown> | null {
+  if (!sampling) return null
+  return Object.fromEntries(Object.entries(sampling).filter(([, value]) => !(Array.isArray(value) && value.length === 0)))
+}
+
+/**
+ * Any spelling of the Claude plan connection (review N6): P1's selection check, plus a service field
+ * that carries the connection id's spelling (`claude-plan:local`, `direct:claude-plan`). Every one
+ * reaches admission, which refuses an inconsistent spelling; none reaches ProviderManager.
+ */
+function isClaudePlanSpelling(connection?: ModelConnectionInfo | null): boolean {
+  return isClaudePlanSelection(connection) || isClaudePlanConnection(connection?.service)
+}
+
+/**
+ * SA-139 (D4): the Claude plan's admission wrapper goes on the OUTERMOST layer, outside the readable
+ * wrapper (`wrapToolsWithReadableModelOutput`, which tracks each execution for BL-1959), so a Stop
+ * during the admission wait records no call that never ran. `repairToolCall` hands Claude the SDK's
+ * own error text for a call it refused before running; an approval card refuses visibly until P3.
+ * Every other connection gets exactly what it got before.
+ */
+function claudePlanToolOptions(
+  claudePlan: ClaudePlanWiring | null,
+  tools: Record<string, any> | undefined,
+  approvals: Record<string, any>,
+  download: unknown
+): Record<string, unknown> {
+  const hasApprovals = Object.keys(approvals).length > 0
+  if (!claudePlan) return { tools, ...(hasApprovals ? { toolApproval: approvals } : {}) }
+  const { model, runtime } = claudePlan
+  return {
+    tools: tools ? runtime.wrapClaudePlanToolSet(tools, model, download ? { download: download as any } : {}) : tools,
+    ...(hasApprovals ? { toolApproval: runtime.wrapClaudePlanApprovals(approvals, model) } : {}),
+    repairToolCall: model.repairToolCall
+  }
 }

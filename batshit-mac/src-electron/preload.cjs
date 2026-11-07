@@ -14,6 +14,26 @@ const maximumPortMessageBytes = 512 * 1024;
 const roleArgument = process.argv.find((argument) => argument.startsWith('--batshit-window-role='));
 const requestedRole = roleArgument?.slice('--batshit-window-role='.length);
 const role = requestedRole === 'desktop' || requestedRole === 'controls' ? requestedRole : 'main';
+const hiddenTitleBar = role === 'main' && process.argv.includes('--batshit-title-bar=hidden');
+
+// The main window draws no title bar on macOS (main-window-policy.mjs), so the page lays out its
+// own top bar around the window buttons. Mark the document before its first paint: the preload runs
+// before the parser has made <html>, so wait for it rather than letting the layout jump once loaded.
+function markHiddenTitleBar() {
+  const mark = () => document.documentElement.setAttribute('data-batshit-mac-titlebar', 'hidden');
+  if (document.documentElement) {
+    mark();
+    return;
+  }
+  const observer = new MutationObserver(() => {
+    if (!document.documentElement) return;
+    observer.disconnect();
+    mark();
+  });
+  observer.observe(document, { childList: true });
+}
+
+if (hiddenTitleBar) markHiddenTitleBar();
 
 const mainCommands = new Set([
   'desktopGoon.getStatus',

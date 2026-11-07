@@ -1,4 +1,5 @@
 // @vitest-environment node
+import { useSendHandlerFixture } from '$lib/test-utils/sendHandlerFixture'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { redis } from '$lib/server/redis'
@@ -26,30 +27,8 @@ const AGENT = 'agent-bl775-wake'
 const PRESET = 'preset-bl775-wake'
 const REPLY = 'msg-reply-bl775-wake'
 
-/**
- * Sealed from any real Redis. The default lane's `$lib/server/redis` is the in-memory fake, but the
- * live hub opens its own clients with `redis.createClient` (the server's external subscriber, and a
- * chat's visual-indicator monitoring). Unstubbed they connected to whatever `REDIS_URL` named, and
- * opening the hub waited for that connection, so the tab test hung until its time limit whenever
- * that Redis was down (a full lane on 2026-09-28 while the native Redis was stopped; reproduced with
- * an unreachable `REDIS_URL`, and gone with this stub). The reply itself never needed it.
- */
-vi.mock('redis', () => ({
-  createClient: vi.fn(() => ({
-    isOpen: true,
-    isReady: true,
-    connect: vi.fn(async () => undefined),
-    on: vi.fn(),
-    subscribe: vi.fn(async () => undefined),
-    pSubscribe: vi.fn(async () => undefined),
-    unsubscribe: vi.fn(async () => undefined),
-    pUnsubscribe: vi.fn(async () => undefined),
-    publish: vi.fn(async () => 0),
-    configSet: vi.fn(async () => 'OK'),
-    quit: vi.fn(async () => undefined),
-    disconnect: vi.fn(async () => undefined)
-  }))
-}))
+// Physical monitoring and subscribers are isolated by the opt-in handler fixture.
+
 
 vi.mock('$lib/server/services/nativeTools', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
@@ -104,6 +83,7 @@ let POST: (event: any) => Promise<Response>
 let SSE_POST: (event: any) => Promise<Response>
 let SSE_ROUTE: any
 let SESSION = ''
+useSendHandlerFixture({ sessionIds: () => [SESSION], postStartupMcpUsers: () => [USER] })
 let count = 0
 
 /** The event fetch: a forward to `/api/sse` reaches the real route; nothing else is called. */

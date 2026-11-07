@@ -17,7 +17,8 @@ async function refuseLargeBody(reader: ReadableStreamDefaultReader<Uint8Array>):
 }
 
 /** Bound actual streamed UTF-8 bytes, not an untrusted Content-Length header. */
-export async function readAppActionBody(request: Request): Promise<unknown> {
+export async function readAppActionBody(request: Request, maxBytes = APP_ACTION_MAX_BYTES): Promise<unknown> {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 131072) refuse('invalid_request')
   const reader = request.body?.getReader()
   if (!reader) refuse('invalid_request')
   const chunks: Uint8Array[] = []
@@ -27,7 +28,7 @@ export async function readAppActionBody(request: Request): Promise<unknown> {
       const part = await reader.read()
       if (part.done) break
       length += part.value.byteLength
-      if (length > APP_ACTION_MAX_BYTES) return await refuseLargeBody(reader)
+      if (length > maxBytes) return await refuseLargeBody(reader)
       chunks.push(part.value)
     }
   } finally { reader.releaseLock() }

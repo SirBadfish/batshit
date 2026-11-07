@@ -6,36 +6,29 @@ import {
   REFERENCE_SCAN_HAND_CASES,
   generateReferenceScanTexts
 } from '$lib/test-utils/referenceScanTexts'
+import { zipIdsNamedInText } from '$lib/utils/messageDeletionZips'
 
 /**
  * BL-707: deleting a chat (`redis.deleteSession`) also deletes every zip its messages reference,
  * read from each stored message's words with `/\{\{batshit-zip:([^:}\s]+)(?::::[^}]+)?\}\}/g`.
  * That pattern's description part searched to the first `}` again from every opener: seconds of
  * the one Node process per message of openers that never close, inside the delete. It is one
- * scan now, with the same rules (no whitespace in the id, a description of at least one
- * character). The real facade drives the sweep with its client stubbed (the claim is CPU, not
- * Redis), and the sweeps it imports are stubbed so nothing touches a Redis.
+ * scan now. Since BL-1513 (2026-10-18) the sweep reads a message's words with the message
+ * delete's reader (`zipIdsNamedInText`: the trust reader's shapes, an empty description and a
+ * spaced id included, plus the older `{{batshit|id:…|` form), and since BL-1798 it takes a named
+ * zip only when the zip's record names the chat. The real facade drives the sweep with its client
+ * stubbed (the claim is CPU, not Redis), and the sweeps it imports are stubbed so nothing touches
+ * a Redis.
  */
 
 vi.mock('$lib/server/services/controlApprovals', () => ({ sweepSessionApprovals: vi.fn(async () => undefined) }))
 vi.mock('$lib/server/services/postTurnCheckState', () => ({ sweepPostTurnRecords: vi.fn(async () => undefined) }))
-vi.mock('$lib/server/services/codexCleanupWarnings', () => ({
-  sweepCodexCleanupWarnings: vi.fn(async () => undefined)
-}))
 
-/** The sweep's two patterns as they were, kept here only as oracles. */
-function oldSweptZipIds(content: string): string[] {
-  const ids = new Set<string>()
-  let match: RegExpExecArray | null
-  const newZipPattern = /\{\{batshit-zip:([^:}\s]+)(?::::[^}]+)?\}\}/g
-  while ((match = newZipPattern.exec(content || '')) !== null) ids.add(match[1])
-  const oldZipPattern = /\{\{batshit\|id:([^|]+)\|/g
-  while ((match = oldZipPattern.exec(content || '')) !== null) ids.add(match[1])
-  return Array.from(ids).sort()
-}
-
-/** Deletes a chat holding one message with `content`; answers the zip ids it deleted and the time. */
-async function deleteChatWithMessage(content: string) {
+/**
+ * Deletes a chat holding one message with `content`, every zip record naming `recordedChat`;
+ * answers the zip ids it deleted and the time.
+ */
+async function deleteChatWithMessage(content: string, recordedChat = 'session-1') {
   const { RedisService } = await vi.importActual<typeof import('$lib/server/redis')>(
     '$lib/server/redis'
   )
@@ -45,9 +38,16 @@ async function deleteChatWithMessage(content: string) {
     json: {
       get: vi.fn(async (key: string) => {
         if (key === 'session:session-1') return { id: 'session-1', user_id: 'user-1' }
-        if (key === 'message:session-1:m1') return { id: 'm1', role: 'assistant', content }
         return null
-      })
+      }),
+      // The sweep reads the message by path (its words; it has no metadata), and takes a named
+      // zip only when the zip's record names this chat (BL-1798).
+      mGet: vi.fn(async (keys: string[], path: string) =>
+        keys.map((key) => {
+          if (key === 'message:session-1:m1') return path === '$.content' ? [content] : []
+          return path === '$.metadata.sessionId' ? [recordedChat] : []
+        })
+      )
     },
     lRange: vi.fn(async (key: string) => (key === 'messages:session-1' ? ['m1'] : [])),
     sMembers: vi.fn(async () => []),
@@ -70,7 +70,7 @@ async function deleteChatWithMessage(content: string) {
 }
 
 describe('deleting a chat reads its messages once (BL-707)', () => {
-  it('deletes exactly the zips the old patterns read', async () => {
+  it('deletes exactly the zips its words name, when their records name the chat (BL-1513)', async () => {
     const texts = [
       ...REFERENCE_SCAN_HAND_CASES,
       ...generateReferenceScanTexts(1_500, 4_707),
@@ -78,12 +78,23 @@ describe('deleting a chat reads its messages once (BL-707)', () => {
     ]
     let swept = 0
     for (const text of texts) {
-      const expected = oldSweptZipIds(text)
+      const expected = [...zipIdsNamedInText(text)].sort()
       const { deletedZipIds } = await deleteChatWithMessage(text)
       expect(deletedZipIds, JSON.stringify(text)).toEqual(expected)
       if (expected.length > 0) swept++
     }
     expect(swept).toBeGreaterThan(300)
+  }, 60_000)
+
+  it('deletes none of the zips its words name when their records name another chat (BL-1798)', async () => {
+    const texts = [...REFERENCE_SCAN_HAND_CASES, ...generateReferenceScanTexts(300, 1_798)]
+    let named = 0
+    for (const text of texts) {
+      const { deletedZipIds } = await deleteChatWithMessage(text, 'session-2')
+      expect(deletedZipIds, JSON.stringify(text)).toEqual([])
+      if (zipIdsNamedInText(text).length > 0) named++
+    }
+    expect(named).toBeGreaterThan(50)
   }, 60_000)
 
   it('deletes a chat whose message holds 20,000 unclosed openers in 1 MB in well under 200 ms', async () => {

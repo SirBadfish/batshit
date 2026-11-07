@@ -63,6 +63,8 @@ import {
 } from './fixtures/hairAssetFixture'
 import { planAppearanceRecipeMigration } from './appearanceRecipeMigrationPlanner'
 import { RECIPE_ROLLBACK_PREVIEW_RESULT_CONTRACT } from './recipeRollbackPreviewResult'
+import { RECIPE_SERVER_BUILD_RESULT_CONTRACT } from './recipeServerBuildResult'
+import type { LiveGoonBakerClientOptions } from './liveGoonBakerClient'
 const hash = (character: string) => character.repeat(64)
 const bytes = (value: string) => new TextEncoder().encode(value)
 
@@ -87,6 +89,19 @@ function appearanceState() {
     neutralRecipeSha256: hash('2'),
     values: { body_height: 0.25 },
     unlockedDialIds: []
+  }
+}
+
+function unrelatedSiblingDraft() {
+  return {
+    id: 'futureSurface',
+    contract: 'future-surface-state/v1',
+    definitionSha256: hash('e'),
+    state: {
+      contract: 'future-surface-state/v1',
+      definitionSha256: hash('e'),
+      enabled: true
+    }
   }
 }
 
@@ -267,6 +282,13 @@ function source(
   )
 }
 
+/** The released browser Worker path is package update; ordinary explicit
+ * first-bake/rebake uses server construction. Keep failure fixtures on this
+ * actual supported path without introducing a held structural sibling. */
+function publicPackageUpdateStart(request: { expectedWriteVersion: number; idempotencyKey: string; state?: unknown }) {
+  return { kind: 'package-update' as const, request: { expectedWriteVersion: request.expectedWriteVersion, idempotencyKey: request.idempotencyKey, analysisId: 'client-reviewed-public-update' } }
+}
+
 async function createFailureWorkflowHarness(
   point: 'upload' | 'registration' | 'staging' | 'commit',
   assetBase?: string,
@@ -289,7 +311,7 @@ async function createFailureWorkflowHarness(
   const recipeSource = await source(sourcePackage, sourceModel, sourceManifest)
   const job = {
     jobId: `job_${point}_failure`,
-    operation: 'rebake',
+    operation: ordinary ? 'rebake' : 'package-update',
     status: 'baking',
     stateVersion: 3,
     targetRevisionId: 'recipe_revision_2_client',
@@ -300,7 +322,7 @@ async function createFailureWorkflowHarness(
     goon: minimalGoon({ recipe: { writeVersion: 20 } as GoonRecipeV2 }),
     job,
     reviewedState: {
-      operation: 'rebake',
+      operation: ordinary ? 'rebake' : 'package-update',
       state: recipeState
     } as RecipeReviewedState,
     replayed: false
@@ -361,6 +383,7 @@ async function createFailureWorkflowHarness(
     cleanupCustomPackage
   })
   vi.spyOn(client, 'startBake').mockResolvedValue(started)
+  vi.spyOn(client, 'startPackageUpdate').mockResolvedValue(started)
   const registered = {
     owner: { writeVersion: 21 } as GoonRecipeV2,
     job: { ...job, status: 'packaging', stateVersion: 4 } as GoonRecipeJob,
@@ -372,6 +395,7 @@ async function createFailureWorkflowHarness(
     job: { ...job, status: 'ready', stateVersion: 5 } as GoonRecipeJob,
     envelope: { live: await deriveRecipeAssetSetFromUpload(upload) }
   } as RecipeStageResponse
+  const serverStage = vi.spyOn(client, 'buildAndStageCandidate').mockResolvedValue(staged)
   const injectedError = new Error(`Injected ${point} failure.`)
   const register = vi.spyOn(client, 'registerCandidateAssets')
   const stage = vi.spyOn(client, 'stageCandidate')
@@ -400,7 +424,7 @@ async function createFailureWorkflowHarness(
   const previewCandidate = vi.fn(async () => undefined)
 
   return {
-    client, started, staged,
+    client, started, staged, serverStage,
     bake,
     recipeSource,
     recipeState,
@@ -417,6 +441,267 @@ async function createFailureWorkflowHarness(
 }
 
 describe('Recipe workflow browser client', () => {
+  it.each(['first-bake', 'rebake'] as const)('uses one server construction for ordinary %s and waits for mounted preview', async (operation) => {
+    const h = await createFailureWorkflowHarness('staging', undefined, undefined, true)
+    h.started.job.operation = operation
+    h.started.reviewedState.operation = operation
+    let release!: () => void
+    let entered!: () => void
+    const enteredPreview = new Promise<void>(resolve => { entered = resolve })
+    const previewGate = new Promise<void>(resolve => { release = resolve })
+    const preview = vi.fn(async () => { entered(); await previewGate })
+    const workflow = h.client.buildUploadStageCommit({
+      start: { kind: 'bake', request: { expectedWriteVersion: 20, idempotencyKey: 'server-build', state: h.recipeState } },
+      previewCandidate: preview
+    })
+    await enteredPreview
+    expect(h.serverStage).toHaveBeenCalledWith(h.started.job.jobId,
+      { expectedWriteVersion: 20, expectedJobStateVersion: 3 }, { signal: expect.any(AbortSignal) })
+    expect(h.bake).not.toHaveBeenCalled()
+    expect(h.uploadCustomPackage).not.toHaveBeenCalled()
+    expect(h.register).not.toHaveBeenCalled()
+    expect(h.stage).not.toHaveBeenCalled()
+    expect(h.commit).not.toHaveBeenCalled()
+    release()
+    const result = await workflow
+    expect(result.live).toEqual(h.staged.envelope.live)
+    expect(result.bake).toBeNull()
+    expect(h.commit).toHaveBeenCalledWith(h.staged.job.jobId,
+      { expectedWriteVersion: 22, expectedJobStateVersion: 5 })
+  })
+
+  it.each(['server', 'browser', 'ready'] as const)('forwards cancellation and waits for %s preview restoration before failure or cleanup', async branch => {
+    const h = await createFailureWorkflowHarness('commit', undefined, undefined, branch === 'server')
+    const abort = new AbortController()
+    let entered!: () => void, finishRestoration!: () => void
+    const previewEntered = new Promise<void>(resolve => { entered = resolve })
+    const restored = new Promise<void>(resolve => { finishRestoration = resolve })
+    const preview = vi.fn(async (_staged: RecipeStageResponse, options: { signal?: AbortSignal }) => {
+      expect(options.signal).toBe(abort.signal)
+      entered()
+      await new Promise<void>(resolve => options.signal!.addEventListener('abort', () => resolve(), { once: true }))
+      await restored
+      options.signal!.throwIfAborted()
+    })
+    let workflow: Promise<unknown>
+    if (branch === 'ready') {
+      const recovery = { goon: h.staged.goon, owner: h.staged.owner,
+        job: { ...h.staged.job, goonId: h.staged.goon.id, status: 'ready', stagedLive: h.staged.envelope.live },
+        candidate: h.staged.envelope, reviewedState: { state: h.recipeState }, recovered: true } as RecipeJobRecoveryResponse
+      workflow = h.client.resumeReadyCandidate({ recovery, signal: abort.signal, previewCandidate: preview })
+    } else if (branch === 'server') {
+      workflow = h.client.buildUploadStageCommit({ signal: abort.signal, previewCandidate: preview,
+        start: { kind: 'bake', request: { expectedWriteVersion: 20, idempotencyKey: 'cancel-preview-server', state: h.recipeState } } })
+    } else {
+      h.started.job.operation = 'package-update'; h.started.reviewedState.operation = 'package-update'
+      vi.spyOn(h.client, 'startPackageUpdate').mockResolvedValue(h.started)
+      workflow = h.client.buildUploadStageCommit({ signal: abort.signal, previewCandidate: preview,
+        start: { kind: 'package-update', request: { expectedWriteVersion: 20, idempotencyKey: 'cancel-preview-browser', analysisId: 'reviewed-update' } } })
+    }
+    const observed = workflow.catch(error => error)
+    await previewEntered
+    abort.abort(new DOMException('Canceled during actual preview.', 'AbortError'))
+    await Promise.resolve()
+    expect(h.action).not.toHaveBeenCalled()
+    expect(h.cleanupCustomPackage).not.toHaveBeenCalled()
+    expect(h.commit).not.toHaveBeenCalled()
+    finishRestoration()
+    expect(await observed).toMatchObject({ name: 'AbortError' })
+    expect(h.action).toHaveBeenCalled()
+    expect(h.commit).not.toHaveBeenCalled()
+    if (branch === 'browser') expect(h.cleanupCustomPackage).toHaveBeenCalledOnce()
+    else expect(h.cleanupCustomPackage).not.toHaveBeenCalled()
+  })
+
+  it('never races browser Fail or cleanup against an aborted server upload', async () => {
+    const h = await createFailureWorkflowHarness('staging', undefined, undefined, true)
+    const abort = new AbortController()
+    let entered!: () => void
+    const enteredBuild = new Promise<void>(resolve => { entered = resolve })
+    h.serverStage.mockImplementation(async (_id, _request, options) => {
+      entered()
+      return new Promise((_resolve, reject) => {
+        options!.signal!.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true })
+      })
+    })
+    let settle!: (value: RecipeJobRecoveryResponse) => void
+    const recovery = vi.spyOn(h.client, 'recoverJob').mockImplementation(() =>
+      new Promise(resolve => { settle = resolve }))
+    const progress = vi.fn()
+    const workflow = h.client.buildUploadStageCommit({
+      start: { kind: 'bake', request: { expectedWriteVersion: 20, idempotencyKey: 'cancel-server-upload', state: h.recipeState } },
+      signal: abort.signal, previewCandidate: h.previewCandidate, onProgress: progress
+    })
+    const outcome = workflow.catch(error => error)
+    await enteredBuild
+    abort.abort()
+    await vi.waitFor(() => expect(recovery).toHaveBeenCalledOnce())
+    expect(progress).toHaveBeenLastCalledWith('settling-server-build')
+    expect(h.action).not.toHaveBeenCalled()
+    expect(h.cleanupCustomPackage).not.toHaveBeenCalled()
+    settle({ job: { ...h.started.job, status: 'failed' } } as RecipeJobRecoveryResponse)
+    expect(await outcome).toMatchObject({ name: 'AbortError' })
+    expect(h.action).not.toHaveBeenCalled()
+    expect(h.previewCandidate).not.toHaveBeenCalled()
+    expect(h.commit).not.toHaveBeenCalled()
+  })
+
+  it.each(['failed', 'ready'] as const)(
+    'keeps observing after a transient recovery error and refuses activation when settlement is %s',
+    async (terminalStatus) => {
+      const h = await createFailureWorkflowHarness('staging', undefined, undefined, true)
+      h.serverStage.mockRejectedValue(new TypeError('Connection lost'))
+      const recovery = vi.spyOn(h.client, 'recoverJob')
+        .mockRejectedValueOnce(new TypeError('Recovery connection lost'))
+        .mockResolvedValueOnce({ job: { ...h.started.job, status: 'baking' } } as RecipeJobRecoveryResponse)
+        .mockResolvedValueOnce({ job: { ...h.started.job, status: terminalStatus } } as RecipeJobRecoveryResponse)
+      vi.useFakeTimers()
+      try {
+        const outcome = h.client.buildUploadStageCommit({
+          start: { kind: 'bake', request: { expectedWriteVersion: 20,
+            idempotencyKey: `settle-${terminalStatus}`, state: h.recipeState } },
+          previewCandidate: h.previewCandidate
+        }).catch(error => error)
+        await vi.advanceTimersByTimeAsync(3_000)
+        expect(await outcome).toMatchObject({ message: 'Connection lost' })
+        expect(recovery).toHaveBeenCalledTimes(3)
+        expect(h.action).not.toHaveBeenCalled()
+        expect(h.previewCandidate).not.toHaveBeenCalled()
+        expect(h.commit).not.toHaveBeenCalled()
+      } finally {
+        vi.useRealTimers()
+      }
+    }
+  )
+
+  it('bounds a recovery request that never settles and continues observing', async () => {
+    const h = await createFailureWorkflowHarness('staging', undefined, undefined, true)
+    h.serverStage.mockRejectedValue(new TypeError('Connection lost'))
+    const signals: AbortSignal[] = []
+    const recovery = vi.spyOn(h.client, 'recoverJob').mockImplementationOnce((_jobId, options) => {
+      signals.push(options!.signal!)
+      return new Promise<RecipeJobRecoveryResponse>(() => {})
+    }).mockResolvedValueOnce({ job: { ...h.started.job, status: 'failed' } } as RecipeJobRecoveryResponse)
+    vi.useFakeTimers()
+    try {
+      const outcome = h.client.buildUploadStageCommit({
+        start: { kind: 'bake', request: { expectedWriteVersion: 20,
+          idempotencyKey: 'settle-hung-recovery', state: h.recipeState } },
+        previewCandidate: h.previewCandidate
+      }).catch(error => error)
+      await vi.advanceTimersByTimeAsync(16_000)
+      expect(await outcome).toMatchObject({ message: 'Connection lost' })
+      expect(signals[0]?.aborted).toBe(true)
+      expect(recovery).toHaveBeenCalledTimes(2)
+      expect(h.action).not.toHaveBeenCalled()
+      expect(h.commit).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('leaves an unresolved server build pending after the settlement deadline', async () => {
+    const h = await createFailureWorkflowHarness('staging', undefined, undefined, true)
+    h.serverStage.mockRejectedValue(new TypeError('Connection lost'))
+    const recovery = vi.spyOn(h.client, 'recoverJob').mockRejectedValue(new TypeError('Recovery unavailable'))
+    vi.useFakeTimers()
+    try {
+      const outcome = h.client.buildUploadStageCommit({
+        start: { kind: 'bake', request: { expectedWriteVersion: 20,
+          idempotencyKey: 'settle-deadline', state: h.recipeState } },
+        previewCandidate: h.previewCandidate
+      }).catch(error => error)
+      await vi.advanceTimersByTimeAsync(5 * 60_000)
+      const error = await outcome
+      expect(error).toBeInstanceOf(AggregateError)
+      expect(error.message).toContain('final saved status could not be confirmed')
+      expect(error.message).toContain('remains pending')
+      expect(recovery.mock.calls.length).toBeGreaterThan(1)
+      expect(h.action).not.toHaveBeenCalled()
+      expect(h.previewCandidate).not.toHaveBeenCalled()
+      expect(h.commit).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('fails a canceled started job directly only when server construction was never dispatched', async () => {
+    const h = await createFailureWorkflowHarness('staging', undefined, undefined, true)
+    const abort = new AbortController()
+    vi.spyOn(h.client, 'startBake').mockImplementation(async () => { abort.abort(); return h.started })
+    await expect(h.client.buildUploadStageCommit({
+      start: { kind: 'bake', request: { expectedWriteVersion: 20, idempotencyKey: 'cancel-after-start', state: h.recipeState } },
+      signal: abort.signal, previewCandidate: h.previewCandidate
+    })).rejects.toMatchObject({ name: 'AbortError' })
+    expect(h.serverStage).not.toHaveBeenCalled()
+    expect(h.action).toHaveBeenCalledWith(h.started.job.jobId,
+      expect.objectContaining({ action: 'fail', stage: 'validating' }))
+  })
+
+  it('records ordinary mounted-preview failure only after server settlement and never commits', async () => {
+    const h = await createFailureWorkflowHarness('staging', undefined, undefined, true)
+    vi.spyOn(h.client, 'recoverJob').mockResolvedValue({ owner: h.staged.owner, job: h.staged.job } as RecipeJobRecoveryResponse)
+    await expect(h.client.buildUploadStageCommit({
+      start: { kind: 'bake', request: { expectedWriteVersion: 20, idempotencyKey: 'server-preview-failure', state: h.recipeState } },
+      previewCandidate: async () => { throw new Error('Mounted preview failed') }
+    })).rejects.toThrow('Mounted preview failed')
+    expect(h.action).toHaveBeenCalledWith(h.started.job.jobId,
+      expect.objectContaining({ action: 'fail', stage: 'preview-load', expectedWriteVersion: 22, expectedJobStateVersion: 5 }))
+    expect(h.cleanupCustomPackage).not.toHaveBeenCalled()
+    expect(h.commit).not.toHaveBeenCalled()
+  })
+
+  it('does not activate a ready result discovered after a lost server response', async () => {
+    const h = await createFailureWorkflowHarness('staging', undefined, undefined, true)
+    h.serverStage.mockRejectedValue(new TypeError('Connection lost'))
+    vi.spyOn(h.client, 'recoverJob').mockResolvedValue({ owner: h.staged.owner, job: h.staged.job } as RecipeJobRecoveryResponse)
+    await expect(h.client.buildUploadStageCommit({
+      start: { kind: 'bake', request: { expectedWriteVersion: 20, idempotencyKey: 'lost-server-response', state: h.recipeState } },
+      previewCandidate: h.previewCandidate
+    })).rejects.toThrow('Connection lost')
+    expect(h.action).not.toHaveBeenCalled()
+    expect(h.previewCandidate).not.toHaveBeenCalled()
+    expect(h.commit).not.toHaveBeenCalled()
+  })
+
+  it('sends only expected versions to the session-authorized server construction route', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 }))
+    const client = new RecipeWorkflowClient('goon/server id', { fetchImpl })
+    await expect(client.buildAndStageCandidate('job/server id',
+      { expectedWriteVersion: 4, expectedJobStateVersion: 2 })).rejects.toMatchObject({ status: 401 })
+    expect(fetchImpl).toHaveBeenCalledWith('/api/goons/goon%2Fserver%20id/recipe/jobs/job%2Fserver%20id/build-stage',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ expectedWriteVersion: 4, expectedJobStateVersion: 2 }) }))
+  })
+
+  it('preserves the streamed build refusal as a typed conflict with its code and status', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
+      contract: RECIPE_SERVER_BUILD_RESULT_CONTRACT,
+      kind: 'error', status: 409, error: 'The Recipe changed.', code: 'WRITE_CONFLICT'
+    })))
+    const client = new RecipeWorkflowClient(minimalGoon().id, { fetchImpl: fetchImpl as typeof fetch })
+    const error = await client.buildAndStageCandidate('job-1',
+      { expectedWriteVersion: 4, expectedJobStateVersion: 2 }).catch(caught => caught)
+    expect(error).toBeInstanceOf(RecipeWorkflowHttpError)
+    expect(error).toMatchObject({ status: 409, code: 'WRITE_CONFLICT', message: 'The Recipe changed.' })
+  })
+
+  it.each([
+    [{ kind: 'success', staged: {} }, 'unsupported result contract'],
+    [{ contract: RECIPE_SERVER_BUILD_RESULT_CONTRACT, kind: 'future', staged: {} }, 'unknown result kind'],
+    [{ contract: RECIPE_SERVER_BUILD_RESULT_CONTRACT, kind: 'error', status: 200,
+      error: 'No failure', code: null }, 'invalid error result'],
+    [{ contract: RECIPE_SERVER_BUILD_RESULT_CONTRACT, kind: 'error', status: 409,
+      error: 'Conflict', code: 42 }, 'invalid error result'],
+    [{ contract: RECIPE_SERVER_BUILD_RESULT_CONTRACT, kind: 'success', staged: {} },
+      'Recipe stage response.goon']
+  ] as const)('rejects malformed or unknown server build envelopes', async (payload, message) => {
+    const client = new RecipeWorkflowClient(minimalGoon().id, {
+      fetchImpl: vi.fn(async () => new Response(JSON.stringify(payload))) as typeof fetch
+    })
+    await expect(client.buildAndStageCandidate('job-1',
+      { expectedWriteVersion: 4, expectedJobStateVersion: 2 })).rejects.toThrow(message)
+  })
+
   it('resolves stored Recipe upload refs against the browser-facing batshit-server URL', () => {
     expect(
       resolveRecipeAssetUrl('/uploads/goon_custom_manifests/live.json', 'http://127.0.0.1:5651/')
@@ -654,7 +939,7 @@ describe('Recipe workflow browser client', () => {
       owner: recovery.owner,
       job: recovery.job,
       envelope: recovery.candidate
-    })
+    }, { signal: undefined })
     expect(commit).toHaveBeenCalledWith('recipe_job_ready_resume', {
       expectedWriteVersion: 41,
       expectedJobStateVersion: 8
@@ -1217,7 +1502,7 @@ describe('Recipe workflow browser client', () => {
       { signal: buildController.signal }
     )
     expect(register.mock.invocationCallOrder[0]).toBeLessThan(stage.mock.invocationCallOrder[0])
-    expect(previewCandidate).toHaveBeenCalledWith(staged)
+    expect(previewCandidate).toHaveBeenCalledWith(staged, { signal: buildController.signal })
     expect(stage.mock.invocationCallOrder[0]).toBeLessThan(
       previewCandidate.mock.invocationCallOrder[0]
     )
@@ -1242,7 +1527,7 @@ describe('Recipe workflow browser client', () => {
     const recipeSource = await source(sourcePackage, sourceModel, sourceManifest)
     const job = {
       jobId: 'job_failure',
-      operation: 'rebake',
+      operation: 'package-update',
       status: 'baking',
       stateVersion: 3,
       targetRevisionId: 'recipe_revision_3_client',
@@ -1253,7 +1538,7 @@ describe('Recipe workflow browser client', () => {
       goon: minimalGoon({ recipe: { writeVersion: 20 } as GoonRecipeV2 }),
       job,
       reviewedState: {
-        operation: 'rebake',
+        operation: 'package-update',
         state: recipeState
       } as RecipeReviewedState,
       replayed: false
@@ -1275,7 +1560,7 @@ describe('Recipe workflow browser client', () => {
         throw error
       })
     })
-    vi.spyOn(client, 'startBake').mockResolvedValue(started)
+    vi.spyOn(client, 'startPackageUpdate').mockResolvedValue(started)
     const recovery = {
       owner: { writeVersion: 21 } as GoonRecipeV2,
       job: { ...job, stateVersion: 4 } as GoonRecipeJob
@@ -1285,14 +1570,11 @@ describe('Recipe workflow browser client', () => {
 
     await expect(
       client.buildUploadStageCommit({
-        start: {
-          kind: 'bake',
-          request: {
+        start: publicPackageUpdateStart({
             expectedWriteVersion: 20,
             idempotencyKey: 'rebake-key',
             state: recipeState
-          }
-        },
+          }),
         previewCandidate: vi.fn(async () => undefined)
       })
     ).rejects.toMatchObject({ name: 'AbortError' })
@@ -1320,7 +1602,7 @@ describe('Recipe workflow browser client', () => {
     const recipeSource = await source(sourcePackage, sourceModel, sourceManifest)
     const job = {
       jobId: 'job_source_load_failure',
-      operation: 'first-bake',
+      operation: 'package-update',
       status: 'validating',
       stateVersion: 3,
       targetRevisionId: 'recipe_revision_1_source_load',
@@ -1331,7 +1613,7 @@ describe('Recipe workflow browser client', () => {
       goon: minimalGoon({ recipe: { writeVersion: 20 } as GoonRecipeV2 }),
       job,
       reviewedState: {
-        operation: 'first-bake',
+        operation: 'package-update',
         state: recipeState
       } as RecipeReviewedState,
       replayed: false
@@ -1342,7 +1624,7 @@ describe('Recipe workflow browser client', () => {
       }) as typeof fetch,
       assetUrl: (ref) => ref
     })
-    vi.spyOn(client, 'startBake').mockResolvedValue(started)
+    vi.spyOn(client, 'startPackageUpdate').mockResolvedValue(started)
     vi.spyOn(client, 'recoverJob').mockResolvedValue({
       owner: { writeVersion: 21 } as GoonRecipeV2,
       job: { ...job, stateVersion: 4 }
@@ -1351,14 +1633,11 @@ describe('Recipe workflow browser client', () => {
 
     await expect(
       client.buildUploadStageCommit({
-        start: {
-          kind: 'bake',
-          request: {
+        start: publicPackageUpdateStart({
             expectedWriteVersion: 20,
             idempotencyKey: 'source-load-key',
             state: recipeState
-          }
-        },
+          }),
         previewCandidate: vi.fn(async () => undefined)
       })
     ).rejects.toThrow(`Failed to load exact Recipe asset ${recipeSource.package.ref}: Load failed`)
@@ -1392,7 +1671,7 @@ describe('Recipe workflow browser client', () => {
     const recipeSource = await source(sourcePackage, sourceModel, sourceManifest)
     const job = {
       jobId: 'job_preview_failure',
-      operation: 'rebake',
+      operation: 'package-update',
       status: 'baking',
       stateVersion: 3,
       targetRevisionId: 'recipe_revision_3_preview',
@@ -1403,7 +1682,7 @@ describe('Recipe workflow browser client', () => {
       goon: minimalGoon({ recipe: { writeVersion: 20 } as GoonRecipeV2 }),
       job,
       reviewedState: {
-        operation: 'rebake',
+        operation: 'package-update',
         state: recipeState
       } as RecipeReviewedState,
       replayed: false
@@ -1459,7 +1738,7 @@ describe('Recipe workflow browser client', () => {
       uploadCustomPackage: vi.fn(async () => upload),
       cleanupCustomPackage
     })
-    vi.spyOn(client, 'startBake').mockResolvedValue(started)
+    vi.spyOn(client, 'startPackageUpdate').mockResolvedValue(started)
     vi.spyOn(client, 'registerCandidateAssets').mockResolvedValue({
       owner: { writeVersion: 21 } as GoonRecipeV2,
       job: { ...job, status: 'packaging', stateVersion: 4 } as GoonRecipeJob,
@@ -1480,14 +1759,11 @@ describe('Recipe workflow browser client', () => {
 
     await expect(
       client.buildUploadStageCommit({
-        start: {
-          kind: 'bake',
-          request: {
+        start: publicPackageUpdateStart({
             expectedWriteVersion: 20,
             idempotencyKey: 'preview-key',
             state: recipeState
-          }
-        },
+          }),
         previewCandidate: vi.fn(async () => {
           throw new Error('Candidate GLB could not be loaded')
         })
@@ -1520,14 +1796,11 @@ describe('Recipe workflow browser client', () => {
 
       await expect(
         harness.client.buildUploadStageCommit({
-          start: {
-            kind: 'bake',
-            request: {
+          start: publicPackageUpdateStart({
               expectedWriteVersion: 20,
               idempotencyKey: `${point}-failure-key`,
               state: harness.recipeState
-            }
-          },
+            }),
           previewCandidate: harness.previewCandidate
         })
       ).rejects.toThrow(harness.injectedError.message)
@@ -1567,10 +1840,7 @@ describe('Recipe workflow browser client', () => {
     })
     const abort = new AbortController()
     const workflow = harness.client.buildUploadStageCommit({
-      start: {
-        kind: 'bake',
-        request: { expectedWriteVersion: 20, idempotencyKey: 'cancel-upload', state: harness.recipeState }
-      },
+      start: publicPackageUpdateStart({ expectedWriteVersion: 20, idempotencyKey: 'cancel-upload', state: harness.recipeState }),
       signal: abort.signal,
       previewCandidate: harness.previewCandidate
     })
@@ -1608,10 +1878,7 @@ describe('Recipe workflow browser client', () => {
     vi.useFakeTimers()
     try {
       const workflow = harness.client.buildUploadStageCommit({
-        start: {
-          kind: 'bake',
-          request: { expectedWriteVersion: 20, idempotencyKey: 'hung-renew', state: harness.recipeState }
-        },
+        start: publicPackageUpdateStart({ expectedWriteVersion: 20, idempotencyKey: 'hung-renew', state: harness.recipeState }),
         previewCandidate: harness.previewCandidate
       })
       const outcome = workflow.then(

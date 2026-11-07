@@ -20,7 +20,11 @@ const K = new Uint32Array([
 const encoder = new TextEncoder()
 
 export function sha256Hex(text: string): string {
-  const bytes = encoder.encode(text)
+  return sha256BytesHex(encoder.encode(text))
+}
+
+/** Hash exactly this byte view. Callers own its contents while it is read. */
+export function sha256BytesHex(bytes: Uint8Array): string {
   const bitLength = bytes.length * 8
   // Message, one 0x80 byte, zero padding, and the 64-bit length: a whole number of 64-byte blocks.
   const padded = new Uint8Array(Math.ceil((bytes.length + 9) / 64) * 64)

@@ -3,11 +3,12 @@
  * done (2026-09-18).
  *
  * Measured before, on the dev lane (`_local/deletemid-proof/before-*.json`): a chat deleted while
- * its Codex or API reply ran `sleep 20` was swept in 35-85 ms, and nothing stopped the reply. Its
- * request ran on for another 20 seconds and wrote the reply's message, the message list, the
- * tool result's zip and the session zip set, and (when the delete beat its first snapshot) the
- * Execution Viewer log, into a chat that no longer existed. Nothing sweeps those later, and the
- * reply spent tokens and ran commands for a chat nobody had.
+ * its Codex (removed in SA-139 R1) or API reply ran `sleep 20` was swept in 35-85 ms, and
+ * nothing stopped the reply. Its request ran on for another 20 seconds and wrote the reply's
+ * message, the message list, the tool result's zip and the session zip set, and (when the
+ * delete beat its first snapshot) the Execution Viewer log, into a chat that no longer existed.
+ * Nothing sweeps those later, and the reply spent tokens and ran commands for a chat nobody
+ * had.
  *
  * The rejected alternative was to make every late writer refuse a chat that no longer exists:
  * one check in each writer (the finalize, the Execution Viewer snapshot, every zip writer, the
@@ -29,6 +30,8 @@
  *    Stop end a lock while its request may still be writing. Then it sweeps. There is no silent
  *    fallback: a request still running at the bound makes the delete refuse (409) and sweep
  *    nothing, and a retry waits for that same request again.
+ *    The chat's Claude plan runs (SA-139 D10, a run held at an approval card included) then end
+ *    and their Claude Code exits are awaited; an exit that cannot be confirmed refuses the same way.
  * 4. The mark ends after the sweep. A send that read the chat before the delete and registers
  *    after it re-reads the chat under its lock (send-routed) and answers "not found".
  * 5. Every tab of the chat's owner is told (`session_deleted` on the user channel), so the chat
@@ -48,6 +51,8 @@ import {
 } from '$lib/server/services/streamAbortRegistry'
 import { abortWakeRun } from '$lib/server/services/wakeRunRegistry'
 import { forgetChatReplyRecords } from '$lib/server/services/replyStreamRecord'
+import { endClaudePlanRuns } from '$lib/server/services/claudePlanRunRegistry'
+import { stopCompactRuns } from '$lib/server/services/compactRunRegistry'
 
 export const SESSION_DELETE_TURN_STOP_MS = 30_000
 export const SESSION_DELETE_TURN_POLL_MS = 100
@@ -98,6 +103,16 @@ function stopWhatRuns(sessionId: string) {
 }
 
 /**
+ * SA-139 (D10): the chat's Claude plan runs end and settle before its data goes. SIGTERM alone is
+ * not settlement, so a run whose exit cannot be confirmed keeps the chat (409), as a request still
+ * running does.
+ */
+async function endChatClaudePlanRuns(sessionId: string): Promise<void> {
+  const { unsettled } = await endClaudePlanRuns({ sessionId }, 'This chat was deleted.')
+  if (unsettled > 0) throw new SessionDeleteRefusedError('session_turn_still_stopping')
+}
+
+/**
  * Delete a chat: stop its running requests, wait until each has released its own registration,
  * then `sweep`.
  *
@@ -111,9 +126,14 @@ export async function deleteSessionAfterItsTurn(
   if (!beginSessionDelete(sessionId)) {
     throw new SessionDeleteRefusedError('session_delete_in_progress')
   }
+  // SA-139 P4 (review): the chat's Compacts stop first. A Compact is not a running request, and one
+  // still setting up (its reads, admission, the executable bind) would otherwise start its model call,
+  // or its Claude plan run, after this delete's sweeps, on the deleted chat's messages.
+  stopCompactRuns(sessionId, SESSION_DELETED_ABORT_REASON)
 
   try {
     if (!hasRunningRequest(sessionId)) {
+      await endChatClaudePlanRuns(sessionId)
       await sweep()
       forgetChatReplyRecords(sessionId)
       cancelQueuedSessionTurnsOfDeletedChat(sessionId)
@@ -132,6 +152,7 @@ export async function deleteSessionAfterItsTurn(
       stopWhatRuns(sessionId)
     }
 
+    await endChatClaudePlanRuns(sessionId)
     await sweep()
     // BL-775: the chat's recorded reply events and zip detector state go with it.
     forgetChatReplyRecords(sessionId)

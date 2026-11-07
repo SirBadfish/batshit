@@ -6,7 +6,7 @@ import {
   WakeHookError
 } from '$lib/server/services/dm/wakeHookStore'
 import { resolveAgentDmsEnabled, resolveAgentWakeEnabled } from '$lib/utils/dmControl'
-import { normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
+import { isApiPrimaryAgentType, normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
 
 /**
  * SA-113 P3 (DL-113-09) — the Admin "Wake-up webhooks" card's list and create.
@@ -34,10 +34,7 @@ async function listEligibleAgents(userId: string) {
   const agents = await redis.getAgents(userId)
   return agents
     .map((agent) => agent as unknown as Record<string, any>)
-    .filter((agent) => {
-      const type = normalizePrimaryAgentType(agent as any)
-      return type === 'api' || type === 'cli'
-    })
+    .filter((agent) => isApiPrimaryAgentType(normalizePrimaryAgentType(agent as any)))
     .map((agent) => ({
       id: agent.id,
       name:

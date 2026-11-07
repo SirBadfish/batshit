@@ -106,7 +106,8 @@ describe('generation-owned speech commit with the shared projection', () => {
       releasePending: () => { calls.push('release_waiting') }
     })
     expect(result).toBe('only-this')
-    expect(calls).toEqual(['voice_end', 'release_waiting', 'store_mark'])
+    // Auto Listen remains held until the swallowed turn's mark is durably accepted.
+    expect(calls).toEqual(['voice_end', 'store_mark', 'release_waiting'])
     expect(stored).toEqual({ id: 'end_voice_mode', tab: null, onlyThis: true, confidence: 0.93,
       snapshotId: 'qa_voice_parity', at: '2026-10-04T12:00:00.000Z' })
     expect(isSwallowedQuickActionTurn({ role: 'user', metadata: { quickAction: stored } })).toBe(true)

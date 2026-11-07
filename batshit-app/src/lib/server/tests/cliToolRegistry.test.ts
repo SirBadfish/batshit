@@ -42,11 +42,13 @@ describe.runIf(REAL_REDIS_LANE)('cliToolRegistry', () => {
     await seedAgent()
   })
 
-  it('refuses a virtual delegated agent without a server-owned physical owner', async () => {
+  it('refuses a retired actor and a virtual delegated run without a physical owner', async () => {
     const result = await executeCliTool({
-      userId, agentId: 'subagent_cli_runtime', toolId: 'missing_tool', input: {}, actorType: 'agent'
+      userId, agentId: 'subagent_cli_runtime', toolId: 'missing_tool', input: {}, actorType: 'agent' as never
     })
     expect(result).toMatchObject({ success: false, blocked: true, code: 'OWNER_UNAVAILABLE' })
+    const delegated = await executeCliTool({ userId, agentId: 'subagent_cli_runtime', toolId: 'missing_tool', input: {}, actorType: 'in-process' })
+    expect(delegated).toMatchObject({ success: false, blocked: true, code: 'OWNER_UNAVAILABLE' })
   })
 
   it('accepts a server-resolved owner from service dispatch', async () => {
@@ -722,18 +724,6 @@ describe.runIf(REAL_REDIS_LANE)('cliToolRegistry', () => {
     expect(inProcess.success).toBe(false)
     if (!inProcess.success) expect(inProcess.approvalRequest?.lane).toBe('api')
 
-    const helper = await executeCliTool({
-      userId,
-      agentId,
-      sessionId: 'session_f5',
-      messageId: 'msg_helper',
-      toolId: 'confirm_echo',
-      input: { query: 'y' },
-      actorType: 'agent'
-    })
-    expect(helper.success).toBe(false)
-    if (!helper.success) expect(helper.approvalRequest?.lane).toBe('cli')
-
     // A caller with no chat to click in — a service-token call, or a helper call whose
     // message id went missing — is `service`, never a silent `api` pause that persists no card.
     const service = await executeCliTool({
@@ -748,23 +738,9 @@ describe.runIf(REAL_REDIS_LANE)('cliToolRegistry', () => {
     if (!service.success) expect(service.approvalRequest?.lane).toBe('service')
   })
 
-  it('F-6: the pause tells the managed CLI lane to retry after the resume turn, and the API lane not to', async () => {
+  it('F-6: the API lane\'s pause tells the model not to retry it itself', async () => {
+    // SA-139 R4: the managed CLI lane's "retry after the resume turn" wording went with that lane.
     await seedConfirmEcho()
-
-    const cli = await executeCliTool({
-      userId,
-      agentId,
-      sessionId: 'session_f6',
-      messageId: 'msg_cli',
-      toolId: 'confirm_echo',
-      input: { query: 'a' },
-      actorType: 'agent'
-    })
-    expect(cli.success).toBe(false)
-    if (!cli.success) {
-      expect(cli.error).toContain('When the user clicks Approve you are resumed')
-      expect(cli.error).not.toContain('Do not retry it yourself')
-    }
 
     const api = await executeCliTool({
       userId,

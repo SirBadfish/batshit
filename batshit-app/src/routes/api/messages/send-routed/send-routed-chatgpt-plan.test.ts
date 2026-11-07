@@ -1,9 +1,19 @@
 // @vitest-environment node
+import { useSendHandlerFixture } from '$lib/test-utils/sendHandlerFixture'
 /** Real compiler, installed SDK, SSE handler and saved/reloaded replies; synthetic provider only. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 vi.unmock('ai'); vi.unmock('@ai-sdk/openai')
 const slot = vi.hoisted(() => ({ runtime: null as any }))
 vi.mock('$lib/server/services/chatgptPlanHost', () => ({ getChatgptPlanRuntime: () => slot.runtime }))
+vi.mock('$lib/server/services/systemSlashCommands', async original => {
+  const actual = await original<typeof import('$lib/server/services/systemSlashCommands')>()
+  if (process.env.VITEST_USE_REAL_REDIS === 'true') return actual
+  return { ...actual, ensureSystemSlashCommands: vi.fn(async (userId: string) => {
+    const { assertInitializedBuiltinPlugin } = await import('$lib/test-utils/initialized-builtin-plugin')
+    const { redis } = await import('$lib/server/redis')
+    return assertInitializedBuiltinPlugin(userId, key => redis.json.get(key))
+  }) }
+})
 vi.mock('$lib/server/services/nativeTools', async original => ({ ...(await original<Record<string, unknown>>()), nativeToolService: { cleanupExecutionSandboxesForSession: vi.fn(async () => []) } }))
 import { mkdtempSync, realpathSync, rmSync } from 'node:fs'
 import os from 'node:os'
@@ -11,6 +21,7 @@ import path from 'node:path'
 import { env } from '$env/dynamic/private'
 import { redis } from '$lib/server/redis'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
+import { initializedBuiltinPluginEntries } from '$lib/test-utils/initialized-builtin-plugin'
 import { ChatgptPlanVault } from '$lib/server/services/chatgptPlanVault'
 import { ChatgptPlanOAuth } from '$lib/server/services/chatgptPlanOAuth'
 import { ChatgptPlanRuntime } from '$lib/server/services/chatgptPlanRuntime'
@@ -31,6 +42,7 @@ import { GET as reload } from '../[sessionId]/+server'
 import { POST as interrupt } from '../interrupt/+server'
 useRedisTestServer()
 const USER = 'sa130-send-user', AGENT = 'sa130-send-agent', PRESET = 'sa130-send-preset', SESSION = 'sa130-send-session', REPLY = 'sa130-send-reply'
+useSendHandlerFixture({ sessionIds: () => [SESSION], postStartupMcpUsers: () => [USER], strictCompiler: true })
 let vault: ChatgptPlanVault, runtime: ChatgptPlanRuntime, root: string
 let bodies: any[], forwards: any[], storedAtEnd: any, complete = true
 let stopAfterText: (() => void) | undefined
@@ -69,8 +81,12 @@ beforeEach(async () => {
   vi.spyOn(console, 'error').mockImplementation(() => {}); vi.spyOn(console, 'warn').mockImplementation(() => {})
   __resetReplyRecordsForTests(); __resetStreamAbortRegistryForTests(); __resetSteerInboxRegistryForTests()
   await redis.set(`model:${PRESET}`, { id: PRESET, provider: 'openai', modelId: 'fixture-model', effectiveModelId: 'fixture-model', modelName: 'Fixture', connection: { id: `chatgpt-plan:${row.id}`, type: 'direct', service: 'chatgpt-plan' }, settings: {}, pricing: {}, contextWindow: 10000 })
+  await redis.sAdd(`user:${USER}:models`, PRESET)
   await redis.createAgent({ id: AGENT, user_id: USER, name: 'Fixture', agentType: 'api', primary_model_preset_id: PRESET, memory_enabled: false, tool_approval_mode: 'all' } as any)
   await redis.createSession({ id: SESSION, user_id: USER, title: 'Synthetic plan proof', agent_id: AGENT } as any)
+  // This consumer starts after catalog bootstrap. Keep actual complete inventory/access
+  // projection, with all built-ins OFF; migration/Lua is a separate owner's proof.
+  for (const [key, value] of initializedBuiltinPluginEntries(USER)) await redis.json.set(key, '$', value)
 })
 afterEach(async () => {
   await runtime.close(); rmSync(root, { recursive: true, force: true }); slot.runtime = null
@@ -91,6 +107,19 @@ function run(signal?: AbortSignal, extra: Record<string, unknown> = {}) {
   return send({ request: new Request('http://127.0.0.1:45671/api/messages/send-routed', { method: 'POST', signal, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId: SESSION, agentId: AGENT, agentType: 'api', content: 'Current fixture question.', messageId: REPLY, messages: [{ id: 'prior-user', role: 'user', content: 'Earlier fixture question.' }, { id: 'prior-assistant', role: 'assistant', content: 'Earlier fixture answer.' }, { id: 'current-user', role: 'user', content: 'Current fixture question.' }], ...extra }) }), fetch: sseFetch, locals: { user: { id: USER } } } as any)
 }
 describe('plan ordinary API reply contract', () => {
+  it.runIf(process.env.VITEST_USE_REAL_REDIS !== 'true').each(['missing command', 'malformed command'])('refuses an unconfirmed post-startup catalog before provider dispatch: %s', async condition => {
+    const catalog = initializedBuiltinPluginEntries(USER)
+    const [key, metadata] = catalog.find(([key, value]) => key.startsWith('slash_command:') && value.id !== 'app-actions')!
+    if (condition === 'missing command') {
+      await redis.del(key)
+    } else {
+      await redis.json.set(key, '$', { ...metadata, type: 'prompt' })
+    }
+    const response = await run()
+    expect(response.status).toBe(503)
+    expect(await response.json()).toMatchObject({ code: 'SYSTEM_SKILLS_UNAVAILABLE' })
+    expect(bodies).toHaveLength(0)
+  })
   it.each([
     { vision: true, finished: true },
     { vision: undefined, finished: true },
@@ -145,7 +174,9 @@ describe('plan ordinary API reply contract', () => {
   it.each([true, false])('uses the real canonical compiler and saves before end; completed=%s', async finished => {
     complete = finished
     const response = await run()
-    expect(response.status).toBe(finished ? 200 : 502)
+    expect(response.status, JSON.stringify({ response: await response.clone().json(),
+      failures: vi.mocked(console.error).mock.calls.flat().filter(value => value instanceof Error).map(error => error.stack) }))
+      .toBe(finished ? 200 : 502)
     expect(bodies).toHaveLength(1)
     expect(bodies[0]).toMatchObject({ stream: true, store: false })
     expect(bodies[0].input[0].role).toBe('developer')
@@ -301,6 +332,8 @@ it('independent race: disconnect before grant commit cannot approve the control'
   const toolCall = { type: 'tool-call', toolCallId: callId, toolName: 'native_batshit_tool_use', input: { ref: 'fabric:sys.memory.delete', input } }
   const current = { id: 'current-user', session_id: SESSION, user_id: USER, role: 'user', content: 'Current fixture question.' }
   const card = { id: REPLY, session_id: SESSION, user_id: USER, agent_id: AGENT, role: 'assistant', content: 'Pending fixture approval.', metadata: {
+    whiteboardContextSnapshot: { schema_version: 1, userId: USER, sessionId: SESSION, agentId: AGENT, messageId: REPLY,
+      settings: { mode: 'neither', whiteboardEnabled: false, preserveReasoning: false, whiteboardBudgetTokens: 1500, showWhiteboard: true }, dcmLines: [] },
     providerMessageSource: { providerId: 'openai', connectionId: `chatgpt-plan:${row.id}`, modelId: 'fixture-model', planBinding: binding },
     providerMessages: [{ role: 'assistant', content: [toolCall, { type: 'tool-approval-request', approvalId, toolCall }] }],
     toolApprovals: { mode: 'all', source: 'vercel', approvals: [{ approvalId, status: 'pending', requestedAt: new Date().toISOString(), expiresAt: new Date(Date.now()+180000).toISOString(), toolName: toolCall.toolName, input: toolCall.input, toolCall, source: 'vercel', control: { approvalId: control.id, controlId: control.controlId, controlTitle: control.controlTitle, riskLevel: 'confirm', input, lane: 'api' } }] }

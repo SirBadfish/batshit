@@ -8,8 +8,8 @@
  * steered) is sent the moment `end` arrives, so it lands inside that work. Measured on the
  * smoke stack (`_local/queued-send-proof/`): it reached send-routed 0.8 to 1.6 s before the
  * reply's request had finished and was refused `session_turn_in_progress` in 9 runs out of 9,
- * on the Codex lane and the API lane alike. The user's words were stored and never answered,
- * beside an error bubble and a "Response already in progress" toast.
+ * on the Codex lane (removed in SA-139 R1) and the API lane alike. The user's words were stored
+ * and never answered, beside an error bubble and a "Response already in progress" toast.
  *
  * So a new turn waits while the chat's turn is only finishing (`isSessionTurnFinishing`):
  * the same shape as an approval click waiting for the reply that raised its card, and the

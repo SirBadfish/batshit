@@ -14,6 +14,7 @@ import {
 import { resolvePresetMaxOutputTokenResolution } from '$lib/utils/modelOutputTokens'
 import { resolveCatalogIds } from '$lib/utils/modelIdResolver'
 import { resolveConnectionServiceFromId } from '$lib/utils/modelConnections'
+import { projectCatalogReasoningEvidence } from '$lib/utils/catalogReasoningEvidence'
 import {
   resolveCatalogConnectionLimits,
   resolveCatalogConnectionPricing
@@ -182,6 +183,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       provider: catalogIdentity?.developerId ?? info.provider,
       catalogModelId: vercelModel?.id,
       effectiveModelId: catalogIdentity?.effectiveModelId,
+      reasoningEvidence: projectCatalogReasoningEvidence(vercelModel, selectedConnectionId, catalogIdentity?.effectiveModelId),
       contextWindow,
       // BL-67: an unknown price stays absent (the Token Panel then says Unknown); a
       // catalog price of 0 is a real zero and passes through.

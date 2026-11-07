@@ -1,3 +1,4 @@
+import { applySkillDcmUpdate, readSkillDcmUpdate, type SkillDcmUpdate } from './skillDcmUpdate'
 /** BL-474: provenance sidecars never alter or duplicate the SDK's replay transcript. */
 import { sha256Hex } from '$lib/utils/sha256'
 import { buildSteerInjectionText, formatSteerForModel, type SteerEntry } from '$lib/utils/steerControl'
@@ -16,6 +17,13 @@ export type ApiInputObservation = {
   compiledPrefixCount: number
   initialSystem: unknown
   userSources: readonly UserInputSource[]
+  /** Opaque exact-span replacements minted by the compiler, never request metadata. */
+  skillDcmUpdates?: readonly SkillDcmUpdate[]
+  /**
+   * SA-139 D5: what a Claude plan run hands Claude Code between steps, outside the SDK prompt (a person's
+   * steer, an agent's DM, a skill update), each with its source. Only the adapter's own record supplies it.
+   */
+  nativeAdditions?: readonly AddressSourcePiece[]
 }
 
 /** Registered only while the server constructs a real steer injection. */
@@ -77,8 +85,17 @@ export class ApiImageInputCollector {
     }
     const prompt = input.promptMessages
     if (!Array.isArray(input.compiledMessages) || input.compiledPrefixCount > input.compiledMessages.length) { this.poison(); return }
+    const dcmContexts: string[] = []
+    let expectedMessages: readonly any[] = input.compiledMessages.slice(0, input.compiledPrefixCount)
+    try {
+      for (const token of input.skillDcmUpdates ?? []) {
+        const update = readSkillDcmUpdate(token)
+        expectedMessages = applySkillDcmUpdate(expectedMessages, token)
+        if (update.context) dcmContexts.push(update.context)
+      }
+    } catch { this.poison(); return }
     const expected: string[] = []
-    input.compiledMessages.slice(0, input.compiledPrefixCount).forEach((message) => {
+    expectedMessages.forEach((message) => {
       if (message?.role !== 'user') return
       if (typeof message.content === 'string') {
         if (message.content.length) expected.push(message.content)
@@ -109,6 +126,14 @@ export class ApiImageInputCollector {
     if (next !== expected.length) { this.poison(); compiledMatches = false }
     if (!compiledMatches) this.poison()
     this.compiledObserved ||= compiledMatches
+    if (compiledMatches) for (const text of dcmContexts) {
+      const key = `batshit:${sha256Hex(text)}`
+      if (!this.seen.has(key)) { this.seen.add(key); this.run.pieces.push({ source: 'batshit', text }) }
+    }
+    if (compiledMatches) for (const piece of input.nativeAdditions ?? []) {
+      const key = `${piece.source}:${sha256Hex(piece.text)}`
+      if (!this.seen.has(key)) { this.seen.add(key); this.run.pieces.push({ source: piece.source, text: piece.text }) }
+    }
     if (!Object.hasOwn(input, 'toolDefinitions') || (input.toolDefinitions !== undefined && !Array.isArray(input.toolDefinitions))) this.poison()
     else for (const tool of input.toolDefinitions ?? []) {
       if (tool?.type !== 'function') { this.poison(); continue }

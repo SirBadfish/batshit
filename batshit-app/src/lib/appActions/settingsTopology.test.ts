@@ -31,7 +31,7 @@ describe('the actual sidebar + AgentSelector + ModelSelector Settings topology',
     const { execute, openOwners } = setup()
     expect(await execute('settings.open', { tab: 'theme' })).toMatchObject({ status: 'completed' })
     expect(openOwners()).toEqual({ sidebar: true, agent: false, model: false })
-    expect(screen.getAllByText('Theme Controls In Progress')).toHaveLength(1)
+    expect(await screen.findAllByRole('heading', { name: 'Themes' })).toHaveLength(1)
     expect(appActionObservation().settings).toMatchObject({ open: true, tab: 'theme' })
     expect(await execute('settings.open', { tab: 'theme' })).toMatchObject({ status: 'no_op' })
     expect(await execute('settings.close')).toMatchObject({ status: 'completed' })

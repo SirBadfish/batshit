@@ -2,7 +2,20 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+// Install the supported lane root before any production module captures skill/voice paths.
+const ownedHome = vi.hoisted(() => {
+  const root = `${(process.env.TMPDIR ?? '/tmp').replace(/\/$/, '')}/batshit-restore-recovery-home-${process.pid}-${Date.now()}`
+  const previous = process.env.BATSHIT_HOME_DIR
+  process.env.BATSHIT_HOME_DIR = `${root}/.batshit`
+  return { root, previous }
+})
+afterAll(async () => {
+  if (ownedHome.previous === undefined) delete process.env.BATSHIT_HOME_DIR
+  else process.env.BATSHIT_HOME_DIR = ownedHome.previous
+  await fs.rm(ownedHome.root, { recursive: true, force: true })
+})
+
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { redis } from '$lib/server/redis'
 import { createBackupBundle, ensureBackupRestoreRecovery, restoreBackupBundle } from '../backupRestoreService'
@@ -57,9 +70,9 @@ async function interruptedSwap() {
 
 describe('backup upload-tree crash recovery', () => {
   it.each(['before', 'after'])('leaves final commit-journal failure %s rename to disk-authoritative recovery', async (timing) => {
-    await redis.json.set('user:target:settings', '$', { marker: 'backup' })
+    await redis.json.set('user:target:settings', '$', { user_id: 'target', marker: 'backup' })
     const bundle = await createBackupBundle('target')
-    await redis.json.set('user:target:settings', '$', { marker: 'original' })
+    await redis.json.set('user:target:settings', '$', { user_id: 'target', marker: 'original' })
     await fs.writeFile(path.join(uploads, 'original.txt'), 'original bytes')
     const rename = fs.rename.bind(fs)
     const spy = vi.spyOn(fs, 'rename').mockImplementation(async (source, target) => {
@@ -76,10 +89,10 @@ describe('backup upload-tree crash recovery', () => {
     expect(journals).toHaveLength(1)
     expect(JSON.parse(await fs.readFile(path.join(staging, journals[0]), 'utf8')).phase)
       .toBe(timing === 'before' ? 'redis-replacing' : 'redis-complete')
-    expect(await redis.json.get('user:target:settings')).toEqual({ marker: 'backup' })
+    expect(await redis.json.get('user:target:settings')).toEqual({ user_id: 'target', marker: 'backup' })
     expect(await fs.readFile(path.join(staging, 'goon-asset-restore.json'), 'utf8')).toContain('goon-asset-restore/v1')
     await ensureBackupRestoreRecovery()
-    expect(await redis.json.get('user:target:settings')).toEqual({ marker: timing === 'before' ? 'original' : 'backup' })
+    expect(await redis.json.get('user:target:settings')).toEqual({ user_id: 'target', marker: timing === 'before' ? 'original' : 'backup' })
     if (timing === 'before') expect(await fs.readFile(path.join(uploads, 'original.txt'), 'utf8')).toBe('original bytes')
     else await expect(fs.stat(path.join(uploads, 'original.txt'))).rejects.toThrow()
     expect((await fs.readdir(staging)).filter((name) => name.endsWith('.restore-journal.json'))).toEqual([])
@@ -187,10 +200,10 @@ describe('backup upload-tree crash recovery', () => {
     const journal = JSON.parse(await fs.readFile(journalPath, 'utf8'))
     journal.phase = 'redis-replacing'
     await fs.writeFile(journalPath, JSON.stringify(journal))
-    await redis.json.set('user:target:settings', '$', { marker: 'keep until recovery can complete' })
+    await redis.json.set('user:target:settings', '$', { user_id: 'target', marker: 'keep until recovery can complete' })
     await fs.writeFile(path.join(staging, `${storageKey}.plan.ndjson`), JSON.stringify({ key: 'user:target:settings' }) + '\n')
     await expect(ensureBackupRestoreRecovery()).rejects.toThrow('rollback data is missing')
-    expect(await redis.json.get('user:target:settings')).toEqual({ marker: 'keep until recovery can complete' })
+    expect(await redis.json.get('user:target:settings')).toEqual({ user_id: 'target', marker: 'keep until recovery can complete' })
   })
 
   it.each(['truncated-json', 'valid-prefix', 'same-size-change', 'malformed-matching-identity'])('refuses %s rollback evidence before changing either store', async (damage) => {
@@ -210,9 +223,9 @@ describe('backup upload-tree crash recovery', () => {
       damage === 'same-size-change' ? rollback.replace('original', 'tampered') :
       damage === 'malformed-matching-identity' ? malformed : rollback.slice(0, -4)
     await fs.writeFile(path.join(staging, `${storageKey}.rollback.ndjson`), damaged)
-    await redis.json.set('user:target:settings', '$', { marker: 'target' })
+    await redis.json.set('user:target:settings', '$', { user_id: 'target', marker: 'target' })
     await expect(ensureBackupRestoreRecovery()).rejects.toThrow()
-    expect(await redis.json.get('user:target:settings')).toEqual({ marker: 'target' })
+    expect(await redis.json.get('user:target:settings')).toEqual({ user_id: 'target', marker: 'target' })
     expect(await fs.readFile(path.join(oldRoot, 'a.txt'), 'utf8')).toBe('original a.txt')
     expect(await fs.readFile(path.join(uploads, 'a.txt'), 'utf8')).toBe('replacement a.txt')
     expect(await fs.readFile(journalPath, 'utf8')).toContain('redis-replacing')

@@ -154,7 +154,8 @@ export function useRedisTestServer(options: RedisTestServerOptions = {}) {
     try {
       const envModule = await import('$env/dynamic/private')
       if (envModule?.env && !closed) {
-        envModule.env.REDIS_URL = redisUrl
+        // Only Vitest's mutable env-mock alias is updated; the real Kit namespace is readonly.
+        Object.assign(envModule.env, { REDIS_URL: redisUrl })
       }
     } catch {
       // ignore if env module not available yet

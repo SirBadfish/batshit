@@ -101,7 +101,7 @@ preset's own name, so check the preset after a switch.
 8. Confirm Batshit sees the model you want.
 9. Go to **Settings → Models**.
 10. Create or edit a model preset that uses the local connection.
-11. Select that preset on an `API` Primary Agent.
+11. Select that preset on a Primary Agent.
 12. Send a small text prompt first.
 
 Local connection IDs use shapes like `direct:ollama`, `direct:dmr`, `direct:lmstudio`, `direct:llama-cpp`, `direct:vllm`, `direct:sglang`, and `direct:omlx`.
@@ -253,9 +253,9 @@ llama.cpp accepts the widest set of sampling settings of anything here — DRY, 
 
 ## Agents and Local AI
 
-Local AI is for `API` Primary Agents.
+Local AI is for Primary Agents.
 
-n8n Workflow Subagents use whatever model/provider nodes you configure in n8n — if you want a workflow specialist to call a local model, configure that inside n8n. `CLI` Primary Agents use their CLI's own model and provider setup; a CLI agent can still call Batshit tools and local services, but local model selection isn't the same control path as an `API` model preset.
+An n8n workflow uses whatever model/provider nodes you configure in n8n — if you want a workflow to call a local model, configure that inside n8n.
 
 ## Backup boundary
 

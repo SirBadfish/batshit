@@ -1,3 +1,4 @@
+import { refusePluginMemberWrite } from './agentPlugins'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -16,6 +17,8 @@ import { sanitizeId } from '$lib/utils/idSanitizer'
 
 import { importSkillDefinition } from './skillImport'
 import { normalizeSkillId, upsertSkill } from './skillRegistry'
+import { normalizeAccessAgentId, parseAccessAgentIds, readSavedAccessAgentIds } from './agentAccessLists'
+import { beginSlashCommandWrite, captureSlashCommandWriteBasis, captureSkillSourceWriteBasis, saveSkillSourceRecord, deleteSkillSourceRecord, updateSkillSourceScan, isSlashCommandMutationError, SlashCommandMutationError, COMMAND_ACCESS_FIELDS, saveSlashCommandRecord, type SlashCommandWritePreparation, type SkillSourceWriteBasis } from './slashCommandRevision'
 
 const MAX_SCAN_DEPTH = 8
 const MAX_SKILLS_PER_SCAN = 200
@@ -49,7 +52,7 @@ interface UpsertSourceInput {
   scope?: SkillSourceRow['scope']
   trustLevel?: SkillRow['trust_level']
   enabledForAllAgents?: boolean
-  enabledAgentIds?: string[]
+  enabledAgentIds?: unknown
   projectPath?: string | null
 }
 
@@ -80,14 +83,6 @@ function normalizeTrustLevel(value: unknown): SkillRow['trust_level'] {
 
 function normalizeScope(value: unknown): SkillSourceRow['scope'] {
   return value === 'project' ? 'project' : 'global'
-}
-
-function normalizeAgentIds(value: unknown): string[] {
-  if (!Array.isArray(value)) return []
-  const normalized = value
-    .map((entry) => sanitizeId(String(entry ?? '').trim()))
-    .filter((entry) => entry.length > 0)
-  return Array.from(new Set(normalized))
 }
 
 function normalizeLabel(label: string | undefined, rootPath: string) {
@@ -192,10 +187,6 @@ async function getExistingSource(userId: string, sourceId: string): Promise<Skil
   return (await redis.json.get(buildSkillSourceKey(userId, sourceId))) as SkillSourceRow | null
 }
 
-async function putSource(source: SkillSourceRow) {
-  await redis.json.set(buildSkillSourceKey(source.user_id, source.id), '$', source)
-}
-
 async function listSlashCommandKeys(userId: string) {
   return redis.keys(`slash_command:${userId}:*`)
 }
@@ -243,6 +234,8 @@ async function upsertDiscoveredSkillCommand(params: {
   candidate: ScanCandidate
   attachAgentId?: string | null
   nowIso: string
+  preparation: SlashCommandWritePreparation
+  sourceBasis: SkillSourceWriteBasis
 }) {
   const { source, candidate, attachAgentId, nowIso } = params
   const imported = await importSkillDefinition({
@@ -254,7 +247,11 @@ async function upsertDiscoveredSkillCommand(params: {
   const skillId = buildDiscoveredId(source.id, importedSkill.id)
   const commandId = skillId
   const commandKey = `slash_command:${source.user_id}:${commandId}`
+  const basis = await captureSlashCommandWriteBasis(params.preparation, [commandId], params.sourceBasis)
   const existingCommand = (await redis.json.get(commandKey)) as SlashCommandRow | null
+  await refusePluginMemberWrite(source.user_id, existingCommand ?? { id: commandId, skill_id: skillId })
+  const existingAgentIds = existingCommand ? readSavedAccessAgentIds(existingCommand.enabled_agent_ids) : []
+  const sourceAgentIds = readSavedAccessAgentIds(source.enabled_agent_ids) ?? []
 
   const metadata = {
     ...(importedSkill.metadata ?? {}),
@@ -290,12 +287,9 @@ async function upsertDiscoveredSkillCommand(params: {
     }
   })
 
-  const sourceAgentIds = normalizeAgentIds(source.enabled_agent_ids)
-  const nextAgentIds = new Set(
-    existingCommand?.enabled_for_all_agents === true ? [] : normalizeAgentIds(existingCommand?.enabled_agent_ids)
-  )
+  const nextAgentIds = new Set(existingAgentIds ?? [])
   for (const id of sourceAgentIds) nextAgentIds.add(id)
-  const normalizedAttachAgentId = sanitizeId(attachAgentId ?? '')
+  const normalizedAttachAgentId = normalizeAccessAgentId(attachAgentId)
   if (normalizedAttachAgentId) nextAgentIds.add(normalizedAttachAgentId)
 
   const desiredInvocation = toCommandInvocation(importedSkill.name || importedSkill.displayName, commandId)
@@ -306,7 +300,7 @@ async function upsertDiscoveredSkillCommand(params: {
   )
   const enabledForAllAgents =
     existingCommand?.enabled_for_all_agents === true || source.enabled_for_all_agents === true
-  const enabledAgentIds = enabledForAllAgents ? [] : Array.from(nextAgentIds)
+  const enabledAgentIds = existingCommand && existingAgentIds === undefined ? undefined : Array.from(nextAgentIds)
 
   const nextCommand: SlashCommandRow = {
     ...(existingCommand ?? {
@@ -341,7 +335,7 @@ async function upsertDiscoveredSkillCommand(params: {
     has_references: skill.has_references === true,
     has_assets: skill.has_assets === true,
     invocation_pattern: invocation,
-    can_be_attached_to_agents: enabledForAllAgents || enabledAgentIds.length > 0,
+    can_be_attached_to_agents: enabledForAllAgents || (enabledAgentIds?.length ?? 0) > 0,
     can_be_invoked_in_chat: existingCommand?.can_be_invoked_in_chat ?? true,
     enabled_for_all_agents: enabledForAllAgents,
     enabled_agent_ids: enabledAgentIds,
@@ -356,11 +350,17 @@ async function upsertDiscoveredSkillCommand(params: {
     created_at: existingCommand?.created_at ?? nowIso,
     updated_at: nowIso
   }
+  if (enabledAgentIds === undefined) Reflect.deleteProperty(nextCommand, 'enabled_agent_ids')
 
-  await redis.json.set(commandKey, '$', nextCommand)
+  const stored = await saveSlashCommandRecord(source.user_id, { record: nextCommand,
+    mode: existingCommand ? 'update' : 'create',
+    preserveAccess: COMMAND_ACCESS_FIELDS.filter(field => field !== 'is_active' || source.enabled !== false),
+    mergeAgentIds: [...sourceAgentIds, ...(normalizedAttachAgentId ? [normalizedAttachAgentId] : [])],
+    enableForAll: source.enabled_for_all_agents === true }, basis)
+  if (!stored) throw Object.assign(new Error('The discovered command changed during the scan. Rescan from its current saved state.'), { status: 409 })
 
   return {
-    command: nextCommand,
+    command: stored,
     skill,
     warnings: imported.warnings
   }
@@ -377,10 +377,12 @@ export async function listSkillSources(userId: string): Promise<SkillSourceRow[]
   return rows
 }
 
-export async function upsertSkillSource(input: UpsertSourceInput): Promise<SkillSourceRow> {
+export async function upsertSkillSource(input: UpsertSourceInput, preparation = beginSlashCommandWrite(input.userId)): Promise<SkillSourceRow> {
+  await captureSlashCommandWriteBasis(preparation, [])
   const rootPath = await assertDirectory(input.rootPath)
   const now = new Date().toISOString()
   const id = sanitizeId(input.id ?? '') || buildSourceId(rootPath, input.label)
+  const basis = await captureSkillSourceWriteBasis(preparation, id)
   const existing = await getExistingSource(input.userId, id)
 
   const source: SkillSourceRow = {
@@ -404,8 +406,8 @@ export async function upsertSkillSource(input: UpsertSourceInput): Promise<Skill
         : existing?.enabled_for_all_agents === true,
     enabled_agent_ids:
       input.enabledAgentIds !== undefined
-        ? normalizeAgentIds(input.enabledAgentIds)
-        : normalizeAgentIds(existing?.enabled_agent_ids),
+        ? parseAccessAgentIds(input.enabledAgentIds)
+        : readSavedAccessAgentIds(existing?.enabled_agent_ids) ?? [],
     project_path:
       typeof input.projectPath === 'string' && input.projectPath.trim()
         ? path.resolve(expandHomePath(input.projectPath))
@@ -418,15 +420,24 @@ export async function upsertSkillSource(input: UpsertSourceInput): Promise<Skill
     created_at: existing?.created_at ?? now,
     updated_at: now
   }
+  if (existing && input.enabledAgentIds === undefined && !Object.hasOwn(existing, 'enabled_agent_ids')) {
+    Reflect.deleteProperty(source, 'enabled_agent_ids')
+  }
 
-  await putSource(source)
-  return source
+  return await saveSkillSourceRecord(source, basis)
 }
 
-export async function scanSkillSource(input: ScanSourceInput) {
+export async function scanSkillSource(input: ScanSourceInput, preparation = beginSlashCommandWrite(input.userId)) {
+  const sourceBasis = await captureSkillSourceWriteBasis(preparation, input.sourceId)
   const source = await getExistingSource(input.userId, input.sourceId)
   if (!source) {
     throw Object.assign(new Error(`Skill source '${input.sourceId}' was not found.`), { status: 404 })
+  }
+
+  // Validate requested identities before importing files or writing source/command metadata.
+  readSavedAccessAgentIds(source.enabled_agent_ids)
+  if (input.attachAgentId !== undefined && input.attachAgentId !== null && !normalizeAccessAgentId(input.attachAgentId)) {
+    throw Object.assign(new Error('The attached agent ID is invalid.'), { status: 400 })
   }
 
   const now = new Date().toISOString()
@@ -442,24 +453,22 @@ export async function scanSkillSource(input: ScanSourceInput) {
         source,
         candidate,
         attachAgentId: input.attachAgentId,
-        nowIso: now
+        nowIso: now, preparation, sourceBasis
       })
       importedCommands.push(result.command)
       importedSkills.push(result.skill)
       warnings.push(...result.warnings)
     }
 
-    const nextSource: SkillSourceRow = {
-      ...source,
-      root_path: rootPath,
+    const nextSource = await updateSkillSourceScan(input.userId, source.id, {
       last_scanned_at: now,
       last_scan_status: 'success',
       last_scan_error: undefined,
-      discovered_skill_ids: importedSkills.map((skill) => skill.id),
-      discovered_command_ids: importedCommands.map((command) => command.id),
+      discovered_skill_ids: importedSkills.map(skill => skill.id),
+      discovered_command_ids: importedCommands.map(command => command.id),
       updated_at: now
-    }
-    await putSource(nextSource)
+    }, sourceBasis)
+    if (!nextSource) throw Object.assign(new Error('The source was deleted during the scan.'), { status: 409 })
 
     return {
       source: nextSource,
@@ -469,19 +478,22 @@ export async function scanSkillSource(input: ScanSourceInput) {
       warnings: Array.from(new Set(warnings))
     }
   } catch (error) {
+    // A refused/stale/unknown command cannot be followed by a fresh bookkeeping write.
+    if (isSlashCommandMutationError(error)) throw new SlashCommandMutationError(error.code, `Earlier skill import/file updates may already have completed. ${error.message}`, error.outcome, error.status)
     const message = error instanceof Error ? error.message : 'Skill source scan failed.'
-    await putSource({
-      ...source,
+    await updateSkillSourceScan(input.userId, source.id, {
       last_scanned_at: now,
       last_scan_status: 'error',
       last_scan_error: message,
       updated_at: now
-    })
+    }, sourceBasis)
     throw error
   }
 }
 
 export async function deleteSkillSource(userId: string, sourceId: string) {
-  await redis.del(buildSkillSourceKey(userId, sourceId))
+  const preparation = beginSlashCommandWrite(userId)
+  const basis = await captureSkillSourceWriteBasis(preparation, sourceId)
+  await deleteSkillSourceRecord(userId, sourceId, basis)
 }
 

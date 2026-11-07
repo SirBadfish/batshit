@@ -22,7 +22,8 @@ export function getTtsEnginePromptGuidance(
 export async function buildVoiceRuntimeGuidanceForProvider(
   userId: string,
   providerId: VoiceProviderId | string | null | undefined,
-  settingsValue: VoiceSettings | unknown
+  settingsValue: VoiceSettings | unknown,
+  modelId?: string | null
 ): Promise<string[]> {
   const normalizedProviderId = normalizeVoiceProviderId(providerId)
   if (!normalizedProviderId) return []
@@ -32,5 +33,8 @@ export async function buildVoiceRuntimeGuidanceForProvider(
     : []
 
   guidance.push(...getTtsEnginePromptGuidance(settingsValue, normalizedProviderId))
+  if (normalizedProviderId === 'inworld' && modelId === 'inworld-tts-2-flash') {
+    guidance.push('Inworld TTS-2 Flash does not support bracketed steering instructions; use normal spoken text. Supported non-verbal tags such as [laugh] may still be used.')
+  }
   return guidance
 }

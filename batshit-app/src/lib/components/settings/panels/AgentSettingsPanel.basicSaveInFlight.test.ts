@@ -36,13 +36,10 @@ import {
  * Redis fake; `holdPuts` holds a PUT after it is recorded and before it writes (a slow round trip).
  */
 
-vi.mock('$lib/server/services/codexProfileManager', () => ({
-  syncAgentCodexProfiles: vi.fn(async () => {}),
-  deleteAgentCodexConfig: vi.fn(async () => {}),
-  buildAgentProfileId: (id: string) => `batshit_agent_${id}`
+vi.mock('$lib/server/services/managedProfileFolderDelete', () => ({
+  deleteManagedProfileFolder: vi.fn(async () => {})
 }))
 vi.mock('$lib/server/services/claudeProfileManager', () => ({
-  syncAgentClaudeProfiles: vi.fn(async () => {}),
   deleteAgentClaudeConfig: vi.fn(async () => {}),
   agentClaudeProfileResource: (id: string) => JSON.stringify(['profile', `claude:${id}`])
 }))
@@ -208,7 +205,7 @@ async function openPanel(extra: Record<string, unknown> = {}, withOther = false)
       if (path === '/api/user/saved-models') return jsonResponse({ models: [PRESET] })
       if (path === '/api/models') return jsonResponse({ data: { connections: [] } })
       if (path === '/api/settings/api-keys') return jsonResponse({ keys: {} })
-      if (path === '/api/goons') return jsonResponse({ goons: [] })
+      if (path === '/api/goons') return jsonResponse({ ownerId: 'josh', goons: [] })
       if (path === '/api/mcp/gateways') return jsonResponse({ gateways: [] })
       if (path === '/api/cli-tools') return jsonResponse({ tools: [] })
       if (path === '/api/icons/library') return jsonResponse({ icons: [], prefs: { favorites: [], recents: [] } })
@@ -305,7 +302,7 @@ describe('a Primary basic save that lands keeps what was typed while it was in f
     expect(input.value).toBe(`${NAME} R!?`)
   }, 120_000)
 
-  it('a different field changed during the round trip stays in the form too, and is the only thing the next save sends', async () => {
+  it('a different field cannot change during the round trip (the surface is locked); flipped after the landing, it is the only thing the next save sends', async () => {
     await openPanel()
     const release = holdNext()
     await fireEvent.input(nameInput(), { target: { value: `${NAME} R` } })
@@ -318,15 +315,19 @@ describe('a Primary basic save that lands keeps what was typed while it was in f
       .find((element) => element?.querySelector('[role="switch"]'))
     const toggle = row!.querySelector('[role="switch"]') as HTMLElement
     expect(toggle.getAttribute('aria-checked')).toBe('true')
-    await fireEvent.click(toggle)
-    expect(toggle.getAttribute('aria-checked')).toBe('false')
+    // The surface is read-only while the agent's own save travels (8d15c594b), and the switch routes
+    // through guardPrimaryChoice since 3cf112848: it cannot change during the round trip.
+    expect(isReadWaitLocked(toggle)).toBe(true)
+    // No click here: jsdom does not model `inert`, so a synthetic click reaches the switch, and the
+    // guard refuses the save while the switch shows itself flipped (BL-1895). A user cannot click it.
     release()
 
-    // The first save landed (the record holds the name) and the second is still in its debounce:
-    // the switch still shows what the user chose.
+    // The first save landed (the record holds the name); the surface unlocks, and only then is the
+    // switch flipped. Nothing else was sent in between.
     await waitFor(async () => expect((await storedAgent(AGENT)).displayName).toBe(`${NAME} R`), { timeout: 8_000 })
-    await pause(200)
+    await waitFor(() => expect(isReadWaitLocked(toggle)).toBe(false), { timeout: 8_000 })
     expect(puts.length).toBe(1)
+    await fireEvent.click(toggle)
     expect(toggle.getAttribute('aria-checked')).toBe('false')
 
     // Only the switch: the name is in the baseline now, so it is no difference from it.
@@ -593,59 +594,6 @@ describe('a save that lands after the same agent was read again does not put the
   }, 120_000)
 })
 
-const CODEX_BASE = {
-  permissionMode: 'chat',
-  includeProjectInstructions: true,
-  model: 'gpt-6-astra',
-  streamingEffect: true,
-  unifiedExec: true,
-  search: true,
-  sandbox: 'read-only',
-  approval: 'never',
-  configScope: 'managed',
-  addDirs: [] as string[],
-  enableFeatures: [] as string[],
-  disableFeatures: [] as string[],
-  configOverrides: [] as unknown[],
-  workingDirectoryMode: 'project',
-  historyPersistence: 'none'
-}
-
-/** A Codex CLI agent, without the API preset the other tests give theirs. */
-const CODEX_AGENT = {
-  agentType: 'cli',
-  primary_model_provider: 'codex',
-  primary_model_name: 'gpt-6-astra',
-  primary_model_connection: { type: 'cli', service: 'codex' },
-  primary_model_preset_id: undefined,
-  primary_model_temperature: null,
-  provider_specific_settings: undefined,
-  codex_settings: CODEX_BASE
-}
-
-function selectTrigger(current: string) {
-  return screen
-    .getAllByRole('button', { hidden: true })
-    .find((element) => element.hasAttribute('data-select-trigger') && (element.textContent ?? '').trim() === current)
-}
-
-/**
- * Picks an option of the select whose visible value is `current`. The popper stays
- * `visibility: hidden` in jsdom (no layout), so its options have no accessible name: they are
- * found hidden and picked by their text.
- */
-async function pickSelectOption(current: string, optionText: RegExp) {
-  const trigger = selectTrigger(current)
-  expect(trigger, `the select showing "${current}"`).toBeTruthy()
-  await fireEvent.keyDown(trigger as HTMLElement, { key: 'ArrowDown' })
-  await waitFor(() => expect(screen.queryAllByRole('option', { hidden: true }).length).toBeGreaterThan(0))
-  const option = screen
-    .getAllByRole('option', { hidden: true })
-    .find((element) => optionText.test((element.textContent ?? '').trim()))
-  expect(option, `an option matching ${optionText}`).toBeTruthy()
-  await fireEvent.pointerUp(option as HTMLElement, { pointerType: 'mouse' })
-}
-
 const card = () => (globalThis as any).__mcpCardProps as Record<string, any>
 
 async function openToolsTab() {
@@ -696,28 +644,6 @@ async function releaseNameAndWaitForDeferredRead(release: () => void) {
 }
 
 describe('the landing re-read waits until every section is at rest (BL-911, second review)', () => {
-  it('the Codex group is read-only during the name save, then saves after the deferred read settles', async () => {
-    await openPanel(CODEX_AGENT, true)
-    const release = await nameSaveInFlightThenReadOlderRecord()
-
-    const control = selectTrigger('Auto') as HTMLElement
-    expect(isReadWaitLocked(control)).toBe(true)
-    expect(isReadWaitLocked(primarySettingsFieldset())).toBe(true)
-    expect(puts).toEqual([{ body: { displayName: `${NAME} R` } }])
-
-    await releaseNameAndWaitForDeferredRead(release)
-    await pickSelectOption('Auto', /^High/)
-    await waitFor(() => expect(puts.length).toBe(2), { timeout: 8_000 })
-    await pause(2500)
-    expect(puts.length).toBe(2)
-    expect(puts[1].body).toEqual({ codex_settings: { reasoningEffort: 'high' } })
-    const record = await storedAgent(AGENT)
-    expect(record.codex_settings.reasoningEffort).toBe('high')
-    expect(record.displayName).toBe(`${NAME} R`)
-    // The form still shows the Codex edit.
-    expect(selectTrigger('High')).toBeTruthy()
-  }, 120_000)
-
   it('the Tool Grid is inside the read-only surface during the name save, then saves after the read settles', async () => {
     await openPanel({}, true)
     const release = await nameSaveInFlightThenReadOlderRecord()

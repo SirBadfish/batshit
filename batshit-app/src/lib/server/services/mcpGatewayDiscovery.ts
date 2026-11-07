@@ -1,3 +1,8 @@
+import { P5McpAdmissionIssuer, assertP5ApiMcpToolDiscoverable, validateP5IntendedMcpArguments, settleBeforeAbort, notifyP5McpClientSettlement, observeInitialStdioProduced, type P5McpClientAdmission } from './mcpGatewayAdmission'
+export { assertInitialStdioObservationIssue, observeInitialStdioProduced, observeInitialStdioConstructor, readInitialStdioObservationSignal, readP5McpHttpAdmission, readP5McpStdioAdmission, revalidateP5McpHttpAdmission, validateP5McpHttpTool, requireP5McpToolUse, readP5McpClientOwner, readP5McpClientSettlement, notifyP5McpClientSettlement, settleBeforeAbort, type P5McpClientAdmission } from './mcpGatewayAdmission'
+import * as originalAOwner from './appActions/mcp/originalTask'
+import { resolveToolActivitySettingsName } from '$lib/utils/toolActivityContract'
+import type { P5ApiOriginalRun, P5ApiManagement, P5ApiDiscoveryOwner } from './appActions/mcp/originalTask'
 /**
  * MCP Gateway Discovery Service
  *
@@ -21,7 +26,7 @@ import { createMCPClient } from '@ai-sdk/mcp'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { apiKeyService } from '$lib/services/apiKey.server'
 import { stdioMCPGatewayClient } from './stdioMCPGatewayClient'
-import { resolveStdioGatewayProcessConfig } from './mcpGatewayStdio'
+import { resolveStdioGatewayProcessConfig, type ResolvedStdioGatewayProcessConfig } from './mcpGatewayStdio'
 import { rewriteN8nGatewayUrlForRuntime } from './runtimeUrlRewrites'
 import type { GatewayMetadata, ToolMetadataMap, ToolWithName } from './mcpGatewayTypes'
 import {
@@ -42,6 +47,9 @@ export interface DiscoveryOptions {
   projectPath?: string | null
   /** Ask the tool server now and replace any saved copy of its tool list (the Refresh button). */
   fresh?: boolean
+  /** Genuine server-only compiler preparation or SDK run, never model input. */
+  originalObservations?: ReadonlyMap<string, P5McpClientAdmission>
+  p5Owner?: P5ApiDiscoveryOwner
 }
 
 export interface GatewayDiscoveryResult {
@@ -62,6 +70,18 @@ export interface GatewayDiscoveryResult {
   fetchedAt?: number
 }
 
+/** Same ordinary HTTP result projection, shared by the private source-bound path. */
+function unwrapMcpToolResult(result: unknown): unknown {
+  if (!result || typeof result !== 'object' || !('content' in result) || !Array.isArray(result.content)) return result
+  const first = result.content[0]
+  if (!first || typeof first !== 'object' || !('text' in first) || !first.text) return result
+  const text = first.text
+  if (typeof text === 'string' && (text.startsWith('[') || text.startsWith('{'))) {
+    try { return JSON.parse(text) } catch { return text }
+  }
+  return text
+}
+
 type ToolListLookupPlan = {
   /** Everything the lookup uses, secrets hashed: the saved copy's key. */
   inputs: Record<string, unknown>
@@ -74,43 +94,88 @@ function describeSavedFailure(result: GatewayDiscoveryResult): string {
   return ` (remembered from ${ageSeconds}s ago; asked again ${MCP_TOOL_LIST_FAILURE_SAVED_MS / 1000}s after it)`
 }
 
-/**
- * BL-454: resolve with `work`, or reject with the Stop's reason when `signal` aborts first.
- * A value that arrives after the Stop goes to `discardLate` (a started client is closed).
- * The listener is removed when either side settles.
- */
-function settleBeforeAbort<T>(
-  work: Promise<T>,
-  signal: AbortSignal | undefined,
-  discardLate: (value: T) => void
-): Promise<T> {
-  if (!signal) return work
-  return new Promise<T>((resolve, reject) => {
-    let stopped = false
-    const onAbort = () => {
-      stopped = true
-      reject(signal.reason)
-    }
-    if (signal.aborted) {
-      onAbort()
-    } else {
-      signal.addEventListener('abort', onAbort, { once: true })
-    }
-    work.then(
-      (value) => {
-        signal.removeEventListener('abort', onAbort)
-        if (stopped) discardLate(value)
-        else resolve(value)
-      },
-      (error) => {
-        signal.removeEventListener('abort', onAbort)
-        if (!stopped) reject(error)
-      }
-    )
-  })
-}
+export class MCPGatewayDiscovery extends P5McpAdmissionIssuer {
+  constructor() { super(n8nMCPGatewayClient, stdioMCPGatewayClient) }
 
-export class MCPGatewayDiscovery {
+  /** Fixed pre-await registration; no metadata/caller flag mints this map membership. */
+  reserveInitialStdioObservations(owner: P5ApiDiscoveryOwner, gatewayIds: readonly string[]): ReadonlyMap<string, P5McpClientAdmission> {
+    const result = new Map<string, P5McpClientAdmission>()
+    for (const gatewayId of new Set(gatewayIds)) {
+      const client = Object.freeze({}) as P5McpClientAdmission
+      if (!originalAOwner.registerP5InitialStdioObservation(owner, gatewayId, client)) continue
+      const context = originalAOwner.readP5InitialStdioContext(owner, client), original = originalAOwner.readP5InitialStdioSource(owner, client)
+      this.retainP5McpClient(client, { kind: 'original-observation', run: owner, original, userId: context.userId, gatewayId,
+        source: original?.sourceRaw ?? '', actorIdentityRaw: original?.actorIdentityRaw ?? '', url: '', headers: {}, signal: context.signal })
+      result.set(gatewayId, client)
+    }
+    return result
+  }
+
+
+  /** Actual setup factory: SAME retained running recipe and real source ACK.
+   * It does not use paused Original-A authority and cannot execute a tool. */
+  async discoverForHeldMcpSetup(reservation: P5ApiManagement, input: {
+    plan: import('./mcpGatewayService').PreparedGatewaySave; gatewayId: string; adapter: import('./appActions/managementTypes').AdapterContext;
+    fences: readonly import('./appActions/mcp/gatewayWriteContext').GatewayRawFence[]
+  }): Promise<P5McpClientAdmission> {
+    const owner = await import('./appActions/mcp/originalTask')
+    const actual = owner.readP5ApiManagementOwner(reservation)
+    input.adapter.assertCurrent()
+    if (actual.gatewayId !== input.gatewayId || actual.userId !== input.adapter.admission.actor.userId || actual.agentId !== input.adapter.admission.actor.id) throw new Error('The actual setup actor differs from its original.')
+    const registry = (await import('./appActions/settings/managementRuntime')).settingsOperationRegistry
+    owner.assertP5ApiManagementCurrent(reservation, input.gatewayId); input.adapter.assertCurrent()
+    const recipe = await registry.readP5ExecutingApiMcpRecipe(actual.run, actual)
+    owner.assertP5ApiManagementCurrent(reservation, input.gatewayId); input.adapter.assertCurrent()
+    mcpGatewayService.assertPreparedMcpSourceReview(input.plan, recipe.resource)
+    const saveOwner = await import('./mcpGatewaySave')
+    owner.assertP5ApiManagementCurrent(reservation, input.gatewayId); input.adapter.assertCurrent()
+    const source = mcpGatewayService.readPreparedMcpSource(input.plan)
+    if (source.userId !== actual.userId || source.gatewayId !== input.gatewayId) throw new Error('The actual setup source differs from its original.')
+    await input.adapter.refreshAuthority()
+    owner.assertP5ApiManagementCurrent(reservation, input.gatewayId); input.adapter.assertCurrent()
+    const cut = await mcpGatewayService.readMcpPrerequisiteIssueCut(actual.userId, actual.agentId, input.gatewayId, input.adapter.deadlineAt,
+      mcpGatewayService.joinMcpPrerequisiteFences([input.adapter.admission.fence], input.fences))
+    owner.assertP5ApiManagementCurrent(reservation, input.gatewayId); input.adapter.assertCurrent()
+    if (cut.sourceRaw !== source.raw || !cut.gateway || source.gateway.type !== 'stdio' && !source.gateway.url) throw new Error('The actual source postimage changed before setup.')
+    const resolved = source.gateway.type === 'stdio' ? mcpGatewayService.readPreparedMcpStdioLaunch(input.plan) : undefined
+    const auth = resolved ? { headers: {} } : mcpGatewayService.readPreparedMcpHttpAuth(input.plan)
+    const admission = Object.freeze({}) as P5McpClientAdmission
+    try {
+      this.retainP5McpClient(admission, { kind: 'setup', run: actual.run, reservation, userId: actual.userId, gatewayId: input.gatewayId,
+        source: source.raw, actorIdentityRaw: cut.actorIdentityRaw, url: source.gateway.url ?? '', headers: auth.headers, ...(resolved ? { stdio: { plan: input.plan, resolved } } : {}), signal: input.adapter.signal ?? actual.signal,
+        plan: input.plan, adapter: input.adapter, fences: input.fences })
+      owner.bindP5ApiSetupClientWork(reservation, admission)
+      owner.assertP5ApiManagementCurrent(reservation, input.gatewayId); input.adapter.assertCurrent()
+      saveOwner.observeP5ApiSetupClient(reservation, admission)
+      // The actual client owner observes initialize/list/close, including late facts.
+      const tools = await this.heldP5McpClient(admission).listForHeldApi(admission)
+      owner.assertP5ApiManagementCurrent(reservation, input.gatewayId); input.adapter.assertCurrent()
+      if (recipe.resource.intent.zip) {
+        const name = recipe.resource.intent.zip.toolName
+        const saved = await saveOwner.readP5ApiPrerequisiteSavedSelection(reservation)
+        const identity = await this.resolveP5ZipSettingsIdentity(actual.run, recipe.resource.intent.subject.id, source.gateway as MCPGateway, name, saved, tools)
+        owner.assertP5ApiManagementCurrent(reservation, input.gatewayId); input.adapter.assertCurrent()
+        if (identity !== recipe.resource.target.settingsIdentity) throw new Error('The fresh source list does not match the complete reviewed Zip identity.')
+      }
+    }
+    finally {
+      try { await this.closeP5McpClientForCaller(admission) }
+      finally {
+        // No constructor means no issued process obligation to release or fake
+        // close to invent. Wipe THIS copied envelope in place, then notify the
+        // existing owner of its truthful not-started observation.
+        if (resolved && this.heldP5McpClient(admission).readHeldApiSettlement(admission).constructor === 'not_started') {
+          for (const name of Object.keys(resolved.env)) delete resolved.env[name]
+          notifyP5McpClientSettlement(admission)
+        }
+      }
+    }
+    const fact = this.heldP5McpClient(admission).readHeldApiSettlement(admission)
+    if (fact.requests !== 'known' || fact.initialize !== 'known' || fact.list !== 'known' || fact.execute !== 'not_started' || fact.close !== 'known') throw new Error('The actual setup physical result is not confirmed.')
+    owner.assertP5ApiManagementCurrent(reservation, input.gatewayId); input.adapter.assertCurrent()
+    return admission
+  }
+
   /**
    * Sanitize name for OpenAI API compatibility
    * OpenAI tool names must match: ^[a-zA-Z0-9_-]+$
@@ -135,6 +200,14 @@ export class MCPGatewayDiscovery {
     userId?: string,
     options?: DiscoveryOptions
   ): Promise<GatewayDiscoveryResult> {
+    const initialObservation = options?.originalObservations?.get(gateway.id) ?? (options?.p5Owner && gateway.type === 'stdio' ? reserveInitialStdioObservations(options.p5Owner, [gateway.id]).get(gateway.id) : undefined)
+    if (options?.p5Owner && !initialObservation) {
+      const owner = await import('./appActions/mcp/originalTask')
+      if (owner.p5ApiHasVerifiedMcpSource(options.p5Owner, gateway.id)) return this.discoverVerifiedMcpSource(options.p5Owner, gateway.id)
+      const original = await owner.readP5ApiOriginalStdioAuthority(options.p5Owner, gateway.id)
+      if (original) return this.discoverOriginalStdioSource(options.p5Owner, original)
+      if (gateway.type === 'stdio' && owner.p5ApiManagedMcpActiveForDiscovery(options.p5Owner)) throw new Error('This managed STDIO source has no frozen original A or verified C authority.')
+    }
     gateway = await this.applyRuntimeGatewayUrl(gateway, userId)
     const result: GatewayDiscoveryResult = {
       gatewayId: gateway.id,
@@ -181,7 +254,8 @@ export class MCPGatewayDiscovery {
         authToken,
         authHeaders,
         userId,
-        projectPath: options?.projectPath
+        projectPath: options?.projectPath,
+        initialObservation
       })
       if (!plan) {
         result.error = `Unknown gateway type: ${gateway.type}`
@@ -231,6 +305,7 @@ export class MCPGatewayDiscovery {
       authHeaders?: Record<string, string>
       userId?: string
       projectPath?: string | null
+      initialObservation?: P5McpClientAdmission
     }
   ): Promise<ToolListLookupPlan | null> {
     const ask = (discover: () => Promise<ToolWithName[]>) => async (): Promise<ToolListLookup> => {
@@ -272,6 +347,7 @@ export class MCPGatewayDiscovery {
           userId: context.userId,
           projectPath: context.projectPath
         })
+        if (context.initialObservation) await observeInitialStdioProduced(context.initialObservation, resolved)
         return {
           inputs: {
             type: gateway.type,
@@ -288,7 +364,7 @@ export class MCPGatewayDiscovery {
               gateway,
               userId: context.userId,
               projectPath: context.projectPath,
-              resolved
+              resolved, originalObservation: context.initialObservation
             })
           )
         }
@@ -459,6 +535,99 @@ export class MCPGatewayDiscovery {
     }
   }
 
+  private assignToolKey(tool: ToolWithName, gateway: MCPGateway, occupied: Record<string, unknown>) {
+    const identity = this.resolveToolIdentity(tool, gateway, gateway.name)
+    return { ...identity, key: occupied[identity.sanitizedToolName]
+      ? `${this.sanitizeToolName(gateway.name)}_${identity.sanitizedToolName}` : identity.sanitizedToolName }
+  }
+  /** Pure named-row projection over actual retained ordinary identities. No
+   * source is contacted while the original is paused to guess an alias. */
+  async resolveP5ZipSettingsIdentity(run: P5ApiDiscoveryOwner, subjectId: string, gateway: MCPGateway, toolName: string, saved: readonly string[], fullTools?: Record<string, Tool>): Promise<string> {
+    const owner = await import('./appActions/mcp/originalTask')
+    const retained = owner.readP5ApiZipToolNames(run, subjectId, gateway.id, saved)
+    const catalog = await mcpGatewayService.readManagementSources((owner.readP5ApiManagementIdentity(run)).userId)
+    owner.assertP5ApiDiscoveryCurrent(run)
+    for (const row of retained) if (!catalog.some(source => source.id === row.gatewayId && source.name === row.gatewayName && source.created_at === row.createdAt)) throw new Error('The retained ordinary tool identity source changed.')
+    const order = [...catalog.map(row => row.id), ...(catalog.some(row => row.id === gateway.id) ? [] : [gateway.id])]
+    const data = retained.map(row => ({ gateway: { id: row.gatewayId, name: row.gatewayName } as MCPGateway, tools: row.names.map(name => ({ name }) as ToolWithName) }))
+    data.push({ gateway, tools: fullTools ? Object.entries(fullTools).map(([name, tool]) => ({ ...tool, name })) : [{ name: toolName } as ToolWithName] })
+    data.sort((left, right) => order.indexOf(left.gateway.id) - order.indexOf(right.gateway.id))
+    const assigned: Record<string, { gatewayId: string; name: string }> = {}
+    const matches: string[] = []
+    for (const row of data) for (const tool of row.tools) {
+      const identity = this.assignToolKey(tool, row.gateway, assigned)
+      assigned[identity.key] = { gatewayId: row.gateway.id, name: tool.name }
+      if (row.gateway.id === gateway.id && tool.name === toolName) matches.push(identity.key)
+    }
+    if (matches.length !== 1 || assigned[matches[0]]?.gatewayId !== gateway.id || assigned[matches[0]]?.name !== toolName) throw new Error('The named MCP tool identity is genuinely ambiguous or unavailable.')
+    return resolveToolActivitySettingsName({ toolName: 'native_dynamic_mcp_use', toolResult: { toolName: matches[0] } }, 'dynamic_use') ?? (() => { throw new Error('The actual tool settings identity is unavailable.') })()
+  }
+
+  private async discoverOriginalStdioSource(handle: P5ApiDiscoveryOwner, actual: NonNullable<Awaited<ReturnType<typeof originalAOwner.readP5ApiOriginalStdioAuthority>>>): Promise<GatewayDiscoveryResult> {
+    const source = actual.source
+    return mcpGatewayService.withOriginalMcpStdioLaunch(source, actual.deadlineAt, async resolved => {
+      originalAOwner.assertP5ApiOriginalStdioCurrent(handle, source)
+      const inputs = { type: 'stdio', command: resolved.command, args: resolved.args, cwd: resolved.cwd ?? null,
+        env: Object.fromEntries(Object.entries(resolved.env).map(([name, value]) => [name, fingerprintSecret(value)])), startupTimeoutMs: resolved.startupTimeoutMs }
+      const answer = await mcpToolListCache.read({ userId: actual.userId, gatewayId: source.gatewayId, inputs }, async () => {
+        const cut = await mcpGatewayService.readMcpPrerequisiteIssueCut(actual.userId, actual.agentId, source.gatewayId, actual.deadlineAt, actual.fences)
+        originalAOwner.assertP5ApiOriginalStdioCurrent(handle, source)
+        if (cut.sourceRaw !== source.sourceRaw || cut.actorIdentityRaw !== source.actorIdentityRaw) throw new Error('The actual original A changed before discovery.')
+        const admission = Object.freeze({}) as P5McpClientAdmission
+        this.retainP5McpClient(admission, { kind: 'original-discovery', run: handle, original: source, userId: actual.userId, gatewayId: source.gatewayId,
+          source: source.sourceRaw, actorIdentityRaw: cut.actorIdentityRaw, url: '', headers: {}, signal: actual.signal, stdio: { original: source, resolved } })
+        originalAOwner.bindP5ApiClientWork(handle, admission)
+        let tools: Record<string, Tool>
+        try { tools = await stdioMCPGatewayClient.listForHeldApi(admission) }
+        finally { await this.closeP5McpClientForCaller(admission) }
+        const fact = stdioMCPGatewayClient.readHeldApiSettlement(admission)
+        if (fact.requests !== 'known' || fact.initialize !== 'known' || fact.list !== 'known' || fact.execute !== 'not_started' || fact.close !== 'known') throw new Error('Original A physical discovery remains unconfirmed.')
+        return { ok: true as const, tools: Object.entries(tools).map(([name, tool]) => ({ ...tool, name })) }
+      })
+      const final = await originalAOwner.readP5ApiOriginalStdioAuthority(handle, source.gatewayId)
+      if (!final || final.source !== source || !answer.lookup.ok) throw new Error('The same original A discovery is unavailable.')
+      return { gatewayId: source.gatewayId, gatewayName: source.gateway.name, gatewayType: source.gateway.type, gateway: source.gateway,
+        success: true, tools: answer.lookup.tools, lookupSource: answer.source, fetchedAt: answer.fetchedAt }
+    })
+  }
+
+  /** Same HTTP/client owner and existing shared cache; only verified C takes
+   * this exact retained source/ref path. Ordinary A/human lookups stay below. */
+  private async discoverVerifiedMcpSource(handle: P5ApiDiscoveryOwner, gatewayId: string): Promise<GatewayDiscoveryResult> {
+    const owner = await import('./appActions/mcp/originalTask')
+    const actual = await owner.readP5ApiVerifiedMcpAuthority(handle, gatewayId)
+    if (!actual) throw new Error('The actual verified source is unavailable.')
+    const source = mcpGatewayService.readPreparedMcpSource(actual.plan)
+    const discover = async (auth: { headers: Record<string, string>; resolved?: ResolvedStdioGatewayProcessConfig }) => {
+      owner.assertP5ApiVerifiedMcpCurrent(handle, gatewayId, actual.plan)
+      const inputs = auth.resolved ? { type: source.gateway.type, command: auth.resolved.command, args: auth.resolved.args, cwd: auth.resolved.cwd ?? null,
+        env: Object.fromEntries(Object.entries(auth.resolved.env).map(([name, value]) => [name, fingerprintSecret(value)])), startupTimeoutMs: auth.resolved.startupTimeoutMs } :
+        { type: source.gateway.type, url: source.gateway.url, token: fingerprintSecret(auth.headers.Authorization?.slice(7)) }
+      const answer = await mcpToolListCache.read({ userId: actual.userId, gatewayId, inputs }, async () => {
+        const cut = await mcpGatewayService.readMcpPrerequisiteIssueCut(actual.userId, actual.agentId, gatewayId, actual.deadlineAt, actual.fences)
+        owner.assertP5ApiVerifiedMcpCurrent(handle, gatewayId, actual.plan)
+        if (cut.sourceRaw !== source.raw || !auth.resolved && !source.gateway.url) throw new Error('The actual original source changed before discovery.')
+        const admission = Object.freeze({}) as P5McpClientAdmission
+        this.retainP5McpClient(admission, { kind: 'verified-discovery', run: handle, plan: actual.plan, userId: actual.userId, gatewayId,
+          source: source.raw, actorIdentityRaw: cut.actorIdentityRaw, url: source.gateway.url ?? '', headers: auth.headers, signal: actual.signal, ...(auth.resolved ? { stdio: { plan: actual.plan, resolved: auth.resolved } } : {}) })
+        owner.bindP5ApiClientWork(handle, admission)
+        let tools: Record<string, Tool>
+        try { tools = await this.heldP5McpClient(admission).listForHeldApi(admission) }
+        finally { await this.closeP5McpClientForCaller(admission) }
+        const fact = this.heldP5McpClient(admission).readHeldApiSettlement(admission)
+        if (fact.requests !== 'known' || fact.initialize !== 'known' || fact.list !== 'known' || fact.execute !== 'not_started' || fact.close !== 'known') throw new Error('The actual continued discovery physical work is unconfirmed.')
+        return { ok: true as const, tools: Object.entries(tools).map(([name, tool]) => ({ ...tool, name })) }
+      })
+      const final = await owner.readP5ApiVerifiedMcpAuthority(handle, gatewayId)
+      if (!final || final.plan !== actual.plan || !answer.lookup.ok) throw new Error('The same original verified discovery is unavailable.')
+      return { gatewayId, gatewayName: source.gateway.name, gatewayType: source.gateway.type, gateway: { ...source.gateway }, tools: answer.lookup.tools,
+        success: true, lookupSource: answer.source, fetchedAt: answer.fetchedAt }
+    }
+    return source.gateway.type === 'stdio'
+      ? mcpGatewayService.withVerifiedMcpStdioLaunch(actual.plan, resolved => discover({ headers: {}, resolved }))
+      : mcpGatewayService.withVerifiedMcpHttpAuth(actual.plan, discover)
+  }
+
   /**
    * Sanitize tool parameters schema for OpenAI compatibility
    *
@@ -576,6 +745,7 @@ export class MCPGatewayDiscovery {
     executionContext?: {
       userId?: string
       projectPath?: string | null
+      groupName?: string
     }
   ): Tool {
     if (gateway.type === 'n8n-mcp-client') {
@@ -603,9 +773,86 @@ export class MCPGatewayDiscovery {
       // BL-454: `options.abortSignal` is the reply's Stop (the AI SDK hands it to a directly
       // selected tool; Batshit Tool Use and the helper dispatch pass it on). It reaches the MCP
       // call, and a Stop closes this call's client, which ends a STDIO gateway's process.
-      execute: async (args: any, options?: { abortSignal?: AbortSignal }) => {
+      execute: async (args: any, options?: { abortSignal?: AbortSignal; p5ApiRun?: P5ApiOriginalRun }) => {
         const abortSignal = options?.abortSignal
+        const originalObservation = options?.p5ApiRun && gateway.type === 'stdio' ? reserveInitialStdioObservations(options.p5ApiRun, [gateway.id]).get(gateway.id) : undefined
         abortSignal?.throwIfAborted()
+        const p5Owner = options?.p5ApiRun ? await import('./appActions/mcp/originalTask') : undefined
+        if (options?.p5ApiRun) { p5Owner!.assertP5ApiRunCurrent(options.p5ApiRun); abortSignal?.throwIfAborted() }
+        if (options?.p5ApiRun && p5Owner!.p5ApiManagedMcpActive(options.p5ApiRun)) {
+          const actual = p5Owner!.readP5ApiMcpAuthority(options.p5ApiRun, gateway.id)
+          if (actual.userId !== executionContext?.userId) throw new Error('The actual MCP user changed.')
+          const verified = actual.preparedSource ? await p5Owner!.readP5ApiVerifiedMcpAuthority(options.p5ApiRun, gateway.id) : undefined
+          const originalA = !verified ? await p5Owner!.readP5ApiOriginalStdioAuthority(options.p5ApiRun, gateway.id) : undefined
+          const source = verified ? mcpGatewayService.readPreparedMcpSource(verified.plan).gateway : originalA?.source.gateway ?? await mcpGatewayService.get(actual.userId, gateway.id)
+          p5Owner!.readP5ApiMcpAuthority(options.p5ApiRun, gateway.id); abortSignal?.throwIfAborted()
+          if (source?.type === 'stdio') {
+            if ((!verified && !originalA) || !source.enabled || gateway.type !== 'stdio' || JSON.stringify(source.stdioConfig) !== JSON.stringify(gateway.stdioConfig)) throw new Error('The same original verified STDIO launch is unavailable.')
+            const expectedSchema = await Promise.resolve((originalTool.inputSchema as { jsonSchema?: unknown })?.jsonSchema ?? originalTool.inputSchema)
+            p5Owner!.readP5ApiMcpAuthority(options.p5ApiRun, gateway.id); abortSignal?.throwIfAborted()
+            await validateP5IntendedMcpArguments(expectedSchema, args)
+            p5Owner!.readP5ApiMcpAuthority(options.p5ApiRun, gateway.id); abortSignal?.throwIfAborted()
+            const heldSource = verified ?? originalA!
+            const sourceRaw = verified ? mcpGatewayService.readPreparedMcpSource(verified.plan).raw : originalA!.source.sourceRaw
+            const issueStdio = async (resolved: ResolvedStdioGatewayProcessConfig) => {
+              const cut = await mcpGatewayService.readMcpPrerequisiteIssueCut(actual.userId, actual.agentId, gateway.id, heldSource.deadlineAt, heldSource.fences)
+              p5Owner!.readP5ApiMcpAuthority(options.p5ApiRun!, gateway.id); abortSignal?.throwIfAborted()
+              if (!cut.gateway || cut.sourceRaw !== sourceRaw) throw new Error('The original verified STDIO source changed before use.')
+              assertP5ApiMcpToolDiscoverable(cut.actor, { ...cut.gateway }, actual, originalTool.name, toolName, executionContext?.groupName ?? 'Ungrouped Tools')
+              const admission = Object.freeze({}) as P5McpClientAdmission
+              this.retainP5McpClient(admission, { kind: 'use', run: options.p5ApiRun!, userId: actual.userId, gatewayId: gateway.id,
+                source: cut.sourceRaw, keyName: null, actorIdentityRaw: cut.actorIdentityRaw, url: '', headers: {}, signal: abortSignal ?? actual.signal,
+                ...(verified ? { verifiedPlan: verified.plan, stdio: { plan: verified.plan, resolved } } : { original: originalA!.source, stdio: { original: originalA!.source, resolved } }), toolName: originalTool.name, displayName: toolName,
+                groupName: executionContext?.groupName ?? 'Ungrouped Tools', expectedSchema: structuredClone(expectedSchema), arguments: structuredClone(args) })
+              p5Owner!.bindP5ApiClientWork(options.p5ApiRun!, admission)
+              try { return unwrapMcpToolResult(await stdioMCPGatewayClient.executeForHeldApi(admission)) }
+              finally { void stdioMCPGatewayClient.closeForHeldApi(admission) }
+            }
+            return verified ? mcpGatewayService.withVerifiedMcpStdioLaunch(verified.plan, issueStdio) :
+              mcpGatewayService.withOriginalMcpStdioLaunch(originalA!.source, originalA!.deadlineAt, issueStdio)
+          }
+          const keyless = !!source && !Object.hasOwn(source, 'authKeyName') && !!actual.preparedSource
+          if (!source || source.type !== 'custom' || !source.enabled || !source.url || !keyless && !source.authKeyName || source.metadata && Object.hasOwn(source.metadata, 'authToken') ||
+            source.url !== gateway.url || source.authKeyName !== gateway.authKeyName) throw new Error('This exact MCP source is outside the admitted API HTTP cohort.')
+          if (keyless) {
+            const known = mcpGatewayService.readPreparedMcpSource(actual.preparedSource!)
+            if (known.gateway.id !== source.id || known.gateway.created_at !== source.created_at || known.gateway.url !== source.url ||
+              Object.hasOwn(known.gateway, 'authKeyName') || known.gateway.metadata && Object.hasOwn(known.gateway.metadata, 'authToken')) throw new Error('The actual verified no-key source changed.')
+          }
+          const reference = keyless ? undefined : verified ? mcpGatewayService.readVerifiedMcpHttpReference(verified.plan).reference : await apiKeyService.readReferenceState(source.authKeyName!, actual.userId)
+          p5Owner!.readP5ApiMcpAuthority(options.p5ApiRun, gateway.id); abortSignal?.throwIfAborted()
+          if (!keyless && (!reference || !verified && (!('present' in reference) || !reference.present || !('shapeValid' in reference) || !reference.shapeValid) || typeof reference.raw !== 'string')) throw new Error('The actual MCP saved-key reference is unavailable.')
+          const expectedSchema = await Promise.resolve((originalTool.inputSchema as { jsonSchema?: unknown })?.jsonSchema ?? originalTool.inputSchema)
+          p5Owner!.readP5ApiMcpAuthority(options.p5ApiRun, gateway.id); abortSignal?.throwIfAborted()
+          const url = new URL(source.url)
+          if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash || isBlockedBatshitServerGatewayUrl(source.url)) throw new Error('This MCP endpoint is outside the exact held HTTP cohort.')
+          await validateP5IntendedMcpArguments(expectedSchema, args)
+          p5Owner!.readP5ApiMcpAuthority(options.p5ApiRun, gateway.id); abortSignal?.throwIfAborted()
+          const issue = async (key?: { state: string; value: string | null; key: string; raw: string }) => {
+            p5Owner!.readP5ApiMcpAuthority(options.p5ApiRun!, gateway.id); abortSignal?.throwIfAborted()
+            if (!keyless && (!key || !reference || key.state !== 'readable' || !key.value || key.key !== reference.key || key.raw !== reference.raw)) throw new Error('The actual MCP saved-key reference changed or is unavailable; no unauthenticated fallback was used.')
+            const cut = verified
+              ? await mcpGatewayService.readMcpPrerequisiteIssueCut(actual.userId, actual.agentId, gateway.id, verified.deadlineAt, verified.fences)
+              : keyless ? await mcpGatewayService.readMcpPrerequisiteIssueCut(actual.userId, actual.agentId, gateway.id, Math.min(actual.deadlineAt ?? Infinity, Date.now() + 120000), [])
+              : await mcpGatewayService.readMcpHttpIssueCut(actual.userId, actual.agentId, gateway.id, source.authKeyName!)
+            if (verified && cut.sourceRaw !== mcpGatewayService.readPreparedMcpSource(verified.plan).raw) throw new Error('The same verified C source changed before tool use.')
+            p5Owner!.readP5ApiMcpAuthority(options.p5ApiRun!, gateway.id); abortSignal?.throwIfAborted()
+            if (!cut.gateway || !keyless && !verified && (!('keyRaw' in cut) || cut.keyRaw !== key?.raw) || cut.gateway.id !== gateway.id || cut.gateway.type !== 'custom' || cut.gateway.enabled !== true ||
+                typeof cut.gateway.name !== 'string' || cut.gateway.created_at !== source.created_at ||
+                cut.gateway.url !== source.url || (keyless ? Object.hasOwn(cut.gateway, 'authKeyName') : cut.gateway.authKeyName !== source.authKeyName) ||
+                (cut.gateway.metadata && typeof cut.gateway.metadata === 'object' && Object.hasOwn(cut.gateway.metadata, 'authToken')) || cut.gateway.stdioConfig != null) throw new Error('The actual held MCP source changed before construction.')
+            assertP5ApiMcpToolDiscoverable(cut.actor, { ...cut.gateway }, actual, originalTool.name, toolName, executionContext?.groupName ?? 'Ungrouped Tools')
+            const admission = Object.freeze({}) as P5McpClientAdmission
+            this.retainP5McpClient(admission, { kind: 'use', run: options.p5ApiRun!, userId: actual.userId, gatewayId: gateway.id, source: cut.sourceRaw,
+              keyName: keyless ? null : source.authKeyName!, actorIdentityRaw: cut.actorIdentityRaw, ...(key ? { keyReference: { key: key.key, raw: key.raw } } : {}), url: source.url!,
+              ...(verified ? { verifiedPlan: verified.plan } : {}), headers: keyless ? {} : { Authorization: `Bearer ${key!.value}` }, signal: abortSignal ?? actual.signal,
+              toolName: originalTool.name, displayName: toolName, groupName: executionContext?.groupName ?? 'Ungrouped Tools', expectedSchema: structuredClone(expectedSchema), arguments: structuredClone(args) })
+            p5Owner!.bindP5ApiClientWork(options.p5ApiRun!, admission)
+            try { return unwrapMcpToolResult(await n8nMCPGatewayClient.executeForHeldApi(admission)) }
+            finally { void n8nMCPGatewayClient.closeForHeldApi(admission) }
+          }
+          return keyless ? issue() : apiKeyService.withConfiguredValue(source.authKeyName!, actual.userId, issue)
+        }
 
         let mcpClient: any | undefined
         let closing: Promise<void> | undefined
@@ -638,7 +885,7 @@ export class MCPGatewayDiscovery {
               stdioMCPGatewayClient.createClient({
                 gateway,
                 userId: executionContext?.userId,
-                projectPath: executionContext?.projectPath
+                projectPath: executionContext?.projectPath, originalObservation
               }),
               abortSignal,
               // A client that finishes starting after the Stop is closed, with its process.
@@ -724,29 +971,8 @@ export class MCPGatewayDiscovery {
           const result = await targetTool.execute(args, { abortSignal })
           logger.debug(`[MCP Tool Execution] Successfully executed ${toolName}`)
 
-          // FIX: Unwrap MCP result if it's wrapped in content array
-          // MCP returns: {content: [{type: 'text', text: '...'}]}
-          // We need: the actual text value
-          if (result && result.content && Array.isArray(result.content) && result.content[0]?.text) {
-            logger.debug(`[MCP Tool Execution] Unwrapping MCP content structure`);
-            let unwrapped = result.content[0].text;
+          return unwrapMcpToolResult(result)
 
-            // Check if the text itself is a JSON string that needs parsing
-            if (typeof unwrapped === 'string' && (unwrapped.startsWith('[') || unwrapped.startsWith('{'))) {
-              try {
-                const parsed = JSON.parse(unwrapped);
-                logger.debug(`[MCP Tool Execution] Further unwrapping JSON string`);
-                return parsed;
-              } catch (e) {
-                // Not valid JSON, return as-is
-                return unwrapped;
-              }
-            }
-
-            return unwrapped;
-          }
-
-          return result
         } catch (error) {
           if (abortSignal?.aborted) {
             logger.debug(`[MCP Tool Execution] Stopped ${toolName} on ${gateway.name}`)
@@ -786,13 +1012,30 @@ export class MCPGatewayDiscovery {
     toolSelections?: MCPToolSelections,
     discoveryOptions?: DiscoveryOptions
   ): Promise<ToolMetadataMap> {
+    if (discoveryOptions?.p5Owner && !discoveryOptions.originalObservations) discoveryOptions = { ...discoveryOptions,
+      originalObservations: reserveInitialStdioObservations(discoveryOptions.p5Owner, selectedGatewayIds ?? []) }
     try {
       // Get every registered gateway, then keep the enabled ones. Reading the
       // full registry (rather than the enabled subset) lets SA-096 P6 tell a
       // selection pointing at a *disabled* gateway apart from one pointing at a
       // gateway that no longer exists; the second used to be indistinguishable
       // from "this gateway returned no tools".
+      if (discoveryOptions?.p5Owner) {
+        const owner = await import('./appActions/mcp/originalTask')
+        if (owner.readP5ApiManagementIdentity(discoveryOptions.p5Owner).userId !== userId) throw new Error('The original discovery user changed.')
+        for (const id of selectedGatewayIds ?? []) {
+          await owner.readP5ApiVerifiedMcpAuthority(discoveryOptions.p5Owner, id)
+          await owner.readP5ApiOriginalStdioAuthority(discoveryOptions.p5Owner, id)
+        }
+      }
       const registeredGateways = await mcpGatewayService.list(userId)
+      if (discoveryOptions?.p5Owner) {
+        const owner = await import('./appActions/mcp/originalTask')
+        for (const id of selectedGatewayIds ?? []) {
+          const original = await owner.readP5ApiOriginalStdioAuthority(discoveryOptions.p5Owner, id)
+          if ((owner.p5ApiHasVerifiedMcpSource(discoveryOptions.p5Owner, id) || original) && !registeredGateways.some(row => row.id === id && row.enabled)) throw new Error('The original source is no longer present.')
+        }
+      }
       const allGateways = registeredGateways.filter(g => g.enabled)
       const gatewaysWithAuth = await this.applyUserAuthTokens(allGateways, userId)
 
@@ -835,6 +1078,10 @@ export class MCPGatewayDiscovery {
         userId,
         resolvedDiscoveryOptions
       )
+      if (discoveryOptions?.p5Owner) {
+        const owner = await import('./appActions/mcp/originalTask')
+        for (const result of results) if (!result.success && (owner.p5ApiHasVerifiedMcpSource(discoveryOptions.p5Owner, result.gatewayId) || owner.p5ApiManagedMcpActiveForDiscovery(discoveryOptions.p5Owner) && await owner.readP5ApiOriginalStdioAuthority(discoveryOptions.p5Owner, result.gatewayId))) throw new Error('The original source discovery was refused or unconfirmed.')
+      }
       const discoveryTime = performance.now() - startTime
 
       // Aggregate tools from all successful discoveries
@@ -878,15 +1125,8 @@ export class MCPGatewayDiscovery {
           // Story 6.6: Wrap MCP tools with on-demand client execution (CRITICAL FIX!)
           // CRITICAL: Sanitize gateway name for OpenAI API compatibility (spaces → underscores)
           for (const tool of filteredTools) {
-            const identity = this.resolveToolIdentity(tool, result.gateway, result.gatewayName)
-
-            let toolKey = identity.sanitizedToolName
-
-            // Ensure uniqueness across gateways (fallback to gateway namespace on collision)
-            if (allTools[toolKey]) {
-              const fallbackNamespace = this.sanitizeToolName(result.gatewayName)
-              toolKey = `${fallbackNamespace}_${identity.sanitizedToolName}`
-            }
+            const identity = this.assignToolKey(tool, result.gateway, allTools)
+            const toolKey = identity.key
 
             // STORY 6.6 CRITICAL FIX: Wrap tool with on-demand client execution
             // Raw MCP tools have execute functions that reference closed clients.
@@ -897,7 +1137,7 @@ export class MCPGatewayDiscovery {
               toolKey,
               {
                 userId,
-                projectPath: resolvedDiscoveryOptions.projectPath
+                projectPath: resolvedDiscoveryOptions.projectPath, groupName: identity.displayGroupName
               }
             )
             allTools[toolKey] = wrappedTool
@@ -954,13 +1194,35 @@ export class MCPGatewayDiscovery {
         )
       }
 
+      if (discoveryOptions?.p5Owner) {
+        const owner = await import('./appActions/mcp/originalTask')
+        for (const id of selectedGatewayIds ?? []) {
+          const verified = await owner.readP5ApiVerifiedMcpAuthority(discoveryOptions.p5Owner, id)
+          await owner.readP5ApiOriginalStdioAuthority(discoveryOptions.p5Owner, id)
+          if (!verified?.intent.zip) continue
+          const entries = [...toolMetadata].filter(([, meta]) => meta.gatewayId === id && meta.originalToolName === verified.intent.zip!.toolName)
+          if (entries.length !== 1 || resolveToolActivitySettingsName({ toolName: 'native_dynamic_mcp_use', toolResult: { toolName: entries[0][0] } }, 'dynamic_use') !== verified.settingsIdentity) throw new Error('The actual continued ordinary assignment changed the verified C Zip identity.')
+        }
+      }
+      if (discoveryOptions?.p5Owner && discoveryOptions.skipFiltering) {
+        const owner = await import('./appActions/mcp/originalTask')
+        owner.recordP5ApiToolNames(discoveryOptions.p5Owner, results.filter(result => result.success).map(result => ({ gatewayId: result.gatewayId,
+          gatewayName: result.gateway.name, createdAt: result.gateway.created_at, names: result.tools.map(tool => tool.name) })))
+      }
       return {
         tools: allTools,
-        metadata: toolMetadata
+        metadata: toolMetadata,
+        gatewayAvailability: results.map(result => ({
+          gatewayId: result.gatewayId, gatewayName: result.gatewayName, available: result.success
+        }))
       }
     } catch (error) {
+      if (discoveryOptions?.p5Owner) {
+        const owner = await import('./appActions/mcp/originalTask')
+        if (owner.p5ApiHasVerifiedMcpSource(discoveryOptions.p5Owner) || owner.p5ApiManagedMcpActiveForDiscovery(discoveryOptions.p5Owner)) throw error
+      }
       console.error('[Gateway Discovery] Error loading tools for user:', error)
-      return { tools: {}, metadata: new Map() }
+      return { tools: {}, metadata: new Map(), unavailable: true }
     }
   }
 
@@ -1208,3 +1470,8 @@ export class MCPGatewayDiscovery {
 
 // Export singleton instance
 export const mcpGatewayDiscovery = new MCPGatewayDiscovery()
+
+/** Fixed pre-await registration stays with discovery's trusted issuer. */
+export function reserveInitialStdioObservations(owner: P5ApiDiscoveryOwner, gatewayIds: readonly string[]): ReadonlyMap<string, P5McpClientAdmission> {
+  return mcpGatewayDiscovery.reserveInitialStdioObservations(owner, gatewayIds)
+}

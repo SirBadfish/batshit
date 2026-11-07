@@ -73,10 +73,11 @@ export interface ZipActivationResult {
   /** Set when the dead-copy rule keeps this zip compressed (DL-01). */
   deadCopy: DeadCopyReason | null
   /**
-   * The compressed reference says why (`DEAD_COPY_REASON_TEXT`): the copy died while the
-   * automatic rules still kept it open. A copy that had already aged out of its buffer when it
-   * died keeps its plain reference, so an old history line never changes when the agent reads
-   * the file again much later (append-only history; cache forensics `historyStability`).
+   * The copy died while the automatic rules still kept it open, so the dead-copy rule is what
+   * compressed it: the Zip Index names it on the turn it died (BL-1541). A copy that had
+   * already aged out of its buffer, an Auto copy, a rezip, and a large result were compressed
+   * already and are not named. The reference never says why: it keeps its plain label, so an
+   * old history line never changes (append-only history; cache forensics `historyStability`).
    */
   deadCopyNamed: boolean
 }
@@ -206,7 +207,7 @@ function operationKindOwnsSettingsIdentity(operationKind: ToolOperationKind): bo
   )
 }
 
-function resolveToolIdentity(toolName?: string, zipData?: ZipLikeMetadata | null): {
+export function resolveZipToolIdentity(toolName?: string, zipData?: ZipLikeMetadata | null): {
   toolName?: string
   operationKind?: ToolOperationKind
 } {
@@ -249,7 +250,16 @@ function resolveToolIdentity(toolName?: string, zipData?: ZipLikeMetadata | null
  * SA-129 P1 (DL-03): what an expanded read says on the last reply it is open. P2 added the second
  * way to keep it: hold the file (`zipHoldWords.ts`).
  */
-export const READ_COMPRESS_HINT_LAST_REPLY = 'Compresses after this reply. Note what you need or hold the file.'
+export const READ_COMPRESS_HINT_LAST_REPLY = 'Compresses after this reply. Save what you need in Tool Notes, or Hold the file.'
+/**
+ * BL-1785 (Josh, 2026-10-19, option B): with Tool Notes off the agent is never told to use them.
+ * Steady per setting like the line above: a setting change shows from the next compile on.
+ */
+export const READ_COMPRESS_HINT_LAST_REPLY_NO_TOOL_NOTES = 'Compresses after this reply. Hold the file if you still need it.'
+
+export function readCompressHintLastReply(toolNotesEnabled: boolean): string {
+  return toolNotesEnabled ? READ_COMPRESS_HINT_LAST_REPLY : READ_COMPRESS_HINT_LAST_REPLY_NO_TOOL_NOTES
+}
 
 /**
  * SA-129 P1 (DL-03): the one line an expanded `read_file` or `skill_read` transcript carries, so
@@ -264,13 +274,14 @@ export const READ_COMPRESS_HINT_LAST_REPLY = 'Compresses after this reply. Note 
  */
 export function describeReadCompressHint(
   activation: ZipActivationResult,
-  options: { isUnzipped: boolean }
+  options: { isUnzipped: boolean; toolNotesEnabled?: boolean }
 ): string | null {
   if (activation.shouldCompress || activation.zipDisabled || options.isUnzipped) return null
+  const lastReply = readCompressHintLastReply(options.toolNotesEnabled !== false)
   // An Auto result is open only through a recovery hold, which ends when this reply completes.
-  if (activation.autoZip) return activation.recoveryHold ? READ_COMPRESS_HINT_LAST_REPLY : null
+  if (activation.autoZip) return activation.recoveryHold ? lastReply : null
   if (!activation.meetsThreshold) return null
-  if (activation.messagesFromEnd + 1 >= activation.bufferSize) return READ_COMPRESS_HINT_LAST_REPLY
+  if (activation.messagesFromEnd + 1 >= activation.bufferSize) return lastReply
   // Reached only with a buffer of 2 or more.
   return `Compresses ${activation.bufferSize} replies after it was read.`
 }
@@ -296,7 +307,7 @@ export function calculateZipActivation(options: ZipActivationOptions): ZipActiva
     isUserUnzipped = false
   } = options
 
-  const resolvedIdentity = resolveToolIdentity(toolName, zipData)
+  const resolvedIdentity = resolveZipToolIdentity(toolName, zipData)
   const resolvedToolName = resolvedIdentity.toolName
   const isSubagentTool =
     zipType === 'cool_tool' &&

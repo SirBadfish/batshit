@@ -27,10 +27,6 @@ describe('send-routed answers a failed tool call through the failed tool-result 
         '              ? toolErrorAsFailedToolResult(chunk as any)\n' +
         '              : (chunk as any)\n'
     )
-    // A failed plan update opened no card and has no plan to show.
-    expect(source).toContain(
-      "\n          if (isPlanUpdateTool(toolResult.toolName)) {\n            if (chunk.type === 'tool-error') break\n"
-    )
   })
 
   it('counts a tool-error in the finish-step fallback', () => {

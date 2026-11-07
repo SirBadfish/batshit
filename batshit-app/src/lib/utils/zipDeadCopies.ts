@@ -1,5 +1,7 @@
 import { endsWithToolModelCutNotice } from './toolModelTextSizeGuard'
-import { failedCommandExitCode } from './toolActivityContract'
+import { failedCommandExitCode, READ_RANGE_ARGUMENT_NAMES } from './toolActivityContract'
+import { readTypedFileReadFacts, typedFileChangeOutcome } from './typedFileFacts'
+import type { FileReadSource } from './fileReadSource'
 
 /**
  * SA-129 P1 (DL-01): dead copies of file reads.
@@ -14,8 +16,9 @@ import { failedCommandExitCode } from './toolActivityContract'
  * - A later whole read supersedes every earlier read of that file, whole or partial; a partial read
  *   (`sed -n`, `head`, `tail`, a piped read, a read with a range or a cut) never supersedes.
  * - "Edited" is a `write_file` or `edit_file` result for the same path after the read, including a
- *   managed `apply_patch`. A failed edit never counts, and a Bash command with an unknown effect is
- *   never an edit (it is not stored as one). Only whole copies go stale; a partial copy stays until
+ *   managed `apply_patch`. A failed edit never counts (a managed patch is written whole or not at
+ *   all, BL-1916), except the paths a failed patch names as left changed when Batshit could not put
+ *   them back; a Bash command with an unknown effect is never an edit (it is not stored as one). Only whole copies go stale; a partial copy stays until
  *   a whole read supersedes it.
  * - A result that holds several files compresses only when every file in it is dead. A result whose file
  *   set is unknown (a command this module cannot read word for word, a failed read, BL-233's
@@ -35,10 +38,34 @@ import { failedCommandExitCode } from './toolActivityContract'
 
 export type DeadCopyReason = 'superseded' | 'stale'
 
-/** What the compressed reference of a dead copy says after its description (DL-01, P1). */
+/**
+ * Why a held dead copy is compressed, in its Zip Holds line of the Zip Index (SA-129 P2). The
+ * compressed reference itself never says why (BL-1541): history is frozen once written.
+ */
 export const DEAD_COPY_REASON_TEXT: Record<DeadCopyReason, string> = {
   superseded: 'superseded by a later read',
   stale: 'stale, edited since'
+}
+
+/** BL-1541: why each file of an older copy compressed, under Zipped this turn in the Zip Index, on the turn it did. */
+export const DEAD_COPY_THIS_TURN_REASON_TEXT: Record<DeadCopyReason, string> = {
+  superseded: 'was read again later',
+  stale: 'was edited after the read'
+}
+
+/**
+ * BL-1541: the one Zipped this turn line that tells the agent which older copies compressed
+ * this turn and why, or null when none did. A path appears once; when several copies of one file
+ * compressed at once, the newest copy's reason wins. `copies` are in chat order.
+ */
+export function describeDeadCopiesCompressedThisTurn(
+  copies: ReadonlyArray<{ files: ReadonlyArray<DeadCopyFile> }>
+): string | null {
+  const reasons = new Map<string, DeadCopyReason>()
+  for (const copy of copies) for (const file of copy.files) reasons.set(file.path, file.reason)
+  if (reasons.size === 0) return null
+  const items = [...reasons].map(([path, reason]) => `${describeHeldPath(path)} (${DEAD_COPY_THIS_TURN_REASON_TEXT[reason]})`)
+  return `- Older copies compressed this turn: ${items.join(', ')}.`
 }
 
 export type FileReadMode = 'whole' | 'partial'
@@ -62,12 +89,25 @@ export interface DeadCopyToolResult {
   operationKind?: string | null
   /** The parsed cool_tool payload, or null when the zip is not a tool result. */
   payload: Record<string, any> | null
+  /**
+   * The zip's `metadata.fileReadSource`, already checked by `readFileReadSource`: written by the zip
+   * adapter only from a read proof sealed in this process (SA-137), never from a result field.
+   */
+  fileReadSource?: FileReadSource | null
+}
+
+/** One file of a dead copy, by its ledger key, and what made that file dead. */
+export interface DeadCopyFile {
+  path: string
+  reason: DeadCopyReason
 }
 
 export interface DeadCopy {
   reason: DeadCopyReason
   /** The message whose result made the last file of this copy dead. */
   deadAtMessageIndex: number
+  /** Every file of the copy, in the order the read named them. */
+  files: DeadCopyFile[]
 }
 
 export interface DeadCopyOptions {
@@ -289,7 +329,8 @@ function programName(word: ShellWord): string {
 }
 
 const SHELL_PROGRAMS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh'])
-const SED_RANGE_SCRIPT = /^\d+(?:,(?:\d+|\$))?p(?:;\d+(?:,(?:\d+|\$))?p)*;?$/
+/** `sed -n` scripts the ledger reads as line ranges (`5p`, `10,40p`, `1,$p`, joined by `;`). */
+export const SED_RANGE_SCRIPT = /^\d+(?:,(?:\d+|\$))?p(?:;\d+(?:,(?:\d+|\$))?p)*;?$/
 const COUNT_OPTION = /^-(?:\d+|[nc]\d+)$/
 
 /** `cat`/`nl` (whole) or `sed -n <range>p`/`head`/`tail` (partial) with their file operands. */
@@ -434,6 +475,76 @@ export function readFilesFromCommand(
   return files.size > 0 ? files : null
 }
 
+/**
+ * BL-1652: one top-level command of a command line, as `shellReadSplit.ts` splits a multi-file
+ * read's output. `words` are the command's literal words; a read through a pipe keeps the filter
+ * in `pipe`, and an `other` pipeline keeps each of its commands' words.
+ * - `cd`: the leading `cd`, whose target the reads after it resolve against;
+ * - `read`: a read in this module's grammar (`cat`, `nl`, `sed -n <range>p`, `head`, `tail`, or a
+ *   whole read piped to a range filter), with the files it names;
+ * - `echo`: an `echo` or `printf` separator;
+ * - `other`: any other simple command or pipeline (`ls`, `npm test`), whose output is unknown.
+ */
+export type ShellReadSegment =
+  | { kind: 'cd'; dir: string; words: string[] }
+  | { kind: 'read'; files: string[]; mode: FileReadMode; words: string[]; pipe: string[] | null }
+  | { kind: 'echo'; words: string[] }
+  | { kind: 'other'; pipeline: string[][] }
+
+/**
+ * BL-1652: the top-level commands of a command line, in order, read with the same tokenizer and
+ * joiners as `readFilesFromCommand` (`&&`, `;`, a newline; one shell wrapper unwrapped), but where
+ * that reading fails on any program outside its grammar, this one names it `other`. Null for
+ * everything the tokenizer refuses (a redirect, `||`, a subshell, a comment), for any word that is
+ * not literal (a variable, a glob, a substitution), and for a `cd` that is not the first command.
+ */
+export function readSegmentsFromCommand(command: string, depth = 0): ShellReadSegment[] | null {
+  const tokens = tokenizeShell(command)
+  const pipelines = tokens ? parsePipelines(tokens) : null
+  if (!pipelines || pipelines.length === 0) return null
+  if (pipelines.some((pipeline) => pipeline.some((words) => words.some((word) => word.dynamic)))) return null
+
+  const only = pipelines.length === 1 && pipelines[0].length === 1 ? pipelines[0][0] : null
+  if (only && depth < 2 && only.length === 3 && SHELL_PROGRAMS.has(programName(only[0])) && /^-[a-z]*c[a-z]*$/.test(only[1].text)) {
+    return readSegmentsFromCommand(only[2].text, depth + 1)
+  }
+
+  const segments: ShellReadSegment[] = []
+  for (let index = 0; index < pipelines.length; index += 1) {
+    const pipeline = pipelines[index]
+    const texts = pipeline.map((words) => words.map((word) => word.text))
+    if (pipeline.length === 1) {
+      const words = pipeline[0]
+      const program = programName(words[0])
+      if (program === 'cd') {
+        if (index !== 0 || words.length !== 2 || words[1].text === '-' || !isLiteralPath(words[1].text)) return null
+        segments.push({ kind: 'cd', dir: words[1].text, words: texts[0] })
+        continue
+      }
+      if (program === 'echo' || program === 'printf') {
+        segments.push({ kind: 'echo', words: texts[0] })
+        continue
+      }
+      const read = readOperands(words)
+      if (read && read.files.every((file) => isLiteralPath(file))) {
+        segments.push({ kind: 'read', files: read.files, mode: read.mode, words: texts[0], pipe: null })
+        continue
+      }
+      segments.push({ kind: 'other', pipeline: texts })
+      continue
+    }
+    if (pipeline.length === 2) {
+      const read = readOperands(pipeline[0])
+      if (read && read.mode === 'whole' && read.files.length === 1 && isLiteralPath(read.files[0]) && isRangeFilter(pipeline[1])) {
+        segments.push({ kind: 'read', files: read.files, mode: 'partial', words: texts[0], pipe: texts[1] })
+        continue
+      }
+    }
+    segments.push({ kind: 'other', pipeline: texts })
+  }
+  return segments
+}
+
 // ---------------------------------------------------------------------------------------------
 // Stored payloads
 
@@ -495,25 +606,6 @@ function readWasCut(payload: Record<string, any>, result: Record<string, any> | 
   )
 }
 
-/** Arguments that ask a read tool for part of a file (Claude Code's Read takes `offset`/`limit`). */
-const RANGE_ARGUMENTS = [
-  'offset',
-  'limit',
-  'startLine',
-  'endLine',
-  'start_line',
-  'end_line',
-  'lineStart',
-  'lineEnd',
-  'fromLine',
-  'toLine',
-  'range',
-  'lines',
-  'maxLines',
-  'max_lines',
-  'head',
-  'tail'
-]
 
 /**
  * Claude Code's Read returns at most 2,000 lines and its stored result keeps only the count it
@@ -521,24 +613,45 @@ const RANGE_ARGUMENTS = [
  */
 const LONGEST_KNOWN_WHOLE_DIRECT_READ = 1999
 
-function readFiles(payload: Record<string, any>, operationKind: string, project: string | null): ToolResultFiles {
+function readFiles(
+  payload: Record<string, any>,
+  operationKind: string,
+  project: string | null,
+  source: FileReadSource | null = null
+): ToolResultFiles {
   const args = payloadArgs(payload)
   const result = payloadResult(payload)
   if (resultFailed(payload, result)) return { kind: 'unknown_read' }
   if (result?.contentOmitted === true || payload.storage?.binaryLikeOmitted === true) return { kind: 'unknown_read' }
-  const cut = readWasCut(payload, result)
+  // A typed read the 90,000-character cap cut (one long line it cut included) says so in its own
+  // block (SA-136, P2b review): it holds the start of the file, so it is a part, never a whole copy.
+  const cut = readWasCut(payload, result) || readTypedFileReadFacts(result?.typedFileRead)?.truncated === true
+
+  // SA-136: a typed `read_file` whose sealed proof was verified when it was stored says itself
+  // whether it showed the whole file: a `typed` view from line 1 to the end, never cut (a proof is
+  // made only for an uncut read). Its range arguments and line count then decide nothing. Any other
+  // read keeps the rules below; a result field alone never makes a read whole.
+  if (operationKind === 'read_file' && source?.view.kind === 'typed') {
+    const key = filePathKey(firstText(result?.filePath, args.filePath, args.file_path, args.path, result?.path), null, project)
+    if (!key) return { kind: 'unknown_read' }
+    const whole = !cut && source.view.startLine === 1 && source.view.endLine === null
+    return { kind: 'read', files: new Map([[key, whole ? 'whole' : 'partial']]) }
+  }
 
   if (operationKind === 'skill_read') {
     const skillId = firstText(args.skillId, result?.skillId)
     const file = normalizePosixPath(firstText(args.path, result?.path, result?.filePath) ?? 'SKILL.md')
     if (!skillId || !file || file.startsWith('/') || file.startsWith('..')) return { kind: 'unknown_read' }
-    // Only `invoke` returns a whole file (the skill's SKILL.md). A `read` or `script_read` returns
-    // a window whose size each lane sets, and the stored result does not keep whether it was cut,
-    // so it is always a part.
-    const whole =
-      !cut &&
-      firstText(args.action, result?.action) === 'invoke' &&
-      (args.offset === undefined || args.offset === null || args.offset === 0)
+    // New skill reads retain exact source/window facts. A complete read replaces older
+    // windows of that file; partial or old unproven windows never supersede a whole read.
+    const start = result?.offset ?? 0
+    const exactWindow = typeof result?.sourceSha256 === 'string' && /^[a-f0-9]{64}$/.test(result.sourceSha256) &&
+      Number.isSafeInteger(start) && start >= 0 && Number.isSafeInteger(result?.returnedChars) && result.returnedChars >= 0 &&
+      Number.isSafeInteger(result?.originalChars) && result.originalChars >= result.returnedChars + start
+    const whole = exactWindow
+      ? start === 0 && result!.returnedChars === result!.originalChars && result?.modelTextOnly !== true
+      : !cut && firstText(args.action, result?.action) === 'invoke' &&
+        (args.offset === undefined || args.offset === null || args.offset === 0)
     // A skill's files are named inside the skill, never by a project path.
     return { kind: 'read', files: new Map([[`skill:${skillId}:${file}`, whole ? 'whole' : 'partial']]) }
   }
@@ -556,7 +669,7 @@ function readFiles(payload: Record<string, any>, operationKind: string, project:
   const lineCount = Number(result?.lineCount ?? result?.numLines)
   const partial =
     cut ||
-    RANGE_ARGUMENTS.some((name) => args[name] !== undefined && args[name] !== null) ||
+    READ_RANGE_ARGUMENT_NAMES.some((name) => args[name] !== undefined && args[name] !== null) ||
     (Number.isFinite(lineCount) && lineCount > LONGEST_KNOWN_WHOLE_DIRECT_READ)
   return { kind: 'read', files: new Map([[key, partial ? 'partial' : 'whole']]) }
 }
@@ -646,8 +759,11 @@ const patchFileHeaders = () => /^\*\*\* (?:Update File|Add File|Delete File|Move
  */
 function managedPatchBase(command: string): string | null {
   const beforePatch = command.slice(0, command.indexOf('*** Begin Patch'))
-  // The document arrives through a heredoc (`<<'PATCH'`) or as one quoted argument.
-  const invocation = beforePatch.replace(/<<-?\s*(['"]?)[A-Za-z_][A-Za-z0-9_]*\1\s*$/, '').replace(/(['"])\s*$/, '')
+  // The document arrives through a heredoc (`<<'PATCH'`) or as one quoted argument. A command
+  // after the heredoc's `&&` (`apply_patch <<'PATCH' && npm test`) is never run (BL-1915).
+  const invocation = beforePatch
+    .replace(/<<-?\s*(['"]?)[A-Za-z_][A-Za-z0-9_]*\1(?:\s*&&[^\n]*)?\s*$/, '')
+    .replace(/(['"])\s*$/, '')
   const tokens = tokenizeShell(invocation)
   const pipelines = tokens ? parsePipelines(tokens) : null
   if (!pipelines || pipelines.length === 0) return null
@@ -672,8 +788,28 @@ function managedPatchBase(command: string): string | null {
 function editFiles(payload: Record<string, any>, project: string | null): ToolResultFiles {
   const args = payloadArgs(payload)
   const result = payloadResult(payload)
-  if (resultFailed(payload, result)) return { kind: 'none' }
   const files = new Set<string>()
+  // BL-1916: a managed patch is written whole or not at all, so a failed one changed nothing,
+  // unless a write failed and Batshit could not put every path back: those paths it names.
+  // (The n8n automation lane keeps it in the error's details.)
+  const partialPatch = asRecord(result?.managedApplyPatch) ?? asRecord(asRecord(asRecord(result?.error)?.details)?.managedApplyPatch)
+  if (partialPatch?.partial === true && Array.isArray(partialPatch.changedPaths)) {
+    for (const changed of partialPatch.changedPaths) {
+      const key = filePathKey(changed, null, project)
+      if (key) files.add(key)
+    }
+    return files.size > 0 ? { kind: 'edit', files } : { kind: 'none' }
+  }
+  // SA-136: a typed write or edit says its own outcome. Applied, and unknown (it never returned
+  // after reporting it was renaming), may have changed the file, so the path's earlier whole copies
+  // retire even when the call is stored as stopped; unapplied wrote nothing.
+  const typedOutcome = typedFileChangeOutcome(result)
+  if (typedOutcome !== null) {
+    if (typedOutcome === 'unapplied') return { kind: 'none' }
+    const key = filePathKey(firstText(result?.filePath, args.filePath, args.path), null, project)
+    return key ? { kind: 'edit', files: new Set([key]) } : { kind: 'none' }
+  }
+  if (resultFailed(payload, result)) return { kind: 'none' }
   const command = commandOf(args, result)
 
   if (command && command.includes('*** Begin Patch')) {
@@ -681,7 +817,15 @@ function editFiles(payload: Record<string, any>, project: string | null): ToolRe
     if (base === null) return { kind: 'none' }
     const baseDir = base ? baseDirectory(base, project) : null
     if (base && !baseDir) return { kind: 'none' }
-    for (const match of command.matchAll(patchFileHeaders())) {
+    // Only the patch's own headers: commands after it are never run (BL-1915).
+    const begin = command.indexOf('*** Begin Patch')
+    let end = command.lastIndexOf('*** End Patch')
+    // A heredoc patch ends at its delimiter line: a never-run heredoc after it may hold markers too.
+    const delimiter = command.slice(0, begin).match(/<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/)?.[2]
+    const closing = delimiter ? new RegExp(`\\n\\t*${delimiter}[ \\t]*(?:\\n|$)`).exec(command.slice(begin)) : null
+    if (closing) end = command.lastIndexOf('*** End Patch', begin + closing.index)
+    const document = end > begin ? command.slice(begin, end) : command.slice(begin)
+    for (const match of document.matchAll(patchFileHeaders())) {
       const key = filePathKey(match[1].trim(), baseDir, project)
       if (key) files.add(key)
     }
@@ -703,7 +847,8 @@ function editFiles(payload: Record<string, any>, project: string | null): ToolRe
     return key ? { kind: 'edit', files: new Set([key]) } : { kind: 'none' }
   }
 
-  // A direct edit or write tool names its file (and a Codex patch of several files names them all).
+  // A direct edit or write tool names its file (and a patch of several files, as saved Codex
+  // steps carry it, names them all).
   const changes = Array.isArray(result?.changes) ? result.changes : []
   const candidates = [
     result?.filePath,
@@ -724,14 +869,14 @@ function editFiles(payload: Record<string, any>, project: string | null): ToolRe
 
 /** What one stored tool result did to files (see the rules at the top of this module). */
 export function describeToolResultFiles(
-  result: Pick<DeadCopyToolResult, 'operationKind' | 'payload'>,
+  result: Pick<DeadCopyToolResult, 'operationKind' | 'payload' | 'fileReadSource'>,
   options: DeadCopyOptions = {}
 ): ToolResultFiles {
   const payload = result.payload
   if (!payload) return { kind: 'none' }
   const project = normalizeDeadCopyProjectPath(options.projectPath)
   const operationKind = firstText(result.operationKind, payload.operationKind, payload.metadata?.operationKind)
-  if (operationKind === 'read_file' || operationKind === 'skill_read') return readFiles(payload, operationKind, project)
+  if (operationKind === 'read_file' || operationKind === 'skill_read') return readFiles(payload, operationKind, project, result.fileReadSource ?? null)
   if (operationKind === 'edit_file' || operationKind === 'write_file') return editFiles(payload, project)
   if (operationKind === 'dynamic_use') return gatewayReadFiles(payload, project)
   return { kind: 'none' }
@@ -787,6 +932,8 @@ export function findDeadCopies(results: DeadCopyToolResult[], options: DeadCopyO
 
     for (const file of effect.files) {
       for (const earlier of readsByFile.get(file) ?? []) {
+        // Josh, 2026-11-04: an edit retires a copy whether or not Refreshed File Reads is on, so the
+        // feature never keeps more open than it would be with the feature off (SA-137 D3 amended).
         if (earlier.files.get(file) === 'whole' && !earlier.dead.has(file)) {
           earlier.dead.set(file, { reason: 'stale', at: result.messageIndex })
         }
@@ -800,7 +947,8 @@ export function findDeadCopies(results: DeadCopyToolResult[], options: DeadCopyO
     const marks = [...copy.dead.values()]
     dead.set(copy.zipId, {
       reason: marks.some((mark) => mark.reason === 'stale') ? 'stale' : 'superseded',
-      deadAtMessageIndex: Math.max(...marks.map((mark) => mark.at))
+      deadAtMessageIndex: Math.max(...marks.map((mark) => mark.at)),
+      files: [...copy.files.keys()].map((path) => ({ path, reason: copy.dead.get(path)!.reason }))
     })
   }
   return dead

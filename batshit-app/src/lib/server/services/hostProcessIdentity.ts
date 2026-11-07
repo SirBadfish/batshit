@@ -55,7 +55,7 @@ export async function readHostProcessTable(): Promise<HostProcessTable> {
     const [, pid, parent, group, started, state, executable] = match
     table.set(Number(pid), { pid: Number(pid), parent: Number(parent), group: Number(group), started, state, program: path.basename(executable).slice(0, 80) })
   }
-  if (table.size === 0) throw new Error('Codex cleanup could not read process identities.')
+  if (table.size === 0) throw new Error('Process cleanup could not read process identities.')
   return table
 }
 

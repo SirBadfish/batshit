@@ -15,8 +15,9 @@ describe('AB home control labels', () => {
     expect(source).not.toContain('data-ab-control="toggle-test-mode"')
     expect(source).toContain('data-ab-control="open-execution-viewer"')
     expect(source).toContain('data-ab-control="work-mode"')
-    expect(source).toContain('data-ab-control="codex-permission-mode"')
-    expect(source).toContain('data-ab-control="claude-permission-mode"')
+    expect(source).not.toContain('data-ab-control="codex-permission-mode"')
+    // SA-139 R4: the Claude Code CLI Primary lane and its chat-bar permission chip were removed.
+    expect(source).not.toContain('data-ab-control="claude-permission-mode"')
     expect(source).not.toContain('data-ab-control="n8n-workflow-mode"')
     expect(source).toContain('data-ab-control="voice-input-once"')
     expect(source).toContain('data-ab-control="voice-mode-toggle"')
@@ -84,8 +85,8 @@ describe('AB home control labels', () => {
     const compactArtifactShelf = readSource('src/lib/components/artifacts/CompactArtifactShelf.svelte')
     const headerBarIcons = readSource('src/lib/components/artifacts/HeaderBarIcons.svelte')
     const agentSelector = readSource('src/lib/components/agents/AgentSelector.svelte')
-    const codexReasoningSelector = readSource(
-      'src/lib/components/models/CodexReasoningEffortSelector.svelte'
+    const reasoningSelector = readSource(
+      'src/lib/components/models/ModelReasoningControl.svelte'
     )
 
     expect(sidebar).toContain('data-ab-control="toggle-archives"')
@@ -110,6 +111,9 @@ describe('AB home control labels', () => {
     expect(headerBarIcons).toContain('Open widget menu')
 
     expect(agentSelector).toContain('data-ab-control="chat-target"')
-    expect(codexReasoningSelector).toContain('data-ab-control="codex-reasoning-effort"')
+    expect(reasoningSelector).toContain('data-ab-control="model-reasoning-effort"')
+    // SA-139 R4: the chat bar's Claude Code CLI Thinking control went with the lane.
+    expect(reasoningSelector).not.toContain('claude-thinking-mode')
+    expect(reasoningSelector).not.toContain('codex-reasoning-effort')
   })
 })

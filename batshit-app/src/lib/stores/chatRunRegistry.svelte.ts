@@ -25,8 +25,8 @@ export type SessionRunState = {
   /**
    * SA-114 P3 (DL-114-09): can the reply running in this chat be steered, and if not, why?
    *
-   * The SERVER decides (`resolveSteerability` at the moment it registers the run — a Codex
-   * run's answer depends on the transport lane it actually got) and the client only reports
+   * The SERVER decides (`resolveSteerability` at the moment it registers the run — a CLI
+   * run's answer depends on how it was actually started) and the client only reports
    * it. It arrives on the `start` event for a chat the user is watching, and on
    * `session_run_status` for a turn Batshit started on its own. `null` means "not told yet",
    * which is not the same as `false`: the send button treats an unknown answer as steerable

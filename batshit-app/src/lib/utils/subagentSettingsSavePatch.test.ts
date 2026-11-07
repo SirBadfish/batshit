@@ -17,13 +17,12 @@ import {
 
 const CONNECTION = { type: 'direct', service: 'openai' } as const
 
-/** A Subagent with a value in every field: a workflow-backed one, so the webhook fields count. */
+/** A Subagent with a value in every field. */
 function baseForm(): SubagentSaveForm {
   return {
     displayName: 'Research helper',
-    subagentType: 'n8n-workflow',
+    subagentType: 'api',
     specialty: 'general',
-    webhook_url: 'https://n8n.example.com/webhook/research',
     include_global_prompt: false,
     system_prompt: 'Answer only in haiku.',
     primary_model_provider: 'openai',
@@ -31,6 +30,7 @@ function baseForm(): SubagentSaveForm {
     primary_model_preset_id: 'preset_a',
     primary_model_connection: { ...CONNECTION },
     timeout_seconds: '45',
+    max_tool_steps: '30',
     avatar: null,
     avatar_icon_ref: DEFAULT_AGENT_ICON_REF,
     avatar_icon_fit: 'fill',
@@ -63,6 +63,18 @@ describe('what a Subagent save sends (BL-844)', () => {
 
   it('names a cleared Call Timeout as null', () => {
     expect(patchOf({ timeout_seconds: '' })).toEqual({ timeout_seconds: null })
+  })
+
+  it('delegation limits: sends a long Call Timeout, and Max Tool Steps the way it sends the timeout', () => {
+    // Decision 4: a limit up to 24 hours. Decision 3: an optional tool-step limit, blank = none.
+    expect(patchOf({ timeout_seconds: '86400' })).toEqual({ timeout_seconds: 86_400 })
+    expect(patchOf({ max_tool_steps: '12' })).toEqual({ max_tool_steps: 12 })
+    expect(patchOf({ max_tool_steps: '' })).toEqual({ max_tool_steps: null })
+    // The number input gives a number, or null once emptied.
+    const asNumber = { ...baseForm(), max_tool_steps: 30 as unknown as string }
+    expect(buildSubagentSettingsSavePatch(baseForm(), asNumber)).toEqual({})
+    expect(patchOf({ max_tool_steps: null as unknown as string })).toEqual({ max_tool_steps: null })
+    expect(() => makeSubagentFormSignature({ ...baseForm(), max_tool_steps: null as unknown as string })).not.toThrow()
   })
 
   it('reads the Call Timeout a number input gives as the same value as the string it loaded', () => {
@@ -121,22 +133,6 @@ describe('what a Subagent save sends (BL-844)', () => {
     for (const key of ['primary_model_preset_id', 'primary_model_provider', 'primary_model_name', 'primary_model_connection']) {
       expect(patch).not.toHaveProperty(key)
     }
-  })
-
-  it('sends the workflow URL with the type when either changed', () => {
-    expect(patchOf({ webhook_url: 'https://n8n.example.com/webhook/other' })).toEqual({
-      subagentType: 'n8n-workflow',
-      webhook_url: 'https://n8n.example.com/webhook/other',
-      webhookUrl: 'https://n8n.example.com/webhook/other'
-    })
-  })
-
-  it('sends a workflow URL an API Subagent does not keep as no change at all', () => {
-    const api = { ...baseForm(), subagentType: 'api' as const, webhook_url: '' }
-    // The form empties a stale URL on open: its signature moves, the payload does not.
-    const stale = { ...api, webhook_url: 'https://n8n.example.com/webhook/stale' }
-    expect(buildSubagentSettingsSavePatch(stale, api)).toEqual({})
-    expect(buildSubagentSettingsSavePatch(api, stale)).toEqual({})
   })
 
   it('sends the avatar fields together', () => {
@@ -225,10 +221,25 @@ describe('what a Subagent save sends (BL-844)', () => {
   })
 
   it('never puts an undefined value in the patch', () => {
-    const api = { ...baseForm(), subagentType: 'api' as const, webhook_url: '' }
-    const patch = buildSubagentSettingsSavePatch(baseForm(), api)
+    const changed = { ...baseForm(), specialty: 'artifact', webhook_url: '' }
+    const patch = buildSubagentSettingsSavePatch(baseForm(), changed)
     expect(Object.values(patch).some((value) => value === undefined)).toBe(false)
-    expect(patch).toMatchObject({ subagentType: 'api' })
+    expect(patch).toEqual({ specialty: 'artifact' })
+  })
+
+  // SA-139 R5 (D14): a leftover CLI Subagent (Claude Code CLI or Codex CLI) is never saved. The
+  // payload builder refuses its form with the readable sentence, so no save can name it.
+  it('refuses to build a save for a leftover CLI Subagent, either side of the save', () => {
+    const claudeLeftover: SubagentSaveForm = { ...baseForm(), subagentType: 'cli', primary_model_provider: 'anthropic-claude-cli', primary_model_name: 'opus' }
+    const codexLeftover: SubagentSaveForm = { ...baseForm(), subagentType: 'cli', primary_model_provider: 'codex', primary_model_name: 'gpt-6.1-sol' }
+    const claudeSentence = /^Research helper ran on the Claude Code CLI lane, which Batshit no longer supports, so it can only be deleted\./
+    const codexSentence = /^Research helper ran on Codex CLI, which Batshit no longer supports, so it can only be deleted\./
+    expect(() => buildSubagentPayload(claudeLeftover)).toThrow(claudeSentence)
+    expect(() => buildSubagentPayload(codexLeftover)).toThrow(codexSentence)
+    expect(() => buildSubagentSettingsSavePatch(claudeLeftover, { ...claudeLeftover, displayName: 'Renamed' })).toThrow(claudeSentence)
+    // A live form cannot become one either.
+    expect(() => buildSubagentSettingsSavePatch(baseForm(), { ...baseForm(), subagentType: 'cli' })).toThrow(/Claude Code CLI lane/)
+    expect(() => buildSubagentPayload({ ...baseForm(), subagentType: 'n8n-workflow' })).toThrow(/n8n Subagent type that Batshit removed/)
   })
 })
 
@@ -239,9 +250,9 @@ describe('what a Subagent save sends (BL-844)', () => {
  */
 const CHANGE_ONE_FIELD: { [K in keyof SubagentSaveForm]: (form: SubagentSaveForm) => SubagentSaveForm } = {
   displayName: (form) => ({ ...form, displayName: `${form.displayName} changed` }),
-  subagentType: (form) => ({ ...form, subagentType: 'api' }),
+  // SA-139 R5: `api` is the one live type, so the only other value is a retired one (refused below).
+  subagentType: (form) => ({ ...form, subagentType: 'cli' }),
   specialty: (form) => ({ ...form, specialty: 'artifact' }),
-  webhook_url: (form) => ({ ...form, webhook_url: 'https://n8n.example.com/webhook/changed' }),
   include_global_prompt: (form) => ({ ...form, include_global_prompt: !form.include_global_prompt }),
   system_prompt: (form) => ({ ...form, system_prompt: 'A changed prompt.' }),
   primary_model_provider: (form) => ({ ...form, primary_model_provider: 'anthropic' }),
@@ -249,6 +260,7 @@ const CHANGE_ONE_FIELD: { [K in keyof SubagentSaveForm]: (form: SubagentSaveForm
   primary_model_preset_id: (form) => ({ ...form, primary_model_preset_id: 'preset_changed' }),
   primary_model_connection: (form) => ({ ...form, primary_model_connection: { type: 'direct', service: 'anthropic' } }),
   timeout_seconds: (form) => ({ ...form, timeout_seconds: '120' }),
+  max_tool_steps: (form) => ({ ...form, max_tool_steps: '45' }),
   avatar: (form) => ({ ...form, avatar: 'https://example.com/changed.png' }),
   avatar_icon_ref: (form) => ({ ...form, avatar_icon_ref: { kind: 'batshit', id: 'changed_icon' } as SubagentSaveForm['avatar_icon_ref'] }),
   avatar_icon_fit: (form) => ({ ...form, avatar_icon_fit: 'contain' }),
@@ -257,12 +269,15 @@ const CHANGE_ONE_FIELD: { [K in keyof SubagentSaveForm]: (form: SubagentSaveForm
 
 describe('every field the Subagent save can name is saved when it changes (BL-844)', () => {
   const fields = Object.keys(CHANGE_ONE_FIELD) as (keyof SubagentSaveForm)[]
+  // SA-139 R5: the type has one live value, so a change of it is a change to a retired type, which
+  // the save refuses out loud (never a silent loss); its signature still moves.
+  const savedFields = fields.filter((field) => field !== 'subagentType')
 
   it('the table names every field of the form', () => {
     expect(fields.sort()).toEqual(Object.keys(baseForm()).sort())
   })
 
-  for (const field of fields) {
+  for (const field of savedFields) {
     it(`a change to ${field} is sent and moves the autosave trigger`, () => {
       const changed = CHANGE_ONE_FIELD[field](baseForm())
       expect(buildSubagentSettingsSavePatch(baseForm(), changed)).not.toEqual({})
@@ -270,17 +285,20 @@ describe('every field the Subagent save can name is saved when it changes (BL-84
     })
   }
 
+  it('a change to subagentType moves the autosave trigger and the save refuses it (SA-139 R5)', () => {
+    const changed = CHANGE_ONE_FIELD.subagentType(baseForm())
+    expect(makeSubagentFormSignature(changed)).not.toBe(makeSubagentFormSignature(baseForm()))
+    expect(() => buildSubagentSettingsSavePatch(baseForm(), changed)).toThrow(/can only be deleted/)
+  })
+
   it('every field the payload builder names is in some change\'s patch', () => {
     const named = new Set(Object.keys(buildSubagentPayload(baseForm())))
     const sent = new Set<string>()
-    for (const field of fields) {
+    for (const field of savedFields) {
       const patch = buildSubagentSettingsSavePatch(baseForm(), CHANGE_ONE_FIELD[field](baseForm()))
       for (const key of Object.keys(patch)) sent.add(key)
     }
-    expect([...named].filter((key) => !sent.has(key))).toEqual([])
-  })
-
-  it('refuses a Subagent type that was removed', () => {
-    expect(() => buildSubagentPayload({ ...baseForm(), subagentType: 'n8n-subnode' })).toThrow(/removed from Batshit/)
+    // `subagentType` is always the live `api` in a save (above), so no change sends it.
+    expect([...named].filter((key) => !sent.has(key))).toEqual(['subagentType'])
   })
 })

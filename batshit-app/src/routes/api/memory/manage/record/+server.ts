@@ -1,3 +1,4 @@
+import { MemoryMutationError } from '$lib/server/services/memory/memoryMutation'
 import { json, type RequestHandler } from '@sveltejs/kit'
 import { requireUser } from '$lib/server/services/routeSecurity'
 import {
@@ -8,6 +9,7 @@ import {
 } from '$lib/server/services/memory/memoryManage'
 
 function handleError(error: unknown, action: string): Response {
+  if (error instanceof MemoryMutationError) return json({ error: error.message, code: error.code }, { status: error.status })
   if (error instanceof MemoryManageError) {
     return json({ error: error.message }, { status: error.status })
   }
@@ -50,7 +52,8 @@ export const PATCH: RequestHandler = async ({ locals, request }) => {
     const record = await updateManagedMemory(
       { userId: user.value.id, agentId: typeof body.agentId === 'string' ? body.agentId : '' },
       typeof body.memoryId === 'string' ? body.memoryId : '',
-      body.updates && typeof body.updates === 'object' ? body.updates : {}
+      body.updates && typeof body.updates === 'object' ? body.updates : {},
+      { deliberateLaneMove: body.moveLane === true }
     )
     return json({ record })
   } catch (error) {

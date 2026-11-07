@@ -3,6 +3,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 vi.unmock('ai')
 vi.unmock('@ai-sdk/openai')
 import { streamText, tool, jsonSchema, isStepCount } from 'ai'
+import { createOpenAI } from '@ai-sdk/openai'
+import { resolveRuntimeModelSelection } from '$lib/utils/modelPresetRuntime'
+import { buildRuntimeModelSettings } from '$lib/utils/modelSettingsMapper'
+import { reasoningOverrideKey } from '$lib/utils/modelReasoningControls'
+import { planProviderOptions } from '../chatgptPlanInference'
 import { mkdtempSync, realpathSync, rmSync } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
@@ -38,6 +43,30 @@ const messages = [{ role: 'system' as const, content: 'Canonical fixture identit
 const options = { messages, allowSystemInMessages: true, maxRetries: 0, providerOptions: { openai: { store: false, systemMessageMode: 'developer' } }, onError: () => {} }
 
 describe('ChatGPT plan real SDK wire and request ownership', () => {
+  it.each(['api', 'plan'].flatMap(lane => ['gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna'].map(modelId => [lane, modelId])))('SA-132: exact %s %s efforts reach the real Responses serializer', async (lane, modelId) => {
+    const bodies: any[] = []
+    const http = vi.fn(async (_url, init) => { bodies.push(JSON.parse(String(init?.body))); return sse([...textEvents, complete]) }) as typeof fetch
+    const f = setup(http)
+    const connection = lane === 'plan'
+      ? { type: 'direct' as const, service: 'chatgpt-plan', id: `chatgpt-plan:${f.row.id}` }
+      : { type: 'direct' as const, service: 'openai', id: 'direct:openai' }
+    const preset = { id: 'reasoning-fixture', provider: 'openai', modelId, effectiveModelId: modelId, connection,
+      settings: { 'openai.reasoningEffort': 'high', parallelToolCalls: false } } as any
+    const key = reasoningOverrideKey({ presetId: preset.id, connection, effectiveModelId: preset.modelId }, 'effort')
+    const model = lane === 'plan' ? f.runtime.model(f.lease, preset.modelId) : createOpenAI({ apiKey: 'fixture-only', fetch: http }).responses(preset.modelId)
+    for (const effort of [...(modelId === 'gpt-6-sol' || modelId === 'gpt-6-luna' ? ['none'] : []), 'low', 'medium', 'high', 'xhigh', 'max', 'default', 'inherit']) {
+      const selection = resolveRuntimeModelSelection({ preset, reasoningOverrides: effort === 'inherit' ? {}
+        : { [key]: effort === 'default' ? { mode: 'provider-default' } : { mode: 'value', value: effort } } })
+      const runtime = buildRuntimeModelSettings({ provider: 'openai', modelId: preset.modelId, connection, settings: selection.settings })
+      const result = streamText({ ...options, model, providerOptions: lane === 'plan' ? planProviderOptions(runtime.providerOptions) : runtime.providerOptions })
+      await result.consumeStream()
+      expect(await result.text).toBe('fixture reply')
+      expect(bodies.at(-1)?.reasoning?.effort).toBe(effort === 'default' ? undefined : effort === 'inherit' ? 'high' : effort)
+      expect(bodies.at(-1)?.parallel_tool_calls).toBe(false)
+      if (lane === 'plan') expect(bodies.at(-1)).toMatchObject({ store: false, stream: true })
+    }
+    expect(preset.settings).toEqual({ 'openai.reasoningEffort': 'high', parallelToolCalls: false })
+  })
   it('redacts malformed catalog bodies and failed cancellation diagnostics', async () => {
     const f = setup(vi.fn(async () => new Response('RAW_SECRET_SENTINEL')) as typeof fetch)
     await expect(f.runtime.models(f.lease)).rejects.toMatchObject({ code: 'catalog_invalid' })
@@ -65,14 +94,22 @@ describe('ChatGPT plan real SDK wire and request ownership', () => {
       const body = JSON.parse(String(init?.body)); requests.push(body)
       return sse(events.shift()!)
     }) as typeof fetch
-    const { runtime, lease } = setup(http)
+    const { runtime, lease, row } = setup(http)
+    const connection = { type: 'direct' as const, id: `chatgpt-plan:${row.id}`, service: 'chatgpt-plan' }
+    const preset = { id: 'frozen-effort', provider: 'openai', modelId: 'gpt-6.1-sol', connection, settings: {} } as any
+    const effortKey = reasoningOverrideKey({ presetId: preset.id, connection, effectiveModelId: preset.modelId }, 'effort')
+    const overrides = { [effortKey]: { mode: 'value' as const, value: 'max' } }
+    const frozen = resolveRuntimeModelSelection({ preset, reasoningOverrides: overrides })
+    const frozenOptions = buildRuntimeModelSettings({ provider: 'openai', modelId: preset.modelId, connection, settings: frozen.settings }).providerOptions
     const echo = tool({ description: 'Fixture echo', inputSchema: jsonSchema<{ value: string }>({ type: 'object', properties: { value: { type: 'string' } }, required: ['value'], additionalProperties: false }),
-      providerOptions: { openai: { namespace: { name: 'batshit', description: 'Batshit client tools' } } }, execute: async ({ value }) => ({ echoed: value }) })
-    const result = streamText({ ...options, model: runtime.model(lease, 'fixture-model'), tools: { echo }, stopWhen: isStepCount(3) })
+      providerOptions: { openai: { namespace: { name: 'batshit', description: 'Batshit client tools' } } }, execute: async ({ value }) => { overrides[effortKey] = { mode: 'value', value: 'low' }; return { echoed: value } } })
+    const result = streamText({ ...options, providerOptions: planProviderOptions(frozenOptions), model: runtime.model(lease, preset.modelId), tools: { echo }, stopWhen: isStepCount(3) })
     const parts = []; for await (const part of result.stream) parts.push(part)
     expect(await result.text).toBe('fixture reply')
     expect(parts.some(part => part.type === 'tool-result' && part.toolCallId === 'call_fixture')).toBe(true)
     expect(requests).toHaveLength(2)
+    expect(requests.map(body => body.reasoning?.effort)).toEqual(['max', 'max'])
+    expect(resolveRuntimeModelSelection({ preset, reasoningOverrides: overrides }).settings?.reasoningEffort).toBe('low')
     requests.forEach(body => { expect(body.store).toBe(false); expect(body.stream).toBe(true); expect(body.input[0].role).toBe('developer'); expect(body.tools[0].type).toBe('namespace'); expect(body).not.toHaveProperty('previous_response_id') })
     expect(requests[1].input).toEqual(expect.arrayContaining([expect.objectContaining({ type: 'function_call', namespace: 'batshit', call_id: 'call_fixture' }), expect.objectContaining({ type: 'function_call_output', call_id: 'call_fixture' })]))
   })

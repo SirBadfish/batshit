@@ -9,6 +9,22 @@ import {
 } from './modelSettingsMapper'
 
 describe('buildRuntimeModelSettings', () => {
+  it('keeps dormant direct Anthropic settings saved while omitting them from the runtime projection', () => {
+    const settings = { presencePenalty: 0, frequencyPenalty: 0.35, seed: 0, temperature: 0, maxTokens: 32 }
+    const original = structuredClone(settings)
+    const connection = { type: 'direct' as const, service: 'anthropic', id: 'direct:anthropic' }
+    const args = { provider: 'anthropic', modelId: 'claude-sonnet-4-5', connection, settings }
+    const runtime = buildRuntimeModelSettings(args)
+    for (const key of ['presencePenalty', 'frequencyPenalty', 'seed']) expect(runtime.standard).not.toHaveProperty(key)
+    expect(runtime.standard).toMatchObject({ temperature: 0, maxTokens: 32 })
+    expect(normaliseModelSettings(args)).toEqual(original)
+    expect(settings).toEqual(original)
+    for (const route of [{ type: 'vercel-gateway' as const, service: 'vercel' }, { type: 'openrouter' as const, service: 'openrouter' },
+      { type: 'direct' as const, service: 'custom_claude' }]) {
+      expect(buildRuntimeModelSettings({ ...args, connection: route }).standard).toMatchObject({ presencePenalty: 0, frequencyPenalty: 0.35, seed: 0 })
+    }
+  })
+
   it('maps standard OpenAI parameters from settings', () => {
     const runtime = buildRuntimeModelSettings({
       provider: 'openai',
@@ -93,6 +109,37 @@ describe('buildRuntimeModelSettings', () => {
     expect(runtime.standard.topK).toBeUndefined()
     expect(runtime.standard.maxTokens).toBe(128000)
     expect(runtime.providerOptions.openai?.reasoningEffort).toBe('high')
+  })
+
+  for (const [parameter, preset, fallback] of [
+    ['temperature', 0.7, 0.6],
+    ['topP', 0.9, 0.8],
+    ['topK', 50, 40]
+  ] as const) {
+    it(`BL-926: sends no ${parameter} to a Claude model whose SDK discards it, from the preset or the agent`, () => {
+      for (const modelId of ['claude-opus-5-5', 'claude-fable-5-1', 'claude-sonnet-5-5', 'claude-opus-4-8']) {
+        const runtime = buildRuntimeModelSettings({
+          provider: 'anthropic',
+          modelId,
+          settings: { [parameter]: preset, maxTokens: 8000 },
+          fallbacks: { [parameter]: fallback, maxTokens: 4000 }
+        })
+        expect(runtime.standard[parameter], modelId).toBeUndefined()
+        expect(runtime.standard.maxTokens, modelId).toBe(8000)
+      }
+    })
+  }
+
+  it('BL-926: still sends the sampling values to a Claude model that takes them', () => {
+    const runtime = buildRuntimeModelSettings({
+      provider: 'anthropic',
+      modelId: 'claude-sonnet-4-6',
+      settings: { temperature: 0.7, topP: 0.9, topK: 50, maxTokens: 8000 },
+      fallbacks: { temperature: 0.6 }
+    })
+    expect(runtime.standard.temperature).toBe(0.7)
+    expect(runtime.standard.topP).toBe(0.9)
+    expect(runtime.standard.topK).toBe(50)
   })
 
   it('clamps stale OpenRouter context-window values used as max output tokens', () => {
@@ -458,5 +505,18 @@ describe('BL-515: Batshit\'s own keys never reach a provider, legacy ones includ
     for (const key of ['nativeTools', 'batshitNativeTools', 'bashEnabled', 'nativeWebSearchProvider', 'codex_permission_mode', 'claude_permission_mode', 'batshit_tool_search']) {
       expect(sent).not.toContain(key)
     }
+  })
+})
+
+describe('request-local custom object ownership', () => {
+  it('clones a custom ancestor before applying a dotted sibling without changing replacement precedence', () => {
+    const settings = { customObject: { preserved: false }, 'openai.customObject.flag': true }
+    const mapped = buildRuntimeModelSettings({ provider: 'openai', modelId: 'gpt-4o', settings })
+    expect(mapped.providerOptions.openai.customObject).toEqual({ preserved: false, flag: true })
+    expect(settings.customObject).toEqual({ preserved: false })
+  })
+  it('retains the existing error for a malformed primitive ancestor instead of replacing it silently', () => {
+    expect(() => buildRuntimeModelSettings({ provider: 'openai', modelId: 'gpt-4o',
+      settings: { 'openai.customObject': 'malformed', 'openai.customObject.flag': true } })).toThrow(TypeError)
   })
 })

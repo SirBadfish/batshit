@@ -161,7 +161,7 @@ Open n8n at:
 http://localhost:5678
 ```
 
-The n8n profile starts an official pinned n8n image and a matching task-runner sidecar. It still requires normal n8n setup: create credentials, import the Batshit Workflow Subagent templates, configure provider nodes, and create matching Workflow Subagent records in Batshit.
+The n8n profile starts an official pinned n8n image and a matching task-runner sidecar. It still requires normal n8n setup: create credentials, import the workflows you want, and configure provider nodes.
 
 The n8n profile needs one Docker-internal app setting:
 
@@ -260,29 +260,6 @@ The core Docker stack is small. Add-ons are opt-in.
 
 An add-on listed in `compose.yaml` is a recipe, not a default running service. Batshit agents can start/stop only approved startable add-ons through the authenticated host operator. Connect-existing services are yours to run and maintain.
 
-## CLI agents in Docker (Codex / Claude Code)
-
-The Docker image doesn't ship the Codex or Claude Code CLI. Install them with one click from inside Batshit: open your `CLI` agent in Settings and use the install card in the model section. Batshit downloads an official, checksum-verified copy into a persistent Docker volume, so the install survives container restarts and upgrades. Docker CLI login state is also kept in persistent Docker state after login.
-
-After installing, each CLI must be logged in separately inside the container. Host Codex or Claude login is not copied into Docker. Batshit shows the exact copyable Docker-aware command in Agent Settings — for a Batshit-managed install without the n8n profile, it looks like:
-
-```sh
-docker compose --env-file .env.docker exec app /home/batshit-cli/.batshit/installs/cli/bin/codex login --device-auth
-docker compose --env-file .env.docker exec --user batshit-cli --env HOME=/home/batshit-cli --env USER=batshit-cli --env LOGNAME=batshit-cli --env SHELL=/bin/sh app /home/batshit-cli/.batshit/installs/cli/bin/claude auth login
-```
-
-If you started with the n8n profile, the command includes `--profile n8n`:
-
-```sh
-docker compose --env-file .env.docker --profile n8n exec app /home/batshit-cli/.batshit/installs/cli/bin/codex login --device-auth
-docker compose --env-file .env.docker --profile n8n exec --user batshit-cli --env HOME=/home/batshit-cli --env USER=batshit-cli --env LOGNAME=batshit-cli --env SHELL=/bin/sh app /home/batshit-cli/.batshit/installs/cli/bin/claude auth login
-```
-
-On Windows, Claude Code may print `Paste code here if prompted >` after the browser login. Paste the browser auth code at that prompt, then press Enter. The pasted code may not appear in the terminal, so do not wait for visible text. Do not save or share auth codes in docs or chat.
-
-Docker Claude runs as the non-root `batshit-cli` user so Claude Code Bypass Permissions can work. If a Docker Claude agent still reports that Bypass Permissions cannot run as root, rebuild the app image from current source and use the exact login command shown in Agent Settings.
-
-Always prefer the command Batshit shows in Agent Settings — it already matches your setup.
 
 ## Docker troubleshooting
 
@@ -304,10 +281,6 @@ docker compose --env-file .env.docker logs batshit-server
 ### Saved API keys break after restart
 
 Check that `ENCRYPTION_KEY` didn't change in `.env.docker`.
-
-### n8n callback auth fails
-
-Current official n8n templates use Batshit's per-message `x-batshit-native-tool-token`, so normal native-tool calls don't need a static Docker token in n8n.
 
 ### Docker Sandbox says Operator Required
 

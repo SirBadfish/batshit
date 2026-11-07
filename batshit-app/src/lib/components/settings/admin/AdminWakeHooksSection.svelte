@@ -60,8 +60,7 @@
   /**
    * The address to paste into n8n.
    *
-   * `localhost` is rewritten to `127.0.0.1` on purpose, the same rule Batshit's own n8n callback base applies
-   * to `N8N_BATSHIT_FRONTEND_URL`: Node resolves `localhost` to IPv6 `::1` first and Batshit
+   * `localhost` is rewritten to `127.0.0.1` on purpose: Node resolves `localhost` to IPv6 `::1` first and Batshit
    * listens on IPv4, so an n8n HTTP node pointed at `http://localhost:5620` fails with "the
    * service refused the connection" while Batshit is running perfectly. Handing the user a
    * URL that does not work in the tool this feature exists for would be a trap.
@@ -274,10 +273,10 @@
     </p>
   {:else if loadError}
     <p class="batshit-settings-form-meta is-error">{loadError}</p>
-  {:else if selectableAgents.length === 0}
+  {:else if selectableAgents.length === 0 && hooks.length === 0}
     <p class="batshit-settings-form-help">
       No agent has Agent DMs turned on yet. A webhook writes a DM to one agent, so turn on Agent
-      DMs for that agent in Agent Settings first.
+      DMs, and the Fabric &amp; Utilities switch they need, for that agent in Agent Settings first.
     </p>
   {:else if hooks.length === 0}
     <p class="batshit-settings-form-help">
@@ -285,6 +284,13 @@
       for one of your agents.
     </p>
   {:else}
+    {#if selectableAgents.length === 0}
+      <!-- Saved webhooks stay listed (to pause, rotate or revoke) when no agent can receive one. -->
+      <p class="batshit-settings-form-help" data-testid="wake-hooks-no-eligible-agent">
+        No agent can receive a webhook's DM right now (Agent DMs, or the Fabric &amp; Utilities
+        switch they need, is off), so calls to these webhooks are refused until that is turned back on.
+      </p>
+    {/if}
     <div class="batshit-settings-group">
       {#each hooks as hook (hook.id)}
         {@const agent = agentById.get(hook.agentId)}

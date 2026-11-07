@@ -6,7 +6,7 @@ import { POST } from '../../../../routes/api/clips/+server'
 import { PUT } from '../../../../routes/api/clips/[id]/+server'
 import { PUT as PUT_SYSTEM } from '../../../../routes/api/clips/system/[id]/+server'
 
-describe('actual Clip whole-row publishers (default seam, not Lua)', () => {
+describe.each(['goon_hair_assets', 'goon_clothing_assets', 'goon_closet'])('actual Clip whole-row publishers for %s (default seam, not Lua)', uploadType => {
   useRedisTestServer()
   const originalExecute = vi.mocked(redis.execute).getMockImplementation()!
   const evalRefusal = vi.fn().mockResolvedValue('ASSET_UNAVAILABLE')
@@ -21,7 +21,7 @@ describe('actual Clip whole-row publishers (default seam, not Lua)', () => {
     method: 'POST', body: JSON.stringify(body)
   })
   const clip = { id: 'borrower', filename: 'borrowed.txt', fileType: 'text', mimeType: 'text/plain',
-    localUrl: '/uploads/goon_hair_assets/shared.png', localBase64: Buffer.from('text').toString('base64') }
+    localUrl: `/uploads/${uploadType}/shared.png`, localBase64: Buffer.from('text').toString('base64') }
 
   it('refuses arbitrary POST acquisition before storing a Clip or index member', async () => {
     const response = await POST({ locals, request: request(clip) } as any)

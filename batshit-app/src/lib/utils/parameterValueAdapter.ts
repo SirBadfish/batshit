@@ -1,3 +1,4 @@
+import { parseReasoningBudget } from './modelReasoningBudget'
 import type { ParameterDefinition, ParameterValue } from '$lib/data/parameter-schemas'
 
 /**
@@ -155,6 +156,7 @@ export function fromInputValue(
       return Number.isFinite(parsed) ? parsed : undefined
     }
     case 'integer': {
+      if (definition.reviewedBudget) return parseReasoningBudget(trimmed, definition.reviewedBudget)
       const parsed = parseInt(stripNumericFormatting(trimmed), 10)
       return Number.isFinite(parsed) ? parsed : undefined
     }

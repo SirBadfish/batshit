@@ -63,7 +63,7 @@ describe('apiPromptCachePolicy', () => {
     )
   })
 
-  it('keeps the stable prefix signature deterministic across tool insertion order', () => {
+  it('changes the stable prefix signature when the registered tool array order changes', () => {
     const alphaTool = {
       description: 'Alpha tool',
       inputSchema: { type: 'object', properties: { value: { type: 'string' } } },
@@ -97,8 +97,8 @@ describe('apiPromptCachePolicy', () => {
       },
     })
 
-    expect(first.metadata.stablePrefixHash).toBe(second.metadata.stablePrefixHash)
-    expect(first.providerOptions?.openai?.promptCacheKey).toBe(
+    expect(first.metadata.stablePrefixHash).not.toBe(second.metadata.stablePrefixHash)
+    expect(first.providerOptions?.openai?.promptCacheKey).not.toBe(
       second.providerOptions?.openai?.promptCacheKey,
     )
   })

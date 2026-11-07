@@ -12,35 +12,38 @@ import { buildCliSubagentRuntimeId } from '$lib/utils/subagentSlug'
  * edit's write now refuses a record that is gone (`JSON.SET … XX`) and answers 404.
  *
  * The delete removes the profile folder before the record (BL-157), so it holds the folder's turn
- * (`agentProfileFolderGate.ts`) from the folder removal until the record is gone: a sync waiting
- * for that folder then finds no record and writes nothing.
+ * (`agentProfileFolderGate.ts`) from the folder removal until the record is gone: a write waiting
+ * for that folder then finds no record and writes nothing. SA-139 R5: no save writes a profile any
+ * more (a leftover CLI Subagent is delete-only), so the edits here are of an API Subagent and only
+ * the delete of a leftover still takes the folder's turn.
  *
  * Drives the real route. Real Redis 8 under `npm run test:redis` (the `XX` write is RedisJSON's
  * own); the default lane's fake twin under plain `npm test`.
  */
 
-const syncManagedCliSubagentProfile = vi.hoisted(() => vi.fn())
 const deleteManagedCliSubagentProfile = vi.hoisted(() => vi.fn())
 vi.mock('$lib/server/services/cliSubagentProfileSync', async (importOriginal) => {
   const actual = await importOriginal<typeof import('$lib/server/services/cliSubagentProfileSync')>()
   return {
     ...actual,
-    syncManagedCliSubagentProfile,
     deleteManagedCliSubagentProfile,
     planManagedCliSubagentProfileDeletion: vi.fn(async () => ({
       profileId: 'batshit_agent_subagent_cli-zcsubag_route', deleted: true, sharedWith: null, sharedWithKind: null
     }))
   }
 })
-vi.mock('$lib/server/services/codexProfileManager', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('$lib/server/services/codexProfileManager')>()
-  return { ...actual, syncAgentCodexProfiles: vi.fn(async () => {}) }
-})
-vi.mock('$lib/server/services/claudeProfileManager', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('$lib/server/services/claudeProfileManager')>()
-  return { ...actual, syncAgentClaudeProfiles: vi.fn(async () => {}) }
-})
-vi.mock('$lib/server/services/n8nParameterCompatibility', () => ({ runTrackedN8nCompatibilitySync: vi.fn() }))
+// b34b0e201: the delete captures its slash-command write basis through EVAL first, and reaches
+// other fixed Lua owners after it. The default lane's fake has no generic EVAL, so there those
+// owners are held by the doubles shared with `subagent-delete-route.test.ts`; the real lane keeps
+// the actual owners.
+vi.mock('$lib/server/services/appActions/settings/authority', async importOriginal =>
+  (await import('$lib/test-utils/subagentDeleteRouteDoubles')).appActionsAuthorityDouble(await importOriginal(), 'default'))
+vi.mock('$lib/server/services/slashCommandRevision', async importOriginal =>
+  (await import('$lib/test-utils/subagentDeleteRouteDoubles')).slashCommandRevisionDouble(await importOriginal(), 'default'))
+vi.mock('$lib/server/services/subjectPopulation', async importOriginal =>
+  (await import('$lib/test-utils/subagentDeleteRouteDoubles')).subjectPopulationDouble(await importOriginal(), 'default'))
+vi.mock('$lib/server/services/artifactAgentAccessCleanup', async importOriginal =>
+  (await import('$lib/test-utils/subagentDeleteRouteDoubles')).artifactAgentAccessCleanupDouble(await importOriginal(), 'default'))
 
 useRedisTestServer()
 
@@ -49,15 +52,17 @@ const SUB = 'zcsubag_route'
 const SERVER = 'http://batshit-server.test:5613'
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
-async function seedSubagent() {
+/** A live API Subagent, the one an edit can save; the delete's case seeds a leftover CLI one. */
+const API_FIELDS = { subagentType: 'api', primary_model_provider: 'openai', primary_model_name: 'gpt-5.5' }
+const CLI_LEFTOVER_FIELDS = { subagentType: 'cli', primary_model_provider: 'anthropic-claude-cli', primary_model_name: 'claude-cli' }
+
+async function seedSubagent(fields: Record<string, unknown> = API_FIELDS) {
   await redis.json.set(`subagent:${SUB}`, '$', {
     id: SUB,
     user_id: USER,
     displayName: 'zcsubag route',
     slug: SUB,
-    subagentType: 'cli',
-    primary_model_provider: 'openai-codex',
-    primary_model_name: 'codex-cli',
+    ...fields,
     created_at: '2026-09-28T00:00:00.000Z',
     updated_at: '2026-09-28T00:00:00.000Z'
   })
@@ -102,8 +107,6 @@ beforeEach(() => {
       throw new Error(`unexpected batshit-server call ${method} ${url}`)
     })
   )
-  syncManagedCliSubagentProfile.mockReset()
-  syncManagedCliSubagentProfile.mockImplementation(async () => ({ runtime: 'codex', profileId: 'p', written: true }))
   deleteManagedCliSubagentProfile.mockReset()
 })
 
@@ -115,7 +118,7 @@ afterEach(async () => {
 })
 
 describe('PUT /api/subagents/[id] racing the delete (BL-753)', () => {
-  it('control: an edit of a live Subagent writes the record and syncs its profile', async () => {
+  it('control: an edit of a live Subagent writes the record', async () => {
     await seedSubagent()
 
     const { status, body } = await callPut({ description: 'edited' })
@@ -123,7 +126,6 @@ describe('PUT /api/subagents/[id] racing the delete (BL-753)', () => {
     expect(status).toBe(200)
     expect(body.subagent.description).toBe('edited')
     expect(((await redis.json.get(`subagent:${SUB}`)) as any).description).toBe('edited')
-    expect(syncManagedCliSubagentProfile).toHaveBeenCalledTimes(1)
   })
 
   it('an edit whose write lands after the delete does not bring the record back, and answers 404', async () => {
@@ -139,23 +141,13 @@ describe('PUT /api/subagents/[id] racing the delete (BL-753)', () => {
     expect(body.error).toMatch(/not found|deleted/i)
     expect(await redis.json.get(`subagent:${SUB}`)).toBeNull()
     expect(await redis.sMembers(`user:${USER}:subagents`)).toEqual([])
-    expect(syncManagedCliSubagentProfile).not.toHaveBeenCalled()
-  })
-
-  it('an edit whose profile sync finds the Subagent deleted answers 404', async () => {
-    await seedSubagent()
-    syncManagedCliSubagentProfile.mockImplementation(async () => ({ runtime: 'codex', profileId: 'p', written: false }))
-
-    const { status } = await callPut({ description: 'edited' })
-
-    expect(status).toBe(404)
   })
 })
 
 describe('DELETE /api/subagents/[id] holds the profile folder until the record is gone (BL-753)', () => {
   it('a folder write waiting behind the folder removal runs only once the record is gone', async () => {
-    await seedSubagent()
-    const { buildAgentProfileId } = await import('$lib/server/services/codexProfileManager')
+    await seedSubagent(CLI_LEFTOVER_FIELDS)
+    const { buildAgentProfileId } = await import('$lib/server/services/managedProfileIdentity')
     const profileId = buildAgentProfileId(buildCliSubagentRuntimeId(SUB))
     let folderRemoved!: () => void
     const removed = new Promise<void>((resolve) => {
@@ -170,8 +162,8 @@ describe('DELETE /api/subagents/[id] holds the profile folder until the record i
 
     const deletion = callDelete()
     await removed
-    // A profile sync's write for this folder, queued after the removal (from the test's own
-    // context, not the delete's). What it sees is what a sync's fresh record check would see.
+    // A write for this folder, queued after the removal (from the test's own context, not the
+    // delete's). What it sees is what a fresh record check would see.
     const write = withAgentProfileFolder(profileId, async () => redis.json.get(`subagent:${SUB}`))
 
     const response = await deletion

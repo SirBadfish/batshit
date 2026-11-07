@@ -80,10 +80,12 @@ export function createSubagentRedisMock(): SubagentRedisMock {
      */
     async eval(script: string, options?: { keys?: string[]; arguments?: string[] }) {
       const normalized = script.replace(/\s+/g, ' ').trim()
-      const isCompareAndDelete =
-        normalized.includes("redis.call('GET', KEYS[1]) == ARGV[1]") &&
-        normalized.includes("redis.call('DEL', KEYS[1])")
-      if (!isCompareAndDelete) {
+      const comparesOwner = normalized.includes("redis.call('GET', KEYS[1]) == ARGV[1]")
+      const isCompareAndDelete = comparesOwner && normalized.includes("redis.call('DEL', KEYS[1])")
+      // Delegation limits (2026-10-24): the lock's heartbeat refresh, compare-and-PEXPIRE.
+      const isCompareAndRefresh =
+        comparesOwner && normalized.includes("redis.call('PEXPIRE', KEYS[1], ARGV[2])")
+      if (!isCompareAndDelete && !isCompareAndRefresh) {
         throw new Error(`subagent-redis-mock: unsupported eval script: ${normalized}`)
       }
       const key = options?.keys?.[0]
@@ -95,6 +97,12 @@ export function createSubagentRedisMock(): SubagentRedisMock {
         return 0
       }
       if (String(entry.value) !== expected) return 0
+      if (isCompareAndRefresh) {
+        const ttlMs = Number(options?.arguments?.[1])
+        if (!Number.isFinite(ttlMs) || ttlMs <= 0) throw new Error('subagent-redis-mock: PEXPIRE needs a positive TTL')
+        entry.expiresAt = Date.now() + ttlMs
+        return 1
+      }
       store.delete(key)
       return 1
     },

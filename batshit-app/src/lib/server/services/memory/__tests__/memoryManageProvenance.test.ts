@@ -13,7 +13,17 @@ import { getManagedMemoryDetail } from '../memoryManage'
  */
 
 if (memorySearchLaneActive()) useMemorySearchTestServer()
-else useRedisTestServer()
+else useRedisTestServer({ beforeCleanupAdmission: async ({ adminClient, resolvedUrl }) => {
+  const expectedRunId = process.env.SA133_REDIS_RUN_ID
+  if (expectedRunId === undefined) return
+  expect(expectedRunId.trim()).not.toBe('')
+  expect(Number(new URL(resolvedUrl).pathname.slice(1))).toBe(14)
+  for (const client of [adminClient, await redis.execute(async connection => connection)]) {
+    expect((await client.clientInfo()).db).toBe(14)
+    const actualRunId = /^run_id:([^\r\n]+)\r?$/m.exec(await client.info('server'))?.[1]
+    expect(actualRunId).toBe(expectedRunId)
+  }
+} })
 
 const USER = 'bl447-user'
 const AGENT = 'bl447-agent'

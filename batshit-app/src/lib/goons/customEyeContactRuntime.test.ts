@@ -184,16 +184,16 @@ describe('Advanced/GLB Eye Contact runtime', () => {
       customPerformanceRigRuntime: CustomPerformanceRigRuntime | null
       appearanceDialsRuntime: {
         setValues(values: unknown): void
+        setFittedValues(values: unknown): void
       } | null
     }
 
     internals.customPerformanceRigRuntime = rig.runtime
-    internals.appearanceDialsRuntime = {
-      setValues() {
-        rig.leftEye.position.copy(nextLeftEyePosition)
-        rig.rightEye.position.copy(nextRightEyePosition)
-      }
+    const applyEyePositions = () => {
+      rig.leftEye.position.copy(nextLeftEyePosition)
+      rig.rightEye.position.copy(nextRightEyePosition)
     }
+    internals.appearanceDialsRuntime = { setValues: applyEyePositions, setFittedValues: applyEyePositions }
 
     engine.setAppearanceDialValues(null)
     rig.leftEye.rotateX(0.3)

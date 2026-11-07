@@ -5,6 +5,7 @@ import { redis } from '$lib/server/redis'
 import * as agentStore from '$lib/stores/agents.svelte'
 import { buildPickedPresetModelFields } from '$lib/utils/modelPresetPick'
 import { resolveSavedModelConnection } from '$lib/utils/modelConnections'
+import { loadAgentRoute } from '$lib/test-utils/agentPutRoute'
 
 /**
  * BL-834: opening a Subagent changed its form and saved the change.
@@ -19,17 +20,14 @@ import { resolveSavedModelConnection } from '$lib/utils/modelConnections'
  * lane's Redis fake.
  */
 
-vi.mock('$lib/server/services/codexProfileManager', () => ({
-  syncAgentCodexProfiles: vi.fn(async () => {}),
-  deleteAgentCodexConfig: vi.fn(async () => {}),
-  buildAgentProfileId: (id: string) => `batshit_agent_${id}`
+vi.mock('$lib/server/services/managedProfileFolderDelete', () => ({
+  deleteManagedProfileFolder: vi.fn(async () => {})
 }))
 vi.mock('$lib/server/services/claudeProfileManager', () => ({
   syncAgentClaudeProfiles: vi.fn(async () => {}),
   deleteAgentClaudeConfig: vi.fn(async () => {}),
   agentClaudeProfileResource: (id: string) => JSON.stringify(['profile', `claude:${id}`])
 }))
-vi.mock('$lib/server/services/n8nParameterCompatibility', () => ({ runTrackedN8nCompatibilitySync: vi.fn() }))
 
 useRedisTestServer()
 
@@ -140,7 +138,7 @@ function installRoutes() {
     if (path === '/api/user/saved-models') return jsonResponse({ models: PRESETS })
     if (path === '/api/models') return jsonResponse({ data: { connections: [] } })
     if (path === '/api/settings/api-keys') return jsonResponse({ keys: {} })
-    if (path === '/api/goons') return jsonResponse({ goons: [] })
+    if (path === '/api/goons') return jsonResponse({ ownerId: 'josh', goons: [] })
     if (path === '/api/icons/library') return jsonResponse({ icons: [], prefs: { favorites: [], recents: [] } })
     return jsonResponse({ error: `not routed in this test: ${method} ${path}` }, 404)
   })
@@ -222,7 +220,8 @@ function modelFieldsOf(record: Record<string, any>) {
 describe('opening a Subagent never changes or saves its model (BL-834)', () => {
   const originalFetch = global.fetch
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    agentRoute = await loadAgentRoute()
     ensureBrowserStubs()
     installRoutes()
     vi.spyOn(console, 'error').mockImplementation(() => {})

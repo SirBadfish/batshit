@@ -333,44 +333,6 @@ class ExecutionViewerService {
     })
   }
 
-  /** Read only context evidence, never the compiled prompts, tool payloads or event logs. */
-  async getCliContextSnapshots(
-    sessionId: string
-  ): Promise<Pick<ExecutionSnapshot, 'agentId' | 'createdAt' | 'runtime'>[]> {
-    const fields = ['agentId', 'createdAt', 'runtime.runtimeId', 'runtime.metadata.cliContextWindow']
-    const paths = Array.from({ length: EXECUTION_VIEWER_MAX_SNAPSHOTS }, (_, index) =>
-      fields.map(field => `$[${index}].${field}`)).flat()
-    return await redis.execute(async client => {
-      const data = await client.json.get(this.getKey(sessionId), { path: paths })
-      if (data === null) return []
-      if (!data || typeof data !== 'object' || Array.isArray(data)) {
-        throw new Error('Invalid CLI context evidence projection')
-      }
-      const projection = data as Record<string, unknown>
-      const result: Pick<ExecutionSnapshot, 'agentId' | 'createdAt' | 'runtime'>[] = []
-      const read = (index: number, field: string): unknown => {
-        const values = projection[`$[${index}].${field}`]
-        if (!Array.isArray(values)) throw new Error('Invalid CLI context evidence path')
-        return values[0]
-      }
-      for (let index = 0; index < EXECUTION_VIEWER_MAX_SNAPSHOTS; index += 1) {
-        const agentId = read(index, 'agentId')
-        const createdAt = read(index, 'createdAt')
-        const runtimeId = read(index, 'runtime.runtimeId')
-        const report = read(index, 'runtime.metadata.cliContextWindow')
-        if (typeof createdAt !== 'string' || (agentId !== null && typeof agentId !== 'string')) continue
-        result.push({
-          agentId,
-          createdAt,
-          ...(['codex', 'claude', 'vercel'].includes(String(runtimeId)) ? {
-            runtime: { runtimeId: runtimeId as 'codex' | 'claude' | 'vercel', metadata: { cliContextWindow: report } }
-          } : {})
-        })
-      }
-      return result.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
-    })
-  }
-
   async clearSnapshots(sessionId: string): Promise<void> {
     const key = this.getKey(sessionId)
     await redis.execute(async (client) => {

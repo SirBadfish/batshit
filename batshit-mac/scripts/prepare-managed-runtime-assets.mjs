@@ -39,7 +39,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const macRoot = resolve(__dirname, '..');
 const repoRoot = resolve(macRoot, '..');
 
-const nodeVersion = process.env.BATSHIT_MAC_NODE_VERSION || '24.21.0';
+const nodeVersion = process.env.BATSHIT_MAC_NODE_VERSION || '24.22.1';
 const redisVersion = process.env.BATSHIT_MAC_REDIS_VERSION || '8.10.1';
 const ffmpegVersion = process.env.BATSHIT_MAC_FFMPEG_VERSION || '8.1.2';
 const dav1dVersion = '1.5.4';

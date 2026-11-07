@@ -48,7 +48,7 @@ There's a practical bonus: you don't have to stand up a Batshit-owned MCP gatewa
 
 Because the tool surface stays small and stable, two good things happen at once.
 
-The obvious one is direct: you aren't paying for a tool catalog on turns that don't use it. The subtler one is the cache win. With the bulky, shifting catalog out of the request, the front of an `API` Primary Agent request stays steady from one send to the next — which is exactly the condition provider caching needs. So keeping tools out of the prefix doesn't just trim the tool cost itself; it protects the reusable prefix that saves tokens across the *whole* request. The two optimizations reinforce each other instead of fighting. For how that prefix and provider caching work, see [Context, caching, and token optimization](context-caching-tokens.md).
+The obvious one is direct: you aren't paying for a tool catalog on turns that don't use it. The subtler one is the cache win. With the bulky, shifting catalog out of the request, the front of a Primary Agent request stays steady from one send to the next — which is exactly the condition provider caching needs. So keeping tools out of the prefix doesn't just trim the tool cost itself; it protects the reusable prefix that saves tokens across the *whole* request. The two optimizations reinforce each other instead of fighting. For how that prefix and provider caching work, see [Context, caching, and token optimization](context-caching-tokens.md).
 
 Cost goes down and clarity goes up, for the same structural reason: Batshit only brings a capability into the conversation at the moment it's needed, and never before.
 

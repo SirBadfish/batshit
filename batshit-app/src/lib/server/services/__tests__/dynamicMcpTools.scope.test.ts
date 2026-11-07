@@ -64,6 +64,20 @@ describe('shared Dynamic MCP gateway scope', () => {
     expect(executeG2).not.toHaveBeenCalled()
   })
 
+  it('adds the canonical compact hint only beside requested schema metadata', async () => {
+    const inputSchema = { type: 'object', properties: { query: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: 10, default: 5 } }, required: ['query'] }
+    loadToolsForUser.mockResolvedValue({ tools: { sample: { description: 'Sample', inputSchema } },
+      metadata: new Map([['sample', { gatewayId: 'g1', mcpServerName: 'g1' }]]) })
+    const common = { userId: 'josh', agentId: 'agent_1' }
+    const without = await executeDynamicMcpFind(common)
+    expect(without.results[0]).not.toHaveProperty('inputSchema')
+    expect(without.results[0]).not.toHaveProperty('schemaHint')
+    const withSchema = await executeDynamicMcpFind({ ...common, includeSchema: true })
+    expect(withSchema.results[0].inputSchema).toBe(inputSchema)
+    expect(withSchema.results[0].schemaHint).toBe('required: query:string · optional: limit:integer (min 1; max 10; default 5)')
+    expect(executeG1).not.toHaveBeenCalled()
+  })
+
   it('keys cached discovery by the bound snapshot and preserves an explicit empty filter', async () => {
     const cache: GatewayToolsCache = new Map()
     const common = {

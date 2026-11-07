@@ -1,14 +1,10 @@
 import type { LocalContextBudgetEvidence } from '$lib/types/localContextBudget'
-import { buildCodexPromptPackageFromMessages } from '$lib/server/services/codexBridge'
 import { getSmartAutoCompactTriggerTokens } from '$lib/utils/contextCompaction'
 import { countTotalTokens } from '$lib/utils/tokenCounter'
 
-export type PromptBudgetRuntime = 'vercel' | 'codex' | 'claude' | 'n8n'
+export type PromptBudgetRuntime = 'vercel' | 'claude' | 'n8n'
 export type PromptBudgetStatus = 'safe' | 'compact_recommended' | 'blocked' | 'unknown'
 export type PromptBudgetLimitStatus = 'safe' | 'near_limit' | 'blocked' | 'unknown'
-
-export const CODEX_CLI_INPUT_CHAR_LIMIT = 1_048_576
-export const CODEX_CLI_INPUT_CHAR_SAFETY_MARGIN = 32_768
 
 export interface PromptBudgetReport {
   runtime: PromptBudgetRuntime
@@ -30,12 +26,6 @@ export interface PromptBudgetReport {
   autoCompactTriggerTokens: number | null
   shouldAutoCompact: boolean
   tokenStatus: PromptBudgetLimitStatus
-  runtimeHardLimitStatus: PromptBudgetLimitStatus
-  runtimeHardLimitName: string | null
-  packagedInputChars: number | null
-  packagedInputCharLimit: number | null
-  packagedInputSafeCharLimit: number | null
-  packagedInputRemainingChars: number | null
   canSend: boolean
   status: PromptBudgetStatus
   reason: string
@@ -82,31 +72,13 @@ export function resolveBudgetOutputReserve(params: {
   return 0
 }
 
-export function countCodexPackagedInputChars(params: {
-  messages: Array<{ role?: string; content: unknown; name?: string }>
-  images?: Array<{ url: string; alt?: string }>
-  extraRuntimeInputChars?: number
-}): number {
-  const promptPackage = buildCodexPromptPackageFromMessages({
-    messages: params.messages,
-    images: params.images
-  })
-  return (
-    promptPackage.prompt.length +
-    (promptPackage.developerInstructions?.length ?? 0) +
-    Math.max(0, Math.round(params.extraRuntimeInputChars ?? 0))
-  )
-}
-
 export function buildPromptBudgetReport(params: {
   runtime: PromptBudgetRuntime
   messages: Array<{ role?: string; content: unknown; name?: string }>
-  images?: Array<{ url: string; alt?: string }>
   contextLimit?: number | null
   nativeOverheadTokens?: number
   outputReserveTokens?: number
   autoCompactTriggerTokens?: number | null
-  extraRuntimeInputChars?: number
 }): PromptBudgetReport {
   const runtime = params.runtime
   const contextLimit = normalizePositiveInteger(params.contextLimit)
@@ -145,35 +117,8 @@ export function buildPromptBudgetReport(params: {
     }
   }
 
-  let packagedInputChars: number | null = null
-  let packagedInputCharLimit: number | null = null
-  let packagedInputSafeCharLimit: number | null = null
-  let packagedInputRemainingChars: number | null = null
-  let runtimeHardLimitStatus: PromptBudgetLimitStatus = 'unknown'
-  let runtimeHardLimitName: string | null = null
-
-  if (runtime === 'codex') {
-    packagedInputChars = countCodexPackagedInputChars({
-      messages: params.messages,
-      images: params.images,
-      extraRuntimeInputChars: params.extraRuntimeInputChars
-    })
-    packagedInputCharLimit = CODEX_CLI_INPUT_CHAR_LIMIT
-    packagedInputSafeCharLimit = CODEX_CLI_INPUT_CHAR_LIMIT - CODEX_CLI_INPUT_CHAR_SAFETY_MARGIN
-    packagedInputRemainingChars = packagedInputSafeCharLimit - packagedInputChars
-    runtimeHardLimitName = 'Codex CLI input character limit'
-    runtimeHardLimitStatus =
-      packagedInputChars > packagedInputSafeCharLimit
-        ? 'blocked'
-        : packagedInputChars > packagedInputSafeCharLimit - CODEX_CLI_INPUT_CHAR_SAFETY_MARGIN
-          ? 'near_limit'
-          : 'safe'
-  } else {
-    runtimeHardLimitStatus = 'safe'
-  }
-
-  const blocked = tokenStatus === 'blocked' || runtimeHardLimitStatus === 'blocked'
-  const nearLimit = tokenStatus === 'near_limit' || runtimeHardLimitStatus === 'near_limit'
+  const blocked = tokenStatus === 'blocked'
+  const nearLimit = tokenStatus === 'near_limit'
   const canSend = !blocked
   const shouldAutoCompact = Boolean(
     !blocked &&
@@ -186,14 +131,12 @@ export function buildPromptBudgetReport(params: {
     ? 'blocked'
     : nearLimit || shouldAutoCompact
       ? 'compact_recommended'
-      : contextLimit === null && runtime !== 'codex'
+      : contextLimit === null
         ? 'unknown'
         : 'safe'
 
   let reason = 'The compiled prompt is within the current runtime budget.'
-  if (runtimeHardLimitStatus === 'blocked') {
-    reason = `The packaged Codex CLI input is too large to launch safely. Compact context or return protected unzipped items to automatic before sending.`
-  } else if (tokenStatus === 'blocked') {
+  if (tokenStatus === 'blocked') {
     reason = 'The compiled prompt plus output headroom is larger than the selected model context window.'
   } else if (status === 'compact_recommended') {
     reason = 'The compiled prompt is near the configured Auto Compact safety margin.'
@@ -214,12 +157,6 @@ export function buildPromptBudgetReport(params: {
     autoCompactTriggerTokens,
     shouldAutoCompact,
     tokenStatus,
-    runtimeHardLimitStatus,
-    runtimeHardLimitName,
-    packagedInputChars,
-    packagedInputCharLimit,
-    packagedInputSafeCharLimit,
-    packagedInputRemainingChars,
     canSend,
     status,
     reason

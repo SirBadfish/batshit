@@ -8,6 +8,8 @@ declare global {
 		interface Locals {
 			user: User | null
 			session: Session | null
+			/** The look the root layout read for this page; painted on <html data-look>. */
+			appLook?: import('$lib/appearance/appLook').AppLook
 		}
 		interface PageData {
 			user: User | null

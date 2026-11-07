@@ -1,3 +1,4 @@
+import './presetStorageScriptDouble'
 // @vitest-environment node
 /**
  * BL-483: a model preset cannot be deleted while anything still uses it.

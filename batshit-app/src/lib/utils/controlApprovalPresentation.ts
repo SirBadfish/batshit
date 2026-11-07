@@ -127,7 +127,7 @@ export function describeControlApproval(approval: ApprovalLike): string {
  *    paused a call the policy had let through (a transient resolver failure; F-P3-1 raises
  *    no card there). The text says so, rather than promise a button that is not there, and
  *    still says not to retry: the next attempt pauses at the policy and earns a real card.
- *  - **`cli`**: a managed Codex or Claude call has already been made by the time the gate
+ *  - **`cli`**: a managed Claude call has already been made by the time the gate
  *    answers, so there is nothing to un-pause. The click starts a resume turn carrying an
  *    approval message, and the model's own retry is what runs the control. Telling it "do
  *    not retry" there would strand the approval.
@@ -204,6 +204,18 @@ export function resolveApprovalSubmitSource(
   const entrySource = typeof approval?.source === 'string' ? approval.source.trim() : ''
   if (entrySource) return entrySource
   return typeof summarySource === 'string' ? summarySource.trim() : ''
+}
+
+/** Only saved cards from the removed CLI lanes are eligible for non-executing retirement. */
+export function isRetiredSavedApproval(
+  approval: Record<string, any> | null | undefined,
+  summarySource?: string | null,
+  metadata?: Record<string, any> | null
+): boolean {
+  if (!approval || typeof approval !== 'object') return false
+  if (approval.control?.lane === 'cli') return true
+  return !approval.control && metadata?.claudePlanReply !== true &&
+    resolveApprovalSubmitSource(approval, summarySource) === 'claude'
 }
 
 /**

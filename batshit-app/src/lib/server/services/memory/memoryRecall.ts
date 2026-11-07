@@ -1,3 +1,6 @@
+import { memoryIsDeleted, memoryIsEligible } from './memoryState'
+import { commitMemoryMutation, readMemoryMutationSnapshot } from './memoryMutation'
+import { captureSettingsLifecycle, type SettingsLifecycleSnapshot } from '../appActions/settings/lifecycle'
 /**
  * SA-104 P4 — the recall engine (DL-104-04 / -08 / -09 / -16 / -17).
  *
@@ -51,7 +54,7 @@ import {
 } from './memoryLinger'
 import { MEMORY_SCHEMA_VERSION } from './memoryTypes'
 import { isFixedSession } from '$lib/utils/fixedSession'
-import { getOpenEpisode, whiteboardAuthor, type WhiteboardAuthor } from './memoryEpisodes'
+import { getOpenEpisode } from './memoryEpisodes'
 
 /** SA-120 P4b: closes the `Memory context:` entries whenever one of them was inferred. */
 export const MEMORY_INFERRED_RECALL_NOTE =
@@ -320,7 +323,7 @@ export function selectAwarenessState(
   const awarenessSorted = records
     .filter(
       (record) =>
-        record.lane === 'awareness' && record.is_superseded !== 'y' && !isExpired(record, nowTs)
+        record.lane === 'awareness' && record.is_superseded !== 'y' && memoryIsEligible(record, false, nowTs)
     )
     .sort(
       (a, b) =>
@@ -354,7 +357,7 @@ function selectMemoryInserts(options: {
   inferred?: MemoryInferredRecall[]
 }): MemorySelection {
   const { agentId, currentUserMessage, records, linger, budgets, episode, nowTs } = options
-  const byId = new Map(records.map((record) => [record.id, record]))
+  const byId = new Map(records.filter(record => memoryIsEligible(record, false, nowTs)).map((record) => [record.id, record]))
 
   // --- On-my-mind compile (also the DL-104-17 rule-2 dedup set) ---
   const awarenessState = selectAwarenessState(records, budgets, nowTs)
@@ -405,7 +408,7 @@ function selectMemoryInserts(options: {
   // Trigger scan (STM only; superseded memories never auto-fire, expired stop firing).
   for (const record of records) {
     if (record.lane !== 'stm') continue
-    if (record.is_superseded === 'y' || isExpired(record, nowTs)) continue
+    if (record.is_superseded === 'y' || !memoryIsEligible(record, false, nowTs)) continue
     if (onMyMindIds.has(record.id)) continue
     const matched = matchTriggerTerms(currentUserMessage, record)
     if (matched.length === 0) continue
@@ -696,34 +699,6 @@ function formatInsertLine(
   return lines
 }
 
-/**
- * SA-110 (DL-110-01) — the episode whiteboard as a DCM section: the agent-maintained
- * working-facts block for the OPEN episode, rendered with the current message where
- * its by-design churn costs no cache. Content changes through deliberate edits
- * (sys.memory.whiteboard), nap extraction, or episode close. The stamp uses full
- * date+time — tail bytes are free, and freshness awareness is the point of the board.
- */
-function formatWhiteboardDcmLines(whiteboard: {
-  content: string
-  updated_at: string
-  written_by?: WhiteboardAuthor
-}): string[] {
-  // 2026-09-19 (Josh): the board names its author. A nap fills only an empty board and
-  // never rewrites one the agent wrote, and the agent is told so where the board arrives.
-  const stamp = fmtDateTime(whiteboard.updated_at)
-  return whiteboardAuthor(whiteboard) === 'nap'
-    ? [
-        `Episode whiteboard (working facts for the current episode; filled in by a nap because you had not written one, updated ${stamp}):`,
-        whiteboard.content,
-        '(Rewrite it with sys.memory.whiteboard — full replacement. Once you write it, naps leave it alone. It dissolves when the episode closes.)'
-      ]
-    : [
-        `Episode whiteboard (working facts you maintain for the current episode; last written by you, updated ${stamp}):`,
-        whiteboard.content,
-        '(Rewrite it with sys.memory.whiteboard — full replacement. Naps never change a board you wrote, so keep it current. It dissolves when the episode closes.)'
-      ]
-}
-
 /** One awareness entry's exact rendered lines — the unit the fold fingerprints. */
 function formatOnMyMindEntryLines(record: MemoryRecord): string[] {
   const parts = [record.id, `importance ${record.importance}`, `saved ${fmtDate(record.saved_at)}`]
@@ -783,7 +758,7 @@ function formatOnMyMindBlock(entries: MemoryRecord[], truncatedCount: number): s
 // same bytes, so the deploy transition itself causes no divergence.
 // ---------------------------------------------------------------------------
 
-export type MemoryFoldReason = 'bootstrap' | 'new-session' | 'nap' | 'dreaming' | 'delete'
+export type MemoryFoldReason = 'bootstrap' | 'new-session' | 'nap' | 'dreaming' | 'delete' | 'membership'
 
 export interface MemoryFoldRecord {
   schema_version: typeof MEMORY_SCHEMA_VERSION
@@ -805,9 +780,18 @@ export function awarenessEntryLineHash(record: MemoryRecord): string {
     .slice(0, 16)
 }
 
+function parseMemoryFold(record: unknown): MemoryFoldRecord | null {
+  if (record == null) return null
+  if (!record || typeof record !== 'object' || Array.isArray(record)) throw new Error('Stored Awareness snapshot is unreadable.')
+  const value = record as MemoryFoldRecord & { mutation_revision?: string }
+  // The existing memory-owned record may contain only its publication revision.
+  if (value.block === undefined && typeof value.mutation_revision === 'string' && Object.keys(value).length === 1) return null
+  if (typeof value.block !== 'string' || !Array.isArray(value.records) || value.records.some(entry => !entry || typeof entry.id !== 'string' || typeof entry.line_hash !== 'string')) throw new Error('Stored Awareness snapshot is unreadable.')
+  return value
+}
+
 export async function getMemoryFold(agentId: string): Promise<MemoryFoldRecord | null> {
-  const record = (await redis.json.get(memoryFoldKey(agentId))) as MemoryFoldRecord | null
-  return record && typeof record === 'object' && typeof record.block === 'string' ? record : null
+  return parseMemoryFold(await redis.json.get(memoryFoldKey(agentId)))
 }
 
 /**
@@ -818,24 +802,39 @@ export async function getMemoryFold(agentId: string): Promise<MemoryFoldRecord |
  * never fails the send (a failed fold changes nothing — the SP keeps compiling
  * the previous snapshot and the pending notes stay honest).
  */
+/** Membership invalidation uses trusted ids/state only; memory prose is never parsed. */
+function foldHasRemovedMembers(fold: MemoryFoldRecord, records: MemoryRecord[], nowTs: number): boolean {
+  const byId = new Map(records.map(record => [record.id, record]))
+  return fold.records.some(entry => {
+    const record = byId.get(entry.id)
+    return !record || !memoryIsEligible(record, false, nowTs) || record.lane !== 'awareness' || record.is_superseded === 'y'
+  })
+}
+
 export async function foldAwarenessState(options: {
   agentId: string
   reason: MemoryFoldReason
   now?: Date
+  lifecycle?: SettingsLifecycleSnapshot
+  session?: { id: string; raw: string }
 }): Promise<{ folded: boolean; changed: boolean; block: string }> {
   const agentId = options.agentId?.trim()
   if (!agentId) throw new Error('foldAwarenessState requires an agentId.')
-  const agent = await loadAgentRecord(agentId)
+  const lifecycle = options.lifecycle ?? captureSettingsLifecycle([`agent:${agentId}`])
+  const snapshot = await readMemoryMutationSnapshot(agentId, { lifecycle, targetIds: [], context: true, extraKeys: [memoryFoldKey(agentId), ...(options.session ? [`session:${options.session.id}`] : [])] })
+  if (options.session) snapshot.raw.set(`session:${options.session.id}`, options.session.raw)
+  const agent = JSON.parse(snapshot.raw.get(`agent:${agentId}`)!)
   if (!agent || !resolveAgentMemoryEnabled(agent)) {
     return { folded: false, changed: false, block: '' }
   }
-  const now = options.now ?? new Date()
+  const now = new Date(snapshot.observedTs)
   const budgets = resolveMemoryLaneBudgets(agent)
-  const records = await listMemories(agentId)
+  const records = snapshot.records
   const selection = selectAwarenessState(records, budgets, now.getTime())
   const block = formatOnMyMindBlock(selection.entries, selection.truncatedCount)
 
-  const existing = await getMemoryFold(agentId)
+  const foldRaw = snapshot.raw.get(memoryFoldKey(agentId))
+  const existing = foldRaw ? parseMemoryFold(JSON.parse(foldRaw)) : null
   if (existing && existing.block === block) {
     return { folded: false, changed: false, block }
   }
@@ -852,7 +851,7 @@ export async function foldAwarenessState(options: {
     })),
     truncated_count: selection.truncatedCount
   }
-  await redis.json.set(memoryFoldKey(agentId), '$', record as never)
+  await commitMemoryMutation(snapshot, new Map([[memoryFoldKey(agentId), record]]))
   return { folded: true, changed: true, block }
 }
 
@@ -886,13 +885,13 @@ function computeAwarenessPending(options: {
     moved: 0,
     removed: 0
   }
-  const byId = new Map(memoryRecords.map((record) => [record.id, record]))
+  const byId = new Map(memoryRecords.filter(record => !memoryIsDeleted(record)).map((record) => [record.id, record]))
   const foldHashById = new Map(fold.records.map((entry) => [entry.id, entry.line_hash]))
   const entryLines: string[] = []
 
   const eligible = memoryRecords.filter(
     (record) =>
-      record.lane === 'awareness' && record.is_superseded !== 'y' && !isExpired(record, nowTs)
+      record.lane === 'awareness' && record.is_superseded !== 'y' && memoryIsEligible(record, false, nowTs)
   )
   for (const record of eligible) {
     const foldHash = foldHashById.get(record.id)
@@ -918,6 +917,11 @@ function computeAwarenessPending(options: {
       entryLines.push(
         `  - removed [${foldEntry.id}]: this AWARENESS entry was deleted — disregard it.`
       )
+      continue
+    }
+    if (isExpired(live, nowTs)) {
+      counts.expired += 1
+      entryLines.push(`  - expired [${foldEntry.id}]: this entry is no longer in effect.`)
       continue
     }
     if (live.lane !== 'awareness') {
@@ -1013,22 +1017,23 @@ export async function computeMemoryCompileContext(options: {
   const sessionId = options.sessionId?.trim()
   if (!agentId || !sessionId) return EMPTY_CONTEXT
 
+  const lifecycle = captureSettingsLifecycle([`agent:${agentId}`, `session:${sessionId}`])
   const agent = await loadAgentRecord(agentId)
   if (!agent || !resolveAgentMemoryEnabled(agent)) return EMPTY_CONTEXT
   if (typeof agent.user_id === 'string' && agent.user_id !== options.userId) {
     return EMPTY_CONTEXT
   }
 
-  const { ts: nowTs } = nowStamps()
+  let { ts: nowTs } = nowStamps()
   const budgets = resolveMemoryLaneBudgets(agent)
   const lingerWindow = resolveMemoryLingerTurns(agent)
   const recallLingerWindow = resolveMemoryRecallLingerTurns(agent)
-  const [memoryRecords, linger] = await Promise.all([
+  let [memoryRecords, linger] = await Promise.all([
     listMemories(agentId),
     getMemoryLingerState(sessionId)
   ])
   // SA-104 P6: recalled graduated segments join the same selection machinery.
-  const records = [
+  let records = [
     ...memoryRecords,
     ...(await loadRecalledSegmentInsertables(agentId, linger))
   ]
@@ -1073,6 +1078,17 @@ export async function computeMemoryCompileContext(options: {
       selection = selectMemoryInserts({ ...selectionInput, inferred: inferredRecalls })
     }
   }
+
+  // This atomic read is the final asynchronous memory observation. Compile still
+  // writes nothing; records/fold/cutoff agree even if deletion/expiry raced an earlier
+  // episode or inferred-recall await. The provider answer is only re-filtered here.
+  const view = await readMemoryMutationSnapshot(agentId, { lifecycle, targetIds: [], context: true, extraKeys: [memoryFoldKey(agentId)] })
+  memoryRecords = view.records
+  nowTs = view.observedTs
+  records = [...memoryRecords, ...records.filter(record => (record as InsertableRecord).__segment)]
+  selection = selectMemoryInserts({ ...selectionInput, records, nowTs, inferred: inferredRecalls })
+  const foldRaw = view.raw.get(memoryFoldKey(agentId))
+  const fold = foldRaw ? parseMemoryFold(JSON.parse(foldRaw)) : null
 
   // SA-109 (DL-109-04): session clips are NOT listed here any more. The general
   // DCM clip roster owns every clip line for every agent, memory-on or not, so
@@ -1150,27 +1166,17 @@ export async function computeMemoryCompileContext(options: {
   // No snapshot yet (pre-fold agent) = live render, byte-identical to the pre-fold
   // world; the next accepted-send commit writes the bootstrap fold from these same
   // bytes. Changes newer than the fold ride the DCM as pending notes.
-  const fold = await getMemoryFold(agentId)
-  const onMyMindBlock = fold
+  const invalidFold = fold && foldHasRemovedMembers(fold, memoryRecords, nowTs)
+  const onMyMindBlock = fold && !invalidFold
     ? fold.block
     : formatOnMyMindBlock(selection.onMyMind.entries, selection.onMyMind.truncatedCount)
-  const awarenessPending = fold
+  const awarenessPending = fold && !invalidFold
     ? computeAwarenessPending({ fold, memoryRecords, nowTs })
     : { lines: [], counts: null }
 
-  // SA-110 (DL-110-01): the open episode's whiteboard compiles as a DCM section for
-  // Infinite Sessions (already loaded by the shared episode-context loader above).
-  let whiteboardDcmLines: string[] = []
-  let whiteboardTokens = 0
-  let whiteboardWrittenBy: WhiteboardAuthor | null = null
-  if (episode.isFixedSession) {
-    const whiteboard = openEpisode?.whiteboard
-    if (whiteboard?.content?.trim()) {
-      whiteboardDcmLines = formatWhiteboardDcmLines(whiteboard)
-      whiteboardTokens = estimateTokens(whiteboard.content)
-      whiteboardWrittenBy = whiteboardAuthor(whiteboard)
-    }
-  }
+  // Episode-board compilation belonged to the retired CLI Primary. The live API
+  // Whiteboard has its own independent DCM owner in databaseRedis.server.ts.
+  const whiteboardDcmLines: string[] = []
 
   return {
     enabled: true,
@@ -1187,18 +1193,18 @@ export async function computeMemoryCompileContext(options: {
       whiteboard: {
         present: whiteboardDcmLines.length > 0,
         placement: 'dcm',
-        writtenBy: whiteboardWrittenBy,
-        tokenEstimate: whiteboardTokens
+        writtenBy: null,
+        tokenEstimate: 0
       },
       awarenessFold: {
-        source: fold ? 'fold' : 'live-bootstrap',
-        foldedAt: fold?.folded_at ?? null,
+        source: fold && !invalidFold ? 'fold' : 'live-bootstrap',
+        foldedAt: fold && !invalidFold ? fold.folded_at : null,
         ...(awarenessPending.counts ? { pending: awarenessPending.counts } : {})
       },
       onMyMind: {
-        count: fold ? fold.records.length : selection.onMyMind.entries.length,
-        truncatedCount: fold ? fold.truncated_count : selection.onMyMind.truncatedCount,
-        tokenEstimate: fold ? estimateTokens(fold.block) : selection.onMyMind.tokenEstimate
+        count: fold && !invalidFold ? fold.records.length : selection.onMyMind.entries.length,
+        truncatedCount: fold && !invalidFold ? fold.truncated_count : selection.onMyMind.truncatedCount,
+        tokenEstimate: estimateTokens(onMyMindBlock)
       },
       awarenessMedia: standingMedia.map(({ memoryId, media }) => ({
         memoryId,
@@ -1367,6 +1373,9 @@ export async function commitMemoryTurnState(options: {
   }
   if (!agentId || !sessionId) return empty
 
+  const lifecycle = captureSettingsLifecycle([`agent:${agentId}`, `session:${sessionId}`])
+  const sessionRaw = await redis.execute(client => client.sendCommand<string | null>(['JSON.GET', `session:${sessionId}`]))
+  if (!sessionRaw) return empty
   const agent = await loadAgentRecord(agentId)
   if (!agent || !resolveAgentMemoryEnabled(agent)) return empty
   if (typeof agent.user_id === 'string' && agent.user_id !== options.userId) return empty
@@ -1524,10 +1533,11 @@ export async function commitMemoryTurnState(options: {
   const isFirstSessionCommit = typeof linger?.last_commit_ts !== 'number'
   try {
     const existingFold = await getMemoryFold(agentId)
-    if (!existingFold || isFirstSessionCommit) {
+    if (!existingFold || isFirstSessionCommit || foldHasRemovedMembers(existingFold, memoryRecords, nowTs)) {
       await foldAwarenessState({
         agentId,
-        reason: existingFold ? 'new-session' : 'bootstrap'
+        reason: !existingFold ? 'bootstrap' : isFirstSessionCommit ? 'new-session' : 'membership',
+        lifecycle, session: { id: sessionId, raw: sessionRaw }
       })
     }
   } catch (error) {

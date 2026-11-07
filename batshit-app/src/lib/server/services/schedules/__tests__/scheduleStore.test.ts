@@ -130,11 +130,29 @@ describe('creating a schedule', () => {
     )
   })
 
-  it('refuses an agent that is not an API or CLI primary', async () => {
+  it('refuses an agent that is not an API primary', async () => {
     await seedAgent('agent-n8n', USER, { agentType: 'n8n' })
     await expect(createSchedule(baseInput({ agentId: 'agent-n8n' }))).rejects.toThrow(
-      /API and CLI/i
+      'N8n cannot be put on a schedule. The n8n Primary Agent type was removed from Batshit.'
     )
+  })
+
+  // SA-139 R4 (D14): a stored CLI Primary is a retired type; the create is refused readably
+  // (409, with the delete-only hint) and nothing is stored.
+  it('refuses a CLI Primary agent and stores no schedule', async () => {
+    await seedAgent('agent-clio', USER, {
+      agentType: 'cli',
+      primary_model_provider: 'anthropic-claude-cli',
+      primary_model_name: 'claude-cli'
+    })
+    const failure = await createSchedule(baseInput({ agentId: 'agent-clio' })).catch((error) => error)
+    expect(failure).toBeInstanceOf(ScheduleError)
+    expect(failure).toMatchObject({ status: 409 })
+    expect(failure.message).toBe(
+      'Clio cannot be put on a schedule. The Claude Code CLI lane was removed from Batshit.'
+    )
+    expect(failure.hint).toContain('so it can only be deleted')
+    expect(await listSchedules(USER)).toHaveLength(0)
   })
 
   it('refuses an invalid cadence rather than clamping it', async () => {

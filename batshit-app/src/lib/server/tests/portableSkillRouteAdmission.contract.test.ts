@@ -10,7 +10,7 @@ import { describe, expect, it } from 'vitest'
  * server-code policy constants. This file parses every non-test TypeScript file under `src/` and
  * holds the call sites to the reviewed list:
  *
- *   - exactly these 22 route files call the resolver (a new caller fails here, so someone has
+ *   - exactly these 19 route files call the resolver (a new caller fails here, so someone has
  *     to decide on purpose whether it may ever see the portable lane);
  *   - only `/api/controls/find` passes a policy (scoped discovery) and only `/api/controls/use`
  *     passes one (scoped execution), each as the bare exported constant;
@@ -27,6 +27,13 @@ const RESOLVER_FILE = 'lib/server/services/nativeToolAuth.ts'
 const POLICY_OPTION = 'portableSkillPolicy'
 const PORTABLE_TOKENS_FILE = 'lib/server/services/portableSkillTokens.ts'
 const POLICY_CONSTANTS = ['PORTABLE_SKILL_SCOPED_DISCOVERY', 'PORTABLE_SKILL_SCOPED_EXECUTION']
+const PORTABLE_HEADER = 'x-batshit-portable-token'
+/**
+ * Files that name the portable header only to REFUSE every non-session credential: they test the
+ * header's presence and never read its value, validate it, or admit anything. 3cf1e093b added the
+ * Pinokio connection routes' session-only refusal. The last test below holds each to that.
+ */
+const HEADER_REFUSAL_ONLY_FILES = ['lib/server/services/pinokioMachineRoutes.ts']
 
 const EXPECTED_OPT_INS: Record<string, string> = {
   'routes/api/controls/find/+server.ts': 'PORTABLE_SKILL_SCOPED_DISCOVERY',
@@ -46,16 +53,15 @@ const EXPECTED_CALLERS = [
   'routes/api/controls/use/+server.ts',
   'routes/api/mcp/tools/execute/+server.ts',
   'routes/api/mcp/tools/find/+server.ts',
-  'routes/api/memory/recall-media/+server.ts',
   'routes/api/native-tools/agent-browser/+server.ts',
   'routes/api/native-tools/bash/execute/+server.ts',
   'routes/api/native-tools/dispatch/+server.ts',
   'routes/api/native-tools/fetch-zip/+server.ts',
-  'routes/api/native-tools/guard-result/+server.ts',
   'routes/api/native-tools/sandbox/status/+server.ts',
   'routes/api/native-tools/web-search/+server.ts',
-  'routes/api/skills/runtime/+server.ts',
-  'routes/api/subagents/managed-execute/+server.ts'
+  // SA-139 R4: `/api/skills/deliver` and `/api/subagents/managed-execute` served only the
+  // retired Claude Code CLI Primary and were removed with it.
+  'routes/api/skills/runtime/+server.ts'
 ]
 
 function listSourceFiles(dir: string, out: string[] = []): string[] {
@@ -148,7 +154,7 @@ function scan() {
 describe('BL-704: the portable lane is admitted only by the two control routes', () => {
   const { calls, problems, constantUses } = scan()
 
-  it('finds every caller, and the caller list is exactly the reviewed 22 route files', () => {
+  it('finds every caller, and the caller list is exactly the reviewed 19 route files', () => {
     const files = [...new Set(calls.map((call) => call.file))].sort()
     expect(files).toEqual([...EXPECTED_CALLERS].sort())
     expect(calls).toHaveLength(EXPECTED_CALLERS.length)
@@ -177,7 +183,31 @@ describe('BL-704: the portable lane is admitted only by the two control routes',
       )
       .map((full) => path.relative(SRC, full).split(path.sep).join('/'))
       .sort()
-    expect(readers).toEqual([PORTABLE_TOKENS_FILE, RESOLVER_FILE].sort())
+    expect(readers).toEqual([PORTABLE_TOKENS_FILE, RESOLVER_FILE, ...HEADER_REFUSAL_ONLY_FILES].sort())
+  })
+
+  it('a file that names the portable header only to refuse it never validates or admits a portable token', () => {
+    for (const file of HEADER_REFUSAL_ONLY_FILES) {
+      const text = readFileSync(path.join(SRC, file), 'utf8')
+      // It names the raw header (the refusal list), never the token module's constant or validator.
+      expect([file, text.includes(PORTABLE_HEADER)]).toEqual([file, true])
+      expect([file, /validatePortableSkillToken|PORTABLE_SKILL_TOKEN_HEADER|portableSkillTokens/.test(text)]).toEqual([file, false])
+      // No admission path: it calls no resolver and passes no portable policy.
+      expect([file, /resolveNativeToolUser|portableSkillPolicy|PORTABLE_SKILL_SCOPED_/.test(text)]).toEqual([file, false])
+      // It never reads the header's value: no `headers.get` names it.
+      expect([file, new RegExp(`headers\\.get\\(\\s*['"\`]${PORTABLE_HEADER}`).test(text)]).toEqual([file, false])
+      // Nor indirectly: the header text appears once, in one refused-header list that is only
+      // tested with `headers.has`, and every value it reads is a fixed non-credential header.
+      expect([file, text.split(PORTABLE_HEADER).length - 1]).toEqual([file, 1])
+      const list = new RegExp(`const (\\w+) = \\[[^\\]]*'${PORTABLE_HEADER}'[^\\]]*\\]`).exec(text)?.[1] ?? null
+      expect([file, typeof list]).toEqual([file, 'string'])
+      expect([file, text.match(new RegExp(`\\b${list}\\b`, 'g'))?.length]).toEqual([file, 2])
+      expect([file, text.includes(`${list}.some((header) => request.headers.has(header))`)]).toEqual([file, true])
+      const reads = Array.from(text.matchAll(/headers\.get\(([^)]*)\)/g), (match) => match[1].trim())
+      expect([file, reads.filter((arg) => !["'origin'", "'content-type'"].includes(arg))]).toEqual([file, []])
+      // Nor by walking or copying all headers.
+      expect([file, /headers\.(entries|forEach|values|keys)\(|\.\.\.\s*request\.headers|fromEntries\(\s*request\.headers/.test(text)]).toEqual([file, false])
+    }
   })
 
   it('the policy constants are used only by their one route each', () => {

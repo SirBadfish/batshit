@@ -31,6 +31,16 @@ async function hashFile(filePath) {
   return { sha256: hash.digest('hex'), bytes };
 }
 
+async function hashOpenFile(handle) {
+  const hash = crypto.createHash('sha256');
+  let bytes = 0;
+  for await (const chunk of handle.createReadStream({ start: 0, autoClose: false })) {
+    hash.update(chunk);
+    bytes += chunk.length;
+  }
+  return { sha256: hash.digest('hex'), bytes };
+}
+
 function exactRecipeMemberPath(value) {
   if (typeof value !== 'string' || !RECIPE_ARCHIVE_MEMBER_PATHS.includes(value)) {
     throw new RecipeArchiveError(
@@ -110,6 +120,7 @@ async function cleanupOutputs(outputs) {
 
 async function inspectAndExtractRecipeArchive({
   archivePath,
+  archiveHandle,
   outputDir,
   maxArchiveBytes,
   maxModelBytes,
@@ -121,7 +132,7 @@ async function inspectAndExtractRecipeArchive({
   const resolvedOutputDir = path.resolve(outputDir);
   await fs.mkdir(resolvedOutputDir, { recursive: true });
 
-  const archive = await hashFile(resolvedArchivePath);
+  const archive = archiveHandle ? await hashOpenFile(archiveHandle) : await hashFile(resolvedArchivePath);
   if (archive.bytes < 1 || archive.bytes > maxArchiveBytes) {
     throw new RecipeArchiveError('Recipe package exceeds the allowed archive size.');
   }
@@ -214,9 +225,10 @@ async function inspectAndExtractRecipeArchive({
   unzipper.register(UnzipInflate);
 
   try {
-    for await (const chunk of fsSync.createReadStream(resolvedArchivePath, {
-      highWaterMark: 64 * 1024
-    })) {
+    const stream = archiveHandle
+      ? archiveHandle.createReadStream({ start: 0, autoClose: false, highWaterMark: 64 * 1024 })
+      : fsSync.createReadStream(resolvedArchivePath, { highWaterMark: 64 * 1024 });
+    for await (const chunk of stream) {
       if (firstError) throw firstError;
       unzipper.push(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength));
       await Promise.all([...outputs.values()].map((output) => output.writeChain));
@@ -298,6 +310,7 @@ module.exports = {
   decodeManifestStrict,
   exactRecipeMemberPath,
   hashFile,
+  hashOpenFile,
   inspectAndExtractRecipeArchive,
   sha256Buffer
 };

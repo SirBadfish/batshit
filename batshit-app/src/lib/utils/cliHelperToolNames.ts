@@ -1,21 +1,22 @@
 /**
- * BL-5 — the MCP server name every managed CLI profile gives Batshit's helper bridge
- * (`scripts/mode4-controls-mcp.cjs`), owned here once.
+ * BL-5 — the MCP server name every managed CLI profile gave Batshit's helper bridge (removed with
+ * the CLI Subagent in SA-139 R5), owned here once so saved chats that name it still resolve.
  *
- * A CLI shows the model an MCP tool as `mcp__<server>__<tool>`. Codex first turns every
- * character outside [A-Za-z0-9_] into `_`, and codex-cli 0.139.0 through 0.148.0 cap the
- * result at 64 bytes (0.149.0 raised it to 128): anything longer becomes a truncated head plus
- * a hash, so the model never sees the name Batshit's prompt teaches it. The old per-agent name
- * `batshit_gateway_<agent>-mode4-controls` hashed `batshit_server_bash_execute` and
- * `batshit_server_fetch_zip` for every agent, `batshit_tool_search` for an agent id over 7
- * characters, and every helper for an id over 14 and in most CLI Subagent and Worker profiles
- * (measured live on codex-cli 0.139.0, 2026-09-22). One profile is one agent and this is its
- * only helper server, so the name needs no agent in it. Fixed, it keeps the longest helper
- * (`batshit_server_agent_browser_find`) at 55 bytes for every agent, and with no hyphen Codex
- * and Claude Code show the same string.
+ * A CLI shows the model an MCP tool as `mcp__<server>__<tool>`. Codex CLI (removed in SA-139
+ * R1) first turned every character outside [A-Za-z0-9_] into `_`, and codex-cli 0.139.0 through
+ * 0.148.0 capped the result at 64 bytes (0.149.0 raised it to 128): anything longer became a
+ * truncated head plus a hash, so the model never saw the name Batshit's prompt teaches it. The
+ * old per-agent name `batshit_gateway_<agent>-mode4-controls` hashed
+ * `batshit_server_bash_execute` and `batshit_server_fetch_zip` for every agent,
+ * `batshit_tool_search` for an agent id over 7 characters, and every helper for an id over 14
+ * and in most CLI Subagent and Worker profiles (measured live on codex-cli 0.139.0,
+ * 2026-09-22). One profile is one agent and this is its only helper server, so the name needs
+ * no agent in it. Fixed, it keeps the longest helper (`batshit_server_agent_browser_find`) at
+ * 55 bytes for every agent, and with no hyphen the CLI shows the same string Batshit's prompt
+ * teaches.
  *
  * Browser-safe on purpose: the activity contract, which the chat page runs, recognizes the
- * name too. Server code reaches it through `mode4InternalTools.ts`, which re-exports it.
+ * name in saved steps.
  */
 export const CLI_HELPER_MCP_SERVER_NAME = 'batshit_helpers'
 

@@ -2,11 +2,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { env } from '$env/dynamic/private'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { redis } from '$lib/server/redis'
-import { AGENT_RUN_CREDENTIAL_HEADER, mintRunCredential } from '../agentRunCredentials'
-import {
-  N8N_NATIVE_TOOL_CALLBACK_TOKEN_HEADER,
-  createN8nSseCallbackToken
-} from '../n8nCallbackTokens'
 import {
   PORTABLE_SKILL_FAMILIES,
   PORTABLE_SKILL_TOKEN_HEADER,
@@ -316,43 +311,37 @@ describe('every other lane is unchanged', () => {
     expect(auth).toEqual({ userId: USER, auth: 'service' })
   })
 
-  it('the agent lane keeps its place first', async () => {
-    await redis.createAgent({
-      id: 'agent-zcbl704',
-      user_id: USER,
-      displayName: 'zcbl704',
-      agentType: 'api',
-      primary_model_provider: 'anthropic',
-      primary_model_name: 'claude-sonnet-4-5'
-    } as any)
-    const run = await mintRunCredential({
-      userId: USER,
-      agentId: 'agent-zcbl704',
-      sessionId: 'sess-zcbl704',
-      runtime: 'codex'
-    } as any)
+  it('a retired run header refuses even alongside a valid Portable Skill Token', async () => {
     const { token } = await mintPortable(['artifacts'])
     const auth = await resolveNativeToolUser({
-      request: request({ [AGENT_RUN_CREDENTIAL_HEADER]: run.token, [PORTABLE_SKILL_TOKEN_HEADER]: token })
+      request: request({ 'x-batshit-agent-token': 'arc_old.bsac_secret', [PORTABLE_SKILL_TOKEN_HEADER]: token }),
+      portableSkillPolicy: PORTABLE_SKILL_SCOPED_EXECUTION
     })
-    expect(auth?.auth).toBe('agent')
+    expect(auth).toBeNull()
   })
 
-  it('the n8n callback lane keeps its place ahead of the portable check', async () => {
-    const callback = await createN8nSseCallbackToken({
-      sessionId: 'sess-zcbl704',
-      messageId: 'msg-zcbl704',
-      userId: USER
+  // SA-139 R2 removed the n8n callback lane. This request carries everything that lane admitted
+  // at b3d8b8686: an unexpired record in the old `n8n:sse-callback:<session>:<message>` format
+  // (stored the way `createN8nSseCallbackToken` stored it), its token header, and a dispatch
+  // payload whose context names that run. The old resolver returned `auth: 'n8n-callback'`.
+  it('a once-valid n8n callback token is no longer a credential (SA-139 R2 removed that lane)', async () => {
+    const token = 'zcsa139r2-old-callback-token-0123456789abcdef'
+    const key = 'n8n:sse-callback:session-r2:message-r2'
+    const now = Date.now()
+    await redis.execute(async (client) => {
+      await client.set(key, JSON.stringify({ token, sessionId: 'session-r2', messageId: 'message-r2', userId: USER,
+        agentId: 'agent-r2', createdAt: new Date(now).toISOString(), expiresAt: new Date(now + 30 * 60_000).toISOString() }),
+      { EX: 60 })
     })
-    const { token } = await mintPortable(['artifacts'])
-    const auth = await resolveNativeToolUser({
-      request: request({
-        [N8N_NATIVE_TOOL_CALLBACK_TOKEN_HEADER]: callback.token,
-        [PORTABLE_SKILL_TOKEN_HEADER]: token
-      }),
-      payload: { sessionId: 'sess-zcbl704', messageId: 'msg-zcbl704' }
-    })
-    expect(auth).toMatchObject({ userId: USER, auth: 'n8n-callback' })
+    try {
+      const options = {
+        request: request({ 'x-batshit-native-tool-token': token }, '/api/native-tools/dispatch'),
+        payload: { context: { session_id: 'session-r2', message_id: 'message-r2', actor_type: 'primary', agent_id: 'agent-r2' } }
+      }
+      expect(await resolveNativeToolUser(options as Parameters<typeof resolveNativeToolUser>[0])).toBeNull()
+    } finally {
+      await redis.execute(async (client) => { await client.del(key) })
+    }
   })
 
   it('still returns null for a request with no credential of any kind', async () => {

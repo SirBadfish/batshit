@@ -35,6 +35,7 @@ Generated from `tools/system-skills/userdocs-skill-references.manifest.json`. Re
 | `installation/first-run.md` | `references/installation-first-run.md` |
 | `installation/install-docker.md` | `references/installation-install-docker.md` |
 | `installation/install-mac-app.md` | `references/installation-install-mac-app.md` |
+| `installation/install-pinokio.md` | `references/installation-install-pinokio.md` |
 | `installation/updating-batshit.md` | `references/installation-updating-batshit.md` |
 | `judge-juice/overview.md` | `references/judge-juice-overview.md` |
 | `local-ai/model-settings.md` | `references/local-ai-model-settings.md` |

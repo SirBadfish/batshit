@@ -10,12 +10,17 @@ import { onDestroy, untrack } from 'svelte'
 import { Button } from '$lib/components/ui/button'
 import { Badge } from '$lib/components/ui/badge'
 import * as DropdownMenu from '$lib/components/ui/dropdown-menu'
-import { debounce } from '$lib/utils/debounce'
+import { withExpectedMcpSettings, readMcpSettingsRevisions, type ExpectedMcpSettings } from '$lib/utils/agentSettingsSectionSaves'
 import {
   RefreshCcw,
   Wrench
 } from '@lucide/svelte'
 import AgentMcpDefaultsCard from '$lib/components/settings/agent/AgentMcpDefaultsCard.svelte'
+import { applyCliDcmPatch, readCliDcmPair } from '$lib/utils/cliToolGridEnable'
+import { createChatToolGridEnableControls } from './chatToolGridEnableControls.svelte'
+import { applyAgentProviderSettingsUpdate } from '$lib/utils/agentProviderSettings'
+import { liveFileReadsChosenOn, resolveZipAiViewModeOf } from '$lib/utils/liveFileReads'
+import { agentRefreshedFileReadsAvailability } from '$lib/utils/refreshedFileReadsSettings'
 import {
 	SHARED_NON_MCP_TOOL_GRID_CONFIG,
 	SHARED_NON_MCP_TOOL_GRID_ROWS,
@@ -29,6 +34,8 @@ import {
 } from '$lib/utils/toolGridCli'
 import { getToolGridDefaultAutoZip, getToolGridDefaultNumber } from '$lib/utils/toolGridZipDefaults'
 import {
+	getAgentMcpSettingsCut, loadAgentMcpSettingsDetail,
+	getAgentById, updateAgent, getAgentProviderSettingsReadState, refreshAgentFieldsFromServer,
 	getCurrentAgentId,
 	getAgents,
 	updateAgentSettings,
@@ -36,7 +43,8 @@ import {
 } from '$lib/stores/agents.svelte'
 import { diffAgentBlock, sameJsonValue } from '$lib/utils/agentBlockFieldSettings'
 import { getUserSettings } from '$lib/stores/userSettings.svelte'
-import { isCliPrimaryAgentType, normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
+import { refreshAllDeadCopies } from '$lib/stores/zipDeadCopies.svelte'
+import { normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
 import {
 	buildDcmDisplaySettingsSignature,
 	cloneDcmDisplaySettings,
@@ -135,6 +143,7 @@ const ZIP_AUTO_INHERIT = '__inherit__'
 const ZIP_LAYOUT_INHERIT = '__inherit__'
 
 interface CustomToolZipFormEntry {
+	retained?: Record<string, unknown>
 	tool_name: string
 	buffer_size: string
 	zip_threshold: string
@@ -263,6 +272,7 @@ let selectedGateways = $state<Set<string>>(new Set())
 let selectedCliToolIds = $state<string[]>([])
 let selectedCliToolIdsExplicit = $state(false)
 let dcmDisplaySettings = $state<AgentDcmDisplaySettings>(createDefaultDcmDisplaySettings())
+let gatewayCatalogLoaded = $state(false)
 let loading = $state(false)
 let error = $state<string | null>(null)
 let gatewayMCPs = $state<GatewayMCPs>({})
@@ -277,11 +287,13 @@ let mcpLastSaved = $state<Date | null>(null)
 let mcpRenderNonce = $state(0)
 
 let zipAiViewMode = $state(ZIP_LAYOUT_INHERIT)
+let zipToolNotesEnabled = $state(ZIP_LAYOUT_INHERIT)
+let liveFileReads = $state(ZIP_LAYOUT_INHERIT)
 let customToolZipOverrides = $state<CustomToolZipFormEntry[]>([])
 let nonMcpZipOverrides = $state<Record<NonMcpZipRowId, CustomToolZipFormEntry>>(
 	createInheritedNonMcpZipOverrides()
 )
-let zipSaveState = $state<'idle' | 'saving' | 'saved'>('idle')
+let zipSaveState = $state<'idle' | 'saving' | 'saved' | 'error'>('idle')
 let zipSaveError = $state<string | null>(null)
 let zipLastSaved = $state<Date | null>(null)
 let zipSaveResetTimer: ReturnType<typeof setTimeout> | null = null
@@ -356,6 +368,52 @@ let currentAgent = $derived.by(() => {
 	const agents = getAgents()
 	return agents.find((agent) => agent.id === agentId)
 })
+
+const nativeControls = createChatToolGridEnableControls({
+	getAgent: () => currentAgent,
+	readState: getAgentProviderSettingsReadState,
+	refresh: (id) => { void refreshAgentFieldsFromServer(id, 'provider-settings') },
+  cliBusy: () => saveStatus === 'saving' || mcpDraftHeld,
+  cliSnapshot: () => [dcmDisplaySettings, mcpViewSignature, mcpSaveEpoch],
+  refreshCli: (id) => { void loadAgentMcpSettingsDetail(id) },
+  installCli: (owner, patch, record) => {
+    if (!currentAgent || gridOwnerKey(currentAgent) !== gridOwnerKey(owner as typeof currentAgent) || !mcpSavedValues) return
+    const pair = readCliDcmPair({ dcmDisplaySettings: patch })
+    dcmDisplaySettings = applyCliDcmPatch(dcmDisplaySettings, pair)
+    const baseline = applyCliDcmPatch(mcpSavedValues.dcm ?? mcpSavedValues.viewedDcm, patch)
+    const keepLegacy = record && record.dcmDisplaySettings == null && record.dcm_display_settings != null
+    mcpSavedValues = { ...mcpSavedValues, dcm: keepLegacy ? null : baseline, viewedDcm: baseline }
+    mcpViewSignature = JSON.stringify({ gateways: mcpSavedValues.gateways, dcm: baseline, cli: mcpSavedValues.cliTools })
+    const current = getAgentById(owner.id)
+    if (current) {
+      const fields = keepLegacy ? { dcm_display_settings: applyCliDcmPatch((current as any).dcm_display_settings, pair) } : { dcmDisplaySettings: applyCliDcmPatch(current.dcmDisplaySettings ?? (current as any).dcm_display_settings, patch) }
+      updateAgent(owner.id, fields as Partial<typeof current>)
+    }
+  },
+	install: (owner, fields) => {
+		const current = getAgentById(owner.id)
+		if (!current || current.user_id !== owner.user_id || current.created_at !== owner.created_at || current.agentType !== owner.agentType) return
+		updateAgent(owner.id, { provider_specific_settings: applyAgentProviderSettingsUpdate(current.provider_specific_settings, { nativeTools: fields }) })
+	}
+})
+onDestroy(() => nativeControls.dispose())
+$effect(() => { nativeControls.sync() })
+const refreshedFileReadsAvailability = $derived(agentRefreshedFileReadsAvailability({
+	primaryType: normalizePrimaryAgentType(currentAgent),
+	zipViewMode: resolveZipAiViewModeOf({ zip_ai_view_mode: zipAiViewMode }, effectiveUserSettings?.global_zip_settings),
+	backend: currentAgent ? nativeControls.backend(currentAgent) : null,
+	host: nativeControls.host,
+	hostCheckFailed: nativeControls.hostFailed,
+	chosenOn: liveFileReadsChosenOn({ live_file_reads: liveFileReads === 'enabled' ? true : liveFileReads === 'disabled' ? false : null }, effectiveUserSettings?.global_zip_settings)
+}))
+
+function gridOwnerKey(agent: typeof currentAgent): string {
+	return JSON.stringify([agent?.id, agent?.user_id, agent?.created_at, agent?.agentType])
+}
+function guardGridChoice<T extends (...args: any[]) => any>(owner: typeof currentAgent, choice: T, cliShared = false): T {
+	const captured = gridOwnerKey(owner)
+	return ((...args: Parameters<T>) => { if (currentAgent && gridOwnerKey(currentAgent) === captured && (!cliShared || !nativeControls.cliHeld)) return choice(...args) }) as T
+}
 
 let nativeDynamicMcpEnabled = $derived.by(() => {
 	const parsed = parseBooleanSetting(getNativeToolsSettings(currentAgent).dynamicMcpEnabled)
@@ -531,6 +589,7 @@ function normalizeCustomToolZipOverrides(value: unknown): CustomToolZipFormEntry
 		const rawBuffer = (item as any).buffer_size
 		const rawThreshold = (item as any).zip_threshold
 		next.push({
+			retained: Object.fromEntries(Object.entries(item).filter(([field]) => !['tool_name','buffer_size','zip_threshold','auto_zip','zip_disabled'].includes(field))),
 			tool_name: toolName,
 			buffer_size: typeof rawBuffer === 'number' && Number.isFinite(rawBuffer) ? String(rawBuffer) : '',
 			zip_threshold:
@@ -695,6 +754,7 @@ function handleNonMcpZipOverrideChangeById(
 			customToolZipOverrides.find((tool) => tool.tool_name === toolName) ??
 			{ tool_name: toolName, buffer_size: '', zip_threshold: '', auto_zip: ZIP_AUTO_INHERIT }
 		const next: CustomToolZipFormEntry = {
+			retained: current.retained,
 			tool_name: toolName,
 			buffer_size: patch.buffer_size ?? current.buffer_size,
 			zip_threshold: patch.zip_threshold ?? current.zip_threshold,
@@ -752,8 +812,9 @@ function toZipPayloadCustomTools(source: CustomToolZipFormEntry[]): Array<{
 		const threshold = parseOptionalNumber(tool.zip_threshold)
 		const autoZip =
 			tool.auto_zip === 'enabled' ? true : tool.auto_zip === 'disabled' ? false : undefined
-		if (buffer === undefined && threshold === undefined && autoZip === undefined) continue
+		if (buffer === undefined && threshold === undefined && autoZip === undefined && !Object.keys(tool.retained ?? {}).length) continue
 		next.push({
+			...tool.retained,
 			tool_name: toolName,
 			buffer_size: buffer,
 			zip_threshold: threshold,
@@ -780,9 +841,33 @@ type McpSavedValues = {
 	cliTools: string[] | null
 	/** The Tool Grid display settings as the surface reads them; null while only the older `dcm_display_settings` name holds them. */
 	dcm: AgentDcmDisplaySettings | null
+  viewedDcm?: AgentDcmDisplaySettings
 }
 
+let mcpViewSignature: string | undefined
+const mcpFormSignature = () => JSON.stringify({ gateways: Array.from(selectedGateways), dcm: dcmDisplaySettings, cli: selectedCliToolIdsExplicit ? selectedCliToolIds : null })
 let mcpSavedValues: McpSavedValues | null = null
+let mcpOriginalBase: ExpectedMcpSettings | undefined
+let lastDetailCut: ReturnType<typeof getAgentMcpSettingsCut>
+let mcpDraftHeld = $state(false), zipDraftHeld = $state(false)
+let mcpFollowPending = $state(false), zipFollowPending = $state(false)
+let requestedMcpDetailId: string | undefined
+function adoptMcpAck(id: string, expected: ExpectedMcpSettings | undefined, payload: any) {
+  if (currentAgent?.id !== id || !expected) return
+  const revisions = readMcpSettingsRevisions(JSON.stringify(payload?.mcpSettings?.revisions))
+  if (revisions && Object.keys(expected).every(field => mcpOriginalBase?.[field as keyof ExpectedMcpSettings] === expected[field as keyof ExpectedMcpSettings] && revisions[field as keyof ExpectedMcpSettings])) mcpOriginalBase = { ...mcpOriginalBase, ...Object.fromEntries(Object.keys(expected).map(field => [field, revisions[field as keyof ExpectedMcpSettings]])) }
+}
+async function useSavedToolSettings() {
+  const id = currentAgent?.id
+  if (!id || saveStatus === 'saving' || zipSaveState === 'saving') return
+  const cut = await loadAgentMcpSettingsDetail(id)
+  if (currentAgent?.id !== id) return
+  if (!cut) { saveStatus = 'error'; saveError = 'Saved Tool Settings could not be read. Your draft is kept.'; return }
+  // Explicit discard/current-value choice only; a background read never does this.
+  mcpDraftHeld = false; zipDraftHeld = false; mcpSavedValues = null; zipSavedFields = null
+  lastDetailCut = undefined; lastAgentId = undefined
+}
+
 let mcpSaveEpoch = 0
 let zipSavedFields: Record<string, unknown> | null = null
 
@@ -794,22 +879,26 @@ function readMcpSavedValues(agent: any): McpSavedValues {
 	return {
 		gateways: normalizeGatewaySelection(agent?.defaultMCPGateways),
 		cliTools: holdsCliTools ? normalizeCliToolSelections(agent?.defaultTools ?? agent?.default_tools) : null,
+		viewedDcm: cloneDcmDisplaySettings(extractAgentDcmDisplaySettings(agent)),
 		dcm: holdsOnlyOlderDcmName ? null : cloneDcmDisplaySettings(extractAgentDcmDisplaySettings(agent))
 	}
 }
 
 /**
  * The zip fields a save writes, from the values a surface holds (`null` is a real value: inherit).
- * SA-129 DL-06 (BL-1484): never the parked zip control permission; no Settings surface reads or
- * writes its hidden experiment key.
+ * SA-129 DL-06 (BL-1484): never a zip control key; agent zip control is retired (2026-10-23).
  */
 function buildZipSaveFields(source: {
 	layout: string
+	notes: string
+	liveReads: string
 	customTools: CustomToolZipFormEntry[]
 	nonMcp: Record<NonMcpZipRowId, CustomToolZipFormEntry>
 }): Record<string, unknown> {
 	const fields: Record<string, unknown> = {
 		zip_ai_view_mode: source.layout === 'inline' || source.layout === 'appended' ? source.layout : null,
+		zip_tool_notes_enabled: source.notes === 'enabled' ? true : source.notes === 'disabled' ? false : null,
+		live_file_reads: source.liveReads === 'enabled' ? true : source.liveReads === 'disabled' ? false : null,
 		custom_tool_settings: toZipPayloadCustomTools(source.customTools)
 	}
 	for (const row of NON_MCP_ZIP_ROW_ORDER) {
@@ -863,20 +952,31 @@ async function persistMcpSettings(reason: string, gatewayToggles?: GatewayToggle
 	if (dcmChange !== undefined) update.dcmDisplaySettings = dcmChange
 	if (Object.keys(update).length === 0) return
 
+	const id = currentAgent.id
+	let request: AgentSettingsUpdate
+	try { if (mcpDraftHeld) throw new Error('Your Tool Settings draft is kept. Use Saved Tool Settings before another choice.'); request = withExpectedMcpSettings(update, mcpOriginalBase) }
+	catch (error) { saveStatus = 'error'; saveError = error instanceof Error ? error.message : 'Read Saved Tool Settings.'; return }
+	const savedView = mcpFormSignature()
 	const saveEpoch = ++mcpSaveEpoch
 	saveStatus = 'saving'
 	saveError = null
 	clearSaveResetTimer()
 
 	try {
-		await updateAgentSettings(currentAgent.id, update)
+		const acknowledgement = await updateAgentSettings(id, request)
+		adoptMcpAck(id, request.expectedMcpSettings, acknowledgement)
+		if (currentAgent?.id !== id) return
 		if (saveEpoch === mcpSaveEpoch) {
 			mcpSavedValues = { gateways: nextGateways, cliTools: nextCliTools, dcm: nextDcmDisplaySettings }
+			mcpViewSignature = savedView
 		}
 		saveStatus = 'saved'
 		mcpLastSaved = new Date()
 		scheduleSaveReset()
 	} catch (saveFailure) {
+		if (currentAgent?.id !== id) return
+		adoptMcpAck(id, request.expectedMcpSettings, { mcpSettings: (saveFailure as any)?.mcpSettings })
+		if (request.expectedMcpSettings && !(saveFailure as any)?.mcpSettingsSaved) mcpDraftHeld = true
 		const message = saveFailure instanceof Error ? saveFailure.message : 'Failed to save MCP settings'
 		saveStatus = 'error'
 		saveError = message
@@ -885,48 +985,56 @@ async function persistMcpSettings(reason: string, gatewayToggles?: GatewayToggle
 	}
 }
 
-async function persistZipSettings(reason: string) {
-	const saved = zipSavedFields
-	if (!currentAgent?.id || !persistReady || !saved) return
-
-	const next = buildZipSaveFields({
-		layout: zipAiViewMode,
-		customTools: customToolZipOverrides,
-		nonMcp: nonMcpZipOverrides
-	})
-	// BL-855: only the zip fields that changed since the values this surface last knew, a
-	// `custom_tool_settings` whole (it is one list) and only when a custom tool row changed.
-	const update: Record<string, unknown> = {}
-	for (const [field, value] of Object.entries(next)) {
-		if (!sameJsonValue(saved[field], value)) update[field] = value
-	}
-	if (Object.keys(update).length === 0) return
-
-	zipSaveState = 'saving'
-	zipSaveError = null
-	clearZipSaveResetTimer()
-
-	try {
-		await updateAgentSettings(currentAgent.id, update as AgentSettingsUpdate)
-		zipSaveState = 'saved'
-		zipLastSaved = new Date()
-		scheduleZipSaveReset()
-	} catch (saveFailure) {
-		const message =
-			saveFailure instanceof Error ? saveFailure.message : 'Failed to save zip settings'
-		zipSaveState = 'idle'
-		zipSaveError = message
-		console.error('[MCPsDropdown] Failed to persist zip settings', { reason, error: saveFailure })
-		toast.error('Failed to save tool zip settings', { description: message })
-	}
+type CapturedZip = { id: string; reason: string; body: AgentSettingsUpdate; values: ReturnType<typeof buildZipSaveFields>; started: boolean; cancelled?: boolean }
+let queuedZip: CapturedZip | undefined
+async function persistZipSettings(captured: CapturedZip) {
+  if (captured.started || captured.cancelled) return
+  captured.started = true
+  if (queuedZip === captured) queuedZip = undefined
+  const { id, body, values } = captured
+  if (currentAgent?.id === id) { zipSaveState = 'saving'; zipSaveError = null; clearZipSaveResetTimer() }
+  try {
+    const acknowledgement = await updateAgentSettings(id, body)
+    adoptMcpAck(id, body.expectedMcpSettings, acknowledgement)
+    if ('live_file_reads' in body || 'zip_ai_view_mode' in body) void refreshAllDeadCopies()
+    if (currentAgent?.id !== id) return
+    zipSavedFields = values
+    zipSaveState = 'saved'; zipLastSaved = new Date(); scheduleZipSaveReset()
+  } catch (error) {
+    if (currentAgent?.id !== id) return
+    adoptMcpAck(id, body.expectedMcpSettings, { mcpSettings: (error as any)?.mcpSettings })
+    if (body.expectedMcpSettings && !(error as any)?.mcpSettingsSaved) zipDraftHeld = true
+    zipSaveState = 'error'; zipSaveError = error instanceof Error ? error.message : 'Failed to save tool zip settings'
+    toast.error('Failed to save tool zip settings', { description: zipSaveError })
+  }
 }
-
-const debouncedPersistZipSettings = debounce((reason: string) => {
-	void persistZipSettings(reason)
-}, 250)
-
+let zipPersistTimer: ReturnType<typeof setTimeout> | undefined
+function debouncedPersistZipSettings(captured: CapturedZip) {
+  if (zipPersistTimer) clearTimeout(zipPersistTimer)
+  zipPersistTimer = setTimeout(() => { zipPersistTimer = undefined; void persistZipSettings(captured) }, 250)
+}
 function queuePersistZipSettings(reason: string) {
-	debouncedPersistZipSettings(reason)
+  const id = currentAgent?.id, saved = zipSavedFields
+  if (!id || !persistReady || !saved) return
+	const values = buildZipSaveFields({ layout: zipAiViewMode, notes: zipToolNotesEnabled, liveReads: liveFileReads, customTools: customToolZipOverrides, nonMcp: nonMcpZipOverrides })
+  const update = Object.fromEntries(Object.entries(values).filter(([field, value]) => !sameJsonValue(saved[field], value)))
+  if (!Object.keys(update).length) {
+    if (queuedZip?.id === id && !queuedZip.started) {
+      queuedZip.cancelled = true
+      queuedZip = undefined
+      if (zipPersistTimer) clearTimeout(zipPersistTimer)
+      zipPersistTimer = undefined
+      if (!zipDraftHeld) { zipSaveState = 'idle'; zipSaveError = null }
+    }
+    return
+  }
+  try {
+    if (zipDraftHeld) throw new Error('Your Tool Settings draft is kept. Use Saved Tool Settings before another choice.')
+    const body = withExpectedMcpSettings(update, mcpOriginalBase) as AgentSettingsUpdate
+    if (queuedZip && queuedZip.id !== id) void persistZipSettings(queuedZip)
+    queuedZip = { id, reason, body: structuredClone($state.snapshot(body)), values: structuredClone($state.snapshot(values)), started: false }
+    zipSaveState = 'saving'; debouncedPersistZipSettings(queuedZip)
+  } catch (error) { zipSaveState = 'error'; zipSaveError = error instanceof Error ? error.message : 'Read Saved Tool Settings.' }
 }
 
 function handleMcpGatewaysChange(gateways: string[]) {
@@ -962,6 +1070,7 @@ function handleMcpToolZipOverrideChange(
 
 	const current = customToolZipOverrides.find((tool) => tool.tool_name === normalizedName)
 	const nextEntry: CustomToolZipFormEntry = {
+		retained: current?.retained,
 		tool_name: normalizedName,
 		buffer_size: current?.buffer_size ?? '',
 		zip_threshold: current?.zip_threshold ?? '',
@@ -973,7 +1082,7 @@ function handleMcpToolZipOverrideChange(
 	const isEmptyOverride =
 		!nextEntry.buffer_size &&
 		!nextEntry.zip_threshold &&
-		(nextEntry.auto_zip === ZIP_AUTO_INHERIT || !nextEntry.auto_zip)
+		(nextEntry.auto_zip === ZIP_AUTO_INHERIT || !nextEntry.auto_zip) && !Object.keys(nextEntry.retained ?? {}).length
 	const nextCustomTools = isEmptyOverride
 		? withoutCurrent
 		: [...withoutCurrent, nextEntry].sort((left, right) =>
@@ -993,8 +1102,21 @@ function handleZipAiViewModeChange(value: string) {
 	queuePersistZipSettings('tool-grid-zip-layout')
 }
 
+function handleZipToolNotesChange(value: string) {
+	zipToolNotesEnabled = value || ZIP_LAYOUT_INHERIT
+	queuePersistZipSettings('tool-grid-tool-notes')
+}
+
+function handleLiveFileReadsChange(value: string) {
+	if (refreshedFileReadsAvailability.unavailableReason) return
+	liveFileReads = value || ZIP_LAYOUT_INHERIT
+	queuePersistZipSettings('tool-grid-refreshed-file-reads')
+}
+
 function handleResetZipOverrides() {
 	zipAiViewMode = ZIP_LAYOUT_INHERIT
+	zipToolNotesEnabled = ZIP_LAYOUT_INHERIT
+	liveFileReads = ZIP_LAYOUT_INHERIT
 	customToolZipOverrides = []
 	nonMcpZipOverrides = createInheritedNonMcpZipOverrides()
 	queuePersistZipSettings('tool-grid-zip-reset')
@@ -1005,6 +1127,8 @@ function handleClearDefaults() {
 	selectedGateways = new Set()
 	dcmDisplaySettings = createDefaultDcmDisplaySettings()
 	zipAiViewMode = ZIP_LAYOUT_INHERIT
+	zipToolNotesEnabled = ZIP_LAYOUT_INHERIT
+	liveFileReads = ZIP_LAYOUT_INHERIT
 	customToolZipOverrides = []
 	nonMcpZipOverrides = createInheritedNonMcpZipOverrides()
 	onMCPsChange([])
@@ -1044,6 +1168,15 @@ $effect(() => {
 })
 
 $effect(() => {
+	const id = currentAgent?.id
+	const cut = id ? getAgentMcpSettingsCut(id) : undefined
+	const detailChanged = cut !== lastDetailCut
+	const mcpDirty = mcpViewSignature !== undefined && mcpViewSignature !== mcpFormSignature()
+	const zipDirty = zipSavedFields !== null && !sameJsonValue(zipSavedFields, buildZipSaveFields({ layout: zipAiViewMode, notes: zipToolNotesEnabled, liveReads: liveFileReads, customTools: customToolZipOverrides, nonMcp: nonMcpZipOverrides }))
+	// An owed follow wakes hydration only when that section can take it. Returning
+	// a draft to baseline cannot hydrate over an issued save or spin on the debt.
+	const mcpCanFollow = !nativeControls.cliHeld && !mcpDraftHeld && !mcpDirty && saveStatus !== 'saving'
+	const zipCanFollow = !zipDraftHeld && !zipDirty && zipSaveState !== 'saving'
 	const currentGatewaySignature = JSON.stringify(normalizeGatewaySelection(currentAgent?.defaultMCPGateways))
 	const currentDcmSignature = buildDcmSignature(extractAgentDcmDisplaySettings(currentAgent))
 	const currentToolSelectionSignature = JSON.stringify(
@@ -1056,6 +1189,8 @@ $effect(() => {
 	)
 	const currentZipSignature = JSON.stringify({
 		zip_ai_view_mode: toZipLayoutValue(currentAgent?.zip_ai_view_mode),
+		zip_tool_notes_enabled: currentAgent?.zip_tool_notes_enabled,
+		live_file_reads: currentAgent?.live_file_reads,
 		custom_tool_settings: normalizeCustomToolZipOverrides(currentAgent?.custom_tool_settings),
 		non_mcp_rows: normalizeNonMcpZipOverrides(currentAgent as Record<string, any>)
 	})
@@ -1067,8 +1202,11 @@ $effect(() => {
 	const cliToolsChanged = currentCliToolSignature !== lastCliToolSignature
 	const zipChanged = currentZipSignature !== lastZipSignature
 
-	if (agentChanged || gatewaysChanged || dcmChanged || selectionsChanged || cliToolsChanged || zipChanged) {
+	if (agentChanged || detailChanged || gatewaysChanged || dcmChanged || selectionsChanged || cliToolsChanged || zipChanged || mcpFollowPending && mcpCanFollow || zipFollowPending && zipCanFollow) {
 		persistReady = false
+		if (agentChanged) { mcpDraftHeld = false; zipDraftHeld = false; mcpOriginalBase = undefined }
+		if (id && requestedMcpDetailId !== id) { requestedMcpDetailId = id; untrack(() => { void loadAgentMcpSettingsDetail(id).then(cut => { if (currentAgent?.id === id && !cut) { mcpDraftHeld = true; zipDraftHeld = true; saveStatus = 'error'; saveError = 'Saved Tool Settings could not be read. Your draft is kept.' } }) }) }
+		lastDetailCut = cut
 		lastAgentId = currentAgent?.id
 		lastGatewaySignature = currentGatewaySignature
 		lastDcmSignature = currentDcmSignature
@@ -1076,35 +1214,48 @@ $effect(() => {
 		lastCliToolSignature = currentCliToolSignature
 		lastZipSignature = currentZipSignature
 
-		const defaultGateways = normalizeGatewaySelection(currentAgent?.defaultMCPGateways)
-		selectedGateways = new Set(defaultGateways)
+		const originalRead = cut?.record ?? currentAgent
+		const defaultGateways = normalizeGatewaySelection(originalRead?.defaultMCPGateways)
+		const takeMcp = agentChanged || mcpCanFollow
+		const takeZip = agentChanged || zipCanFollow
+		if (takeMcp) {
+		selectedGateways = new Set(gatewayCatalogLoaded ? defaultGateways.filter(id => gateways.some(gateway => gateway.id === id && gateway.type !== 'n8n-mcp-client')) : defaultGateways)
 		selectedCliToolIdsExplicit =
 			Array.isArray(currentAgent?.defaultTools) || Array.isArray((currentAgent as any)?.default_tools)
 		selectedCliToolIds = normalizeCliToolSelections(
 			currentAgent?.defaultTools ?? (currentAgent as any)?.default_tools
 		)
 		dcmDisplaySettings = cloneDcmDisplaySettings(extractAgentDcmDisplaySettings(currentAgent))
+			if (cut) mcpOriginalBase = { ...mcpOriginalBase, defaultMCPGateways: cut.revisions.defaultMCPGateways, defaultMCPToolSelections: cut.revisions.defaultMCPToolSelections }
+			mcpViewSignature = mcpFormSignature()
+			mcpFollowPending = false
+		} else mcpFollowPending = true
+		if (takeZip) {
 			zipAiViewMode = toZipLayoutValue(currentAgent?.zip_ai_view_mode)
-			customToolZipOverrides = normalizeCustomToolZipOverrides(currentAgent?.custom_tool_settings)
-			nonMcpZipOverrides = normalizeNonMcpZipOverrides(currentAgent as Record<string, any>)
+			zipToolNotesEnabled = typeof currentAgent?.zip_tool_notes_enabled === 'boolean' ? currentAgent.zip_tool_notes_enabled ? 'enabled' : 'disabled' : ZIP_LAYOUT_INHERIT
+			liveFileReads = typeof currentAgent?.live_file_reads === 'boolean' ? currentAgent.live_file_reads ? 'enabled' : 'disabled' : ZIP_LAYOUT_INHERIT
+			customToolZipOverrides = normalizeCustomToolZipOverrides(originalRead?.custom_tool_settings)
+			nonMcpZipOverrides = normalizeNonMcpZipOverrides({ ...currentAgent, custom_tool_settings: originalRead?.custom_tool_settings })
 			// BL-855: the baselines the two saves diff against: the agent as this surface just read it.
-			mcpSaveEpoch += 1
-			mcpSavedValues = currentAgent ? readMcpSavedValues(currentAgent) : null
-			zipSavedFields = currentAgent
+			if (cut) mcpOriginalBase = { ...mcpOriginalBase, custom_tool_settings: cut.revisions.custom_tool_settings }
+			zipFollowPending = false
+		} else zipFollowPending = true
+			if (takeMcp) { mcpSaveEpoch += 1; mcpSavedValues = currentAgent ? { ...readMcpSavedValues(currentAgent), gateways: defaultGateways } : null }
+			if (takeZip) zipSavedFields = currentAgent
 				? buildZipSaveFields({
 						layout: toZipLayoutValue(currentAgent.zip_ai_view_mode),
-						customTools: normalizeCustomToolZipOverrides(currentAgent.custom_tool_settings),
-						nonMcp: normalizeNonMcpZipOverrides(currentAgent as Record<string, any>)
+						notes: typeof currentAgent.zip_tool_notes_enabled === 'boolean' ? currentAgent.zip_tool_notes_enabled ? 'enabled' : 'disabled' : ZIP_LAYOUT_INHERIT,
+						liveReads: typeof currentAgent.live_file_reads === 'boolean' ? currentAgent.live_file_reads ? 'enabled' : 'disabled' : ZIP_LAYOUT_INHERIT,
+						customTools: normalizeCustomToolZipOverrides(originalRead?.custom_tool_settings),
+						nonMcp: normalizeNonMcpZipOverrides({ ...currentAgent, custom_tool_settings: originalRead?.custom_tool_settings })
 					})
 				: null
 			mcpRenderNonce += 1
 		clearSaveResetTimer()
 		clearZipSaveResetTimer()
-		saveStatus = 'idle'
-		saveError = null
-		zipSaveState = 'idle'
-		zipSaveError = null
-		onMCPsChange(defaultGateways)
+		if (takeMcp) { saveStatus = 'idle'; saveError = null }
+		if (takeZip) { zipSaveState = 'idle'; zipSaveError = null }
+		if (takeMcp) onMCPsChange(Array.from(selectedGateways))
 		onToolSelectionsChange(normalizeToolSelections(currentAgent?.defaultMCPToolSelections))
 
 		untrack(() => {
@@ -1112,7 +1263,7 @@ $effect(() => {
 				void fetchGatewayTools(gatewayId)
 			}
 		})
-		persistReady = Boolean(currentAgent?.id)
+		persistReady = Boolean(currentAgent?.id && cut)
 	}
 })
 
@@ -1144,6 +1295,7 @@ async function fetchGateways() {
 		}
 		const data = await response.json()
 		gateways = data.gateways || []
+		gatewayCatalogLoaded = true
 	} catch (loadError) {
 		error = loadError instanceof Error ? loadError.message : 'Failed to load gateways'
 		console.error('[MCPsDropdown] Error loading gateways:', loadError)
@@ -1159,9 +1311,11 @@ async function fetchGateways() {
 	const validIds = new Set(
 		gateways.filter((gateway) => gateway.type !== 'n8n-mcp-client').map((gateway) => gateway.id)
 	)
+	const wasClean = mcpViewSignature === mcpFormSignature() && saveStatus !== 'saving' && !mcpDraftHeld
 	const filteredSelection = Array.from(selectedGateways).filter((id) => validIds.has(id))
 	if (filteredSelection.length !== selectedGateways.size) {
 		selectedGateways = new Set(filteredSelection)
+		if (wasClean) mcpViewSignature = mcpFormSignature()
 		onMCPsChange(filteredSelection)
 	}
 }
@@ -1298,6 +1452,7 @@ let contextBadgeTitle = $derived(totalToolsSelected > 0 ? `${totalToolsSelected}
 
 	<DropdownMenu.Content
 		align="start"
+		collisionPadding={8}
 		class="mcp-tools-dropdown-content batshit-settings-sheet"
 		forceMount={true}
 	>
@@ -1312,14 +1467,19 @@ let contextBadgeTitle = $derived(totalToolsSelected > 0 ? `${totalToolsSelected}
 						<p>Error: {error}</p>
 						<Button variant="outline" size="sm" onclick={refreshToolCatalogs} class="mt-2"><RefreshCcw aria-hidden="true" />Retry</Button>
 					</div>
-				{:else if interactiveGateways.length === 0}
+				{:else if !currentAgent}
 					<div class="mcp-tools-dropdown-state batshit-settings-caption">
-						No MCP gateways available.
+						Choose an agent to edit its tools.
 					</div>
 				{:else}
+                    {#if mcpDraftHeld || zipDraftHeld}
+                      <div class="batshit-settings-action-row"><span class="batshit-settings-form-meta is-error">Your Tool Settings draft is kept.</span><Button variant="outline" size="sm" disabled={saveStatus === 'saving' || zipSaveState === 'saving'} onclick={useSavedToolSettings}>Use Saved Tool Settings</Button></div>
+                    {/if}
+					{#key gridOwnerKey(currentAgent)}
 					<AgentMcpDefaultsCard
 						agentId={currentAgent?.id ?? null}
-						toolHostScope={isCliPrimaryAgentType(normalizePrimaryAgentType(currentAgent)) ? 'cli' : 'api'}
+						subjectKind="primary"
+						toolHostScope="api"
 						userId={userId ?? null}
 						defaultMCPGateways={Array.from(selectedGateways)}
 						defaultMCPToolSelections={normalizeToolSelections(currentAgent?.defaultMCPToolSelections)}
@@ -1333,15 +1493,16 @@ let contextBadgeTitle = $derived(totalToolsSelected > 0 ? `${totalToolsSelected}
 						nativeDynamicMcpEnabled={nativeDynamicMcpEnabled}
 						nativeCliToolsEnabled={nativeCliToolsEnabled}
 						nativeToolSettings={getNativeToolsSettings(currentAgent)}
-						isCodexMode={isCliPrimaryAgentType(normalizePrimaryAgentType(currentAgent))}
-						onGatewaysChange={handleMcpGatewaysChange}
-						onDcmDisplaySettingsChange={handleMcpDcmDisplaySettingsChange}
-						onCliToolIdsChange={handleCliToolSelectionsChange}
+						getEnableControl={(id) => nativeControls.control(id)}
+            discoveryReadOnly={nativeControls.cliHeld}
+						onGatewaysChange={guardGridChoice(currentAgent, handleMcpGatewaysChange, true)}
+						onDcmDisplaySettingsChange={guardGridChoice(currentAgent, handleMcpDcmDisplaySettingsChange, true)}
+						onCliToolIdsChange={guardGridChoice(currentAgent, handleCliToolSelectionsChange, true)}
 						getToolZipOverride={getToolZipOverride}
-						onToolZipOverrideChange={handleMcpToolZipOverrideChange}
+						onToolZipOverrideChange={guardGridChoice(currentAgent, handleMcpToolZipOverrideChange)}
 						showZipControls={true}
 						showCardHeader={false}
-						showZipModeControls={false}
+						showZipModeControls={true}
 						showPostTableControls={false}
 						showGridIntroBlock={false}
 						fullWidthTable={true}
@@ -1349,15 +1510,23 @@ let contextBadgeTitle = $derived(totalToolsSelected > 0 ? `${totalToolsSelected}
 						defaultOpen={true}
 						cardCollapsible={false}
 						zipAiViewMode={zipAiViewMode}
+						{zipToolNotesEnabled}
+						{liveFileReads}
+						liveFileReadsUnavailableReason={refreshedFileReadsAvailability.unavailableReason}
+						liveFileReadsWarn={refreshedFileReadsAvailability.warn}
+						liveFileReadsNote={refreshedFileReadsAvailability.note}
 						nonMcpZipRows={NON_MCP_ZIP_ROW_ORDER}
 						getNonMcpZipOverride={getNonMcpZipOverrideById}
-						onNonMcpZipOverrideChange={handleNonMcpZipOverrideChangeById}
-						onZipAiViewModeChange={handleZipAiViewModeChange}
-						zipSaveState={zipSaveState}
+						onNonMcpZipOverrideChange={guardGridChoice(currentAgent, handleNonMcpZipOverrideChangeById)}
+						onZipAiViewModeChange={guardGridChoice(currentAgent, handleZipAiViewModeChange)}
+						onZipToolNotesChange={guardGridChoice(currentAgent, handleZipToolNotesChange)}
+						onLiveFileReadsChange={guardGridChoice(currentAgent, handleLiveFileReadsChange)}
+						zipSaveState={zipSaveState === 'error' ? 'idle' : zipSaveState}
 						zipSaveError={zipSaveError}
 						zipValidationError={null}
 						zipLastSaved={zipLastSaved}
 					/>
+					{/key}
 				{/if}
 
 			{#if syntheticGateways.length > 0}
@@ -1393,7 +1562,7 @@ let contextBadgeTitle = $derived(totalToolsSelected > 0 ? `${totalToolsSelected}
 		display: flex;
 		width: min(780px, calc(100vw - 1.5rem));
 		max-width: calc(100vw - 1.5rem);
-		max-height: 640px;
+		max-height: min(640px, calc(100dvh - 1rem), var(--bits-dropdown-menu-content-available-height, 640px));
 		flex-direction: column;
 		overflow: hidden;
 		z-index: var(--z-popover);

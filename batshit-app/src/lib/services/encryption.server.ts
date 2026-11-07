@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { building } from '$app/environment';
+import { building } from '$app/env';
 import { env } from '$env/dynamic/private';
 
 // Historical placeholder value — recognized so an old .env that still carries

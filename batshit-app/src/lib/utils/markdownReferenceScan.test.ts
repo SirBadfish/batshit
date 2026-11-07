@@ -1,13 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import {
-  scanTranscriptReferences, scanMessageZipReferences, scanMessageClipReferences,
+  scanTranscriptReferences,
   scanTranscriptLegacyClipBlocks
 } from './markdownReferenceScan'
 
 // Literal pre-fix readers are an independent compatibility oracle on short inputs.
 const transcriptRegex = /\{\{(batshit-zip|batshit-clip):([^:}]+?)(?::::([^}]+))?\}\}/g
-const messageZipRegex = /\{\{batshit-zip:([^:]+?)(?::::([^}]+?))?\}\}/g
-const messageClipRegex = /\{\{batshit-clip:([^:]+?)(?::::([^}]+?))?\}\}/g
 const legacyRegex = /\{\{batshit-clip\|([^}]+)\}\}([\s\S]*?)\{\{\/batshit-clip\}\}/g
 function modernOracle(text: string, regex: RegExp, kind?: 'batshit-zip' | 'batshit-clip') {
   return Array.from(text.matchAll(regex), (m) => ({
@@ -49,12 +47,6 @@ function examples() {
 describe('markdownReferenceScan existing grammar compatibility', () => {
   it('matches the transcript modern reader exactly, including positions and captures', () => {
     for (const text of examples()) expect(scanTranscriptReferences(text), text).toEqual(modernOracle(text, transcriptRegex))
-  })
-  it('matches the message zip reader exactly, retaining its broader id grammar', () => {
-    for (const text of examples()) expect(scanMessageZipReferences(text), text).toEqual(modernOracle(text, messageZipRegex, 'batshit-zip'))
-  })
-  it('matches the message clip reader exactly, retaining its broader id grammar', () => {
-    for (const text of examples()) expect(scanMessageClipReferences(text), text).toEqual(modernOracle(text, messageClipRegex, 'batshit-clip'))
   })
   it('matches the legacy block reader exactly, including nested and unfinished blocks', () => {
     for (const text of examples()) expect(scanTranscriptLegacyClipBlocks(text), text).toEqual(legacyOracle(text))

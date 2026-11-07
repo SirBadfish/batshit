@@ -69,6 +69,7 @@ describe('LipArtworkEngineRuntime', () => {
     const runtime = new LipArtworkEngineRuntime(root, contract, {
       loadAsync: async () => texture
     })
+    expect(runtime.getMotionMeshes()).toEqual([mesh])
 
     expect(await runtime.apply(fixtureState())).toBe(true)
     expect(mesh.material).not.toBe(original)
@@ -92,6 +93,7 @@ describe('LipArtworkEngineRuntime', () => {
     expect(await runtime.apply(null)).toBe(true)
     expect(mesh.material).toBe(original)
     runtime.dispose()
+    expect(runtime.getMotionMeshes()).toBeNull()
     expect(mesh.material).toBe(original)
   })
 

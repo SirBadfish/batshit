@@ -3,7 +3,7 @@
    * The two Tool Grid cells a broker family owns: Discoverable and Display Detail.
    *
    * SA-096. Rendered by `BrokerFamilyToolGridRow` on the discoverability-only surfaces
-   * and by `NonMcpZipRowsSection` on the `Fabric Controls` / `Artifact Tools` rows inside
+   * and by `NonMcpZipRowsSection` on the `Fabric & Utilities` / `Artifact Tools` rows inside
    * the `Batshit Tools` accordion. Keeping the markup here is what makes the two
    * placements behave identically instead of drifting into two lookalike controls.
    *
@@ -17,18 +17,20 @@
 
   interface Props {
     controls: BrokerFamilyRowControls
+    showDiscoverable?: boolean
     /** Rendered at the end of the Display Detail cell; used for the row info menu. */
     trailing?: Snippet
     /** Layout of the Display Detail cell. `spread` pushes `trailing` to the far edge. */
     detailLayout?: 'compact' | 'spread'
   }
 
-  let { controls, trailing, detailLayout = 'compact' }: Props = $props()
+  let { controls, trailing, detailLayout = 'compact', showDiscoverable = true }: Props = $props()
 
   const toneClass = $derived(controls.toneClass ?? (() => 'text-white'))
   const triggerClass = $derived(controls.triggerClass ?? (() => ''))
 </script>
 
+{#if showDiscoverable}
 <td class="batshit-settings-table-cell">
   <Switch.Root
     checked={controls.visible}
@@ -37,6 +39,7 @@
     onCheckedChange={(checked) => controls.onVisibleChange(checked === true)}
   />
 </td>
+{/if}
 <td class="batshit-settings-table-cell">
   <div class={`flex items-center gap-2 ${detailLayout === 'spread' ? 'justify-between' : ''}`}>
     {#if controls.visible}

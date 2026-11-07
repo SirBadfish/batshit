@@ -20,6 +20,9 @@ export function generatePinokioRuntimeApi(): string {
     var START_TIMEOUT_MS = 180000;
     var pending = {};
     var banner = null;
+    // An issued native chain may outlive our observation. Only a normal recipe retry follows it.
+    var observeOnly = false;
+    var observationMessage = '';
 
     window.addEventListener('message', function(event) {
       var data = event.data || {};
@@ -40,7 +43,7 @@ export function generatePinokioRuntimeApi(): string {
       return new Promise(function(resolve) {
         var timer = setTimeout(function() {
           delete pending[requestId];
-          resolve({ ok: false, message: 'Batshit did not answer the start request.' });
+          resolve({ ok: false, launchState: 'unknown', observationEnded: 'timeout', message: 'Batshit did not answer the start request. Check the app before trying its recipe again.' });
         }, START_TIMEOUT_MS);
         pending[requestId] = function(data) { clearTimeout(timer); resolve(data); };
         window.parent.postMessage({ type: 'batshit:pinokio:start-request', artifactId: window.batshit.artifactId, requestId: requestId }, '*');
@@ -64,14 +67,14 @@ export function generatePinokioRuntimeApi(): string {
     function offerStart(meta) {
       removeBanner();
       var title = (meta && meta.title) || 'The app';
-      var starting = meta && meta.state === 'starting';
+      var starting = observeOnly || (meta && meta.state === 'starting');
       banner = document.createElement('div');
       banner.className = 'batshit-builder-status batshit-pinokio-offline';
       banner.setAttribute('data-kind', 'warning');
       banner.setAttribute('role', 'status');
       banner.style.cssText = 'display:grid;gap:8px;margin:0 0 12px;padding:10px 12px;border:1px solid var(--batshit-border-subtle);border-radius:var(--batshit-radius);font:500 13px/1.4 var(--batshit-font);color:var(--batshit-text);';
       var text = document.createElement('div');
-      text.textContent = starting ? title + ' is still starting in Pinokio.' : title + ' is not running in Pinokio.';
+      text.textContent = observeOnly ? observationMessage : starting ? title + ' is still starting in Pinokio.' : title + ' is not running in Pinokio.';
       var actions = document.createElement('div');
       actions.className = 'batshit-builder-inline';
       actions.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;';
@@ -93,7 +96,10 @@ export function generatePinokioRuntimeApi(): string {
           later.disabled = true;
           text.textContent = 'Confirm the start in Batshit. Starting ' + title + ' can take a minute.';
           requestStart().then(function(result) {
-            if (result && result.ok) {
+            var remote = result && result.machineId && result.machineId !== 'local';
+            var ended = result && (result.nativeControlOutcome === 'blocked' || result.nativeControlOutcome === 'cancelled' || result.observationEnded === 'cancelled' || result.observationEnded === 'timeout');
+            var uncertain = result && (result.launchState === 'pending' || result.launchState === 'unknown' || result.state === 'starting');
+            if (result && result.ok && !ended && !uncertain && (!remote || result.endpointReady === true)) {
               text.textContent = title + ' is running. Running again…';
               resolve(true);
               return;
@@ -101,7 +107,16 @@ export function generatePinokioRuntimeApi(): string {
             text.textContent = (result && result.message) || (title + ' did not start.');
             go.disabled = false;
             later.disabled = false;
-            if (result && result.state === 'starting') { starting = true; go.textContent = 'Try Again'; }
+            var notSent = result && result.ok === false && result.startEffect === 'not_sent' && !ended && !uncertain;
+            if (observeOnly || !notSent) {
+              observeOnly = true;
+              observationMessage = text.textContent;
+              starting = true;
+              go.textContent = 'Try Again';
+            } else {
+              starting = false;
+              go.textContent = 'Start with Pinokio';
+            }
           });
         });
       });

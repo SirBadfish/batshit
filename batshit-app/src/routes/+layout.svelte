@@ -9,7 +9,24 @@
   import ConfirmDialogHost from '$lib/components/ui/ConfirmDialogHost.svelte';
   import PinokioStartBridge from '$lib/components/artifacts/PinokioStartBridge.svelte';
   import { installGlobalClientTelemetry } from '$lib/services/clientTelemetry';
+  import { setGoonsOwner } from '$lib/stores/goons.svelte';
+  import { setGoonAnimationLibraryOwner } from '$lib/stores/goonAnimationLibrary.svelte';
+  import { applyAppLook, resolveAppLook } from '$lib/appearance/appLook';
+  import { getUserSettings, getUserSettingsReadState } from '$lib/stores/userSettings.svelte';
   const { data, children } = $props();
+
+  // The app's look: the server painted it on <html> before the first frame; this keeps it
+  // current once the settings store holds a confirmed copy (a save, or a refresh).
+  $effect(() => {
+    const confirmed = getUserSettingsReadState() === 'confirmed';
+    applyAppLook(resolveAppLook(confirmed ? getUserSettings() : data?.userSettings));
+  });
+
+  $effect(() => {
+    const owner = typeof page.data?.user?.id === 'string' ? page.data.user.id : null;
+    setGoonsOwner(owner);
+    setGoonAnimationLibraryOwner(owner);
+  });
 
   const isDesktopGoonPage = $derived(page.url.pathname === '/desktop-goon');
   const isDesktopControlsPage = $derived(page.url.pathname === '/desktop-controls');
@@ -122,6 +139,11 @@
   )
 </script>
 
+{#if !isDesktopCompanionPage}
+  <!-- The Mac app window's drag handle; shown only there (app.css, Mac title bar). -->
+  <div class="app-window-drag-strip" aria-hidden="true"></div>
+{/if}
+
 {#if isDesktopCompanionPage}
   {@render children?.()}
 {:else if isAuthPage}
@@ -137,6 +159,14 @@
       <!-- Main content area with inset -->
       <Sidebar.SidebarInset class="app-main-inset">
         <header class="app-header-bar">
+          <!-- The closed sidebar's logo, in the Mac app's top bar only. -->
+          <img
+            src="/batshit-logo-small.svg"
+            alt=""
+            class="app-header-logo"
+            width="41"
+            height="20"
+          />
           <div class="app-header-spacer"></div>
         </header>
         

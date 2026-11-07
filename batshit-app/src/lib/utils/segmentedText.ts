@@ -2,10 +2,11 @@
  * A reply's text kept as pieces by segment (BL-759).
  *
  * A managed lane may take back a message its vendor never finished and started again: Codex's
- * app-server lane retries a dropped response stream by itself and starts the answer again as a
- * new item. Each text chunk of such a lane names its segment (the vendor message it belongs to),
- * and a retract names one segment. A reader that keeps the text removes that segment's pieces and
- * nothing else: never by a count of characters, never by a search for its words.
+ * app-server lane (removed in SA-139 R1) retried a dropped response stream by itself and started
+ * the answer again as a new item. Each text chunk of such a lane names its segment (the vendor
+ * message it belongs to), and a retract names one segment. A reader that keeps the text removes
+ * that segment's pieces and nothing else: never by a count of characters, never by a search for
+ * its words.
  *
  * Text with no segment (Batshit's own additions, and every lane that never takes text back) is
  * never removed. Adjacent pieces of the same segment are joined, so the list stays as long as the

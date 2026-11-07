@@ -5,6 +5,7 @@ import type {
   DelegatedRunStatus,
   DelegatedRunThread,
 } from '$lib/types/delegation'
+import { DELEGATED_RUN_STATUSES } from '$lib/types/delegation'
 import {
   buildUsageLike,
   normalizeUsageLike,
@@ -55,7 +56,7 @@ function findDelegatedPayload(value: unknown, depth = 0): Record<string, any> | 
   if (!record) return null
   if (
     (record.kind === 'subagent' || record.kind === 'worker') &&
-    ['completed', 'failed', 'timed_out'].includes(record.status)
+    DELEGATED_RUN_STATUSES.includes(record.status)
   ) {
     return record
   }
@@ -162,7 +163,7 @@ export function buildDelegatedExecutionSummary(steps: unknown): DelegatedExecuti
     if (batch) {
       for (const entry of batch) {
         const status = entry.status as DelegatedRunStatus
-        if (!['completed', 'failed', 'timed_out'].includes(status)) continue
+        if (!DELEGATED_RUN_STATUSES.includes(status)) continue
         const observation = observationOf(entry)
         const usage = observation.observedUsage || observation.observedUsageUnavailable ? null : normalizeUsageLike(entry.usage) ?? null
         addUsageForRun(usage)
@@ -229,6 +230,7 @@ export function buildDelegatedExecutionSummary(steps: unknown): DelegatedExecuti
       completed: runs.filter((run) => run.status === 'completed').length,
       failed: runs.filter((run) => run.status === 'failed').length,
       timedOut: runs.filter((run) => run.status === 'timed_out').length,
+      partial: runs.filter((run) => run.status === 'partial').length,
       usageKnownRuns,
       usageUnknownRuns: runs.length - usageKnownRuns,
       usage: buildUsageLike(totalUsage) ?? null,
@@ -269,6 +271,7 @@ export function mergeDelegatedSummaries(prior: unknown, resumed: unknown): Deleg
       completed: runs.filter((run) => run.status === 'completed').length,
       failed: runs.filter((run) => run.status === 'failed').length,
       timedOut: runs.filter((run) => run.status === 'timed_out').length,
+      partial: runs.filter((run) => run.status === 'partial').length,
       usageKnownRuns: count('usageKnownRuns'),
       usageUnknownRuns: count('usageUnknownRuns'),
       usage: usage ?? null,

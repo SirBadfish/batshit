@@ -7,6 +7,8 @@ import {
   isAgentRuntimeSettingKey,
   type RuntimeModelStandardSettings,
 } from '$lib/utils/modelSettingsMapper'
+import type { AgentReasoningOverrides, ExplicitReasoningSnapshot, LocalReasoningContract } from '$lib/types/reasoningControls'
+import { resolveModelReasoningControls } from '$lib/utils/modelReasoningControls'
 
 type ProviderSettings = Record<string, any> | null | undefined
 
@@ -20,6 +22,9 @@ export interface RuntimeModelSelectionArgs {
   contextWindow?: number | null
   capabilities?: ModelCapabilities | null
   settings?: ProviderSettings
+  reasoningOverrides?: AgentReasoningOverrides | null
+  localReasoning?: LocalReasoningContract | null
+  transport?: 'api'
 }
 
 export interface RuntimeModelSelection {
@@ -32,6 +37,7 @@ export interface RuntimeModelSelection {
   contextWindow: number | null
   capabilities: ModelCapabilities | null
   settings: Record<string, any> | null
+  explicitReasoning?: ExplicitReasoningSnapshot[]
 }
 
 function normalizeString(value: unknown): string | null {
@@ -127,8 +133,10 @@ export function resolveRuntimeModelSelection({
   contextWindow = null,
   capabilities = null,
   settings = null,
+  reasoningOverrides = null,
+  localReasoning = null,
 }: RuntimeModelSelectionArgs): RuntimeModelSelection {
-  return {
+  const selection: RuntimeModelSelection = {
     preset,
     presetId: normalizeString(preset?.id) ?? normalizeString(presetId),
     provider: normalizeString(preset?.provider) ?? normalizeString(provider),
@@ -147,4 +155,14 @@ export function resolveRuntimeModelSelection({
       ? mergePresetRuntimeSettings(settings, preset.settings ?? null)
       : nonEmptyRecord(settings),
   }
+  if (selection.connection && (selection.effectiveModelId || selection.modelId) && reasoningOverrides) {
+    const reasoning = resolveModelReasoningControls({
+      identity: { presetId: selection.presetId, connection: selection.connection,
+        effectiveModelId: selection.effectiveModelId ?? selection.modelId! },
+      settings: selection.settings, overrides: reasoningOverrides, localReasoning
+    })
+    selection.settings = reasoning.settings
+    if (reasoning.explicitReasoning.length) selection.explicitReasoning = reasoning.explicitReasoning
+  }
+  return selection
 }

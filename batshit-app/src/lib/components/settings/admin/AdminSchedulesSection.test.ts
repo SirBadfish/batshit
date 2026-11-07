@@ -390,3 +390,58 @@ describe('AdminSchedulesSection — editing a schedule (DL-118-13)', () => {
     expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('half typed')
   })
 })
+
+/**
+ * Independent review, 2026-10-25 — saved schedules stay listed when no agent can receive one.
+ * Turning off Agent DMs, or the Fabric & Utilities switch they need, for every agent empties
+ * the eligible list, but the schedules still fire (and record why each run failed), so the
+ * card must keep showing them, with a note, rather than claiming there is nothing here.
+ */
+describe('AdminSchedulesSection — saved schedules with no eligible agent', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('lists them with a note instead of the empty-state text', async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({
+        success: true,
+        schedules: [
+          {
+            id: 'sch_1',
+            agentId: 'agent-cooper',
+            agentName: 'Cooper',
+            name: 'Morning check',
+            cadence: { type: 'daily', at: '09:00' },
+            timeZone: 'America/Chicago',
+            message: 'Say good morning.',
+            kind: 'info',
+            deliver: 'wake',
+            enabled: true,
+            nextRunAt: '2026-09-09T14:00:00.000Z',
+            lastRunAt: null,
+            lastOutcome: null,
+            lastDmId: null,
+            runCount: 0,
+            missedRun: null,
+            createdBy: 'user',
+            createdAt: '2026-09-07T09:00:00.000Z',
+            updatedAt: '2026-09-07T09:00:00.000Z'
+          }
+        ],
+        agents: []
+      })
+    }))
+    // @ts-expect-error test override
+    global.fetch = fetchMock
+
+    render(AdminSchedulesSection, { props: { disabled: false } })
+
+    expect(await screen.findByText('Morning check')).toBeTruthy()
+    expect(screen.getByTestId('schedules-no-eligible-agent').textContent).toContain(
+      'No agent can receive a schedule'
+    )
+    expect(screen.queryByText(/No agent has Agent DMs turned on yet/)).toBeNull()
+  })
+})

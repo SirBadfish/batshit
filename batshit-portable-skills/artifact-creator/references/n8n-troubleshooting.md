@@ -35,15 +35,18 @@ Ask for a readable confirmation from Respond to Webhook: `{ "text": "Added 12 ch
 - The workflow sees `{ artifactId, prompt, context, ... }` instead of its own keys: turn on `metadata.webhook_passthrough: true`.
 - The workflow was built for that envelope and now sees flat keys: turn passthrough off for it.
 
-## Instance MCP limits
+## Instance MCP: capabilities and the artifact boundary
 
-Use the n8n Instance MCP to **find and inspect** workflows; artifacts **run** them through their webhook URL.
+For an artifact build, use the n8n Instance MCP to **find and inspect** an existing working workflow; artifacts **run** it through the saved webhook URL. Available MCP execution, test, edit, or publish tools do not authorize using them as part of the build. Those actions need a separate explicit user request and the appropriate tool access; follow `brain-n8n.md` for artifact readiness.
 
-1. **Binary data flooding:** a workflow that handles images or files returns all its internal execution data through MCP, not just the final output; a 600-character reply can become 200,000+ tokens. Artifacts are unaffected (they use the webhook), but running such a workflow through MCP's execute tool is expensive.
-2. **5-minute limit:** runs longer than five minutes are killed.
-3. **Text-only input:** MCP cannot send files to a workflow (a webhook can).
-4. **Read-only:** MCP cannot create, edit, or activate workflows.
-5. **Two opt-ins:** MCP must be on for the n8n instance and for each workflow, so not every workflow is visible.
+**Version scope:** the facts below were checked against n8n **2.35.4**. Inspect the connected instance's discovered tool schemas before relying on them. Batshit's optional Docker n8n/runner defaults are separately pinned to **2.22.1**; do not assume they expose the same tools or behavior.
+
+1. **Execution is asynchronous:** `execute_workflow` returns an execution ID and `started` status without waiting for completion. That is not a completed result or a universal five-minute run limit.
+2. **Execution data is opt-in:** `get_workflow_execution` returns metadata only by default. `includeData: true` can return large node inputs/outputs; use `nodeNames` and `truncateData` to narrow a necessary read. The item limit does not bound each item's byte size or strip embedded binary content. Artifact replies still come from Respond to Webhook.
+3. **Test timeout is separate:** `test_workflow` waits for its test run, with `timeout` defaulting to **300 seconds**, maximum **3600 seconds**. Pin data does not make all nodes harmless: credential-free command/file nodes can still act for real. Do not start a test merely to inspect a workflow.
+4. **Authoring exists:** this version includes `update_workflow` and `publish_workflow` (activate), subject to n8n permissions. Availability is not permission to change the user's workflow.
+5. **Inputs are structured data:** the execution schema accepts chat text, form data, or webhook JSON/headers/query; it provides no binary-file upload channel. Use the workflow's supported webhook upload contract for files.
+6. **Access is tool-specific:** the instance needs MCP enabled and valid authentication. In 2.35.4, detail/execution/update/publish access also checks workflow permissions and **Available in MCP**; a search result alone does not prove those operations are allowed.
 
 ## Webhook unreachable
 

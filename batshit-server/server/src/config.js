@@ -38,12 +38,18 @@ try {
   console.warn(`Failed to load config from ${configPath}:`, error.message);
 }
 
-// Merge configurations with environment variables taking precedence
+// Apply config-file fields over the environment-derived defaults.
 const config = {
   ...defaultConfig,
   ...fileConfig,
-  // Add any environment variable overrides here
 };
+
+if (config.httpsOnly && !config.enableHttps) {
+  throw new Error(
+    'Invalid server listener configuration: HTTPS_ONLY requires ENABLE_HTTPS. ' +
+    'Enable HTTPS (ENABLE_HTTPS=true) or disable HTTPS_ONLY (HTTPS_ONLY=false).'
+  );
+}
 
 // Ensure required directories exist
 if (!fs.existsSync(config.uploadsDir)) {

@@ -12,8 +12,9 @@
  * Both now become a failed turn of their own kind, `output_limit`, through the same metadata the
  * failure banner, the compile note, and the zip recovery hold already read (`response_failed`,
  * `error_message`, `failure_kind`). The rule is here; send-routed's pins are in
- * `send-routed-output-limit-contract.test.ts`. API lane only: the CLI tools meet their own output
- * limits inside their own loops, and their adapters never report a `length` finish.
+ * `send-routed-output-limit-contract.test.ts`. API lane only (the Claude plan connection, SA-139, is an
+ * API-lane model and reports `length` too): the CLI tools meet their own output limits inside their own
+ * loops, and their adapters never report a `length` finish.
  */
 
 export const OUTPUT_LIMIT_FAILURE_KIND = 'output_limit' as const
@@ -35,16 +36,21 @@ function limitPhrase(outputTokens: number | null | undefined): string {
 /**
  * The sentence the banner shows and the next compile passes on. `outputTokens` is the last
  * request's output count, which at a `length` stop is the limit itself; `wroteReply` says whether
- * any reply text or tool work came before the stop.
+ * any reply text or tool work came before the stop. A Claude plan reply (SA-139 D7) has no Max
+ * Tokens setting to raise: Claude Code owns its output limit, so the advice is a lower effort.
  */
 export function describeOutputLimitStop(input: {
   outputTokens: number | null | undefined
   wroteReply: boolean
+  claudePlan?: boolean
 }): string {
   const limit = limitPhrase(input.outputTokens)
+  const raise = input.claudePlan
+    ? 'lower the effort in its model settings, so less of the limit goes to thinking'
+    : 'raise Max Tokens in its model preset'
   return input.wroteReply
-    ? `The model reached ${limit} before this reply was finished. Ask the agent to continue, or raise Max Tokens in its model preset.`
-    : `The model reached ${limit} before it wrote a reply (its thinking counts toward the limit). Ask again, or raise Max Tokens in its model preset.`
+    ? `The model reached ${limit} before this reply was finished. Ask the agent to continue, or ${raise}.`
+    : `The model reached ${limit} before it wrote a reply (its thinking counts toward the limit). Ask again, or ${raise}.`
 }
 
 /**

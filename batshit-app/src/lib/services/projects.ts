@@ -1,4 +1,5 @@
 import type { Project } from '$lib/stores/projects.svelte'
+import { applySavedAnswersSince, projectAnswerSeq } from '$lib/projects/projectSaveAnswers'
 import type { ProjectPreferences } from '$lib/types/database'
 
 export class ProjectService {
@@ -21,13 +22,16 @@ export class ProjectService {
   }
   
   async loadProjects(userId: string): Promise<Project[]> {
+    // BL-2384 round 5: a save that answers while this read is on its way wins over the list,
+    // which the server may have read before that save landed.
+    const answersBefore = projectAnswerSeq()
     const response = await fetch('/api/projects')
     if (!response.ok) {
       throw new Error(await this.getErrorMessage(response, 'Failed to load projects'))
     }
 
     const { projects } = await response.json()
-    return projects || []
+    return applySavedAnswersSince<Project>(projects || [], answersBefore)
   }
   
   async createProject(project: Partial<Project>): Promise<Project> {
@@ -90,8 +94,7 @@ export class ProjectService {
     })
 
     if (!response.ok) {
-      const message = await response.text()
-      throw new Error(message || 'Failed to save project preferences')
+      throw new Error(await this.getErrorMessage(response, 'Failed to save project preferences'))
     }
 
     const { preferences } = await response.json()

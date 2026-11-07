@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { parseReasoningBudget } from '$lib/utils/modelReasoningBudget'
+  import { availableReasoningParameterValues } from '$lib/utils/modelReasoningPreview'
   import { refuse, type SettingsTarget } from '$lib/appActions/catalog'
   import { appActionsHaveDrafts, type ActionContext } from '$lib/appActions/owners'
 
@@ -38,7 +40,6 @@ import {
 } from '@lucide/svelte'
 import {
   filterParameters,
-  isParameterSupportedInN8N,
   isParameterSuppressedForModel,
   resolveParameterProvider
 } from '$lib/utils/parameterFilter'
@@ -63,14 +64,9 @@ import type { ParameterDefinition, ParameterValue } from '$lib/data/parameter-sc
 import { getParameterSchema } from '$lib/data/parameter-schemas'
 import { acknowledgeOllamaPresetCapabilities, projectOllamaPresetCapabilities } from '$lib/utils/ollamaModelCapabilities'
 import { LOCAL_AI_SERVER_DEFINITIONS } from '$lib/data/localAiServers'
+import { projectCatalogReasoningEvidence } from '$lib/utils/catalogReasoningEvidence'
 import { isTieredPricing } from '$lib/types/savedModels'
-import { determineModelCompatibility, isN8NSupported } from '$lib/data/model-compatibility-registry'
-import {
-  CODEX_SUBMODEL_CHOICES,
-  CODEX_XHIGH_REASONING_HELPER_TEXT,
-  supportsCodexXhighReasoning
-} from '$lib/data/codex-models'
-import type { CodexPermissionMode } from '$lib/types/codex'
+import { determineModelCompatibility } from '$lib/data/model-compatibility-registry'
 import {
   autoSelectConnectionForModel,
   getSavedModelBadgeProvider,
@@ -94,18 +90,15 @@ import { isManualEntryCatalogConnection } from '$lib/utils/modelCatalogConnectio
 import {
   CATALOG_ROLE_OPTIONS,
   almostEqual,
-  formatCompatibilityLabel,
   formatCurrencyDisplay,
   formatDeveloperLabel,
   formatFlexibleNumberDisplay,
   formatGroupedIntegerDisplay,
-  formatN8NStatus,
   formatParameterDisplayValue,
   formatPrice,
   getConnectionIconMeta,
   matchesCatalogRole,
   normalizeCatalogRole,
-  parameterSupportLabel,
   parseFormattedInteger,
   parseFormattedNumber,
   resolveConnectionIconKey,
@@ -129,6 +122,7 @@ import {
 } from '$lib/utils/catalogConnectionLimits'
 import { isFlatFeePlanConnection } from '$lib/utils/catalogPricing'
 import { isChatgptPlanConnection, CHATGPT_PLAN_PARAMETERS } from '$lib/utils/chatgptPlanConnection'
+import { isClaudePlanConnection, CLAUDE_PLAN_PARAMETERS } from '$lib/utils/claudePlanConnection'
 import { themeStore } from '$lib/stores/theme'
 import { LIVE_SETTINGS_EVENTS } from '$lib/utils/liveSettingsEvents'
 	import * as savedModelsStore from '$lib/stores/savedModels.svelte'
@@ -143,6 +137,12 @@ import {
   const CREATE_SENTINEL = '__create__'
   const MODIFIED_BADGE_CLASS = 'batshit-settings-pill is-warning'
   const ESTIMATED_BADGE_CLASS = 'batshit-settings-pill is-info'
+
+  // Plan connections (SA-130 ChatGPT, SA-139 Claude) keep separate identities; each takes only its own
+  // settings and has no API price or output-limit estimate. Null for every other connection.
+  function planConnectionParameters(connectionId?: string | null): ReadonlySet<string> | null {
+    return isChatgptPlanConnection(connectionId) ? CHATGPT_PLAN_PARAMETERS : isClaudePlanConnection(connectionId) ? CLAUDE_PLAN_PARAMETERS : null
+  }
 
   type PanelData = {
     user?: { id: string } | null
@@ -204,63 +204,6 @@ import {
     connectionUseDeveloperPrefix: boolean
   }
 
-  interface CodexConfigRow {
-    id: string
-    key: string
-    value: string
-  }
-
-  interface CodexFormOptions {
-    permissionMode: CodexPermissionMode
-    model: string
-    reasoningEffort: 'default' | 'low' | 'medium' | 'high' | 'xhigh'
-    streamingEffect: boolean
-    search: boolean
-    sandbox: 'read-only' | 'workspace-write' | 'danger-full-access'
-    approval: 'never' | 'on-request'
-    addDirs: string[]
-    enableFeatures: string[]
-    disableFeatures: string[]
-    configOverrides: CodexConfigRow[]
-    workingDirectoryMode: 'project' | 'custom'
-    customWorkingDirectory: string
-  }
-
-  const CODEX_REASONING_OPTIONS: Array<{
-    value: CodexFormOptions['reasoningEffort']
-    label: string
-    helper: string
-  }> = [
-    { value: 'default', label: 'Auto', helper: 'Use provider default' },
-    { value: 'low', label: 'Low', helper: 'Faster, fewer deliberations' },
-    { value: 'medium', label: 'Medium', helper: 'Balanced effort' },
-    { value: 'high', label: 'High', helper: 'Slowest, more careful planning' },
-    { value: 'xhigh', label: 'Extra High', helper: CODEX_XHIGH_REASONING_HELPER_TEXT }
-  ]
-
-  const CODEX_PERMISSION_PRESETS: Record<
-    CodexPermissionMode,
-    { sandbox: CodexFormOptions['sandbox']; approval: CodexFormOptions['approval'] }
-  > = {
-    chat: { sandbox: 'read-only', approval: 'never' },
-    agent: { sandbox: 'workspace-write', approval: 'on-request' },
-    agent_full: { sandbox: 'danger-full-access', approval: 'never' }
-  }
-  const CODEX_PERMISSION_OPTIONS: Array<{ value: CodexPermissionMode; label: string; helper: string }> = [
-    { value: 'chat', label: 'Chat', helper: 'Read-only, never prompts' },
-    { value: 'agent', label: 'Agent', helper: 'Workspace write, ask when needed' },
-    { value: 'agent_full', label: 'Agent (full)', helper: 'Full access, run without prompts' }
-  ]
-  const CODEX_SANDBOX_OPTIONS = [
-    { value: 'read-only', label: 'Read-only' },
-    { value: 'workspace-write', label: 'Workspace write' },
-    { value: 'danger-full-access', label: 'Danger full access' }
-  ] as const
-  const CODEX_APPROVAL_OPTIONS = [
-    { value: 'never', label: 'Never' },
-    { value: 'on-request', label: 'On request' }
-  ] as const
-
 const EMPTY_FORM: ModelFormState = {
     id: null,
     modelName: '',
@@ -297,7 +240,6 @@ const EMPTY_FORM: ModelFormState = {
 type CatalogProviderOption = {
   label: string
   value: string
-  n8nSupported: boolean
 }
 
 const CAPABILITY_LABELS: { key: keyof ModelCapabilities; label: string }[] = [
@@ -318,7 +260,7 @@ const MODEL_PURPOSE_OPTIONS: Array<{
   label: string
   helper: string
 }> = [
-  { value: 'chat', label: 'Chat (Agents)', helper: 'Available to API agents and chat model pickers' },
+  { value: 'chat', label: 'Chat (Agents)', helper: 'Available to agents and chat model pickers' },
   { value: 'visual', label: 'Media', helper: 'Image, video, and 3D generation presets' },
   { value: 'audio', label: 'Audio', helper: 'Speech, transcription, and audio-only presets' },
   { value: 'utility', label: 'Utility', helper: 'Embeddings, reranking, classification, and similar tasks' }
@@ -576,6 +518,11 @@ function allowModelForConnection(model: CatalogModel, connection: CatalogConnect
   let utilitySectionOpen = $state(false)
   let isLoading = $state(true)
   let listError = $state<string | null>(null)
+  let listErrorOwner: { kind: 'shared' | 'panel'; generation: number } | null = null
+  function setPanelListError(message: string | null) {
+    listErrorOwner = { kind: 'panel', generation: savedModelsStore.getReadErrorState().generation }
+    listError = message
+  }
   let catalogModels = $state<CatalogModel[]>([])
   let connectionOptions = $state<CatalogConnectionOption[]>([])
   let catalogLoading = $state(false)
@@ -607,7 +554,7 @@ function allowModelForConnection(model: CatalogModel, connection: CatalogConnect
   let numericDraftActive = $state(false)
   let formSelection = 0
   let panelDisposed = false
-  const presetDrafts = getModelPresetDrafts<ModelFormState, ReturnType<typeof createDefaultCodexOptions>, SavedModel>()
+  const presetDrafts = getModelPresetDrafts<ModelFormState, SavedModel>()
   let creationContinuation: { selection: number; draft: ReturnType<typeof capturePresetDraft> | null } | null = null
   let creatingNew = $state(false)
   let suppressDraftAutoCreate = $state(false)
@@ -615,25 +562,12 @@ function allowModelForConnection(model: CatalogModel, connection: CatalogConnect
 
 let saveState = $state<'idle' | 'saving' | 'saved'>('idle')
 let saveError = $state<string | null>(null)
-let n8nCompatibilitySyncing = $state(false)
-let n8nCompatibilitySyncError = $state<string | null>(null)
   let deleteBusy = $state(false)
   let deleteDisclosureOpen = $state(false)
 
-let codexDirDraft = $state('')
-let codexEnableDraft = $state('')
-let codexDisableDraft = $state('')
-let codexOptions = $state(createDefaultCodexOptions())
 let lastAppliedInitialModelId = $state<string | null>(null)
 let formValidationError = $state<string | null>(null)
 let lastInvalidModelSignature = $state<string | null>(null)
-
-  // SA-017: `xhigh` reasoning effort is only allowed for compatible Codex models.
-  $effect(() => {
-    if (codexOptions.reasoningEffort !== 'xhigh') return
-    if (supportsCodexXhighReasoning(codexOptions.model)) return
-    codexOptions = { ...codexOptions, reasoningEffort: 'high' }
-  })
 
   const hasSelection = $derived(!creatingNew && !!selectedModelId)
   const isExistingModel = $derived(hasSelection && !!selectedModelId)
@@ -670,8 +604,7 @@ let lastInvalidModelSignature = $state<string | null>(null)
       if (!unique.has(scopedModel.canonicalDeveloperId)) {
         unique.set(scopedModel.canonicalDeveloperId, {
           label: formatDeveloperLabel(scopedModel.canonicalDeveloperId),
-          value: scopedModel.canonicalDeveloperId,
-          n8nSupported: isN8NSupported(scopedModel.canonicalDeveloperId)
+          value: scopedModel.canonicalDeveloperId
         })
       }
     }
@@ -818,6 +751,13 @@ let lastInvalidModelSignature = $state<string | null>(null)
     if (!editingForm.connectionId) return null
     return connectionOptions.find((option) => option.id === editingForm.connectionId) ?? null
   })
+  const presetReasoningEvidence = $derived.by(() => {
+    const row = findConnectionScopedCatalogPreset(catalogModels, appliedConnection, {
+      provider: editingForm.provider, modelId: editingForm.modelId, targetId: editingForm.catalogModelId
+    })
+    return projectCatalogReasoningEvidence(row ? $state.snapshot(row) : null,
+      editingForm.connectionId, editingForm.effectiveModelId || editingForm.modelId)
+  })
   let activeParameterDefinitions = $state<ParameterDefinition[]>([])
   let parameterSections = $state<{
     id: 'core' | 'reasoning' | 'visual' | 'audio' | 'utility' | 'provider'
@@ -828,7 +768,6 @@ let lastInvalidModelSignature = $state<string | null>(null)
   }[]>([])
   let parameterSectionOpen = $state<Record<string, boolean>>({})
   let customParametersJsonError = $state<string | null>(null)
-  const isCodexModel = $derived.by(() => isCodexForm(editingForm))
   // SA-102 P1 (DL-102-16): the program that owns this model's defaults, by name.
   const localProgramLabel = $derived.by(() => resolveLocalProgramLabel(editingForm))
   const localProviderId = $derived.by(() => resolveLocalProviderId(editingForm))
@@ -1080,9 +1019,11 @@ let lastInvalidModelSignature = $state<string | null>(null)
       vercelId,
       capabilities: effectiveFormCapabilities,
       connection: editingForm.connectionType ?? undefined,
+      connectionInfo: editingForm.connectionType ? { type: editingForm.connectionType,
+        id: editingForm.connectionId || undefined, service: editingForm.connectionService || undefined } : null,
       purpose: activePresetRole,
       matrixEntries
-    }).filter(definition => !isChatgptPlanConnection(editingForm.connectionId) || CHATGPT_PLAN_PARAMETERS.has(definition.name))
+    }).filter(definition => planConnectionParameters(editingForm.connectionId)?.has(definition.name) ?? true)
   })
 
   const PARAMETER_SECTION_ORDER = {
@@ -1124,26 +1065,6 @@ let lastInvalidModelSignature = $state<string | null>(null)
     if (!normalized) return 'Provider'
     if (normalized === 'vercel-gateway') return 'Vercel AI Gateway'
     return formatDeveloperLabel(normalized)
-  }
-
-  /**
-   * BL-58 / SA-125 follow-up: whether to badge a connection as n8n-usable.
-   *
-   * This used to be hardcoded static text on every row, which made it a badge
-   * that carried no information and, worse, said something false: the CLI
-   * connections report `n8nStatus: 'locked'` and every other row reports
-   * `'unknown'`, so nothing actually reported compatible. Local programs are
-   * `n8n: false` / `batshit_only` in their own compatibility records too.
-   *
-   * Two gates now. n8n is no longer a Primary Agent type at all — it is only a
-   * Workflow Subagent platform — so a user without one never needs to see the
-   * badge, and `hasWorkflowSubagents` already existed for exactly that. Beyond
-   * that, only a connection whose own data says `ready` earns the badge.
-   */
-  function showsN8nBadge(option: { id: string; n8nStatus?: string } | null | undefined) {
-    if (!option) return false
-    if (!n8nCompatibilityState.hasWorkflowSubagents) return false
-    return option.n8nStatus === 'ready'
   }
 
   function resolveProviderSectionTitle(
@@ -1354,18 +1275,6 @@ let lastInvalidModelSignature = $state<string | null>(null)
     }
   }
 
-  function createConfigRow(initial?: Partial<CodexConfigRow>): CodexConfigRow {
-    const id =
-      typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
-        ? crypto.randomUUID()
-        : `codex_cfg_${Math.random().toString(36).slice(2, 10)}`
-    return {
-      id,
-      key: initial?.key ?? '',
-      value: initial?.value ?? ''
-    }
-  }
-
   const CUSTOM_PARAM_TYPE_OPTIONS: Array<{ value: CustomParamType; label: string }> = [
     { value: 'string', label: 'String' },
     { value: 'number', label: 'Number' },
@@ -1409,233 +1318,10 @@ let lastInvalidModelSignature = $state<string | null>(null)
     return String(value)
   }
 
-  function updateCodexOptions(updater: (current: CodexFormOptions) => CodexFormOptions) {
-    codexOptions = updater(codexOptions)
-  }
-
-  function setCodexPermissionMode(mode: CodexPermissionMode) {
-    const preset = CODEX_PERMISSION_PRESETS[mode]
-    updateCodexOptions((current) => ({
-      ...current,
-      permissionMode: mode,
-      sandbox: preset.sandbox,
-      approval: preset.approval
-    }))
-  }
-
-  function addCodexListValue(
-    key: 'addDirs' | 'enableFeatures' | 'disableFeatures',
-    value: string
-  ) {
-    const trimmed = value.trim()
-    if (!trimmed.length) return
-    updateCodexOptions((current) => {
-      if (current[key].includes(trimmed)) {
-        return current
-      }
-      return {
-        ...current,
-        [key]: [...current[key], trimmed]
-      }
-    })
-  }
-
-  function removeCodexListValue(
-    key: 'addDirs' | 'enableFeatures' | 'disableFeatures',
-    index: number
-  ) {
-    updateCodexOptions((current) => ({
-      ...current,
-      [key]: current[key].filter((_, idx) => idx !== index)
-    }))
-  }
-
-  function addCodexConfig() {
-    updateCodexOptions((current) => ({
-      ...current,
-      configOverrides: [...current.configOverrides, createConfigRow()]
-    }))
-  }
-
-  function updateCodexConfig(id: string, field: 'key' | 'value', value: string) {
-    updateCodexOptions((current) => ({
-      ...current,
-      configOverrides: current.configOverrides.map((row) =>
-        row.id === id ? { ...row, [field]: value } : row
-      )
-    }))
-  }
-
-  function removeCodexConfig(id: string) {
-    updateCodexOptions((current) => ({
-      ...current,
-      configOverrides: current.configOverrides.filter((row) => row.id !== id)
-    }))
-  }
-
-  function createDefaultCodexOptions(): CodexFormOptions {
-    return {
-      permissionMode: 'chat',
-      model: CODEX_SUBMODEL_CHOICES[0]?.value ?? 'gpt-6-astra',
-      reasoningEffort: 'default',
-      streamingEffect: false,
-      search: true,
-      sandbox: CODEX_PERMISSION_PRESETS.chat.sandbox,
-      approval: CODEX_PERMISSION_PRESETS.chat.approval,
-      addDirs: [],
-      enableFeatures: [],
-      disableFeatures: [],
-      configOverrides: [],
-      workingDirectoryMode: 'project',
-      customWorkingDirectory: ''
-    }
-  }
-
-  function isCodexForm(form: ModelFormState): boolean {
-    const provider = form.provider?.toLowerCase() ?? ''
-    const service = form.connectionService?.toLowerCase() ?? ''
-    const connectionId = form.connectionId?.toLowerCase() ?? ''
-    const connectionType = form.connectionType?.toLowerCase() ?? ''
-    const modelId = form.modelId?.toLowerCase() ?? ''
-
-    return (
-      provider.includes('codex') ||
-      service.includes('codex') ||
-      connectionId.includes('codex') ||
-      connectionType.includes('codex') ||
-      modelId.includes('codex')
-    )
-  }
-
-  function toStringList(value: unknown): string[] {
-    if (!value) return []
-    if (Array.isArray(value)) {
-      return value
-        .map((entry) => (typeof entry === 'string' ? entry.trim() : ''))
-        .filter((entry) => entry.length > 0)
-    }
-    if (typeof value === 'string') {
-      return value
-        .split(',')
-        .map((entry) => entry.trim())
-        .filter((entry) => entry.length > 0)
-    }
-    return []
-  }
-
-  function normaliseCodexOptions(settings?: Record<string, any> | null): CodexFormOptions {
-    const options = createDefaultCodexOptions()
-    if (!settings) return options
-
-    if (settings.codex_permission_mode === 'agent' || settings.codex_permission_mode === 'agent_full') {
-      options.permissionMode = settings.codex_permission_mode
-    }
-
-    options.model =
-      typeof settings.codex_model === 'string' && settings.codex_model.trim().length
-        ? settings.codex_model.trim()
-        : options.model
-
-    if (
-      settings.codex_reasoning_effort === 'low' ||
-      settings.codex_reasoning_effort === 'medium' ||
-      settings.codex_reasoning_effort === 'high' ||
-      settings.codex_reasoning_effort === 'xhigh'
-    ) {
-      options.reasoningEffort = settings.codex_reasoning_effort
-    }
-
-    options.streamingEffect = Boolean(settings.codex_streaming_effect)
-    options.search = settings.codex_search === false ? false : true
-
-    const preset = CODEX_PERMISSION_PRESETS[options.permissionMode]
-    options.sandbox =
-      settings.codex_sandbox === 'workspace-write' || settings.codex_sandbox === 'danger-full-access'
-        ? settings.codex_sandbox
-        : settings.codex_sandbox === 'read-only'
-          ? 'read-only'
-          : preset.sandbox
-
-    options.approval =
-      settings.codex_approval === 'on-request' ||
-      settings.codex_approval === 'on-failure' ||
-      settings.codex_approval === 'untrusted'
-        ? 'on-request'
-        : settings.codex_approval === 'never'
-          ? 'never'
-          : preset.approval
-
-    options.addDirs = toStringList(settings.codex_additional_dirs)
-    options.enableFeatures = toStringList(settings.codex_feature_enable)
-    options.disableFeatures = toStringList(settings.codex_feature_disable)
-
-    if (Array.isArray(settings.codex_config_overrides)) {
-      options.configOverrides = settings.codex_config_overrides
-        .map((entry: any) => {
-          if (!entry || typeof entry !== 'object') return null
-          const key = typeof entry.key === 'string' ? entry.key : ''
-          const value = typeof entry.value === 'string' ? entry.value : entry.value !== undefined ? String(entry.value) : ''
-          return createConfigRow({ key, value })
-        })
-        .filter((row: CodexConfigRow | null): row is CodexConfigRow => Boolean(row))
-    }
-
-    options.workingDirectoryMode =
-      settings.codex_workdir_mode === 'custom' ? 'custom' : 'project'
-    options.customWorkingDirectory =
-      typeof settings.codex_custom_workdir === 'string' ? settings.codex_custom_workdir : ''
-
-    return options
-  }
-
   const matrixEntries = $derived.by(() => compatibilityMatrixStore.getMatrixEntries())
-  const n8nCompatibilityState = $derived.by(() => compatibilityMatrixStore.getN8nState())
-  const showN8nParameterSupport = $derived(
-    n8nCompatibilityState.hasWorkflowSubagents && n8nCompatibilityState.localSnapshotAvailable
-  )
-
-  async function refreshN8nParameterCompatibility(
-    trigger: 'model-card-open' | 'model-card-manual'
-  ) {
-    n8nCompatibilitySyncing = true
-    n8nCompatibilitySyncError = null
-    try {
-      const response = await fetch('/api/admin/compatibility-matrix/n8n-sync', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ trigger })
-      })
-      if (!response.ok) {
-        throw new Error(await extractError(response, 'Failed to refresh n8n parameter support'))
-      }
-      await compatibilityMatrixStore.loadCompatibilityMatrix()
-      if (trigger === 'model-card-manual') {
-        toast.success('n8n parameter support refreshed')
-      }
-    } catch (error) {
-      n8nCompatibilitySyncError =
-        error instanceof Error ? error.message : 'Failed to refresh n8n parameter support'
-      if (trigger === 'model-card-manual') toast.error(n8nCompatibilitySyncError)
-    } finally {
-      n8nCompatibilitySyncing = false
-    }
-  }
-
-  async function refreshN8nParameterCompatibilityOnOpen() {
-    const state = compatibilityMatrixStore.getN8nState()
-    n8nCompatibilitySyncError = state.syncStatus?.status === 'error'
-      ? state.syncStatus.error
-      : null
-    if (!state.hasWorkflowSubagents) return
-    const fetchedAtMs = state.fetchedAt ? new Date(state.fetchedAt).getTime() : 0
-    const fresh = Number.isFinite(fetchedAtMs) && Date.now() - fetchedAtMs < 24 * 60 * 60 * 1000
-    if (fresh) return
-    await refreshN8nParameterCompatibility('model-card-open')
-  }
 
   onMount(async () => {
     await Promise.all([loadModels(), loadCatalog(), compatibilityMatrixStore.loadCompatibilityMatrix()])
-    await refreshN8nParameterCompatibilityOnOpen()
   })
 
   /**
@@ -1654,23 +1340,45 @@ let lastInvalidModelSignature = $state<string | null>(null)
     }
   })
 
+  // Only membership/list records follow automatic pure reads. Form, drafts, save queues,
+  // baselines and unknown outcomes remain owned by the current editor.
+  $effect(() => {
+    const stored = savedModelsStore.getSavedModels()
+    const error = savedModelsStore.getReadErrorState()
+    if (savedModelsStore.isInitialized()) untrack(() => { models = [...stored] })
+    untrack(() => {
+      if (error.message !== null) {
+        if (listErrorOwner?.kind !== 'panel' || listError === null && error.generation > listErrorOwner.generation) {
+          listError = error.message
+          listErrorOwner = { kind: 'shared', generation: error.generation }
+        }
+      } else if (listErrorOwner?.kind === 'shared' && error.generation > listErrorOwner.generation) {
+        listError = null; listErrorOwner = null
+      }
+    })
+  })
+
   async function loadModels() {
+    let read: ReturnType<typeof savedModelsStore.beginSavedModelsRead> | undefined
     isLoading = true
-    listError = null
+    setPanelListError(null)
 
     try {
       // A reopened editor must read after its predecessor's completed saves settle.
       await waitForModelPresetSaves()
       if (panelDisposed) return
+      // That save publishes a local list write. Capture this read only afterwards,
+      // so its fresh request is not invalidated before it has even been issued.
+      read = savedModelsStore.beginSavedModelsRead()
       const response = await fetch('/api/user/saved-models')
       if (!response.ok) {
         const message = await extractError(response, 'Failed to load models')
         throw new Error(message)
       }
       const result = await response.json()
-      const loaded: SavedModel[] = Array.isArray(result) ? result : result?.models ?? []
-      models = loaded ?? []
-      savedModelsStore.setSavedModels(models)
+      const loaded: SavedModel[] = Array.isArray(result) ? result : result?.models
+      if (panelDisposed || !read.install(loaded)) return
+      models = loaded
 
       const unlisted: Array<{ modelName: string }> = Array.isArray(result)
         ? []
@@ -1693,11 +1401,13 @@ let lastInvalidModelSignature = $state<string | null>(null)
         selectFirstModelOrShowCatalogLanding()
       }
     } catch (error) {
+      if (panelDisposed || read && !read.current()) return
+      read?.fail('Models could not be loaded. The last good list is retained.')
       console.error('Failed to load models:', error)
-      listError = error instanceof Error ? error.message : 'Failed to load models'
-      models = []
-      showCatalogLanding()
+      setPanelListError(error instanceof Error ? error.message : 'Failed to load models')
+      // Failed reads do not clear existing presets or editor intent.
     } finally {
+      read?.finish()
       isLoading = false
     }
   }
@@ -1764,7 +1474,7 @@ let lastInvalidModelSignature = $state<string | null>(null)
 
   function capturePresetDraft() {
     return {
-      form: $state.snapshot(editingForm), codex: $state.snapshot(codexOptions),
+      form: $state.snapshot(editingForm),
       signature: makeFormSignature(editingForm), persistedSignature: formPersistedSignature,
       error: saveError, failedSignature: saveError ? lastInvalidModelSignature : null, numericDraft: numericDraftActive,
       payload: !numericDraftActive && canCreate && !validateModelForm(editingForm) ? buildModelPayload(editingForm) : null
@@ -1795,7 +1505,6 @@ let lastInvalidModelSignature = $state<string | null>(null)
     const retained = presetDrafts.get(model.id)
     numericDraftActive = retained?.numericDraft ?? false
     editingForm = retained?.form ?? normaliseModel(model)
-    codexOptions = retained?.codex ?? normaliseCodexOptions(model.settings ?? null)
     formPersistedSignature = retained?.persistedSignature ?? makeFormSignature(editingForm)
     formValidationError = null
     lastInvalidModelSignature = retained?.failedSignature ?? null
@@ -1827,7 +1536,6 @@ let lastInvalidModelSignature = $state<string | null>(null)
     lastDraftCreateAttemptSignature = null
     selectedModelId = null
     editingForm = { ...EMPTY_FORM }
-    codexOptions = createDefaultCodexOptions()
     formPersistedSignature = null
     saveState = 'idle'
     saveError = null
@@ -1855,7 +1563,6 @@ let lastInvalidModelSignature = $state<string | null>(null)
       showCatalogLanding()
       creatingNew = true
       editingForm = failedCreate.form
-      codexOptions = failedCreate.codex
       numericDraftActive = failedCreate.numericDraft
       lastDraftCreateAttemptSignature = failedCreate.signature
       saveError = failedCreate.error
@@ -2078,7 +1785,7 @@ $effect(() => {
   saveError = null
 
   const payload = buildModelPayload(editingForm)
-  if (!isChatgptPlanConnection(editingForm.connectionId) &&
+  if (!planConnectionParameters(editingForm.connectionId) &&
     payload.settings?.maxTokens !== parseFormattedInteger(editingForm.parameterValues.maxTokens ?? '')) {
     // Normalize a completed dirty form before acknowledging it, never a focused numeric draft.
     untrack(() => applySafeMaxOutputToEditingForm(editingForm.parameterValues.maxTokens))
@@ -2349,9 +2056,10 @@ $effect(() => {
 
   async function handleOverwriteSelectedPreset() {
     if (!selectedModelId) return
+    const target = selectedCatalogModel ? resolveCatalogApplyTarget(selectedCatalogModel).connectionId : selectedConnectionId
     const confirmed = await confirmDialog({
       title: 'Overwrite selected preset?',
-      description: getOverwriteConfirmationMessage(),
+      description: getOverwriteConfirmationMessage(target),
       confirmLabel: 'Overwrite Preset'
     })
     if (!confirmed) return
@@ -2617,14 +2325,16 @@ $effect(() => {
 
   function getHydrationParameterDefinitions(model: SavedModel): ParameterDefinition[] {
     const definitions = filterParameters({
+      projection: 'saved',
       provider: resolveParameterProvider(model.provider, model.connection),
       modelId: model.modelId,
       vercelId: model.catalogModelId ?? model.vercelSourceId ?? undefined,
       capabilities: projectOllamaPresetCapabilities(model, catalogModels),
       connection: model.connection?.type ?? undefined,
+      connectionInfo: model.connection,
       purpose: resolvePresetType(model),
       matrixEntries
-    }).filter(definition => !isChatgptPlanConnection(model.connection?.id) || CHATGPT_PLAN_PARAMETERS.has(definition.name))
+    }).filter(definition => planConnectionParameters(model.connection?.id)?.has(definition.name) ?? true)
     // Preserve an already saved Thinking value even if optional metadata has
     // not arrived. Hydrating a known field does not advertise its capability.
     if (model.connection?.type === 'direct' && model.connection.service === 'ollama' &&
@@ -2703,7 +2413,7 @@ $effect(() => {
   }
 
   function applySafeMaxOutputToEditingForm(rawMaxOutputTokens: string | number | null | undefined) {
-    if (isChatgptPlanConnection(editingForm.connectionId)) return
+    if (planConnectionParameters(editingForm.connectionId)) return
     const contextWindow = parseFormattedInteger(editingForm.contextWindow) || 0
     const resolution = resolveSafeFormMaxOutputTokenResolution(rawMaxOutputTokens, contextWindow, getFormLoadedContext(editingForm))
 
@@ -2770,7 +2480,7 @@ $effect(() => {
 
     const contextWindow = model.contextWindow ?? 0
     const maxOutputResolution = resolveSafeFormMaxOutputTokenResolution(model.settings?.maxTokens ?? null, contextWindow)
-    const plan = isChatgptPlanConnection(model.connection?.id)
+    const plan = Boolean(planConnectionParameters(model.connection?.id))
     const parameterValues = plan ? buildParameterValueMap(model) : ensureSafeMaxOutputValue(buildParameterValueMap(model), contextWindow)
     const enrichment = withAppliedBaselineFields(model.enrichment ?? null, {
       modelName: model.modelName,
@@ -2833,12 +2543,36 @@ $effect(() => {
     return ''
   }
 
+  function formParameterDefinitions(form: ModelFormState) {
+    return filterParameters({
+      projection: 'saved',
+      provider: resolveParameterProvider(
+        form.provider || selectedCatalogEntry?.developerId || undefined,
+        { type: form.connectionType, service: form.connectionService },
+      ),
+      modelId: form.modelId || selectedCatalogEntry?.modelId || undefined,
+      vercelId: form.catalogModelId || form.vercelSourceId || selectedCatalogModel?.id || undefined,
+      capabilities: getFormCapabilities(form),
+      connection: form.connectionType ?? undefined,
+      connectionInfo: form.connectionType ? { type: form.connectionType,
+        id: form.connectionId || undefined, service: form.connectionService || undefined } : null,
+      purpose: activePresetRole,
+      matrixEntries
+    })
+  }
+
   function validateModelForm(form: ModelFormState): string | null {
-    if (customParametersJsonError) {
+    // Plan presets hide and never send Custom Parameters, so a leftover draft cannot block their save.
+    if (customParametersJsonError && !planConnectionParameters(form.connectionId)) {
       return customParametersJsonError
     }
     if (!form.connectionType) {
       return 'Select a connection for this model.'
+    }
+    for (const definition of formParameterDefinitions(form)) {
+      const raw = form.parameterValues[definition.name]
+      if (!definition.reviewedBudget || !raw?.trim()) continue
+      try { parseReasoningBudget(raw, definition.reviewedBudget) } catch (error) { return error instanceof Error ? error.message : 'Enter a valid thinking budget.' }
     }
     if (form.pricingInputMode === 'tiered') {
       if (form.pricingInputTiers.length === 0) {
@@ -2872,18 +2606,7 @@ $effect(() => {
   }
 
   function buildParameterSettings(form: ModelFormState) {
-    const definitions = filterParameters({
-      provider: resolveParameterProvider(
-        form.provider || selectedCatalogEntry?.developerId || undefined,
-        { type: form.connectionType, service: form.connectionService },
-      ),
-      modelId: form.modelId || selectedCatalogEntry?.modelId || undefined,
-      vercelId: form.catalogModelId || form.vercelSourceId || selectedCatalogModel?.id || undefined,
-      capabilities: getFormCapabilities(form),
-      connection: form.connectionType ?? undefined,
-      purpose: activePresetRole,
-      matrixEntries
-    })
+    const definitions = formParameterDefinitions(form)
 
     const settings: Record<string, ParameterValue> = {}
     // A restriction or metadata outage may hide Thinking; retain its saved
@@ -2894,7 +2617,7 @@ $effect(() => {
       if (thinking) definitions.push(thinking)
     }
     for (const definition of definitions) {
-      if (isChatgptPlanConnection(form.connectionId) && !CHATGPT_PLAN_PARAMETERS.has(definition.name)) continue
+      if (planConnectionParameters(form.connectionId)?.has(definition.name) === false) continue
       const raw = form.parameterValues[definition.name]
       if (raw === undefined || raw.trim().length === 0) {
         continue
@@ -2906,6 +2629,15 @@ $effect(() => {
     }
 
     return settings
+  }
+
+  function availableParameterValues(parameter: ParameterDefinition) {
+    if (!parameter.reviewedReasoningControl || parameter.reviewedBudget || !editingForm?.connectionType) return null
+    const values = availableReasoningParameterValues({ provider: editingForm.provider,
+      modelId: editingForm.modelId, connection: { type: editingForm.connectionType,
+        id: editingForm.connectionId || undefined, service: editingForm.connectionService || undefined },
+      settings: { ...buildParameterSettings(editingForm), ...buildCustomSettings(editingForm) }, parameterName: parameter.name })
+    return values
   }
 
   function parseCustomJson(value: string): Record<string, ParameterValue> | null {
@@ -2974,22 +2706,19 @@ $effect(() => {
     const contextWindow = parsePresetContextWindow(form.contextWindow)
     const maxOutputResolution = resolveSafeFormMaxOutputTokenResolution(form.parameterValues.maxTokens ?? null, contextWindow, getFormLoadedContext(form))
     const settings = buildParameterSettings(form)
-    if (!isChatgptPlanConnection(form.connectionId)) settings.maxTokens = maxOutputResolution.maxOutputTokens
-    const customSettings = buildCustomSettings(form)
-    const includeCodexSettings = isCodexForm(form)
-    const codexSettings = includeCodexSettings ? buildCodexSettingsPayload(codexOptions) : {}
+    if (!planConnectionParameters(form.connectionId)) settings.maxTokens = maxOutputResolution.maxOutputTokens
+    // Plan connections take no Custom Parameters (their save refuses them); the section is hidden there.
+    const customSettings = planConnectionParameters(form.connectionId) ? {} : buildCustomSettings(form)
     const voiceSession = resolveLiveKitSpeechToSpeechFormConfig(form)
 
     const mergedSettings =
       Object.keys({
         ...(settings || {}),
-        ...(customSettings || {}),
-        ...codexSettings
+        ...(customSettings || {})
       }).length > 0
         ? {
             ...(settings || {}),
-            ...(customSettings || {}),
-            ...codexSettings
+            ...(customSettings || {})
           }
         : undefined
 
@@ -3012,7 +2741,7 @@ $effect(() => {
       isVercelImport: form.isVercelImport,
       vercelSourceId: form.vercelSourceId ?? undefined,
       vercelDisplayName: form.vercelDisplayName ?? undefined,
-      enrichment: isChatgptPlanConnection(form.connectionId) ? undefined : withMaxOutputResolution(form.enrichment ?? {
+      enrichment: planConnectionParameters(form.connectionId) ? undefined : withMaxOutputResolution(form.enrichment ?? {
         source: 'provider-manager',
         fetchedAt: now
       }, maxOutputResolution),
@@ -3026,34 +2755,6 @@ $effect(() => {
         : undefined,
       createdAt: now,
       updatedAt: now
-    }
-  }
-
-  function buildCodexSettingsPayload(options: CodexFormOptions): Record<string, any> {
-    const overrides = options.configOverrides
-      .map((row) => ({
-        key: row.key.trim(),
-        value: row.value
-      }))
-      .filter((row) => row.key.length > 0)
-
-    const workdir = options.customWorkingDirectory.trim()
-    return {
-      codex_permission_mode: options.permissionMode,
-      codex_model: options.model,
-      codex_reasoning_effort:
-        options.reasoningEffort === 'default' ? undefined : options.reasoningEffort,
-      codex_streaming_effect: options.streamingEffect,
-      codex_search: options.search,
-      codex_sandbox: options.sandbox,
-      codex_approval: options.approval,
-      codex_additional_dirs: options.addDirs,
-      codex_feature_enable: options.enableFeatures,
-      codex_feature_disable: options.disableFeatures,
-      codex_config_overrides: overrides,
-      codex_workdir_mode: options.workingDirectoryMode,
-      codex_custom_workdir:
-        options.workingDirectoryMode === 'custom' && workdir.length > 0 ? workdir : undefined
     }
   }
 
@@ -3108,7 +2809,7 @@ $effect(() => {
       return
     }
     const connectionForVariant = target.connection
-    const hostedCatalogIdentity = !['local', 'n8n-only', 'codex', 'claude-cli'].includes(model.source ?? '')
+    const hostedCatalogIdentity = !['local', 'n8n-only'].includes(model.source ?? '')
     const isGatewaySelection = connectionForVariant?.transport === 'vercel-gateway'
     editingForm = {
       ...editingForm,
@@ -3178,7 +2879,14 @@ $effect(() => {
     return 'Use to Create New Preset'
   }
 
-  function getOverwriteConfirmationMessage() {
+  function getOverwriteConfirmationMessage(targetConnectionId?: string | null) {
+    // A plan connection (ChatGPT or Claude) keeps only its own settings, so the overwrite says what goes.
+    const plan = isChatgptPlanConnection(targetConnectionId) ? { label: 'ChatGPT Plan', keeps: 'reasoning effort, reasoning summary, text verbosity and parallel tool calls' }
+      : isClaudePlanConnection(targetConnectionId) ? { label: 'Claude Plan', keeps: 'reasoning effort (and Thinking on models that allow it)' } : null
+    if (plan) return [
+      'This updates the basic model info, connection details, supported features, compatibility badges, pricing, and context window.',
+      `${plan.label} presets keep only ${plan.keeps}. Your other model parameters, custom parameters, and Max Output Tokens are removed from this preset. Your image transport setting stays as it is.`
+    ].join('\n')
     return [
       'This updates the basic model info, connection details, supported features, compatibility badges, pricing, context window, and Max Output Tokens.',
       'Your other model parameters, custom parameters, and image transport setting will stay exactly as they are.'
@@ -3308,13 +3016,13 @@ $effect(() => {
     }
     const baselineModelId = resolvedIds.modelId
     const baselineProvider = resolvedIds.developerId
-    const hostedCatalogIdentity = !['local', 'n8n-only', 'codex', 'claude-cli'].includes(model.source ?? '')
+    const hostedCatalogIdentity = !['local', 'n8n-only'].includes(model.source ?? '')
     const isGatewaySelection = selectedConnection?.transport === 'vercel-gateway'
     // BL-68: the chosen connection's own limits when its variant carries them.
     // BL-67: a window of 0 (or less) is not a window; it is unknown.
     const connectionLimits = resolveCatalogConnectionLimits(model, baselineConnectionId)
     const rawMaxOutputTokens = connectionLimits.maxOutputTokens
-    const plan = isChatgptPlanConnection(baselineConnectionId)
+    const plan = Boolean(planConnectionParameters(baselineConnectionId))
     // BL-132: and the chosen connection's own price when its variant carries one.
     const connectionPricing = resolveCatalogConnectionPricing(model, baselineConnectionId).pricing
     const pricingInput = toCatalogNumber(connectionPricing?.input)
@@ -3750,25 +3458,7 @@ $effect(() => {
         from,
         to,
         cost
-      })),
-      codexOptions: {
-        model: codexOptions.model,
-        reasoningEffort: codexOptions.reasoningEffort,
-        permissionMode: codexOptions.permissionMode,
-        streamingEffect: codexOptions.streamingEffect,
-        search: codexOptions.search,
-        sandbox: codexOptions.sandbox,
-        approval: codexOptions.approval,
-        addDirs: [...codexOptions.addDirs],
-        enableFeatures: [...codexOptions.enableFeatures],
-        disableFeatures: [...codexOptions.disableFeatures],
-        configOverrides: codexOptions.configOverrides.map(({ key, value }) => ({
-          key,
-          value
-        })),
-        workingDirectoryMode: codexOptions.workingDirectoryMode,
-        customWorkingDirectory: codexOptions.customWorkingDirectory
-      }
+      }))
     })
   }
 
@@ -3934,11 +3624,6 @@ $effect(() => {
                                   <CheckCircle2 class="h-3 w-3" />
                                 {/if}
                                 <span>Batshit · {option.status === 'ready' ? 'ready' : 'compatible'}</span>
-                              </Badge>
-                            {/if}
-                            {#if showsN8nBadge(option)}
-                              <Badge variant="outline" class="batshit-settings-child-label">
-                                n8n · compatible
                               </Badge>
                             {/if}
                           </div>
@@ -4189,11 +3874,6 @@ $effect(() => {
                             <CheckCircle2 class="h-3 w-3" />
                           {/if}
                           <span>Batshit · {selectedConnection.status === 'ready' ? 'ready' : 'compatible'}</span>
-                        </Badge>
-                      {/if}
-                      {#if showsN8nBadge(selectedConnection)}
-                        <Badge variant="outline" class="batshit-settings-child-label">
-                          n8n · compatible
                         </Badge>
                       {/if}
                     </div>
@@ -4472,11 +4152,6 @@ $effect(() => {
 		                          <span>Batshit · {appliedConnection.status === 'ready' ? 'ready' : 'compatible'}</span>
 		                        </Badge>
 		                      {/if}
-		                      {#if showsN8nBadge(appliedConnection)}
-		                        <Badge variant="outline" class="batshit-settings-child-label">
-		                          n8n · compatible
-		                        </Badge>
-		                      {/if}
 		                    </div>
 		                  {:else if editingForm.connectionId}
 		                    <p class="batshit-settings-form-meta">
@@ -4562,7 +4237,7 @@ $effect(() => {
                         <p>
                           Automatic uses the Model Catalog classification. Choose a category manually
                           when a provider reports the model incorrectly. Chat presets are available to
-                          API agents; Utility is intended for embeddings, reranking, and similar tasks.
+                          agents; Utility is intended for embeddings, reranking, and similar tasks.
                         </p>
                       </SettingsInfoMenu>
                     </div>
@@ -4717,6 +4392,8 @@ $effect(() => {
 
 		            {#if isChatgptPlanConnection(editingForm.connectionId)}
                 <p class="batshit-settings-note">ChatGPT plan inference has no API token price. Manage plan usage in ChatGPT; quota percentages and resets are not reported here.</p>
+              {:else if isClaudePlanConnection(editingForm.connectionId)}
+                <p class="batshit-settings-note">Claude plan replies count against your Claude plan's usage limits and have no API token price. Check plan usage in Claude; limits and resets are not reported here.</p>
               {:else}
 		            <div class="batshit-settings-form-row is-tall">
 		              <div class="batshit-settings-form-copy">
@@ -4907,7 +4584,7 @@ $effect(() => {
 	                  type="text"
                     inputmode="numeric"
 	                  value={editingForm.contextWindow}
-	                  placeholder={isChatgptPlanConnection(editingForm.connectionId) ? 'Unknown' : '200,000'}
+	                  placeholder={planConnectionParameters(editingForm.connectionId) ? 'Unknown' : '200,000'}
                     onfocus={beginNumericDraft}
                     onkeydown={commitNumericDraftOnEnter}
 	                  oninput={(event) => {
@@ -4935,6 +4612,45 @@ $effect(() => {
 	              </div>
 	            </div>
 
+                <div class="batshit-settings-form-row is-tall" data-testid="model-reasoning-evidence">
+                  <div class="batshit-settings-form-copy">
+                    <span class="batshit-settings-form-label">Reasoning Controls</span>
+                  </div>
+                  <div class="batshit-settings-form-control">
+                    {#if presetReasoningEvidence.evidence?.lastGood}
+                      {@const facts = presetReasoningEvidence.evidence.lastGood}
+                      {#if facts.support === 'unsupported'}
+                        <p class="batshit-settings-form-meta">No adjustable reasoning controls are reported for this connection.</p>
+                      {:else}
+                        {#each facts.controls as control (control.id)}
+                          <p class="batshit-settings-form-meta">
+                            {#if control.kind === 'effort' || control.kind === 'mode'}
+                              {control.kind === 'effort' ? 'Effort' : 'Mode'}: {control.values.join(', ')}.
+                              {#if control.defaultValue !== undefined}Default: {control.defaultValue}.{/if}
+                            {:else if control.kind === 'toggle'}
+                              Thinking: on or off. {#if control.defaultValue !== undefined}Default: {control.defaultValue ? 'on' : 'off'}.{/if}
+                            {:else if control.kind === 'budget'}
+                              Token budget: {control.min}{control.max === undefined ? ' or more' : `–${control.max}`}.
+                              {#if control.specialValues?.length} Special values: {control.specialValues.join(', ')}.{/if}
+                              {#if control.defaultValue !== undefined}Default: {control.defaultValue}.{/if}
+                            {/if}
+                          </p>
+                        {/each}
+                      {/if}
+                      <p class="batshit-settings-form-meta">Last verified: {facts.lastVerified}.</p>
+                      {#if presetReasoningEvidence.evidence.lastAttempt.outcome !== 'verified'}
+                        <p class="batshit-settings-form-meta">Latest check {presetReasoningEvidence.evidence.lastAttempt.at}: {presetReasoningEvidence.evidence.lastAttempt.outcome === 'unavailable' ? 'unavailable' : 'needs review'}. Previous verified information is shown.</p>
+                      {/if}
+                      <div class="batshit-settings-form-meta">
+                        {#each facts.evidence as source, index}
+                          <a href={source.url} target="_blank" rel="noopener noreferrer" class="underline">Source {index + 1}</a>{' '}
+                        {/each}
+                      </div>
+                    {:else}
+                      <p class="batshit-settings-form-meta">The catalog has no verified reasoning information for this model and connection.</p>
+                    {/if}
+                  </div>
+                </div>
 	            {#if localModelFormat}
 	              <div class="batshit-settings-form-row">
 	                <div class="batshit-settings-form-copy">
@@ -4986,9 +4702,9 @@ $effect(() => {
 	                <Input
 	                  type="text"
                     inputmode="numeric"
-	                  value={isChatgptPlanConnection(editingForm.connectionId) ? '' : getParameterValue('maxTokens')}
-                    disabled={isChatgptPlanConnection(editingForm.connectionId)}
-	                  placeholder={isChatgptPlanConnection(editingForm.connectionId) ? 'Managed by ChatGPT' : '4,000'}
+	                  value={planConnectionParameters(editingForm.connectionId) ? '' : getParameterValue('maxTokens')}
+                    disabled={Boolean(planConnectionParameters(editingForm.connectionId))}
+	                  placeholder={isChatgptPlanConnection(editingForm.connectionId) ? 'Managed by ChatGPT' : isClaudePlanConnection(editingForm.connectionId) ? 'Managed by Claude Code' : '4,000'}
                     onfocus={beginNumericDraft}
                     onkeydown={commitNumericDraftOnEnter}
 	                  oninput={(event) => {
@@ -5019,50 +4735,7 @@ $effect(() => {
                   set them unless you change them here yourself.
                 </p>
               </SettingsInfoMenu>
-              {#if showN8nParameterSupport}
-                <Tooltip.Root>
-                  <Tooltip.Trigger>
-                    <button
-                      type="button"
-                      class="batshit-settings-model-support-legend-trigger"
-                      aria-label="About API and n8n parameter support markers"
-                    >
-                      <CheckCircle2 class="h-3.5 w-3.5 text-[var(--batshit-primary)]" />
-                      <CheckCircle2 class="h-3.5 w-3.5 text-[var(--n8n-brand)]" />
-                    </button>
-                  </Tooltip.Trigger>
-                  <Tooltip.Content class="max-w-[240px] text-left">
-                    <p>A Batshit-colored check means the parameter works in API presets.</p>
-                    <p class="mt-2">
-                      A second n8n-colored check means the same parameter also works in n8n Chat
-                      Model nodes used by Workflow Subagents.
-                    </p>
-                  </Tooltip.Content>
-                </Tooltip.Root>
-              {/if}
-              {#if n8nCompatibilityState.hasWorkflowSubagents}
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="outline"
-                  onclick={() => void refreshN8nParameterCompatibility('model-card-manual')}
-                  disabled={n8nCompatibilitySyncing}
-                >
-                  {#if n8nCompatibilitySyncing}
-                    <Loader2 class="animate-spin" />
-                  {:else}
-                    <RefreshCcw />
-                  {/if}
-                  Refresh n8n
-                </Button>
-              {/if}
           {/snippet}
-	        {#if n8nCompatibilitySyncError && n8nCompatibilityState.hasWorkflowSubagents}
-	          <div class="batshit-settings-inline-alert is-warning">
-	            Batshit could not reach n8n to check which settings its nodes accept. Your preset is
-	            unaffected; only the n8n column of the compatibility notes is out of date.
-	          </div>
-	        {/if}
 		          <div class="batshit-settings-form-stack">
 		            <div class="batshit-settings-toggle-row is-spine-toggle">
 		              <div>
@@ -5128,7 +4801,6 @@ $effect(() => {
 		            </div>
 		          </div>
 
-		          {#if !isCodexModel}
 		            <div class="space-y-4">
 		              <div class="flex items-center justify-between gap-4">
 		                <div class="space-y-1">
@@ -5213,13 +4885,10 @@ $effect(() => {
                         {#snippet parameterFields(parameters: ParameterDefinition[])}
                           <div class="batshit-settings-form-stack">
                             {#each parameters as parameter (parameter.name)}
-                              {@const parameterSupportsN8N = isParameterSupportedInN8N(parameter, {
-                                provider: editingForm.provider || selectedCatalogEntry?.developerId || '',
-                                model: editingForm.modelId || selectedCatalogEntry?.modelId || '',
-                                matrixEntries
-                              })}
                               {@const responseFormatWarningVisible = showResponseFormatWarning(parameter)}
                               {@const unlistedChoiceNotice = getUnlistedChoiceNotice(parameter)}
+                              {@const availableValues = availableParameterValues(parameter)}
+                              {@const availableOptions = availableValues === null ? parameter.options ?? [] : (parameter.options ?? []).filter(option => availableValues.includes(String(option.value)))}
 	                              <div class="batshit-settings-form-row">
                                 <div class="batshit-settings-form-copy">
                                   <div class="batshit-settings-form-label-line">
@@ -5227,16 +4896,6 @@ $effect(() => {
                                     <SettingsInfoMenu ariaLabel={`About ${parameter.label}`}>
                                       <p>{getParameterHint(parameter)}</p>
                                     </SettingsInfoMenu>
-                                    <span
-                                      class="batshit-settings-parameter-support-icons"
-                                      title={parameterSupportLabel(showN8nParameterSupport && parameterSupportsN8N)}
-                                      aria-label={parameterSupportLabel(showN8nParameterSupport && parameterSupportsN8N)}
-                                    >
-                                      <Check class="h-3 w-3 text-[var(--batshit-primary)]" />
-                                      {#if showN8nParameterSupport && parameterSupportsN8N}
-                                        <Check class="h-3 w-3 text-[var(--n8n-brand)]" />
-                                      {/if}
-                                    </span>
                                     {#if responseFormatWarningVisible}
                                       <SettingsInfoMenu
                                         ariaLabel="Response Format Warning"
@@ -5325,7 +4984,7 @@ $effect(() => {
                                           {#if !(parameter.options ?? []).some((option) => option.value === '')}
                                             <Select.Item value="">{blankChoiceLabel(parameter, 'Use provider default')}</Select.Item>
                                           {/if}
-                                          {#each parameter.options ?? [] as option (option.value)}
+                                          {#each availableOptions as option (option.value)}
                                             <Select.Item value={option.value}>{option.label}</Select.Item>
                                           {/each}
                                         </Select.Content>
@@ -5416,6 +5075,7 @@ $effect(() => {
 			                  {/each}
 			                {/if}
 
+			                {#if !planConnectionParameters(editingForm.connectionId)}
 			                <Collapsible.Root open={parameterSectionOpen[CUSTOM_PARAMETERS_SECTION_ID] ?? false}>
 			                  <div class="batshit-settings-disclosure-row">
 			                    <div class="batshit-settings-disclosure-trigger batshit-settings-parameter-trigger-row">
@@ -5595,17 +5255,9 @@ $effect(() => {
 		                    </Collapsible.Content>
 			                  </div>
 			                </Collapsible.Root>
+			                {/if}
 			              </div>
 				            </div>
-	          {/if}
-
-	          {#if isCodexModel}
-	            <div class="batshit-settings-inline-alert is-dashed">
-	              Manage Codex CLI defaults per agent now. Open Agent Settings for any Codex agent to configure
-	              permission modes, sandboxes, feature flags, and working directories. This preset only stores the
-	              underlying model parameters.
-	            </div>
-	          {/if}
 	      </SettingsAccordionCard>
 
         {#if saveError}

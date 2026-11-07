@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { committedColorInput } from '$lib/utils/committedColorInput'
   import { Badge } from '$lib/components/ui/badge'
   import { Button } from '$lib/components/ui/button'
   import { Slider } from '$lib/components/ui/slider'
@@ -17,10 +18,11 @@
   import { BATSHIT_SERVER_URL } from '$lib/services/apiClient'
   import {
     classifyHairAssetAvailability,
+    projectBuiltinHairStyleCards,
     resolveHairAssetBrowserUrl,
     resolveHairSelectionCatalogStatus
   } from '$lib/goons/hairCatalog'
-  import type { HairAssetV1, HairRefitSourceV1, HairStateV2 } from '$lib/goons/hairAssets'
+  import { parseHairState, type HairAssetV1, type HairRefitSourceV1, type HairStateV2 } from '$lib/goons/hairAssets'
   import { HAIR_COLOR_PRESETS } from '$lib/goons/hairMaterial'
   import {
     HAIR_MOTION_INTENSITY_MAX,
@@ -33,6 +35,9 @@
 
   type Props = {
     assets: HairAssetV1[]
+    retainedBuiltinAssets?: HairAssetV1[]
+    ownerId?: string | null
+    stateOwnerId?: string | null
     refitSources?: HairRefitSourceV1[]
     valueState: HairStateV2
     recipeSource: RecipeSourceIdentity | null
@@ -47,7 +52,7 @@
     } | null
     disabled?: boolean
     onRefresh: () => void | Promise<void>
-    onSelect: (asset: HairAssetV1 | null) => void | Promise<void>
+    onSelect: (asset: HairAssetV1 | null, restoreState?: HairStateV2) => void | Promise<void>
     onColorsChange: (colors: {
       baseColor: string
       highlightColor: string
@@ -61,6 +66,9 @@
 
   let {
     assets,
+    retainedBuiltinAssets = [],
+    ownerId = null,
+    stateOwnerId = null,
     refitSources = [],
     valueState,
     recipeSource,
@@ -86,17 +94,49 @@
   let deleteDialogOpen = $state(false)
   let deleteBusy = $state(false)
   let previousSelectedKey = $state('')
-  const selectionStatus = $derived(resolveHairSelectionCatalogStatus(valueState, assets))
+  let previousSelectedState = $state<HairStateV2 | null>(null)
+  let previousOwnerId = $state<string | null>(null)
+  let previousRestoreError = $state<string | null>(null)
+  const selectionStatus = $derived(
+    resolveHairSelectionCatalogStatus(valueState, [...assets, ...retainedBuiltinAssets])
+  )
+  const selectionAvailability = $derived(
+    selectionStatus.status === 'ready' && selectionStatus.asset
+      ? classifyHairAssetAvailability(selectionStatus.asset, recipeSource)
+      : null
+  )
+  const retainedSelection = $derived(
+    selectionStatus.status === 'ready' && selectionStatus.asset !== null &&
+      retainedBuiltinAssets.some((asset) => assetKey(asset) === assetKey(selectionStatus.asset!))
+  )
+  const selectionMessage = $derived(
+    selectionStatus.message ?? (selectionAvailability && !selectionAvailability.selectable
+      ? selectionAvailability.message
+      : null)
+  )
   const selectedKey = $derived(
     valueState.selected
       ? `${valueState.selected.assetId}@${valueState.selected.assetRevisionId}`
       : ''
   )
-  const builtInAssets = $derived(assets.filter((asset) => asset.sourceClass === 'builtin'))
+  const builtinCards = $derived(projectBuiltinHairStyleCards(assets, recipeSource))
+  const builtInAssets = $derived(builtinCards.map((card) => card.asset))
   const importedAssets = $derived(assets.filter((asset) => asset.sourceClass === 'user'))
+  const visibleAssets = $derived([...builtInAssets, ...importedAssets])
 
   $effect(() => {
-    if (selectedKey) previousSelectedKey = selectedKey
+    if (ownerId !== previousOwnerId) {
+      previousOwnerId = ownerId
+      previousSelectedKey = ''
+      previousSelectedState = null
+      previousRestoreError = null
+    }
+    if (stateOwnerId !== ownerId) return
+    if (selectedKey) {
+      previousSelectedKey = selectedKey
+      previousSelectedState = parseHairState(valueState)
+      previousRestoreError = null
+    }
   })
 
   function assetKey(asset: HairAssetV1) {
@@ -124,15 +164,33 @@
     return classifyHairAssetAvailability(asset, recipeSource).selectable
   }
 
+  function cardAvailability(asset: HairAssetV1) {
+    if (asset.sourceClass === 'builtin') {
+      return builtinCards.find((card) => assetKey(card.asset) === assetKey(asset))?.availability ??
+        classifyHairAssetAvailability(asset, recipeSource)
+    }
+    return classifyHairAssetAvailability(asset, recipeSource)
+  }
+
   function handleNoHairChange(checked: boolean) {
     if (checked) {
+      previousRestoreError = null
       void onSelect(null)
       return
     }
-    const previous = assets.find(
+    const previous = [...assets, ...retainedBuiltinAssets].find(
       (asset) => assetKey(asset) === previousSelectedKey && selectableAsset(asset)
     )
-    const fallback = previous ?? assets.find(selectableAsset)
+    if (previousSelectedState) {
+      if (previous && resolveHairSelectionCatalogStatus(previousSelectedState, [previous]).status === 'ready') {
+        previousRestoreError = null
+        void onSelect(previous, previousSelectedState)
+      } else {
+        previousRestoreError = 'The previous Hair fit is unavailable for this Goon. Choose an available style.'
+      }
+      return
+    }
+    const fallback = visibleAssets.find((asset) => cardAvailability(asset).selectable)
     if (fallback) void onSelect(fallback)
   }
 
@@ -156,7 +214,7 @@
       <AlertDialogTitle>Delete this Hair revision?</AlertDialogTitle>
       <AlertDialogDescription>
         {deleteTarget
-          ? `${deleteTarget.display.name} revision ${deleteTarget.revision} and its owned import files will be permanently deleted. Other immutable revisions remain available. Batshit will block deletion if a saved Goon still uses this exact revision.`
+          ? `${deleteTarget.display.name} revision ${deleteTarget.revision} and its owned import files will be permanently deleted. Other immutable revisions remain available. Hair used by a saved Goon, including its Previous Version (rollback), is kept until those versions no longer need it.`
           : ''}
       </AlertDialogDescription>
     </AlertDialogHeader>
@@ -202,11 +260,17 @@
           : 'Choose a style here, preview it immediately, then use Save Goon to keep it.'}
       </p>
       <Badge variant="secondary" class="batshit-settings-child-label">
-        {assets.length} {assets.length === 1 ? 'style' : 'styles'}
+        {visibleAssets.length} {visibleAssets.length === 1 ? 'style' : 'styles'}
       </Badge>
     </div>
 
-    {#if selectionStatus.status === 'ready' && selectionStatus.asset}
+    {#if retainedSelection && selectionStatus.asset}
+      <div class="batshit-settings-muted-panel" role="status">
+        <p class="batshit-settings-caption">Currently selected: {selectionStatus.asset.display.name} (saved fit)</p>
+      </div>
+    {/if}
+
+    {#if selectionStatus.status === 'ready' && selectionStatus.asset && selectionAvailability?.selectable}
       <div class="batshit-settings-muted-panel space-y-3">
         <div class="flex items-center gap-1.5">
           <div class="batshit-settings-form-label">Two-color Hair Palette</div>
@@ -225,11 +289,12 @@
               value={valueState.baseColor}
               aria-label="Hair Base Color"
               disabled={disabled || busy}
-              oninput={(event) =>
-                void onColorsChange({
-                  baseColor: (event.currentTarget as HTMLInputElement).value,
-                  highlightColor: valueState.highlightColor
-                })}
+              use:committedColorInput={{
+                value: valueState.baseColor,
+                resetKey: valueState,
+                disabled: disabled || busy,
+                onCommit: (color) => void onColorsChange({ baseColor: color, highlightColor: valueState.highlightColor })
+              }}
             />
           </label>
           <label class="batshit-hair-color-control">
@@ -240,11 +305,12 @@
               value={valueState.highlightColor}
               aria-label="Hair Highlight Color"
               disabled={disabled || busy}
-              oninput={(event) =>
-                void onColorsChange({
-                  baseColor: valueState.baseColor,
-                  highlightColor: (event.currentTarget as HTMLInputElement).value
-                })}
+              use:committedColorInput={{
+                value: valueState.highlightColor,
+                resetKey: valueState,
+                disabled: disabled || busy,
+                onCommit: (color) => void onColorsChange({ baseColor: valueState.baseColor, highlightColor: color })
+              }}
             />
           </label>
         </div>
@@ -334,10 +400,17 @@
       {/if}
     {/if}
 
-    {#if selectionStatus.message && !loading && !loadError}
+    {#if selectionMessage && !loading && !loadError}
       <div class="batshit-settings-muted-panel flex items-start gap-2" role="alert">
         <CircleAlert class="mt-0.5 h-4 w-4 shrink-0 text-destructive" aria-hidden="true" />
-        <p class="batshit-settings-caption is-danger">{selectionStatus.message}</p>
+        <p class="batshit-settings-caption is-danger">{selectionMessage}</p>
+      </div>
+    {/if}
+
+    {#if previousRestoreError && !loading && !loadError}
+      <div class="batshit-settings-muted-panel flex items-start gap-2" role="alert">
+        <CircleAlert class="mt-0.5 h-4 w-4 shrink-0 text-destructive" aria-hidden="true" />
+        <p class="batshit-settings-caption is-danger">{previousRestoreError}</p>
       </div>
     {/if}
 
@@ -409,7 +482,7 @@
                     <Switch.Root
                       checked={!selectedKey}
                       onCheckedChange={(checked) => handleNoHairChange(Boolean(checked))}
-                      disabled={disabled || busy || (!selectedKey && !assets.some(selectableAsset))}
+                      disabled={disabled || busy || (!selectedKey && !previousSelectedState && !visibleAssets.some((asset) => cardAvailability(asset).selectable))}
                       aria-label="No Hair"
                     />
                   </label>
@@ -441,7 +514,7 @@
             {#if section.items.length > 0}
               <div class="grid grid-cols-[repeat(auto-fill,minmax(148px,1fr))] gap-3">
                 {#each section.items as asset (assetKey(asset))}
-                  {@const availability = classifyHairAssetAvailability(asset, recipeSource)}
+                  {@const availability = cardAvailability(asset)}
                   {@const selected = selectedKey === assetKey(asset)}
                   {@const refitSource = refitSourceFor(asset)}
                   <div class="batshit-hair-card-stack">
@@ -568,7 +641,7 @@
   }
 
   .batshit-hair-card.is-selected {
-    border-color: var(--primary);
+    border-color: var(--primary-text);
     background: color-mix(in oklch, var(--primary) 18%, var(--bs-settings-display-surface, oklch(0.23 0.02 285)));
   }
 
@@ -681,8 +754,8 @@
 
   .batshit-hair-palette-preset:hover:not(:disabled),
   .batshit-hair-palette-preset-active {
-    border-color: color-mix(in oklab, var(--primary) 70%, transparent);
-    background: color-mix(in oklab, var(--primary) 12%, transparent);
+    border-color: color-mix(in oklab, var(--primary-text) 70%, transparent);
+    background: var(--bs-app-primary-faint);
   }
 
   .batshit-hair-palette-preset:focus-visible {

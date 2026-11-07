@@ -12,7 +12,7 @@
  */
 import { stripZipControlBlocks } from '$lib/utils/zipControl'
 import { stripLeadingSubagentZipEcho } from '$lib/utils/subagentEchoSanitizer'
-import { isConcreteZipId, scanZipReferences } from '$lib/utils/zipReferenceSafety'
+import { extractZipIdFromReference, isConcreteZipId, scanZipReferences } from '$lib/utils/zipReferenceSafety'
 import { createNextIndexFinder, scanBracedTokens } from '$lib/utils/braceScan'
 
 type ReplyZipReferenceLike = {
@@ -132,30 +132,6 @@ function replaceMatches(text: string, matches: CoolToolMatch[], replacer: (match
   return parts.join('')
 }
 
-/**
- * The id of the first `{{batshit-zip:<id>}}` or `{{batshit-zip:<id>:::<description>}}` in a
- * reference: exactly `/\{\{batshit-zip:([^:}]+)(?::::[^}]*)?\}\}/`, in one pass.
- */
-function firstZipIdInReference(reference: string): string | undefined {
-  const nextBrace = createNextIndexFinder(reference, '}')
-  let from = 0
-  for (;;) {
-    const start = reference.indexOf(ZIP_OPEN, from)
-    if (start < 0) return undefined
-    const idStart = start + ZIP_OPEN.length
-    const brace = nextBrace(idStart)
-    let idEnd = idStart
-    while (idEnd < brace && reference.charCodeAt(idEnd) !== 58 /* : */) idEnd += 1
-    if (idEnd > idStart && brace < reference.length) {
-      if (idEnd === brace && reference.charCodeAt(brace + 1) === 125) return reference.slice(idStart, idEnd)
-      if (idEnd < brace && reference.startsWith(':::', idEnd) && reference.charCodeAt(brace + 1) === 125) {
-        return reference.slice(idStart, idEnd)
-      }
-    }
-    from = start + 1
-  }
-}
-
 /** Every inline `<cool_tool>` marker becomes its server-made zip reference, in order. */
 export function replaceCoolToolMarkersWithZipRefs(content: string, zipRefs: unknown): string {
   const refs = referenceList(zipRefs)
@@ -219,7 +195,11 @@ export function sanitizeFinishedReplyContent(content: string): string {
   return sanitized
 }
 
-/** The zip ids a reply's `zipReferences` entries name, concrete ones only. */
+/**
+ * The zip ids a reply's `zipReferences` entries name, concrete ones only. An entry's text is read
+ * like every other reader of these entries (BL-609): its first reference as the trust reader reads
+ * one (`extractZipIdFromReference`). The server writes the entries, and each reads as before.
+ */
 export function zipIdsFromReplyReferences(references: unknown): string[] {
   const ids = new Set<string>()
   const addId = (value: unknown) => {
@@ -241,7 +221,7 @@ export function zipIdsFromReplyReferences(references: unknown): string[] {
         ? ref.reference
         : ''
     if (!reference) continue
-    addId(firstZipIdInReference(reference))
+    addId(extractZipIdFromReference(reference))
   }
   return Array.from(ids)
 }

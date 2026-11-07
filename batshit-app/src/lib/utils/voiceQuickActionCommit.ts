@@ -20,6 +20,8 @@ export interface VoiceReplyObservation {
 export interface VoiceQuickActionCommitContext {
   sessionId: string | null
   agentId: string | null
+  /** Canonical voice-only configuration; omitted by consumers without that lifetime. */
+  voiceLifetimeKey?: string
 }
 
 export interface VoiceQuickActionCommitToken {
@@ -32,6 +34,7 @@ export interface VoiceQuickActionCommitCoordinator {
   begin(context: VoiceQuickActionCommitContext): VoiceQuickActionCommitToken
   isCurrent(token: VoiceQuickActionCommitToken, context: VoiceQuickActionCommitContext): boolean
   ownsLatestGeneration(token: VoiceQuickActionCommitToken): boolean
+  adoptCreatedSession(token: VoiceQuickActionCommitToken, current: VoiceQuickActionCommitContext, sessionId: string): boolean
   finish(token: VoiceQuickActionCommitToken): boolean
   invalidate(): boolean
   invalidateContext(context: VoiceQuickActionCommitContext): boolean
@@ -55,7 +58,8 @@ export interface RunVoiceQuickActionCommitOptions<Verdict, Mark> {
 }
 
 function sameContext(left: VoiceQuickActionCommitContext, right: VoiceQuickActionCommitContext) {
-  return left.sessionId === right.sessionId && left.agentId === right.agentId
+  return left.sessionId === right.sessionId && left.agentId === right.agentId &&
+    left.voiceLifetimeKey === right.voiceLifetimeKey
 }
 
 export function voiceQuickActionSnapshotMatches(
@@ -106,6 +110,16 @@ export function createVoiceQuickActionCommitCoordinator(): VoiceQuickActionCommi
     ownsLatestGeneration(token) {
       return generation === token.generation && !token.signal.aborted
     },
+    adoptCreatedSession(token, current, sessionId) {
+      if (latestToken !== token || generation !== token.generation || token.signal.aborted ||
+        !token.context.agentId ||
+        token.context.sessionId !== null || current.sessionId !== null ||
+        !sameContext(token.context, current) || !sessionId || sessionId.trim() !== sessionId) return false
+      // The exact composer preparation/page send created this id and calls before selection.
+      // A previous null-context cleanup can no longer retire the transferred token.
+      token.context.sessionId = sessionId
+      return true
+    },
     finish(token) {
       if (active?.token !== token) return false
       active = null
@@ -154,8 +168,10 @@ export async function runVoiceQuickActionCommit<Verdict, Mark>(
       options.applyAction(verdict, decision.mark)
       if (decision.onlyThis) {
         options.coordinator.finish(options.token)
-        releasePending()
+        // Keep the existing Auto Listen wait until storage settles. A failed save
+        // cannot silently rearm a recorded capture before its partial outcome is shown.
         await options.persistOnly(decision.mark)
+        releasePending()
         return 'only-this'
       }
     }

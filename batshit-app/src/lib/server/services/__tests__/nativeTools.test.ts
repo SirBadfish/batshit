@@ -1,14 +1,20 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { isTestProcessRunning } from '$lib/test-utils/process-state'
+import { initializedBuiltinPluginEntries } from '$lib/test-utils/initialized-builtin-plugin'
 import os from 'node:os'
 import path from 'node:path'
-import { execFileSync, spawnSync } from 'node:child_process'
+import { execFileSync, spawn, spawnSync } from 'node:child_process'
+import { __setAgentBrowserCliTestSpawner, __setAgentBrowserTestShell } from '../agentBrowserCliProcess'
+import { existsSync } from 'node:fs'
 import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import {
   GROUP_APPROVAL_UNAVAILABLE_REASON,
+  AGENT_MODE_POLICY_REFUSAL,
+  delegatedAgentModePolicyRefusal,
   mapBrokerFailureToNativeAutomationErrorCode,
   mapControlUseErrorToNativeAutomationErrorCode,
   nativeToolService,
+  parseBatshitToolRef,
   normalizeNativeControlUseInput
 } from '../nativeTools'
 import { buildSbxSandboxName } from '../dockerSandboxSbx'
@@ -19,6 +25,7 @@ import { redis } from '$lib/server/redis'
 import { resolveDynamicMcpGatewayScope } from '../mcpSelectionResolver'
 import * as fabricRegistry from '../fabricRegistry'
 import * as localShell from '../localCommandShell'
+import * as sandboxMounts from '../sandboxHomeMounts'
 import {
   buildSkillScriptCommand,
   executeSkillRuntimeAction,
@@ -28,11 +35,18 @@ import {
   resolveSkillRuntimeForTool
 } from '../skillRuntimeToolService'
 import * as runtimeAddons from '../runtimeAddons'
-import { resolveEnabledMode4InternalHelperTools } from '../mode4InternalTools'
 import { isBrokerAvailable, resolveBrokerToolToggles } from '$lib/utils/brokerAvailability'
 import { createEphemeralImageRegistry } from '../toolResultImageDelivery'
 import { normalizeToolStep } from '$lib/utils/toolResultProcessor'
+import { readMemoryObservation } from '../memory/memoryOwnership'
+import { createRecallMediaPermit } from '../memory/memoryRecallDelivery'
 import { createCommandModelCapture, getCommandModelCapture } from '../commandModelCapture'
+import { resolveToolOperationalSettings } from '$lib/utils/toolOperationalSettings'
+
+const toolOperationalMocks = vi.hoisted(() => ({ read: vi.fn() }))
+// Actual strict/raw Redis reads have their own owner suite. Here the existing settings
+// fixture is a confirmed snapshot; rejection propagates and is never an absent default.
+vi.mock('$lib/server/toolOperationalSettingsOwner', () => ({ readToolOperationalSettings: toolOperationalMocks.read }))
 
 const skillRuntimeToolMocks = vi.hoisted(() => ({
   resolveSkillRuntimeForTool: vi.fn(),
@@ -100,6 +114,7 @@ vi.mock('$lib/server/redis', () => ({
     execute: vi.fn(),
     json: {
       get: vi.fn(),
+      getRaw: vi.fn(),
       set: vi.fn()
     },
     expire: vi.fn(),
@@ -110,6 +125,13 @@ vi.mock('$lib/server/redis', () => ({
     getProjectPreferences: vi.fn()
   }
 }))
+
+vi.mock('../systemSlashCommands', async importOriginal => {
+  const { assertInitializedBuiltinPlugin } = await import('$lib/test-utils/initialized-builtin-plugin')
+  const { redis } = await import('$lib/server/redis')
+  return { ...(await importOriginal<typeof import('../systemSlashCommands')>()), ensureSystemSlashCommands: (userId: string) =>
+    assertInitializedBuiltinPlugin(userId, key => redis.json.get(key)) }
+})
 
 vi.mock('../mcpGatewayDiscovery', () => ({
   mcpGatewayDiscovery: {
@@ -188,6 +210,12 @@ export PATH
 exec /bin/sh -c "$2"
 `, 'utf8')
   await chmod(shellPath, 0o755)
+  __setAgentBrowserTestShell(shellPath)
+  const fixtureCli = path.join(root, 'agent-browser')
+  __setAgentBrowserCliTestSpawner((command, args, options) => {
+    if (command !== fixtureCli) throw new Error('Browser policy proof admits only its exact owned fake executable.')
+    return spawn(command, args, options)
+  })
   vi.spyOn(localShell, 'resolveLocalCommandShell').mockResolvedValue(shellPath)
 }
 
@@ -202,7 +230,11 @@ async function createBrowserPolicyFixture() {
 
 describe('nativeToolService hardening', () => {
   beforeEach(() => {
+    __setAgentBrowserCliTestSpawner(null)
+    __setAgentBrowserTestShell(null)
     vi.clearAllMocks()
+    toolOperationalMocks.read.mockReset().mockImplementation(async (userId: string) =>
+      resolveToolOperationalSettings(await redis.getUserSettings(userId)))
     for (const key of Object.keys(nativeToolEnv)) {
       delete nativeToolEnv[key]
     }
@@ -253,6 +285,11 @@ describe('nativeToolService hardening', () => {
       })
     })
     vi.mocked(redis.json.get).mockResolvedValue(null as any)
+    vi.mocked(redis.json.getRaw).mockImplementation(async (key, jsonPath) => {
+      if (jsonPath !== '$') throw new Error(`Unsupported native-tool raw fixture path: ${jsonPath}`)
+      const row = await redis.json.get(key)
+      return row === null ? null : JSON.stringify([row])
+    })
     vi.mocked(redis.getUserSettings).mockResolvedValue(null as any)
     vi.mocked(redis.getProjectPreferences).mockResolvedValue(null as any)
     vi.mocked(apiKeyService.exists).mockResolvedValue(false)
@@ -314,6 +351,8 @@ describe('nativeToolService hardening', () => {
   })
 
   afterEach(async () => {
+    __setAgentBrowserCliTestSpawner(null)
+    __setAgentBrowserTestShell(null)
     nativeToolService.__setAgentBrowserCliRunnerForTests(null)
     vi.unstubAllGlobals()
     vi.unstubAllEnvs()
@@ -536,8 +575,10 @@ describe('nativeToolService hardening', () => {
       'src',
       'lib',
       'server',
-      'system-skills',
-      'speech-setup',
+      'system-plugins',
+      'batshit',
+      'skills',
+      'voice-engine-installer',
       'SKILL.md'
     )
 
@@ -546,7 +587,7 @@ describe('nativeToolService hardening', () => {
       await writeFile(protectedFile, '# Original\n', 'utf8')
 
       const result = await nativeToolService.nativeBashExecute({
-        command: "cat > batshit-app/src/lib/server/system-skills/speech-setup/SKILL.md <<'EOF'\n# Mutated\nEOF",
+        command: "cat > batshit-app/src/lib/server/system-plugins/batshit/skills/voice-engine-installer/SKILL.md <<'EOF'\n# Mutated\nEOF",
         workspaceRoot: tempWorkspace,
         cwd: tempWorkspace,
         accessMode: 'dangerous',
@@ -707,14 +748,19 @@ describe('nativeToolService hardening', () => {
     const tempWorkspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-native-protected-skill-cache-'))
     const tempHome = await mkdtemp(path.join(os.tmpdir(), 'batshit-native-protected-home-'))
     const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(tempHome)
+    const previousBatshitHome = process.env.BATSHIT_HOME_DIR
+    // This fixture owns the protected cache even when the outer proof lane has a home override.
+    process.env.BATSHIT_HOME_DIR = path.join(tempHome, '.batshit')
     const systemSkillSource = path.join(
       tempWorkspace,
       'batshit-app',
       'src',
       'lib',
       'server',
-      'system-skills',
-      'speech-setup',
+      'system-plugins',
+      'batshit',
+      'skills',
+      'voice-engine-installer',
       'SKILL.md'
     )
     const protectedFile = path.join(
@@ -745,6 +791,8 @@ describe('nativeToolService hardening', () => {
       expect(await readFile(protectedFile, 'utf8')).toBe('# Original Cache\n')
     } finally {
       homedirSpy.mockRestore()
+      if (previousBatshitHome === undefined) delete process.env.BATSHIT_HOME_DIR
+      else process.env.BATSHIT_HOME_DIR = previousBatshitHome
       await rm(tempWorkspace, { recursive: true, force: true })
       await rm(tempHome, { recursive: true, force: true })
     }
@@ -1431,6 +1479,194 @@ PATCH`
     expect(allowed.blocked).not.toBe(true)
   })
 
+  // BL-2182: a delegated API run (Subagent or Worker) runs with `toolApprovalMode: 'off'`, so it can
+  // never raise a card and the Approval Policy cannot help it. Its refusal names what works for it;
+  // a Primary's refusal keeps its text.
+  describe('BL-2182: the Agent-mode refusal on a delegated run', () => {
+    const agentMode = {
+      nativeTools: {
+        bashEnabled: true,
+        executionBackend: 'local',
+        bashAccessMode: 'agent',
+        bashCommandAllowList: [],
+        fetchZipEnabled: false,
+        dynamicMcpEnabled: false,
+        webSearchEnabled: false,
+        agentBrowserEnabled: false
+      }
+    }
+    const cases = [
+      {
+        name: 'a Subagent',
+        run: { processOwner: { userId: 'josh', kind: 'subagent', id: 'sub_helper' }, scopeAgentId: 'sub_helper' },
+        text: "Blocked by Agent mode policy. A Subagent run cannot ask the user for approval. To allow this command, add it to this Subagent's allow list, or switch this Subagent to Dangerous mode."
+      },
+      {
+        name: 'a built-in Worker',
+        run: { processOwner: { userId: 'josh', kind: 'agent', id: 'agent_main' }, scopeAgentId: 'worker_1a2b' },
+        text: "Blocked by Agent mode policy. A Worker run cannot ask the user for approval. A built-in Worker uses the Primary Agent's Work Mode, so to allow this command, add it to the Primary Agent's allow list, or switch the Primary Agent to Dangerous mode."
+      },
+      {
+        name: 'a base clone Worker',
+        run: { processOwner: { userId: 'josh', kind: 'agent', id: 'agent_main' }, scopeAgentId: 'sub_helper' },
+        text: 'Blocked by Agent mode policy. A Worker run cannot ask the user for approval. To allow this command, add it to the allow list of the Subagent this Worker copies, or switch that Subagent to Dangerous mode.'
+      }
+    ] as const
+
+    beforeEach(() => {
+      vi.mocked(redis.get).mockImplementation(async (key: string) =>
+        key === 'agent:agent_main' ? ({ id: 'agent_main', user_id: 'josh', provider_specific_settings: agentMode } as any) : null
+      )
+    })
+    afterEach(() => {
+      vi.mocked(redis.get).mockReset()
+    })
+
+    it.each(cases)('$name: Bash names its own allow list or Dangerous mode, never the Approval Policy', async ({ run, text }) => {
+      expect(delegatedAgentModePolicyRefusal({ scopeAgentId: run.scopeAgentId, processOwnerKind: run.processOwner.kind })).toBe(text)
+      const { tools, toolApprovals } = await nativeToolService.buildMode3NativeTools({
+        userId: 'josh',
+        agentId: 'agent_main',
+        projectPath: process.cwd(),
+        ...run,
+        delegatedBashEnabled: true,
+        providerSettings: agentMode,
+        toolApprovalMode: 'off'
+      } as any)
+      expect(toolApprovals.native_bash_execute).toBeUndefined()
+      const refused = await (tools as any).native_bash_execute.execute({ command: 'npm run build' })
+      expect(refused).toMatchObject({ success: false, blocked: true, command: 'npm run build' })
+      expect(refused.reason).toBe(text)
+      expect(refused.reason).not.toMatch(/Approval Policy/)
+    })
+
+    it('a Primary keeps its refusal, Approval Policy included', async () => {
+      const { tools } = await nativeToolService.buildMode3NativeTools({
+        userId: 'josh',
+        agentId: 'agent_main',
+        projectPath: process.cwd(),
+        providerSettings: agentMode,
+        toolApprovalMode: 'off'
+      } as any)
+      const refused = await (tools as any).native_bash_execute.execute({ command: 'npm run build' })
+      expect(refused.reason).toBe(AGENT_MODE_POLICY_REFUSAL)
+      expect(AGENT_MODE_POLICY_REFUSAL).toBe(
+        'Blocked by Agent mode policy. Add this command to the allow list, switch Approval Policy to On Failure, or switch to Batshit Crazy mode. ' +
+          'To create or edit a file, send an apply_patch by itself, or use write_file or edit_file if you have them: default Agent mode runs these without an approval card.'
+      )
+    })
+
+    // BL-2374: the refusal names the Approval Policy by its label in Agent Settings (On Failure since
+    // Josh's rename of On Request, 2026-10-27), and the file
+    // routes that run in Agent mode without a card, so a model refused on a shell write learns
+    // what works. A shell write itself is refused as before.
+    it('BL-2374: a refused shell write names On Failure and the card-free file routes', async () => {
+      const { tools } = await nativeToolService.buildMode3NativeTools({
+        userId: 'josh',
+        agentId: 'agent_main',
+        projectPath: process.cwd(),
+        providerSettings: agentMode,
+        toolApprovalMode: 'off'
+      } as any)
+      const refused = await (tools as any).native_bash_execute.execute({ command: "printf 'hi' > notes.txt" })
+      expect(refused).toMatchObject({ success: false, blocked: true, command: "printf 'hi' > notes.txt" })
+      expect(refused.reason).toContain('switch Approval Policy to On Failure')
+      expect(refused.reason).not.toContain('On Request')
+      expect(refused.reason).toContain('switch to Batshit Crazy mode')
+      for (const route of ['apply_patch', 'write_file', 'edit_file']) expect(refused.reason).toContain(route)
+    })
+  })
+
+  // SA-126 item 2: commands after a managed patch run on the API lane once the whole patch applied,
+  // so such a call always asks, once, for both; no allow pattern covers it (`apply_patch*` matches
+  // the whole text), and where no card can be raised it writes nothing and says why.
+  describe('a patch with commands after it (SA-126 item 2)', () => {
+    const patchThen = (tail: string, file = 'n.md') =>
+      `apply_patch <<'PATCH' && ${tail}\n*** Begin Patch\n*** Add File: ${file}\n+hello\n*** End Patch\nPATCH`
+    const patchLines = (lines: string, file = 'n.md') =>
+      `apply_patch <<'PATCH'\n*** Begin Patch\n*** Add File: ${file}\n+hello\n*** End Patch\nPATCH\n${lines}`
+    const build = (projectPath: string, extra: Record<string, unknown> = {}, nativeTools: Record<string, unknown> = {}) =>
+      nativeToolService.buildMode3NativeTools({
+        userId: 'josh',
+        projectPath,
+        providerSettings: {
+          nativeTools: {
+            bashEnabled: true,
+            executionBackend: 'local',
+            bashAccessMode: 'agent',
+            bashAgentApprovalCardsEnabled: true,
+            bashCommandAllowList: ['apply_patch*', 'npm test'],
+            fetchZipEnabled: false,
+            dynamicMcpEnabled: false,
+            webSearchEnabled: false,
+            agentBrowserEnabled: false,
+            ...nativeTools
+          }
+        },
+        toolApprovalMode: 'all',
+        ...extra
+      } as any)
+
+    it('asks once for both, whatever the allow list says; a patch alone still needs no card', async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), 'batshit-after-patch-card-'))
+      try {
+        const { toolApprovals } = await build(root)
+        expect(await toolApprovals.native_bash_execute!({ command: patchThen('npm test') })).toBe('user-approval')
+        expect(await toolApprovals.native_bash_execute!({ command: patchLines('npm test') })).toBe('user-approval')
+        expect(await toolApprovals.native_bash_execute!({ command: patchLines('').trimEnd() })).toBeUndefined()
+        // A refused command raises no card: the call fails before any write.
+        expect(await toolApprovals.native_bash_execute!({ command: patchThen('sudo make install') })).toBeUndefined()
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    })
+
+    it('in a group chat writes nothing and says why, while a patch alone is written', async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), 'batshit-after-patch-group-'))
+      try {
+        const { tools, toolApprovals } = await build(root, { groupMemberRun: true })
+        expect(toolApprovals.native_bash_execute).toBeUndefined()
+
+        const refused = await (tools as any).native_bash_execute.execute({ command: patchLines('npm test') })
+        expect(refused).toMatchObject({ success: false, blocked: true })
+        expect(refused.reason).toBe(
+          "Not run: a patch with commands after it needs the user's approval, and approval cards are not available in group chats. Nothing was written. Send the patch alone (Agent mode allows a patch by itself), then the commands in their own call."
+        )
+        await expect(stat(path.join(root, 'n.md'))).rejects.toThrow()
+
+        const alone = await (tools as any).native_bash_execute.execute({ command: patchLines('', 'alone.md').trimEnd() })
+        expect(alone).toMatchObject({ success: true })
+        expect(await readFile(path.join(root, 'alone.md'), 'utf8')).toBe('hello\n')
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    })
+
+    it('with approval cards off, Agent mode writes nothing and says why', async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), 'batshit-after-patch-nocards-'))
+      try {
+        const { tools } = await build(root, { toolApprovalMode: 'none' }, { bashAgentApprovalCardsEnabled: false })
+        const refused = await (tools as any).native_bash_execute.execute({ command: patchThen('npm test') })
+        expect(refused).toMatchObject({ success: false, blocked: true })
+        expect(refused.reason).toMatch(/approval cards are off for this agent\. Nothing was written\./)
+        await expect(stat(path.join(root, 'n.md'))).rejects.toThrow()
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    })
+
+    it('an approved call applies the patch, then runs the command, in one call (Dangerous needs no card)', async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), 'batshit-after-patch-run-'))
+      try {
+        const { tools } = await build(root, { toolApprovalMode: 'none' }, { bashAccessMode: 'dangerous' })
+        const result = await (tools as any).native_bash_execute.execute({ command: patchLines('cat n.md') })
+        expect(result).toMatchObject({ success: true, stdout: 'hello\n', managedApplyPatch: { applied: true, afterPatchStarted: true } })
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    })
+  })
+
   it('uses Agent allow list to skip approval prompts when Approval Policy is On Failure', async () => {
     const { tools, toolApprovals } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
@@ -1483,11 +1719,16 @@ PATCH`
         "cd notes_dir && apply_patch <<'PATCH'\n*** Begin Patch\n*** Add File: NOTES.md\n+hello\n*** End Patch\nPATCH"
       )
     ).toBeUndefined()
-    // BL-252: a patch with another command after it is refused by the executor; it is never
-    // auto-allowed as a managed patch.
+    // BL-252: a patch with another command after it is never auto-allowed. Since BL-1915 the
+    // executor applies the patch and never runs the command; the command still asks, as before.
     expect(
       await bashApproval(
         "apply_patch <<'PATCH'\n*** Begin Patch\n*** Add File: NOTES.md\n+hello\n*** End Patch\nPATCH\nnode -e 'process.exit(3)'"
+      )
+    ).toBe('user-approval')
+    expect(
+      await bashApproval(
+        "apply_patch <<'PATCH' && ls\n*** Begin Patch\n*** Add File: NOTES.md\n+hello\n*** End Patch\nPATCH"
       )
     ).toBe('user-approval')
     expect(await bashApproval({ command: 'apply_patch > out.md' })).toBe('user-approval')
@@ -1647,6 +1888,268 @@ PATCH`
       expect(result.reason).toMatch(/never allow/i)
     } finally {
       await rm(tempWorkspace, { recursive: true, force: true })
+    }
+  })
+
+  it.each(['\n', '\r\n', ' && ', '; '])('enforces a simple Never Allow pattern after %j', async (separator) => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-never-allow-component-'))
+    try {
+      const result = await nativeToolService.nativeBashExecute({
+        command: `printf safe${separator}printf forbidden`, backend: 'local', accessMode: 'dangerous',
+        neverAllowList: ['printf forbidden*'], requireApproval: false, workspaceRoot: workspace
+      })
+      expect(result).toMatchObject({ success: false, blocked: true })
+      expect(result.reason).toMatch(/Never Allow/)
+    } finally {
+      await rm(workspace, { recursive: true, force: true })
+    }
+  })
+
+  // BL-1981: a plain entry sees every command the shell runs, inside substitutions too, and the
+  // program the shell runs whatever quoting or assignment spells it. Each command would create
+  // ran.txt; each is refused before it runs.
+  it.each([
+    ['a `$(…)`', 'echo $(touch ran.txt)'],
+    ['backticks', 'echo `touch ran.txt`'],
+    ['a double-quoted `$(…)`', 'echo "$(touch ran.txt)"'],
+    ['double-quoted backticks', 'echo "x `touch ran.txt` y"'],
+    ['a nested `$(…)`', 'echo $(echo $(touch ran.txt))'],
+    ['three levels of nesting', 'echo $(echo $(echo `touch ran.txt`))'],
+    ['a subshell inside `$(…)`', 'echo $( (touch ran.txt) )'],
+    ['an assignment', 'X=$(touch ran.txt) true'],
+    ['a parameter default', 'echo ${X:-$(touch ran.txt)}'],
+    ['a redirect target', 'echo hi > $(touch ran.txt)'],
+    ['an unquoted heredoc body', 'cat <<EOF\n$(touch ran.txt)\nEOF'],
+    ['a process substitution', 'cat <(touch ran.txt)'],
+    ['a single-quoted program', "'touch' ran.txt"],
+    ['a program split by empty quotes', 't""ouch ran.txt'],
+    ['a backslash before the program', '\\touch ran.txt'],
+    ['an ANSI-C quoted program', "$'touch' ran.txt"],
+    ['an assignment before the program', 'X=1 touch ran.txt'],
+    ['extra spaces', 'touch    ran.txt'],
+    // The review of BL-1981: the shell's own words before the program, and a path to it.
+    ['`!` before the program', '! touch ran.txt'],
+    ['`time` before the program', 'time touch ran.txt'],
+    ['`time -p` before the program', 'time -p touch ran.txt'],
+    ['a brace group', '{ touch ran.txt; }'],
+    ['a function body', 'f(){ touch ran.txt; }; f'],
+    ['a `function` definition and its call', 'function f { touch ran.txt; }; f'],
+    ['a named bash coprocess', 'coproc foo { touch ran.txt; }'],
+    ['zsh `repeat`', 'repeat 3 touch ran.txt'],
+    ['an `if` condition', 'if touch ran.txt; then :; fi'],
+    ['an `if !` condition', 'if ! touch ran.txt; then :; fi'],
+    ['a `while` condition', 'while touch ran.txt; do break; done'],
+    ['a loop body on its line', 'for x in a; do touch ran.txt; done'],
+    ['an assignment after `time`', 'time X=1 touch ran.txt'],
+    ['a path to the program', '/usr/bin/touch ran.txt'],
+    ['a relative path to the program', './touch ran.txt'],
+    ['zsh `=` before the program', '=touch ran.txt'],
+    ['a quoted `time` (runs /usr/bin/time)', "'time' touch ran.txt"],
+    // BL-1992: forms the shared lexer read as data; each runs touch in zsh or bash (or both).
+    ["nested backticks with escapes", "echo `echo \\`touch ran.txt\\``"],
+    ["three levels of escaped backticks", "echo `echo \\`echo \\\\\\`touch ran.txt\\\\\\`\\``"],
+    ["a `\"…\"` with a `)` inside `$(…)`", "echo $(echo \"$(echo \")\"; touch ran.txt)\")"],
+    ["a comment inside `$(…)`", "echo \"$( # )\ntouch ran.txt\n)\""],
+    ["a heredoc inside `$(…)` (zsh)", "echo \"$(cat <<X\n)\nX\ntouch ran.txt\n)\""],
+    ["an ANSI-C hex escape", "$'tou\\x63h' ran.txt"],
+    ["an ANSI-C octal escape", "$'\\164ouch' ran.txt"],
+    ["an ANSI-C \\u escape", "$'tou\\u0063h' ran.txt"],
+    ["an ANSI-C \\U escape", "$'tou\\U00000063h' ran.txt"],
+    ["an escape only zsh drops", "$'t\\ouch' ran.txt"],
+    ["bash `$\"…\"`", "$\"touch\" ran.txt"],
+    ["a `case` pattern inside `$(…)` (zsh)", "echo \"$(case x in x) touch ran.txt;; esac)\""],
+    ["a second `case` pattern inside `$(…)`", "echo \"$(case y in x) echo no;; y) touch ran.txt;; esac)\""],
+    ["a zsh `case x { … }` with a group inside `$(…)`", "echo \"$(case y { x) { echo; } ;; y) touch ran.txt;; })\""],
+    ["a `${x:-)}` inside `$(…)`", "echo \"$(echo ${x:-)}; touch ran.txt)\""],
+    ["a double-quoted `${…}` holding `\")\"` inside `$(…)`", "echo \"$(echo \"${x:-\")\"}\"; touch ran.txt)\""],
+    ["a `'` in a double-quoted `${…}`, read as zsh does", "echo \"${x:-'}\" ; touch ran.txt ; \"'}\""],
+    ["a `'` in a double-quoted `${…}`, read as bash does", "echo \"${x:-'}\"'}\"; touch ran.txt #'"],
+    ["a zsh `case x { … }` whose first pattern opens with `(`", "echo \"$(case y { (x) { :; } ;; y) touch ran.txt;; })\""],
+    ["a quoted `}` inside `${…}` inside `$(…)`", "echo \"$(echo ${x:-\"}\"}; touch ran.txt)\""],
+    ["zsh `always` after a group (review)", "{ :; } always { touch ran.txt }"],
+    ["zsh `always` inside `$(…)` (review)", "echo \"$({ :; } always { touch ran.txt })\""],
+    ["a `(esac)` pattern inside `$(…)` (review)", "echo \"$(case e in (esac) echo;; e) touch ran.txt;; esac)\""],
+    ["a zsh group with no `;` before `}`", "{ touch ran.txt }"],
+    ["a zsh `while` with a `{ … }` body", "while [[ 1 ]] { touch ran.txt; break }"],
+    ["a zsh `else { … }`", "if [[ 0 == 1 ]] { : } else { touch ran.txt }"]
+  ])('refuses a plain Never Allow program inside %s (BL-1981, BL-1992)', async (_label, command) => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-never-allow-substitution-'))
+    try {
+      const result = await nativeToolService.nativeBashExecute({
+        command, backend: 'local', accessMode: 'dangerous',
+        neverAllowList: ['touch ran.txt'], requireApproval: false, workspaceRoot: workspace
+      })
+      expect(result, command).toMatchObject({ success: false, blocked: true })
+      expect(result.reason).toMatch(/Never Allow/)
+      expect(existsSync(path.join(workspace, 'ran.txt'))).toBe(false)
+    } finally {
+      await rm(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses a one-word Never Allow program inside `$(…)` too (BL-1981)', async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-never-allow-substitution-word-'))
+    try {
+      const result = await nativeToolService.nativeBashExecute({
+        command: 'echo $(touch ran.txt)', backend: 'local', accessMode: 'dangerous',
+        neverAllowList: ['touch'], requireApproval: false, workspaceRoot: workspace
+      })
+      expect(result).toMatchObject({ success: false, blocked: true })
+      expect(existsSync(path.join(workspace, 'ran.txt'))).toBe(false)
+    } finally {
+      await rm(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    ['a single-quoted `$(…)`', "echo '$(touch ran.txt)'"],
+    ['a quoted heredoc body', "cat <<'EOF'\n$(touch ran.txt)\nEOF"],
+    ['an argument', 'echo touch ran.txt'],
+    ['a double-quoted argument', 'printf "%s" "touch ran.txt"'],
+    ['a reserved word as an argument', 'echo then touch ran.txt'],
+    // BL-1992: data the fuller reading must keep as data.
+    ["single quotes inside an unquoted `${…}`", "echo ${x:-'$(touch ran.txt)'}"],
+    ["an ANSI-C `$` that only spells `$(`", "echo $'\\x24(touch ran.txt)'"],
+    ["bash `$\"…\"` as an argument", "echo $\"touch ran.txt\""],
+    ["a `case` inside a double-quoted argument", "echo \"case x in x) touch ran.txt;; esac\""],
+    ["braces inside a double-quoted argument", "echo \"{ touch ran.txt }\""],
+    ["`{}` in `find -exec`", "find . -name nothing -exec echo {} \\;"]
+  ])('does not refuse a plain Never Allow program that is only data: %s (BL-1981)', async (_label, command) => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-never-allow-substitution-data-'))
+    try {
+      const result = await nativeToolService.nativeBashExecute({
+        command, backend: 'local', accessMode: 'dangerous',
+        neverAllowList: ['touch ran.txt'], requireApproval: false, workspaceRoot: workspace
+      })
+      expect(result, command).toMatchObject({ success: true, exitCode: 0 })
+      expect(existsSync(path.join(workspace, 'ran.txt'))).toBe(false)
+    } finally {
+      await rm(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses nesting deeper than any real command, rather than leave it unread (BL-1981)', async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-never-allow-substitution-deep-'))
+    try {
+      const deep = `${'echo $('.repeat(20)}true${')'.repeat(20)}`
+      const result = await nativeToolService.nativeBashExecute({
+        command: deep, backend: 'local', accessMode: 'dangerous',
+        neverAllowList: ['touch ran.txt'], requireApproval: false, workspaceRoot: workspace
+      })
+      expect(result).toMatchObject({ success: false, blocked: true })
+      // Without a deny list nothing is read for it, and the same command runs.
+      const plain = await nativeToolService.nativeBashExecute({
+        command: deep, backend: 'local', accessMode: 'dangerous', requireApproval: false, workspaceRoot: workspace
+      })
+      expect(plain).toMatchObject({ success: true, exitCode: 0 })
+    } finally {
+      await rm(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses a plain Never Allow program inside `$(…)` after a managed patch, before any write (BL-1981)', async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-never-allow-substitution-tail-'))
+    try {
+      const result = await nativeToolService.nativeBashExecute({
+        command: "apply_patch <<'PATCH'\n*** Begin Patch\n*** Add File: n.md\n+hello\n*** End Patch\nPATCH\necho $(touch ran.txt)",
+        backend: 'local', accessMode: 'dangerous', runCommandAfterPatch: true,
+        neverAllowList: ['touch ran.txt'], requireApproval: false, workspaceRoot: workspace
+      } as any)
+      expect(result).toMatchObject({ success: false, blocked: true })
+      expect(result.reason).toMatch(/Never Allow.*the command after the patch: `echo \$\(touch ran\.txt\)`/)
+      expect(existsSync(path.join(workspace, 'n.md'))).toBe(false)
+      expect(existsSync(path.join(workspace, 'ran.txt'))).toBe(false)
+    } finally {
+      await rm(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it('leaves Auto Allow as it was: whole-input matching, no grant from inside a substitution (BL-1981)', async () => {
+    const { toolApprovals } = await nativeToolService.buildMode3NativeTools({
+      userId: 'josh', projectPath: process.cwd(), toolApprovalMode: 'all',
+      providerSettings: { nativeTools: {
+        bashEnabled: true, bashAccessMode: 'agent', bashAgentApprovalCardsEnabled: true,
+        bashCommandAllowList: ['touch ran.txt'], fetchZipEnabled: false,
+        dynamicMcpEnabled: false, webSearchEnabled: false, agentBrowserEnabled: false
+      } }
+    } as any)
+    // An allow entry for the inner command never grants the outer one.
+    expect(await toolApprovals.native_bash_execute({ command: 'echo $(touch ran.txt)' })).toBe('user-approval')
+    expect(await toolApprovals.native_bash_execute({ command: "'touch' ran.txt" })).toBe('user-approval')
+    expect(await toolApprovals.native_bash_execute({ command: 'touch ran.txt' })).toBeUndefined()
+  })
+
+  it.each([
+    ['quoted multiline argument', "printf '%s\\n' 'safe\nprintf forbidden'\nprintf safe"],
+    ['quoted heredoc', "cat <<'EOF'\nprintf forbidden\nEOF\nprintf safe"],
+    ['unquoted heredoc data', 'cat <<EOF\nprintf forbidden\nEOF\nprintf safe'],
+    ['comment', '# printf forbidden\nprintf safe\nprintf safe'],
+    ['continued argument', 'printf \\\nprintf forbidden\nprintf safe']
+  ])('does not promote %s into a Never Allow command', async (_label, command) => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-never-allow-data-'))
+    try {
+      const result = await nativeToolService.nativeBashExecute({
+        command, backend: 'local', accessMode: 'plan', neverAllowList: ['printf forbidden*'],
+        requireApproval: false, workspaceRoot: workspace
+      })
+      // Plan mode refuses this multi-command input before execution. The quoted/data
+      // line must not become a different, earlier Never Allow refusal.
+      expect(result).toMatchObject({ success: false, blocked: true })
+      expect(result.reason).not.toMatch(/Never Allow/)
+    } finally {
+      await rm(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    ['re:^printf forbidden', false],
+    ['/^printf forbidden/', false],
+    ['/^printf forbidden/m', true],
+    ['re:printf forbidden', true]
+  ] as const)('preserves explicit regex whole-input behavior for %s', async (pattern, denied) => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-never-allow-regex-'))
+    try {
+      const result = await nativeToolService.nativeBashExecute({
+        command: 'printf safe\nprintf forbidden', backend: 'local', accessMode: 'plan',
+        neverAllowList: [pattern], requireApproval: false, workspaceRoot: workspace
+      })
+      expect(result).toMatchObject({ success: false, blocked: true })
+      expect(/Never Allow/.test(result.reason ?? '')).toBe(denied)
+    } finally {
+      await rm(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it('does not grant Auto Allow from a matching later command component', async () => {
+    const { toolApprovals } = await nativeToolService.buildMode3NativeTools({
+      userId: 'josh', projectPath: process.cwd(), toolApprovalMode: 'all',
+      providerSettings: { nativeTools: {
+        bashEnabled: true, bashAccessMode: 'agent', bashAgentApprovalCardsEnabled: true,
+        bashCommandAllowList: ['printf approved*'], fetchZipEnabled: false,
+        dynamicMcpEnabled: false, webSearchEnabled: false, agentBrowserEnabled: false
+      } }
+    } as any)
+    expect(await toolApprovals.native_bash_execute({ command: 'mkdir scratch\nprintf approved' })).toBe('user-approval')
+    expect(await toolApprovals.native_bash_execute({ command: 'printf approved' })).toBeUndefined()
+  })
+
+  it('denies a later automation command before considering its allow list', async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-automation-deny-component-'))
+    try {
+      vi.mocked(redis.getProjectPreferences).mockResolvedValue({ default_workspace_path: workspace } as any)
+      vi.mocked(redis.get).mockResolvedValue({ user_id: 'josh', provider_specific_settings: { nativeTools: {
+        bashEnabled: true, executionBackend: 'local', bashAccessMode: 'agent',
+        bashCommandAllowList: ['*'], automationBashDenyList: ['printf forbidden*']
+      } } } as any)
+      const result = await nativeToolService.dispatchNativeAutomationPackAction({
+        userId: 'josh', action: 'bash_execute', payloadInput: { command: 'printf safe\nprintf forbidden' },
+        context: { session_id: 'session_deny_component', agent_id: 'agent_primary', mode: 'mode1', actor_type: 'primary' }
+      })
+      expect(result.success).toBe(false)
+      expect(result.error?.code).toBe('POLICY_BLOCKED')
+      expect(result.error?.message).toMatch(/deny list/i)
+    } finally {
+      await rm(workspace, { recursive: true, force: true })
     }
   })
 
@@ -1855,6 +2358,62 @@ PATCH`
     expect(mcpGatewayDiscovery.loadToolsForUser).not.toHaveBeenCalled()
   })
 
+  it('operational globals refuse failed reads before Web, Browser or browser-Bash contact', async () => {
+    toolOperationalMocks.read.mockRejectedValue(new Error('Global options read failed'))
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    const runner = vi.fn()
+    nativeToolService.__setAgentBrowserCliRunnerForTests(runner)
+    await expect(nativeToolService.nativeWebSearch({ userId: 'josh', query: 'no contact' })).rejects.toThrow('Global options read failed')
+    await expect(nativeToolService.nativeAgentBrowserFind({ userId: 'josh' })).rejects.toThrow('Global options read failed')
+    await expect(nativeToolService.nativeAgentBrowserUse({ userId: 'josh', toolName: 'get_url' })).rejects.toThrow('Global options read failed')
+    await expect(nativeToolService.nativeBashExecute({ userId: 'josh', command: 'agent-browser snapshot -i',
+      accessMode: 'dangerous', backend: 'local', agentBrowserSettings: { enabled: true } })).rejects.toThrow('Global options read failed')
+    expect(toolOperationalMocks.read).toHaveBeenCalledTimes(4)
+    expect(toolOperationalMocks.read.mock.calls.every(([userId]) => userId === 'josh')).toBe(true)
+    expect(fetchSpy).not.toHaveBeenCalled(); expect(runner).not.toHaveBeenCalled()
+    expect(apiKeyService.exists).not.toHaveBeenCalled()
+  })
+
+  it('operational globals are fresh per Browser operation and explicit params keep precedence', async () => {
+    const runtime = { command: 'agent-browser', args: [], stdout: 'agent-browser 0.3.0', stderr: '',
+      exitCode: 0, signal: null, timedOut: false, durationMs: 1, truncated: false }
+    const runner = vi.fn(async ({ args }) => ({ ...runtime, args, stdout: args[0] === '--version'
+      ? 'agent-browser 0.3.0' : JSON.stringify({ success: true, data: { ok: true } }) }))
+    nativeToolService.__setAgentBrowserCliRunnerForTests(runner)
+    toolOperationalMocks.read.mockResolvedValue({ ...resolveToolOperationalSettings(null), agentBrowser: {
+      liveViewEnabled: true, runtimeMode: 'chrome-cdp', cdpPort: 9444, provider: 'browserbase',
+      timeoutMs: 17001, extraFlags: ['--global']
+    } })
+    const found = await nativeToolService.nativeAgentBrowserFind({ userId: 'josh' })
+    expect(found.defaults).toMatchObject({ runtimeMode: 'chrome-cdp', cdpPort: 9444, provider: 'browserbase', timeoutMs: 17001 })
+    const used = await nativeToolService.nativeAgentBrowserUse({ userId: 'josh', toolName: 'get_url', params: {
+      runtimeMode: 'chromium', provider: 'local', liveView: false, timeoutMs: 5000, extraFlags: ['--requested']
+    } })
+    expect(used.success).toBe(true)
+    const issued = runner.mock.calls.map(([call]) => call).find(call => call.args.includes('get'))
+    expect(issued?.args).toEqual(['--global', '--requested', '--json', 'get', 'url'])
+    expect(issued?.timeoutMs).toBe(5000)
+    expect(toolOperationalMocks.read).toHaveBeenCalledTimes(2)
+  })
+
+  it('operational globals cannot grant disabled Web or Browser and pure resolution performs no read', async () => {
+    const grants = { nativeTools: { webSearchEnabled: false, agentBrowserEnabled: false, bashEnabled: false,
+      agentBrowserProvider: 'kernel', webSearchProvider: 'exa' } }
+    const resolved = nativeToolService.resolveNativeToolSettings(grants)
+    expect(resolved).toMatchObject({ webSearchEnabled: false, agentBrowserEnabled: false, bashEnabled: false })
+    expect(resolved).not.toHaveProperty('webSearchProvider')
+    expect(resolved).not.toHaveProperty('agentBrowserProvider')
+    const { tools } = await nativeToolService.buildMode3NativeTools({ userId: 'josh', providerSettings: grants } as any)
+    expect(tools.native_web_search).toBeUndefined()
+    expect(tools.native_bash_execute).toBeUndefined()
+    vi.mocked(redis.get).mockResolvedValue({ user_id: 'josh', provider_specific_settings: grants } as any)
+    const refused = await nativeToolService.dispatchNativeAutomationPackAction({ userId: 'josh', action: 'agent_browser_find',
+      payloadInput: {}, context: { session_id: 'session_disabled_globals', agent_id: 'agent_primary', mode: 'mode2', actor_type: 'primary' } })
+    expect(refused.success).toBe(false)
+    expect(refused.error?.code).toBe('ACTION_DISABLED')
+    expect(toolOperationalMocks.read).not.toHaveBeenCalled()
+  })
+
   it('returns timeout-style error when web search aborts', async () => {
     const fetchSpy = vi
       .spyOn(globalThis, 'fetch')
@@ -1868,6 +2427,46 @@ PATCH`
     expect(result.success).toBe(false)
     expect(result.error).toMatch(/timed out/i)
     fetchSpy.mockRestore()
+  })
+
+  it.each(['duckduckgo-html', 'exa', 'perplexity'])('forwards the run Stop to %s during fetch and body consumption', async provider => {
+    vi.mocked(apiKeyService.exists).mockResolvedValue(true)
+    vi.mocked(apiKeyService.retrieve).mockResolvedValue('fixture-search-key')
+    for (const phase of ['fetch', 'body'] as const) {
+      const stop = new AbortController()
+      let entered!: () => void
+      const reached = new Promise<void>(resolve => { entered = resolve })
+      let providerSignal: AbortSignal | undefined
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, options) => {
+        providerSignal = options!.signal as AbortSignal
+        const pendingRead = () => new Promise<never>((_resolve, reject) => {
+          providerSignal!.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true })
+          entered()
+        })
+        if (phase === 'fetch') return pendingRead()
+        return { ok: true, status: 200, text: pendingRead, json: pendingRead } as unknown as Response
+      })
+      try {
+        const pending = nativeToolService.nativeWebSearch({ userId: 'josh', query: 'fixture', provider, abortSignal: stop.signal })
+        await reached
+        expect(providerSignal?.aborted).toBe(false)
+        stop.abort('user')
+        expect(await pending).toMatchObject({ success: false, stopped: true, error: 'Search stopped.' })
+        expect(providerSignal?.aborted).toBe(true)
+        expect(fetchSpy).toHaveBeenCalledTimes(1)
+      } finally { fetchSpy.mockRestore() }
+    }
+  })
+
+  it('sends no search request when the run was stopped before provider admission', async () => {
+    const stop = new AbortController()
+    stop.abort('user')
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    try {
+      const result = await nativeToolService.nativeWebSearch({ query: 'fixture', provider: 'duckduckgo-html', abortSignal: stop.signal })
+      expect(result).toMatchObject({ success: false, stopped: true, error: 'Search stopped.' })
+      expect(fetchSpy).not.toHaveBeenCalled()
+    } finally { fetchSpy.mockRestore() }
   })
 
   it('uses Exa when configured and key exists', async () => {
@@ -2038,6 +2637,9 @@ PATCH`
   })
 
   it('Mode 3 native web search uses saved settings instead of model-supplied provider overrides', async () => {
+    vi.mocked(redis.getUserSettings).mockResolvedValue({ admin_settings: {
+      web_search_default_provider: 'perplexity', web_search_perplexity_max_tokens_per_page: 2048
+    } } as any)
     vi.mocked(apiKeyService.exists).mockImplementation(async (service, userId) => {
       return service === 'perplexity' && userId === 'josh'
     })
@@ -2066,8 +2668,8 @@ PATCH`
       providerSettings: {
         nativeTools: {
           webSearchEnabled: true,
-          webSearchProvider: 'perplexity',
-          webSearchPerplexityMaxTokensPerPage: 2048
+          webSearchProvider: 'duckduckgo-html',
+          webSearchPerplexityMaxTokensPerPage: 64
         }
       }
     } as any)
@@ -2085,7 +2687,9 @@ PATCH`
     expect(result.success).toBe(true)
     expect(result.provider).toBe('perplexity')
     expect(result.providerRequested).toBeNull()
-    expect(result.providerAgentDefault).toBe('perplexity')
+    expect(result.providerAgentDefault).toBeNull()
+    expect(result.providerAdminDefault).toBe('perplexity')
+    expect(toolOperationalMocks.read).toHaveBeenCalledExactlyOnceWith('josh')
     expect(result.maxTokensPerPage).toBe(2048)
     fetchSpy.mockRestore()
   })
@@ -2342,14 +2946,18 @@ PATCH`
       }
     }
 
-    // Subagent-style caller (broad Fabric closed, memory off): no family is reachable,
-    // so the broker pair is not even registered — memory tools are structurally inert.
+    // BL-2269: the factory retains a utility-only broker for captured Skill document
+    // calls. That presence grants no Fabric family or Memory control.
     const subagentBuild = await nativeToolService.buildMode3NativeTools({
       ...baseContext,
       allowFabricControlTools: false,
       memoryControlsEnabled: false
     } as any)
-    expect((subagentBuild.tools as any).native_batshit_tool_search).toBeFalsy()
+    expect((subagentBuild.tools as any).native_batshit_tool_search).toBeTruthy()
+    expect(subagentBuild.utilityBrokerOnly).toBe(true)
+    const unavailable = await (subagentBuild.tools as any).native_batshit_tool_search.execute({ query: 'memory', family: 'fabric' })
+    expect(unavailable.results).toEqual([])
+    expect(unavailable.unavailableFamilies).toContainEqual(expect.objectContaining({ family: 'fabric' }))
 
     // Memory-enabled primary with the broad control plane still closed: the fabric family
     // opens with ONLY the memory scope.
@@ -3940,6 +4548,10 @@ PATCH`
   })
 
   it('routes Agent Browser use through the Docker sidecar', async () => {
+    toolOperationalMocks.read.mockResolvedValue({ ...resolveToolOperationalSettings(null), agentBrowser: {
+      liveViewEnabled: true, runtimeMode: 'chrome-cdp', cdpPort: 9222, provider: 'local',
+      executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', extraFlags: [], timeoutMs: 45000
+    } })
     nativeToolEnv.BATSHIT_CONTAINERIZED = '1'
     nativeToolEnv.BATSHIT_AGENT_BROWSER_SIDECAR_URL = 'http://agent-browser.test'
     nativeToolEnv.BATSHIT_AGENT_BROWSER_SIDECAR_TOKEN = 'sidecar-token'
@@ -3989,16 +4601,7 @@ PATCH`
     const result = await nativeToolService.nativeAgentBrowserUse({
       userId: 'josh',
       toolName: 'open',
-      params: { url: 'http://localhost:5620', headed: true },
-      settings: {
-        liveViewEnabled: true,
-        runtimeMode: 'chrome-cdp',
-        cdpPort: 9222,
-        provider: 'local',
-        executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-        extraFlags: [],
-        timeoutMs: 45_000
-      }
+      params: { url: 'http://localhost:5620', headed: true }
     })
 
     expect(result.success).toBe(true)
@@ -5008,6 +5611,10 @@ PATCH`
   })
 
   it('native Agent Browser settings shape CLI runtime args (cdp/provider/live view)', async () => {
+    toolOperationalMocks.read.mockResolvedValue({ ...resolveToolOperationalSettings(null), agentBrowser: {
+      runtimeMode: 'chrome-cdp', cdpPort: 9333, provider: 'browserbase', liveViewEnabled: false,
+      extraFlags: ['--trace'], timeoutMs: 45_000
+    } })
     const runner = vi.fn(async ({ args }) => {
       if (Array.isArray(args) && args[0] === '--version') {
         return {
@@ -5045,15 +5652,7 @@ PATCH`
     const result = await nativeToolService.nativeAgentBrowserUse({
       userId: 'josh',
       toolName: 'get_url',
-      params: {},
-      settings: {
-        runtimeMode: 'chrome-cdp',
-        cdpPort: 9333,
-        provider: 'browserbase',
-        liveViewEnabled: false,
-        extraFlags: ['--trace'],
-        timeoutMs: 45_000
-      }
+      params: {}
     })
 
     expect(result.success).toBe(true)
@@ -5190,6 +5789,12 @@ PATCH`
   })
 
   it('applies Agent Browser runtime defaults to native_bash_execute commands', async () => {
+    toolOperationalMocks.read.mockResolvedValue({ ...resolveToolOperationalSettings(null), agentBrowser: {
+      runtimeMode: 'chrome-cdp', cdpPort: 9333, liveViewEnabled: true, provider: 'local',
+      session: 'qa-agent', profilePath: '~/.batshit/ab-profile',
+      executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      extraFlags: ['--debug', '--slow-mo 150'], timeoutMs: 45_000
+    } })
     await createBrowserPolicyFixture()
     const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
@@ -5264,6 +5869,7 @@ echo "managed-agent-browser-ok"
       process.env.BATSHIT_AGENT_BROWSER_BIN = fakeAgentBrowserPath
 
       const result = await nativeToolService.nativeBashExecute({
+        userId: 'josh',
         command: 'npx agent-browser --help',
         accessMode: 'dangerous',
         requireApproval: false,
@@ -5271,11 +5877,7 @@ echo "managed-agent-browser-ok"
         workspaceRoot: tempWorkspace,
         cwd: tempWorkspace,
         agentBrowserSettings: {
-          enabled: true,
-          runtimeMode: 'chrome-cdp',
-          cdpPort: 9222,
-          liveViewEnabled: true,
-          provider: 'local'
+          enabled: true
         }
       })
 
@@ -5318,6 +5920,7 @@ echo "managed-agent-browser-ok"
     nativeToolService.__setAgentBrowserCliRunnerForTests(runner)
 
     const result = await nativeToolService.nativeBashExecute({
+      userId: 'josh',
       command: 'npx agent-browser --help',
       accessMode: 'dangerous',
       requireApproval: false,
@@ -5325,11 +5928,7 @@ echo "managed-agent-browser-ok"
       workspaceRoot: process.cwd(),
       cwd: process.cwd(),
       agentBrowserSettings: {
-        enabled: true,
-        runtimeMode: 'chrome-cdp',
-        cdpPort: 9222,
-        liveViewEnabled: true,
-        provider: 'local'
+        enabled: true
       }
     })
 
@@ -5811,7 +6410,7 @@ printf 'ok\n'
       expect(synthetic.agentBrowser?.screenshot?.modelVisibleInLoop).toBe(true)
       expect(synthetic.agentBrowser?.screenshot?.lane).toBe('synthetic_user')
 
-      // No lane at all (Workflow Subagent dispatch): the flag keeps its older
+      // No lane at all (a dispatch call): the flag keeps its older
       // meaning — an image payload exists — and carries no lane fields.
       const dispatch = await runScreenshot(undefined)
       expect(dispatch.success).toBe(true)
@@ -5861,6 +6460,7 @@ printf 'ok\n'
   })
 
   it('returns a clear API key error when agent-browser bash command uses Browserbase without credentials', async () => {
+    vi.mocked(redis.getUserSettings).mockResolvedValue({ admin_settings: { agent_browser: { provider: 'browserbase' } } } as any)
     const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       projectPath: process.cwd(),
@@ -5871,8 +6471,7 @@ printf 'ok\n'
           webSearchEnabled: false,
           bashEnabled: true,
           executionBackend: 'local',
-          agentBrowserEnabled: true,
-          agentBrowserProvider: 'browserbase'
+          agentBrowserEnabled: true
         }
       },
       toolApprovalMode: 'none'
@@ -6054,16 +6653,8 @@ printf 'ok\\n'
     expect(result.error?.code).toBe('INVALID_CONTEXT')
   })
 
-  it("keeps primary_agent_type 'n8n' as the Category 2 subagent wire value (SA-106)", async () => {
-    // SA-106 DL-106-01. The n8n PRIMARY agent type is retired, but BOTH surviving
-    // official `n8n Workflow Subagent` templates hardcode `primary_agent_type: 'n8n'`
-    // with `actor_type: 'subagent'`, and PUBLIC_PRIMARY_AGENT_TYPE_TO_NATIVE_MODE maps
-    // that value to 'mode2'. Dropping 'n8n' from the dispatch context vocabulary reads
-    // like obvious retired-lane cleanup and would break every already-imported
-    // Workflow Subagent workflow in every user's n8n instance.
-    //
-    // It costs nothing to keep: every mode3/mode4 gate is scoped to
-    // `actor_type === 'primary'`, so a subagent caller never reaches them.
+  it.each(['n8n', 'cli'])("refuses retired primary_agent_type '%s' without a mode", async (primaryAgentType) => {
+    // Retired types map to no mode and are refused instead of running.
     vi.mocked(redis.get).mockResolvedValue({
       user_id: 'josh',
       provider_specific_settings: {
@@ -6080,22 +6671,18 @@ printf 'ok\\n'
       context: {
         session_id: 'session_demo',
         agent_id: 'subagent_workflow',
-        primary_agent_type: 'n8n',
+        primary_agent_type: primaryAgentType,
         actor_type: 'subagent',
-        // Required for subagent actors by NATIVE_AUTOMATION_CONTEXT_SCHEMA; both
-        // official Workflow Subagent templates send it.
         parent_agent_id: 'agent_parent_api'
       }
     })
 
-    // The context parsed and resolved rather than being rejected as an unknown type:
-    // that is the whole point of this test.
-    expect(result.context.mode).toBe('mode2')
-    expect(result.context.actor_type).toBe('subagent')
-    expect(result.error?.code).not.toBe('INVALID_CONTEXT')
+    expect(result.success).toBe(false)
+    expect(result.error?.code).toBe('INVALID_CONTEXT')
   })
 
   it('dispatches agent_browser_find through the native automation pack for primary agents', async () => {
+    vi.mocked(redis.getUserSettings).mockResolvedValue({ admin_settings: { agent_browser: { provider: 'browserbase', liveViewEnabled: false } } } as any)
     const runner = vi.fn(async ({ args }) => {
       if (Array.isArray(args) && args[0] === '--version') {
         return {
@@ -6128,9 +6715,7 @@ printf 'ok\\n'
       user_id: 'josh',
       provider_specific_settings: {
         nativeTools: {
-          agentBrowserEnabled: true,
-          agentBrowserProvider: 'browserbase',
-          agentBrowserLiveViewEnabled: false
+          agentBrowserEnabled: true
         }
       }
     } as any)
@@ -6256,7 +6841,7 @@ printf 'ok\\n'
       context: {
         session_id: 'session_command_exit_failure',
         agent_id: 'agent_primary',
-        primary_agent_type: 'n8n',
+        mode: 'mode2',
         actor_type: 'primary'
       }
     })
@@ -6676,7 +7261,7 @@ PATCH`
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
-  it.each([8, 9, 10, 11, undefined, '12'])('refuses an unverified operator revision %s before status or command execution', async (revision) => {
+  it.each([8, 9, 10, 11, 12, undefined, '13'])('refuses an unverified operator revision %s before status or command execution', async (revision) => {
     nativeToolEnv.BATSHIT_CONTAINERIZED = '1'
     nativeToolEnv.BATSHIT_DOCKER_SANDBOX_OPERATOR_URL = 'http://host.docker.internal:5629'
     nativeToolEnv.BATSHIT_DOCKER_SANDBOX_OPERATOR_TOKEN = 'operator-token'
@@ -6687,13 +7272,13 @@ PATCH`
       new Response(JSON.stringify({ ok: true, sandboxRevision: revision })))
     const workspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-stale-operator-'))
     try {
-      expect(await nativeToolService.getSandboxBackendStatus()).toMatchObject({ available: false, reason: expect.stringMatching(/revision 12/) })
+      expect(await nativeToolService.getSandboxBackendStatus()).toMatchObject({ available: false, reason: expect.stringMatching(/revision 13/) })
       const result = await nativeToolService.nativeBashExecute({
         userId: 'josh', command: 'pwd', cwd: workspace, workspaceRoot: workspace,
         backend: 'docker_sandbox', accessMode: 'dangerous'
       })
       expect(result.success).toBe(false)
-      expect(result.reason).toMatch(/revision 12/)
+      expect(result.reason).toMatch(/revision 13/)
       expect(fetchMock.mock.calls.every(([url]) => String(url).endsWith('/health'))).toBe(true)
     } finally {
       await rm(workspace, { recursive: true, force: true })
@@ -6708,7 +7293,7 @@ PATCH`
     process.env.BATSHIT_DOCKER_SANDBOX_OPERATOR_URL = 'http://host.docker.internal:5629'
     process.env.BATSHIT_DOCKER_SANDBOX_OPERATOR_TOKEN = 'operator-token'
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) =>
-      String(url).endsWith('/health') ? new Response(JSON.stringify({ sandboxRevision: 12 })) : new Response(
+      String(url).endsWith('/health') ? new Response(JSON.stringify({ sandboxRevision: 13 })) : new Response(
         JSON.stringify({
           ok: true,
           available: true,
@@ -6748,7 +7333,7 @@ PATCH`
     process.env.BATSHIT_DOCKER_SANDBOX_OPERATOR_URL = 'http://host.docker.internal:5629'
     process.env.BATSHIT_DOCKER_SANDBOX_OPERATOR_TOKEN = 'operator-token'
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) =>
-      String(url).endsWith('/health') ? new Response(JSON.stringify({ sandboxRevision: 12 })) : new Response(
+      String(url).endsWith('/health') ? new Response(JSON.stringify({ sandboxRevision: 13 })) : new Response(
         JSON.stringify({
           ok: true,
           sandboxName: 'batshit-josh-operator',
@@ -6809,7 +7394,7 @@ PATCH`
       // Run-end cleanup asks the operator only for a chat that used Docker Sandbox.
       fetchMock.mockClear()
       fetchMock.mockImplementation(async (url) =>
-        String(url).endsWith('/health') ? new Response(JSON.stringify({ sandboxRevision: 12 })) : new Response(JSON.stringify({ ok: true, warnings: [] }), {
+        String(url).endsWith('/health') ? new Response(JSON.stringify({ sandboxRevision: 13 })) : new Response(JSON.stringify({ ok: true, warnings: [] }), {
           status: 200,
           headers: { 'content-type': 'application/json' }
         })
@@ -6960,7 +7545,7 @@ PATCH`
     // The operator answers when its command ends; this one does not end on its own.
     vi.spyOn(globalThis, 'fetch').mockImplementation(
       (_url, init) =>
-        String(_url).endsWith('/health') ? Promise.resolve(new Response(JSON.stringify({ sandboxRevision: 12 }))) : new Promise<Response>((_resolve, reject) => {
+        String(_url).endsWith('/health') ? Promise.resolve(new Response(JSON.stringify({ sandboxRevision: 13 }))) : new Promise<Response>((_resolve, reject) => {
           init?.signal?.addEventListener('abort', () =>
             reject(new DOMException('The operation was aborted.', 'AbortError'))
           )
@@ -7141,7 +7726,7 @@ PATCH`
         backend: 'docker_sandbox',
         accessMode: 'dangerous'
       })
-    const seedSandbox = async (sandbox: { name: string; status: string; lastUsedAt: string }) => {
+    const seedSandbox = async (sandbox: { name: string; status: string; lastUsedAt: string; workspaces?: string[] }) => {
       await mkdir(path.join(stateDir, 'sandboxes'), { recursive: true })
       await writeFile(
         path.join(stateDir, 'sandboxes', `${sandbox.name}.json`),
@@ -7150,12 +7735,67 @@ PATCH`
           agent: 'shell',
           status: sandbox.status,
           last_used_at: sandbox.lastUsedAt,
-          workspaces: ['/tmp/elsewhere'],
+          workspaces: sandbox.workspaces ?? ['/tmp/elsewhere'],
           denyNetwork: ['**']
         }),
         'utf8'
       )
     }
+
+    it.each(['execute', 'recover'] as const)('refuses protected roots before %s can reuse a current sandbox', async (action) => {
+      const prior = process.env.BATSHIT_SANDBOX_PROTECTED_HOME_DIR
+      const privateHome = path.join(workspace, 'protected-home')
+      process.env.BATSHIT_SANDBOX_PROTECTED_HOME_DIR = privateHome
+      const sessionId = action === 'execute' ? 'session_current_protected' : undefined
+      const name = buildSbxSandboxName({ userId: 'josh', workspaceRoot: workspace, sessionId })
+      await seedSandbox({ name, status: 'running', lastUsedAt: new Date().toISOString(), workspaces: [workspace] })
+      const original = await readFile(path.join(stateDir, 'sandboxes', `${name}.json`), 'utf8')
+      try {
+        const result = action === 'execute' ? await bash('pwd', sessionId) : await nativeToolService.recoverSandboxBackend({ userId: 'josh', workspaceRoot: workspace })
+        expect(result.success).toBe(false)
+        expect(action === 'execute' ? result.reason : result.error?.message).toMatch(/protected|managed agent homes/)
+        expect((await events()).filter((event) => /^(create |exec |rm |stop |policy deny )/.test(event))).toEqual([])
+        expect(await readFile(path.join(stateDir, 'sandboxes', `${name}.json`), 'utf8')).toBe(original)
+      } finally {
+        if (prior === undefined) delete process.env.BATSHIT_SANDBOX_PROTECTED_HOME_DIR
+        else process.env.BATSHIT_SANDBOX_PROTECTED_HOME_DIR = prior
+      }
+    })
+
+    it.each(['descendant', 'aliased-missing-leaf'] as const)('refuses a %s protected-root overlap without sandbox effects', async (kind) => {
+      const prior = process.env.BATSHIT_SANDBOX_PROTECTED_HOME_DIR
+      const home = path.join(workspace, 'hidden-home')
+      await mkdir(home)
+      let root = workspace
+      if (kind === 'descendant') {
+        root = path.join(home, 'agents', 'project')
+        await mkdir(root, { recursive: true })
+        process.env.BATSHIT_SANDBOX_PROTECTED_HOME_DIR = home
+      } else {
+        const alias = path.join(stateDir, 'protected-alias')
+        await symlink(home, alias)
+        process.env.BATSHIT_SANDBOX_PROTECTED_HOME_DIR = alias
+      }
+      try {
+        const result = await nativeToolService.nativeBashExecute({ userId: 'josh', command: 'pwd', cwd: root, workspaceRoot: root, backend: 'docker_sandbox', accessMode: 'dangerous' })
+        expect(result).toMatchObject({ success: false, errorCode: 'POLICY_BLOCKED' })
+        expect(result.reason).toMatch(/protected|managed agent homes/)
+        expect((await events()).filter((event) => /^(create |exec |rm |stop |policy deny )/.test(event))).toEqual([])
+      } finally {
+        if (prior === undefined) delete process.env.BATSHIT_SANDBOX_PROTECTED_HOME_DIR
+        else process.env.BATSHIT_SANDBOX_PROTECTED_HOME_DIR = prior
+      }
+    })
+
+    it('fails closed on a strict admission metadata error before lifecycle effects', async () => {
+      const denied = vi.spyOn(sandboxMounts, 'assertSandboxMountRootsSafe').mockRejectedValueOnce(Object.assign(new Error('Protected metadata is unreadable'), { code: 'EACCES' }))
+      try {
+        const result = await bash('pwd', 'session_metadata_denied')
+        expect(result).toMatchObject({ success: false, errorCode: 'POLICY_BLOCKED' })
+        expect(result.reason).toContain('Protected metadata is unreadable')
+        expect((await events()).filter((event) => /^(create |exec |rm |stop |policy deny )/.test(event))).toEqual([])
+      } finally { denied.mockRestore() }
+    })
 
     // BL-61 (2026-09-21): a status check started Docker's sbx daemon and nothing ever stopped it.
     // A call whose output says it started the daemon records that, so quitting can stop it.
@@ -7804,7 +8444,31 @@ PY`
     expect(result.error?.message).toMatch(/plan mode/i)
   })
 
-  it('inherits the parent session project path for workflow-backed subagent bash execution', async () => {
+  // SA-139 R2 (review N1): a record of a removed n8n Subagent type owns nothing, like a missing
+  // one, so its own settings never merge. Here they would have turned Bash on in plan mode; the
+  // parent's Bash stays off. Both refuse `mkdir`, so no command runs either way.
+  it('never merges the settings of a Subagent of a removed n8n type', async () => {
+    vi.mocked(redis.get).mockImplementation(async (key: string) => key === 'agent:agent_parent'
+      ? { user_id: 'josh', provider_specific_settings: { nativeTools: { bashEnabled: false, executionBackend: 'local' } } } as any
+      : null as any)
+    vi.mocked(redis.json.get).mockImplementation(async (key: string) => key === 'subagent:agent_sub'
+      ? { user_id: 'josh', subagentType: 'n8n-workflow',
+          provider_specific_settings: { nativeTools: { bashEnabled: true, bashAccessMode: 'plan' } } } as any
+      : null as any)
+
+    const result = await nativeToolService.dispatchNativeAutomationPackAction({
+      userId: 'josh',
+      action: 'bash_execute',
+      payloadInput: { command: 'mkdir scratch' },
+      context: { session_id: 'session_demo', agent_id: 'agent_sub', mode: 'mode1', actor_type: 'subagent', parent_agent_id: 'agent_parent' }
+    })
+
+    expect(result.success).toBe(false)
+    expect(result.error?.message).not.toMatch(/plan mode/i)
+    expect(result.error).toMatchObject({ code: 'ACTION_DISABLED' })
+  })
+
+  it('inherits the parent session project path for delegated subagent bash execution', async () => {
     const tempWorkspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-subagent-project-'))
     const resolvedWorkspace = await realpath(tempWorkspace).catch(() => tempWorkspace)
 
@@ -7864,6 +8528,7 @@ PY`
   })
 
   it('lets subagent native overrides enable agent_browser_use while inheriting backend from the parent primary agent', async () => {
+    vi.mocked(redis.getUserSettings).mockResolvedValue({ admin_settings: { agent_browser: { runtimeMode: 'chrome-cdp', cdpPort: 9444 } } } as any)
     const runner = vi.fn(async ({ args }) => {
       if (Array.isArray(args) && args[0] === '--version') {
         return {
@@ -7919,9 +8584,7 @@ PY`
           user_id: 'josh',
           provider_specific_settings: {
             nativeTools: {
-              agentBrowserEnabled: true,
-              agentBrowserRuntimeMode: 'chrome-cdp',
-              agentBrowserCdpPort: 9444
+              agentBrowserEnabled: true
             }
           }
         } as any
@@ -8224,7 +8887,7 @@ PY`
       family: 'mcp',
       title: 'sample_tool'
     })
-    expect(result.data?.results?.[0]?.hint).toContain('query')
+    expect(result.data?.results?.[0]?.hint).toBe('required: query:string')
   })
 
   it('dispatches subagent batshit_tool_search with subagent artifact visibility scope', async () => {
@@ -8983,43 +9646,11 @@ PY`
       }
     )
 
-    it('uses the run credential on the agent lane, and a delegated run\'s scope', async () => {
+    it('checks a signed-in subagent-shaped context against the subagent\'s own list', async () => {
       mockPrimaryAndSubagent('josh')
       vi.mocked(executeSkillRuntimeAction).mockResolvedValue(refusal())
 
-      await dispatchSkill({ actorType: 'agent', context: primaryContext })
-      expect(executeSkillRuntimeAction).toHaveBeenLastCalledWith(
-        expect.objectContaining({ actor: { kind: 'agent', agentId: 'agent_primary', delegated: false } })
-      )
-
-      await dispatchSkill({
-        actorType: 'agent',
-        delegatedRun: true,
-        scopeAgentId: 'research_bot',
-        context: primaryContext
-      })
-      expect(executeSkillRuntimeAction).toHaveBeenLastCalledWith(
-        expect.objectContaining({ actor: { kind: 'agent', agentId: 'research_bot', delegated: true } })
-      )
-    })
-
-    it('never lets an agent-lane context claim a subagent\'s skills', async () => {
-      mockPrimaryAndSubagent('josh')
-      vi.mocked(executeSkillRuntimeAction).mockResolvedValue(refusal())
-
-      await dispatchSkill({ actorType: 'agent', context: subagentContext })
-
-      // The governing field (the parent) is the credential's; the claimed subagent is ignored.
-      expect(executeSkillRuntimeAction).toHaveBeenLastCalledWith(
-        expect.objectContaining({ actor: { kind: 'agent', agentId: 'agent_parent', delegated: false } })
-      )
-    })
-
-    it('checks an n8n Workflow Subagent against its own list', async () => {
-      mockPrimaryAndSubagent('josh')
-      vi.mocked(executeSkillRuntimeAction).mockResolvedValue(refusal())
-
-      const result = await dispatchSkill({ actorType: 'n8n-callback', context: subagentContext })
+      const result = await dispatchSkill({ actorType: 'session', context: subagentContext })
 
       expect(executeSkillRuntimeAction).toHaveBeenLastCalledWith(
         expect.objectContaining({ actor: { kind: 'agent', agentId: 'research_bot', delegated: true } })
@@ -9027,26 +9658,28 @@ PY`
       expect(result.success).toBe(false)
       expect(result.error?.code).toBe('POLICY_BLOCKED')
       expect(result.error?.message).toContain('is not enabled for this agent')
-      // The gate's own code survives for a workflow to read.
+      // The gate's own code survives for the caller to read.
       expect(result.error?.details).toEqual({ skillErrorCode: 'SKILL_NOT_ENABLED' })
     })
 
-    it('refuses an n8n call that presents itself as the parent agent', async () => {
+    // SA-139 R2 (review N1): a record of a removed n8n Subagent type is never a skill actor.
+    it('refuses a signed-in context that names a Subagent of a removed n8n type', async () => {
       mockPrimaryAndSubagent('josh')
+      vi.mocked(redis.json.get).mockImplementation(async (key: string) => key === 'subagent:research_bot'
+        ? { id: 'research_bot', user_id: 'josh', subagentType: 'n8n-workflow' } as any
+        : null as any)
+      vi.mocked(executeSkillRuntimeAction).mockClear()
 
-      const result = await dispatchSkill({
-        actorType: 'n8n-callback',
-        context: { agent_id: 'agent_parent', actor_type: 'primary' }
-      })
+      const result = await dispatchSkill({ actorType: 'session', context: subagentContext })
 
       expect(result.success).toBe(false)
-      expect(result.error?.code).toBe('INVALID_CONTEXT')
-      expect(result.error?.message).toContain('only as a Workflow Subagent')
+      expect(result.error).toMatchObject({ code: 'INVALID_CONTEXT', message: 'Unable to resolve subagent "research_bot" for this skill request.' })
       expect(executeSkillRuntimeAction).not.toHaveBeenCalled()
     })
 
     it('asks no approval for a script the access gate will refuse, and asks for one it allows', async () => {
       const commands: Record<string, any> = {
+        ...Object.fromEntries(initializedBuiltinPluginEntries('josh')),
         'slash_command:josh:skill_alpha': {
           id: 'skill_alpha',
           type: 'skill',
@@ -9056,8 +9689,18 @@ PY`
           enabled_agent_ids: ['agent_main']
         }
       }
-      ;(redis as any).keys = vi.fn(async () => Object.keys(commands))
+      ;(redis as any).keys = vi.fn(async (pattern: string) => {
+        if (!pattern.endsWith('*') || pattern.slice(0, -1).includes('*')) {
+          throw new Error(`Unsupported native-skill fixture pattern: ${pattern}`)
+        }
+        return Object.keys(commands).filter(key => key.startsWith(pattern.slice(0, -1)))
+      })
       vi.mocked(redis.json.get).mockImplementation(async (key: string) => commands[key] ?? null)
+      // The current capability owner reads the raw client, from this same store.
+      vi.mocked(redis.execute).mockImplementation(async callback => callback({
+        keys: (pattern: string) => (redis as any).keys(pattern),
+        json: { get: (key: string) => redis.json.get(key) }
+      } as any))
       try {
         const { toolApprovals } = await nativeToolService.buildMode3NativeTools({
           userId: 'josh',
@@ -9091,7 +9734,7 @@ PY`
     it('refuses a subagent context that names a subagent the user does not own', async () => {
       mockPrimaryAndSubagent('someone_else')
 
-      const result = await dispatchSkill({ actorType: 'n8n-callback', context: subagentContext })
+      const result = await dispatchSkill({ actorType: 'session', context: subagentContext })
 
       expect(result.success).toBe(false)
       expect(result.error?.code).toBe('INVALID_CONTEXT')
@@ -9318,6 +9961,56 @@ PY`
     expect(refused.error).toBe(GROUP_APPROVAL_UNAVAILABLE_REASON)
   })
 
+  // BL-2182: the skill script path refuses a delegated run with the same text as its Bash.
+  it('BL-2182: a delegated run refuses a skill script with what works for it, not the Approval Policy', async () => {
+    vi.mocked(resolveSkillRuntimeForTool).mockResolvedValue({
+      runtime: {
+        skill: { id: 'skill-alpha', name: 'skill-alpha', displayName: 'Skill Alpha' },
+        cacheDir: '/tmp/skill-alpha',
+        bundleFiles: [
+          { path: 'scripts/run.sh', kind: 'script', encoding: 'utf8', content: 'echo hi', sha256: 'abc', size: 7 }
+        ]
+      },
+      error: null
+    } as any)
+    vi.mocked(resolveBundleFileAbsolutePath).mockReturnValue('/tmp/skill-alpha/scripts/run.sh')
+    vi.mocked(buildSkillScriptCommand).mockReturnValue('/tmp/skill-alpha/scripts/run.sh')
+    const nativeTools = {
+      fetchZipEnabled: false,
+      dynamicMcpEnabled: false,
+      batshitToolsEnabled: false,
+      webSearchEnabled: false,
+      bashEnabled: true,
+      executionBackend: 'local',
+      bashAccessMode: 'agent'
+    }
+    vi.mocked(redis.get).mockImplementation(async (key: string) =>
+      key === 'agent:agent_main' ? ({ id: 'agent_main', user_id: 'josh', provider_specific_settings: { nativeTools } } as any) : null
+    )
+
+    const { tools } = await nativeToolService.buildMode3NativeTools({
+      userId: 'josh',
+      sessionId: 'session_skill_delegated',
+      agentId: 'agent_main',
+      projectPath: process.cwd(),
+      processOwner: { userId: 'josh', kind: 'agent', id: 'agent_main' },
+      scopeAgentId: 'worker_1a2b',
+      delegatedBashEnabled: true,
+      providerSettings: { nativeTools },
+      toolApprovalMode: 'off'
+    } as any)
+
+    const refused = await (tools as any).native_skill.execute({
+      skillId: 'skill-alpha',
+      action: 'script_run',
+      path: 'scripts/run.sh'
+    })
+    expect(refused).toMatchObject({ success: false, blocked: true, errorCode: 'POLICY_BLOCKED' })
+    expect(refused.error).toBe(delegatedAgentModePolicyRefusal({ scopeAgentId: 'worker_1a2b', processOwnerKind: 'agent' }))
+    expect(refused.error).not.toMatch(/Approval Policy/)
+    vi.mocked(redis.get).mockReset()
+  })
+
   it('a Stop ends a running skill script (2026-09-18)', async () => {
     seedCommandOwner('agent_main')
     vi.mocked(resolveSkillRuntimeForTool).mockResolvedValue({
@@ -9372,7 +10065,7 @@ PY`
     expect(runResult.execution).toMatchObject({ success: false, stopped: true })
   })
 
-  it('a Stop reaches a skill script run through the dispatch (n8n Workflow Subagents), 2026-09-18', async () => {
+  it('a Stop reaches a skill script run through the dispatch, 2026-09-18', async () => {
     seedCommandOwner('agent_main')
     vi.mocked(resolveSkillRuntimeForTool).mockResolvedValue({
       runtime: {
@@ -9469,8 +10162,11 @@ PY`
   describe('SA-105 P2 recall media delivery', () => {
     const PNG_BYTES = Buffer.from('iVBORw0KGgo=', 'base64')
 
-    function recallOutput(media: Array<Record<string, any>>, memoryId = 'mem_maggie') {
-      return {
+    const SESSION = 'session_memory_recall'
+    const rows = new Map<string, any>()
+
+    async function recallOutput(media: Array<Record<string, any>>, memoryId = 'mem_maggie') {
+      const output = {
         success: true,
         controlId: 'sys.memory.recall',
         target: 'sys.memory.recall',
@@ -9486,19 +10182,32 @@ PY`
               ...(media.length ? { media } : {})
             }
           ],
-          note: 'Full content above.'
+          note: 'Full content above.',
+          recall_media_token: ''
         }
       }
+      rows.set(`memory:agent_1:${memoryId}`, {
+        id: memoryId, agent_id: 'agent_1', user_id: 'josh', lane: 'ltm',
+        media: media.map(image => ({ id: image.media_id, filename: `agent_1/${memoryId}/${image.media_id}.png`, mime_type: image.mime_type, bytes: image.bytes }))
+      })
+      const owner = await readMemoryObservation({ userId: 'josh', agentId: 'agent_1', sessionId: SESSION })
+      output.result.recall_media_token = createRecallMediaPermit({
+        userId: 'josh', agentId: 'agent_1', sessionId: SESSION, lifecycle: owner.lifecycle,
+        agentOwner: owner.agentOwner, sessionOwner: owner.sessionOwner!, includeExpired: false,
+        records: output.result.recalled.map(row => ({ ...row, expired: false }))
+      })
+      return output
     }
 
     const oneImage = [
       { media_id: 'md_1', filename: 'maggie.png', mime_type: 'image/png', bytes: 1024 }
     ]
 
-    async function brokerUseWith(imageDelivery: any, ephemeralImages?: any) {
+    async function brokerUseWith(imageDelivery: any, ephemeralImages?: any, sessionId: string | undefined = SESSION) {
       const { tools } = await nativeToolService.buildMode3NativeTools({
         userId: 'josh',
         agentId: 'agent_1',
+        sessionId,
         projectPath: process.cwd(),
         imageDelivery,
         ephemeralImages,
@@ -9510,6 +10219,25 @@ PY`
     }
 
     beforeEach(() => {
+      rows.clear()
+      rows.set('agent:agent_1', { id: 'agent_1', user_id: 'josh', memory_enabled: true })
+      // A regular chat can legitimately host another agent than its stored default.
+      rows.set(`session:${SESSION}`, { id: SESSION, user_id: 'josh', agent_id: 'other_agent', created_at: 'original-chat' })
+      const original = vi.mocked(redis.execute).getMockImplementation()!
+      vi.mocked(redis.execute).mockImplementation(operation => original(client => operation(new Proxy(Object.create(null), {
+        get(_empty, key) {
+          if (key !== 'eval') {
+            const value = Reflect.get(client, key, client)
+            return typeof value === 'function' ? value.bind(client) : value
+          }
+          return async (script: string, options: { keys: string[] }) => {
+            if (!script.includes('BATSHIT_MEMORY_OBSERVATION_V1')) throw new Error('This native recall fixture accepts only an opaque ownership read.')
+            const read = (key: string) => rows.has(key) ? ['ReJSON-RL', JSON.stringify(rows.get(key))] : ['none', '']
+            const [agent, session, ...keys] = options.keys
+            return [String(Math.floor(Date.now() / 1000)), String(Date.now() % 1000 * 1000), ...read(agent), ...read(session), keys.map(key => [key, rows.has(key) ? JSON.stringify(rows.get(key)) : ''])]
+          }
+        }
+      }))))
       memoryMediaMocks.loadMemoryMedia.mockReset()
       memoryMediaMocks.loadMemoryMedia.mockResolvedValue({
         media: { id: 'md_1', mime_type: 'image/png' },
@@ -9523,7 +10251,7 @@ PY`
       const brokerUse = await brokerUseWith({ lane: 'tool_result', reason: 'test' })
       const modelOutput = await brokerUse.toModelOutput({
         toolCallId: 'call_1',
-        output: recallOutput(oneImage)
+        output: await recallOutput(oneImage)
       })
 
       expect(modelOutput.type).toBe('content')
@@ -9547,7 +10275,7 @@ PY`
       )
       const modelOutput = await brokerUse.toModelOutput({
         toolCallId: 'call_2',
-        output: recallOutput(oneImage)
+        output: await recallOutput(oneImage)
       })
 
       // A content output here would be JSON.stringify'd into base64 text.
@@ -9566,7 +10294,7 @@ PY`
       const brokerUse = await brokerUseWith({ lane: 'none', reason: 'model_capabilities_vision_false' })
       const modelOutput = await brokerUse.toModelOutput({
         toolCallId: 'call_3',
-        output: recallOutput(oneImage)
+        output: await recallOutput(oneImage)
       })
 
       expect(modelOutput.type).toBe('text')
@@ -9586,7 +10314,7 @@ PY`
       const brokerUse = await brokerUseWith({ lane: 'tool_result', reason: 'test' })
       const modelOutput = await brokerUse.toModelOutput({
         toolCallId: 'call_4',
-        output: recallOutput(six)
+        output: await recallOutput(six)
       })
 
       expect(modelOutput.value.filter((p: any) => p.type === 'file')).toHaveLength(4)
@@ -9598,7 +10326,7 @@ PY`
       const brokerUse = await brokerUseWith({ lane: 'tool_result', reason: 'test' })
       const modelOutput = await brokerUse.toModelOutput({
         toolCallId: 'call_5',
-        output: recallOutput([
+        output: await recallOutput([
           { media_id: 'md_svg', filename: 'a.svg', mime_type: 'image/svg+xml', bytes: 10 }
         ])
       })
@@ -9613,7 +10341,7 @@ PY`
       const brokerUse = await brokerUseWith({ lane: 'tool_result', reason: 'test' })
       const modelOutput = await brokerUse.toModelOutput({
         toolCallId: 'call_6',
-        output: recallOutput(oneImage)
+        output: await recallOutput(oneImage)
       })
 
       expect(modelOutput.type).toBe('text')
@@ -9621,7 +10349,7 @@ PY`
     })
 
     it('DL-105-13 parity: a recall with no media is untouched on every lane', async () => {
-      const plain = recallOutput([])
+      const plain = await recallOutput([])
       const before = JSON.stringify(plain)
 
       for (const lane of ['tool_result', 'synthetic_user', 'none'] as const) {
@@ -9639,7 +10367,7 @@ PY`
       const brokerUse = await brokerUseWith({ lane: 'tool_result', reason: 'test' })
       const modelOutput = await brokerUse.toModelOutput({
         toolCallId: 'call_7',
-        output: recallOutput(oneImage)
+        output: await recallOutput(oneImage)
       })
       const text = modelOutput.value.find((p: any) => p.type === 'text')?.text ?? ''
       const json = JSON.parse(text.slice(text.indexOf('{')))
@@ -9658,6 +10386,25 @@ PY`
         bytes: 1024
       })
       expect(JSON.stringify(json)).not.toContain(PNG_BYTES.toString('base64'))
+    })
+
+    it('never authorizes recalled image bytes from a result token belonging to another caller session', async () => {
+      const output = await recallOutput(oneImage)
+      const brokerUse = await brokerUseWith({ lane: 'tool_result', reason: 'test' }, undefined, 'another_chat')
+      const modelOutput = await brokerUse.toModelOutput({ toolCallId: 'wrong_session', output })
+      expect(modelOutput.type).toBe('text')
+      expect(String(modelOutput.value)).not.toContain(PNG_BYTES.toString('base64'))
+      expect(memoryMediaMocks.loadMemoryMedia).not.toHaveBeenCalled()
+    })
+
+    it('does not load recalled image bytes after the originating session disappears', async () => {
+      const output = await recallOutput(oneImage)
+      rows.delete(`session:${SESSION}`)
+      const brokerUse = await brokerUseWith({ lane: 'tool_result', reason: 'test' })
+      const modelOutput = await brokerUse.toModelOutput({ toolCallId: 'deleted_session', output })
+      expect(modelOutput.type).toBe('text')
+      expect(String(modelOutput.value)).not.toContain(PNG_BYTES.toString('base64'))
+      expect(memoryMediaMocks.loadMemoryMedia).not.toHaveBeenCalled()
     })
   })
 
@@ -10038,8 +10785,7 @@ describe('protected Batshit repo write guardrail', () => {
 })
 
 describe('SA-096 P5 — broker registration pins the documented availability rules', () => {
-  // The compiled system prompt gates its broker guidance on isBrokerAvailable(). Both the
-  // gate and the registration sites derive families from $lib/utils/brokerAvailability, so
+  // The ordinary family ceiling and registration sites derive families from brokerAvailability, so
   // comparing them to each other proves nothing. These cases instead restate the intended
   // condition independently and walk the whole toggle matrix through the REAL registration
   // path — a change to either side that is not also a deliberate contract change fails here.
@@ -10070,14 +10816,14 @@ describe('SA-096 P5 — broker registration pins the documented availability rul
   }
 
   it.each([false, true])(
-    'registers the mode 3 broker exactly when a family is reachable (allowFabricControlTools=%s)',
+    'distinguishes ordinary families from the API utility-only broker (allowFabricControlTools=%s; BL-2269)',
     async (allowFabricControlTools) => {
       const cases = buildCases()
       expect(cases).toHaveLength(32)
-      const registrations: boolean[] = []
+      const utilityOnlyStates: boolean[] = []
 
       for (const nativeTools of cases) {
-        const { tools } = await nativeToolService.buildMode3NativeTools({
+        const { tools, utilityBrokerOnly } = await nativeToolService.buildMode3NativeTools({
           userId: 'josh',
           sessionId: 'session_sa096_p5',
           providerSettings: { nativeTools },
@@ -10086,8 +10832,7 @@ describe('SA-096 P5 — broker registration pins the documented availability rul
           allowFabricControlTools
         } as any)
 
-        const registered = Boolean((tools as any).native_batshit_tool_search)
-        registrations.push(registered)
+        utilityOnlyStates.push(utilityBrokerOnly)
 
         // Independent restatement of buildMode3NativeTools' documented condition. Agent
         // Browser is deliberately absent: it is a separate native tool on this lane, and
@@ -10098,13 +10843,16 @@ describe('SA-096 P5 — broker registration pins the documented availability rul
           nativeTools.fetchZipEnabled ||
           (nativeTools.batshitToolsEnabled && allowFabricControlTools)
 
-        expect({ nativeTools, registered }).toEqual({ nativeTools, registered: expected })
-        expect(Boolean((tools as any).native_batshit_tool_use)).toBe(expected)
+        // The native Skill candidate retains the API utility broker at this factory
+        // stage; final filtering/capture still decides which utilities it can execute.
+        expect(Boolean((tools as any).native_batshit_tool_search)).toBe(true)
+        expect(Boolean((tools as any).native_batshit_tool_use)).toBe(true)
+        expect({ nativeTools, utilityBrokerOnly }).toEqual({ nativeTools, utilityBrokerOnly: !expected })
       }
 
       // Guards against a matrix that silently collapses to one answer.
-      expect(registrations).toContain(true)
-      expect(registrations).toContain(false)
+      expect(utilityOnlyStates).toContain(true)
+      expect(utilityOnlyStates).toContain(false)
     }
   )
 
@@ -10128,7 +10876,11 @@ describe('SA-096 P5 — broker registration pins the documented availability rul
       providerSettings,
       selectedCliToolIds: []
     } as any)
-    expect((withoutSelection.tools as any).native_batshit_tool_search).toBeUndefined()
+    expect((withoutSelection.tools as any).native_batshit_tool_search).toBeTruthy()
+    expect(withoutSelection.utilityBrokerOnly).toBe(true)
+    const unavailable = await (withoutSelection.tools as any).native_batshit_tool_search.execute({ family: 'cli' })
+    expect(unavailable.results).toEqual([])
+    expect(unavailable.unavailableFamilies).toContainEqual(expect.objectContaining({ family: 'cli' }))
 
     const withSelection = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
@@ -10137,40 +10889,7 @@ describe('SA-096 P5 — broker registration pins the documented availability rul
       selectedCliToolIds: ['cli_tool_alpha']
     } as any)
     expect((withSelection.tools as any).native_batshit_tool_search).toBeTruthy()
-  })
-
-  it('exposes the mode 4 broker helpers exactly when a family is reachable', () => {
-    const registrations: boolean[] = []
-
-    for (const settings of buildCases()) {
-      for (const agentBrowserEnabled of [false, true]) {
-        for (const hasCliTools of [false, true]) {
-          const input = { ...settings, agentBrowserEnabled }
-          const registered = resolveEnabledMode4InternalHelperTools(input, {
-            hasCliTools
-          }).includes('batshit_tool_search')
-          registrations.push(registered)
-
-          // Independent restatement of the managed-CLI condition. Fetch-zip is deliberately
-          // absent: it ships as its own helper (batshit_server_fetch_zip) on this lane.
-          const expected =
-            input.dynamicMcpEnabled ||
-            (input.cliToolsEnabled && hasCliTools) ||
-            input.agentBrowserEnabled ||
-            input.artifactRuntimeEnabled ||
-            input.batshitToolsEnabled
-
-          expect({ input, hasCliTools, registered }).toEqual({
-            input,
-            hasCliTools,
-            registered: expected
-          })
-        }
-      }
-    }
-
-    expect(registrations).toContain(true)
-    expect(registrations).toContain(false)
+    expect(withSelection.utilityBrokerOnly).toBe(false)
   })
 
   // SA-096 P4 — the Fabric control-id scope the broker will serve.
@@ -10243,12 +10962,12 @@ describe('SA-096 P5 — broker registration pins the documented availability rul
   it('opens the Dynamic MCP Fabric pair only when Dynamic MCP is on', async () => {
     const withBatshitTools = { ...FABRIC_ONLY_FETCH_ZIP, batshitToolsEnabled: true }
     await expect(
-      probeFabricRef(withBatshitTools, 'fabric:sys.mcp.dynamic.find')
+      probeFabricRef(withBatshitTools, 'batshit:sys.mcp.dynamic.find')
     ).resolves.toBe('OUT_OF_SCOPE')
     await expect(
       probeFabricRef(
         { ...withBatshitTools, dynamicMcpEnabled: true },
-        'fabric:sys.mcp.dynamic.find'
+        'batshit:sys.mcp.dynamic.find'
       )
     ).resolves.not.toBe('OUT_OF_SCOPE')
   })
@@ -10327,5 +11046,100 @@ describe('PR #106 F-11: one map for a failed broker call', () => {
       'BACKEND_UNAVAILABLE'
     )
     expect(mapBrokerFailureToNativeAutomationErrorCode({ error: 'plain text' })).toBe('BACKEND_UNAVAILABLE')
+  })
+})
+
+
+describe('Fabric and utility namespace parity', () => {
+  const utilityIds = ['sys.judge.ask', 'sys.mcp.dynamic.find', 'sys.mcp.dynamic.use']
+  it.each(utilityIds)('accepts canonical batshit:%s and refuses every moved Fabric spelling', (id) => {
+    expect(parseBatshitToolRef(`batshit:${id}`)).toEqual({ family: 'batshit', target: id })
+    for (const prefix of ['fabric', 'control', 'controls']) expect(() => parseBatshitToolRef(`${prefix}:${id}`)).toThrow(`batshit:${id}`)
+  })
+  it.each(['batshit:sys.zip.fetch', 'batshit:sys.judge.configure', 'batshit_tool:sys.zip.fetch', 'batshit_tools:sys.zip.fetch'])( 'refuses %s without an execution alias', (ref) => {
+    expect(() => parseBatshitToolRef(ref)).toThrow(/Invalid|retired/)
+  })
+  it.each(['fabric', 'control', 'controls'])('retains %s only for Fabric controls', (prefix) => {
+    expect(parseBatshitToolRef(`${prefix}:sys.zip.fetch`)).toEqual({ family: 'fabric', target: 'sys.zip.fetch' })
+  })
+  it('routes canonical utility refs through the scoped control executor with unchanged presentation', async () => {
+    const use = vi.spyOn(fabricRegistry, 'useControl').mockResolvedValue({ success: true, result: {} } as any)
+    try {
+      const { tools } = await nativeToolService.buildMode3NativeTools({ userId: 'josh', agentId: 'agent1', judgeControlsEnabled: true } as any)
+      for (const id of utilityIds) {
+        const result = await (tools as any).native_batshit_tool_use.execute({ ref: `batshit:${id}`, input: {} })
+        expect(result).toMatchObject({ family: 'batshit', operationKind: 'fabric_use', rendererFamily: 'generic_tool' })
+        expect(use).toHaveBeenLastCalledWith(expect.objectContaining({ controlId: id, actorType: 'in-process', allowedControlIds: expect.arrayContaining([id]) }))
+      }
+      const before = use.mock.calls.length
+      await expect((tools as any).native_batshit_tool_use.execute({ ref: 'fabric:sys.judge.ask' })).rejects.toThrow('batshit:sys.judge.ask')
+      expect(use).toHaveBeenCalledTimes(before)
+    } finally { use.mockRestore() }
+  })
+  it('executes the same namespace contract through actual automation dispatch', async () => {
+    const use = vi.spyOn(fabricRegistry, 'useControl').mockResolvedValue({ success: true, result: {} } as any)
+    vi.mocked(redis.get).mockResolvedValue({ user_id: 'josh', jev_juice_judge_tool: true, provider_specific_settings: { nativeTools: { batshitToolsEnabled: true, dynamicMcpEnabled: true } } } as any)
+    const context = { session_id: 'naming-session', agent_id: 'naming-agent', mode: 'mode4', actor_type: 'primary' }
+    const dispatch = (ref: string, callContext = context) => nativeToolService.dispatchNativeAutomationPackAction({ userId: 'josh', action: 'batshit_tool_use', actorType: 'service', payloadInput: { ref, input: {} }, context: callContext })
+    try {
+      for (const id of utilityIds) {
+        const result = await dispatch(`batshit:${id}`)
+        expect(result).toMatchObject({ success: true, data: { family: 'batshit', target: id, operationKind: 'fabric_use', rendererFamily: 'generic_tool' } })
+        expect(use).toHaveBeenLastCalledWith(expect.objectContaining({ controlId: id, actorType: 'service' }))
+      }
+      for (const ref of ['fabric:sys.judge.ask', 'control:sys.mcp.dynamic.use', 'controls:sys.mcp.dynamic.find', 'batshit:sys.zip.fetch', 'batshit_tool:sys.zip.fetch', 'batshit_tools:sys.zip.fetch']) {
+        use.mockClear()
+        expect((await dispatch(ref)).success).toBe(false)
+        expect(use).not.toHaveBeenCalled()
+      }
+      use.mockClear()
+      const delegated = await dispatch('batshit:sys.mcp.dynamic.find', { ...context, agent_id: 'naming-subagent', parent_agent_id: 'naming-agent', actor_type: 'subagent' } as any)
+      expect(delegated.success).toBe(false)
+      expect(use).not.toHaveBeenCalled()
+      vi.mocked(redis.get).mockResolvedValue({ user_id: 'josh', provider_specific_settings: { nativeTools: { batshitToolsEnabled: false, dynamicMcpEnabled: true } } } as any)
+      expect((await dispatch('batshit:sys.mcp.dynamic.use')).success).toBe(false)
+      expect(use).not.toHaveBeenCalled()
+    } finally { use.mockRestore() }
+  })
+
+  it('preserves the registry total beyond the returned page and fetches shared namespaces once (BL-1571)', async () => {
+    const find = vi.spyOn(fabricRegistry, 'findControls').mockResolvedValue({ results: [{ controlId: 'sys.cli_tool.list', title: 'List CLI tools' }], totalMatches: 75, query: 'naming_count_probe', limit: 1 } as any)
+    try {
+      const { tools } = await nativeToolService.buildMode3NativeTools({ userId: 'josh', judgeControlsEnabled: true } as any)
+      const result = await (tools as any).native_batshit_tool_search.execute({ families: ['fabric', 'batshit'], query: 'naming_count_probe', limit: 1 })
+      expect(result.totalMatches).toBe(75)
+      expect(result.results).toHaveLength(1)
+      expect(find).toHaveBeenCalledTimes(1)
+      expect(find).toHaveBeenCalledWith(expect.objectContaining({ brokerFamilies: ['fabric', 'batshit'], limit: 1 }))
+    } finally { find.mockRestore() }
+  })
+  it('narrows an explicit Settings domain before unrelated families/helper counts can crowd out a low-limit result', async () => {
+    const find = vi.spyOn(fabricRegistry, 'findControls').mockImplementation(async options => ({
+      results: [options.domain === 'agent-settings'
+        ? { controlId: 'sys.app_settings.native.report', title: 'Zip settings report' }
+        : { controlId: 'use.artifact.unrelated', title: 'Zip settings artifact' }],
+      totalMatches: options.domain === 'agent-settings' ? 1 : 100, query: 'zip', limit: 1
+    } as any))
+    try {
+      const { tools } = await nativeToolService.buildMode3NativeTools({ userId: 'josh', agentId: 'primary',
+        providerSettings: { nativeTools: { batshitToolsEnabled: true, fetchZipEnabled: true, artifactRuntimeEnabled: true } } } as any)
+      const search = (tools as any).native_batshit_tool_search
+      const result = await search.execute({ domain: 'agent-settings', families: ['artifact', 'fabric'], query: 'zip', limit: 1 })
+      expect(result).toMatchObject({ totalMatches: 1, families: ['fabric'], results: [{ ref: 'fabric:sys.app_settings.native.report' }] })
+      expect(find).toHaveBeenCalledOnce()
+      expect(find).toHaveBeenCalledWith(expect.objectContaining({ domain: 'agent-settings', brokerFamilies: ['fabric'], limit: 1,
+        allowedControlIds: expect.arrayContaining(['sys.app_settings.native.report', 'sys.app_settings.native.change']) }))
+      find.mockClear()
+      expect((await search.execute({ domain: 'agent-settings', family: 'artifact', query: 'zip', limit: 1 })).results).toEqual([])
+      expect(find).not.toHaveBeenCalled()
+    } finally { find.mockRestore() }
+  })
+
+  it('invalid/retired family filters never become unfiltered searches', async () => {
+    const { tools } = await nativeToolService.buildMode3NativeTools({ userId: 'josh' } as any)
+    for (const family of ['bad_family', 'batshit_tool', 'batshit_tools']) {
+      await expect((tools as any).native_batshit_tool_search.execute({ family })).rejects.toThrow('Invalid Batshit tool family')
+    }
+    expect((await (tools as any).native_batshit_tool_search.execute({ families: [] })).results).toEqual([])
   })
 })

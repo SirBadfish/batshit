@@ -5,6 +5,7 @@ import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { createClient, type RedisClientType } from 'redis'
+import { BATSHIT_RUNTIME_REDIS_PORTS } from '$lib/server/redisRuntimePorts'
 
 /**
  * SA-104 memory-search test harness (testing-architecture.md §3, DL-104-14).
@@ -21,14 +22,69 @@ import { createClient, type RedisClientType } from 'redis'
  *
  * Guards, layered:
  *  - Runs only under the memory lane (VITEST_MEMORY_SEARCH=true + VITEST_USE_REAL_REDIS=true).
- *  - Refuses Batshit's known runtime ports (6379, 5639, 6380, 5649).
- *  - Refuses any instance that already contains a `user:` key.
+ *  - Refuses Batshit's runtime Redis ports (`BATSHIT_RUNTIME_REDIS_PORTS`: 6379, 5639, 5659,
+ *    6380, 5649; the same list `redis.ts` keeps its memory-search escape off).
+ *  - Refuses a URL that names a database other than 0 (BL-1824): FT.CREATE needs db 0, and the
+ *    harness flushes the WHOLE instance, so a URL naming db 15 points at an instance that may
+ *    hold other data (`memorySearchTestUrlRefusal`).
+ *  - Refuses, before any flush, an instance it has not claimed that holds ANY key in any database
+ *    (BL-1824; `memorySearchTestInstanceRefusal`); before, only `user:*` keys in db 0 refused it,
+ *    so a test Redis with data only in db 14 or 15 was flushed whole. The claim expires an hour
+ *    after the last flush (`HARNESS_CLAIM_TTL_SECONDS`), so a long-lived configured instance
+ *    that something else has written to since must be empty again before it is flushed.
+ *  - On the spawned path, refuses a server that is not the one it spawned (a port collision).
  *  - Uses a run-unique BATSHIT_MEMORY_INDEX_SUFFIX for index names.
  *  - The RedisService db-0 rewrite stays active for every URL except the one this
  *    harness designates via MEMORY_TEST_REDIS_URL (see isDesignatedMemorySearchTestUrl).
  */
 
-const REFUSED_PORTS = new Set([6379, 5639, 6380, 5649])
+
+/**
+ * BL-1824: why `url` may not be used, or null. The harness runs FLUSHALL, which empties every
+ * database of the instance, so it may only point at db 0 of an instance it owns: a URL naming
+ * another database (db 15, say) names an instance other data may live on.
+ */
+export function memorySearchTestUrlRefusal(url: string): string | null {
+  let parsed: URL
+  try {
+    parsed = new URL(url)
+  } catch {
+    return `Memory-search harness refuses MEMORY_TEST_REDIS_URL ${JSON.stringify(url)}: it is not a Redis URL.`
+  }
+  const port = Number(parsed.port || '6379')
+  if (BATSHIT_RUNTIME_REDIS_PORTS.has(port)) {
+    return (
+      `Memory-search harness refuses port ${port}: it belongs to a real Batshit Redis lane. ` +
+      'Point MEMORY_TEST_REDIS_URL at a dedicated disposable instance.'
+    )
+  }
+  const db = parsed.pathname.replace(/^\//, '')
+  if (db !== '' && db !== '0') {
+    return (
+      `Memory-search harness refuses ${parsed.host}/${db}: it flushes the WHOLE instance (every database), ` +
+      'and search indexes need db 0, so the URL must name db 0 of a dedicated disposable Redis, never another database of a shared one.'
+    )
+  }
+  return null
+}
+
+/**
+ * BL-1824: why the instance may not be flushed, or null. `claimed` is whether this harness's
+ * claim key is already there (its own leftovers from an earlier suite file); `keyspace` is the
+ * `INFO keyspace` text (`db0:keys=3,...`). An instance it has not claimed must be EMPTY in every
+ * database: anything else may be someone's data, and FLUSHALL would take all of it.
+ */
+export function memorySearchTestInstanceRefusal(input: { claimed: boolean; keyspace: string }): string | null {
+  if (input.claimed) return null
+  const filled = [...input.keyspace.matchAll(/^(db\d+):keys=(\d+)/gm)]
+    .filter((match) => Number(match[2]) > 0)
+    .map((match) => `${match[1]} holds ${match[2]} ${match[2] === '1' ? 'key' : 'keys'}`)
+  if (filled.length === 0) return null
+  return (
+    `Memory-search harness refuses this instance: it has not claimed it, and ${filled.join(', ')}. ` +
+    'It flushes the WHOLE instance, so it only uses an empty instance of its own. Point MEMORY_TEST_REDIS_URL at a dedicated disposable Redis.'
+  )
+}
 
 export function memorySearchLaneActive(): boolean {
   return (
@@ -79,7 +135,7 @@ function resolveRedisRuntime(): ResolvedRedisRuntime {
 function randomPort(): number {
   for (;;) {
     const port = 20000 + Math.floor(Math.random() * 40000)
-    if (!REFUSED_PORTS.has(port)) return port
+    if (!BATSHIT_RUNTIME_REDIS_PORTS.has(port)) return port
   }
 }
 
@@ -114,6 +170,11 @@ export interface MemorySearchTestContext {
 
 /** Stamped into the disposable instance so later suite files know it is harness-owned. */
 const HARNESS_CLAIM_KEY = 'batshit:memory_test_harness_claim'
+/**
+ * BL-1824: the claim lasts an hour after the last flush. Every test re-stamps it (beforeEach),
+ * so the suite files of one run stay claimed; an instance left alone longer must be empty again.
+ */
+const HARNESS_CLAIM_TTL_SECONDS = 3600
 
 export function useMemorySearchTestServer(): MemorySearchTestContext {
   let child: ChildProcess | null = null
@@ -131,7 +192,7 @@ export function useMemorySearchTestServer(): MemorySearchTestContext {
   const claimAndFlush = async () => {
     if (!admin) return
     await admin.flushAll()
-    await admin.set(HARNESS_CLAIM_KEY, new Date().toISOString())
+    await admin.set(HARNESS_CLAIM_KEY, new Date().toISOString(), { EX: HARNESS_CLAIM_TTL_SECONDS })
   }
 
   beforeAll(async () => {
@@ -163,33 +224,40 @@ export function useMemorySearchTestServer(): MemorySearchTestContext {
       await waitForReady(redisUrl, 15000)
     }
 
-    const parsed = new URL(redisUrl)
-    const port = Number(parsed.port || '6379')
-    if (REFUSED_PORTS.has(port)) {
-      throw new Error(
-        `Memory-search harness refuses port ${port}: it belongs to a real Batshit Redis lane. ` +
-          'Point MEMORY_TEST_REDIS_URL at a dedicated disposable instance.'
-      )
-    }
+    const urlRefusal = memorySearchTestUrlRefusal(redisUrl)
+    if (urlRefusal) throw new Error(urlRefusal)
 
-    admin = createClient({ url: redisUrl, database: 0 })
-    admin.on('error', (error) => console.error('[memory-search harness] Redis error:', error))
-    await admin.connect()
+    // `admin` is set only after every check passes, so no hook can flush a refused instance.
+    const candidate: RedisClientType = createClient({ url: redisUrl, database: 0 })
+    candidate.on('error', (error) => console.error('[memory-search harness] Redis error:', error))
+    await candidate.connect()
 
-    // Belt and suspenders: a real Batshit instance always has user records. The
-    // claim marker distinguishes THIS harness's own leftovers from real data: in CI
-    // every suite file shares one service container, and earlier files legitimately
-    // write user:* fixtures — without the marker, file two's guard mistook those
-    // leftovers for live data and refused (found on the job's first flight,
-    // 2026-08-29). An unclaimed instance with user:* keys still refuses loudly.
-    const alreadyClaimed = (await admin.exists(HARNESS_CLAIM_KEY)) > 0
-    if (!alreadyClaimed) {
-      const userKeys = await admin.keys('user:*')
-      if (userKeys.length > 0) {
-        throw new Error(
-          'Memory-search harness refuses this instance: it contains user:* keys and therefore looks like real Batshit data.'
-        )
+    // FLUSHALL below empties EVERY database of the instance, so an instance this harness has
+    // not claimed must be empty in all of them (BL-1824; before, only user:* keys in db 0
+    // refused it). The claim marker distinguishes THIS harness's own leftovers from real data:
+    // in CI every suite file shares one service container, and earlier files legitimately
+    // write fixtures (user:* in db 0, and db 15 in realRedisLaneCleanup) — without the marker,
+    // file two's guard mistook those leftovers for live data and refused (found on the job's
+    // first flight, 2026-08-29).
+    try {
+      let refusal: string | null = null
+      if (child) {
+        const processId = /^process_id:(\d+)/m.exec(await candidate.info('server'))?.[1]
+        if (Number(processId) !== child.pid) {
+          refusal =
+            `Memory-search harness refuses ${redisUrl}: another Redis (process ${processId ?? 'unknown'}) ` +
+            `already listens on the port it spawned process ${child.pid} for.`
+        }
       }
+      refusal ??= memorySearchTestInstanceRefusal({
+        claimed: (await candidate.exists(HARNESS_CLAIM_KEY)) > 0,
+        keyspace: await candidate.info('keyspace')
+      })
+      if (refusal) throw new Error(refusal)
+      admin = candidate
+    } finally {
+      // A refusal, or a check that failed, closes the client nothing else holds.
+      if (admin !== candidate) await candidate.disconnect().catch(() => undefined)
     }
     await claimAndFlush()
 
@@ -199,7 +267,8 @@ export function useMemorySearchTestServer(): MemorySearchTestContext {
     try {
       const envModule = await import('$env/dynamic/private')
       if (envModule?.env) {
-        envModule.env.REDIS_URL = redisUrl
+        // Only Vitest's mutable env-mock alias is updated; the real Kit namespace is readonly.
+        Object.assign(envModule.env, { REDIS_URL: redisUrl })
       }
     } catch {
       // ignore if env module not available yet

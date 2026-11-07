@@ -1,8 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
-import { failNextRedisCommand } from '$lib/test-utils/redis-command-failure'
 import { redis } from '$lib/server/redis'
+import { commitSlashCommandAgentAccess, SlashCommandMutationError } from '$lib/server/services/slashCommandRevision'
+import { deleteSubagentPopulation } from '$lib/server/services/subjectPopulation'
+import { withSettingsRecordReplacement, withSettingsRestoreFence } from '$lib/server/services/appActions/settings/lifecycle'
 import { pinHostCommandOwner, prepareHostCommand } from '$lib/server/services/hostCommandOwnership'
+import { ArtifactAccessCleanupUnknownError, removeArtifactAgentReferences } from '$lib/server/services/artifactAgentAccessCleanup'
+
+// The fixed five-path Lua owner is qualified by its actual 13-case Redis suite.
+// Here its boundary is held/scripted to test the real deletion caller and custody.
+vi.mock('$lib/server/services/artifactAgentAccessCleanup', async importOriginal =>
+  (await import('$lib/test-utils/subagentDeleteRouteDoubles')).artifactAgentAccessCleanupDouble(await importOriginal()))
 
 /**
  * `DELETE /api/subagents/[id]` deletes everything that is the Subagent's (2026-09-25):
@@ -31,14 +39,19 @@ vi.mock('$lib/server/services/cliSubagentProfileSync', () => ({
     profileId: 'batshit_agent_subagent_cli_route_probe', deleted: true, sharedWith: null, sharedWithKind: null
   }))
 }))
-const syncAgentCodexProfiles = vi.hoisted(() => vi.fn(async () => {}))
-const syncAgentClaudeProfiles = vi.hoisted(() => vi.fn(async () => {}))
-vi.mock('$lib/server/services/codexProfileManager', () => ({ syncAgentCodexProfiles }))
 vi.mock('$lib/server/services/claudeProfileManager', () => ({
-  syncAgentClaudeProfiles,
   agentClaudeProfileResource: (id: string) => JSON.stringify(['profile', `claude:${id}`])
 }))
-vi.mock('$lib/server/services/n8nParameterCompatibility', () => ({ runTrackedN8nCompatibilitySync: vi.fn() }))
+
+// Authority sweep has its own actual owner proof; this default route fixture has no Lua client.
+vi.mock('$lib/server/services/appActions/settings/authority', async importOriginal =>
+  (await import('$lib/test-utils/subagentDeleteRouteDoubles')).appActionsAuthorityDouble(await importOriginal()))
+// Route ordering/custody only. Physical fixed Lua owners have exclusive real-Redis suites.
+// The doubles are shared with the other Subagent delete-route suites.
+vi.mock('$lib/server/services/slashCommandRevision', async importOriginal =>
+  (await import('$lib/test-utils/subagentDeleteRouteDoubles')).slashCommandRevisionDouble(await importOriginal()))
+vi.mock('$lib/server/services/subjectPopulation', async importOriginal =>
+  (await import('$lib/test-utils/subagentDeleteRouteDoubles')).subjectPopulationDouble(await importOriginal()))
 
 useRedisTestServer()
 
@@ -85,6 +98,19 @@ const refused = async (): Promise<Response> => {
 
 beforeEach(() => {
   events.length = 0
+  vi.mocked(removeArtifactAgentReferences).mockReset().mockImplementation(async (args, context) => {
+    context.checkBeforeIssue()
+    // Legacy top-level fixtures retain their prior assertion. The actual five-path
+    // transformation is proved in the helper's real suite, not reimplemented here.
+    const row = await redis.json.get(`artifact:${args.artifactId}`) as { agent_allowlist?: unknown[] } | null
+    const list = row?.agent_allowlist
+    if (!Array.isArray(list) || !list.includes(args.agentId)) return { status: 'unchanged' }
+    context.checkBeforeIssue()
+    await redis.json.set(`artifact:${args.artifactId}`, '$.agent_allowlist', list.filter(id => id !== args.agentId) as never)
+    const removed = list.filter(id => id === args.agentId).length
+    context.onChanged({ removed, scopePinned: false })
+    return { status: 'changed', removed, scopePinned: false, notification: 'recorded' }
+  })
   vi.stubEnv('BATSHIT_SERVER_URL', SERVER)
   vi.stubEnv('BATSHIT_TOKEN', 'route-test-token')
   health = async () => jsonResponse(200, { ok: true, service: 'batshit-server', checks: { http: true, redis: true } })
@@ -102,8 +128,8 @@ beforeEach(() => {
     events.push(PROFILE)
     return { profileId: `batshit_agent_subagent_cli_${SUB}`, deleted: true, sharedWith: null }
   })
-  syncAgentCodexProfiles.mockClear()
-  syncAgentClaudeProfiles.mockClear()
+  vi.mocked(commitSlashCommandAgentAccess).mockClear()
+  vi.mocked(deleteSubagentPopulation).mockClear()
 })
 
 afterEach(() => {
@@ -140,6 +166,7 @@ describe('DELETE /api/subagents/[id]: avatar pictures (BL-139)', () => {
     expect(JSON.parse(String(sweepInit.body))).toEqual({ entityType: 'subagent', entityId: SUB, legacyFilenames: [] })
     expect(await redis.json.get(`subagent:${SUB}`)).toBeNull()
     expect(await redis.sMembers(`user:${USER}:subagents`)).toEqual([])
+    expect(deleteSubagentPopulation).toHaveBeenCalledWith(expect.anything(), { userId: USER, subjectId: SUB, expectedCatalogueRevision: null })
   })
 
   it('batshit-server down: 503, and NOTHING is deleted (record, folder, assignments)', async () => {
@@ -176,12 +203,16 @@ describe('DELETE /api/subagents/[id]: avatar pictures (BL-139)', () => {
 
   it('an id outside the owner id rule (no picture can be stored for it) skips the sweep and still deletes', async () => {
     await seedSubagent({}, 'odd.id')
+    await redis.json.set(`slash_command:${USER}:legacy_exact`, '$', { id: 'legacy_exact', enabled_agent_ids: ['odd.id', 'odd_id', 7] } as never)
+    await redis.json.set(`skill_source:${USER}:legacy_exact`, '$', { id: 'legacy_exact', enabled_agent_ids: ['odd.id', 'odd_id', []] } as never)
 
     const response = await callDelete(USER, 'odd.id')
 
     expect(response.status).toBe(200)
     expect(events).toEqual([HEALTH, PROFILE])
     expect(await redis.json.get('subagent:odd.id')).toBeNull()
+    expect(await redis.json.get(`slash_command:${USER}:legacy_exact`)).toMatchObject({ enabled_agent_ids: ['odd_id', 7] })
+    expect(await redis.json.get(`skill_source:${USER}:legacy_exact`)).toMatchObject({ enabled_agent_ids: ['odd_id', []] })
   })
 
   it('another user’s Subagent: 403 before anything is asked of batshit-server', async () => {
@@ -224,7 +255,42 @@ describe('DELETE /api/subagents/[id]: managed profile and assignments (BL-157)',
     expect(await redis.sMembers('agent:primary:subagents')).toEqual(['keep_me'])
   })
 
-  it('asks for the profile folder with the stored Subagent, then syncs the primaries’ managed profiles', async () => {
+  // SA-139 R2 (D14): no migration, so a record of a removed n8n Subagent type stays until its
+  // owner deletes it; DELETE is the one route that still acts on it, assignments included.
+  it('deletes a Subagent of a removed n8n type and its assignments like any other', async () => {
+    await seedSubagent({ subagentType: 'n8n-workflow', webhookUrl: 'https://n8n.example/webhook/old' })
+    await seedAgent('primary', { assigned_subagent_ids: [SUB, 'keep_me'], assignedSubagents: [SUB] })
+
+    const response = await callDelete(USER)
+
+    expect(response.status).toBe(200)
+    expect(await redis.json.get(`subagent:${SUB}`)).toBeNull()
+    expect(await redis.sMembers(`user:${USER}:subagents`)).toEqual([])
+    expect(await redis.json.get('agent:primary')).toMatchObject({ assigned_subagent_ids: ['keep_me'], assignedSubagents: [] })
+  })
+
+  // SA-139 R5 (D14): a leftover CLI Subagent (Claude Code or Codex) is delete-only. Every other
+  // route refuses it, so this delete must still act on it: its profile folder, its assignments
+  // and its record all go.
+  it.each([
+    ['Claude Code CLI', { primary_model_provider: 'claude-cli', primary_model_name: 'claude-cli' }],
+    ['Codex CLI', { primary_model_provider: 'openai-codex', primary_model_name: 'codex-cli' }]
+  ])('deletes a leftover %s Subagent with its profile folder and its assignments', async (_name, fields) => {
+    await seedSubagent({ subagentType: 'cli', ...fields })
+    await seedAgent('primary', { assigned_subagent_ids: [SUB, 'keep_me'], assignedSubagents: [SUB] })
+
+    const response = await callDelete(USER)
+
+    expect(response.status).toBe(200)
+    expect(events).toEqual([HEALTH, PROFILE, SWEEP])
+    expect(deleteManagedCliSubagentProfile).toHaveBeenCalledWith(USER, expect.objectContaining({ id: SUB, subagentType: 'cli', ...fields }))
+    expect(await redis.json.get(`subagent:${SUB}`)).toBeNull()
+    expect(await redis.sMembers(`user:${USER}:subagents`)).toEqual([])
+    expect(await redis.json.get('agent:primary')).toMatchObject({ assigned_subagent_ids: ['keep_me'], assignedSubagents: [] })
+  })
+
+  // SA-139 R4 removed the primaries' profile sync that followed this delete.
+  it('asks for the profile folder with the stored Subagent', async () => {
     await seedSubagent({ slug: 'custom_slug' })
 
     const response = await callDelete(USER)
@@ -234,8 +300,6 @@ describe('DELETE /api/subagents/[id]: managed profile and assignments (BL-157)',
       USER,
       expect.objectContaining({ id: SUB, slug: 'custom_slug' })
     )
-    expect(syncAgentCodexProfiles).toHaveBeenCalledWith(USER)
-    expect(syncAgentClaudeProfiles).toHaveBeenCalledWith(USER)
   })
 
   it('a profile folder that cannot be removed keeps the Subagent (and its pictures) for a retry', async () => {
@@ -289,15 +353,35 @@ describe('DELETE /api/subagents/[id]: a same-id Primary Agent and a failed scrub
     await seedSubagent()
     await seedAgent('primary', { assigned_subagent_ids: [SUB], assignedSubagents: [SUB] })
     await seedAccessLists()
-    // BL-607: failed at the client the route's steps read through, so it fails on real Redis too.
-    const failure = failNextRedisCommand('keys', new Error('Socket closed unexpectedly'))
+    // BL-607: fail the exact ordinary-skill scan at its actual client, on both
+    // lanes. Earlier plugin scans pass through; call-order drift cannot move
+    // this error to another cleanup family.
+    const execute = redis.execute
+    let reached = false
+    ;(redis as any).execute = async (operation: (client: any) => unknown) =>
+      execute.call(redis, async (client: any) => operation(new Proxy(Object.create(null), {
+        get(_target, property) {
+          if (property === 'keys') return async (pattern: string) => {
+            if (!reached && pattern === `slash_command:${USER}:*`) {
+              reached = true
+              throw new Error('Socket closed unexpectedly')
+            }
+            return client.keys(pattern)
+          }
+          const value = Reflect.get(client, property, client)
+          return typeof value === 'function' ? value.bind(client) : value
+        },
+        has(_target, property) { return property in client }
+      })))
     const quiet = vi.spyOn(console, 'error').mockImplementation(() => {})
 
-    const refused = await callDelete(USER).finally(failure.restore)
+    const refused = await callDelete(USER).finally(() => {
+      ;(redis as any).execute = execute
+      quiet.mockRestore()
+    })
     const body = await refused.json()
-    quiet.mockRestore()
 
-    expect(failure.failed()).toBe(true)
+    expect(reached).toBe(true)
 
     expect(refused.status).toBe(500)
     expect(body.code).toBe('subagent_references_not_removed')
@@ -340,5 +424,176 @@ describe('DELETE /api/subagents/[id]: access lists (BL-187)', () => {
     })
     expect(await redis.json.get(`slash_command:${USER}:other`)).toEqual({ id: 'other', enabled_agent_ids: ['primary'] })
     expect(await redis.json.get('artifact:art1')).toEqual({ id: 'art1', agent_allowlist: [], title: 'unchanged' })
+  })
+})
+
+
+describe('required command/source cleanup outcomes under the actual replacement fence', () => {
+  it('finishes metadata cleanup while the subject still exists, before final deletion', async () => {
+    await seedSubagent()
+    await redis.json.set('artifact:legacy-artifact', '$', { metadata: { assignedAgentIds: [SUB] } })
+    await redis.sAdd(`user:${USER}:artifacts`, 'legacy-artifact')
+    vi.mocked(removeArtifactAgentReferences).mockImplementationOnce(async (args, context) => {
+      expect(args).toEqual({ userId: USER, artifactId: 'legacy-artifact', agentId: SUB })
+      expect(await redis.json.get(`subagent:${SUB}`)).not.toBeNull()
+      context.checkBeforeIssue()
+      await redis.json.set('artifact:legacy-artifact', '$.metadata.assignedAgentIds', [])
+      context.onChanged({ removed: 1, scopePinned: true })
+      return { status: 'changed', removed: 1, scopePinned: true, notification: 'recorded' }
+    })
+    expect((await callDelete(USER)).status).toBe(200)
+    expect(await redis.json.get('artifact:legacy-artifact')).toEqual({ metadata: { assignedAgentIds: [] } })
+    expect(vi.mocked(removeArtifactAgentReferences).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(deleteSubagentPopulation).mock.invocationCallOrder[0])
+  })
+
+  it('accepts only the exact missing-Artifact refusal as confirmed absence', async () => {
+    await seedSubagent()
+    await redis.sAdd(`user:${USER}:artifacts`, 'already-deleted')
+    vi.mocked(removeArtifactAgentReferences).mockResolvedValueOnce({ status: 'refused', reason: 'artifact_missing' })
+    expect((await callDelete(USER)).status).toBe(200)
+    expect(await redis.json.get(`subagent:${SUB}`)).toBeNull()
+  })
+
+  it.each(['artifact_unreadable', 'conflict', 'read_unavailable'] as const)('retains the subject on %s and settles known refusal custody', async reason => {
+    await seedSubagent()
+    await redis.sAdd(`user:${USER}:artifacts`, 'unreadable')
+    vi.mocked(removeArtifactAgentReferences).mockResolvedValueOnce({ status: 'refused', reason })
+    const response = await callDelete(USER)
+    expect(response.status).toBe(409)
+    expect(deleteSubagentPopulation).not.toHaveBeenCalled()
+    expect(await redis.json.get(`subagent:${SUB}`)).not.toBeNull()
+    await expect(withSettingsRecordReplacement(`subagent:${SUB}`, async () => 'settled')).resolves.toBe('settled')
+  })
+
+  it('keeps all three untyped families for a legacy same-ID Primary', async () => {
+    await seedSubagent()
+    await seedAgent(SUB, {})
+    await redis.json.set(`slash_command:${USER}:shared`, '$', { enabled_agent_ids: [SUB] })
+    await redis.json.set(`skill_source:${USER}:shared`, '$', { enabled_agent_ids: [SUB] })
+    await redis.sAdd(`user:${USER}:artifacts`, 'shared')
+    expect((await callDelete(USER)).status).toBe(200)
+    expect(removeArtifactAgentReferences).not.toHaveBeenCalled()
+    expect(await redis.json.get(`slash_command:${USER}:shared`)).toEqual({ enabled_agent_ids: [SUB] })
+    expect(await redis.json.get(`skill_source:${USER}:shared`)).toEqual({ enabled_agent_ids: [SUB] })
+    expect(await redis.json.get(`agent:${SUB}`)).not.toBeNull()
+  })
+
+  it('reports known progress when a later Artifact refuses or notification fails', async () => {
+    await seedSubagent()
+    await redis.sAdd(`user:${USER}:artifacts`, ['first', 'second'])
+    vi.mocked(removeArtifactAgentReferences).mockImplementationOnce(async (_args, context) => {
+      context.checkBeforeIssue(); context.onChanged({ removed: 3, scopePinned: true })
+      return { status: 'changed', removed: 3, scopePinned: true, notification: 'recorded' }
+    }).mockResolvedValueOnce({ status: 'changed', removed: 2, scopePinned: false, notification: 'failed' })
+    const response = await callDelete(USER)
+    expect(response.status).toBe(503)
+    expect(await response.json()).toMatchObject({ outcome: 'progress_unavailable', cleanup: { changedArtifacts: 2, removedReferences: 5 } })
+    expect(deleteSubagentPopulation).not.toHaveBeenCalled()
+    await expect(withSettingsRecordReplacement(`subagent:${SUB}`, async () => 'settled')).resolves.toBe('settled')
+  })
+
+  it('refuses an original preparation after restore, synchronously before the held helper issues', async () => {
+    await seedSubagent()
+    await redis.sAdd(`user:${USER}:artifacts`, 'held')
+    let entered!: () => void; let release!: () => void
+    const atIssue = new Promise<void>(resolve => { entered = resolve })
+    const held = new Promise<void>(resolve => { release = resolve })
+    let issued = false
+    vi.mocked(removeArtifactAgentReferences).mockImplementationOnce(async (_args, context) => {
+      entered(); await held; context.checkBeforeIssue(); issued = true
+      return { status: 'unchanged' }
+    })
+    const deleting = callDelete(USER)
+    await atIssue
+    // Restore marks its epoch immediately, then drains the held exact-subject lease.
+    const restoring = withSettingsRestoreFence(async () => 'restored')
+    release()
+    const response = await deleting
+    expect(response.status).toBe(409)
+    expect(issued).toBe(false)
+    expect(deleteSubagentPopulation).not.toHaveBeenCalled()
+    expect(await restoring).toBe('restored')
+  })
+
+  it('retains prior confirmed cleanup and exact custody for one later unknown Artifact without replay', async () => {
+    const id = `${SUB}_artifact_unknown`
+    await seedSubagent({}, id)
+    await redis.sAdd(`user:${USER}:artifacts`, ['known', 'unknown'])
+    vi.mocked(removeArtifactAgentReferences).mockImplementationOnce(async (_args, context) => {
+      context.checkBeforeIssue(); context.onChanged({ removed: 2, scopePinned: false })
+      return { status: 'changed', removed: 2, scopePinned: false, notification: 'recorded' }
+    }).mockRejectedValueOnce(new ArtifactAccessCleanupUnknownError())
+    const response = await callDelete(USER, id)
+    expect(response.status).toBe(503)
+    const body = await response.json()
+    expect(body).toMatchObject({ code: 'AGENT_ARTIFACT_CLEANUP_UNCONFIRMED', outcome: 'unknown', cleanup: { changedArtifacts: 1, removedReferences: 2 } })
+    expect(body.error).not.toMatch(/try again/i)
+    expect(removeArtifactAgentReferences).toHaveBeenCalledTimes(2)
+    expect(deleteSubagentPopulation).not.toHaveBeenCalled()
+    expect(await redis.json.get(`subagent:${id}`)).not.toBeNull()
+    await expect(withSettingsRecordReplacement(`subagent:${id}`, async () => 'must-not-run')).rejects.toThrow('unknown outcome')
+    await expect(withSettingsRestoreFence(async () => 'must-not-run')).rejects.toThrow('unknown outcome')
+  })
+
+  it('requires the five-path Artifact owner before final deletion and retains an unowned indexed Artifact', async () => {
+    await seedSubagent()
+    await redis.sAdd(`user:${USER}:artifacts`, 'legacy-artifact')
+    vi.mocked(removeArtifactAgentReferences).mockResolvedValueOnce({ status: 'refused', reason: 'artifact_not_owned' })
+    const response = await callDelete(USER)
+    expect(response.status).toBe(409)
+    expect(await response.json()).toMatchObject({ code: 'AGENT_ARTIFACT_CLEANUP_REFUSED' })
+    expect(deleteSubagentPopulation).not.toHaveBeenCalled()
+    expect(await redis.json.get(`subagent:${SUB}`)).not.toBeNull()
+  })
+
+  it('retains a confirmed scrub count when the original guard refuses the next issue', async () => {
+    await seedSubagent()
+    await redis.sAdd(`user:${USER}:artifacts`, ['saved', 'held'])
+    vi.mocked(removeArtifactAgentReferences).mockImplementationOnce(async (_args, context) => {
+      context.checkBeforeIssue(); context.onChanged({ removed: 4, scopePinned: false })
+      return { status: 'changed', removed: 4, scopePinned: false, notification: 'recorded' }
+    }).mockRejectedValueOnce(new SlashCommandMutationError('SLASH_COMMAND_CONFLICT', 'Original preparation refused.', 'not_written'))
+    const response = await callDelete(USER)
+    expect(response.status).toBe(409)
+    expect(await response.json()).toMatchObject({ outcome: 'refused', cleanup: { changedArtifacts: 1, removedReferences: 4 } })
+    expect(deleteSubagentPopulation).not.toHaveBeenCalled()
+    await expect(withSettingsRecordReplacement(`subagent:${SUB}`, async () => 'settled')).resolves.toBe('settled')
+  })
+  it('keeps absent universal lists and source siblings while using the source cleanup owner', async () => {
+    await seedSubagent()
+    await redis.json.set(`slash_command:${USER}:legacy`, '$', { id: 'legacy', content: 'keep' })
+    await redis.json.set(`skill_source:${USER}:owned`, '$', { id: 'owned', enabled_agent_ids: [SUB, 'A-B'], root_path: '/keep' })
+    await redis.json.set(`skill_source:${USER}:legacy`, '$', { id: 'legacy', root_path: '/also-keep' })
+    expect((await callDelete(USER)).status).toBe(200)
+    expect(await redis.json.get(`slash_command:${USER}:legacy`)).toEqual({ id: 'legacy', content: 'keep' })
+    expect(await redis.json.get(`skill_source:${USER}:owned`)).toEqual({ id: 'owned', enabled_agent_ids: ['A-B'], root_path: '/keep' })
+    expect(await redis.json.get(`skill_source:${USER}:legacy`)).toEqual({ id: 'legacy', root_path: '/also-keep' })
+  })
+
+  it('settles a proven no-effect refusal, retains the record, and does not call final deletion', async () => {
+    await seedSubagent()
+    await redis.json.set(`slash_command:${USER}:reviewer`, '$', { id: 'reviewer', enabled_agent_ids: [SUB] })
+    vi.mocked(commitSlashCommandAgentAccess).mockRejectedValueOnce(new SlashCommandMutationError('SLASH_COMMAND_CONFLICT', 'Access changed during cleanup; earlier profile cleanup may have completed.', 'not_written'))
+    const response = await callDelete(USER)
+    expect(response.status).toBe(409)
+    expect(await response.json()).toMatchObject({ code: 'SLASH_COMMAND_CONFLICT' })
+    expect(deleteSubagentPopulation).not.toHaveBeenCalled()
+    expect(await redis.json.get(`subagent:${SUB}`)).not.toBeNull()
+    await expect(withSettingsRecordReplacement(`subagent:${SUB}`, async () => 'settled')).resolves.toBe('settled')
+  })
+
+  // Final case: this deliberately retains unresolved process-local custody.
+  it('holds exact replacement and restore after an issued unknown, with no final delete or retry language', async () => {
+    await seedSubagent()
+    await redis.json.set(`slash_command:${USER}:reviewer`, '$', { id: 'reviewer', enabled_agent_ids: [SUB] })
+    vi.mocked(commitSlashCommandAgentAccess).mockRejectedValueOnce(new SlashCommandMutationError('SLASH_COMMAND_UNCONFIRMED', 'The access write may have reached storage. Do not retry it.', 'unknown'))
+    const response = await callDelete(USER)
+    expect(response.status).toBe(503)
+    expect(await response.json()).toMatchObject({ code: 'SLASH_COMMAND_UNCONFIRMED' })
+    expect(deleteSubagentPopulation).not.toHaveBeenCalled()
+    expect(commitSlashCommandAgentAccess).toHaveBeenCalledTimes(1)
+    expect(await redis.json.get(`subagent:${SUB}`)).not.toBeNull()
+    await expect(withSettingsRecordReplacement(`subagent:${SUB}`, async () => 'must-not-run')).rejects.toThrow('unknown outcome')
+    await expect(withSettingsRestoreFence(async () => 'must-not-run')).rejects.toThrow('unknown outcome')
   })
 })

@@ -5,8 +5,10 @@ import {
   RECIPE_STRICT_TOLERANCE_PROFILE,
   planAppearanceRecipeMigration,
   type RecipeMigrationReport,
-  type RecipeMigrationReportEntry
+  type RecipeMigrationReportEntry,
+  type RecipeStateSnapshot
 } from '$lib/goons/recipe'
+import type { GoonOperationState } from '../GoonOperationOverlay.svelte'
 import RecipeBuildProgress from './RecipeBuildProgress.svelte'
 import RecipeConfirmationDialogs from './RecipeConfirmationDialogs.svelte'
 import RecipeDirtyGuardDialog from './RecipeDirtyGuardDialog.svelte'
@@ -141,6 +143,45 @@ function report(overrides: Partial<RecipeMigrationReport> = {}): RecipeMigration
     },
     ...overrides
   }
+}
+
+function operationLifecycleGoons(state: RecipeStateSnapshot) {
+  const committed = {
+    id: 'recipe-operation-goon',
+    user_id: 'recipe-operation-user',
+    name: 'Operation Goon',
+    kind: 'custom',
+    sourceProfile: 'expert-custom-glb',
+    files: {},
+    recipe: {
+      contract: 'goon-recipe/v2',
+      writeVersion: 2,
+      nextRecipeRevision: 3,
+      liveStatus: 'up_to_date',
+      authoringRevision: { recipeRevision: 2, state },
+      activeRevision: { ref: 'active-2' },
+      previousRevision: { ref: 'active-1' },
+      pendingAnalysis: null,
+      pendingJob: null,
+      lastFailure: null
+    },
+    appearanceDials: state.appearanceDials,
+    created_at: '2026-09-20T00:00:00.000Z',
+    updated_at: '2026-09-20T00:00:00.000Z'
+  } as unknown as GoonRecord
+  const starting = {
+    ...structuredClone(committed),
+    recipe: {
+      ...structuredClone(committed.recipe),
+      writeVersion: 1,
+      nextRecipeRevision: 2,
+      liveStatus: 'needs_bake',
+      authoringRevision: { recipeRevision: 1, state },
+      activeRevision: { ref: 'active-1' },
+      previousRevision: null
+    }
+  } as unknown as GoonRecord
+  return { starting, committed }
 }
 
 describe('Recipe R5 Settings components', () => {
@@ -353,7 +394,7 @@ describe('Recipe R5 Settings components', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Finish Update' }))
     await waitFor(() => expect(resumeReadyCandidate).toHaveBeenCalledOnce())
     expect(recoverJob).toHaveBeenCalledWith(pendingJob.jobId)
-    expect(recipeServiceMocks.loadGoons).toHaveBeenCalled()
+    await waitFor(() => expect(recipeServiceMocks.loadGoons).toHaveBeenCalled())
   })
 
   it('shows the real Recipe preparation failure instead of an unexplained empty action state', () => {
@@ -1268,4 +1309,419 @@ describe('Recipe R5 Settings components', () => {
     expect(screen.queryByRole('dialog', { name: 'Restore Previous Version?' })).toBeNull()
     expect(document.querySelector('[data-slot="dialog-overlay"]')).toBeNull()
   })
+  it.each([['rebuild', 'committed'], ['rebuild', 'failed'], ['ready', 'committed'], ['ready', 'failed']] as const)(
+    'settles a captured Retry draft only after %s recovery is %s', async (branch, outcome) => {
+    const fixture = await createRecipePhysicalMigrationFixture()
+    const pendingJob = { jobId: 'retry-hair-job', jobRef: 'retry-hair-ref', status: 'failed', operation: 'rebake',
+      targetWriteVersion: 1, targetRecipeRevision: 2, targetRevisionId: 'retry-hair-revision', idempotencyKey: 'retry-key' }
+    const owner = { contract: 'goon-recipe/v2', writeVersion: 1, nextRecipeRevision: 3, liveStatus: 'failed',
+      authoringRevision: { recipeRevision: 1, state: fixture.sourceState }, activeRevision: { ref: 'active-1' },
+      previousRevision: null, pendingAnalysis: null, pendingJob, lastFailure: { stage: 'baking', reason: 'failed' } }
+    const starting = { id: 'retry-hair-goon', user_id: 'retry-hair-user', name: 'Retry Hair', kind: 'custom',
+      sourceProfile: 'expert-custom-glb', files: {}, recipe: owner, appearanceDials: fixture.sourceState.appearanceDials,
+      created_at: '2026-08-11T00:00:00.000Z', updated_at: '2026-08-11T00:00:00.000Z' } as unknown as GoonRecord
+    const committed = { ...structuredClone(starting), recipe: { ...structuredClone(owner), liveStatus: 'up_to_date',
+      pendingJob: null, lastFailure: null, activeRevision: { ref: 'active-2' } } } as unknown as GoonRecord
+    const recovery = { goon: starting, owner, job: { ...pendingJob, stateVersion: 1 },
+      reviewedState: { state: fixture.sourceState }, candidate: null, recovered: true }
+    const readyRecovery = { ...recovery, job: { ...recovery.job, status: 'ready' } }
+    const recoverJob = vi.fn(async () => recovery).mockResolvedValueOnce(recovery).mockResolvedValue(
+      branch === 'ready' ? readyRecovery : recovery)
+    const retryJob = vi.fn(async () => ({ ...recovery, owner: { ...owner, writeVersion: 2 },
+      job: { ...recovery.job, status: branch === 'ready' ? 'ready' : 'baking' } }))
+    const buildUploadStageCommit = vi.fn(async () => {
+      if (outcome === 'failed') throw new Error('retry failed')
+      return { committed: { goon: committed } }
+    })
+    const resumeReadyCandidate = vi.fn(async () => {
+      if (outcome === 'failed') throw new Error('ready recovery failed')
+      return { goon: committed }
+    })
+    const settle = vi.fn(), onRetryBegin = vi.fn((_reviewed: RecipeStateSnapshot) => settle)
+    recipeServiceMocks.workflowClient = { recoverJob, retryJob, buildUploadStageCommit, resumeReadyCandidate }
+    recipeServiceMocks.loadGoons.mockResolvedValue([outcome === 'committed' ? committed : starting])
+    render(RecipeWorkflowControllerHarness, { goon: starting,
+      appearanceDials: structuredClone(fixture.sourceState.appearanceDials), onRetryBegin })
+    await waitFor(() => expect(recoverJob).toHaveBeenCalled())
+    await fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    if (branch === 'ready') await waitFor(() => expect(resumeReadyCandidate).toHaveBeenCalledOnce())
+    else await waitFor(() => expect(buildUploadStageCommit).toHaveBeenCalledOnce())
+    expect(onRetryBegin).toHaveBeenCalledOnce()
+    expect(onRetryBegin.mock.calls[0]![0]).toEqual(fixture.sourceState)
+    expect(onRetryBegin.mock.invocationCallOrder[0]).toBeLessThan(retryJob.mock.invocationCallOrder[0]!)
+    if (outcome === 'committed') await waitFor(() => expect(settle).toHaveBeenCalledWith(committed))
+    else await waitFor(() => expect(recoverJob.mock.calls.length).toBeGreaterThan(1))
+    if (outcome === 'failed') expect(settle).not.toHaveBeenCalled()
+  })
+
+  it('keeps a saved exact Hair sibling during an unrelated runtime-only Save', async () => {
+    const fixture = await createRecipePhysicalMigrationFixture()
+    const { createHairAssetFixture, createRigidHairGlbFixture } = await import('$lib/goons/recipe/fixtures/hairAssetFixture')
+    const { recipeSiblingStateSha256, recipeStateSnapshotSha256 } = await import('$lib/goons/recipe')
+    const asset = await createHairAssetFixture({
+      recipeSource: fixture.source.recipeSource, mainBytes: createRigidHairGlbFixture(),
+      headNode: 'HeadAnchor', sourceClass: 'builtin'
+    })
+    const hairState = createHairState(asset, { baseColor: '#123456', highlightColor: '#abcdef' })
+    const sourceState = structuredClone(fixture.sourceState)
+    sourceState.siblings.push({
+      id: 'hairState', contract: hairState.schemaVersion, definitionSha256: hairState.definitionSha256!,
+      stateSha256: await recipeSiblingStateSha256(hairState), state: hairState
+    })
+    sourceState.siblings.sort((left, right) => left.id.localeCompare(right.id))
+    sourceState.stateSha256 = await recipeStateSnapshotSha256(sourceState)
+    const before = JSON.stringify(sourceState)
+    const goon = {
+      id: 'recipe-retained-hair-runtime-save', user_id: 'recipe-runtime-only-save-user',
+      name: 'Runtime Only Save Goon', kind: 'custom', sourceProfile: 'expert-custom-glb', files: {},
+      recipe: { contract: 'goon-recipe/v2', writeVersion: 1, nextRecipeRevision: 2,
+        liveStatus: 'up_to_date', authoringRevision: { recipeRevision: 1, state: sourceState },
+        activeRevision: { ref: 'active-1' }, previousRevision: null, pendingAnalysis: null,
+        pendingJob: null, lastFailure: null },
+      appearanceDials: sourceState.appearanceDials, hairState,
+      created_at: '2026-07-18T00:00:00.000Z', updated_at: '2026-07-18T00:00:00.000Z'
+    } as unknown as GoonRecord
+    const buildUploadStageCommit = vi.fn()
+    recipeServiceMocks.workflowClient = { buildUploadStageCommit }
+    render(RecipeWorkflowControllerHarness, {
+      goon, appearanceDials: structuredClone(sourceState.appearanceDials), hairState
+    })
+    await waitFor(() => expect(screen.getByText('Ready')).toBeTruthy())
+    await fireEvent.click(screen.getByRole('button', { name: 'Save Goon' }))
+    await waitFor(() => expect(screen.getByTestId('save-result')).toHaveTextContent('true'))
+    expect(buildUploadStageCommit).not.toHaveBeenCalled()
+    expect(JSON.stringify(sourceState)).toBe(before)
+  })
+
+  it('cancels previous-version preparation without late publication, then reviews the exact verified Live envelope', async () => {
+    const fixture = await createRecipePhysicalMigrationFixture()
+    const {
+      GOON_LIVE_BUILD_CONTRACT,
+      GOON_RECIPE_REVISION_CONTRACT,
+      GOON_RECIPE_REVISION_ENVELOPE_CONTRACT,
+      RECIPE_ARCHIVE_CONTAINMENT_RECEIPT_CONTRACT,
+      createRecipeRevisionEnvelope,
+      recipeRevisionBundleSha256,
+      verifyRecipeRevisionEnvelope
+    } = await import('$lib/goons/recipe')
+    const unsignedRevision = {
+      contract: GOON_RECIPE_REVISION_CONTRACT,
+      recipeRevision: 1,
+      revisionId: 'recipe-previous-live-revision',
+      revisionSha256: '0'.repeat(64),
+      source: fixture.source.recipeSource,
+      state: fixture.sourceState,
+      liveBuildReceipt: {
+        contract: GOON_LIVE_BUILD_CONTRACT,
+        ref: 'goon_recipe_document:recipe-previous-live-user:recipe-previous-live-goon:receipt',
+        sha256: '1'.repeat(64)
+      },
+      updateReport: null
+    }
+    const revision = {
+      ...unsignedRevision,
+      revisionSha256: await recipeRevisionBundleSha256(unsignedRevision)
+    }
+    const previousEnvelope = await createRecipeRevisionEnvelope({
+      contract: GOON_RECIPE_REVISION_ENVELOPE_CONTRACT,
+      revision,
+      sourceContainmentReceipt: {
+        contract: RECIPE_ARCHIVE_CONTAINMENT_RECEIPT_CONTRACT,
+        ref: 'goon_recipe_document:recipe-previous-live-user:recipe-previous-live-goon:containment',
+        sha256: '2'.repeat(64)
+      },
+      live: {
+        package: { ref: '/uploads/goon_custom_packages/previous.bgoon', sha256: '3'.repeat(64), bytes: 300 },
+        model: { ref: '/uploads/goon_custom_models/previous.glb', sha256: '4'.repeat(64), bytes: 200 },
+        manifest: { ref: '/uploads/goon_custom_manifests/previous.json', sha256: '5'.repeat(64), bytes: 100 }
+      }
+    })
+    const verifiedPreviousEnvelope = await verifyRecipeRevisionEnvelope(previousEnvelope)
+    const previousRevisionRef = {
+      contract: GOON_RECIPE_REVISION_ENVELOPE_CONTRACT,
+      ref: 'goon_recipe_revision:recipe-previous-live-user:recipe-previous-live-goon:recipe-previous-live-revision',
+      sha256: verifiedPreviousEnvelope.envelopeSha256
+    }
+    const owner = {
+      contract: 'goon-recipe/v2', writeVersion: 2, nextRecipeRevision: 3,
+      liveStatus: 'up_to_date',
+      authoringRevision: { recipeRevision: 2, source: fixture.source.recipeSource, state: fixture.sourceState },
+      activeRevision: {
+        contract: GOON_RECIPE_REVISION_ENVELOPE_CONTRACT,
+        ref: 'goon_recipe_revision:recipe-previous-live-user:recipe-previous-live-goon:active',
+        sha256: '6'.repeat(64)
+      },
+      previousRevision: previousRevisionRef,
+      pendingAnalysis: null, pendingJob: null, lastFailure: null
+    }
+    const goon = {
+      id: 'recipe-previous-live-goon', user_id: 'recipe-previous-live-user',
+      name: 'Previous Live Review', kind: 'custom', sourceProfile: 'expert-custom-glb', files: {},
+      recipe: owner, appearanceDials: fixture.sourceState.appearanceDials,
+      created_at: '2026-09-17T00:00:00.000Z', updated_at: '2026-09-17T00:00:00.000Z'
+    } as unknown as GoonRecord
+    const response = {
+      goon, owner, previous: await verifyRecipeRevisionEnvelope(verifiedPreviousEnvelope)
+    }
+    let resolveFirst!: (value: typeof response) => void
+    const firstRequest = new Promise<typeof response>(resolve => { resolveFirst = resolve })
+    const previewRollback = vi.fn(async (_options?: { signal?: AbortSignal }) => response)
+      .mockImplementationOnce(() => firstRequest)
+    recipeServiceMocks.workflowClient = { previewRollback }
+    const onPreviewTargetChange = vi.fn()
+    const onWorkflowOperationChange = vi.fn()
+
+    render(RecipeWorkflowControllerHarness, {
+      goon,
+      appearanceDials: structuredClone(fixture.sourceState.appearanceDials),
+      onPreviewTargetChange,
+      onWorkflowOperationChange
+    })
+
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Restore Previous Version' })).toBeTruthy())
+    await fireEvent.click(screen.getByRole('button', { name: 'Restore Previous Version' }))
+    await waitFor(() => expect(previewRollback).toHaveBeenCalledOnce())
+    await waitFor(() => expect(onWorkflowOperationChange.mock.calls.at(-1)?.[0]?.onCancel).toBeTypeOf('function'))
+    const operation = onWorkflowOperationChange.mock.calls.at(-1)![0] as GoonOperationState
+    await operation.onCancel?.()
+    await waitFor(() => expect(previewRollback.mock.calls[0][0]?.signal?.aborted).toBe(true))
+    await waitFor(() => expect(onWorkflowOperationChange.mock.calls.at(-1)?.[0]).toBeNull())
+    resolveFirst(response)
+    await firstRequest
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(onPreviewTargetChange.mock.calls.some(([value]) => Boolean(value?.liveEnvelope))).toBe(false)
+    expect(screen.queryByRole('dialog', { name: 'Restore Previous Version?' })).toBeNull()
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Restore Previous Version' }))
+    await waitFor(() => expect(previewRollback).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(
+      onPreviewTargetChange.mock.calls.some(([value]) => Boolean(value?.liveEnvelope))
+    ).toBe(true))
+    const target = onPreviewTargetChange.mock.calls
+      .map(([value]) => value)
+      .find((value) => value?.liveEnvelope)!
+    expect(target).toMatchObject({
+      side: 'updated',
+      state: verifiedPreviousEnvelope.revision.state,
+      liveEnvelope: verifiedPreviousEnvelope
+    })
+    expect(target.liveEnvelope.envelopeSha256).toBe(previousRevisionRef.sha256)
+    expect(target.liveEnvelope.live).toEqual(verifiedPreviousEnvelope.live)
+  })
+
+  it('publishes cancelable build phases, removes Cancel for commit, and clears the operation after success', async () => {
+    const fixture = await createRecipePhysicalMigrationFixture()
+    const { starting, committed } = operationLifecycleGoons(fixture.sourceState)
+    let buildRequest: any = null
+    let resolveBuild: ((value: unknown) => void) | null = null
+    let resolveSavedPreview: (() => void) | null = null
+    let currentOperation: GoonOperationState | null = null
+    const onWorkflowOperationChange = vi.fn((operation: GoonOperationState | null) => {
+      currentOperation = operation
+    })
+    const buildUploadStageCommit = vi.fn((request: any) => {
+      buildRequest = request
+      return new Promise((resolve) => { resolveBuild = resolve })
+    })
+    const onLoadSavedPreview = vi.fn(() => new Promise<void>((resolve) => { resolveSavedPreview = resolve }))
+    recipeServiceMocks.workflowClient = { buildUploadStageCommit }
+    recipeServiceMocks.loadGoons.mockResolvedValue([committed])
+
+    render(RecipeWorkflowControllerHarness, {
+      goon: starting,
+      appearanceDials: structuredClone(fixture.sourceState.appearanceDials),
+      onLoadSavedPreview,
+      onWorkflowOperationChange
+    })
+
+    await waitFor(() => expect(screen.getByText('Appearance changes ready to save')).toBeTruthy())
+    await fireEvent.click(screen.getByRole('button', { name: 'Save Goon' }))
+    await waitFor(() => expect(buildUploadStageCommit).toHaveBeenCalledOnce())
+
+    buildRequest.onProgress('rewriting-model')
+    await waitFor(() => expect(currentOperation?.phase).toBe('Baking the Goon model'))
+    expect(currentOperation?.onCancel).toEqual(expect.any(Function))
+
+    buildRequest.onProgress('committing')
+    await waitFor(() => expect(currentOperation?.phase).toBe('Saving the Goon'))
+    expect(currentOperation?.onCancel).toBeFalsy()
+
+    resolveBuild!({ committed: { goon: committed } })
+    await waitFor(() => expect(onLoadSavedPreview).toHaveBeenCalledWith(committed))
+    expect(currentOperation?.phase).toBe('Loading the saved Goon')
+    expect(currentOperation?.onCancel).toBeFalsy()
+    expect(screen.getByTestId('save-result')).toHaveTextContent('not-run')
+    expect(buildUploadStageCommit).toHaveBeenCalledOnce()
+
+    resolveSavedPreview!()
+    await waitFor(() => expect(screen.getByTestId('save-result')).toHaveTextContent('true'))
+    await waitFor(() => expect(currentOperation).toBeNull())
+  })
+
+  it('keeps a committed rebake saved when reopening its preview fails', async () => {
+    const fixture = await createRecipePhysicalMigrationFixture()
+    const { starting, committed } = operationLifecycleGoons(fixture.sourceState)
+    let rejectSavedPreview: ((reason: Error) => void) | null = null
+    let currentOperation: GoonOperationState | null = null
+    const onLoadSavedPreview = vi.fn(() => new Promise<void>((_resolve, reject) => { rejectSavedPreview = reject }))
+    const buildUploadStageCommit = vi.fn(async () => ({ committed: { goon: committed } }))
+    const recoverJob = vi.fn()
+    recipeServiceMocks.workflowClient = { buildUploadStageCommit, recoverJob }
+    recipeServiceMocks.loadGoons.mockResolvedValue([committed])
+
+    render(RecipeWorkflowControllerHarness, {
+      goon: starting,
+      appearanceDials: structuredClone(fixture.sourceState.appearanceDials),
+      onLoadSavedPreview,
+      onWorkflowOperationChange: (operation) => { currentOperation = operation }
+    })
+
+    await waitFor(() => expect(screen.getByText('Appearance changes ready to save')).toBeTruthy())
+    await fireEvent.click(screen.getByRole('button', { name: 'Save Goon' }))
+    await waitFor(() => expect(onLoadSavedPreview).toHaveBeenCalledWith(committed))
+    expect(currentOperation?.phase).toBe('Loading the saved Goon')
+    expect(currentOperation?.onCancel).toBeFalsy()
+    expect(screen.getByTestId('save-result')).toHaveTextContent('not-run')
+
+    rejectSavedPreview!(new Error('fixture preview failed'))
+    await waitFor(() => expect(screen.getByTestId('save-result')).toHaveTextContent('true'))
+    await waitFor(() => expect(currentOperation).toBeNull())
+    expect(buildUploadStageCommit).toHaveBeenCalledOnce()
+    expect(recipeServiceMocks.loadGoons).toHaveBeenCalledOnce()
+    expect(recoverJob).not.toHaveBeenCalled()
+  })
+
+  it('keeps the operation blocked while cancellation and recovery settle', async () => {
+    const fixture = await createRecipePhysicalMigrationFixture()
+    const { starting } = operationLifecycleGoons(fixture.sourceState)
+    let currentOperation: GoonOperationState | null = null
+    let resolveRecovery: ((goons: GoonRecord[]) => void) | null = null
+    const recovery = new Promise<GoonRecord[]>((resolve) => { resolveRecovery = resolve })
+    const buildUploadStageCommit = vi.fn((request: any) =>
+      new Promise((_resolve, reject) => {
+        request.onProgress('rewriting-model')
+        request.signal.addEventListener('abort', () => reject(request.signal.reason), { once: true })
+      })
+    )
+    recipeServiceMocks.workflowClient = { buildUploadStageCommit }
+    recipeServiceMocks.loadGoons.mockImplementation(() => recovery)
+
+    render(RecipeWorkflowControllerHarness, {
+      goon: starting,
+      appearanceDials: structuredClone(fixture.sourceState.appearanceDials),
+      onWorkflowOperationChange: (operation) => { currentOperation = operation }
+    })
+
+    await waitFor(() => expect(screen.getByText('Appearance changes ready to save')).toBeTruthy())
+    await fireEvent.click(screen.getByRole('button', { name: 'Save Goon' }))
+    await waitFor(() => expect(currentOperation?.onCancel).toEqual(expect.any(Function)))
+    currentOperation?.onCancel?.()
+
+    await waitFor(() => expect(currentOperation?.phase).toBe('Canceling the Goon operation'))
+    expect(currentOperation?.onCancel).toBeFalsy()
+    expect(screen.getByTestId('save-result')).toHaveTextContent('not-run')
+
+    resolveRecovery!([starting])
+    await waitFor(() => expect(screen.getByTestId('save-result')).toHaveTextContent('false'))
+    await waitFor(() => expect(currentOperation).toBeNull())
+  })
+
+  it('clears the blocking operation after a failed build finishes recovery', async () => {
+    const fixture = await createRecipePhysicalMigrationFixture()
+    const { starting } = operationLifecycleGoons(fixture.sourceState)
+    let currentOperation: GoonOperationState | null = null
+    let rejectBuild: ((reason: unknown) => void) | null = null
+    const buildUploadStageCommit = vi.fn((request: any) => {
+      request.onProgress('auditing-model')
+      return new Promise((_resolve, reject) => { rejectBuild = reject })
+    })
+    recipeServiceMocks.workflowClient = { buildUploadStageCommit }
+    recipeServiceMocks.loadGoons.mockResolvedValue([starting])
+
+    render(RecipeWorkflowControllerHarness, {
+      goon: starting,
+      appearanceDials: structuredClone(fixture.sourceState.appearanceDials),
+      onWorkflowOperationChange: (operation) => { currentOperation = operation }
+    })
+
+    await waitFor(() => expect(screen.getByText('Appearance changes ready to save')).toBeTruthy())
+    await fireEvent.click(screen.getByRole('button', { name: 'Save Goon' }))
+    await waitFor(() => expect(currentOperation?.phase).toBe('Checking the baked model'))
+    rejectBuild!(new Error('fixture build failed'))
+
+    await waitFor(() => expect(screen.getByTestId('save-result')).toHaveTextContent('false'))
+    await waitFor(() => expect(currentOperation).toBeNull())
+  })
+  it.each(['failed', 'superseded'] as const)(
+    'reports a %s draft fit without replacing the last valid preview and clears errors after Cancel',
+    async (outcome) => {
+      const fixture = await createRecipePhysicalMigrationFixture()
+      const goon = {
+        id: 'recipe-preview-fit-error-goon',
+        user_id: 'recipe-preview-fit-error-user',
+        name: 'Recipe Preview Fit Error',
+        kind: 'custom',
+        sourceProfile: 'expert-custom-glb',
+        files: {},
+        customAvatar: { manifestSummary: { anatomyFitReady: true } },
+        recipe: {
+          contract: 'goon-recipe/v2',
+          writeVersion: 1,
+          nextRecipeRevision: 2,
+          liveStatus: 'up_to_date',
+          authoringRevision: {
+            recipeRevision: 1,
+            source: fixture.source.recipeSource,
+            state: fixture.sourceState
+          },
+          activeRevision: { ref: 'active' },
+          previousRevision: null,
+          pendingAnalysis: null,
+          pendingJob: null,
+          lastFailure: null
+        },
+        appearanceDials: fixture.sourceState.appearanceDials,
+        created_at: '2026-09-08T00:00:00.000Z',
+        updated_at: '2026-09-08T00:00:00.000Z'
+      } as unknown as GoonRecord
+      const onDraftPreviewStateChange = vi.fn()
+      const onDraftPreviewErrorChange = vi.fn()
+      let rejectFit!: (error: Error) => void
+      recipeServiceMocks.loadCustomAvatarManifest.mockImplementationOnce(
+        () => new Promise((_, reject) => { rejectFit = reject })
+      )
+      const view = render(RecipeWorkflowControllerHarness, {
+        goon,
+        appearanceDials: structuredClone(fixture.sourceState.appearanceDials),
+        onDraftPreviewStateChange,
+        onDraftPreviewErrorChange,
+      })
+      await waitFor(() => expect(onDraftPreviewStateChange).toHaveBeenCalledOnce())
+      const validPreview = onDraftPreviewStateChange.mock.lastCall?.[0]
+      await fireEvent.click(screen.getByRole('button', { name: 'Mutate nested Recipe dial' }))
+      await waitFor(() => expect(recipeServiceMocks.loadCustomAvatarManifest).toHaveBeenCalledOnce())
+      const failure = new Error('The previous Anatomy Fit sibling state hash is stale.')
+      if (outcome === 'failed') {
+        rejectFit(failure)
+        await waitFor(() => expect(onDraftPreviewErrorChange).toHaveBeenLastCalledWith(failure.message))
+        expect(onDraftPreviewStateChange).toHaveBeenCalledOnce()
+        expect(onDraftPreviewStateChange.mock.lastCall?.[0]).toBe(validPreview)
+      }
+      await fireEvent.click(screen.getByRole('button', { name: 'Cancel appearance changes' }))
+      await waitFor(() => expect(onDraftPreviewStateChange).toHaveBeenCalledTimes(2))
+      expect(onDraftPreviewStateChange.mock.lastCall?.[0]).toEqual(validPreview)
+      expect(onDraftPreviewErrorChange).toHaveBeenLastCalledWith(null)
+      if (outcome === 'superseded') {
+        rejectFit(failure)
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        expect(onDraftPreviewErrorChange).not.toHaveBeenCalledWith(failure.message)
+        expect(onDraftPreviewStateChange).toHaveBeenCalledTimes(2)
+      }
+      view.unmount()
+      expect(onDraftPreviewStateChange).toHaveBeenLastCalledWith(null)
+      expect(onDraftPreviewErrorChange).toHaveBeenLastCalledWith(null)
+    }
+  )
+
+
 })

@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 const script = join(dirname(fileURLToPath(import.meta.url)), 'prepare-managed-runtime-assets.mjs');
-const version = '24.21.0';
+const version = '24.22.1';
 const filename = `node-v${version}-darwin-arm64.tar.xz`;
 
 function run(command, args, env = process.env) {
@@ -47,11 +47,12 @@ async function cachedArchive(root, actualVersion, validChecksum = true) {
 }
 
 function prepare(root) {
-  return run(process.execPath, [script, '--only', 'node'], {
+  const env = {
     ...process.env,
-    BATSHIT_MAC_NODE_VERSION: version,
     BATSHIT_MAC_RUNTIME_ASSET_ROOT: root
-  });
+  };
+  delete env.BATSHIT_MAC_NODE_VERSION;
+  return run(process.execPath, [script, '--only', 'node'], env);
 }
 
 test('replaces a valid stale Node cache, reuses the requested version, and preserves checksum verification',
@@ -67,7 +68,7 @@ test('replaces a valid stale Node cache, reuses the requested version, and prese
     const upgraded = prepare(root);
     assert.equal(upgraded.status, 0, upgraded.stderr);
     assert.equal(run(join(cached, 'bin', 'node'), ['--version']).stdout.trim(), `v${version}`);
-    assert.match(await readFile(join(cached, 'SOURCE.txt'), 'utf8'), /Node\.js 24\.21\.0/);
+    assert.match(await readFile(join(cached, 'SOURCE.txt'), 'utf8'), /Node\.js 24\.22\.1/);
     assert.equal(await readFile(join(cached, 'CHECKSUMS.txt'), 'utf8'), `${sha256}  ${filename}\n`);
     await assert.rejects(readFile(join(cached, 'old-marker')));
 
@@ -108,6 +109,6 @@ test('rejects a checksum-valid archive with the wrong Node version before replac
 
     const result = prepare(root);
     assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /Downloaded Node runtime version mismatch: expected v24\.21\.0, got v24\.20\.0/);
+    assert.match(result.stderr, /Downloaded Node runtime version mismatch: expected v24\.22\.1, got v24\.20\.0/);
     assert.equal(run(join(cached, 'bin', 'node'), ['--version']).stdout.trim(), 'v24.17.0');
   });

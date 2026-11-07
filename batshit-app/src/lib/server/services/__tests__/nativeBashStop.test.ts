@@ -1,13 +1,24 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { spawn } from 'node:child_process'
 import { inspectTestProcessState, isTestProcessRunning } from '$lib/test-utils/process-state'
 import os from 'node:os'
 import path from 'node:path'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync } from 'node:fs'
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
-import { NATIVE_BASH_STOP_GUIDANCE, nativeToolService } from '../nativeTools'
+import { nativeToolService } from '../nativeTools'
 import { __runAppleContainerCommandForTests } from '../appleContainerSandbox'
 import { closeRegisteredRuntimeResources } from '../runtimeShutdown'
 import { redis } from '$lib/server/redis'
+import { __setAgentBrowserCliTestSpawner, __setAgentBrowserTestShell } from '../agentBrowserCliProcess'
+
+// This consumer owns confirmed fixture snapshots; atomic/raw settings reads have their own
+// owner suites. Read the same store rather than adding generic EVAL behavior to shared Redis.
+vi.mock('$lib/server/toolOperationalSettingsOwner', async () => {
+  const { redis } = await import('$lib/server/redis')
+  const { resolveToolOperationalSettings } = await import('$lib/utils/toolOperationalSettings')
+  return { readToolOperationalSettings: async (userId: string) =>
+    resolveToolOperationalSettings(await redis.getUserSettings(userId)) }
+})
 
 /**
  * Stop ends a running command on the API lane (2026-09-18).
@@ -21,7 +32,14 @@ import { redis } from '$lib/server/redis'
 
 let workspace: string | null = null
 
+beforeEach(() => {
+  __setAgentBrowserCliTestSpawner(null)
+  __setAgentBrowserTestShell(null)
+})
+
 afterEach(async () => {
+  __setAgentBrowserCliTestSpawner(null)
+  __setAgentBrowserTestShell(null)
   if (workspace) await rm(workspace, { recursive: true, force: true })
   workspace = null
 })
@@ -64,12 +82,13 @@ async function seedDispatchAgent(nativeTools: Record<string, unknown> = {}) {
 }
 
 /**
- * The dispatch the managed CLI helper and n8n Workflow Subagents call, with the route's Stop.
+ * The dispatch the managed CLI helper and the signed-in session call, with the route's Stop.
  *
  * `lane` is the route's `actorType`: the helper's run credential is the `agent` lane. Since BL-878
  * (Josh, 2026-09-28) the agent lane is refused `bash_execute` (Codex and Claude have their own
- * Bash), so the Stop proofs for a COMMAND run on the lane that keeps it: an n8n Workflow
- * Subagent's `n8n-callback`. Agent Browser and broker calls stay on the agent lane.
+ * Bash), so the Stop proofs for a COMMAND run on a lane that keeps it: the signed-in `session`
+ * (SA-139 R2 removed the n8n Workflow Subagent's `n8n-callback` lane these used before). Agent
+ * Browser and broker calls use the retained signed-in session lane too; the old agent lane is retired.
  */
 function dispatch(
   action: string,
@@ -82,7 +101,7 @@ function dispatch(
     payloadInput,
     context: { session_id: 'session-bsd2', agent_id: DISPATCH_AGENT_ID, mode: 'mode4', actor_type: 'primary' },
     projectPath: options.projectPath ?? null,
-    actorType: options.lane ?? 'agent',
+    actorType: options.lane ?? 'session',
     abortSignal: options.abortSignal
   } as any) as Promise<Record<string, any>>
 }
@@ -210,26 +229,18 @@ describe('the command tool hands the model run’s abort signal to the command',
     return (tools as any).native_bash_execute
   }
 
-  it('tells the model what a Stop and a timeout end, and how to leave a program running (Agent Docs)', async () => {
+  it('tells the model how to leave a program running (Agent Docs; Josh trimmed the Stop mechanics, 2026-10-23)', async () => {
     const description: string = (await buildBashTool(await freshWorkspace())).description
 
-    expect(description).toContain("A Stop or a timeout ends programs still in the command's managed group.")
-    expect(description).toContain('A program that leaves that group or creates a new session can survive cleanup.')
     // The redirect is what lets the command finish: a background program that still holds the
     // command's output keeps the tool waiting, and the timeout then ends it.
-    expect(description).toContain('> log 2>&1 &')
-    expect(description).toMatch(/let the command finish/)
-    expect(description).toContain('programs remaining in the managed group are ended when Batshit quits')
+    expect(description).toContain('start it in the background with its output in a file (`cmd > log 2>&1 &`) and let the command end')
+    // The result of a stopped or timed-out command does not say what else it ended, so the text does.
+    expect(description).toContain('a Stop or timeout of that command ends it too.')
     // Every reply removes the chat's sandboxes when it ends, and what runs in them.
-    expect(description).toMatch(/in a sandbox, at most until this reply ends/)
-  })
-
-  it('the managed CLI helper’s own bash tool says the same words: its commands take the same Stop', () => {
-    // `batshit_server_bash_execute` runs through the dispatch, which hands its command the Stop
-    // of the reply running in the chat (2026-09-18). The helper is a `.cjs` script and keeps a
-    // copy of the text, held here to the one constant.
-    const helper = readFileSync(path.resolve(__dirname, '../../../../../scripts/mode4-controls-mcp.cjs'), 'utf8')
-    expect(helper).toContain(NATIVE_BASH_STOP_GUIDANCE)
+    expect(description).toContain('In a sandbox it lasts at most until this reply ends.')
+    // One clause, without the managed-group mechanics.
+    expect(description).not.toContain('managed group')
   })
 
   it('stops a running command when the run is stopped', async () => {
@@ -498,6 +509,10 @@ describe('a Stop ends a running Agent Browser call, never its daemon', () => {
     await writeFile(bin, `#!/bin/sh\nexec "${process.execPath}" "${path.join(dir, 'fake-agent-browser.mjs')}" "$@"\n`)
     await chmod(bin, 0o755)
     process.env.BATSHIT_AGENT_BROWSER_BIN = bin
+    __setAgentBrowserCliTestSpawner((command, args, options) => {
+      if (command !== bin) throw new Error('Agent Browser Stop proof admits only its exact owned fake executable.')
+      return spawn(command, args, options)
+    })
     return dir
   }
 
@@ -519,8 +534,7 @@ describe('a Stop ends a running Agent Browser call, never its daemon', () => {
     return nativeToolService.nativeAgentBrowserUse({
       userId: 'josh',
       toolName: 'get title',
-      params: extra.params ?? {},
-      settings: { liveViewEnabled: false },
+      params: { liveView: false, ...extra.params },
       abortSignal: extra.abortSignal
     } as any)
   }
@@ -602,8 +616,7 @@ describe('a Stop ends a running Agent Browser call, never its daemon', () => {
     const call = nativeToolService.nativeAgentBrowserUse({
       userId: 'josh',
       toolName: 'open',
-      params: { url: 'https://example.com' },
-      settings: { liveViewEnabled: true, runtimeMode: 'chromium', provider: 'local' },
+      params: { url: 'https://example.com', liveView: true, runtimeMode: 'chromium', provider: 'local' },
       abortSignal: stop.signal
     } as any)
     await pidFrom(dir, 'cli.pid')
@@ -627,7 +640,7 @@ describe('a Stop ends a running Agent Browser call, never its daemon', () => {
     const call = nativeToolService.nativeAgentBrowserUse({
       userId: 'josh',
       toolName: 'screenshot',
-      settings: { liveViewEnabled: false },
+      params: { liveView: false },
       abortSignal: stop.signal
     } as any)
     await pidFrom(dir, 'cli.pid')
@@ -767,7 +780,7 @@ describe('a Stop ends a running Agent Browser call, never its daemon', () => {
     expect(result).toMatchObject({ success: true, family: 'agent_browser', result: { title: 'Example' } })
   })
 
-  it('a timeout still ends only the CLI call, the same way, with no signal at all (the n8n dispatch)', async () => {
+  it('a timeout still ends only the CLI call, the same way, with no signal at all (a dispatch with no Stop)', async () => {
     const dir = await fakeAgentBrowser()
     const started = Date.now()
     const call = useGetTitle({ params: { timeoutMs: 1_000 } })
@@ -788,11 +801,11 @@ describe('a Stop ends a running Agent Browser call, never its daemon', () => {
  * A Stop reaches a command run through the dispatch (2026-09-18, the sweep's second round).
  *
  * The managed CLI lanes' own `batshit_server_bash_execute` (until BL-878 refused it on the agent
- * lane), and n8n Workflow Subagents, run their commands through `/api/native-tools/dispatch`,
- * which passed no Stop: after a Stop such a command ran on to its own time limit. The route now
- * hands the dispatch the Stop of the reply running in the chat, and the dispatch hands it to the
- * command through `nativeBashExecute`'s own path. The commands below run as an n8n Workflow
- * Subagent (`n8n-callback`), the caller that keeps Bash through the dispatch.
+ * lane) ran its commands through `/api/native-tools/dispatch`, which passed no Stop: after a Stop
+ * such a command ran on to its own time limit. The route now hands the dispatch the Stop of the
+ * reply running in the chat, and the dispatch hands it to the command through
+ * `nativeBashExecute`'s own path. The commands below run on the signed-in `session` lane, a
+ * caller that keeps Bash through the dispatch.
  */
 describe('a Stop reaches a command run through the dispatch', () => {
   const leftovers: number[] = []
@@ -813,7 +826,7 @@ describe('a Stop reaches a command run through the dispatch', () => {
     const call = dispatch('bash_execute', { command: 'sleep 20 & echo $! > bg.pid; sleep 19' }, {
       abortSignal: stop.signal,
       projectPath: cwd,
-      lane: 'n8n-callback'
+      lane: 'session'
     })
     const pid = Number(await markerText(cwd, 'bg.pid'))
     leftovers.push(pid)
@@ -845,7 +858,7 @@ describe('a Stop reaches a command run through the dispatch', () => {
     const result = await dispatch('bash_execute', { command: 'echo ran > ran.txt' }, {
       abortSignal: stop.signal,
       projectPath: cwd,
-      lane: 'n8n-callback'
+      lane: 'session'
     })
 
     expect(result).toMatchObject({ success: true, data: { success: false, stopped: true } })
@@ -857,7 +870,7 @@ describe('a Stop reaches a command run through the dispatch', () => {
     const cwd = await freshWorkspace()
     await seedDispatchAgent()
 
-    const result = await dispatch('bash_execute', { command: 'echo hello' }, { projectPath: cwd, lane: 'n8n-callback' })
+    const result = await dispatch('bash_execute', { command: 'echo hello' }, { projectPath: cwd, lane: 'session' })
 
     expect(result).toMatchObject({ success: true, data: { success: true, exitCode: 0 } })
     expect(result.data.stopped).toBeUndefined()

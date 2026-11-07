@@ -63,15 +63,18 @@ function decisionsById(sent: ApprovalEntry[]): Map<string, ApprovalEntry['status
 /**
  * The server ACCEPTED the answer: each entry it carried keeps the decision it carried, marked
  * sent. The decision is written from what was sent, not read off the card, because a chat
- * reload while the answer was out puts the stored copy (still pending) back on screen.
+ * reload while the answer was out puts the stored copy (still pending) back on screen. An entry
+ * the server already marked expired while the answer was out stays expired: on a Claude plan
+ * reply whose run had ended, the server records "Expired: the reply ended" and nothing ran
+ * (SA-139 P3 Part 3), so the card must not go back to the decision the person sent.
  */
 export function markApprovalDecisionsSent<T extends ApprovalEntry>(approvals: T[], sent: ApprovalEntry[]): T[] {
   const sentStatus = decisionsById(sent)
-  return approvals.map((entry) =>
-    entry && sentStatus.has(entry.approvalId as string)
-      ? { ...entry, status: sentStatus.get(entry.approvalId as string), submitted: true }
-      : entry
-  )
+  return approvals.map((entry) => {
+    if (!entry || !sentStatus.has(entry.approvalId as string)) return entry
+    if (entry.status === 'expired') return { ...entry, submitted: true }
+    return { ...entry, status: sentStatus.get(entry.approvalId as string), submitted: true }
+  })
 }
 
 /**

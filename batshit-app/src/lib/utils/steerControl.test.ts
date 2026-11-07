@@ -201,71 +201,6 @@ describe('resolveSteerability (DL-114-09)', () => {
     expect(verdict.reason).toContain('Group chats cannot be steered')
   })
 
-  it('steers a managed Codex run on the app-server transport (P2, DL-114-06)', () => {
-    expect(
-      resolveSteerability({
-        primaryAgentType: 'cli',
-        isGroupSession: false,
-        cli: { provider: 'codex', configScope: 'managed', codexTransport: 'app-server' }
-      })
-    ).toEqual({ steerable: true, lane: 'codex' })
-  })
-
-  it('steers a managed Claude run (P2, DL-114-08)', () => {
-    expect(
-      resolveSteerability({
-        primaryAgentType: 'cli',
-        isGroupSession: false,
-        cli: { provider: 'claude', configScope: 'managed' }
-      })
-    ).toEqual({ steerable: true, lane: 'claude' })
-  })
-
-  it('refuses the Codex exec transport, which closed its stdin after the prompt', () => {
-    const verdict = resolveSteerability({
-      primaryAgentType: 'cli',
-      isGroupSession: false,
-      cli: { provider: 'codex', configScope: 'managed', codexTransport: 'exec' }
-    })
-    expect(verdict.steerable).toBe(false)
-    if (verdict.steerable) throw new Error('expected a refusal')
-    expect(verdict.reason).toContain('exec transport')
-    // F-P1-2: it used to end "Your message interrupts instead". DL-119-07 took that branch
-    // away, so the sentence now says what actually happens.
-    expect(verdict.reason).toContain('queues and sends when the reply ends')
-  })
-
-  /**
-   * The transport lane is not derivable from the agent record — `BATSHIT_CODEX_TRANSPORT`
-   * decides it at run time — so a Codex verdict with no lane supplied must refuse rather
-   * than assume the steerable one. A wrong "yes" takes the user's words into a transport
-   * with no channel to carry them.
-   */
-  it('refuses a Codex run whose transport is unknown', () => {
-    for (const codexTransport of [null, undefined]) {
-      expect(
-        resolveSteerability({
-          primaryAgentType: 'cli',
-          isGroupSession: false,
-          cli: { provider: 'codex', configScope: 'managed', codexTransport }
-        }).steerable
-      ).toBe(false)
-    }
-  })
-
-  it('refuses a CLI profile Batshit does not manage (DL-114-09)', () => {
-    for (const provider of ['codex', 'claude'] as const) {
-      const verdict = resolveSteerability({
-        primaryAgentType: 'cli',
-        isGroupSession: false,
-        cli: { provider, configScope: 'global', codexTransport: 'app-server' }
-      })
-      expect(verdict.steerable).toBe(false)
-      if (verdict.steerable) throw new Error('expected a refusal')
-      expect(verdict.reason).toContain('your own CLI profile')
-    }
-  })
-
   it('refuses a CLI primary whose runtime could not be resolved', () => {
     for (const cli of [null, undefined, { provider: null, configScope: 'managed' } as const]) {
       const verdict = resolveSteerability({
@@ -504,7 +439,7 @@ describe('resolveBusySendActions (DL-119-02)', () => {
 /**
  * SA-119 P2 (DL-119-07, F-P1-2) — the words a refused Steer shows the user.
  *
- * These four sentences are the server's own "why not", and DL-119-03 puts them on screen as
+ * These three sentences are the server's own "why not", and DL-119-03 puts them on screen as
  * plain text beside a Steer badge that cannot be pressed. Every one of them used to end
  * "Your message interrupts instead", which stopped being TRUE the moment interrupt-and-send
  * was retired: the message now queues and goes when the reply ends. A sentence that
@@ -512,26 +447,18 @@ describe('resolveBusySendActions (DL-119-02)', () => {
  * on it.
  */
 describe('the refusal sentences (F-P1-2)', () => {
+  // SA-139 R4 removed the third reason (a CLI profile Batshit does not drive) with the Claude
+  // Code CLI Primary: a group, or a lane that cannot take a steer.
   const refusals = [
     resolveSteerability({ primaryAgentType: 'api', isGroupSession: true }),
-    resolveSteerability({ primaryAgentType: 'cli', isGroupSession: false, cli: null }),
-    resolveSteerability({
-      primaryAgentType: 'cli',
-      isGroupSession: false,
-      cli: { provider: 'codex', configScope: 'user', codexTransport: 'app-server' }
-    }),
-    resolveSteerability({
-      primaryAgentType: 'cli',
-      isGroupSession: false,
-      cli: { provider: 'codex', configScope: 'managed', codexTransport: 'exec' }
-    })
+    resolveSteerability({ primaryAgentType: 'cli', isGroupSession: false })
   ].map((verdict) => {
     expect(verdict.steerable).toBe(false)
     return verdict.steerable === false ? verdict.reason : ''
   })
 
   it('never promises an interrupt that no longer exists', () => {
-    expect(refusals).toHaveLength(4)
+    expect(refusals).toHaveLength(2)
     for (const reason of refusals) {
       expect(reason.length).toBeGreaterThan(0)
       expect(reason).not.toMatch(/interrupt/i)
@@ -544,8 +471,8 @@ describe('the refusal sentences (F-P1-2)', () => {
     }
   })
 
-  it('is still four different sentences, one per reason', () => {
-    expect(new Set(refusals).size).toBe(4)
+  it('is still a different sentence for each reason', () => {
+    expect(new Set(refusals).size).toBe(2)
   })
 })
 

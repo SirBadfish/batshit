@@ -97,7 +97,7 @@ class BatshitMcpServer {
           isError: true,
           content: [{
             type: 'text',
-            text: 'The standalone file-server MCP Fetch Zip tool is retired. API agents use fabric:sys.zip.fetch through Batshit Tool Use; managed CLI agents use the Fetch Zip tool in batshit_helpers.'
+            text: 'The standalone file-server MCP Fetch Zip tool is retired. Agents use fabric:sys.zip.fetch through Batshit Tool Use.'
           }]
         };
       }

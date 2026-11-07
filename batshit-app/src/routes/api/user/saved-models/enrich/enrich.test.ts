@@ -60,6 +60,23 @@ beforeEach(() => {
 })
 
 describe('POST /api/user/saved-models/enrich unknown price and context window (BL-67)', () => {
+  it('projects reasoning controls from the selected exact variant without changing settings/baselines', async () => {
+    const row: any = catalogRow()
+    const variant = row.idVariants['direct:anthropic']
+    const evidence = { lastGood: { version: 1, scope: 'public', support: 'supported', connection: 'direct:anthropic',
+      effectiveModelId: variant.effectiveId, endpoint: 'messages', controls: [{ id: 'effort', kind: 'effort', values: ['low', 'high'] }],
+      evidence: [{ url: 'https://platform.claude.com/docs/en/build-with-claude/effort', checkedAt: '2026-10-14' }], lastVerified: '2026-10-14' },
+      lastAttempt: { at: '2026-10-14T12:00:00Z', outcome: 'verified' } }
+    variant.reasoningEvidence = evidence
+    row.features.reasoning = false
+    catalogEntries.set(row.id, row)
+    const before = structuredClone(row)
+    const data = await enrich(row.id)
+    expect(data.reasoningEvidence).toEqual({ status: 'supported', evidence })
+    expect(data.enrichment).not.toHaveProperty('reasoningEvidence')
+    expect(data.settings).not.toHaveProperty('reasoningEvidence')
+    expect(row).toEqual(before)
+  })
   it('returns no price and no context window for a catalog row that has neither, never 0', async () => {
     const row = catalogRow()
     catalogEntries.set(row.id, row)

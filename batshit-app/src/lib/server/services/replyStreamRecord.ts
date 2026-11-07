@@ -19,8 +19,9 @@
  *   what the rebuild reads;
  * - the terminal cleanup timers (a finished message's entries go 5 s after its terminal event);
  * - the zip detector the stream path uses (`replyZipDetection`), because the flush takes the
- *   words of a block that never closed (or a lone start of its tag) and the rebuild takes the
- *   stream-made zip references from it.
+ *   words it still holds, settled (a block that never closed, a lone start of its tag, a pair held
+ *   after a stray backtick, zipped then: BL-779), and the rebuild takes the stream-made zip
+ *   references from it.
  *
  * The rebuild's rules are the `/api/sse` `end` case's, moved unchanged, plus the edits the chat page
  * used to make before it saved (`replyEndContent.ts`).
@@ -39,12 +40,56 @@ import {
   collectTrustedZipIdsFromMetadata,
   extractZipIdFromReference,
   neutralizeAllClipReferenceSyntax,
-  neutralizeUntrustedZipReferenceSyntax
+  neutralizeUntrustedZipReferenceSyntax,
+  scanZipReferences
 } from '$lib/utils/zipReferenceSafety'
 import { replaceBracedTokens } from '$lib/utils/braceScan'
 import { stripReplyControlBlocks } from '$lib/utils/replyControl'
 import { finishReplyEndContent, replyEndZipIds } from '$lib/utils/replyEndContent'
 import { stripGroupChatPresentationControls } from '$lib/server/services/groupChatUtils'
+import { beginP5CanonicalWrite, failP5CanonicalCustody, p5CanonicalWriteOwner, p5CanonicalWriteUnknown, observeP5CanonicalReceipt,
+  type P5CanonicalWrite, type P5OriginalPreparation, type P5OriginalRequest, type P5ApiReplyPart } from './appActions/mcp/originalTask'
+
+const p5CanonicalSaves = new WeakMap<object, { write: P5CanonicalWrite; owner: P5OriginalRequest }>()
+/** The canonical/failure writers use this SAME save, never a readback or saved flag.
+ * Ordinary callers have no original custody and retain the existing single await. */
+export async function persistCanonicalReply(message: Parameters<typeof redis.saveMessage>[0], preparation?: P5OriginalPreparation, apiPart?: P5ApiReplyPart): Promise<void> {
+  let write: P5CanonicalWrite | undefined
+  let custodyFailure: unknown
+  let custodyFailed = false
+  const retainCustodyFailure = () => {
+    // Bookkeeping can never prevent the mandatory write or replace its error.
+    try { failP5CanonicalCustody(preparation) } catch { /* Keep the original failure and no positive receipt. */ }
+  }
+  try { write = beginP5CanonicalWrite(preparation, message, apiPart) }
+  catch (error) { custodyFailed = true; custodyFailure = error; retainCustodyFailure() }
+  try { await redis.saveMessage(message) }
+  catch (error) {
+    if (write) { try { p5CanonicalWriteUnknown(write) } catch { /* retain original save failure and restrictive receipt */ } }
+    throw error
+  }
+  if (custodyFailed) {
+    // The save is KNOWN. Throwing a bookkeeping-only error here would make
+    // ordinary finalizers replay their save/failure writer and misreport loss.
+    logger.error('[P5] Canonical reply was saved; original request custody remains unavailable.', custodyFailure)
+  } else if (write) {
+    // Actual known acknowledgement is captured BEFORE any subsequent await or end.
+    const receipt = Object.freeze({})
+    try {
+      p5CanonicalSaves.set(receipt, Object.freeze({ write, owner: p5CanonicalWriteOwner(write) }))
+      observeP5CanonicalReceipt(write, receipt)
+    } catch (error) {
+      p5CanonicalSaves.delete(receipt)
+      retainCustodyFailure()
+      logger.error('[P5] Canonical reply was saved; original request acknowledgement custody remains unavailable.', error)
+    }
+  }
+}
+export function readP5CanonicalSaveReceipt(receipt: object): Readonly<{ write: P5CanonicalWrite; owner: P5OriginalRequest }> {
+  const saved = p5CanonicalSaves.get(receipt)
+  if (!saved) throw new Error('The actual canonical save receipt is unavailable.')
+  return saved
+}
 
 export type RecordedStreamEvent = {
   type: string
@@ -109,10 +154,32 @@ export const REPLY_EVENT_FORWARD_LIMIT = { ms: 10_000 }
 export const CLOSED_REPLY_TTL_MS = 10 * 60_000
 
 /**
- * Whether `promise` settles within `ms`. The timer is cleared either way; the promise itself is
- * never cancelled (a forward left running still records, or is refused as late).
+ * BL-871 (d): the events of a reply that reach `/api/sse` even while it stalls, strictly in order
+ * (each is sent only once the one before it has answered), so `complete` never overtakes `end`: the
+ * terminal events, and `steer_delivered`, which no tab can rebuild from `end` (a steer the model
+ * read but a tab never heard of is marked "Not sent" when the reply ends, with a Send now that would
+ * send it twice). Every other event is live only: `end` carries what it showed.
  */
-export async function settlesWithin(promise: Promise<unknown>, ms: number): Promise<boolean> {
+export const REPLY_ORDERED_EVENT_TYPES: ReadonlySet<string> = new Set(['steer_delivered', 'end', 'error', 'complete'])
+
+/**
+ * BL-871 (d): how long an ordered event waits for the ordered event before it to answer. Past it,
+ * it is not sent at all (logged), and neither is any later ordered event of the reply, so the order
+ * still holds. The closed mark's lifetime: past it the reply no longer refuses late forwards either.
+ * A setting object so a test can shorten it.
+ */
+export const REPLY_ORDERED_FORWARD_GIVE_UP = { ms: CLOSED_REPLY_TTL_MS }
+
+/**
+ * Whether `promise` settles within `ms`. The timer is cleared either way; the promise itself is
+ * never cancelled (a forward left running still records, or is refused as late). `unref` keeps a
+ * long wait from holding the process open (BL-871 d: the terminal events' bounded tail).
+ */
+export async function settlesWithin(
+  promise: Promise<unknown>,
+  ms: number,
+  options: { unref?: boolean } = {}
+): Promise<boolean> {
   let timer: ReturnType<typeof setTimeout> | undefined
   const settled = promise.then(
     () => true,
@@ -120,6 +187,7 @@ export async function settlesWithin(promise: Promise<unknown>, ms: number): Prom
   )
   const timedOut = new Promise<false>((resolve) => {
     timer = setTimeout(() => resolve(false), ms)
+    if (options.unref) (timer as { unref?: () => void }).unref?.()
   })
   try {
     return await Promise.race([settled, timedOut])
@@ -129,8 +197,8 @@ export async function settlesWithin(promise: Promise<unknown>, ms: number): Prom
 }
 
 /**
- * BL-759: a managed lane takes back a segment of the reply (a Codex message that dropped and was
- * started again). Not recorded as an event: it removes the segment's chunks from the record.
+ * BL-759: a managed lane takes back a segment of the reply (a message the removed Codex CLI lane
+ * dropped and started again). Not recorded as an event: it removes the segment's chunks from the record.
  */
 export const TEXT_RETRACT_EVENT_TYPE = 'text_retract'
 
@@ -160,12 +228,18 @@ const records = new Map<string, ChatStreamRecord>()
 let nextEventIndex = 0
 const cleanupTimers = new Map<string, Map<string, ReturnType<typeof setTimeout>>>()
 /**
- * Replies whose finalize has rebuilt (or given up on) the record, per chat, each with its expiry
- * timer. A content or tool event for one of them is late: `/api/sse` refuses it before its zip
- * detection, so a forward that answers after the finalize can neither close an `<error>` block
- * into a zip no reply names nor bring back a record the cleanup removed.
+ * A reply whose finalize has rebuilt (or given up on) the record: the approval resume version of
+ * the part that finalize ended (0 for a reply's first part) and the mark's expiry timer.
  */
-const closedReplies = new Map<string, Map<string, ReturnType<typeof setTimeout>>>()
+type ClosedReply = { version: number; timer: ReturnType<typeof setTimeout> }
+/**
+ * Replies whose finalize has rebuilt (or given up on) the record, per chat. A content or tool event
+ * for one of them is late: `/api/sse` refuses it before its zip detection, so a forward that answers
+ * after the finalize can neither close an `<error>` block into a zip no reply names nor bring back a
+ * record the cleanup removed. A `start` for one of them is late too unless it opens a NEWER part
+ * (BL-871 a): only an approval resume with a newer version reopens a closed reply.
+ */
+const closedReplies = new Map<string, Map<string, ClosedReply>>()
 
 /** The zip detector of the stream path. One per process: its scan state is keyed by chat and message. */
 export const replyZipDetection = new ZipDetectionService()
@@ -228,8 +302,17 @@ function appendReconstructionEvent(record: ChatStreamRecord, event: RecordedStre
 /**
  * A reply's `start`. An approval resume reuses its message id on purpose: the earlier run's replay
  * and reconstruction must not bleed into the continuation (its terminal cleanup waits 5 s).
+ * Answers false, and changes nothing, for a late start of a closed reply (BL-871 a,
+ * `isLateReplyStart`): checked here again, right before the write, as `recordReplyEvent` does.
  */
-export function startReplyRecord(sessionId: string, startEvent: RecordedStreamEvent) {
+export function startReplyRecord(sessionId: string, startEvent: RecordedStreamEvent): boolean {
+  if (isLateReplyStart(sessionId, startEvent)) {
+    logger.warn('[ReplyRecord] BL-871: refused a late start of a reply already saved', {
+      sessionId,
+      messageId: startEvent.messageId
+    })
+    return false
+  }
   stampReplyEventId(sessionId, startEvent)
   if (startEvent.messageId) {
     clearReplyRecordCleanup(sessionId, startEvent.messageId)
@@ -241,6 +324,7 @@ export function startReplyRecord(sessionId: string, startEvent: RecordedStreamEv
     record.reconstructionByMessage.set(startEvent.messageId, { start: { ...startEvent }, events: [] })
   }
   pushReplayEvent(record, startEvent)
+  return true
 }
 
 /** Any other message-scoped event. Answers false for an event that names no message (not recorded). */
@@ -281,34 +365,67 @@ export function recordReplayOnlyEvent(sessionId: string, event: RecordedStreamEv
  * The finalize is about to rebuild this reply (every forward it waited for has answered, or the
  * wait ran out): from now on a content or tool event for it is late and is refused. The finalize
  * calls `flushHeldReplyText` first: the words the zip detector still holds are a content event too.
+ * `approvalResumeVersion` names the part this finalize ended (0 for the reply's first part, an
+ * approval resume's own version for its continuation): from now on a `start` is late as well
+ * unless it carries a newer version (BL-871 a). The mark keeps the newest version it was given.
  */
-export function closeReplyRecord(sessionId: string, messageId: string) {
-  const closed = closedReplies.get(sessionId) ?? new Map<string, ReturnType<typeof setTimeout>>()
+export function closeReplyRecord(sessionId: string, messageId: string, approvalResumeVersion = 0) {
+  const closed = closedReplies.get(sessionId) ?? new Map<string, ClosedReply>()
   const existing = closed.get(messageId)
-  if (existing) clearTimeout(existing)
+  if (existing) clearTimeout(existing.timer)
   const timer = setTimeout(() => reopenReplyRecord(sessionId, messageId), CLOSED_REPLY_TTL_MS)
   // A closed mark must never hold the process open.
   ;(timer as { unref?: () => void }).unref?.()
-  closed.set(messageId, timer)
+  const version = Math.max(existing?.version ?? 0, partVersion(approvalResumeVersion))
+  closed.set(messageId, { version, timer })
   closedReplies.set(sessionId, closed)
 }
 
 function reopenReplyRecord(sessionId: string, messageId: string) {
   const closed = closedReplies.get(sessionId)
-  const timer = closed?.get(messageId)
-  if (!closed || !timer) return
-  clearTimeout(timer)
+  const mark = closed?.get(messageId)
+  if (!closed || !mark) return
+  clearTimeout(mark.timer)
   closed.delete(messageId)
   if (closed.size === 0) closedReplies.delete(sessionId)
 }
 
+/** A part's approval resume version: a positive safe integer, or 0 for a reply's first part. */
+function partVersion(value: unknown): number {
+  return Number.isSafeInteger(value) && (value as number) > 0 ? (value as number) : 0
+}
+
+/** The approval resume version a `start` opens (`approvalResume.version`), 0 for a first part. */
+function startedPartVersion(event: { metadata?: unknown }): number {
+  const metadata = event.metadata && typeof event.metadata === 'object' ? (event.metadata as Record<string, any>) : null
+  return readApprovalResumeStart(metadata)?.version ?? 0
+}
+
+/**
+ * BL-871 (a): whether a `start` of this reply is late. A start for a reply the finalize closed is
+ * late unless it opens a NEWER part: an approval resume whose version is above the version the
+ * reply was closed with. A start never answered within its forward's limit can finish after the
+ * finalize; refused, it can no longer reopen the saved reply and replace its record with an empty
+ * one (it looked like an approval resume's start, which was never refused).
+ */
+export function isLateReplyStart(sessionId: string, event: { messageId?: unknown; metadata?: unknown }): boolean {
+  if (typeof event.messageId !== 'string') return false
+  const mark = closedReplies.get(sessionId)?.get(event.messageId)
+  if (!mark) return false
+  return startedPartVersion(event) <= mark.version
+}
+
 /**
  * Whether `/api/sse` must refuse this event as late: a content or tool event of a reply whose
- * finalize already rebuilt it. A `start` (an approval resume reopens the reply) and the terminal
- * events are never refused.
+ * finalize already rebuilt it, or a `start` of one that does not open a newer approval resume part
+ * (`isLateReplyStart`, BL-871 a). The terminal events are never refused.
  */
-export function isLateReplyEvent(sessionId: string, event: { type?: unknown; messageId?: unknown }): boolean {
+export function isLateReplyEvent(
+  sessionId: string,
+  event: { type?: unknown; messageId?: unknown; metadata?: unknown }
+): boolean {
   if (typeof event.messageId !== 'string' || typeof event.type !== 'string') return false
+  if (event.type === 'start' || event.type === 'begin') return isLateReplyStart(sessionId, event)
   if (!RECONSTRUCTION_EVENT_TYPES.has(event.type) && event.type !== TEXT_RETRACT_EVENT_TYPE) return false
   return isReplyClosed(sessionId, event.messageId)
 }
@@ -344,15 +461,16 @@ export type RetractedReplySegment =
     }
 
 /**
- * BL-759 — a managed lane took back a segment of a running reply (a Codex message that dropped and
- * was started again), by its name. When the zip detector can rewind it (the segment is the last run
- * it read, read in one run, which the Codex adapter makes sure of), the segment's chunks leave the
- * rebuild's reconstruction and a joining tab's replay, the detector is as it was before the segment
- * (a block the segment opened is forgotten, a block it closed is open again), and a zip made from
- * the segment's words is removed. Text with no segment, and every other segment, stays. Answers the
- * reply's text as it now reads, for the tabs' `content_reset`. Answers `superseded` (and changes
- * nothing) when the detector cannot; null when there is nothing to take back from (no record) or
- * the reply is already closed (a late retract of a saved reply is refused, like a late chunk).
+ * BL-759 — a managed lane took back a segment of a running reply (a message the removed Codex CLI
+ * lane dropped and started again), by its name. When the zip detector can rewind it (the segment is
+ * the last run it read, read in one run, which the Codex adapter made sure of), the segment's
+ * chunks leave the rebuild's reconstruction and a joining tab's replay, the detector is as it was
+ * before the segment (a block the segment opened is forgotten, a block it closed is open again),
+ * and a zip made from the segment's words is removed. Text with no segment, and every other
+ * segment, stays. Answers the reply's text as it now reads, for the tabs' `content_reset`. Answers
+ * `superseded` (and changes nothing) when the detector cannot; null when there is nothing to take
+ * back from (no record) or the reply is already closed (a late retract of a saved reply is
+ * refused, like a late chunk).
  */
 export async function retractReplySegment(
   sessionId: string,
@@ -513,7 +631,7 @@ export function clearAllReplyRecords() {
   cleanupTimers.clear()
   records.clear()
   for (const closed of closedReplies.values()) {
-    for (const timer of closed.values()) clearTimeout(timer)
+    for (const mark of closed.values()) clearTimeout(mark.timer)
   }
   closedReplies.clear()
 }
@@ -548,7 +666,7 @@ export function forgetChatReplyRecords(sessionId: string) {
   records.delete(sessionId)
   const closed = closedReplies.get(sessionId)
   if (closed) {
-    for (const timer of closed.values()) clearTimeout(timer)
+    for (const mark of closed.values()) clearTimeout(mark.timer)
     closedReplies.delete(sessionId)
   }
   replyZipDetection.deleteSessionBuffers(sessionId)
@@ -738,12 +856,15 @@ export function buildRecordedReplyEnd(input: RecordedReplyEndInput): RecordedRep
 }
 
 /**
- * The words the zip detector still holds for this reply, as the chunk that puts them where they
- * were written: an `<error>` block that never closed (BL-489) or a lone start of the tag (`<`,
- * `<e`, ... `<erro`) the reply ended on. Takes them, so the detector holds nothing afterwards.
+ * The words the zip detector still holds for this reply, settled, as the chunk that puts them where
+ * they were written: an `<error>` block that never closed (BL-489), a lone start of the tag (`<`,
+ * `<e`, ... `<erro`) the reply ended on, and a pair held while a stray backtick before it might
+ * still make it code, zipped now (BL-779 a: no more words come, so its reading is decided). Takes
+ * them, so the detector holds nothing afterwards. The trusted zip ids are read after the take, so
+ * the reference of a pair it zipped is kept.
  */
-function takeHeldReplyTextEvent(sessionId: string, messageId: string): RecordedStreamEvent | null {
-  const unclosed = replyZipDetection.takeUnclosedText(sessionId, messageId)
+async function takeHeldReplyTextEvent(sessionId: string, messageId: string): Promise<RecordedStreamEvent | null> {
+  const unclosed = await replyZipDetection.takeHeldText(sessionId, messageId)
   if (!unclosed) return null
   const knownStreamingZipIds = replyZipDetection
     .getMessageReferences(sessionId, messageId)
@@ -763,16 +884,33 @@ function takeHeldReplyTextEvent(sessionId: string, messageId: string): RecordedS
  * The finalize's first step, BEFORE `closeReplyRecord` (BL-775 deep read): the words the zip
  * detector still holds join the record as a chunk while the reply is still open. Once the reply is
  * closed it refuses every content event, so words written after the close are lost from the saved
- * reply and from `end`. Answers whether it wrote anything. Words for a reply with no record stay
- * held (the finalize then saves its own copy), and words for a reply already closed stay held for
- * the rebuild, which reports them.
+ * reply and from `end`. The words are settled first (BL-779 a): a pair held after a stray backtick
+ * is zipped, the zip written before its reference is recorded, so the rebuild after the close takes
+ * the zip with the reply's other stream-made zips (or, for a gap, the own-copy sweep removes it when
+ * no message names it). That zip is the only await; the caller closes the reply right after.
+ * Answers whether it wrote anything. Words for a reply with no record stay held, unzipped (the
+ * finalize then saves its own copy, whose sweep lets go of them), and words for a reply already
+ * closed stay held for the rebuild, which reports them.
  */
-export function flushHeldReplyText(sessionId: string, messageId: string): boolean {
+export async function flushHeldReplyText(sessionId: string, messageId: string): Promise<boolean> {
   if (!hasReplyRecord(sessionId, messageId)) return false
   if (isReplyClosed(sessionId, messageId)) return false
-  const held = takeHeldReplyTextEvent(sessionId, messageId)
+  const held = await takeHeldReplyTextEvent(sessionId, messageId)
   if (!held) return false
-  return recordReplyEvent(sessionId, held)
+  // `recordReplyEvent` refuses it, as late, if the reply was closed while the zip was written. The
+  // detector no longer holds the words then, so they and the zips they name are in no saved reply:
+  // said loudly, with what was lost.
+  const recorded = recordReplyEvent(sessionId, held)
+  if (!recorded) {
+    const content = typeof held.content === 'string' ? held.content : ''
+    logger.error('[ReplyRecord] BL-779: the reply refused the held words its finalize took; they are not in the saved reply', {
+      sessionId,
+      messageId,
+      droppedCharacters: content.length,
+      zipIds: scanZipReferences(content).map((reference) => reference.id)
+    })
+  }
+  return recorded
 }
 
 /** `events` with `chunk` after them, as `appendReconstructionEvent` joins it, on a copy: nothing is written to the record. */
@@ -808,7 +946,7 @@ export async function rebuildRecordedReply(input: {
   if (!hasReplyRecord(sessionId, messageId)) return null
 
   let heldOnClosedReply: RecordedStreamEvent | null = null
-  const held = takeHeldReplyTextEvent(sessionId, messageId)
+  const held = await takeHeldReplyTextEvent(sessionId, messageId)
   if (held) {
     if (isReplyClosed(sessionId, messageId)) {
       logger.error(

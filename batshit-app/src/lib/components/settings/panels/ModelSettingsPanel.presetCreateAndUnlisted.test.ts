@@ -1,3 +1,4 @@
+import * as savedModelsStore from '$lib/stores/savedModels.svelte'
 /**
  * BL-516 and BL-517 in the Models panel.
  *
@@ -9,7 +10,7 @@
  * it had removed them).
  */
 
-import { fireEvent, render, screen, waitFor } from '@testing-library/svelte'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const toastMock = vi.hoisted(() => ({
@@ -25,6 +26,7 @@ vi.mock('$lib/components/ui/sonner/settings-toast', () => ({ toast: toastMock })
 
 import ModelSettingsPanel from './ModelSettingsPanel.svelte'
 import TooltipProviderWrapper from '$lib/test-utils/TooltipProviderWrapper.svelte'
+import { getModelPresetDrafts, waitForModelPresetSaves } from '../models/modelPresetAutosave'
 import type { SavedModel } from '$lib/types/savedModels'
 import type { CatalogConnectionOption, CatalogModel } from '$lib/types/modelCatalog'
 
@@ -126,6 +128,7 @@ function ensureAnimateStub() {
 describe('Models panel: BL-516 create refusal and BL-517 unlisted presets', () => {
   beforeEach(() => {
     postedBodies = []
+    savedModelsStore.setSavedModels([])
     Object.values(toastMock).forEach((fn) => fn.mockReset())
     ensureAnimateStub()
     globalThis.ResizeObserver = class {
@@ -135,11 +138,79 @@ describe('Models panel: BL-516 create refusal and BL-517 unlisted presets', () =
     } as unknown as typeof ResizeObserver
   })
 
-  afterEach(() => {
+  afterEach(async () => {
+    cleanup()
+    await waitForModelPresetSaves()
+    await waitFor(() => expect(savedModelsStore.getIsLoading()).toBe(false))
+    getModelPresetDrafts().clear()
     globalThis.fetch = originalFetch
     globalThis.ResizeObserver = originalResizeObserver
     vi.restoreAllMocks()
   })
+
+  it('A12 pure list reconciliation shows a new named copy without resetting a dirty existing editor or saving it', async () => {
+    const copied = { ...FIRST_PRESET, id: 'a12-mounted-copy', modelName: 'A12 mounted named copy' }
+    const ordinary = mockFetch({ models: [FIRST_PRESET], meta: { unlisted: [] } })
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => String(input).includes('projection=stored')
+      ? Response.json({ projection: 'stored', models: [FIRST_PRESET, copied], total: 2, offset: 0, nextOffset: null }) : ordinary(input, init))
+    globalThis.fetch = fetcher as typeof fetch
+    render(TooltipProviderWrapper as any, { props: { component: ModelSettingsPanel, props: { active: true, initialModelId: FIRST_PRESET.id } } })
+    const name = await screen.findByDisplayValue(FIRST_PRESET.modelName, {}, { timeout: 10000 })
+    await fireEvent.input(name, { target: { value: '' } })
+    expect(await savedModelsStore.refreshStoredSavedModels()).toBe(true)
+    await screen.findByText(copied.modelName)
+    expect((name as HTMLInputElement).value).toBe('')
+    expect(postedBodies).toEqual([])
+    expect(fetcher.mock.calls.filter(([input]) => String(input) === '/api/user/saved-models')).toHaveLength(1)
+    expect(savedModelsStore.getSavedModels().map(model => model.id)).toContain(copied.id)
+  }, 30000)
+
+  it('recovers only the owned shared read error, shows the named copy and preserves the dirty model with no autosave', async () => {
+    const copied = { ...FIRST_PRESET, id: 'a12-recovered-copy', modelName: 'Recovered named copy' }
+    const ordinary = mockFetch({ models: [FIRST_PRESET], meta: { unlisted: [] } })
+    let storedFails = true
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => String(input).includes('projection=stored')
+      ? storedFails ? Response.json({ error: 'Stored fixture unavailable' }, { status: 503 }) : Response.json({ projection: 'stored', models: [FIRST_PRESET, copied], total: 2, offset: 0, nextOffset: null }) : ordinary(input, init))
+    globalThis.fetch = fetcher as typeof fetch
+    render(TooltipProviderWrapper as any, { props: { component: ModelSettingsPanel, props: { active: true, initialModelId: FIRST_PRESET.id } } })
+    const name = await screen.findByDisplayValue(FIRST_PRESET.modelName, {}, { timeout: 10000 })
+    await fireEvent.input(name, { target: { value: '' } })
+    expect(await savedModelsStore.refreshStoredSavedModels()).toBe(false)
+    const error = savedModelsStore.getReadError()!
+    await screen.findByText(error)
+    storedFails = false
+    expect(await savedModelsStore.refreshStoredSavedModels()).toBe(true)
+    await waitFor(() => expect(screen.queryByText(error)).toBeNull())
+    await screen.findByText(copied.modelName)
+    expect((name as HTMLInputElement).value).toBe(''); expect(postedBodies).toEqual([])
+    expect(fetcher.mock.calls.filter(([url]) => String(url) === '/api/user/saved-models')).toHaveLength(1)
+  }, 30000)
+
+  it.each(['same-text', 'different-text'] as const)('a recovered shared read cannot clear a newer independent %s panel failure', async wording => {
+    const sharedMessage = 'Stored presets could not be refreshed. The last good list is retained.'
+    const independent = wording === 'same-text' ? sharedMessage : 'Independent ordinary model-list failure.'
+    const copied = { ...FIRST_PRESET, id: 'a12-independent-error-copy', modelName: 'Copy behind independent error' }
+    let recoverStored = false
+    const ordinary = mockFetch({ models: [FIRST_PRESET], meta: { unlisted: [] } })
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('projection=stored')) return recoverStored ? Response.json({ projection: 'stored', models: [FIRST_PRESET, copied], total: 2, offset: 0, nextOffset: null }) : Response.json({ error: 'Stored unavailable' }, { status: 503 })
+      if (url === '/api/user/saved-models') return Response.json({ error: independent }, { status: 503 })
+      return ordinary(input, init)
+    }) as typeof fetch
+    savedModelsStore.setSavedModels([FIRST_PRESET])
+    expect(await savedModelsStore.refreshStoredSavedModels()).toBe(false)
+    const priorErrorGeneration = savedModelsStore.getReadErrorState().generation
+    render(TooltipProviderWrapper as any, { props: { component: ModelSettingsPanel, props: { active: true, initialModelId: FIRST_PRESET.id } } })
+    await waitFor(() => expect(savedModelsStore.getReadErrorState().generation).toBeGreaterThan(priorErrorGeneration))
+    await screen.findByText(independent)
+    recoverStored = true
+    expect(await savedModelsStore.refreshStoredSavedModels()).toBe(true)
+    expect(savedModelsStore.getReadError()).toBeNull()
+    expect(screen.getByText(independent)).toBeTruthy()
+    expect(savedModelsStore.getSavedModels().some(model => model.id === copied.id)).toBe(true)
+    expect(postedBodies).toEqual([])
+  }, 30000)
 
   it('shows the server\'s "already exists" sentence for a second create, and never saves over the first preset', async () => {
     globalThis.fetch = mockFetch({ models: [FIRST_PRESET], meta: { unlisted: [] } }) as unknown as typeof fetch

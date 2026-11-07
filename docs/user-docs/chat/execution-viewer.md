@@ -21,7 +21,7 @@ A few limits:
 
 - It keeps the last ten runs of each chat.
 - Text longer than 120,000 characters is stored as its beginning and its end, with a note in between. Images show as a short placeholder, not their data.
-- For a `CLI` agent, the prompt shown is what Batshit handed Codex or Claude Code. The CLI adds its own tools and project files (such as `AGENTS.md` or `CLAUDE.md`) before it calls the model, and Codex adds its own instructions too. Batshit cannot see those, so the input count the CLI reports is larger than the prompt shown.
+- On the Claude plan connection, Claude Code adds some of its own context before calling the model. Batshit cannot show that extra context, so the reported input count can be larger than the prompt shown. Capture is exact for API connections and best effort for the Claude plan.
 
 ## When to reach for it
 
@@ -54,7 +54,7 @@ The **Delegated runs** table shows the Subagents and Workers called during a mes
 
 Delegated usage contributes to the Token Panel's running conversation totals and cost, with a separate subtotal in the cost tooltip. It does **not** inflate the Primary Agent's context meter: the helper ran in a separate context. The result returned to the Primary Agent still uses space in its own conversation.
 
-Unknown usage or unavailable pricing stays unknown. In particular, the official n8n Workflow Subagent templates do not return usage; a custom workflow can report it. Claude Code's native helpers are labeled **Claude Code Helper** and do not receive Batshit's separate Worker accounting.
+Unknown usage or unavailable pricing stays unknown.
 
 When a CLI reply fails or is stopped, the Viewer keeps the request and tool evidence it captured. For a failed Claude Code reply, token counts from its final model usage report remain visible when supplied; a count it did not supply stays unknown. A reported `0` stays `0`.
 

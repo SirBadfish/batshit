@@ -1,7 +1,42 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, beforeAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { redis } from '$lib/server/redis'
+import { failRedisJsonGets, stopFailingRedisJsonGets } from '$lib/test-utils/failRedisJsonGets'
+import { randomUUID } from 'node:crypto'
 import { pinHostCommandOwner, prepareHostCommand } from '$lib/server/services/hostCommandOwnership'
+import { readHostBootIdentity } from '$lib/server/services/hostProcessIdentity'
+import { removeArtifactAgentReferences, ArtifactAccessCleanupUnknownError } from '$lib/server/services/artifactAgentAccessCleanup'
+import { deletePrimaryPopulation, SubjectPopulationError } from '$lib/server/services/subjectPopulation'
+import { captureSlashCommandWriteBasis } from '$lib/server/services/slashCommandRevision'
+import { slashCommandPreparationState } from '$lib/server/services/slashCommandRevisionProtocol'
+import { withSettingsRecordReplacement, withSettingsRestoreFence } from '$lib/server/services/appActions/settings/lifecycle'
+
+vi.mock('$lib/server/services/artifactAgentAccessCleanup', async importOriginal => ({
+  ...await importOriginal<typeof import('$lib/server/services/artifactAgentAccessCleanup')>(),
+  removeArtifactAgentReferences: vi.fn(async (_args, context) => { context.checkBeforeIssue(); return { status: 'unchanged' } })
+}))
+vi.mock('$lib/server/services/slashCommandRevision', async importOriginal => ({
+  ...await importOriginal<typeof import('$lib/server/services/slashCommandRevision')>(),
+  captureSlashCommandWriteBasis: vi.fn(async preparation => {
+    const state = slashCommandPreparationState(preparation)
+    if (state.revision === undefined) state.revision = null
+    return Object.freeze({})
+  }),
+  captureSkillSourceWriteBasis: vi.fn(async () => Object.freeze({})),
+  removeExplicitSkillSourceAgentAccess: vi.fn(async () => false)
+}))
+vi.mock('$lib/server/services/agentAccessLists', async importOriginal => ({
+  ...await importOriginal<typeof import('$lib/server/services/agentAccessLists')>(),
+  removeExplicitSlashCommandAgentAccess: vi.fn(async () => false)
+}))
+vi.mock('$lib/server/services/subjectPopulation', async importOriginal => ({
+  ...await importOriginal<typeof import('$lib/server/services/subjectPopulation')>(),
+  deletePrimaryPopulation: vi.fn(async (client, subject) => {
+    await client.sRem(`user:${subject.userId}:agents`, subject.subjectId)
+    await client.del(`agent:${subject.subjectId}`)
+    return 'DELETED'
+  })
+}))
 
 /**
  * BL-41 (2026-09-22): `DELETE /api/agents/[id]` deletes the agent's avatar pictures.
@@ -25,10 +60,8 @@ const deleteAgentChats = vi.hoisted(() => vi.fn())
 vi.mock('$lib/server/services/agentChatDeletion', () => ({ deleteAgentChats }))
 const publishUserEvent = vi.hoisted(() => vi.fn(async () => {}))
 vi.mock('$lib/server/ssePublisher', () => ({ publishUserEvent }))
-vi.mock('$lib/server/services/codexProfileManager', () => ({
-  syncAgentCodexProfiles: vi.fn(async () => {}),
-  deleteAgentCodexConfig: vi.fn(async () => {}),
-  buildAgentProfileId: (id: string) => `batshit_agent_${id}`
+vi.mock('$lib/server/services/managedProfileFolderDelete', () => ({
+  deleteManagedProfileFolder: vi.fn(async () => {})
 }))
 vi.mock('$lib/server/services/claudeProfileManager', () => ({
   syncAgentClaudeProfiles: vi.fn(async () => {}),
@@ -41,7 +74,21 @@ vi.mock('$lib/server/services/cliSubagentProfileSync', () => ({
   planAgentWorkerProfileDeletion: vi.fn(async () => ({ deletable: [], kept: [] }))
 }))
 
-useRedisTestServer()
+let reasoningProofPoolId: string | undefined
+beforeAll(() => {
+  if (process.env.VITEST_USE_REAL_REDIS !== 'true') return
+  reasoningProofPoolId = process.env.VITEST_POOL_ID
+  process.env.VITEST_POOL_ID = '0'
+})
+afterAll(() => {
+  if (process.env.VITEST_USE_REAL_REDIS !== 'true') return
+  if (reasoningProofPoolId === undefined) delete process.env.VITEST_POOL_ID
+  else process.env.VITEST_POOL_ID = reasoningProofPoolId
+})
+useRedisTestServer({ beforeCleanupAdmission: async ({ adminClient, resolvedUrl }) => {
+  expect(new URL(resolvedUrl).pathname).toBe('/15')
+  expect((await adminClient.clientInfo()).db).toBe(15)
+} })
 
 const USER = 'user-agent-delete-route'
 const AGENT = 'zb_route_agent'
@@ -123,6 +170,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  stopFailingRedisJsonGets()
   vi.unstubAllEnvs()
   vi.unstubAllGlobals()
   delete (redis as any).deleteAgent
@@ -150,8 +198,14 @@ describe('DELETE /api/agents/[id] and the agent’s avatar pictures (BL-41)', ()
     const agentId = `${AGENT}_recovered`
     await seedAgent({ id: agentId })
     const pin = pinHostCommandOwner({ userId: USER, kind: 'agent', id: agentId })
-    const lease = await prepareHostCommand(pin, { kind: 'codex', program: '/bin/codex' })
-    lease.observe([{ pid: 999999999, parent: 1, group: 999999999, started: 'old-birth', state: 'S', program: 'old-codex' }])
+    // A `codex` run record left by the retired Codex CLI lane, as that app saved it: nothing
+    // writes one any more, but its deletion still reads and retires it.
+    pin.store.prepare({
+      version: 1, runId: randomUUID(), kind: 'codex', resources: pin.resources,
+      ...await readHostBootIdentity(), instanceId: 'previous-app', lane: 'mac',
+      owner: pin.owner, profileId: pin.profileId, sessionId: null, messageId: null, program: 'codex',
+      phase: 'running', processes: [{ pid: 999999999, parent: 1, group: 999999999, started: 'old-birth', state: 'S', program: 'old-codex' }]
+    }, pin.generations)
 
     const response = await callDelete(USER, '', agentId)
     const body = await response.json()
@@ -161,7 +215,9 @@ describe('DELETE /api/agents/[id] and the agent’s avatar pictures (BL-41)', ()
   })
 
   it('checks batshit-server, then asks it to delete the avatars, BEFORE the agent record goes', async () => {
-    await seedAgent()
+    const { reasoningOverrideKey } = await import('$lib/utils/modelReasoningControls')
+    const reasoningKey = reasoningOverrideKey({ presetId: 'fixture', connection: { type: 'direct', id: 'direct:openai', service: 'openai' }, effectiveModelId: 'gpt-6.1-sol' }, 'effort')
+    await seedAgent({ model_reasoning_overrides: { [reasoningKey]: { mode: 'value', value: 'max' } } })
 
     const response = await callDelete(USER)
 
@@ -280,6 +336,109 @@ describe('DELETE /api/agents/[id] and the agent’s avatar pictures (BL-41)', ()
     expect(await redis.get(`agent:${AGENT}`)).not.toBeNull()
   })
 
+  describe('SA-139 (D10): the agent\'s Claude plan runs', () => {
+    const claudePlanRun = (agentId: string, settlement: 'exited' | 'unknown' = 'exited') => {
+      let settle!: (value: 'exited' | 'unknown') => void
+      const run = {
+        owner: { userId: USER, sessionId: 'some-chat', agentId, kind: 'primary' as const },
+        settled: new Promise<'exited' | 'unknown'>(resolve => { settle = resolve }),
+        exited: new Promise<void>(() => {}),
+        isEnded: false,
+        // The exit comes later than the stop, so a delete that did not wait for it would be caught.
+        stop: vi.fn(() => { events.push(`run stopped ${agentId}`); run.isEnded = true; setTimeout(() => { events.push(`run exited ${agentId}`); settle(settlement) }, 30) })
+      }
+      return run
+    }
+    afterEach(async () => {
+      const { resetClaudePlanRunRegistryForTests } = await import('$lib/server/services/claudePlanRunRegistry')
+      resetClaudePlanRunRegistryForTests()
+    })
+
+    it('end and settle before the chats and the agent go; another agent\'s run is left alone', async () => {
+      const { registerClaudePlanRun } = await import('$lib/server/services/claudePlanRunRegistry')
+      await seedAgent()
+      const mine = claudePlanRun(AGENT)
+      const other = claudePlanRun('another_agent')
+      registerClaudePlanRun(mine as any)
+      registerClaudePlanRun(other as any)
+      deleteAgentChats.mockImplementation(async () => { events.push('chats'); return { deleted: [], keptLocked: [] } })
+
+      const response = await callDelete(USER, '?chats=1')
+
+      expect(response.status).toBe(200)
+      expect(events.indexOf(`run stopped ${AGENT}`)).toBeGreaterThan(-1)
+      expect(events.indexOf(`run exited ${AGENT}`)).toBeGreaterThan(events.indexOf(`run stopped ${AGENT}`))
+      expect(events.indexOf(`run exited ${AGENT}`)).toBeLessThan(events.indexOf('chats'))
+      expect(other.stop).not.toHaveBeenCalled()
+    })
+
+    it('keep the agent and its chats (409) while a Claude Code exit cannot be confirmed', async () => {
+      const { registerClaudePlanRun } = await import('$lib/server/services/claudePlanRunRegistry')
+      await seedAgent()
+      registerClaudePlanRun(claudePlanRun(AGENT, 'unknown') as any)
+
+      const response = await callDelete(USER, '?chats=1')
+      const body = await response.json()
+
+      expect(response.status).toBe(409)
+      expect(body.code).toBe('claude_plan_run_still_stopping')
+      expect(deleteAgentChats).not.toHaveBeenCalled()
+      expect(await redis.get(`agent:${AGENT}`)).not.toBeNull()
+    })
+  })
+
+  // BL-642: `redis.get` answers null for a failed read (the same answer as a missing key), so the
+  // route's first read said "Agent not found" for a Redis error. It reads with `redis.json.get`,
+  // which throws, so the failure is answered as one and nothing is deleted.
+  async function expectReadFailureAnswered(inject: () => { failures?: number; stop: () => void }) {
+    await seedAgent()
+    const failing = inject()
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    const response = await callDelete(USER, '?chats=1')
+    const body = await response.json()
+    failing.stop()
+    errorLog.mockRestore()
+
+    expect(response.status).toBe(500)
+    expect(body.error).not.toMatch(/not found/i)
+    expect(body.error).toMatch(/Failed to delete agent/)
+    // Nothing was asked of batshit-server and nothing was deleted, chats included.
+    expect(events).toEqual([])
+    expect(deleteAgentChats).not.toHaveBeenCalled()
+    expect(await redis.get(`agent:${AGENT}`)).not.toBeNull()
+    return failing
+  }
+
+  it('a failed read of the agent answers the error, not "Agent not found", and deletes nothing (BL-642)', async () => {
+    const spy = vi.spyOn(redis.json, 'get').mockImplementation(async (key: string) => {
+      if (key === `agent:${AGENT}`) throw new Error('Redis read failed (injected by the test)')
+      return null
+    })
+    let readKeys: unknown[] = []
+    await expectReadFailureAnswered(() => ({
+      stop: () => {
+        readKeys = spy.mock.calls.map(([key]) => key)
+        spy.mockRestore()
+      }
+    }))
+    expect(readKeys).toContain(`agent:${AGENT}`)
+  })
+
+  // The faithful reproduction needs the real facade, whose `redis.get` swallows a read error; the
+  // default lane's fake does not. Run it with `npm run test:redis`-style env on a scratch Redis.
+  it.runIf(process.env.VITEST_USE_REAL_REDIS === 'true')('a failed JSON.GET inside the real read answers the error (BL-642, real Redis)', async () => {
+    const failing = await expectReadFailureAnswered(() => failRedisJsonGets((key) => key === `agent:${AGENT}`))
+    expect(failing.failures).toBeGreaterThan(0)
+  })
+
+  it('a missing agent still answers 404 Agent not found (BL-642 keeps the real answer)', async () => {
+    const response = await callDelete(USER, '', `${AGENT}_missing`)
+    expect(response.status).toBe(404)
+    expect(await response.json()).toEqual({ error: 'Agent not found' })
+    expect(events).toEqual([])
+  })
+
   it('another user’s agent: 403 before anything is asked of batshit-server', async () => {
     await seedAgent({ user_id: 'someone-else' })
 
@@ -319,5 +478,169 @@ describe('DELETE /api/agents/[id] tells open tabs about the holds it released (B
     const response = await callDelete(USER)
     expect(response.status).toBe(200)
     expect(publishUserEvent).not.toHaveBeenCalled()
+  })
+})
+
+// The real deletion method runs on the existing default client. Its fixed Lua
+// dependencies retain their separate Redis proof; this is caller/custody proof.
+describe('actual Primary deletion required reference cleanup (BL1631/392)', () => {
+  let restoreExecute: (() => void) | undefined
+  beforeEach(async () => {
+    vi.mocked(removeArtifactAgentReferences).mockReset().mockImplementation(async (_args, context) => {
+      context.checkBeforeIssue(); return { status: 'unchanged' }
+    })
+    vi.mocked(captureSlashCommandWriteBasis).mockClear()
+    vi.mocked(deletePrimaryPopulation).mockClear()
+    const authority = await import('$lib/server/services/appActions/settings/authority')
+    vi.spyOn(authority, 'sweepAppActionsSubjectReferences').mockResolvedValue(undefined)
+    const media = await import('$lib/server/services/memory/memoryMedia')
+    vi.spyOn(media, 'sweepAgentMemoryMedia').mockResolvedValue(0)
+    const dms = await import('$lib/server/services/dm/dmStore')
+    vi.spyOn(dms, 'sweepAgentDms').mockResolvedValue(0)
+    const hooks = await import('$lib/server/services/dm/wakeHookStore')
+    vi.spyOn(hooks, 'sweepAgentWakeHooks').mockResolvedValue(0)
+    const schedules = await import('$lib/server/services/schedules/scheduleStore')
+    vi.spyOn(schedules, 'sweepAgentSchedules').mockResolvedValue(0)
+    const credentials = await import('$lib/server/services/agentRunCredentials')
+    vi.spyOn(credentials, 'sweepAgentRunCredentials').mockResolvedValue(0)
+    const holds = await import('$lib/server/services/zipHolds')
+    vi.spyOn(holds, 'releaseDeletedAgentHolds').mockResolvedValue([])
+    const { RedisService } = await vi.importActual<typeof import('$lib/server/redis')>('$lib/server/redis')
+    ;(redis as any).deleteAgent = (id: string) => RedisService.prototype.deleteAgent.call(redis, id)
+  })
+  afterEach(() => { restoreExecute?.(); restoreExecute = undefined; vi.restoreAllMocks() })
+
+  it('returns the real lifecycle refusal when another indexed Primary is being replaced (BL-2058)', async () => {
+    await seedAgent()
+    const peer = `${AGENT}_peer`
+    await seedAgent({ id: peer })
+    const authority = await import('$lib/server/services/appActions/settings/authority')
+    vi.mocked(authority.sweepAppActionsSubjectReferences).mockRestore()
+    const media = await import('$lib/server/services/memory/memoryMedia')
+
+    await withSettingsRecordReplacement(`agent:${peer}`, async () => {
+      const response = await callDelete(USER)
+      expect(response.status).toBe(409)
+      expect(await response.json()).toEqual({
+        error: 'Settings identity changed or is being replaced. Reload before continuing.',
+        code: 'SETTINGS_LIFECYCLE_CHANGED'
+      })
+      expect(await redis.json.get(`agent:${AGENT}`)).not.toBeNull()
+      expect(await redis.json.get(`agent:${peer}`)).not.toBeNull()
+      expect(media.sweepAgentMemoryMedia).not.toHaveBeenCalled()
+      expect(deletePrimaryPopulation).not.toHaveBeenCalled()
+      expect(deleteAgentWorkerProfiles).not.toHaveBeenCalled()
+      expect(publishUserEvent).not.toHaveBeenCalled()
+      // The route already swept avatars before entering the record owner.
+      expect(events).toEqual([HEALTH, SWEEP])
+    })
+  })
+
+  it('keeps an unexpected reference-sweep failure a 500 and retains the agent (BL-2058)', async () => {
+    await seedAgent()
+    const authority = await import('$lib/server/services/appActions/settings/authority')
+    vi.mocked(authority.sweepAppActionsSubjectReferences).mockRejectedValueOnce(new Error('storage unavailable'))
+    const response = await callDelete(USER)
+    expect(response.status).toBe(500)
+    expect(await response.json()).toEqual({ error: 'Failed to delete agent' })
+    expect(await redis.json.get(`agent:${AGENT}`)).not.toBeNull()
+    expect(deletePrimaryPopulation).not.toHaveBeenCalled()
+  })
+
+  it('captures the original catalogue before the opposite-kind read and preserves all shared lists', async () => {
+    await seedAgent()
+    await redis.json.set(`subagent:${AGENT}`, '$', { id: AGENT, user_id: USER })
+    await redis.json.set(`slash_command:${USER}:shared`, '$', { enabled_agent_ids: [AGENT] })
+    await redis.json.set(`skill_source:${USER}:shared`, '$', { enabled_agent_ids: [AGENT] })
+    await redis.sAdd(`user:${USER}:artifacts`, 'shared')
+    const execute = redis.execute
+    let checked = false
+    ;(redis as any).execute = (operation: (client: any) => Promise<unknown>) => execute.call(redis, client => operation(new Proxy(client, {
+      get(target, property) {
+        if (property === 'exists') return async (key: string) => {
+          if (key === `subagent:${AGENT}`) {
+            checked = true
+            expect(captureSlashCommandWriteBasis).toHaveBeenCalledWith(expect.anything(), [])
+          }
+          return target.exists(key)
+        }
+        return Reflect.get(target, property)
+      }
+    })))
+    restoreExecute = () => { redis.execute = execute }
+    await redis.deleteAgent(AGENT)
+    expect(checked).toBe(true)
+    expect(removeArtifactAgentReferences).not.toHaveBeenCalled()
+    expect(await redis.json.get(`slash_command:${USER}:shared`)).toEqual({ enabled_agent_ids: [AGENT] })
+    expect(await redis.json.get(`skill_source:${USER}:shared`)).toEqual({ enabled_agent_ids: [AGENT] })
+    expect(await redis.json.get(`subagent:${AGENT}`)).not.toBeNull()
+  })
+
+  it('completes the required metadata owner before removing the Primary record', async () => {
+    await seedAgent()
+    await redis.sAdd(`user:${USER}:artifacts`, 'legacy')
+    vi.mocked(removeArtifactAgentReferences).mockImplementationOnce(async (args, context) => {
+      expect(args).toEqual({ userId: USER, agentId: AGENT, artifactId: 'legacy' })
+      expect(await redis.json.get(`agent:${AGENT}`)).not.toBeNull()
+      context.checkBeforeIssue(); context.onChanged({ removed: 2, scopePinned: true })
+      return { status: 'changed', removed: 2, scopePinned: true, notification: 'recorded' }
+    })
+    await redis.deleteAgent(AGENT)
+    expect(removeArtifactAgentReferences).toHaveBeenCalledTimes(1)
+    expect(deletePrimaryPopulation).toHaveBeenCalledOnce()
+    expect(vi.mocked(removeArtifactAgentReferences).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(deletePrimaryPopulation).mock.invocationCallOrder[0])
+    expect(await redis.json.get(`agent:${AGENT}`)).toBeNull()
+  })
+
+  it('retains the Primary on an indexed unreadable Artifact and settles known refusal', async () => {
+    await seedAgent()
+    await redis.sAdd(`user:${USER}:artifacts`, 'unreadable')
+    vi.mocked(removeArtifactAgentReferences).mockResolvedValueOnce({ status: 'refused', reason: 'artifact_unreadable' })
+    await expect(redis.deleteAgent(AGENT)).rejects.toMatchObject({ code: 'AGENT_ARTIFACT_CLEANUP_REFUSED', subjectRetained: true })
+    expect(deletePrimaryPopulation).not.toHaveBeenCalled()
+    expect(await redis.json.get(`agent:${AGENT}`)).not.toBeNull()
+    await expect(withSettingsRecordReplacement(`agent:${AGENT}`, async () => 'settled')).resolves.toBe('settled')
+  })
+
+  it('keeps the original final catalogue expectation on concurrent population conflict', async () => {
+    await seedAgent()
+    vi.mocked(deletePrimaryPopulation).mockRejectedValueOnce(new SubjectPopulationError('The original catalogue changed.', false, true))
+    await expect(redis.deleteAgent(AGENT)).rejects.toMatchObject({ code: 'SUBJECT_POPULATION_CONFLICT' })
+    expect(captureSlashCommandWriteBasis).toHaveBeenCalledTimes(1)
+    expect(deletePrimaryPopulation).toHaveBeenCalledWith(expect.anything(), { subjectId: AGENT, userId: USER, expectedCatalogueRevision: null })
+    expect(await redis.json.get(`agent:${AGENT}`)).not.toBeNull()
+  })
+
+  // Distinct identity: deliberately retains an unresolved exact-subject lease.
+  it('maps the actual Primary retained-record unknown with confirmed cleanup counts to503', async () => {
+    const id = `${AGENT}_route_unknown`
+    await seedAgent({ id })
+    await redis.sAdd(`user:${USER}:artifacts`, ['saved', 'unknown'])
+    vi.mocked(removeArtifactAgentReferences).mockImplementationOnce(async (_args, context) => {
+      context.checkBeforeIssue(); context.onChanged({ removed: 2, scopePinned: true })
+      return { status: 'changed', removed: 2, scopePinned: true, notification: 'recorded' }
+    }).mockRejectedValueOnce(new ArtifactAccessCleanupUnknownError())
+    const response = await callDelete(USER, '', id)
+    expect(response.status).toBe(503)
+    const body = await response.json()
+    expect(body).toMatchObject({ code: 'AGENT_ARTIFACT_CLEANUP_UNCONFIRMED', outcome: 'unknown', subjectRetained: true,
+      cleanup: { changedArtifacts: 1, removedReferences: 2 } })
+    expect(body.error).not.toMatch(/try again/i)
+    expect(removeArtifactAgentReferences).toHaveBeenCalledTimes(2)
+    expect(deletePrimaryPopulation).not.toHaveBeenCalled()
+    expect(await redis.json.get(`agent:${id}`)).not.toBeNull()
+  })
+
+  it('does not remove or replay a Primary after one issued unknown Artifact scrub', async () => {
+    const id = `${AGENT}_artifact_unknown`
+    await seedAgent({ id })
+    await redis.sAdd(`user:${USER}:artifacts`, 'unknown')
+    vi.mocked(removeArtifactAgentReferences).mockRejectedValueOnce(new ArtifactAccessCleanupUnknownError())
+    await expect(redis.deleteAgent(id)).rejects.toMatchObject({ code: 'AGENT_ARTIFACT_CLEANUP_UNCONFIRMED', outcome: 'unknown' })
+    expect(removeArtifactAgentReferences).toHaveBeenCalledOnce()
+    expect(deletePrimaryPopulation).not.toHaveBeenCalled()
+    expect(await redis.json.get(`agent:${id}`)).not.toBeNull()
+    await expect(withSettingsRecordReplacement(`agent:${id}`, async () => 'must-not-run')).rejects.toThrow('unknown outcome')
+    await expect(withSettingsRestoreFence(async () => 'must-not-run')).rejects.toThrow('unknown outcome')
   })
 })

@@ -2,10 +2,10 @@
  * BL-245 — what a reply that failed (or was stopped) mid-stream leaves in its Execution Viewer
  * snapshot, and the words it shows for the failure.
  *
- * The API lane wrote the run's model calls (`llmCalls`, `llmSummary`) and its tool steps into the
- * snapshot only in the AI SDK's finish callback. A reply that fails mid-stream never gets there:
- * send-routed stops reading the stream at the error, so the SDK never finishes its record of the
- * steps and never calls its finish. Seen on the SA-126 benchmark instance: a GLM 5.3 reply read
+ * Historically the API lane wrote model calls (`llmCalls`, `llmSummary`) and tool steps only in
+ * the AI SDK's finish callback. That callback may never arrive on failure; SDK7 can also call
+ * onEnd with an error step and incomplete totals. Such callbacks are deliberately refused before
+ * async enrichment, leaving call evidence to the failure recorder. Seen on SA-126: a GLM 5.3 reply read
  * two files and wrote a script (three tool calls, several billed requests), then DashScope sent
  * an error chunk after 35 minutes, and the snapshot said `failed` with no calls, no summary, and
  * no tool steps. The user could not see what the failed reply cost or did.
@@ -22,7 +22,35 @@
  * the provider's own `error.message` from such a chunk, with its code kept beside it.
  */
 
+import { InvalidResponseDataError } from '@ai-sdk/provider'
 import { isContextExhaustionError } from '$lib/server/services/contextExhaustion'
+import { buildUsageLike, normalizeUsageLike, type ApiUsageLike } from './apiProviderUsage'
+
+/**
+ * BL-1569: explain the SDK's rejection of an unmatched tool delta with no name. A valid
+ * continuation may omit its name, so raw deltas or the message alone are not authority.
+ * This only changes presentation: the stream still fails, with no guessed tool or retry.
+ */
+export function classifyIncompleteToolCallStreamFailure(error: unknown): {
+  code: 'MODEL_INCOMPLETE_TOOL_CALL'
+  status: 502
+  userMessage: string
+} | null {
+  if (!InvalidResponseDataError.isInstance(error) ||
+    error.message !== "Expected 'function.name' to be a string.") return null
+  const data = error.data
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return null
+  const delta = data as Record<string, unknown>
+  if (delta.type != null && delta.type !== 'function') return null
+  const fn = delta.function
+  if (fn != null && (typeof fn !== 'object' || Array.isArray(fn))) return null
+  if (fn != null && (fn as Record<string, unknown>).name != null) return null
+  return {
+    code: 'MODEL_INCOMPLETE_TOOL_CALL',
+    status: 502,
+    userMessage: 'The model response contained an incomplete tool call, so the response stopped. Earlier tool actions may already have run; review the saved response before continuing.'
+  }
+}
 
 export type RecordedStreamStep = {
   request?: unknown
@@ -45,6 +73,32 @@ export type StreamStepRecorder = {
    * finished call reports.
    */
   steps: (unfinishedReason: string) => RecordedStreamStep[]
+}
+
+/**
+ * BL-1596: a failed reply can keep an aggregate only after its consumer received the complete,
+ * non-error sequence. SDK7 can sum missing failed-step counters as zero. Never use that partial
+ * sum, or a raw per-call chunk, as the whole reply; keep only fields every call actually reported.
+ */
+export function resolveFailedApiUsage(input: {
+  aggregateUsage: ApiUsageLike
+  steps: RecordedStreamStep[]
+  finishReason: unknown
+}): ApiUsageLike {
+  if (typeof input.finishReason !== 'string' || input.finishReason === 'error' ||
+    input.steps.length === 0 || input.steps.some(step => !step.finished || step.finishReason === 'error')) return null
+  const aggregate = normalizeUsageLike(input.aggregateUsage)
+  if (!aggregate) return null
+  const steps = input.steps.map(step => normalizeUsageLike(step.usage))
+  const known: NonNullable<ApiUsageLike> = {}
+  for (const field of ['inputTokens', 'outputTokens', 'totalTokens', 'reasoningTokens', 'cachedInputTokens', 'cacheCreationInputTokens'] as const) {
+    const count = aggregate[field]
+    if (typeof count === 'number' && Number.isFinite(count) && count >= 0 &&
+      steps.every(usage => typeof usage?.[field] === 'number' && Number.isFinite(usage[field]) && usage[field]! >= 0)) {
+      known[field] = count
+    }
+  }
+  return buildUsageLike(known) ?? null
 }
 
 export function createStreamStepRecorder(): StreamStepRecorder {

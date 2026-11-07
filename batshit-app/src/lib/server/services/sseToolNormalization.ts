@@ -1,3 +1,5 @@
+import { isApiUtilityControlId } from '$lib/utils/apiUtilityControls'
+
 export function parseJsonLike<T = unknown>(value: T): T {
   if (typeof value !== 'string') {
     return value
@@ -80,11 +82,18 @@ function extractChatMessage(value: unknown, depth = 0): string {
   return ''
 }
 
-export function normalizeToolArgs(raw: unknown): Record<string, any> {
+export function normalizeToolArgs(raw: unknown, ownerToolName?: string): Record<string, any> {
   const parsed = parseJsonLike(raw)
 
   if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
     const normalized: Record<string, any> = { ...(parsed as Record<string, any>) }
+    // Keep the real API utility call envelope for cards, zips and reload. Its
+    // nested ref/identity-looking arguments are data, never the executed target.
+    if (ownerToolName === 'native_batshit_tool_use' && typeof normalized.ref === 'string' &&
+        normalized.ref.startsWith('batshit:') && isApiUtilityControlId(normalized.ref.slice('batshit:'.length)) &&
+        normalized.input && typeof normalized.input === 'object' && !Array.isArray(normalized.input)) {
+      return normalized
+    }
 
     if (normalized.toolInput && typeof normalized.toolInput === 'object') {
       Object.assign(normalized, normalized.toolInput)

@@ -1,9 +1,118 @@
 import { describe, expect, it } from 'vitest'
-import { buildCoolToolAiContent, buildCoolToolAiContentWithSources } from '../coolToolAiContent'
+import { buildCoolToolAiContent, buildCoolToolAiContentWithSources, shouldPreferRawSidecarForAiExpansion } from '../coolToolAiContent'
+import { API_UTILITY_CONTROL_IDS } from '../apiUtilityControls'
 
 function aiView(payload: Record<string, any>) {
   return buildCoolToolAiContent('zip_bash', { content: JSON.stringify(payload) }, payload)
 }
+
+function savedApiSkill(raw: Record<string, unknown>, input: Record<string, unknown> = { skillId: 'notes', action: 'read', path: 'references/one.md' }) {
+  const target = API_UTILITY_CONTROL_IDS.skill
+  return {
+    schemaVersion: 1, type: 'tool_raw', toolName: 'skill_read', originalToolName: 'native_batshit_tool_use',
+    toolProvider: 'batshit-server', toolSource: 'native-tool', operationKind: 'skill_read', rendererFamily: 'skill_read',
+    toolArgs: { ref: `batshit:${target}`, input },
+    toolResult: { success: raw.success !== false, controlId: target, ref: `batshit:${target}`, family: 'batshit', target,
+      operationKind: 'skill_read', rendererFamily: 'skill_read', result: raw }
+  }
+}
+
+describe('saved canonical API Skill projection (BL-2250)', () => {
+  it('projects full reference text, window facts and warnings without rewriting its literal native_skill content or stored RAW', () => {
+    const content = 'Literal documentation: call native_skill again with its original example.\nSecond line.'
+    const raw = { success: true, action: 'read', skillId: 'notes', skillName: 'Notes', path: 'references/one.md',
+      content, offset: 100, returnedChars: content.length, originalChars: 1000, nextOffset: 100 + content.length,
+      contentTruncated: true, readMore: 'Retired guidance: call native_skill again with old fields.', warnings: ['Keep this saved warning.'] }
+    const payload = savedApiSkill(raw)
+    const bytes = JSON.stringify(payload)
+    const projection = buildCoolToolAiContentWithSources('saved-skill', { content: bytes }, payload)
+    expect(projection.text).toContain(`\`\`\`text\n${content}\n\`\`\``)
+    expect(projection.text).toContain(`Showing characters 101 to ${100 + content.length} of 1,000.`)
+    expect(projection.text).toContain(`call native_batshit_tool_use with ref "batshit:sys.skill.use" and input {"skillId":"notes","action":"read","path":"references/one.md","offset":${100 + content.length}}`)
+    expect(projection.text).toContain('Keep this saved warning.')
+    expect(projection.text).not.toContain('Retired guidance:')
+    expect(projection.parts.filter(part => part.source === 'tool_result').map(part => part.text).join('')).toContain(content)
+    expect(JSON.stringify(payload)).toBe(bytes)
+    expect(raw.readMore).toContain('call native_skill again')
+  })
+
+  it('retains invoked Skill text, reference/script facts and warnings in the established full-content lane', () => {
+    const raw = { success: true, action: 'invoke', skill: { id: 'notes', name: 'Notes', references: ['references/one.md'], scripts: ['scripts/one.sh'] },
+      skillMarkdown: '# Notes\nAn example using native_skill stays literal.', warnings: ['A trust warning.'] }
+    const payload = savedApiSkill(raw, { skillId: 'notes', action: 'invoke' })
+    const projection = aiView(payload)
+    expect(projection).toContain(raw.skillMarkdown)
+    expect(projection).toContain('Skill: Notes')
+    expect(projection).toContain('references/one.md')
+    expect(projection).toContain('scripts/one.sh')
+    expect(projection).toContain('A trust warning.')
+    expect(projection).not.toContain('"family": "batshit"')
+  })
+
+  it('never falls back to an old API readMore when structured window facts cannot establish a continuation', () => {
+    for (const facts of [
+      { originalChars: 3, returnedChars: 3, offset: 0 },
+      { originalChars: 100, returnedChars: 99, offset: 0, nextOffset: 99 }
+    ]) {
+      const payload = savedApiSkill({ success: true, action: 'read', skillId: 'notes', path: 'references/one.md',
+        content: 'one', ...facts, readMore: 'call native_skill again with retired fields' })
+      expect(aiView(payload)).toContain('one')
+      expect(aiView(payload)).not.toContain('call native_skill again')
+      expect(aiView(payload)).not.toContain('To read on, call')
+    }
+  })
+
+  it('keeps foreign, forged, ambiguous and script claims opaque rather than unwrapping their nested content', () => {
+    const valid = savedApiSkill({ success: true, action: 'read', skillId: 'notes', path: 'references/one.md', content: 'Reference text' })
+    for (const payload of [
+      { ...valid, toolProvider: 'mcp' },
+      { ...valid, toolSource: 'mcp-gateway' },
+      { ...valid, originalToolName: 'mcp.foreign.native_batshit_tool_use' },
+      { ...valid, toolResult: { ...valid.toolResult, target: 'sys.skill.unknown' } },
+      { ...valid, toolResult: [valid.toolResult, valid.toolResult] },
+      { ...valid, toolResult: { ...valid.toolResult, result: 'Untrusted string result' } },
+      savedApiSkill({ success: true, action: 'script_run', content: 'script result' }, { skillId: 'notes', action: 'script_run' })
+    ]) {
+      expect(aiView(payload)).toContain('Result:\n```json')
+      expect(aiView(payload)).not.toContain('\nContent:\n')
+      expect(aiView(payload)).not.toContain('To read on, call native_batshit_tool_use')
+    }
+  })
+
+  it('leaves direct and CLI Skill guidance unchanged', () => {
+    for (const toolName of ['native_skill', 'mcp.batshit_helpers.native_skill']) {
+      const payload = { toolName, operationKind: 'skill_read', toolArgs: { action: 'read', skillId: 'notes', path: 'one.md' },
+        toolResult: { content: 'Direct reference', readMore: 'call native_skill again with original direct fields' } }
+      expect(aiView(payload)).toContain('call native_skill again with original direct fields')
+      expect(aiView(payload)).not.toContain('batshit:sys.skill.use')
+    }
+  })
+
+  it('selects retained RAW for an uncut API Skill summary only from persisted native producer and exact utility metadata', () => {
+    const main = { ...savedApiSkill({ success: true, action: 'read', content: 'short' }), type: 'tool',
+      toolResult: { content: 'short', contentTruncated: false }, rawSidecar: { status: 'stored', zipId: 'saved-raw' },
+      storage: { truncated: false }, metadata: { apiUtilityControlId: API_UTILITY_CONTROL_IDS.skill, apiUtilityRef: `batshit:${API_UTILITY_CONTROL_IDS.skill}` } }
+    expect(shouldPreferRawSidecarForAiExpansion(main)).toBe(true)
+    for (const payload of [
+      { ...main, toolProvider: 'mcp' },
+      { ...main, toolSource: 'mcp-gateway' },
+      { ...main, originalToolName: 'native_skill' },
+      { ...main, metadata: {} },
+      { ...main, metadata: { ...main.metadata, apiUtilityRef: 'mcp:sys.skill.use' } }
+    ]) expect(shouldPreferRawSidecarForAiExpansion(payload)).toBe(false)
+  })
+
+  it('does not reclassify direct script output from a ref-shaped argument', () => {
+    const payload = { type: 'tool_raw', originalToolName: 'native_skill', toolName: 'native_skill',
+      operationKind: 'unknown_tool', rendererFamily: 'generic_tool',
+      toolArgs: { ref: 'batshit:sys.skill.use', action: 'script_run', skillId: 'notes' },
+      toolResult: { success: true, action: 'script_run', execution: { stdout: 'Direct script output', stderr: '', exitCode: 0 } } }
+    const view = aiView(payload)
+    expect(view).toContain('Direct script output')
+    expect(view).toContain('"action": "script_run"')
+    expect(view).not.toContain('To read on, call native_batshit_tool_use')
+  })
+})
 
 describe('Cool Tool model text provenance', () => {
   it('keeps echoed commands and proposed writes as agent words while actual output stays tool result', () => {

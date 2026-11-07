@@ -6,11 +6,11 @@ This page explains which URLs to use for Batshit, batshit-server, n8n, Docker si
 
 | Thing | Browser or host URL | Docker/container URL | Notes |
 | --- | --- | --- | --- |
-| Batshit app | Mac app: `http://127.0.0.1:5620`; Docker host: `http://localhost:5620`; source dev: `http://localhost:5621` | `http://app:3000` | `5620` is the launch-facing local app port. Source checkout uses an alternate dev port so it can run beside the Mac app. |
-| batshit-server | Mac/Docker host: `http://localhost:5600`; source dev: `http://localhost:5610` | `http://batshit-server:5600` | Uploads, helper APIs, and batshit-server health. |
-| batshit-server API | Mac/Docker host: `http://localhost:5600/api/v1`; source dev: `http://localhost:5610/api/v1` | `http://batshit-server:5600/api/v1` | Used by helper tooling. |
+| Batshit app | Mac app: `http://127.0.0.1:5620`; Docker host: `http://localhost:5620`; Pinokio: `http://127.0.0.1:5650`; source dev: `http://localhost:5621` | `http://app:3000` | The Mac app and Docker use `5620`; Pinokio has its own fixed lane. Source checkout uses an alternate dev port so it can run beside the Mac app. |
+| batshit-server | Mac/Docker host: `http://localhost:5600`; Pinokio: `http://127.0.0.1:5651`; source dev: `http://localhost:5610` | `http://batshit-server:5600` | Uploads, helper APIs, and batshit-server health. |
+| batshit-server API | Mac/Docker host: `http://localhost:5600/api/v1`; Pinokio: `http://127.0.0.1:5651/api/v1`; source dev: `http://localhost:5610/api/v1` | `http://batshit-server:5600/api/v1` | Used by helper tooling. |
 | n8n | `http://localhost:5678` | `http://n8n:5678` | `http://n8n:5678` only works inside the optional Docker n8n profile network. |
-| Redis | Mac app: `localhost:5639`; source-checkout repair: `localhost:6379` | `redis://redis:6379/0` | Docker Redis is internal-only by default. |
+| Redis | Mac app: `localhost:5639`; Pinokio: `127.0.0.1:5659`; source-checkout repair: `localhost:6379` | `redis://redis:6379/0` | Docker Redis is internal-only by default. |
 | Artifact Complete callback | Mac app: `http://127.0.0.1:5620/api/artifacts/complete`; source dev: `http://127.0.0.1:5621/api/artifacts/complete` | `http://app:3000/api/artifacts/complete` | Server-to-app callback, not a page users open. |
 | Mac app streamable MCP helper | `http://localhost:5601/mcp` | not public Docker core | Managed by Runtime Doctor for the Mac app path. |
 
@@ -21,6 +21,7 @@ Use this table when a URL works in one place but fails somewhere else.
 | Caller | Use this URL shape | Example |
 | --- | --- | --- |
 | Browser on the user's computer using Mac app Batshit | Mac app-owned IPv4 loopback port | `http://127.0.0.1:5620` |
+| Browser on the user’s computer using Pinokio Batshit | Pinokio’s local app address | `http://127.0.0.1:5650` |
 | Browser on the user's computer using Docker Batshit | Host-published localhost port | `http://localhost:5620` |
 | Browser on the user's computer using source-checkout dev Batshit | Alternate source dev localhost port | `http://localhost:5621` |
 | Batshit app container calling batshit-server | Docker Compose service name | `http://batshit-server:5600` |
@@ -33,16 +34,20 @@ Use this table when a URL works in one place but fails somewhere else.
 
 If a URL works in the browser but fails from a Batshit agent, it is usually a caller mismatch. `localhost` inside a container means that container, not the user's computer.
 
+Windows Pinokio’s server requests originate inside WSL2. A Windows-host speech/model service must already be reachable from that environment; Windows `localhost` is not automatically the guest’s host address. Batshit does not change WSL networking or retarget saved connections. See [the Pinokio guide](../installation/install-pinokio.md#use-a-voice-engine-you-already-run-in-pinokio).
+
 ## Core health checks
 
 | Service | Health URL |
 | --- | --- |
 | Batshit app from Mac app browser companion | `http://127.0.0.1:5620/api/health` |
+| Batshit app from Pinokio browser host | `http://127.0.0.1:5650/api/health` |
 | Batshit app from Docker browser host | `http://localhost:5620/api/health` |
 | Batshit app from source-checkout dev browser host | `http://localhost:5621/api/health` |
 | Batshit app from Docker network | `http://app:3000/api/health` |
 | batshit-server from Mac/Docker browser host | `http://localhost:5600/health` |
 | batshit-server from source-checkout dev host | `http://localhost:5610/health` |
+| batshit-server from Pinokio browser host | `http://127.0.0.1:5651/health` |
 | batshit-server from Docker network | `http://batshit-server:5600/health` |
 | n8n from browser/host | `http://localhost:5678/healthz` |
 | n8n from Docker network | `http://n8n:5678/healthz` |
@@ -144,7 +149,7 @@ If the optional Docker n8n profile must run beside another n8n on the same machi
 
 ## n8n callback rules
 
-n8n Workflow Subagent callbacks and tool calls must use a Batshit URL reachable from the n8n process. Current official Batshit Subagent Tools calls authenticate with Batshit's short-lived `x-batshit-native-tool-token` payload header, not a static `BATSHIT_TOKEN` credential.
+A workflow that calls Batshit, such as the official wake-up template, must use a Batshit URL reachable from the n8n process. A wake-up webhook authenticates with its own token, not `BATSHIT_TOKEN`.
 
 | n8n process | Callback base |
 | --- | --- |

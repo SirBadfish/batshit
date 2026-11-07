@@ -1,4 +1,5 @@
-import { describe, it, expect, vi } from 'vitest'
+import { afterEach, describe, it, expect, vi } from 'vitest'
+import { setImmediate as nextTurn } from 'node:timers/promises'
 
 // Ensure we use the real RedisService, even if other suites mocked the module earlier
 vi.mock('$lib/server/redis', async () => {
@@ -8,7 +9,11 @@ vi.mock('$lib/server/redis', async () => {
 
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { ArtifactsService, isRedisJsonMissingPathError } from '$lib/server/artifacts/artifactsService'
-import { RedisService } from '$lib/server/redis'
+import { RedisService, redis } from '$lib/server/redis'
+import { withSettingsRecordReplacement, withSettingsRestoreFence } from '$lib/server/services/appActions/settings/lifecycle'
+import { admitArtifactGrants, prepareArtifactGrants } from '$lib/server/artifacts/artifactGrantLifecycle'
+import { withArtifactWriteLock } from '$lib/server/artifacts/artifactWriteLock'
+import { pinokioMachineService, pinokioMachinesKey, restoredPinokioMachineRegistry } from '$lib/server/services/pinokioMachineService'
 import { DEFAULT_ARTIFACT_SCAFFOLD_CONTENT } from '$lib/artifacts/structureEnforcement'
 import {
   finishArtifactRunLog,
@@ -44,8 +49,15 @@ const COMPLIANT_ARTIFACT_CONTENT = `<!DOCTYPE html>
 // (VITEST_USE_REAL_REDIS=true) and reports as skipped in the default mocked lane.
 const REAL_REDIS_LANE = process.env.VITEST_USE_REAL_REDIS === 'true'
 
+async function seedOwnedGrantTargets(userId: string, ids: string[]) {
+  for (const id of ids) {
+    await redis.json.set(`agent:${id}`, '$', { id, user_id: userId, displayName: id })
+    await redis.sAdd(`user:${userId}:agents`, id)
+  }
+}
+
 describe.runIf(REAL_REDIS_LANE)('ArtifactsService legacy cleanup', () => {
-  useRedisTestServer()
+  const admission = useRedisTestServer()
   const service = new ArtifactsService()
 
   it('blocks creating raw HTML artifacts while structure enforcement is on', async () => {
@@ -119,6 +131,16 @@ describe.runIf(REAL_REDIS_LANE)('ArtifactsService legacy cleanup', () => {
     // A Pinokio app has a Batshit runtime, so agents may use it (unlike a plain ComfyUI panel).
     expect(draft.agent_use_enabled).toBe(true)
 
+    // The preparatory revision-pair metadata was never admitted as remote user data.
+    // Both create and merged updates refuse it rather than drop its machine id.
+    const remoteBinding = { pinokio_machine_id: 'd86fbc94-7364-4bbc-bb21-f21627736492', pinokio_machine_revision: 1 }
+    await expect(service.create(userId, {
+      name: 'Remote not admitted', content: COMPLIANT_ARTIFACT_CONTENT, brain_type: 'pinokio_app',
+      metadata: { ...metadata, ...remoteBinding }, mode: 'edit'
+    })).rejects.toMatchObject({ status: 400, code: 'ARTIFACT_PINOKIO_INVALID' })
+    await expect(service.update(draft.id, userId, { metadata: remoteBinding } as any)).rejects.toMatchObject({ status: 400, code: 'ARTIFACT_PINOKIO_INVALID' })
+    expect((await service.getAccessible(draft.id, userId))?.metadata).not.toHaveProperty('pinokio_machine_id')
+
     await expect(service.update(draft.id, userId, { mode: 'published', zone: 'panel' } as any)).rejects.toMatchObject({
       code: 'ARTIFACT_PINOKIO_INVALID'
     })
@@ -142,6 +164,24 @@ describe.runIf(REAL_REDIS_LANE)('ArtifactsService legacy cleanup', () => {
       metadata: { runtime_manager: null, source_type: 'built_in' }
     } as any)
     expect(leftPinokio.brain_type).toBe('built_in')
+  })
+
+  it('saves only an owned confirmed stable remote binding and never changes it on address edits', async () => {
+    const userId = 'user_pinokio_remote_artifact'
+    const machine = await pinokioMachineService.create(userId, { label: 'Studio PC', controlHost: '192.168.1.90', controlPort: 42000 })
+    const metadata = { source_type: 'custom', runtime_manager: 'pinokio', pinokio_app_id: 'image.git', pinokio_machine_id: machine.id, fabric_fields: [{ fabricId: 'prompt', type: 'text', label: 'Prompt' }] }
+    const input = { name: 'Remote app', content: COMPLIANT_ARTIFACT_CONTENT, brain_type: 'pinokio_app' as const, metadata, mode: 'edit' as const }
+    const saved = await service.create(userId, input)
+    expect(saved.metadata).toMatchObject({ pinokio_machine_id: machine.id })
+    expect(saved.metadata).not.toHaveProperty('pinokio_machine_revision')
+    await pinokioMachineService.update(userId, machine.id, { expectedVersion: 1, controlHost: '192.168.1.91' })
+    const renamed = await service.update(saved.id, userId, { name: 'Renamed remote app' })
+    expect(renamed.metadata).toEqual(saved.metadata)
+    await expect(service.create('different_user', input)).rejects.toMatchObject({ code: 'pinokio_machine_missing' })
+    const current = await redis.json.get(pinokioMachinesKey(userId))
+    await redis.json.set(pinokioMachinesKey(userId), '$', restoredPinokioMachineRegistry(current))
+    await expect(service.update(saved.id, userId, { name: 'Blocked restored app' })).rejects.toMatchObject({ code: 'pinokio_machine_confirmation_required' })
+    expect((await service.getAccessible(saved.id, userId))?.metadata).toEqual(saved.metadata)
   })
 
   it('allows scaffold draft creation before the user disables enforcement or adds real structure', async () => {
@@ -501,6 +541,7 @@ describe.runIf(REAL_REDIS_LANE)('ArtifactsService legacy cleanup', () => {
   // A legacy multi-path JSON.GET and the whole-record fallback both return values as stored.
   it('lists one-element arrays as arrays on the projection and on the whole-record fallback', async () => {
     const userId = 'user_one_element_arrays'
+    await seedOwnedGrantTargets(userId, ['agent_only'])
     const created = await service.create(userId, {
       name: 'One Element Arrays Artifact',
       content: '<div>test</div>',
@@ -629,6 +670,7 @@ describe.runIf(REAL_REDIS_LANE)('ArtifactsService legacy cleanup', () => {
 
   it('clears agent allowlist on explicit null updates', async () => {
     const userId = 'user_allowlist_clear'
+    await seedOwnedGrantTargets(userId, ['agent_old'])
     const created = await service.create(userId, {
       name: 'Allowlist Clear Artifact',
       content: '<div>test</div>',
@@ -789,6 +831,7 @@ describe.runIf(REAL_REDIS_LANE)('ArtifactsService legacy cleanup', () => {
 
   it('preserves explicit top-level allowlist during metadata-only updates', async () => {
     const userId = 'user_allowlist_preserve'
+    await seedOwnedGrantTargets(userId, ['agent_a', 'agent_stale'])
     const created = await service.create(userId, {
       name: 'Allowlist Preserve Artifact',
       content: '<div>test</div>',
@@ -815,6 +858,7 @@ describe.runIf(REAL_REDIS_LANE)('ArtifactsService legacy cleanup', () => {
     const userId = 'user_artifact_access_guard'
     const allowedAgentId = 'agent_allowed'
     const otherAgentId = 'agent_other'
+    await seedOwnedGrantTargets(userId, [allowedAgentId])
     const created = await service.create(userId, {
       name: 'Access Guard Probe',
       content: '<div>Original</div>',
@@ -891,6 +935,7 @@ describe.runIf(REAL_REDIS_LANE)('ArtifactsService legacy cleanup', () => {
 
   it('blocks publishing agent-usable artifacts without fabric_fields or run_only', async () => {
     const userId = 'user_runtime_contract'
+    await seedOwnedGrantTargets(userId, ['agent_a'])
     const created = await service.create(userId, {
       name: 'Contract Artifact',
       content: '<div>test</div>',
@@ -915,6 +960,7 @@ describe.runIf(REAL_REDIS_LANE)('ArtifactsService legacy cleanup', () => {
 
   it('allows publishing run-only artifacts without fabric_fields', async () => {
     const userId = 'user_runtime_contract_run_only'
+    await seedOwnedGrantTargets(userId, ['agent_a'])
     const created = await service.create(userId, {
       name: 'Run Only Artifact',
       content: '<div>test</div>',
@@ -1025,6 +1071,7 @@ describe.runIf(REAL_REDIS_LANE)('ArtifactsService legacy cleanup', () => {
 
   it('revalidates published artifacts on content-only updates', async () => {
     const userId = 'user_runtime_contract_revalidate'
+    await seedOwnedGrantTargets(userId, ['agent_a'])
     const created = await service.create(userId, {
       name: 'Compliant Published Artifact',
       content: COMPLIANT_ARTIFACT_CONTENT,
@@ -1189,6 +1236,29 @@ PATCH`
     })
   })
 
+  // BL-1915 made the native Bash patch read an Add File section without `+` as the file as
+  // written; the artifact patch keeps the strict grammar and its exact refusals.
+  it.each([
+    ['no + prefixes', '*** Add File: artifact.html\n<div>Hi</div>', '<div>Hi</div>'],
+    ['a blank line between + lines', '*** Add File: artifact.html\n+<div>Hi</div>\n\n+<p>x</p>', '']
+  ])('keeps refusing an Add File section with %s, with the same words (BL-1915)', async (_label, section, badLine) => {
+    const userId = 'user_patch_strict_add_file'
+    const created = await service.create(userId, {
+      name: 'Strict Add File Artifact',
+      content: '<div>Hello</div>\n',
+      metadata: { enforce_batshit_artifact_structure: false }
+    })
+
+    await expect(
+      service.applyPatch(created.id, userId, `*** Begin Patch\n${section}\n*** End Patch`)
+    ).rejects.toMatchObject({
+      status: 400,
+      code: 'INVALID_ARTIFACT_PATCH',
+      message: `Invalid line in "*** Add File" section: "${badLine}".`
+    })
+    expect((await service.getOwned(created.id, userId)).content).toBe('<div>Hello</div>\n')
+  })
+
   describe('writes to one artifact never drop each other (BL-546, BL-547)', () => {
     const THREE_LINE_CONTENT = '<div id="top">Top</div>\n<p>middle</p>\n<div id="bottom">Bottom</div>\n'
     const patchLine = (from: string, to: string) => `*** Begin Patch
@@ -1287,29 +1357,19 @@ PATCH`
       let injected = false
       // A writer outside this process (no in-process lock can see it) lands right after the
       // update's read: it changes the description and stamps its own updated_at.
-      // Empty proxy targets: the real client's `json` is a read-only, non-configurable property,
-      // so a proxy over the client itself may not hand back a different object for it.
+      // Intercept the physical atomic snapshot reply (the read used to be json.get).
       const bind = (target: any, value: unknown) => (typeof value === 'function' ? value.bind(target) : value)
-      const realJson = realClient.json
-      const jsonProxy = new Proxy({}, {
-        get(_target, prop) {
-          if (prop === 'get') {
-            return async (key: string, options?: unknown) => {
-              const value = await realJson.get(key, options)
-              if (!injected && key === `artifact:${created.id}` && options === undefined) {
-                injected = true
-                await realJson.set(key, '$.description', 'written by another process')
-                await realJson.set(key, '$.updated_at', '2099-01-01T00:00:00.000Z')
-              }
-              return value
-            }
-          }
-          return bind(realJson, Reflect.get(realJson, prop))
-        }
-      })
       const clientProxy = new Proxy({}, {
         get(_target, prop) {
-          if (prop === 'json') return jsonProxy
+          if (prop === 'eval') return async (script: string, options: { keys: string[]; arguments: string[] }) => {
+            const value = await realClient.eval(script, options)
+            if (!injected && options.keys[0] === `artifact:${created.id}` && Array.isArray(value) && value[0] === 'OK') {
+              injected = true
+              await realClient.json.set(`artifact:${created.id}`, '$.description', 'written by another process')
+              await realClient.json.set(`artifact:${created.id}`, '$.updated_at', '2099-01-01T00:00:00.000Z')
+            }
+            return value
+          }
           return bind(realClient, Reflect.get(realClient, prop))
         }
       })
@@ -1702,6 +1762,7 @@ PATCH`
 
   describe('the per-agent list survives other writers (BL-815, BL-544)', () => {
     async function createSelected(userId: string, extra: Record<string, unknown> = {}) {
+      await seedOwnedGrantTargets(userId, ['agent_nova', 'agent_orla', 'agent_pax'])
       return await service.create(userId, {
         name: 'Access Probe',
         content: '<div>ssacc access probe</div>',
@@ -1826,6 +1887,7 @@ PATCH`
     }
 
     async function makeRecord(userId: string, kind: Kind): Promise<string> {
+      await seedOwnedGrantTargets(userId, ['agent_nova', 'agent_orla'])
       const created = await service.create(userId, {
         name: 'Scope Probe',
         content: '<div>bl886 scope probe</div>',
@@ -1955,14 +2017,14 @@ PATCH`
       })
     })
 
-    it('a save of a legacy record with no list writes the list back as [] when Agent Use goes off (BL-815, not part of this fix)', async () => {
+    it('an unnamed save keeps a legacy list absent when Agent Use goes off (BL-815/BL-981c/BL-1614)', async () => {
       const userId = 'user_bl886_list_shape'
       const id = await makeRecord(userId, 'legacy')
       const client = await rawClient()
       expect('agent_allowlist' in (await client.json.get(`artifact:${id}`))).toBe(false)
 
       await service.update(id, userId, { agent_use_enabled: false } as any)
-      expect((await client.json.get(`artifact:${id}`)).agent_allowlist).toEqual([])
+      expect(Object.hasOwn(await client.json.get(`artifact:${id}`), 'agent_allowlist')).toBe(false)
     })
 
     it.each(ORDERS)('a record saved for all agents keeps the scope all through every save: %s', async (order) => {
@@ -2194,5 +2256,332 @@ PATCH`
       // With the id, it compares exactly as the save does: the kept field is only an advisory.
       expect(result.advisories.join('\n')).not.toContain('No artifactId was given')
     })
+  })
+
+  it('keeps exact saved Artifact references and refuses unstamped access changes without a second-read adoption (BL1614/BL821)', async () => {
+    admission.requireAdmission()
+    const userId = 'artifact_access_basis_fixture'
+    await seedOwnedGrantTargets(userId, ['A-B', 'C-D'])
+    const created = await service.create(userId, { name: 'Exact access basis probe', content: '<div>Owned fixture</div>',
+      agent_use_enabled: true, agent_access_scope: 'selected', agent_allowlist: ['A-B'], metadata: { enforce_batshit_artifact_structure: false } })
+    const key = `artifact:${created.id}`
+    const client = await redis.execute(value => value)
+    const rawList = '[" A-B ","A-B","odd.id",9007199254740993,[],{"keep":[]}]'
+    const raw = () => client.sendCommand(['JSON.GET', key, '$.agent_allowlist'])
+    const quiet = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      await client.sendCommand(['JSON.SET', key, '$.agent_allowlist', rawList])
+      const before = await raw()
+      const returned = await service.update(created.id, userId, { description: 'Unrelated metadata' })
+      expect(() => structuredClone(returned)).not.toThrow()
+      expect(await raw()).toBe(before)
+      const removed = await service.setAgentAccess(created.id, userId, 'odd.id', false)
+      expect(() => structuredClone(removed)).not.toThrow()
+      expect(await raw()).toBe('[' + rawList.replace(',"odd.id"', '') + ']')
+      await expect(service.setAgentAccess(created.id, userId, ' A-B ', true)).rejects.toMatchObject({ status: 400, code: 'ARTIFACT_AGENT_ALLOWLIST_INVALID' })
+
+      // An unnamed save keeps absence and the raw metadata fallback; a named toggle
+      // can materialize the same exact references without trimming or dropping bystanders.
+      await client.sendCommand(['JSON.DEL', key, '$.agent_allowlist'])
+      await client.sendCommand(['JSON.SET', key, '$.metadata.assignedAgentIds', rawList])
+      const fallback = await client.sendCommand(['JSON.GET', key, '$.metadata.assignedAgentIds'])
+      await service.update(created.id, userId, { description: 'Fallback metadata stays' })
+      expect(await raw()).toBe('[]')
+      expect(await client.sendCommand(['JSON.GET', key, '$.metadata.assignedAgentIds'])).toBe(fallback)
+      await service.setAgentAccess(created.id, userId, 'C-D', true)
+      expect(await raw()).toBe('[' + rawList.slice(0, -1) + ',"C-D"]]')
+
+      // Actual unstamped path scrub after the write snapshot: the metadata update
+      // must refuse instead of putting the removed grant back.
+      const owner = service as any
+      const originalRead = owner.readWriteSnapshot.bind(owner)
+      const readHook = vi.spyOn(owner, 'readWriteSnapshot').mockImplementationOnce(async (...args: unknown[]) => {
+        const held = await originalRead(...args)
+        await client.sendCommand(['JSON.SET', key, '$.agent_allowlist', '["A-B"]'])
+        return held
+      })
+      await expect(service.update(created.id, userId, { name: 'Stale metadata must not land' })).rejects.toMatchObject({ status: 409, code: 'ARTIFACT_WRITE_CONFLICT' })
+      expect(readHook).toHaveBeenCalledTimes(1); readHook.mockRestore()
+      expect(await raw()).toBe('[["A-B"]]')
+      expect((await service.getOwned(created.id, userId)).name).toBe('Exact access basis probe')
+
+      // Outer toggle snapshot -> concurrent raw scrub -> inner writer. It must
+      // retain that original basis, not adopt a second read and restore stale input.
+      await client.sendCommand(['JSON.SET', key, '$.agent_allowlist', '["A-B","odd.id"]'])
+      const readSpy = vi.spyOn(owner, 'readWriteSnapshot')
+      const originalUpdate = owner.updateUnderLock.bind(owner)
+      const updateHook = vi.spyOn(owner, 'updateUnderLock').mockImplementationOnce(async (...args: unknown[]) => {
+        await client.sendCommand(['JSON.SET', key, '$.agent_allowlist', '["odd.id"]'])
+        return originalUpdate(...args)
+      })
+      await expect(service.setAgentAccess(created.id, userId, 'C-D', true)).rejects.toMatchObject({ status: 409, code: 'ARTIFACT_WRITE_CONFLICT' })
+      expect(readSpy).toHaveBeenCalledTimes(1)
+      expect(updateHook).toHaveBeenCalledTimes(1)
+      readSpy.mockRestore(); updateHook.mockRestore()
+      expect(await raw()).toBe('[["odd.id"]]')
+    } finally {
+      vi.restoreAllMocks(); quiet.mockRestore(); admission.requireAdmission()
+      await service.delete(created.id, userId)
+      expect(await client.sMembers(`user:${userId}:artifacts`)).toEqual([])
+      await redis.del(`user:${userId}:artifacts`)
+      await redis.disconnect()
+    }
+  })
+
+})
+
+// Existing service owners with held client boundaries, no network or Lua twin.
+// Physical storage/CAS/index behavior remains the actual Redis lane below.
+describe('Artifact grant lifecycle admission and service custody (BL1635)', () => {
+  const userId = 'grant_lifecycle_default'
+  let serial = 0
+  afterEach(() => vi.restoreAllMocks())
+  function fixture() {
+    const target = `grant_default_${++serial}`
+    const artifactId = `artifact_grant_default_${serial}`
+    const owners = new Map<string, unknown>([[`agent:${target}`, { id: target, user_id: userId }]])
+    const client = {
+      json: { get: vi.fn(async (key: string) => owners.get(key) ?? null), set: vi.fn(async (_key: string, _path: string, _value: unknown) => 'OK') },
+      sAdd: vi.fn(async () => 1), eval: vi.fn(async (_script: string, _options: { keys: string[]; arguments: string[] }) => 'OK')
+    }
+    const existing = { id: artifactId, user_id: userId, name: 'Grant fixture', slug: 'grant_fixture', content: '<div>fixture</div>',
+      mode: 'edit', version: 1, updated_at: 'old', brain_type: 'none', ai_enabled: false,
+      agent_allowlist: [] as unknown[], metadata: { enforce_batshit_artifact_structure: false } }
+    const service = new ArtifactsService()
+    vi.spyOn(service as any, 'client').mockResolvedValue(client)
+    vi.spyOn(service as any, 'generateSlug').mockResolvedValue('grant_fixture')
+    vi.spyOn(service as any, 'readWriteSnapshot').mockImplementation(async () => ({ record: existing,
+      access: [JSON.stringify([existing.agent_allowlist]), '[]', '[]', '[]', '[]'] }))
+    const create = () => service.create(userId, { name: 'Grant fixture', content: '<div>fixture</div>',
+      brain_type: 'none', agent_allowlist: [target], metadata: { enforce_batshit_artifact_structure: false } })
+    return { target, artifactId, owners, client, existing, service, create }
+  }
+  function gate() {
+    let open!: () => void
+    const promise = new Promise<void>(resolve => { open = resolve })
+    return { promise, open }
+  }
+
+  it.each(['agent_allowlist', 'agentAllowlist', 'assigned_agent_ids', 'assignedAgentIds'])('admits shadowed metadata %s only for an exact owned subject', async alias => {
+    const f = fixture()
+    const input = { agent_allowlist: [], metadata: { [alias]: [f.target] } }
+    const preparation = prepareArtifactGrants(input)
+    const lease = await admitArtifactGrants(preparation, userId, {}, input, f.client)
+    expect(lease).toBeDefined(); lease!.settle()
+    f.owners.set(`agent:${f.target}`, { id: 'wrong-id', user_id: userId })
+    await expect(admitArtifactGrants(prepareArtifactGrants(input), userId, {}, input, f.client)).rejects.toMatchObject({ code: 'ARTIFACT_GRANT_SUBJECT_INVALID', status: 404 })
+  })
+
+  it('defers a tentative refusal for unchanged malformed/large legacy arrays without reading subjects', async () => {
+    const f = fixture()
+    const list = [...Array.from({ length: 300 }, (_, i) => `legacy_${i}`), ' odd.id ', 7, [], { keep: [] }]
+    const input = { agent_allowlist: list }
+    await withSettingsRecordReplacement('agent:legacy_0', async () => {
+      const preparation = prepareArtifactGrants(input)
+      expect(await admitArtifactGrants(preparation, userId, input, input, f.client)).toBeUndefined()
+    })
+    expect(f.client.json.get).not.toHaveBeenCalled()
+    expect(list).toHaveLength(304)
+  })
+
+  it('counts the complete candidate set and refuses an added uncaptured grant without a write', async () => {
+    const f = fixture()
+    const ids = Array.from({ length: 257 }, (_, i) => `candidate_${i}`)
+    await expect(admitArtifactGrants(prepareArtifactGrants({ agent_allowlist: ids }), userId, {}, { agent_allowlist: ids }, f.client))
+      .rejects.toMatchObject({ code: 'ARTIFACT_GRANT_BUDGET_EXCEEDED', outcome: 'not_written' })
+    await expect(admitArtifactGrants(prepareArtifactGrants({}), userId, {}, { agent_allowlist: [f.target] }, f.client))
+      .rejects.toMatchObject({ code: 'ARTIFACT_GRANT_BUDGET_EXCEEDED' })
+    expect(f.client.json.get).not.toHaveBeenCalled()
+  })
+
+  it.each(['agent', 'subagent'])('captures the original %s namespace before waiting for the Artifact lock', async namespace => {
+    const f = fixture(); const hold = gate(); const entered = gate()
+    const locking = withArtifactWriteLock(f.artifactId, async () => { entered.open(); await hold.promise })
+    await entered.promise
+    const saving = f.service.setAgentAccess(f.artifactId, userId, f.target, true).catch(error => error)
+    await withSettingsRecordReplacement(`${namespace}:${f.target}`, async () => { f.owners.set(`${namespace}:${f.target}`, { id: f.target, user_id: userId }) })
+    hold.open(); await locking
+    expect(await saving).toMatchObject({ code: 'ARTIFACT_GRANT_STALE', outcome: 'not_written' })
+    expect(f.client.eval).not.toHaveBeenCalled()
+  })
+
+  it('refuses an original create preparation after restore while client acquisition is held', async () => {
+    const f = fixture(); const hold = gate(); const entered = gate()
+    vi.mocked((f.service as any).client).mockImplementation(async () => { entered.open(); await hold.promise; return f.client })
+    const saving = f.create().catch(error => error)
+    await entered.promise
+    await withSettingsRestoreFence(async () => {})
+    hold.open()
+    expect(await saving).toMatchObject({ code: 'ARTIFACT_GRANT_STALE' })
+    expect(f.client.json.set).not.toHaveBeenCalled()
+  })
+
+  it('keeps a confirmed create leased through held index publication, including replacement marking', async () => {
+    const f = fixture(); const hold = gate(); const entered = gate()
+    f.client.sAdd.mockImplementation(async () => { entered.open(); await hold.promise; return 1 })
+    const saving = f.create()
+    await entered.promise
+    let replaced = false
+    const replacing = withSettingsRecordReplacement(`agent:${f.target}`, async () => { replaced = true })
+    await nextTurn()
+    expect(replaced).toBe(false)
+    expect(f.client.json.set).toHaveBeenCalledOnce()
+    hold.open(); await saving; await replacing
+    expect(replaced).toBe(true)
+    expect(f.client.sAdd).toHaveBeenCalledOnce()
+  })
+
+  it('settles a recognized no-effect CAS conflict before a subsequent replacement', async () => {
+    const f = fixture(); f.client.eval.mockResolvedValueOnce('CHANGED')
+    await expect(f.service.setAgentAccess(f.artifactId, userId, f.target, true)).rejects.toMatchObject({ code: 'ARTIFACT_WRITE_CONFLICT' })
+    await expect(withSettingsRecordReplacement(`agent:${f.target}`, async () => 'settled')).resolves.toBe('settled')
+  })
+
+  it('preserves a large malformed legacy list on an actual unrelated service update without subject admission', async () => {
+    const f = fixture()
+    const list = [...Array.from({ length: 300 }, (_, i) => `legacy_${i}`), ' odd.id ', 7, [], { keep: [] }]
+    f.existing.agent_allowlist = list
+    const result = await f.service.update(f.artifactId, userId, { description: 'Only this changes' })
+    expect(result.agent_allowlist).toEqual(list)
+    expect(f.client.json.get).not.toHaveBeenCalled()
+    expect(f.client.eval).toHaveBeenCalledOnce()
+    expect(JSON.parse(f.client.eval.mock.calls[0][1].arguments[2]).agent_allowlist).toEqual(list)
+  })
+
+  it('permits the one-ID toggle against a large unchanged list using only that new candidate', async () => {
+    const f = fixture()
+    f.existing.agent_allowlist = Array.from({ length: 300 }, (_, i) => `legacy_${i}`)
+    const result = await f.service.setAgentAccess(f.artifactId, userId, f.target, true)
+    expect(result.agent_allowlist).toEqual([...f.existing.agent_allowlist, f.target])
+    expect(f.client.json.get).toHaveBeenCalledTimes(2)
+  })
+
+  it('refuses explicit enable of an already-referenced missing target, but still permits removing it', async () => {
+    const f = fixture(); f.existing.agent_allowlist = [f.target]; f.owners.clear()
+    await expect(f.service.setAgentAccess(f.artifactId, userId, f.target, true)).rejects.toMatchObject({ code: 'ARTIFACT_GRANT_SUBJECT_INVALID', status: 404 })
+    expect(f.client.eval).not.toHaveBeenCalled()
+    expect((await f.service.setAgentAccess(f.artifactId, userId, f.target, false)).agent_allowlist).toEqual([])
+    expect(f.client.json.get).toHaveBeenCalledTimes(2)
+  })
+
+  // Final cases retain only their distinct exact subject's unresolved issued custody.
+  it.each(['record', 'index', 'unrecognized_record', 'unrecognized_index', 'invalid_index_two'] as const)('keeps %s response loss precise and never replays', async stage => {
+    const f = fixture()
+    if (stage === 'record') f.client.json.set.mockRejectedValueOnce(new Error('raw internal record failure'))
+    else if (stage === 'index') f.client.sAdd.mockRejectedValueOnce(new Error('raw internal index failure'))
+    else if (stage === 'unrecognized_record') f.client.json.set.mockResolvedValueOnce(undefined as any)
+    else if (stage === 'invalid_index_two') f.client.sAdd.mockResolvedValueOnce(2)
+    else f.client.sAdd.mockResolvedValueOnce(undefined as any)
+    const error = await f.create().catch(error => error)
+    const recordUnknown = stage === 'record' || stage === 'unrecognized_record'
+    expect(error).toMatchObject({ code: 'ARTIFACT_GRANT_UNCONFIRMED', outcome: 'unknown',
+      record: recordUnknown ? 'unknown' : 'saved', indexPublication: recordUnknown ? 'not_started' : 'unknown' })
+    expect(error.message).not.toContain('raw internal')
+    expect(f.client.json.set).toHaveBeenCalledOnce()
+    expect(f.client.sAdd).toHaveBeenCalledTimes(recordUnknown ? 0 : 1)
+    await expect(withSettingsRecordReplacement(`agent:${f.target}`, async () => 'must-not-run')).rejects.toThrow('unknown outcome')
+  })
+
+  it('retains an issued update with a lost CAS answer as unknown without replay', async () => {
+    const f = fixture(); f.client.eval.mockRejectedValueOnce(new Error('raw CAS transport error'))
+    await expect(f.service.setAgentAccess(f.artifactId, userId, f.target, true)).rejects.toMatchObject({
+      code: 'ARTIFACT_GRANT_UNCONFIRMED', record: 'unknown', indexPublication: 'unchanged' })
+    expect(f.client.eval).toHaveBeenCalledOnce()
+    await expect(withSettingsRecordReplacement(`agent:${f.target}`, async () => 'must-not-run')).rejects.toThrow('unknown outcome')
+  })
+})
+
+// Run actual ambiguous-issue cases last: their exact leases intentionally remain
+// held for this test process; there is no test-only lifecycle reset.
+describe.runIf(REAL_REDIS_LANE)('actual Artifact grant issue/publication owners (BL1635)', () => {
+  useRedisTestServer()
+  const userId = 'grant_actual_fixture'
+  const service = new ArtifactsService()
+  let sequence = 0
+  afterEach(() => vi.restoreAllMocks())
+  async function seed() {
+    const target = `grant_actual_${++sequence}`
+    await redis.createAgent({ id: target, user_id: userId, displayName: target, agentType: 'API' })
+    return target
+  }
+  const input = (target?: string) => ({ name: 'Actual grant fixture', content: '<div>fixture</div>', brain_type: 'none' as const,
+    agent_allowlist: target ? [target] : [], metadata: { enforce_batshit_artifact_structure: false } })
+  function gate() {
+    let open!: () => void
+    const promise = new Promise<void>(resolve => { open = resolve })
+    return { promise, open }
+  }
+
+  it('keeps a known JSON save under custody through held index publication so actual deletion sees and scrubs it', async () => {
+    const target = await seed()
+    const client = await (service as any).client()
+    const add = client.sAdd.bind(client)
+    const hold = gate(); const entered = gate()
+    vi.spyOn(client, 'sAdd').mockImplementation(async (...args: unknown[]) => {
+      if (args[0] === `user:${userId}:artifacts`) { entered.open(); await hold.promise }
+      return add(...args)
+    })
+    const creating = service.create(userId, input(target))
+    await entered.promise
+    let replacementStarted = false
+    let observedIndex: string[] = []
+    const replacing = withSettingsRecordReplacement(`agent:${target}`, async () => {
+      replacementStarted = true
+      observedIndex = await client.sMembers(`user:${userId}:artifacts`)
+    })
+    await nextTurn()
+    expect(replacementStarted).toBe(false)
+    hold.open()
+    const artifact = await creating
+    await replacing
+    expect(observedIndex).toEqual([artifact.id])
+    await redis.deleteAgent(target)
+    expect(await redis.json.get(`agent:${target}`)).toBeNull()
+    expect(await client.sMembers(`user:${userId}:artifacts`)).toContain(artifact.id)
+    expect(await client.json.get(`artifact:${artifact.id}`)).toMatchObject({ agent_allowlist: [], agent_access_scope: 'selected' })
+  })
+
+  it('refuses an original lock-waiting grant after actual target deletion and same-ID recreation', async () => {
+    const target = await seed()
+    const artifact = await service.create(userId, input())
+    const hold = gate(); const entered = gate()
+    const locking = withArtifactWriteLock(artifact.id, async () => { entered.open(); await hold.promise })
+    await entered.promise
+    const saving = service.setAgentAccess(artifact.id, userId, target, true).catch(error => error)
+    await redis.deleteAgent(target)
+    await redis.createAgent({ id: target, user_id: userId, displayName: 'Replacement', agentType: 'API' })
+    hold.open(); await locking
+    expect(await saving).toMatchObject({ code: 'ARTIFACT_GRANT_STALE', outcome: 'not_written' })
+    expect((await service.getOwned(artifact.id, userId)).agent_allowlist).toEqual([])
+    expect(await redis.json.get(`agent:${target}`)).toMatchObject({ displayName: 'Replacement' })
+  })
+
+  it.each(['record', 'index'] as const)('retains actual saved-but-unanswered %s custody without replay', async stage => {
+    const target = await seed()
+    const client = await (service as any).client()
+    let issued = 0
+    if (stage === 'record') {
+      const set = client.json.set.bind(client.json)
+      vi.spyOn(client.json, 'set').mockImplementation(async (...args: unknown[]) => {
+        const answer = await set(...args)
+        if (String(args[0]).startsWith('artifact:')) { issued++; throw new Error('lost actual record answer') }
+        return answer
+      })
+    } else {
+      const add = client.sAdd.bind(client)
+      vi.spyOn(client, 'sAdd').mockImplementation(async (...args: unknown[]) => {
+        const answer = await add(...args)
+        if (args[0] === `user:${userId}:artifacts`) { issued++; throw new Error('lost actual index answer') }
+        return answer
+      })
+    }
+    const error = await service.create(userId, input(target)).catch(error => error)
+    expect(error).toMatchObject({ code: 'ARTIFACT_GRANT_UNCONFIRMED', outcome: 'unknown',
+      details: { record: stage === 'record' ? 'unknown' : 'saved', indexPublication: stage === 'record' ? 'not_started' : 'unknown' } })
+    expect(issued).toBe(1)
+    expect(await client.json.get(`artifact:${error.details.artifactId}`)).toMatchObject({ agent_allowlist: [target] })
+    expect(await client.sMembers(`user:${userId}:artifacts`)).toEqual(stage === 'record' ? [] : [error.details.artifactId])
+    await expect(redis.deleteAgent(target)).rejects.toThrow('unknown outcome')
+    expect(await redis.json.get(`agent:${target}`)).not.toBeNull()
   })
 })

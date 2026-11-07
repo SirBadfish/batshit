@@ -1,0 +1,107 @@
+{
+  "version": 2,
+  "fetchedAt": "2026-10-23T06:00:17.434Z",
+  "models": [
+    {
+      "id": "mistral/mistral-medium-3.5",
+      "canonicalId": "mistral/mistral-medium-3.5",
+      "provider": "mistral",
+      "upstreamProvider": "vercel",
+      "name": "mistral-medium-3.5",
+      "displayName": "Mistral Medium Latest",
+      "description": "Mistral's frontier-class multimodal model optimized for agentic and coding use cases.",
+      "tags": [
+        "reasoning",
+        "tool-use",
+        "vision",
+        "structured-output"
+      ],
+      "contextWindow": 262144,
+      "purpose": "chat",
+      "pricing": {
+        "input": 1.5,
+        "output": 7.5,
+        "cachedInput": 0.15
+      },
+      "features": {
+        "streaming": true,
+        "tools": true,
+        "vision": true,
+        "reasoning": true,
+        "cacheControl": true,
+        "code": false,
+        "fast": false,
+        "maxTokens": 262144,
+        "longContext": true
+      },
+      "category": "reasoning",
+      "source": "vercel",
+      "transport": "vercel-gateway",
+      "connectionId": "vercel-gateway",
+      "modelType": "language",
+      "aaSlug": "mistral-medium-3-5",
+      "availableConnections": [
+        "vercel-gateway",
+        "direct:mistral"
+      ],
+      "idVariants": {
+        "vercel-gateway": {
+          "developerId": "mistral",
+          "modelId": "mistral-medium-3.5",
+          "effectiveId": "mistral/mistral-medium-3.5",
+          "source": "vercel"
+        },
+        "direct:mistral": {
+          "developerId": "mistral",
+          "modelId": "mistral-medium-3.5",
+          "effectiveId": "mistral-medium-3.5",
+          "source": "direct"
+        }
+      }
+    },
+    {
+      "id": "mistral-medium-3-5",
+      "canonicalId": "mistral/mistral-medium-3-5",
+      "provider": "mistral",
+      "upstreamProvider": "mistral",
+      "name": "mistral-medium-3-5",
+      "displayName": "mistral-medium-3-5",
+      "description": "Official mistral-medium-latest Mistral AI model",
+      "tags": [],
+      "contextWindow": 262144,
+      "purpose": "chat",
+      "pricing": {
+        "input": 1.5,
+        "output": 7.5
+      },
+      "features": {
+        "streaming": true,
+        "tools": false,
+        "vision": false,
+        "reasoning": false,
+        "cacheControl": false,
+        "code": false,
+        "fast": false,
+        "maxTokens": 262144,
+        "longContext": true
+      },
+      "category": "powerful",
+      "source": "direct",
+      "transport": "direct",
+      "connectionId": "direct:mistral",
+      "modelType": "base",
+      "aaSlug": "mistral-medium-3-5",
+      "availableConnections": [
+        "direct:mistral"
+      ],
+      "idVariants": {
+        "direct:mistral": {
+          "developerId": "mistral",
+          "modelId": "mistral-medium-3-5",
+          "effectiveId": "mistral-medium-3-5",
+          "source": "direct"
+        }
+      }
+    }
+  ]
+}

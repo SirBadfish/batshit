@@ -23,7 +23,8 @@ import { buildDelegatedExecutionSummary } from '../delegatedRunAccounting'
 import { buildTokenStat, buildTokenUsage } from '../executionViewerLlmCapture'
 import { summarizeRunningCost } from '$lib/utils/tokenPanel'
 
-describe('returned Codex child observations through frozen-prefix resume', () => {
+// A Codex child observation saved before SA-139 R1 removed the Codex CLI lane still reads back.
+describe('returned Codex child observations saved before the Codex CLI lane retired, through frozen-prefix resume', () => {
   it('retains the child once beside known siblings without changing parent usage or filling child totals', () => {
     const observedUsage = { completeness: 'partial', parts: [{ source: 'codex-app-server-progress', counts: { outputTokens: 0 } }] }
     const child = buildDelegatedExecutionSummary([{ toolCallId: 'prior-child', toolOutput: { kind: 'subagent', status: 'failed', usage: null, observedUsage } }])
@@ -54,6 +55,28 @@ import type { SavedModel } from '$lib/types/savedModels'
  */
 
 useRedisTestServer()
+
+describe('SA-137: what a resume\'s writers do with the paused replay fields', () => {
+  const prior = {
+    whiteboardContextSnapshot: { dcmLines: ['board'] },
+    liveFileReadSnapshot: { schema_version: 1, pauseId: 'pause-1' }
+  }
+
+  it('a failure writer keeps the Whiteboard fragment and clears the spent pause\'s live-file-read replay', () => {
+    const failed = mergeResumedMetadata(prior, { response_failed: true })
+    expect(failed.whiteboardContextSnapshot).toEqual(prior.whiteboardContextSnapshot)
+    expect(failed.liveFileReadSnapshot).toBeNull()
+  })
+
+  it('an absent replay stays absent, and a writer that names either field wins', () => {
+    expect(Object.hasOwn(mergeResumedMetadata({ whiteboardContextSnapshot: null }, { response_failed: true }), 'liveFileReadSnapshot')).toBe(false)
+    const paused = { schema_version: 1, pauseId: 'pause-2' }
+    expect(mergeResumedMetadata(prior, { liveFileReadSnapshot: paused }).liveFileReadSnapshot).toBe(paused)
+    const settled = mergeResumedMetadata(prior, { whiteboardContextSnapshot: null, liveFileReadSnapshot: null })
+    expect(settled.whiteboardContextSnapshot).toBeNull()
+    expect(settled.liveFileReadSnapshot).toBeNull()
+  })
+})
 
 describe('BL-1361: observed portions stay separate through a frozen-prefix resume', () => {
   const known = { inputTokens: 100, outputTokens: 10, totalTokens: 110, cachedInputTokens: 20, cacheCreationInputTokens: 30 }
@@ -300,18 +323,15 @@ describe('resolveFailedTurnContent', () => {
 
 describe('isInPlaceApprovalResume', () => {
   it('is the stream handler\'s rule: approval responses and no user turn', () => {
-    expect(isInPlaceApprovalResume({ approvalResponseCount: 1, content: '', controlResumeContent: null })).toBe(true)
-    expect(isInPlaceApprovalResume({ approvalResponseCount: 1, content: '   ', controlResumeContent: null })).toBe(true)
-    expect(isInPlaceApprovalResume({ approvalResponseCount: 1, content: null, controlResumeContent: null })).toBe(true)
+    expect(isInPlaceApprovalResume({ approvalResponseCount: 1, content: '' })).toBe(true)
+    expect(isInPlaceApprovalResume({ approvalResponseCount: 1, content: '   ' })).toBe(true)
+    expect(isInPlaceApprovalResume({ approvalResponseCount: 1, content: null })).toBe(true)
   })
 
-  it('is not a resume without responses, with a user turn, or for a CLI control resume', () => {
-    expect(isInPlaceApprovalResume({ approvalResponseCount: 0, content: '', controlResumeContent: null })).toBe(false)
-    expect(isInPlaceApprovalResume({ approvalResponseCount: 1, content: 'next question', controlResumeContent: null })).toBe(false)
-    expect(isInPlaceApprovalResume({ approvalResponseCount: 1, content: [{ type: 'text' }], controlResumeContent: null })).toBe(false)
-    expect(
-      isInPlaceApprovalResume({ approvalResponseCount: 1, content: '', controlResumeContent: '[Approval — from the user]' })
-    ).toBe(false)
+  it('is not a resume without responses or with a user turn', () => {
+    expect(isInPlaceApprovalResume({ approvalResponseCount: 0, content: '' })).toBe(false)
+    expect(isInPlaceApprovalResume({ approvalResponseCount: 1, content: 'next question' })).toBe(false)
+    expect(isInPlaceApprovalResume({ approvalResponseCount: 1, content: [{ type: 'text' }] })).toBe(false)
   })
 
   it('reads a user turn the way the stream handler does', () => {
@@ -750,5 +770,14 @@ describe('a resumed message counts both halves (BL-525)', () => {
         expect(cost.state).toBe('exact')
       })
     })
+  })
+})
+
+
+describe('SA-133 frozen Whiteboard snapshot continuation', () => {
+  it('carries a pending snapshot through a failed resume and honors explicit terminal null', () => {
+    const snapshot = { schema_version: 1, dcmLines: ['exact original board'] }
+    expect(mergeResumedMetadata({ whiteboardContextSnapshot: snapshot }, { response_failed: true }).whiteboardContextSnapshot).toEqual(snapshot)
+    expect(mergeResumedMetadata({ whiteboardContextSnapshot: snapshot }, { whiteboardContextSnapshot: null }).whiteboardContextSnapshot).toBeNull()
   })
 })

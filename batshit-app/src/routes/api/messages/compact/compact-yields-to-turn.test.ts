@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { redis } from '$lib/server/redis'
+import { retireSavedCliApprovals } from '$lib/server/services/approvalExpiry'
 import {
   __resetStreamAbortRegistryForTests,
   clearSessionTurn,
@@ -157,6 +158,30 @@ describe('a Compact does not start beside a turn (BL-622, C3)', () => {
     await storeApproval(status)
     expect((await compact()).status).toBe(200)
     expect(calls.summaries).toBe(1)
+  })
+
+  it('waits for actual retired-card settlement, then allows Compact', async () => {
+    await storeApproval('pending', { toolApprovals: { source: 'claude', approvals: [
+      { approvalId: 'old-claude', status: 'pending', source: 'claude' },
+      { approvalId: 'old-control', status: 'pending', source: 'fabric', control: { lane: 'cli' } }
+    ] } })
+    expect((await compact()).body.code).toBe('approval_pending')
+    expect(calls.summaries).toBe(0)
+    expect(await retireSavedCliApprovals({ userId: USER, sessionId: SESSION, messageId: 'approval-card', approvalIds: ['old-control'] }))
+      .toMatchObject({ hasPending: false, retiredApprovalIds: ['old-claude', 'old-control'] })
+    expect((await compact()).status).toBe(200)
+    expect(calls.summaries).toBe(1)
+  })
+
+  it('still blocks Compact if a genuine API approval remains on a partially retired card', async () => {
+    await storeApproval('pending', { toolApprovals: { source: 'claude', approvals: [
+      { approvalId: 'old-claude', status: 'pending', source: 'claude' },
+      { approvalId: 'live-api', status: 'pending', source: 'vercel', control: { lane: 'api' } }
+    ] } })
+    expect(await retireSavedCliApprovals({ userId: USER, sessionId: SESSION, messageId: 'approval-card', approvalIds: ['old-claude'] }))
+      .toMatchObject({ hasPending: true, retiredApprovalIds: ['old-claude'] })
+    expect((await compact()).body.code).toBe('approval_pending')
+    expect(calls.summaries).toBe(0)
   })
 
   it('honors the server\'s recorded answer even if an older card entry still says pending', async () => {

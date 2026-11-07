@@ -15,6 +15,7 @@ export type RuntimeContext = {
   macApp: boolean
   containerized: boolean
   pinokio: boolean
+  windowsWsl: boolean
   localVoiceEngineStopPolicy: LocalVoiceEngineStopPolicy
   runtimeOwner: string | null
   runtimeEnv: string | null
@@ -55,6 +56,7 @@ export function resolveRuntimeContext(
     macApp,
     containerized,
     pinokio,
+    windowsWsl,
     localVoiceEngineStopPolicy: windowsWsl ? 'all-owned' : 'per-engine',
     runtimeOwner,
     runtimeEnv: runtimeEnvName,

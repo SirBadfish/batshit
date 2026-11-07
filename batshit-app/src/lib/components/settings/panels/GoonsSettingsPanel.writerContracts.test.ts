@@ -20,7 +20,8 @@ function panelWriter(name: string, context: Record<string, unknown>) {
   const names = new Set([
     'requireConfirmedUserSettings', 'persistGoonsSettingsPatch',
     'saveKitchenSettings', 'saveClosetSettings', 'saveScenesSettings',
-    'saveMotionsAndPostures', 'persistGlbPreviewGoonSelection', 'confirmLibraryImport',
+    'saveMotionsAndPostures', 'resolveMotionDraftPayload', 'hasMotionMetadataChanges',
+    'persistGlbPreviewGoonSelection', 'confirmLibraryImport',
     'handleSceneSelection', 'handleRoomShellSelection', 'handleRoomTextureSelection', 'handleScenePropSelection'
   ])
   const declarations = file.statements.filter(
@@ -74,7 +75,11 @@ let posts: Array<{ body: Record<string, any> }>
 beforeAll(async () => { route = await loadUserSettingsRoute() }, 60_000)
 beforeEach(async () => {
   resetUserSettings()
-  await redis.updateUserSettings(USER, { displayName: 'Authoritative', goons_settings: structuredClone(SAVED) } as any)
+  // Seed an existing historical legacy closet through the guarded test DB,
+  // rather than asking the product writer to create a new legacy record.
+  await redis.json.set(`user:${USER}:settings`, '$', {
+    id: 'settings', user_id: USER, displayName: 'Authoritative', goons_settings: structuredClone(SAVED)
+  })
   posts = installUserSettingsRoutes({ userId: USER, route }).posts
 })
 afterEach(() => { resetUserSettings(); vi.unstubAllGlobals(); vi.restoreAllMocks() })
@@ -137,15 +142,16 @@ describe('Goons panel writers preserve non-owned server settings (BL-975 D3-D6)'
     expect(apply).toHaveBeenCalledOnce()
   })
 
-  it('Closet patches only globalCloset', async () => {
+  it('patches only global Closet and preserves existing sibling settings', async () => {
     const globalCloset = { items: { new_coat: { id: 'new_coat', name: 'New coat' } } }
     const apply = vi.fn()
-    await panelWriter('saveClosetSettings', context({
+    const owner = context({
       closetSaving: false,
       globalCloset,
       sanitizeGlobalClosetLibrary: (value: unknown) => value,
       applyClosetStateFromSettings: apply
-    }))()
+    })
+    expect(await panelWriter('saveClosetSettings', owner)()).toBe(true)
     expect(posts.map(({ body }) => body)).toEqual([{ goons_settings_patch: { globalCloset } }])
     await assertStored({ globalCloset })
     expect(apply).toHaveBeenCalledOnce()
@@ -214,6 +220,42 @@ describe('Goons panel writers preserve non-owned server settings (BL-975 D3-D6)'
     expect(posts.map(({ body }) => body)).toEqual([{ goons_settings_patch: patch }])
     await assertStored({ kitchen: patch.kitchen })
     expect(apply).toHaveBeenCalledOnce()
+  })
+
+  it('retains an unavailable saved Motion posture through hydration and unrelated edits', async () => {
+    const file = { filename: 'wave.glb', originalName: 'wave.glb', tags: ['old'],
+      motionMeta: { posture: 'missing_custom', playback: 'loop' } }
+    const update = vi.fn(async () => ({ vrma: [file] }))
+    const scope = context({
+      motionsSaving: false, validateMotionPostureDrafts: () => null,
+      normalizeCustomPostureMap: (value: unknown) => value, motionCustomPostureDraftMap: {},
+      postureMapsMatch: () => true, vrmaLibrary: [file], animationLibrary: { vrma: [file] },
+      animationDisplayNameInputs: { 'wave.glb': 'wave' }, animationTagInputs: { 'wave.glb': 'old' },
+      animationPostureInputs: { 'wave.glb': 'missing_custom' }, animationPlaybackInputs: { 'wave.glb': 'loop' },
+      motionStagePostureMap: { sit: { id: 'sit' } },
+      animationEyeContactInputs: {}, resolveMotionDisplayName: () => 'wave',
+      normalizeTagInput: (value: string) => value.split(',').map(tag => tag.trim()).filter(Boolean),
+      updateGoonAnimationLibraryMetadata: update, applyMotionsStateFromSources: vi.fn()
+    }) as any
+    const changed = panelWriter('hasMotionMetadataChanges', scope)
+    const payload = panelWriter('resolveMotionDraftPayload', scope)
+    expect(changed(file)).toBe(false)
+    expect(payload(file)).toMatchObject({ motionMeta: { posture: 'missing_custom', playback: 'loop' } })
+    scope.animationTagInputs['wave.glb'] = 'new'
+    expect(changed(file)).toBe(true)
+    await panelWriter('saveMotionsAndPostures', scope)()
+    expect(update).toHaveBeenCalledWith('wave.glb', expect.objectContaining({
+      tags: ['new'], motionMeta: { posture: 'missing_custom', playback: 'loop' }
+    }))
+    scope.animationPostureInputs['wave.glb'] = ''
+    expect(payload(file)).toMatchObject({ motionMeta: { playback: 'loop' } })
+    expect((payload(file) as any).motionMeta).not.toHaveProperty('posture')
+    await panelWriter('saveMotionsAndPostures', scope)()
+    expect(update).toHaveBeenLastCalledWith('wave.glb', expect.objectContaining({ motionMeta: { playback: 'loop' } }))
+    scope.animationPostureInputs['wave.glb'] = 'sit'
+    expect(payload(file)).toMatchObject({ motionMeta: { posture: 'sit', playback: 'loop' } })
+    await panelWriter('saveMotionsAndPostures', scope)()
+    expect(update).toHaveBeenLastCalledWith('wave.glb', expect.objectContaining({ motionMeta: { posture: 'sit', playback: 'loop' } }))
   })
 
   it('GLB preview patches only the preview body and preserves sibling user settings', async () => {

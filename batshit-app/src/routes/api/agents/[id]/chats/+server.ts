@@ -1,6 +1,7 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
 import { redis } from '$lib/server/redis'
 import { selectAgentChatsForUser } from '$lib/server/services/agentChatDeletion'
+import { SettingsLifecycleRefusal } from '$lib/server/services/appActions/settings/lifecycle'
 
 /**
  * GET /api/agents/[id]/chats — what "Also delete its chats" would delete (2026-09-19). The
@@ -11,14 +12,14 @@ export const GET: RequestHandler = async ({ params, locals }) => {
   if (!locals.user?.id) {
     return json({ error: 'Unauthorized' }, { status: 401 })
   }
-  const agent = await redis.get(`agent:${params.id}`)
-  if (!agent) {
-    return json({ error: 'Agent not found' }, { status: 404 })
-  }
-  if (agent.user_id !== locals.user.id) {
-    return json({ error: 'Unauthorized' }, { status: 403 })
-  }
   try {
+    const agent = await redis.get(`agent:${params.id}`, { throwOnError: true })
+    if (!agent) {
+      return json({ error: 'Agent not found' }, { status: 404 })
+    }
+    if (agent.user_id !== locals.user.id) {
+      return json({ error: 'Unauthorized' }, { status: 403 })
+    }
     const selection = await selectAgentChatsForUser(locals.user.id, params.id!)
     return json({
       deletable: selection.deletable.length,
@@ -30,6 +31,7 @@ export const GET: RequestHandler = async ({ params, locals }) => {
     })
   } catch (error) {
     console.error('[Agents API] Failed to count agent chats:', error)
+    if (error instanceof SettingsLifecycleRefusal) return json({ error: error.message, code: error.code }, { status: error.status })
     return json({ error: 'Failed to count chats' }, { status: 500 })
   }
 }

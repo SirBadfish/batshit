@@ -39,17 +39,17 @@ Under the hood, the agent searches the registry for the capability it needs, the
 Fabric actions are **risk-gated**, so the agent can't quietly do something heavy without the right clearance:
 
 - **Safe** actions (like reading a model catalog or creating a draft Artifact) run directly.
-- **Confirm** actions (the ones that execute something or change real state) stop and wait for you to press **Approve**.
+- **Confirm** actions normally wait for **Approve**. Scoped [App Actions](app-actions.md) follows your saved Block, Ask first or Allow policy; Ask first reviews one exact operation.
 - **Restricted** actions do the same, with a red badge — deleting an Artifact version, deleting a CLI Tool, rolling an Artifact back.
 
 Every Fabric action is also validated against what the agent is actually permitted to do, and executions are recorded. Honest boundaries are the whole point — Batshit fails clearly instead of pretending an action succeeded. For the bigger picture on agent permissions, sandboxing, and trust, see [Security and trust](../security/overview.md).
 
 ## Approving a risky action
 
-When an agent tries a **Confirm** or **Restricted** action, Batshit stops it *before* it happens and puts a card on the agent's message:
+When an agent tries a **Confirm** or **Restricted** action that requires approval, Batshit stops it *before* it happens and puts a card on the agent's message:
 
 > **Approval required** — Skill Import · **Confirm**
-> Batshit Codex wants to **install skill from https://example.com/skill.zip**
+> Batshit Helper wants to **install skill from https://example.com/skill.zip**
 > ▸ Exact input
 > **Deny**  **Approve**
 
@@ -59,10 +59,9 @@ In a chat that a DM, a webhook, or a schedule started, the card also says who st
 
 **Approve** runs that one action, with that exact input, once.
 
-- On an **API** agent the paused call simply carries on — same action, same input, no second guess from the model.
-- On a **Codex** or **Claude** agent, Batshit starts a short follow-up turn that tells the agent you approved it, and the agent runs it. This is why the click still works hours later and with no Batshit tab open.
+The paused call carries on with the same action and input.
 
-**Deny** runs nothing. The action is recorded as denied and the agent is told, so it does not try again: an **API** agent's paused reply carries on knowing you said no, and a **Codex** or **Claude** agent reads it on your next message. If you typed something while the agent worked, that is your next message, and it is answered right after your click.
+**Deny** runs nothing. The action is recorded as denied and the agent is told, so it does not try again: the agent's paused reply carries on knowing you said no. If you typed something while the agent worked, that is your next message, and it is answered right after your click.
 
 A few things worth knowing:
 
@@ -71,7 +70,7 @@ A few things worth knowing:
 - **There is no "always allow", on purpose.** Every risky action asks, every time. A switch that turned the asking off would be clicked once, on a quiet afternoon, and would still be off the day it mattered.
 - **The agent cannot approve itself**, and neither can another agent, a webhook, an n8n workflow, or anything written inside a message. Your click is the only thing that counts.
 - **What you type while a card waits, waits too.** A steer or a queued message the agent did not get to before the card becomes a message marked *Waits for your answer to the approval card.*, and the agent answers it after your click (your click only: a card that expired does not release it). See [When the reply stops at an approval card](../chat/overview.md#when-the-reply-stops-at-an-approval-card).
-- **Nothing is cancelled while a card waits.** The turn ends normally. A card raised by an API agent expires after three minutes (ask again and you get a fresh one); a card on a Codex or Claude agent says **Waits for you** and has no clock at all.
+- **Nothing is cancelled while a card waits.** The turn ends normally. A card expires after three minutes (ask again and you get a fresh one). Cards in older chats from the removed Claude Code CLI lane stay visible, but answering one does not start the old agent again.
 - **A chat that started on its own** — from an Agent DM, a webhook, or a schedule — raises exactly the same card, and Batshit marks that chat **Needs you** so you can find it. See [Agent DMs and wake-ups](../primary-agents/agent-dms-and-wake-ups.md#risky-actions-wait-for-you).
 - **A [Portable Skill Token](../reference/portable-skills.md) carries its own approval** in an ordinary chat, because you chose which families it could touch when you minted it, and there is no chat there to click in. In a chat that started on its own it does not: a woken chat is driven by text somebody else wrote, so it gets the card like anything else.
 
@@ -98,6 +97,8 @@ With Fabric Controls enabled, a Primary Agent can open or close Settings, show o
 The agent can inspect a limited, masked view of Settings and read or change its own display name, Awareness/Triggers/Recalled Lane Budgets and the linger defaults for trigger and recalled memories. Memory changes require your approval. These controls do not expose keys, change permissions or configure native runtimes. A conflicting edit makes the action stop rather than overwrite the newer choice.
 
 If the result says it could not confirm what happened, check the current view or saved setting before requesting another change. The first action may already have taken effect. A visible change and a saved preference are reported separately.
+
+See [App Actions](app-actions.md) to grant selected Settings access, review outside requests and interpret saved, checked, visible or unknown outcomes. MCP setup approval is separate from a tool’s later effects.
 
 ## Related docs
 

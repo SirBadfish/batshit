@@ -175,7 +175,7 @@ describe('the dispatch doors carry the scope id beside delegatedRun (BL-186)', (
       action: 'batshit_tool_use',
       payloadInput: { ref: 'artifact:use.artifact.subagent-only', input: { prompt: 'hi' } },
       context,
-      actorType: 'agent',
+      actorType: 'in-process',
       // The authenticated helper supplies the stored owner separately from audit identity.
       processOwner: { userId: USER, kind: 'subagent', id: SUBAGENT },
       delegatedRun: true,
@@ -186,7 +186,7 @@ describe('the dispatch doors carry the scope id beside delegatedRun (BL-186)', (
       action: 'artifact_use',
       payloadInput: { control_id: 'use.artifact.subagent-only', prompt: 'hi' },
       context,
-      actorType: 'agent',
+      actorType: 'in-process',
       // The authenticated helper supplies the stored owner separately from audit identity.
       processOwner: { userId: USER, kind: 'subagent', id: SUBAGENT },
       delegatedRun: true,

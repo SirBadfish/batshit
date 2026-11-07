@@ -1,10 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import {
-  CODEX_CLI_INPUT_CHAR_LIMIT,
-  CODEX_CLI_INPUT_CHAR_SAFETY_MARGIN,
-  buildPromptBudgetReport
-} from '$lib/server/services/contextBudgetPreflight'
+import { buildPromptBudgetReport } from '$lib/server/services/contextBudgetPreflight'
 
 describe('context budget preflight', () => {
   it('blocks sends that exceed the model context window after output reserve', () => {
@@ -34,22 +30,5 @@ describe('context budget preflight', () => {
     expect(report.canSend).toBe(true)
     expect(report.status).toBe('compact_recommended')
     expect(report.shouldAutoCompact).toBe(true)
-  })
-
-  it('blocks Codex CLI launches before the packaged character hard limit', () => {
-    const safeLimit = CODEX_CLI_INPUT_CHAR_LIMIT - CODEX_CLI_INPUT_CHAR_SAFETY_MARGIN
-    const report = buildPromptBudgetReport({
-      runtime: 'codex',
-      messages: [{ role: 'user', content: 'A'.repeat(safeLimit) }],
-      contextLimit: 2_000_000,
-      outputReserveTokens: 0,
-      autoCompactTriggerTokens: 80_000
-    })
-
-    expect(report.canSend).toBe(false)
-    expect(report.status).toBe('blocked')
-    expect(report.runtimeHardLimitStatus).toBe('blocked')
-    expect(report.packagedInputSafeCharLimit).toBe(safeLimit)
-    expect(report.reason).toContain('Codex CLI')
   })
 })

@@ -4,9 +4,13 @@ const retirements: import('$lib/data/catalog-confirmed-retirements').ConfirmedCa
 vi.mock('$lib/data/catalog-confirmed-retirements', () => ({ CONFIRMED_CATALOG_RETIREMENTS: retirements }))
 
 const upstashKvGet = vi.fn()
-const upstashKvSet = vi.fn(async () => undefined)
+const upstashKvGetRaw = vi.fn(async (...args: unknown[]) => {
+  const value = await upstashKvGet(...args)
+  return value === null || typeof value === 'string' ? value : JSON.stringify(value)
+})
+const upstashKvSetIfUnchanged = vi.fn(async () => true)
 const getRuntimeEnv = vi.fn(async (name: string): Promise<string | undefined> => name === 'FAL_API_KEY' ? 'fixture-key' : undefined)
-vi.mock('$lib/server/services/upstashKv', () => ({ upstashKvGet, upstashKvSet }))
+vi.mock('$lib/server/services/upstashKv', () => ({ upstashKvGetRaw, upstashKvSetIfUnchanged }))
 vi.mock('$lib/server/services/modelCatalogReportStore', () => ({
   storeCatalogSyncReport: vi.fn(async () => ({ warningStreak: 0, warningAlert: null }))
 }))
@@ -52,7 +56,8 @@ describe('dated Fal recovery entries', () => {
     retirements.length = 0
     falModels = []
     upstashKvGet.mockReset().mockResolvedValue(null)
-    upstashKvSet.mockClear()
+    upstashKvGetRaw.mockClear()
+    upstashKvSetIfUnchanged.mockClear()
     getRuntimeEnv.mockReset().mockImplementation(async name => name === 'FAL_API_KEY' ? 'fixture-key' : undefined)
     vi.stubGlobal('fetch', vi.fn(async (input: string) => new Response(JSON.stringify(
       input.includes('ai-gateway.vercel.sh')
@@ -76,7 +81,7 @@ describe('dated Fal recovery entries', () => {
       fetchedCount: 1,
       pendingRemovalIds: recoveredIds
     })
-    expect(upstashKvSet).not.toHaveBeenCalled()
+    expect(upstashKvSetIfUnchanged).not.toHaveBeenCalled()
   })
 
   it('uses fresh Fal metadata when a recovered ID returns', async () => {

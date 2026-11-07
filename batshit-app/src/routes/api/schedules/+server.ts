@@ -6,7 +6,7 @@ import {
   ScheduleError
 } from '$lib/server/services/schedules/scheduleStore'
 import { resolveAgentDmsEnabled } from '$lib/utils/dmControl'
-import { normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
+import { isApiPrimaryAgentType, normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
 
 /**
  * SA-115 P2 (DL-115-01, DL-115-09) — the Admin "Schedules" card's list and create.
@@ -37,7 +37,7 @@ function errorHint(error: unknown): string | undefined {
 /**
  * The agents a schedule may point at.
  *
- * Only API/CLI primaries with **Agent DMs on** are eligible (AMD-113-05 parity): a fire
+ * Only API primaries with **Agent DMs on** are eligible (AMD-113-05 parity): a fire
  * writes a DM, so an agent with DMs off would never see it and would have no `sys.dm.*`
  * tools to close it with. The card shows this list rather than every agent, and says why
  * when it is empty, so nobody discovers the rule from a 400 after filling in a form.
@@ -46,10 +46,11 @@ async function listEligibleAgents(userId: string) {
   const agents = await redis.getAgents(userId)
   return agents
     .map((agent) => agent as unknown as Record<string, any>)
-    .filter((agent) => {
-      const type = normalizePrimaryAgentType(agent as any)
-      return (type === 'api' || type === 'cli') && resolveAgentDmsEnabled(agent)
-    })
+    .filter(
+      (agent) =>
+        isApiPrimaryAgentType(normalizePrimaryAgentType(agent as any)) &&
+        resolveAgentDmsEnabled(agent)
+    )
     .map((agent) => ({
       id: agent.id,
       name:

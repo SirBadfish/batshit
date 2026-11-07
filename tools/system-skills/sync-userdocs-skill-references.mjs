@@ -7,11 +7,10 @@
 //   so a new UserDocs page fails this script instead of silently never
 //   reaching the skill.
 // - Destination reference folders contain byte-for-byte UserDocs mirrors plus
-//   one generated Guide navigation map. --write copies includes and deletes
-//   unlisted files; --check exits 1 on content, index, link, or map drift.
-// - Run this BEFORE tools/portable-skills/sync-portable-skills.mjs whenever
-//   UserDocs change, because portable bundles copy from the in-app skill
-//   folder this script writes.
+//   one generated Guide navigation map. Explicit lane-authored references are
+//   preserved. --write removes only unlisted, non-preserved mirror files.
+// - The prior portable downloads are frozen. This writes only the canonical
+//   package; held release/help prose belongs outside UserDocs publication inputs.
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import process from 'node:process'
@@ -59,6 +58,7 @@ function validateSync(sync) {
   const errors = []
   const include = Array.isArray(sync.include) ? sync.include : []
   const exclude = Array.isArray(sync.exclude) ? sync.exclude : []
+  const preserved = Array.isArray(sync.preservedReferences) ? sync.preservedReferences : []
 
   const sources = new Set()
   const references = new Set()
@@ -84,6 +84,14 @@ function validateSync(sync) {
     }
     if (sources.has(entry.source)) errors.push(`source listed as both include and exclude: ${entry.source}`)
     sources.add(entry.source)
+  }
+
+  for (const reference of preserved) {
+    if (typeof reference !== 'string' || !/^[\w-]+\.md$/.test(reference)) {
+      errors.push(`preserved references must be flat Markdown filenames: ${String(reference)}`)
+    } else if (references.has(reference)) {
+      errors.push(`reference is both mirrored and preserved: ${reference}`)
+    }
   }
 
   return { errors, include, exclude, sources }
@@ -146,7 +154,9 @@ async function main() {
     const expectedReferences = new Map(include.map((entry) => [entry.reference, entry.source]))
 
     if (sync.id === 'batshit-guide') {
-      const skillPath = path.join(path.dirname(destinationRoot), 'SKILL.md')
+      const skillPath = sync.referenceIndex
+        ? path.join(destinationRoot, sync.referenceIndex)
+        : path.join(path.dirname(destinationRoot), 'SKILL.md')
       const skillMarkdown = await fs.readFile(skillPath, 'utf8')
       for (const problem of validateGuideReferenceIndex(skillMarkdown, include)) {
         problems.push(`[${syncId}] ${problem}`)
@@ -211,6 +221,7 @@ async function main() {
     for (const entry of destinationEntries) {
       if (entry.name.startsWith('.')) continue
       if ((expectedReferences.has(entry.name) || (sync.id === 'batshit-guide' && entry.name === GUIDE_NAVIGATION_FILE)) && entry.isFile()) continue
+      if (sync.preservedReferences?.includes(entry.name) && entry.isFile()) continue
       const stalePath = path.join(destinationRoot, entry.name)
       if (mode === 'write') {
         await fs.rm(stalePath, { recursive: true, force: true })

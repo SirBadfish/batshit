@@ -6,10 +6,12 @@
   import ProjectSelector from './ProjectSelector.svelte'
   import FileTree from './FileTree.svelte'
   import ProjectQuickViewDialog from './ProjectQuickViewDialog.svelte'
-  import { onMount } from 'svelte'
+  import { onMount, untrack } from 'svelte'
   import { FileTreeService } from '$lib/services/fileTree'
   import { loadProjectTree, refreshProjectTree } from '$lib/projects/fileTreeActions'
   import { ProjectService } from '$lib/services/projects'
+  import * as agentStore from '$lib/stores/agents.svelte'
+  import { watchAgentProjectSelection } from '$lib/projects/agentProjectSelection.svelte'
   import { toast } from 'svelte-sonner'
   import { artifactService } from '$lib/services/artifactService'
   import { marked } from 'marked'
@@ -43,7 +45,6 @@
   let rightPanelTemporaryCollapsed = $state(false)
   let collapsedBeforeRightPanel: boolean | null = null
   
-  const projects = $derived(projectStore.getProjects())
   const currentProject = $derived(projectStore.getCurrentProject())
   const fileTree = $derived(projectStore.getFileTree())
   const flatFiles = $derived(projectStore.getFlatFileList())
@@ -121,16 +122,18 @@
     return normalizedFile.slice(normalizedRoot.length + 1)
   }
 
+  // The Default Project counts as a project here too (BL-2373): a link to a file under the
+  // Default Project Path opens in it.
   async function ensureProjectsAvailable() {
     const existing = projectStore.getProjects()
-    if (existing.length > 0 || !data?.user?.id) return existing
+    if (existing.length > 0 || !data?.user?.id) return projectStore.getSelectableProjects()
 
     const service = new ProjectService()
     const loadedProjects = await service.loadProjects(data.user.id)
     if (loadedProjects.length > 0) {
       projectStore.setProjects(loadedProjects)
     }
-    return loadedProjects
+    return projectStore.getSelectableProjects()
   }
 
   function resolveQuickViewTarget(rawPath: string, availableProjects: Project[]) {
@@ -352,6 +355,57 @@
     await loadCurrentProjectFileTree(true, { notify: true })
   }
   
+  // BL-2372/BL-2373: the agent's project is chosen here, where it holds whether the sidebar is
+  // open or closed. A change while the sidebar shows loads the new tree; a closed sidebar loads
+  // it when it opens (the switch clears the old tree, which reads as stale).
+  watchAgentProjectSelection({
+    agent: () => agentStore.getCurrentAgent(),
+    onSelected: (project) => {
+      if (project && !isCollapsed) void loadProjectTree(project)
+    }
+  })
+
+  // BL-2373 / BL-2391: the shown project keeps its id when its folder changes (the Default
+  // Project Path, or a saved project's Root Path edited, saved or read back). The store clears
+  // the old folder's tree and @ mention index (`keepingTreeWithItsFolder`); an open sidebar loads
+  // the new folder here, and a closed one when it opens (the cleared tree reads as stale). A
+  // change of the shown project's exclusions refreshes its tree in place, keeping open folders.
+  // A different project, or none, is the selection owner's and the selector's to load.
+  const shownProjectKey = $derived(
+    currentProject
+      ? JSON.stringify([currentProject.id, currentProject.root_path, currentProject.custom_exclusions ?? []])
+      : ''
+  )
+  let shownProject: { id: string; root: string; exclusions: string } | null = null
+  $effect(() => {
+    void shownProjectKey
+    untrack(() => {
+      const project = projectStore.getCurrentProject()
+      const previous = shownProject
+      shownProject = project
+        ? { id: project.id, root: project.root_path, exclusions: JSON.stringify(project.custom_exclusions ?? []) }
+        : null
+      if (!project || !previous || previous.id !== project.id) return
+      if (previous.root !== project.root_path) {
+        if (!isCollapsed) void loadProjectTree(project)
+        return
+      }
+      if (previous.exclusions !== shownProject!.exclusions && projectStore.hasProjectBeenLoaded(project.id)) {
+        if (isCollapsed) projectStore.markFileTreeStale()
+        else void refreshProjectTree(project, { notify: false })
+      }
+    })
+  })
+
+  // Load the shown project's tree when the sidebar has just opened and that tree is missing or
+  // stale (a project chosen while the sidebar was closed has none yet).
+  function loadTreeForOpenedSidebar() {
+    if (isCollapsed || !currentProject) return
+    if (!projectStore.hasProjectBeenLoaded(currentProject.id) || isScanStale()) {
+      void loadCurrentProjectFileTree(true)
+    }
+  }
+
   function toggleSidebar() {
     isCollapsed = !isCollapsed
     rightPanelTemporaryCollapsed = false
@@ -361,11 +415,7 @@
     localStorage.setItem('projectsSidebarCollapsed', String(isCollapsed))
     
     // Load file tree on first open or when stale
-    if (!isCollapsed && currentProject) {
-      if (!projectStore.hasProjectBeenLoaded(currentProject.id) || isScanStale()) {
-        loadCurrentProjectFileTree(true)
-      }
-    }
+    loadTreeForOpenedSidebar()
   }
 
   function needsProjectWidthForRightPanel() {
@@ -379,6 +429,8 @@
     if (!rightPanelOpen) {
       if (rightPanelTemporaryCollapsed && collapsedBeforeRightPanel !== null) {
         isCollapsed = collapsedBeforeRightPanel
+        // BL-2372 review A3: the sidebar comes back; its project may have changed while hidden.
+        untrack(loadTreeForOpenedSidebar)
       }
       rightPanelTemporaryCollapsed = false
       collapsedBeforeRightPanel = null
@@ -401,6 +453,7 @@
       isCollapsed = false
       rightPanelTemporaryCollapsed = false
       collapsedBeforeRightPanel = null
+      untrack(loadTreeForOpenedSidebar)
     }
   })
   
@@ -450,7 +503,9 @@
     if (savedCollapsedStr !== null) {
       isCollapsed = savedCollapsedStr === 'true'
     }
-    
+    // A selection made before the open state was restored has no tree yet.
+    loadTreeForOpenedSidebar()
+
     const handleProjectCreated = async (event: Event) => {
       const customEvent = event as CustomEvent;
       // If sidebar is open, load the new project's file tree

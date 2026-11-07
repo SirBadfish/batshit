@@ -5,7 +5,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { env } from '$env/dynamic/private'
 import { armBackgroundSchedulers, assertInternalServiceTokenConfigured } from './hooks.server'
 
-vi.mock('$app/environment', () => ({
+// SA-139: importing the hooks arms the Claude plan run lifecycle (boot sweep of /tmp, shutdown task).
+vi.mock('$lib/server/services/claudePlanRunRegistry', () => ({ armClaudePlanRunLifecycle: vi.fn() }))
+vi.mock('$app/env', () => ({
   building: false,
   dev: false
 }))

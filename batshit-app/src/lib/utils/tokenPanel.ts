@@ -9,17 +9,12 @@ import type {
 } from '$lib/types/executionViewer'
 import { countMessageTokens, countTotalTokens } from '$lib/utils/tokenCounter'
 import { resolveSavedModelConnection } from '$lib/utils/modelConnections'
-import { normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
+import { CLAUDE_PLAN_USAGE_URL, isClaudePlanConnection, isClaudePlanSelection } from '$lib/utils/claudePlanConnection'
+import { isChatgptPlanConnection } from '$lib/utils/chatgptPlanConnection'
 import { resolveRuntimeModelSelection } from '$lib/utils/modelPresetRuntime'
-import {
-  cliContextSettingsKey, latestCliContextReport, latestCliContextSnapshot, matchingCliContextReport,
-  resolveEffectiveAgentCliModel, resolveCliContextWindow,
-  type CliContextRuntime
-} from '$lib/utils/cliContextWindow'
-import { claudeContextCappedByFlags, type ClaudeContextEnvironment } from '$lib/utils/cliContextWindow'
-import { scanLooseClipReferences, scanLooseZipReferences } from '$lib/utils/zipReferenceSafety'
+import { scanClipReferences, scanZipReferences } from '$lib/utils/zipReferenceSafety'
+import { normalizeId } from '$lib/utils/idNormalizer'
 
-export const CLI_WRAPPER_OVERHEAD_TOKENS = 17_000
 const MANUAL_TRIM_NOTICE_ID = 'batshit_manual_context_trim_notice'
 
 export interface ManualTrimProtections {
@@ -130,13 +125,14 @@ export function extendTrimmedMessageIds(
 }
 
 /**
- * The zip or clip ids a message's words reference (the older shape), read once (BL-707): the old
- * patterns searched to the first `}` again from every opener. The server runs this in the trim
- * preview, the context preview, and memory graduation.
+ * The zip or clip ids a message's words reference, read once (BL-707: the old patterns searched to
+ * the first `}` again from every opener) with the trust reader's shapes (BL-609), so a held zip
+ * protects a message exactly where the chat view and the compile read its reference. The server
+ * runs this in the trim preview, the context preview, and memory graduation.
  */
 function extractReferenceIds(content: string, type: 'zip' | 'clip'): string[] {
   if (!content) return []
-  const references = type === 'zip' ? scanLooseZipReferences(content) : scanLooseClipReferences(content)
+  const references = type === 'zip' ? scanZipReferences(content) : scanClipReferences(content)
   const ids = new Set<string>()
   for (const reference of references) {
     const id = reference.id.trim()
@@ -169,8 +165,11 @@ export function isMessageProtectedFromManualTrim(
         .map((id) => (typeof id === 'string' ? id.trim() : ''))
         .filter(Boolean)
     ])
+    // BL-1512: a held zip is recorded under its state id, `normalizeId(<raw id>)` (BL-476), and
+    // the message names the raw id. Only the raw side is normalized: `normalizeId` cuts a
+    // digit-only `_N` tail, so a second pass on the state id would cut it again.
     for (const zipId of zipIds) {
-      if (protectedZipIds.has(zipId)) return true
+      if (protectedZipIds.has(zipId) || protectedZipIds.has(normalizeId(zipId))) return true
     }
   }
 
@@ -359,6 +358,8 @@ function readCallsCount(snapshot: ExecutionSnapshot): number {
 function isCliRuntimeSnapshot(snapshot: ExecutionSnapshot): boolean {
   const runtimeId = normalize(snapshot.runtime?.runtimeId)
   const agentType = normalize(snapshot.agentType)
+  // Historical snapshots can lack runtime while retaining agentType. This is display-only:
+  // treat their tool activity as CLI so aggregate usage is not presented as an exact call.
   return runtimeId === 'codex' || runtimeId === 'claude' || agentType === 'cli'
 }
 
@@ -642,7 +643,6 @@ export interface ContextUsageSummary {
   visibleEstimateTokens: number
   compiledEstimateTokens: number | null
   batshitEstimateTokens: number
-  cliWrapperOverheadTokens: number
   lastInputTokens: number | null
   lastReasoningTokens: number | null
   lastUsageSource: string | null
@@ -708,31 +708,6 @@ function findLatestCompiledSnapshot(
   return preferred ?? sorted.find(hasCompiledPayload) ?? null
 }
 
-function cliRuntimeAndModel(agent: Agent | null | undefined, model: SavedModel | null): {
-  runtime: CliContextRuntime
-  model: string | null
-  selectedSettings: Record<string, any> | null
-  selectedModelId: string | null
-} | null {
-  if (normalizePrimaryAgentType(agent) !== 'cli') return null
-  const rawAgent = agent as Record<string, any>
-  const service = model?.connection?.service ?? agent?.primary_model_connection?.service ??
-    agent?.primary_model_provider ?? ''
-  const selection = resolveRuntimeModelSelection({
-    preset: model, modelId: agent?.primary_model_name,
-    settings: rawAgent.provider_specific_settings ?? null
-  })
-  const selectedSettings = selection.settings
-  const selectedModelId = selection.modelId
-  if (service === 'openai-codex' || service === 'codex') {
-    return { runtime: 'codex', model: resolveEffectiveAgentCliModel('codex', rawAgent, selectedSettings, selectedModelId), selectedSettings, selectedModelId }
-  }
-  if (service === 'anthropic-claude-cli' || service === 'claude-cli') {
-    return { runtime: 'claude', model: resolveEffectiveAgentCliModel('claude', rawAgent, selectedSettings, selectedModelId), selectedSettings, selectedModelId }
-  }
-  return null
-}
-
 function resolveReserveTokens(activeModel: SavedModel | null): number | null {
   const maxTokens = activeModel?.settings?.maxTokens
   if (typeof maxTokens === 'number' && Number.isFinite(maxTokens) && maxTokens > 0) {
@@ -769,70 +744,29 @@ export function summarizeContextUsage(params: {
   manualTrimEstimateTokens?: number | null
   liveContextEstimateTokens?: number | null
   liveContextEstimateReason?: string | null
-  /** Server preview knows instance-only CLI settings such as disabled 1M context. */
+  /** The server preview's limit; only a fresh Local AI reading uses it. */
   liveContextLimit?: number | null
   liveLocalContext?: LocalContextBudgetEvidence | null
   now?: number
-  liveContextWindowWarning?: string | null
-  liveContextCheckedAt?: number | null
-  claudeContextEnvironment?: ClaudeContextEnvironment | null
 }): ContextUsageSummary {
   const { messages, snapshots, activeModel, agent } = params
-  const cli = cliRuntimeAndModel(agent, activeModel)
-  const savedReport = cli ? latestCliContextReport(snapshots, agent?.id, cli.runtime) : null
-  const claudeCap = cli?.runtime === 'claude'
-    ? claudeContextCappedByFlags(cli.model, params.claudeContextEnvironment) : false
-  const matchedReport = cli && agent ? matchingCliContextReport(savedReport,
-    cliContextSettingsKey(cli.runtime, agent as Record<string, any>, activeModel?.contextWindow,
-      cli.selectedSettings, cli.selectedModelId)) : null
-  const matchingReport = matchedReport && (cli?.runtime !== 'claude' ||
-    Boolean(matchedReport.disableClaude1M) === claudeCap) ? matchedReport : null
-  const cliResolution = cli ? resolveCliContextWindow({
-    ...cli,
-    presetContextWindow: activeModel?.contextWindow,
-    reported: matchingReport,
-    disableClaude1M: claudeCap
-  }) : null
   const serverLimit = typeof params.liveContextLimit === 'number' &&
     Number.isFinite(params.liveContextLimit) && params.liveContextLimit > 0
       ? params.liveContextLimit : null
-  const latestCliSnapshot = cli ? latestCliContextSnapshot(snapshots, agent?.id, cli.runtime) : null
-  const savedBudget = latestCliSnapshot?.executionMetadata?.promptBudget
-  const activeSettingsKey = cli && agent ? cliContextSettingsKey(cli.runtime, agent as Record<string, any>,
-    activeModel?.contextWindow, cli.selectedSettings, cli.selectedModelId) : null
-  const savedWarning = activeSettingsKey && savedBudget?.contextWindowSettingsKey === activeSettingsKey &&
-    typeof savedBudget?.contextWindowWarning === 'string'
-      ? savedBudget.contextWindowWarning.trim() : null
-  const previewIsNewer = typeof params.liveContextCheckedAt === 'number' &&
-    params.liveContextCheckedAt > (savedBudget?.contextWindowCheckedAt ?? Infinity)
-  const newestWarningAt = Math.max(
-    savedWarning ? savedBudget?.contextWindowCheckedAt ?? Infinity : 0,
-    params.liveContextWindowWarning ? params.liveContextCheckedAt ?? Infinity : 0
-  )
-  const newerRuntimeEvidence = matchingReport?.evidence === 'runtime' &&
-    typeof matchingReport.reportedAt === 'number' && matchingReport.reportedAt > newestWarningAt
-  const contextWindowWarning = cli && !newerRuntimeEvidence
-    ? params.liveContextWindowWarning?.trim() || (!previewIsNewer ? savedWarning : null)
-    : null
   const apiSelection = resolveRuntimeModelSelection({ preset: activeModel,
     provider: agent?.primary_model_provider, modelId: agent?.primary_model_name,
     connection: agent?.primary_model_connection, settings: agent?.provider_specific_settings })
-  const local = !cli && LOCAL_AI_SERVER_IDS.has(apiSelection.provider as any)
+  const local = LOCAL_AI_SERVER_IDS.has(apiSelection.provider as any)
   const localEvidence = params.liveLocalContext
   const freshLocal = localEvidence && localEvidence.providerId === apiSelection.provider &&
     localEvidence.modelId === apiSelection.modelId && localEvidence.expiresAt > (params.now ?? Date.now())
       ? localEvidence : null
   const localNote = local ? freshLocal?.note ?? 'The Local AI context limit is waiting for a fresh server reading.' : ''
-  const contextLimit = contextWindowWarning || (cli && matchingReport?.evidence === 'unresolved')
-    ? null
-    : cli ? (serverLimit ?? cliResolution?.contextWindow ?? null)
-      : local ? (freshLocal ? serverLimit : null) : activeModel?.contextWindow ?? null
-  const agentType = normalizePrimaryAgentType(agent)
-  const cliWrapperOverheadTokens = agentType === 'cli' ? CLI_WRAPPER_OVERHEAD_TOKENS : 0
+  const contextLimit = local ? (freshLocal ? serverLimit : null) : activeModel?.contextWindow ?? null
   const visibleEstimateTokens = countTotalTokens(messages)
   const latestCompiledSnapshot = findLatestCompiledSnapshot(snapshots, agent)
   const compiledEstimateTokens = countCompiledPayloadTokens(latestCompiledSnapshot)
-  const batshitEstimateTokens = visibleEstimateTokens + cliWrapperOverheadTokens
+  const batshitEstimateTokens = visibleEstimateTokens
   const latest = findLatestUsageSnapshot(snapshots, agent)
   const latestInput = latest?.usage.inputTokens ?? null
   const latestInputTokens = latest?.inputTokens ?? null
@@ -845,7 +779,7 @@ export function summarizeContextUsage(params: {
   const reserveNote =
     (reserveTokens !== null
       ? ` Batshit also keeps ${formatCompactTokens(reserveTokens)} tokens in mind for output/reasoning headroom when warning near the edge.`
-      : '') + (contextWindowWarning ? ` ${contextWindowWarning}` : '') + (localNote ? ` ${localNote}` : '')
+      : '') + (localNote ? ` ${localNote}` : '')
   const liveContextEstimateTokens =
     typeof params.liveContextEstimateTokens === 'number' &&
     Number.isFinite(params.liveContextEstimateTokens)
@@ -881,7 +815,6 @@ export function summarizeContextUsage(params: {
       visibleEstimateTokens,
       compiledEstimateTokens,
       batshitEstimateTokens,
-      cliWrapperOverheadTokens,
       lastInputTokens: latestInputTokens,
       lastReasoningTokens: latestReasoningTokens,
       lastUsageSource: latest?.source ?? latest?.snapshot.runtime?.runtimeId ?? null,
@@ -901,7 +834,6 @@ export function summarizeContextUsage(params: {
       visibleEstimateTokens,
       compiledEstimateTokens,
       batshitEstimateTokens,
-      cliWrapperOverheadTokens,
       lastInputTokens: latestInputTokens,
       lastReasoningTokens: latestReasoningTokens,
       lastUsageSource: latest?.source ?? latest?.snapshot.runtime?.runtimeId ?? null,
@@ -916,12 +848,6 @@ export function summarizeContextUsage(params: {
   if (latestInputTokens !== null) {
     const confidence = latest?.confidence ?? (latestInput?.confidence === 'exact' ? 'exact' : 'near')
     const source = latest?.source ?? latestInput?.source ?? latest?.snapshot.runtime?.runtimeId ?? 'execution viewer'
-    const cliNote =
-      agentType === 'cli'
-        ? ` CLI wrapper overhead is already included when the CLI reports input usage; the ${formatCompactTokens(
-            CLI_WRAPPER_OVERHEAD_TOKENS
-          )} wrapper reserve is used only before runtime usage exists.`
-        : ''
     const reasoningNote =
       latestReasoningTokens !== null
         ? ` The last run reported ${formatCompactTokens(latestReasoningTokens)} reasoning tokens.`
@@ -950,7 +876,6 @@ export function summarizeContextUsage(params: {
       visibleEstimateTokens,
       compiledEstimateTokens,
       batshitEstimateTokens,
-      cliWrapperOverheadTokens,
       lastInputTokens: latestInputTokens,
       lastReasoningTokens: latestReasoningTokens,
       lastUsageSource: source,
@@ -960,7 +885,7 @@ export function summarizeContextUsage(params: {
         compiledEstimateTokens === null ? 'unavailable' : formatCompactTokens(compiledEstimateTokens)
       }; visible chat alone estimates ${formatCompactTokens(
         visibleEstimateTokens
-      )}; Batshit send estimates include system prompts, DCM/tool context, clips/zips, and runtime packaging when known.${cliNote}${reasoningNote}${reserveNote}`,
+      )}; Batshit send estimates include system prompts, DCM/tool context, clips/zips, and runtime packaging when known.${reasoningNote}${reserveNote}`,
       trimAvailable: messages.length > 1,
       trimUnavailableReason
     }
@@ -974,7 +899,6 @@ export function summarizeContextUsage(params: {
       visibleEstimateTokens,
       compiledEstimateTokens,
       batshitEstimateTokens,
-      cliWrapperOverheadTokens,
       lastInputTokens: latestInputTokens,
       lastReasoningTokens: latestReasoningTokens,
       lastUsageSource: latest?.source ?? latest?.snapshot.runtime?.runtimeId ?? null,
@@ -994,14 +918,12 @@ export function summarizeContextUsage(params: {
       visibleEstimateTokens,
       compiledEstimateTokens,
       batshitEstimateTokens,
-      cliWrapperOverheadTokens,
       lastInputTokens: null,
       lastReasoningTokens: null,
       lastUsageSource: null,
       state: 'unknown',
       label: 'Unknown',
-      detail:
-        contextWindowWarning ?? 'Context usage is unavailable because this agent does not have a known model context window yet.',
+      detail: 'Context usage is unavailable because this agent does not have a known model context window yet.',
       trimAvailable: messages.length > 1,
       trimUnavailableReason
     }
@@ -1009,12 +931,6 @@ export function summarizeContextUsage(params: {
 
   if (compiledEstimateTokens !== null) {
     const compiledRuntime = latestCompiledSnapshot?.runtime?.runtimeId ?? 'execution viewer'
-    const cliNote =
-      agentType === 'cli'
-        ? ` The ${formatCompactTokens(
-            CLI_WRAPPER_OVERHEAD_TOKENS
-          )} CLI wrapper reserve is added only to pre-send estimates; this compiled snapshot is the Batshit-owned payload before the CLI adds runtime-owned instructions.`
-        : ''
     const reasoningEstimateNote = activeModel?.capabilities?.reasoning
       ? ' Current-turn hidden reasoning cannot be known before the run, so Batshit shows reported reasoning tokens after completion when the provider/runtime exposes them.'
       : ''
@@ -1026,7 +942,6 @@ export function summarizeContextUsage(params: {
       visibleEstimateTokens,
       compiledEstimateTokens,
       batshitEstimateTokens,
-      cliWrapperOverheadTokens,
       lastInputTokens: null,
       lastReasoningTokens: null,
       lastUsageSource: compiledRuntime,
@@ -1034,18 +949,12 @@ export function summarizeContextUsage(params: {
       label: `~${formatCompactTokens(compiledEstimateTokens)} compiled`,
       detail: `Provider/runtime token usage is not available for the latest run, so the meter is estimated from the actual compiled messages saved in Execution Viewer after zip decisions were applied. Visible chat alone estimates ${formatCompactTokens(
         visibleEstimateTokens
-      )}.${cliNote}${reasoningEstimateNote}${reserveNote}`,
+      )}.${reasoningEstimateNote}${reserveNote}`,
       trimAvailable: messages.length > 1,
       trimUnavailableReason
     }
   }
 
-  const cliEstimateNote =
-    cliWrapperOverheadTokens > 0
-      ? ` This estimate includes a ${formatCompactTokens(
-          cliWrapperOverheadTokens
-        )} CLI wrapper reserve for Codex/Claude Code instructions; it will be replaced by runtime-reported usage after a send.`
-      : ''
   const reasoningEstimateNote = activeModel?.capabilities?.reasoning
     ? ' Current-turn hidden reasoning cannot be known before the run, so Batshit reserves headroom and shows reported reasoning tokens after completion.'
     : ''
@@ -1057,13 +966,12 @@ export function summarizeContextUsage(params: {
     visibleEstimateTokens,
     compiledEstimateTokens,
     batshitEstimateTokens,
-    cliWrapperOverheadTokens,
     lastInputTokens: null,
     lastReasoningTokens: null,
     lastUsageSource: null,
     state: 'estimated',
     label: `~${formatCompactTokens(batshitEstimateTokens)} estimated`,
-    detail: `No completed compiled payload or runtime usage is available for this chat yet. The meter is only a pre-send estimate, so it is labeled as estimated until the next send records the actual post-zip payload.${cliEstimateNote}${reasoningEstimateNote}${reserveNote}`,
+    detail: `No completed compiled payload or runtime usage is available for this chat yet. The meter is only a pre-send estimate, so it is labeled as estimated until the next send records the actual post-zip payload.${reasoningEstimateNote}${reserveNote}`,
     trimAvailable: messages.length > 1,
     trimUnavailableReason
   }
@@ -1083,7 +991,6 @@ function findDelegatedSavedModel(
       model.modelId,
       model.effectiveModelId,
       model.settings?.model,
-      model.settings?.codex_model,
       model.settings?.claude_model,
     ].map((value) => normalize(typeof value === 'string' ? value : null))
     if (!modelIds.includes(wantedModel)) return false
@@ -1164,8 +1071,14 @@ function summarizeDelegatedCost(
         delegatedUsageUnknownRuns += 1
       }
 
-      if (run.provider === 'chatgpt-plan') { delegatedCostUnknownRuns += 1; continue }
+      // A plan run (ChatGPT or Claude, any spelling) has no monetary cost, and neither does a run
+      // whose matched preset is on a plan connection: never a paid preset's price for it.
+      if (run.provider === 'chatgpt-plan' || isChatgptPlanConnection(run.provider) || isClaudePlanConnection(run.provider)) { delegatedCostUnknownRuns += 1; continue }
       const model = findDelegatedSavedModel(run.model, run.provider, models)
+      const matchedConnection = model ? resolveSavedModelConnection(model) : null
+      if (matchedConnection && (matchedConnection.service === 'chatgpt-plan' || isChatgptPlanConnection(matchedConnection.id) || isClaudePlanSelection(matchedConnection))) {
+        delegatedCostUnknownRuns += 1; continue
+      }
       const inputPrice = model ? getFlatPrice(model.pricing.input) : null
       const outputPrice = model ? getFlatPrice(model.pricing.output) : null
       if (
@@ -1233,6 +1146,10 @@ export function summarizeRunningCost(
 
   if (activeModel.connection?.service === 'chatgpt-plan' || activeModel.connection?.id?.startsWith('chatgpt-plan:')) return {
     cost: null, state: 'unknown', note: 'ChatGPT plan usage is managed at https://chatgpt.com/settings/usage. Batshit has no documented quota or monetary cost telemetry for this connection.', ...delegated,
+  }
+  // SA-139 (D12): Claude plan replies are counted against the plan, never priced as paid Anthropic tokens.
+  if (isClaudePlanSelection(activeModel.connection)) return {
+    cost: null, state: 'unknown', note: `Claude plan usage counts against your Claude plan limits; check it at ${CLAUDE_PLAN_USAGE_URL}. Batshit has no monetary cost or quota telemetry for this connection.`, ...delegated,
   }
 
   const inputPrice = getFlatPrice(activeModel.pricing.input)

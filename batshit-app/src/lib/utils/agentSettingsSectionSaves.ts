@@ -6,7 +6,7 @@ import { diffAgentBlock, sameJsonValue, type AgentDcmDisplaySettingsSave } from 
  * gateways, the tool selections, the display settings) and its zip save send.
  *
  * Agent Settings keeps each section as it was loaded or last saved. Other places change the same
- * record while that copy is on screen (the chat bar's Tools menu and Codex and Claude controls,
+ * record while that copy is on screen (the chat bar's Tools menu and Claude controls,
  * a second Settings window), and a save that sent the whole section took those changes back with
  * no word. So each save sends only what differs from the copy the section loaded or last saved,
  * the rule the chat bar's Tools menu follows (`MCPsDropdown.svelte`) and Agent Settings' basic
@@ -35,6 +35,8 @@ export type CustomToolPayload = {
 export interface ZipPayloadBody {
   zip_ai_view_mode?: 'inline' | 'appended' | null
   zip_tool_notes_enabled?: boolean | null
+  /** SA-137 P4a: `null` inherits the global Tool Grid value (the server removes the field). */
+  live_file_reads?: boolean | null
   buffer_size: number | null
   buffer_size_image: number | null
   buffer_size_error: number | null
@@ -91,6 +93,8 @@ export interface McpSectionValues {
   gateways: string[]
   selections: MCPToolSelections
   dcm: AgentDcmDisplaySettings | null
+  /** Viewed legacy values while dcm stays null for first-write promotion. */
+  viewedDcm?: AgentDcmDisplaySettings
 }
 
 /** What a save of the MCP section sends: only the parts that changed. */
@@ -134,4 +138,34 @@ export function diffZipPayload(baseline: ZipPayloadBody, next: ZipPayloadBody): 
     if (!sameJsonValue(before[field] ?? null, after[field] ?? null)) changes[field] = after[field] ?? null
   }
   return changes as Partial<ZipPayloadBody>
+}
+
+
+/** Human Primary concurrency data only. Subagent/shared sparse diffs stay unchanged. */
+export const MCP_SETTINGS_FIELDS = ['defaultMCPGateways', 'defaultMCPToolSelections', 'custom_tool_settings'] as const
+export type McpSettingsField = typeof MCP_SETTINGS_FIELDS[number]
+export type ExpectedMcpSettings = Partial<Record<McpSettingsField, string>>
+export const MCP_SETTINGS_REVISION_HEADER = 'x-batshit-mcp-settings-revisions'
+export function mcpSettingsLeaves(body: object): McpSettingsField[] {
+  return MCP_SETTINGS_FIELDS.filter(field => Object.hasOwn(body, field) && (body as Record<string, unknown>)[field] !== undefined)
+}
+export function readMcpSettingsRevisions(value: string | null): ExpectedMcpSettings | undefined {
+  try {
+    const parsed: unknown = JSON.parse(value ?? 'null')
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || Object.keys(parsed).some(key => !MCP_SETTINGS_FIELDS.includes(key as McpSettingsField)) ||
+      Object.values(parsed).some(token => typeof token !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(token))) return undefined
+    return parsed as ExpectedMcpSettings
+  } catch { return undefined }
+}
+export function withExpectedMcpSettings<T extends object>(body: T, base: ExpectedMcpSettings | undefined): T & { expectedMcpSettings?: ExpectedMcpSettings } {
+  const leaves = mcpSettingsLeaves(body)
+  if (!leaves.length) return body
+  if (!base || leaves.some(field => !/^sha256:[a-f0-9]{64}$/.test(base[field] ?? ''))) throw Object.assign(new Error('Read Saved Tool Settings before making a new choice. Your draft is kept; nothing was sent.'), { status: 400, code: 'mcp_settings_base_required' })
+  return { ...body, expectedMcpSettings: Object.fromEntries(leaves.map(field => [field, base[field]])) }
+}
+
+/** Expected-write data belongs only to the HTTP request, never an Agent/cache record. */
+export function withoutExpectedMcpSettings<T extends object>(body: T): Omit<T, 'expectedMcpSettings'> {
+  const { expectedMcpSettings: _expected, ...values } = body as T & { expectedMcpSettings?: unknown }
+  return values
 }

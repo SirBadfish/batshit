@@ -1,4 +1,14 @@
 import type { IconRef } from '$lib/icons/iconTypes'
+import type { BuiltinVoiceLane } from './builtinVoiceCatalog.js'
+
+export const VOICE_ENGINE_DELETE_OUTCOME_CONTRACT = 'voice-engine-delete-outcome/v1' as const
+
+/** A terminal failure fact for one awaited DELETE, never retry or cross-request authority. */
+export type VoiceEngineDeleteOutcomeReceipt = {
+  contract: typeof VOICE_ENGINE_DELETE_OUTCOME_CONTRACT
+  engineId: string
+  configurationOutcome: 'known_no_change' | 'known_settled_partial' | 'unknown'
+}
 
 export type VoiceProviderId =
   | 'browser'
@@ -38,6 +48,7 @@ export interface VoiceCommonOptions {
   volume?: number
   language?: string
   instructions?: string
+  endpoint?: string
 }
 
 export type VoiceItalicNarrationBehavior = 'speak' | 'silent'
@@ -493,6 +504,20 @@ export interface VoiceProviderSummary {
   sttCapabilities?: VoiceSttCapabilityProfile
   voiceSurface?: VoiceEngineVoiceSurface
   suite?: VoiceEngineSuiteConfig
+  modelCatalog?: {
+    source: 'remote' | 'retained' | 'bundled' | 'unavailable'
+    sourceStatus: 'verified' | 'blocked' | 'runtime-owned' | 'bundled'
+    warning?: string
+    failure?: string
+    lastVerifiedAt: string | null
+    lastAttemptAt: string | null
+    stale: boolean
+    discoveryCoverage: string
+    qualificationCoverage: string
+    unavailableCount: number
+    compatibilityProfiles?: Record<string, Record<string, string>>
+    lifecycleWarnings?: Array<{ modelId: string; lane: BuiltinVoiceLane; release: 'unknown' | 'stable' | 'preview' | 'deprecated'; shutdownAt?: string }>
+  }
 }
 
 export interface VoiceSummary {

@@ -11,7 +11,7 @@ Both features are opt-in and start turned off.
 Batshit uses three plain labels, and you'll see them everywhere — in settings, in the Memory Panel, and in what agents say:
 
 - **Awareness** — what the agent simply knows right now: the recent conversation plus the memories it deliberately keeps in front of itself at all times (like "Josh's birthday is coming up" — optionally with an expiry so it can let go afterward). An Awareness memory can also keep one of its pictures visibly in the agent's standing awareness on every message.
-- **STM (Trigger Memories)** — memories attached to trigger words. Say "Maggie" and the agent instantly *knows* about Maggie — no search, no delay, like hearing a name and remembering the person. Trigger Memories can carry photos: save one from a Clip and a vision-capable agent sees the picture when the memory fires. When the agent deliberately recalls a photo memory while answering, supported API models and Codex CLI can see it in that same reply too.
+- **STM (Trigger Memories)** — memories attached to trigger words. Say "Maggie" and the agent instantly *knows* about Maggie — no search, no delay, like hearing a name and remembering the person. Trigger Memories can carry photos: save one from a Clip and a vision-capable agent sees the picture when the memory fires. When the agent deliberately recalls a photo memory while answering, supported API models can see it in that same reply too.
 - **LTM (Long-term Memory)** — everything else, searchable. The agent "thinks a little harder": it searches by meaning, by keywords, and by time ("what were we doing last week?"). Ordinary search balances relevance, freshness, and importance within current and outdated memories separately. Current facts come first; outdated facts remain clearly marked.
 
 When your agent narrows a memory search by calendar date, the search includes the whole day in your Batshit instance's timezone, even when the clocks change.
@@ -35,9 +35,34 @@ Memory is **per agent** and off by default:
 
 That's it. The agent can now save and recall memories in ordinary chats. You don't need an Infinite Session to use memory.
 
-An ordinary API agent connected through a ChatGPT plan can use the same local memory system. The plan connection cannot provide memory embeddings: keep the built-in model or choose a separate embedding preset. Editing or restoring a preset to use ChatGPT does not switch memory work to a paid API key. Automatic naps and memory graduation also require a separate supported summary preset; plain Compact supports the plan connection.
+An ordinary agent connected through a ChatGPT plan can use the same local memory system. The plan connection cannot provide memory embeddings: keep the built-in model or choose a separate embedding preset. Editing or restoring a preset to use ChatGPT does not switch memory work to a paid API key. Automatic naps and memory graduation also require a separate supported summary preset; plain Compact supports the plan connection.
 
 The same card holds the tuning knobs (sensible defaults; you can ignore them): how long inserted memories "linger" (one default for trigger memories, one for recalled ones), token budgets for inserted memories, and the Infinite Session window settings described below. A single Trigger Memory can also carry its own linger setting — a custom number of messages, or "rest of the episode" so one mention keeps it present until that chapter of the conversation ends. Edit that per-memory setting in the Memory Panel, or let the agent set it when it saves.
+
+## Whiteboard and reasoning retention
+
+Your agent can keep a Whiteboard of useful working conclusions: the current goal, decisions, constraints, references, unfinished work and next steps. It belongs to that agent in that chat, survives reopening, and continues across Infinite Session episodes. It works independently of long-term Memory.
+
+Choose Reasoning Retention in Agent Settings → Core, beside Display Reasoning. Each agent has its own choice, display preference and budget; there is no global setting:
+
+| Choice | What the agent receives on later turns |
+| --- | --- |
+| Whiteboard Only | Its latest saved working notes; completed-reply reasoning is omitted |
+| Preserve Reasoning Only | Available reasoning from earlier completed replies |
+| Whiteboard + Preserved Reasoning | Both |
+| Neither | Neither source |
+
+The starting choice is Whiteboard Only: the agent keeps working notes, and its earlier reasoning is not sent again. Whiteboard starts with a 1,500-token budget and its display preference on; those controls appear while Whiteboard Only or Whiteboard + Preserved Reasoning is chosen. The Whiteboard needs Batshit Tools: with Batshit Tools off, the agent has no Whiteboard.
+
+These settings do not change how much reasoning a model generates or reveal reasoning the provider does not expose. Reasoning stays separately collapsible on its original replies. Display Reasoning only changes what you see.
+
+When Whiteboard is enabled, Display Whiteboard shows its icon on the latest agent reply. Click or tap to open a floating panel, select or copy its text, and close it when finished. The panel follows new replies and shows the confirmed last-save time. You cannot edit or clear it yourself; the agent uses Update Whiteboard to replace or clear its notes. Naps and dreaming never refill or rewrite it.
+
+Whiteboard Budget is available space in estimated tokens, roughly one token per four characters. The starting allowance is 1,500 estimated tokens and the adjustable range is 250–16,000. The agent should use only what helps. An oversized replacement is refused and the previous board remains saved. Lowering the budget keeps existing notes intact until the agent writes a shorter replacement.
+
+Turning Whiteboard off retains its contents, display preference and budget, while stopping new model delivery and updates. Re-enabling restores those saved choices. Hiding the panel alone leaves the feature enabled.
+
+Whiteboards are available in single-agent chats; group and delegated boards are not included. Chat or agent deletion removes its board; deleting one reply leaves current notes intact. A normal backup includes saved boards.
 
 ## Infinite Sessions
 
@@ -57,25 +82,20 @@ Why this matters: when the conversation gets long, Batshit never chops off "the 
 
 ### The episode whiteboard
 
-If your agent talks about "the whiteboard" or "my board", this is what it means. The **episode whiteboard** is the agent's own working notes for the current episode: the goal, the decisions so far, what is live right now, and the open items. Batshit hands the board to the agent with every message until the episode ends, so the agent does not have to re-read the whole conversation to remember where things stand. The agent rewrites it on purpose, with a tool, when something worth pinning changes; it is not the model's thinking (that happens inside one reply and is gone by the next) but a small sticky note that outlives replies. Durable facts still belong in memories; the board is only for the current stretch of work.
-
-The board belongs to the agent. A nap fills it in only when the agent has not written one, and never rewrites a board the agent wrote. When an episode ends, the board is kept with that episode's record and its facts go into the episode's summary.
-
-Where you see it: the Infinite Session's menu in the sidebar says "Whiteboard active", who wrote it last (the agent, or a nap), and when; and the [Execution Viewer](execution-viewer.md) shows the board inside the message the model actually received, under "Episode whiteboard".
+The agent’s [Whiteboard](#whiteboard-and-reasoning-retention) keeps current working notes across Infinite Session episodes. It is independent of long-term Memory. Naps and dreaming do not refill or rewrite it.
 
 ### Naps
 
-When one very long conversation gets close to the model's context limit, the agent takes a **nap** — a between-turns cleanup that graduates finished episodes, compresses stale tool output, and if needed condenses the oldest part of the current episode into memory. The agent keeps an **episode whiteboard** in front of itself (goal, decisions, open items), and that board is the agent's: a nap only fills it in when the agent has not written one, and never rewrites a board the agent wrote. You'll see a Nap button in the token panel (replacing Compact, which is intentionally disabled in Infinite Sessions), and every nap leaves a visible record of what it did. You can still send a message while a nap runs. Your message goes first: the nap stops before its next step, keeps what it already finished, and its record says it ended early. The next nap picks up the rest.
+When one very long conversation gets close to the model’s context limit, a **nap** graduates finished episodes, compresses stale tool output and, when needed, condenses older context into memory. The agent’s Whiteboard stays intact. The token panel shows **Nap** in Infinite Sessions, where Compact is disabled. Each nap leaves a visible result. Sending a message stops the nap before its next step and preserves work already completed; the next nap can pick up the rest.
 
-Naps and memory graduation use the model limit for that chat, including a matching limit learned from a CLI run. A named CLI model can supply a known estimate without a model preset; a runtime report can refine it. With CLI default or an unknown model, Batshit needs a known preset or a report before it can calculate the nap threshold. Changing model/settings prevents reuse of an older report. The summary-model requirements below still apply.
+Naps and memory graduation use the model limit for that chat. If it is unknown, Batshit cannot calculate the nap threshold. The summary-model requirements below still apply.
 
 Compressing stale tool output needs no embedding model. If there is no finished episode to summarize and compression frees enough room, a nap can finish even when embedding setup is unavailable. When a summary is needed, embedding setup must succeed before the summary call. If it fails after some tool output was compressed, that completed work stays and the nap record reports the failure. Sending a message or deleting the chat while setup runs stops the nap before it makes a summary.
 
 One setup note, honestly: **nap and graduation summaries need a model that can write them.**
 
-- `API` agents: work out of the box.
-- Codex `CLI` agents: work out of the box.
-- Claude `CLI` agents: need a saved **API-compatible compact/summary model preset** (pick one in the Auto Compact settings or the Agent Memory card). Until then, naps fail with a clear message telling you exactly that — nothing breaks silently.
+- Most agents: work out of the box with their own model.
+- Agents on the Claude plan connection: need a saved **API-compatible compact/summary model preset** (pick one in the Auto Compact settings or the Agent Memory card). The Claude plan runs Compact, but not memory's background summaries. Until then, naps fail with a clear message telling you exactly that — nothing breaks silently.
 
 ### Dreaming
 
@@ -108,14 +128,14 @@ Between conversations — never during one — the agent's memory "dreams": it m
 - **Backups include memory.** [Backup and restore](../admin/backup-and-restore.md) covers memories, their owned photos, graduated episodes, and settings; the search index rebuilds automatically after a restore.
 - **Group chats don't do memory recall yet.** Agents can still save memories in groups, but automatic remembering is single-agent chats only for now.
 - **Memory photos are local owned copies.** A Clip is only the input used when the memory is saved; Batshit makes a bounded copy and the memory never depends on that Clip afterward. Missing or damaged owned files fail loudly instead of silently dropping the photo.
-- **Instant photo recall needs vision support.** Supported API models and Codex CLI can receive up to four images per recall call during the same reply. Claude CLI uses the next-message path. The recall result tells the agent which photos arrived and which were deferred, with a reason; a missing source is identified as unavailable. Recalled photos can remain available on later messages while the memory lingers, but the in-turn image bytes are not added to saved tool history. Text-only models cannot see photos.
+- **Instant photo recall needs vision support.** Supported API models can receive up to four images per recall call during the same reply. The recall result tells the agent which photos arrived and which were deferred, with a reason; a missing source is identified as unavailable. Recalled photos can remain available on later messages while the memory lingers, but the in-turn image bytes are not added to saved tool history. Text-only models cannot see photos.
 - **Standing Awareness photos have a real token cost.** Their bytes are kept in the model's stable prompt prefix so supported providers can reuse them from cache, but each model/provider accounts for images differently. The Memory Panel estimate is per model call: a reply with several tool steps may send the same image more than once. Treat the estimate as guidance and the Execution Viewer as the truth for a specific run.
 - **Models are imperfect.** Some models under-save ("I'll keep that in mind" — without actually saving). If it matters, say "save that as a memory" — and check for the chip.
 
 ## Troubleshooting
 
 - **"Memory search index is not ready" or similar loud errors** — open Settings → Memory and run **Re-Index**. This rebuilds the search index from your stored memories (originals are never at risk).
-- **Nap fails asking for a compact model preset** — that's the Claude `CLI` requirement above. Pick an API-compatible preset in Auto Compact settings or the Agent Memory card.
+- **Nap fails asking for a compact model preset** — that's the Claude plan requirement above. Pick an API-compatible preset in Auto Compact settings or the Agent Memory card.
 - **Nap fails because embedding setup is unavailable** — check the selected embedding preset or local model in Settings → Memory. A nap can still compress stale tool output when no summary is needed; a required summary reports the setup error before calling its model.
 - **First memory save is slow** — enable memory from Agent Settings first; the toggle pre-downloads the model with a progress bar so saves are instant afterward.
 - **A trigger didn't fire** — check the memory's trigger words in the Memory Panel (matching is whole-word), and note that superseded or expired memories deliberately never auto-fire.

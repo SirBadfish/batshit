@@ -22,7 +22,7 @@
 
 import type { TypesafeCallRecord } from '$lib/types/typesafe'
 import { describeTypesafeReason } from '$lib/utils/jevJuice'
-import { resolveAgentJevJudgeToolEnabled } from '$lib/utils/jevJuiceControl'
+import { readAgentJevJudgeToolSwitch, resolveAgentJevJudgeToolEnabled } from '$lib/utils/jevJuiceControl'
 import { judgeModelName, judgeServiceName, resolveJudgeProviderForLane } from '$lib/utils/judgeProviders'
 import { redis } from '$lib/server/redis'
 import { runTypesafeJudgment } from './typesafe/typesafeAvailability'
@@ -99,7 +99,9 @@ export async function requireJudgeEnabledAgent(
   if (!resolveAgentJevJudgeToolEnabled(agent)) {
     throw new JudgeAskError(
       'Judge Juice: Judgment Tool is off for this agent.',
-      'The user can turn it on in Settings → Agents → this agent → Judge Juice: Judgment Tool.'
+      readAgentJevJudgeToolSwitch(agent)
+        ? 'The Judgment Tool needs Fabric & Utilities: the user can turn it on in Settings → Agents → this agent → Fabric & Utilities.'
+        : 'The user can turn it on in Settings → Agents → this agent → Judge Juice: Judgment Tool.'
     )
   }
   return agent

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/svelte'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { MCPGateway } from '$lib/types/database'
@@ -27,7 +28,7 @@ const STORED_THEN_FAILED = 'Failed to update gateway'
 const NOTHING_SAVED = 'The MCP gateways kept changing while this was being saved, so nothing was saved. Try again.'
 
 function stdio(id: string, name: string, args: string, updatedAt: string): MCPGateway {
-  return {
+  return presentFixture({
     id,
     name,
     type: 'stdio',
@@ -35,7 +36,11 @@ function stdio(id: string, name: string, args: string, updatedAt: string): MCPGa
     created_at: '2026-10-01T00:00:00.000Z',
     updated_at: updatedAt,
     stdioConfig: { command: 'npx', args: args.split('\n'), cwdPolicy: 'none', startupTimeoutMs: 10000, toolCallTimeoutMs: 60000, lastTestStatus: 'never' }
-  }
+  })
+}
+
+function presentFixture(value: MCPGateway): MCPGateway & { sourceRevision: string } {
+  return { ...value, sourceRevision: `source1:${createHash('sha256').update(JSON.stringify({ id: value.id, name: value.name, type: value.type, url: value.url, authKeyName: value.authKeyName, stdioConfig: value.stdioConfig, metadata: value.metadata })).digest('hex')}` }
 }
 
 type Held<T> = { answer: Promise<T>; release: (value: T) => void }
@@ -46,7 +51,11 @@ function held<T>(): Held<T> {
 }
 
 function json(status: number, body: unknown) {
-  return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
+  const value = body as { gateway?: MCPGateway; sourceAcknowledgement?: unknown }
+  const gateway = value?.gateway ? presentFixture(value.gateway) : undefined
+  const answer = gateway && status >= 200 && status < 300 ? { ...value, gateway,
+    sourceAcknowledgement: value.sourceAcknowledgement ?? { id: gateway.id, sourceRevision: gateway.sourceRevision } } : body
+  return new Response(JSON.stringify(answer), { status, headers: { 'Content-Type': 'application/json' } })
 }
 
 type PutRequest = { id: string; body: any }
@@ -72,8 +81,9 @@ function store(request: PutRequest, updatedAt?: string): MCPGateway {
     ...(request.body.stdioConfig !== undefined ? { stdioConfig: { ...current.stdioConfig!, ...request.body.stdioConfig } } : {}),
     updated_at: updatedAt ?? new Date(Date.parse(T0) + stamp * 1000).toISOString()
   }
-  stored.set(request.id, next)
-  return next
+  const acknowledged = presentFixture(next)
+  stored.set(request.id, acknowledged)
+  return acknowledged
 }
 
 const savedAnswer = (request: PutRequest) => json(200, { gateway: store(request) })

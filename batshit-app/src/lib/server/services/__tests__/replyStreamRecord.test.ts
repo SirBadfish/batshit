@@ -1,6 +1,7 @@
 // @vitest-environment node
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { logger } from '$lib/utils/logger'
+import * as originalTask from '../appActions/mcp/originalTask'
 import { unclosedReferenceReplies } from '$lib/test-utils/unclosedReferenceReplies'
 import {
   MAX_REPLAY_EVENTS,
@@ -19,15 +20,21 @@ import {
   replyZipDetection,
   retractReplySegment,
   REPLY_RECORDED_EVENT_TYPES,
+  REPLY_ORDERED_EVENT_TYPES,
   takeStreamMadeZipReferences,
   scheduleReplyRecordCleanup,
-  startReplyRecord
+  startReplyRecord,
+  persistCanonicalReply
 } from '$lib/server/services/replyStreamRecord'
 import { redis } from '$lib/server/redis'
 import { SegmentedText } from '$lib/utils/segmentedText'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
+import { createSettingsRedisAdmission } from '$lib/test-utils/settingsRedisAdmission'
 
-useRedisTestServer()
+const realRedis = process.env.VITEST_USE_REAL_REDIS === 'true'
+const strictAdmission = createSettingsRedisAdmission(redis)
+useRedisTestServer({ beforeCleanupAdmission: strictAdmission.beforeCleanupAdmission })
+afterAll(() => strictAdmission.close())
 
 /**
  * BL-775: the server owns a reply's saved record, and its text has ONE maker, the stream path: the
@@ -45,6 +52,153 @@ vi.mock('$lib/server/zipService', async (importOriginal) => ({
 const SESSION = 'session-record'
 beforeEach(async () => { await redis.createSession({ id: SESSION, user_id: 'reply-record-fixture', title: 'Reply record fixture' } as any) })
 const COOL_A = '{{batshit-zip:cool_tool_1790000000001_abcd12:::read_file: a.ts - 3 lines}}'
+
+describe('canonical reply save when original-request bookkeeping refuses (BL-1891)', () => {
+  afterEach(() => {
+    // spyOn(existing vi.fn) returns that fake itself. Its own mockRestore
+    // restores the original persistence implementation as well as call state.
+    if (vi.isMockFunction(redis.saveMessage)) redis.saveMessage.mockRestore()
+    vi.restoreAllMocks()
+  })
+  const message = { id: 'canonical-custody', session_id: SESSION, user_id: 'reply-record-fixture', role: 'assistant' as const,
+    content: 'The actual recorded reply.', created_at: '2026-10-20T00:00:00.000Z' }
+  it('saves exactly once before reporting custody refusal and issues no positive receipt', async () => {
+    vi.spyOn(originalTask, 'beginP5CanonicalWrite').mockImplementation(() => { throw new Error('custody refused') })
+    const failed = vi.spyOn(originalTask, 'failP5CanonicalCustody')
+    const receipt = vi.spyOn(originalTask, 'observeP5CanonicalReceipt')
+    let acknowledged = false
+    const save = vi.spyOn(redis, 'saveMessage').mockClear().mockImplementation(async () => { acknowledged = true })
+    const diagnostic = vi.spyOn(logger, 'error').mockImplementation(() => { expect(acknowledged).toBe(true) })
+    await expect(persistCanonicalReply(message as any)).resolves.toBeUndefined()
+    expect(save).toHaveBeenCalledExactlyOnceWith(message)
+    expect(failed).toHaveBeenCalledOnce()
+    expect(receipt).not.toHaveBeenCalled()
+    expect(diagnostic).toHaveBeenCalledWith(expect.stringContaining('reply was saved'), expect.any(Error))
+  })
+  it('preserves the original Redis rejection when custody also refuses, without claiming a known save', async () => {
+    vi.spyOn(originalTask, 'beginP5CanonicalWrite').mockImplementation(() => { throw new Error('custody refused') })
+    const failure = new Error('actual Redis write failed')
+    const save = vi.spyOn(redis, 'saveMessage').mockClear().mockRejectedValueOnce(failure)
+    const receipt = vi.spyOn(originalTask, 'observeP5CanonicalReceipt')
+    const diagnostic = vi.spyOn(logger, 'error').mockImplementation(() => {})
+    await expect(persistCanonicalReply(message as any)).rejects.toBe(failure)
+    expect(save).toHaveBeenCalledExactlyOnceWith(message)
+    expect(receipt).not.toHaveBeenCalled()
+    expect(diagnostic).not.toHaveBeenCalled()
+  })
+  it('keeps a post-ACK bookkeeping failure restrictive without replaying the known save', async () => {
+    const ticket = Object.freeze({}) as any
+    vi.spyOn(originalTask, 'beginP5CanonicalWrite').mockReturnValue(ticket)
+    vi.spyOn(originalTask, 'p5CanonicalWriteOwner').mockImplementation(() => { throw new Error('receipt owner refused') })
+    const failed = vi.spyOn(originalTask, 'failP5CanonicalCustody')
+    const receipt = vi.spyOn(originalTask, 'observeP5CanonicalReceipt')
+    const save = vi.spyOn(redis, 'saveMessage').mockClear().mockResolvedValueOnce(undefined)
+    const diagnostic = vi.spyOn(logger, 'error').mockImplementation(() => {})
+    await expect(persistCanonicalReply(message as any)).resolves.toBeUndefined()
+    expect(save).toHaveBeenCalledExactlyOnceWith(message)
+    expect(failed).toHaveBeenCalledOnce()
+    expect(receipt).not.toHaveBeenCalled()
+    expect(diagnostic).toHaveBeenCalledWith(expect.stringContaining('reply was saved'), expect.any(Error))
+  })
+})
+
+describe.runIf(realRedis)('BL-1891 actual canonical Redis write despite custody refusal', () => {
+  afterEach(() => vi.restoreAllMocks())
+  it.each(['begin refusal', 'post-ACK receipt refusal'] as const)('retains the same actual saved record exactly once after %s', async boundary => {
+    const message = { id: 'canonical-wire-custody', session_id: SESSION, user_id: 'reply-record-fixture',
+      role: 'assistant' as const, content: 'The recorded canonical bytes.', created_at: '2026-10-20T00:00:00.000Z',
+      ...(boundary === 'begin refusal' ? { status: 'error' as const } : {}),
+      metadata: { zipIds: [], response_failed: boundary === 'begin refusal',
+        ...(boundary === 'begin refusal' ? { custodySentinel: 'first-record-only' } : {}) } }
+    const begin = vi.spyOn(originalTask, 'beginP5CanonicalWrite')
+    const receipt = vi.spyOn(originalTask, 'observeP5CanonicalReceipt')
+    if (boundary === 'begin refusal') begin.mockImplementation(() => { throw new Error('custody refused before the actual save') })
+    else {
+      begin.mockReturnValue(Object.freeze({}) as any)
+      vi.spyOn(originalTask, 'p5CanonicalWriteOwner').mockReturnValue(Object.freeze({}) as any)
+      receipt.mockImplementation(() => { throw new Error('custody receiver refused after the actual save') })
+    }
+    const save = vi.spyOn(redis, 'saveMessage') // CALL THROUGH to the real Redis service/client.
+    vi.spyOn(logger, 'error').mockImplementation(() => {})
+    await expect(persistCanonicalReply(message as any)).resolves.toBeUndefined()
+    expect(save).toHaveBeenCalledExactlyOnceWith(message)
+    const stored = await redis.execute(client => client.json.get(`message:${SESSION}:${message.id}`))
+    // The real service assigns the initial date; the caller's supplied date
+    // is not the storage contract. Capture its ACTUAL first saved value.
+    expect(stored).toMatchObject({ ...message, created_at: expect.any(String) })
+    if (boundary === 'begin refusal') {
+      expect(receipt).not.toHaveBeenCalled()
+      const firstCreatedAt = (stored as { created_at: string }).created_at
+      const reconciliation = { ...message, created_at: '2000-01-01T00:00:00.000Z',
+        metadata: { zipIds: [], response_failed: true, http_status: 500 } }
+      await expect(persistCanonicalReply(reconciliation as any)).resolves.toBeUndefined()
+      expect(save).toHaveBeenCalledTimes(2) // Exactly once for EACH actual invocation.
+      expect(save).toHaveBeenNthCalledWith(2, reconciliation)
+      const reconciled = await redis.execute(client => client.json.get(`message:${SESSION}:${message.id}`))
+      expect(reconciled).toMatchObject({ id: message.id, session_id: SESSION, user_id: message.user_id,
+        role: 'assistant', status: 'error', content: message.content, created_at: firstCreatedAt,
+        metadata: { zipIds: [], response_failed: true, custodySentinel: 'first-record-only', http_status: 500 } })
+      const messageIds = await redis.execute(client => client.lRange(`messages:${SESSION}`, 0, -1))
+      expect(messageIds.filter(id => id === message.id)).toHaveLength(1)
+      expect(receipt).not.toHaveBeenCalled()
+    } else expect(receipt).toHaveBeenCalledOnce()
+  })
+})
+
+
+/** SAME strict Redis fixture; no provider/native/approval result is manufactured. */
+describe.runIf(realRedis)('API original canonical part actual Redis boundary', () => {
+  it.each(['current', 'Stop'] as const)('retains actual same-ID part ACK/readback across %s without a verified-use grant', async boundary => {
+    const turns = await import('../streamAbortRegistry')
+    const { createApprovalResumeStart } = await import('../approvalResumeMessage')
+    const identity = { userId: 'reply-record-fixture', agentId: 'reply-api-primary', sessionId: SESSION }
+    const agent = { id: identity.agentId, user_id: identity.userId, agentType: 'api', created_at: 'synthetic-wire-actor' }
+    await redis.set(`agent:${identity.agentId}`, agent)
+    const storedAgent = await redis.get(`agent:${identity.agentId}`)
+    const session = await redis.getSession(SESSION)
+    const stop = new AbortController()
+    const lookup = originalTask.captureP5OriginalLookup({ ...identity, signal: stop.signal })!
+    const registered = turns.registerSessionTurn(SESSION, 'single', 'api-canonical-wire')
+    if (!registered.ok || !session || !storedAgent || typeof storedAgent !== 'object' || Array.isArray(storedAgent) ||
+      !('id' in storedAgent) || !('user_id' in storedAgent) || storedAgent.id !== identity.agentId || storedAgent.user_id !== identity.userId) throw new Error('Actual owned API fixture state is unavailable.')
+    const preparation = originalTask.prepareP5OriginalTask(lookup, { ...identity, session,
+      agent: { id: storedAgent.id, user_id: storedAgent.user_id }, turn: registered.entry })!
+    try {
+      originalTask.recordP5ResolvedApiScope(preparation, { gateways: [], tools: [], authority: { humanSelection: true } })
+      const first = originalTask.bindP5ApiReplyPart(preparation, { replyId: 'api-canonical-wire', version: 0 })!
+      const run = originalTask.associateP5ApiOriginalRun(preparation, first, { ...identity, replyId: 'api-canonical-wire', signal: stop.signal })!
+      originalTask.recordP5ApiManagementIntent(run) // restrictive intent only
+      const message = { id: 'api-canonical-wire', session_id: SESSION, user_id: identity.userId, agent_id: identity.agentId,
+        role: 'assistant' as const, content: 'Actual first canonical part.', metadata: { custodySentinel: 'actual-first-save' }, intermediateSteps: [] }
+      await persistCanonicalReply(message, preparation, first)
+      await originalTask.refreshP5OriginalRequest(originalTask.p5OriginalRequestForPreparation(preparation)!)
+      const prior = await redis.execute(client => client.json.get(`message:${SESSION}:${message.id}`))
+      expect(prior).toMatchObject({ ...message, created_at: expect.any(String) })
+      expect(originalTask.p5CanonicalReplySealed(preparation, message.id, first)).toBe(true)
+      const start = createApprovalResumeStart(prior as any, Date.now())
+      const next = originalTask.bindP5ApiReplyPart(preparation, { replyId: message.id, version: start.version })!
+      if (boundary === 'Stop') {
+        expect(turns.stopSessionTurn(SESSION, 'actual API canonical boundary Stop')).toBe(true)
+        expect(() => originalTask.assertP5ApiRunCurrent(run)).toThrow()
+      }
+      // Even a real old-part ACK cannot seal the actual new server part.
+      await persistCanonicalReply({ ...message, content: 'Old-part enrichment.' }, preparation, first)
+      expect(originalTask.p5CanonicalReplySealed(preparation, message.id, next)).toBe(false)
+      await persistCanonicalReply({ ...message, content: 'Final actual joined canonical bytes.', metadata: { http_status: 200 } }, preparation, next)
+      await originalTask.refreshP5OriginalRequest(originalTask.p5OriginalRequestForPreparation(preparation)!)
+      expect(originalTask.p5CanonicalReplySealed(preparation, message.id, next)).toBe(true)
+      const final = await redis.execute(client => client.json.get(`message:${SESSION}:${message.id}`))
+      expect(final).toMatchObject({ id: message.id, content: 'Final actual joined canonical bytes.',
+        created_at: (prior as { created_at: string }).created_at, metadata: { custodySentinel: 'actual-first-save', http_status: 200 } })
+      expect((await redis.execute(client => client.lRange(`messages:${SESSION}`, 0, -1))).filter(id => id === message.id)).toHaveLength(1)
+      if (boundary === 'Stop') await expect(originalTask.takeP5ApiVerifiedContinuation(preparation)).rejects.toThrow()
+      else await expect(originalTask.takeP5ApiVerifiedContinuation(preparation)).resolves.toBeUndefined()
+    } finally {
+      await originalTask.sealP5OriginalPreparation(preparation); originalTask.retireP5OriginalPreparation(preparation)
+      turns.releaseSessionTurn(SESSION, registered.entry.turnId)
+    }
+  })
+})
 
 function start(messageId: string, metadata: Record<string, unknown> = {}) {
   startReplyRecord(SESSION, { type: 'start', sessionId: SESSION, messageId, metadata })
@@ -96,7 +250,7 @@ describe('replyStreamRecord: the recorded events of a running reply', () => {
     expect(hasReplyRecord(SESSION, 'm1')).toBe(false)
     expect(__countReplyRecordChatsForTests()).toBe(0)
     expect(vi.getTimerCount()).toBe(0)
-    expect(replyZipDetection.takeUnclosedText(SESSION, 'm1')).toBe('')
+    expect(await replyZipDetection.takeHeldText(SESSION, 'm1')).toBe('')
   })
 
   it('caps the joining replay, keeps the start pinned for a late tab, and rebuilds the whole reply past the cap', async () => {
@@ -208,6 +362,17 @@ describe('replyStreamRecord: the rebuild the finalize saves', () => {
     expect(rebuilt?.content).toBe('Just words.')
   })
 
+  it('saves an empty reply when the reply end left nothing of an open cue block (BL-695)', async () => {
+    start('m-only-cue')
+    chunk('m-only-cue', '<batshit-cue>{"goon_mood":"happy"}')
+    const rebuilt = await rebuild('m-only-cue', { endContent: '' })
+    expect(rebuilt?.content).toBe('')
+    // Without the reply end's flag nothing is dropped.
+    start('m-only-cue-raw')
+    chunk('m-only-cue-raw', '<batshit-cue>{"goon_mood":"happy"}')
+    expect((await rebuild('m-only-cue-raw', { replyControlFinalized: false }))?.content).toContain('<batshit-cue>')
+  })
+
   it('drops the control blocks the reply end applied, and only when it says so', () => {
     const blocks = '\n<batshit-tool-notes>{"notes":[{"toolName":"bash","summary":"ok"}]}</batshit-tool-notes>'
     const reconstruction = { start: null, events: [{ type: 'chunk', messageId: 'm', content: `All done.${blocks}` }] }
@@ -279,7 +444,7 @@ describe('replyStreamRecord: the rebuild the finalize saves', () => {
     start('m-held')
     chunk('m-held', 'Intro. ')
     await replyZipDetection.processChunk(SESSION, 'm-held', '<error>Traceback: never closed')
-    expect(flushHeldReplyText(SESSION, 'm-held')).toBe(true)
+    expect(await flushHeldReplyText(SESSION, 'm-held')).toBe(true)
     closeReplyRecord(SESSION, 'm-held')
 
     const rebuilt = await rebuild('m-held')
@@ -289,7 +454,7 @@ describe('replyStreamRecord: the rebuild the finalize saves', () => {
       'Intro. ',
       '<error>Traceback: never closed'
     ])
-    expect(replyZipDetection.takeUnclosedText(SESSION, 'm-held')).toBe('')
+    expect(await replyZipDetection.takeHeldText(SESSION, 'm-held')).toBe('')
   })
 
   it('keeps a lone start of the error tag the reply ended on', async () => {
@@ -298,7 +463,7 @@ describe('replyStreamRecord: the rebuild the finalize saves', () => {
       start('m-tag')
       chunk('m-tag', 'And then ')
       await replyZipDetection.processChunk(SESSION, 'm-tag', tail)
-      expect(flushHeldReplyText(SESSION, 'm-tag')).toBe(true)
+      expect(await flushHeldReplyText(SESSION, 'm-tag')).toBe(true)
       closeReplyRecord(SESSION, 'm-tag')
       expect((await rebuild('m-tag'))?.content, tail).toBe(`And then ${tail}`)
     }
@@ -307,14 +472,14 @@ describe('replyStreamRecord: the rebuild the finalize saves', () => {
   it('flushes nothing when the detector holds nothing, and leaves a reply with no record alone', async () => {
     start('m-none')
     chunk('m-none', 'All closed.')
-    expect(flushHeldReplyText(SESSION, 'm-none')).toBe(false)
+    expect(await flushHeldReplyText(SESSION, 'm-none')).toBe(false)
     expect(listReplayEvents(SESSION).filter((event) => event.type === 'chunk')).toHaveLength(1)
 
     // Held words with no record to write them to stay held; the finalize then saves its own copy.
     await replyZipDetection.processChunk(SESSION, 'never-recorded', '<error>held')
-    expect(flushHeldReplyText(SESSION, 'never-recorded')).toBe(false)
+    expect(await flushHeldReplyText(SESSION, 'never-recorded')).toBe(false)
     expect(hasReplyRecord(SESSION, 'never-recorded')).toBe(false)
-    expect(replyZipDetection.takeUnclosedText(SESSION, 'never-recorded')).toBe('<error>held')
+    expect(await replyZipDetection.takeHeldText(SESSION, 'never-recorded')).toBe('<error>held')
   })
 
   // A finalize that closes without flushing is a bug in the caller; the rebuild says so loudly and
@@ -418,7 +583,7 @@ describe('replyStreamRecord: the rebuild the finalize saves', () => {
 
   // BL-775: after the finalize closed a reply, a content or tool event of it is refused at the
   // write itself (the route checks on arrival and before its zip detection too); the next start
-  // (an approval resume) reopens it, and a terminal event is never refused.
+  // of a newer part (an approval resume, BL-871 a) reopens it, and a terminal event is never refused.
   it('refuses a late content or tool event of a closed reply at the write, until its next start', () => {
     start('m-closed')
     expect(recordReplyEvent(SESSION, { type: 'chunk', messageId: 'm-closed', content: 'On time.' })).toBe(true)
@@ -431,9 +596,46 @@ describe('replyStreamRecord: the rebuild the finalize saves', () => {
     const chunks = listReplayEvents(SESSION).filter((event) => event.type === 'chunk').map((event) => event.content)
     expect(chunks).toEqual(['On time.'])
 
-    start('m-closed')
+    start('m-closed', { approvalResume: { version: 3, prior: { content: 'On time.', metadata: {} } } })
     expect(isLateReplyEvent(SESSION, { type: 'chunk', messageId: 'm-closed' })).toBe(false)
     expect(recordReplyEvent(SESSION, { type: 'chunk', messageId: 'm-closed', content: 'Resumed.' })).toBe(true)
+  })
+
+  // BL-871 (d): while `/api/sse` stalls, send-routed sends only these, in order. `steer_delivered`
+  // is one of them: a tab that never heard of a steer the model read marks it "Not sent" when the
+  // reply ends, with a Send now that would send it twice; `end` cannot rebuild that.
+  it('keeps the terminal events and steer_delivered as the events a stalled reply still sends, in order', () => {
+    expect([...REPLY_ORDERED_EVENT_TYPES].sort()).toEqual(['complete', 'end', 'error', 'steer_delivered'])
+  })
+
+  // BL-871 (a): a start whose forward passed its limit can finish after the finalize closed the
+  // reply. It is refused at the write too, unless it opens a newer approval resume part than the
+  // part the reply was closed with; refused, it leaves the record and the closed mark as they were.
+  it('refuses a late start of a closed reply at the write unless it opens a newer part', () => {
+    const resumeAt = (version: number) => ({ approvalResume: { version, prior: { content: 'On time.', metadata: {} } } })
+    start('m-start')
+    chunk('m-start', 'On time.')
+    closeReplyRecord(SESSION, 'm-start', 0)
+
+    expect(isLateReplyEvent(SESSION, { type: 'start', messageId: 'm-start' })).toBe(true)
+    expect(startReplyRecord(SESSION, { type: 'start', sessionId: SESSION, messageId: 'm-start', metadata: {} })).toBe(false)
+    expect(isLateReplyEvent(SESSION, { type: 'chunk', messageId: 'm-start' })).toBe(true)
+    expect(listReplayEvents(SESSION).filter((event) => event.messageId === 'm-start').map((event) => event.type)).toEqual([
+      'start',
+      'chunk'
+    ])
+    // A start of another reply is never late.
+    expect(isLateReplyEvent(SESSION, { type: 'start', messageId: 'm-other' })).toBe(false)
+
+    expect(isLateReplyEvent(SESSION, { type: 'start', messageId: 'm-start', metadata: resumeAt(2) })).toBe(false)
+    expect(startReplyRecord(SESSION, { type: 'start', sessionId: SESSION, messageId: 'm-start', metadata: resumeAt(2) })).toBe(true)
+    closeReplyRecord(SESSION, 'm-start', 2)
+    expect(isLateReplyEvent(SESSION, { type: 'start', messageId: 'm-start', metadata: resumeAt(2) })).toBe(true)
+    expect(isLateReplyEvent(SESSION, { type: 'begin', messageId: 'm-start', metadata: resumeAt(1) })).toBe(true)
+    // A later close with an older version (a second finalize of an older part) keeps the newest.
+    closeReplyRecord(SESSION, 'm-start', 0)
+    expect(isLateReplyEvent(SESSION, { type: 'start', messageId: 'm-start', metadata: resumeAt(2) })).toBe(true)
+    expect(isLateReplyEvent(SESSION, { type: 'start', messageId: 'm-start', metadata: resumeAt(3) })).toBe(false)
   })
 })
 

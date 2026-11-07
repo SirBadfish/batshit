@@ -77,7 +77,7 @@ export function resolveClaudeRuntimeUid(
   if (identity.uid !== undefined) return identity.uid
 
   const getuid = (process as NodeJS.Process & { getuid?: () => number }).getuid
-  return typeof getuid === 'function' ? getuid.call(process) : null
+  return typeof getuid === 'function' ? getuid() : null
 }
 
 export function buildClaudeDockerExecOptions(

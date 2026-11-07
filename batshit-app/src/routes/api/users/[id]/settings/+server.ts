@@ -1,4 +1,5 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
+import { normalizeAppearanceSettings } from '$lib/appearance/appLook'
 import { redis } from '$lib/server/redis'
 import { resolveDefaultNativeExecutionBackend } from '$lib/server/services/nativeExecutionDefaults'
 
@@ -44,6 +45,8 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
 
   try {
     const settings = await request.json()
+    // The app's look is stored only as {look} with a named look (src/lib/appearance/appLook.ts).
+    if (settings && typeof settings === 'object' && Object.hasOwn(settings, 'appearance_settings')) settings.appearance_settings = normalizeAppearanceSettings(settings.appearance_settings)
     await redis.updateUserSettings(params.id, settings)
     return json({ success: true })
   } catch (error) {

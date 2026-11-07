@@ -4,10 +4,12 @@ import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { redis } from '$lib/server/redis'
 import {
   installUserSettingsRoutes,
+  jsonResponse,
   loadUserSettingsRoute,
   storedUserSettings
 } from '$lib/test-utils/userSettingsRoute'
 import ZipVisualIndicatorsCard from './ZipVisualIndicatorsCard.svelte'
+import { getUserSettingsReadState, resetUserSettings } from '$lib/stores/userSettings.svelte'
 
 /**
  * BL-962 (the class of BL-939 and BL-487): when `GET /api/user/settings` failed, the Visual
@@ -105,12 +107,12 @@ async function storedOther() {
   return Object.fromEntries(Object.keys(OTHER).map((key) => [key, stored[key]]))
 }
 
-function installRoutes() {
+function installRoutes(overrideGet?: (response: Response) => Response | Promise<Response>) {
   failGetsWith = null
   holdGets = null
   const installed = installUserSettingsRoutes({
     userId: USER,
-    route,
+    route: overrideGet ? { ...route, GET: async (event: any) => overrideGet(await route.GET(event) as Response) } : route,
     failGetsWith: () => failGetsWith,
     holdGets: () => holdGets
   })
@@ -149,6 +151,90 @@ describe('Visual Indicators never turns a failed load into a save (BL-962)', () 
     vi.restoreAllMocks()
     global.fetch = originalFetch
   })
+
+  it.each([
+    ['missing settings', {}], ['null envelope', null], ['array envelope', []],
+    ['array record', { settings: [] }], ['scalar record', { settings: 42 }],
+    ['declared failure', { success: false, settings: SAVED }]
+  ])('BL-978(i): %s grants no read/save authority; Retry reads the real saved record', async (_name, payload) => {
+    resetUserSettings()
+    await seedStored(SAVED)
+    let healthy = false
+    installRoutes(response => healthy ? response : jsonResponse(payload))
+    renderCard(SAVED)
+    const notice = await screen.findByTestId('zip-visual-indicators-load-error')
+    expect(switches()).toEqual([])
+    expect(getUserSettingsReadState()).toBe('unread')
+    await pause(700)
+    expect(posts).toEqual([])
+    expect(await storedVisual()).toEqual(SAVED)
+    healthy = true
+    await fireEvent.click(within(notice).getByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect(switches()).toHaveLength(8))
+    expect(switchStates()).toEqual(expectedStates(SAVED))
+    expect(getUserSettingsReadState()).toBe('confirmed')
+    await pause(700)
+    expect(posts).toEqual([])
+    await fireEvent.click(switches()[0])
+    await waitFor(() => expect(posts).toHaveLength(1))
+    expect(await storedVisual()).toEqual({ ...SAVED, show_zipped_badges: true })
+    expect(await storedOther()).toEqual(OTHER)
+  }, 60_000)
+
+  it('BL-978(i): Retry may confirm genuine no-record defaults without a hydration save or stale page values', async () => {
+    resetUserSettings()
+    let healthy = false
+    installRoutes(response => healthy ? response : jsonResponse({}))
+    renderCard(SAVED)
+    const notice = await screen.findByTestId('zip-visual-indicators-load-error')
+    healthy = true
+    await fireEvent.click(within(notice).getByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect(switches()).toHaveLength(8))
+    expect(switchStates()).toEqual(expectedStates(DEFAULTS))
+    expect(getUserSettingsReadState()).toBe('confirmed')
+    await pause(700)
+    expect(posts).toEqual([])
+    expect(await storedUserSettings(USER)).toBeNull()
+    await fireEvent.click(switches()[0])
+    await waitFor(() => expect(posts).toHaveLength(1))
+    expect(await storedVisual()).toEqual({ ...DEFAULTS, show_zipped_badges: false })
+  }, 60_000)
+
+  it('BL-978(i): a later malformed Retry answer preserves the last good switches and their save baseline', async () => {
+    resetUserSettings()
+    await seedStored(SAVED)
+    let attempts = 0
+    let release = () => {}
+    const gate = new Promise<void>(resolve => { release = resolve })
+    installRoutes(async response => {
+      attempts += 1
+      if (attempts === 1) return response
+      await gate
+      return jsonResponse({})
+    })
+    failGetsWith = 500
+    renderCard()
+    const notice = await screen.findByTestId('zip-visual-indicators-load-error')
+    failGetsWith = null
+    const retry = within(notice).getByRole('button', { name: 'Retry' })
+    try {
+      const first = fireEvent.click(retry)
+      const second = fireEvent.click(retry)
+      await Promise.all([first, second])
+      await waitFor(() => expect(attempts).toBe(2))
+      await waitFor(() => expect(switchStates()).toEqual(expectedStates(SAVED)))
+      release()
+      await pause(700)
+      expect(switchStates()).toEqual(expectedStates(SAVED))
+      expect(getUserSettingsReadState()).toBe('confirmed')
+      expect(posts).toEqual([])
+      expect(await storedVisual()).toEqual(SAVED)
+      await fireEvent.click(switches()[0])
+      await waitFor(() => expect(posts).toHaveLength(1))
+      expect(await storedVisual()).toEqual({ ...SAVED, show_zipped_badges: true })
+      expect(await storedOther()).toEqual(OTHER)
+    } finally { release() }
+  }, 60_000)
 
   it('the load fails and the user tries an edit: no write leaves and the stored settings are unchanged', async () => {
     await seedStored(SAVED)

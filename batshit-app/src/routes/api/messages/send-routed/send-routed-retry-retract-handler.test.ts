@@ -1,4 +1,5 @@
 // @vitest-environment node
+import { useSendHandlerFixture } from '$lib/test-utils/sendHandlerFixture'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { redis } from '$lib/server/redis'
@@ -14,10 +15,11 @@ import { env } from '$env/dynamic/private'
  * BL-759 phase 2 through the real send-routed handler and the real `/api/sse` POST, joined by the
  * event fetch: a managed lane takes back a message its vendor never finished and started again.
  *
- * Codex's app-server lane retries a dropped response stream by itself and starts the answer again
- * as a NEW agent message; the dropped one never completes. Its adapter names each text chunk's
- * segment (the message) and, once Codex writes again, hands on a `text-retract` for the segment it
- * dropped (phase 1, `codexEventAdapter.ts`). The fake model here streams those same parts.
+ * The Codex CLI app-server lane (removed in SA-139 R1) retried a dropped response stream by itself
+ * and started the answer again as a NEW agent message; the dropped one never completed. Its adapter
+ * named each text chunk's segment (the message) and, once Codex wrote again, handed on a
+ * `text-retract` for the segment it dropped (phase 1). No live lane streams these parts now;
+ * send-routed still takes them, and the fake model here streams them.
  *
  * - send-routed keeps its own copy of the reply by segment and takes the segment out of it, and
  *   forwards the retract to `/api/sse`.
@@ -49,7 +51,7 @@ const mocks = vi.hoisted(() => ({
   /** The parts the fake model streams, per model run (1-based); the last list repeats. */
   runs: [] as Array<Array<Record<string, any>>>,
   runCount: 0,
-  /** What the model's `onFinish` says its text was (Codex: its last finished message). */
+  /** What the model's `onFinish` says its text was (its last finished message). */
   finishText: '',
   /** A forwarded event type the event fetch answers 500 for, without reaching `/api/sse`. */
   failForwardOf: null as string | null,
@@ -59,26 +61,8 @@ const mocks = vi.hoisted(() => ({
   replayAtEnd: null as any[] | null
 }))
 
-/**
- * Sealed from any real Redis: the live hub opens its own clients with `redis.createClient` (see
- * `send-routed-woken-turn-zips-handler.test.ts`).
- */
-vi.mock('redis', () => ({
-  createClient: vi.fn(() => ({
-    isOpen: true,
-    isReady: true,
-    connect: vi.fn(async () => undefined),
-    on: vi.fn(),
-    subscribe: vi.fn(async () => undefined),
-    pSubscribe: vi.fn(async () => undefined),
-    unsubscribe: vi.fn(async () => undefined),
-    pUnsubscribe: vi.fn(async () => undefined),
-    publish: vi.fn(async () => 0),
-    configSet: vi.fn(async () => 'OK'),
-    quit: vi.fn(async () => undefined),
-    disconnect: vi.fn(async () => undefined)
-  }))
-}))
+// Physical monitoring and subscribers are isolated by the opt-in handler fixture.
+
 
 vi.mock('$lib/server/services/nativeTools', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
@@ -139,6 +123,7 @@ let previousToken: string | undefined
 let POST: (event: any) => Promise<Response>
 let SSE_ROUTE: any
 let SESSION = ''
+useSendHandlerFixture({ sessionIds: () => [SESSION], postStartupMcpUsers: () => [USER] })
 let count = 0
 
 /** The event fetch: a forward to `/api/sse` reaches the real route; nothing else is called. */
@@ -320,8 +305,8 @@ describe('send-routed + /api/sse: a retried answer takes back its fragment (BL-7
   }, 30_000)
 
   it('a fragment that other words followed is superseded: /api/sse answers without success, and the own copy is taken back by segment', async () => {
-    // Words with no segment land after the fragment (the Codex adapter never lets this happen:
-    // it hands the retract on first). The zip detector then cannot take the fragment back exactly.
+    // Words with no segment land after the fragment (the retired Codex adapter never let this
+    // happen: it handed the retract on first). The zip detector then cannot take the fragment back exactly.
     mocks.runs = [[text('Partial <error>boom', 'm1'), text(' kept', undefined), retract('m1'), text('Answer.', 'm2')]]
     mocks.finishText = 'Answer.'
     expect((await send()).status).toBe(200)

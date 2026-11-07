@@ -1,3 +1,6 @@
+import { refreshToolOperationsSource, setToolOperationsOwner } from '$lib/stores/toolOperationalSettings.svelte'
+import { refreshAppearanceFromServer } from '$lib/appearance/appLookSync.svelte'
+import { refreshStoredSavedModels, setSavedModelsOwner } from '$lib/stores/savedModels.svelte'
 /**
  * SA-113 P1 (DL-113-06) — the browser's one connection to the user-wide live channel.
  *
@@ -24,9 +27,11 @@
 import * as sessionStore from '$lib/stores/session.svelte'
 import * as chatRunRegistry from '$lib/stores/chatRunRegistry.svelte'
 import { applyDmInboxChanged } from '$lib/stores/dmInbox.svelte'
-import { refreshAgentFieldsFromServer } from '$lib/stores/agents.svelte'
+import { getAgents, refreshAgentFieldsFromServer } from '$lib/stores/agents.svelte'
+import { subagentStore, refreshSubagentIdentityFromServer, refreshSubagentModelSelectionFromServer, refreshSubagentInstructionsFromServer, refreshSubagentProviderSettingsFromServer } from '$lib/stores/subagents.svelte'
 import { subscribeLive, type LiveSubscription } from '$lib/services/liveHub/liveHubClient'
 import { logger } from '$lib/utils/logger'
+import { dispatchSlashCommandsUpdated } from '$lib/utils/liveSettingsEvents'
 
 export type UserChannelEvent =
   | { type: 'connected'; scope: 'user' }
@@ -37,6 +42,10 @@ export type UserChannelEvent =
    * turn that ended, for one), so the chat page catches up the chats it still thinks are busy.
    */
   | { type: 'reconnected' }
+  | { type: 'slash_commands_changed' }
+  | { type: 'plugin_access_changed'; pluginId?: string }
+  | { type: 'model_presets_changed' }
+  | { type: 'user_settings_changed'; family: 'tool-operations' | 'appearance' }
   | { type: 'session_created'; session: Record<string, any> }
   | { type: 'session_updated'; sessionId: string; patch: Record<string, any> }
   /**
@@ -109,13 +118,12 @@ export type UserChannelEvent =
    * page, not by `applyToStores`.
    */
   | { type: 'jev_juice_post_turn'; sessionId: string; messageId: string }
-  /** Server-owned warning learned after a stopped Codex reply's stream ended. */
-  | { type: 'codex_cleanup_warning'; sessionId: string; messageId: string }
   /**
    * BL-474 step 2: the server decided where a reply's outside pictures came from (written before
    * that reply's `end`). The tab showing the chat re-reads its records. Handled by the chat page.
    */
   | { type: 'image_origin_changed'; sessionId: string; messageId: string }
+  | { type: 'whiteboard_changed'; sessionId: string; agentId: string; version: number }
   /**
    * The SERVER changed a chat's stored messages in a way no stream event can show a tab:
    * an approval resume that streams into a message every tab has already marked finished,
@@ -132,7 +140,10 @@ export type UserChannelEvent =
    * family of fields again here (`applyToStores`), and a mounted Agents or Memory panel reads it
    * again by its own rules. It carries no values: the record is the one source.
    */
-  | { type: 'agent_settings_changed'; agentId: string; family: 'memory' | 'identity' }
+  | { type: 'mcp_gateway_source_changed'; gatewayId: string }
+  | { type: 'agent_settings_changed'; agentId: string; family: 'mcp-settings' | 'provider-settings' | 'memory' | 'identity' | 'retention' | 'app-actions-policy' | 'model-selection' | 'instructions' | 'auto-compact' | 'voice-selection' }
+  | { type: 'subagent_settings_changed'; agentId: string; family: 'identity' | 'model-selection' | 'instructions' | 'provider-settings' }
+  | { type: 'portable_skill_authority_changed'; tokenId: string; authorityGeneration: number }
   | (Record<string, any> & { type: string })
 
 type Listener = (event: UserChannelEvent) => void
@@ -142,7 +153,6 @@ let connectedUserId: string | null = null
 let holders = 0
 
 const listeners = new Set<Listener>()
-
 type ServerRunStatus = 'running' | 'tooling' | 'complete' | 'failed' | 'stopped'
 const SERVER_RUN_STATUSES: ServerRunStatus[] = [
   'running',
@@ -174,6 +184,7 @@ function emit(event: UserChannelEvent) {
  */
 function applyToStores(event: UserChannelEvent) {
   switch (event.type) {
+    case 'model_presets_changed': void refreshStoredSavedModels(); break
     case 'session_created': {
       const session = (event as any).session
       if (session?.id) sessionStore.upsertSession(session)
@@ -217,9 +228,28 @@ function applyToStores(event: UserChannelEvent) {
       applyDmInboxChanged(event as any)
       break
     }
+    case 'plugin_access_changed':
+    case 'slash_commands_changed': {
+      dispatchSlashCommandsUpdated({ source: 'unknown' })
+      break
+    }
+    case 'user_settings_changed': {
+      if (event.family === 'tool-operations') void refreshToolOperationsSource()
+      if (event.family === 'appearance') void refreshAppearanceFromServer()
+      break
+    }
+    case 'subagent_settings_changed': {
+      const { agentId, family } = event as any
+      if (typeof agentId === 'string' && agentId && family === 'provider-settings') void refreshSubagentProviderSettingsFromServer(agentId)
+      if (typeof agentId === 'string' && agentId && family === 'identity') void refreshSubagentIdentityFromServer(agentId)
+      if (typeof agentId === 'string' && agentId && family === 'model-selection') { void refreshSubagentModelSelectionFromServer(agentId); void refreshStoredSavedModels() }
+      if (typeof agentId === 'string' && agentId && family === 'instructions') void refreshSubagentInstructionsFromServer(agentId)
+      break
+    }
     case 'agent_settings_changed': {
       const { agentId, family } = event as any
-      if (typeof agentId === 'string' && agentId && (family === 'memory' || family === 'identity')) {
+      if (typeof agentId === 'string' && agentId && family === 'model-selection') void refreshStoredSavedModels()
+      if (typeof agentId === 'string' && agentId && (family === 'mcp-settings' || family === 'provider-settings' || family === 'memory' || family === 'identity' || family === 'retention' || family === 'model-selection' || family === 'instructions' || family === 'auto-compact' || family === 'voice-selection')) {
         void refreshAgentFieldsFromServer(agentId, family)
       }
       break
@@ -246,6 +276,8 @@ function open(userId: string) {
   if (typeof window === 'undefined') return
   if (subscription) return
   connectedUserId = userId
+  setSavedModelsOwner(userId)
+  setToolOperationsOwner(userId)
   let opened = false
   subscription = subscribeLive(
     { scope: 'user' },
@@ -255,7 +287,26 @@ function open(userId: string) {
         if (status === 'open') {
           logger.debug('[UserChannel] Connected.')
           // BL-382: every `open` after the first means the server added the channel again.
-          if (opened) emit({ type: 'reconnected' })
+          if (opened) {
+            for (const agent of getAgents()) {
+              void refreshAgentFieldsFromServer(agent.id, 'retention')
+              void refreshAgentFieldsFromServer(agent.id, 'mcp-settings')
+              void refreshAgentFieldsFromServer(agent.id, 'provider-settings')
+              void refreshAgentFieldsFromServer(agent.id, 'model-selection')
+              void refreshAgentFieldsFromServer(agent.id, 'instructions')
+              void refreshAgentFieldsFromServer(agent.id, 'auto-compact')
+              void refreshAgentFieldsFromServer(agent.id, 'voice-selection')
+            }
+            for (const subagent of subagentStore.subagents) {
+              void refreshSubagentProviderSettingsFromServer(subagent.id)
+              void refreshSubagentModelSelectionFromServer(subagent.id)
+              void refreshSubagentInstructionsFromServer(subagent.id)
+            }
+            dispatchSlashCommandsUpdated({ source: 'unknown' })
+            void refreshStoredSavedModels()
+            void refreshToolOperationsSource()
+            emit({ type: 'reconnected' })
+          }
           opened = true
         } else if (status === 'down') logger.debug('[UserChannel] Live connection dropped; reconnecting.')
         else logger.warn('[UserChannel] The server refused the user channel:', code)
@@ -295,6 +346,8 @@ export function stopUserChannel() {
   subscription = null
   current?.unsubscribe()
   connectedUserId = null
+  setSavedModelsOwner(null)
+  setToolOperationsOwner(null)
   holders = 0
 }
 

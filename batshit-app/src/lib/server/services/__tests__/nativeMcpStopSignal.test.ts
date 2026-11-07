@@ -32,7 +32,10 @@ vi.mock('$lib/server/artifacts/artifactsService', () => ({
     Object.assign(this, { listByUser: vi.fn(async () => []) })
   })
 }))
-vi.mock('../mcpGatewayDiscovery', () => ({
+vi.mock('../mcpGatewayDiscovery', async (importOriginal) => ({
+  // Preserve the real in-process original-observation owner/opaque handles. Only the actual
+  // discovery/client boundary is a stand-in; this suite never opens a native/HTTP transport.
+  ...(await importOriginal<typeof import('../mcpGatewayDiscovery')>()),
   mcpGatewayDiscovery: { loadToolsForUser: mocks.loadToolsForUser }
 }))
 vi.mock('../mcpSelectionResolver', async (importOriginal) => ({
@@ -53,8 +56,7 @@ const nativeSettings = {
   bashEnabled: false
 }
 
-describe('MCP gateway Stop signal forwarding (BL-454)', () => {
-  beforeEach(() => {
+beforeEach(() => {
     vi.clearAllMocks()
     mocks.gatewayExecute.mockResolvedValue({ ok: true })
     mocks.resolveDynamicMcpGatewayScope.mockResolvedValue({
@@ -79,6 +81,7 @@ describe('MCP gateway Stop signal forwarding (BL-454)', () => {
     redisMocks.getSession.mockResolvedValue(null)
   })
 
+describe('MCP gateway Stop signal forwarding (BL-454)', () => {
   it('hands the API broker run signal to the gateway tool, apart from the model input', async () => {
     const controller = new AbortController()
     const { tools } = await nativeToolService.buildMode3NativeTools({
@@ -120,7 +123,7 @@ describe('MCP gateway Stop signal forwarding (BL-454)', () => {
         actor_type: 'primary'
       },
       projectPath: '/tmp',
-      actorType: 'agent',
+      actorType: 'in-process',
       abortSignal: controller.signal
     } as any)
 
@@ -131,11 +134,11 @@ describe('MCP gateway Stop signal forwarding (BL-454)', () => {
     )
   })
 
-  // Review follow-up: `fabric:sys.mcp.dynamic.use` reaches the same executor through
+  // Review follow-up: `batshit:sys.mcp.dynamic.use` reaches the same executor through
   // `useControl`; the Stop travels in the server-owned control context, never in the body.
   const fabricSettings = { ...nativeSettings, batshitToolsEnabled: true }
 
-  it('hands the API broker run signal to the gateway tool through fabric:sys.mcp.dynamic.use', async () => {
+  it('hands the API broker run signal to the gateway tool through batshit:sys.mcp.dynamic.use', async () => {
     const controller = new AbortController()
     const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'user-1',
@@ -147,7 +150,7 @@ describe('MCP gateway Stop signal forwarding (BL-454)', () => {
 
     const result = await (tools as any).native_batshit_tool_use.execute(
       {
-        ref: 'fabric:sys.mcp.dynamic.use',
+        ref: 'batshit:sys.mcp.dynamic.use',
         input: { toolName: 'remote_write', params: { value: 'from-model' } }
       },
       { abortSignal: controller.signal }
@@ -160,7 +163,7 @@ describe('MCP gateway Stop signal forwarding (BL-454)', () => {
     )
   })
 
-  it('hands the helper dispatch reply signal to the gateway tool through fabric:sys.mcp.dynamic.use', async () => {
+  it('hands the helper dispatch reply signal to the gateway tool through batshit:sys.mcp.dynamic.use', async () => {
     const controller = new AbortController()
     redisMocks.get.mockResolvedValue({
       user_id: 'user-1',
@@ -171,7 +174,7 @@ describe('MCP gateway Stop signal forwarding (BL-454)', () => {
       userId: 'user-1',
       action: 'batshit_tool_use',
       payloadInput: {
-        ref: 'fabric:sys.mcp.dynamic.use',
+        ref: 'batshit:sys.mcp.dynamic.use',
         input: { toolName: 'remote_write', params: { value: 'from-helper' } }
       },
       context: {
@@ -181,7 +184,7 @@ describe('MCP gateway Stop signal forwarding (BL-454)', () => {
         actor_type: 'primary'
       },
       projectPath: '/tmp',
-      actorType: 'agent',
+      actorType: 'in-process',
       abortSignal: controller.signal
     } as any)
 
@@ -202,11 +205,46 @@ describe('MCP gateway Stop signal forwarding (BL-454)', () => {
     } as any)
 
     await (tools as any).native_batshit_tool_use.execute({
-      ref: 'fabric:sys.mcp.dynamic.use',
+      ref: 'batshit:sys.mcp.dynamic.use',
       input: { toolName: 'remote_write', params: { value: 'x' }, abortSignal: 'from-model' },
       abortSignal: 'from-model'
     })
 
     expect(mocks.gatewayExecute).toHaveBeenCalledWith({ value: 'x' }, { abortSignal: undefined })
+  })
+})
+
+
+describe('genuine private API run and Stop share the actual native/Fabric context', () => {
+  it.each(['mcp:remote_write', 'batshit:sys.mcp.dynamic.use'])('forwards the registered run and original signal through %s, never model substitutes', async ref => {
+    const original = await import('../appActions/mcp/originalTask')
+    const turns = await import('../streamAbortRegistry')
+    const identity = { userId: 'user-1', agentId: 'agent-1', sessionId: `private-stop-${ref.startsWith('mcp:') ? 'direct' : 'fabric'}` }
+    const stop = new AbortController(), replyId = 'private-stop-reply'
+    const registration = turns.registerSessionTurn(identity.sessionId, 'single', replyId)
+    if (!registration.ok) throw new Error('Actual API turn unavailable')
+    const lookup = original.captureP5OriginalLookup({ ...identity, signal: stop.signal })!
+    const preparation = original.prepareP5OriginalTask(lookup, { ...identity, session: { id: identity.sessionId, user_id: identity.userId },
+      agent: { id: identity.agentId, user_id: identity.userId, agentType: 'api' }, turn: registration.entry })!
+    original.recordP5ResolvedApiScope(preparation, { gateways: ['gw-1'], tools: [], authority: { humanSelection: true } })
+    const part = original.bindP5ApiReplyPart(preparation, { replyId, version: 0 })!
+    const run = original.associateP5ApiOriginalRun(preparation, part, { ...identity, replyId, signal: stop.signal })!
+    try {
+      const { tools } = await nativeToolService.buildMode3NativeTools({ ...identity, messageId: replyId, p5ApiRun: run,
+        abortSignal: stop.signal, selectedGateways: ['gw-1'], providerSettings: { nativeTools: { ...nativeSettings, batshitToolsEnabled: true } } })
+      const input = ref.startsWith('mcp:') ? { value: 'controlled' } : { toolName: 'remote_write', params: { value: 'controlled' }, p5ApiRun: { forged: true } }
+      await (tools as any).native_batshit_tool_use.execute({ ref, input, p5ApiRun: { forged: true }, abortSignal: 'model-signal' }, { abortSignal: stop.signal })
+      expect(mocks.gatewayExecute).toHaveBeenCalledTimes(1)
+      expect(mocks.gatewayExecute).toHaveBeenCalledWith({ value: 'controlled' }, { abortSignal: stop.signal, p5ApiRun: run })
+      stop.abort(new Error('Original Stop'))
+      const forwarded = mocks.gatewayExecute.mock.calls[0][1]
+      expect(forwarded.abortSignal.aborted).toBe(true)
+      expect(forwarded.p5ApiRun).toBe(run)
+      expect(() => original.readP5ApiMcpAuthority(run, 'gw-1')).toThrow()
+      // This is the genuine context/signal join; physical HTTP admission/close is a separate owner.
+    } finally {
+      await original.sealP5OriginalPreparation(preparation); original.retireP5OriginalPreparation(preparation)
+      turns.releaseSessionTurn(identity.sessionId, registration.entry.turnId)
+    }
   })
 })

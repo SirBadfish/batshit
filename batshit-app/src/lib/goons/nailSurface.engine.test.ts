@@ -94,6 +94,7 @@ describe('NailSurfaceEngineRuntime', () => {
     const toes = root.getObjectByName(
       contract.runtimeBindings.toes.node
     ) as THREE.SkinnedMesh
+    expect(runtime.getMotionMeshes()).toEqual([fingers, toes])
     const toeTargets = contract.runtimeBindings.toes.targets
     const toeInfluence = (name: string) =>
       toes.morphTargetInfluences?.[toes.morphTargetDictionary![name]]
@@ -114,6 +115,7 @@ describe('NailSurfaceEngineRuntime', () => {
     expect(influence(fingerTargets.lengthIncrease)).toBe(0)
     expect(influence(fingerTargets.widthNarrow)).toBe(0)
     runtime.dispose()
+    expect(runtime.getMotionMeshes()).toBeNull()
   })
 
   it('fails loudly for missing surfaces, renamed materials, and missing control morphs', () => {

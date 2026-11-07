@@ -10,6 +10,8 @@ Batshit's core system prompts — the foundational prompts that keep tools, Skil
 
 This is powerful and worth respecting. Editing a core prompt can change how the whole product behaves, and a bad edit can break tools, Skills, zips, or voice. Batshit shows the packaged default metadata and lets you reset a prompt back to default without silently overwriting a customization you made on purpose. If you're not sure, leave the core prompts alone — your per-agent system prompts (in Settings → Skills & Prompts and Agent Settings) are the normal place to shape behavior.
 
+Some of the instructions your agents get are built into Batshit instead of stored as a prompt you can edit. You can still read all of them here. A prompt with a placeholder that Batshit fills with a block of text, such as `{{ $api_tool_zip_guidance }}`, has a **Built-in Text** button that shows that text. If you remove such a placeholder from the prompt, Built-in Text says that part is no longer sent. The **Maintaining Your Working Context** section (the Whiteboard, reasoning retention, and Tool Notes) is built in completely, so it is listed with a **Built in** tag and a **View** button. Built-in text is read-only, and it is shown with the default settings; an agent with different settings gets the matching version.
+
 ## Backup and restore
 
 Backup and restore is the app-owned way to export and re-import your Batshit data as a structured `.zip`. Normal exports exclude saved secrets; an explicit "With Secrets" option exists when you really need to move keys. Restore is a **replace** operation, not a merge, so Batshit shows you the backup's contents first and requires an explicit confirmation before it changes the instance.

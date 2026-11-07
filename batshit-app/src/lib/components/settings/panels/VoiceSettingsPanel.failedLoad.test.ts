@@ -10,6 +10,8 @@ import {
 } from '$lib/test-utils/userSettingsRoute'
 import { dispatchVoiceEnginesUpdated } from '$lib/utils/voiceEngineEvents'
 import VoiceSettingsPanel from './VoiceSettingsPanel.svelte'
+import { get } from 'svelte/store'
+import { activeConfirmDialog, resolveConfirmDialog } from '$lib/stores/confirmDialog'
 
 /**
  * BL-962: when `GET /api/user/settings` failed, the Voice panel put the page's copy of the voice
@@ -124,29 +126,60 @@ let failGetsWith: number | null = null
 let holdGets: Promise<void> | null = null
 /** Every write to the engine list (the panel's own PUT). */
 let enginePuts: Array<Record<string, any>> = []
+let engineRecords: Array<Record<string, any>> = []
+let failRegistryRead = false
+let deletes: Array<Record<string, any>> = []
+type DeleteFixture = { userId?: string; outcome?: 'success' | 'terminal-error' | 'transport' | 'wrong-id' | 'wrong-provider' | 'bad-agent' | 'missing-files'; agentReadFailure?: boolean; receipt?: unknown; failAfter?: 'settings' | 'registry' }
+const DELETE_ENGINE = { id: '978-engine', providerId: 'byo:978-engine', name: 'Engine 978', enabled: true,
+  supportsTts: true, supportsStt: false, supportsClone: false }
 
-async function seedStored(voice: Record<string, unknown>) {
-  await redis.updateUserSettings(USER, { displayName: 'Probe', voice_settings: structuredClone(voice) })
+async function seedStored(voice: Record<string, unknown>, userId = USER) {
+  // Seed an existing saved snapshot; the whole-Voice write path intentionally normalizes input.
+  await redis.json.set(`user:${userId}:settings`, '$', {
+    id: `settings_${userId}`, user_id: userId, displayName: 'Probe', voice_settings: structuredClone(voice)
+  })
 }
 
-async function storedVoice() {
-  return (await storedUserSettings(USER))?.voice_settings
+async function storedVoice(userId = USER) {
+  return (await storedUserSettings(userId))?.voice_settings
 }
 
-function installRoutes() {
+function installRoutes(options: DeleteFixture = {}) {
+  const userId = options.userId ?? USER
+  engineRecords = options.outcome ? [structuredClone(DELETE_ENGINE)] : []
+  failRegistryRead = false
+  deletes = []
   failGetsWith = null
   holdGets = null
   enginePuts = []
   const installed = installUserSettingsRoutes({
-    userId: USER,
+    userId,
     route,
     failGetsWith: () => failGetsWith,
     holdGets: () => holdGets,
-    extra: (path, method, init) => {
+    extra: async (path, method, init) => {
       if (path === '/api/voice/byo/engines') {
         if (method === 'PUT') enginePuts.push(JSON.parse(String(init.body)))
-        return jsonResponse({ engines: [] })
+        if (failRegistryRead && method === 'GET') return jsonResponse({ error: 'Registry unavailable' }, 500)
+        return jsonResponse({ engines: structuredClone(engineRecords) })
       }
+      if (path === '/api/voice/byo/engines/978-engine' && method === 'DELETE') {
+        deletes.push(JSON.parse(String(init.body)))
+        if ((options.receipt as any)?.configurationOutcome === 'known_no_change') {
+          return jsonResponse({ error: 'Removal refused before a write', deleteOutcome: options.receipt }, 400)
+        }
+        const voice = await storedVoice(userId)
+        await redis.updateUserSettings(userId, { voice_settings: { ...voice, tts: { providerId: 'browser' } } })
+        engineRecords = []
+        if (options.failAfter === 'settings') failGetsWith = 500
+        if (options.failAfter === 'registry') failRegistryRead = true
+        if (options.outcome === 'transport') throw new TypeError('Connection lost after issue')
+        if (options.outcome === 'terminal-error') return jsonResponse({ error: 'Cleanup write was not confirmed', ...(options.receipt ? { deleteOutcome: options.receipt } : {}) }, 400)
+        return jsonResponse({ success: true, deletedEngineId: options.outcome === 'wrong-id' ? 'other-engine' : '978-engine',
+          deletedProviderId: options.outcome === 'wrong-provider' ? 'byo:other-engine' : 'byo:978-engine', deletedProviderIds: ['byo:978-engine'], clearedUserDefaults: true, clearedAgentIds: options.outcome === 'bad-agent' ? [null] : options.agentReadFailure ? ['agent-978'] : [], deletedVoiceProfileIds: [],
+          localFiles: options.outcome === 'missing-files' ? undefined : { requested: false, deleted: false, deletedInstallRoots: [], deletedStateRoots: [], skipped: [], errors: [] } })
+      }
+      if (path === '/api/agents/agent-978' && options.agentReadFailure) throw new TypeError('Agent view refresh unavailable')
       if (path === '/api/voice/runtime/livekit') return jsonResponse({ runtime: null })
       if (path === '/api/voice/providers') return jsonResponse({ providers: [browserProvider, openaiProvider] })
       if (path === '/api/voice/profiles') return jsonResponse({ profiles: [] })
@@ -158,9 +191,9 @@ function installRoutes() {
   counts = installed.counts
 }
 
-function renderPanel(userSettings: unknown = null) {
+function renderPanel(userSettings: unknown = null, userId = USER) {
   return render(VoiceSettingsPanel, {
-    props: { data: { user: { id: USER }, userSettings } as any }
+    props: { data: { user: { id: userId }, userSettings } as any }
   })
 }
 
@@ -190,6 +223,25 @@ async function waitForLoadEnded() {
   await pause(300)
 }
 
+async function openDeleteFixture() {
+  await openEnginesTab()
+  const title = await screen.findByText('Installed Engine Controls')
+  const details = title.closest('details') as HTMLDetailsElement
+  if (details && !details.open) await fireEvent.click(details.querySelector('summary')!)
+  await fireEvent.click(await screen.findByRole('button', { name: /Engine 978/i }))
+  return screen.getByRole('button', { name: 'Delete', exact: true })
+}
+
+async function confirmEngineDelete(button: HTMLElement) {
+  await fireEvent.click(button)
+  const confirmation = await waitFor(() => {
+    const value = get(activeConfirmDialog)
+    expect(value).toBeTruthy()
+    return value!
+  })
+  resolveConfirmDialog(confirmation.id, true)
+}
+
 describe('Voice Settings never turns a failed load into a save (BL-962)', () => {
   const originalFetch = global.fetch
 
@@ -199,11 +251,162 @@ describe('Voice Settings never turns a failed load into a save (BL-962)', () => 
     vi.spyOn(console, 'warn').mockImplementation(() => {})
   })
 
-  afterEach(() => {
+  afterEach(async () => {
+    for (let i = 0; i < 8; i += 1) {
+      const pending = get(activeConfirmDialog)
+      if (!pending) break
+      resolveConfirmDialog(pending.id, false)
+      await Promise.resolve()
+    }
     vi.unstubAllGlobals()
     vi.restoreAllMocks()
     global.fetch = originalFetch
   })
+
+  it.each(['settings', 'registry'] as const)('BL-978(j): a confirmed delete with a failed %s refresh holds both writers until Retry reads current values', async failAfter => {
+    const userId = `vs978-delete-${failAfter}`
+    await seedStored({ ...SAVED, tts: { providerId: 'byo:978-engine', narration: { italicBehavior: 'silent' } } }, userId)
+    installRoutes({ userId, outcome: 'success', failAfter })
+    renderPanel(null, userId)
+    await confirmEngineDelete(await openDeleteFixture())
+    await waitFor(() => expect(deletes).toHaveLength(1))
+    const notice = await screen.findByTestId('voice-settings-load-error')
+    await pause(700)
+    expect(posts).toEqual([])
+    expect(enginePuts).toEqual([])
+    expect((await storedVoice(userId)).tts.providerId).toBe('browser')
+    failGetsWith = null
+    failRegistryRead = false
+    await fireEvent.click(within(notice).getByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect(screen.queryByTestId('voice-settings-load-error')).toBeNull())
+    await fireEvent.click(screen.getByRole('tab', { name: 'Global Voice Settings' }))
+    const control = await waitFor(() => { expect(italicSwitch()).toBeTruthy(); return italicSwitch()! })
+    await fireEvent.click(control)
+    await waitFor(() => expect(posts).toHaveLength(1))
+    expect(posts[0].body.voice_settings.tts.providerId).toBe('browser')
+    expect((await storedVoice(userId)).tts.providerId).toBe('browser')
+    expect(deletes).toHaveLength(1)
+  }, 60_000)
+
+  it.each(['terminal-error', 'transport', 'wrong-id', 'wrong-provider', 'bad-agent', 'missing-files'] as const)('BL-978(j): %s remains held across refresh and remount without DELETE replay', async outcome => {
+    const userId = `vs978-delete-${outcome}`
+    await seedStored({ ...SAVED, tts: { providerId: 'byo:978-engine' } }, userId)
+    installRoutes({ userId, outcome })
+    const panel = renderPanel(null, userId)
+    await confirmEngineDelete(await openDeleteFixture())
+    await screen.findByTestId('voice-engine-delete-notice')
+    await pause(100)
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeDisabled()
+    dispatchVoiceEnginesUpdated()
+    await pause(700)
+    expect(posts).toEqual([])
+    expect(enginePuts).toEqual([])
+    panel.unmount()
+    renderPanel(null, userId)
+    await screen.findByTestId('voice-engine-delete-notice')
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeDisabled()
+    expect(italicSwitch()).toBeNull()
+    expect(deletes).toHaveLength(1)
+    expect(posts).toEqual([])
+  }, 60_000)
+
+  it.each(['known_no_change', 'known_settled_partial'] as const)('BL-978(j): matching %s receipt requires explicit fresh reads and retains incomplete-removal notice', async configurationOutcome => {
+    const userId = `vs978-receipt-${configurationOutcome}`
+    await seedStored({ ...SAVED, tts: { providerId: 'byo:978-engine', narration: { italicBehavior: 'silent' } } }, userId)
+    installRoutes({ userId, outcome: 'terminal-error', receipt: {
+      contract: 'voice-engine-delete-outcome/v1', engineId: '978-engine', configurationOutcome
+    } })
+    renderPanel(null, userId)
+    const remove = await openDeleteFixture()
+    const before = counts.reads
+    await confirmEngineDelete(remove)
+    await screen.findByTestId('voice-engine-delete-notice')
+    expect(counts.reads).toBe(before)
+    const retry = screen.getByRole('button', { name: 'Retry' })
+    expect(retry).not.toBeDisabled()
+    expect(posts).toEqual([])
+    await fireEvent.click(retry)
+    await waitFor(() => expect(screen.queryByTestId('voice-settings-load-error')).toBeNull())
+    expect(counts.reads).toBeGreaterThan(before)
+    expect(screen.getByTestId('voice-engine-delete-notice').textContent).toMatch(/incomplete|did not finish/)
+    await fireEvent.click(screen.getByRole('tab', { name: 'Global Voice Settings' }))
+    const control = await waitFor(() => { expect(italicSwitch()).toBeTruthy(); return italicSwitch()! })
+    await fireEvent.click(control)
+    await waitFor(() => expect(posts).toHaveLength(1))
+    const currentProvider = configurationOutcome === 'known_no_change' ? 'byo:978-engine' : 'browser'
+    expect(posts[0].body.voice_settings.tts.providerId).toBe(currentProvider)
+    expect((await storedVoice(userId)).tts.providerId).toBe(currentProvider)
+    expect(deletes).toHaveLength(1)
+    expect(screen.getByTestId('voice-engine-delete-notice')).toBeTruthy()
+  }, 60_000)
+
+  it.each([
+    ['wrong engine', { contract: 'voice-engine-delete-outcome/v1', engineId: 'other-engine', configurationOutcome: 'known_no_change' }],
+    ['wrong contract', { contract: 'voice-engine-delete-outcome/v2', engineId: '978-engine', configurationOutcome: 'known_no_change' }],
+    ['unknown outcome', { contract: 'voice-engine-delete-outcome/v1', engineId: '978-engine', configurationOutcome: 'unknown' }],
+    ['invented outcome', { contract: 'voice-engine-delete-outcome/v1', engineId: '978-engine', configurationOutcome: 'settled' }]
+  ])('BL-978(j): %s receipt never releases configuration custody', async (name, receipt) => {
+    const userId = `vs978-receipt-${name}`
+    await seedStored(SAVED, userId)
+    installRoutes({ userId, outcome: 'terminal-error', receipt })
+    renderPanel(null, userId)
+    await confirmEngineDelete(await openDeleteFixture())
+    await screen.findByTestId('voice-engine-delete-notice')
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeDisabled()
+    dispatchVoiceEnginesUpdated()
+    await pause(500)
+    expect(posts).toEqual([])
+    expect(deletes).toHaveLength(1)
+  }, 60_000)
+
+  it('BL-978(j): a changed same-ID target during confirmation requires a new choice', async () => {
+    const userId = 'vs978-delete-replaced-target'
+    await seedStored(SAVED, userId)
+    installRoutes({ userId, outcome: 'success' })
+    renderPanel(null, userId)
+    await fireEvent.click(await openDeleteFixture())
+    const confirmation = await waitFor(() => { expect(get(activeConfirmDialog)).toBeTruthy(); return get(activeConfirmDialog)! })
+    const before = counts.reads
+    engineRecords = [{ ...DELETE_ENGINE, name: 'Replacement engine' }]
+    dispatchVoiceEnginesUpdated()
+    await waitFor(() => expect(counts.reads).toBeGreaterThan(before))
+    await waitFor(() => expect(screen.getAllByRole('button', { name: /Replacement engine/ }).some(button => button.hasAttribute('aria-expanded'))).toBe(true))
+    resolveConfirmDialog(confirmation.id, true)
+    await pause(700)
+    expect(deletes).toEqual([])
+    expect(enginePuts).toEqual([])
+  }, 60_000)
+
+  it('BL-978(j): a failed post-success agent view read never reclassifies the confirmed DELETE as unknown', async () => {
+    const userId = 'vs978-delete-followup'
+    await seedStored(SAVED, userId)
+    installRoutes({ userId, outcome: 'success', agentReadFailure: true })
+    renderPanel(null, userId)
+    await confirmEngineDelete(await openDeleteFixture())
+    await waitFor(() => expect(screen.getByTestId('voice-engine-delete-notice').textContent).toContain('removal was confirmed'))
+    expect(screen.queryByTestId('voice-settings-load-error')).toBeNull()
+    await fireEvent.click(screen.getByRole('tab', { name: 'Global Voice Settings' }))
+    await waitFor(() => expect(italicSwitch()).toBeTruthy())
+    expect(deletes).toHaveLength(1)
+    expect(posts).toEqual([])
+  }, 60_000)
+
+  it('BL-978(j): an edit made during confirmation refuses Delete before HTTP admission', async () => {
+    const userId = 'vs978-delete-confirmation'
+    await seedStored(SAVED, userId)
+    installRoutes({ userId, outcome: 'success' })
+    renderPanel(null, userId)
+    const remove = await openDeleteFixture()
+    await fireEvent.click(remove)
+    const confirmation = await waitFor(() => { expect(get(activeConfirmDialog)).toBeTruthy(); return get(activeConfirmDialog)! })
+    const enabledRow = screen.getByText('Enabled').closest('.batshit-settings-pill') as HTMLElement
+    await fireEvent.click(within(enabledRow).getByRole('switch'))
+    resolveConfirmDialog(confirmation.id, true)
+    await pause(800)
+    expect(deletes).toEqual([])
+    expect(enginePuts).toHaveLength(1)
+    expect(await storedVoice(userId)).toMatchObject(SAVED)
+  }, 60_000)
 
   it('the load fails and the user tries an edit: no write leaves and the stored voice settings are unchanged', async () => {
     await seedStored(SAVED)

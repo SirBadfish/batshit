@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { initializedBuiltinPluginEntries } from '$lib/test-utils/initialized-builtin-plugin'
 
 const mocks = vi.hoisted(() => ({
   getSkill: vi.fn(),
@@ -10,17 +11,31 @@ vi.mock('../skillRegistry', () => ({
   evaluateSkillDependencies: vi.fn()
 }))
 
-// The real access gate runs (BL-75); only the command records it reads are faked.
-vi.mock('$lib/server/redis', () => ({
-  redis: {
-    keys: vi.fn(async (pattern: string) =>
-      Array.from(mocks.commands.keys()).filter((key) => key.startsWith(pattern.replace(/\*$/, '')))
-    ),
-    json: {
-      get: vi.fn(async (key: string) => mocks.commands.get(key) ?? null)
-    }
-  }
-}))
+// The real access gate and grouped-plugin projection run against post-startup records.
+// Physical catalog migration remains with its owning Redis suites, never a fake Lua engine.
+vi.mock('$lib/server/redis', () => {
+  const keys = vi.fn(async (pattern: string) => {
+    const escaped = pattern.split('*').map(part => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.*')
+    const matches = new RegExp(`^${escaped}$`)
+    return [...mocks.commands.keys()].filter(key => matches.test(key))
+  })
+  const get = vi.fn(async (key: string) => mocks.commands.get(key) ?? null)
+  const readClient = { keys, json: { get } }
+  const getRaw = vi.fn(async (key: string, jsonPath: string) => {
+    if (jsonPath !== '$') throw new Error(`Unsupported skill-runtime raw fixture path: ${jsonPath}`)
+    const row = await get(key)
+    return row === null ? null : JSON.stringify([row])
+  })
+  return { redis: { ...readClient, json: { get, getRaw },
+    execute: vi.fn(async (operation: (client: typeof readClient) => unknown) => operation(readClient)) } }
+})
+
+vi.mock('../systemSlashCommands', async () => {
+  const { assertInitializedBuiltinPlugin } = await import('$lib/test-utils/initialized-builtin-plugin')
+  const { redis } = await import('$lib/server/redis')
+  return { ensureSystemSlashCommands: (userId: string) =>
+    assertInitializedBuiltinPlugin(userId, key => redis.json.get(key)) }
+})
 
 import {
   buildSkillScriptCommand,
@@ -33,9 +48,15 @@ import {
 
 const PRIMARY = { kind: 'agent', agentId: 'agent-1' } as const
 
+function seedInitializedCatalog() {
+  mocks.commands.clear()
+  for (const [key, value] of initializedBuiltinPluginEntries('josh')) mocks.commands.set(key, value)
+}
+
 function seedSkillCommand(skillId: string, access: Record<string, unknown>) {
   mocks.commands.set(`slash_command:josh:${skillId}`, {
     id: skillId,
+    user_id: 'josh',
     name: skillId,
     displayName: 'Skill Alpha',
     type: 'skill',
@@ -51,7 +72,7 @@ function seedSkillCommand(skillId: string, access: Record<string, unknown>) {
 describe('skillRuntimeToolService', () => {
   beforeEach(() => {
     mocks.getSkill.mockReset()
-    mocks.commands.clear()
+    seedInitializedCatalog()
     seedSkillCommand('skill_alpha', { enabled_agent_ids: ['agent-1'] })
     seedSkillCommand('nonexistent', { enabled_agent_ids: ['agent-1'] })
   })
@@ -225,7 +246,7 @@ describe('a partial skill read says what it showed and how to read on (find 1)',
 
   beforeEach(() => {
     mocks.getSkill.mockReset()
-    mocks.commands.clear()
+    seedInitializedCatalog()
     seedSkillCommand('skill_alpha', { enabled_agent_ids: ['agent-1'] })
     mocks.getSkill.mockResolvedValue({
       id: 'skill_alpha',
@@ -296,7 +317,7 @@ describe('a partial skill read says what it showed and how to read on (find 1)',
     expect(result.readMore).toContain('Showing characters 101 to 600 of 38,635.')
   })
 
-  it('a whole read is exactly what it was before', async () => {
+  it('a whole read preserves the source text and adds its exact source version', async () => {
     const result = await read({ path: 'references/small.md' })
     expect(JSON.stringify(result)).toBe(
       JSON.stringify({
@@ -308,7 +329,8 @@ describe('a partial skill read says what it showed and how to read on (find 1)',
         content: 'Small guide',
         contentTruncated: false,
         originalChars: 11,
-        returnedChars: 11
+        returnedChars: 11,
+        sourceSha256: '5021d8a5223a74dbefffbc9b6edb0d731c2a7921e8853aba2b3d181d9144bade'
       })
     )
   })

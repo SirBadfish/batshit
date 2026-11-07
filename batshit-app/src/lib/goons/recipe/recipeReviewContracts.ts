@@ -26,13 +26,12 @@ import type {
 } from './recipeLifecycleContracts'
 import type { GoonLiveBuildReceipt } from './liveBuildContracts'
 import { RECIPE_ARCHIVE_CONTAINMENT_RECEIPT_CONTRACT } from './archiveContainmentContracts'
-import { RECIPE_MIGRATION_REPORT_CONTRACT } from './contractIds'
+import { RECIPE_MIGRATION_REPORT_CONTRACT, RECIPE_REVIEWED_STATE_CONTRACT } from './contractIds'
+export { RECIPE_REVIEWED_STATE_CONTRACT } from './contractIds'
 import { canonicalRecipeString, requireLowercaseSha256 } from './recipeCanonical'
 import { type RecipeMigrationReport, type RecipeSiblingSurface } from './updateContracts'
 
 export const RECIPE_UPDATE_ANALYSIS_CONTEXT_CONTRACT = 'recipe-update-analysis-context/v3' as const
-import { RECIPE_REVIEWED_STATE_CONTRACT } from './contractIds'
-export { RECIPE_REVIEWED_STATE_CONTRACT } from './contractIds'
 
 export const RECIPE_REVIEW_OPERATIONS = ['first-bake', 'rebake', 'package-update'] as const
 

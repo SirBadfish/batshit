@@ -24,8 +24,9 @@ type CachedUpdateStatus = {
 
 let cachedStatus: CachedUpdateStatus | null = null
 
-function readEnv(name: string): string {
-  return (env[name] ?? process.env[name] ?? '').trim()
+function readEnv(name: keyof typeof env | 'PUBLIC_BATSHIT_APP_VERSION'): string {
+  const privateValue = Object.hasOwn(env, name) ? env[name as keyof typeof env] : undefined
+  return (privateValue ?? process.env[name] ?? '').trim()
 }
 
 function normalizeVersionForDisplay(version: string | null | undefined): string | null {

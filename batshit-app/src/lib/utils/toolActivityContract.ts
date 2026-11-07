@@ -6,9 +6,12 @@ import {
   slugToolName
 } from './toolNameNormalization'
 import { countTextLines, extractWriteContentFromSources } from './writePreview'
+import { isManagedApplyPatchCommand } from './managedApplyPatch'
+import { typedFileChangeOutcome, typedFileFactsFields } from './typedFileFacts'
 import { isCliHelperMcpServerName } from './cliHelperToolNames'
 import { TOOL_RESULT_LARGE_TOKENS } from './toolResultSizeGuard'
 import { isToolModelCutView, SAVED_TOOL_MODEL_CUT_VIEW_MAX_CHARS } from './toolModelTextSizeGuard'
+import { API_UTILITY_CONTROL_IDS, isApiUtilityControlId, type ApiUtilityKind } from './apiUtilityControls'
 
 export const TOOL_ACTIVITY_SCHEMA_VERSION = 1
 export const TOOL_ACTIVITY_FORCE_COMPRESS_TOKENS = TOOL_RESULT_LARGE_TOKENS
@@ -166,6 +169,58 @@ function normalizeInternalMode4HelperName(value: string | undefined | null): str
 
 function isPlainObject(value: unknown): value is Record<string, any> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+type ApiUtilityPresentation = {
+  kind: ApiUtilityKind
+  operationKind: ToolOperationKind
+  settingsName: string
+  displayName: string
+  args: Record<string, any>
+  raw: Record<string, any>
+  envelope: Record<string, any>
+}
+
+/** Serialized presentation identity only. Execution authority stays with the server's private run scope. */
+export function resolveApiUtilityPresentation(input: CompactToolInput): ApiUtilityPresentation | null {
+  if (input.toolName !== 'native_batshit_tool_use' ||
+      input.toolProvider !== undefined && input.toolProvider !== 'batshit-server' || !isPlainObject(input.toolArgs) ||
+      !isPlainObject(input.toolArgs.input) || !isPlainObject(input.toolResult)) return null
+  const envelope = input.toolResult
+  const kind = (Object.keys(API_UTILITY_CONTROL_IDS) as ApiUtilityKind[])
+    .find(kind => input.toolArgs!.ref === `batshit:${API_UTILITY_CONTROL_IDS[kind]}`)
+  if (!kind || envelope.ref !== input.toolArgs.ref || envelope.family !== 'batshit' ||
+      envelope.target !== API_UTILITY_CONTROL_IDS[kind] || envelope.controlId !== envelope.target ||
+      typeof envelope.success !== 'boolean' || !Object.hasOwn(envelope, 'result') || !isPlainObject(envelope.result)) return null
+  const raw = envelope.result
+  if (typeof raw.success === 'boolean' && raw.success !== envelope.success) return null
+  const args = input.toolArgs.input
+  const skillAction = args.action ?? raw.action ?? 'invoke'
+  if (kind === 'skill' && (!['invoke', 'list', 'read'].includes(skillAction) ||
+      raw.action !== undefined && raw.action !== skillAction)) return null
+  if (kind === 'subagent' && (envelope.isSubagent !== true ||
+      typeof envelope.subagentId !== 'string' || !envelope.subagentId.trim() || raw.kind !== 'subagent')) return null
+  const profile = {
+    webSearch: { operationKind: 'web_search', settingsName: 'web_search', displayName: 'Web Search' },
+    workers: { operationKind: 'workers', settingsName: 'workers', displayName: 'Workers' },
+    skill: { operationKind: skillAction === 'list' ? 'unknown_tool' : 'skill_read',
+      settingsName: skillAction === 'list' ? 'native_skill' : 'skill_read', displayName: 'Skill Reference' },
+    subagent: { operationKind: 'subagent', settingsName: 'subagent', displayName: 'Subagent' }
+  }[kind] as Pick<ApiUtilityPresentation, 'operationKind' | 'settingsName' | 'displayName'>
+  if (envelope.operationKind !== profile.operationKind ||
+      envelope.rendererFamily !== resolveToolRendererFamily(profile.operationKind)) return null
+  return { kind, ...profile, args, raw, envelope }
+}
+
+function hasApiUtilityPresentationClaim(input: CompactToolInput): boolean {
+  const args = isPlainObject(input.toolArgs) ? input.toolArgs : {}
+  const result = isPlainObject(input.toolResult) ? input.toolResult : {}
+  const values = [args.ref, result.ref, result.target, result.controlId]
+  if (values.some(value => typeof value === 'string' &&
+      (isApiUtilityControlId(value) || isApiUtilityControlId(extractTargetFromTypedRef(value) ?? '')))) return true
+  return input.toolName === 'native_batshit_tool_use' &&
+    (result.family === 'batshit' || typeof args.ref === 'string' && args.ref.startsWith('batshit:')) &&
+    ['web_search', 'workers', 'skill_read', 'subagent'].includes(result.operationKind)
 }
 
 function parseMaybeJson(value: unknown): unknown {
@@ -375,7 +430,7 @@ function pickPlainObject(value: unknown): Record<string, any> | null {
   return isPlainObject(value) ? value : null
 }
 
-function normalizeExplicitOperationKind(value: unknown): ToolOperationKind | null {
+export function normalizeExplicitOperationKind(value: unknown): ToolOperationKind | null {
   if (typeof value !== 'string') return null
   const normalized = value
     .trim()
@@ -448,6 +503,8 @@ export function resolveToolActivitySettingsName(
   input: CompactToolInput,
   operationKind: ToolOperationKind = resolveToolOperationKind(input)
 ): string | undefined {
+  const utility = resolveApiUtilityPresentation(input)
+  if (utility) return utility.settingsName
   const toolArgs = input.toolArgs && isPlainObject(input.toolArgs) ? input.toolArgs : {}
   const nestedToolArgs = extractNestedToolArgs(toolArgs)
   const {
@@ -692,6 +749,7 @@ function extractFamilyFromTypedRef(value: unknown): string | undefined {
     case 'cli':
     case 'artifact':
     case 'fabric':
+    case 'batshit':
     case 'agent_browser':
       return family
     default:
@@ -737,6 +795,7 @@ function resolveBrokerOperationKind(toolArgs: Record<string, any>, toolResult: u
     case 'artifact':
       return 'artifact_use'
     case 'fabric':
+    case 'batshit':
       if (target === 'sys.zip.fetch') return 'fetch_zip'
       return 'fabric_use'
     case 'agent_browser':
@@ -2188,7 +2247,7 @@ function summarizeSearchResult(
       output: preview.text,
       stdout: preview.text,
       truncated: preview.truncated,
-      // A lane that merges its streams (Codex, Claude Code) already stores a failure's words here.
+      // A lane that merges its streams (Claude Code, saved Codex steps) already stores a failure's words here.
       ...shellFailureFields(toolArgs, toolResult, previewSource),
       ...outputCutFields(normalizedToolResult)
     },
@@ -2491,8 +2550,8 @@ export function commandExitOneIsExpectedAnswer(
 
 /**
  * A failed listing's text without its commands' own error lines (`ls: /nope: No such file …`,
- * `find: ‘/x’: Permission denied`). Codex merges both output streams, and those lines are not
- * entries. Claude Code's Bash tool runs `find` through `bfs`, which names itself in its
+ * `find: ‘/x’: Permission denied`). Saved Codex steps merge both output streams, and those lines
+ * are not entries. Claude Code's Bash tool runs `find` through `bfs`, which names itself in its
  * diagnostics (`bfs: error: /nope: No such file or directory.`), so a `find` line drops those too.
  */
 export function stripShellErrorLines(text: string, command: string | undefined): string {
@@ -2513,7 +2572,7 @@ export function stripShellErrorLines(text: string, command: string | undefined):
  * as an edit, `ls` as a listing) keeps this beside its result, so the zip description reads
  * `exit 1` and the card and AI view show the failure. Zero is not stored, which keeps a
  * successful action's payload unchanged. A read tool's own `status` or `code` is not a command's
- * exit code, and neither is Codex's `status` word. Given the command, exit 1 from a search
+ * exit code, and neither is a saved Codex step's `status` word. Given the command, exit 1 from a search
  * (`rg`, `grep`, …, including an `rg --files` listing) is "nothing matched", not a failure. A
  * stored payload is already filtered, so its readers pass no command.
  */
@@ -2530,8 +2589,8 @@ export function failedCommandExitCode(result: unknown, command?: unknown): numbe
  * True when a shell command answered "nothing matched" instead of failing: it ran to the end and
  * exited 1 from a search (D1's one exception, `failedCommandExitCode` above). A lane that reports
  * every non-zero exit as a failure — the API lane's `success: exitCode === 0`, Claude Code's
- * `is_error` — asks this before it turns that flag into a stored failure, so `rg zzz <dir>` is
- * the answer it is on the Codex lane. A command that timed out or never started is a failure
+ * `is_error` — asks this before it turns that flag into a stored failure, so `rg zzz <dir>` reads
+ * as nothing matched, not a failure. A command that timed out or never started is a failure
  * whatever it exited with.
  */
 export function commandFoundNothing(result: unknown, command?: unknown): boolean {
@@ -2655,8 +2714,8 @@ export function describeOutputCut(cut: ToolOutputCut): string {
 
 /**
  * True when a shell command stored as a file action failed: it reported a failing exit code, or
- * it never reported one and its result says it did not succeed (a command Codex declined, a
- * sandbox that never started, a policy block).
+ * it never reported one and its result says it did not succeed (a declined command, a sandbox
+ * that never started, a policy block).
  */
 export function shellCommandFailed(result: unknown, command?: unknown): boolean {
   const record = pickPlainObject(result)
@@ -2666,8 +2725,7 @@ export function shellCommandFailed(result: unknown, command?: unknown): boolean 
 }
 
 /**
- * What a failed shell command printed: Codex's merged `output`, or the API's `stdout` and
- * `stderr`. A file action stores it as `commandOutput` only when the command failed; the name is
+ * What a failed shell command printed: a merged `output`, or the API's `stdout` and `stderr`. A file action stores it as `commandOutput` only when the command failed; the name is
  * deliberate, because every generic text reader takes `content`, `output`, or `stdout`, and a
  * failure's output must never read as written content, a diff, or file entries.
  */
@@ -2683,6 +2741,59 @@ export function failedCommandOutput(result: unknown): string | undefined {
   if (streams.length === 0) return undefined
   // One line break between the streams, as a merged output would have it, never a blank line.
   return streams.reduce((joined, stream) => (joined && !joined.endsWith('\n') ? `${joined}\n${stream}` : joined + stream), '')
+}
+
+/**
+ * BL-1916 / SA-126 item 2: the paths a managed patch left changed when a write failed and Batshit
+ * could not put them back, as the dead-copy ledger reads them (`zipDeadCopies.ts`). Both edit
+ * shapers keep this one fact on a failed edit; before, they dropped it, so on the API lane the
+ * ledger's "left changed" rule never fired. The n8n lane keeps it in the error's details.
+ */
+export function managedPatchLeftChangedFields(result: unknown): Record<string, unknown> {
+  const record = pickPlainObject(result)
+  const patch =
+    pickPlainObject(record?.managedApplyPatch) ??
+    pickPlainObject(pickPlainObject(pickPlainObject(record?.error)?.details)?.managedApplyPatch) ??
+    pickPlainObject(pickPlainObject(record?.data)?.managedApplyPatch)
+  if (patch?.partial !== true || !Array.isArray(patch.changedPaths)) return {}
+  const changedPaths = patch.changedPaths.filter((entry): entry is string => typeof entry === 'string')
+  return changedPaths.length > 0 ? { managedApplyPatch: { managed: true, partial: true, changedPaths } } : {}
+}
+
+/**
+ * BL-1979: a shell command stored as an edit or a write that was cut before it finished (a Stop,
+ * its time limit, or a call still running when BL-1959's Stop rule ended the stream). It may have
+ * changed the file before it was cut, so whether its edit or write was made is unknown: the cards
+ * say so instead of "not applied". Both shapers keep these facts on the stored result. A managed
+ * patch is applied whole or not at all and says which (BL-1916; SA-126 item 2 stores an applied
+ * one as its own edit part), so it never gets them; nor does a command that never started.
+ */
+export function shellCommandCutFields(result: unknown, command?: unknown): Record<string, true> {
+  const record = pickPlainObject(unwrapNativeAutomationData(result))
+  if (!record || (typeof command === 'string' && isManagedApplyPatchCommand(command))) return {}
+  // SA-136: a typed write or edit says its own outcome. Only `unknown` (it never returned after
+  // reporting `committing`, just before its rename) may or may not have changed the file; a Stop
+  // before the rename wrote nothing, and one after it left the change applied.
+  const typedOutcome = typedFileChangeOutcome(record)
+  if (typedOutcome !== null) {
+    return typedOutcome === 'unknown'
+      ? { stopped: true as const, ...(record.neverReturned === true ? { neverReturned: true as const } : {}) }
+      : {}
+  }
+  // A command the Stop reached before it started changed nothing: that one stays "not applied".
+  if (record.neverStarted === true) return {}
+  return {
+    ...(record.stopped === true || record.neverReturned === true ? { stopped: true as const } : {}),
+    ...(record.timedOut === true ? { timedOut: true as const } : {}),
+    ...(record.neverReturned === true ? { neverReturned: true as const } : {})
+  }
+}
+
+/** How a stored edit or write was cut before it finished (`shellCommandCutFields`), if it was. */
+export function commandCutShort(result: unknown): 'stopped' | 'timed-out' | null {
+  const record = pickPlainObject(result)
+  if (record?.timedOut === true) return 'timed-out'
+  return record?.stopped === true ? 'stopped' : null
 }
 
 /** The command a mapped shell action ran, unwrapped when the lane recorded both spellings. */
@@ -2771,7 +2882,9 @@ function summarizeReadResult(
       contentOmitted: binaryLike,
       omittedReason: binaryLike ? 'binary_like' : undefined,
       contentChars: normalizedContent.length,
-      ...(exitCode !== undefined ? { exitCode } : {})
+      ...(exitCode !== undefined ? { exitCode } : {}),
+      // SA-136: a typed read's frozen block (range, total, whole, cut) as `read_file` wrote it.
+      ...typedFileFactsFields(toolResult)
     },
     flags: {
       compacted: preview.truncated || binaryLike,
@@ -2847,7 +2960,9 @@ function summarizeWriteResult(toolArgs: Record<string, any>, toolResult: any): {
       contentOmitted: binaryLike,
       omittedReason: binaryLike ? 'binary_like' : undefined,
       contentChars: normalizedContent.length,
-      ...shellFailureFields(toolArgs, toolResult)
+      ...shellFailureFields(toolArgs, toolResult),
+      ...shellCommandCutFields(normalizedToolResult, shellActionCommand(toolArgs, toolResult)),
+      ...typedFileFactsFields(normalizedToolResult)
     },
     flags: {
       compacted: preview.truncated || binaryLike,
@@ -2953,7 +3068,10 @@ function summarizeEditResult(toolArgs: Record<string, any>, toolResult: any): { 
         typeof toolResult?.changeCount === 'number'
           ? toolResult.changeCount
           : undefined,
-      ...shellFailureFields(toolArgs, toolResult)
+      ...shellFailureFields(toolArgs, toolResult),
+      ...managedPatchLeftChangedFields(normalizedToolResult),
+      ...shellCommandCutFields(normalizedToolResult, shellActionCommand(toolArgs, toolResult)),
+      ...typedFileFactsFields(normalizedToolResult)
     },
     flags: {
       compacted: preview.truncated || binaryLike,
@@ -3142,6 +3260,13 @@ function summarizeSubagentResult(toolResult: any): { result: any; flags: Compact
 }
 
 export function resolveToolOperationKind(input: CompactToolInput): ToolOperationKind {
+  const utility = resolveApiUtilityPresentation(input)
+  if (utility) return utility.operationKind
+  // New utility profiles require the exact API event and consistent canonical envelope.
+  // A copied ref, classifier, CLI wrapper, missing callback result or multi-result array grants none.
+  if (hasApiUtilityPresentationClaim(input)) {
+    return resolveBrokerOperationKind(input.toolArgs ?? {}, input.toolResult) ?? 'unknown_tool'
+  }
   const toolName = normalizeInternalMode4HelperName(input.toolName)
   const originalToolName = normalizeInternalMode4HelperName(input.originalToolName)
   const mappedToolName = normalizeInternalMode4HelperName(extractNativeMappedToolName(input.toolResult))
@@ -3219,7 +3344,7 @@ export function resolveToolOperationKind(input: CompactToolInput): ToolOperation
   const namedKind = resolveOperationKindFromNames(names)
   if (namedKind) return namedKind
   if (names.includes('native_skill') || names.includes('native_skill_reference')) {
-    if (action === 'read' || action === 'invoke') return 'skill_read'
+    if (action === 'read' || action === 'invoke' || action === 'script_read') return 'skill_read'
     return 'unknown_tool'
   }
 
@@ -3299,6 +3424,38 @@ export function resolveRawSidecarPolicy(operationKind: ToolOperationKind): ToolR
   }
 }
 
+/**
+ * Arguments that ask a read tool for part of a file (Claude Code's Read takes `offset`/`limit`).
+ * The dead-copy ledger reads them on the STORED arguments (`zipDeadCopies.ts`), so a compact read
+ * keeps every one of them (BL-2005).
+ */
+export const READ_RANGE_ARGUMENT_NAMES = [
+  'offset',
+  'limit',
+  'startLine',
+  'endLine',
+  'start_line',
+  'end_line',
+  'lineStart',
+  'lineEnd',
+  'fromLine',
+  'toLine',
+  'range',
+  'lines',
+  'maxLines',
+  'max_lines',
+  'head',
+  'tail',
+  // Claude Code's Read of a PDF takes a page range.
+  'pages'
+] as const
+
+/** A stored argument value: a number, text, a flag, or a list of those. */
+function isScalarArgument(value: unknown): boolean {
+  if (Array.isArray(value)) return value.length <= 16 && value.every((entry) => isScalarArgument(entry) && !Array.isArray(entry))
+  return typeof value === 'number' || typeof value === 'string' || typeof value === 'boolean'
+}
+
 function compactToolArgs(operationKind: ToolOperationKind, toolArgs: Record<string, any>, toolResult: any): Record<string, any> {
   const normalizedToolResult = unwrapNativeAutomationData(toolResult)
   const mappedToolInput = extractNativeMappedToolInput(toolResult)
@@ -3329,10 +3486,19 @@ function compactToolArgs(operationKind: ToolOperationKind, toolArgs: Record<stri
       else if (typeof toolArgs.cwd === 'string') compact.cwd = toolArgs.cwd
       if (typeof mappedToolInput?.workingDir === 'string') compact.workingDir = mappedToolInput.workingDir
       else if (typeof toolArgs.workingDir === 'string') compact.workingDir = toolArgs.workingDir
+      // BL-2005: a read of part of a file keeps the arguments that asked for that part. They
+      // were dropped here, so the ledger took Claude Code's `Read` of lines 100-149 for a whole
+      // read: it retired the agent's earlier whole copy as superseded, and a hold could sit on it.
+      if (operationKind === 'read_file') {
+        for (const name of READ_RANGE_ARGUMENT_NAMES) {
+          if (isScalarArgument(toolArgs[name])) compact[name] = toolArgs[name]
+        }
+      }
       return compact
     }
     case 'skill_read': {
-      const skillAction = extractToolActionName(toolArgs, toolResult) === 'invoke' ? 'invoke' : 'read'
+      const requestedSkillAction = extractToolActionName(toolArgs, toolResult)
+      const skillAction = requestedSkillAction === 'invoke' ? 'invoke' : requestedSkillAction === 'script_read' ? 'script_read' : 'read'
       return {
         ...(typeof toolArgs.skillId === 'string'
           ? { skillId: toolArgs.skillId }
@@ -3620,11 +3786,13 @@ function compactToolArgs(operationKind: ToolOperationKind, toolArgs: Record<stri
 }
 
 export function normalizeCompactTool(input: CompactToolInput): CompactToolNormalization {
+  const utility = resolveApiUtilityPresentation(input)
+  const utilityClaim = hasApiUtilityPresentationClaim(input)
   const operationKind = resolveToolOperationKind(input)
   const rendererFamily = resolveToolRendererFamily(operationKind)
   const rawSidecarPolicy = resolveRawSidecarPolicy(operationKind)
-  const toolArgs = input.toolArgs && isPlainObject(input.toolArgs) ? { ...input.toolArgs } : {}
-  const toolResult = input.toolResult
+  const toolArgs = utility ? { ...utility.args } : input.toolArgs && isPlainObject(input.toolArgs) ? { ...input.toolArgs } : {}
+  const toolResult = utility?.raw ?? input.toolResult
   const unwrappedText = unwrapNativeAutomationData(toolResult)
   // Reload normalizes the already-saved compact result again. Preserve its plain-text
   // view; reinterpreting it as typed Bash/Fetch Zip data invents an empty/failure card.
@@ -3666,7 +3834,8 @@ export function normalizeCompactTool(input: CompactToolInput): CompactToolNormal
       break
     }
     case 'skill_read': {
-      const skillAction = extractToolActionName(toolArgs, toolResult) === 'invoke' ? 'invoke' : 'read'
+      const requestedSkillAction = extractToolActionName(toolArgs, toolResult)
+      const skillAction = requestedSkillAction === 'invoke' ? 'invoke' : requestedSkillAction === 'script_read' ? 'script_read' : 'read'
       const nestedToolArgs = extractNestedToolArgs(toolArgs)
       const normalizedSkillResult = unwrapNativeAutomationData(toolResult)
       const nestedInputArgs = extractNestedToolArgs(
@@ -3719,7 +3888,15 @@ export function normalizeCompactTool(input: CompactToolInput): CompactToolNormal
       })
       compactResult = {
         ...summarized.result,
-        action: skillAction
+        action: skillAction,
+        ...Object.fromEntries(['success', 'blocked', 'error', 'errorCode', 'reason']
+          .filter((key) => (normalizedSkillResult as any)?.[key] !== undefined)
+          .map((key) => [key, (normalizedSkillResult as any)[key]])),
+        // Preserve the actual source/window identity. Windows of an edited skill remain
+        // separate original reads, never a synthetic combined current file.
+        ...Object.fromEntries(['sourceSha256', 'offset', 'returnedChars', 'originalChars', 'nextOffset', 'readMore']
+          .filter((key) => ['string', 'number'].includes(typeof (normalizedSkillResult as any)?.[key]))
+          .map((key) => [key, (normalizedSkillResult as any)[key]]))
       }
       flags = summarized.flags
       break
@@ -3789,7 +3966,12 @@ export function normalizeCompactTool(input: CompactToolInput): CompactToolNormal
     // in the zip, and the compact form keeps the card readable.
     case 'workers': {
       const summarized = summarizeSubagentResult(toolResult)
-      compactResult = summarized.result
+      compactResult = utility?.kind === 'subagent' && Array.isArray(toolResult.intermediateSteps)
+        ? { ...summarized.result, intermediateSteps: toolResult.intermediateSteps }
+        : summarized.result
+      if (utility?.kind === 'subagent') {
+        compactResult = { ...compactResult, subagentId: utility.envelope.subagentId }
+      }
       flags = summarized.flags
       break
     }
@@ -3832,16 +4014,25 @@ export function normalizeCompactTool(input: CompactToolInput): CompactToolNormal
     // A brokered zip fetch names its control too (`sys.zip.fetch` → Fetch Zip); a direct
     // helper fetch names none and keeps its own tool label.
     displayToolName:
-      operationKind === 'artifact_use' || operationKind === 'fabric_use' || operationKind === 'fetch_zip'
+      utility?.displayName ?? (!utilityClaim && (operationKind === 'artifact_use' || operationKind === 'fabric_use' || operationKind === 'fetch_zip')
         ? formatBatshitToolTargetDisplayName(extractControlTarget(toolArgs, toolResult))
           ?? undefined
-        : undefined,
+        : undefined),
     toolArgs: compactArgs,
     toolResult: typeof shell === 'string' && compactResult && typeof compactResult === 'object'
       ? { ...compactResult, shell }
       : compactResult,
     flags,
     rawSidecarPolicy,
+    ...(utility ? { metadata: {
+      apiUtilityRef: utility.envelope.ref,
+      apiUtilityControlId: utility.envelope.controlId,
+      ...(utility.kind === 'subagent' ? {
+        isSubagent: true, subagentId: utility.envelope.subagentId,
+        subagentName: utility.envelope.subagentName, subagentType: utility.envelope.subagentType,
+        subagentAvatar: utility.envelope.subagentAvatar
+      } : {})
+    } } : {}),
     rawReason:
       operationKind === 'dynamic_find'
         ? 'dynamic-find-main-payload-is-already-compact'

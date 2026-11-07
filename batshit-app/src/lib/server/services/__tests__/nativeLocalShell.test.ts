@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import os from 'node:os'
 import path from 'node:path'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync } from 'node:fs'
 import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises'
-import { NATIVE_BASH_SHELL_GUIDANCE, nativeToolService } from '../nativeTools'
+import { nativeToolService } from '../nativeTools'
 import * as localShell from '../localCommandShell'
 
 // Real local processes; the default lane only fakes Redis/providers, never these shells.
@@ -116,7 +116,3 @@ it('does not select or start a shell after Stop', async () => {
   expect(selection).not.toHaveBeenCalled()
 })
 
-it('keeps managed helper agent guidance in sync', () => {
-  const helper = readFileSync(path.resolve('scripts/mode4-controls-mcp.cjs'), 'utf8')
-  expect(helper).toContain(NATIVE_BASH_SHELL_GUIDANCE)
-})

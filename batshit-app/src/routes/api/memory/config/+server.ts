@@ -13,8 +13,9 @@ import {
   MEMORY_API_EMBEDDING_PROVIDERS,
   suggestEmbeddingPrefixes
 } from '$lib/server/services/memory/memoryEmbedder'
-import { redis } from '$lib/server/redis'
 import type { MemoryEmbeddingConfig } from '$lib/server/services/memory/memoryTypes'
+import { preparePresetReferences } from '$lib/server/services/modelPresetReferenceGuard'
+import { readOwnedModelPresetDependency, type OwnedModelPresetDependency } from '$lib/server/services/modelPresetSelectionOwner'
 
 const MASKED_KEY = '***'
 
@@ -79,6 +80,8 @@ export const PUT: RequestHandler = async ({ locals, request }) => {
   }
 
   try {
+    const referencePreparation = preparePresetReferences('memory', { embedding: body.embedding })
+    let presetDependency: OwnedModelPresetDependency | undefined
     const incoming = body.embedding
     // A masked local-ai key means "keep the stored one".
     if (incoming.localAi?.apiKey === MASKED_KEY) {
@@ -100,10 +103,8 @@ export const PUT: RequestHandler = async ({ locals, request }) => {
       if (!presetId) {
         return json({ error: 'Choose a model preset for the embedding source.' }, { status: 400 })
       }
-      const preset = (await redis.get(`model:${presetId}`).catch(() => null)) as Record<
-        string,
-        any
-      > | null
+      presetDependency = await readOwnedModelPresetDependency(user.value.id, presetId)
+      const preset = presetDependency.preset as unknown as Record<string, any>
       if (!preset) {
         return json(
           {
@@ -141,14 +142,15 @@ export const PUT: RequestHandler = async ({ locals, request }) => {
       incoming.modelId = `preset:${provider}:${modelName}`
     }
 
-    const record = await setMemoryConfig(incoming)
+    const record = await setMemoryConfig(incoming, { userId: user.value.id, preparation: referencePreparation, dependency: presetDependency })
     const meta = await getMemoryIndexMeta()
     return json({ embedding: maskConfig(record.embedding), indexMeta: meta })
   } catch (error) {
     console.error('[Memory Config] Save failed:', error)
     return json(
-      { error: error instanceof Error ? error.message : 'Failed to save memory config' },
-      { status: 400 }
+      { error: error instanceof Error ? error.message : 'Failed to save memory config',
+        ...(typeof (error as any)?.code === 'string' ? { code: (error as any).code } : {}) },
+      { status: typeof (error as any)?.status === 'number' ? (error as any).status : 500 }
     )
   }
 }

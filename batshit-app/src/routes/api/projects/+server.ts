@@ -4,7 +4,6 @@ import { RedisService } from '$lib/server/redis'
 import { normalizeProjectExclusions } from '$lib/projects/exclusions'
 import { cloneIconRef, isIconRef, type IconRef } from '$lib/icons/iconTypes'
 import { validateProjectRootPath } from '$lib/server/services/projectPathValidation'
-import { syncAgentCodexProfiles } from '$lib/server/services/codexProfileManager'
 
 function normalizeProjectIconRef(value: unknown): IconRef | null {
 	if (value === null || value === undefined) return null
@@ -89,11 +88,6 @@ export const PUT: RequestHandler = async ({ request, locals }) => {
 				: {})
 		}
 		const updated = await redis.updateProject(projectId, locals.user.id, normalizedUpdates)
-		try {
-			await syncAgentCodexProfiles(locals.user.id)
-		} catch (error) {
-			console.warn('[Projects API] Failed to sync Codex profiles after project update:', error)
-		}
 		
 		return json({
 			project: {
@@ -119,11 +113,6 @@ export const DELETE: RequestHandler = async ({ request, locals }) => {
 		const redis = new RedisService()
 		
 		await redis.deleteProject(projectId, locals.user.id)
-		try {
-			await syncAgentCodexProfiles(locals.user.id)
-		} catch (error) {
-			console.warn('[Projects API] Failed to sync Codex profiles after project delete:', error)
-		}
 		
 		return json({ success: true })
 	} catch (error) {

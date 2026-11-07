@@ -138,12 +138,21 @@ async function readPngMetadata(buffer, limitInputPixels) {
   return metadata;
 }
 
-async function prepareBaseColor(buffer, contract) {
-  const width = contract.canvas.width;
-  const height = contract.canvas.height;
-  const metadata = await readPngMetadata(buffer, width * height);
-  if (metadata.width !== width || metadata.height !== height) {
-    fail(`Base Color artwork must be a single-frame ${width}x${height} PNG`);
+async function prepareBaseColor(buffer, contract, targetCanvas) {
+  const width = targetCanvas?.width;
+  const height = targetCanvas?.height;
+  const masterWidth = contract.canvas.width;
+  const masterHeight = contract.canvas.height;
+  const exactTemplate = width === masterWidth && height === masterHeight;
+  const halfMaster = masterWidth === 4096 && masterHeight === 4096 && width === 2048 && height === 2048;
+  if (!exactTemplate && !halfMaster) {
+    fail('Base Color target canvas is unsupported');
+  }
+  const metadata = await readPngMetadata(buffer, masterWidth * masterHeight);
+  const exactTarget = metadata.width === width && metadata.height === height;
+  const acceptedMaster = halfMaster && metadata.width === masterWidth && metadata.height === masterHeight;
+  if (!exactTarget && !acceptedMaster) {
+    fail(`Base Color artwork must be a single-frame ${width}x${height}${halfMaster ? ' or 4096x4096' : ''} PNG`);
   }
   if (metadata.depth !== 'uchar' || (metadata.bitsPerSample ?? 8) > 8) {
     fail('Base Color artwork must use 8-bit RGB or RGBA channels');
@@ -151,15 +160,19 @@ async function prepareBaseColor(buffer, contract) {
 
   let decoded;
   try {
-    decoded = await sharp(buffer, { failOn: 'error', limitInputPixels: width * height })
+    let pipeline = sharp(buffer, { failOn: 'error', limitInputPixels: masterWidth * masterHeight })
       .toColourspace('srgb')
-      .ensureAlpha()
+      .ensureAlpha();
+    if (acceptedMaster) {
+      pipeline = pipeline.resize(width, height, { fit: 'fill', kernel: sharp.kernel.lanczos3 });
+    }
+    decoded = await pipeline
       .raw({ depth: 'uchar' })
       .toBuffer({ resolveWithObject: true });
   } catch {
     fail('Base Color artwork could not be converted to canonical sRGB RGBA8');
   }
-  if (decoded.info.channels !== 4) {
+  if (decoded.info.channels !== 4 || decoded.info.width !== width || decoded.info.height !== height) {
     fail('Base Color artwork could not be prepared as RGBA8');
   }
   const prepared = await sharp(decoded.data, {
@@ -176,7 +189,8 @@ async function prepareBaseColor(buffer, contract) {
       flipY: false,
       encoding: 'rgba8'
     },
-    validation: { sourceDepth: metadata.depth, sourceChannels: metadata.channels }
+    validation: { sourceDepth: metadata.depth, sourceChannels: metadata.channels,
+      sourceWidth: metadata.width, sourceHeight: metadata.height, resized: acceptedMaster }
   };
 }
 
@@ -446,7 +460,7 @@ async function prepareSkinSurfaceArtworkUpload(input) {
 
   const canonical =
     input.map === 'baseColor'
-      ? await prepareBaseColor(input.buffer, contract)
+      ? await prepareBaseColor(input.buffer, contract, input.targetCanvas)
       : input.map === 'normal'
         ? await prepareNormal(input.buffer, contract, contractPath)
         : await prepareScalarMap(input.buffer, input.map);

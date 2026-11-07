@@ -121,6 +121,85 @@ describe('the lean Bash text (BL-1483)', () => {
     ].join('\n'))
   })
 
+  it('names what a patch left changed when Batshit could not put it back (BL-1916)', () => {
+    expect(formatBashResultForModel({
+      success: false, blocked: false, errorCode: 'INVALID_INPUT',
+      reason: 'Writing "b.txt" failed (EIO), and Batshit could not put back keep.txt: that path is left changed. Read it before you patch again.',
+      managedApplyPatch: { managed: true, partial: true, changedPaths: ['/work/keep.txt'] }, ...BOOKKEEPING
+    })).toBe([
+      'success:false; errorCode:INVALID_INPUT',
+      'reason: Writing "b.txt" failed (EIO), and Batshit could not put back keep.txt: that path is left changed. Read it before you patch again.',
+      'apply_patch: partly written; left changed: /work/keep.txt'
+    ].join('\n'))
+  })
+
+  describe('commands after a patch (SA-126 item 2)', () => {
+    const applied = (extra: Record<string, unknown>) => ({
+      managed: true, applied: true, operationsApplied: 2, touchedPaths: ['a.js', 'b.js'],
+      afterPatch: { command: 'set -e\nnpm test', tail: 'npm test' }, afterPatchStarted: true, ...extra
+    })
+
+    it('a failing command after an applied patch: its status and output, the patch, then the command', () => {
+      expect(formatBashResultForModel(ranResult({
+        success: false, exitCode: 1, stdout: 'FAIL adds\n', stderr: '', shell: '/bin/zsh',
+        managedApplyPatch: applied({})
+      }))).toBe([
+        'success:false; exitCode:1',
+        'shell: /bin/zsh',
+        'apply_patch: 2 operations; files: a.js, b.js',
+        'then ran: npm test',
+        'stdout:',
+        'FAIL adds\n'
+      ].join('\n'))
+    })
+
+    it('several lines after the patch show the first and how many more', () => {
+      expect(formatBashResultForModel(ranResult({
+        managedApplyPatch: applied({ afterPatch: { command: 'npm run build\n# then\nnpm test', tail: 'npm run build\n# then\nnpm test' } })
+      }))).toContain('then ran: npm run build (+1 more line)')
+    })
+
+    it('a Stop between the write and the command: never started, the patch stays applied', () => {
+      expect(formatBashResultForModel({
+        success: false, blocked: false, stopped: true, reason: 'The command was stopped.', exitCode: null,
+        stdout: '', stderr: '', managedApplyPatch: applied({ afterPatchStarted: false }), ...BOOKKEEPING
+      })).toBe([
+        'success:false; stopped:true',
+        'reason: The command was stopped.',
+        'apply_patch: 2 operations; files: a.js, b.js',
+        'then not run: npm test (stopped before it started); the patch stays applied',
+        '(no output)'
+      ].join('\n'))
+    })
+
+    it('a call still running when the Stop wait ended: no result, never "stopped before it started" (BL-1978)', () => {
+      const { afterPatchStarted: _started, ...reported } = applied({})
+      expect(formatBashResultForModel({
+        success: false, blocked: false, stopped: true, neverReturned: true,
+        reason: 'The reply was stopped while this ran, and it returned no result.',
+        managedApplyPatch: reported, ...BOOKKEEPING
+      })).toBe([
+        'success:false; stopped:true',
+        'reason: The reply was stopped while this ran, and it returned no result.',
+        'apply_patch: 2 operations; files: a.js, b.js',
+        'then: npm test returned no result (the reply was stopped while it ran); the patch stays applied'
+      ].join('\n'))
+    })
+
+    it('a command that could not start keeps its error code and says the patch applied', () => {
+      expect(formatBashResultForModel({
+        success: false, blocked: false, errorCode: 'SANDBOX_UNAVAILABLE',
+        reason: 'The patch applied; the command after it could not start: Docker Sandbox is unavailable.',
+        managedApplyPatch: applied({ afterPatchStarted: false }), ...BOOKKEEPING
+      })).toBe([
+        'success:false; errorCode:SANDBOX_UNAVAILABLE',
+        'reason: The patch applied; the command after it could not start: Docker Sandbox is unavailable.',
+        'apply_patch: 2 operations; files: a.js, b.js',
+        'then not run: npm test (it could not start); the patch stays applied'
+      ].join('\n'))
+    })
+  })
+
   it('drops the command, the modes, the backend, the folders, the renderer mapping and the duration', () => {
     const text = formatBashResultForModel(ranResult({ command: 'npm test -- --grep unique-command-marker' }))
     for (const dropped of ['unique-command-marker', 'policyMode', 'accessMode', 'This Mac', '/work', 'mappedTool', 'generic shell command', 'durationMs', '812']) {

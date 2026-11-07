@@ -73,7 +73,7 @@ describe('buildDynamicMcpIndex discoverable refs (SA-120 P1)', () => {
     expect(mcp.find((entry) => entry.name === 'hf_search')).toMatchObject({ enabled: true, description: 'Search models', hint: 'required: query:string', group: 'HuggingFace' })
     expect(mcp.find((entry) => entry.name === 'hf_whoami')?.enabled).toBe(false)
 
-    expect(result.discoverable.find((entry) => entry.ref === 'cli:ffmpeg')).toMatchObject({ family: 'cli', description: 'ffmpeg — Convert media', hint: 'input:string*' })
+    expect(result.discoverable.find((entry) => entry.ref === 'cli:ffmpeg')).toMatchObject({ family: 'cli', description: 'ffmpeg — Convert media', hint: 'required: input:string' })
     expect(result.discoverable.find((entry) => entry.ref === 'fabric:sys.memory.save')).toMatchObject({ family: 'fabric', hint: 'Save memory — lane, content' })
     expect(result.resolvedGatewayIds).toEqual(['gw_hf'])
   })
@@ -94,4 +94,31 @@ describe('buildDynamicMcpIndex discoverable refs (SA-120 P1)', () => {
     expect(result.discoverable).toEqual([])
     expect(result.resolvedGatewayIds).toBeNull()
   })
+  it('keeps an authorized utility discoverable while retired Fabric presentation choices leave its fixed line unchanged', async () => {
+    listVisibleControlsMock.mockResolvedValue([{ controlId: 'sys.judge.ask', title: 'Ask Judge Juice', schemaHint: 'state, questions' }])
+    const options = { userId: 'josh', nativeDynamicMcpEnabled: false, cliToolsEnabled: false, runtime: 'api' as const, allowFabricControlTools: false, judgeControlsEnabled: true,
+      brokerToggles: { fetchZipEnabled: false, dynamicMcpEnabled: false, cliToolsEnabled: false, artifactRuntimeEnabled: false, batshitToolsEnabled: true, agentBrowserEnabled: false } }
+    const expected = [expect.objectContaining({ ref: 'batshit:sys.judge.ask', family: 'batshit', group: 'Fabric & Utilities', hint: 'Ask Judge Juice — state, questions' })]
+    let fixedLine: string | undefined
+    for (const mode of ['hidden', 'group-only', 'group+tools+names', 'group+tools+hints'] as const) {
+      const result = await buildDynamicMcpIndex({ ...options, dcmDisplaySettings: { version: 1, groups: { '__fabric_controls__::Fabric Controls': mode }, tools: {} } })
+      expect(result.text).toContain('Fabric & Utilities')
+      expect(result.discoverable).toEqual(expected)
+      expect(result.text).not.toContain('sys.judge.ask')
+      expect(result.text).not.toContain('state, questions')
+      fixedLine ??= result.text
+      expect(result.text).toBe(fixedLine)
+    }
+    const hiddenTool = await buildDynamicMcpIndex({ ...options, dcmDisplaySettings: { version: 1, groups: { '__fabric_controls__::Fabric Controls': 'group+tools+hints' }, tools: { '__fabric_controls__::sys.judge.ask': 'hidden' } } })
+    expect(hiddenTool.discoverable).toEqual(expected)
+    expect(hiddenTool.text).toBe(fixedLine)
+    // Actual capability switches still decide reachability; a presentation choice never grants it.
+    for (const [judgeControlsEnabled, batshitToolsEnabled] of [[false, true], [true, false], [false, false]] as const) {
+      const disabled = await buildDynamicMcpIndex({ ...options, judgeControlsEnabled,
+        brokerToggles: { ...options.brokerToggles, batshitToolsEnabled } })
+      expect(disabled.discoverable).toEqual([])
+      expect(disabled.text).toBe('')
+    }
+  })
+
 })

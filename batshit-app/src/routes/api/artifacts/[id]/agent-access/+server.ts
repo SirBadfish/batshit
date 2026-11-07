@@ -1,7 +1,8 @@
 import { json, error, isHttpError, isRedirect, type RequestHandler } from '@sveltejs/kit'
 import { apiError, serviceRefusalResponse } from '$lib/server/services/apiResponses'
 import { ArtifactsService } from '$lib/server/artifacts/artifactsService'
-import { isOwnAgentOrSubagent, parseAgentAccessChange } from '$lib/server/services/agentAccessLists'
+import { parseAgentAccessChange } from '$lib/server/services/agentAccessLists'
+import { serializeArtifactGrantFailure } from '$lib/server/artifacts/artifactGrantLifecycle'
 
 /**
  * PUT /api/artifacts/[id]/agent-access: turn ONE agent or Subagent on or off for one artifact,
@@ -33,13 +34,12 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
   }
 
   try {
-    if (change.enabled && !(await isOwnAgentOrSubagent(userId, change.agentId))) {
-      return apiError(`There is no agent or Subagent "${change.agentId}" to turn this on for.`, 404)
-    }
     const artifactsService = new ArtifactsService()
     const artifact = await artifactsService.setAgentAccess(id, userId, change.agentId, change.enabled)
     return json(artifact)
   } catch (err) {
+    const grantFailure = serializeArtifactGrantFailure(err)
+    if (grantFailure) { const { status, ...body } = grantFailure; return json(body, { status }) }
     const refusal = serviceRefusalResponse(err)
     if (refusal) {
       console.warn('Artifact agent access change refused:', err instanceof Error ? err.message.split('\n')[0] : err)

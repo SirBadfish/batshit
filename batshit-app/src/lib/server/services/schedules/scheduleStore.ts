@@ -22,8 +22,8 @@
 
 import { randomBytes } from 'node:crypto'
 import { redis } from '$lib/server/redis'
-import { normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
-import { resolveAgentDmsEnabled } from '$lib/utils/dmControl'
+import { retiredPrimaryAgentRefusal } from '$lib/utils/primaryAgentType'
+import { agentDmsOffHint, resolveAgentDmsEnabled } from '$lib/utils/dmControl'
 import { closeUnreadScheduleDms } from '$lib/server/services/dm/dmStore'
 import {
   MAX_SCHEDULES_PER_AGENT,
@@ -275,9 +275,14 @@ async function requireEligibleAgent(
   if (!agent || (agent.user_id && agent.user_id !== userId)) {
     throw new ScheduleError(`Agent "${normalized}" was not found.`, 404)
   }
-  const agentType = normalizePrimaryAgentType(agent as any)
-  if (agentType !== 'api' && agentType !== 'cli') {
-    throw new ScheduleError('Only API and CLI primary agents can be put on a schedule.')
+  // SA-139 R4 (D14): only an API primary runs; a stored retired type is refused readably.
+  const retired = retiredPrimaryAgentRefusal(agent as any)
+  if (retired) {
+    throw new ScheduleError(
+      `${agent.displayName ?? agent.name ?? normalized} cannot be put on a schedule. ${retired.error}`,
+      409,
+      retired.details
+    )
   }
   // AMD-113-05 parity: a fire writes a DM, so an agent with DMs off would never see it
   // and would have no `sys.dm.*` tools to close it with.
@@ -285,7 +290,7 @@ async function requireEligibleAgent(
     throw new ScheduleError(
       `${agent.displayName ?? agent.name ?? normalized} does not have Agent DMs turned on, so it would never see this.`,
       400,
-      'Turn on Agent DMs for that agent in Agent Settings.'
+      agentDmsOffHint(agent)
     )
   }
   return agent

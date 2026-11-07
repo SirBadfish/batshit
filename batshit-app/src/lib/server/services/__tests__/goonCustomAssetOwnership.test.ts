@@ -7,6 +7,14 @@ import {
 } from '../goonCustomAssetOwnership.server'
 
 describe('custom Goon upload reference collection', () => {
+  it('guards existing local/global Closet and retained-history upload refs without requiring new metadata fields', async () => {
+    const item = { id: 'legacy', xwear: { textures: { main: { url: '/uploads/goon_closet/old.png' } } } }
+    const rows = [{ closet: { items: { legacy: item } } }, { goons_settings: { globalCloset: { items: { legacy: item } } } },
+      { retained: { url: 'https://local.test/uploads/goon_closet/history.png' } }]
+    expect(await collectGoonGuardedReferences(rows, 'owner')).toEqual(['upload:goon_closet:history.png', 'upload:goon_closet:old.png'])
+  })
+
+
   it('binds identity guards only to Hair state, preserving Clothing and unrelated receipts', async () => {
     const selected = { assetId: 'user-hair', assetRevisionId: 'r2', assetRevision: 2,
       assetRevisionSha256: 'a'.repeat(64), fitFamily: 'advanced', fitSha256: 'b'.repeat(64) }

@@ -58,8 +58,12 @@ export type ManagedTunnelStatus = {
 }
 
 const CLOUDFLARED_UNINSTALL_TIMEOUT_MS = 30_000
+const CLOUDFLARED_TUNNEL_KILL_TIMEOUT_MS = 5_000
 const CLOUDFLARED_PROCESS_MAX_OUTPUT_CHARS = 250_000
 const CLOUDFLARED_TUNNEL_START_TIMEOUT_MS = 20_000
+const CLOUDFLARED_DOWNLOAD_TIMEOUT_MS = 120_000
+const CLOUDFLARED_DOWNLOAD_MAX_BYTES = 256 * 1024 * 1024
+const CLOUDFLARED_ERROR_BODY_MAX_BYTES = 4_096
 const FALLBACK_MANAGED_TUNNEL_TARGET_URL = 'http://localhost:5600'
 const CLOUDFLARED_RELEASE_TAG = '2026.3.0'
 const DOCKER_CLOUDFLARED_STATE_PATH = '/runtime/cloudflared/status.json'
@@ -122,6 +126,7 @@ type ProcessRunResult = {
 
 type TunnelState = {
   child: ChildProcess | null
+  stopRequested: boolean
   command: string | null
   args: string[]
   publicUrl: string | null
@@ -132,6 +137,7 @@ type TunnelState = {
 
 const tunnelState: TunnelState = {
   child: null,
+  stopRequested: false,
   command: null,
   args: [],
   publicUrl: null,
@@ -151,11 +157,18 @@ type InFlightTunnelStart = {
   promise: Promise<ManagedTunnelStartResult>
 }
 
+type ManagedTunnelStopResult = {
+  stopped: boolean
+  status: ManagedTunnelStatus
+  reason?: string
+}
+
 // Serializes managed tunnel spawns. tunnelState can only track one child, so
 // concurrent ensure/start callers must share a single in-flight start instead
 // of each spawning their own cloudflared process and orphaning all but the
 // last one from the app's point of view.
 let inFlightTunnelStart: InFlightTunnelStart | null = null
+let inFlightTunnelStop: Promise<ManagedTunnelStopResult> | null = null
 const runtimeMutations = new Set<string>()
 
 async function withCloudflaredRuntimeMutation<T>(operation: (installDir: string) => Promise<T>): Promise<T> {
@@ -537,7 +550,12 @@ function formatCloudflaredLaunchError(command: string, error: unknown): string {
 }
 
 function tunnelProcessAlive() {
-  return Boolean(tunnelState.child && tunnelState.child.exitCode === null && !tunnelState.child.killed)
+  // `killed` only records successful signal delivery, not process exit.
+  return Boolean(tunnelState.child && !tunnelChildExited(tunnelState.child))
+}
+
+function tunnelChildExited(child: ChildProcess) {
+  return child.exitCode !== null || child.signalCode !== null
 }
 
 function getManagedTunnelStatus(): ManagedTunnelStatus {
@@ -564,6 +582,7 @@ function getWaitingDockerManagedTunnelStatus(): ManagedTunnelStatus {
 
 function resetTunnelState() {
   tunnelState.child = null
+  tunnelState.stopRequested = false
   tunnelState.command = null
   tunnelState.args = []
   tunnelState.publicUrl = null
@@ -722,7 +741,88 @@ async function verifyInstalledVersion(command: string): Promise<string> {
   return version
 }
 
-export async function installCloudflaredRuntime(platform: CloudflaredInstallPlatform): Promise<CloudflaredRuntimeStatus> {
+export type CloudflaredInstallOptions = { signal?: AbortSignal; deadlineAt?: number }
+type InstallControl = {
+  signal: AbortSignal
+  downloadRefusal: Promise<never>
+  check(): void
+  downloadFinished(): void
+  dispose(): void
+}
+
+function createInstallControl(options: CloudflaredInstallOptions): InstallControl {
+  if (options.deadlineAt !== undefined && !Number.isFinite(options.deadlineAt)) throw new Error('Cloudflared installation deadline is invalid.')
+  if (options.signal?.aborted) throw new Error('Cloudflared installation was cancelled before download.')
+  if (options.deadlineAt !== undefined && Date.now() >= options.deadlineAt) throw new Error('Cloudflared installation deadline elapsed before download.')
+  const controller = new AbortController()
+  let downloading = true
+  let refuse!: (error: Error) => void
+  const downloadRefusal = new Promise<never>((_resolve, reject) => { refuse = reject })
+  const cancelled = () => {
+    if (controller.signal.aborted) return
+    const error = new Error('Cloudflared installation was cancelled before publication. Unfinished work remains owned until it settles.')
+    controller.abort(error)
+    if (downloading) refuse(error)
+  }
+  const expired = () => {
+    if (controller.signal.aborted) return
+    const error = new Error(downloading
+      ? 'Cloudflared download deadline elapsed. The previous installation is retained; an unfinished transfer remains owned until it settles.'
+      : 'Cloudflared installation deadline elapsed before publication. Admitted local work remains owned until it settles.')
+    controller.abort(error)
+    if (downloading) refuse(error)
+  }
+  const deadlineAt = Math.min(Date.now() + CLOUDFLARED_DOWNLOAD_TIMEOUT_MS, options.deadlineAt ?? Infinity)
+  const timer = setTimeout(expired, Math.max(0, deadlineAt - Date.now()))
+  options.signal?.addEventListener('abort', cancelled, { once: true })
+  const check = () => {
+    if (options.signal?.aborted) cancelled()
+    if ((downloading && Date.now() >= deadlineAt) || options.deadlineAt !== undefined && Date.now() >= options.deadlineAt) expired()
+    if (controller.signal.aborted) throw controller.signal.reason
+  }
+  return {
+    signal: controller.signal, downloadRefusal, check,
+    downloadFinished() { check(); downloading = false; clearTimeout(timer) },
+    dispose() { clearTimeout(timer); options.signal?.removeEventListener('abort', cancelled) }
+  }
+}
+
+async function readCloudflaredDownloadBody(response: Response, control: InstallControl): Promise<{ data: Buffer; truncated: boolean }> {
+  const maximum = response.ok ? CLOUDFLARED_DOWNLOAD_MAX_BYTES : CLOUDFLARED_ERROR_BODY_MAX_BYTES
+  const declaredLength = Number(response.headers.get('content-length'))
+  if (Number.isFinite(declaredLength) && declaredLength > maximum) {
+    await response.body?.cancel()
+    control.check()
+    if (!response.ok) return { data: Buffer.alloc(0), truncated: true }
+    throw new Error('Cloudflared download exceeded the 256 MiB archive limit. No installation was published.')
+  }
+  if (!response.body) return { data: Buffer.alloc(0), truncated: false }
+  const reader = response.body.getReader()
+  const chunks: Buffer[] = []
+  let length = 0
+  let truncated = false
+  try {
+    while (true) {
+      control.check()
+      const part = await reader.read()
+      control.check()
+      if (part.done) break
+      if (part.value.byteLength > maximum - length) {
+        if (!response.ok && length < maximum) chunks.push(Buffer.from(part.value.subarray(0, maximum - length)))
+        await reader.cancel()
+        control.check()
+        if (response.ok) throw new Error('Cloudflared download exceeded the 256 MiB archive limit. No installation was published.')
+        truncated = true
+        break
+      }
+      chunks.push(Buffer.from(part.value))
+      length += part.value.byteLength
+    }
+  } finally { reader.releaseLock() }
+  return { data: Buffer.concat(chunks), truncated }
+}
+
+export async function installCloudflaredRuntime(platform: CloudflaredInstallPlatform, options: CloudflaredInstallOptions = {}): Promise<CloudflaredRuntimeStatus> {
   if (isBatshitContainerizedRuntime()) {
     return await getCloudflaredRuntimeStatus()
   }
@@ -734,64 +834,70 @@ export async function installCloudflaredRuntime(platform: CloudflaredInstallPlat
       reason: 'Invalid cloudflared install platform.'
     }
   }
-  return await withCloudflaredRuntimeMutation((installDir) => installVerifiedCloudflaredRuntime(platform, installDir))
+  const control = createInstallControl(options)
+  const owned = withCloudflaredRuntimeMutation((installDir) => installVerifiedCloudflaredRuntime(platform, installDir, control))
+    .finally(() => control.dispose())
+  // Headers/body can refuse promptly, but the root lock follows actual owned
+  // settlement. An ignored abort can never publish its late download.
+  return await Promise.race([owned, control.downloadRefusal])
 }
 
-async function installVerifiedCloudflaredRuntime(platform: CloudflaredInstallPlatform, installDir: string): Promise<CloudflaredRuntimeStatus> {
+async function installVerifiedCloudflaredRuntime(platform: CloudflaredInstallPlatform, installDir: string, control: InstallControl): Promise<CloudflaredRuntimeStatus> {
   const asset = CLOUDFLARED_ASSETS[platform]
   const stagingDir = `${installDir}.tmp-${randomUUID()}`
   const previousDir = `${installDir}.previous`
   let retainStagingForRecovery = false
-  await fs.mkdir(stagingDir, { recursive: true })
-
+  let stagingAdmitted = false
   try {
+    control.check()
     const url = resolveCloudflaredDownloadUrl(platform)
-    const response = await fetch(url)
+    const response = await fetch(url, { signal: control.signal })
+    control.check()
+    const { data, truncated } = await readCloudflaredDownloadBody(response, control)
+    control.downloadFinished()
     if (!response.ok) {
-      const body = await response.text().catch(() => '')
-      return {
-        ...(await getCloudflaredRuntimeStatus()),
-        installed: false,
-        reason: body || `Failed to download cloudflared (${response.status}).`
-      }
+      const body = data.toString('utf8').trim()
+      throw new Error(`Failed to download cloudflared (${response.status}).${body ? ` ${body}` : ''}${truncated ? ' (Error response truncated.)' : ''}`)
     }
 
-    const data = Buffer.from(await response.arrayBuffer())
     const checksum = sha256Hex(data)
+    control.check()
     if (checksum !== asset.sha256) {
-      return {
-        ...(await getCloudflaredRuntimeStatus()),
-        installed: false,
-        reason: `Cloudflared checksum mismatch for ${asset.assetName}. Expected ${asset.sha256}, got ${checksum}.`
-      }
+      throw new Error(`Cloudflared checksum mismatch for ${asset.assetName}. Expected ${asset.sha256}, got ${checksum}.`)
     }
 
+    control.check()
+    stagingAdmitted = true
+    await fs.mkdir(stagingDir, { recursive: true })
+    control.check()
     // Archives retain their release filename for extraction; raw assets are the executable itself.
     const targetPath = path.join(stagingDir, asset.archiveType === 'tgz' ? asset.assetName : asset.binaryName)
     // The downloaded asset is verified against the pinned SHA-256 above before this private staging write.
     // codeql[js/http-to-file-access]
     await fs.writeFile(targetPath, data)
+    control.check()
 
     if (asset.archiveType === 'tgz') {
       await extractArchive(targetPath, stagingDir)
+      control.check()
       await fs.rm(targetPath, { force: true })
     }
 
     const binaryPath = path.join(stagingDir, asset.binaryName)
+    control.check()
     if (!(await exists(binaryPath))) {
-      return {
-        ...(await getCloudflaredRuntimeStatus()),
-        installed: false,
-        reason: `Cloudflared binary not found after install: ${binaryPath}`
-      }
+      throw new Error(`Cloudflared binary not found after install: ${binaryPath}`)
     }
 
     if (!binaryPath.endsWith('.exe')) {
+      control.check()
       await fs.chmod(binaryPath, 0o755)
     }
 
     const installedAt = new Date().toISOString()
+    control.check()
     const version = await verifyInstalledVersion(binaryPath)
+    control.check()
     const manifest: CloudflaredManifest = {
       version,
       platform,
@@ -811,6 +917,7 @@ async function installVerifiedCloudflaredRuntime(platform: CloudflaredInstallPla
 
     let movedPrevious = false
     try {
+      control.check()
       await fs.rename(installDir, previousDir)
       movedPrevious = true
     } catch (error) {
@@ -818,6 +925,9 @@ async function installVerifiedCloudflaredRuntime(platform: CloudflaredInstallPla
     }
 
     try {
+      control.check()
+      // Once this publication is issued it must settle; a later Stop is not
+      // reported as an undo. Local stages never race an early caller refusal.
       await fs.rename(stagingDir, installDir)
     } catch (publishError) {
       if (movedPrevious) {
@@ -846,7 +956,7 @@ async function installVerifiedCloudflaredRuntime(platform: CloudflaredInstallPla
       reason: status.installed ? null : status.reason
     }
   } finally {
-    if (!retainStagingForRecovery) {
+    if (stagingAdmitted && !retainStagingForRecovery) {
       await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => {})
     }
   }
@@ -874,7 +984,18 @@ export async function uninstallCloudflaredRuntime(): Promise<{
 
   return await withCloudflaredRuntimeMutation(async (installDir) => {
     const managedBinaryBefore = await resolveManagedBinaryPath()
-    await stopManagedCloudflaredTunnel()
+    const stopped = await stopManagedCloudflaredTunnel()
+    if (!stopped.stopped) {
+      const status = await getCloudflaredRuntimeStatus()
+      return {
+        uninstalled: false,
+        supported: status.supported,
+        dockerUnsupported: status.dockerUnsupported,
+        removedManagedInstall: false,
+        reason: stopped.reason || 'Cloudflared removal refused because managed tunnel exit was not confirmed.',
+        status
+      }
+    }
     try {
       await fs.rm(installDir, { recursive: true, force: true })
     } catch {
@@ -955,14 +1076,36 @@ async function performManagedTunnelStart(
   targetUrl: string,
   timeoutMs: number
 ): Promise<ManagedTunnelStartResult> {
+  const refusal = () => {
+    if (runtimeMutations.has(resolveCloudflaredInstallDir())) {
+      return 'Cloudflared installation or removal is in progress. Wait for that operation to finish.'
+    }
+    if (inFlightTunnelStop || tunnelState.stopRequested) {
+      return 'Managed Cloudflare tunnel stop is pending or its exit was not confirmed. A replacement cannot start until exit is observed.'
+    }
+    return null
+  }
+  const initialRefusal = refusal()
+  if (initialRefusal) {
+    return { started: false, status: getManagedTunnelStatus(), reason: initialRefusal }
+  }
   if (tunnelProcessAlive()) {
     if (tunnelState.targetUrl === targetUrl) {
       return { started: true, status: getManagedTunnelStatus() }
     }
-    await stopManagedTunnelProcess()
+    const stopped = await stopManagedTunnelProcess()
+    if (!stopped.stopped) {
+      return { started: false, status: stopped.status, reason: stopped.reason }
+    }
   }
 
   const availability = await checkAvailability()
+  // Installation/removal can claim its lock while the version probe awaits.
+  // Recheck before the only spawn; no await separates this check and custody.
+  const latestRefusal = refusal()
+  if (latestRefusal) {
+    return { started: false, status: getManagedTunnelStatus(), reason: latestRefusal }
+  }
   if (!availability.available || !availability.command) {
     return {
       started: false,
@@ -981,6 +1124,7 @@ async function performManagedTunnelStart(
   })
 
   tunnelState.child = child
+  tunnelState.stopRequested = false
   tunnelState.command = availability.command
   tunnelState.args = args
   tunnelState.publicUrl = null
@@ -997,13 +1141,16 @@ async function performManagedTunnelStart(
   })
 
   child.on('exit', (code, signal) => {
-    // A SIGKILLed predecessor can emit exit after its replacement is tracked;
-    // it must never wipe the live child's state.
+    // A late predecessor event must never wipe a replacement's custody.
     if (tunnelState.child !== child) return
     if (code !== 0 && signal !== 'SIGTERM') {
       tunnelState.lastError = `cloudflared tunnel exited (${code ?? 'unknown'}${signal ? `, ${signal}` : ''}).`
     }
     resetTunnelState()
+  })
+  // A failed spawn can emit error + close without an exit event.
+  child.on('close', () => {
+    if (tunnelState.child === child) resetTunnelState()
   })
 
   const deadline = Date.now() + timeoutMs
@@ -1023,11 +1170,11 @@ async function performManagedTunnelStart(
   const reason =
     tunnelState.lastError ||
     'Managed Cloudflare tunnel started but no trycloudflare URL was detected in time.'
-  await stopManagedTunnelProcess()
+  const stopped = await stopManagedTunnelProcess()
   return {
     started: false,
     status: getManagedTunnelStatus(),
-    reason
+    reason: stopped.stopped ? reason : `${reason} ${stopped.reason}`
   }
 }
 
@@ -1035,7 +1182,9 @@ export async function ensureManagedCloudflaredTunnel(options?: {
   targetUrl?: string
 }): Promise<ManagedTunnelStartResult> {
   const targetUrl = normalizeTargetUrl(options?.targetUrl)
-  if (tunnelProcessAlive() && tunnelState.targetUrl === targetUrl && tunnelState.publicUrl) {
+  if (!runtimeMutations.has(resolveCloudflaredInstallDir()) &&
+      !inFlightTunnelStop && !tunnelState.stopRequested &&
+      tunnelProcessAlive() && tunnelState.targetUrl === targetUrl && tunnelState.publicUrl) {
     return {
       started: true,
       status: getManagedTunnelStatus()
@@ -1046,11 +1195,7 @@ export async function ensureManagedCloudflaredTunnel(options?: {
   })
 }
 
-export async function stopManagedCloudflaredTunnel(): Promise<{
-  stopped: boolean
-  status: ManagedTunnelStatus
-  reason?: string
-}> {
+export async function stopManagedCloudflaredTunnel(): Promise<ManagedTunnelStopResult> {
   if (isBatshitContainerizedRuntime()) {
     const runtimeStatus = await getCloudflaredRuntimeStatus()
     return {
@@ -1072,16 +1217,13 @@ export async function stopManagedCloudflaredTunnel(): Promise<{
   return await stopManagedTunnelProcess()
 }
 
-// Raw kill of the tracked tunnel process. performManagedTunnelStart calls this
+// Stop only the tracked child. performManagedTunnelStart calls this
 // directly because it already holds the in-flight start slot; waiting on it
 // from there would deadlock.
-async function stopManagedTunnelProcess(): Promise<{
-  stopped: boolean
-  status: ManagedTunnelStatus
-  reason?: string
-}> {
+async function stopManagedTunnelProcess(): Promise<ManagedTunnelStopResult> {
+  if (inFlightTunnelStop) return await inFlightTunnelStop
   const child = tunnelState.child
-  if (!child || child.exitCode !== null || child.killed) {
+  if (!child || tunnelChildExited(child)) {
     resetTunnelState()
     return {
       stopped: true,
@@ -1089,24 +1231,46 @@ async function stopManagedTunnelProcess(): Promise<{
     }
   }
 
-  const waited = await new Promise<boolean>((resolve) => {
-    const timer = setTimeout(() => resolve(false), CLOUDFLARED_UNINSTALL_TIMEOUT_MS)
-    child.once('exit', () => {
-      clearTimeout(timer)
-      resolve(true)
-    })
-    child.kill('SIGTERM')
+  tunnelState.stopRequested = true
+  const stopping: Promise<ManagedTunnelStopResult> = (async (): Promise<ManagedTunnelStopResult> => {
+    const terminated = await signalAndObserveTunnelExit(child, 'SIGTERM', CLOUDFLARED_UNINSTALL_TIMEOUT_MS)
+    const exited = terminated || await signalAndObserveTunnelExit(child, 'SIGKILL', CLOUDFLARED_TUNNEL_KILL_TIMEOUT_MS)
+    if (!exited) {
+      const reason = 'Managed Cloudflare tunnel exit was not confirmed after SIGTERM and SIGKILL. Batshit retains this process; replacement and removal are refused until exit is observed.'
+      if (tunnelState.child === child) tunnelState.lastError = reason
+      return { stopped: false, status: getManagedTunnelStatus(), reason }
+    }
+    if (tunnelState.child === child) resetTunnelState()
+    return { stopped: true, status: getManagedTunnelStatus() }
+  })().finally(() => {
+    if (inFlightTunnelStop === stopping) inFlightTunnelStop = null
   })
+  inFlightTunnelStop = stopping
+  return await stopping
+}
 
-  if (!waited && child.exitCode === null && !child.killed) {
-    child.kill('SIGKILL')
-  }
-
-  resetTunnelState()
-  return {
-    stopped: true,
-    status: getManagedTunnelStatus()
-  }
+function signalAndObserveTunnelExit(child: ChildProcess, signal: NodeJS.Signals, timeoutMs: number): Promise<boolean> {
+  if (tunnelChildExited(child)) return Promise.resolve(true)
+  return new Promise<boolean>((resolve) => {
+    const finish = (exited: boolean) => {
+      clearTimeout(timer)
+      child.removeListener('exit', onExit)
+      child.removeListener('close', onExit)
+      resolve(exited)
+    }
+    const onExit = () => finish(true)
+    const timer = setTimeout(() => finish(false), timeoutMs)
+    child.once('exit', onExit)
+    child.once('close', onExit)
+    try {
+      child.kill(signal)
+    } catch (error) {
+      if (tunnelState.child === child) {
+        tunnelState.lastError = error instanceof Error ? error.message : String(error)
+      }
+      // A refused signal is not exit proof. Keep custody and the bounded wait.
+    }
+  })
 }
 
 export function getDefaultManagedTunnelTargetUrl(env: NodeJS.ProcessEnv = process.env) {

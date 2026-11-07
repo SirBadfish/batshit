@@ -51,6 +51,8 @@ A Zip you hold is yours: an agent can't release it, re-compress it, or hold it o
 
 Changing a Zip while an agent is mid-answer affects the model's *next* calls and future sends — it doesn't rewrite what the already-running request has seen. The context meter in the [Token Panel](overview.md#the-token-panel-your-context-meter) updates to reflect the next send, so you can watch your changes take effect there.
 
+With **Refreshed File Reads**, a file-read badge can show whether the newest reply used a refreshed snapshot or hid the copy because it could not refresh. The card retains the original read. See [Refreshed File Reads](../tools/zips.md#refreshed-file-reads).
+
 ## Related docs
 
 - [Zips and context](../tools/zips.md) — what Zips are and why

@@ -289,6 +289,21 @@ describe('modelIdResolver', () => {
   })
 
   describe('resolveCatalogIds', () => {
+    it.each([['mimo', 'xiaomi', 'mimo-v2.6-pro'], ['zai_coding', 'zai', 'glm-5.3']] as const)(
+      'keeps the exact %s catalog identity through inferred and explicit connection contexts',
+      (service, developerId, modelId) => {
+        const connectionId = `direct:${service}`
+        const input = { connectionId, developerId, modelId, idVariants: {
+          [connectionId]: { developerId, modelId, effectiveId: modelId, source: 'direct' }
+        } }
+        for (const connection of [undefined, { id: connectionId, transport: 'direct' as const, service, providers: [service] }]) {
+          expect(resolveCatalogIds({ ...input, connection })).toEqual({ developerId, modelId, effectiveModelId: modelId, source: 'direct' })
+          expect(resolveCatalogIds({ ...input, connection, idVariants: {
+            [connectionId]: { ...input.idVariants[connectionId], developerId: 'unrelated-maker' }
+          } })).toBeNull()
+        }
+      }
+    )
     it('uses the selected connection variant when present', () => {
       const resolved = resolveCatalogIds({
         connectionId: 'openrouter',

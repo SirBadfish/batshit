@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { ApiCallError } from './redisCore'
 import { SessionApiClient } from './sessionApiClient'
+import { AgentStore } from './agentStore'
+import { INSTRUCTIONS_REVISION_HEADER } from '$lib/appActions/settings/instructionsBaseline'
 
 /**
  * Bug sweep #3 (2026-09-18): a failed `apiCall` threw `API error: <raw response body>`, so the
@@ -26,6 +28,23 @@ async function deleteFailure(): Promise<ApiCallError> {
 }
 
 describe('apiCall failures', () => {
+  it('keeps the original detail/header pair through configured transport and sends only caller-captured instruction tokens', async () => {
+    const tokens = { customPrompt: `sha256:${'a'.repeat(64)}`, includeGlobalPrompt: `sha256:${'b'.repeat(64)}` }
+    const row = { id: 'one', agentType: 'api', system_prompt: 'Opening text', include_global_prompt: true }
+    const transport = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => init?.method === 'PUT'
+      ? Response.json({ success: true }) : Response.json(row, { headers: { [INSTRUCTIONS_REVISION_HEADER]: JSON.stringify(tokens) } }))
+    const store = new AgentStore()
+    store.configureApi(transport, '/custom-api')
+    const { baseline } = await store.getInstructionsBaseline('agent', 'one')
+    expect(baseline?.group).toEqual({ system_prompt: 'Opening text', include_global_prompt: true })
+    expect(baseline?.tokens).toEqual(tokens)
+    await store.updateAgent('one', { system_prompt: 'New text', expectedInstructions: { customPrompt: baseline!.tokens.customPrompt } })
+    expect(transport.mock.calls[0][0]).toBe('/custom-api/agents/one')
+    expect(JSON.parse(String(transport.mock.calls[1][1]?.body))).toEqual({ system_prompt: 'New text', expectedInstructions: { customPrompt: tokens.customPrompt } })
+    const refusal = { error: 'Instructions changed', code: 'instructions_settings_changed' }
+    transport.mockImplementationOnce(async () => Response.json(refusal, { status: 409 }))
+    await expect(store.updateAgent('one', { include_global_prompt: false, expectedInstructions: { includeGlobalPrompt: tokens.includeGlobalPrompt } })).rejects.toMatchObject({ status: 409, payload: refusal })
+  })
   afterEach(() => {
     vi.unstubAllGlobals()
   })

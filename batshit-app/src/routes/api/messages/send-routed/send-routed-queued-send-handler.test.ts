@@ -1,3 +1,4 @@
+import { useSendHandlerFixture } from '$lib/test-utils/sendHandlerFixture'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
@@ -165,6 +166,7 @@ let POST: (event: any) => Promise<Response>
 let chatCount = 0
 /** This test's own chat. A request a timed-out test left behind names another one. */
 let SESSION = ''
+useSendHandlerFixture({ sessionIds: () => [SESSION], rawSessionRead: false })
 /** Every request this test started, until it has finished (its final answer, when answered early). */
 let requests: Promise<unknown>[] = []
 

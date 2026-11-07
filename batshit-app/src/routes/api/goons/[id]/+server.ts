@@ -31,6 +31,8 @@ import { collectSkinSurfaceUploads } from '$lib/goons/skinSurface'
 import { parseSocketEyeContactSettings } from '$lib/goons/socketEyeContact'
 import {
   GoonMutationError,
+  GoonCompatibilityError,
+  writeOwnedGoonCompatibilityForClient,
   assertGenericGoonPatchAllowed,
   patchOwnedGoonForClient
 } from '$lib/server/services/goonMutationRepository.server'
@@ -75,9 +77,28 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
   const goonId = params.id
 
   try {
-    const updates = await request.json()
-    if (!updates || typeof updates !== 'object' || Array.isArray(updates)) {
+    const payload = await request.json()
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
       return json({ error: 'Goon updates must be a JSON object' }, { status: 400 })
+    }
+    const updates = { ...payload } as Record<string, unknown>
+    const compatibilityBasis = updates.__compatibilityBasis
+    const compatibilityResetBasis = updates.__compatibilityResetBasis
+    delete updates.__compatibilityBasis
+    delete updates.__compatibilityResetBasis
+
+    if (Object.hasOwn(updates, 'compatibility')) {
+      if (compatibilityBasis === undefined || compatibilityResetBasis !== undefined || Object.keys(updates).length !== 1) {
+        throw new GoonCompatibilityError('COMPATIBILITY_UNAVAILABLE', 'Compatibility requires its captured producer inputs.', 409)
+      }
+      const goon = await redis.execute((client) => writeOwnedGoonCompatibilityForClient({
+        client, userId: locals.user!.id, goonId, basis: compatibilityBasis,
+        report: updates.compatibility, updatedAt: new Date().toISOString()
+      }))
+      return json({ goon: resolveUploadUrlsForBrowserInPayload(goon) })
+    }
+    if (compatibilityBasis !== undefined) {
+      throw new GoonCompatibilityError('COMPATIBILITY_UNAVAILABLE', 'Compatibility requires a report.', 409)
     }
 
     const goon = await redis.execute(async (client) => {
@@ -186,7 +207,8 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
         userId: locals.user!.id,
         goonId,
         updates: storagePatch,
-        updatedAt: storageUpdated.updated_at
+        updatedAt: storageUpdated.updated_at,
+        ...(compatibilityResetBasis !== undefined ? { compatibilityResetBasis } : {})
       })
     })
 
@@ -196,6 +218,9 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
 
     return json({ goon: resolveUploadUrlsForBrowserInPayload(goon) })
   } catch (error) {
+    if (error instanceof GoonCompatibilityError) {
+      return json({ error: error.message, code: error.code }, { status: error.status })
+    }
     console.error('Error updating goon:', error)
     if (error instanceof GoonMutationError) {
       return json({ error: error.message, code: error.code }, { status: error.status })
@@ -451,7 +476,7 @@ export const DELETE: RequestHandler = async ({ params, locals }) => {
       return clearedAgentIds
     })
 
-    return json({ success: true, clearedAgentIds })
+    return json({ success: true, clearedAgentIds, ownerId: locals.user.id })
   } catch (error: any) {
     const message = error instanceof Error ? error.message : 'Failed to delete goon'
     const status = message === 'Unauthorized' ? 403 : message === 'Goon not found' ? 404 : 500

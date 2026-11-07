@@ -42,8 +42,9 @@ describe('the page and a queued send (BL-4)', () => {
     const handler = page.indexOf("\n    } else if (data.type === 'user_message' && data.message) {\n")
     // Up to and including the newline that closes the branch.
     const body = page.slice(handler, page.indexOf("\n    } else if (data.type === 'steer_queued') {\n", handler) + 1)
+    // BL-921: a copy the server moved to the end goes there; any other copy updates in place.
     expect(body).toContain(
-      '\n        messageStore.updateMessage(incoming.id, normalizedUserMessage)\n        settleKeptReceipt(incoming.id)\n        return\n'
+      '\n          messageStore.updateMessage(incoming.id, normalizedUserMessage)\n        }\n        settleKeptReceipt(incoming.id)\n        return\n'
     )
     expect(body).toContain(
       '\n      messageStore.addMessage(normalizedUserMessage)\n      settleKeptReceipt(incoming.id)\n'
@@ -52,7 +53,7 @@ describe('the page and a queued send (BL-4)', () => {
 
   it('a Send now of a kept message goes the ordinary way, and writes nothing twice', () => {
     expect(page).toContain(
-      '\n\t    const managedBusy =\n\t      isManagedPrimaryAgentType(agentType) && hasActiveStream && !sendOptions.existingUserMessageId\n'
+      '\n\t    const managedBusy =\n\t      isApiPrimaryAgentType(agentType) && hasActiveStream && !sendOptions.existingUserMessageId\n'
     )
     expect(page).toContain(
       '\n    if (!sendOptions.existingUserMessageId) {\n      // Add user message to store\n      messageStore.addMessage(userMessage)\n'
@@ -159,9 +160,11 @@ describe('the page and a send while a reply runs (BL-713)', () => {
   })
 
   it('a busy send is saved and posted at once, in the same call, with the message it saved', () => {
+    // SA-139 R4: the API lane is the only live Primary type.
     const rule = sendPath.indexOf(
-      '\n\t    const sendWaitsInLine = isManagedPrimaryAgentType(agentType) && hasActiveStream\n'
+      '\n\t    const sendWaitsInLine = isApiPrimaryAgentType(agentType) && hasActiveStream\n'
     )
+    expect(rule).toBeGreaterThan(-1)
     const save = sendPath.indexOf('\n      await dbService.saveMessage(userMessage, currentAgentForSend)\n', rule)
     const post = sendPath.indexOf('\n          const routedSend = await postSendRoutedWithInterruptRetry({\n', save)
     expect(rule).toBeGreaterThan(sendPath.indexOf('if (steerBranchEligible || serverQueueEligible) {'))
@@ -187,7 +190,7 @@ describe('the page and a send while a reply runs (BL-713)', () => {
 
   it('the next send is not ignored while one waits: the server owns it from its 202', () => {
     expect(sendPath).toContain(
-      '\n\t            onAccepted: sendWaitsInLine\n\t              ? () => {\n\t                  if (isLatestSendSerial(sendSessionId, sendRunId)) setSendInFlight(sendSessionId, false)\n'
+      '\n\t            onAccepted: () => {\n\t              sendOrder.settle()\n\t              if (sendWaitsInLine && isLatestSendSerial(sendSessionId, sendRunId)) setSendInFlight(sendSessionId, false)\n'
     )
     const retry = page.indexOf('  async function postSendRoutedWithInterruptRetry(params: {')
     expect(page.slice(retry, retry + 900)).toContain(
@@ -196,7 +199,8 @@ describe('the page and a send while a reply runs (BL-713)', () => {
   })
 
   it('protects the captured spoken wait before save/post, while still awaiting the queued turn’s final response', () => {
-    const rule = sendPath.indexOf('const sendWaitsInLine = isManagedPrimaryAgentType(agentType) && hasActiveStream')
+    const rule = sendPath.indexOf('const sendWaitsInLine = isApiPrimaryAgentType(agentType) && hasActiveStream')
+    expect(rule).toBeGreaterThan(-1)
     const guard = sendPath.indexOf("sendOptions.onReplyAdmitted?.(sendWaitsInLine ? 'queued' : 'direct')", rule)
     const save = sendPath.indexOf('await dbService.saveMessage(userMessage, currentAgentForSend)', guard)
     const send = sendPath.indexOf('const routedSend = await postSendRoutedWithInterruptRetry({', save)

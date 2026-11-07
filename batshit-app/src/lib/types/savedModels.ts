@@ -1,5 +1,7 @@
 // Type definitions for saved AI models
-import type { PublishedModelMetadata } from './modelCatalog'
+import type { CatalogReasoningProjection, PublishedModelMetadata } from './modelCatalog'
+import type { ModelConnectionInfo, ModelPurpose } from './modelIdentity'
+export type { ModelConnectionInfo, ModelPurpose, ModelTransport } from './modelIdentity'
 
 export interface PricingTier {
   from: number;
@@ -8,10 +10,6 @@ export interface PricingTier {
 }
 
 export type ModelCompatibilityLabel = 'both' | 'n8n_only' | 'batshit_only'
-
-export type ModelTransport = 'vercel-gateway' | 'direct' | 'openrouter'
-
-export type ModelPurpose = 'chat' | 'visual' | 'audio' | 'utility'
 
 export type ImageTransport = 'auto' | 'url'
 
@@ -50,13 +48,6 @@ export interface ModelVoiceSessionConfig {
   transcriptTiming?: ModelVoiceSessionTranscriptTiming
   toolSupport?: ModelVoiceSessionToolSupport
   notes?: string[]
-}
-
-export interface ModelConnectionInfo {
-  id?: string
-  type: ModelTransport
-  service?: string
-  useDeveloperPrefix?: boolean
 }
 
 export interface ModelCompatibility {
@@ -154,6 +145,8 @@ export interface SavedModel {
   };
 
   capabilities?: ModelCapabilities;
+  /** Read-only selected-connection catalog projection; never a persisted setting/baseline. */
+  reasoningEvidence?: CatalogReasoningProjection;
   publishedMetadata?: PublishedModelMetadata;
   voiceSession?: ModelVoiceSessionConfig;
   compatibility?: ModelCompatibility;

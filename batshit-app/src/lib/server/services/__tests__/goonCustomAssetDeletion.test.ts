@@ -22,7 +22,12 @@ const type = 'goon_custom_models' as const
 const filename = `${'a'.repeat(64)}.glb`
 const uploadKey = `upload:${type}:${filename}`
 const markerKey = `goon_asset_delete:${type}:${filename}`
-useRedisTestServer()
+useRedisTestServer({ beforeCleanupAdmission: async ({ adminClient, resolvedUrl }) => {
+  if (!process.env.CLOTHING_CUSTODY_REDIS_RUN_ID) return
+  expect(resolvedUrl).toBe('redis://127.0.0.1:5769/14')
+  expect((await adminClient.clientInfo()).db).toBe(14)
+  expect(await adminClient.info('server')).toContain(`run_id:${process.env.CLOTHING_CUSTODY_REDIS_RUN_ID}\r\n`)
+} })
 beforeEach(() => vi.stubEnv('BATSHIT_TOKEN', 'goon-deletion-test-service-token'))
 afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs() })
 

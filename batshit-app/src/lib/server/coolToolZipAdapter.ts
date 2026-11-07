@@ -11,9 +11,10 @@ import type { ZipReference } from './zipService'
 import { createZipFromContent } from './zipService'
 import type { AgentRow } from '$lib/types/database'
 import { canonicalToolName, getToolSettings, shouldPreferFieldSettingsForTool } from '$lib/utils/toolRenderMap'
-import { mapBashCommandToMode4Tool } from '$lib/server/services/bashCommandMapper'
+import { mapBashCommandToMode4Tool, mapBashCommandToRendererTool } from '$lib/server/services/bashCommandMapper'
+import { parseManagedApplyPatchCommand } from '$lib/utils/managedApplyPatch'
 import type { IntermediateStep } from '$lib/utils/toolResultProcessor'
-import { normalizeToolStep } from '$lib/utils/toolResultProcessor'
+import { normalizeToolStep, toolStepFailureMessage } from '$lib/utils/toolResultProcessor'
 import {
   TOOL_ACTIVITY_FORCE_COMPRESS_TOKENS,
   TOOL_ACTIVITY_SCHEMA_VERSION,
@@ -29,12 +30,24 @@ import {
 import {
   buildCoolToolAiContent,
   parseCoolToolPayload,
+  buildCoolToolAiContentWithSources,
+  type CoolToolAiContentPart,
   shouldPreferRawSidecarForAiExpansion
 } from '$lib/utils/coolToolAiContent'
 import { isBrokerToolUseName } from '$lib/utils/toolNameNormalization'
 import { isToolModelCutView } from '$lib/utils/toolModelTextSizeGuard'
-import { isMemoryControlToolStep } from '$lib/utils/memoryControl'
+import { isTransientContextControlToolStep } from '$lib/utils/memoryControl'
+import { API_UTILITY_CONTROL_IDS } from '$lib/utils/apiUtilityControls'
+import { validShellReadSplit, type FileReadView, type ShellReadSplitPart } from '$lib/utils/shellReadSplit'
+import { fileReadSourceFromProof, type FileReadSource } from '$lib/utils/fileReadSource'
+import { verifyFileReadProofSeal } from '$lib/server/services/fileReadProofSeal'
+import { TYPED_READ_FILE_TOOL, typedReadResultFromBytes } from '$lib/server/services/typedFileTools'
 import { logger } from '$lib/utils/logger'
+import { withZipStateLock } from './services/zipStateLock'
+import { openSkillSessionRead, type SkillSessionActor } from './services/skillSessions'
+import { redis } from './redis'
+import { publishUserEvent } from './ssePublisher'
+import { originalCoolToolReadDigest } from './services/coolToolPromptTokens'
 import {
   normalizeToolPayload,
   parseJsonIfLikely,
@@ -46,6 +59,20 @@ type ReservedZipIdSource = Map<string, string> | Record<string, string | undefin
 
 type CoolToolZipAdapterOptions = {
   reservedZipIdsByToolCallId?: ReservedZipIdSource
+  /** Only the Primary turn owner supplies this, never a tool result or delegated run. */
+  skillSessionActor?: Omit<SkillSessionActor, 'sessionId'>
+  /** Actual delivery owner only; checked inside the shared lock, before any RAW write. */
+  beforeSkillReadPersist?: () => Promise<void>
+}
+
+function isSkillLifecycleProducer(tool: NormalizedCoolTool): boolean {
+  const name = tool.originalToolName || tool.toolName
+  if (name === 'native_batshit_tool_use') {
+    return tool.metadata?.apiUtilityControlId === API_UTILITY_CONTROL_IDS.skill &&
+      tool.metadata?.apiUtilityRef === `batshit:${API_UTILITY_CONTROL_IDS.skill}` && tool.toolSource === 'native-tool'
+  }
+  if (name === 'native_skill') return tool.toolProvider !== 'mcp' || tool.mcpServerName === 'batshit_helpers'
+  return name === 'mcp.batshit_helpers.native_skill' || name === 'mcp__batshit_helpers__native_skill'
 }
 
 type NormalizedCoolTool = {
@@ -90,6 +117,8 @@ type NormalizedCoolTool = {
 type PreparedCoolTool = {
   payload: NormalizedCoolTool
   rawSidecarContent: string | null
+  /** The raw sidecar's content whether or not it is kept (SA-137's refresh reads it). */
+  rawSidecarCandidate: string
   rawSidecarReason?: string
   rawTokens: number
   compactTokens: number
@@ -859,12 +888,12 @@ function buildCoolToolMetadata(step: any, normalized: IntermediateStep): Record<
 
 /**
  * BL-233 review (finding 2): every lane classifies a shell command once, with the shared mapper.
- * The API lane does it in send-routed (its result carries `mappedToolName`), Codex and Claude in
- * their adapters (they name the step for the mapper's answer). A command step no lane's mapper saw
- * (batshit-server's own `execute_command`, a third-party MCP tool, an n8n Workflow Subagent) is
+ * The API lane does it in send-routed (its result carries `mappedToolName`), Claude in
+ * its adapter (it names the step for the mapper's answer). A command step no lane's mapper saw
+ * (batshit-server's own `execute_command`, a third-party MCP tool) is
  * classified here by the SAME mapper, so it is stored as that mapping and never by a second
  * reading of its text (`normalizeToolStep` reads only a result's shape). The mapper is
- * deterministic: a Codex or Claude step it already named a command gets the same answer again.
+ * deterministic: a Claude (or saved Codex) step it already named a command gets the same answer again.
  */
 function applySharedCommandMapping(base: IntermediateStep): void {
   if (canonicalToolName(base.toolName) !== 'execute_command') return
@@ -1036,12 +1065,14 @@ function prepareCoolTool(step: any): PreparedCoolTool {
 
   const mergedMetadata = buildCoolToolMetadata(step, normalized)
   const compactInput = {
-    toolName: normalized.toolName || sourceToolName || 'tool',
+    // This is the actual SDK producer name, before canonicalToolName folds the
+    // broker to fabric_use. Strict utility presentation must see that provenance.
+    toolName: sourceToolName === 'native_batshit_tool_use' ? sourceToolName : normalized.toolName || sourceToolName || 'tool',
     originalToolName: normalized.originalToolName || sourceToolName,
     toolArgs,
-    // Preserve the actual MCP text blocks for display normalization. Codex also returns
-    // structured_content:null; its wrapper otherwise stringifies content[] as JSON here.
-    // The normalizer decides presentation only, and never trusts ids inside this text.
+    // Preserve the actual MCP text blocks for display normalization. Saved Codex steps
+    // returned structured_content:null, and their wrapper otherwise stringified content[] as
+    // JSON here. The normalizer decides presentation only, and never trusts ids inside this text.
     toolResult: modelFacingResultText !== null && isToolModelCutView(modelFacingResultText)
       ? [{ type: 'text', text: modelFacingResultText }]
       : toolResult,
@@ -1050,6 +1081,8 @@ function prepareCoolTool(step: any): PreparedCoolTool {
     toolProvider: normalized.toolProvider
   }
   const compact = normalizeCompactTool(compactInput)
+  const utilityChild = compact.operationKind === 'subagent' && compact.metadata?.apiUtilityControlId === API_UTILITY_CONTROL_IDS.subagent &&
+    compact.metadata?.isSubagent === true ? compact.metadata : undefined
   const compactToolResult =
     compact.operationKind === 'subagent' &&
     compact.toolResult &&
@@ -1101,10 +1134,10 @@ function prepareCoolTool(step: any): PreparedCoolTool {
     gatewayName: normalized.gatewayName,
     gatewayType: normalized.gatewayType,
     mcpServerName: normalized.mcpServerName,
-    isSubagent: normalized.isSubagent,
-    subagentName: normalized.subagentName,
-    subagentId: (step as any).subagentId,
-    subagentAvatar: (step as any).subagentAvatar,
+    isSubagent: utilityChild ? true : normalized.isSubagent,
+    subagentName: utilityChild ? utilityChild.subagentName : normalized.subagentName,
+    subagentId: utilityChild ? utilityChild.subagentId : (step as any).subagentId,
+    subagentAvatar: utilityChild ? utilityChild.subagentAvatar : (step as any).subagentAvatar,
     agentName: normalized.agentName,
     rawSidecar: {
       status: 'not_retained',
@@ -1130,6 +1163,8 @@ function prepareCoolTool(step: any): PreparedCoolTool {
     toolName: payload.toolName,
     displayToolName: payload.displayToolName,
     originalToolName: payload.originalToolName,
+    toolProvider: payload.toolProvider,
+    toolSource: payload.toolSource,
     operationKind: payload.operationKind,
     rendererFamily: payload.rendererFamily,
     toolCallId: payload.toolCallId,
@@ -1180,6 +1215,7 @@ function prepareCoolTool(step: any): PreparedCoolTool {
   return {
     payload,
     rawSidecarContent: retainRawSidecar ? rawSidecarContent : null,
+    rawSidecarCandidate: rawSidecarContent,
     rawSidecarReason: compact.rawReason,
     rawTokens,
     compactTokens,
@@ -1204,6 +1240,269 @@ function transformStepToContent(step: any): string {
       originalError: error?.toString()
     }, getCircularReplacer())
   }
+}
+
+/**
+ * BL-1652: a command that read several files is stored as one zip per file it read, plus one
+ * Bash zip for what its other commands printed (`ls`, `npm test`), when the native Bash result
+ * carries a split proven against the files (`readSplit`, `nativeTools.ts` and `shellReadSplit.ts`)
+ * that still covers its stdout exactly. Each part is an ordinary step: a Read File of that file
+ * alone, whose command (`cd <dir> && cat a.js`) is what the dead-copy ledger and holds read, so an
+ * edit of one file retires that file's copy only. Every part keeps the call's `toolCallId`; a
+ * separators-only remainder (`echo ---`) is dropped. Any other step is returned as it is.
+ */
+type ShellReadSplitStepPart = { index: number; of: number; command: string }
+
+/**
+ * SA-137: the native Bash tool's read proof (`fileReadProof`, sent only with live file reads on)
+ * for one stored part: the run's proof, the part's index in the run's split (null for a one-file
+ * read), and the file the part names. The zip adapter turns it into the zip's `fileReadSource`.
+ */
+type FileReadProofPart = { proof: unknown; part: number | null; file?: string }
+type ExpandedStep = { step: any; part: ShellReadSplitStepPart | null; readProof?: FileReadProofPart }
+
+/** The step with its read proof taken out of every place a result can sit; the stored payload never keeps it. */
+function withoutFileReadProof(step: any): any {
+  const strip = (value: unknown) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value) || !('fileReadProof' in value)) return value
+    const { fileReadProof: _proof, ...rest } = value as Record<string, unknown>
+    return rest
+  }
+  const next = { ...step }
+  for (const key of ['output', 'toolResult', 'toolOutput', 'result', 'observation'] as const) {
+    if (key in next) next[key] = strip(next[key])
+  }
+  return next
+}
+
+/**
+ * SA-136 P2b: the API lane's typed `read_file`, by its exact registered name (`buildMode3NativeTools`
+ * adds it on the API lane only), carries its own read proof: one read, part null. The stored
+ * payload never keeps the proof, and the descriptor is written only when its in-process seal
+ * verifies (`adaptCoolToolsToZipSystem`), so a tool of the same name on another lane, or a posted
+ * result, is data. Null for any other step.
+ */
+function expandTypedFileRead(step: any): ExpandedStep[] | null {
+  if (step?.originalToolName !== 'read_file') return null
+  const output = step?.output
+  const result = output && typeof output === 'object' && !Array.isArray(output) ? (output as Record<string, any>) : null
+  if (!result || !('fileReadProof' in result)) return null
+  return [{ step: withoutFileReadProof(step), part: null, readProof: { proof: result.fileReadProof, part: null } }]
+}
+
+/**
+ * The API lane's own Bash tool, by its exact name: only `buildMode3NativeTools`' `native_bash_execute`
+ * asks for a split (review: a last-part match let `mcp__any__native_bash_execute` through).
+ */
+function isNativeBashCall(name: unknown): boolean {
+  return name === 'native_bash_execute'
+}
+
+function expandShellReadSplit(step: any): ExpandedStep[] {
+  const output = step?.output
+  const result = output && typeof output === 'object' && !Array.isArray(output) ? (output as Record<string, any>) : null
+  // Only the native Bash tool's own local run writes a split (review: a tool result of any other
+  // origin that carries the same field, an MCP or n8n answer, is data and stays one zip).
+  const nativeOrigin = isNativeBashCall(step?.originalToolName) && result?.backend === 'local' && typeof result?.mappedReason === 'string'
+  // SA-137: the read proof travels only from the native Bash tool's own run, and the adapter still
+  // checks its in-process seal (`fileReadProofSeal.ts`), so a proof posted from anywhere else is data.
+  // Round 2: a run inside a sandbox that mounts the host workspace (Apple Container, Docker Sandbox)
+  // proves its single-file read host-side too; its proof travels when it names the run's own backend.
+  const proofBackend = (result?.fileReadProof as { backend?: unknown } | undefined)?.backend
+  const proofOrigin = isNativeBashCall(step?.originalToolName) && typeof result?.mappedReason === 'string' &&
+    (result?.backend === 'local' || result?.backend === 'apple_container' || result?.backend === 'docker_sandbox') &&
+    proofBackend === result?.backend
+  const proof = proofOrigin && result && 'fileReadProof' in result ? result.fileReadProof : undefined
+  // A proof the gate did not accept (another backend than the run's, a posted copy) is never stored either.
+  const whole = (): ExpandedStep[] =>
+    proof === undefined
+      ? [{ step: isNativeBashCall(step?.originalToolName) ? withoutFileReadProof(step) : step, part: null }]
+      : [{ step: withoutFileReadProof(step), part: null, readProof: { proof, part: null } }]
+  const split = result && nativeOrigin ? validShellReadSplit(result.readSplit, result.stdout) : null
+  if (!result || !split) return whole()
+  const kept = split.parts.filter((part) => part.kind === 'read' || (!part.separatorsOnly && part.end > part.start))
+  if (kept.length < 2) return whole()
+  const { readSplit: _readSplit, truncated: _truncated, fileReadProof: _fileReadProof, ...baseResult } = result
+  const args = step.input && typeof step.input === 'object' && !Array.isArray(step.input) ? step.input : {}
+  const originalToolName = args.originalToolName ?? step.originalToolName ?? 'native_bash_execute'
+  return kept.map((part: ShellReadSplitPart, index) => {
+    const splitPart: ShellReadSplitStepPart = { index, of: kept.length, command: split.command }
+    const text = result.stdout.slice(part.start, part.end)
+    const isRead = part.kind === 'read'
+    const toolName = isRead ? 'batshit_server_read_file' : 'native_bash_execute'
+    const partArgs = isRead
+      ? { command: part.command, innerCommand: part.command, filePath: part.path, path: part.path, originalToolName }
+      : { command: part.command, innerCommand: part.command, originalToolName }
+    const { originalToolName: _origin, ...mappedInput } = partArgs
+    const partResult = {
+      ...baseResult,
+      input: partArgs,
+      command: part.command,
+      stdout: text,
+      stderr: '',
+      mappedToolName: toolName,
+      mappedToolInput: mappedInput,
+      mappedReason: isRead ? 'read-command' : 'fallback-command',
+      shellReadSplitPart: splitPart
+    }
+    return {
+      part: splitPart,
+      ...(isRead && proof !== undefined ? { readProof: { proof, part: split.parts.indexOf(part), file: part.path } } : {}),
+      step: {
+        ...withoutFileReadProof(step),
+        tool: toolName,
+        toolName,
+        originalToolName,
+        input: partArgs,
+        toolInput: partArgs,
+        toolArgs: partArgs,
+        output: partResult,
+        toolResult: partResult,
+        metadata: { ...(step.metadata || {}), shellReadSplitPart: splitPart }
+      }
+    }
+  })
+}
+
+/** A folder as a shell word: bare when it is plain, single-quoted otherwise. */
+function shellWord(value: string): string {
+  return /^[A-Za-z0-9_./@%+=:,-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`
+}
+
+/**
+ * SA-126 item 2: a native Bash call that applied a managed patch and then ran the commands after
+ * it (`managedApplyPatch.afterPatch`, `nativeTools.ts`) is stored as two ordinary parts, in call
+ * order, through the same per-call part path as BL-1652's reads (one `toolCallId`, the same part
+ * ids and Tool Note line):
+ *
+ * - part 0, the patch: a successful managed edit, whatever the commands after it did, so the card,
+ *   the AI view, its label, holds and the dead-copy ledger keep the applied-edit fact even when the
+ *   call failed (Ashe's contract). Before, such a call was stored as a failed edit (the run's exit
+ *   code and output), which every reader takes for "nothing was written".
+ * - part 1, the commands: their run (exit code, output, Stop, timeout, cut, shell, backend), as the
+ *   shared mapper reads their text (`npm test` is Bash, `cat a.js` a Read of the file as patched).
+ *   Its command is `cd <folder> && <what ran>` when the patch had a `cd`: a label, never run.
+ *
+ * Each part gets its own step error: the call's ("The command failed with exit code 1.") belongs
+ * to part 1 only. Any other step is returned as it is.
+ */
+function expandManagedPatchAfterCommand(step: any): ExpandedStep[] | null {
+  const output = step?.output
+  const result = output && typeof output === 'object' && !Array.isArray(output) ? (output as Record<string, any>) : null
+  const patch = result?.managedApplyPatch
+  const nativeOrigin = isNativeBashCall(step?.originalToolName) && typeof result?.mappedReason === 'string'
+  if (!result || !nativeOrigin || !patch || patch.applied !== true || typeof patch.afterPatch?.command !== 'string') return null
+  const originalCommand = typeof result.command === 'string' ? result.command : ''
+  const parsed = parseManagedApplyPatchCommand(originalCommand)
+  if (parsed.kind !== 'managed' || !parsed.afterPatch) return null
+
+  const args = step.input && typeof step.input === 'object' && !Array.isArray(step.input) ? step.input : {}
+  const originalToolName = args.originalToolName ?? step.originalToolName ?? 'native_bash_execute'
+  const {
+    managedApplyPatch: _patch, shell: _shell, stopped: _stopped, reason: _reason, error: _error, errorCode: _errorCode,
+    stdout: _stdout, stderr: _stderr, exitCode: _exitCode, signal: _signal, timedOut: _timedOut, truncated: _truncated,
+    sandboxName: _sandboxName, neverReturned: _neverReturned, fileReadProof: _fileReadProof, ...callResult
+  } = result
+  // BL-1978: the call was still running when BL-1959's Stop rule ended the stream; its patch had
+  // applied (it reported so), and the commands after it returned no result.
+  const neverReturned = result.neverReturned === true
+  const parts: Array<{ toolName: string; input: Record<string, any>; result: Record<string, any> }> = []
+
+  // Part 0: the patch, applied.
+  const { afterPatch: _after, afterPatchStarted: _started, ...appliedPatch } = patch
+  parts.push({
+    toolName: step.toolName,
+    input: args,
+    result: {
+      ...callResult,
+      success: true,
+      blocked: false,
+      stdout: `Managed apply_patch applied ${appliedPatch.operationsApplied ?? 0} operation(s).`,
+      stderr: '',
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      truncated: false,
+      managedApplyPatch: appliedPatch
+    }
+  })
+
+  // Part 1: the commands after it, as they ran (or why they never started).
+  const command = `${parsed.cdPath !== null ? `cd ${shellWord(parsed.cdPath)} && ` : ''}${patch.afterPatch.command}`
+  const mapping = mapBashCommandToRendererTool(command)
+  const neverStarted = !neverReturned && patch.afterPatchStarted !== true
+  const partArgs = { ...(mapping.args || {}), command, innerCommand: command, originalToolName }
+  const { originalToolName: _origin, ...mappedInput } = partArgs
+  const { mappedToolName: _m, mappedToolInput: _mi, mappedReason: _mr, diff: _diff, ...runFacts } = callResult
+  parts.push({
+    toolName: mapping.toolName,
+    input: partArgs,
+    result: {
+      ...runFacts,
+      success: result.success === true,
+      blocked: false,
+      command,
+      stdout: typeof result.stdout === 'string' ? result.stdout : '',
+      stderr: typeof result.stderr === 'string' ? result.stderr : '',
+      exitCode: result.exitCode ?? null,
+      signal: result.signal ?? null,
+      timedOut: result.timedOut === true,
+      truncated: result.truncated === true,
+      ...(result.shell ? { shell: result.shell } : {}),
+      ...(result.sandboxName ? { sandboxName: result.sandboxName } : {}),
+      ...(result.errorCode ? { errorCode: result.errorCode } : {}),
+      ...(result.stopped ? { stopped: true } : {}),
+      ...(neverReturned ? { neverReturned: true } : {}),
+      ...(neverStarted
+        ? { reason: result.stopped ? 'Never started: the reply was stopped after the patch applied.' : result.reason, neverStarted: true }
+        : result.reason ? { reason: result.reason } : {}),
+      mappedToolName: mapping.toolName,
+      mappedToolInput: mappedInput,
+      mappedReason: mapping.reason
+    }
+  })
+
+  return parts.map((entry, index) => {
+    const splitPart: ShellReadSplitStepPart = { index, of: parts.length, command: originalCommand }
+    const partResult = { ...entry.result, input: entry.input, shellReadSplitPart: splitPart }
+    const error = toolStepFailureMessage(entry.toolName, entry.input, partResult)
+    return {
+      part: splitPart,
+      step: {
+        ...step,
+        tool: entry.toolName,
+        toolName: entry.toolName,
+        originalToolName,
+        input: entry.input,
+        toolInput: entry.input,
+        toolArgs: entry.input,
+        output: partResult,
+        toolResult: partResult,
+        error,
+        type: error ? 'tool_error' : 'tool',
+        success: !error,
+        metadata: { ...(step.metadata || {}), shellReadSplitPart: splitPart }
+      }
+    }
+  })
+}
+
+/**
+ * A split part's own zip id, from its call's reserved id: the first part takes the reserved id,
+ * a later part a fixed id made from it, so both zip-writing sites (the stream and the finish)
+ * would store the same id for the same part. It keeps zipService's id shape (`<type>_<ms>_<tail>`)
+ * and never an all-digit tail (BL-853).
+ */
+function shellReadSplitZipId(reservedZipId: string | undefined, part: ShellReadSplitStepPart | null): string | undefined {
+  if (!reservedZipId || !part || part.index === 0) return reservedZipId
+  const match = reservedZipId.match(/^([a-zA-Z][a-zA-Z0-9_-]*_\d{10,17})_[a-z0-9]{5,12}$/)
+  if (!match) return undefined
+  let hash = 0x811c9dc5
+  for (const char of `${reservedZipId}#${part.index}`) {
+    hash ^= char.charCodeAt(0)
+    hash = Math.imul(hash, 0x01000193) >>> 0
+  }
+  return `${match[1]}_s${part.index.toString(36)}${hash.toString(36).padStart(7, '0').slice(0, 7)}`
 }
 
 function getReservedZipIdForToolCall(
@@ -1247,7 +1546,12 @@ export async function adaptCoolToolsToZipSystem(
 
   // Transform each step, handling errors gracefully
   const zipReferences: ZipReference[] = []
-  const validSteps: { index: number; prepared: PreparedCoolTool }[] = []
+  const validSteps: {
+    index: number
+    prepared: PreparedCoolTool
+    part: ShellReadSplitStepPart | null
+    fileReadSource: FileReadSource | null
+  }[] = []
 
   // First pass: validate and prepare all steps
   intermediateSteps.forEach((step, index) => {
@@ -1258,14 +1562,29 @@ export async function adaptCoolToolsToZipSystem(
     // persisted across turns only through the DCM insert channel — a cool-tool zip here would double-store
     // memory content as tool output. Tradeoff: memory broker calls render no persistent
     // cool-tool card (Execution Viewer still records them).
-    if (isMemoryControlToolStep(validStep)) {
+    if (isTransientContextControlToolStep(validStep)) {
       logger.debug('[CoolToolZipAdapter] Skipping zip for memory control step (DL-104-17)', {
         toolName: validStep?.toolName ?? validStep?.tool ?? null
       })
       return
     }
-    const prepared = prepareCoolTool(validStep)
-    validSteps.push({ index, prepared })
+    // A call's parts: a patch and the commands after it (SA-126 item 2), or a split read (BL-1652).
+    for (const { step: partStep, part, readProof } of
+      expandManagedPatchAfterCommand(validStep) ?? expandTypedFileRead(validStep) ?? expandShellReadSplit(validStep)) {
+      const prepared = prepareCoolTool(partStep)
+      // SA-137: a proven read of one file, bound to this chat, this reply and this call.
+      const fileReadSource =
+        readProof && prepared.payload.operationKind === 'read_file' && verifyFileReadProofSeal(readProof.proof)
+          ? fileReadSourceFromProof(readProof.proof, {
+              sessionId,
+              messageId,
+              toolCallId: prepared.payload.toolCallId,
+              part: readProof.part,
+              ...(readProof.file !== undefined ? { file: readProof.file } : {})
+            })
+          : null
+      validSteps.push({ index, prepared, part, fileReadSource })
+    }
   })
 
   // If no valid steps, return empty
@@ -1280,7 +1599,7 @@ export async function adaptCoolToolsToZipSystem(
   for (const entry of validSteps) {
     const callId = entry.prepared.payload.toolCallId
     if (callId) {
-      const key = `id:${callId}`
+      const key = entry.part ? `id:${callId}#${entry.part.index}` : `id:${callId}`
       if (seenCallIds.has(key)) continue
       seenCallIds.add(key)
     }
@@ -1290,14 +1609,47 @@ export async function adaptCoolToolsToZipSystem(
   // Second pass: ZIP-FIRST APPROACH
   // ALWAYS create zips for ALL tools - buffer/threshold control RENDERING only (in compileForAI)
   for (let i = 0; i < dedupedSteps.length; i++) {
-    const { index, prepared } = dedupedSteps[i]
+    const { index, prepared, part, fileReadSource } = dedupedSteps[i]
+    const writeStep = async () => {
     const step = prepared.payload
-    const reservedZipId = getReservedZipIdForToolCall(
-      options.reservedZipIdsByToolCallId,
-      step.toolCallId
+    const reservedZipId = shellReadSplitZipId(
+      getReservedZipIdForToolCall(options.reservedZipIdsByToolCallId, step.toolCallId),
+      part
     )
     const resultLineCount = inferCoolToolResultLineCount(step)
     const zipDescriptionHints = buildZipDescriptionHints(step, resultLineCount)
+    let previousSkillZip: any = null
+    if (reservedZipId && step.operationKind === 'skill_read' && options.skillSessionActor) {
+      try {
+        previousSkillZip = await redis.json.get(`zip:${reservedZipId}`)
+        const receipt = previousSkillZip?.metadata?.skillSessionReadReceipt ?? previousSkillZip?.metadata?.skillSessionAdmission
+        if (receipt) {
+          if (previousSkillZip.metadata?.sessionId !== sessionId || previousSkillZip.metadata?.messageId !== messageId ||
+              previousSkillZip.metadata?.toolCallId !== step.toolCallId || receipt.agentId !== options.skillSessionActor.agentId) {
+            throw new Error('An earlier skill read belongs to another execution owner.')
+          }
+          const oldPayload = parseCoolToolPayload(previousSkillZip.content)
+          const incoming = oldPayload && shouldPreferRawSidecarForAiExpansion(oldPayload)
+            ? parseCoolToolPayload(prepared.rawSidecarContent) : step
+          if (!incoming || receipt.transcriptSha256 !== originalCoolToolReadDigest(incoming)) {
+            throw new Error('An earlier admitted skill read changed during same-call replay.')
+          }
+          zipReferences.push({ zipId: reservedZipId, placeholder: `{{ZIP_COOL_TOOL_${index}}}`,
+            reference: `{{batshit-zip:${reservedZipId}:::${previousSkillZip.description || 'Skill read'}}}`,
+            position: { start: index, end: index }, skillSessionChanged: false,
+            ...(!previousSkillZip.metadata?.skillSessionAdmission ? { skillSessionError:
+              'This earlier skill read was not confirmed open. Make a new skill read if you still need it; replaying the old call cannot open it.' } : {}) })
+          return
+        }
+      } catch (error) {
+        console.error('[CoolToolZipAdapter] Refused an unverifiable skill read replay:', error)
+        zipReferences.push({ reference: '', skillSessionError:
+          'Batshit could not verify the earlier skill read, so it did not rewrite or reopen it. Make a new skill read if needed.' })
+        return
+      }
+    }
+
+    if (step.operationKind === 'skill_read' && options.beforeSkillReadPersist) await options.beforeSkillReadPersist()
 
     if (prepared.rawSidecarContent) {
       try {
@@ -1424,23 +1776,50 @@ export async function adaptCoolToolsToZipSystem(
         forceCompress,
         rawSidecarZipId: step.rawSidecar?.zipId,
         resultLineCount,
-        contentLineCount: resultLineCount
+        contentLineCount: resultLineCount,
+        ...(part ? { shellReadSplitPart: part } : {}),
+        ...(fileReadSource ? { fileReadSource } : {})
       }
 
       // ⭐ ZIP-FIRST: Create permanent zip for EVERY tool (no conditional check)
       // Buffer/threshold settings are applied later in compileForAI() for activation/rendering
       // This ensures ALL tools are stored in Redis as zips, and activation is controlled at render time
-      const result = await createZipFromContent(
+      const persist = async () => {
+        // A reserved zip is rewritten by lifecycle/finalize retries. Preserve its original
+        // consumed-read stamp only when this same reply and call own it.
+        const previous = previousSkillZip
+        const admission = previous?.metadata?.sessionId === sessionId && previous?.metadata?.messageId === messageId &&
+          previous?.metadata?.toolCallId === step.toolCallId ? previous?.metadata?.skillSessionAdmission : undefined
+        if (admission && admission.transcriptSha256 !== originalCoolToolReadDigest(promptPayload)) {
+          throw new Error('An admitted skill read changed during same-call replay; its original stored read was retained.')
+        }
+        const result = await createZipFromContent(
         content,
         'cool_tool',
         sessionId,
         messageId,
-        metadata,
+        { ...metadata, ...(admission ? { skillSessionAdmission: admission } : {}),
+          ...(options.skillSessionActor && step.operationKind === 'skill_read' && isSkillLifecycleProducer(step)
+            ? { skillSessionReadReceipt: { agentId: options.skillSessionActor.agentId,
+                transcriptSha256: originalCoolToolReadDigest(promptPayload) } } : {}) },
         reservedZipId ? { zipId: reservedZipId } : undefined
       )
+        let skillSessionChanged = false
+        let skillSessionError: string | undefined
+        if (options.skillSessionActor && step.operationKind === 'skill_read' && isSkillLifecycleProducer(step)) {
+          try {
+            skillSessionChanged = await openSkillSessionRead({
+              ...options.skillSessionActor, sessionId, messageId, rawZipId: result.zipId
+            })
+          } catch (error) { skillSessionError = error instanceof Error ? error.message : String(error) }
+        }
+        return { ...result, skillSessionChanged, skillSessionError }
+      }
+      const result = options.skillSessionActor && step.operationKind === 'skill_read'
+        ? await withZipStateLock(sessionId, persist) : await persist()
 
       if (result) {
-        zipReferences.push({
+        const reference: ZipReference = {
           zipId: result.zipId,
           placeholder: `{{ZIP_COOL_TOOL_${index}}}`,
           reference: result.reference,
@@ -1448,15 +1827,163 @@ export async function adaptCoolToolsToZipSystem(
             start: index,
             end: index
           }
-        })
+        }
+        zipReferences.push(reference)
+        reference.skillSessionChanged = result.skillSessionChanged
+        reference.skillSessionError = result.skillSessionError
+        if (result.skillSessionChanged && options.skillSessionActor) {
+          try {
+            await publishUserEvent(options.skillSessionActor.userId, {
+              type: 'zip_state_changed', sessionId, source: 'agent', opened: [result.zipId], rezipped: []
+            })
+          } catch {
+            reference.skillSessionError = 'The skill opened, but Batshit could not refresh the live skill indicator. Refresh the chat to read its current state.'
+          }
+        }
       }
     } catch (error) {
       console.error(`[CoolToolZipAdapter] Failed to create zip for tool ${i}:`, error)
+      if (options.skillSessionActor && step.operationKind === 'skill_read') {
+        zipReferences.push({ reference: '', skillSessionError:
+          'Batshit could not confirm the stored skill read, so it did not rewrite or reopen that read. Check open_skills before continuing.' })
+      }
       // Continue processing other tools even if one fails
     }
+    }
+    if (options.skillSessionActor && prepared.payload.operationKind === 'skill_read') await withZipStateLock(sessionId, writeStep)
+    else await writeStep()
   }
 
   return zipReferences
+}
+
+/**
+ * SA-137: whether this stored copy's transcript can be rebuilt for today's file: a native Bash read
+ * in a Bash view (`refreshedReadTranscript`), or SA-136's typed `read_file`, by its exact registered
+ * name, in its typed view (`refreshedTypedReadTranscript`).
+ */
+export function canRefreshReadTranscript(stored: Record<string, any> | null | undefined, view: FileReadView): boolean {
+  if (stored?.operationKind !== 'read_file') return false
+  return view.kind === 'typed' ? stored.originalToolName === TYPED_READ_FILE_TOOL : isNativeBashCall(stored.originalToolName)
+}
+
+type RefreshedReadTranscript = { text: string; parts: CoolToolAiContentPart[]; promptTokens: number }
+
+/**
+ * SA-137 (live file reads): a stored Read File copy as the model would read it had its command printed
+ * `stdout` now: the same pipeline a fresh read takes (`prepareCoolTool` on the stored call with the
+ * new output), so the transcript has the same form (sanitized tabs and line ends, the same preview
+ * cut, the raw sidecar's full text when the preview was cut), and the same prompt-token count the
+ * adapter would stamp. Nothing is stored. Null for anything that is not a native Bash Read File.
+ */
+export function refreshedReadTranscript(
+  zipId: string,
+  stored: Record<string, any>,
+  storedMetadata: Record<string, any>,
+  stdout: string
+): RefreshedReadTranscript | null {
+  if (stored?.operationKind !== 'read_file' || !isNativeBashCall(stored.originalToolName)) return null
+  const args = storedToolArgs(stored)
+  const command = typeof args.innerCommand === 'string' ? args.innerCommand : typeof args.command === 'string' ? args.command : null
+  if (!command) return null
+  const prepared = prepareCoolTool({
+    ...storedCallFields(stored),
+    input: args,
+    output: {
+      success: true,
+      blocked: false,
+      command,
+      stdout,
+      stderr: '',
+      exitCode: 0,
+      backend: 'local',
+      mappedToolName: 'read_file',
+      mappedReason: 'read-command',
+      originalToolName: stored.originalToolName,
+      input: args
+    }
+  })
+  return transcriptOfPrepared(zipId, stored, storedMetadata, prepared)
+}
+
+/**
+ * SA-137 with SA-136: a stored typed `read_file` copy as the model would read a fresh call with the
+ * same arguments on a file whose whole text is `fileText` now. The result is the tool's own
+ * (`typedReadResultFromBytes`: its decoding, slicing and facts), prepared and formatted as the
+ * adapter stores a fresh call. The stored arguments must give exactly the descriptor's `view`, as the
+ * read's proof derived it. Null where they do not, where the tool would refuse those bytes, or where
+ * the range no longer shows whole lines in full (cut, one partial line, or starting past the end of
+ * a file that shrank): such a read is never proven, so it is never refreshed either.
+ */
+export function refreshedTypedReadTranscript(
+  zipId: string,
+  stored: Record<string, any>,
+  storedMetadata: Record<string, any>,
+  fileText: string,
+  view: FileReadView
+): RefreshedReadTranscript | null {
+  if (stored?.operationKind !== 'read_file' || stored.originalToolName !== TYPED_READ_FILE_TOOL || view.kind !== 'typed') return null
+  const args = storedToolArgs(stored)
+  const filePath = typeof stored.toolResult?.filePath === 'string' ? stored.toolResult.filePath : null
+  if (typeof args.path !== 'string' || !filePath) return null
+  const offset = args.offset === undefined ? undefined : args.offset
+  const limit = args.limit === undefined ? undefined : args.limit
+  if ((offset !== undefined && !Number.isSafeInteger(offset)) || (limit !== undefined && !Number.isSafeInteger(limit))) return null
+  // The range the proof derived from these same arguments (`typedReadProof`).
+  const startLine = offset && offset > 0 ? offset : 1
+  const endLine = limit && limit > 0 ? startLine + limit - 1 : null
+  if (view.startLine !== startLine || view.endLine !== endLine) return null
+  const input = { path: args.path, ...(offset !== undefined ? { offset } : {}), ...(limit !== undefined ? { limit } : {}) }
+  const result = typedReadResultFromBytes(input, filePath, Buffer.from(fileText, 'utf8'))
+  const facts = (result as Record<string, any> | null)?.typedFileRead
+  if (!result || result.success !== true || !facts || facts.truncated || (result as Record<string, any>).partialLine) return null
+  if (!facts.empty && facts.endLine < facts.startLine) return null
+  return transcriptOfPrepared(zipId, stored, storedMetadata, prepareCoolTool({ ...storedCallFields(stored), input: args, output: result }))
+}
+
+function storedToolArgs(stored: Record<string, any>): Record<string, any> {
+  return stored.toolArgs && typeof stored.toolArgs === 'object' && !Array.isArray(stored.toolArgs) ? stored.toolArgs : {}
+}
+
+/** The stored call's own fields a fresh read of it would carry. */
+function storedCallFields(stored: Record<string, any>) {
+  return {
+    toolName: stored.toolName,
+    originalToolName: stored.originalToolName,
+    toolCallId: stored.toolCallId,
+    timestamp: stored.timestamp,
+    toolProvider: stored.toolProvider,
+    toolSource: stored.toolSource,
+    mcpServerName: stored.mcpServerName
+  }
+}
+
+function transcriptOfPrepared(
+  zipId: string,
+  stored: Record<string, any>,
+  storedMetadata: Record<string, any>,
+  prepared: PreparedCoolTool
+): RefreshedReadTranscript {
+  // The compile expands the raw sidecar when the copy has one and its policy prefers it (a cut
+  // preview, or an empty content). The stored copy's sidecar counts, so an unchanged file reads
+  // exactly as stored; a refresh whose preview is now cut keeps the full text as a fresh read would.
+  const storedSidecarId = typeof stored.rawSidecar?.zipId === 'string'
+    ? stored.rawSidecar.zipId
+    : typeof storedMetadata?.rawSidecarZipId === 'string' ? storedMetadata.rawSidecarZipId : null
+  const sidecarId = storedSidecarId ?? (prepared.rawSidecarContent ? `${zipId}:refreshed-raw` : null)
+  const payload = sidecarId
+    ? { ...(prepared.payload as Record<string, any>), rawSidecar: { status: 'stored', zipId: sidecarId } }
+    : (prepared.payload as Record<string, any>)
+  const rawPayload = sidecarId && shouldPreferRawSidecarForAiExpansion(payload)
+    ? parseCoolToolPayload(prepared.rawSidecarCandidate)
+    : null
+  const content = JSON.stringify(payload, getCircularReplacer())
+  const formatted = buildCoolToolAiContentWithSources(zipId, { content, metadata: storedMetadata }, rawPayload ?? payload)
+  return {
+    text: formatted.text,
+    parts: formatted.parts,
+    promptTokens: Math.max(calculateTokens(formatted.text), prepared.modelFacingResultTokens)
+  }
 }
 
 /**

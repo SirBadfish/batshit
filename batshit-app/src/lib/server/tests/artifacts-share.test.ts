@@ -6,7 +6,6 @@ import { resolveCompiledMessageElement } from '$lib/utils/compiledChatTags'
 import { env } from '$env/dynamic/private'
 import { createServer } from 'node:http'
 import * as artifactImageFetch from '../services/artifactShareImageFetch.server'
-import { mintRunCredential, AGENT_RUN_CREDENTIAL_HEADER } from '../services/agentRunCredentials'
 
 const publishMock = vi.fn()
 const fetchMock = vi.fn()
@@ -418,23 +417,17 @@ describe('POST /api/artifacts/share', () => {
     expect(body.followupTriggered).toBe(true)
   })
 
-  it.each(['service', 'agent'])('BL-472: %s authentication cannot claim human speech', async (lane) => {
+  it('BL-472: service authentication cannot claim human speech', async () => {
     const { POST } = await import('../../../routes/api/artifacts/share/+server')
     const request = buildRequest({ artifactId: 'art_share', content: 'machine output', sessionId: 'sess_1', initiator: 'user' })
-    if (lane === 'service') {
-      request.headers.set('x-batshit-token', 'test-acts-share-test-token')
-      request.headers.set('x-batshit-user-id', 'user_a')
-    } else {
-      await redis.set('agent:agent_1', { id: 'agent_1', user_id: 'user_a' })
-      const { token } = await mintRunCredential({ userId: 'user_a', agentId: 'agent_1', sessionId: 'sess_1', runtime: 'codex' })
-      request.headers.set(AGENT_RUN_CREDENTIAL_HEADER, token)
-    }
+    request.headers.set('x-batshit-token', 'test-acts-share-test-token')
+    request.headers.set('x-batshit-user-id', 'user_a')
     const response = await POST({ request, locals: {}, fetch: fetchMock } as any)
     const body = await response.json()
     const message = await redis.json.get(`message:sess_1:${body.messageId}`) as any
-    expect(message.metadata.shareInitiator).toBe(lane === 'agent' ? 'agent' : 'artifact')
+    expect(message.metadata.shareInitiator).toBe('artifact')
     expect(resolveCompiledMessageElement(message, { selfAgentId: 'agent_1', agentNames: new Map() }).tag).toBe('note')
-    expect(body.followupTriggered).toBe(lane !== 'agent')
+    expect(body.followupTriggered).toBe(true)
   })
 
   it('skips auto-followup for trusted service agent shares during an active agent turn', async () => {

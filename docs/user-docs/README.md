@@ -31,15 +31,15 @@ Mac app and Docker are peer setup paths. The Mac app is the normal Mac local pat
 - Mac app local data: `~/Library/Application Support/Batshit`; logs: `~/Library/Logs/Batshit`; cache: `~/Library/Caches/Batshit`.
 - Docker internal app URL: `http://app:3000`.
 - n8n default URL: `http://localhost:5678` from the browser, `http://n8n:5678` from the optional Docker n8n profile network.
-- Primary Agent names: `API` and `CLI`.
-- Subagent names: `API Subagents`, `CLI Subagents`, and `n8n Workflow Subagents`.
-- Portable Skills are downloaded from the docs site and use scoped Portable Skill Tokens from Settings -> Skills & Prompts -> Portable Skills, never `BATSHIT_TOKEN`.
+- Primary Agents: one kind. Name the model connection (API key, Local AI, ChatGPT plan, Claude plan), not a type.
+- Subagents: one kind. Name the model connection, not a type.
+- The complete Batshit plugin downloads from Plugins → Batshit → Download Plugin. Older per-skill docs-site ZIPs are archives. Operational outside skills use scoped Portable Skill Tokens; informational Guides need none.
 
 ## Source rule
 
 `docs/user-docs/` is the only canonical public UserDocs source tree. The online docs site, raw Markdown files, LLM text bundles, and public template downloads are generated from this folder.
 
-The official n8n templates under `docs/user-docs/user-templates/batshit-official-n8n-workflow-templates/` are the current public-safe workflow templates. Don't keep old guide sets, raw experiments, private setup notes, or unvalidated template experiments in this tree.
+The official n8n template under `docs/user-docs/user-templates/batshit-official-n8n-workflow-templates/` is the current public-safe workflow template. Don't keep old guide sets, raw experiments, private setup notes, or unvalidated template experiments in this tree.
 
 ## Writing rules
 
@@ -48,7 +48,7 @@ The official n8n templates under `docs/user-docs/user-templates/batshit-official
 - **Teach novel concepts from zero.** Batshit invented a lot the world hasn't seen — Zips, Clips, the Tool Grid, DCM, Schema Hints, Group Chat's single-speaker queue, the Execution Viewer, Goons. For those, lead with *why it exists / what problem it solves* before *how to use it*.
 - **Keep prose self-sufficient.** Screenshots reinforce; they never carry meaning the text lacks. A stale screenshot must never break comprehension, and AI/screen-reader users must get the full story from words + alt text.
 - **Profanity is allowed where it fits the brand** (the product is named Batshit). Use it naturally — "this part is easy to fuck up," "not the same shit you're used to" — never forced, never trying to hit a quota.
-- Don't use retired numbered or n8n-primary terminology. Use `API` and `CLI` for Primary Agents, and `API Subagents` / `CLI Subagents` / `n8n Workflow Subagents` for Subagents.
+- Do not describe the removed Codex CLI, Claude Code CLI or n8n agent types as current. n8n remains a workflow tool and wake-up platform.
 - Never publish real tokens, API keys, local secrets, private local paths, or raw logs.
 - Don't tell public users to run private development launchers as install steps.
 - Don't present manual source-checkout setup as the normal public Mac path while the Mac app path is supported.

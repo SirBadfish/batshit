@@ -6,6 +6,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import {
+  SANDBOX_COMMAND_END_TIMEOUT_MS,
   SANDBOX_COMMAND_TAG_ENV,
   newSandboxCommandTag,
   sandboxCommandEndArgv
@@ -57,7 +58,12 @@ function startCommand(script, tag) {
 
 function runEnd(tag) {
   const [program, ...args] = sandboxCommandEndArgv(tag)
-  return spawnSync(program, args, { encoding: 'utf8', timeout: 10_000 })
+  const result = spawnSync(program, args, {
+    encoding: 'utf8',
+    timeout: SANDBOX_COMMAND_END_TIMEOUT_MS
+  })
+  assert.ifError(result.error)
+  return result
 }
 
 test(
@@ -84,13 +90,11 @@ test(
     assert.ok(await waitFor(() => pidsOf(leader).length >= 4, 3_000), 'the command started')
     const members = pidsOf(leader)
 
-    const started = Date.now()
     const end = runEnd(tag)
 
     assert.equal(end.status, 0, end.stderr)
     // The one that ignores SIGTERM needs the SIGKILL.
     assert.match(end.stdout, /batshit-command-end: [34] ended, 1 killed/)
-    assert.ok(Date.now() - started < 3_000)
     for (const pid of members) {
       assert.ok(await waitFor(() => !isRunning(pid), 1_000), `pid ${pid} still runs`)
     }

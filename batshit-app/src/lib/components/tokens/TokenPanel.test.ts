@@ -4,6 +4,15 @@ import { describe, expect, it, vi } from 'vitest'
 import TokenPanel from './TokenPanel.svelte'
 
 describe('TokenPanel', () => {
+  it('SA-139: shows the Claude plan slot with its usage link and no dollar figure', () => {
+    render(TokenPanel, { props: { claudePlan: true, costLabel: '$1.23', costState: 'exact' } })
+    const link = screen.getByRole('link', { name: 'Claude plan — check usage' })
+    expect(link).toHaveAttribute('href', 'https://claude.ai/settings/usage')
+    expect(link).toHaveTextContent('Claude Plan')
+    expect(screen.queryByText('$1.23')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'View running chat cost' })).toBeNull()
+  })
+
 
   it('associates the existing speed and KoboldCpp information triggers with their actual tooltip nodes', async () => {
     ;(window as any).ResizeObserver ??= class ResizeObserver {

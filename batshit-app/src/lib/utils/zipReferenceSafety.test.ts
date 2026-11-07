@@ -15,13 +15,9 @@ import {
   neutralizeUntrustedZipReferenceSyntax,
   replaceClipReferences,
   replaceLegacyClipReferences,
-  replaceLooseZipReferences,
   replaceZipReferences,
   scanClipReferences,
-  scanDeletionSweepZipReferences,
   scanLegacyClipReferences,
-  scanLooseClipReferences,
-  scanLooseZipReferences,
   scanZipReferences,
   stripTrustedClipReferenceSyntax,
   zipBelongsToAnotherChat
@@ -625,18 +621,16 @@ describe('reference readers on 1 MB of 20,000 unclosed openers', () => {
 })
 
 /**
- * BL-707: the older reference shape several readers still keep (BL-609 moves them onto the
- * shared one): an id of any length with no `:` or `}` (so `{`, spaces, and line breaks are id
- * characters) and an optional `:::` description with no `}`. Kept here only as oracles, literally:
- * the metadata readers' and the routes' first-reference pattern, and its global form.
+ * BL-609: one `zipReferences` or `clipReferences` entry is read with the trust reader's shape
+ * (`scanZipReferences`, `scanClipReferences`), the first reference only, once (BL-707). The older
+ * shape these readers kept (an id with no `:` or `}`, so `{`, spaces, and line breaks counted) is
+ * gone. The shared entry patterns are kept here only as oracles, literally.
  */
-const OLD_LOOSE_ZIP_REFERENCE_REGEX = /\{\{batshit-zip:([^:}]+)(?::::([^}]*))?\}\}/g
-const OLD_LOOSE_CLIP_REFERENCE_REGEX = /\{\{batshit-clip:([^:}]+)(?::::([^}]*))?\}\}/g
-const OLD_ZIP_ENTRY_REGEX = /\{\{batshit-zip:([^:}]+)(?::::[^}]*)?\}\}/
-const OLD_CLIP_ENTRY_REGEX = /\{\{batshit-clip:([^:}]+)(?::::[^}]*)?\}\}/
+const SHARED_ZIP_ENTRY_REGEX = /\{\{batshit-zip:([^:{}\r\n]{1,160})(?::::[^}]*)?\}\}/
+const SHARED_CLIP_ENTRY_REGEX = /\{\{batshit-clip:([^:}\s]+)(?::::[^}]*)?\}\}/
 
-/** `collectTrustedZipIdsFromMetadata` as it was, with its old pattern. */
-function oldCollectTrustedZipIdsFromMetadata(metadata: unknown): string[] {
+/** `collectTrustedZipIdsFromMetadata` over the shared entry pattern. */
+function expectedTrustedZipIdsFromMetadata(metadata: unknown): string[] {
   if (!metadata || typeof metadata !== 'object') return []
   const ids = new Set<string>()
   const record = metadata as Record<string, any>
@@ -651,21 +645,21 @@ function oldCollectTrustedZipIdsFromMetadata(metadata: unknown): string[] {
   if (Array.isArray(record.zipReferences)) {
     for (const entry of record.zipReferences) {
       if (typeof entry === 'string') {
-        const match = entry.match(OLD_ZIP_ENTRY_REGEX)
+        const match = entry.match(SHARED_ZIP_ENTRY_REGEX)
         add(match?.[1] ?? entry)
       } else if (entry && typeof entry === 'object') {
         add(entry.zipId)
         add(entry.zip_id)
         add(entry.id)
-        if (typeof entry.reference === 'string') add(entry.reference.match(OLD_ZIP_ENTRY_REGEX)?.[1])
+        if (typeof entry.reference === 'string') add(entry.reference.match(SHARED_ZIP_ENTRY_REGEX)?.[1])
       }
     }
   }
   return Array.from(ids)
 }
 
-/** `collectTrustedClipIdsFromMetadata` as it was, with its old pattern. */
-function oldCollectTrustedClipIdsFromMetadata(metadata: unknown): string[] {
+/** `collectTrustedClipIdsFromMetadata` over the shared entry pattern. */
+function expectedTrustedClipIdsFromMetadata(metadata: unknown): string[] {
   if (!metadata || typeof metadata !== 'object') return []
   const ids = new Set<string>()
   const record = metadata as Record<string, any>
@@ -689,22 +683,20 @@ function oldCollectTrustedClipIdsFromMetadata(metadata: unknown): string[] {
   if (Array.isArray(record.clipReferences)) {
     for (const entry of record.clipReferences) {
       if (typeof entry === 'string') {
-        const match = entry.match(OLD_CLIP_ENTRY_REGEX)
+        const match = entry.match(SHARED_CLIP_ENTRY_REGEX)
         add(match?.[1] ?? entry)
       } else if (entry && typeof entry === 'object') {
         add(entry.clipId)
         add(entry.clip_id)
         add(entry.id)
-        if (typeof entry.reference === 'string') add(entry.reference.match(OLD_CLIP_ENTRY_REGEX)?.[1])
+        if (typeof entry.reference === 'string') add(entry.reference.match(SHARED_CLIP_ENTRY_REGEX)?.[1])
       }
     }
   }
   return Array.from(ids)
 }
 
-describe('BL-707: the older reference shape, read once', () => {
-  const tag = (match: string, id: string, description: string | undefined) =>
-    `<${id}|${description === undefined ? '-' : 'd:' + description}|${match.length}>`
+describe("BL-609: a posted reference entry is read with the trust reader's shape", () => {
   const texts = [
     ...REFERENCE_SCAN_HAND_CASES,
     ...REFERENCE_SCAN_CASES,
@@ -713,31 +705,49 @@ describe('BL-707: the older reference shape, read once', () => {
     ...generateReferenceTexts(1_500, 70_707)
   ]
 
-  it('finds exactly the references, ids, descriptions, and positions the old patterns found', () => {
-    const counts = { zip: 0, zipOpenersOnly: 0, clip: 0, clipOpenersOnly: 0, zipWithSpaceOrBreak: 0 }
-    for (const text of texts) {
-      const label = JSON.stringify(text)
-      const zips = oldReferences(OLD_LOOSE_ZIP_REFERENCE_REGEX, text)
-      const clips = oldReferences(OLD_LOOSE_CLIP_REFERENCE_REGEX, text)
-      expect(scanLooseZipReferences(text), label).toEqual(zips)
-      expect(scanLooseClipReferences(text), label).toEqual(clips)
-      expect(extractZipIdFromReference(text), label).toBe(text.match(OLD_ZIP_ENTRY_REGEX)?.[1] ?? null)
-      expect(replaceLooseZipReferences(text, tag), label).toBe(
-        text.replace(OLD_LOOSE_ZIP_REFERENCE_REGEX, tag)
-      )
-      if (zips.length > 0) counts.zip++
-      else if (text.includes('{{batshit-zip:')) counts.zipOpenersOnly++
-      if (clips.length > 0) counts.clip++
-      else if (text.includes('{{batshit-clip:')) counts.clipOpenersOnly++
-      if (zips.some((zip) => /[\s{]/.test(zip.id))) counts.zipWithSpaceOrBreak++
+  it('reads an odd entry exactly as the trust reader reads a reference', () => {
+    const ZIP = 'cool_tool_1790500000000_abcde'
+    const LATER = 'cool_tool_1790500000009_later'
+    const long = `cool_tool_${'1'.repeat(150)}_abcde`
+    const cases: Array<[string, string | null]> = [
+      [`{{batshit-zip:${ZIP}:::}}`, ZIP], // an empty description: a reference
+      [`{{batshit-zip:a{b:::x}} {{batshit-zip:${LATER}}}`, LATER], // a `{`: not one, so the next one is read
+      [`{{batshit-zip:a\nb}} {{batshit-zip:${LATER}}}`, LATER], // a line break: not one
+      [`{{batshit-zip:${long}}}`, null], // longer than 160 characters: not one
+      ['{{batshit-zip:a b:::x}}', 'a b'] // a space: a reference, which trust then refuses
+    ]
+    for (const [entry, id] of cases) {
+      expect(extractZipIdFromReference(entry), JSON.stringify(entry)).toBe(id)
+      expect(extractZipIdFromReference(entry), JSON.stringify(entry)).toBe(scanZipReferences(entry)[0]?.id ?? null)
     }
-    // Both answers for both shapes, and ids the shared shape would refuse (a space, a break, a `{`).
-    for (const [kind, count] of Object.entries(counts)) {
-      expect(count, kind).toBeGreaterThan(1_000)
-    }
+    // Trust follows: the concrete id after an odd reference is trusted, the long one never.
+    expect(collectTrustedZipIdsFromMetadata({ zipReferences: [cases[1][0], { reference: cases[2][0] }, cases[3][0]] })).toEqual([LATER])
+    // A clip id holds no whitespace, so a spaced entry names no clip, as in a message's text.
+    expect(
+      collectTrustedClipIdsFromMetadata({
+        clipReferences: ['{{batshit-clip: clip_1790500000000_abcd1234 }}', '{{batshit-clip:clip_1790500000001_abcd1234:::}}']
+      })
+    ).toEqual(['clip_1790500000001_abcd1234'])
   })
 
-  it('the metadata readers trust exactly the ids they trusted', () => {
+  it('reads the first reference of an entry exactly as the shared shape does', () => {
+    const counts = { zip: 0, zipOpenersOnly: 0, refusedByShape: 0 }
+    for (const text of texts) {
+      const label = JSON.stringify(text)
+      const first = scanZipReferences(text)[0]?.id ?? null
+      expect(extractZipIdFromReference(text), label).toBe(first)
+      expect(extractZipIdFromReference(text), label).toBe(text.match(SHARED_ZIP_ENTRY_REGEX)?.[1] ?? null)
+      if (first !== null) counts.zip++
+      else if (text.includes('{{batshit-zip:')) counts.zipOpenersOnly++
+      // An id the older shape read and this one refuses (a `{`, a line break, too long).
+      if (/\{\{batshit-zip:[^:}]*[{\r\n][^:}]*(?::::[^}]*)?\}\}/.test(text)) counts.refusedByShape++
+    }
+    expect(counts.zip).toBeGreaterThan(1_000)
+    expect(counts.zipOpenersOnly).toBeGreaterThan(1_000)
+    expect(counts.refusedByShape).toBeGreaterThan(500)
+  })
+
+  it('the metadata readers trust exactly the ids the shared shape reads', () => {
     const counts = { zip: 0, clip: 0 }
     for (const text of texts) {
       const label = JSON.stringify(text)
@@ -751,8 +761,8 @@ describe('BL-707: the older reference shape, read once', () => {
         clippedItems: [{ clipId: text }, null],
         clipReferences: [text, { reference: text }, { clip_id: text }, 42, null]
       }
-      const zipIds = oldCollectTrustedZipIdsFromMetadata(zipMetadata)
-      const clipIds = oldCollectTrustedClipIdsFromMetadata(clipMetadata)
+      const zipIds = expectedTrustedZipIdsFromMetadata(zipMetadata)
+      const clipIds = expectedTrustedClipIdsFromMetadata(clipMetadata)
       expect(collectTrustedZipIdsFromMetadata(zipMetadata), label).toEqual(zipIds)
       expect(collectTrustedClipIdsFromMetadata(clipMetadata), label).toEqual(clipIds)
       // An id read from inside a reference (not the metadata's own zip id or the whole text).
@@ -765,7 +775,7 @@ describe('BL-707: the older reference shape, read once', () => {
   })
 })
 
-describe('BL-707: readers of the older shape on 1 MB of 20,000 unclosed openers', () => {
+describe('BL-707: the entry readers on 1 MB of 20,000 unclosed openers', () => {
   const within200ms = <T>(label: string, read: () => T): T => {
     const started = performance.now()
     const result = read()
@@ -773,9 +783,8 @@ describe('BL-707: readers of the older shape on 1 MB of 20,000 unclosed openers'
     return result
   }
 
-  it('scan, read one posted reference, and trust metadata entries in well under 200 ms', () => {
+  it('read one posted reference and trust metadata entries in well under 200 ms', () => {
     for (const [shape, reply] of Object.entries(unclosedReferenceReplies('zip'))) {
-      expect(within200ms(shape, () => scanLooseZipReferences(reply))).toEqual([])
       expect(within200ms(shape, () => extractZipIdFromReference(reply))).toBeNull()
       expect(
         within200ms(shape, () =>
@@ -784,64 +793,11 @@ describe('BL-707: readers of the older shape on 1 MB of 20,000 unclosed openers'
       ).toEqual([])
     }
     for (const [shape, reply] of Object.entries(unclosedReferenceReplies('clip'))) {
-      expect(within200ms(shape, () => scanLooseClipReferences(reply))).toEqual([])
       expect(
         within200ms(shape, () =>
           collectTrustedClipIdsFromMetadata({ clipReferences: [reply, { reference: reply }] })
         )
       ).toEqual([])
-    }
-  })
-})
-
-/**
- * BL-707: the chat deletion sweep's own shape (`redis.deleteSession`), kept here only as the
- * oracle: an id with no whitespace, and a description of at least one character.
- */
-const OLD_DELETION_SWEEP_ZIP_REGEX = /\{\{batshit-zip:([^:}\s]+)(?::::[^}]+)?\}\}/g
-
-describe("BL-707: the chat deletion sweep's shape, read once", () => {
-  it('finds exactly the references, ids, and positions the old pattern found', () => {
-    const texts = [
-      ...REFERENCE_SCAN_HAND_CASES,
-      ...REFERENCE_SCAN_CASES,
-      ...generateReferenceScanTexts(6_000, 7_071),
-      ...generateTokenTexts(1_500, 7_072),
-      ...generateReferenceTexts(1_500, 7_073)
-    ]
-    const counts = { found: 0, openersOnly: 0, emptyDescription: 0 }
-    for (const text of texts) {
-      const expected = Array.from(text.matchAll(OLD_DELETION_SWEEP_ZIP_REGEX), (match) => ({
-        start: match.index ?? -1,
-        end: (match.index ?? -1) + match[0].length,
-        match: match[0],
-        id: match[1]
-      }))
-      const found = scanDeletionSweepZipReferences(text).map(({ start, end, match, id }) => ({
-        start,
-        end,
-        match,
-        id
-      }))
-      expect(found, JSON.stringify(text)).toEqual(expected)
-      if (expected.length > 0) counts.found++
-      else if (text.includes('{{batshit-zip:')) counts.openersOnly++
-      if (scanLooseZipReferences(text).some((reference) => reference.description === '')) {
-        counts.emptyDescription++
-      }
-    }
-    // Both answers, and texts where the one rule only this shape has (an empty description is
-    // refused) is in play.
-    expect(counts.found).toBeGreaterThan(1_000)
-    expect(counts.openersOnly).toBeGreaterThan(1_000)
-    expect(counts.emptyDescription).toBeGreaterThan(100)
-  })
-
-  it('reads 1 MB of 20,000 unclosed openers in well under 200 ms', () => {
-    for (const [shape, reply] of Object.entries(unclosedReferenceReplies('zip'))) {
-      const started = performance.now()
-      expect(scanDeletionSweepZipReferences(reply), shape).toEqual([])
-      expect(performance.now() - started, shape).toBeLessThan(200)
     }
   })
 })

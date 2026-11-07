@@ -65,6 +65,7 @@ function zip(zipId: string, description: string, overrides: Partial<ZipCompressi
     rezippedBy: null,
     groupUnshared: false,
     deadCopy: null,
+    deadCopyNamed: false,
     messagesFromEnd: 3,
     ...overrides
   }
@@ -114,6 +115,12 @@ beforeEach(() => {
 })
 
 describe('selectSmartZipCandidates', () => {
+  it('leaves every skill read to its lifecycle, including a named closed read', () => {
+    expect(selectSmartZipCandidates([
+      zip('skill_closed', 'skill_read: artifact_creator/SKILL.md', { operationKind: 'skill_read', toolName: 'native_skill', rezipped: true, rezippedBy: 'inferred' }),
+      zip('skill_legacy', 'skill_read: artifact_creator/reference.md', { operationKind: undefined, toolName: 'skill_read' })
+    ]).candidates).toEqual([])
+  })
   it('keeps described tool results in chat order under short keys', () => {
     const { candidates, eligible, foldedRepeats } = selectSmartZipCandidates(ZIPPED)
     expect(eligible).toBe(3)
@@ -367,7 +374,7 @@ describe('buildSmartZipDcmLines', () => {
     const decision = decideSmartZipHints(noulAnswers({ z1: 0.84, z2: 0.07, z3: 0.38, z4: 0.66, z5: 0.71 }), request)
     expect(buildSmartZipDcmLines(decision, { fetchZipEnabled: true })).toEqual([
       jevJuiceZipsOpenedHeading(1),
-      '- Unzipped for you (inferred): zip_aaa | read_file: src/lib/goons/cueParser.ts - 412 lines | about 1200 tokens | 0.84 | its full content is in this prompt, and it zips again by itself after 2 messages (zip control, when you have it, closes it sooner)',
+      '- Unzipped for you (inferred): zip_aaa | read_file: src/lib/goons/cueParser.ts - 412 lines | about 1200 tokens | 0.84 | its full content is in this prompt, and it zips again by itself after 2 messages',
       '- Likely needed, not unzipped (you or the user zipped it by hand, and Batshit does not undo that): zip_mine | read_file: notes.md - 12 lines | about 90 tokens | 0.71',
       '- Likely needed, not unzipped (oversized: it stays zipped even if unzipped, so fetch it): zip_big | read_file: send-routed/+server.ts - 4000 lines | about 41000 tokens | 0.66',
       '- Possibly related: zip_ccc | read_file: docs/user-docs/voice/overview.md - 210 lines | about 1200 tokens | 0.38',
@@ -412,7 +419,7 @@ describe('buildSmartZipClosedDcmLines', () => {
       JEV_JUICE_ZIPS_CLOSED_HEADING,
       '- Zipped for you (inferred): zip_aaa | read_file: package.json - 142 lines | done with it 0.91'
     ])
-    expect(JEV_JUICE_ZIPS_CLOSED_HEADING).toContain('fetch or unzip one if that was wrong')
+    expect(JEV_JUICE_ZIPS_CLOSED_HEADING).toContain('fetch one if that was wrong')
   })
 })
 
@@ -639,6 +646,12 @@ const postAnswers = (values: Record<string, [number, number]>) =>
   )
 
 describe('selectSmartZipPostTurnCandidates', () => {
+  it('never closes held, buffer-expanded, or new skill reads outside the lifecycle', () => {
+    expect(selectSmartZipPostTurnCandidates([
+      exposed('skill_open', { operationKind: 'skill_read', unzippedBy: 'agent' }),
+      exposed('skill_buffer', { operationKind: 'skill_read', unzippedBy: null })
+    ], [fresh('skill_new', { operationKind: 'skill_read' })])).toEqual([])
+  })
   it('asks only about results that would stay open into the next turn and that Jev may close', () => {
     const candidates = selectSmartZipPostTurnCandidates(
       [

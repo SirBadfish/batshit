@@ -5,7 +5,6 @@ import {
 
 describe('resolveCliContextWindow', () => {
   it.each([
-    ['codex', 'gpt-6.1-sol', 258_400],
     ['claude', 'claude-sonnet-5-5', 1_000_000],
     ['claude', 'haiku', 1_000_000],
     ['claude', 'claude-haiku-5-5', 1_000_000],
@@ -18,12 +17,6 @@ describe('resolveCliContextWindow', () => {
     } })).toMatchObject({ contextWindow: 123_456, source: 'runtime' })
   })
 
-  it.each(['codex', 'codex-cli', 'gpt-6-sol'])('uses the Codex CLI default when settings name no model, regardless of primary label %s', label => {
-    expect(resolveAgentCliModel('codex', {
-      primary_model_name: label, codex_settings: { permissionMode: 'chat', model: null }
-    })).toBeNull()
-  })
-
   it.each(['claude', 'claude-cli', 'sonnet'])('uses the Claude CLI default when settings name no model, regardless of primary label %s', label => {
     expect(resolveAgentCliModel('claude', {
       primary_model_name: label, claude_settings: { permissionMode: 'default', model: null }
@@ -31,12 +24,12 @@ describe('resolveCliContextWindow', () => {
   })
   it('uses a reported window only for the active runtime and model', () => {
     expect(resolveCliContextWindow({
-      runtime: 'codex', model: 'gpt-6-sol', presetContextWindow: 100_000,
-      reported: { runtime: 'codex', model: 'gpt-6-sol', contextWindow: 258_400, evidence: 'runtime' }
+      runtime: 'claude', model: 'claude-sonnet-5-5', presetContextWindow: 100_000,
+      reported: { runtime: 'claude', model: 'claude-sonnet-5-5', contextWindow: 258_400, evidence: 'runtime' }
     })).toMatchObject({ contextWindow: 258_400, source: 'runtime' })
     expect(resolveCliContextWindow({
-      runtime: 'codex', model: 'gpt-6-sol', presetContextWindow: 100_000,
-      reported: { runtime: 'codex', model: 'gpt-6-astra', contextWindow: 258_400, evidence: 'runtime' }
+      runtime: 'claude', model: 'claude-sonnet-5-5', presetContextWindow: 100_000,
+      reported: { runtime: 'claude', model: 'claude-opus-5-5', contextWindow: 258_400, evidence: 'runtime' }
     })).toMatchObject({ contextWindow: 100_000, source: 'preset' })
   })
 
@@ -59,75 +52,55 @@ describe('resolveCliContextWindow', () => {
       .toMatchObject({ contextWindow: 200_000, source: 'choice' })
   })
 
-  it('keeps a changed config distinct from prior runtime evidence', () => {
-    const base = { codex_settings: { permissionMode: 'default', model: 'gpt-6-sol', configOverrides: [] } }
-    const changed = { codex_settings: {
-      ...base.codex_settings, configOverrides: [{ key: 'model_context_window', value: '128000' }]
-    } }
-    expect(cliContextSettingsKey('codex', base, 100_000))
-      .not.toBe(cliContextSettingsKey('codex', changed, 100_000))
-    expect(cliContextSettingsKey('codex', base, 100_000))
-      .not.toBe(cliContextSettingsKey('codex', base, 200_000))
+  it('keeps a changed model or preset window distinct from prior runtime evidence', () => {
+    const base = { claude_settings: { permissionMode: 'default', model: 'claude-sonnet-5-5', configOverrides: [] } }
+    const changed = { claude_settings: { ...base.claude_settings, model: 'claude-opus-5-5' } }
+    expect(cliContextSettingsKey('claude', base, 100_000))
+      .not.toBe(cliContextSettingsKey('claude', changed, 100_000))
+    expect(cliContextSettingsKey('claude', base, 100_000))
+      .not.toBe(cliContextSettingsKey('claude', base, 200_000))
   })
 
-  it('serializes only numeric context overrides and never credential values', () => {
+  it('never serializes override values or an untrusted key, so credentials never reach a snapshot', () => {
     const secret = 'SENTINEL-PRIVATE-HEADER-value-123'
     const report = {
-      runtime: 'codex' as const, model: 'gpt-6-sol', contextWindow: 258_400,
+      runtime: 'claude' as const, model: 'claude-sonnet-5-5', contextWindow: 1_000_000,
       evidence: 'runtime' as const
     }
     for (const settings of [
-      { codex_settings: { permissionMode: 'chat', model: 'gpt-6-sol',
-        configOverrides: [{ key: 'model_providers.custom.http_headers.Authorization', value: secret }] } },
-      { provider_specific_settings: { codex_model: 'gpt-6-sol',
-        codex_config_overrides: [{ key: 'model_providers.custom.http_headers.Authorization', value: secret }] } }
+      { claude_settings: { permissionMode: 'default', model: 'claude-sonnet-5-5',
+        configOverrides: [{ key: 'env.ANTHROPIC_CUSTOM_HEADERS', value: `Authorization: ${secret}` }] } },
+      { provider_specific_settings: { claude_model: 'claude-sonnet-5-5',
+        claude_config_overrides: [{ key: 'env.ANTHROPIC_CUSTOM_HEADERS', value: `Authorization: ${secret}` }] } }
     ]) {
-      expect(cliContextSettingsKey('codex', settings)).toBeNull()
       const serialized = JSON.stringify({ metadata: {
         cliContextWindow: reportForCliSnapshot({ ...report, settingsKey: secret }, settings)
       } })
       expect(serialized).not.toContain(secret)
       expect(serialized).not.toContain('Authorization')
-      expect(JSON.parse(serialized).metadata.cliContextWindow).not.toHaveProperty('settingsKey')
+      expect(JSON.parse(serialized).metadata.cliContextWindow.settingsKey).toBe(cliContextSettingsKey('claude', settings))
     }
   })
 
-  it('accepts only positive integer context overrides and invalidates numeric changes', () => {
+  it('Claude takes no context override: override rows never change or enter the key', () => {
     const agent = (overrides: unknown) => ({
-      codex_settings: { permissionMode: 'chat', model: 'gpt-6-sol', configOverrides: overrides }
+      claude_settings: { permissionMode: 'default', model: 'claude-sonnet-5-5', configOverrides: overrides }
     })
-    const first = cliContextSettingsKey('codex', agent([
-      { key: 'model_context_window', value: '128000' },
-      { key: 'model_auto_compact_token_limit', value: 100_000 }
-    ]))
-    expect(first).toContain('128000')
-    expect(first).not.toContain('100_000')
-    expect(first).not.toBe(cliContextSettingsKey('codex', agent([
-      { key: 'model_context_window', value: '256000' },
-      { key: 'model_auto_compact_token_limit', value: 100_000 }
-    ])))
-    expect(cliContextSettingsKey('codex', agent([]))).not.toBeNull()
-    const legacy = (value: unknown) => ({ provider_specific_settings: {
-      codex_model: 'gpt-6-sol', codex_config_overrides: [{ key: 'model_context_window', value }]
-    } })
-    expect(cliContextSettingsKey('codex', legacy('128000')))
-      .not.toBe(cliContextSettingsKey('codex', legacy('256000')))
-    expect(cliContextSettingsKey('codex', legacy('SENTINEL-PRIVATE-HEADER-value-123'))).toBeNull()
+    const key = cliContextSettingsKey('claude', agent([]))
+    expect(key).not.toBeNull()
     for (const overrides of [
-      [{ key: 'model_context_window', value: '128000; secret' }],
-      [{ key: 'model_context_window', value: '0' }],
-      [{ key: 'model_context_window', value: '1.5' }],
-      [{ key: 'model_context_window', value: '999999999999999999999' }],
-      [{ key: 'model_context_window', value: '128000' }, { key: 'model_context_window', value: '256000' }],
+      [{ key: 'model_context_window', value: '128000' }],
       [{ key: 'other.setting', value: 'opaque' }],
-      [{ value: 128000 }],
       'malformed'
-    ]) expect(cliContextSettingsKey('codex', agent(overrides))).toBeNull()
+    ]) {
+      expect(cliContextSettingsKey('claude', agent(overrides))).toBe(key)
+    }
+    expect(JSON.parse(key!).contextOverrides).toEqual([])
   })
 
   it('never matches missing or null keys across settings reads', () => {
     const report = {
-      runtime: 'codex' as const, model: 'gpt-6-sol', contextWindow: 258_400,
+      runtime: 'claude' as const, model: 'claude-sonnet-5-5', contextWindow: 1_000_000,
       evidence: 'runtime' as const
     }
     expect(matchingCliContextReport(report, null)).toBeNull()

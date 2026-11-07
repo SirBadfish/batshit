@@ -26,7 +26,7 @@ This is Batshit's first **informational** Portable Skill. It performs no Batshit
 1. **Read before you claim.** For anything beyond top-level orientation, read the matching reference file from this bundle first. Do not answer from memory about Batshit UI paths, settings, or behavior.
 2. **Relay documented steps faithfully.** References are written to the Batshit user ("open Settings -> ..."). Pass those steps along accurately; do not improvise extra steps or rename controls.
 3. **Say when the docs don't cover it.** If no reference answers the question, say so plainly instead of inventing behavior, and suggest the closest documented path or a bug report via Batshit Settings -> Admin -> Diagnostics.
-4. **Mind the install lane.** Batshit runs as the Mac app or Docker (peer options — neither is "the default"), and some steps differ by lane. Check or ask which lane the user runs before quoting lane-specific steps. Never present source-checkout/dev launchers as normal user steps.
+4. **Mind the install lane.** Batshit runs as the Mac app, Docker, or Pinokio within the guide’s stated platform limits, and some steps differ by lane. Check or ask which lane the user runs before quoting lane-specific steps. Never present source-checkout/dev launchers as normal user steps.
 5. **Follow page links through the map.** Product pages retain their original UserDocs links, but the bundled reference filenames are flat. For a relative `.md` link, open `references/reference-paths.md` on demand: find the current reference's original UserDocs path, resolve the link relative to it, and open the target's mapped `references/<file>` path. For example, from `judge-juice-overview.md`, `../groups/overview.md` resolves to `groups/overview.md`, then to `references/groups-overview.md`. Keep any `#section` anchor when finding the target section.
 
 ## Finding The Right Reference
@@ -36,7 +36,7 @@ Reference filenames are flattened UserDocs paths: `<section>-<page>.md`. List th
 `reference-paths.md` maps every original UserDocs source path to its flat reference path when you need to follow a link inside a page.
 
 - `quick-start-*`, `architecture-overview.md` — orientation; `architecture-overview.md` is the best "how does Batshit actually work" read.
-- `installation-*` — choosing Mac app vs Docker, installing either, first run, Docker add-ons, updating.
+- `installation-*` — choosing Mac app, Docker or Pinokio, platform limits, installation, first run, Docker add-ons and updates.
 - `providers-*` — AI providers, API keys, models, Model Catalog/Presets.
 - `security-overview.md` — trust model and boundaries.
 - `primary-agents-*`, `subagents-overview.md`, `groups-overview.md` — the two Primary Agent types (API and CLI), the three Subagent lanes, and Group Chat.

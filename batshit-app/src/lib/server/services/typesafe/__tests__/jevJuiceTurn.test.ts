@@ -376,7 +376,7 @@ describe('smart zip after the reply (runPostTurn)', () => {
     )
     expect(calls.writeRezips).toHaveBeenCalledWith('session-1', [
       { zipId: 'zip_pkg', description: 'read_file: package.json - 142 lines', done: 0.93, again: 0.16 }
-    ])
+    ], { onSkipped: expect.any(Function) })
     expect(calls.publish).toHaveBeenCalledWith('josh', {
       type: 'zip_state_changed',
       sessionId: 'session-1',
@@ -402,11 +402,14 @@ describe('smart zip after the reply (runPostTurn)', () => {
   })
 
   it('the user or the agent winning the write is reported, and nobody is told about a rezip that did not happen', async () => {
-    const { turn, calls } = postTurn({}, { writeRezips: vi.fn(async () => []) })
+    const { turn, calls } = postTurn({}, { writeRezips: vi.fn(async (_session, _items, options) => {
+      options.onSkipped({ zipId: 'zip_pkg', reason: 'explicit_state' })
+      return []
+    }) })
     expect(await turn.runPostTurn({ messageId: 'msg-9', reply: 'Done.', newZipIds: ['zip_pkg'] })).toEqual([])
     expect(calls.publish).not.toHaveBeenCalled()
     expect(calls.appendRecords).toHaveBeenCalledTimes(1)
-    expect((calls.appendRecords.mock.calls[0] as any)[2][0].detail).toBe('1 left alone: the user or the agent changed it first')
+    expect((calls.appendRecords.mock.calls[0] as any)[2][0].detail).toBe('1 left alone: zip_pkg (explicit_state)')
   })
 
   it('no record means nothing happened: no write, no notice, no row; an empty reply is never judged', async () => {
@@ -995,6 +998,49 @@ describe('a reply that a later run finishes (BL-527)', () => {
     })
   })
 
+  /**
+   * BL-1443: a context continuation of a CLI control-approval resume. The resume ran out of room, so
+   * a continuation finishes the reply the card split; walking back from its failed part lands on the
+   * approval note, and the same chain rule carries it over the note to the card's reply.
+   */
+  describe('a context continuation of a CLI control-approval resume (findContextContinuationTurn, BL-1443)', () => {
+    const request = { id: 'u1', role: 'user', content: REQUEST }
+    const CARD = {
+      id: 'msg-card',
+      role: 'assistant',
+      content: 'I need your approval to import the skill.',
+      metadata: { toolApprovals: null, answeredApprovalIds: ['apr_one'] }
+    }
+    const NOTE = {
+      id: 'n1',
+      role: 'user',
+      content: '[Approval — from the user, not from the agent]\nApproved: Skill Import (sys.skill.import, approval apr_one).\nRun it now by calling the same ref with the same input.',
+      metadata: { approvalResume: { approvalIds: ['apr_one'] } }
+    }
+    const HELD = { id: 'h1', role: 'user', content: 'Also count them.', metadata: { waitsForApproval: { messageId: 'msg-card' } } }
+    const RESUMED = { id: 'r1', role: 'assistant', content: 'Importing it now.', metadata: { response_failed: true, failure_kind: 'context_exhausted' } }
+
+    it('judges the whole reply, the card\'s part included, against the request (and the words held for the card)', () => {
+      const continued = findContextContinuationTurn([...BEFORE, request, CARD, HELD, NOTE, RESUMED], 'r1')
+      expect(continued).toEqual({
+        request: `${REQUEST}\n\nAlso count them.`,
+        history: BEFORE,
+        earlierParts: [earlierReplyPartOf(CARD), earlierReplyPartOf(RESUMED)]
+      })
+      expect(findContextContinuationTurn([...BEFORE, request, CARD, NOTE, RESUMED], 'r1')?.request).toBe(REQUEST)
+    })
+
+    it('never takes the note, or any message carrying the resume mark, for the request', () => {
+      // The reply before the note did not answer the approvals it names: nothing, never the note.
+      const unanswered = { ...CARD, metadata: { toolApprovals: null } }
+      expect(findContextContinuationTurn([...BEFORE, request, unanswered, NOTE, RESUMED], 'r1')).toBeNull()
+      // A note with no reply before it.
+      expect(findContextContinuationTurn([NOTE, RESUMED], 'r1')).toBeNull()
+      // A marked message with no ids it can name.
+      expect(findContextContinuationTurn([...BEFORE, { ...NOTE, metadata: { approvalResume: {} } }, RESUMED], 'r1')).toBeNull()
+    })
+  })
+
   describe('the steps it gets (buildContinuedReplySteps)', () => {
     const steps = (overrides: Record<string, unknown> = {}) =>
       buildContinuedReplySteps({
@@ -1134,5 +1180,15 @@ describe('a reply that a later run finishes (BL-527)', () => {
       expect(facts.earlierToolLabels).toEqual([])
       expect(d.appendRecords).toHaveBeenCalledWith('session-1', 'msg-card', [{ feature: 'reply_check', status: 'ok' }])
     })
+  })
+})
+
+
+describe('API original lineage admission', () => {
+  it('does not turn a body/model management marker into a whole-reply lineage', async () => {
+    const { originalApiContinuationReplyTurn } = await import('../jevJuiceTurn')
+    const before = computeReplyCheck.mock.calls.length + computeSmartZipRezips.mock.calls.length
+    await expect(Reflect.apply(originalApiContinuationReplyTurn, undefined, [{ managementContinuation: true, messageId: 'forged', response_failed: true }])).rejects.toThrow()
+    expect(computeReplyCheck.mock.calls.length + computeSmartZipRezips.mock.calls.length).toBe(before)
   })
 })

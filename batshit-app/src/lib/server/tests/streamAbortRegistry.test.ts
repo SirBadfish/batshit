@@ -12,9 +12,9 @@ import {
   endSessionDelete,
   getActiveSessionTurn,
   getActiveStream,
-  getRunCredentialStopSignal,
   getRunningReplyStopSignal,
   hasRunningRequest,
+  isRegisteredRunningRequest,
   hasTurnStartedAfter,
   isSessionDeleting,
   isSessionTurnFinishing,
@@ -25,7 +25,6 @@ import {
   registerSessionTurn,
   registerStreamAbort,
   releaseSessionTurn,
-  RETIRED_REPLY_STOP_REASON,
   stopRunningRequests,
   stopSessionTurn
 } from '../services/streamAbortRegistry'
@@ -36,6 +35,25 @@ describe('streamAbortRegistry', () => {
     // A hard reset, not `clearSessionTurn`: an id-less release no longer deletes a live
     // owned lock, so teardown cannot rely on it.
     __resetStreamAbortRegistryForTests()
+  })
+
+  it('recognizes only the exact running request object until actual request release', () => {
+    const registration = registerSessionTurn('exact-request', 'single', 'exact-reply')
+    expect(registration.ok).toBe(true)
+    if (!registration.ok) throw new Error('registration refused')
+    const entry = registration.entry
+    expect(isRegisteredRunningRequest('exact-request', entry)).toBe(true)
+    expect(isRegisteredRunningRequest('wrong-session', entry)).toBe(false)
+    expect(isRegisteredRunningRequest('exact-request', { ...entry })).toBe(false)
+    // A lock may go while the request remains responsible for physical cleanup.
+    clearSessionTurn('exact-request', 'exact-reply')
+    expect(getActiveSessionTurn('exact-request')).toBeNull()
+    expect(isRegisteredRunningRequest('exact-request', entry)).toBe(true)
+    releaseSessionTurn('exact-request', entry.turnId)
+    expect(isRegisteredRunningRequest('exact-request', entry)).toBe(false)
+    const replacement = registerSessionTurn('exact-request', 'single', 'exact-reply')
+    expect(replacement.ok).toBe(true)
+    expect(isRegisteredRunningRequest('exact-request', entry)).toBe(false)
   })
 
   it('allows only one active session turn per session', () => {
@@ -639,59 +657,4 @@ describe('streamAbortRegistry', () => {
     })
   })
 
-  describe('BL-1321: the Stop a run credential hears', () => {
-    it('gives a primary run its own reply’s Stop while that reply runs, and the stopped one after a Stop', () => {
-      const reply = new AbortController()
-      registerStreamAbort('session-1', 'reply-1', reply)
-
-      const signal = getRunCredentialStopSignal({ sessionId: ' session-1 ', messageId: 'reply-1' })
-      expect(signal).toBe(reply.signal)
-      expect(signal?.aborted).toBe(false)
-
-      abortStream('session-1', 'user')
-      expect(getRunCredentialStopSignal({ sessionId: 'session-1', messageId: 'reply-1' })?.aborted).toBe(true)
-    })
-
-    it('gives a retired primary run an already-aborted Stop, never a newer reply’s', () => {
-      const earlier = new AbortController()
-      registerStreamAbort('session-1', 'reply-earlier', earlier)
-      clearStreamAbort('session-1', 'reply-earlier')
-
-      // Its reply is gone and nothing runs: before BL-1321 the call had no Stop at all.
-      const gone = getRunCredentialStopSignal({ sessionId: 'session-1', messageId: 'reply-earlier' })
-      expect(gone?.aborted).toBe(true)
-      expect(gone?.reason).toBe(RETIRED_REPLY_STOP_REASON)
-
-      // A newer reply runs: before BL-1321 the call heard that reply's live Stop.
-      const newer = new AbortController()
-      registerStreamAbort('session-1', 'reply-newer', newer)
-      const replaced = getRunCredentialStopSignal({ sessionId: 'session-1', messageId: 'reply-earlier' })
-      expect(replaced).not.toBe(newer.signal)
-      expect(replaced?.aborted).toBe(true)
-      expect(replaced?.reason).toBe(RETIRED_REPLY_STOP_REASON)
-      expect(newer.signal.aborted).toBe(false)
-    })
-
-    it('keeps the chat’s running reply for a Subagent or Worker run and for a credential that names no reply', () => {
-      const parent = new AbortController()
-      registerStreamAbort('session-1', 'reply-parent', parent)
-
-      // A delegated credential names its own run id, never a Stop entry: it hears its parent.
-      expect(getRunCredentialStopSignal({ sessionId: 'session-1', messageId: 'subagent-s-1', delegated: true }))
-        .toBe(parent.signal)
-      expect(getRunCredentialStopSignal({ sessionId: 'session-1', messageId: '', delegated: false }))
-        .toBe(getRunningReplyStopSignal('session-1'))
-      expect(getRunCredentialStopSignal({ sessionId: 'session-1' })).toBe(parent.signal)
-
-      clearStreamAbort('session-1', 'reply-parent')
-      expect(getRunCredentialStopSignal({ sessionId: 'session-1', messageId: 'subagent-s-1', delegated: true }))
-        .toBeUndefined()
-    })
-
-    it('gives no Stop when the credential names no chat', () => {
-      registerStreamAbort('session-1', 'reply-1', new AbortController())
-      expect(getRunCredentialStopSignal({ sessionId: '', messageId: 'reply-1' })).toBeUndefined()
-      expect(getRunCredentialStopSignal({})).toBeUndefined()
-    })
-  })
 })

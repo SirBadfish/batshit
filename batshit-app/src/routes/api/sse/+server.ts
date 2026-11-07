@@ -24,7 +24,7 @@ import {
 import { resolveUploadUrlForBrowser } from '$lib/server/services/batshitServerUrls'
 import { requireOwnedSession } from '$lib/server/services/routeSecurity'
 import { isTrustedInternalRequest } from '$lib/server/services/internalRequestAuth'
-import { isTrustedN8nSseCallbackRequest } from '$lib/server/services/n8nCallbackTokens'
+import { projectBrowserUserMessageEvent } from '$lib/server/services/browserSseEvent'
 import { normalizeAssignedSubagent } from '$lib/server/services/assignedSubagentNormalization'
 import { parseJsonLike, normalizeToolArgs } from '$lib/server/services/sseToolNormalization'
 import {
@@ -39,16 +39,7 @@ import {
   registerSseExternalSinks
 } from '$lib/server/sseExternalSubscriber'
 import {
-  buildClaudeApprovalReplayEvents,
-  isClaudeApprovalEvent
-} from '$lib/server/services/claudeApprovalEvents'
-import {
-  forgetClaudeApprovals,
-  listClaudeApprovalsForSession
-} from '$lib/server/services/claudeApprovalRegistry'
-import {
   clearAllReplyRecords,
-  hasReplyRecord,
   isLateReplyEvent,
   listReplayEvents,
   setChatForgetHook,
@@ -65,6 +56,7 @@ import {
   getActiveSessionTurn,
   getActiveStream,
   hasRunningRequest,
+  isMessageOfRunningRequest,
   keepAllQueuedSessionTurns,
   listWaitingQueuedSends,
   getQueueCardHold
@@ -187,24 +179,10 @@ export function _closeSseRuntimeResources(reason = 'shutdown'): Promise<void> {
 registerRuntimeShutdownTask('sse', _closeSseRuntimeResources)
 
 // The server's Redis subscriber (`sseExternalSubscriber.ts`) forwards the chat and user channels
-// to this route's listeners. It may have started before this module loaded (a managed Claude
-// run waits for it before launch, BL-496); events published before now reached no tab anyway.
+// to this route's listeners.
 registerSseExternalSinks({ session: forwardExternalEvent, user: forwardUserEvent })
 
 function forwardExternalEvent(sessionId: string, payload: any) {
-  // BL-496 (A2): a Claude approval card is part of its reply's replay, watched or not, in the
-  // order it came. Replay only: its events must not enter the end rebuild, which never held
-  // them (the card lives in the reply's `metadata.toolApprovals`, not in its text).
-  // Only for a reply still on record or a chat with a running request: a late event after the
-  // reply's end and cleanup must not create replay state nobody clears.
-  if (
-    isClaudeApprovalEvent(payload) &&
-    typeof payload.messageId === 'string' &&
-    payload.messageId &&
-    (hasReplyRecord(sessionId, payload.messageId) || hasRunningRequest(sessionId))
-  ) {
-    recordReplayOnlyEvent(sessionId, payload)
-  }
   const listeners = connections.get(sessionId)
   if (!listeners || listeners.size === 0) return
 
@@ -626,9 +604,6 @@ async function attachSessionListener(
 
   // If an active stream is in progress, replay it for this listener
   replayActiveStreamForListener(sessionId, controllerRef)
-  // BL-496 (A2): and a Claude approval card the buffer does not hold (it came before its
-  // reply's start, or the cap evicted it), from the server's record of it.
-  replayClaudeApprovalCardsForListener(sessionId, controllerRef)
   // BL-4: and the sends waiting in the chat's line, from the line itself.
   await replayQueuedSendsForListener(sessionId, controllerRef)
 
@@ -900,9 +875,16 @@ async function emitDetectedChunk(
 }
 
 /**
- * BL-489: the words of an `<error>` block that never closed go out as an ordinary chunk where
- * they were written: before a tool card, and when the reply ends. The detector holds them only
- * while the pair may still close, so a block never spans a tool card and a reply keeps its words.
+ * BL-489, BL-779: the words the zip detector holds go out as an ordinary chunk where they were
+ * written, so a block never spans a tool card and a reply keeps its words.
+ * - Before a tool card they are settled (`takeHeldText`): no more words come before the card, so a
+ *   pair held after a stray backtick is zipped now, and its reference goes out and is recorded
+ *   before the card. BL-871 (c): when the finalize closed the reply while that zip was written (a
+ *   stalled forward), the zips the settle made are removed again (no saved reply names them) and
+ *   this answers `reply_closed`, so the caller refuses its event.
+ * - When the reply ends with `complete` or `error` they go out as words (`releaseEndedReply`), and
+ *   the detector lets go of the reply: it was saved already (the finalize's flush took a recorded
+ *   reply's words, settled, before it closed it), so a zip made now would be named by no saved reply.
  */
 async function emitUnclosedZipText(
   sessionId: string,
@@ -910,10 +892,61 @@ async function emitUnclosedZipText(
   adapter: ReturnType<typeof getStreamAdapter>,
   controller: ReadableStreamDefaultController,
   options?: { endOfReply?: boolean }
-) {
-  const text = zipDetection.takeUnclosedText(sessionId, messageId, options)
+): Promise<'reply_closed' | null> {
+  if (options?.endOfReply) {
+    const words = zipDetection.releaseEndedReply(sessionId, messageId)
+    if (words) await emitDetectedChunk(sessionId, messageId, adapter, controller, words)
+    return null
+  }
+  const zipIdsBefore = new Set(referencedZipIds(zipDetection.getMessageReferences(sessionId, messageId)))
+  const text = await zipDetection.takeHeldText(sessionId, messageId)
+  if (isLateReplyEvent(sessionId, { type: 'chunk', messageId })) {
+    await removeZipsMadeAfterClose(sessionId, messageId, zipIdsBefore)
+    return 'reply_closed'
+  }
   if (text) {
     await emitDetectedChunk(sessionId, messageId, adapter, controller, text)
+  }
+  return null
+}
+
+/** The zip ids of the zip detector's references (each is made with its id). */
+function referencedZipIds(references: ReturnType<typeof zipDetection.getMessageReferences>): string[] {
+  return references
+    .map((ref) => ref.zipId)
+    .filter((id): id is string => typeof id === 'string' && id.length > 0)
+}
+
+/**
+ * BL-871 (c): the zips one chunk's detection made after the finalize closed its reply. Only the NEW
+ * ids the detector's list still holds are taken, and they leave the list in the same synchronous
+ * step: an id a rebuild already took is left to the finalize (the saved reply may name it), and a
+ * dropped one can no longer be taken by a later rebuild of the reply. Then each goes when no message
+ * of the chat names it (`removeUnclaimedZipsMadeByMessage` reads every message's claims, so a zip a
+ * saved reply names is never removed). A removal that fails is logged, never silent.
+ */
+async function removeZipsMadeAfterClose(sessionId: string, messageId: string, zipIdsBefore: Set<string>) {
+  const made = referencedZipIds(zipDetection.getMessageReferences(sessionId, messageId)).filter(
+    (zipId) => !zipIdsBefore.has(zipId)
+  )
+  if (made.length === 0) return
+  const dropped = referencedZipIds(zipDetection.dropMessageReferences(sessionId, messageId, made))
+  if (dropped.length === 0) return
+  try {
+    const removed = await redis.removeUnclaimedZipsMadeByMessage(sessionId, messageId, dropped)
+    console.warn('[SSE] BL-871: removed the zips a late chunk made after its reply was saved', {
+      sessionId,
+      messageId,
+      made: dropped,
+      removed
+    })
+  } catch (removeError) {
+    console.error('[SSE] BL-871: the zips a late chunk made after its reply was saved could not be removed', {
+      sessionId,
+      messageId,
+      zipIds: dropped,
+      error: removeError instanceof Error ? removeError.message : String(removeError)
+    })
   }
 }
 
@@ -940,6 +973,16 @@ async function processNDJSONLine(
   switch (eventType) {
     case 'begin':
     case 'start': {
+      const startMetadata = eventData.metadata || data.metadata || {}
+      // BL-871 (a): a start of a reply the finalize already closed is late unless it opens a newer
+      // approval resume part. Checked again here, after the POST's awaits and before this start
+      // touches the chat's caches or its stream adapter; `startReplyRecord` checks once more at
+      // the write. Refused, it reaches no tab and leaves the saved reply's record as it is.
+      if (isLateReplyEvent(sessionId, { type: 'start', messageId, metadata: startMetadata })) {
+        console.warn('[SSE] BL-871: refused a late start of a reply already saved', { sessionId, messageId })
+        return { refused: 'reply_closed' }
+      }
+
       // New stream → reset per-session caches so agent/subagent resolution stays correct
       agentSettingsCache.delete(sessionId)
       sessionSubagentCache.delete(sessionId)
@@ -950,11 +993,13 @@ async function processNDJSONLine(
 
       const startEvent = await adapter.emitStart({
         messageId,
-        metadata: eventData.metadata || data.metadata || {}
+        metadata: startMetadata
       })
 
+      // Recorded first (it stamps the event's id, which the tab's copy then keeps), and only a
+      // recorded start is handed to the tabs.
+      if (!startReplyRecord(sessionId, startEvent)) return { refused: 'reply_closed' }
       enqueueWithTelemetry(sessionId, controller as SSEController, startEvent)
-      startReplyRecord(sessionId, startEvent)
       logger.debug('[SSE] Recorded start event for session', {
         sessionId,
         messageId
@@ -976,20 +1021,29 @@ async function processNDJSONLine(
 
       // BL-775: checked again right before the zip detection, because the awaits above can let the
       // finalize close the reply after this forward passed the POST's arrival check. A close that
-      // lands INSIDE one `processChunk` call is a known, narrow race (the detector can still make
-      // one zip no saved reply names); the record write refuses the chunk either way.
+      // lands INSIDE the `processChunk` call is handled right after it (BL-871 c, below); the
+      // record write refuses the chunk either way.
       if (isLateReplyEvent(sessionId, { type: 'chunk', messageId })) {
         console.warn('[SSE] BL-775: refused a late chunk of a reply already saved, before its zip detection', {
           sessionId,
           messageId
         })
-        break
+        return { refused: 'reply_closed' }
       }
 
       // Check for zip patterns and handle streaming to temporary storage. BL-759: the chunk's
       // segment goes along, so what the detector hands back and holds is that segment's.
       const segmentId = typeof data.segmentId === 'string' && data.segmentId ? data.segmentId : null
+      const zipIdsBefore = new Set(referencedZipIds(zipDetection.getMessageReferences(sessionId, messageId)))
       const processed = await zipDetection.processChunk(sessionId, messageId, content, segmentId)
+
+      // BL-871 (c): the finalize closed the reply while this chunk's zip detection ran (a forward
+      // past its limit, so the reply is a gap, saved from its own copy). A block the chunk closed
+      // was zipped after the finalize's sweep of the stream-made zips, so no saved reply names it.
+      if (isLateReplyEvent(sessionId, { type: 'chunk', messageId })) {
+        await removeZipsMadeAfterClose(sessionId, messageId, zipIdsBefore)
+        return { refused: 'reply_closed' }
+      }
 
       if (processed.shouldStream) {
         await emitDetectedChunk(sessionId, messageId, adapter, controller, processed.content, segmentId)
@@ -998,8 +1052,8 @@ async function processNDJSONLine(
     }
 
     case 'text_retract': {
-      // BL-759: a managed lane took back a segment of this reply (a Codex message that dropped
-      // and was started again). `retractReplySegment` takes its chunks out of the record and the
+      // BL-759: a managed lane took back a segment of this reply (a message the removed Codex CLI
+      // lane dropped and started again). `retractReplySegment` takes its chunks out of the record and the
       // replay, rewinds the zip detector, and removes a zip made from its words. Every tab then
       // gets the reply's text as it now reads, and so does a tab that joins later (the replay).
       // The retract itself is not recorded or sent to a tab: it has no words of its own.
@@ -1047,7 +1101,8 @@ async function processNDJSONLine(
     }
 
     case 'tool_start': {
-      await emitUnclosedZipText(sessionId, messageId, adapter, controller)
+      // The held words, settled, go before the card (BL-779); refused when the reply closed meanwhile.
+      if (await emitUnclosedZipText(sessionId, messageId, adapter, controller)) return { refused: 'reply_closed' }
       const toolCallId =
         data.toolCallId ||
         eventData.toolCallId ||
@@ -1077,7 +1132,7 @@ async function processNDJSONLine(
     }
 
     case 'tool-call': {
-      await emitUnclosedZipText(sessionId, messageId, adapter, controller)
+      if (await emitUnclosedZipText(sessionId, messageId, adapter, controller)) return { refused: 'reply_closed' }
       const toolCallId =
         data.toolCallId ||
         eventData.toolCallId
@@ -1344,11 +1399,18 @@ async function processNDJSONLine(
     case 'steer_queued':
     case 'steer_delivered':
     case 'steer_promoted': {
+      // BL-903 (b): a queued send's Queued bubble says whether its line holds for an approval card,
+      // as the line has it now, by the joining tab's replay rule (no hold while a turn holds the chat).
+      const lineHold =
+        eventType === 'steer_queued' && data.queuedSend
+          ? (getActiveSessionTurn(sessionId) ? null : getQueueCardHold(sessionId))
+          : undefined
       const steerEvent = {
         type: eventType,
         sessionId,
         ...data,
-        ...eventData
+        ...eventData,
+        ...(lineHold !== undefined ? { heldForApprovalCard: lineHold ? { messageId: lineHold.messageId } : null } : {})
       }
       enqueueWithTelemetry(sessionId, controller as SSEController, steerEvent)
       // BL-4: a send waiting in the chat's line is replayed from the line itself
@@ -1369,13 +1431,21 @@ async function processNDJSONLine(
      */
     case 'user_message':
     case 'queued_send_dropped':
-    // BL-713: the chat's line starts or stops holding for an approval card.
+    // BL-713: the chat's line starts or stops holding for an approval card. BL-903 (b): its notices
+    // come from different requests and can arrive in any order, so every tab gets the hold as the
+    // line has it now (read in this same step as the enqueue, by the replay's rule), never the
+    // notice's own claim: a late notice only repeats the current state.
     case 'queued_send_hold': {
+      const lineHold =
+        eventType === 'queued_send_hold'
+          ? (getActiveSessionTurn(sessionId) ? null : getQueueCardHold(sessionId))
+          : undefined
       enqueueWithTelemetry(sessionId, controller as SSEController, {
         type: eventType,
         sessionId,
         ...data,
-        ...eventData
+        ...eventData,
+        ...(lineHold !== undefined ? { heldForApprovalCard: lineHold ? { messageId: lineHold.messageId } : null } : {})
       })
       break
     }
@@ -1525,19 +1595,16 @@ export const POST: RequestHandler = async ({ request, locals }) => {
   } catch {
     throw error(400, 'Invalid JSON body')
   }
-  const { sessionId } = data
+  const sessionId = data && typeof data === 'object' ? data.sessionId : undefined
 
   if (!sessionId) {
     throw error(400, 'Session ID is required')
   }
 
   const isInternalForward = isTrustedInternalRequest(request)
-  const isTrustedCallback =
-    isInternalForward ||
-    (await isTrustedN8nSseCallbackRequest(request, data))
 
   let sessionOwnerId: string | null = null
-  if (isTrustedCallback) {
+  if (isInternalForward) {
     const session = await redis.getSession(sessionId)
     if (!session) {
       throw error(404, 'Session not found')
@@ -1550,6 +1617,39 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
     const sessionCheck = await requireOwnedSession(sessionId, locals.user.id)
     if (!sessionCheck.ok) return sessionCheck.response
+
+    const projected = projectBrowserUserMessageEvent(data, {
+      sessionId: sessionCheck.value.id,
+      userId: locals.user.id
+    })
+    if (!projected.ok) return json({ error: projected.error }, { status: projected.status })
+
+    // A browser marker can precede its ordinary user-message save, but cannot relabel a
+    // running or stored server-owned reply through the tab's user_message handler.
+    const userMessage = projected.event.message
+    if (isMessageOfRunningRequest(sessionCheck.value.id, userMessage.id)) {
+      return json({ error: 'A browser cannot broadcast a server reply as a user message.' }, { status: 403 })
+    }
+    const stored = await redis.execute((client) =>
+      client.json.get(`message:${sessionCheck.value.id}:${userMessage.id}`)
+    ) as Record<string, unknown> | null
+    if (stored && (stored.role !== 'user' || stored.id !== userMessage.id ||
+        stored.session_id !== sessionCheck.value.id || stored.user_id !== locals.user.id)) {
+      return json({ error: 'A browser cannot replace another message identity.' }, { status: 403 })
+    }
+    const currentSession = await requireOwnedSession(sessionCheck.value.id, locals.user.id)
+    if (!currentSession.ok) return currentSession.response
+    if (isMessageOfRunningRequest(sessionCheck.value.id, userMessage.id)) {
+      return json({ error: 'A browser cannot broadcast a server reply as a user message.' }, { status: 403 })
+    }
+
+    const listeners = connections.get(sessionCheck.value.id)
+    if (!listeners?.size) return json({ success: false, message: 'No active SSE connection' })
+    for (const controller of listeners) {
+      enqueueWithTelemetry(sessionCheck.value.id, controller, projected.event)
+    }
+    // Browser broadcasts never enter a reply adapter, zip detector or replay/save record.
+    return json({ success: true })
   }
 
   // BL-775: a content or tool event of a reply whose finalize already rebuilt it is late (a slow
@@ -1573,7 +1673,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
   // SA-113 P1 / AMD-113-01 — a woken turn is watchable even before anyone watches it.
   //
-  // Dropping events for an unwatched session is right for an async n8n callback, but a
+  // Dropping events for an unwatched session is right when nothing runs there, but a
   // wake-up opens a real user-facing chat. The P0 spike measured the cost: a tab opened
   // 7 s into a headless turn received no `start`, no `tool-call`, and none of the first
   // chunks, so the reply appeared to begin mid-sentence. Running the event through the
@@ -1699,25 +1799,6 @@ function replayActiveStreamForListener(sessionId: string, controller: SSEControl
   }
 }
 
-/**
- * BL-496 (A2): a Claude approval card the replay does not hold (it came before its reply's start,
- * or the cap evicted it), from the server's record of it.
- */
-function replayClaudeApprovalCardsForListener(sessionId: string, controller: SSEController) {
-  const buffered = new Set(
-    listReplayEvents(sessionId)
-      .filter((event) => event.type === 'tool-call' && isClaudeApprovalEvent(event))
-      .map((event) => event.toolCallId)
-  )
-  for (const record of listClaudeApprovalsForSession(sessionId)) {
-    // A card whose run ended is in that reply's `end` and its saved record.
-    if (record.runEndedAt !== null || buffered.has(record.approvalId)) continue
-    for (const event of buildClaudeApprovalReplayEvents(record)) {
-      enqueueWithTelemetry(sessionId, controller, event)
-    }
-  }
-}
-
 function removeController(sessionId: string, controller: SSEController) {
   const sessionControllers = connections.get(sessionId)
   if (!sessionControllers || !sessionControllers.has(controller)) {
@@ -1781,6 +1862,16 @@ function enqueueWithTelemetry(sessionId: string, controller: SSEController, payl
   }
 }
 
+/**
+ * What one POST hands to the chat's tabs once its event is processed (`processNDJSONLine` runs with
+ * this collector, and the POST then sends what it collected to every listener).
+ *
+ * BL-871 (b): a content or tool event of a reply the finalize closed while this POST was awaiting
+ * (after its arrival check, during the zip detection, the metadata reads, or the adapter) is not
+ * collected. Every case enqueues such an event and records it (`recordReplyEvent`) in one
+ * synchronous step, and the record refuses it then, so the tabs get exactly what the record took:
+ * never words or a tool card the saved reply does not hold.
+ */
 function createCollectingController(sessionId: string) {
   const events: StreamEventPayload[] = []
   const controller = {
@@ -1791,7 +1882,16 @@ function createCollectingController(sessionId: string) {
       const payloadText = chunk.slice(6).trim()
       if (!payloadText) return
       try {
-        events.push(JSON.parse(payloadText))
+        const payload = JSON.parse(payloadText)
+        if (isLateReplyEvent(sessionId, payload)) {
+          console.warn('[SSE] BL-871: a late event of a reply already saved was not sent to the tabs', {
+            sessionId,
+            messageId: payload?.messageId,
+            type: payload?.type
+          })
+          return
+        }
+        events.push(payload)
       } catch (error) {
         logger.warn('[SSE] Failed to parse collected event payload', {
           sessionId,
@@ -1806,15 +1906,11 @@ function createCollectingController(sessionId: string) {
 
 /**
  * A message reached its terminal event: its recorded events go 5 s later (a tab that joins in
- * that window still gets the finished reply). Then its Claude cards' record (BL-496: its `end`
- * carried them and the finalize saved them), and, when the chat has nothing left recorded, the
+ * that window still gets the finished reply). Then, when the chat has nothing left recorded, the
  * zip settings an unwatched run loaded.
  */
 function scheduleActiveStreamCleanup(sessionId: string, messageId?: string) {
   scheduleReplyRecordCleanup(sessionId, messageId, {
-    onMessageCleared: () => {
-      if (messageId) forgetClaudeApprovals(sessionId, messageId)
-    },
     onChatEmpty: () => releaseUnwatchedChatState(sessionId)
   })
 }

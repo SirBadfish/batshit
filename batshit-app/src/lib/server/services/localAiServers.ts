@@ -96,6 +96,19 @@ async function loadRecord(userId: string, id: LocalAiServerId): Promise<LocalAiS
   })
 }
 
+/** Selection admission reads only this stored connection, never its running program. */
+export async function readStoredLocalAiServer(userId: string, id: LocalAiServerId) {
+  const definition = LOCAL_AI_SERVER_DEFINITIONS.find(entry => entry.id === id)
+  if (!definition) throw new Error('Unknown local AI server')
+  const key = providerKey(userId, id)
+  const raw = await redis.json.getRaw(key, '$')
+  const decoded = raw === null ? null : JSON.parse(raw)
+  if (decoded !== null && (!Array.isArray(decoded) || decoded.length !== 1 || !decoded[0] || typeof decoded[0] !== 'object' || Array.isArray(decoded[0]))) {
+    throw new Error('The saved Local AI connection is unreadable.')
+  }
+  return { key, raw: raw ?? '', summary: buildSummary(definition, decoded?.[0] ?? null) }
+}
+
 /**
  * Every Local AI server, each with its saved record or, when none was ever saved, its default.
  *

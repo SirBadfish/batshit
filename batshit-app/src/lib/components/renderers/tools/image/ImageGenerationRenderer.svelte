@@ -4,6 +4,7 @@
   import ImageRenderer from '../../content/ImageRenderer.svelte'
   import { api } from '$lib/services/api'
   import type { ToolData } from '../toolRendererRegistry'
+  import { zipIdOfReference } from '$lib/utils/messageZipIds'
 
   let { tool } = $props<{ tool: ToolData }>()
 
@@ -17,10 +18,8 @@
     tokens?: number
   }>>([])
 
-  const extractZipId = (ref: string): string | null => {
-    const match = ref.match(/\{\{batshit-zip:([^:}]+)(?::::[^}]*)?\}\}/)
-    return match ? match[1] : null
-  }
+  // BL-609: the trust reader's one shape.
+  const extractZipId = (ref: string): string | null => zipIdOfReference(ref)
 
   const parseMaybeJson = (value: any) => {
     if (typeof value !== 'string') return value

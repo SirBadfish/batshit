@@ -1,3 +1,4 @@
+import './presetStorageScriptDouble'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SavedModel } from '$lib/types/savedModels'
 import { LOCAL_AI_SERVER_DEFINITIONS } from '$lib/data/localAiServers'
@@ -491,31 +492,8 @@ describe('normaliseSavedModel unknown price and context window (BL-67)', () => {
     expect(normalized.pricing).toEqual({ output: 15 })
   })
 
-  it.each([
-    ['codex-cli', 'openai-codex'],
-    ['claude-cli', 'anthropic-claude-cli']
-  ])(
-    'prices a %s preset at a real 0 because the user\'s plan pays for it',
-    async (connectionId, service) => {
-      const normalized = await routeModule._normaliseSavedModel(
-        {
-          id: `cli-${service}`,
-          modelName: 'CLI model',
-          provider: service,
-          modelId: 'some-cli-model',
-          purpose: 'chat',
-          connection: { id: connectionId, type: 'direct', service, useDeveloperPrefix: false },
-          pricing: {},
-          createdAt: '',
-          updatedAt: ''
-        } as SavedModel,
-        manager
-      )
-
-      expect(normalized.pricing).toEqual({ input: 0, output: 0, cachedInput: 0 })
-    }
-  )
-
+  // SA-139 R5: a Claude Code CLI preset is no longer saved (POST refuses it before this
+  // normaliser, `saved-models-create-update.test.ts`), so its plan-paid zero price is gone.
   it.each(LOCAL_AI_SERVER_DEFINITIONS.map(({ id }) => id))(
     'prices a %s Local AI preset at a real 0 because the local program is free',
     async (service) => {

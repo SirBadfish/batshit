@@ -52,8 +52,8 @@ export type CliRetiredClaudeModel = { value: string; label: string; leftOn: stri
 
 /**
  * BL-158 — every model Batshit's Claude CLI list once offered and no longer does (none so far:
- * nothing has left the list). The Codex list's rule applies: a stored model found here is
- * flagged in its settings and a run with it stops before Claude Code starts; a model id Batshit
+ * nothing has left the list). A stored model found here is flagged in its settings and a run
+ * with it stops before Claude Code starts; a model id Batshit
  * never listed is never refused. When a model leaves `CLAUDE_CLI_MODEL_CHOICES`, add it here.
  */
 export const CLAUDE_CLI_RETIRED_MODELS: ReadonlyArray<CliRetiredClaudeModel> = []

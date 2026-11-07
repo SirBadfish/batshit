@@ -6,6 +6,7 @@
     posture?: string
     postureLabel?: string
     tags?: string[]
+    disabled?: boolean
   }
 </script>
 
@@ -54,7 +55,8 @@
         sourceLabel: option.sourceLabel ?? null,
         posture: option.posture ?? '',
         postureLabel: option.postureLabel ?? 'Any Posture',
-        tags: Array.isArray(option.tags) ? option.tags : []
+        tags: Array.isArray(option.tags) ? option.tags : [],
+        disabled: option.disabled ?? false
       }))
       .filter((option) => option.name)
       .sort((left, right) => left.label.localeCompare(right.label) || left.name.localeCompare(right.name))
@@ -109,6 +111,7 @@
 {#snippet motionItem(motion: NormalizedMotionOption, showPosture = false)}
   <DropdownMenu.Item
     class={`goon-motion-picker-item ${motion.name === value ? 'is-selected' : ''}`}
+    disabled={motion.disabled}
     onSelect={() => selectMotion(motion.name)}
   >
     <span class="goon-motion-picker-option-copy">

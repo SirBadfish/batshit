@@ -5,7 +5,8 @@ export function retainCatalogSourceEntries<T extends { id: string }>(
   connectionId: string,
   fresh: T[],
   previous: T[],
-  retirements: readonly ConfirmedCatalogRetirement[] = CONFIRMED_CATALOG_RETIREMENTS
+  retirements: readonly ConfirmedCatalogRetirement[] = CONFIRMED_CATALOG_RETIREMENTS,
+  mergePresent?: (fresh: T, previous: T | undefined) => T
 ) {
   const present = new Set(fresh.map(entry => entry.id))
   const approved = new Set<string>()
@@ -21,8 +22,9 @@ export function retainCatalogSourceEntries<T extends { id: string }>(
   }
   const absent = previous.filter(entry => !present.has(entry.id))
   const missing = absent.filter(entry => !approved.has(entry.id))
+  const previousById = new Map(previous.map(entry => [entry.id, entry]))
   return {
-    entries: [...fresh, ...missing],
+    entries: [...fresh.map(entry => mergePresent ? mergePresent(entry, previousById.get(entry.id)) : entry), ...missing],
     pendingRemovalIds: [...new Set(missing.map(entry => entry.id))],
     confirmedRemovalIds: [...new Set(absent.filter(entry => approved.has(entry.id)).map(entry => entry.id))],
     warning: missing.length

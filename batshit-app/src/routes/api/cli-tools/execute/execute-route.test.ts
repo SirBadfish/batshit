@@ -68,10 +68,9 @@ describe('/api/cli-tools/execute — where a cli: pause pins its card', () => {
     } as any)
 
     expect(mocks.executeCliTool).toHaveBeenCalledWith(
-      expect.objectContaining({ sessionId: 'session-1', messageId: 'msg_1', processOwner: undefined }),
-      // The service lane has no bound chat, so no Stop (`stop-signal.test.ts`).
-      { abortSignal: undefined }
+      expect.objectContaining({ sessionId: 'session-1', messageId: 'msg_1' })
     )
+    expect(mocks.executeCliTool.mock.calls[0][0]).not.toHaveProperty('processOwner')
   })
 
   it('drops both when the session belongs to somebody else', async () => {
@@ -107,86 +106,7 @@ describe('/api/cli-tools/execute — where a cli: pause pins its card', () => {
     expect(params.sessionId).toBe('session-1')
     expect(params.messageId).toBeUndefined()
   })
-  /* ---------------------------------------------------------------------- *
-   * SA-117 P2 (DL-117-04) — the managed CLI helper moved to the `agent` lane.
-   * ---------------------------------------------------------------------- */
 
-  const agentLaneAuth = {
-    auth: 'agent',
-    userId: 'user-1',
-    agentId: 'agent-cooper',
-    sessionId: 'session-1',
-    credentialId: 'arc_test'
-  }
-
-  it('pins the card to the credential reply even when the body names another saved reply', async () => {
-    mocks.resolveNativeToolUser.mockResolvedValue({ ...agentLaneAuth, messageId: 'bound-reply' })
-    // The credential's reply is running, as it is for every live call (BL-1321: a primary run's
-    // call hears that reply's Stop; with its reply gone it would be refused before the tool).
-    const reply = new AbortController()
-    registerStreamAbort('session-1', 'bound-reply', reply)
-    await POST({ request: request({
-      toolId: 'repo_snapshot', sessionId: 'session-1', messageId: 'other-saved-reply'
-    }), locals: {} } as any)
-    expect(mocks.executeCliTool).toHaveBeenCalledWith(expect.objectContaining({ messageId: 'bound-reply' }), expect.objectContaining({ abortSignal: reply.signal }))
-  })
-
-  it('uses the bound agent and still reads the run project path', async () => {
-    // The project path check used to be `auth.auth === 'service'` only. The helper that
-    // sends it is on the agent lane now, so a route that forgot to widen the check would
-    // have silently run every user CLI tool outside its project.
-    mocks.resolveNativeToolUser.mockResolvedValue(agentLaneAuth)
-
-    await POST({
-      request: request({
-        toolId: 'repo_snapshot',
-        input: { query: 'x' },
-        sessionId: 'session-1',
-        projectPath: '/tmp/example-project'
-      }),
-      locals: {}
-    } as any)
-
-    const params = mocks.executeCliTool.mock.calls[0][0]
-    expect(params.agentId).toBe('agent-cooper')
-    expect(params.projectPath).toBe('/tmp/example-project')
-  })
-
-  it('refuses a body agentId that differs from the bound one', async () => {
-    mocks.resolveNativeToolUser.mockResolvedValue(agentLaneAuth)
-
-    const response = await POST({
-      request: request({
-        toolId: 'repo_snapshot',
-        input: { query: 'x' },
-        agentId: 'agent-faye'
-      }),
-      locals: {}
-    } as any)
-
-    expect(response.status).toBe(400)
-    expect((await response.json()).code).toBe('AGENT_MISMATCH')
-    expect(mocks.executeCliTool).not.toHaveBeenCalled()
-  })
-
-  it('passes the credential owner and ignores a forged body owner', async () => {
-    const owner = { userId: 'user-1', kind: 'subagent', id: 'stored-subagent' }
-    mocks.resolveNativeToolUser.mockResolvedValue({ ...agentLaneAuth,
-      agentId: 'subagent_cli_runtime', delegated: true, processOwner: owner })
-    await POST({ request: request({ toolId: 'repo_snapshot',
-      processOwner: { userId: 'user-1', kind: 'agent', id: 'agent-victim' } }), locals: {} } as any)
-    expect(mocks.executeCliTool).toHaveBeenCalledWith(
-      expect.objectContaining({ processOwner: owner }), expect.anything())
-  })
-
-  it('refuses a delegated command without a minted physical owner', async () => {
-    mocks.resolveNativeToolUser.mockResolvedValue({ ...agentLaneAuth,
-      agentId: 'subagent_cli_runtime', delegated: true })
-    const response = await POST({ request: request({ toolId: 'repo_snapshot' }), locals: {} } as any)
-    expect(response.status).toBe(403)
-    expect((await response.json()).code).toBe('OWNER_UNAVAILABLE')
-    expect(mocks.executeCliTool).not.toHaveBeenCalled()
-  })
 })
 
 /* ------------------------------------------------------------------------ *
@@ -203,37 +123,6 @@ describe('/api/cli-tools/execute — the saved CLI tools a caller may reach (BL-
 
   const run = (body: Record<string, unknown>) =>
     POST({ request: request(body), locals: {} } as any)
-
-  it("bounds an agent credential by its own list, whatever list the body names", async () => {
-    mocks.resolveNativeToolUser.mockResolvedValue({
-      auth: 'agent', userId: 'user-1', agentId: 'agent_a', sessionId: 'session-1',
-      cliToolScope: ['a_tool']
-    })
-    await run({ toolId: 'b_tool', selectedToolIds: ['b_tool'], cliToolScope: ['b_tool'] })
-
-    const params = mocks.executeCliTool.mock.calls[0][0]
-    expect(params.agentId).toBe('agent_a')
-    expect(params.cliToolScope).toEqual(['a_tool'])
-    expect(params.selectedToolIds).toEqual(['b_tool'])
-  })
-
-  it('gives an older agent credential with no list an empty one', async () => {
-    mocks.resolveNativeToolUser.mockResolvedValue({
-      auth: 'agent', userId: 'user-1', agentId: 'agent_a', sessionId: 'session-1'
-    })
-    await run({ toolId: 'a_tool' })
-    expect(mocks.executeCliTool.mock.calls[0][0].cliToolScope).toEqual([])
-  })
-
-  it('bounds a delegated run by its credential list too', async () => {
-    mocks.resolveNativeToolUser.mockResolvedValue({
-      auth: 'agent', userId: 'user-1', agentId: 'subagent_cli_helper', sessionId: 'session-1',
-      delegated: true, delegatedAllowedControlIds: [], cliToolScope: ['sub_tool'],
-      processOwner: { userId: 'user-1', kind: 'subagent', id: 'stored-subagent' }
-    })
-    await run({ toolId: 'global_tool' })
-    expect(mocks.executeCliTool.mock.calls[0][0].cliToolScope).toEqual(['sub_tool'])
-  })
 
   it("leaves the signed-in and service lanes on the named agent's saved list", async () => {
     for (const auth of [

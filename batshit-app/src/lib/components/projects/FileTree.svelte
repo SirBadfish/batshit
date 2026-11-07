@@ -7,7 +7,7 @@
 
 <div class="project-file-tree">
   {#each nodes as node}
-    <FileTreeNode {node} level={0} />
+    <FileTreeNode {node} level={0} NodeComponent={FileTreeNode} />
   {/each}
 </div>
 

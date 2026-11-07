@@ -51,13 +51,11 @@ describe('tool model result retention', () => {
 
   it('cuts server-classified memory results without raw storage or a fetch identifier', async () => {
     const getSession = vi.spyOn(redis, 'getSession')
-    const result = await guardToolModelText(source, {
-      ...context, memoryResult: true, modelTextBudget: { maxUtf8Bytes: 8_000, source: 'codex-fallback' }
-    })
+    const result = await guardToolModelText(source, { ...context, memoryResult: true })
     expect(result).toContain('Search again with a narrower query or a smaller limit, or recall one memory by its id.')
     expect(result).not.toContain('zipId')
     expect(result).not.toContain('offset')
-    expect(Buffer.byteLength(result)).toBeLessThanOrEqual(8_000)
+    expect(result.length).toBeLessThanOrEqual(96_000)
     expect(getSession).not.toHaveBeenCalled()
     expect(await redis.keys('zip:*')).toEqual([])
   })

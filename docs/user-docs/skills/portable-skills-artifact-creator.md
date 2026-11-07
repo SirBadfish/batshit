@@ -8,10 +8,10 @@ Use it when you want a full coding agent to author the artifact HTML and wiring 
 
 - Batshit running locally.
 - A Portable Skill Token with the `Artifacts` scope.
-- The downloaded `artifact-creator` Portable Skill bundle.
+- The `artifact-creator` skill from the current complete Batshit plugin.
 - A clear request for the artifact you want.
 
-Download links are listed in [Portable Skill downloads](../reference/portable-skills.md).
+Download the current package from **Settings → Plugins & shit → Plugins → Batshit → Download Plugin**; see [outside-agent setup](portable-skills.md).
 
 ## What the skill is allowed to do
 

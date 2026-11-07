@@ -128,3 +128,65 @@ describe('MarkdownRenderer file mentions', () => {
     expect(screen.getByRole('button', { name: /Code.*Ts.*\b1 line\b/i })).toBe(firstHeader)
   })
 })
+
+describe('MarkdownRenderer raw tags (BL-812)', () => {
+  it('shows a tag that is not HTML, written in prose, as its words', () => {
+    for (const [content, shown] of [
+      ['The server writes <error> before the text.', 'The server writes <error> before the text.'],
+      ['Close it with </error> after.', 'Close it with </error> after.'],
+      ['Name the <batshit-memory> tag here.', 'Name the <batshit-memory> tag here.'],
+      ['It returns Promise<void> now.', 'It returns Promise<void> now.'],
+      ['Use <error class="x">b</error> or <Terminal>.', 'Use <error class="x">b</error> or <Terminal>.']
+    ]) {
+      const { container, unmount } = render(MarkdownRenderer, { props: { content } })
+      expect(container.textContent?.trim()).toBe(shown)
+      unmount()
+    }
+  })
+
+  it('shows a non-HTML tag in a block of raw HTML too', () => {
+    const { container } = render(MarkdownRenderer, { props: { content: '<error>\nit broke\n</error>' } })
+    expect(container.textContent).toContain('<error>')
+    expect(container.textContent).toContain('</error>')
+    expect(container.querySelector('error')).toBeNull()
+  })
+
+  it('still hides the reasoning tags a thinking model leaves in its text, and keeps their words', () => {
+    for (const [content, shown] of [
+      ['<think>plan it</think> The answer is 4.', 'plan it The answer is 4.'],
+      ['plan it</think> The answer is 4.', 'plan it The answer is 4.'],
+      ['<thinking>hmm</thinking> Done. <reasoning>why</reasoning>', 'hmm Done. why']
+    ]) {
+      const { container, unmount } = render(MarkdownRenderer, { props: { content } })
+      expect(container.textContent?.trim()).toBe(shown)
+      unmount()
+    }
+  })
+
+  it('drops inline SVG in prose as before, and shows type names that are plain words', () => {
+    const { container, unmount } = render(MarkdownRenderer, { props: { content: 'An icon <svg viewBox="0 0 1 1"><circle r="1"/></svg> here.' } })
+    expect(container.textContent?.trim()).toBe('An icon  here.')
+    expect(container.querySelector('svg, circle')).toBeNull()
+    unmount()
+    const words = render(MarkdownRenderer, { props: { content: 'Use List<Set>, Array<Path>, or Map<Text>.' } })
+    expect(words.container.textContent?.trim()).toBe('Use List<Set>, Array<Path>, or Map<Text>.')
+  })
+
+  it('keeps allowed HTML as HTML and still drops unsafe HTML', () => {
+    const { container } = render(MarkdownRenderer, {
+      props: {
+        content:
+          'Keep <strong>bold</strong>. An <img src=x onerror="alert(1)"> and <script>alert(2)</script> and <foo onclick="alert(3)">x</foo>.'
+      }
+    })
+    expect(container.querySelector('strong')?.textContent).toBe('bold')
+    expect(container.querySelector('img')).toBeNull()
+    expect(container.querySelector('script')).toBeNull()
+    expect(container.querySelector('foo')).toBeNull()
+    expect(container.querySelector('[onerror], [onclick]')).toBeNull()
+    // The made-up tag is words, attributes included; the real ones are not.
+    expect(container.textContent).toContain('<foo onclick="alert(3)">x</foo>')
+    expect(container.textContent).not.toContain('<strong>')
+    expect(container.textContent).not.toContain('alert(2)')
+  })
+})

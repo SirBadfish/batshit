@@ -1,5 +1,6 @@
 import type { ClaudeAgentSettings } from '$lib/types/claude'
-import type { CodexAgentSettings } from '$lib/types/codex'
+import type { AgentReasoningOverridesPatch } from '$lib/types/reasoningControls'
+import { validateReasoningOverridesPatch } from '$lib/utils/modelReasoningControls'
 import type {
   AgentDcmDisplaySettings,
   AgentDcmGroupDisplayMode,
@@ -12,8 +13,8 @@ import type {
  * BL-848, BL-855: three agent blocks are written FIELD BY FIELD, so a save that changes one key
  * never carries an older copy of the others.
  *
- * - `codex_settings` and `claude_settings` (the Codex and Claude model, mode, reasoning, sandbox,
- *   directories, config overrides): each key a save names is written at `$.<field>["<key>"]`;
+ * - `claude_settings` (the Claude model, mode, reasoning, thinking, directories, config
+ *   overrides): each key a save names is written at `$.<field>["<key>"]`;
  * - `dcmDisplaySettings` (the Tool Grid display modes): `version` at its own key, and each ENTRY
  *   of the four maps (`groups`, `tools`, `groupDisplayPreferences`, `toolDisplayPreferences`, each
  *   keyed by a gateway or tool id) at `$.dcmDisplaySettings["<map>"]["<id>"]`.
@@ -37,44 +38,29 @@ import type {
  * - for `dcmDisplaySettings` a map sent as an object is written entry by entry the same way (the
  *   map is made an object first only when one of its entries is set); a map sent as `null` is
  *   removed;
- * - the block sent as `null` is a whole write of `null`: the Codex and Claude readers then use the
- *   older `codex_*` and `claude_*` keys of `provider_specific_settings`, and the Tool Grid readers
- *   the older `dcm_display_settings` name (which can bring older settings back); a block that is
+ * - the block sent as `null` is a whole write of `null`: the retired CLI Claude reader used the
+ *   older `claude_*` keys of `provider_specific_settings`, and the live Tool Grid readers use the
+ *   older `dcm_display_settings` name (which can bring older display settings back); a block that is
  *   neither an object nor null is refused.
  * Every OTHER agent field keeps its whole write: a list such as `defaultMCPGateways` is one value,
  * and a save names only the lists it changed.
  *
- * A few keys are ONE choice, not separate settings (BL-919): the Codex mode, its sandbox and its
- * approval; Claude's thinking switch and its budget. `CODEX_PERMISSION_GROUP` and
- * `CLAUDE_THINKING_GROUP` name them once, for the chat bar (`chatBarBlockSave`'s `group`) and for
- * Agent Settings (`diffAgentBlockWithGroups`): a control or form that sets one of these keys sends
- * the whole group, so a copy older than the record can never leave the record holding a MIX of its
- * pick and another window's (a sandbox or approval left over from another mode).
+ * A few keys are ONE choice, not separate settings (BL-919): Claude's thinking switch and its
+ * budget. `CLAUDE_THINKING_GROUP` and `diffAgentBlockWithGroups` retain that grouping rule for
+ * saved-block operations. The live CLI Claude Settings and chat-bar controls were retired; no
+ * current control reads or saves these keys as a run configuration.
  */
 
-export const AGENT_FIELD_BY_FIELD_BLOCKS = ['codex_settings', 'claude_settings', 'dcmDisplaySettings'] as const
-
-/**
- * BL-919: the keys of one Codex permission choice. The run reads the saved mode and sandbox
- * (`codexBridge.ts`); its approval is derived from the mode and the agent's Tool Approval, and the
- * saved `approval` reaches only the managed `config.toml` (`codexProfileManager.ts`), which the run
- * settings override. The three still go together: the record must never hold a mix the picker did
- * not show (one window's `permissionMode` with another's `sandbox`, or a config file that says
- * another mode's approval).
- */
-export const CODEX_PERMISSION_GROUP = ['permissionMode', 'sandbox', 'approval'] as const satisfies readonly (keyof CodexAgentSettings)[]
+export const AGENT_FIELD_BY_FIELD_BLOCKS = ['claude_settings', 'dcmDisplaySettings', 'model_reasoning_overrides'] as const
 
 /** BL-919: Claude's thinking switch and its budget (the budget only means something while the switch is on). */
 export const CLAUDE_THINKING_GROUP = ['alwaysThinkingEnabled', 'maxThinkingTokens'] as const satisfies readonly (keyof ClaudeAgentSettings)[]
 
-/**
- * BL-919: the groups Agent Settings sends whole, per block: a change to any key of a group sends all
- * of its keys (`diffAgentBlockWithGroups`). The Tool Grid display settings have none.
- */
+/** BL-919 grouped saved-block diffs: changing any key names the whole group. */
 export const AGENT_SETTINGS_KEY_GROUPS = {
-  codex_settings: [CODEX_PERMISSION_GROUP],
   claude_settings: [CLAUDE_THINKING_GROUP],
-  dcmDisplaySettings: []
+  dcmDisplaySettings: [],
+  model_reasoning_overrides: []
 } as const satisfies { [Field in AgentFieldByFieldBlock]: readonly (readonly string[])[] }
 
 export type AgentFieldByFieldBlock = (typeof AGENT_FIELD_BY_FIELD_BLOCKS)[number]
@@ -98,9 +84,9 @@ export interface AgentDcmDisplaySettingsSave {
 
 /** What a save of each block sends (`diffAgentBlock` builds it; the agent PUT writes it field by field). */
 export interface AgentBlockSaveByField {
-  codex_settings: AgentBlockSave<CodexAgentSettings>
   claude_settings: AgentBlockSave<ClaudeAgentSettings>
   dcmDisplaySettings: AgentDcmDisplaySettingsSave
+  model_reasoning_overrides: AgentReasoningOverridesPatch
 }
 
 /**
@@ -125,9 +111,9 @@ export class AgentBlockShapeError extends Error {
 }
 
 const BLOCK_LABELS: Record<AgentFieldByFieldBlock, string> = {
-  codex_settings: 'the Codex settings',
   claude_settings: 'the Claude settings',
-  dcmDisplaySettings: 'the Tool Grid display settings'
+  dcmDisplaySettings: 'the Tool Grid display settings',
+  model_reasoning_overrides: 'the model reasoning controls'
 }
 
 export function isAgentFieldByFieldBlock(field: string): field is AgentFieldByFieldBlock {
@@ -204,6 +190,10 @@ function shapeError(field: AgentFieldByFieldBlock, entry?: string): AgentBlockSh
  */
 export function planAgentBlockWrite(field: AgentFieldByFieldBlock, sent: unknown): AgentBlockWrite {
   if (sent === undefined) return { kind: 'steps', steps: [] }
+  if (field === 'model_reasoning_overrides') {
+    const error = validateReasoningOverridesPatch(sent)
+    if (error) throw new AgentBlockShapeError(`The setting "model_reasoning_overrides": ${error}`)
+  }
   if (sent === null) return { kind: 'whole', value: null }
   if (!isPlainObject(sent)) throw shapeError(field)
 
@@ -324,19 +314,19 @@ function diffBlock(field: AgentFieldByFieldBlock, baseline: unknown, next: unkno
 }
 
 /**
- * BL-919: `diffAgentBlock` for a form that sets GROUPS of keys as one choice (Agent Settings' Codex
- * and Claude sections). A group is sent WHOLE whenever ANY of its keys differs from `baseline`, with
+ * BL-919: `diffAgentBlock` for a saved-block operation that sets GROUPS of keys as one choice.
+ * The CLI Claude Settings form that used this was retired. A group is sent WHOLE whenever ANY
+ * of its keys differs from `baseline`, with
  * the values of `next` (a key `next` leaves out goes as `null`, a removal), even the keys that equal
  * the baseline. The baseline is the copy the form loaded or last saved, and the record may be newer
  * (the chat bar, a second window): a key left out because it equals that older copy would keep the
  * record's other value, and the record would end up holding a MIX of this pick and the other window's
- * (BL-919: Agent with another mode's sandbox). Every key outside the groups still goes by difference.
+ * (BL-919). Every key outside the groups still goes by difference.
  * `groups` is `AGENT_SETTINGS_KEY_GROUPS[field]` unless given.
  *
  * As `diffAgentBlock` otherwise: `undefined` when nothing changed (an unchanged group is not sent);
  * `null` for a `next` of `null` over a block that is an object; a block with no copy goes out whole
  * (its group keys `next` lacks as `null`, since another window may have created the block since).
- * The chat bar's own rule for its controls (always send the group they set) is `chatBarBlockSave`.
  */
 export function diffAgentBlockWithGroups<Field extends AgentFieldByFieldBlock>(
   field: Field,

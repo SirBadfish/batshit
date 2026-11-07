@@ -68,6 +68,11 @@ export class LipArtworkEngineRuntime {
     this.mesh.visible = this.enabled && this.contentVisible
   }
 
+  /** Actual presentation mesh; this is not a motion authority grant. */
+  getMotionMeshes(): readonly THREE.Mesh[] | null {
+    return this.disposed ? null : Object.freeze([this.mesh])
+  }
+
   setEnabled(enabled: boolean) {
     if (this.disposed) fail('cannot change presence after disposal')
     this.enabled = enabled

@@ -5,6 +5,7 @@ const mocks = vi.hoisted(() => ({
   getAgents: vi.fn(),
   getRecentMessages: vi.fn(),
   getUserSettings: vi.fn(),
+  jsonGet: vi.fn(),
   buildFormattedChatInput: vi.fn()
 }))
 
@@ -20,7 +21,7 @@ vi.mock('$lib/server/redis', () => ({
     getRecentMessages: mocks.getRecentMessages,
     getUserSettings: mocks.getUserSettings,
     json: {
-      get: vi.fn()
+      get: mocks.jsonGet
     }
   }
 }))
@@ -31,7 +32,7 @@ vi.mock('$lib/services/databaseRedis.server', () => ({
   }
 }))
 
-import { createLiveKitVoiceSession } from '$lib/server/services/liveKitVoiceRuntime'
+import { createLiveKitVoiceSession, LiveKitRetiredAgentError } from '$lib/server/services/liveKitVoiceRuntime'
 
 const liveKitTestOptions = {
   env: {
@@ -73,6 +74,8 @@ describe('createLiveKitVoiceSession speech-to-speech', () => {
     mocks.getRecentMessages.mockReset()
     mocks.getUserSettings.mockReset()
     mocks.buildFormattedChatInput.mockReset()
+    mocks.jsonGet.mockReset()
+    mocks.jsonGet.mockResolvedValue(null)
     liveKitTestOptions.tokenFactory.mockClear()
     liveKitTestOptions.dispatchFactory.mockClear()
     mocks.retrieve.mockResolvedValue('saved-xai-key')
@@ -115,7 +118,7 @@ describe('createLiveKitVoiceSession speech-to-speech', () => {
     })
     mocks.buildFormattedChatInput.mockResolvedValue({
       primarySystemPrompt: [
-        '==== API PRIMARY SYSTEM PROMPT ====',
+        '==== PRIMARY AGENT SYSTEM PROMPT ====',
         'API Primary Agent base instructions with clips and Dynamic MCP.',
         '',
         '==== GLOBAL CUSTOM SYSTEM PROMPT ====',
@@ -221,7 +224,7 @@ describe('createLiveKitVoiceSession speech-to-speech', () => {
       adapterId: 'livekit-xai-grok-voice',
       modelId: 'grok-voice-think-fast-1.0',
       voiceId: 'ara',
-      instructions: expect.stringContaining('==== API PRIMARY SYSTEM PROMPT ===='),
+      instructions: expect.stringContaining('==== PRIMARY AGENT SYSTEM PROMPT ===='),
       surface: 'chat-input'
     })
     expect(dispatchMetadata.instructions).toContain('==== GLOBAL CUSTOM SYSTEM PROMPT ====')
@@ -250,7 +253,6 @@ describe('createLiveKitVoiceSession speech-to-speech', () => {
       [],
       'user-1',
       expect.objectContaining({
-        runtimeFlavor: 'vercel',
         voiceState: expect.objectContaining({
           voiceMode: 'speech-to-speech',
           provider: 'livekit'
@@ -262,6 +264,37 @@ describe('createLiveKitVoiceSession speech-to-speech', () => {
         })
       })
     )
+  })
+
+  // SA-139 R2 (review M1): a stored assignment of a removed n8n Subagent type is never cleaned,
+  // so the voice roster must drop it the way send-routed does, not hand it to the compiler.
+  it('leaves an assigned Subagent of a removed n8n type off the voice roster and still starts', async () => {
+    mocks.getAgents.mockResolvedValue([
+      {
+        id: 'agent-1',
+        user_id: 'user-1',
+        displayName: 'Luna',
+        agentType: 'api',
+        assigned_subagent_ids: ['sub-api', 'sub-workflow']
+      }
+    ])
+    mocks.jsonGet.mockImplementation(async (key: string) => {
+      if (key === 'subagent:sub-api') return { id: 'sub-api', name: 'Researcher', subagentType: 'api' }
+      if (key === 'subagent:sub-workflow') {
+        return { id: 'sub-workflow', name: 'Old Flow', subagentType: 'n8n-workflow' }
+      }
+      return null
+    })
+    mocks.buildFormattedChatInput.mockResolvedValue({
+      primarySystemPrompt: 'You are Luna.',
+      structuredInput: { messages: [{ role: 'user', content: '<dynamic_info>\nx\n</dynamic_info>' }] }
+    })
+
+    await createLiveKitVoiceSession('user-1', createSpeechToSpeechRequest(), liveKitTestOptions)
+
+    const roster = mocks.buildFormattedChatInput.mock.calls[0][4] as Array<{ id: string }>
+    expect(roster.map((subagent) => subagent.id)).toEqual(['sub-api'])
+    expect(liveKitTestOptions.dispatchFactory).toHaveBeenCalledTimes(1)
   })
 
   it('fails speech-to-speech session creation when no selected agent is provided', async () => {
@@ -290,6 +323,36 @@ describe('createLiveKitVoiceSession speech-to-speech', () => {
     ).rejects.toThrow(
       'LiveKit speech-to-speech session could not start because Batshit could not load the selected agent prompt.'
     )
+    expect(liveKitTestOptions.tokenFactory).not.toHaveBeenCalled()
+    expect(liveKitTestOptions.dispatchFactory).not.toHaveBeenCalled()
+  })
+
+  // SA-139 R4 (D14): a stored CLI Primary is a retired type, so its session is refused before the
+  // compile (never compiled as an API agent) and before any room token or agent dispatch.
+  it('refuses a retired CLI Primary with LiveKitRetiredAgentError before compiling', async () => {
+    mocks.getAgents.mockResolvedValue([
+      {
+        id: 'agent-1',
+        user_id: 'user-1',
+        displayName: 'Luna',
+        agentType: 'cli',
+        primary_model_provider: 'anthropic-claude-cli',
+        primary_model_name: 'claude-cli'
+      }
+    ])
+    mocks.buildFormattedChatInput.mockResolvedValue({
+      primarySystemPrompt: 'You are Luna.',
+      structuredInput: { messages: [{ role: 'user', content: '<dynamic_info>\nx\n</dynamic_info>' }] }
+    })
+
+    const started = createLiveKitVoiceSession('user-1', createSpeechToSpeechRequest(), liveKitTestOptions)
+
+    await expect(started).rejects.toBeInstanceOf(LiveKitRetiredAgentError)
+    await expect(started).rejects.toMatchObject({ code: 'primary_agent_type_retired' })
+    await expect(started).rejects.toThrow(
+      'LiveKit speech-to-speech session could not start. The Claude Code CLI lane was removed from Batshit.'
+    )
+    expect(mocks.buildFormattedChatInput).not.toHaveBeenCalled()
     expect(liveKitTestOptions.tokenFactory).not.toHaveBeenCalled()
     expect(liveKitTestOptions.dispatchFactory).not.toHaveBeenCalled()
   })
@@ -362,7 +425,7 @@ describe('createLiveKitVoiceSession speech-to-speech', () => {
  */
 describe('createLiveKitVoiceSession speech-to-speech — dispatch metadata budget (BL-467)', () => {
   const SYSTEM_PROMPT = [
-    '==== API PRIMARY SYSTEM PROMPT ====',
+    '==== PRIMARY AGENT SYSTEM PROMPT ====',
     'API Primary Agent base instructions.'
   ].join('\n')
 
@@ -383,6 +446,8 @@ describe('createLiveKitVoiceSession speech-to-speech — dispatch metadata budge
     mocks.getRecentMessages.mockReset()
     mocks.getUserSettings.mockReset()
     mocks.buildFormattedChatInput.mockReset()
+    mocks.jsonGet.mockReset()
+    mocks.jsonGet.mockResolvedValue(null)
     liveKitTestOptions.tokenFactory.mockClear()
     liveKitTestOptions.dispatchFactory.mockClear()
     mocks.retrieve.mockResolvedValue(null)

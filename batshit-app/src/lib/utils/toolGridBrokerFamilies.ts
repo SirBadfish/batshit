@@ -1,6 +1,6 @@
 /**
  * Tool Grid rows for the two broker families that are not gateways and not CLI tools:
- * Fabric controls and published agent-usable Artifact runtime tools.
+ * Fabric controls with neutral utilities, and published agent-usable Artifact runtime tools.
  *
  * SA-096 P3. Both families were already reachable through the Batshit Tool Search/Use
  * broker but had no row in the Tool Grid, so a user could not say how much of either
@@ -32,11 +32,13 @@ import {
 } from './dcmDisplaySettings'
 
 export const FABRIC_TOOL_GRID_ID = '__fabric_controls__'
+// Stable saved-policy key. Never use this as the visible mixed-family heading.
 export const FABRIC_TOOL_GRID_GROUP_NAME = 'Fabric Controls'
+export const FABRIC_TOOL_GRID_DISPLAY_NAME = 'Fabric & Utilities'
 
 /**
  * SA-072 P2 step 0: the plain words the Fabric line in `tool_discovery` uses for each control
- * family, so `- Fabric Controls (65 tools: agent DMs, artifacts, …, Pinokio, …)` tells an
+ * family, so `- Fabric & Utilities (… tools: agent DMs, artifacts, …, Pinokio, …)` tells an
  * agent WHAT it can reach, not just how many. Without them a plain-words ask ("which apps do
  * I have in Pinokio?") never triggers a search, because nothing in the index names Pinokio.
  *
@@ -46,13 +48,14 @@ export const FABRIC_TOOL_GRID_GROUP_NAME = 'Fabric Controls'
  */
 export const FABRIC_CONTROL_FAMILY_LABELS: Readonly<Record<string, string>> = {
   ui: 'App Actions',
+  app_settings: 'App Actions',
   artifact: 'artifacts',
   cli_tool: 'CLI tools',
   comfyui: 'ComfyUI',
   dm: 'agent DMs',
   goon_scene: 'Goon scenes',
   judge: 'Judge Juice',
-  mcp: 'MCP tools',
+  mcp: 'MCP search/call',
   memory: 'memory',
   model_catalog: 'model catalog',
   pinokio: 'Pinokio',
@@ -60,6 +63,7 @@ export const FABRIC_CONTROL_FAMILY_LABELS: Readonly<Record<string, string>> = {
   schedule: 'schedules',
   skill: 'skills',
   voice: 'voice engines',
+  whiteboard: 'whiteboard',
   zip: 'zips'
 }
 
@@ -106,13 +110,15 @@ export type BrokerFamilyToolGridKey = 'fabric' | 'artifact'
 interface BrokerFamilyToolGridDefinition {
   key: BrokerFamilyToolGridKey
   gatewayId: string
+  /** Stable saved-policy group key, independent of display wording. */
   groupName: string
+  /** Visible Tool Grid/DCM heading only; never a settings lookup key. */
+  displayName: string
   /**
    * The mode an untouched install resolves to.
    *
-   * Fabric ships 60+ controls in one group, which is over the DCM tool-name threshold on
-   * its own, so listing them is both noisy and pointless — the threshold would suppress
-   * the list anyway. `group-only` states that intent instead of leaving it to arithmetic;
+   * Fabric and utilities share a large group, so `group-only` avoids listing every
+   * capability in each message and states that intent independently of the threshold;
    * the line still names the families (`describeFabricControlFamilies`).
    *
    * Artifacts are a small, user-created family where a schema hint is what buys the agent
@@ -129,12 +135,14 @@ export const BROKER_FAMILY_TOOL_GRID_DEFINITIONS: Record<
     key: 'fabric',
     gatewayId: FABRIC_TOOL_GRID_ID,
     groupName: FABRIC_TOOL_GRID_GROUP_NAME,
+    displayName: FABRIC_TOOL_GRID_DISPLAY_NAME,
     defaultGroupMode: 'group-only'
   },
   artifact: {
     key: 'artifact',
     gatewayId: ARTIFACT_TOOL_GRID_ID,
     groupName: ARTIFACT_TOOL_GRID_GROUP_NAME,
+    displayName: ARTIFACT_TOOL_GRID_GROUP_NAME,
     defaultGroupMode: 'group+tools+hints'
   }
 }
@@ -145,9 +153,8 @@ export const BROKER_FAMILY_TOOL_GRID_DEFINITIONS: Record<
  * default is what it is.
  */
 export const FABRIC_TOOL_GRID_INFO_PARAGRAPHS = [
-  "Fabric controls are Batshit's own built-in actions, such as publishing an artifact, registering a voice engine, or starting a runtime add-on.",
-  'This row only changes how much of that list appears in the capability index the agent receives with each message. The agent can search for these controls and run them either way.',
-  'There are more than sixty of them, so by default Batshit shows the group, its count, and the kinds of control it holds (such as artifacts, memory, or Pinokio) instead of naming every control. Choose a Tools option if you want the names or input hints in every message.'
+  "Fabric controls let agents inspect, configure, and operate Batshit, including feature helpers for Artifacts, voice engines, and runtime add-ons.",
+  'This family also includes the Judge Juice judgment tool and the MCP search/call helpers. Bash and other separately listed tools have their own settings.'
 ]
 
 export const ARTIFACT_TOOL_GRID_INFO_PARAGRAPHS = [
@@ -254,5 +261,11 @@ export function createDefaultArtifactToolGridSettings() {
 export function normalizeArtifactToolGridSettings(
   value?: GlobalBrokerFamilyToolGridSettings | Record<string, unknown> | null
 ) {
-  return normalizeBrokerFamilyToolGridSettings('artifact', value)
+  const normalized = normalizeBrokerFamilyToolGridSettings('artifact', value)
+  // Discovery is now the independent capability choice. An old hidden global has no
+  // retained detail field; project its existing factory detail, without writing storage.
+  if (normalized.dcmDisplayDefaults.groups[ARTIFACT_TOOL_GRID_GROUP_NAME] === 'hidden') {
+    normalized.dcmDisplayDefaults.groups[ARTIFACT_TOOL_GRID_GROUP_NAME] = BROKER_FAMILY_TOOL_GRID_DEFINITIONS.artifact.defaultGroupMode
+  }
+  return normalized
 }

@@ -847,18 +847,21 @@ export function resolveCustomFaceMeshes(
 
 export async function loadCustomAvatarManifest(
   file: GoonFileRef | null | undefined,
+  options: { signal?: AbortSignal } = {},
 ): Promise<GoonCustomAvatarManifest> {
+  const signal = options.signal;
+  signal?.throwIfAborted();
   if (!file?.url) {
     throw new Error("Custom Goon is missing its avatar manifest.");
   }
 
-  const cached = customManifestCache.get(file.url);
+  const cached = signal ? undefined : customManifestCache.get(file.url);
   if (cached) {
     return cached;
   }
 
   const request = (async () => {
-    const response = await fetch(file.url);
+    const response = signal ? await fetch(file.url, { signal: signal }) : await fetch(file.url);
     if (!response.ok) {
       throw new Error(
         `Failed to load Custom avatar manifest (${response.status}).`,
@@ -869,6 +872,7 @@ export async function loadCustomAvatarManifest(
     try {
       payload = await response.json();
     } catch {
+      signal?.throwIfAborted();
       throw new Error("Custom avatar manifest is not valid JSON.");
     }
 
@@ -879,9 +883,11 @@ export async function loadCustomAvatarManifest(
     return payload as GoonCustomAvatarManifest;
   })();
 
-  customManifestCache.set(file.url, request);
+  // A cancelable read owns its request; it cannot borrow or invalidate a
+  // different owner's cached in-flight manifest.
+  if (!signal) customManifestCache.set(file.url, request);
   request.catch(() => {
-    if (customManifestCache.get(file.url) === request) {
+    if (!signal && customManifestCache.get(file.url) === request) {
       customManifestCache.delete(file.url);
     }
   });
@@ -893,6 +899,7 @@ export async function loadAvatarIntoEngine(
   goon: GoonRecord,
   options: {
     role?: "automatic" | "recipe-source" | "recipe-live-candidate" | "mounted-live";
+    signal?: AbortSignal;
   } = {},
 ) {
   const kind = resolveGoonKind(goon);
@@ -911,7 +918,7 @@ export async function loadAvatarIntoEngine(
     if (kind === "custom") {
       let manifest: GoonCustomAvatarManifest;
       try {
-        manifest = await loadCustomAvatarManifest(resolveCustomManifestFile(goon));
+        manifest = await loadCustomAvatarManifest(resolveCustomManifestFile(goon), { signal: options.signal });
       } catch (error) {
         if (!engine.isCurrentGoonLoad(goonLoadToken)) {
           return { kind, manifest: null, role: "cancelled" as const };
@@ -951,6 +958,7 @@ export async function loadAvatarIntoEngine(
         : true;
       engine.setSocketEyeContactSettings(socketEyeContactSettings);
       await engine.loadCustomGoon(avatarUrl, manifest, {
+        ...(options.signal ? { signal: options.signal } : {}),
         ...(!isLeanLive
           ? { appearanceDialValues: goon.appearanceDials ?? null }
           : {}),
@@ -973,7 +981,7 @@ export async function loadAvatarIntoEngine(
     if (sourceProfile === "guided-custom-vrm") {
       let manifest: GoonCustomAvatarManifest;
       try {
-        manifest = await loadCustomAvatarManifest(resolveGuidedManifestFile(goon));
+        manifest = await loadCustomAvatarManifest(resolveGuidedManifestFile(goon), { signal: options.signal });
       } catch (error) {
         if (!engine.isCurrentGoonLoad(goonLoadToken)) {
           return { kind, manifest: null, role: "cancelled" as const };
@@ -983,7 +991,8 @@ export async function loadAvatarIntoEngine(
       if (!engine.isCurrentGoonLoad(goonLoadToken)) {
         return { kind, manifest: null, role: "cancelled" as const };
       }
-      await engine.loadGoon(avatarUrl, manifest, goonLoadToken);
+      if (options.signal) await engine.loadGoon(avatarUrl, manifest, goonLoadToken, options.signal);
+      else await engine.loadGoon(avatarUrl, manifest, goonLoadToken);
       if (!engine.isCurrentGoonLoad(goonLoadToken)) {
         return { kind, manifest: null, role: "cancelled" as const };
       }
@@ -1001,11 +1010,15 @@ export async function loadAvatarIntoEngine(
       return { kind, manifest, role: "vrm" as const };
     }
 
-    await engine.loadGoon(avatarUrl, null, goonLoadToken);
+    if (options.signal) await engine.loadGoon(avatarUrl, null, goonLoadToken, options.signal);
+    else await engine.loadGoon(avatarUrl, null, goonLoadToken);
     if (!engine.isCurrentGoonLoad(goonLoadToken)) {
       return { kind, manifest: null, role: "cancelled" as const };
     }
     return { kind, manifest: null, role: "vrm" as const };
+  } catch (error) {
+    if (!engine.isCurrentGoonLoad(goonLoadToken)) return { kind, manifest: null, role: 'cancelled' as const };
+    throw error;
   } finally {
     engine.finishGoonLoad(goonLoadToken);
   }

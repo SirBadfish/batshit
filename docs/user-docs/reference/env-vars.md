@@ -19,7 +19,7 @@ Docker users must run Compose with `--env-file .env.docker` whenever they rely o
 
 | Variable | Required for | What it does | Notes |
 | --- | --- | --- | --- |
-| `BATSHIT_TOKEN` | Real Mac app, advanced source-checkout, and Docker instances | Internal service token shared by Batshit, batshit-server, and trusted helper calls. | Keep stable. Current official n8n Native Tools use scoped per-message tokens, but rotating `BATSHIT_TOKEN` still requires updating any deliberate service-token caller. Runtime launchers create it when missing, and Settings -> API Keys shows it as a runtime-managed/copyable value instead of saving a second encrypted row. |
+| `BATSHIT_TOKEN` | Real Mac app, advanced source-checkout, and Docker instances | Internal service token shared by Batshit, batshit-server, and trusted helper calls. | Keep stable. Rotating `BATSHIT_TOKEN` requires updating any deliberate service-token caller. Runtime launchers create it when missing, and Settings -> API Keys shows it as a runtime-managed/copyable value instead of saving a second encrypted row. |
 | `ENCRYPTION_KEY` | Saving API keys/secrets | Encrypts saved provider keys and custom secrets. | Keep stable. If it changes, saved encrypted secrets may stop decrypting. |
 
 Use long random values. A local command such as `openssl rand -hex 32` is a reasonable way to generate each value. Do not publish real values in docs, screenshots, logs, issues, or templates.
@@ -31,7 +31,7 @@ These apply when Batshit runs through `Batshit.app` or directly from source on t
 | Variable | Default example | Purpose |
 | --- | --- | --- |
 | `NODE_ENV` | Mac app: `production`; source checkout: `development` | Node runtime environment. |
-| `BATSHIT_FRONTEND_HOST` | source checkout: `127.0.0.1` | Vite dev-server bind host for source-checkout Batshit. Keep this IPv4 loopback unless `N8N_BATSHIT_FRONTEND_URL` is also changed, because local n8n native-tool callbacks use `127.0.0.1`. |
+| `BATSHIT_FRONTEND_HOST` | source checkout: `127.0.0.1` | Vite dev-server bind host for source-checkout Batshit. Keep this IPv4 loopback unless `N8N_BATSHIT_FRONTEND_URL` is also changed, because local n8n workflows call Batshit at `127.0.0.1`. |
 | `BATSHIT_FRONTEND_PORT` | Mac app: `5620`; source checkout: `5621` | Browser-facing Batshit app port. |
 | `BATSHIT_SERVER_PORT` | Mac app: `5600`; source checkout: `5610` | batshit-server port used by the Mac app supervisor and source-checkout repair launchers. |
 | `BATSHIT_FRONTEND_URL` | Mac app: `http://127.0.0.1:5620`; source checkout: `http://localhost:5621` | Browser-facing Batshit base URL used by local runtime helpers. |
@@ -42,13 +42,13 @@ These apply when Batshit runs through `Batshit.app` or directly from source on t
 | `PUBLIC_BATSHIT_SERVER_URL` | Mac app: `http://127.0.0.1:5600`; source checkout: `http://localhost:5610` | Browser-facing batshit-server URL saved/returned to users. |
 | `PUBLIC_BATSHIT_SERVER_API_URL` | Mac app: `http://127.0.0.1:5600/api/v1`; source checkout: `http://localhost:5610/api/v1` | Browser-facing batshit-server API root. |
 | `BATSHIT_ARTIFACT_COMPLETE_URL` | Mac app: `http://127.0.0.1:5620/api/artifacts/complete`; source checkout: `http://localhost:5621/api/artifacts/complete` | Server-to-app artifact completion callback. |
-| `BATSHIT_APP_VERSION` | `0.1.0-alpha.3` | Current installed Batshit version shown by the in-app update check. Normal users should not change this. |
+| `BATSHIT_APP_VERSION` | `0.1.0-alpha.4` | Current installed Batshit version shown by the in-app update check. Normal users should not change this. |
 | `BATSHIT_APP_CHANNEL` | `alpha` | Release channel label shown by the in-app update check. |
 | `BATSHIT_UPDATE_CHECK_DISABLED` | `0` | Set to `1` to disable in-app update checks for offline/private environments. |
 | `BATSHIT_UPDATE_FEED_URL` | blank | Optional custom release feed: a GitHub-style release list or one release. Blank uses Batshit's official GitHub release list, pre-releases included. |
 | `BATSHIT_UPDATE_LATEST_VERSION` | blank | Optional local/test override for the latest available version. Leave blank for normal installs. |
 | `BATSHIT_UPDATE_RELEASE_URL` / `BATSHIT_UPDATE_DOWNLOAD_URL` | blank | Optional local/test links used with `BATSHIT_UPDATE_LATEST_VERSION`. |
-| `N8N_BATSHIT_FRONTEND_URL` | Mac app: `http://127.0.0.1:5620`; Docker: the app/container-reachable Batshit URL | Server-to-server Batshit app URL that n8n workflows call for native-tool dispatch and callbacks. |
+| `N8N_BATSHIT_FRONTEND_URL` | Mac app: `http://127.0.0.1:5620`; Docker: the app/container-reachable Batshit URL | Server-to-server Batshit app URL that n8n workflows call, for example the official wake-up template. |
 | `BODY_SIZE_LIMIT` | Mac app: `1G`; source checkout: unset/SvelteKit default unless you set it | SvelteKit incoming request body limit for ordinary app requests and large imports. Backup export and restore use dedicated disk streams instead. |
 | `REDIS_URL` | Mac app: `redis://127.0.0.1:5639/0`; source checkout: `redis://localhost:6379/0` | Redis connection string. |
 | `REDIS_HOST` | Mac app: `127.0.0.1`; source checkout: `localhost` | Redis host when not using `REDIS_URL`. |
@@ -88,7 +88,7 @@ These live in `.env.docker`.
 | `BATSHIT_SESSION_COOKIE_SECURE` | blank | Leave blank for automatic local HTTP vs HTTPS behavior. |
 | `BATSHIT_SESSION_COOKIE_NAME` | `batshit_session_docker` | Lets Docker stay logged in beside another local Batshit instance. |
 | `BODY_SIZE_LIMIT` | `1G` | SvelteKit incoming request body limit for ordinary app requests and trusted local imports. It is not a backup export or restore limit. |
-| `BATSHIT_APP_VERSION` | `0.1.0-alpha.3` | Current installed Batshit version shown by the in-app update check. |
+| `BATSHIT_APP_VERSION` | `0.1.0-alpha.4` | Current installed Batshit version shown by the in-app update check. |
 | `BATSHIT_APP_CHANNEL` | `alpha` | Release channel label shown by the in-app update check. |
 | `BATSHIT_UPDATE_CHECK_DISABLED` | `0` | Set to `1` to disable in-app update checks. |
 | `BATSHIT_UPDATE_FEED_URL` | blank | Optional custom release feed: a GitHub-style release list or one release. Blank uses Batshit's official GitHub release list, pre-releases included. |
@@ -102,28 +102,15 @@ Docker core containers also set internal values such as `BATSHIT_CONTAINERIZED=1
 | Variable | Default example | Purpose |
 | --- | --- | --- |
 | `BATSHIT_WORKSPACE_MOUNT` | blank, filled by `./start-docker.sh` | Host folder mounted into Docker at `/workspace`. |
-| `BATSHIT_CODEX_WORKDIR` | `/workspace` | Working directory for Docker CLI/Codex agents. |
-| `BATSHIT_AGENT_RUNTIME_ROOT` | `/home/batshit-cli/.batshit` | Docker app path for managed CLI installs, Claude auth state, and managed Claude profiles. |
+| `BATSHIT_CODEX_WORKDIR` | `/workspace` | Legacy-named container workspace/base path used by Projects, filesystem MCP path mapping and backup restore. |
+| `BATSHIT_AGENT_RUNTIME_ROOT` | `/home/batshit-cli/.batshit` | Docker app path for the managed Claude Code install and Claude Code's sign-in state. |
 | `BATSHIT_MANAGED_INSTALLS_ROOT` | `/home/batshit-cli/.batshit/installs` | Docker app path for one-click managed CLI/runtime installs. |
 | `BATSHIT_CLAUDE_RUN_AS_USER` | `batshit-cli` | Non-root Docker user used for Claude Code child processes and Claude auth/status commands. |
-| `BATSHIT_CLAUDE_RUN_AS_UID` / `BATSHIT_CLAUDE_RUN_AS_GID` | `10001` / `10001` | UID/GID used when Batshit spawns Claude Code inside Docker. This keeps Claude Bypass Permissions out of root. |
+| `BATSHIT_CLAUDE_RUN_AS_UID` / `BATSHIT_CLAUDE_RUN_AS_GID` | `10001` / `10001` | UID/GID used when Batshit spawns Claude Code inside Docker. This keeps Claude Code from ever running as root. |
 | `BATSHIT_CLAUDE_RUN_AS_HOME` | `/home/batshit-cli` | HOME used for Docker Claude Code auth and runtime files. |
-| `BATSHIT_CODEX_PROVIDER_ENABLED` | `true` | Enables the Docker Codex provider path when the CLI is authenticated. |
 
-For Docker installs, the Codex/Claude Code CLI is not bundled in the image. Install it with the one-click card in Agent Settings (saved in the persistent `batshit_agent_runtime` volume), then log each CLI in inside the app container before its `CLI` agents can run. Batshit shows Docker-aware commands such as:
+Optional override: `BATSHIT_CLAUDE_CLI_PATH` / `CLAUDE_CLI_PATH` points Batshit at a specific CLI executable and wins over the managed install and PATH lookup.
 
-```sh
-docker compose --env-file .env.docker exec app /home/batshit-cli/.batshit/installs/cli/bin/codex login --device-auth
-docker compose --env-file .env.docker exec --user batshit-cli --env HOME=/home/batshit-cli --env USER=batshit-cli --env LOGNAME=batshit-cli --env SHELL=/bin/sh app /home/batshit-cli/.batshit/installs/cli/bin/claude auth login
-```
-
-When the stack was started with optional Docker n8n profile, the command may include `--profile n8n` before `exec`. Claude commands include the non-root Docker user flags so Claude Code status, login, and Bypass Permissions use the same HOME.
-
-On Windows, Claude Code may print `Paste code here if prompted >` after the browser login. Paste the browser auth code at that prompt, then press Enter. The pasted code may not appear in the terminal.
-
-Optional overrides: `BATSHIT_CODEX_CLI_PATH` / `CODEX_CLI_PATH` and `BATSHIT_CLAUDE_CLI_PATH` / `CLAUDE_CLI_PATH` point Batshit at a specific CLI executable and win over the managed install and PATH lookup.
-
-Advanced tuning: `BATSHIT_CODEX_CONTEXT_GUARD_THRESHOLD` and `BATSHIT_CLAUDE_CONTEXT_GUARD_THRESHOLD` adjust when Batshit gracefully stops a long managed CLI run to relay it before the model's context window fills (default `0.8`, valid from `0.5` inclusive to `1` exclusive). Either variable accepts `off`, `false`, `disabled`, `none`, or `0` to disable its guard. Invalid values fail the run before the CLI starts instead of silently using a different threshold. `BATSHIT_CODEX_TRANSPORT=exec` reverts normal managed Codex chat runs to the one-shot exec transport, which has no live token feed and therefore no proactive guard; Batshit's hidden Codex maintenance summarizer remains on the guarded app-server lane.
 
 ## Docker Sandbox and runtime add-on operator
 
@@ -163,10 +150,7 @@ When `DOCKER_MCP_GATEWAY_PORT` or `DOCKER_MCP_GATEWAY_URL` is set in `.env.docke
 | Variable | Default example | Purpose |
 | --- | --- | --- |
 | `N8N_API_URL` | native: `http://localhost:5678`; Docker host-managed: `http://host.docker.internal:5678`; optional Docker n8n profile: `http://n8n:5678` | n8n API URL Batshit should call server-side. |
-| `N8N_API_KEY` | blank | Optional n8n API key for Batshit-side workflow discovery, node-parameter compatibility refresh, and n8n API/MCP integrations. This is not Docker MCP Gateway auth. |
-| `N8N_UI_EMAIL` | blank | Optional n8n UI login for parameter discovery/automation where supported. |
-| `N8N_UI_PASSWORD` | blank | Optional n8n UI login password. |
-| `BATSHIT_N8N_CALLBACK_BASE_URL` | Docker default `http://app:3000` | Callback base optional Docker n8n profile can use to reach Batshit. |
+| `N8N_API_KEY` | blank | Optional n8n API key for Batshit-side workflow discovery and n8n API/MCP integrations. This is not Docker MCP Gateway auth. |
 | `N8N_BASE_IMAGE` | `ghcr.io/n8n-io/n8n:2.22.1` | Optional Docker n8n profile image. |
 | `N8N_RUNNERS_IMAGE` | `ghcr.io/n8n-io/runners:2.22.1` | Optional Docker n8n profile task-runner image. |
 | `N8N_RUNNERS_AUTH_TOKEN` | blank, defaults to `BATSHIT_TOKEN` when blank | Internal n8n runner token. |

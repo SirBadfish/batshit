@@ -291,6 +291,27 @@ describe('customAvatar helpers', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
+  it('cancels an owned manifest read without borrowing or evicting another owner\'s cached request', async () => {
+    const file = { url: '/avatars/independent-owner.json', filename: 'independent-owner.json' }
+    let finishOther!: () => void
+    const abort = new AbortController()
+    const fetcher = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((resolveResponse, reject) => {
+      if (init?.signal) init.signal.addEventListener('abort', () => reject(init.signal!.reason), { once: true })
+      else finishOther = () => resolveResponse(new Response(JSON.stringify({ contractVersion: 1, name: 'Other owner' }), { status: 200 }))
+    }))
+    vi.stubGlobal('fetch', fetcher)
+    const other = loadCustomAvatarManifest(file)
+    const owned = loadCustomAvatarManifest(file, { signal: abort.signal }).catch(error => error)
+    expect(fetcher).toHaveBeenCalledTimes(2)
+    abort.abort(new DOMException('Cancel owned manifest.', 'AbortError'))
+    expect(await owned).toMatchObject({ name: 'AbortError' })
+    finishOther()
+    const manifest = await other
+    expect(manifest.name).toBe('Other owner')
+    expect(await loadCustomAvatarManifest(file)).toBe(manifest)
+    expect(fetcher).toHaveBeenCalledTimes(2)
+  })
+
   it('extracts an embedded Batshit manifest from a glTF extension payload', () => {
     const manifest = extractEmbeddedCustomAvatarManifest({
       asset: { version: '2.0' },

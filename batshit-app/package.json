@@ -22,13 +22,13 @@
 		"test": "vitest",
 		"test:ui": "vitest --ui",
 		"test:coverage": "vitest --coverage",
-		"test:redis": "VITEST_REDIS_URL=redis://127.0.0.1:6379/15 VITEST_USE_REAL_REDIS=true vitest run --pool=threads --maxWorkers=1",
+		"test:redis": "VITEST_REDIS_URL=\"${VITEST_REDIS_URL:-redis://127.0.0.1:6379/15}\" VITEST_USE_REAL_REDIS=true vitest run --pool=threads --maxWorkers=1",
 		"test:memory": "VITEST_MEMORY_SEARCH=true VITEST_USE_REAL_REDIS=true vitest run --pool=forks --maxWorkers=1 src/lib/server/services/memory",
 		"generate:brand-icons": "tsx scripts/generate-brand-icons.ts",
 		"generate:file-icons": "tsx scripts/generate-file-icons.ts",
 		"compare:model-catalog-sources": "tsx scripts/compare-model-catalog-sources.ts",
 		"sync:model-catalog": "tsx scripts/sync-model-catalog.ts",
-		"sync:compatibility-matrix": "tsx scripts/sync-compatibility-matrix.ts",
+		"sync:voice-model-catalog": "tsx build-scripts/sync-voice-model-catalog.ts",
 		"livekit:agent:install": "npm --prefix ../tools/livekit-agent-sidecar install",
 		"livekit:agent:dev": "npm --prefix ../tools/livekit-agent-sidecar run dev",
 		"livekit:agent:start": "npm --prefix ../tools/livekit-agent-sidecar run start"
@@ -39,9 +39,9 @@
 		"@lucide/svelte": "^1.31.0",
 		"@pixiv/three-vrm": "^3.5.3",
 		"@pixiv/three-vrm-animation": "^3.5.3",
-		"@sveltejs/adapter-node": "^5.5.4",
-		"@sveltejs/adapter-vercel": "^6.3.3",
-		"@sveltejs/kit": "^2.70.2",
+		"@sveltejs/adapter-node": "^6.0.1",
+		"@sveltejs/adapter-vercel": "^7.0.2",
+		"@sveltejs/kit": "^3.0.0",
 		"@sveltejs/vite-plugin-svelte": "^7.0.0",
 		"@tailwindcss/postcss": "^4.2.2",
 		"@tailwindcss/vite": "^4.2.2",
@@ -51,12 +51,12 @@
 		"@types/prismjs": "^1.26.6",
 		"@types/three": "^0.183.1",
 		"@types/yauzl": "^2.10.3",
-		"@vitest/coverage-v8": "^4.1.2",
-		"@vitest/ui": "^4.1.2",
+		"@vitest/coverage-v8": "^4.1.12",
+		"@vitest/ui": "^4.1.12",
 		"autoprefixer": "^10.4.27",
 		"bits-ui": "^2.17.2",
 		"clsx": "^2.1.1",
-		"happy-dom": "^20.8.9",
+		"happy-dom": "^21.0.4",
 		"jsdom": "^29.0.1",
 		"lip-sync-engine": "^1.0.3",
 		"livekit-client": "^2.19.2",
@@ -64,7 +64,7 @@
 		"patch-package": "^8.0.1",
 		"playwright-core": "^1.60.0",
 		"postcss": "^8.5.10",
-		"svelte": "^5.55.1",
+		"svelte": "^5.57.1",
 		"svelte-check": "^4.4.6",
 		"tailwind-merge": "^3.5.0",
 		"tailwind-variants": "^3.2.2",
@@ -72,8 +72,8 @@
 		"three": "^0.185.1",
 		"tsx": "^4.22.4",
 		"typescript": "^6.0.2",
-		"vite": "^8.0.16",
-		"vitest": "^4.1.2"
+		"vite": "^8.1.6",
+		"vitest": "^4.1.12"
 	},
 	"dependencies": {
 		"@ai-sdk/alibaba": "^2.0.57",
@@ -105,7 +105,8 @@
 		"ansi-to-html": "^0.7.2",
 		"bcrypt": "^6.0.0",
 		"cheerio": "^1.2.0",
-		"dompurify": "^3.4.16",
+		"cookie": "^2.0.1",
+		"dompurify": "^3.4.17",
 		"eventsource": "^4.1.0",
 		"fflate": "^0.8.3",
 		"livekit-server-sdk": "^2.15.3",
@@ -118,10 +119,11 @@
 		"simple-icons": "^16.18.1",
 		"svelte-dnd-action": "^0.9.69",
 		"svelte-sonner": "^1.0.5",
-		"undici": "^7.29.1",
+		"undici": "^7.30.1",
 		"uuid": "^13.0.1",
+		"yaml": "2.8.3",
 		"yauzl": "^3.4.0",
-		"zod": "^4.4.3"
+		"zod": "^4.6.6"
 	},
 	"overrides": {
 		"jsdom": {
@@ -133,8 +135,12 @@
 		"@asamuzakjp/dom-selector": {
 			"lru-cache": "^11.2.7"
 		},
-		"body-parser": "^2.3.0",
-		"glob": "^10.5.0",
-		"cookie": "^0.7.2"
+		"body-parser": "^2.4.0",
+		"@vercel/nft": {
+			"glob": "^14.0.3"
+		},
+		"bits-ui": {
+			"runed": "^0.38.0"
+		}
 	}
 }

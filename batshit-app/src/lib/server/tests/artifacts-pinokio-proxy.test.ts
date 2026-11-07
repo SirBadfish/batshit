@@ -42,10 +42,16 @@ vi.mock('$lib/server/services/pinokioAppEndpoint', () => ({
   forgetPinokioAppEndpoint: (...args: any[]) => mocks.forgetPinokioAppEndpoint(...args)
 }))
 
-vi.mock('$lib/server/services/pinokioService', () => ({
-  previewPinokioAppStart: (...args: any[]) => mocks.previewPinokioAppStart(...args),
-  startPinokioApp: (...args: any[]) => mocks.startPinokioApp(...args)
-}))
+vi.mock('$lib/server/services/pinokioService', async () => {
+  const actual = await vi.importActual<typeof import('$lib/server/services/pinokioService')>('$lib/server/services/pinokioService')
+  return {
+    PINOKIO_RUN_DEFAULT_WAIT_SECONDS: actual.PINOKIO_RUN_DEFAULT_WAIT_SECONDS,
+    PINOKIO_RUN_MAX_WAIT_SECONDS: actual.PINOKIO_RUN_MAX_WAIT_SECONDS,
+    pinokioAppIdProblem: actual.pinokioAppIdProblem,
+    previewPinokioAppStart: (...args: any[]) => mocks.previewPinokioAppStart(...args),
+    startPinokioApp: (...args: any[]) => mocks.startPinokioApp(...args)
+  }
+})
 
 import { GET as proxyGet, POST as proxyPost } from '../../../routes/api/artifacts/pinokio/[...path]/+server'
 import { GET as startGet, POST as startPost } from '../../../routes/api/pinokio/apps/start/+server'
@@ -53,7 +59,7 @@ import { pinokioProxyPathProblem } from '$lib/server/artifacts/pinokioProxyRules
 
 const COMFY_ARTIFACT = {
   ok: true,
-  artifact: { id: 'art_comfy', name: 'Flux via Pinokio', user_id: 'josh' },
+  artifact: { id: 'art_comfy', name: 'Flux via Pinokio', user_id: 'josh', brain_type: 'pinokio_app', metadata: { runtime_manager: 'pinokio', source_type: 'comfyui', pinokio_app_id: 'comfy.git', pinokio_runtime: null } },
   binding: { appId: 'comfy.git', kind: 'comfyui', runtime: null }
 }
 
@@ -82,6 +88,44 @@ describe('the Pinokio app proxy', () => {
     expect(response.headers.get('x-batshit-pinokio-app')).toBe('comfy.git')
     expect(vi.mocked(fetch).mock.calls[0][0]).toBe('http://127.0.0.1:8188/system_stats?x=1')
     expect(mocks.loadPinokioArtifactForUser).toHaveBeenCalledWith('art_comfy', 'josh')
+  })
+
+
+  it('uses the saved remote binding and its single guarded app reader', async () => {
+    const machineId = 'd86fbc94-7364-4bbc-bb21-f21627736492'
+    mocks.loadPinokioArtifactForUser.mockResolvedValue({ ...COMFY_ARTIFACT, artifact: { ...COMFY_ARTIFACT.artifact, metadata: { ...COMFY_ARTIFACT.artifact.metadata, pinokio_machine_id: machineId } }, binding: { ...COMFY_ARTIFACT.binding, machineId } })
+    const boundFetch = vi.fn(async () => Response.json({ ok: true }))
+    mocks.resolvePinokioAppEndpoint.mockResolvedValue({ ok: true, appId: 'comfy.git', title: 'Comfyui', baseUrl: 'http://192.168.1.90:8188', machineId, machineRevision: 3, fetch: boundFetch })
+    const response = await proxyGet(proxyEvent('system_stats', { query: `?artifactId=art_comfy&machineId=${machineId}&revision=3&machineRevision=3&x=1` }))
+    expect(response.status).toBe(200)
+    await response.text()
+    expect(boundFetch).toHaveBeenCalledWith('http://192.168.1.90:8188/system_stats?x=1', expect.objectContaining({ signal: expect.any(AbortSignal) }))
+    expect(fetch).not.toHaveBeenCalled()
+    expect(mocks.resolvePinokioAppEndpoint).toHaveBeenCalledWith('comfy.git', expect.objectContaining({ userId: 'josh', machineId }))
+  })
+
+  it('refuses query retargeting and a changed saved binding before an app request', async () => {
+    const response = await proxyGet(proxyEvent('system_stats', { query: '?artifactId=art_comfy&machineId=another' }))
+    expect(response.status).toBe(403)
+    expect(fetch).not.toHaveBeenCalled()
+    mocks.resolvePinokioAppEndpoint.mockImplementation(async () => {
+      mocks.loadPinokioArtifactForUser.mockResolvedValue({ ...COMFY_ARTIFACT, artifact: { ...COMFY_ARTIFACT.artifact, metadata: { ...COMFY_ARTIFACT.artifact.metadata, pinokio_app_id: 'different.git' } }, binding: { ...COMFY_ARTIFACT.binding, appId: 'different.git' } })
+      return { ok: true, appId: 'comfy.git', title: 'Comfyui', baseUrl: 'http://127.0.0.1:8188' }
+    })
+    expect((await proxyGet(proxyEvent('system_stats'))).status).toBe(502)
+    expect(fetch).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['', 20_000], ['&timeoutMs=', 20_000], ['&timeoutMs=%20%20', 20_000],
+    ['&timeoutMs=not-a-number', 20_000], ['&timeoutMs=0', 1_000], ['&timeoutMs=999999', 60_000]
+  ])('uses the default or bounded explicit timeout for %s', async (query, expected) => {
+    const timer = vi.spyOn(globalThis, 'setTimeout')
+    try {
+      const response = await proxyGet(proxyEvent('system_stats', { query: `?artifactId=art_comfy${query}` }))
+      await response.text()
+      expect(timer).toHaveBeenCalledWith(expect.any(Function), expected)
+    } finally { timer.mockRestore() }
   })
 
   it('answers a typed app_offline the Builder Kit turns into Start with Pinokio', async () => {
@@ -172,6 +216,15 @@ function startEvent(method: 'GET' | 'POST', init: { body?: unknown; headers?: Re
   } as any
 }
 
+async function startPreviewBody() {
+  const response = await startGet(startEvent('GET'))
+  expect(response.status).toBe(200)
+  const preview = await response.json()
+  expect(preview.success).toBe(true)
+  return { artifactId: 'art_comfy', machineId: preview.machineId, revision: preview.machineRevision,
+    bindingFingerprint: preview.bindingFingerprint, launchFingerprint: preview.launchFingerprint, alsoStarts: preview.alsoStarts }
+}
+
 describe('Start with Pinokio from a panel', () => {
   beforeEach(() => {
     for (const mock of Object.values(mocks)) mock.mockReset()
@@ -193,10 +246,18 @@ describe('Start with Pinokio from a panel', () => {
   })
 
   it('starts only the app the artifact names, with the confirmed chain, and forgets the old address', async () => {
-    const response = await startPost(startEvent('POST', { body: { artifactId: 'art_comfy', appId: 'evil.git', alsoStarts: ['dep.git'] } }))
+    mocks.previewPinokioAppStart.mockResolvedValue({ ok: true, value: { appId: 'comfy.git', title: 'Comfyui', state: 'offline', ready: false, alsoStarts: ['dep.git'] } })
+    const custody = await startPreviewBody()
+    const response = await startPost(startEvent('POST', { body: { ...custody, appId: 'evil.git' } }))
     expect(response.status).toBe(200)
     expect(mocks.startPinokioApp).toHaveBeenCalledWith({ appId: 'comfy.git', alsoStarts: ['dep.git'] })
     expect(mocks.forgetPinokioAppEndpoint).toHaveBeenCalledWith('comfy.git')
+  })
+
+  it('refuses legacy local starts without the current saved-binding and launch preview', async () => {
+    const response = await startPost(startEvent('POST', { body: { artifactId: 'art_comfy', alsoStarts: [] } }))
+    expect(response.status).toBe(409)
+    expect(mocks.startPinokioApp).not.toHaveBeenCalled()
   })
 
   it('refuses every caller that is not the signed-in page', async () => {
@@ -211,7 +272,7 @@ describe('Start with Pinokio from a panel', () => {
 
   it('passes a refused start through as the service worded it', async () => {
     mocks.startPinokioApp.mockResolvedValue({ ok: false, kind: 'refused', message: 'Starting Comfyui also starts dep.git.' })
-    const response = await startPost(startEvent('POST'))
+    const response = await startPost(startEvent('POST', { body: await startPreviewBody() }))
     expect(response.status).toBe(400)
     expect(await response.json()).toMatchObject({ success: false, error: 'Starting Comfyui also starts dep.git.' })
   })

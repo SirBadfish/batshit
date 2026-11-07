@@ -1,6 +1,7 @@
 import { json, error, isHttpError, isRedirect, type RequestHandler } from '@sveltejs/kit';
 import { apiError, serviceRefusalResponse } from '$lib/server/services/apiResponses'
 import { ArtifactsService } from '$lib/server/artifacts/artifactsService';
+import { serializeArtifactGrantFailure } from '$lib/server/artifacts/artifactGrantLifecycle'
 
 export const GET: RequestHandler = async ({ locals }) => {
   // Check authentication
@@ -30,6 +31,8 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     const artifact = await artifactsService.create(locals.user.id, data);
     return json(artifact);
   } catch (err) {
+    const grantFailure = serializeArtifactGrantFailure(err)
+    if (grantFailure) { const { status, ...body } = grantFailure; return json(body, { status }) }
     // A refusal (a structure or field-name rule, a bad preset) answers with its own status and
     // sentence; SvelteKit turned the rethrown refusal into 500 "Internal Error" (BL-89).
     const refusal = serviceRefusalResponse(err);

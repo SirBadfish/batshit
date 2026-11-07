@@ -4,10 +4,31 @@ const redisMock = vi.hoisted(() => {
   const mock = {
     get: vi.fn(),
     getSession: vi.fn(async () => null),
+    getSessionForCompile: vi.fn(async () => null),
     getUserSettings: vi.fn(),
     getProjects: vi.fn(),
     sMembers: vi.fn(),
     getZips: vi.fn(),
+    lRange: vi.fn(async (key: string, start: number, end: number): Promise<string[]> => {
+      if (!key.startsWith('messages:') || start !== 0 || end !== -1) {
+        throw new Error(`Unexpected compile list read: ${key} ${start} ${end}`)
+      }
+      const value = await mock.get(key)
+      if (value !== null) throw new Error('This fixture supports only known-absent message lists.')
+      return []
+    }),
+    // These compile fixtures contain no persisted skill lifecycle. Read the same
+    // store seam and return RedisJSON's missing-key null, never fabricated state.
+    json: {
+      getRaw: vi.fn(async (key: string, path: string): Promise<null> => {
+        if (path !== '$' || !key.startsWith('skill_sessions:')) {
+          throw new Error(`Unexpected raw compile read: ${key} ${path}`)
+        }
+        const value = await mock.get(key)
+        if (value !== null) throw new Error('This fixture supports only known-absent skill lifecycle records.')
+        return null
+      })
+    },
     // BL-230: stored prompts are read as raw strings through `execute`, not the facade `get`.
     execute: vi.fn(async (operation: (client: any) => Promise<unknown>) =>
       operation({ get: (key: string) => mock.get(key) })
@@ -61,20 +82,33 @@ vi.mock('./userStore', () => ({
 }))
 
 import { DatabaseService } from './databaseRedis.server'
-import { buildCliWorkerSpawnToolReference } from '$lib/utils/cliSubagentToolNames'
 import {
   WORKERS_FEATURE_ENABLED,
-  WORKERS_MAX_CONCURRENT,
-  WORKERS_MAX_RUNS_PER_TURN
+  WORKERS_MAX_CONCURRENT
 } from '$lib/utils/delegationCapabilities'
 
 async function dynamicInfoText(service: DatabaseService, options: Record<string, unknown>): Promise<string> {
-  const result = await (service as any).buildDynamicInfoBlock(options)
+  const result = await (service as any).buildDynamicInfoBlock({
+    toolIndex: emptyToolIndex(), skillsCommandsDcm: { lines: [], capabilities: [] }, ...options
+  })
   expect(result).toMatchObject({
     text: expect.any(String),
     addressSourcePieces: expect.any(Array)
   })
   return result.text
+}
+
+function emptyToolIndex() {
+  return { text: '', discoverable: [], resolvedGatewayIds: null, setupBlocks: [], sources: [],
+    hintBudget: { limit: 3000, budgetedTokens: 0, featureTokens: 0 } }
+}
+
+function mockEmptySetupReads(service: DatabaseService) {
+  ;(service as any).buildSkillsCommandsDcm = vi.fn().mockResolvedValue({ lines: [], capabilities: [] })
+  ;(service as any).buildDynamicMcpDcm = vi.fn().mockResolvedValue(emptyToolIndex())
+  // Browser's strict operational settings owner is independent of the project-path
+  // and fetch-boundary contracts here, just like the other scoped Setup reads.
+  ;(service as any).buildNativeAgentBrowserDcmLines = vi.fn().mockResolvedValue(null)
 }
 
 describe('DatabaseService prompt and DCM contract helpers', () => {
@@ -116,11 +150,12 @@ describe('DatabaseService prompt and DCM contract helpers', () => {
       }
     ])
 
+    // SA-139 R4: `subagentSnapshot` fed only the CLI DCM's subagent roster, which left with the
+    // CLI Primary; a stored one is ignored.
     expect(snapshot).toEqual({
       projectPath: '/Users/example/batshit',
       projectRules: { allowedRoots: ['/Users/example/batshit'] },
-      fileReferences: [{ path: 'docs/user-docs/admin/backup-and-restore.md' }],
-      subagentIds: ['seed_api_subagent']
+      fileReferences: [{ path: 'docs/user-docs/admin/backup-and-restore.md' }]
     })
   })
 
@@ -161,6 +196,7 @@ describe('DatabaseService prompt and DCM contract helpers', () => {
       exposedZips: []
     })
     ;(service as any).buildDynamicInfoBlock = vi.fn().mockResolvedValue({ text: '', addressSourcePieces: [] })
+    mockEmptySetupReads(service)
 
     const result = await service.buildFormattedChatInput(
       'session-1',
@@ -168,18 +204,22 @@ describe('DatabaseService prompt and DCM contract helpers', () => {
       {
         id: 'agent-api',
         primary_agent_type: 'api',
-        name: 'Cody'
+        name: 'Cody',
+        // The project path is under test, not the board: the factory Whiteboard (SA-126) would read
+        // the board through Redis JSON, outside this fixture's lifecycle-only read.
+        api_reasoning_retention: 'neither'
       },
       'hello',
       [],
       'josh',
       {
-        runtimeFlavor: 'codex'
+        runtimeFlavor: 'claude'
       }
     )
 
     expect(result.resolvedProjectPath).toBe('/Users/example/agent-default')
     expect(result.structuredInput.metadata.resolvedProjectPath).toBe('/Users/example/agent-default')
+    expect(redisMock.json.getRaw).toHaveBeenCalledExactlyOnceWith('skill_sessions:session-1', '$')
   })
 
   it('summarizes auto-zip content and tool settings for the DCM block', () => {
@@ -212,58 +252,26 @@ describe('DatabaseService prompt and DCM contract helpers', () => {
     )
   })
 
-  it('shows exact CLI MCP tool names for assigned subagents in Codex/Claude DCM', async () => {
+  it('lists the factory Auto rows for an agent record that stores no zip row (SA-126 C6, 2026-10-19)', () => {
     const service = new DatabaseService()
-
-    const block = await dynamicInfoText(service, {
-      agentRecord: {
-        id: 'sample_codex_primary',
-        slug: 'sample_codex_primary'
-      },
-      agentId: 'sample_codex_primary',
-      subagentDescriptions: {
-        api_subagent: 'API slice coverage',
-        cli_subagent: 'CLI slice coverage'
-      },
-      assignedSubagents: [
-        {
-          id: 'sample_api_subagent',
-          slug: 'api_subagent',
-          name: 'API Subagent',
-          displayName: 'API Subagent'
-        },
-        {
-          id: 'sample_codex_subagent',
-          slug: 'cli_subagent',
-          name: 'CLI Subagent',
-          displayName: 'CLI Subagent'
-        }
-      ],
-      isCodexMode: true
-    })
-
-    expect(block).toContain(
-      'CLI subagent delegation: call the MCP server/tool pair shown for the chosen subagent.'
+    const summarize = (agent: Record<string, unknown>, globalZipSettings: Record<string, unknown> = {}) =>
+      (service as any).buildAutoZipSummary({ agent, globalZipSettings }).autoZipTools
+    expect(summarize({})).toEqual(['write_file', 'edit_file', 'execute_command', 'list_files', 'all_other_tools'])
+    // A stored row still wins, agent first, then global; Off is never listed as Auto.
+    expect(summarize({ auto_zip_all_other_tools: false })).not.toContain('all_other_tools')
+    expect(summarize({}, { auto_zip_all_other_tools: false })).not.toContain('all_other_tools')
+    expect(summarize({ zip_disabled_all_other_tools: true })).not.toContain('all_other_tools')
+    expect(summarize({ auto_zip_read_file: true, auto_zip_edit_file: false })).toEqual(
+      ['read_file', 'write_file', 'execute_command', 'list_files', 'all_other_tools']
     )
-    // SA-111 P1 (AMD-111-01): these names are bounded so `mcp__<server>__<tool>` fits
-    // OpenAI's 64-character function-name limit. Before the bound, Codex silently rewrote
-    // the 81-character form and the roster advertised a tool name that did not exist.
-    expect(block).toContain(
-      'API Subagent (api_subagent; server: batshit_gateway_sample_co_6708b5; tool: subagent_sample_ap_af55e1; full: mcp__batshit_gateway_sample_co_6708b5__subagent_sample_ap_af55e1)'
-    )
-    expect(block).toContain(
-      'CLI Subagent (cli_subagent; server: batshit_gateway_sample_co_6708b5; tool: subagent_sample_co_62a73f; full: mcp__batshit_gateway_sample_co_6708b5__subagent_sample_co_62a73f)'
-    )
-    for (const line of block.split('\n')) {
-      const match = line.match(/full: (mcp__\S+?)\)/)
-      if (match) expect(match[1].length).toBeLessThanOrEqual(64)
-    }
   })
 
-  it('SA-111 P1: the roster prints each subagent\u2019s capabilities (DL-111-03)', async () => {
+  // SA-139 R4: the Claude CLI DCM's subagent roster (its MCP tool names and capability lines) left
+  // with the CLI Primary; the DCM carries no roster, and API stable facts belong to Agent Setup.
+  it('keeps no subagent roster in the DCM: API stable facts belong to Agent Setup (BL-2260)', async () => {
     const service = new DatabaseService()
 
-    const block = await dynamicInfoText(service, {
+    const options = {
       agentId: 'sample_api_primary',
       agentRecord: { id: 'sample_api_primary' },
       subagentDescriptions: {
@@ -272,74 +280,46 @@ describe('DatabaseService prompt and DCM contract helpers', () => {
       },
       subagentCapabilityFragments: {
         researcher:
-          'API Subagent; model: anthropic/claude-sonnet-5; tools: Bash, Web Search, MCP (Docker Catalog); skills: /research; thread: resumable',
+          'Subagent; model: anthropic/claude-sonnet-5; tools: Bash, Web Search, MCP (Docker Catalog); skills: /research; thread: resumable',
         n8n_helper: 'n8n Workflow Subagent; model: not set here; tools: defined in n8n; skills: none; thread: none'
       },
       assignedSubagents: [
         { id: 'researcher', slug: 'researcher', name: 'Researcher', displayName: 'Researcher' },
         { id: 'n8n_helper', slug: 'n8n_helper', name: 'n8n Helper', displayName: 'n8n Helper' }
       ]
-    })
-
-    expect(block).toContain(
-      '- Researcher (researcher): Digs through docs \u2014 API Subagent; model: anthropic/claude-sonnet-5; tools: Bash, Web Search, MCP (Docker Catalog); skills: /research; thread: resumable'
-    )
-    expect(block).toContain(
-      '- n8n Helper (n8n_helper): Runs the intake workflow \u2014 n8n Workflow Subagent; model: not set here; tools: defined in n8n; skills: none; thread: none'
-    )
+    }
+    // S28 in databaseRedis.compileContract.test.ts covers API Setup plus current
+    // thread facts through the real compile and captured registrations.
+    const apiBlock = await dynamicInfoText(service, options)
+    expect(apiBlock).not.toContain('subagents:')
+    expect(apiBlock).not.toContain('Researcher (researcher)')
+    expect(apiBlock).not.toContain('CLI subagent delegation')
   })
 
-  it('SA-111 P4: the roster carries a workers line that follows the per-agent setting', async () => {
+  it('SA-111 P4: Agent Setup carries a workers line that follows the per-agent setting', () => {
     // The `workers:` line and the `spawn_workers` tool ship together — an agent told it has
     // workers must actually have the tool, and an agent with the setting off must be told
     // so rather than left to guess. That pairing is the F1 failure this story exists to fix.
     const service = new DatabaseService()
     expect(WORKERS_FEATURE_ENABLED).toBe(true)
 
-    const enabled = await dynamicInfoText(service, {
-      agentId: 'sample_api_primary',
-      agentRecord: { id: 'sample_api_primary', workers_enabled: true },
-      subagentDescriptions: { researcher: 'Digs through docs' },
-      assignedSubagents: [{ id: 'researcher', slug: 'researcher', displayName: 'Researcher' }]
-    })
+    const enabled = (service as any).buildWorkersSetupLine({ id: 'sample_api_primary', workers_enabled: true })
     expect(enabled).toContain(
-      `workers: enabled (max ${WORKERS_MAX_CONCURRENT} parallel, ${WORKERS_MAX_RUNS_PER_TURN} per turn)`
+      `workers: enabled (max ${WORKERS_MAX_CONCURRENT} parallel)`
     )
+    // Delegation limits (decision 6): six at a time, and no per-turn total to state any more.
+    expect(WORKERS_MAX_CONCURRENT).toBe(6)
+    expect(enabled).not.toContain('per turn')
 
-    const disabled = await dynamicInfoText(service, {
-      agentId: 'sample_api_primary',
-      agentRecord: { id: 'sample_api_primary', workers_enabled: false },
-      subagentDescriptions: { researcher: 'Digs through docs' },
-      assignedSubagents: [{ id: 'researcher', slug: 'researcher', displayName: 'Researcher' }]
-    })
+    const disabled = (service as any).buildWorkersSetupLine({ id: 'sample_api_primary', workers_enabled: false })
     expect(disabled).toContain('workers: disabled')
 
     // Default ON for a primary agent that never stored the field (DL-111-11).
-    const defaulted = await dynamicInfoText(service, {
-      agentId: 'sample_api_primary',
-      agentRecord: { id: 'sample_api_primary' },
-      subagentDescriptions: {},
-      assignedSubagents: []
-    })
+    const defaulted = (service as any).buildWorkersSetupLine({ id: 'sample_api_primary' })
     expect(defaulted).toContain('workers: enabled')
-    // The API lane has no composed MCP name to print — only the CLI lane does.
+    // The API lane has no composed MCP name to print (SA-139 R4: the CLI lane that did is gone).
+    expect(enabled).toBe(`workers: enabled (max ${WORKERS_MAX_CONCURRENT} parallel)`)
     expect(enabled).not.toContain('tool: mcp__')
-
-    // AMD-111-01's rule applies to the worker tool too: on a managed CLI lane the roster
-    // prints the exact name the CLI exposes, so the agent never has to guess it.
-    const codex = await dynamicInfoText(service, {
-      agentId: 'sample_codex_primary',
-      agentRecord: { id: 'sample_codex_primary', slug: 'sample_codex_primary' },
-      isCodexMode: true,
-      subagentDescriptions: {},
-      assignedSubagents: []
-    })
-    expect(codex).toContain(
-      `workers: enabled (max ${WORKERS_MAX_CONCURRENT} parallel, ${WORKERS_MAX_RUNS_PER_TURN} per turn); tool: ${
-        buildCliWorkerSpawnToolReference({ id: 'sample_codex_primary', slug: 'sample_codex_primary' })
-          ?.fullToolName
-      }`
-    )
   })
 
   it('adds concise speech-to-text guidance when the current user message was transcribed', async () => {
@@ -445,16 +425,11 @@ describe('DatabaseService prompt and DCM contract helpers', () => {
     expect(block).toContain('Use [whispers] sparingly')
   })
 
-  it('adds compact runtime network guidance without baseline runtime URL aliases', async () => {
+  it('adds compact runtime network guidance to Setup without baseline runtime URL aliases', () => {
     const service = new DatabaseService()
 
-    const block = await dynamicInfoText(service, {
-      agentRecord: {
-        id: 'api-agent',
-        primary_agent_type: 'api'
-      },
-      agentId: 'api-agent'
-    })
+    const agent = { id: 'api-agent', primary_agent_type: 'api' }
+    const block = [(service as any).buildNativeBashDcmLine(agent), (service as any).buildRuntimeNetworkDcmLine(agent)].join('\n')
 
     expect(block).toContain('native_bash: enabled')
     expect(block).toContain('runtime_network: backend=')
@@ -470,11 +445,10 @@ describe('DatabaseService prompt and DCM contract helpers', () => {
     expect(block).not.toContain('batshit_server_upload_single')
   })
 
-  it('states the enforced Plan-mode read-only boundary in dynamic context', async () => {
+  it('states the enforced Plan-mode read-only boundary in Setup', () => {
     const service = new DatabaseService()
 
-    const block = await dynamicInfoText(service, {
-      agentRecord: {
+    const block = (service as any).buildNativeBashDcmLine({
         id: 'api-plan-agent',
         primary_agent_type: 'api',
         provider_specific_settings: {
@@ -483,8 +457,6 @@ describe('DatabaseService prompt and DCM contract helpers', () => {
             bashAccessMode: 'plan'
           }
         }
-      },
-      agentId: 'api-plan-agent'
     })
 
     expect(block).toContain('native_bash: enabled | mode=plan')
@@ -521,6 +493,7 @@ describe('DatabaseService prompt and DCM contract helpers', () => {
       exposedZips: []
     })
     ;(service as any).buildDynamicInfoBlock = vi.fn().mockResolvedValue({ text: '', addressSourcePieces: [] })
+    mockEmptySetupReads(service)
 
     await service.buildFormattedChatInput(
       'livekit-session',
@@ -545,5 +518,6 @@ describe('DatabaseService prompt and DCM contract helpers', () => {
     )
 
     expect(globalFetch).not.toHaveBeenCalled()
+    expect(redisMock.json.getRaw).toHaveBeenCalledExactlyOnceWith('skill_sessions:livekit-session', '$')
   })
 })

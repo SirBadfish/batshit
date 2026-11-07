@@ -206,6 +206,32 @@ function artworkProjection(
 }
 
 describe('SkinAppearanceEngineRuntime', () => {
+  it('does not publish material work after projection initialization outlives disposal', async () => {
+    const contract = definition(), fixture = fixtureRoot(contract)
+    const runtime = new SkinAppearanceEngineRuntime(fixture.root, contract)
+    let finish!: () => void
+    ;(runtime as any).artworkProjection = { initialize: () => new Promise<void>(resolve => { finish = resolve }), dispose: vi.fn() }
+    const prepare = vi.spyOn(runtime as any, 'prepare')
+    const pending = runtime.apply(null)
+    runtime.dispose(); finish()
+    expect(await pending).toBe(false)
+    expect(prepare).not.toHaveBeenCalled()
+    expect(fixture.mesh.material).toBe(fixture.material)
+  })
+
+  it('disposes a newly cloned material when ordinary mask validation fails before publication', async () => {
+    const contract = definition(), fixture = fixtureRoot(contract), canvases = mockCanvases()
+    const cloned = fixture.material.clone(), disposed = vi.spyOn(cloned, 'dispose')
+    vi.spyOn(fixture.material, 'clone').mockReturnValue(cloned)
+    const runtime = new SkinAppearanceEngineRuntime(fixture.root, contract, { loadAsync: async () => texture(16) })
+    const state = updateSkinAppearanceRegion(contract, createDefaultSkinAppearanceState(contract), 'cheekBlush', { mode: 'custom', color: [0.4, 0.3, 0.2] })
+    try {
+      await expect(runtime.apply(state)).rejects.toThrow()
+      expect(disposed).toHaveBeenCalledOnce()
+      expect(fixture.mesh.material).toBe(fixture.material)
+    } finally { runtime.dispose(); canvases.spy.mockRestore() }
+  })
+
   it('composes tinted Base Color and regions, then binds all custom PBR roles correctly', async () => {
     const contract = definition()
     const fixture = fixtureRoot(contract)

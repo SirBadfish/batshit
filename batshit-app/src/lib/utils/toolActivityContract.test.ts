@@ -8,6 +8,8 @@ import {
   describeOutputCut,
   failedCommandExitCode,
   failedCommandOutput,
+  commandCutShort,
+  shellCommandCutFields,
   isBinaryLikeText,
   joinListingSectionPath,
   modelFacingMcpText,
@@ -35,6 +37,112 @@ import {
   renameHelperServer
 } from '$lib/test-utils/cli-helper-steps'
 import { CLI_HELPER_MCP_SERVER_NAME } from './cliHelperToolNames'
+import { API_UTILITY_CONTROL_IDS } from './apiUtilityControls'
+import { getToolSettings } from './toolRenderMap'
+
+function apiUtilityStep(controlId: string, input: Record<string, unknown>, raw: Record<string, unknown>, operationKind: string, rendererFamily = operationKind, metadata: Record<string, unknown> = {}) {
+  const ref = `batshit:${controlId}`
+  return { toolName: 'native_batshit_tool_use', toolArgs: { ref, input }, toolResult: {
+    success: raw.success !== false, controlId, ref, family: 'batshit', target: controlId,
+    operationKind, rendererFamily, result: raw, ...metadata
+  } }
+}
+
+describe('API utility semantic presentation', () => {
+  it.each([
+    ['webSearch', 'native_web_search', 'web_search', 'web_search', { query: 'release notes', maxResults: 3 },
+      { success: true, query: 'release notes', provider: 'exa', results: [{ title: 'Notes', url: 'https://example.test/notes', snippet: 'Release notes' }] }],
+    ['workers', 'native_spawn_workers', 'workers', 'workers', { workers: [{ task: 'Inspect one file' }] },
+      { kind: 'workers', success: true, requested: 2, completed: 0, workers: [
+        { name: 'Worker 1', status: 'partial', output: 'Work so far', usage: { inputTokens: 12 }, modelId: 'saved-model', provider: 'saved-provider' },
+        { name: 'Worker 2', status: 'failed', output: 'Could not start', usage: null, modelId: null, provider: null }
+      ] }],
+    ['skill', 'native_skill', 'skill_read', 'skill_read', { skillId: 'notes', action: 'read', path: 'references/one.md', offset: 10 },
+      { success: true, action: 'read', skillId: 'notes', skillName: 'Notes', path: 'references/one.md', content: 'Next section', offset: 10, nextOffset: 22, readMore: 'Read the next window.' }],
+    ['skill', 'native_skill', 'skill_read', 'skill_read', { skillId: 'notes', action: 'invoke' },
+      { success: true, action: 'invoke', skill: { id: 'notes', name: 'Notes', references: ['references/one.md'], scripts: [] },
+        skillMarkdown: '# Notes\nUse the saved reference.', warnings: ['An existing warning'] }],
+    ['skill', 'native_skill', 'unknown_tool', 'generic_tool', { skillId: 'notes', action: 'list' },
+      { success: true, action: 'list', references: ['references/one.md'] }]
+  ] as const)('preserves the existing %s direct payload, renderer and retention policy (%s)', (kind, directName, operationKind, rendererFamily, args, raw) => {
+    const direct = normalizeCompactTool({ toolName: directName, toolArgs: args, toolResult: raw })
+    const step = apiUtilityStep(API_UTILITY_CONTROL_IDS[kind], args, raw, operationKind, rendererFamily)
+    const migrated = normalizeCompactTool(step)
+    expect(migrated.operationKind).toBe(operationKind)
+    expect(migrated.rendererFamily).toBe(rendererFamily)
+    expect(migrated.toolArgs).toEqual(direct.toolArgs)
+    expect(migrated.toolResult).toEqual(direct.toolResult)
+    expect(migrated.rawSidecarPolicy).toBe(direct.rawSidecarPolicy)
+    const settings = { buffer_size_web_search: 5, zip_threshold_web_search: 61,
+      buffer_size_workers: 4, zip_threshold_workers: 71,
+      buffer_size_skill_read: 7, zip_threshold_skill_read: 81 }
+    const migratedSettings = resolveToolActivitySettingsName(step)
+    const directSettings = resolveToolActivitySettingsName({ toolName: directName, toolArgs: args, toolResult: raw })
+    expect(migratedSettings).toBe(directSettings)
+    expect(migratedSettings).toBeTruthy()
+    expect(getToolSettings(migratedSettings!, settings)).toEqual(getToolSettings(directSettings!, settings))
+    if (kind === 'workers') {
+      expect(migrated.toolResult.workers.map((worker: any) => worker.status)).toEqual(['partial', 'failed'])
+      expect(migrated.toolResult.workers.every((worker: any) => !Object.hasOwn(worker, 'id'))).toBe(true)
+    }
+  })
+
+  it('uses captured Subagent identity, retaining partial status, thread, usage and complete nested steps', () => {
+    const nested = [{ toolCallId: 'nested-call', toolResult: { detail: { more: { text: 'Complete nested fact' } } } }]
+    const step = apiUtilityStep(API_UTILITY_CONTROL_IDS.subagent,
+      { subagentId: 'model-guess', name: 'Wrong name', chatInput: 'Review', thread: 'resume' },
+      { kind: 'subagent', success: true, subagentName: 'Saved Helper', subagentType: 'api', status: 'partial', thread: 'resumed',
+        usage: { inputTokens: 10, outputTokens: 4 }, output: 'Work so far', intermediateSteps: nested, subagentId: 'raw-guess' },
+      'subagent', 'subagent', { isSubagent: true, subagentId: 'saved-helper-id', subagentName: 'Saved Helper', subagentType: 'api' })
+    const normalized = normalizeCompactTool(step)
+    expect(normalized.rendererFamily).toBe('subagent')
+    expect(normalized.metadata).toMatchObject({ subagentId: 'saved-helper-id', subagentName: 'Saved Helper', subagentType: 'api' })
+    expect(normalized.toolResult.subagentId).toBe('saved-helper-id')
+    expect(normalized.toolResult).toMatchObject({ status: 'partial', thread: 'resumed', usage: { inputTokens: 10, outputTokens: 4 } })
+    expect(normalized.toolResult.intermediateSteps).toEqual(nested)
+    expect(normalized.rawSidecarPolicy).toBe('always')
+    expect(resolveToolActivitySettingsName(step)).toBe('subagent')
+  })
+
+  it('keeps callback failures in their old profile while refusals before a callback stay generic', () => {
+    const raw = { success: false, stopped: true, error: 'Search stopped.' }
+    const step = apiUtilityStep(API_UTILITY_CONTROL_IDS.webSearch, { query: 'one' }, raw, 'web_search')
+    expect(normalizeCompactTool(step).toolResult).toEqual(normalizeCompactTool({ toolName: 'native_web_search', toolArgs: { query: 'one' }, toolResult: raw }).toolResult)
+    const { result: _raw, ...refused } = step.toolResult
+    expect(normalizeCompactTool({ ...step, toolResult: { ...refused, success: false, error: { code: 'CONTROL_NOT_ALLOWED' } } }).rendererFamily).toBe('generic_tool')
+  })
+
+  it('uses the canonical server identity rather than nested input or RAW classifier lookalikes', () => {
+    const step = apiUtilityStep(API_UTILITY_CONTROL_IDS.webSearch,
+      { query: 'one', ref: 'mcp:another-target' },
+      { success: true, query: 'one', results: [], controlId: API_UTILITY_CONTROL_IDS.subagent,
+        operationKind: 'subagent', rendererFamily: 'subagent', ref: 'mcp:another-target' }, 'web_search')
+    const normalized = normalizeCompactTool(step)
+    expect(normalized.operationKind).toBe('web_search')
+    expect(normalized.rendererFamily).toBe('web_search')
+    expect(normalized.toolArgs.query).toBe('one')
+    expect(normalized.metadata?.apiUtilityControlId).toBe(API_UTILITY_CONTROL_IDS.webSearch)
+  })
+
+  it('rejects lookalike, mismatched, missing-result and ambiguous profiles without changing direct CLI reads', () => {
+    const valid = apiUtilityStep(API_UTILITY_CONTROL_IDS.webSearch, { query: 'one' }, { success: true, results: [] }, 'web_search')
+    for (const step of [
+      { ...valid, toolName: 'mcp.unrelated.native_batshit_tool_use' },
+      { ...valid, toolProvider: 'mcp' },
+      { ...valid, toolName: `mcp.${CLI_HELPER_MCP_SERVER_NAME}.batshit_tool_use` },
+      { ...valid, toolArgs: { ...valid.toolArgs, ref: `mcp:${API_UTILITY_CONTROL_IDS.webSearch}` } },
+      { ...valid, toolResult: { ...valid.toolResult, family: 'mcp' } },
+      { ...valid, toolResult: { ...valid.toolResult, controlId: API_UTILITY_CONTROL_IDS.skill } },
+      { ...valid, toolResult: { ...valid.toolResult, rendererFamily: 'subagent' } },
+      { ...valid, toolResult: [valid.toolResult, valid.toolResult] },
+      { ...valid, toolResult: { ...valid.toolResult, result: [valid.toolResult.result] } },
+      { ...valid, toolArgs: { ref: 'batshit:sys.web_search.unknown', input: {} }, toolResult: { ...valid.toolResult, ref: 'batshit:sys.web_search.unknown', target: 'sys.web_search.unknown', controlId: 'sys.web_search.unknown' } },
+      apiUtilityStep(API_UTILITY_CONTROL_IDS.skill, { action: 'script_run', skillId: 'notes' }, { success: true, action: 'script_run' }, 'skill_read'),
+      apiUtilityStep(API_UTILITY_CONTROL_IDS.subagent, { subagentId: 'model-only' }, { kind: 'subagent', success: true }, 'subagent')
+    ]) expect(normalizeCompactTool(step).rendererFamily).toBe('generic_tool')
+    expect(normalizeCompactTool({ toolName: 'native_skill', toolArgs: { action: 'read', skillId: 'notes' }, toolResult: { action: 'read', content: 'Old direct read' } }).rendererFamily).toBe('skill_read')
+  })
+})
 
 describe('toolActivityContract', () => {
   it('normalizes native skill reads into the skill_read lane', () => {
@@ -2253,5 +2361,45 @@ describe('browser-loaded code has no regex lookbehind', () => {
     walk(path.join(root, 'lib'))
     walk(path.join(root, 'routes'))
     expect(found).toEqual([])
+  })
+})
+
+
+describe('neutral utility cards keep the shared control renderer', () => {
+  it.each([
+    ['sys.judge.ask', 'Ask Judge Juice'],
+    ['sys.mcp.dynamic.find', 'Dynamic Tool Search'],
+    ['sys.mcp.dynamic.use', 'MCP Tool']
+  ])('preserves %s operation, title, and reload metadata', (id, title) => {
+    for (const toolName of ['native_batshit_tool_use', 'batshit_tool_use']) {
+      const compact = normalizeCompactTool({ toolName, toolArgs: { ref: `batshit:${id}`, input: {} }, toolResult: { success: true, family: 'batshit', target: id, result: {} } })
+      expect(compact.operationKind).toBe('fabric_use')
+      expect(compact.rendererFamily).toBe('generic_tool')
+      expect(compact.displayToolName).toBe(title)
+    }
+  })
+})
+
+describe('a shell command cut before it finished (BL-1979)', () => {
+  it('keeps how it was cut, and nothing for a command that finished', () => {
+    expect(shellCommandCutFields({ success: false, stopped: true, signal: 'SIGTERM' }, "sed -i 's/a/b/' x.js")).toEqual({ stopped: true })
+    expect(shellCommandCutFields({ success: false, timedOut: true }, "sed -i 's/a/b/' x.js")).toEqual({ timedOut: true })
+    expect(shellCommandCutFields({ success: false, stopped: true, neverReturned: true }, 'echo hi > y.txt')).toEqual({ stopped: true, neverReturned: true })
+    expect(shellCommandCutFields({ success: false, neverReturned: true }, 'echo hi > y.txt')).toEqual({ stopped: true, neverReturned: true })
+    expect(shellCommandCutFields({ success: false, exitCode: 1 }, "sed -i 's/a/b/' x.js")).toEqual({})
+    expect(shellCommandCutFields({ success: true, exitCode: 0 }, "sed -i 's/a/b/' x.js")).toEqual({})
+  })
+
+  it('never for a managed patch: it is written whole or not at all, and says which', () => {
+    const patch = "apply_patch <<'PATCH'\n*** Begin Patch\n*** Add File: a.txt\n+a\n*** End Patch\nPATCH"
+    expect(shellCommandCutFields({ success: false, stopped: true }, patch)).toEqual({})
+  })
+
+  it('reads the stored facts back for the cards', () => {
+    expect(commandCutShort({ stopped: true })).toBe('stopped')
+    expect(commandCutShort({ stopped: true, neverReturned: true })).toBe('stopped')
+    expect(commandCutShort({ timedOut: true })).toBe('timed-out')
+    expect(commandCutShort({ exitCode: 1 })).toBeNull()
+    expect(commandCutShort(undefined)).toBeNull()
   })
 })

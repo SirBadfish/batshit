@@ -8,13 +8,17 @@ Batshit is single-user-per-instance for alpha, so there's one admin: you. The Ad
 
 Batshit's core system prompts — the foundational prompts that keep tools, Skills, zips, and voice working correctly — are managed here as public, admin-editable settings, with packaged defaults shipped in the app.
 
-This is powerful and worth respecting. Editing a core prompt can change how the whole product behaves, and a bad edit can break tools, Skills, zips, or voice. Batshit shows the packaged default metadata and lets you reset a prompt back to default without silently overwriting a customization you made on purpose. If you're not sure, leave the core prompts alone — your per-agent system prompts (in Settings → Skills & Prompts and Agent Settings) are the normal place to shape behavior.
+This is powerful and worth respecting. Editing a core prompt can change how the whole product behaves, and a bad edit can break tools, Skills, zips, or voice. Batshit shows the packaged default metadata and lets you reset a prompt back to default without silently overwriting a customization you made on purpose. If you're not sure, leave the core prompts alone — your per-agent system prompts (in Settings → Plugins & shit and Agent Settings) are the normal place to shape behavior.
+
+Some of the instructions your agents get are built into Batshit instead of stored as a prompt you can edit. You can still read all of them here. A prompt with a placeholder that Batshit fills with a block of text, such as `{{ $api_tool_zip_guidance }}`, has a **Built-in Text** button that shows that text. If you remove such a placeholder from the prompt, Built-in Text says that part is no longer sent. The **Maintaining Your Working Context** section (the Whiteboard, reasoning retention, and Tool Notes) is built in completely, so it is listed with a **Built in** tag and a **View** button. Built-in text is read-only, and it is shown with the default settings; an agent with different settings gets the matching version.
 
 ## Backup and restore
 
 Backup and restore is the app-owned way to export and re-import your Batshit data as a structured `.zip`. Normal exports exclude saved secrets; an explicit "With Secrets" option exists when you really need to move keys. Restore is a **replace** operation, not a merge, so Batshit shows you the backup's contents first and requires an explicit confirmation before it changes the instance.
 
 This is the most important Admin habit to build early: export a backup once after your first working setup, and again before upgrades or risky changes. Full guidance, including what is and isn't included and how Docker and Mac app paths differ, is in [Backup and restore](backup-and-restore.md).
+
+You can also enable [Automatic Backups](backup-and-restore.md#automatic-backups), with Daily or Weekly scheduling and two verified recovery copies. It starts off; backup-after-update is a separate choice.
 
 ## Diagnostics
 
@@ -31,6 +35,16 @@ On Mac, the Cloudflared installer selects Apple Silicon/arm64 or Intel/x64 to ma
 ## Instance-wide defaults
 
 A few instance-level defaults live in Admin because they apply across the instance rather than to a single agent. These include Web Search and Dynamic Schema Hints (shared caps on how large compact tool-schema summaries get — they affect prompt size and clarity, not permissions).
+
+### Dynamic Schema Hints
+
+These detail controls cap scalable tool hints in Agent Setup and compact tool-search summaries. New settings default to 10 required fields, 10 optional fields, 400 characters per hint, and 30 tools per inherited group. Fixed built-in feature hints keep their complete guidance. Existing saved choices stay as they are. An explicit Tool Grid display choice can show more than the per-group threshold.
+
+**Total Tool Hint Budget** defaults to 3,000 estimated tokens and accepts 500–20,000. Batshit collapses the largest scalable tool groups to their names and counts until they fit, including groups with an explicit display choice. Fixed feature hints and the complete enabled Skills catalog are separate from this budget, so the whole Agent Setup can be larger. If group names and counts alone exceed the budget, Batshit shows an error. Increase the budget, enable fewer groups, or shorten group names before continuing.
+
+In an agent's Tool Grid, **Preview Agent Setup Tools** shows the computed tool portion and its token estimates. API runtime utilities are not prepared by this preview, so their size is unknown and the estimates are partial; the actual message can include more. It also excludes the separate enabled Skills catalog. Estimates use characters divided by four, rounded up; they are not measured provider usage.
+
+**Core System Prompts → Agent Setup** explains the generated section read-only. Admin preserves customized prompt text and shows a review notice for moved fields or API tool calls. Invalid runtime markers stay editable, with a syntax notice; repair them before using that prompt.
 
 ### Agent Wake-ups
 

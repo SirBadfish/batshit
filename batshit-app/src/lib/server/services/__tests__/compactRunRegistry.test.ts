@@ -48,39 +48,63 @@ describe('compactRunRegistry', () => {
   /**
    * BL-653 (review): the Compact route registers its run only after it has read the body and
    * checked the chat's owner, so a Stop pressed in those milliseconds found no run (stopped 0) and
-   * the Compact then wrote. A Stop that finds no run leaves a short pending stop for its chat, and
-   * the next run of that chat starts already stopped.
+   * the Compact then wrote. A Stop whose Compact has not registered leaves a short pending stop,
+   * and that Compact's run starts already stopped.
    */
-  it('a Stop that finds no run stops the next run of its chat, once, within the window', () => {
+  it('a Stop whose Compact has not registered stops that Compact\'s run, once, within the window', () => {
     vi.useFakeTimers()
-    expect(stopCompactRuns('chat-1')).toBe(0)
-    const late = startCompactRun('chat-1')
+    expect(stopCompactRuns('chat-1', 'stopped', 'compact-a')).toBe(0)
+    const late = startCompactRun('chat-1', 'compact-a')
     expect(late.signal.aborted).toBe(true)
     expect(late.signal.reason).toBe('stopped')
     // Used up: the run after it starts clean, and another chat never saw it.
+    expect(startCompactRun('chat-1', 'compact-a').signal.aborted).toBe(false)
+    expect(startCompactRun('chat-2', 'compact-a').signal.aborted).toBe(false)
+  })
+
+  /** BL-795: a pending stop was the chat's, so another tab's Compact of the chat met it. */
+  it('a pending stop belongs to its Compact, never to another Compact of the same chat (BL-795)', () => {
+    vi.useFakeTimers()
+    expect(stopCompactRuns('chat-1', 'stopped', 'compact-a')).toBe(0)
+    expect(startCompactRun('chat-1', 'compact-b').signal.aborted).toBe(false)
     expect(startCompactRun('chat-1').signal.aborted).toBe(false)
-    expect(startCompactRun('chat-2').signal.aborted).toBe(false)
+    expect(startCompactRun('chat-1', 'compact-a').signal.aborted).toBe(true)
+  })
+
+  it('a Stop while another tab\'s Compact runs stops it, and still waits for its own (BL-795)', () => {
+    vi.useFakeTimers()
+    const tabB = startCompactRun('chat-1', 'compact-b')
+    expect(stopCompactRuns('chat-1', 'stopped', 'compact-a')).toBe(1)
+    expect(tabB.signal.aborted).toBe(true)
+    expect(startCompactRun('chat-1', 'compact-a').signal.aborted).toBe(true)
+  })
+
+  it('a Stop that names no Compact leaves nothing pending', () => {
+    expect(stopCompactRuns('chat-1')).toBe(0)
+    expect(__countPendingCompactStopsForTests()).toBe(0)
+    expect(startCompactRun('chat-1').signal.aborted).toBe(false)
   })
 
   it('a pending stop lapses after its window', () => {
     vi.useFakeTimers()
-    expect(stopCompactRuns('chat-1')).toBe(0)
+    expect(stopCompactRuns('chat-1', 'stopped', 'compact-a')).toBe(0)
     vi.advanceTimersByTime(COMPACT_PENDING_STOP_MS + 1)
-    expect(startCompactRun('chat-1').signal.aborted).toBe(false)
+    expect(startCompactRun('chat-1', 'compact-a').signal.aborted).toBe(false)
   })
 
   it('expired pending stops are pruned when the next Stop comes, so the map stays bounded', () => {
     vi.useFakeTimers()
-    for (const chat of ['chat-1', 'chat-2', 'chat-3']) expect(stopCompactRuns(chat)).toBe(0)
+    for (const chat of ['chat-1', 'chat-2', 'chat-3']) expect(stopCompactRuns(chat, 'stopped', 'compact-a')).toBe(0)
     expect(__countPendingCompactStopsForTests()).toBe(3)
     vi.advanceTimersByTime(COMPACT_PENDING_STOP_MS + 1)
-    expect(stopCompactRuns('chat-4')).toBe(0)
+    expect(stopCompactRuns('chat-4', 'stopped', 'compact-a')).toBe(0)
     expect(__countPendingCompactStopsForTests()).toBe(1)
   })
 
-  it('a Stop that found a run leaves nothing pending', () => {
-    startCompactRun('chat-1')
-    expect(stopCompactRuns('chat-1')).toBe(1)
-    expect(startCompactRun('chat-1').signal.aborted).toBe(false)
+  it('a Stop that found its Compact running leaves nothing pending', () => {
+    startCompactRun('chat-1', 'compact-a')
+    expect(stopCompactRuns('chat-1', 'stopped', 'compact-a')).toBe(1)
+    expect(__countPendingCompactStopsForTests()).toBe(0)
+    expect(startCompactRun('chat-1', 'compact-a').signal.aborted).toBe(false)
   })
 })

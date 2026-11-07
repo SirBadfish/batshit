@@ -628,7 +628,7 @@ async function fetchOperatorHealth(env) {
 
 // Must match `SANDBOX_REVISION` in runtime-addon-operator.mjs. An operator started by an
 // older checkout keeps running its old code until it is restarted.
-const REQUIRED_OPERATOR_SANDBOX_REVISION = 12
+const REQUIRED_OPERATOR_SANDBOX_REVISION = 13
 
 function operatorSupportsCurrentRuntimeControls(health) {
   return (

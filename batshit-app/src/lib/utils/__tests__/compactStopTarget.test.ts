@@ -2,7 +2,6 @@ import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
-  createCompactStopTracker,
   holdAutoCompactAfterStop,
   isAutoCompactHeldAfterStop,
   releaseAutoCompactHoldOnReplyEnd,
@@ -21,33 +20,10 @@ describe('what the chat\'s Stop stops', () => {
 
   it('a stopped Compact\'s answer is recognized, and nothing else is', () => {
     expect(isStoppedCompactAnswer(409, { code: 'ended_early', reason: 'stopped' })).toBe(true)
+    expect(isStoppedCompactAnswer(409, { code: 'ended_early', reason: 'session_deleted' })).toBe(true)
     expect(isStoppedCompactAnswer(409, { code: 'ended_early', reason: 'compaction_changed' })).toBe(false)
     expect(isStoppedCompactAnswer(500, { code: 'ended_early', reason: 'stopped' })).toBe(false)
     expect(isStoppedCompactAnswer(409, null)).toBe(false)
-  })
-
-  describe('the Compact\'s own chat and a Stop during it (Faye, 2026-09-28)', () => {
-    it('the Stop names the chat whose Compact runs, not the chat open at the press', () => {
-      const tracker = createCompactStopTracker()
-      tracker.begin()
-      tracker.enterPhase('chat-a')
-      // The user opens chat B; the page's current chat changes, the tracker's does not.
-      expect(tracker.requestStop()).toBe('chat-a')
-      tracker.leavePhase()
-      expect(tracker.requestStop()).toBeNull()
-    })
-
-    it('a Stop in the first phase is remembered after that phase ends, until the next Compact', () => {
-      const tracker = createCompactStopTracker()
-      tracker.begin()
-      tracker.enterPhase('chat-a')
-      expect(tracker.stopRequested).toBe(false)
-      tracker.requestStop()
-      tracker.leavePhase()
-      expect(tracker.stopRequested).toBe(true)
-      tracker.begin()
-      expect(tracker.stopRequested).toBe(false)
-    })
   })
 
   describe('a stopped Auto Compact waits for the next reply (BL-653)', () => {
@@ -79,27 +55,57 @@ describe('what the chat\'s Stop stops', () => {
       expect(page).toContain("\n      const response = await fetch('/api/messages/compact/stop', {\n")
     })
 
-    it('the Stop sends the chat whose Compact runs, never the open chat', () => {
+    // BL-781: the Stop shows only for the chat on screen's own Compact, so it ends that one.
+    it('the Stop ends the Compact of the chat on screen, and only while one of its requests runs', () => {
       const stop = page.slice(page.indexOf('\n  async function stopRunningCompact() {'))
       const body = stop.slice(0, stop.indexOf('\n  }\n'))
-      expect(body).toContain('\n    const sessionId = compactStopTracker.requestStop()\n')
-      expect(body).not.toContain('currentSessionId')
+      expect(body).toContain(
+        '\n    const sessionId = currentSessionId\n    const compactId = sessionId ? compactRuns.compactIdOf(sessionId) : null\n    if (!sessionId || !compactId || !compactRuns.requestStop(sessionId)) return\n'
+      )
+      // BL-795: the Stop names the Compact it was pressed for.
+      expect(body).toContain('body: JSON.stringify({ sessionId, compactId })')
     })
 
-    it('both phases name their chat while they run and forget it in their finally', () => {
+    it('the composer and the Token Panel read the chat on screen\'s Compact (BL-781)', () => {
+      expect(page).toContain('\n  const compactBusy = $derived(compactRuns.isBusy(currentSessionId))\n')
+      expect(page).toContain('\n  const compactStatus = $derived(compactRuns.statusOf(currentSessionId))\n')
+      expect(page).not.toMatch(/\n\s*compactBusy = (true|false)\n/)
+    })
+
+    it('a Compact holds its chat from start to end, the confirm dialog included (BL-781)', () => {
       const compact = page.slice(page.indexOf('\n  async function handleCompact('))
       const body = compact.slice(0, compact.indexOf('\n  }\n'))
-      expect(body.split('\n    compactBusy = true\n    compactStopTracker.enterPhase(sessionId)\n')).toHaveLength(3)
-      expect(body.split('\n      compactBusy = false\n      compactStopTracker.leavePhase()\n')).toHaveLength(3)
-      expect(body).toContain('\n    if (compactBusy) return\n    compactStopTracker.begin()\n')
+      expect(body).toContain(
+        '\n    const compactId = compactRuns.begin(sessionId)\n    if (!compactId) return\n    try {\n      await runCompact(sessionId, compactId, currentAgent, options.mode ?? \'manual\', options.confirmFirst ?? true)\n    } finally {\n      compactRuns.end(sessionId)\n    }'
+      )
+    })
+
+    it('both requests make their own chat busy and leave it in their finally', () => {
+      const compact = page.slice(page.indexOf('\n  async function runCompact('))
+      const body = compact.slice(0, compact.indexOf('\n  }\n'))
+      expect(body.split('\n    compactRuns.enterPhase(sessionId, ')).toHaveLength(3)
+      expect(body.split('\n      compactRuns.leavePhase(sessionId)\n')).toHaveLength(3)
+      // BL-795: both requests carry the Compact's id, so a Stop pressed for it before it
+      // registered waits for it alone.
+      expect(body.split('\n          sessionId,\n          compactId,\n')).toHaveLength(3)
+    })
+
+    it('the Compact reads its chat by id, never the chat on screen after it started (BL-781)', () => {
+      const compact = page.slice(page.indexOf('\n  async function runCompact('))
+      const body = compact.slice(0, compact.indexOf('\n  }\n'))
+      expect(body).toContain('const currentMessages = messageStore.getMessages(sessionId)')
+      expect(body).not.toContain('currentTrimmedMessageIds,')
+      expect(body).not.toContain('sessionStore.getCurrentSession()')
+      expect(body).not.toContain('setTrimmedIdsForCurrentSession(')
+      expect(body).toContain('setTrimmedIdsForSession(sessionId, nextTrimmedIds)')
     })
 
     it('a Stop during the plan ends the Compact before the summary request starts', () => {
-      const compact = page.slice(page.indexOf('\n  async function handleCompact('))
+      const compact = page.slice(page.indexOf('\n  async function runCompact('))
       const stopCheck = compact.indexOf(
-        '\n      if (compactStopTracker.stopRequested) {\n        autoCompactStopHolds = holdAutoCompactAfterStop(autoCompactStopHolds, sessionId, mode)\n        toast.info(STOPPED_COMPACT_MESSAGE)\n        return\n      }\n'
+        '\n      if (compactRuns.stopRequested(sessionId)) {\n        autoCompactStopHolds = holdAutoCompactAfterStop(autoCompactStopHolds, sessionId, mode)\n        toast.info(STOPPED_COMPACT_MESSAGE)\n        return\n      }\n'
       )
-      const secondRequest = compact.indexOf("compactStatus = 'Generating compact summary...'")
+      const secondRequest = compact.indexOf("compactRuns.enterPhase(sessionId, 'Generating compact summary...')")
       expect(stopCheck).toBeGreaterThan(-1)
       expect(stopCheck).toBeLessThan(secondRequest)
     })
@@ -107,7 +113,7 @@ describe('what the chat\'s Stop stops', () => {
     it('the Auto Compact trigger reads the hold before its key; both stop paths set it', () => {
       const trigger = page.slice(page.indexOf('\n    const promptKey = [') - 1500, page.indexOf('\n    const promptKey = ['))
       expect(trigger).toContain('\n    if (isAutoCompactHeldAfterStop(autoCompactStopHolds, sessionId)) return\n')
-      const compact = page.slice(page.indexOf('\n  async function handleCompact('))
+      const compact = page.slice(page.indexOf('\n  async function runCompact('))
       const body = compact.slice(0, compact.indexOf('\n  }\n'))
       expect(body.split('autoCompactStopHolds = holdAutoCompactAfterStop(autoCompactStopHolds, sessionId, mode)')).toHaveLength(3)
     })

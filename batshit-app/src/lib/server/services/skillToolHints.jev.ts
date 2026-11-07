@@ -5,7 +5,7 @@
  * threshold, and cap lives here, so a reviewer reads the whole decision surface in one
  * file. Thresholds change in code review, never in a prompt.
  *
- * What it does, per accepted user turn on a PRIMARY API or managed CLI lane whose agent
+ * What it does, per accepted user turn of a PRIMARY API agent that
  * has "Judge Juice: Suggest Skills and Tools" ON:
  *   1. one Jev request with up to five parallel questions — an action gate, a Choice
  *      over the agent's enabled skills, a Choice over its discoverable typed refs, and
@@ -28,7 +28,6 @@ import type { DynamicMcpDiscoverableRef } from './dynamicMcpIndex'
 import { listCliTools } from './cliToolRegistry'
 import { mcpGatewayService } from './mcpGatewayService'
 import { resolveNativeToolSettings } from './nativeTools'
-import { normalizePrimaryAgentType, primaryAgentAllowsNativeBash } from '$lib/utils/primaryAgentType'
 import { runTypesafeJudgment } from './typesafe/typesafeAvailability'
 import type {
   JevChoiceAnswer,
@@ -309,10 +308,10 @@ export const JEV_JUICE_HINTS_HEADING =
 /** The DCM tail lines. Empty when nothing cleared a floor, so a quiet turn costs no bytes. */
 export function buildJevJuiceHintDcmLines(decision: SkillToolHintDecision): string[] {
   const lines: string[] = []
-  if (decision.skill) {
+  if (decision.skill?.candidate.skillId) {
     const { invocation, skillId } = decision.skill.candidate
     lines.push(
-      `- Likely skill: ${invocation}${skillId ? ` (skillId=${skillId})` : ''} — if it fits, call native_skill with that skillId and action="invoke" before answering.`
+      `- Likely skill: ${invocation}${skillId ? ` (skillId=${skillId})` : ''} — if it fits, read it with your listed skill document tool using that exact skillId and action="invoke" before answering.`
     )
   }
   if (decision.tool) {
@@ -367,7 +366,7 @@ export function toolCandidatesFromDiscoverable(discoverable: DynamicMcpDiscovera
     ref: entry.ref,
     name: entry.name,
     family: entry.family,
-    description: entry.description ?? (entry.family === 'fabric' || entry.family === 'artifact' ? entry.hint : null),
+    description: entry.description ?? (entry.family === 'fabric' || entry.family === 'batshit' || entry.family === 'artifact' ? entry.hint : null),
     hint: entry.hint,
     enabled: entry.enabled
   }))
@@ -384,7 +383,7 @@ export const NATIVE_CAPABILITY_GAPS = Object.freeze([
   { id: 'native:dynamic_tool_search', setting: 'dynamicMcpEnabled', label: 'Dynamic Tool Search (MCP tools)', what: 'find and call the connected MCP tool servers' },
   { id: 'native:cli_tools', setting: 'cliToolsEnabled', label: 'CLI Tools', what: 'run the user\'s saved command-line tools' },
   { id: 'native:artifact_tools', setting: 'artifactRuntimeEnabled', label: 'Artifact Tools', what: 'run the user\'s published artifacts as tools' },
-  { id: 'native:batshit_tools', setting: 'batshitToolsEnabled', label: 'Batshit Tools (Fabric controls)', what: 'manage Batshit itself: artifacts, skills, CLI tools, voice engines, ComfyUI, model catalog' },
+  { id: 'native:batshit_tools', setting: 'batshitToolsEnabled', label: 'Fabric & Utilities', what: 'manage Batshit itself (artifacts, skills, CLI tools, voice engines, ComfyUI, model catalog), ask Judge Juice, and find/call connected MCP tools' },
   { id: 'native:fetch_zip', setting: 'fetchZipEnabled', label: 'Fetch Zip', what: 'read the full content of a zipped earlier tool result or message' }
 ] as const)
 
@@ -414,14 +413,7 @@ export async function buildCapabilityGapCatalog(
   const partial: string[] = []
 
   const native = resolveNativeToolSettings(input.agent?.provider_specific_settings ?? input.agent?.providerSpecificSettings ?? null)
-  // BL-878 (Josh, 2026-09-28): a Codex or Claude agent has its own Bash, and Batshit's Bash is not
-  // offered to it. A saved Bash value of `false` (an API agent changed to CLI keeps it, and the
-  // greyed-out switch cannot clear it) is not a missing capability there: "Off for this agent:
-  // Bash" would tell the agent to say so plainly instead of using its own shell. The DCM's Bash
-  // section already follows the same rule (`primaryAgentAllowsNativeBash`, API agents only).
-  const agentHasBatshitBash = primaryAgentAllowsNativeBash(normalizePrimaryAgentType(input.agent))
   for (const entry of NATIVE_CAPABILITY_GAPS) {
-    if (entry.id === 'native:bash' && !agentHasBatshitBash) continue
     if ((native as unknown as Record<string, unknown>)[entry.setting] === false) {
       gaps.push({ id: entry.id, kind: 'native', label: entry.label, what: entry.what })
     }
@@ -499,6 +491,8 @@ export interface ComputeSkillToolHintsInput {
   skills: AgentSlashCapability[]
   discoverable: DynamicMcpDiscoverableRef[]
   resolvedGatewayIds: string[] | null
+  /** Current open skills and sticky user-closed skills, supplied by the lifecycle owner. */
+  excludedSkillIds?: readonly string[]
   /** Test seam. */
   client?: TypesafeClient
   now?: () => Date
@@ -519,7 +513,10 @@ export async function computeSkillToolHints(input: ComputeSkillToolHintsInput): 
   const agentId = String(input.agent?.id ?? '')
   const agentName = String(input.agent?.displayName ?? input.agent?.name ?? agentId ?? 'this agent')
 
-  const skills = skillCandidatesFromCapabilities(input.skills)
+  const excludedSkillIds = new Set(input.excludedSkillIds ?? [])
+  const skills = skillCandidatesFromCapabilities(input.skills).filter(
+    (skill) => skill.skillId !== null && !excludedSkillIds.has(skill.skillId)
+  )
   const tools = toolCandidatesFromDiscoverable(input.discoverable)
   const catalog = await buildCapabilityGapCatalog({
     userId: input.userId,

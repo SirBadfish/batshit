@@ -17,10 +17,11 @@ import {
 import {
   listCurrentHairBuiltinAssets,
   migrateHairBuiltinStateToCurrent,
-  type HairBuiltinCatalogV2,
+  type HairBuiltinCatalog,
   type HairBuiltinStateMigration
 } from '$lib/goons/hairBuiltinCatalog'
 import { canonicalRecipeString, sha256Hex } from '$lib/goons/recipe/recipeCanonical'
+import type { RecipeSourceIdentity } from '$lib/goons/recipe/packageMetadata'
 import { redis } from '$lib/server/redis'
 import { loadHairBuiltinCatalogMetadata } from './hairBuiltinCatalogMetadata.server'
 import { collectCustomGoonUploadKeys, CUSTOM_GOON_UPLOAD_GUARD_LUA } from './goonCustomAssetOwnership.server'
@@ -192,7 +193,7 @@ redis.call('SREM', KEYS[4], ARGV[7])
 return { 'INSERTED' }
 `
 
-let builtinCatalogPromise: Promise<HairBuiltinCatalogV2> | null = null
+let builtinCatalogPromise: Promise<HairBuiltinCatalog> | null = null
 
 function stableSegment(value: string, context: string) {
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(value)) {
@@ -232,7 +233,7 @@ function parseIndexMember(value: string) {
   }
 }
 
-export async function loadHairBuiltinCatalog(): Promise<HairBuiltinCatalogV2> {
+export async function loadHairBuiltinCatalog(): Promise<HairBuiltinCatalog> {
   if (!builtinCatalogPromise) {
     builtinCatalogPromise = (async () => {
       const catalog = await loadHairBuiltinCatalogMetadata()
@@ -278,10 +279,20 @@ async function builtinRevisionHistory(
   return (await loadHairBuiltinCatalog()).assets
 }
 
+/** History resolves an existing saved identity; it is not a discovery list. */
+export async function listRetainedHairBuiltinAssets(): Promise<HairAssetV1[]> {
+  const catalog = await loadHairBuiltinCatalog()
+  const current = new Set(
+    catalog.currentRevisions.map((ref) => `${ref.assetId}@${ref.revisionId}`)
+  )
+  return catalog.assets.filter((asset) => !current.has(`${asset.assetId}@${asset.revisionId}`))
+}
+
 export async function migrateSavedHairBuiltinState(
-  state: HairStateV2
+  state: HairStateV2,
+  target?: RecipeSourceIdentity
 ): Promise<HairBuiltinStateMigration> {
-  return migrateHairBuiltinStateToCurrent(state, await loadHairBuiltinCatalog())
+  return migrateHairBuiltinStateToCurrent(state, await loadHairBuiltinCatalog(), target)
 }
 
 async function listUserAssetsForClient(

@@ -1,6 +1,6 @@
-# Portable Skills
+# Use the Batshit plugin outside the app
 
-Portable Skills are Batshit system skills you can carry into an outside coding agent.
+The complete **Batshit** plugin carries eight skills into an outside coding agent. Download it from **Settings → Plugins & shit → Plugins → Batshit → Download Plugin**. It includes the current official help and the native/outside instructions each skill needs.
 
 They are useful when you want your own agent, such as Claude Code, Codex, or another local coding assistant, to do setup work against your local Batshit instance without giving it Batshit's internal service token or your Batshit password.
 
@@ -15,7 +15,7 @@ A Portable Skill is a folder with:
 Portable Skills come in two kinds:
 
 - **Operational** bundles perform real Batshit work from outside (install a voice engine, build an artifact, save a CLI tool or skill, plan a Goon scene). They authenticate with a scoped Portable Skill Token.
-- **Informational** bundles only teach the outside agent. The Portable Batshit Guide is the first of these: it carries the official Batshit docs as references and needs **no token at all**.
+- **Informational** bundles only teach the outside agent. Batshit Guide and Goon Guide are informational and need **no token at all**. App Actions is a separate operational skill with explicit access.
 
 Operational Portable Skills call Batshit through the local app API:
 
@@ -46,7 +46,7 @@ Portable Skills complement in-app skills. They are not a replacement for Batshit
 ## Create a Portable Skill Token
 
 1. Open Batshit.
-2. Go to Settings -> Skills & Prompts -> Portable Skills.
+2. Go to Settings → Plugins & shit → Portable Skills.
 3. Click **Create Portable Skill Token**.
 4. Pick only the scopes the outside agent needs.
 5. Copy the token when Batshit shows it. It is shown once.
@@ -55,13 +55,14 @@ Scopes match the current Portable Skill families:
 
 | Scope | Use it for |
 | --- | --- |
+| App Actions | Supported Settings operations, with a separately saved scope and expiry grant |
 | Voice Engines | Portable Voice Engine Installer |
 | Artifacts | Portable Artifact Creator |
 | CLI Tools | Portable CLI Tool Creator |
 | Skills | Portable Skill Creator |
 | Goon Scenes | Portable Goon Scene Creator |
 
-The Portable Batshit Guide is informational and has no scope — skip token creation entirely if that is the only bundle you want.
+Batshit Guide and Goon Guide are informational and have no scope. Skip token creation if you only want help. Installing the plugin does not enable operational scopes.
 
 A token can have more than one scope. For the simplest setup, create one token with the scopes you plan to use and store it once in `portable-skills.env`. Use separate tokens only when you want a tighter boundary for a specific job. You can rotate or revoke tokens from the same Settings page.
 
@@ -90,71 +91,22 @@ Use this shared file when one token should work for more than one Portable Skill
 ~/.batshit/portable-skills/artifact-creator.env
 ```
 
-On Mac/native Batshit, Settings -> Skills & Prompts -> Portable Skills creates the shared placeholder file when possible. Batshit never writes the real token automatically because it stores only the token hash after creation. After token creation or rotation, copy the `.env` snippet Batshit shows and paste it deliberately into your private file.
+On Mac/native Batshit, Settings → Plugins & shit → Portable Skills creates the shared placeholder file when possible. Batshit never writes the real token automatically because it stores only the token hash after creation. After token creation or rotation, copy the `.env` snippet Batshit shows and paste it deliberately into your private file.
 
 For Docker Batshit, save the file on the host where your outside agent runs. The app container may not be able to write your host home folder.
 
 Do not save real tokens inside the downloaded Portable Skill bundle. Bundles should stay safe to re-download, share, delete, and replace.
 
-## Download a bundle
+## Download and install the complete plugin
 
-Portable Skill bundles are published by the docs site under `/portable-skills/`.
+1. Open **Settings → Plugins & shit → Plugins**.
+2. Find **Batshit** and choose **Download Plugin**.
+3. Give the downloaded ZIP to your outside assistant's supported plugin installer. Keep the entire package and reference files together.
+4. If your assistant accepts individual skills rather than plugins, use the desired folder inside the package's `skills/` directory with its complete `references/` and `assets/`, where present. Follow that assistant's supported local skill installation instructions.
 
-See [Portable Skill downloads](../reference/portable-skills.md) for the current bundle list.
+For an assistant without skill discovery, point it at the extracted skill's `SKILL.md` and ask it to follow that file. The skill chooses its outside instructions. A package install alone grants no Batshit permissions.
 
-Download the zip for the skill you need, then extract it so your outside agent can read the folder.
-
-The Portable Skills tab also shows one install prompt per skill. Copy that line into your outside agent when you want it to install a bundle for you. The copied prompt uses the shared env-file path shown by your instance. Use that displayed path if it differs from the default in the examples below.
-
-The prompt format is:
-
-```txt
-Install the Batshit Portable <skill name> skill from <bundle zip URL>. Use credentials from ~/.batshit/portable-skills/portable-skills.env.
-```
-
-Informational bundles use a token-free variant instead:
-
-```txt
-Install the Batshit Portable Batshit Guide skill from https://docs.batshit.ai/portable-skills/batshit-guide.zip. No token or env file is needed; it is informational only.
-```
-
-Example:
-
-```txt
-Install the Batshit Portable Voice Engine Installer skill from https://docs.batshit.ai/portable-skills/voice-engine-installer.zip. Use credentials from ~/.batshit/portable-skills/portable-skills.env.
-```
-
-## Install into Claude Code
-
-Claude Code discovers skills from skill folders. A normal user-level install is:
-
-```txt
-~/.claude/skills/<skill-id>/SKILL.md
-```
-
-Example:
-
-```txt
-~/.claude/skills/voice-engine-installer/SKILL.md
-```
-
-Put the whole extracted bundle folder there, including `references/`.
-
-## Install into Codex
-
-For Codex builds that support local skills, install the folder in your Codex skills directory. The common local path is:
-
-```txt
-~/.codex/skills/<skill-id>/SKILL.md
-```
-
-Example:
-
-```txt
-~/.codex/skills/artifact-creator/SKILL.md
-```
-
-Put the whole extracted bundle folder there, including `references/`.
+Do not use the older separate `/portable-skills/*.zip` downloads to set up the current release. Those are [older-version archives](../reference/portable-skills.md), kept for people maintaining an older installation. Their bundled help may describe removed agent types.
 
 ## Use with a generic agent
 
@@ -166,7 +118,7 @@ Give it:
 - the Portable Skill Token or private env file path, usually `~/.batshit/portable-skills/portable-skills.env`;
 - the job you want done.
 
-The skill should first check `/api/health`, prove the token, and stop loudly if Batshit is not reachable or the token scope is wrong.
+An operational skill checks `/api/health`, proves its token scope and reports an unavailable instance or missing scope. Informational help needs neither a token nor that handshake.
 
 ## Base URL and Docker notes
 
@@ -192,9 +144,11 @@ Docker has caller-relative URLs. A URL that works in your browser may not be the
 - Do not install untrusted Portable Skills.
 - Read the `SKILL.md` before running high-risk local setup.
 
-## Current Portable Skills
+## Skills in the current plugin
 
 - [Batshit Guide](portable-skills-batshit-guide.md) — informational, no token needed
+- Goon Guide — informational, no token needed
+- [App Actions](../fabric/app-actions.md) — explicit scoped access and one-operation review
 - [Voice Engine Installer](portable-skills-voice-engine-installer.md)
 - [Artifact Creator](portable-skills-artifact-creator.md)
 - [CLI Tool Creator](portable-skills-cli-tool-creator.md)

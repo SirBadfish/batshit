@@ -13,6 +13,7 @@ import {
 import { GoonRecipeLifecycleError } from '$lib/server/services/goonRecipeLifecycleService.server'
 import {
   createOwnedGoonForClient,
+  readOwnedGoonRawForClient,
   GoonMutationError
 } from '$lib/server/services/goonMutationRepository.server'
 
@@ -52,9 +53,16 @@ export const POST: RequestHandler = async ({ params, locals }) => {
     }
 
     const result = await redis.execute(async (client) => {
-      const existing = (await client.json.get(`goon:${goonId}`)) as GoonRecord | null
+      const observed = await readOwnedGoonRawForClient(client, locals.user!.id, goonId)
+      const existing = observed.goon
       if (!existing) return null
       if (existing.user_id !== locals.user!.id) return null
+      // The first read chose the legacy path. Preparation can complete while
+      // the original branch read is in flight; the fresh owner then needs the Recipe
+      // duplicator so its revision documents are copied into the new namespace.
+      if (existing.recipe?.contract === GOON_RECIPE_OWNER_V2_CONTRACT) {
+        throw new GoonRecipeDuplicationError('The Goon changed while duplicating. Reload it and try again.', 409)
+      }
 
       const now = new Date().toISOString()
       const newGoonId = generateGoonId()
@@ -77,7 +85,8 @@ export const POST: RequestHandler = async ({ params, locals }) => {
         delete clone.customAvatar.pending
       }
 
-      return createOwnedGoonForClient({ client, userId: locals.user!.id, goon: clone })
+      return createOwnedGoonForClient({ client, userId: locals.user!.id, goon: clone,
+        duplicateSource: { goonId, raw: observed.raw } })
     })
 
     if (!result) {
@@ -88,7 +97,8 @@ export const POST: RequestHandler = async ({ params, locals }) => {
   } catch (error) {
     if (error instanceof GoonRecipeDuplicationError ||
         error instanceof GoonRecipeLifecycleError || error instanceof GoonMutationError) {
-      return json({ error: error.message }, { status: error.status })
+      return json({ error: error.message, ...(error instanceof GoonRecipeDuplicationError && error.outcome ? { outcome: error.outcome,
+        ...(error.recovery ? { recovery: error.recovery } : {}) } : {}) }, { status: error.status })
     }
     console.error('Error duplicating goon:', error)
     return json({ error: 'Failed to duplicate goon' }, { status: 500 })

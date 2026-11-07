@@ -1,6 +1,6 @@
 # Batshit
 
-Batshit is an alpha self-hosted AI workspace with API agents, CLI-powered agents, n8n workflow tools and Workflow Subagents, artifacts, voice, local runtimes, and project-aware work.
+Batshit is an alpha self-hosted AI workspace with agents on your chosen models, n8n workflow tools, artifacts, voice, local runtimes and project-aware work. Use API keys, Local AI or supported ChatGPT and Claude plan connections.
 
 Batshit is open source under **AGPL-3.0-only**. See [LICENSE](LICENSE) for code terms and [TRADEMARKS.md](TRADEMARKS.md) for Batshit brand-use rules.
 
@@ -24,7 +24,7 @@ For a first install, read:
 2. [Install Mac app](docs/user-docs/installation/install-mac-app.md) or [Install Docker](docs/user-docs/installation/install-docker.md)
 3. [First run](docs/user-docs/installation/first-run.md)
 4. [API keys and models](docs/user-docs/providers/api-keys-and-models.md)
-5. [Connect n8n tools and Workflow Subagents](docs/user-docs/primary-agents/connect-n8n.md)
+5. [Connect n8n tools](docs/user-docs/primary-agents/connect-n8n.md)
 6. [Backup and restore](docs/user-docs/admin/backup-and-restore.md)
 
 Mac app and Docker are peer setup paths. The Mac app is the normal Mac path for host-local runtimes and direct local tooling. Docker is the cross-platform Compose path with clearer package boundaries, explicit sidecars, and the host-operator path for sandbox/add-on control.
@@ -45,14 +45,16 @@ See [Ports And URLs](docs/user-docs/reference/ports-and-urls.md) for the full ca
 
 ## Mac app release status
 
-Public users should install the packaged Mac app release artifact from the current GitHub release. Source-checkout rebuild scripts are maintainer/development workflow, not the normal install path.
+Install the DMG and matching checksum from the [current GitHub release](https://github.com/SirBadfish/batshit/releases/latest). Read the [alpha.4 release notes](docs/user-docs/reference/release-notes.md), including the removed CLI-agent and chat-deletion warnings, before upgrading. Source-checkout rebuild scripts are maintainer/development workflow, not the normal install path.
+
+The complete eight-skill Batshit plugin is available inside the app at **Settings → Plugins & shit → Plugins → Batshit → Download Plugin**. See [outside-agent setup](docs/user-docs/skills/portable-skills.md).
 
 ## Documentation Map
 
 - [User Docs Index](docs/user-docs/index.md)
 - [Primary agents](docs/user-docs/primary-agents/overview.md)
 - [Subagents](docs/user-docs/subagents/overview.md)
-- [n8n workflow templates](docs/user-docs/resources/n8n-workflow-templates.md)
+- [n8n wake-up template](docs/user-docs/reference/templates.md)
 - [Docker runtime and add-ons](docs/user-docs/installation/docker-runtime-and-add-ons.md)
 - [Security and trust](docs/user-docs/security/overview.md)
 - [Troubleshooting](docs/user-docs/troubleshooting/agents-and-tools.md)

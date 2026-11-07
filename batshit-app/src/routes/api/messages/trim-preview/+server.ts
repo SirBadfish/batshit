@@ -12,11 +12,10 @@ import {
   loadContextProtections,
   normalizeMessages,
   normalizeStringArray,
-  resolveCliWrapperOverhead,
-  resolveRuntimeFlavor,
   type AgentRow
 } from '$lib/server/services/contextTokenPreview'
 import { requireOwnedSession, requireUser } from '$lib/server/services/routeSecurity'
+import { retiredPrimaryAgentRefusal } from '$lib/utils/primaryAgentType'
 import {
   applyContextCompactionToMessages,
   getContextCompactionState
@@ -46,6 +45,9 @@ export const POST: RequestHandler = async ({ request, locals, fetch: eventFetch 
     if (!agent || agent.user_id !== user.value.id) {
       return json({ error: 'Agent not found' }, { status: 404 })
     }
+    // SA-139 R4 (D14): a retired Primary type compiles nothing, so it has no preview.
+    const retired = retiredPrimaryAgentRefusal(agent, body?.agentType)
+    if (retired) return json(retired, { status: 409 })
 
     const rawMessages = normalizeMessages(body?.messages)
     const compactionState = getContextCompactionState(sessionCheck.value.metadata ?? null)
@@ -74,8 +76,6 @@ export const POST: RequestHandler = async ({ request, locals, fetch: eventFetch 
       return message && !isMessageProtectedFromManualTrim(message, protections)
     })
     const protectedMessageCount = countProtectedManualTrimCandidates(messages, protections)
-    const runtimeFlavor = resolveRuntimeFlavor(agent, body?.agentType)
-    const wrapperOverheadTokens = resolveCliWrapperOverhead(agent, body?.agentType)
 
     const baseMessages = applyManualTrimToMessages(messages, currentTrimmedMessageIds, {
       protections,
@@ -88,8 +88,6 @@ export const POST: RequestHandler = async ({ request, locals, fetch: eventFetch 
       agent,
       userId: user.value.id,
       assignedSubagents,
-      runtimeFlavor,
-      wrapperOverheadTokens,
       eventFetch
     })
 
@@ -110,7 +108,6 @@ export const POST: RequestHandler = async ({ request, locals, fetch: eventFetch 
         afterTokens: beforeTokens,
         estimatedFreedTokens: 0,
         protectedMessageCount,
-        wrapperOverheadTokens,
         noticeContent: null
       })
     }
@@ -129,8 +126,6 @@ export const POST: RequestHandler = async ({ request, locals, fetch: eventFetch 
         agent,
         userId: user.value.id,
         assignedSubagents,
-        runtimeFlavor,
-        wrapperOverheadTokens,
         eventFetch
       })
 
@@ -164,7 +159,6 @@ export const POST: RequestHandler = async ({ request, locals, fetch: eventFetch 
       afterTokens,
       estimatedFreedTokens: Math.max(0, beforeTokens - afterTokens),
       protectedMessageCount,
-      wrapperOverheadTokens,
       noticeContent: noticeMessage?.content ?? null
     })
   } catch (error) {

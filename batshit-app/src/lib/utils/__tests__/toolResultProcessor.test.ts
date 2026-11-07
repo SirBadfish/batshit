@@ -10,6 +10,13 @@ import {
 import { PRESENT_FILE_CONTENT, PRESENT_FILE_PATH, apiShellStep } from '$lib/test-utils/shell-command-steps'
 
 describe('normalizeToolStep', () => {
+  it('keeps a neutral utility as a tool even when gateway metadata suggests a subagent', () => {
+    const step = normalizeToolStep({ type: 'tool', toolName: 'native_batshit_tool_use', isSubagent: true, toolArgs: { ref: 'batshit:sys.judge.ask', input: {} }, toolResult: { success: true } } as any)
+    expect(step.isSubagent).toBe(false)
+    expect(step.toolName).toBe('fabric_use')
+    expect((step.toolArgs as any).ref).toBe('batshit:sys.judge.ask')
+  })
+
   it('parses native bash list stdout into list_files entries', () => {
     const normalized = normalizeToolStep({
       type: 'tool',
@@ -111,6 +118,26 @@ describe('normalizeToolStep', () => {
 
     expect(normalized.toolName).toBe('edit_file')
     expect((normalized.toolResult as any).filePath).toBe('docs/user-docs/architecture/local-first-boundaries.md')
+  })
+
+  it('keeps a shell edit or write cut before it finished as cut, for the live card (BL-1979)', () => {
+    const stoppedEdit = normalizeToolStep({
+      type: 'tool',
+      toolName: 'batshit_server_edit_file',
+      toolArgs: { command: "sed -i '' 's/a/b/' x.js\nsleep 30", filePath: 'x.js' },
+      toolResult: { success: false, stopped: true, neverReturned: true, reason: 'The reply was stopped while this ran, and it returned no result.' }
+    } as any)
+    expect(stoppedEdit.toolName).toBe('edit_file')
+    expect(stoppedEdit.toolResult as any).toMatchObject({ stopped: true, neverReturned: true })
+
+    const timedWrite = normalizeToolStep({
+      type: 'tool',
+      toolName: 'batshit_server_overwrite_file',
+      toolArgs: { command: 'echo hi > y.txt\nsleep 30', filePath: 'y.txt' },
+      toolResult: { success: false, timedOut: true, exitCode: null, stdout: '', stderr: '' }
+    } as any)
+    expect(timedWrite.toolName).toBe('write_file')
+    expect(timedWrite.toolResult as any).toMatchObject({ timedOut: true })
   })
 
   it('preserves blocked apply_patch edits as failed edit_file results', () => {

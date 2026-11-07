@@ -1,5 +1,7 @@
+import { refusePluginMemberWrite, AgentPluginError } from '$lib/server/services/agentPlugins'
 import { json, type RequestHandler } from '@sveltejs/kit'
 
+import { beginSlashCommandWrite, captureSlashCommandWriteBasis, isSlashCommandMutationError } from '$lib/server/services/slashCommandRevision'
 import { redis } from '$lib/server/redis'
 import {
   isOwnAgentOrSubagent,
@@ -26,18 +28,22 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
     return json({ error: 'Slash command id is required' }, { status: 400 })
   }
 
-  let body: unknown
   try {
-    body = await request.json()
-  } catch {
-    return json({ error: 'Send { agentId, enabled } as JSON.' }, { status: 400 })
-  }
-  const change = parseAgentAccessChange(body)
-  if ('error' in change) {
-    return json({ error: change.error }, { status: 400 })
-  }
+    const preparation = beginSlashCommandWrite(userId)
+    let body: unknown
+    try {
+      body = await request.json()
+    } catch {
+      return json({ error: 'Send { agentId, enabled } as JSON.' }, { status: 400 })
+    }
+    const change = parseAgentAccessChange(body)
+    if ('error' in change) {
+      return json({ error: change.error }, { status: 400 })
+    }
 
-  try {
+    const existing = await redis.json.get(slashCommandKey(userId, commandId)) as SlashCommandRow | null
+    if (existing) await refusePluginMemberWrite(userId, existing)
+    const basis = await captureSlashCommandWriteBasis(preparation, [commandId])
     if (change.enabled && !(await isOwnAgentOrSubagent(userId, change.agentId))) {
       return json(
         { error: `There is no agent or Subagent "${change.agentId}" to turn this on for.` },
@@ -45,7 +51,7 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
       )
     }
 
-    const answer = await setSlashCommandAgentAccess(userId, commandId, change.agentId, change.enabled)
+    const answer = await setSlashCommandAgentAccess(userId, commandId, change.agentId, change.enabled, basis)
     if (answer === 'MISSING') {
       return json({ error: 'Slash command not found' }, { status: 404 })
     }
@@ -55,6 +61,8 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
     }
     return json({ slashCommand, changed: answer === 'OK' })
   } catch (error) {
+    if (error instanceof AgentPluginError) return json({ error: error.message, code: error.code }, { status: error.status })
+    if (isSlashCommandMutationError(error)) return json({ error: error.message, code: error.code }, { status: error.status })
     console.error('Error changing slash command agent access:', error)
     return json({ error: 'Failed to change who may use this command' }, { status: 500 })
   }

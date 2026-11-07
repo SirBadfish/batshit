@@ -4,6 +4,7 @@ import { sveltekit } from '@sveltejs/kit/vite';
 import { defineConfig, searchForWorkspaceRoot } from 'vite';
 import tailwindcss from '@tailwindcss/vite';
 import { macCustodyDevPlugin } from './build-scripts/vite-mac-custody-dev.mjs';
+import sveltekitOptions from './build-scripts/sveltekit-options.mjs';
 
 const workspaceRoot = searchForWorkspaceRoot(process.cwd());
 const configuredDevPort = Number(process.env.BATSHIT_FRONTEND_PORT || process.env.VITE_DEV_PORT || 5620);
@@ -25,7 +26,10 @@ const sharedNodeModulesPath = (() => {
 })();
 
 export default defineConfig({
-	plugins: [macCustodyDevPlugin(), tailwindcss(), sveltekit()],
+	plugins: [macCustodyDevPlugin(), tailwindcss(), sveltekit(sveltekitOptions)],
+	resolve: {
+		alias: { '$lib': path.resolve('./src/lib') }
+	},
 	build: {
 		// Bundle the shared helper-server custody contract into the app SSR build.
 		commonjsOptions: { include: [/node_modules/, /macCustodyPaths\.cjs$/] },

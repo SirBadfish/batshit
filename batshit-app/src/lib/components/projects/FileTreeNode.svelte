@@ -9,6 +9,7 @@
     Loader2,
     Upload
   } from '@lucide/svelte'
+  import type { Component } from 'svelte'
   import type { FileTreeNode } from '$lib/stores/projects.svelte'
   import * as projectStore from '$lib/stores/projects.svelte'
   import { expandDirectory } from '$lib/projects/fileTreeActions'
@@ -16,9 +17,14 @@
   import IconRenderer from '$lib/components/icons/IconRenderer.svelte'
   import { getProjectTreeIconRef } from '$lib/icons/fileTypeIcons'
   import { copyTextToClipboard } from '$lib/utils/clipboard'
-  import FileTreeNodeComponent from './FileTreeNode.svelte'
 
-  let { node, level = 0 } = $props<{ node: FileTreeNode; level?: number }>()
+  type FileTreeNodeProps = {
+    node: FileTreeNode
+    level?: number
+    NodeComponent: Component<FileTreeNodeProps>
+  }
+
+  let { node, level = 0, NodeComponent }: FileTreeNodeProps = $props()
 
   const activeFilePath = $derived(projectStore.getActiveFilePath())
   const isActive = $derived(activeFilePath === node.path)
@@ -209,7 +215,7 @@
       </div>
     {:else if node.children}
       {#each node.children as child (child.path)}
-        <FileTreeNodeComponent node={child} level={level + 1} />
+        <NodeComponent node={child} level={level + 1} {NodeComponent} />
       {/each}
       {#if showEmptyState}
         <div

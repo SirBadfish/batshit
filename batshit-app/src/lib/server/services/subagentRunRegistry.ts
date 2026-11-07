@@ -3,8 +3,9 @@
  * them, and waits until each has ended before anything of it is deleted.
  *
  * Before, the delete removed the Subagent's managed CLI profile folder (BL-157) while its CLI
- * could still be running, and the CLI wrote into that folder again (Codex's logs and sessions),
- * so the folder the delete had just removed came back with the deleted Subagent's prompts in it.
+ * could still be running, and the CLI wrote into that folder again (a CLI's logs and sessions;
+ * found with Codex, removed in SA-139 R1), so the folder the delete had just removed came back
+ * with the deleted Subagent's prompts in it.
  *
  * A Subagent's own run (never a Worker's: a Worker runs in its own slot folder, BL-285) is
  * registered here for as long as it runs, including its CLI's shutdown after a Stop:
@@ -17,7 +18,7 @@
  *    moment the call itself gives up), and calls `end` when the call is done. What it tracks
  *    is `settleSubagentRunWork` (`subagentRunSettle.ts`): the lane's work, then verified cleanup
  *    of its CLI processes. An unverified cleanup at 25 s keeps the run registered for a retry;
- *    non-Codex CLI children retain their 15 s kill grace.
+ *    CLI children keep their 15 s kill grace.
  * 3. The delete calls `stopSubagentRunsForDelete`: the Subagent is marked (no new run starts),
  *    every registered run is stopped through its signal with the reason `subagent_deleted`, and
  *    the delete waits until each has ended. Past 30 s it refuses (409) with nothing deleted and

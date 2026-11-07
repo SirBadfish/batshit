@@ -28,14 +28,6 @@ The GNU Affero General Public License v3.0 only. This is the planned Batshit cor
 
 Batshit's first public launch posture. Alpha means useful for early adopters, but still expected to have bugs and evolving docs.
 
-### API Primary Agent
-
-A Primary Agent that talks directly to model providers through Batshit's built-in provider path.
-
-### API Subagent
-
-A Batshit-managed direct-provider specialist that a compatible Primary Agent can call.
-
 ### Approval Card
 
 The **Approve** / **Deny** card Batshit puts on an agent's message when it tries a risky action. The action is paused, not refused: it runs only when you press **Approve**, exactly once, with exactly the input the card shows. Nothing an agent says can stand in for that click. See [Approving a risky action](../fabric/overview.md#approving-a-risky-action).
@@ -64,17 +56,13 @@ Speech-to-text provided by the browser/platform. It is the free/default Voice Mo
 
 ## C
 
+### Claude plan
+
+A model connection that uses your own Claude plan through Claude Code. Claude Code acts only as the model; Batshit runs every tool. See [Claude plan](../providers/claude-plan.md).
+
 ### CLI
 
-Command-line interface. In Batshit docs, `CLI` also means the Primary Agent type that runs a managed Codex or Claude Code path inside Batshit.
-
-### CLI Primary Agent
-
-A Primary Agent that uses a managed CLI agent while Batshit still owns chat history, Clips, Zips, tool rendering, and workspace UI.
-
-### CLI Subagent
-
-A one-shot managed CLI specialist that a compatible Primary Agent can call.
+Command-line interface. Saved CLI Tools are your own local commands. The Claude Code CLI and Codex CLI lanes for Primary Agents and Subagents were removed; leftover agent records are unavailable and can only be deleted.
 
 ### CLI Tool
 
@@ -142,7 +130,7 @@ A natural stretch of conversation inside an Infinite Session (for example, one a
 
 ### Episode Whiteboard
 
-The agent's own working notes for the current episode of an Infinite Session: the goal, the decisions made, what is live right now, and the open items. Batshit shows the board to the agent with every message until the episode ends, and the agent rewrites it deliberately with a tool. It is not the model's thinking (that happens inside one reply and is gone by the next); it is a small sticky note that outlives replies. It belongs to the agent: a nap fills it only when the agent has not written one, and never rewrites a board the agent wrote. You can read it in the Execution Viewer (the compiled message carries an "Episode whiteboard" section), and the Infinite Session's menu says when it was last written and by whom.
+The agent's saved working notes in a chat: goals, decisions, constraints and next steps. The Whiteboard continues across Infinite Session episodes, independently of long-term Memory. The agent updates or clears it; naps and dreaming do not refill it. Whiteboard Only is the initial Reasoning Retention choice, with a 1,500 estimated-token budget. See [Whiteboard and reasoning retention](../chat/memory-and-infinite-sessions.md#whiteboard-and-reasoning-retention).
 
 ### Execution Viewer
 
@@ -182,13 +170,13 @@ The settings area for shared Goon moods, emotes, eye-contact profiles, and relat
 
 ### Group Chat
 
-A Batshit conversation where multiple Primary Agents can participate. Launch-facing Group Chat is for `API` and `CLI` Primary Agents.
+A Batshit conversation where multiple Primary Agents can participate. Launch-facing Group Chat is for Primary Agents.
 
 ## H
 
 ### Hold
 
-Keeping a result open for the model instead of letting the automatic Zip rules compress it. You hold a result from its Zip badge or the Zip Manager (**Hold**, or **Hold for 10 messages**); an agent holds a file it read by naming the file in its Tool Notes. **Release** gives it back to the automatic rules. Your holds always win over an agent's. See [Zips](../tools/zips.md#hold-and-release).
+Keeping a result open for the model instead of letting the automatic Zip rules compress it. You hold a result from its Zip badge or the Zip Manager (**Hold**, or **Hold for 10 messages**); an agent holds a file it read by naming the file in its Tool Notes block (this works with Tool Notes off too). **Release** gives it back to the automatic rules. Your holds always win over an agent's. See [Zips](../tools/zips.md#hold-and-release).
 
 ### Host Operator
 
@@ -259,21 +247,17 @@ A persistent Goon expression or motion state that stays active until changed.
 
 ### n8n
 
-A workflow automation platform. Batshit uses n8n for workflow tools, Workflow Subagents, MCP gateways, uploads, and Artifact workflows.
-
-### n8n Workflow Subagent
-
-A separate n8n workflow with its own webhook, called by an `API` or `CLI` Primary Agent as a specialist.
+A workflow automation platform. Batshit uses n8n for workflow tools, MCP gateways, uploads, and Artifact workflows, and an n8n workflow can call a wake-up webhook to start a chat.
 
 ### Nap
 
-An Infinite Session's between-turns context relief: graduate finished episodes, compress stale tool output, and condense the oldest open-episode narrative into memory. The episode whiteboard belongs to the agent: a nap fills it only when the agent has not written one, and never rewrites a board the agent wrote. Replaces Compact inside Infinite Sessions; every nap leaves a visible record.
+An Infinite Session's between-turns context relief: graduate finished episodes, compress stale tool output and condense older context into memory. The agent’s continuous Whiteboard is read-only context for the nap: the nap neither fills nor rewrites it. Nap replaces Compact inside Infinite Sessions and leaves a visible result. See [Naps](../chat/memory-and-infinite-sessions.md#naps).
 
 ## P
 
 ### Primary Agent
 
-The main AI agent you chat with directly. Batshit has `API` and `CLI` Primary Agent types.
+The main AI agent you chat with directly. Batshit runs it on the saved model you pick, using an API key, Local AI or a supported plan connection. There is no agent-type choice.
 
 ### Project
 
@@ -355,7 +339,7 @@ as coming from another agent rather than from you. See
 
 ### Subagent
 
-A specialist assistant called by a Primary Agent. Subagents are not general MCP tools, even though they are invoked through tool-like calls.
+A specialist assistant called by a Primary Agent. Batshit runs it on the saved model you pick, on any connection (an API key, a Local AI runtime, your ChatGPT plan or your Claude plan), and any Primary Agent can call it. There is one kind of Subagent. Subagents are not general MCP tools, even though they are invoked through tool-like calls.
 
 ## T
 
@@ -409,7 +393,7 @@ One URL plus one token that lets anything outside Batshit — n8n, a Slack bridg
 
 ### Webhook
 
-A URL that receives a request from Batshit or another service. n8n Workflow Subagents and webhook-backed Artifacts use webhooks.
+A URL that receives a request from Batshit or another service. Wake-up webhooks and webhook-backed Artifacts use webhooks.
 
 ### Workspace
 
@@ -417,7 +401,7 @@ The files and runtime context available to Batshit agents. In Docker, the normal
 
 ### Worker
 
-A temporary AI helper a Primary Agent starts for one task. It uses either the parent's model and tools without inheriting the parent's Skills, or a fresh copy of an assigned API or CLI Subagent with that specialist's model, tools, and Skills. Workers keep no conversation or memory, and Batshit allows up to three at once and nine per Primary Agent turn. See [Subagents and Workers](../subagents/overview.md#workers).
+A temporary AI helper a Primary Agent starts for one task. It uses either the parent's model and tools without inheriting the parent's Skills, or a fresh copy of an assigned Subagent with that specialist's model, tools, and Skills. Workers keep no conversation or memory. Batshit allows six per call and six at a time, with no per-reply total. See [Subagents and Workers](../subagents/overview.md#workers).
 
 ## Z
 

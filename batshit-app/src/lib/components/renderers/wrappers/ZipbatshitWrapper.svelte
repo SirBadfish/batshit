@@ -3,6 +3,7 @@
   import BatshitIcon from '$lib/components/icons/BatshitIcon.svelte'
   import { buildZipStatusPresentation } from '$lib/utils/zipStatusPresentation'
   import type { ToolResultSizeGuard } from '$lib/utils/toolResultSizeGuard'
+  import { liveSnapshotTokens, type ZipLiveSnapshot } from '$lib/utils/zipLiveSnapshot'
 
   let {
     isZipped = false,
@@ -19,9 +20,12 @@
     remainingMessages = undefined,
     autoZip = false,
     holdLabel = null,
+    skillSessionOpen = false,
     deadCopyReason = null,
     heldDeadCopy = false,
+    userHeld = false,
     sizeGuard = null,
+    liveSnapshot = null,
     name = '',
     description = '',
     // Visual indicator settings
@@ -56,14 +60,28 @@
     autoZip?: boolean
     /** SA-129 P2 (D1): who holds it, in the user's words ("Held by you", "Held by Opie"). */
     holdLabel?: string | null
+    skillSessionOpen?: boolean
     /** SA-129 P2 (BL-333): the prompt compresses this read as a dead copy, and why. */
     deadCopyReason?: 'superseded' | 'stale' | null
     /**
      * SA-129 P2b (BL-358): a hold that is not the user's sits on this dead copy, which the prompt
-     * compresses anyway. The user can still Release it here, as in the Zip Manager.
+     * compresses anyway. The user can still Release it here, as in the Zip Manager. Round 2: the
+     * same for a held copy the newest reply did not refresh (zipped that turn, held or not).
      */
     heldDeadCopy?: boolean
+    /**
+     * Round 2: the stored hold is the user's. A copy the newest reply zipped (not refreshed) can be
+     * drawn compressed under the user's own Hold; offering "Hold for 10" or "Hold" there would
+     * silently replace a permanent Hold, so only Release (and Zip now) stay.
+     */
+    userHeld?: boolean
     sizeGuard?: ToolResultSizeGuard
+    /**
+     * SA-137 P4 (D9, D10): the chat's newest reply showed this Read File as a file snapshot of this
+     * size. Only the tooltip and the aria label say so; the badge keeps the stored `tokens`. Round 2:
+     * `not-refreshed` says the newest reply zipped this copy instead.
+     */
+    liveSnapshot?: ZipLiveSnapshot | null
     name?: string
     description?: string
     // Visual indicator settings
@@ -94,6 +112,7 @@
   const canManualUnzip = $derived.by(
     () =>
       sizeGuard !== 'too_large' &&
+      !userHeld &&
       (isZipped ||
         (!isUnzipped && expandedReason === 'buffer') ||
         (isUnzipped && (expandedReason === 'agent' || expandedReason === 'inferred')))
@@ -144,7 +163,9 @@
       holdLabel,
       deadCopyReason,
       sizeGuard,
-      tokens
+      liveSnapshot,
+      // The size guard judged the snapshot's size, so a "too large" line names that one.
+      tokens: sizeGuard === 'too_large' ? liveSnapshotTokens(liveSnapshot) ?? tokens : tokens
     })
   )
 
@@ -250,8 +271,8 @@
             <button
               class="unzip-button unzip"
               onclick={handleUnzip10Click}
-              aria-label="Hold for 10 messages"
-              title="Hold for 10 messages"
+              aria-label={skillSessionOpen ? "Hold skill for 10 messages" : "Hold for 10 messages"}
+              title={skillSessionOpen ? "Hold for 10 messages; the skill closes on expiry, preserving other explicit holds" : "Hold for 10 messages"}
             >
               <BatshitIcon id="unzip" class="h-3 w-3" />
               <span class="unzip-label">10</span>
@@ -266,7 +287,7 @@
               <Infinity class="h-2.5 w-2.5" />
             </button>
           {/if}
-          {#if canZipNow}
+          {#if canZipNow && !skillSessionOpen}
             <button
               class="unzip-button rezip"
               onclick={handleRezipClick}
@@ -280,10 +301,10 @@
             <button
               class="unzip-button automatic"
               onclick={handleReturnAutomaticClick}
-              aria-label="Release"
-              title="Release: back to the automatic rules"
+              aria-label={skillSessionOpen ? "Close skill" : "Release"}
+              title={skillSessionOpen ? "Close skill, preserving other explicit holds" : "Release: back to the automatic rules"}
             >
-              <Clock class="h-3 w-3" />
+              {#if skillSessionOpen}<BatshitIcon id="zip" class="h-3 w-3" />{:else}<Clock class="h-3 w-3" />{/if}
             </button>
           {/if}
         </div>

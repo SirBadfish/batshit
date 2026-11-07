@@ -22,9 +22,9 @@ All three are supported product lanes, but they intentionally require different 
 
 Independent artists can use that expert lane to offer original, commissioned, or properly licensed Batshit-ready models and conversion services. "Batshit-ready" describes technical compatibility only; it does not prove that an artist owns a character or has permission to redistribute it. Buying or locating a model—including a model extracted from a game—does not automatically grant resale rights. Batshit does not host or supply third-party game-character models. Check the model license and the rights holder's current policy before sharing or selling anything.
 
-## First-party Advanced/GLB Goons
+## Imported Advanced/GLB Goons
 
-The ordinary first-party Advanced/GLB flow is **upload, edit, and Save Goon**:
+The supported imported Advanced/GLB flow is **upload, edit, and Save Goon**:
 
 - After upload, Batshit shows **Preparing** and creates the first verified runtime version automatically. The Goon is not assignable or available in the Dock until it reads **Ready**.
 - You can batch face and body edits inside **Custom Goon Builder**, then click **Save Goon** once. One saved appearance batch produces one checked internal update.

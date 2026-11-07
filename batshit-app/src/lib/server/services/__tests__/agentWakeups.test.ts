@@ -7,8 +7,10 @@ import {
   __resetWakeRunRegistryForTests,
   getWakeAbortSignal,
   hasActiveWakeRun,
-  isWokenTurnMessage
+  isWokenTurnMessage,
+  reserveWakeSlot
 } from '$lib/server/services/wakeRunRegistry'
+import { PRIMARY_AGENT_TYPE_RETIRED_CODE, retiredPrimaryAgentTypeMessage } from '$lib/utils/primaryAgentType'
 import { getDm } from '$lib/server/services/dm/dmStore'
 import {
   __resetStreamAbortRegistryForTests,
@@ -45,6 +47,8 @@ import type { ChatSessionRow } from '$lib/types/database'
  * event instead. The publish itself still runs.
  */
 const finishedRuns = vi.hoisted(() => [] as string[])
+/** The end reason each finished run published (SA-139 R1 reads `failed` vs `agent_busy`). */
+const finishedRunReasons = vi.hoisted(() => new Map<string, string>())
 const runningStatusPublishes = vi.hoisted(() => [] as string[])
 vi.mock('$lib/server/ssePublisher', async (importOriginal) => {
   const actual = await importOriginal<typeof import('$lib/server/ssePublisher')>()
@@ -52,7 +56,10 @@ vi.mock('$lib/server/ssePublisher', async (importOriginal) => {
     ...actual,
     publishUserEvent: async (userId: string, event: Record<string, any>) => {
       await actual.publishUserEvent(userId, event)
-      if (event?.type === 'session_run_status' && event.reason) finishedRuns.push(event.sessionId)
+      if (event?.type === 'session_run_status' && event.reason) {
+        finishedRunReasons.set(event.sessionId, event.reason)
+        finishedRuns.push(event.sessionId)
+      }
       if (event?.type === 'session_run_status' && event.status === 'running') {
         runningStatusPublishes.push(event.sessionId)
       }
@@ -85,6 +92,15 @@ vi.mock('undici', () => {
     }
   }
   return { Agent: MockAgent }
+})
+
+/**
+ * SA-139 R1: a pass-through spy on the running-slot reservation, so a refusal can be proven to
+ * come BEFORE any slot is taken. Behaviour is the real registry's.
+ */
+vi.mock('$lib/server/services/wakeRunRegistry', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('$lib/server/services/wakeRunRegistry')>()
+  return { ...actual, reserveWakeSlot: vi.fn(actual.reserveWakeSlot) }
 })
 
 async function waitForWokenTurnToFinish(sessionId: string) {
@@ -177,6 +193,7 @@ let previousGatewayToken: string | undefined
 beforeEach(() => {
   fetchCalls.length = 0
   finishedRuns.length = 0
+  finishedRunReasons.clear()
   runningStatusPublishes.length = 0
   undiciAgentFailNext.count = 0
   // Not reset: the wake dispatcher is a module-level singleton (one `Agent` for the
@@ -223,10 +240,11 @@ describe('refusals, in the locked order (DL-113-05)', () => {
     if (!result.ok) expect(result.reason).toContain('Cooper')
   })
 
-  it('refuses a retired n8n primary, so only live API/CLI agents are woken', async () => {
+  it('refuses a retired n8n primary, so only live API agents are woken', async () => {
     await seedAgent({ agentType: 'n8n' })
     const result = await requestAgentWakeup(baseInput())
-    expect(result).toMatchObject({ ok: false, code: 'agent_not_primary' })
+    expect(result).toMatchObject({ ok: false, code: PRIMARY_AGENT_TYPE_RETIRED_CODE })
+    if (!result.ok) expect(result.reason).toContain('The n8n Primary Agent type was removed from Batshit.')
   })
 
   it(`refuses past chain depth ${MAX_WAKE_CHAIN_DEPTH}`, async () => {
@@ -382,6 +400,29 @@ describe('accepting a wake-up (DL-113-05, DL-113-08)', () => {
     expect(body.metadata.wake).toMatchObject({ chainDepth: 1, dmId: 'dm_1' })
     expect(sendRouted!.init.headers['x-batshit-service-token']).toBe('test-service-token')
     expect(sendRouted!.init.signal).toBeDefined()
+  })
+
+  it('SA-137: the posted history never carries a paused reply\'s server-only replay fields', async () => {
+    await seedAgent()
+    const read = vi.isMockFunction(redis.getRecentMessages)
+      ? vi.mocked(redis.getRecentMessages).getMockImplementation()!
+      : redis.getRecentMessages.bind(redis)
+    const reader = vi.spyOn(redis, 'getRecentMessages').mockImplementation(async (sessionId: string, limit?: number) => [
+      ...(await read(sessionId, limit)),
+      { id: 'msg-paused', session_id: sessionId, user_id: USER, role: 'assistant', content: 'May I?', created_at: '2026-10-21T01:00:00.000Z',
+        metadata: { toolApprovals: { approvals: [] }, whiteboardContextSnapshot: { dcmLines: ['board'] }, liveFileReadSnapshot: { schema_version: 1, pauseId: 'p' } } } as any
+    ])
+    let result: Awaited<ReturnType<typeof requestAgentWakeup>>
+    try {
+      result = await requestAgentWakeup(baseInput())
+    } finally {
+      reader.mockRestore()
+    }
+    expect(result.ok).toBe(true)
+    const body = JSON.parse(fetchCalls.find((call) => call.url.includes('/api/messages/send-routed'))!.init.body)
+    expect(body.messages.map((message: any) => message.id)).toContain('msg-paused')
+    expect(JSON.stringify(body.messages)).not.toMatch(/liveFileReadSnapshot|whiteboardContextSnapshot/)
+    if (result.ok) await waitForWokenTurnToFinish(result.sessionId)
   })
 
   /**
@@ -813,6 +854,148 @@ describe('F-P1-4: a 409 from send-routed is `agent_busy`, not a failure', () => 
       outcome: 'agent_busy'
     })
     expect(dm?.delivery.reason).toMatch(/started another turn/i)
+  })
+})
+
+describe('SA-139 R4: a stored CLI Primary (Claude Code CLI lane or Codex CLI) is not woken', () => {
+  const CLAUDE_CLI = retiredPrimaryAgentTypeMessage('cli')
+  const CODEX_CLI = retiredPrimaryAgentTypeMessage('cli', { codex: true })
+  const CLI_RECORDS = [
+    ['is on the Claude Code CLI lane', {
+      agentType: 'cli', primary_model_provider: 'anthropic-claude-cli', primary_model_name: 'claude-cli',
+      primary_model_connection: { type: 'direct', id: 'claude-cli', service: 'anthropic-claude-cli' }
+    }, CLAUDE_CLI, 'The Claude Code CLI lane was removed from Batshit.'],
+    ['names no CLI lane', { agentType: 'cli', primary_model_provider: 'openai', primary_model_name: 'gpt-5.1' },
+      CLAUDE_CLI, 'The Claude Code CLI lane was removed from Batshit.'],
+    ['has the provider openai-codex', { agentType: 'cli', primary_model_provider: 'openai-codex', primary_model_name: 'gpt-5.1-codex' },
+      CODEX_CLI, 'Codex CLI agents were removed from Batshit.'],
+    ['has the connection codex-cli', {
+      agentType: 'cli', primary_model_provider: 'openai', primary_model_name: 'gpt-5.1-codex',
+      primary_model_connection: { id: 'codex-cli', service: 'openai-codex', type: 'direct' }
+    }, CODEX_CLI, 'Codex CLI agents were removed from Batshit.']
+  ] as const
+
+  it.each(CLI_RECORDS)('refuses one that %s before it reserves a slot, saves a message or opens a chat', async (label, record, refusal, sentence) => {
+    await seedAgent(record)
+    const content = `[Agent DM — from Faye, not from the user] assignment — CLI wake (${label})`
+    const reserve = vi.mocked(reserveWakeSlot)
+    reserve.mockClear()
+    const createSession = vi.spyOn(redis, 'createSession').mockClear()
+    const saveMessage = vi.spyOn(redis, 'saveMessage').mockClear()
+    try {
+      const result = await requestAgentWakeup(baseInput({ content }))
+
+      expect(result).toMatchObject({ ok: false, degraded: 'wait', code: PRIMARY_AGENT_TYPE_RETIRED_CODE })
+      if (!result.ok) {
+        expect(result.reason).toBe(`Cooper cannot be woken. ${refusal.error} ${refusal.details}`)
+        expect(result.reason).toContain(sentence)
+      }
+      expect(reserve).not.toHaveBeenCalled()
+      expect(createSession).not.toHaveBeenCalled()
+      expect(await redis.getSessions(USER, true)).toHaveLength(0)
+      expect(saveMessage.mock.calls.some(([message]) => (message as any)?.content === content)).toBe(false)
+      // Nothing forwarded to SSE, nothing posted to send-routed, nothing announced as running.
+      expect(fetchCalls).toHaveLength(0)
+      expect(runningStatusPublishes).toHaveLength(0)
+    } finally {
+      createSession.mockRestore()
+      saveMessage.mockRestore()
+    }
+  })
+
+  it('still wakes an API agent whose OpenAI model id contains "codex"', async () => {
+    await seedAgent({
+      agentType: 'api', primary_model_provider: 'openai', primary_model_name: 'gpt-5-codex',
+      primary_model_connection: { type: 'direct', id: 'direct:openai', service: 'openai' }
+    })
+
+    const result = await requestAgentWakeup(baseInput())
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(fetchCalls.some((call) => call.url.includes('/api/messages/send-routed'))).toBe(true)
+    await waitForWokenTurnToFinish(result.sessionId)
+    expect(finishedRunReasons.get(result.sessionId)).toBe('completed')
+  })
+})
+
+describe('SA-139 R4: a 409 from send-routed that names a retired Primary type ends the run as failed', () => {
+  async function seedWakingDm() {
+    await redis.json.set('dm:dm_1', '$', {
+      id: 'dm_1',
+      messageId: 'dm_1',
+      userId: USER,
+      kind: 'info',
+      priority: 'normal',
+      from: { kind: 'agent', agentId: 'agent-faye', name: 'Faye' },
+      to: 'agent-cooper',
+      subject: 'Heads up',
+      body: 'Something happened.',
+      deliver: 'wake',
+      status: 'new',
+      createdAt: '2026-09-07T09:00:00.000Z',
+      createdTs: Date.parse('2026-09-07T09:00:00.000Z'),
+      expiresAt: '2026-09-14T09:00:00.000Z',
+      delivery: { requested: 'wake', actual: 'wake' }
+    } as never)
+  }
+
+  function stubSendRouted409(body: string) {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: any, init?: any) => {
+        const url = String(input)
+        fetchCalls.push({ url, init })
+        if (url.includes('/api/messages/send-routed')) return new Response(body, { status: 409 })
+        return new Response(JSON.stringify({ success: true }), { status: 200 })
+      })
+    )
+  }
+
+  it('send-routed\'s `primary_agent_type_retired` 409 is a failure, not busy', async () => {
+    // The record passed the wake check as API; send-routed refuses its retired type (its own
+    // stored-record check, for example after the record changed between the check and the POST).
+    await seedAgent()
+    await seedWakingDm()
+    const claudeCli = retiredPrimaryAgentTypeMessage('cli')
+    stubSendRouted409(JSON.stringify({
+      error: claudeCli.error,
+      code: PRIMARY_AGENT_TYPE_RETIRED_CODE,
+      details: claudeCli.details
+    }))
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    const result = await requestAgentWakeup(baseInput())
+    expect(result.ok).toBe(true)
+    if (!result.ok) throw new Error('the wake was refused')
+
+    await waitForWokenTurnToFinish(result.sessionId)
+    expect(finishedRunReasons.get(result.sessionId)).toBe('failed')
+    const dm = await getDm('dm_1')
+    expect(dm?.delivery).toMatchObject({ requested: 'wake', actual: 'wake', outcome: 'failed' })
+    expect(dm?.delivery.reason).toBeUndefined()
+    // The refusal's body is still readable for the failure log after its code was read.
+    const failureLog = logged.mock.calls.find(([text]) => String(text).includes('send-routed returned non-OK'))
+    expect(failureLog?.[1]).toMatchObject({ sessionId: result.sessionId, status: 409 })
+    expect((failureLog?.[1] as any)?.detail).toContain(PRIMARY_AGENT_TYPE_RETIRED_CODE)
+  })
+
+  it.each([
+    ['another code', JSON.stringify({ error: 'Earlier sends are waiting in this chat.', code: 'queued_turns_waiting' })],
+    ['no code', JSON.stringify({ error: 'Another response is already in progress for this session.' })],
+    ['a body that is not JSON', 'busy']
+  ])('a 409 with %s is still `agent_busy`', async (_label, body) => {
+    await seedAgent()
+    await seedWakingDm()
+    stubSendRouted409(body)
+
+    const result = await requestAgentWakeup(baseInput())
+    expect(result.ok).toBe(true)
+    if (!result.ok) throw new Error('the wake was refused')
+
+    await waitForWokenTurnToFinish(result.sessionId)
+    expect(finishedRunReasons.get(result.sessionId)).toBe('agent_busy')
+    expect((await getDm('dm_1'))?.delivery).toMatchObject({ actual: 'wait', outcome: 'agent_busy' })
   })
 })
 

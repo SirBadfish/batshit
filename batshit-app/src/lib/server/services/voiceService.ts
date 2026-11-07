@@ -1,3 +1,72 @@
+import { buildMimoSpeechInput, MimoVoiceInputError } from './mimoVoiceInput'
+import { isGemini38TtsModel, buildGemini38TtsRequest, parseGemini38TtsAudio } from './gemini38Tts'
+import { isQwenAudioTtsModel, buildQwenAudioTtsRequest } from '$lib/data/qwenAudioTts'
+import { qwenAudioResultUrl, downloadQwenAudio } from './qwenAudioTtsResponse'
+import { readBoundedSpeechJson, speechProviderStatusError } from './boundedSpeechJson'
+import { DEEPGRAM_AURA2_VOICE_IDS, DEEPGRAM_AURA1_VOICE_IDS, DEEPGRAM_FLUX_TTS_VOICE_IDS } from '$lib/data/deepgramVoiceCatalog'
+import { readBuiltinVoiceCatalog, refreshBuiltinVoiceCatalog, assertBuiltinVoiceCatalogModel } from './builtinVoiceCatalog'
+import { VoiceCatalogCompatibilityError } from './builtinVoiceCatalogErrors'
+import { projectVoiceProviderSummaries } from '$lib/utils/builtinVoiceCatalogProjection'
+import type { VoiceCatalogView } from '$lib/types/builtinVoiceCatalog'
+import { BUNDLED_VOICE_PROVIDER_SUMMARIES as PROVIDER_SUMMARIES,
+  DEFAULT_GEMINI_TTS_MODEL,
+  DEFAULT_GEMINI_STT_MODEL,
+  DEFAULT_GEMINI_TTS_VOICE,
+  GEMINI_TTS_MODELS,
+  GEMINI_STT_MODELS,
+  DEFAULT_OPENAI_STT_MODEL,
+  DEFAULT_OPENAI_REALTIME_STT_MODEL,
+  OPENAI_STT_MODELS,
+  OPENAI_REALTIME_STT_MODELS,
+  DEFAULT_ELEVENLABS_TTS_MODEL,
+  DEFAULT_ELEVENLABS_STT_MODEL,
+  DEFAULT_ELEVENLABS_REALTIME_STT_MODEL,
+  ELEVENLABS_TTS_MODELS,
+  ELEVENLABS_STT_MODELS,
+  ELEVENLABS_REALTIME_STT_MODELS,
+  DEFAULT_DEEPGRAM_TTS_MODEL,
+  DEFAULT_DEEPGRAM_STT_MODEL,
+  DEFAULT_DEEPGRAM_REALTIME_STT_MODEL,
+  DEFAULT_DEEPGRAM_FLUX_TTS_MODEL,
+  DEEPGRAM_STT_MODELS,
+  DEEPGRAM_REALTIME_STT_MODELS,
+  DEFAULT_FISH_TTS_MODEL,
+  DEFAULT_FISH_STT_MODEL,
+  FISH_TTS_MODELS,
+  FISH_STT_MODELS,
+  DEFAULT_MISTRAL_TTS_MODEL,
+  DEFAULT_MISTRAL_STT_MODEL,
+  DEFAULT_MISTRAL_REALTIME_STT_MODEL,
+  MISTRAL_TTS_MODELS,
+  MISTRAL_STT_MODELS,
+  MISTRAL_REALTIME_STT_MODELS,
+  DEFAULT_MINIMAX_TTS_MODEL,
+  DEFAULT_MINIMAX_TTS_VOICE,
+  MINIMAX_TTS_MODELS,
+  DEFAULT_MIMO_TTS_MODEL,
+  DEFAULT_MIMO_STT_MODEL,
+  DEFAULT_MIMO_TTS_VOICE,
+  MIMO_TTS_MODELS,
+  MIMO_STT_MODELS,
+  DEFAULT_ALIBABA_TTS_MODEL,
+  DEFAULT_ALIBABA_TTS_VOICE,
+  ALIBABA_TTS_MODELS,
+  DEFAULT_INWORLD_TTS_MODEL,
+  DEFAULT_INWORLD_TTS_VOICE,
+  INWORLD_TTS_MODELS,
+  DEFAULT_CARTESIA_TTS_MODEL,
+  DEFAULT_CARTESIA_TTS_VOICE,
+  CARTESIA_TTS_MODELS,
+  DEFAULT_ASYNC_TTS_MODEL,
+  DEFAULT_ASYNC_TTS_VOICE,
+  ASYNC_TTS_MODELS,
+  DEFAULT_STEPFUN_TTS_MODEL,
+  DEFAULT_STEPFUN_TTS_VOICE,
+  STEPFUN_TTS_MODELS,
+  DEFAULT_AZURE_TTS_MODEL,
+  DEFAULT_AZURE_TTS_VOICE,
+  AZURE_TTS_MODELS
+} from '$lib/data/builtinVoiceProviderBaseline'
 import { spawn } from 'node:child_process'
 import fs from 'node:fs/promises'
 import os from 'node:os'
@@ -81,28 +150,13 @@ import {
   OPENAI_TTS_VOICES
 } from '$lib/server/services/voiceModelCatalog'
 import { bytesToBlob, toOwnedBytes } from '$lib/utils/binary'
+import { fetchRecordedTranscription, recordedTranscriptionForm } from './voiceRecordedTranscription'
 import { MINIMAX_TOKEN_PLAN_OPENAI_BASE_URL } from '$lib/server/constants/minimaxTokenPlan'
 import { MIMO_TOKEN_PLAN_OPENAI_BASE_URL } from '$lib/server/constants/mimoTokenPlan'
+import { validTtsId, type ConfiguredFishAccountChoice, type ConfiguredFishAccountPage, type ConfiguredFishAccountPageRead, type ConfiguredTtsAccountReadFailure } from '$lib/appActions/settings/configuredTtsPreferences'
 
-const DEFAULT_OPENAI_STT_MODEL = 'gpt-4o-mini-transcribe'
-const OPENAI_STT_MODELS = [
-  'gpt-4o-mini-transcribe',
-  'gpt-4o-transcribe',
-  'gpt-4o-transcribe-diarize',
-  'whisper-1'
-]
-const DEFAULT_OPENAI_REALTIME_STT_MODEL = 'gpt-realtime-whisper'
-const OPENAI_REALTIME_STT_MODELS = [DEFAULT_OPENAI_REALTIME_STT_MODEL]
-const DEFAULT_GEMINI_TTS_MODEL = 'gemini-3.1-flash-tts-preview'
-const GEMINI_TTS_MODELS = [
-  'gemini-3.1-flash-tts-preview',
-  'gemini-2.5-flash-preview-tts',
-  'gemini-2.5-pro-preview-tts'
-]
-const DEFAULT_GEMINI_TTS_VOICE = 'Kore'
-const GOOGLE_API_KEY_ENV_NAMES = ['GOOGLE_GENERATIVE_AI_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY']
-const DEFAULT_GEMINI_STT_MODEL = 'gemini-3.5-transcribe'
-const GEMINI_STT_MODELS = [DEFAULT_GEMINI_STT_MODEL]
+const GOOGLE_API_KEY_ENV_NAMES = ['GOOGLE_GENERATIVE_AI_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY'] as const
+
 const GEMINI_TTS_VOICES = [
   'Zephyr',
   'Puck',
@@ -135,70 +189,13 @@ const GEMINI_TTS_VOICES = [
   'Sadaltager',
   'Sulafat'
 ] as const
-const DEFAULT_DEEPGRAM_TTS_MODEL = 'aura-2-asteria-en'
-const DEFAULT_DEEPGRAM_FLUX_TTS_MODEL = 'flux-hannah-en'
-const DEFAULT_DEEPGRAM_STT_MODEL = 'nova-3'
-const DEEPGRAM_STT_MODELS = [
-  'nova-3',
-  'nova-3-general',
-  'nova-3-medical',
-  'nova-2',
-  'nova-2-general',
-  'nova-2-meeting',
-  'nova-2-phonecall',
-  'nova-2-finance',
-  'nova-2-conversationalai',
-  'nova-2-voicemail',
-  'nova-2-video',
-  'nova-2-medical',
-  'nova-2-drivethru',
-  'nova-2-automotive',
-  'nova-2-atc',
-  'whisper',
-  'whisper-tiny',
-  'whisper-base',
-  'whisper-small',
-  'whisper-medium',
-  'whisper-large'
-]
-const DEFAULT_DEEPGRAM_REALTIME_STT_MODEL = 'flux-general-en'
-const DEEPGRAM_REALTIME_STT_MODELS = ['flux-general-en', 'flux-general-multi']
-const DEFAULT_ELEVENLABS_TTS_MODEL = 'eleven_multilingual_v2'
-const DEFAULT_ELEVENLABS_STT_MODEL = 'scribe_v2'
-const ELEVENLABS_STT_MODELS = ['scribe_v2']
-const DEFAULT_ELEVENLABS_REALTIME_STT_MODEL = 'scribe_v2_realtime'
-const ELEVENLABS_REALTIME_STT_MODELS = [DEFAULT_ELEVENLABS_REALTIME_STT_MODEL]
+
 // `s2.1-pro` is Fish Audio's current recommended production TTS model; `s2.1-pro-free`
 // is the same model under fair-use limits with no service guarantees. Both S2 generations
 // share the `[bracket]` emotion syntax; legacy `s1` uses `(parentheses)` instead.
-const DEFAULT_FISH_TTS_MODEL = 's2.1-pro'
-const FISH_TTS_MODELS = ['s2.1-pro', 's2.1-pro-free', 's2-pro', 's1']
-const DEFAULT_FISH_STT_MODEL = 'transcribe-1'
-const FISH_STT_MODELS = [DEFAULT_FISH_STT_MODEL]
-const DEFAULT_MISTRAL_TTS_MODEL = 'voxtral-mini-tts-2603'
-const MISTRAL_TTS_MODELS = ['voxtral-mini-tts-2603']
-const DEFAULT_MISTRAL_STT_MODEL = 'voxtral-mini-latest'
-const MISTRAL_STT_MODELS = ['voxtral-mini-latest', 'voxtral-mini-2602']
-const DEFAULT_MISTRAL_REALTIME_STT_MODEL = 'voxtral-mini-transcribe-realtime-2602'
-const MISTRAL_REALTIME_STT_MODELS = [DEFAULT_MISTRAL_REALTIME_STT_MODEL]
-const DEFAULT_MINIMAX_TTS_MODEL = 'speech-2.8-hd'
-const DEFAULT_MINIMAX_TTS_VOICE = 'English_expressive_narrator'
-const MINIMAX_TTS_MODELS = [
-  'speech-2.8-hd',
-  'speech-2.8-turbo',
-  'speech-2.6-hd',
-  'speech-2.6-turbo',
-  'speech-02-hd',
-  'speech-02-turbo',
-  'speech-01-hd',
-  'speech-01-turbo'
-]
-const DEFAULT_MIMO_TTS_MODEL = 'mimo-v2.5-tts'
-const DEFAULT_MIMO_STT_MODEL = 'mimo-v2.5-asr'
+
 const MAX_MIMO_ASR_BASE64_CHARS = 10 * 1024 * 1024
-const DEFAULT_MIMO_TTS_VOICE = 'Chloe'
-const MIMO_TTS_MODELS = ['mimo-v2.5-tts', 'mimo-v2.5-tts-voicedesign', 'mimo-v2.5-tts-voiceclone']
-const MIMO_STT_MODELS = [DEFAULT_MIMO_STT_MODEL]
+
 const MIMO_TTS_VOICES = [
   'mimo_default',
   '冰糖',
@@ -210,14 +207,7 @@ const MIMO_TTS_VOICES = [
   'Milo',
   'Dean'
 ]
-const DEFAULT_ALIBABA_TTS_MODEL = 'qwen3-tts-flash'
-const DEFAULT_ALIBABA_TTS_VOICE = 'Cherry'
-const ALIBABA_TTS_MODELS = [
-  'qwen3-tts-flash',
-  'qwen3-tts-instruct-flash',
-  'qwen3-tts-vd-2026-01-26',
-  'qwen3-tts-vc-2026-01-22'
-]
+
 const ALIBABA_TTS_VOICES = [
   'Cherry',
   'Serena',
@@ -230,30 +220,13 @@ const ALIBABA_TTS_VOICES = [
   'Serene',
   'Ethan'
 ]
-const DEFAULT_INWORLD_TTS_MODEL = 'inworld-tts-2'
-const DEFAULT_INWORLD_TTS_VOICE = 'Alex'
-const INWORLD_TTS_MODELS = [
-  'inworld-tts-2',
-  'inworld-tts-1.5-max',
-  'inworld-tts-1.5-mini',
-  'inworld-tts-1',
-  'inworld-tts-1-max'
-]
-const DEFAULT_CARTESIA_TTS_MODEL = 'sonic-3.5'
-const DEFAULT_CARTESIA_TTS_VOICE = 'db6b0ed5-d5d3-463d-ae85-518a07d3c2b4'
-const CARTESIA_TTS_MODELS = ['sonic-3.5', 'sonic-3', 'sonic-latest']
+
 const CARTESIA_VERSION = '2026-03-01'
-const DEFAULT_ASYNC_TTS_MODEL = 'async_flash_v1.0'
-const DEFAULT_ASYNC_TTS_VOICE = 'e0f39dc4-f691-4e78-bba5-5c636692cc04'
-const ASYNC_TTS_MODELS = ['async_flash_v1.0', 'async_flash_v1.5', 'async_pro_v1.0']
+
 const ASYNC_VERSION = 'v1'
-const DEFAULT_STEPFUN_TTS_MODEL = 'step-tts-2'
-const DEFAULT_STEPFUN_TTS_VOICE = 'lively-girl'
-const STEPFUN_TTS_MODELS = ['step-tts-2', 'stepaudio-2.5-tts']
+
 const STEPFUN_TTS_VOICES = ['lively-girl', 'cixingnansheng']
-const DEFAULT_AZURE_TTS_MODEL = 'azure-neural-tts'
-const DEFAULT_AZURE_TTS_VOICE = 'en-US-AvaMultilingualNeural'
-const AZURE_TTS_MODELS = [DEFAULT_AZURE_TTS_MODEL]
+
 const FISH_MODEL_LIST_PAGE_SIZE = 100
 const FISH_PUBLIC_MODEL_LIST_PAGE_SIZE = 50
 const FISH_USER_MODEL_PAGE_LIMIT = 5
@@ -291,154 +264,6 @@ const QWEN_MODE_VOICE_DESIGN = 'voice_design'
 const NORMALIZED_REF_AUDIO_SUFFIX = '.batshit-normalized.wav'
 const REF_AUDIO_PASSTHROUGH_EXTENSIONS = new Set(['.wav'])
 
-const DEEPGRAM_AURA2_VOICE_IDS = [
-  'aura-2-agathe-fr',
-  'aura-2-agustina-es',
-  'aura-2-alvaro-es',
-  'aura-2-ama-ja',
-  'aura-2-amalthea-en',
-  'aura-2-andromeda-en',
-  'aura-2-antonia-es',
-  'aura-2-apollo-en',
-  'aura-2-aquila-es',
-  'aura-2-arcas-en',
-  'aura-2-aries-en',
-  'aura-2-asteria-en',
-  'aura-2-athena-en',
-  'aura-2-atlas-en',
-  'aura-2-aurelia-de',
-  'aura-2-aurora-en',
-  'aura-2-beatrix-nl',
-  'aura-2-callista-en',
-  'aura-2-carina-es',
-  'aura-2-celeste-es',
-  'aura-2-cesare-it',
-  'aura-2-cinzia-it',
-  'aura-2-cora-en',
-  'aura-2-cordelia-en',
-  'aura-2-cornelia-nl',
-  'aura-2-daphne-nl',
-  'aura-2-delia-en',
-  'aura-2-demetra-it',
-  'aura-2-diana-es',
-  'aura-2-dionisio-it',
-  'aura-2-draco-en',
-  'aura-2-ebisu-ja',
-  'aura-2-elara-de',
-  'aura-2-electra-en',
-  'aura-2-elio-it',
-  'aura-2-estrella-es',
-  'aura-2-fabian-de',
-  'aura-2-flavio-it',
-  'aura-2-fujin-ja',
-  'aura-2-gloria-es',
-  'aura-2-harmonia-en',
-  'aura-2-hector-fr',
-  'aura-2-helena-en',
-  'aura-2-hera-en',
-  'aura-2-hermes-en',
-  'aura-2-hestia-nl',
-  'aura-2-hyperion-en',
-  'aura-2-iris-en',
-  'aura-2-izanami-ja',
-  'aura-2-janus-en',
-  'aura-2-javier-es',
-  'aura-2-julius-de',
-  'aura-2-juno-en',
-  'aura-2-jupiter-en',
-  'aura-2-kara-de',
-  'aura-2-lara-de',
-  'aura-2-lars-nl',
-  'aura-2-leda-nl',
-  'aura-2-livia-it',
-  'aura-2-luciano-es',
-  'aura-2-luna-en',
-  'aura-2-maia-it',
-  'aura-2-mars-en',
-  'aura-2-melia-it',
-  'aura-2-minerva-en',
-  'aura-2-neptune-en',
-  'aura-2-nestor-es',
-  'aura-2-odysseus-en',
-  'aura-2-olivia-es',
-  'aura-2-ophelia-en',
-  'aura-2-orion-en',
-  'aura-2-orpheus-en',
-  'aura-2-pandora-en',
-  'aura-2-perseo-it',
-  'aura-2-phoebe-en',
-  'aura-2-pluto-en',
-  'aura-2-rhea-nl',
-  'aura-2-roman-nl',
-  'aura-2-sander-nl',
-  'aura-2-saturn-en',
-  'aura-2-selena-es',
-  'aura-2-selene-en',
-  'aura-2-silvia-es',
-  'aura-2-sirio-es',
-  'aura-2-thalia-en',
-  'aura-2-theia-en',
-  'aura-2-uzume-ja',
-  'aura-2-valerio-es',
-  'aura-2-vesta-en',
-  'aura-2-viktoria-de',
-  'aura-2-zeus-en'
-]
-
-const DEEPGRAM_AURA1_VOICE_IDS = [
-  'aura-asteria-en',
-  'aura-luna-en',
-  'aura-stella-en',
-  'aura-athena-en',
-  'aura-hera-en',
-  'aura-orion-en',
-  'aura-zeus-en',
-  'aura-perseus-en',
-  'aura-helios-en',
-  'aura-angus-en',
-  'aura-orpheus-en',
-  'aura-arcas-en'
-]
-
-const DEEPGRAM_FLUX_TTS_VOICE_IDS = [
-  'flux-hannah-en',
-  'flux-kit-en',
-  'flux-alexis-en',
-  'flux-cliff-en',
-  'flux-sienna-en',
-  'flux-cole-en',
-  'flux-brooke-en',
-  'flux-colin-en',
-  'flux-gemma-en',
-  'flux-haley-en',
-  'flux-heather-en',
-  'flux-miles-en',
-  'flux-sean-en',
-  'flux-bree-en',
-  'flux-brittany-en',
-  'flux-bruce-en',
-  'flux-conor-en',
-  'flux-donovan-en',
-  'flux-drew-en',
-  'flux-elise-en',
-  'flux-jack-en',
-  'flux-kai-en',
-  'flux-kelsey-en',
-  'flux-maeve-en',
-  'flux-marcelo-en',
-  'flux-marcus-en',
-  'flux-meena-en',
-  'flux-meghan-en',
-  'flux-naveen-en',
-  'flux-paige-en',
-  'flux-priya-en',
-  'flux-rufus-en',
-  'flux-sharon-en',
-  'flux-tanner-en',
-  'flux-wade-en',
-  'flux-wes-en'
-]
-
 const formatDeepgramVoiceName = (id: string) => {
   const isAura2 = id.startsWith('aura-2-')
   const stripped = id.replace(/^aura-2-/, '').replace(/^aura-/, '')
@@ -457,13 +282,6 @@ const DEEPGRAM_TTS_VOICES: Array<{ id: string; name: string }> = [
   ...DEEPGRAM_AURA1_VOICE_IDS.map((id) => ({ id, name: formatDeepgramVoiceName(id) }))
 ]
 
-const ELEVENLABS_TTS_MODELS = [
-  'eleven_v3',
-  'eleven_multilingual_v2',
-  'eleven_flash_v2_5',
-  'eleven_flash_v2'
-]
-
 const MAX_TTS_CHARS = 5000
 const MAX_TRANSCRIBE_BYTES = 25 * 1024 * 1024
 
@@ -479,329 +297,6 @@ const MEDIA_TYPE_MAP: Record<string, string> = {
 }
 
 const OPENAI_FORMATS = ['mp3', 'opus', 'aac', 'flac', 'wav', 'pcm']
-
-const PROVIDER_SUMMARIES: VoiceProviderSummary[] = [
-  {
-    id: 'browser',
-    label: 'Browser (Web Speech API)',
-    type: 'browser',
-    supports: {
-      tts: true,
-      stt: true,
-      listVoices: false,
-      clone: false,
-      streaming: false,
-      styles: false,
-      emotions: false
-    },
-    sttCapabilities: BROWSER_STT_CAPABILITIES,
-    defaultVoice: 'system'
-  },
-  {
-    id: 'google',
-    label: 'Google Gemini',
-    type: 'cloud',
-    requiresKey: true,
-    supports: {
-      tts: true,
-      stt: true,
-      listVoices: true,
-      clone: false,
-      streaming: false,
-      styles: false,
-      emotions: false
-    },
-    defaultModel: DEFAULT_GEMINI_TTS_MODEL,
-    defaultTtsModel: DEFAULT_GEMINI_TTS_MODEL,
-    defaultSttModel: DEFAULT_GEMINI_STT_MODEL,
-    defaultVoice: DEFAULT_GEMINI_TTS_VOICE,
-    ttsModels: GEMINI_TTS_MODELS,
-    sttModels: GEMINI_STT_MODELS,
-    sttCapabilities: GOOGLE_STT_CAPABILITIES
-  },
-  {
-    id: 'openai',
-    label: 'OpenAI',
-    type: 'cloud',
-    requiresKey: true,
-    supports: {
-      tts: true,
-      stt: true,
-      listVoices: true,
-      clone: false,
-      streaming: false,
-      styles: true,
-      emotions: false
-    },
-    defaultModel: DEFAULT_OPENAI_TTS_MODEL,
-    defaultTtsModel: DEFAULT_OPENAI_TTS_MODEL,
-    defaultSttModel: DEFAULT_OPENAI_STT_MODEL,
-    defaultRealtimeSttModel: DEFAULT_OPENAI_REALTIME_STT_MODEL,
-    defaultVoice: OPENAI_TTS_VOICES[0],
-    ttsModels: [...OPENAI_TTS_MODELS],
-    sttModels: OPENAI_STT_MODELS,
-    realtimeSttModels: OPENAI_REALTIME_STT_MODELS,
-    sttCapabilities: OPENAI_STT_CAPABILITIES
-  },
-  {
-    id: 'elevenlabs',
-    label: 'ElevenLabs',
-    type: 'cloud',
-    requiresKey: true,
-    supports: {
-      tts: true,
-      stt: true,
-      listVoices: true,
-      clone: true,
-      streaming: false,
-      styles: true,
-      emotions: true
-    },
-    defaultModel: DEFAULT_ELEVENLABS_TTS_MODEL,
-    defaultTtsModel: DEFAULT_ELEVENLABS_TTS_MODEL,
-    defaultSttModel: DEFAULT_ELEVENLABS_STT_MODEL,
-    defaultRealtimeSttModel: DEFAULT_ELEVENLABS_REALTIME_STT_MODEL,
-    ttsModels: ELEVENLABS_TTS_MODELS,
-    sttModels: ELEVENLABS_STT_MODELS,
-    realtimeSttModels: ELEVENLABS_REALTIME_STT_MODELS,
-    sttCapabilities: ELEVENLABS_STT_CAPABILITIES
-  },
-  {
-    id: 'deepgram',
-    label: 'Deepgram',
-    type: 'cloud',
-    requiresKey: true,
-    supports: {
-      tts: true,
-      stt: true,
-      listVoices: true,
-      clone: false,
-      streaming: false,
-      styles: false,
-      emotions: false
-    },
-    defaultModel: DEFAULT_DEEPGRAM_TTS_MODEL,
-    defaultTtsModel: DEFAULT_DEEPGRAM_TTS_MODEL,
-    defaultSttModel: DEFAULT_DEEPGRAM_STT_MODEL,
-    defaultRealtimeSttModel: DEFAULT_DEEPGRAM_REALTIME_STT_MODEL,
-    defaultVoice: DEFAULT_DEEPGRAM_TTS_MODEL,
-    ttsModels: [DEFAULT_DEEPGRAM_TTS_MODEL, DEFAULT_DEEPGRAM_FLUX_TTS_MODEL],
-    sttModels: DEEPGRAM_STT_MODELS,
-    realtimeSttModels: DEEPGRAM_REALTIME_STT_MODELS,
-    sttCapabilities: DEEPGRAM_STT_CAPABILITIES
-  },
-  {
-    id: 'fish',
-    label: 'Fish Audio',
-    type: 'cloud',
-    requiresKey: true,
-    supports: {
-      tts: true,
-      stt: true,
-      listVoices: true,
-      clone: false,
-      streaming: true,
-      styles: false,
-      emotions: false
-    },
-    defaultModel: DEFAULT_FISH_TTS_MODEL,
-    defaultTtsModel: DEFAULT_FISH_TTS_MODEL,
-    defaultSttModel: DEFAULT_FISH_STT_MODEL,
-    ttsModels: FISH_TTS_MODELS,
-    sttModels: FISH_STT_MODELS,
-    sttCapabilities: FISH_STT_CAPABILITIES
-  },
-  {
-    id: 'mistral',
-    label: 'Mistral Voxtral',
-    type: 'cloud',
-    requiresKey: true,
-    supports: {
-      tts: true,
-      stt: true,
-      listVoices: true,
-      clone: true,
-      streaming: false,
-      styles: false,
-      emotions: false
-    },
-    defaultModel: DEFAULT_MISTRAL_TTS_MODEL,
-    defaultTtsModel: DEFAULT_MISTRAL_TTS_MODEL,
-    defaultSttModel: DEFAULT_MISTRAL_STT_MODEL,
-    defaultRealtimeSttModel: DEFAULT_MISTRAL_REALTIME_STT_MODEL,
-    ttsModels: MISTRAL_TTS_MODELS,
-    sttModels: MISTRAL_STT_MODELS,
-    realtimeSttModels: MISTRAL_REALTIME_STT_MODELS,
-    sttCapabilities: MISTRAL_STT_CAPABILITIES,
-    voiceSurface: {
-      kind: 'clone_profiles',
-      summary:
-        'Mistral Voxtral TTS uses saved voice_id values or reference audio. Batshit lists saved Mistral voices from the Audio Voices API when a key is configured, and still allows a manual voice_id entry.',
-      requiresDiscussion: true
-    }
-  },
-  {
-    id: 'minimax',
-    label: 'MiniMax',
-    type: 'cloud',
-    requiresKey: true,
-    supports: {
-      tts: true,
-      stt: false,
-      listVoices: true,
-      clone: false,
-      streaming: false,
-      styles: true,
-      emotions: true
-    },
-    defaultModel: DEFAULT_MINIMAX_TTS_MODEL,
-    defaultTtsModel: DEFAULT_MINIMAX_TTS_MODEL,
-    defaultVoice: DEFAULT_MINIMAX_TTS_VOICE,
-    ttsModels: MINIMAX_TTS_MODELS
-  },
-  {
-    id: 'mimo',
-    label: 'MiMo',
-    type: 'cloud',
-    requiresKey: true,
-    supports: {
-      tts: true,
-      stt: true,
-      listVoices: true,
-      clone: false,
-      streaming: false,
-      styles: true,
-      emotions: true
-    },
-    defaultModel: DEFAULT_MIMO_TTS_MODEL,
-    defaultTtsModel: DEFAULT_MIMO_TTS_MODEL,
-    defaultSttModel: DEFAULT_MIMO_STT_MODEL,
-    defaultVoice: DEFAULT_MIMO_TTS_VOICE,
-    ttsModels: MIMO_TTS_MODELS,
-    sttModels: MIMO_STT_MODELS,
-    sttCapabilities: MIMO_STT_CAPABILITIES
-  },
-  {
-    id: 'alibaba',
-    label: 'Alibaba Cloud Qwen TTS',
-    type: 'cloud',
-    requiresKey: true,
-    supports: {
-      tts: true,
-      stt: false,
-      listVoices: true,
-      clone: false,
-      streaming: false,
-      styles: true,
-      emotions: true
-    },
-    defaultModel: DEFAULT_ALIBABA_TTS_MODEL,
-    defaultTtsModel: DEFAULT_ALIBABA_TTS_MODEL,
-    defaultVoice: DEFAULT_ALIBABA_TTS_VOICE,
-    ttsModels: ALIBABA_TTS_MODELS
-  },
-  {
-    id: 'inworld',
-    label: 'Inworld',
-    type: 'cloud',
-    requiresKey: true,
-    supports: {
-      tts: true,
-      stt: false,
-      listVoices: true,
-      clone: false,
-      streaming: true,
-      styles: true,
-      emotions: true
-    },
-    defaultModel: DEFAULT_INWORLD_TTS_MODEL,
-    defaultTtsModel: DEFAULT_INWORLD_TTS_MODEL,
-    defaultVoice: DEFAULT_INWORLD_TTS_VOICE,
-    ttsModels: INWORLD_TTS_MODELS
-  },
-  {
-    id: 'cartesia',
-    label: 'Cartesia',
-    type: 'cloud',
-    requiresKey: true,
-    supports: {
-      tts: true,
-      stt: false,
-      listVoices: true,
-      clone: false,
-      streaming: false,
-      styles: true,
-      emotions: false
-    },
-    defaultModel: DEFAULT_CARTESIA_TTS_MODEL,
-    defaultTtsModel: DEFAULT_CARTESIA_TTS_MODEL,
-    defaultVoice: DEFAULT_CARTESIA_TTS_VOICE,
-    ttsModels: CARTESIA_TTS_MODELS
-  },
-  {
-    id: 'async',
-    label: 'Async Voice',
-    type: 'cloud',
-    requiresKey: true,
-    supports: {
-      tts: true,
-      stt: false,
-      listVoices: true,
-      clone: false,
-      streaming: false,
-      styles: false,
-      emotions: false
-    },
-    defaultModel: DEFAULT_ASYNC_TTS_MODEL,
-    defaultTtsModel: DEFAULT_ASYNC_TTS_MODEL,
-    defaultVoice: DEFAULT_ASYNC_TTS_VOICE,
-    ttsModels: ASYNC_TTS_MODELS
-  },
-  {
-    id: 'stepfun',
-    label: 'StepFun',
-    type: 'cloud',
-    requiresKey: true,
-    supports: {
-      tts: true,
-      stt: false,
-      listVoices: true,
-      clone: false,
-      streaming: false,
-      styles: true,
-      emotions: true
-    },
-    defaultModel: DEFAULT_STEPFUN_TTS_MODEL,
-    defaultTtsModel: DEFAULT_STEPFUN_TTS_MODEL,
-    defaultVoice: DEFAULT_STEPFUN_TTS_VOICE,
-    ttsModels: STEPFUN_TTS_MODELS
-  },
-  {
-    id: 'azure',
-    label: 'Microsoft Azure Speech',
-    type: 'cloud',
-    requiresKey: true,
-    supports: {
-      tts: true,
-      stt: false,
-      listVoices: true,
-      clone: false,
-      streaming: false,
-      styles: false,
-      emotions: false
-    },
-    defaultModel: DEFAULT_AZURE_TTS_MODEL,
-    defaultTtsModel: DEFAULT_AZURE_TTS_MODEL,
-    defaultVoice: DEFAULT_AZURE_TTS_VOICE,
-    ttsModels: AZURE_TTS_MODELS,
-    voiceSurface: {
-      kind: 'static_catalog',
-      summary:
-        'Azure REST TTS is available now. Viseme and detailed lip-sync events require the Azure Speech SDK event path and are tracked as a separate future bridge.',
-      requiresDiscussion: true
-    }
-  }
-]
 
 export type VoiceSynthesisRequest = {
   text: string
@@ -973,7 +468,7 @@ function resolveByoSynthesisRecord(
   return runtime.primaryRecord
 }
 
-async function resolveApiKey(userId: string, service: string, envKeys: string[]): Promise<string | null> {
+async function resolveApiKey(userId: string, service: string, envKeys: readonly (keyof typeof env)[]): Promise<string | null> {
   const stored = await apiKeyService.retrieve(service, userId).catch(() => null)
   if (stored) return stored
   for (const key of envKeys) {
@@ -1054,7 +549,19 @@ export function resolveAgentVoiceProfile(agent?: AgentRow | null): AgentVoicePro
   return normalizeAgentVoiceProfile(agent?.voice_profile)
 }
 
-export async function buildVoiceProviderSummary(userId: string): Promise<VoiceProviderSummary[]> {
+/** Source catalogs only. Never resolves keys, engine records, endpoints or provider status. */
+export function configuredBuiltinTtsCatalog(view?: VoiceCatalogView) {
+  return (view ? projectVoiceProviderSummaries(PROVIDER_SUMMARIES, view, Date.now()) : PROVIDER_SUMMARIES).filter(provider => provider.supports.tts).map(provider => {
+    const voices = provider.id === 'openai' ? [...OPENAI_TTS_VOICES] : provider.id === 'google' ? [...GEMINI_TTS_VOICES] :
+      provider.id === 'deepgram' ? DEEPGRAM_TTS_VOICES.map(voice => voice.id) : provider.id === 'mimo' ? [...MIMO_TTS_VOICES] :
+      provider.id === 'alibaba' ? [...ALIBABA_TTS_VOICES] : provider.id === 'stepfun' ? [...STEPFUN_TTS_VOICES] : []
+    return { id: provider.id, label: provider.label, models: [...(provider.ttsModels ?? [])], voices,
+      defaultModel: provider.defaultTtsModel ?? provider.defaultModel ?? null, defaultVoice: provider.defaultVoice ?? null,
+      catalog: voices.length ? 'static-complete' as const : 'configured-subset' as const }
+  })
+}
+
+export async function buildVoiceProviderSummary(userId: string, options: { refreshCatalog?: boolean; forceCatalog?: boolean } = {}): Promise<VoiceProviderSummary[]> {
   const openaiKey = await resolveApiKey(userId, 'openai', ['OPENAI_API_KEY'])
   const googleKey = await resolveApiKey(userId, 'google', GOOGLE_API_KEY_ENV_NAMES)
   const elevenKey = await resolveApiKey(userId, 'elevenlabs', ['ELEVENLABS_API_KEY'])
@@ -1073,7 +580,8 @@ export async function buildVoiceProviderSummary(userId: string): Promise<VoicePr
   const azureRegion = await resolveApiKey(userId, 'azure_speech_region', ['AZURE_SPEECH_REGION'])
   const { engines: byoProviders, unreadableEngines } = await listVoiceEngineManagerView(userId)
 
-  const withStatus = PROVIDER_SUMMARIES.map((provider) => {
+  const catalogView = options.refreshCatalog ? await refreshBuiltinVoiceCatalog(options.forceCatalog) : await readBuiltinVoiceCatalog()
+  const withStatus = projectVoiceProviderSummaries(PROVIDER_SUMMARIES, catalogView, Date.now()).map((provider) => {
     if (provider.id === 'openai') {
       return { ...provider, ready: Boolean(openaiKey), statusHint: openaiKey ? undefined : 'API key missing' }
     }
@@ -1602,6 +1110,7 @@ function createPrimaryProviderFailureError(
   provider: string | null | undefined,
   error: unknown
 ): Error {
+  if (error instanceof VoiceCatalogCompatibilityError || error instanceof MimoVoiceInputError) return error
   const detail = extractVoiceErrorMessage(error)
   if (detail.includes(FALLBACK_DISABLED_NOTE)) {
     return error instanceof Error ? error : new Error(detail)
@@ -1660,21 +1169,19 @@ function mapFishModelToVoice(
   }
 }
 
+/** Shared Fish request spelling; credentials never leave the request-local server owner. */
+function fishModelPageRequest(apiKey: string, params: Record<string, string>) {
+  const url = new URL('https://api.fish.audio/model')
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value)
+  return { url: url.toString(), headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/json' } }
+}
+
 async function fetchFishModelPage(
   apiKey: string,
   params: Record<string, string>
 ): Promise<{ voices: VoiceSummary[]; hasMore: boolean }> {
-  const url = new URL('https://api.fish.audio/model')
-  for (const [key, value] of Object.entries(params)) {
-    url.searchParams.set(key, value)
-  }
-
-  const response = await fetch(url.toString(), {
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      Accept: 'application/json'
-    }
-  })
+  const request = fishModelPageRequest(apiKey, params)
+  const response = await fetch(request.url, { headers: request.headers })
 
   if (!response.ok) {
     throw new Error(await readProviderError(response, 'Failed to fetch Fish Audio voices.'))
@@ -1696,6 +1203,116 @@ async function fetchFishModelPage(
   return {
     voices,
     hasMore: payload?.has_more === true
+  }
+}
+
+class FishAccountPageError extends Error {
+  constructor(readonly reason: ConfiguredTtsAccountReadFailure) { super(reason) }
+}
+
+function fishAccountPage(payload: unknown, page: number, privateKey: string): ConfiguredFishAccountPage {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new FishAccountPageError('invalid_payload')
+  const record = payload as Record<string, unknown>
+  if (!Array.isArray(record.items) || record.items.length > FISH_MODEL_LIST_PAGE_SIZE) throw new FishAccountPageError('invalid_payload')
+  const count = (name: string): number | null => {
+    const value = record[name]
+    if (value === undefined || value === null) return null
+    if (!Number.isSafeInteger(value) || Number(value) < 0) throw new FishAccountPageError('invalid_payload')
+    return Number(value)
+  }
+  const flag = (name: string): boolean | null => {
+    const value = record[name]
+    if (value === undefined || value === null) return null
+    if (typeof value !== 'boolean') throw new FishAccountPageError('invalid_payload')
+    return value
+  }
+  const hasMore = flag('has_more')
+  if (hasMore === true && record.items.length === 0) throw new FishAccountPageError('invalid_payload')
+  const choices: ConfiguredFishAccountChoice[] = [], ids = new Set<string>()
+  let filteredCount = 0, rejectedCount = 0
+  for (const item of record.items) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) { rejectedCount++; continue }
+    const row = item as Record<string, unknown>
+    const state = typeof row.state === 'string' ? row.state.toLowerCase() : ''
+    if (state === 'failed' || state === 'training') { filteredCount++; continue }
+    const rawId = typeof row._id === 'string' && row._id.trim() ? row._id : row.id
+    if (!validTtsId(rawId)) { rejectedCount++; continue }
+    const mapped = mapFishModelToVoice({ _id: row._id, id: row.id, title: row.title, name: row.name, state: row.state, visibility: row.visibility, languages: row.languages }, 'user')
+    if (!mapped || mapped.id !== rawId || !mapped.name.isWellFormed() || /[\u0000-\u001f\u007f]/.test(mapped.name)) { rejectedCount++; continue }
+    if (ids.has(rawId) || [rawId, mapped.name].some(value => value.includes(privateKey) || value.includes('https://api.fish.audio'))) throw new FishAccountPageError('invalid_payload')
+    ids.add(rawId)
+    let label = '', labelBytes = 0
+    for (const point of mapped.name) {
+      const bytes = Buffer.byteLength(point, 'utf8')
+      if (labelBytes + bytes > 200) break
+      label += point; labelBytes += bytes
+    }
+    choices.push(Object.freeze({ source: 'provider-list', providerId: 'fish', voiceId: rawId, profileId: null, modelId: null,
+      label, labelTruncated: label !== mapped.name, modelScope: 'unknown' }))
+  }
+  const result: ConfiguredFishAccountPage = Object.freeze({ providerId: 'fish', extent: 'credential-workspace', observedAt: new Date().toISOString(), page,
+    pageSize: 100, choices: Object.freeze(choices), rawCount: record.items.length, filteredCount, rejectedCount,
+    reportedTotal: count('total'), totalExact: flag('total_is_exact'), windowLimited: flag('window_limited'),
+    accessibleUpperBound: count('accessible_upper_bound'), maxOffset: count('max_offset'), hasMore,
+    nextPage: hasMore === true && page < 10 ? page + 1 : null, limitReached: hasMore === true && page === 10 })
+  if (Buffer.byteLength(JSON.stringify(result), 'utf8') > 262144) throw new FishAccountPageError('source_limit')
+  return result
+}
+
+/** Unexposed A10 source read: ONE workspace page, no public sample, retries or readiness claim.
+ * The existing human aggregate above retains its original pagination/mapping behavior. */
+export async function readFishConfiguredAccountVoicePage(input: Readonly<{
+  apiKey: string; page: number; deadlineAt: number; signal?: AbortSignal
+}>): Promise<ConfiguredFishAccountPageRead> {
+  if (!Number.isInteger(input.page) || input.page < 1 || input.page > 10 || !Number.isFinite(input.deadlineAt)) return { status: 'unavailable', reason: 'invalid_payload' }
+  if (!input.apiKey || !input.apiKey.isWellFormed() || Buffer.byteLength(input.apiKey, 'utf8') > 16384 || /[\u0000-\u001f\u007f]/.test(input.apiKey)) return { status: 'unavailable', reason: 'credential_unreadable' }
+  if (input.signal?.aborted) return { status: 'unavailable', reason: 'list_stopped' }
+  const deadlineAt = Math.min(input.deadlineAt, Date.now() + 10_000)
+  if (Date.now() >= deadlineAt) return { status: 'unavailable', reason: 'list_timeout' }
+  const timerController = new AbortController()
+  const signal = input.signal ? AbortSignal.any([input.signal, timerController.signal]) : timerController.signal
+  const reason = () => input.signal?.aborted ? 'list_stopped' as const : 'list_timeout' as const
+  const assertLive = () => { if (signal.aborted || Date.now() >= deadlineAt) throw new FishAccountPageError(reason()) }
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
+  let response: Response | undefined
+  let onAbort: () => void = () => {}
+  const ended = new Promise<never>((_resolve, reject) => { onAbort = () => reject(new FishAccountPageError(reason())); signal.addEventListener('abort', onAbort, { once: true }) })
+  const timeout = setTimeout(() => timerController.abort(), Math.max(0, deadlineAt - Date.now()))
+  try {
+    const work = (async (): Promise<ConfiguredFishAccountPageRead> => {
+      assertLive()
+      const request = fishModelPageRequest(input.apiKey, { self: 'true', page_size: String(FISH_MODEL_LIST_PAGE_SIZE), page_number: String(input.page), sort_by: 'created_at' })
+      response = await fetch(request.url, { headers: request.headers, signal, redirect: 'error' })
+      if (signal.aborted || Date.now() >= deadlineAt) { if (response.body) void response.body.cancel().catch(() => {}); assertLive() }
+      assertLive()
+      if (!response.ok) return { status: 'unavailable', reason: response.status === 401 || response.status === 403 ? 'list_denied' : 'list_unavailable' }
+      const type = response.headers.get('content-type') ?? ''
+      if (type.length > 128 || !/^application\/(?:json|[a-z0-9.+-]+\+json)(?:\s*;|$)/i.test(type) || !response.body) throw new FishAccountPageError('invalid_payload')
+      const length = response.headers.get('content-length')
+      if (length !== null && (!/^\d{1,16}$/.test(length) || Number(length) > 2 * 1024 * 1024)) throw new FishAccountPageError('source_limit')
+      reader = response.body.getReader()
+      const chunks: Uint8Array[] = []; let bytes = 0
+      while (true) {
+        const chunk = await reader.read(); assertLive()
+        if (chunk.done) break
+        bytes += chunk.value.byteLength
+        if (bytes > 2 * 1024 * 1024) throw new FishAccountPageError('source_limit')
+        chunks.push(chunk.value)
+      }
+      let payload: unknown
+      try { payload = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks))) }
+      catch { throw new FishAccountPageError('invalid_payload') }
+      const page = fishAccountPage(payload, input.page, input.apiKey)
+      assertLive()
+      return { status: 'listed', page }
+    })()
+    return await Promise.race([work, ended])
+  } catch (error) {
+    return { status: 'unavailable', reason: error instanceof FishAccountPageError ? error.reason : signal.aborted ? reason() : 'list_unavailable' }
+  } finally {
+    clearTimeout(timeout); signal.removeEventListener('abort', onAbort)
+    if (reader) { void reader.cancel().catch(() => {}); try { reader.releaseLock() } catch { /* Pending cancelled read owns its settlement. */ } }
+    else if (response?.body) void response.body.cancel().catch(() => {})
   }
 }
 
@@ -2189,6 +1806,10 @@ export async function listVoices({
   }
 
   if (provider === 'alibaba') {
+    // The Qwen Audio picker is derived from its selected workspace region in
+    // Settings. The generic voice list has no such input, so it cannot certify
+    // a region or offer legacy Qwen3 voices for these models.
+    if (model && isQwenAudioTtsModel(model)) return []
     return ALIBABA_TTS_VOICES.map((voice) => ({
       id: voice,
       name: voice,
@@ -2209,7 +1830,7 @@ export async function listVoices({
   }
 
   if (provider === 'stepfun') {
-    return STEPFUN_TTS_VOICES.map((voice) => ({
+    return (model === 'stepaudio-3-tts' ? ['zixinnansheng'] : STEPFUN_TTS_VOICES).map((voice) => ({
       id: voice,
       name: voice,
       provider
@@ -2251,6 +1872,7 @@ export async function synthesizeSpeech(request: VoiceSynthesisRequest): Promise<
 
   const resolvedModel = resolveOptionalString(resolved.model ?? undefined)
   const resolvedVoiceId = resolveOptionalString(resolved.voiceId ?? undefined)
+  const catalogAdmission = await assertBuiltinVoiceCatalogModel(resolved.provider, 'tts-batch', resolvedModel ?? PROVIDER_SUMMARIES.find(provider => provider.id === resolved.provider)?.defaultTtsModel, resolvedVoiceId)
   try {
     if (resolved.provider === 'google') {
       return synthesizeGemini({
@@ -2317,7 +1939,8 @@ export async function synthesizeSpeech(request: VoiceSynthesisRequest): Promise<
         userId,
         model: resolvedModel ?? DEFAULT_MIMO_TTS_MODEL,
         voiceId: resolvedVoiceId,
-        options: resolvedOptions
+        options: resolvedOptions,
+        compatibilityProfileId: catalogAdmission?.compatibilityProfileId
       })
     }
 
@@ -2347,7 +1970,8 @@ export async function synthesizeSpeech(request: VoiceSynthesisRequest): Promise<
         userId,
         model: resolvedModel ?? DEFAULT_CARTESIA_TTS_MODEL,
         voiceId: resolvedVoiceId,
-        options: resolvedOptions
+        options: resolvedOptions,
+        compatibilityProfileId: catalogAdmission?.compatibilityProfileId
       })
     }
 
@@ -2850,6 +2474,10 @@ function buildInworldSpeechBody(options: {
     )
   }
 
+  // Flash ignores delivery mode. Keep saved settings intact but never present
+  // an ignored provider field as an effective setting on this model.
+  if (options.model === 'inworld-tts-2-flash') delete body.deliveryMode
+
   const language = resolveOptionalString(
     typeof options.runtimeOptions?.common?.language === 'string'
       ? options.runtimeOptions.common.language
@@ -3124,6 +2752,7 @@ export async function streamSpeechRealtime(
   const resolvedOptions = resolved.options
   const resolvedModel = resolveOptionalString(resolved.model ?? undefined)
   const resolvedVoiceId = resolveOptionalString(resolved.voiceId ?? undefined)
+  await assertBuiltinVoiceCatalogModel(resolved.provider, 'tts-direct-stream', resolvedModel ?? PROVIDER_SUMMARIES.find(provider => provider.id === resolved.provider)?.defaultTtsModel, resolvedVoiceId)
 
   try {
     if (resolved.provider === 'fish') {
@@ -3193,6 +2822,8 @@ export async function transcribeAudio(request: VoiceTranscribeRequest): Promise<
     toPlainObject(request.options?.providerOptions) as VoiceProviderOptionBlock | undefined
   )
 
+  const builtinAdmission = await assertBuiltinVoiceCatalogModel(provider, 'stt-recorded', resolvedModel ?? PROVIDER_SUMMARIES.find(item => item.id === provider)?.defaultSttModel)
+
   const validated = validateVoiceOptionsForProvider(provider, 'stt', {
     language: resolvedLanguage,
     providerOptions: mergedProviderOptions
@@ -3250,11 +2881,19 @@ export async function transcribeAudio(request: VoiceTranscribeRequest): Promise<
       })
     }
 
+    if (provider === 'async') {
+      return transcribeAsync({
+        audio, userId, model: resolvedModel ?? 'async_asr_v1.0',
+        language: validated.language, contentType: request.contentType ?? undefined
+      })
+    }
+
     if (provider === 'mistral') {
       return transcribeMistral({
         audio,
         userId,
         model: resolvedModel ?? DEFAULT_MISTRAL_STT_MODEL,
+        compatibilityProfileId: builtinAdmission?.compatibilityProfileId ?? undefined,
         language: validated.language,
         contentType: request.contentType ?? undefined
       })
@@ -4071,12 +3710,6 @@ export async function resolveVoiceConfigForMetadata({
     normalizeProviderId(baseTts?.providerId) ||
     'browser'
 
-  const profileId = resolveOptionalString(
-    metadata?.voiceProfileId,
-    agentTts?.profileId,
-    baseTts?.profileId
-  )
-
   // This runs on every chat send, voice on or off. A saved engine Batshit cannot read must not stop
   // the message: the reply's voice goes without that engine's defaults, the voice guidance tells
   // the agent, and speaking with the engine fails plainly. Any other failure (Redis) still throws.
@@ -4093,6 +3726,11 @@ export async function resolveVoiceConfigForMetadata({
   const agentTtsForProvider = voiceTtsConfigAppliesToProvider(agentTts, provider)
     ? agentTts
     : undefined
+  const profileId = resolveOptionalString(
+    metadata?.voiceProfileId,
+    agentTtsForProvider?.profileId,
+    baseTtsForProvider?.profileId
+  )
   const engineSettings = getTtsEngineSettingsFor(voiceSettings, provider)
   const profileTtsConfig = await resolveVoiceProfileTtsConfig(profileId, provider)
 
@@ -4375,6 +4013,21 @@ async function synthesizeGemini({
   const apiKey = await resolveApiKey(userId, 'google', GOOGLE_API_KEY_ENV_NAMES)
   if (!apiKey) throw new Error('Google Gemini API key not configured')
 
+  if (isGemini38TtsModel(model)) {
+    const voice = voiceId ?? DEFAULT_GEMINI_TTS_VOICE
+    let response: Response
+    try {
+      response = await fetch('https://generativelanguage.googleapis.com/v1beta/interactions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+        body: JSON.stringify(buildGemini38TtsRequest(model, text, voice)),
+        redirect: 'error', signal: AbortSignal.timeout(60_000)
+      })
+    } catch { throw new Error('Google Gemini speech network error.') }
+    if (!response.ok) throw speechProviderStatusError(response, 'Google Gemini speech synthesis failed.')
+    return { audio: parseGemini38TtsAudio(await readBoundedSpeechJson(response, 64 * 1024 * 1024)), mediaType: 'audio/wav', voiceId: voice, provider: 'google', model }
+  }
+
   const response = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
     {
@@ -4456,10 +4109,10 @@ async function synthesizeElevenLabs({
   if (typeof options?.providerOptions?.similarityBoost === 'number') {
     voiceSettings.similarity_boost = options.providerOptions.similarityBoost
   }
-  if (typeof options?.providerOptions?.style === 'number') {
+  if (model !== 'eleven_v4' && typeof options?.providerOptions?.style === 'number') {
     voiceSettings.style = options.providerOptions.style
   }
-  if (typeof options?.providerOptions?.speakerBoost === 'boolean') {
+  if (model !== 'eleven_v4' && typeof options?.providerOptions?.speakerBoost === 'boolean') {
     voiceSettings.use_speaker_boost = options.providerOptions.speakerBoost
   }
   if (Object.keys(voiceSettings).length > 0) {
@@ -4469,7 +4122,7 @@ async function synthesizeElevenLabs({
   if (typeof options?.common?.language === 'string' && options.common.language.trim()) {
     body.language_code = options.common.language.trim()
   }
-  if (typeof options?.common?.speed === 'number') {
+  if (model !== 'eleven_v4' && typeof options?.common?.speed === 'number') {
     body.speed = options.common.speed
   }
 
@@ -4694,12 +4347,43 @@ async function downloadProviderAudio(url: string, fallbackMediaType: string): Pr
   audio: Uint8Array
   mediaType: string
 }> {
-  const response = await fetch(url)
+  let parsed: URL
+  try { parsed = new URL(url) } catch { throw new Error('The speech provider returned an invalid audio URL.') }
+  if (parsed.username || parsed.password || parsed.hash) throw new Error('The speech provider returned an unsupported audio URL.')
+  let target = url
+  if (parsed.protocol === 'http:') {
+    const region = parsed.hostname.endsWith('.oss-cn-beijing.aliyuncs.com') ? 'beijing' : parsed.hostname.endsWith('.oss-ap-southeast-1.aliyuncs.com') ? 'singapore' : null
+    if (!region) throw new Error('The speech provider returned an unsupported audio URL.')
+    try { target = qwenAudioResultUrl({ output: { finish_reason: 'stop', audio: { url } } }, region) }
+    catch { throw new Error('The speech provider returned an unsupported audio URL.') }
+  } else if (parsed.protocol !== 'https:') throw new Error('The speech provider returned an unsupported audio URL.')
+  let response: Response
+  try { response = await fetch(target, { redirect: 'error', signal: AbortSignal.timeout(60_000) }) }
+  catch { throw new Error('Failed to download synthesized audio.') }
   if (!response.ok) {
-    throw new Error(await readProviderError(response, 'Failed to download synthesized audio'))
+    throw speechProviderStatusError(response, 'Failed to download synthesized audio.')
   }
+  if (!response.body) throw new Error('The speech provider returned empty audio.')
+  const reader = response.body.getReader(), chunks: Uint8Array[] = []
+  let size = 0
+  try {
+    for (;;) {
+      const part = await reader.read()
+      if (part.done) break
+      size += part.value.byteLength
+      if (size > 64 * 1024 * 1024) { void reader.cancel().catch(() => {}); throw new Error('Audio limit') }
+      chunks.push(part.value)
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message === 'Audio limit') throw new Error('Synthesized audio exceeds the download limit.')
+    throw new Error('Failed to download synthesized audio.')
+  } finally { reader.releaseLock() }
+  if (!size) throw new Error('The speech provider returned empty audio.')
+  const audio = new Uint8Array(size)
+  let offset = 0
+  for (const chunk of chunks) { audio.set(chunk, offset); offset += chunk.byteLength }
   return {
-    audio: new Uint8Array(await response.arrayBuffer()),
+    audio,
     mediaType: response.headers.get('content-type') || fallbackMediaType
   }
 }
@@ -4795,29 +4479,23 @@ async function synthesizeMiMo({
   userId,
   model,
   voiceId,
-  options
+  options,
+  compatibilityProfileId
 }: {
   text: string
   userId: string
   model: string
   voiceId?: string | null
   options?: ResolvedVoiceRuntimeOptions
+  compatibilityProfileId?: string | null
 }): Promise<VoiceSynthesisResult> {
+  const format: 'wav' | 'pcm16' = options?.providerOptions?.format === 'pcm16' ? 'pcm16' : 'wav'
+  const input = buildMimoSpeechInput({ modelId: model, text, voiceId, format, defaultVoiceId: DEFAULT_MIMO_TTS_VOICE,
+    instructions: typeof options?.common?.instructions === 'string' ? options.common.instructions : undefined, compatibilityProfileId })
   const credential = await resolveMimoVoiceCredential(userId)
   if (!credential) throw new Error('MiMo API key not configured')
   const paused = await pausedVoicePlanError(credential, 'mimo_token_plan')
   if (paused) throw paused
-
-  const format =
-    typeof options?.providerOptions?.format === 'string' &&
-    ['wav', 'pcm16'].includes(options.providerOptions.format)
-      ? options.providerOptions.format
-      : 'wav'
-  const messages: Array<{ role: 'user' | 'assistant'; content: string }> = []
-  if (typeof options?.common?.instructions === 'string' && options.common.instructions.trim()) {
-    messages.push({ role: 'user', content: options.common.instructions.trim() })
-  }
-  messages.push({ role: 'assistant', content: text })
 
   const baseUrl = credential.baseUrl.replace(/\/+$/, '')
   const response = await fetch(`${baseUrl}/chat/completions`, {
@@ -4829,14 +4507,7 @@ async function synthesizeMiMo({
       'Content-Type': 'application/json',
       Accept: 'application/json'
     },
-    body: JSON.stringify({
-      model,
-      messages,
-      audio: {
-        format,
-        voice: voiceId ?? DEFAULT_MIMO_TTS_VOICE
-      }
-    })
+    body: JSON.stringify({ model: input.model, messages: input.messages, audio: input.audio })
   })
 
   if (!response.ok) {
@@ -4852,7 +4523,7 @@ async function synthesizeMiMo({
   return {
     audio: Uint8Array.from(Buffer.from(audioBase64, 'base64')),
     mediaType: MEDIA_TYPE_MAP[format] ?? 'audio/wav',
-    voiceId: voiceId ?? DEFAULT_MIMO_TTS_VOICE,
+    voiceId: input.voiceIdForMetadata,
     provider: 'mimo',
     model
   }
@@ -4871,6 +4542,27 @@ async function synthesizeAlibaba({
   voiceId?: string | null
   options?: ResolvedVoiceRuntimeOptions
 }): Promise<VoiceSynthesisResult> {
+  if (isQwenAudioTtsModel(model)) {
+    const request = buildQwenAudioTtsRequest({ model, text, voiceId, common: options?.common })
+    if (options?.providerOptions && Object.values(options.providerOptions).some(value => value !== undefined && value !== null && value !== '')) {
+      throw new Error('Qwen Audio does not support the saved provider-specific settings.')
+    }
+    const apiKey = await resolveApiKey(userId, 'alibaba', ['ALIBABA_CLOUD_API_KEY', 'DASHSCOPE_API_KEY'])
+    if (!apiKey) throw new Error('Alibaba Cloud API key not configured')
+    let response: Response
+    try {
+      response = await fetch(request.endpoint, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify(request.body),
+        redirect: 'error', signal: AbortSignal.timeout(60_000)
+      })
+    } catch { throw new Error('Qwen Audio speech network error.') }
+    if (!response.ok) throw speechProviderStatusError(response, 'Qwen Audio speech synthesis failed.')
+    const url = qwenAudioResultUrl(await readBoundedSpeechJson(response, 1024 * 1024), request.region)
+    const audio = await downloadQwenAudio(url)
+    return { audio, mediaType: 'audio/wav', voiceId: request.voiceId, provider: 'alibaba', model }
+  }
   const apiKey = await resolveApiKey(userId, 'alibaba', ['ALIBABA_CLOUD_API_KEY', 'DASHSCOPE_API_KEY'])
   if (!apiKey) throw new Error('Alibaba Cloud API key not configured')
 
@@ -4887,21 +4579,19 @@ async function synthesizeAlibaba({
 
   const baseUrl = (env.ALIBABA_CLOUD_TTS_BASE_URL ?? env.DASHSCOPE_TTS_BASE_URL ?? 'https://dashscope-intl.aliyuncs.com/api/v1')
     .replace(/\/+$/, '')
-  const response = await fetch(`${baseUrl}/services/aigc/multimodal-generation/generation`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-      Accept: 'application/json'
-    },
-    body: JSON.stringify({ model, input })
-  })
+  let response: Response
+  try {
+    response = await fetch(`${baseUrl}/services/aigc/multimodal-generation/generation`, {
+      method: 'POST', headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ model, input }), redirect: 'error', signal: AbortSignal.timeout(60_000)
+    })
+  } catch { throw new Error('Alibaba Cloud speech request failed.') }
 
   if (!response.ok) {
-    throw new Error(await readProviderError(response, 'Failed to synthesize speech with Alibaba Cloud'))
+    throw speechProviderStatusError(response, 'Failed to synthesize speech with Alibaba Cloud.')
   }
 
-  const payload = await response.json().catch(() => null)
+  const payload = await readBoundedSpeechJson(response, 1024 * 1024) as any
   const audioUrl = resolveOptionalString(
     payload?.output?.audio?.url,
     payload?.output?.url,
@@ -4990,13 +4680,15 @@ async function synthesizeCartesia({
   userId,
   model,
   voiceId,
-  options
+  options,
+  compatibilityProfileId
 }: {
   text: string
   userId: string
   model: string
   voiceId?: string | null
   options?: ResolvedVoiceRuntimeOptions
+  compatibilityProfileId?: string | null
 }): Promise<VoiceSynthesisResult> {
   const apiKey = await resolveApiKey(userId, 'cartesia', ['CARTESIA_API_KEY'])
   if (!apiKey) throw new Error('Cartesia API key not configured')
@@ -5010,16 +4702,24 @@ async function synthesizeCartesia({
   if (typeof options?.common?.speed === 'number') generationConfig.speed = options.common.speed
   if (typeof options?.common?.volume === 'number') generationConfig.volume = options.common.volume
 
+  const currentProfile = compatibilityProfileId === 'cartesia.bytes-20260814.v1'
+  if (currentProfile && typeof options?.common?.speed === 'number' && (options.common.speed < 0.6 || options.common.speed > 1.5)) {
+    throw new Error('Sonic 3.6 speed must be between 0.6 and 1.5. The saved setting is unchanged.')
+  }
+  if (currentProfile && typeof options?.common?.volume === 'number' && (options.common.volume < 0.5 || options.common.volume > 2)) {
+    throw new Error('Sonic 3.6 volume must be between 0.5 and 2. The saved setting is unchanged.')
+  }
   const body: Record<string, unknown> = {
     model_id: model,
     transcript: text,
-    voice: {
+    voice: currentProfile ? (voiceId ?? DEFAULT_CARTESIA_TTS_VOICE) : {
       mode: 'id',
       id: voiceId ?? DEFAULT_CARTESIA_TTS_VOICE
     },
-    output_format: {
-      container
-    }
+    output_format: currentProfile
+      ? container === 'mp3' ? { container, sample_rate: 44100, bit_rate: 128000 }
+        : { container, encoding: 'pcm_s16le', sample_rate: 44100 }
+      : { container }
   }
   if (Object.keys(generationConfig).length > 0) {
     body.generation_config = generationConfig
@@ -5032,7 +4732,7 @@ async function synthesizeCartesia({
     method: 'POST',
     headers: {
       Authorization: `Bearer ${apiKey}`,
-      'Cartesia-Version': CARTESIA_VERSION,
+      'Cartesia-Version': currentProfile ? '2026-08-14' : CARTESIA_VERSION,
       'Content-Type': 'application/json'
     },
     body: JSON.stringify(body)
@@ -5131,6 +4831,15 @@ async function synthesizeStepFun({
   if (text.length > 1000) {
     throw new Error('StepFun TTS input cannot exceed 1,000 characters')
   }
+  if (model === 'stepaudio-3-tts' && (!voiceId || STEPFUN_TTS_VOICES.includes(voiceId))) {
+    throw new Error('StepAudio 3 needs a compatible voice. Select zixinnansheng or a compatible custom voice; the saved voice is kept.')
+  }
+  if (model === 'stepaudio-3-tts' && typeof options?.common?.instructions === 'string' && options.common.instructions.trim().length > 500) {
+    throw new Error('StepAudio 3 instructions cannot exceed 500 characters. The saved instructions are unchanged.')
+  }
+  if (model === 'stepaudio-2.5-tts' && typeof options?.common?.instructions === 'string' && Array.from(options.common.instructions.trim()).length > 200) {
+    throw new Error('StepAudio 2.5 accepts at most 200 instruction characters. The saved instructions are unchanged.')
+  }
   const apiKey = await resolveApiKey(userId, 'stepfun', ['STEPFUN_API_KEY', 'STEP_API_KEY'])
   if (!apiKey) throw new Error('StepFun API key not configured')
 
@@ -5150,7 +4859,7 @@ async function synthesizeStepFun({
   if (typeof options?.providerOptions?.sample_rate === 'string') {
     body.sample_rate = Number(options.providerOptions.sample_rate)
   }
-  if (model === 'stepaudio-2.5-tts' && typeof options?.common?.instructions === 'string' && options.common.instructions.trim()) {
+  if ((model === 'stepaudio-2.5-tts' || model === 'stepaudio-3-tts') && typeof options?.common?.instructions === 'string' && options.common.instructions.trim()) {
     body.instruction = options.common.instructions.trim()
   }
 
@@ -5782,6 +5491,11 @@ async function transcribeOpenAI({
     providerLabel: 'OpenAI'
   })
 
+  if (model === 'gpt-transcribe') {
+    if (normalizedAudio.byteLength > 25_000_000) throw new Error('Normalized audio exceeds OpenAI\'s 25 MB transcription limit.')
+    return fetchRecordedTranscription('openai', apiKey, recordedTranscriptionForm('openai', normalizedAudio, model, language), batshitProviderHeaders())
+  }
+
   const result = await transcribe({
     model: openai.transcription(model),
     audio: normalizedAudio,
@@ -5799,6 +5513,16 @@ async function transcribeOpenAI({
     language: result.language,
     segments: result.segments
   }
+}
+
+async function transcribeAsync({ audio, userId, model, language, contentType }: {
+  audio: Uint8Array; userId: string; model: string; language?: string; contentType?: string
+}): Promise<VoiceTranscribeResult> {
+  const apiKey = await resolveApiKey(userId, 'async', ['ASYNC_API_KEY'])
+  if (!apiKey) throw new Error('Async API key not configured')
+  const normalizedAudio = await normalizeUploadedAudioToPcmWav({ audio, contentType, providerLabel: 'Async' })
+  if (normalizedAudio.byteLength > MAX_TRANSCRIBE_BYTES) throw new Error('Normalized audio is too large for transcription.')
+  return fetchRecordedTranscription('async', apiKey, recordedTranscriptionForm('async', normalizedAudio, model, language))
 }
 
 async function transcribeMimo({
@@ -6068,12 +5792,14 @@ async function transcribeMistral({
   audio,
   userId,
   model,
+  compatibilityProfileId,
   language,
   contentType
 }: {
   audio: Uint8Array
   userId: string
   model: string
+  compatibilityProfileId?: string
   language?: string
   contentType?: string
 }): Promise<VoiceTranscribeResult> {
@@ -6086,13 +5812,14 @@ async function transcribeMistral({
     providerLabel: 'Mistral'
   })
 
+  const segmentProfile = compatibilityProfileId === 'mistral.recorded-segments.v2'
   const form = new FormData()
   form.append('model', model)
   form.append('file', bytesToBlob(normalizedAudio, { type: 'audio/wav' }), 'speech.wav')
   if (language) {
     form.append('language', language)
   } else {
-    form.append('timestamp_granularities[]', 'segment')
+    form.append(segmentProfile ? 'timestamp_granularities' : 'timestamp_granularities[]', 'segment')
   }
 
   const response = await fetch('https://api.mistral.ai/v1/audio/transcriptions', {
@@ -6121,7 +5848,7 @@ async function transcribeMistral({
     language:
       (typeof payload.language === 'string' && payload.language) ||
       (typeof payload.language_code === 'string' && payload.language_code) ||
-      language,
+      (segmentProfile ? undefined : language),
     segments: Array.isArray(payload.segments)
       ? payload.segments
       : Array.isArray(payload.words)
@@ -6371,7 +6098,7 @@ async function cloneByoReferenceProfile(request: VoiceCloneRequest): Promise<Voi
 
   const now = new Date().toISOString()
   const profileId = `voice_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
-  const { audioPath, dirPath } = await saveReferenceAudioForByoClone({
+  const { audioPath } = await saveReferenceAudioForByoClone({
     profileId,
     audio: request.audio,
     filename: request.filename,
@@ -6401,14 +6128,8 @@ async function cloneByoReferenceProfile(request: VoiceCloneRequest): Promise<Voi
     updated_at: now
   }
 
-  try {
-    await redis.createVoiceProfile(profile)
-  } catch (error) {
-    if (dirPath && !isContainerizedRuntime()) {
-      await fs.rm(dirPath, { recursive: true, force: true })
-    }
-    throw error
-  }
+  // A rejected write may already reference this audio; its path grants no rollback ownership.
+  await redis.createVoiceProfile(profile)
 
   return {
     voiceId: profile.voiceId,

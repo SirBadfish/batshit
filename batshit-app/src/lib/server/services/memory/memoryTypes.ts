@@ -69,6 +69,12 @@ export interface MemoryRecord {
   expires_ts?: number | null
   /** Expiry demotes, never erases (DL-104-02). */
   expired_demoted_to?: MemoryLane | null
+  /** Recoverable trash; no TTL. Absent means the record is not deleted. */
+  deleted_at?: string
+  deleted_ts?: number
+  /** Cleanup progress only, never restored permission to dispose files. */
+  purge_pending?: boolean
+  expiry_processed_at?: string
   /** Ids this memory replaced. */
   supersedes?: string[]
   superseded_by?: string | null
@@ -178,4 +184,4 @@ export interface MemoryIndexMetaRecord {
 }
 
 /** Bump when the FT schema shape changes; drives explicit re-create on bootstrap. */
-export const MEMORY_INDEX_SCHEMA_VERSION = 1
+export const MEMORY_INDEX_SCHEMA_VERSION = 2

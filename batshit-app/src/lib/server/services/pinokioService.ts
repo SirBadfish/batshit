@@ -32,6 +32,9 @@ import os from 'node:os'
 import path from 'node:path'
 import { isContainerizedRuntime } from '$lib/server/services/runtimeUrlRewrites'
 import { registerRuntimeShutdownTask } from '$lib/server/services/runtimeShutdown'
+import { pinokioRemoteProvider, type PinokioReadTargetOptions, type PinokioRemoteDetection, type PinokioRemoteStartOptions } from './pinokioRemoteProvider'
+import type { PinokioUnavailableReason, PinokioAppState, PinokioAppStatus, PinokioSearchApp, PinokioSearchResult, PinokioLogs, PinokioRunResult, PinokioFailureKind, PinokioOutcome, PinokioStartPreview } from './pinokioTypes'
+export type { PinokioUnavailableReason, PinokioAppState, PinokioAppStatus, PinokioSearchApp, PinokioSearchResult, PinokioLogs, PinokioRunResult, PinokioFailureKind, PinokioOutcome, PinokioStartPreview } from './pinokioTypes'
 
 /** DL-13: the pair P0 proved. A later Pinokio that breaks a fixture moves the floor, never two parsers. */
 export const PINOKIO_VERSION_FLOOR = '8.2.0'
@@ -70,14 +73,6 @@ function ptermStartFailure(error: unknown) {
 /** Environment keys `pterm` may inherit. Nothing else crosses (DL-06). */
 const PTERM_ENV_ALLOWLIST = ['PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TMPDIR', 'TZ'] as const
 
-export type PinokioUnavailableReason =
-  | 'containerized'
-  | 'unsupported_platform'
-  | 'not_installed'
-  | 'unsupported_version'
-  | 'pterm_missing'
-  | 'not_running'
-
 export interface PinokioDetection {
   available: boolean
   reason: PinokioUnavailableReason | null
@@ -91,75 +86,6 @@ export interface PinokioDetection {
   ptermVersion: string | null
   controlPlaneReachable: boolean
 }
-
-export type PinokioAppState = 'offline' | 'starting' | 'online'
-
-export interface PinokioAppStatus {
-  appId: string
-  title: string
-  state: PinokioAppState
-  running: boolean
-  ready: boolean
-  readyUrl: string | null
-  /** `true` or `false` only after `--probe`; `null` when the probe was not asked for. */
-  probe: boolean | null
-  path: string | null
-  lastError: string | null
-}
-
-export interface PinokioSearchApp {
-  appId: string
-  title: string
-  description: string | null
-  state: PinokioAppState
-  running: boolean
-  ready: boolean
-  readyUrl: string | null
-}
-
-export interface PinokioSearchResult {
-  query: string
-  apps: PinokioSearchApp[]
-  /** Apps a peer machine reported; left out, because this story is local only (DL-07). */
-  skippedRemote: number
-}
-
-export interface PinokioLogs {
-  appId: string
-  script: string | null
-  lineCount: number | null
-  lines: string[]
-  truncated: boolean
-}
-
-export interface PinokioRunResult {
-  appId: string
-  title: string
-  /** True when the app was already online and ready: nothing was started. */
-  alreadyRunning: boolean
-  /** True when the app answered its probe before the wait ended. */
-  ready: boolean
-  state: PinokioAppState
-  readyUrl: string | null
-  alsoStarted: string[]
-  waitedMs: number
-  message: string
-  /** The last lines `pterm run` printed, when the app was not ready in time. */
-  outputTail?: string[]
-}
-
-export type PinokioFailureKind = 'unavailable' | 'not_found' | 'refused' | 'error'
-
-export type PinokioOutcome<T> =
-  | { ok: true; value: T }
-  | {
-      ok: false
-      kind: PinokioFailureKind
-      message: string
-      reason?: PinokioUnavailableReason
-      /** A short excerpt of what `pterm` printed, for an unrecognised answer. */
-      raw?: string
-    }
 
 export interface PtermResult {
   exitCode: number | null
@@ -188,6 +114,8 @@ export interface PinokioDeps {
   containerized(): boolean
   homedir(): string
   readFile(file: string): Promise<string | null>
+  /** Requirements admission: only a genuinely missing ENVIRONMENT is empty. */
+  readEnvironmentFile(file: string): Promise<string | null>
   isFile(file: string): Promise<boolean>
   realpath(file: string): Promise<string | null>
   tcpReachable(host: string, port: number, timeoutMs: number): Promise<boolean>
@@ -269,6 +197,10 @@ const realDeps: PinokioDeps = {
   containerized: () => isContainerizedRuntime(),
   homedir: () => os.homedir(),
   readFile: async (file) => fs.readFile(file, 'utf8').catch(() => null),
+  readEnvironmentFile: async (file) => fs.readFile(file, 'utf8').catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return null
+    throw error
+  }),
   isFile: async (file) =>
     fs
       .stat(file)
@@ -833,7 +765,30 @@ async function ptermJson(pinokio: ReadyPinokio, args: string[]): Promise<Pinokio
 
 const REMOTE_REFUSAL = 'That app belongs to another Pinokio machine. Batshit drives only the Pinokio on this computer.'
 
-export async function searchPinokioApps(input: { query?: string; limit?: number } = {}): Promise<PinokioOutcome<PinokioSearchResult>> {
+/** An explicit malformed/stale/remote target must never be interpreted as local. */
+function remoteReadTarget(input: PinokioReadTargetOptions): PinokioOutcome<never> | 'local' | 'remote' {
+  if (input.machineId === undefined) {
+    return input.revision === undefined ? 'local' : { ok: false, kind: 'refused', code: 'pinokio_machine_invalid', message: 'Choose a saved Pinokio computer for this target revision.' }
+  }
+  if (input.machineId === 'local' && (input.revision === undefined || input.revision === 0)) return 'local'
+  if (typeof input.machineId !== 'string' || input.machineId === 'local' || typeof input.userId !== 'string' || !input.userId.trim()) {
+    return { ok: false, kind: 'refused', code: 'pinokio_machine_invalid', message: 'A signed-in user and valid saved Pinokio computer are required.' }
+  }
+  return 'remote'
+}
+
+/** Read-side wrapper for the existing status control; local detection stays unchanged. */
+export async function getPinokioTargetStatus(input: PinokioReadTargetOptions = {}): Promise<PinokioOutcome<PinokioDetection | PinokioRemoteDetection>> {
+  const target = remoteReadTarget(input)
+  if (typeof target !== 'string') return target
+  if (target === 'remote') return pinokioRemoteProvider.detect(input)
+  return { ok: true, value: await detectPinokio({ fresh: true }) }
+}
+
+export async function searchPinokioApps(input: PinokioReadTargetOptions & { query?: string; limit?: number } = {}): Promise<PinokioOutcome<PinokioSearchResult>> {
+  const target = remoteReadTarget(input)
+  if (typeof target !== 'string') return target
+  if (target === 'remote') return pinokioRemoteProvider.search(input)
   const ready = await requirePinokio()
   if (!ready.ok) return ready
   const args = ['search']
@@ -856,17 +811,29 @@ async function readAppStatus(
   return parsePinokioAppStatus(json.value)
 }
 
-export async function getPinokioAppStatus(input: { appId: string; probe?: boolean }): Promise<PinokioOutcome<PinokioAppStatus>> {
+export async function getPinokioAppStatus(input: PinokioReadTargetOptions & { appId: string; probe?: boolean }): Promise<PinokioOutcome<PinokioAppStatus>> {
   const problem = pinokioAppIdProblem(input.appId)
   if (problem) return { ok: false, kind: 'refused', message: problem }
+  const target = remoteReadTarget(input)
+  if (typeof target !== 'string') return target
+  if (target === 'remote') {
+    const result = await pinokioRemoteProvider.appStatus(input)
+    if (!result.ok) return result
+    // Native launch/default details stay in the server provider, not the agent status payload.
+    const { appId, title, state, running, ready, readyUrl, probe, path, lastError, machineId, machineRevision, machineLabel, externalReadyUrls, excludedExternalReadyUrls } = result.value
+    return { ok: true, value: { appId, title, state, running, ready, readyUrl, probe, path, lastError, machineId, machineRevision, machineLabel, externalReadyUrls, excludedExternalReadyUrls } }
+  }
   const ready = await requirePinokio()
   if (!ready.ok) return ready
   return await readAppStatus(ready.value, input.appId.trim(), input.probe !== false)
 }
 
-export async function getPinokioAppLogs(input: { appId: string; tail?: number }): Promise<PinokioOutcome<PinokioLogs>> {
+export async function getPinokioAppLogs(input: PinokioReadTargetOptions & { appId: string; tail?: number }): Promise<PinokioOutcome<PinokioLogs>> {
   const problem = pinokioAppIdProblem(input.appId)
   if (problem) return { ok: false, kind: 'refused', message: problem }
+  const target = remoteReadTarget(input)
+  if (typeof target !== 'string') return target
+  if (target === 'remote') return pinokioRemoteProvider.logs(input)
   const ready = await requirePinokio()
   if (!ready.ok) return ready
   const appId = input.appId.trim()
@@ -902,7 +869,13 @@ async function resolveRequiredApps(home: string, appId: string): Promise<Pinokio
   const found = new Set<string>()
   const visit = async (id: string, depth: number): Promise<string | null> => {
     if (depth > MAX_REQUIRES_DEPTH) return `The requirement chain from ${appId} is deeper than ${MAX_REQUIRES_DEPTH} apps.`
-    const requires = parseScriptRequires(await deps.readFile(path.join(apiRoot, id, 'ENVIRONMENT')))
+    let environment: string | null
+    try {
+      environment = await deps.readEnvironmentFile(path.join(apiRoot, id, 'ENVIRONMENT'))
+    } catch {
+      return `Batshit could not read ${id}'s Pinokio launch requirements. Nothing was started.`
+    }
+    const requires = parseScriptRequires(environment)
     for (const required of requires) {
       const problem = pinokioAppIdProblem(required)
       if (problem) return `${id} lists a requirement Batshit cannot name safely ("${required}").`
@@ -933,23 +906,17 @@ function tailLines(text: string, count: number): string[] {
     .map((line) => (line.length > LOG_LINE_MAX_CHARS ? `${line.slice(0, LOG_LINE_MAX_CHARS)}…` : line))
 }
 
-export interface PinokioStartPreview {
-  appId: string
-  title: string
-  state: PinokioAppState
-  ready: boolean
-  /** Every app a start also starts (`PINOKIO_SCRIPT_REQUIRES`, followed recursively), sorted. */
-  alsoStarts: string[]
-}
-
 /**
  * SA-072 P2: what a start of this app would do, for the confirm dialog Batshit's own page
  * shows before a "Start with Pinokio" click reaches `startPinokioApp` (rule 5: the words the
  * user approves name every app the start also starts). Read-only.
  */
-export async function previewPinokioAppStart(input: { appId: string }): Promise<PinokioOutcome<PinokioStartPreview>> {
+export async function previewPinokioAppStart(input: PinokioReadTargetOptions & { appId: string }): Promise<PinokioOutcome<PinokioStartPreview>> {
   const problem = pinokioAppIdProblem(input.appId)
   if (problem) return { ok: false, kind: 'refused', message: problem }
+  const target = remoteReadTarget(input)
+  if (typeof target !== 'string') return target
+  if (target === 'remote') return pinokioRemoteProvider.previewStart(input)
   const ready = await requirePinokio()
   if (!ready.ok) return ready
   const appId = input.appId.trim()
@@ -972,13 +939,12 @@ export async function previewPinokioAppStart(input: { appId: string }): Promise<
 /** One start per app at a time: parallel tool calls for the same app share the first one. */
 const runsInFlight = new Map<string, Promise<PinokioOutcome<PinokioRunResult>>>()
 
-export async function startPinokioApp(input: {
-  appId: string
-  alsoStarts?: string[]
-  waitSeconds?: number
-}): Promise<PinokioOutcome<PinokioRunResult>> {
+export async function startPinokioApp(input: PinokioRemoteStartOptions): Promise<PinokioOutcome<PinokioRunResult>> {
   const problem = pinokioAppIdProblem(input.appId)
   if (problem) return { ok: false, kind: 'refused', message: problem }
+  const target = remoteReadTarget(input)
+  if (typeof target !== 'string') return target
+  if (target === 'remote') return pinokioRemoteProvider.start(input)
   const appId = input.appId.trim()
   const existing = runsInFlight.get(appId)
   if (existing) return await existing

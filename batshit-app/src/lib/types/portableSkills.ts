@@ -1,9 +1,12 @@
+import type { AppActionsPortableGrant } from '$lib/appActions/settings/managementContract'
+
 export type PortableSkillFamilyId =
   | 'voice-engines'
   | 'artifacts'
   | 'cli-tools'
   | 'skills'
   | 'goon-scenes'
+  | 'app-actions'
 
 export type PortableSkillTokenRecord = {
   id: string
@@ -17,6 +20,9 @@ export type PortableSkillTokenRecord = {
   updatedAt: string
   lastUsedAt: string | null
   revokedAt: string | null
+  /** Authority changes advance this; last-used bookkeeping never does. Legacy absent = 0. */
+  authorityGeneration?: number
+  appActionsGrant?: AppActionsPortableGrant | null
 }
 
 export type PortableSkillTokenSummary = Omit<PortableSkillTokenRecord, 'tokenHash'>

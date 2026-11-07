@@ -95,12 +95,17 @@ function check(overrides: Partial<BackupUploadCheck> = {}): BackupUploadCheck {
 }
 
 function stubCheck(answer: BackupUploadCheck | { status: number; error: string }) {
-  const fetchMock = vi.fn(async () =>
+  const fetchMock = vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) =>
     'status' in answer
       ? new Response(JSON.stringify({ error: answer.error }), { status: answer.status })
       : Response.json({ audit: answer })
   )
-  vi.stubGlobal('fetch', fetchMock)
+  // The new independent settings owner performs its own read on mount. This suite's
+  // counter still measures only upload checks, whose cancel/export boundary it owns.
+  vi.stubGlobal('fetch', (url: RequestInfo | URL, init?: RequestInit) =>
+    String(url) === '/api/admin/backup/automatic'
+      ? Promise.resolve(Response.json({ error: 'Automatic settings are covered by their owning suite.' }, { status: 503 }))
+      : fetchMock(url, init))
   return fetchMock
 }
 

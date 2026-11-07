@@ -1,3 +1,6 @@
+import { memoryIsDeleted, memoryIsEligible } from './memoryState'
+import { commitMemoryMutation, readMemoryMutationSnapshot } from './memoryMutation'
+import { captureSettingsLifecycle } from '../appActions/settings/lifecycle'
 /**
  * SA-104 P7 — Dreaming v1: between-conversation memory maintenance (DL-104-02 /
  * DL-104-13 / DL-104-15; p7 packet doc §1).
@@ -517,6 +520,7 @@ export interface DreamingRunOptions {
 
 export async function runDreamingPass(options: DreamingRunOptions): Promise<DreamingRunRecord> {
   const agentId = String(options.agent?.id ?? '')
+  const lifecycle = captureSettingsLifecycle([`agent:${agentId}`])
   if (!agentId) throw new Error('Dreaming requires an agent id.')
   if (!resolveAgentMemoryEnabled(options.agent)) {
     throw new Error('Dreaming requires agent memory to be enabled.')
@@ -805,20 +809,23 @@ export async function runDreamingPass(options: DreamingRunOptions): Promise<Drea
       )
     } else {
       try {
-        const memories = await listMemories(agentId)
+        const memories = (await listMemories(agentId)).filter(record => memoryIsEligible(record))
         const segments = await listMemorySegments(agentId)
         let refreshed = 0
         for (const memory of memories) {
           if (refreshed >= DREAMING_MAX_REEMBEDS) break
           if (memory.embedding_model === indexMeta.embedding_model) continue
-          const [embedding] = await embedder.embedDocuments([memory.content])
+          const mutation = await readMemoryMutationSnapshot(agentId, { lifecycle, targetIds: [memory.id] })
+          const source = mutation.records.find(entry => entry.id === memory.id)
+          if (!source || !memoryIsEligible(source)) continue
+          const [embedding] = await embedder.embedDocuments([source.content])
           const next = {
-            ...memory,
+            ...source,
             embedding,
             embedding_model: embedder.modelId,
             updated_at: now.toISOString()
           }
-          await redis.json.set(memoryKey(agentId, memory.id), '$', next as never)
+          await commitMemoryMutation(mutation, new Map([[memoryKey(agentId, memory.id), next]]))
           refreshed += 1
           act(
             'reembed',
@@ -853,99 +860,39 @@ export async function runDreamingPass(options: DreamingRunOptions): Promise<Drea
     }
     await flush()
 
-    // ---- Phase 4: expiry processing (demote, never erase — DL-104-02) ----
+    // ---- Phase 4: plain expiry, never lane demotion into ordinary retrieval ----
     try {
-      const memories = await listMemories(agentId)
-      let demoted = 0
-      // BL-786: a record leaving Awareness keeps its images on recall (`markExpiredDemotion`);
-      // say so in the action, which is the change's record.
-      const recallOnlyNote = (before: MemoryRecord, after: MemoryRecord) => {
-        if (before.media_mode !== 'always' || after.media_mode !== 'on_recall') return null
-        const count = before.media?.length ?? 0
-        return {
-          why:
-            `; its ${count} image${count === 1 ? ' was' : 's were'} set to show every message, which only Awareness ` +
-            `can do, so ${count === 1 ? 'it now arrives' : 'they now arrive'} only when the memory is recalled (kept on the memory)`,
-          refs: { mediaMode: { from: 'always', to: 'on_recall' } }
-        }
-      }
+      const memories = (await listMemories(agentId)).filter(record => !memoryIsDeleted(record))
+      let settled = 0
       for (const memory of memories) {
-        if (demoted >= DREAMING_MAX_EXPIRY_DEMOTIONS) break
-        if (!memory.expires_ts || memory.expires_ts > now.getTime()) continue
-        if (memory.expired_demoted_to) {
-          // BL-786: a record an older demotion moved out of Awareness still set to show its images
-          // every message (every save of it was refused). Settle it once, in place.
-          if (memory.lane === 'awareness' || memory.media_mode !== 'always') continue
-          try {
-            const settled = await markExpiredDemotion(agentId, memory.id, memory.lane)
-            demoted += 1
-            const note = recallOnlyNote(memory, settled)
-            act(
-              'expire_demote',
-              'done',
-              `expired ${memory.expires_at} — already demoted to ${memory.lane}` + (note?.why ?? ''),
-              { memoryId: memory.id, from: memory.lane, to: memory.lane, ...note?.refs }
-            )
-          } catch (error) {
-            act(
-              'expire_demote',
-              'failed',
-              'settling the images of an already-demoted memory failed; it keeps its current state',
-              { memoryId: memory.id },
-              error instanceof Error ? error.message : 'unknown error'
-            )
-          }
-          continue
-        }
-        if (memory.is_superseded === 'y') continue
-        const target: MemoryLane =
-          memory.lane === 'awareness'
-            ? memory.trigger_terms?.length
-              ? 'stm'
-              : 'ltm'
-            : 'ltm'
+        if (settled >= DREAMING_MAX_EXPIRY_DEMOTIONS) break
+        if (typeof memory.expires_ts !== 'number' || memory.expires_ts > now.getTime()) continue
+        if (memory.expiry_processed_at && memory.lane === 'ltm' && memory.media_mode !== 'always') continue
         try {
-          const demotedRecord = await markExpiredDemotion(agentId, memory.id, target)
-          demoted += 1
-          const note = recallOnlyNote(memory, demotedRecord)
-          act(
-            'expire_demote',
-            'done',
-            (memory.lane === target
-              ? `expired ${memory.expires_at} — already ${target}; marked processed so it stays searchable and flagged expired`
-              : `expired ${memory.expires_at} — demoted ${memory.lane} → ${target} so it stops ${memory.lane === 'awareness' ? 'compiling into the system prompt' : 'auto-firing on triggers'} but stays searchable (never erased)`) +
-              (note?.why ?? ''),
-            { memoryId: memory.id, from: memory.lane, to: target, ...note?.refs }
-          )
+          await markExpiredDemotion(agentId, memory.id, undefined, { lifecycle })
+          settled++
+          act('expire_demote', 'done', `expired ${memory.expires_at} — retained as expired Long-Term history, available only through explicit expired lookup`, { memoryId: memory.id })
         } catch (error) {
-          act(
-            'expire_demote',
-            'failed',
-            'expiry demotion failed; the memory keeps its current lane',
-            { memoryId: memory.id },
-            error instanceof Error ? error.message : 'unknown error'
-          )
+          act('expire_demote', 'failed', 'expiry settlement failed; the stored record is retained and ordinary retrieval still excludes it', { memoryId: memory.id }, error instanceof Error ? error.message : String(error))
         }
       }
     } catch (error) {
-      act(
-        'expire_demote',
-        'failed',
-        'expiry scan failed; no demotions were performed',
-        {},
-        error instanceof Error ? error.message : 'unknown error'
-      )
+      act('expire_demote', 'failed', 'expiry scan failed; stored memories are retained', {}, error instanceof Error ? error.message : String(error))
     }
     await flush()
 
     // ---- Phase 5: supersession repair (the pointer is the authority) ----
     try {
-      const memories = await listMemories(agentId)
+      const mutation = await readMemoryMutationSnapshot(agentId, { lifecycle, targetIds: [] })
+      const memories = mutation.records
       const byId = new Map(memories.map((memory) => [memory.id, memory]))
       let repairs = 0
+      const changes = new Map<string, MemoryRecord>()
+      const pendingActions: Array<Parameters<typeof act>> = []
+      const repairAct = (...args: Parameters<typeof act>) => pendingActions.push(args)
       const write = async (memory: MemoryRecord) => {
         memory.updated_at = now.toISOString()
-        await redis.json.set(memoryKey(agentId, memory.id), '$', memory as never)
+        changes.set(memoryKey(agentId, memory.id), memory)
       }
       // BL-438: a record restored to current brings its always-on images back into the standing
       // set, and past the cap every send of the agent fails at the compile. A repair cannot be
@@ -975,6 +922,7 @@ export async function runDreamingPass(options: DreamingRunOptions): Promise<Drea
       // The store's supersede/unsupersede own the happy paths; dreaming repairs the
       // broken shapes those functions refuse to touch (crashed half-writes, deletes).
       for (const memory of memories) {
+        if (memoryIsDeleted(memory)) continue
         if (repairs >= DREAMING_MAX_SUPERSESSION_REPAIRS) break
         if (memory.superseded_by) {
           const successor = byId.get(memory.superseded_by)
@@ -984,7 +932,7 @@ export async function runDreamingPass(options: DreamingRunOptions): Promise<Drea
             const capped = keepUnderStandingCap(memory)
             await write(memory)
             repairs += 1
-            act(
+            repairAct(
               'supersession_repair',
               'done',
               'superseded_by pointed at a memory that no longer exists (explicit delete) — restored this record to current' +
@@ -992,11 +940,12 @@ export async function runDreamingPass(options: DreamingRunOptions): Promise<Drea
               { memoryId: memory.id, ...capped?.refs }
             )
           } else {
+            if (memoryIsDeleted(successor)) continue
             if (memory.is_superseded !== 'y') {
               memory.is_superseded = 'y'
               await write(memory)
               repairs += 1
-              act(
+              repairAct(
                 'supersession_repair',
                 'done',
                 'flag mismatch: superseded_by is set but the superseded flag was off — reconciled to the pointer (the write-order authority)',
@@ -1007,7 +956,7 @@ export async function runDreamingPass(options: DreamingRunOptions): Promise<Drea
               successor.supersedes = [...(successor.supersedes ?? []), memory.id]
               await write(successor)
               repairs += 1
-              act(
+              repairAct(
                 'supersession_repair',
                 'done',
                 'completed a crashed supersede: the successor now lists this predecessor in its supersedes chain',
@@ -1020,7 +969,7 @@ export async function runDreamingPass(options: DreamingRunOptions): Promise<Drea
           const capped = keepUnderStandingCap(memory)
           await write(memory)
           repairs += 1
-          act(
+          repairAct(
             'supersession_repair',
             'done',
             'flag mismatch: no superseded_by pointer but the superseded flag was on — restored to current (the pointer is the authority)' +
@@ -1035,7 +984,7 @@ export async function runDreamingPass(options: DreamingRunOptions): Promise<Drea
             const predecessor = byId.get(predecessorId)
             if (!predecessor) {
               repairs += 1
-              act(
+              repairAct(
                 'supersession_repair',
                 'done',
                 'supersedes listed a memory that no longer exists (explicit delete) — pruned the dangling pointer',
@@ -1043,9 +992,10 @@ export async function runDreamingPass(options: DreamingRunOptions): Promise<Drea
               )
               continue
             }
+            if (memoryIsDeleted(predecessor)) { kept.push(predecessorId); continue }
             if (predecessor.superseded_by !== memory.id) {
               repairs += 1
-              act(
+              repairAct(
                 'supersession_repair',
                 'done',
                 predecessor.superseded_by
@@ -1064,6 +1014,22 @@ export async function runDreamingPass(options: DreamingRunOptions): Promise<Drea
           }
         }
       }
+      if (changes.size) {
+        const complete = await readMemoryMutationSnapshot(agentId, { lifecycle, targetIds: [...changes.values()].map(record => record.id) })
+        if (complete.revisionRaw !== mutation.revisionRaw) throw new Error('Memory graph changed during repair preparation.')
+        const publications = new Map<string, MemoryRecord>()
+        for (const [key, planned] of changes) {
+          const original = complete.records.find(record => record.id === planned.id)!
+          const next = { ...original }
+          for (const field of ['supersedes', 'superseded_by', 'is_superseded', 'media_mode', 'updated_at'] as const) {
+            if (planned[field] === undefined) delete next[field]
+            else Object.assign(next, { [field]: planned[field] })
+          }
+          publications.set(key, next)
+        }
+        await commitMemoryMutation(complete, publications)
+      }
+      for (const action of pendingActions) act(...action)
     } catch (error) {
       act(
         'supersession_repair',
@@ -1077,16 +1043,15 @@ export async function runDreamingPass(options: DreamingRunOptions): Promise<Drea
 
     // ---- Phase 6: consolidation (near-dup merge with model judgment) ----
     try {
-      const memories = await listMemories(agentId)
+      const memories = (await listMemories(agentId)).filter(record => memoryIsEligible(record))
       const candidates = memories
         .filter((memory) => memory.is_superseded !== 'y')
         .slice(0, DREAMING_MAX_CONSOLIDATION_SCAN)
       const clusters = await buildConsolidationClusters(agentId, candidates)
 
       for (const clusterIds of clusters.slice(0, DREAMING_MAX_CONSOLIDATION_CLUSTERS)) {
-        const members = (
-          await fetchMemoriesByKeys(clusterIds.map((id) => memoryKey(agentId, id)))
-        ).filter((member) => member.is_superseded !== 'y')
+        const mutation = await readMemoryMutationSnapshot(agentId, { lifecycle, targetIds: clusterIds })
+        const members = mutation.records.filter(member => clusterIds.includes(member.id) && memoryIsEligible(member) && member.is_superseded !== 'y')
         if (members.length < 2) continue
 
         // SA-105 P0b: a merge cannot silently orphan owned image memories. Dreaming
@@ -1186,11 +1151,11 @@ export async function runDreamingPass(options: DreamingRunOptions): Promise<Drea
               event_at: eventAt,
               expires_at: expiresAt,
               ...(links.length ? { links } : {}),
-              provenance
+              provenance,
+              supersedes: Array.from(memberIds)
             },
-            { embedder }
+            { embedder, lifecycle, snapshot: mutation }
           )
-          await supersedeMemory(agentId, mergedRecord.id, Array.from(memberIds))
           act(
             'consolidate_merge',
             'done',

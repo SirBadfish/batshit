@@ -17,6 +17,13 @@ describe('voiceRuntimeGuidance', () => {
     mockGetVoiceEngineGuidanceForProviderId.mockReset()
   })
 
+  it('explains Flash steering only for the selected Flash model', async () => {
+    expect(await buildVoiceRuntimeGuidanceForProvider('user-1', 'inworld', {}, 'inworld-tts-2-flash')).toEqual([
+      expect.stringContaining('does not support bracketed steering instructions')
+    ])
+    expect(await buildVoiceRuntimeGuidanceForProvider('user-1', 'inworld', {}, 'inworld-tts-2')).toEqual([])
+  })
+
   it('builds prompt guidance for built-in TTS providers', () => {
     const guidance = getTtsEnginePromptGuidance(
       {

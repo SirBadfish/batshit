@@ -88,7 +88,7 @@ test('development SSR: old loader fails, canonical repair loads the real guard',
 		}
 		t.diagnostic(JSON.stringify(await assertCustody(custody)));
 		// An ordinary sibling app source module still passes through Vite normally.
-		const sibling = await after.ssrLoadModule(path.join(appRoot, 'src/lib/utils/cliSubagentToolNames.ts'));
+		const sibling = await after.ssrLoadModule(path.join(appRoot, 'src/lib/utils/agentId.ts'));
 		assert.ok(Object.keys(sibling).length > 0);
 	} finally {
 		await after.close();

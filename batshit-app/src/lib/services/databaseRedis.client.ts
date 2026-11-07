@@ -24,6 +24,7 @@ import type {
 } from '$lib/types/database'
 import type { AgentRow } from '$lib/types/database'
 import type { Message } from '$lib/stores/messages.svelte'
+import type { InstructionsBaseline, InstructionsRevisions } from '$lib/appActions/settings/instructionsBaseline'
 
 /**
  * DatabaseService - browser CRUD facade over the focused store clients.
@@ -95,7 +96,11 @@ export class DatabaseService {
     return agentStore.createAgent(agent)
   }
 
-  async updateAgent(id: string, updates: Partial<AgentRow>) {
+  async getInstructionsBaseline(kind: InstructionsBaseline['kind'], id: string) {
+    return agentStore.getInstructionsBaseline(kind, id)
+  }
+
+  async updateAgent(id: string, updates: Partial<AgentRow> & { expectedInstructions?: Partial<InstructionsRevisions> }) {
     return agentStore.updateAgent(id, updates)
   }
 
@@ -111,7 +116,7 @@ export class DatabaseService {
     return agentStore.createSubagent(subagent)
   }
 
-  async updateSubagent(id: string, updates: Partial<SubagentRow>) {
+  async updateSubagent(id: string, updates: Partial<SubagentRow> & { expectedInstructions?: Partial<InstructionsRevisions> }) {
     return agentStore.updateSubagent(id, updates)
   }
 

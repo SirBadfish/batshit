@@ -32,8 +32,9 @@ import type { CacheForensicsSegmentInput } from './fingerprint'
 /**
  * SA-128 (splitter v4): the compiled message is tags now (`$lib/utils/compiledChatTags`). The
  * history is `<conversation>` holding one element per message, the appended zips are one
- * `<zip_index>` element after it, and the new message (`<user>` or `<note>`) plus
- * `<dynamic_info>` and the live media follow. The compiler disarms every tag of that grammar
+ * `<zip_index>` element after it, and the new message (`<user>` or `<note>`, inside
+ * `<current_message>` since decision 11) plus `<dynamic_info>` and the live media follow. The
+ * wrapper sits in the current segment only, so no history segment's bytes change. The compiler disarms every tag of that grammar
  * inside content, so a real tag can only be the compiler's own: the split below is exact.
  */
 /** Opens the compiled chat history. */
@@ -48,8 +49,12 @@ export const COMPILED_ZIP_APPEND_CLOSE = `\n</${COMPILED_TAG.zipIndex}>`
 /** The standing media manifest, the first text part when an Awareness image is standing. */
 export const COMPILED_STANDING_MEDIA_OPEN = `<${COMPILED_TAG.awarenessMedia}>\n`
 
-// The new message opens with one of these (the user's own, or Batshit's note).
-const CURRENT_MESSAGE_START = new RegExp(`^<(?:${COMPILED_TAG.user}|${COMPILED_TAG.note})(?: [^>\\n]*)?>\\n`)
+// The new message opens with one of these (the user's own, or Batshit's note), inside
+// `<current_message>` since decision 11 (2026-10-24); the bare form stays readable for records
+// written before it.
+const CURRENT_MESSAGE_START = new RegExp(
+  `^(?:<${COMPILED_TAG.currentMessage}>\\n)?<(?:${COMPILED_TAG.user}|${COMPILED_TAG.note})(?: [^>\\n]*)?>\\n`
+)
 
 /** Each history element, in order. A fresh expression per call (`/g` keeps `lastIndex`). */
 function historyElementPattern(): RegExp {

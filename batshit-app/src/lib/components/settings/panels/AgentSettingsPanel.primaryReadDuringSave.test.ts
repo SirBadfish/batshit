@@ -7,6 +7,7 @@ import * as agentStore from '$lib/stores/agents.svelte'
 import { buildPickedPresetModelFields } from '$lib/utils/modelPresetPick'
 import { resolveSavedModelConnection } from '$lib/utils/modelConnections'
 import { jsonResponse, loadAgentRoute, storedAgent, type AgentPut } from '$lib/test-utils/agentPutRoute'
+import { INSTRUCTIONS_REVISION_HEADER } from '$lib/appActions/settings/instructionsBaseline'
 
 /**
  * BL-912, BL-942: a Primary Agent save and a newer read of the same agent. `hydrateAgent` reads the
@@ -33,15 +34,15 @@ import { jsonResponse, loadAgentRoute, storedAgent, type AgentPut } from '$lib/t
  * `holdNextGet()` holds the answer of the agent's next GET after it read the record; `failNextGets`
  * makes the next GETs answer 500. `seedSubagent()` gives the agent a Subagent to assign: the
  * assignment routes are then the REAL ones.
+ * SA-139 R4: the CLI Primary's Claude section left with its lane; its cases went with it, and the
+ * surviving rules (Tool Approval, the 30-second save wait, a failed deferred read) run on API
+ * sections.
  */
 
-vi.mock('$lib/server/services/codexProfileManager', () => ({
-  syncAgentCodexProfiles: vi.fn(async () => {}),
-  deleteAgentCodexConfig: vi.fn(async () => {}),
-  buildAgentProfileId: (id: string) => `batshit_agent_${id}`
+vi.mock('$lib/server/services/managedProfileFolderDelete', () => ({
+  deleteManagedProfileFolder: vi.fn(async () => {})
 }))
 vi.mock('$lib/server/services/claudeProfileManager', () => ({
-  syncAgentClaudeProfiles: vi.fn(async () => {}),
   deleteAgentClaudeConfig: vi.fn(async () => {}),
   agentClaudeProfileResource: (id: string) => JSON.stringify(['profile', `claude:${id}`])
 }))
@@ -67,64 +68,6 @@ const PRESET = {
   purpose: 'chat',
   connection: { type: 'direct', service: 'openai' },
   settings: { temperature: 0.7 }
-}
-
-const CODEX_BASE = {
-  permissionMode: 'chat',
-  includeProjectInstructions: true,
-  model: 'gpt-6-astra',
-  streamingEffect: true,
-  unifiedExec: true,
-  search: true,
-  sandbox: 'read-only',
-  approval: 'never',
-  configScope: 'managed',
-  addDirs: [] as string[],
-  enableFeatures: [] as string[],
-  disableFeatures: [] as string[],
-  configOverrides: [] as unknown[],
-  workingDirectoryMode: 'project',
-  historyPersistence: 'none'
-}
-
-const CLAUDE_BASE = {
-  permissionMode: 'acceptEdits',
-  includeCoreSystemPrompt: false,
-  includeProjectInstructions: true,
-  model: 'sonnet',
-  alwaysThinkingEnabled: false,
-  configScope: 'managed',
-  systemPromptMode: 'replace',
-  chrome: false,
-  addDirs: [] as string[],
-  allowedTools: [] as string[],
-  disallowedTools: [] as string[],
-  configOverrides: [] as unknown[],
-  workingDirectoryMode: 'project'
-}
-
-/** A Claude CLI agent, without the API preset the other tests give theirs. */
-const CLAUDE_AGENT = {
-  agentType: 'cli',
-  primary_model_provider: 'claude-cli',
-  primary_model_name: 'claude-cli',
-  primary_model_connection: { type: 'cli', service: 'claude-cli' },
-  primary_model_preset_id: undefined,
-  primary_model_temperature: null,
-  provider_specific_settings: undefined,
-  claude_settings: CLAUDE_BASE
-}
-
-/** A Codex CLI agent, without the API preset the other tests give theirs. */
-const CODEX_AGENT = {
-  agentType: 'cli',
-  primary_model_provider: 'codex',
-  primary_model_name: 'gpt-6-astra',
-  primary_model_connection: { type: 'cli', service: 'codex' },
-  primary_model_preset_id: undefined,
-  primary_model_temperature: null,
-  provider_specific_settings: undefined,
-  codex_settings: CODEX_BASE
 }
 
 function ensureBrowserStubs() {
@@ -258,7 +201,11 @@ async function routeAgent(id: string, method: string, body: string | undefined) 
 }
 
 function installRoutes() {
+  // Each case restores spies. Reinstall the existing atomic GET snapshot twin for
+  // this HTTP fixture, as installAgentRoutes does, before any detail route runs.
+  const routeReady = loadAgentRoute()
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) => {
+    await routeReady
     const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
     const method = (init.method ?? 'GET').toUpperCase()
     const path = url.split('?')[0]
@@ -330,7 +277,7 @@ function installRoutes() {
     if (path === '/api/user/saved-models') return jsonResponse({ models: [PRESET] })
     if (path === '/api/models') return jsonResponse({ data: { connections: [] } })
     if (path === '/api/settings/api-keys') return jsonResponse({ keys: {} })
-    if (path === '/api/goons') return jsonResponse({ goons: [] })
+    if (path === '/api/goons') return jsonResponse({ ownerId: 'josh', goons: [] })
     if (path === '/api/mcp/gateways') return jsonResponse({ gateways: [] })
     if (path === '/api/cli-tools') return jsonResponse({ tools: [] })
     if (path === '/api/icons/library') return jsonResponse({ icons: [], prefs: { favorites: [], recents: [] } })
@@ -446,31 +393,8 @@ function selectShowing(text: string) {
     .find((element) => element.hasAttribute('data-select-trigger') && (element.textContent ?? '').trim() === text)
 }
 
-async function pickSelectOption(current: string, optionText: RegExp) {
-  const trigger = selectShowing(current)
-  expect(trigger, `the select showing "${current}"`).toBeTruthy()
-  await fireEvent.keyDown(trigger as HTMLElement, { key: 'ArrowDown' })
-  await waitFor(() => expect(screen.queryAllByRole('option', { hidden: true }).length).toBeGreaterThan(0))
-  const option = screen
-    .getAllByRole('option', { hidden: true })
-    .find((element) => optionText.test((element.textContent ?? '').trim()))
-  expect(option, `an option matching ${optionText}`).toBeTruthy()
-  await fireEvent.pointerUp(option as HTMLElement, { pointerType: 'mouse' })
-}
-
 function isReadWaitLocked(element: HTMLElement | null) {
   return Boolean(element && (element.matches(':disabled') || element.closest('fieldset:disabled, [inert]')))
-}
-
-function tryReadWaitSelect(current: string, optionText: RegExp) {
-  const trigger = selectShowing(current) as HTMLElement | undefined
-  if (!trigger || isReadWaitLocked(trigger)) return Promise.resolve(false)
-  return pickSelectOption(current, optionText).then(() => true)
-}
-
-function codexPermissionRadio(label: RegExp) {
-  const group = screen.getByRole('group', { name: 'Codex permissions mode' })
-  return within(group).getByRole('radio', { name: label })
 }
 
 /** The switch in the row that carries `label` (the nearest ancestor of the text that holds a switch). */
@@ -480,17 +404,6 @@ function switchOf(label: string) {
     if (found) return found as HTMLElement
   }
   throw new Error(`no switch beside "${label}"`)
-}
-
-function claudeModeRadio(label: RegExp) {
-  const group = screen.getByRole('group', { name: 'Claude permissions mode' })
-  return within(group).getByRole('radio', { name: label })
-}
-
-function thinkingBudgetInput() {
-  const label = screen.getByText('Thinking Token Budget')
-  const row = label.closest('.batshit-settings-form-row') as HTMLElement | null
-  return within(row as HTMLElement).getByRole('spinbutton') as HTMLInputElement
 }
 
 async function openToolsTab() {
@@ -529,94 +442,7 @@ async function openPromptEditor(current: string) {
   return { editor, save }
 }
 
-/** How many PUT bodies repeat an earlier body exactly (S7's harmless second sends of an equal change). */
-function equalRepeats(list: AgentPut[]) {
-  const seen = new Set<string>()
-  let repeats = 0
-  for (const put of list) {
-    const key = JSON.stringify(put.body)
-    if (seen.has(key)) repeats += 1
-    seen.add(key)
-  }
-  return repeats
-}
-
 describe('a Primary section save that lands after the agent was read again (BL-912)', () => {
-  it('Codex, a switch away and back: no PUT takes the change back, the record holds it, and the form shows it after the deferred read', async () => {
-    await openPanel(CODEX_AGENT)
-    const put = holdNextPut({ beforeWrite: true })
-    await pickSelectOption('Auto', /^High/)
-    await waitFor(() => expect(puts.length).toBe(1), { timeout: 8_000 })
-    expect(puts[0].body).toEqual({ codex_settings: { reasoningEffort: 'high' } })
-
-    await switchAwayAndBack()
-    expect(selectShowing('Auto')).toBeTruthy()
-
-    put.write()
-    await waitFor(async () => expect((await storedAgent(AGENT)).codex_settings.reasoningEffort).toBe('high'), {
-      timeout: 8_000
-    })
-    put.answer()
-    await pause(2500)
-
-    expect(puts.length).toBe(1)
-    expect((await storedAgent(AGENT)).codex_settings.reasoningEffort).toBe('high')
-    expect(selectShowing('High')).toBeTruthy()
-    expect(otherPuts).toEqual([])
-  }, 120_000)
-
-  it('Codex, the shown agent read again without a reset: the read leaves the busy section alone; the equal change goes once more (S7) and nothing takes it back', async () => {
-    await openPanel(CODEX_AGENT)
-    const put = holdNextPut({ beforeWrite: true })
-    await pickSelectOption('Auto', /^High/)
-    await waitFor(() => expect(puts.length).toBe(1), { timeout: 8_000 })
-
-    await readShownAgentAgain()
-    const keptDuringRead = Boolean(selectShowing('High'))
-
-    // Past the debounce of anything the read's end queued; then the first PUT writes and answers.
-    await pause(1500)
-    put.write()
-    await waitFor(() => expect(events.filter((event) => event === 'put-written').length).toBeGreaterThan(0), {
-      timeout: 8_000
-    })
-    put.answer()
-    await pause(2500)
-    await waitFor(() => events.filter((event) => event === 'put-answered').length === puts.length, { timeout: 8_000 })
-    await pause(800)
-
-    expect(puts.map((entry) => entry.body)).toEqual([
-      { codex_settings: { reasoningEffort: 'high' } },
-      { codex_settings: { reasoningEffort: 'high' } }
-    ])
-    expect(equalRepeats(puts)).toBe(1)
-    expect((await storedAgent(AGENT)).codex_settings.reasoningEffort).toBe('high')
-    expect(selectShowing('High')).toBeTruthy()
-    expect(keptDuringRead).toBe(true)
-  }, 120_000)
-
-  it('Claude, a switch away and back: no PUT takes the mode back, and the form shows it after the deferred read', async () => {
-    await openPanel(CLAUDE_AGENT)
-    const put = holdNextPut({ beforeWrite: true })
-    await fireEvent.click(claudeModeRadio(/Plan/i))
-    await waitFor(() => expect(puts.length).toBe(1), { timeout: 8_000 })
-    expect(puts[0].body).toEqual({ claude_settings: { permissionMode: 'plan' } })
-
-    await switchAwayAndBack()
-    expect(claudeModeRadio(/Plan/i).getAttribute('aria-checked')).toBe('false')
-
-    put.write()
-    await waitFor(async () => expect((await storedAgent(AGENT)).claude_settings.permissionMode).toBe('plan'), {
-      timeout: 8_000
-    })
-    put.answer()
-    await pause(2500)
-
-    expect(puts.length).toBe(1)
-    expect((await storedAgent(AGENT)).claude_settings.permissionMode).toBe('plan')
-    expect(claudeModeRadio(/Plan/i).getAttribute('aria-checked')).toBe('true')
-  }, 120_000)
-
   it('the Tool Grid, a switch away and back: no PUT takes the gateways back, and the card shows them after the deferred read', async () => {
     await openPanel({ defaultMCPGateways: ['gw_a'], defaultMCPToolSelections: [] })
     await openToolsTab()
@@ -624,7 +450,12 @@ describe('a Primary section save that lands after the agent was read again (BL-9
     card().onGatewaysChange(['gw_a', 'gw_b'])
     await tick()
     await waitFor(() => expect(puts.length).toBe(1), { timeout: 8_000 })
-    expect(puts[0].body).toEqual({ defaultMCPGateways: ['gw_a', 'gw_b'] })
+    expect(puts[0].body).toEqual({
+      defaultMCPGateways: ['gw_a', 'gw_b'],
+      expectedMcpSettings: {
+        defaultMCPGateways: JSON.parse((await routeAgent(AGENT, 'GET', undefined)).headers.get('x-batshit-mcp-settings-revisions') ?? 'null').defaultMCPGateways
+      }
+    })
 
     await switchAwayAndBack()
     await openToolsTab()
@@ -693,12 +524,15 @@ describe('the saves the old at-rest check could not see, during a read (BL-912, 
 
   it('the prompt save: it lands while a read of the older record is on its way; that older answer does not put the older prompt back', async () => {
     await openPanel({ system_prompt: 'Answer in haiku.' })
+    // BL-1670: this unrelated invalid draft prevents the all-sections-at-rest
+    // fallback, so the held read's finally must drain the prompt's own readback.
+    await fireEvent.input(nameInput(), { target: { value: '' } })
     const put = holdNextPut({ beforeWrite: true })
     const { editor, save } = await openPromptEditor('Answer in haiku.')
     await fireEvent.input(editor, { target: { value: 'Answer in limericks.' } })
     await fireEvent.click(save)
     await waitFor(() => expect(puts.length).toBe(1), { timeout: 8_000 })
-    expect(puts[0].body).toEqual({ system_prompt: 'Answer in limericks.' })
+    expect(puts[0].body).toEqual({ system_prompt: 'Answer in limericks.', expectedInstructions: { customPrompt: expect.stringMatching(/^sha256:[a-f0-9]{64}$/) } })
 
     // The shown agent is read again; its GET reads the older prompt, and its answer is slow.
     const answer = holdNextGet()
@@ -719,6 +553,15 @@ describe('the saves the old at-rest check could not see, during a read (BL-912, 
     expect((await storedAgent(AGENT)).system_prompt).toBe('Answer in limericks.')
     const reopened = await openPromptEditor('Answer in limericks.')
     expect(reopened.editor).toBeTruthy()
+    expect(nameInput().value).toBe('')
+    await fireEvent.input(reopened.editor, { target: { value: 'Answer in couplets.' } })
+    await fireEvent.click(reopened.save)
+    await waitFor(() => expect(puts).toHaveLength(2), { timeout: 8_000 })
+    expect(puts[1].body).toEqual({ system_prompt: 'Answer in couplets.', expectedInstructions: { customPrompt: expect.stringMatching(/^sha256:[a-f0-9]{64}$/) } })
+    expect(puts[1].body.expectedInstructions.customPrompt).not.toBe(puts[0].body.expectedInstructions.customPrompt)
+    await waitFor(async () => expect((await storedAgent(AGENT)).system_prompt).toBe('Answer in couplets.'), { timeout: 8_000 })
+    expect(nameInput().value).toBe('')
+    expect((await storedAgent(AGENT)).displayName).toBe(NAME)
   }, 120_000)
 
   it('a multiline editor save: a read answers while it is on its way and a name is typed; after both land the saved list is on screen', async () => {
@@ -763,7 +606,7 @@ describe('the saves the old at-rest check could not see, during a read (BL-912, 
 })
 
 describe('BL-979: edits stay blocked while a same-entity read is deferred', () => {
-  it('a failed Primary GET preserves a Display Reasoning draft and retries its canonical pair', async () => {
+  it('a failed Primary GET preserves an API Display Reasoning draft without changing independent retention', async () => {
     await openPanel({ show_reasoning: true, preserve_reasoning: true })
     const original = await storedAgent(AGENT)
     expect(original).toMatchObject({ show_reasoning: true, preserve_reasoning: true })
@@ -775,8 +618,8 @@ describe('BL-979: edits stay blocked while a same-entity read is deferred', () =
     const notice = await screen.findByTestId('primary-settings-read-wait')
     expect(notice.textContent).toContain('Probe read refusal')
 
-    // The setting remains locally editable after a failed physical GET, but grouped persistence
-    // is blocked until a successful Retry. Hiding the child also normalizes preserve_reasoning.
+    // The setting remains locally editable after a failed physical GET. The new API retention
+    // path is independent; an old Preserve flag is neither mapped nor overwritten.
     await fireEvent.click(switchOf('Display Reasoning'))
     await waitFor(() => expect(switchOf('Display Reasoning').getAttribute('aria-checked')).toBe('false'))
     expect(screen.queryByText('Preserve Reasoning In Chat History')).toBeNull()
@@ -790,51 +633,34 @@ describe('BL-979: edits stay blocked while a same-entity read is deferred', () =
       { timeout: 8_000 }
     )
     await waitFor(() => expect(puts).toHaveLength(1), { timeout: 8_000 })
-    expect(puts[0].body).toEqual({ show_reasoning: false, preserve_reasoning: false })
+    expect(puts[0].body).toEqual({ show_reasoning: false })
     await waitFor(async () => expect((await storedAgent(AGENT)).show_reasoning).toBe(false), { timeout: 8_000 })
-    expect((await storedAgent(AGENT))).toMatchObject({ show_reasoning: false, preserve_reasoning: false })
+    expect((await storedAgent(AGENT))).toMatchObject({ show_reasoning: false, preserve_reasoning: true })
     expect(switchOf('Display Reasoning').getAttribute('aria-checked')).toBe('false')
     expect(puts).toHaveLength(1)
   }, 120_000)
 
-  it('a pending Codex Agent mode cannot be replaced by a second group edit after pick-away/back', async () => {
-    await openPanel(CODEX_AGENT)
-    const first = holdNextPut({ beforeWrite: true })
-    const second = holdNextPut({ beforeWrite: true })
-
-    await fireEvent.click(codexPermissionRadio(/^Agent$/))
+  it('keeps per-agent retention in Core and preserves it through Tool Grid reset', async () => {
+    await openPanel({ show_reasoning: true, api_reasoning_retention: 'whiteboard', whiteboard_budget_tokens: 1750, show_whiteboard: false, defaultTools: ['cli_x'] })
+    expect(screen.getByRole('button', { name: 'Reasoning Retention' }).textContent).toContain('Whiteboard Only')
+    expect(screen.getByRole('button', { name: 'Display Whiteboard' }).textContent).toContain('Disabled')
+    expect((screen.getByRole('spinbutton', { name: 'Whiteboard Budget (estimated tokens)' }) as HTMLInputElement).value).toBe('1750')
+    await fireEvent.keyDown(screen.getByRole('button', { name: 'Reasoning Retention' }), { key: 'ArrowDown' })
+    await fireEvent.pointerUp(await screen.findByRole('option', { name: 'Whiteboard + Preserved Reasoning' }), { pointerType: 'mouse' })
     await waitFor(() => expect(puts).toHaveLength(1), { timeout: 8_000 })
-    expect(puts[0].body).toEqual({ codex_settings: { permissionMode: 'agent', sandbox: 'workspace-write', approval: 'never' } })
-
-    await switchAwayAndBack()
-    const noticeVisible = Boolean(screen.queryByTestId('primary-settings-read-wait'))
-    const sandbox = selectShowing('Read-only') as HTMLElement | undefined
-    const group = screen.getByRole('group', { name: 'Codex permissions mode' })
-    const locked = isReadWaitLocked(sandbox ?? (group as HTMLElement))
-
-    // The old form still shows Chat / Read-only. A sandbox edit sends that old mode with the new
-    // sandbox and takes back the pending Agent choice.
-    const secondEditBlocked = !(await tryReadWaitSelect('Read-only', /^Workspace write/))
-    if (!secondEditBlocked) {
-      await waitFor(() => expect(puts).toHaveLength(2), { timeout: 8_000 })
-      expect(puts[1].body).toEqual({ codex_settings: { permissionMode: 'chat', sandbox: 'workspace-write', approval: 'never' } })
+    expect(puts[0].body).toEqual({ api_reasoning_retention: 'both' })
+    await waitFor(async () => expect((await storedAgent(AGENT)).api_reasoning_retention).toBe('both'), { timeout: 8_000 })
+    await openToolsTab()
+    expect(card()).not.toHaveProperty('retentionControls')
+    card().onResetToGlobalSettings()
+    await waitFor(() => expect(puts.slice(1).some((put) => put.body.defaultTools === null)).toBe(true), { timeout: 8_000 })
+    await pause(900)
+    for (const put of puts.slice(1)) {
+      expect(put.body).not.toHaveProperty('api_reasoning_retention')
+      expect(put.body).not.toHaveProperty('whiteboard_budget_tokens')
+      expect(put.body).not.toHaveProperty('show_whiteboard')
     }
-
-    first.write()
-    await waitFor(async () => expect((await storedAgent(AGENT)).codex_settings.sandbox).toBe('workspace-write'), { timeout: 8_000 })
-    first.answer()
-    if (!secondEditBlocked) {
-      second.write()
-      await waitFor(async () => expect((await storedAgent(AGENT)).codex_settings.permissionMode).toBe('chat'), { timeout: 8_000 })
-      second.answer()
-    }
-    await pause(2500)
-
-    expect(puts).toHaveLength(1)
-    expect(noticeVisible).toBe(true)
-    expect(locked).toBe(true)
-    expect(secondEditBlocked).toBe(true)
-    expect(await storedAgent(AGENT)).toMatchObject({ codex_settings: { permissionMode: 'agent', sandbox: 'workspace-write', approval: 'never' } })
+    expect(await storedAgent(AGENT)).toMatchObject({ show_reasoning: true, api_reasoning_retention: 'both', whiteboard_budget_tokens: 1750, show_whiteboard: false })
   }, 120_000)
 
   it.each(['CLI tools', 'prompt editor', 'multiline editor'] as const)(
@@ -927,72 +753,9 @@ describe('BL-979: edits stay blocked while a same-entity read is deferred', () =
     expect(puts).toHaveLength(1)
   }, 120_000)
 
-  it('a good same-agent GET keeps a Claude thinking-budget draft and then sends the fresh paired group', async () => {
-    await openPanel({
-      ...CLAUDE_AGENT,
-      claude_settings: { ...CLAUDE_BASE, alwaysThinkingEnabled: true, maxThinkingTokens: 64_000 }
-    })
-    const answersBefore = events.filter((event) => event === 'get-answered').length
-    const answer = holdNextGet()
-    await readShownAgentAgain(false)
-    await waitFor(() => expect(events).toContain('get-read'), { timeout: 8_000 })
-
-    const budget = thinkingBudgetInput()
-    await fireEvent.input(budget, { target: { value: '96000' } })
-    await pause(1800)
-    expect(budget.value).toBe('96000')
-    expect(puts).toEqual([])
-    expect((await storedAgent(AGENT)).claude_settings).toMatchObject({ alwaysThinkingEnabled: true, maxThinkingTokens: 64_000 })
-
-    answer()
-    await waitFor(() => expect(events.filter((event) => event === 'get-answered').length).toBeGreaterThan(answersBefore), { timeout: 8_000 })
-    await waitFor(() => expect(puts).toHaveLength(1), { timeout: 8_000 })
-    expect(puts[0].body).toEqual({ claude_settings: { alwaysThinkingEnabled: true, maxThinkingTokens: 96_000 } })
-    await waitFor(async () => expect((await storedAgent(AGENT)).claude_settings).toMatchObject({
-      alwaysThinkingEnabled: true, maxThinkingTokens: 96_000
-    }), { timeout: 8_000 })
-    expect(budget.value).toBe('96000')
-    expect(puts).toHaveLength(1)
-  }, 120_000)
-
-  it('a failed same-agent GET keeps a Claude thinking-budget draft through Retry and sends one paired group after the good read', async () => {
-    await openPanel({
-      ...CLAUDE_AGENT,
-      claude_settings: { ...CLAUDE_BASE, alwaysThinkingEnabled: true, maxThinkingTokens: 64_000 }
-    })
-    const answersBefore = events.filter((event) => event === 'get-answered').length
-    failNextGets = 1
-    const failedAnswer = holdNextGet()
-    await readShownAgentAgain(false)
-    await waitFor(() => expect(events).toContain('get-failed'), { timeout: 8_000 })
-
-    const budget = thinkingBudgetInput()
-    await fireEvent.input(budget, { target: { value: '96000' } })
-    await pause(900)
-    expect(budget.value).toBe('96000')
-    expect(puts).toEqual([])
-    expect((await storedAgent(AGENT)).claude_settings).toMatchObject({ alwaysThinkingEnabled: true, maxThinkingTokens: 64_000 })
-
-    failedAnswer()
-    await waitFor(() => expect(events).toContain('get-failed-answered'), { timeout: 8_000 })
-    const notice = await screen.findByTestId('primary-settings-read-wait')
-    expect(notice.textContent).toContain('Probe read refusal')
-    expect(budget.value).toBe('96000')
-    expect(puts).toEqual([])
-
-    await fireEvent.click(within(notice).getByRole('button', { name: /Retry/ }))
-    await waitFor(() => expect(events.filter((event) => event === 'get-answered').length).toBeGreaterThan(answersBefore), { timeout: 8_000 })
-    await waitFor(() => expect(puts).toHaveLength(1), { timeout: 8_000 })
-    expect(puts[0].body).toEqual({ claude_settings: { alwaysThinkingEnabled: true, maxThinkingTokens: 96_000 } })
-    await waitFor(async () => expect((await storedAgent(AGENT)).claude_settings).toMatchObject({
-      alwaysThinkingEnabled: true, maxThinkingTokens: 96_000
-    }), { timeout: 8_000 })
-    expect(budget.value).toBe('96000')
-    expect(puts).toHaveLength(1)
-  }, 120_000)
-
   it('an already-open Tool Approval portal cannot capture while its own save and a same-agent GET are held', async () => {
-    await openPanel(CODEX_AGENT)
+    // SA-139 R4: Tool Approval belongs to an API Primary Agent (the CLI Primary's lane left).
+    await openPanel()
     const renamed = `${NAME} Held`
     const put = holdNextPut({ beforeWrite: true })
 
@@ -1003,7 +766,7 @@ describe('BL-979: edits stay blocked while a same-entity read is deferred', () =
     await waitFor(() => expect(screen.queryAllByRole('option', { hidden: true }).length).toBeGreaterThan(0))
     const onRequestOption = screen
       .getAllByRole('option', { hidden: true })
-      .find((element) => /On Request/.test((element.textContent ?? '').trim()))
+      .find((element) => /On Failure/.test((element.textContent ?? '').trim()))
     expect(onRequestOption).toBeTruthy()
 
     await waitFor(() => expect(puts).toHaveLength(1), { timeout: 8_000 })
@@ -1043,17 +806,19 @@ describe('BL-979: edits stay blocked while a same-entity read is deferred', () =
   }, 120_000)
 
   it('a save that stays on the wire shows Retry after 30 seconds without recapturing, then settles into a fresh read', async () => {
-    await openPanel(CODEX_AGENT)
+    // SA-139 R4: the held save is the basic name save (the CLI Primary's Claude section left).
+    await openPanel()
+    const renamed = `${NAME} Held`
     // BL-1031: Redis dispatches writes with setImmediate; only the deadline clock is fake.
     vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] })
     const put = holdNextPut({ beforeWrite: true })
     const readsBefore = events.filter((event) => event === 'get-answered').length
 
     try {
-      await fireEvent.click(codexPermissionRadio(/^Agent$/))
+      await fireEvent.input(nameInput(), { target: { value: renamed } })
       await vi.advanceTimersByTimeAsync(1_000)
-      await drainCallbacksUntil(() => puts.length === 1, 'the held Codex group PUT')
-      expect(puts[0].body).toEqual({ codex_settings: { permissionMode: 'agent', sandbox: 'workspace-write', approval: 'never' } })
+      await drainCallbacksUntil(() => puts.length === 1, 'the held name PUT')
+      expect(puts[0].body).toEqual({ displayName: renamed })
 
       await drainCallbacksUntil(() => Boolean(screen.queryByTestId('primary-settings-read-wait')), 'the owned-save wait')
       const capturesBeforeDeadline = puts.length
@@ -1066,10 +831,10 @@ describe('BL-979: edits stay blocked while a same-entity read is deferred', () =
       expect(isReadWaitLocked(nameInput())).toBe(true)
       expect(puts).toHaveLength(capturesBeforeDeadline)
       expect(puts.map((entry) => entry.body)).toEqual(bodiesBeforeDeadline)
-      expect((await storedAgent(AGENT)).codex_settings.permissionMode).toBe('chat')
+      expect((await storedAgent(AGENT)).displayName).toBe(NAME)
 
       put.write()
-      await drainCallbacksUntil(async () => (await storedAgent(AGENT)).codex_settings.permissionMode === 'agent', 'the held group write')
+      await drainCallbacksUntil(async () => (await storedAgent(AGENT)).displayName === renamed, 'the held name write')
       put.answer()
       await drainCallbacksUntil(
         () => events.filter((event) => event === 'get-answered').length > readsBefore,
@@ -1078,9 +843,9 @@ describe('BL-979: edits stay blocked while a same-entity read is deferred', () =
       await drainCallbacksUntil(() => !screen.queryByTestId('primary-settings-read-wait'), 'read-wait recovery')
 
       expect(new Set(puts.map((entry) => JSON.stringify(entry.body))).size).toBe(1)
-      expect((await storedAgent(AGENT)).codex_settings).toMatchObject({ permissionMode: 'agent', sandbox: 'workspace-write' })
+      expect((await storedAgent(AGENT)).displayName).toBe(renamed)
       expect(isReadWaitLocked(nameInput())).toBe(false)
-      expect(codexPermissionRadio(/^Agent$/).getAttribute('aria-checked')).toBe('true')
+      expect(nameInput().value).toBe(renamed)
     } finally {
       // Release this case's owned barriers even if an assertion fails.
       put.write()
@@ -1105,7 +870,12 @@ describe('the deferred read waits for every saver (BL-912, S5 and S6)', () => {
     await switchAwayAndBack()
 
     expect(isReadWaitLocked(nameInput())).toBe(true)
-    expect(puts).toEqual([{ body: { defaultMCPGateways: ['gw_b'] } }])
+    expect(puts).toEqual([{ body: {
+      defaultMCPGateways: ['gw_b'],
+      expectedMcpSettings: {
+        defaultMCPGateways: JSON.parse((await routeAgent(AGENT, 'GET', undefined)).headers.get('x-batshit-mcp-settings-revisions') ?? 'null').defaultMCPGateways
+      }
+    } }])
     gridPut.write()
     await waitFor(async () => expect((await storedAgent(AGENT)).defaultMCPGateways).toEqual(['gw_b']), { timeout: 8_000 })
     gridPut.answer()
@@ -1145,86 +915,6 @@ describe('typing during the read a landing asked for (BL-942)', () => {
     expect(nameInput().value).toBe(`${NAME} typed`)
     expect((await storedAgent(AGENT)).displayName).toBe(`${NAME} typed`)
     expect(puts.at(-1)?.body).toEqual({ displayName: `${NAME} typed` })
-  }, 120_000)
-})
-
-describe('the reviews\' orders on a Primary Agent, with the simple rules (BL-912)', () => {
-  it('a Codex group remains read-only during its save and preserves the committed value', async () => {
-    await openPanel(CODEX_AGENT)
-    const x = holdNextPut({ beforeWrite: true })
-    await pickSelectOption('Auto', /^High/)
-    await waitFor(() => expect(puts.length).toBe(1), { timeout: 8_000 })
-    const control = selectShowing('High') as HTMLElement
-    expect(isReadWaitLocked(control)).toBe(true)
-    await pickSelectOption('High', /^Low/)
-    expect(puts).toHaveLength(1)
-    expect(selectShowing('High')).toBeTruthy()
-    x.write()
-    await waitFor(async () => expect((await storedAgent(AGENT)).codex_settings.reasoningEffort).toBe('high'), { timeout: 8_000 })
-    x.answer()
-    await waitFor(() => events.filter((event) => event === 'put-answered').length === 1, { timeout: 8_000 })
-    await waitFor(() => !isReadWaitLocked(control), { timeout: 8_000 })
-    await pause(2500)
-
-    expect(puts).toEqual([{ body: { codex_settings: { reasoningEffort: 'high' } } }])
-    expect((await storedAgent(AGENT)).codex_settings.reasoningEffort).toBe('high')
-    expect(selectShowing('High')).toBeTruthy()
-  }, 120_000)
-
-  it('guard (green on the old code too: no guard against a second send): the same edit on agent A and then on agent B: both are stored', async () => {
-    await openPanel(CODEX_AGENT, CODEX_AGENT)
-    const put = holdNextPut()
-    await pickSelectOption('Auto', /^High/)
-    await waitFor(() => expect(puts.length).toBe(1), { timeout: 8_000 })
-
-    await switchTo(OTHER_NAME)
-    await waitFor(() => expect(nameInput().value).toBe(OTHER_NAME), { timeout: 15_000 })
-    await waitFor(() => expect(screen.queryByText('Loading agent details…')).toBeNull(), { timeout: 8_000 })
-    await pickSelectOption('Auto', /^High/)
-
-    await waitFor(() => expect(otherPuts.length).toBe(1), { timeout: 8_000 })
-    expect(otherPuts[0].body).toEqual({ codex_settings: { reasoningEffort: 'high' } })
-    put.answer()
-    await pause(2500)
-    expect((await storedAgent(OTHER)).codex_settings.reasoningEffort).toBe('high')
-    expect((await storedAgent(AGENT)).codex_settings.reasoningEffort).toBe('high')
-    expect(otherPuts.length).toBe(1)
-  }, 120_000)
-
-  it('guard (green on the old code too): a save that failed, then a switch away and back, then the same value again: it is sent and stored', async () => {
-    await openPanel(CODEX_AGENT)
-    failNextPuts = 1
-    await pickSelectOption('Auto', /^High/)
-    await waitFor(() => expect(puts.length).toBe(1), { timeout: 8_000 })
-    await waitFor(() => expect(screen.queryAllByText(/Probe refusal/).length).toBeGreaterThan(0), { timeout: 8_000 })
-    expect((await storedAgent(AGENT)).codex_settings.reasoningEffort).toBeUndefined()
-
-    await switchAwayAndBack()
-    expect(selectShowing('Auto')).toBeTruthy()
-    await pickSelectOption('Auto', /^High/)
-    await waitFor(() => expect(puts.length).toBe(2), { timeout: 8_000 })
-    expect(puts[1].body).toEqual({ codex_settings: { reasoningEffort: 'high' } })
-    await pause(1500)
-    expect((await storedAgent(AGENT)).codex_settings.reasoningEffort).toBe('high')
-  }, 120_000)
-
-  it('a same-section edit is blocked during an active write and cannot replace it', async () => {
-    await openPanel(CODEX_AGENT)
-    const x = holdNextPut({ beforeWrite: true })
-    await pickSelectOption('Auto', /^High/)
-    await waitFor(() => expect(puts.length).toBe(1), { timeout: 8_000 })
-    await pickSelectOption('High', /^Low/)
-    expect(puts).toHaveLength(1)
-    expect(selectShowing('High')).toBeTruthy()
-    x.write()
-    await waitFor(async () => expect((await storedAgent(AGENT)).codex_settings.reasoningEffort).toBe('high'), { timeout: 8_000 })
-    x.answer()
-    await waitFor(() => events.filter((event) => event === 'put-answered').length === 1, { timeout: 8_000 })
-    await pause(2500)
-
-    expect(puts.map((entry) => entry.body)).toEqual([{ codex_settings: { reasoningEffort: 'high' } }])
-    expect((await storedAgent(AGENT)).codex_settings.reasoningEffort).toBe('high')
-    expect(selectShowing('High')).toBeTruthy()
   }, 120_000)
 })
 
@@ -1281,6 +971,52 @@ describe('the whole-list savers, a switch away and back while the save travels (
 })
 
 describe('a prompt save and the reads around it (BL-912, the third review)', () => {
+  it('sends the editor opening token after a newer read, keeps a conflict draft and never auto-replays it', async () => {
+    await openPanel({ system_prompt: 'Opening prose.' })
+    const opening = JSON.parse((await routeAgent(AGENT, 'GET', undefined)).headers.get(INSTRUCTIONS_REVISION_HEADER)!)
+    const { editor, save } = await openPromptEditor('Opening prose.')
+    await fireEvent.input(editor, { target: { value: 'My kept draft.' } })
+    await redis.json.set(`agent:${AGENT}`, '$', { ...await storedAgent(AGENT), system_prompt: 'Remote prose.' })
+    await readShownAgentAgain()
+    expect(editor.value).toBe('My kept draft.')
+    await fireEvent.click(save)
+    await waitFor(() => expect(puts).toHaveLength(1), { timeout: 8_000 })
+    expect(puts[0].body).toEqual({ system_prompt: 'My kept draft.', expectedInstructions: { customPrompt: opening.customPrompt } })
+    await waitFor(() => expect(screen.getByTestId('primary-instructions-notice').textContent).toContain('not saved'), { timeout: 8_000 })
+    await pause(1000)
+    expect((await storedAgent(AGENT)).system_prompt).toBe('Remote prose.')
+    expect(editor.value).toBe('My kept draft.')
+    await fireEvent.click(save)
+    await pause(300)
+    expect(puts).toHaveLength(1)
+  }, 120_000)
+
+  it('an inclusion-only draft uses its original independent token and waits for a deliberate current choice after conflict', async () => {
+    await openPanel({ system_prompt: 'Prompt stays.', include_global_prompt: true })
+    const opening = JSON.parse((await routeAgent(AGENT, 'GET', undefined)).headers.get(INSTRUCTIONS_REVISION_HEADER)!)
+    const instructionsTab = screen.getAllByRole('tab').find(element => /Instructions/.test(element.textContent ?? ''))!
+    await fireEvent.mouseDown(instructionsTab); await fireEvent.click(instructionsTab)
+    const row = screen.getByText('Include Global Custom Prompt').closest('.batshit-settings-toggle-row')!
+    const toggle = within(row as HTMLElement).getByRole('switch')
+    const put = holdNextPut({ beforeWrite: true })
+    await fireEvent.click(toggle)
+    await waitFor(() => expect(puts).toHaveLength(1), { timeout: 8_000 })
+    await redis.json.set(`agent:${AGENT}`, '$', { ...await storedAgent(AGENT), system_prompt: 'Independent new prompt.', include_global_prompt: null })
+    put.write(); put.answer()
+    await waitFor(() => expect(screen.getByTestId('primary-instructions-notice').textContent).toContain('not saved'), { timeout: 8_000 })
+    expect(puts[0].body).toEqual({ include_global_prompt: false, expectedInstructions: { includeGlobalPrompt: opening.includeGlobalPrompt } })
+    await pause(1000)
+    expect(puts).toHaveLength(1)
+    expect(await storedAgent(AGENT)).toMatchObject({ include_global_prompt: null, system_prompt: 'Independent new prompt.' })
+    expect(toggle.getAttribute('aria-checked')).toBe('false')
+    await fireEvent.click(screen.getByRole('button', { name: 'Use Saved Instructions', exact: true }))
+    await waitFor(() => expect(toggle.getAttribute('aria-checked')).toBe('true'), { timeout: 8_000 })
+    await fireEvent.click(toggle)
+    await waitFor(() => expect(puts).toHaveLength(2), { timeout: 8_000 })
+    expect(puts[1].body.expectedInstructions).toEqual({ includeGlobalPrompt: expect.stringMatching(/^sha256:[a-f0-9]{64}$/) })
+    expect(puts[1].body.expectedInstructions.includeGlobalPrompt).not.toBe(opening.includeGlobalPrompt)
+  }, 120_000)
+
   it('a prompt save is blocked during a read while its typed draft stays in the editor', async () => {
     await openPanel({ system_prompt: 'Answer in haiku.' })
     const { editor, save } = await openPromptEditor('Answer in haiku.')
@@ -1310,7 +1046,7 @@ describe('a prompt save and the reads around it (BL-912, the third review)', () 
     expect(agentStore.getAgentById(AGENT)?.system_prompt).toBe('Answer in haiku.')
   }, 120_000)
 
-  it('guard (green on the old code too: HEAD moved the prompt at any same-agent landing): a save that lands after a switch away and back (an older landing): the prompt shows the saved text at the landing, as before the read rules, while the read it asked for is still on its way', async () => {
+  it('an instructions save that lands after a switch away and back (an older landing) keeps the prompt behind the saved-instructions notice until its readback lands, then shows the saved text and sends nothing more', async () => {
     await openPanel({ system_prompt: 'Answer in haiku.' })
     const put = holdNextPut({ beforeWrite: true })
     const { editor, save } = await openPromptEditor('Answer in haiku.')
@@ -1330,10 +1066,14 @@ describe('a prompt save and the reads around it (BL-912, the third review)', () 
     put.answer()
     await waitFor(() => expect(events).toContain('get-read'), { timeout: 8_000 })
 
-    // The landing left the prompt where it always did: on the saved text.
-    expect((await openPromptEditor('Answer in limericks.')).editor).toBeTruthy()
+    // Since 3698a4293 a known instructions save holds the editor until its readback lands: the
+    // notice asks to read the saved instructions while that read is on its way.
+    expect(screen.getByTestId('primary-instructions-notice').textContent).toContain('Read the saved instructions')
 
     answer()
+    // The readback landed: the notice is gone and the prompt shows the saved text.
+    await waitFor(() => expect(screen.queryByTestId('primary-instructions-notice')).toBeNull(), { timeout: 8_000 })
+    expect((await openPromptEditor('Answer in limericks.')).editor).toBeTruthy()
     await pause(1500)
     expect(puts.length).toBe(1)
     expect((await storedAgent(AGENT)).system_prompt).toBe('Answer in limericks.')
@@ -1342,16 +1082,21 @@ describe('a prompt save and the reads around it (BL-912, the third review)', () 
 
 describe('a deferred read that fails (BL-912, S6)', () => {
   it('a failed read preserves the last confirmed form values and sends nothing', async () => {
-    await openPanel(CODEX_AGENT)
+    // SA-139 R4: the section save is the zip choice (the CLI Primary's Claude section left).
+    await openPanel()
+    await openToolsTab()
     const put = holdNextPut({ beforeWrite: true })
-    await pickSelectOption('Auto', /^High/)
+    card().onZipAiViewModeChange('appended')
+    await tick()
     await waitFor(() => expect(puts.length).toBe(1), { timeout: 8_000 })
+    expect(puts[0].body).toEqual({ zip_ai_view_mode: 'appended' })
 
     await switchAwayAndBack()
-    expect(selectShowing('Auto')).toBeTruthy()
+    await openToolsTab()
+    expect(card().zipAiViewMode).not.toBe('appended')
 
     put.write()
-    await waitFor(async () => expect((await storedAgent(AGENT)).codex_settings.reasoningEffort).toBe('high'), {
+    await waitFor(async () => expect((await storedAgent(AGENT)).zip_ai_view_mode).toBe('appended'), {
       timeout: 8_000
     })
     // The landing is an older one: it asks for a read, and that read fails.
@@ -1368,55 +1113,8 @@ describe('a deferred read that fails (BL-912, S6)', () => {
     expect(puts.length).toBe(1)
     expect(otherPuts).toEqual([])
     const record = await storedAgent(AGENT)
-    expect(record.codex_settings.reasoningEffort).toBe('high')
+    expect(record.zip_ai_view_mode).toBe('appended')
     expect(record.displayName).toBe(NAME)
-  }, 120_000)
-})
-
-describe('BL-1028: failed settlement is not a new autosave trigger', () => {
-  it.each([
-    { label: /^Agent \(full access\)$/, mode: 'agent_full', sandbox: 'danger-full-access' },
-    { label: /^Chat$/, mode: 'chat', sandbox: 'read-only' }
-  ])('a second permission group edit during debounce resumes once as $mode', async ({ label, mode, sandbox }) => {
-    await openPanel(CODEX_AGENT)
-    const first = holdNextPut()
-    await fireEvent.click(codexPermissionRadio(/^Agent$/))
-    expect(puts).toEqual([])
-    expect(isReadWaitLocked(codexPermissionRadio(label))).toBe(false)
-    await fireEvent.click(codexPermissionRadio(label))
-    expect(puts).toEqual([])
-    expect(codexPermissionRadio(label).getAttribute('aria-checked')).toBe('true')
-    await waitFor(() => expect(puts).toHaveLength(1), { timeout: 8_000 })
-    expect(puts[0].body).toEqual({ codex_settings: { permissionMode: 'agent', sandbox: 'workspace-write', approval: 'never' } })
-    first.answer()
-    await waitFor(() => expect(puts).toHaveLength(2), { timeout: 8_000 })
-    expect(puts[1].body).toEqual({ codex_settings: { permissionMode: mode, sandbox, approval: 'never' } })
-    await waitFor(async () => expect((await storedAgent(AGENT)).codex_settings.permissionMode).toBe(mode), { timeout: 8_000 })
-    await pause(1500)
-    expect(puts).toHaveLength(2)
-    expect((await storedAgent(AGENT)).codex_settings.sandbox).toBe(sandbox)
-    expect(codexPermissionRadio(label).getAttribute('aria-checked')).toBe('true')
-  }, 120_000)
-
-  it('a persistent failed Codex save stays one PUT across several debounce periods until an explicit read', async () => {
-    await openPanel(CODEX_AGENT)
-    failNextPuts = 100
-    try {
-      await pickSelectOption('Auto', /^High/)
-      await waitFor(() => expect(puts).toHaveLength(1), { timeout: 8_000 })
-      await waitFor(() => expect(screen.queryAllByText(/Probe refusal/).length).toBeGreaterThan(0), { timeout: 8_000 })
-      await pause(3000)
-      expect(puts).toHaveLength(1)
-      expect((await storedAgent(AGENT)).codex_settings.reasoningEffort).toBeUndefined()
-      expect(selectShowing('High')).toBeTruthy()
-      expect(screen.queryAllByText(/Probe refusal/).length).toBeGreaterThan(0)
-    } finally {
-      // An explicit good read is an allowed S7 retry and drains this case's own work.
-      failNextPuts = 0
-      await readShownAgentAgain()
-      await waitFor(async () => expect((await storedAgent(AGENT)).codex_settings.reasoningEffort).toBe('high'), { timeout: 8_000 })
-      await pause(1200)
-    }
   }, 120_000)
 })
 
@@ -1448,46 +1146,6 @@ describe('a failed Primary basic autosave (BL-936)', () => {
 })
 
 describe('guards on a Primary Agent (green on the old code too)', () => {
-  it('a Codex save with no read in between lands as before: one PUT, and the next edit sends only its own key', async () => {
-    await openPanel(CODEX_AGENT)
-    const put = holdNextPut()
-    await pickSelectOption('Auto', /^High/)
-    await waitFor(() => expect(puts.length).toBe(1), { timeout: 8_000 })
-    put.answer()
-    await pause(1500)
-    expect(puts.length).toBe(1)
-
-    await fireEvent.click(switchOf('Allow Codex Web Search'))
-    await waitFor(() => expect(puts.length).toBe(2), { timeout: 8_000 })
-    expect(puts[1].body).toEqual({ codex_settings: { search: false } })
-    await pause(1500)
-    expect(puts.length).toBe(2)
-    const record = await storedAgent(AGENT)
-    expect(record.codex_settings.reasoningEffort).toBe('high')
-    expect(record.codex_settings.search).toBe(false)
-  }, 120_000)
-
-  it('a Codex save that lands after a switch to another agent touches nothing of that agent', async () => {
-    await openPanel(CODEX_AGENT)
-    const put = holdNextPut({ beforeWrite: true })
-    await pickSelectOption('Auto', /^High/)
-    await waitFor(() => expect(puts.length).toBe(1), { timeout: 8_000 })
-
-    await switchTo(OTHER_NAME)
-    await waitFor(() => expect(nameInput().value).toBe(OTHER_NAME), { timeout: 15_000 })
-    const otherBefore = await storedAgent(OTHER)
-    put.write()
-    await waitFor(async () => expect((await storedAgent(AGENT)).codex_settings.reasoningEffort).toBe('high'), {
-      timeout: 8_000
-    })
-    put.answer()
-    await pause(2500)
-
-    expect(otherPuts).toEqual([])
-    expect(await storedAgent(OTHER)).toEqual(otherBefore)
-    expect(nameInput().value).toBe(OTHER_NAME)
-  }, 120_000)
-
   it('the panel is pointed at another agent without a reset while a basic save is on its way: every section shows the other agent, and nothing is saved for it', async () => {
     await openPanel()
     const put = holdNextPut({ beforeWrite: true })
@@ -1504,5 +1162,52 @@ describe('guards on a Primary Agent (green on the old code too)', () => {
     expect(nameInput().value).toBe(OTHER_NAME)
     expect(otherPuts).toEqual([])
     expect((await storedAgent(OTHER)).displayName).toBe(OTHER_NAME)
+  }, 120_000)
+
+  // SA-139 R4: these two ran on the CLI Primary's Claude section; the save rules they guard serve
+  // every section, so they now run on the zip section.
+  it('guard (no guard against a second send): the same zip edit on agent A and then on agent B: both are stored', async () => {
+    await openPanel()
+    await openToolsTab()
+    const put = holdNextPut()
+    card().onZipAiViewModeChange('appended')
+    await tick()
+    await waitFor(() => expect(puts.length).toBe(1), { timeout: 8_000 })
+
+    await switchTo(OTHER_NAME)
+    await waitFor(() => expect(nameInput().value).toBe(OTHER_NAME), { timeout: 15_000 })
+    await waitFor(() => expect(screen.queryByText('Loading agent details…')).toBeNull(), { timeout: 8_000 })
+    await openToolsTab()
+    card().onZipAiViewModeChange('appended')
+    await tick()
+
+    await waitFor(() => expect(otherPuts.length).toBe(1), { timeout: 8_000 })
+    expect(otherPuts[0].body).toEqual({ zip_ai_view_mode: 'appended' })
+    put.answer()
+    await pause(2500)
+    expect((await storedAgent(OTHER)).zip_ai_view_mode).toBe('appended')
+    expect((await storedAgent(AGENT)).zip_ai_view_mode).toBe('appended')
+    expect(otherPuts.length).toBe(1)
+  }, 120_000)
+
+  it('guard: a zip save that failed, then a switch away and back, then the same value again: it is sent and stored', async () => {
+    await openPanel()
+    await openToolsTab()
+    failNextPuts = 1
+    card().onZipAiViewModeChange('appended')
+    await tick()
+    await waitFor(() => expect(puts.length).toBe(1), { timeout: 8_000 })
+    await pause(1500)
+    expect((await storedAgent(AGENT)).zip_ai_view_mode).not.toBe('appended')
+
+    await switchAwayAndBack()
+    await openToolsTab()
+    expect(card().zipAiViewMode).not.toBe('appended')
+    card().onZipAiViewModeChange('appended')
+    await tick()
+    await waitFor(() => expect(puts.length).toBe(2), { timeout: 8_000 })
+    expect(puts[1].body).toEqual({ zip_ai_view_mode: 'appended' })
+    await pause(1500)
+    expect((await storedAgent(AGENT)).zip_ai_view_mode).toBe('appended')
   }, 120_000)
 })

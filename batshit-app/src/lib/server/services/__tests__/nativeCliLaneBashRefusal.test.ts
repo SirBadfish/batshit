@@ -7,13 +7,13 @@ import { nativeToolService } from '../nativeTools'
 
 /**
  * BL-878, step 1 — the dispatch REFUSES what the CLI lane is no longer offered (Josh, 2026-09-28,
- * 19:50 EDT: Codex and Claude agents have their own Bash; Batshit does not give them its own as
+ * 19:50 EDT: CLI agents have their own Bash; Batshit does not give them its own as
  * well). Hiding the helper is not enough: tool discovery is an authorization contract, so a call
  * that arrives anyway is refused with `ACTION_DISABLED`, and nothing runs.
  *
  * Two doors start a process under Batshit's rules: `bash_execute`, and `native_skill` with
  * `script_run`. Each is refused on the AGENT lane, the lane a run credential authenticates on
- * (only `CodexBridge` and `ClaudeBridge` mint one; the route passes it as `actorType`). The lane
+ * (only `ClaudeBridge` mints one; the route passes it as `actorType`). The lane
  * is never read from the body: `context.mode` and `primary_agent_type` are claims.
  *
  * The skill refusal reads the action the way `nativeTools.ts` PARSES it (Cooper's condition):
@@ -33,10 +33,8 @@ vi.mock('../skillRuntimeToolService', async (importOriginal) => ({
 }))
 
 const AGENT_ID = 'agent-bl878-refusal'
-const BASH_REFUSAL =
-  "Batshit's Bash helper is not offered to Codex and Claude agents. Use your own shell tool."
-const SCRIPT_REFUSAL =
-  'Batshit does not run skill scripts for Codex and Claude agents. Read the skill with native_skill (invoke or read), then run its script with your own shell tool.'
+const BASH_REFUSAL = 'The retired agent credential lane is not available.'
+const SCRIPT_REFUSAL = BASH_REFUSAL
 
 let workspace = ''
 let marker = ''
@@ -152,7 +150,7 @@ describe('BL-878: Bash through the dispatch, on the agent lane', () => {
     expect(await ranMarker()).toBe(false)
   })
 
-  it.each(['service', 'session', 'n8n-callback', undefined])(
+  it.each(['service', 'session', undefined])(
     'does not change the %s caller: the same settings still run the command',
     async (lane) => {
       const result = await dispatch(lane, 'bash_execute', bashInput())
@@ -166,12 +164,18 @@ describe('BL-878: Bash through the dispatch, on the agent lane', () => {
   it.each([
     { mode: 'mode4', primary_agent_type: 'cli' },
     { mode: undefined, primary_agent_type: 'cli' }
-  ])('never refuses a caller that is not on the agent lane because its body says cli (%j)', async (claim) => {
+  ])('keeps explicit service context but never infers a missing mode from a retired CLI claim (%j)', async (claim) => {
     const result = await dispatch('service', 'bash_execute', bashInput(), claim)
 
-    expect(result.error).toBeUndefined()
-    expect(result.success).toBe(true)
-    expect(await ranMarker()).toBe(true)
+    if (claim.mode === undefined) {
+      expect(result.error).toMatchObject({ code: 'INVALID_CONTEXT' })
+      expect(result.success).toBe(false)
+      expect(await ranMarker()).toBe(false)
+    } else {
+      expect(result.error).toBeUndefined()
+      expect(result.success).toBe(true)
+      expect(await ranMarker()).toBe(true)
+    }
   })
 })
 
@@ -226,12 +230,10 @@ describe('BL-878: a skill script through the dispatch, on the agent lane', () =>
     }
   )
 
-  it.each(['script_list', 'script_read'])('leaves %s on the agent lane as it was (a read, no process)', async (action) => {
+  it.each(['script_list', 'script_read'])('refuses even %s on the retired lane', async (action) => {
     const result = await dispatch('agent', 'native_skill', skillInput(action))
-
-    expect(result.success).toBe(true)
-    expect(skillMocks.resolveSkillRuntimeForTool).toHaveBeenCalledTimes(1)
-    expect(await ranMarker()).toBe(false)
+    expectRefused(result, SCRIPT_REFUSAL)
+    expect(skillMocks.resolveSkillRuntimeForTool).not.toHaveBeenCalled()
   })
 
   it.each(['service', 'session', undefined])(

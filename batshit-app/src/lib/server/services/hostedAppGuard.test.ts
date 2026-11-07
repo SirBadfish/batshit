@@ -30,6 +30,8 @@ describe('hosted app guard', () => {
 
   it('keeps public registry and the model-catalog cron reachable on Vercel', () => {
     expect(isHostedAppExemptPath('/registry/catalog.json')).toBe(true)
+    expect(isHostedAppExemptPath('/registry/voice-model-catalog.json')).toBe(true)
+    expect(isHostedAppExemptPath('/registry/voice-model-catalog.json/anything')).toBe(false)
     expect(isHostedAppExemptPath('/registry/compatibility-matrix.json')).toBe(true)
     expect(isHostedAppExemptPath('/api/admin/cron/model-catalog')).toBe(true)
     expect(isHostedAppExemptPath('/api/admin/cron/compatibility-matrix')).toBe(false)

@@ -4,7 +4,7 @@
 	import type { ToolData } from '../toolRendererRegistry'
 	import { getLanguageFromPath } from '$lib/utils/languageDetection'
 	import { buildCompactEditPreview } from '$lib/utils/editDiff'
-	import { failedCommandExitCode } from '$lib/utils/toolActivityContract'
+	import { commandCutShort, failedCommandExitCode } from '$lib/utils/toolActivityContract'
 	import { AlertCircle, Edit3 } from '@lucide/svelte'
 
 	let { tool }: { tool: ToolData } = $props()
@@ -47,12 +47,29 @@
 		if (typeof tool.error === 'string' && tool.error.trim()) return tool.error.trim()
 		return failedExitCode !== undefined ? `Command exited with code ${failedExitCode}` : ''
 	})
+	// BL-1979: a shell edit cut before it finished (a Stop, its time limit, or a call that never
+	// returned) may have changed the file first, so the card never says it was not applied.
+	let cutShort = $derived(commandCutShort(tool.toolResult))
+	// BL-1986: a managed patch that failed part way and could not put every path back (BL-1916)
+	// left paths changed, so the card says it was partly applied, never "not applied".
+	let partlyChanged = $derived.by(() => {
+		const patch = tool.toolResult?.managedApplyPatch
+		return patch?.partial === true && Array.isArray(patch.changedPaths)
+			? patch.changedPaths.filter((entry: unknown): entry is string => typeof entry === 'string')
+			: []
+	})
 	let rendererTitle = $derived(
-		failureReason
-			? 'Edit Not Applied'
-			: typeof tool.metadata?.rendererTitle === 'string'
-				? tool.metadata.rendererTitle
-				: 'Edit File'
+		cutShort === 'timed-out'
+			? 'Edit Timed Out'
+			: cutShort
+				? 'Edit Stopped'
+				: partlyChanged.length > 0
+					? 'Edit Partly Applied'
+					: failureReason
+						? 'Edit Not Applied'
+						: typeof tool.metadata?.rendererTitle === 'string'
+							? tool.metadata.rendererTitle
+							: 'Edit File'
 	)
 
 	// Check for language in multiple places - md should be markdown
@@ -124,7 +141,14 @@
 		...(failureReason
 			? {
 				...(failedExitCode !== undefined ? { 'Exit Code': failedExitCode } : {}),
-				'Result': 'Not applied',
+				'Result': cutShort
+					? 'Unknown, cut before it finished'
+					: partlyChanged.length > 0
+						? 'Partly applied, some paths left changed'
+						: 'Not applied',
+				...(partlyChanged.length > 0
+					? { 'Left Changed': `${partlyChanged.length} ${partlyChanged.length === 1 ? 'path' : 'paths'}` }
+					: {}),
 				'Reason': failureReason
 			}
 			: {}),
@@ -263,7 +287,13 @@
 			<div class="error-container blocked-edit">
 				<div class="error-icon"><AlertCircle class="h-5 w-5" /></div>
 				<div class="error-message">
-					Edit not applied: {failureReason}
+					{#if cutShort}
+						{cutShort === 'timed-out' ? 'Timed out' : 'Stopped'} before it finished, so the file may or may not have changed: {failureReason}
+					{:else if partlyChanged.length > 0}
+						Edit partly applied: {failureReason}
+					{:else}
+						Edit not applied: {failureReason}
+					{/if}
 				</div>
 			</div>
 		{/if}

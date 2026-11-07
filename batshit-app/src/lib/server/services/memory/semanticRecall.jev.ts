@@ -1,3 +1,4 @@
+import { memoryIsEligible } from './memoryState'
 /**
  * SA-120 P4b (design record A2) — Judge Juice recall by meaning.
  *
@@ -226,7 +227,7 @@ export async function prefilterSemanticRecallCandidates(input: SemanticRecallPre
   return (await fetchMemoriesByKeys(keys))
     .filter(
       (record) =>
-        record.lane === 'ltm' &&
+        memoryIsEligible(record) && record.lane === 'ltm' &&
         record.is_superseded !== 'y' &&
         !(typeof record.expires_ts === 'number' && record.expires_ts <= nowTs)
     )

@@ -17,12 +17,12 @@ describe('send-routed: an approval click and the turn lock', () => {
   const check = source.indexOf('\n    const activeSessionTurn = getActiveSessionTurn(sessionId)\n', kind)
   const register = source.indexOf('\n    const sessionTurnRegistration = registerSessionTurn(\n', check)
 
-  it('waits for the card’s own reply ABOVE the lock check, for a click only', () => {
+  it('waits for the card’s own reply ABOVE the lock check, for a click or retirement', () => {
     expect(kind).toBeGreaterThan(-1)
     expect(check).toBeGreaterThan(kind)
     const between = source.slice(kind, check)
     expect(between).toContain(
-      '\n    const approvalClick = isApprovalClick({\n      approvalResponseCount: approvalResponse.length,\n      content,\n    })\n'
+      '\n    const approvalClick = isApprovalClick({\n      approvalResponseCount: approvalResponse.length,\n      content,\n    }) || hasRetirementRequest\n'
     )
     expect(between).toContain(
       '\n    if (approvalClick) {\n      const clickWait = await waitForCardReplyToFinish(sessionId, requestedMessageId)\n'

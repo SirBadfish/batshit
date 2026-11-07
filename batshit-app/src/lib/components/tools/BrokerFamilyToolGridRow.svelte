@@ -6,7 +6,7 @@
    * SA-096. This row is used **only** on the discoverability-only surfaces — Subagent
    * Settings and the Chatbar dropdown — which do not render the `Batshit Tools` section.
    * On Global and Agent Settings the same two controls live on the existing
-   * `Fabric Controls` / `Artifact Tools` rows inside that section, so a family never
+   * `Fabric & Utilities` / `Artifact Tools` rows inside that section, so a family never
    * appears twice in one grid.
    *
    * The controls themselves come from `BrokerFamilyDiscoverabilityCells` so both
@@ -20,9 +20,10 @@
   interface Props {
     controls: BrokerFamilyRowControls
     rowClass: string
+    showDiscoverable?: boolean
   }
 
-  let { controls, rowClass }: Props = $props()
+  let { controls, rowClass, showDiscoverable = true }: Props = $props()
 </script>
 
 {#snippet infoMenu()}
@@ -48,5 +49,6 @@
       </span>
     </div>
   </td>
-  <BrokerFamilyDiscoverabilityCells {controls} trailing={infoMenu} detailLayout="spread" />
+  {#if !showDiscoverable}<td class="batshit-settings-table-cell"></td>{/if}
+  <BrokerFamilyDiscoverabilityCells {controls} {showDiscoverable} trailing={infoMenu} detailLayout="spread" />
 </tr>

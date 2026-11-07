@@ -1,0 +1,274 @@
+/* ============================================================
+   The app's looks (Josh, 2026-10-29). Three choices in Settings -> Themes, saved as
+   appearance_settings.look and painted on <html data-look> before the first frame
+   (src/lib/appearance/appLook.ts, hooks.server.ts):
+
+   - cave (the default): the Bat Cave look of batshit.ai. Minimal plus the stone: colourless
+     grain and mottle on the ground, faint smoke in the chat light, worn stencils, corner
+     brackets on the Settings rail, a glowing rule under the Settings title.
+   - minimal: the cave's palette and carving, no textures, no motion.
+   - og: the look the app had before, kept for now so Josh can compare. No rules here.
+
+   Every rule here is unlayered on purpose: it sits over app.css's layered rules (base,
+   components) without fighting their specificity, and only changes paint, never layout.
+   The carving is Josh's own chat-bubble recipe: a dark groove edge, one faint light line
+   along the top of a face, one faint light lip under its bottom; never two lines of one
+   colour on one edge. Selection is a brighter fill, never a one-sided accent border.
+   Painted-surface tokens stay paint-only (background shorthand); see the Fragility Map,
+   "Theme Token Types". Designed on the sample sheet in Josh's _local/app-look/.
+   ============================================================ */
+
+/* ---- Minimal: the cave's palette and engraving, no textures, no motion ---- */
+:root:is([data-look='minimal'], [data-look='cave']) {
+  /* Ground and shell: deeper, a little more indigo, as on the websites. */
+  --bs-app-canvas: oklch(0.125 0.022 277);
+  --bs-app-canvas-surface: linear-gradient(135deg, oklch(0.095 0.014 280) 0%, oklch(0.112 0.018 278) 55%, oklch(0.105 0.016 279) 100%);
+  --bs-chat-canvas: linear-gradient(90deg, oklch(0.075 0.012 282) 6%, oklch(0.128 0.034 275) 30%, oklch(0.128 0.034 275) 62%, oklch(0.075 0.012 282) 94%);
+  --bs-app-card: oklch(0.118 0.016 279);
+  --bs-app-raised: oklch(0.16 0.026 281);
+  --bs-app-popover: oklch(0.105 0.016 279 / 0.97);
+  /* Ink: the cave's, a touch brighter at the quiet end for the darker ground. */
+  --bs-app-title: oklch(0.96 0.008 286);
+  --bs-app-text: oklch(0.865 0.02 282);
+  --bs-app-label: oklch(0.62 0.022 284);
+  --bs-app-muted-text: oklch(0.54 0.018 285);
+  /* Lines: quieter than today (Josh, 2026-10-29: the borders stood out too much). */
+  --bs-app-line: oklch(0.62 0.024 282 / 0.11);
+  --bs-app-inner-line: oklch(0.62 0.024 282 / 0.07);
+  --bs-app-line-strong: oklch(0.68 0.026 282 / 0.18);
+  /* The two chat bubbles: the user's keeps its violet, the AI's sinks into the rock. */
+  --message-user-background: linear-gradient(135deg, oklch(0.27 0.05 286 / 0.86) 0%, oklch(0.25 0.034 274 / 0.86) 45%, oklch(0.2 0.036 283 / 0.86) 100%);
+  --message-user-tint: oklch(0.25 0.04 280 / 0.86);   /* the solid companion of the user bubble */
+  --message-ai-background: linear-gradient(168deg, oklch(0.145 0.016 278 / 0.86) 0%, oklch(0.125 0.013 278 / 0.9) 60%, oklch(0.115 0.012 280 / 0.92) 100%);
+  /* The carving (Josh's bubble recipe): a dark groove edge, one light line on top of the face
+     inside, one light lip under the bottom outside. */
+  --look-groove: oklch(0.05 0.01 280 / 0.6);
+  --look-catch: oklch(0.92 0.03 282 / 0.07);
+  --look-lip: oklch(0.92 0.03 282 / 0.05);
+  --look-engrave: inset 0 1px 0 var(--look-catch), 0 1px 0 var(--look-lip);
+  --look-display: "Amarante", Georgia, serif;   /* the brand face, as on the websites */
+  --look-kicker: oklch(0.78 0.15 292);
+  --look-kicker-glow: oklch(0.78 0.15 292 / 0.45);
+  --look-torch-line: oklch(0.8 0.13 62 / 0.42);
+  --look-lavender: oklch(0.79 0.055 274);
+}
+
+:root:is([data-look='minimal'], [data-look='cave']) :is(.batshit-settings-sheet, .batshit-settings-dialog) {
+  /* Surfaces keep today's lightness (Josh, 2026-10-29: darker bodies left the darker parts
+     inside them without contrast, "just a lot of outlines"); only the hue leans to the cave. */
+  --bs-settings-canvas: oklch(0.11 0.02 277);
+  --bs-settings-sidebar: oklch(0.105 0.018 278);
+  --bs-settings-card: oklch(0.118 0.016 279);
+  --bs-settings-raised: oklch(0.16 0.026 281);
+  --bs-settings-accordion-header: oklch(0.18 0.022 282);
+  --bs-settings-accordion-header-hover: oklch(0.225 0.03 276);
+  --bs-settings-accordion-content: oklch(0.18 0.022 282);
+  --bs-settings-line: oklch(0.42 0.03 281.59 / 0.16);
+  --bs-settings-inner-line: oklch(0.62 0.024 282 / 0.07);
+  --bs-settings-line-strong: oklch(0.68 0.026 282 / 0.18);
+  /* Fields: a solid quiet line (the dashed field line is retired in these looks). */
+  --bs-settings-field-line: oklch(0.62 0.024 282 / 0.16);
+  --bs-settings-field-line-hover: oklch(0.68 0.026 282 / 0.26);
+  --bs-settings-popover: oklch(0.105 0.016 279 / 0.97);
+  --bs-settings-title: oklch(0.96 0.008 286);
+  --bs-settings-text: oklch(0.865 0.02 282);
+  --bs-settings-label: oklch(0.66 0.05 281);
+}
+
+/* ---- Cave: Minimal plus the stone itself (grain, mottle, smoke in the light) ---- */
+:root[data-look='cave'] {
+  /* Colourless grain (5%) and a soft mottle (4%), the websites' own, baked at their strength, layered into the
+     painted surfaces (paint-only tokens: every consumer uses the background shorthand). */
+  --look-grain: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='240'%3E%3Cfilter id='g' x='0' y='0' width='100%25' height='100%25'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix values='2.4 0 0 0 -0.95 2.4 0 0 0 -0.95 2.4 0 0 0 -0.95 0 0 0 0 0.05'/%3E%3C/filter%3E%3Crect width='240' height='240' filter='url(%23g)'/%3E%3C/svg%3E") 0 0 / 240px 240px repeat;
+  --look-mottle: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='900' height='900'%3E%3Cfilter id='s' x='0' y='0' width='100%25' height='100%25'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.006' numOctaves='5' seed='7' stitchTiles='stitch'/%3E%3CfeColorMatrix values='2.2 0 0 0 -0.85 2.2 0 0 0 -0.85 2.2 0 0 0 -0.85 0 0 0 0 0.03'/%3E%3C/filter%3E%3Crect width='900' height='900' filter='url(%23s)'/%3E%3C/svg%3E") 0 0 / 900px 900px repeat;
+  --look-haze: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='1200' height='1200'%3E%3Cfilter id='h' x='0' y='0' width='100%25' height='100%25'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.0028 0.0042' numOctaves='4' seed='23'/%3E%3CfeColorMatrix values='0 0 0 0 0.3 0 0 0 0 0.29 0 0 0 0 0.5 0.3 0 0 0 -0.135'/%3E%3C/filter%3E%3Crect width='1200' height='1200' filter='url(%23h)'/%3E%3C/svg%3E") center / cover no-repeat;
+  --look-wear: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='w' x='0' y='0' width='100%25' height='100%25'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' seed='3' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 -1.5 0 0 0 1.75'/%3E%3C/filter%3E%3Crect width='180' height='180' filter='url(%23w)'/%3E%3C/svg%3E");
+  --look-bracket: oklch(0.78 0.15 292 / 0.5);
+  --bs-app-canvas-surface: var(--look-grain), var(--look-mottle), linear-gradient(135deg, oklch(0.095 0.014 280) 0%, oklch(0.112 0.018 278) 55%, oklch(0.105 0.016 279) 100%);
+  --bs-chat-canvas: var(--look-grain), var(--look-haze), radial-gradient(ellipse 60% 46% at 50% -10%, oklch(0.74 0.07 274.7 / 0.14), transparent 72%), linear-gradient(90deg, oklch(0.075 0.012 282) 6%, oklch(0.128 0.034 275) 30%, oklch(0.128 0.034 275) 62%, oklch(0.075 0.012 282) 94%);
+}
+
+/* ============================================================
+   MINIMAL (Cave includes all of this): set into the rock, refined, no textures.
+   Every rule here only changes paint (border, shadow, colour, type); never layout.
+
+   The carving follows Josh's own chat bubble (2026-10-29): light falls from above, so a part
+   set into the rock has a DARK edge (the groove), ONE faint light line along the top of its
+   face (inside), and ONE faint light line under its bottom edge (the groove's lower lip,
+   outside). Never two lines of the same colour on one edge.
+   ============================================================ */
+
+/* ---- Settings: cards and accordions sit in the rock ---- */
+:root:is([data-look='minimal'], [data-look='cave']) :is(.batshit-settings-sheet, .batshit-settings-dialog) {
+  /* The card edges are the groove, through the frame tokens the cards read, so a state variant
+     (danger, a hovered catalog card, a saved-items card) keeps its own border colour. */
+  --bs-settings-frame: var(--look-groove);
+  --bs-settings-card-rim: var(--look-groove);
+}
+:root:is([data-look='minimal'], [data-look='cave']) .batshit-settings-sheet :is([data-slot='card'], .batshit-settings-card, .batshit-settings-card-default, .batshit-settings-accordion-card):not(.batshit-settings-card-danger, .batshit-settings-card-elevated) {
+  box-shadow: var(--look-engrave);
+}
+
+/* The panel title is the one brand-face word on a Settings page: the h3 that heads a panel,
+   never a title inside a card, frame, dialog or menu (the class has other uses). */
+:root:is([data-look='minimal'], [data-look='cave']) .batshit-settings-panel-stage h3.batshit-settings-section-title:not(:is([data-slot='card'], .batshit-settings-card, .batshit-settings-accordion-card, .batshit-settings-subsection, [data-slot='dialog-content'], [data-slot='dropdown-menu-content']) *) {
+  font-family: var(--look-display);
+  font-weight: 400;
+  font-synthesis: none;
+  font-size: 1.375rem;
+  letter-spacing: 0.005em;
+  color: var(--bs-settings-title);
+}
+
+/* "SETTINGS", "FOLDERS" and other small capitals: quiet mono, tracked (Josh: not too bright,
+   not too big). */
+:root:is([data-look='minimal'], [data-look='cave']) :is(.batshit-settings-nav-title, .folder-tree-title) {
+  font-family: var(--bs-font-mono);
+  font-size: 0.6875rem;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--bs-app-label);
+}
+
+/* Selected things are brighter all over (Josh, 2026-10-29): no one-sided accent border. */
+:root:is([data-look='minimal'], [data-look='cave']) {
+  --look-selected: oklch(0.225 0.034 280);
+}
+:root:is([data-look='minimal'], [data-look='cave']) .batshit-settings-nav-item[data-state='active'] {
+  background: var(--look-selected);
+  border-color: transparent;
+  color: var(--bs-settings-title);
+}
+
+/* In-panel tabs: the active tab is a brighter slate. */
+:root:is([data-look='minimal'], [data-look='cave']) .batshit-settings-sheet [data-slot='tabs-trigger'][data-state='active'] {
+  background: var(--look-selected);
+}
+
+/* Every dashed line becomes solid (Josh, 2026-10-29: the dashed field was an old idea that
+   does not fit the cave). */
+:root:is([data-look='minimal'], [data-look='cave']) :is(.batshit-settings-sheet, .batshit-settings-dialog) :is(input[data-slot='input'], textarea[data-slot='textarea'], [data-slot='select-trigger'], .batshit-settings-grid-input, .batshit-settings-textarea, .batshit-settings-selector-trigger, .batshit-settings-dropdown-trigger, .batshit-backup-file-name, .batshit-settings-disclosure-row.is-catalog-details, .batshit-settings-disclosure-row.is-catalog-details > .batshit-settings-disclosure-content, .is-dashed) {
+  border-style: solid;
+}
+
+/* Switches on: a faint glow (a light, not a line). */
+:root:is([data-look='minimal'], [data-look='cave']) .bs-switch[data-state='checked']:not(:focus-visible) {
+  box-shadow: 0 0 10px -3px var(--look-kicker-glow);
+}
+
+/* Buttons: one light line along the top of the face, nothing more. The primary also glows a
+   little. Focus and error rings are box-shadows too, so those states keep the app's own. */
+:root:is([data-look='minimal'], [data-look='cave']) :is(.batshit-button-small-primary, .batshit-button-medium-primary, .batshit-button-large-primary, .bs-button-default):not(:focus-visible):not([aria-invalid='true']) {
+  box-shadow: inset 0 1px 0 oklch(0.92 0.03 282 / 0.14), 0 0 16px -8px var(--look-kicker-glow);
+}
+:root:is([data-look='minimal'], [data-look='cave']) :is(.bs-button-outline, .bs-button-secondary):not(:focus-visible):not([aria-invalid='true']) {
+  box-shadow: inset 0 1px 0 var(--look-catch);
+}
+
+/* Floating surfaces (menus, popovers, dialogs): the same carving, lifted by a soft shadow. */
+:root:is([data-look='minimal'], [data-look='cave']) :is(.bs-select-content, .bs-dropdown-content, .bs-dialog-content, .batshit-settings-info-content) {
+  box-shadow: inset 0 1px 0 var(--look-catch), 0 18px 40px -20px oklch(0 0 0 / 0.7);
+}
+
+/* ---- Chat: the bubbles keep Josh's own groove exactly (the dark backdrop with its light
+   bottom line, the bubble's light top line); only their colours come from the tokens. ---- */
+/* The chat bar is set into the rock like a card. */
+:root:is([data-look='minimal'], [data-look='cave']) .chat-composer-shell {
+  border-color: var(--look-groove);
+  background: oklch(0.1 0.016 279 / 0.92);
+  box-shadow: var(--look-engrave);
+}
+:root:is([data-look='minimal'], [data-look='cave']) :is(.full-tool, .compact-tool, .tool-activity-group) {
+  box-shadow: var(--look-engrave);
+}
+
+/* ---- The app sidebar: the chosen chat is brighter all over ---- */
+:root:is([data-look='minimal'], [data-look='cave']) .session-item-button.is-selected {
+  background: var(--look-selected);
+}
+:root:is([data-look='minimal'], [data-look='cave']) [data-slot='sidebar-container'].batshit-sidebar {
+  border-color: var(--bs-app-line);
+}
+:root:is([data-look='minimal'], [data-look='cave']) .app-header-bar {
+  border-bottom-color: var(--bs-app-line);
+}
+
+/* ============================================================
+   CAVE: Minimal plus the stone (grain on every big surface, smoke in the chat light),
+   worn stencils, corner brackets on the instruments, and the glowing title rule.
+   ============================================================ */
+
+/* The stone is the ground only, never laid over the parts (Josh, 2026-10-29: one overlay
+   over everything read as a sheet, not as stone). Settings forbids background images on its
+   own elements (a flat-calibration lock in app.css), so its ground is a layer of its own
+   behind every part: cards, fields and buttons paint over it and stay clean. */
+:root[data-look='cave'] .batshit-settings-sheet {
+  isolation: isolate;
+}
+/* The rail and the panel paint the canvas colour again over the sheet; in Cave they let the
+   ground show through (the sheet under them is the same colour). */
+:root[data-look='cave'] .batshit-settings-sheet :is(.batshit-settings-nav, .batshit-settings-panel-wrap) {
+  background-color: transparent;
+}
+:root[data-look='cave'] .batshit-settings-sheet::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: var(--look-grain), var(--look-mottle);
+}
+
+/* Worn stencils: the small capitals lose a little ink. */
+:root[data-look='cave'] :is(.batshit-settings-nav-title, .folder-tree-title, .look-stencil) {
+  -webkit-mask-image: var(--look-wear);
+  mask-image: var(--look-wear);
+}
+
+/* The glowing rule under a Settings panel title, with a slow light along it. */
+:root[data-look='cave'] .batshit-settings-panel-stage h3.batshit-settings-section-title:not(:is([data-slot='card'], .batshit-settings-card, .batshit-settings-accordion-card, .batshit-settings-subsection, [data-slot='dialog-content'], [data-slot='dropdown-menu-content']) *) {
+  position: relative;
+  padding-bottom: 0.55rem;
+}
+:root[data-look='cave'] .batshit-settings-panel-stage h3.batshit-settings-section-title:not(:is([data-slot='card'], .batshit-settings-card, .batshit-settings-accordion-card, .batshit-settings-subsection, [data-slot='dialog-content'], [data-slot='dropdown-menu-content']) *)::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: min(14rem, 100%);
+  height: 1px;
+  background:
+    linear-gradient(90deg, transparent, oklch(0.97 0.03 290 / 0.9), transparent) -40% 0 / 22% 100% no-repeat,
+    linear-gradient(90deg, var(--look-kicker), oklch(0.74 0.07 274.7 / 0.6) 62%, oklch(0.72 0.115 185 / 0.75) 92%, transparent);
+  box-shadow: 0 0 8px oklch(0.78 0.15 292 / 0.45);
+  animation: look-rule-sweep 9s cubic-bezier(0.45, 0, 0.2, 1) 1.2s infinite;
+}
+@keyframes look-rule-sweep {
+  0% { background-position: -40% 0, 0 0; }
+  28% { background-position: 140% 0, 0 0; }
+  100% { background-position: 140% 0, 0 0; }
+}
+
+/* Corner brackets on the Settings rail (not the chat bar: there they sat on its buttons). */
+:root[data-look='cave'] .batshit-settings-nav::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  border-radius: inherit;
+  background:
+    linear-gradient(var(--look-bracket), var(--look-bracket)) 6px 6px / 12px 1px no-repeat,
+    linear-gradient(var(--look-bracket), var(--look-bracket)) 6px 6px / 1px 12px no-repeat,
+    linear-gradient(var(--look-bracket), var(--look-bracket)) calc(100% - 6px) 6px / 12px 1px no-repeat,
+    linear-gradient(var(--look-bracket), var(--look-bracket)) calc(100% - 6px) 6px / 1px 12px no-repeat,
+    linear-gradient(var(--look-bracket), var(--look-bracket)) 6px calc(100% - 6px) / 12px 1px no-repeat,
+    linear-gradient(var(--look-bracket), var(--look-bracket)) 6px calc(100% - 6px) / 1px 12px no-repeat,
+    linear-gradient(var(--look-bracket), var(--look-bracket)) calc(100% - 6px) calc(100% - 6px) / 12px 1px no-repeat,
+    linear-gradient(var(--look-bracket), var(--look-bracket)) calc(100% - 6px) calc(100% - 6px) / 1px 12px no-repeat;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root[data-look='cave'] .batshit-settings-panel-stage h3.batshit-settings-section-title:not(:is([data-slot='card'], .batshit-settings-card, .batshit-settings-accordion-card, .batshit-settings-subsection, [data-slot='dialog-content'], [data-slot='dropdown-menu-content']) *)::after { animation: none; }
+}

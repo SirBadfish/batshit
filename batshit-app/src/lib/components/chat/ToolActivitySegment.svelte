@@ -4,6 +4,7 @@
   import ZipbatshitWrapper from '$lib/components/renderers/wrappers/ZipbatshitWrapper.svelte'
   import { normalizeId } from '$lib/utils/idNormalizer'
   import type { ToolResultSizeGuard } from '$lib/utils/toolResultSizeGuard'
+  import type { ZipLiveSnapshot } from '$lib/utils/zipLiveSnapshot'
   import {
     estimateCoolToolAiTokens,
     parseCoolToolPayload
@@ -73,7 +74,9 @@
       holdLabel?: string | null
       deadCopyReason?: 'superseded' | 'stale' | null
       heldDeadCopy?: boolean
+      userHeld?: boolean
       sizeGuard?: ToolResultSizeGuard
+      liveSnapshot?: ZipLiveSnapshot | null
       manualZip?: boolean
     }
     shouldShowAsZip: (segment: any, segmentIndex: number) => boolean
@@ -161,7 +164,11 @@
   let deadCopyReason = $derived(zipState.deadCopyReason ?? null)
   // SA-129 P2b (BL-358): a hold that is not the user's on a dead copy still offers Release.
   let heldDeadCopy = $derived(Boolean(zipState.heldDeadCopy))
+  // Round 2: the user already holds it; the badge offers Release, never a new Hold.
+  let userHeld = $derived(Boolean(zipState.userHeld))
   let sizeGuard = $derived(zipState.sizeGuard ?? null)
+  // SA-137 P4: the newest reply showed this read as a file snapshot.
+  let liveSnapshot = $derived(zipState.liveSnapshot ?? null)
 </script>
 
 <ZipbatshitWrapper
@@ -179,7 +186,9 @@
   {holdLabel}
   {deadCopyReason}
   {heldDeadCopy}
+  {userHeld}
   {sizeGuard}
+  {liveSnapshot}
   {manualZip}
   onToggleUnzip={(permanent: boolean) =>
     handleUnzip(

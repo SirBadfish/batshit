@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import type { ClaudeAgentSettings } from '$lib/types/claude'
-import type { CodexAgentSettings } from '$lib/types/codex'
 import { diffAgentBlock } from '$lib/utils/agentBlockFieldSettings'
 import {
+  withExpectedMcpSettings, withoutExpectedMcpSettings, readMcpSettingsRevisions, MCP_SETTINGS_REVISION_HEADER,
   diffMcpSection,
   diffZipPayload,
   zipPayloadForSave,
@@ -86,6 +86,7 @@ function zipBase(): ZipPayloadBody {
   return {
     zip_ai_view_mode: null,
     zip_tool_notes_enabled: null,
+    live_file_reads: null,
     buffer_size: null,
     buffer_size_image: null,
     buffer_size_error: null,
@@ -149,6 +150,18 @@ describe('what the zip save sends (BL-855)', () => {
     })
   })
 
+  // SA-137 P4a: Live File Reads rides the zip save as one boolean field. Inherit is null (the server
+  // removes the field), On is true, Off is false, and an unchanged choice sends nothing.
+  it('sends Live File Reads on its own: On true, Off false, inherit null', () => {
+    expect(diffZipPayload(zipBase(), { ...zipBase(), live_file_reads: true })).toEqual({ live_file_reads: true })
+    expect(diffZipPayload(zipBase(), { ...zipBase(), live_file_reads: false })).toEqual({ live_file_reads: false })
+    expect(diffZipPayload({ ...zipBase(), live_file_reads: true }, zipBase())).toEqual({ live_file_reads: null })
+    expect(diffZipPayload({ ...zipBase(), live_file_reads: false }, { ...zipBase(), live_file_reads: null })).toEqual({
+      live_file_reads: null
+    })
+    expect(diffZipPayload({ ...zipBase(), live_file_reads: false }, { ...zipBase(), live_file_reads: false })).toEqual({})
+  })
+
   it('sends custom_tool_settings whole, alone, when a row differs', () => {
     const next = { ...zipBase(), custom_tool_settings: [{ tool_name: 'tool_r', buffer_size: 8 }] }
     expect(diffZipPayload(zipBase(), next)).toEqual({ custom_tool_settings: [{ tool_name: 'tool_r', buffer_size: 8 }] })
@@ -175,6 +188,7 @@ describe('what the zip save sends (BL-855)', () => {
 const CHANGE_ONE_ZIP_FIELD: { [K in keyof ZipPayloadBody]-?: ZipPayloadBody[K] } = {
   zip_ai_view_mode: 'appended',
   zip_tool_notes_enabled: false,
+  live_file_reads: true,
   buffer_size: 3,
   buffer_size_image: 0,
   buffer_size_error: 3,
@@ -232,31 +246,6 @@ describe('every zip field the save can name is sent when it changes (BL-855)', (
   }
 })
 
-/** One entry per key of the Codex block: a change to it. */
-const CHANGE_ONE_CODEX_KEY: { [K in keyof CodexAgentSettings]-?: CodexAgentSettings[K] } = {
-  mode4Style: 'cli',
-  permissionMode: 'agent',
-  includeProjectInstructions: false,
-  model: 'gpt-6-sol',
-  profileId: 'profile_x',
-  reasoningEffort: 'high',
-  modelVerbosity: 'high',
-  serviceTier: 'fast',
-  streamingEffect: false,
-  search: false,
-  sandbox: 'workspace-write',
-  approval: 'on-request',
-  addDirs: ['/one'],
-  enableFeatures: ['feature_a'],
-  disableFeatures: ['feature_b'],
-  configOverrides: [{ key: 'model_context_window', value: '1000' }],
-  workingDirectoryMode: 'custom',
-  customWorkingDirectory: '/work',
-  configScope: 'global',
-  unifiedExec: false,
-  historyPersistence: 'save-all'
-}
-
 const CHANGE_ONE_CLAUDE_KEY: { [K in keyof ClaudeAgentSettings]-?: ClaudeAgentSettings[K] } = {
   mode4Style: 'cli',
   permissionMode: 'plan',
@@ -279,20 +268,6 @@ const CHANGE_ONE_CLAUDE_KEY: { [K in keyof ClaudeAgentSettings]-?: ClaudeAgentSe
   customWorkingDirectory: '/work'
 }
 
-const CODEX_BLOCK: CodexAgentSettings = {
-  permissionMode: 'chat',
-  model: 'gpt-6-astra',
-  streamingEffect: true,
-  search: true,
-  sandbox: 'read-only',
-  approval: 'never',
-  addDirs: [],
-  enableFeatures: [],
-  disableFeatures: [],
-  configOverrides: [],
-  workingDirectoryMode: 'project'
-}
-
 const CLAUDE_BLOCK: ClaudeAgentSettings = {
   permissionMode: 'acceptEdits',
   addDirs: [],
@@ -301,36 +276,53 @@ const CLAUDE_BLOCK: ClaudeAgentSettings = {
   configOverrides: []
 }
 
-describe('every Codex and Claude key the sections can name is sent when it changes (BL-848)', () => {
-  for (const key of Object.keys(CHANGE_ONE_CODEX_KEY) as (keyof CodexAgentSettings)[]) {
-    it(`codex_settings.${key}: a change is sent alone, and a dropped key goes as null`, () => {
-      const value = CHANGE_ONE_CODEX_KEY[key]
-      const changed = { ...CODEX_BLOCK, [key]: value }
-      // A required key that already held another value is replaced; a key the block lacks is added.
-      expect(diffAgentBlock('codex_settings', CODEX_BLOCK, changed)).toEqual({ [key]: value })
-      // The same key dropped from the form (an optional one, or one the block lacked) is named as null.
-      const { [key]: _removed, ...without } = changed as Record<string, unknown>
-      expect(diffAgentBlock('codex_settings', changed, without)).toEqual({ [key]: null })
-    })
-  }
-
+describe('every Claude key the sections can name is sent when it changes (BL-848)', () => {
   for (const key of Object.keys(CHANGE_ONE_CLAUDE_KEY) as (keyof ClaudeAgentSettings)[]) {
     it(`claude_settings.${key}: a change is sent alone, and a dropped key goes as null`, () => {
       const value = CHANGE_ONE_CLAUDE_KEY[key]
       const changed = { ...CLAUDE_BLOCK, [key]: value }
+      // A required key that already held another value is replaced; a key the block lacks is added.
       expect(diffAgentBlock('claude_settings', CLAUDE_BLOCK, changed)).toEqual({ [key]: value })
+      // The same key dropped from the form (an optional one, or one the block lacked) is named as null.
       const { [key]: _removed, ...without } = changed as Record<string, unknown>
       expect(diffAgentBlock('claude_settings', changed, without)).toEqual({ [key]: null })
     })
   }
 
   it('an agent with no block yet gets every key the form names (the block is created whole)', () => {
-    expect(diffAgentBlock('codex_settings', null, CODEX_BLOCK)).toEqual(CODEX_BLOCK)
     expect(diffAgentBlock('claude_settings', null, CLAUDE_BLOCK)).toEqual(CLAUDE_BLOCK)
   })
 
   it('a form that changed nothing sends nothing, and a key that stays undefined is not named', () => {
-    expect(diffAgentBlock('codex_settings', CODEX_BLOCK, { ...CODEX_BLOCK, reasoningEffort: undefined })).toBeUndefined()
+    expect(diffAgentBlock('claude_settings', CLAUDE_BLOCK, { ...CLAUDE_BLOCK, systemPrompt: undefined })).toBeUndefined()
     expect(diffAgentBlock('claude_settings', CLAUDE_BLOCK, { ...CLAUDE_BLOCK })).toBeUndefined()
+  })
+})
+
+
+describe('human Primary original whole-field request metadata', () => {
+  const gateway = `sha256:${'1'.repeat(64)}`, custom = `sha256:${'2'.repeat(64)}`
+  it('sends only the requested leaf bases and never adds Primary metadata to shared sparse Subagent/DCM or scalar Zip bodies', () => {
+    const base = { defaultMCPGateways: gateway, custom_tool_settings: custom }
+    const request = withExpectedMcpSettings({ defaultMCPGateways: [], buffer_size_error: 0 }, base)
+    expect(request).toEqual({ defaultMCPGateways: [], buffer_size_error: 0, expectedMcpSettings: { defaultMCPGateways: gateway } })
+    expect(withoutExpectedMcpSettings(request)).toEqual({ defaultMCPGateways: [], buffer_size_error: 0 })
+    const sparse = diffMcpSection(mcpValues(), mcpValues({ dcm: { ...DCM_EMPTY, tools: { tool_one: 'hidden' } } }))
+    expect(sparse).not.toHaveProperty('expectedMcpSettings')
+    expect(withExpectedMcpSettings({ auto_zip_error: false, buffer_size_error: 0 }, undefined)).toEqual({ auto_zip_error: false, buffer_size_error: 0 })
+  })
+  it.each([[], null, [{ tool_name: 'skill_read', buffer_size: 0, auto_zip: false }]])('guards the entire custom array for non-MCP, reset or inherit %j', rows => {
+    const request = withExpectedMcpSettings({ custom_tool_settings: rows }, { custom_tool_settings: custom })
+    expect(request.expectedMcpSettings).toEqual({ custom_tool_settings: custom })
+    expect(request.custom_tool_settings).toBe(rows)
+    expect(() => withExpectedMcpSettings({ custom_tool_settings: rows }, { defaultMCPGateways: gateway })).toThrow('nothing was sent')
+  })
+  it('refuses malformed/missing bases without changing the body and reads only finite typed header data', () => {
+    const body = { defaultMCPToolSelections: [] }
+    expect(() => withExpectedMcpSettings(body, undefined)).toThrow('nothing was sent')
+    expect(body).toEqual({ defaultMCPToolSelections: [] })
+    expect(MCP_SETTINGS_REVISION_HEADER).toBe('x-batshit-mcp-settings-revisions')
+    expect(readMcpSettingsRevisions(JSON.stringify({ custom_tool_settings: custom }))).toEqual({ custom_tool_settings: custom })
+    for (const value of [null, '[]', '{}bad', JSON.stringify({ readiness: true }), JSON.stringify({ custom_tool_settings: 'not-a-base' })]) expect(readMcpSettingsRevisions(value)).toBeUndefined()
   })
 })

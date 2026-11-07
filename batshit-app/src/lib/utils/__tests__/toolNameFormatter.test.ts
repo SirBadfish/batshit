@@ -4,6 +4,27 @@ import {
 	formatToolDisplayName,
 	stripGatewayPrefix
 } from '../toolNameFormatter'
+import { API_UTILITY_CONTROL_IDS } from '../apiUtilityControls'
+
+describe('API utility target labels', () => {
+	it.each([
+		[API_UTILITY_CONTROL_IDS.webSearch, 'Web Search'],
+		[API_UTILITY_CONTROL_IDS.workers, 'Workers'],
+		[API_UTILITY_CONTROL_IDS.skill, 'Skill Reference'],
+		[API_UTILITY_CONTROL_IDS.subagent, 'Subagent']
+	])('retains the existing native label for canonical batshit:%s', (controlId, label) => {
+		expect(formatBatshitToolTargetDisplayName(`batshit:${controlId}`)).toBe(label)
+		expect(formatToolDisplayName(`batshit:${controlId}`)).toBe(label)
+		expect(formatBatshitToolTargetDisplayName(`mcp:${controlId}`)).toBeNull()
+		expect(formatBatshitToolTargetDisplayName(`fabric:${controlId}`)).toBeNull()
+	})
+	it('preserves existing direct and CLI helper labels', () => {
+		expect(formatToolDisplayName('native_web_search')).toBe('Web Search')
+		expect(formatToolDisplayName('native_spawn_workers')).toBe('Workers')
+		expect(formatToolDisplayName('native_skill')).toBe('Skill Reference')
+		expect(formatToolDisplayName('call_subagent')).toBe('Subagent')
+	})
+})
 
 /**
  * SA-118 Guard 2 (DL-118-11) — the alias rows deleted because the derivation already says
@@ -64,7 +85,7 @@ describe('formatToolDisplayName', () => {
 		// what the agent did. The prefix label keeps any later `sys.judge.*` control on the
 		// product name (DL-120-13: two words, both capitalized).
 		expect(formatToolDisplayName('sys.judge.ask')).toBe('Ask Judge Juice')
-		expect(formatToolDisplayName('fabric:sys.judge.ask')).toBe('Ask Judge Juice')
+		expect(formatToolDisplayName('batshit:sys.judge.ask')).toBe('Ask Judge Juice')
 		expect(formatBatshitToolTargetDisplayName('sys.judge.ask')).toBe('Ask Judge Juice')
 		expect(formatBatshitToolTargetDisplayName('sys.judge.rank')).toBe('Judge Juice Rank')
 	})

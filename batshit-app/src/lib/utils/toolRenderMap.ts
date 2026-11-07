@@ -95,7 +95,7 @@ export function canonicalToolName(toolName: string | undefined): string {
     .trim()
   const slug = slugToolName(key)
   const summarySlug = slugToolName(withoutSummary)
-  // Codex / MCP subagent tools are named like `mcp.*.subagent_<slug>`
+  // CLI / MCP subagent tools are named like `mcp.*.subagent_<slug>`
   if (hasSubagentToolSegment(key)) return 'subagent'
   return (
     canonicalToolAliases[key] ||
@@ -123,6 +123,7 @@ export const toolCategories = {
   artifact: ['artifact_find', 'artifact_use'],
   fabric: ['fabric_find', 'fabric_use', 'fetch_zip'],
   agentBrowser: ['agent_browser_find', 'agent_browser_use'],
+  // Tool steps saved before Codex CLI retired (SA-139 R1); stored chats keep this category.
   codex: ['codex_plan_update', 'codex_web_search'],
   subagent: ['subagent'],
   workers: ['workers']
@@ -138,10 +139,10 @@ type ZipPolicyDefault = {
 }
 
 export const categoryDefaults: Record<string, ZipPolicyDefault> = {
-  fileReading: { buffer_size: 8, zip_threshold: 0 },
-  fileWriting: { buffer_size: 2, zip_threshold: 0 },
-  fileEditing: { buffer_size: 2, zip_threshold: 0 },
-  commandExecution: { buffer_size: 1, zip_threshold: 0 },
+  fileReading: { buffer_size: 2, zip_threshold: 0 },
+  fileWriting: { buffer_size: 2, zip_threshold: 0, auto_zip: true },
+  fileEditing: { buffer_size: 2, zip_threshold: 0, auto_zip: true },
+  commandExecution: { buffer_size: 1, zip_threshold: 0, auto_zip: true },
   searchFind: { buffer_size: 1, zip_threshold: 0, auto_zip: true },
   listing: { buffer_size: 1, zip_threshold: 0, auto_zip: true },
   webSearch: { buffer_size: 1, zip_threshold: 0, auto_zip: true },
@@ -158,16 +159,16 @@ export const categoryDefaults: Record<string, ZipPolicyDefault> = {
 }
 
 const TOOL_DEFAULTS: Record<string, ZipPolicyDefault> = {
-  read_file: { buffer_size: 8, zip_threshold: 0, auto_zip: false },
-  skill_read: { buffer_size: 10, zip_threshold: 0, auto_zip: false },
-  write_file: { buffer_size: 2, zip_threshold: 0, auto_zip: false },
-  edit_file: { buffer_size: 2, zip_threshold: 0, auto_zip: false },
-  execute_command: { buffer_size: 1, zip_threshold: 0, auto_zip: false },
-  bash: { buffer_size: 1, zip_threshold: 0, auto_zip: false },
+  read_file: { buffer_size: 2, zip_threshold: 0, auto_zip: false },
+  skill_read: { buffer_size: 0, zip_threshold: 0, auto_zip: true },
+  write_file: { buffer_size: 2, zip_threshold: 0, auto_zip: true },
+  edit_file: { buffer_size: 2, zip_threshold: 0, auto_zip: true },
+  execute_command: { buffer_size: 1, zip_threshold: 0, auto_zip: true },
+  bash: { buffer_size: 1, zip_threshold: 0, auto_zip: true },
   search_files: { buffer_size: 1, zip_threshold: 0, auto_zip: true },
   list_files: { buffer_size: 1, zip_threshold: 0, auto_zip: true },
   web_search: { buffer_size: 1, zip_threshold: 0, auto_zip: true },
-  fetch_zip: { buffer_size: 1, zip_threshold: 0, auto_zip: false },
+  fetch_zip: { buffer_size: 1, zip_threshold: 0, auto_zip: true },
   dynamic_find: { buffer_size: 1, zip_threshold: 0, auto_zip: true },
   tool_find: { buffer_size: 1, zip_threshold: 0, auto_zip: true },
   artifact_find: { buffer_size: 1, zip_threshold: 0, auto_zip: true },
@@ -245,7 +246,8 @@ function findCustomToolSetting(
 ) {
   if (!settings || settings.length === 0) return undefined
   return settings.find(
-    (setting) => setting.tool_name === toolName || alternateNames.includes(setting.tool_name)
+    (setting) => setting !== null && typeof setting === 'object' && !Array.isArray(setting) &&
+      (setting.tool_name === toolName || alternateNames.includes(setting.tool_name))
   )
 }
 
@@ -279,7 +281,9 @@ function getToolLookupNames(toolName: string): string[] {
       names.push('execute_command')
       break
     case 'skill_read':
-      names.push('read_file', 'skill_reference')
+      // Skill Read is its own Tool Grid row: it never borrows Read File's stored fields, or its
+      // row would show one number while skill reads compress at Read File's (SA-126, 2026-10-19).
+      names.push('skill_reference')
       break
     case 'dynamic_find':
       names.push('dynamic_mcp_find')
@@ -376,6 +380,9 @@ export function getToolSettings(
   options: ToolSettingsOptions = {}
 ): { buffer_size: number; zip_threshold: number; auto_zip: boolean; zip_disabled: boolean } {
   const canonicalName = canonicalToolName(toolName)
+  // Skill reads have a lifecycle, no saved buffer/Off override. Delegated one-run reads
+  // are available in their tool loop, then compress with their containing result.
+  if (canonicalName === 'skill_read') return { buffer_size: 0, zip_threshold: 0, auto_zip: true, zip_disabled: false }
   const lookupNames = getToolLookupNames(toolName)
   const primaryLookupName = lookupNames[0] || canonicalName
   const categoryName = getToolCategoryName(canonicalName)

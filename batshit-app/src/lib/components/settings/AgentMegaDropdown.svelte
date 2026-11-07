@@ -4,7 +4,6 @@
   import EntityAvatar from '$lib/components/avatar/EntityAvatar.svelte'
   import ModelProviderIcon from '$lib/components/models/ModelProviderIcon.svelte'
   import SettingsInfoMenu from '$lib/components/settings/SettingsInfoMenu.svelte'
-  import { getPrimaryAgentDisplayLabel, normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
   import type { AvatarIconFit, IconRef } from '$lib/icons/iconTypes'
 
   export interface MegaAgentItem {
@@ -12,7 +11,6 @@
     displayName: string
     agentType?: 'n8n' | 'api' | 'cli' | 'batshit' | null
     badgeLabel?: string | null
-    badgeTone?: 'n8n' | 'api' | 'cli' | 'managed' | null
     avatarUrl?: string | null
     avatarIconRef?: IconRef | null
     avatarIconFit?: AvatarIconFit | null
@@ -75,26 +73,10 @@
     onSelect?.(id)
   }
 
-  function formatAgentType(type: MegaAgentItem['agentType']) {
-    if (type === 'batshit') return 'batshit'
-    return getPrimaryAgentDisplayLabel(normalizePrimaryAgentType(undefined, type))
-  }
-
-  function resolveBadgeLabel(item: MegaAgentItem): string {
-    if (typeof item.badgeLabel === 'string' && item.badgeLabel.trim().length > 0) {
-      return item.badgeLabel
-    }
-    return formatAgentType(item.agentType)
-  }
-
-  function badgeClass(item: MegaAgentItem): string {
-    const tone =
-      item.badgeTone ??
-      (item.agentType === 'batshit'
-        ? 'api'
-        : normalizePrimaryAgentType(undefined, item.agentType))
-
-    return `is-agent-type-${tone === 'managed' ? 'api' : tone}`
+  // SA-139 R3 and R6 (decision 16): no agent-type label. A row shows only the role label its caller
+  // names (Primary Agent or Subagent), or none.
+  function resolveBadgeLabel(item: MegaAgentItem): string | null {
+    return typeof item.badgeLabel === 'string' && item.badgeLabel.trim().length > 0 ? item.badgeLabel : null
   }
 
   function ensureString(value: string | null | undefined): string {
@@ -147,9 +129,11 @@
               <span class="batshit-settings-action-row-title truncate">
               {selectedItem.displayName || 'Unnamed agent'}
               </span>
-              <span class={`batshit-settings-agent-type-pill shrink-0 ${badgeClass(selectedItem)}`}>
-                {resolveBadgeLabel(selectedItem)}
-              </span>
+              {#if resolveBadgeLabel(selectedItem)}
+                <span class="batshit-settings-agent-type-pill shrink-0 is-managed">
+                  {resolveBadgeLabel(selectedItem)}
+                </span>
+              {/if}
             </div>
             <div class="batshit-settings-caption flex min-w-0 items-center gap-2">
               {#if selectedItem.defaultModelName && !selectedItem.disabledReason}
@@ -238,9 +222,11 @@
                         <span class="batshit-settings-action-row-title truncate">
                           {item.displayName || 'Unnamed agent'}
                         </span>
-                        <span class={`batshit-settings-agent-type-pill shrink-0 ${badgeClass(item)}`}>
-                          {resolveBadgeLabel(item)}
-                        </span>
+                        {#if resolveBadgeLabel(item)}
+                          <span class="batshit-settings-agent-type-pill shrink-0 is-managed">
+                            {resolveBadgeLabel(item)}
+                          </span>
+                        {/if}
                       </div>
 
                       <div class="flex min-w-0 items-center gap-2 text-xs text-foreground/80">

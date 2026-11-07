@@ -92,7 +92,7 @@ describe('zipDetection: only a matched pair becomes an Error zip (BL-489)', () =
     const chunks = ['Intro words. Here <error> is where', ' it went wrong,', ' and then more.']
 
     const out = await stream(service, 'bl489-stream-unclosed', chunks)
-    const flushed = service.takeUnclosedText('bl489-stream-unclosed', 'bl489-stream-unclosed')
+    const flushed = await service.takeHeldText('bl489-stream-unclosed', 'bl489-stream-unclosed')
 
     expect(out.join('') + flushed).toBe(chunks.join(''))
     expect(out[0]).toBe('Intro words. Here ')
@@ -160,7 +160,7 @@ describe('zipDetection: only a matched pair becomes an Error zip (BL-489)', () =
     const out = await stream(service, 'bl489-stream-inline', chunks)
 
     expect(out.join('')).toBe(chunks.join(''))
-    expect(service.takeUnclosedText('bl489-stream-inline', 'bl489-stream-inline')).toBe('')
+    expect(await service.takeHeldText('bl489-stream-inline', 'bl489-stream-inline')).toBe('')
   })
 
   it('leaves a tag inside a zip reference label as text', async () => {
@@ -231,7 +231,7 @@ describe('zipDetection: split opening tags, rescan cost, and end-of-reply cleanu
     const chunks = ['Intro <er', 'ror> unclosed words.']
     const watched = new ZipDetectionService()
     const out = await stream(watched, 'bl489-split-same', chunks)
-    const watchedText = out.join('') + watched.takeUnclosedText('bl489-split-same', 'bl489-split-same')
+    const watchedText = out.join('') + (await watched.takeHeldText('bl489-split-same', 'bl489-split-same'))
 
     const unwatched = await new ZipDetectionService().processFullContent('bl489-split-same-full', 'm1', chunks.join(''))
 
@@ -251,7 +251,7 @@ describe('zipDetection: split opening tags, rescan cost, and end-of-reply cleanu
     const service = new ZipDetectionService()
 
     const out = await stream(service, 'bl489-held-end', ['Ends with <err'])
-    const tail = service.takeUnclosedText('bl489-held-end', 'bl489-held-end', { endOfReply: true })
+    const tail = service.releaseEndedReply('bl489-held-end', 'bl489-held-end')
 
     expect(out.join('') + tail).toBe('Ends with <err')
   })
@@ -261,10 +261,12 @@ describe('zipDetection: split opening tags, rescan cost, and end-of-reply cleanu
     const id = 'bl489-rescan'
     await service.processChunk(id, id, 'x <error>' + 'a'.repeat(5000))
 
+    // How many characters each closing-tag search may read (BL-779 d searches a slice of the new
+    // words; before, it searched the whole held text from a lastIndex): never the held words again.
     const seen: number[] = []
     const realExec = RegExp.prototype.exec
     const spy = function (this: RegExp, input: string) {
-      if (this.source === '<\\/error>') seen.push(this.lastIndex)
+      if (this.source === '<\\/error>') seen.push(input.length - this.lastIndex)
       return realExec.call(this, input)
     }
     RegExp.prototype.exec = spy as typeof RegExp.prototype.exec
@@ -275,7 +277,7 @@ describe('zipDetection: split opening tags, rescan cost, and end-of-reply cleanu
     }
 
     expect(seen.length).toBeGreaterThan(0)
-    expect(Math.min(...seen)).toBeGreaterThanOrEqual(5000 - '</error>'.length + 1)
+    expect(Math.max(...seen)).toBeLessThanOrEqual('bbbb'.length + '</error>'.length - 1)
   })
 
   it('lets go of a reply\'s zip references and context when it ends without end', async () => {
@@ -285,7 +287,7 @@ describe('zipDetection: split opening tags, rescan cost, and end-of-reply cleanu
     await service.processChunk(id, id, 'A <error>trace</error> then <error> never closed')
     expect(service.getMessageReferences(id, id)).toHaveLength(1)
 
-    service.takeUnclosedText(id, id, { endOfReply: true })
+    service.releaseEndedReply(id, id)
 
     expect(service.getMessageReferences(id, id)).toEqual([])
     expect((service as any).messageContexts.has(`${id}:${id}`)).toBe(false)
@@ -307,7 +309,7 @@ describe('zipDetection: a segment taken back leaves no trace (BL-759)', () => {
     expect((await service.processChunk(id, id, ' words', 'msg_1')).content).toBe('')
 
     expect(service.discardSegment(id, id, 'msg_1')).toEqual({ outcome: 'rewound', zipReferences: [] })
-    expect(service.takeUnclosedText(id, id)).toBe('')
+    expect(await service.takeHeldText(id, id)).toBe('')
   })
 
   it('forgets what the segment handed back, so a fence it opened does not make later words code', async () => {
@@ -364,7 +366,7 @@ describe('zipDetection: a segment taken back leaves no trace (BL-759)', () => {
     await service.processChunk(id, id, ' Batshit words')
     expect(service.discardSegment(id, id, 'msg_3').outcome).toBe('superseded')
     await service.processChunk(id, id, '<error>open', 'msg_4')
-    expect(service.takeUnclosedText(id, id)).toBe('<error>open')
+    expect(await service.takeHeldText(id, id)).toBe('<error>open')
     expect(service.discardSegment(id, id, 'msg_4').outcome).toBe('superseded')
 
     expect(service.discardSegment(id, id, 'msg_2').outcome).toBe('superseded')
@@ -389,7 +391,7 @@ describe('zipDetection: the runs a retract can rewind (BL-759 review)', () => {
 
     expect(service.discardSegment(id, id, 'msg_b').outcome).toBe('rewound')
     expect(service.discardSegment(id, id, 'msg_a').outcome).toBe('rewound')
-    expect(service.takeUnclosedText(id, id)).toBe('')
+    expect(await service.takeHeldText(id, id)).toBe('')
     const next = await service.processChunk(id, id, 'Hello <error>t</error>', 'msg_c')
     const [ref] = service.getMessageReferences(id, id)
     expect(next.content).toBe(`Hello ${ref.reference}`)
@@ -414,7 +416,7 @@ describe('zipDetection: the runs a retract can rewind (BL-759 review)', () => {
 
     expect(service.discardSegment(id, id, 'msg_x')).toEqual({ outcome: 'superseded', zipReferences: [] })
     expect(service.getMessageReferences(id, id)).toEqual(refs)
-    expect(service.takeUnclosedText(id, id)).toBe('<error>held')
+    expect(await service.takeHeldText(id, id)).toBe('<error>held')
   })
 
   it('a segment with words read after it is superseded, and the detector changes nothing (cases A and C)', async () => {
@@ -427,6 +429,6 @@ describe('zipDetection: the runs a retract can rewind (BL-759 review)', () => {
 
     expect(service.discardSegment(id, id, 'msg_s')).toEqual({ outcome: 'superseded', zipReferences: [] })
     expect(service.getMessageReferences(id, id)).toEqual(refs)
-    expect(service.takeUnclosedText(id, id)).toBe('<error>steer')
+    expect(await service.takeHeldText(id, id)).toBe('<error>steer')
   })
 })

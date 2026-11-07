@@ -22,8 +22,8 @@ export type StreamEventType =
   | 'steer_queued'
   | 'steer_delivered'
   | 'steer_promoted'
-  // BL-759: a managed lane took back a segment of the reply (a Codex message that dropped and
-  // was started again), and `/api/sse` tells every tab the reply's text as it now reads.
+  // BL-759: a managed lane took back a segment of the reply (a message the removed Codex CLI lane
+  // dropped and started again), and `/api/sse` tells every tab the reply's text as it now reads.
   | 'text_retract'
   | 'content_reset'
   | 'file'           // SA-010: Generated file output (images, etc.)

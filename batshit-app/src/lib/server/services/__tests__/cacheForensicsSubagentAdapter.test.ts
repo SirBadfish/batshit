@@ -63,9 +63,10 @@ describe('cacheForensics managed subagent adapter (P4)', () => {
     })
   })
 
-  it('normalizes AI-SDK-shaped CLI subagent finish usage', () => {
+  // SA-139 R5 removed the Claude Code CLI Subagent lane (runtime `claude`) this shape came from;
+  // an API Subagent's usage can arrive AI-SDK-shaped too, cache writes included.
+  it('normalizes AI-SDK-shaped subagent finish usage', () => {
     const record = build({
-      lane: 'claude',
       usage: {
         inputTokens: 9000,
         outputTokens: 200,
@@ -73,7 +74,7 @@ describe('cacheForensics managed subagent adapter (P4)', () => {
         cacheCreationInputTokens: 500,
       },
     })
-    expect(record.runtime).toBe('claude')
+    expect(record.runtime).toBe('vercel')
     expect(record.providerCacheUsage).toEqual({
       source: 'runtime',
       inputTokens: 9000,
@@ -82,14 +83,10 @@ describe('cacheForensics managed subagent adapter (P4)', () => {
     })
   })
 
-  it('discloses the hidden tool/provider boundaries per lane', () => {
+  it('discloses the hidden tool/provider boundaries of its one lane', () => {
     const api = build()
     expect(api.notes?.join(' ')).toContain('provider-request boundary is not exposed')
     expect(api.notes?.join(' ')).toContain('not fingerprinted in v1')
-
-    const codex = build({ lane: 'codex' })
-    expect(codex.runtime).toBe('codex')
-    expect(codex.notes?.join(' ')).toContain('managed CLI profile')
   })
 
   it('never stores raw prompt or id content (DL-093-05/06)', () => {

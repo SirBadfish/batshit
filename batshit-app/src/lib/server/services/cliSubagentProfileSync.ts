@@ -1,25 +1,8 @@
 import { redis } from '$lib/server/redis'
-import {
-  holdAgentProfileFolder,
-  writeSubagentProfileFolderIfSubagentExists
-} from '$lib/server/services/agentProfileFolderGate'
-import {
-  deleteAgentClaudeConfig,
-  prepareManagedClaudeSubagentProfile
-} from '$lib/server/services/claudeProfileManager'
-import { buildClaudeRuntimeSettings } from '$lib/server/services/claudeSettings'
-import { buildCliSubagentProviderSettings } from '$lib/server/services/cliSubagentProfile'
-import {
-  buildAgentProfileId,
-  deleteAgentCodexConfig,
-  prepareManagedCodexSubagentProfile,
-} from '$lib/server/services/codexProfileManager'
-import { buildCodexRuntimeSettings } from '$lib/server/services/codexSettings'
-import {
-  resolveCliSubagentExecutableModel,
-  resolveCliSubagentRuntime,
-  type CliSubagentRuntime,
-} from '$lib/server/services/cliSubagentModelResolution'
+import { holdAgentProfileFolder } from '$lib/server/services/agentProfileFolderGate'
+import { deleteAgentClaudeConfig } from '$lib/server/services/claudeProfileManager'
+import { buildAgentProfileId } from '$lib/server/services/managedProfileIdentity'
+import { deleteManagedProfileFolder } from '$lib/server/services/managedProfileFolderDelete'
 import type { SubagentRow } from '$lib/types/database'
 import {
   buildCliSubagentRuntimeId,
@@ -27,7 +10,13 @@ import {
   normalizeSubagentSlugValue,
   resolveSubagentSlug
 } from '$lib/utils/subagentSlug'
-import { WORKERS_MAX_PER_CALL } from '$lib/utils/delegationCapabilities'
+import { WORKER_PROFILE_SLOTS } from '$lib/utils/delegationCapabilities'
+
+/**
+ * SA-139 R5: the delete side of the managed CLI profile folders. Nothing writes a CLI Subagent
+ * or CLI Worker profile any more (R5 removed the Claude Code CLI Subagent), but a leftover
+ * record can still have one, and its delete removes it here.
+ */
 
 /** The managed CLI profile folder a Subagent's slug names (`batshit_agent_subagent_cli-<slug>`). */
 function managedCliSubagentProfileId(subagent: SubagentRow): string {
@@ -35,97 +24,15 @@ function managedCliSubagentProfileId(subagent: SubagentRow): string {
 }
 
 /**
- * Writes a CLI Subagent's managed profile folder from `subagent`, a row its caller holds in memory.
- *
- * BL-753 (2026-09-28): the write runs in the folder's turn (`agentProfileFolderGate.ts`) and only
- * while `subagent:<id>` still exists then, read at that turn, so an edit racing the Subagent's
- * delete never makes the deleted Subagent's folder again. `written` is false when the Subagent
- * was gone by then (nothing was written).
- */
-export async function syncManagedCliSubagentProfile(
-  userId: string,
-  subagent: SubagentRow,
-  preferredRuntime?: CliSubagentRuntime | null
-): Promise<{ runtime: CliSubagentRuntime; profileId: string; written: boolean } | null> {
-  const runtime = preferredRuntime ?? resolveCliSubagentRuntime(subagent)
-  if (!runtime) return null
-  const profileId = managedCliSubagentProfileId(subagent)
-  const written = await writeSubagentProfileFolderIfSubagentExists(subagent.id, profileId, () =>
-    writeManagedCliSubagentProfile(userId, subagent, runtime, profileId)
-  )
-  return { runtime, profileId, written }
-}
-
-/**
  * BL-753: runs a Subagent delete's steps from its profile folder removal until its record is
- * gone while holding that folder's turn, so a profile write queued meanwhile finds no record.
+ * gone while holding that folder's turn, so other work queued on that folder meanwhile finds no
+ * record.
  */
 export async function holdManagedCliSubagentProfileFolder<T>(
   subagent: SubagentRow,
   action: () => Promise<T>
 ): Promise<T> {
   return holdAgentProfileFolder(managedCliSubagentProfileId(subagent), action)
-}
-
-async function writeManagedCliSubagentProfile(
-  userId: string,
-  subagent: SubagentRow,
-  runtime: CliSubagentRuntime,
-  profileId: string
-): Promise<void> {
-  const subagentSlug = resolveSubagentSlug(subagent)
-  const runtimeId = buildCliSubagentRuntimeId(subagentSlug)
-  const profileLabel = `${subagent.displayName || subagentSlug} CLI Subagent`
-
-  if (runtime === 'codex') {
-    const runtimeSettings = buildCodexRuntimeSettings(
-      subagent.codex_settings ?? subagent.provider_specific_settings ?? null
-    )
-    const executableModel = resolveCliSubagentExecutableModel(subagent, 'codex')
-    if (executableModel) {
-      runtimeSettings.model = executableModel
-    }
-    runtimeSettings.profileId = profileId
-
-    await prepareManagedCodexSubagentProfile({
-      userId,
-      profileId,
-      runtimeId,
-      label: profileLabel,
-      displayName: subagent.displayName || subagentSlug,
-      slug: subagentSlug,
-      providerSettings: buildCliSubagentProviderSettings(subagent),
-      defaultMCPGateways: subagent.defaultMCPGateways ?? null,
-      defaultMCPToolSelections: subagent.defaultMCPToolSelections ?? null,
-      defaultCliToolIds: subagent.defaultTools ?? null,
-      workingDirectory: null,
-      runtimeSettings,
-    })
-    return
-  }
-
-  const runtimeSettings = buildClaudeRuntimeSettings(
-    subagent.claude_settings ?? subagent.provider_specific_settings ?? null
-  )
-  const executableModel = resolveCliSubagentExecutableModel(subagent, 'claude')
-  if (executableModel) {
-    runtimeSettings.model = executableModel
-  }
-  runtimeSettings.profileId = profileId
-
-  await prepareManagedClaudeSubagentProfile({
-    userId,
-    profileId,
-    runtimeId,
-    label: profileLabel,
-    displayName: subagent.displayName || subagentSlug,
-    slug: subagentSlug,
-    providerSettings: buildCliSubagentProviderSettings(subagent),
-    defaultMCPGateways: subagent.defaultMCPGateways ?? null,
-    defaultMCPToolSelections: subagent.defaultMCPToolSelections ?? null,
-    defaultCliToolIds: subagent.defaultTools ?? null,
-    runtimeSettings,
-  })
 }
 
 export interface ManagedCliSubagentProfileDeletion {
@@ -139,10 +46,10 @@ export interface ManagedCliSubagentProfileDeletion {
 
 /**
  * BL-157 (2026-09-25): a deleted Subagent's managed CLI profile folder goes with it,
- * `~/.batshit/agents/batshit_agent_subagent_cli_<slug>/`: its Codex and Claude config and
- * Codex's `logs_2.sqlite`, which holds its prompts. Every type is asked, since a Subagent that
- * was CLI once keeps its folder after a switch to API or n8n Workflow, and asking for a folder
- * that does not exist deletes nothing.
+ * `~/.batshit/agents/batshit_agent_subagent_cli_<slug>/`: every CLI home inside it, its config,
+ * logs and prompts included. Every type is asked, since a Subagent that was CLI once kept its
+ * folder after a switch to another type, and asking for a folder that does not exist deletes
+ * nothing.
  *
  * The folder is named for the Subagent's SLUG, so a folder another of the user's Subagents
  * resolves to is theirs as well and stays (`sharedWith`). So does a folder one of the user's
@@ -151,9 +58,9 @@ export interface ManagedCliSubagentProfileDeletion {
  * never a Subagent's (`buildCliWorkerRuntimeId`). Other Batshit instances on the same Mac
  * share `~/.batshit/agents` and are not seen from here (BL-285, open). The deletes are the
  * Primary Agent delete's own (BL-7 reviewed): Claude's first, which refuses a `.claude` that is not a
- * managed home and removes only the link of a symlinked one, then Codex's, which removes the
- * profile folder without following links. A failure throws, so the caller can keep the
- * Subagent for a retry.
+ * managed home and removes only the link of a symlinked one, then the whole profile folder
+ * (`deleteManagedProfileFolder`), removed without following links. A failure throws, so the
+ * caller can keep the Subagent for a retry.
  */
 export async function planManagedCliSubagentProfileDeletion(
   userId: string,
@@ -189,7 +96,7 @@ export async function deleteManagedCliSubagentProfile(
   if (!plan.deleted) return plan
   const runtimeId = buildCliSubagentRuntimeId(resolveSubagentSlug(subagent))
   await deleteAgentClaudeConfig(runtimeId)
-  await deleteAgentCodexConfig(runtimeId)
+  await deleteManagedProfileFolder(runtimeId)
   return plan
 }
 
@@ -207,7 +114,7 @@ type AgentWorkerProfilePlan = {
 /** The route pre-acquires guards for exactly the folders this delete will remove. */
 export async function planAgentWorkerProfileDeletion(userId: string, agentId: string): Promise<AgentWorkerProfilePlan> {
   const parentSlug = normalizeSubagentSlugValue(agentId, 'agent')
-  const slots = Array.from({ length: WORKERS_MAX_PER_CALL }, (_, index) => `worker_${parentSlug}_${index + 1}`)
+  const slots = Array.from({ length: WORKER_PROFILE_SLOTS }, (_, index) => `worker_${parentSlug}_${index + 1}`)
   const slotFolders = slots.flatMap((slot) => [
     { slot, runtimeId: buildCliWorkerRuntimeId(slot), legacy: false },
     { slot, runtimeId: buildCliSubagentRuntimeId(slot), legacy: true }
@@ -252,15 +159,15 @@ export async function planAgentWorkerProfileDeletion(userId: string, agentId: st
 }
 
 /**
- * BL-393 (2026-09-27): a deleted Primary Agent's Worker slot folders go with it. Its Workers run
- * in one folder per position in a batch (`worker_<agent slug>_<1..3>`, `workerRunner.ts`), each
- * with Codex's `logs_2.sqlite` holding the Workers' prompts, and the agent's delete removed only
- * its own folder. Both names a slot has had are removed: `subagent_cli-worker_…` since BL-285
- * and `subagent_cli_worker_…` before it. The deletes are the careful ones the agent's own folder
- * uses (Claude's home first, then the folder without following links).
+ * BL-393 (2026-09-27): a deleted Primary Agent's Worker slot folders go with it. Its CLI Workers
+ * ran in one folder per slot (`worker_<agent slug>_<1..WORKER_PROFILE_SLOTS>`, until SA-139 R5
+ * removed the CLI Worker), each holding the Workers' prompts and logs, and the agent's delete
+ * removed only its own folder. Both names a slot has had are removed: `subagent_cli-worker_…`
+ * since BL-285 and `subagent_cli_worker_…` before it. The deletes are the careful ones the
+ * agent's own folder uses (Claude's home first, then the folder without following links).
  *
  * Never a folder another record also owns: another of the user's agents with the same slug
- * (`Cooper` and `cooper`) runs its Workers in the same slots, so they all stay; and an old-name
+ * (`Cooper` and `cooper`) ran its Workers in the same slots, so they all stay; and an old-name
  * slot a Subagent slugged `worker_<agent>_<n>` resolves to is that Subagent's folder too.
  */
 export async function deleteAgentWorkerProfiles(
@@ -271,7 +178,7 @@ export async function deleteAgentWorkerProfiles(
   const result: AgentWorkerProfileDeletion = { deleted: [], kept: plan.kept }
   for (const { profileId, runtimeId } of plan.deletable) {
     await deleteAgentClaudeConfig(runtimeId)
-    await deleteAgentCodexConfig(runtimeId)
+    await deleteManagedProfileFolder(runtimeId)
     result.deleted.push(profileId)
   }
   return result

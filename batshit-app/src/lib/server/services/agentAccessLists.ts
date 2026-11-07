@@ -1,6 +1,11 @@
 import { redis } from '$lib/server/redis'
 import type { SlashCommandRow } from '$lib/types/database'
-import { sanitizeId } from '$lib/utils/idSanitizer'
+import { isExactSavedAccessAgentId } from '$lib/utils/agentAccessIds'
+import { AGENT_ID_PATTERN } from './agentIdRules'
+import {
+  saveSlashCommandRecord, commitSlashCommandAgentAccess,
+  type CommandAccessField, type SlashCommandWriteBasis
+} from './slashCommandRevision'
 
 /**
  * BL-544: the per-agent access lists, a skill's `enabled_agent_ids` and an artifact's
@@ -32,108 +37,34 @@ import { sanitizeId } from '$lib/utils/idSanitizer'
  * turning one off writes every OTHER id of ARGV[4] as an explicit list, in this same step, so the
  * others keep the skill. An empty list is different: on for nobody.
  */
-export const SET_SLASH_COMMAND_AGENT_ACCESS_SCRIPT = `
-if redis.call('EXISTS', KEYS[1]) == 0 then
-  return 'MISSING'
-end
-local add = ARGV[2] == 'add'
-local found = redis.call('JSON.GET', KEYS[1], '$.enabled_agent_ids')
-local nextList = {}
-if found == '[]' then
-  if add then
-    return 'UNCHANGED'
-  end
-  for _, value in ipairs(cjson.decode(ARGV[4])) do
-    if value ~= ARGV[1] then
-      table.insert(nextList, value)
-    end
-  end
-else
-  local stored = cjson.decode(found)[1]
-  local current = {}
-  if type(stored) == 'table' then
-    current = stored
-  end
-  local present = false
-  for _, value in ipairs(current) do
-    if value == ARGV[1] then
-      present = true
-    else
-      table.insert(nextList, value)
-    end
-  end
-  if (add and present) or ((not add) and (not present)) then
-    return 'UNCHANGED'
-  end
-  if add then
-    table.insert(nextList, ARGV[1])
-  end
-end
-local encoded = '[]'
-if #nextList > 0 then
-  encoded = cjson.encode(nextList)
-end
-redis.call('JSON.SET', KEYS[1], '$.enabled_agent_ids', encoded)
-local forAll = cjson.decode(redis.call('JSON.GET', KEYS[1], '$.enabled_for_all_agents'))[1] == true
-local attachable = 'false'
-if forAll or #nextList > 0 then
-  attachable = 'true'
-end
-redis.call('JSON.SET', KEYS[1], '$.can_be_attached_to_agents', attachable)
-redis.call('JSON.SET', KEYS[1], '$.updated_at', ARGV[3])
-return 'OK'
-`
-
-/**
- * Write a whole skill command record. KEYS[1]: the command. ARGV[1]: the next record as JSON.
- * ARGV[2]: `keep` (the stored `enabled_agent_ids` stays exactly as it is at this moment, absent
- * included, whatever the record carries) or `replace` (the record's own list is written).
- * `can_be_attached_to_agents` is derived again from what was written. Answers `MISSING` when the
- * command is gone (a write never makes a deleted command again), otherwise the stored record as
- * `JSON.GET $` text.
- */
-export const WRITE_SLASH_COMMAND_RECORD_SCRIPT = `
-if redis.call('EXISTS', KEYS[1]) == 0 then
-  return 'MISSING'
-end
-local keep = ARGV[2] == 'keep'
-local storedList = nil
-if keep then
-  -- JSONPath answers every match in a list: '[]' when the field is absent, '[<list>]' otherwise.
-  local found = redis.call('JSON.GET', KEYS[1], '$.enabled_agent_ids')
-  if found ~= '[]' then
-    storedList = string.sub(found, 2, -2)
-  end
-end
-redis.call('JSON.SET', KEYS[1], '$', ARGV[1])
-if keep then
-  if storedList then
-    redis.call('JSON.SET', KEYS[1], '$.enabled_agent_ids', storedList)
-  else
-    redis.call('JSON.DEL', KEYS[1], '$.enabled_agent_ids')
-  end
-end
-local forAll = cjson.decode(redis.call('JSON.GET', KEYS[1], '$.enabled_for_all_agents'))[1] == true
-local written = cjson.decode(redis.call('JSON.GET', KEYS[1], '$.enabled_agent_ids'))[1]
-local count = 0
-if type(written) == 'table' then
-  count = #written
-end
-local attachable = 'false'
-if forAll or count > 0 then
-  attachable = 'true'
-end
-redis.call('JSON.SET', KEYS[1], '$.can_be_attached_to_agents', attachable)
-return redis.call('JSON.GET', KEYS[1], '$')
-`
+export { SET_SLASH_COMMAND_AGENT_ACCESS_SCRIPT } from './slashCommandRevision'
 
 export function slashCommandKey(userId: string, commandId: string) {
   return `slash_command:${userId}:${commandId}`
 }
 
-/** An agent id as every access-list writer stores it (the skill routes' `sanitizeAgentIds`). */
+/** Stored IDs are identities, not display-name slugs (BL1614). */
 export function normalizeAccessAgentId(value: unknown): string {
-  return sanitizeId(String(value ?? '').trim())
+  if (typeof value !== 'string') return ''
+  const id = value.trim()
+  return AGENT_ID_PATTERN.test(id) ? id : ''
+}
+
+/** Validate an explicitly supplied list. Never apply this as a stored-ID migration. */
+export function parseAccessAgentIds(value: unknown): string[] {
+  if (!Array.isArray(value)) throw Object.assign(new Error('Send a list of agent IDs.'), { status: 400 })
+  const ids = value.map(normalizeAccessAgentId)
+  if (ids.some(id => !id)) throw Object.assign(new Error('Each agent ID must use only letters, digits, "_" and "-".'), { status: 400 })
+  return [...new Set(ids)]
+}
+
+/** Saved identities must already be exact. Absence retains legacy universal meaning. */
+export function readSavedAccessAgentIds(value: unknown): string[] | undefined {
+  if (value === undefined) return undefined
+  if (!Array.isArray(value) || value.some(id => !isExactSavedAccessAgentId(id))) {
+    throw Object.assign(new Error('The saved agent access list is unreadable. No access change was made.'), { status: 409 })
+  }
+  return [...value]
 }
 
 export type AgentAccessChange = { agentId: string; enabled: boolean }
@@ -144,7 +75,9 @@ export function parseAgentAccessChange(body: unknown): AgentAccessChange | { err
     return { error: 'Send { agentId, enabled }: the agent to turn on or off, and whether it is on.' }
   }
   const raw = body as Record<string, unknown>
-  const agentId = typeof raw.agentId === 'string' ? normalizeAccessAgentId(raw.agentId) : ''
+  const agentId = raw.enabled === false
+    ? isExactSavedAccessAgentId(raw.agentId) ? raw.agentId : ''
+    : normalizeAccessAgentId(raw.agentId)
   if (!agentId) return { error: 'agentId must name an agent or Subagent.' }
   if (typeof raw.enabled !== 'boolean') return { error: 'enabled must be true or false.' }
   return { agentId, enabled: raw.enabled }
@@ -171,61 +104,28 @@ export type SlashCommandAccessAnswer = 'OK' | 'UNCHANGED' | 'MISSING'
  * who a skill with no list reaches in Access. A Worker made for one call has a fresh id and is not
  * listed, so once a list is written it keeps such a skill only through Enable For All Agents.
  */
-async function listOwnAgentAndSubagentIds(
-  client: { sMembers: (key: string) => Promise<string[]> },
-  userId: string
-): Promise<string[]> {
-  const [agents, subagents] = await Promise.all([
-    client.sMembers(`user:${userId}:agents`),
-    client.sMembers(`user:${userId}:subagents`)
-  ])
-  return Array.from(new Set([...agents, ...subagents].map((id) => String(id)).filter(Boolean))).sort()
+export function setSlashCommandAgentAccess(userId: string, commandId: string, agentId: string, enabled: boolean, basis: SlashCommandWriteBasis) {
+  return commitSlashCommandAgentAccess(userId, commandId, agentId, enabled, basis, false)
 }
 
-/** Turn one agent on or off for one skill command (`SET_SLASH_COMMAND_AGENT_ACCESS_SCRIPT`). */
-export async function setSlashCommandAgentAccess(
-  userId: string,
-  commandId: string,
-  agentId: string,
-  enabled: boolean
-): Promise<SlashCommandAccessAnswer> {
-  const answer = await redis.execute(async (client) => {
-    // Only a record with no list reads these (turning one agent off keeps every other one on).
-    const everyone = enabled ? [] : await listOwnAgentAndSubagentIds(client, userId)
-    return client.eval(SET_SLASH_COMMAND_AGENT_ACCESS_SCRIPT, {
-      keys: [slashCommandKey(userId, commandId)],
-      arguments: [
-        agentId,
-        enabled ? 'add' : 'remove',
-        JSON.stringify(new Date().toISOString()),
-        JSON.stringify(everyone)
-      ]
-    })
-  })
-  if (answer === 'OK' || answer === 'UNCHANGED' || answer === 'MISSING') return answer
-  throw new Error(`The access change of skill command ${commandId} answered ${String(answer)}.`)
+/** Deletion removes only named entries; it never converts universal legacy access. */
+export function removeExplicitSlashCommandAgentAccess(userId: string, commandId: string, agentId: string, basis: SlashCommandWriteBasis) {
+  return commitSlashCommandAgentAccess(userId, commandId, agentId, false, basis, true)
 }
 
 /**
- * Write a whole skill command record (`WRITE_SLASH_COMMAND_RECORD_SCRIPT`). With `keepAgentAccess`
+ * Write a whole skill command record through the revision owner. With `keepAgentAccess`
  * the stored per-agent list stays as it is at the moment of the write. Answers the record as
  * stored, or `null` when the command was deleted meanwhile (nothing is written then).
  */
 export async function writeSlashCommandRecord(
   key: string,
   record: SlashCommandRow,
-  options: { keepAgentAccess: boolean }
+  options: { keepAgentAccess: boolean; preserveAccess?: readonly CommandAccessField[] },
+  basis: SlashCommandWriteBasis
 ): Promise<SlashCommandRow | null> {
-  const answer = await redis.execute((client) =>
-    client.eval(WRITE_SLASH_COMMAND_RECORD_SCRIPT, {
-      keys: [key],
-      arguments: [JSON.stringify(record), options.keepAgentAccess ? 'keep' : 'replace']
-    })
-  )
-  if (answer === 'MISSING') return null
-  if (typeof answer !== 'string') {
-    throw new Error(`The write of skill command ${key} answered ${String(answer)}.`)
-  }
-  const [stored] = JSON.parse(answer) as SlashCommandRow[]
-  return stored
+  if (key !== slashCommandKey(record.user_id, record.id)) throw new Error('Command identity changed.')
+  return saveSlashCommandRecord(record.user_id, { record, mode: 'update', preserveAccess: [...new Set<CommandAccessField>([
+    ...(options.keepAgentAccess ? ['enabled_agent_ids' as const] : []), ...(options.preserveAccess ?? [])
+  ])] }, basis)
 }

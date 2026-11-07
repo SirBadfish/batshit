@@ -18,14 +18,14 @@ import { describe, expect, it } from 'vitest'
 
 const REPO_ROOT = path.resolve(__dirname, '../../../../../..')
 
-/** The seven texts from SA-116 Part 2.3, plus the two mirrors DL-116-13 names. */
+/** Canonical native operating guides/references, plus the held portable mirrors. */
 const GUIDANCE_PAGES = [
-  'batshit-app/src/lib/server/system-skills/cli-tools/SKILL.md',
-  'batshit-app/src/lib/server/system-skills/speech-setup/SKILL.md',
-  'batshit-app/src/lib/server/system-skills/speech-setup/references/registration-patterns.md',
-  'batshit-app/src/lib/server/system-skills/speech-setup/references/local-self-hosted-engines.md',
-  'batshit-app/src/lib/server/system-skills/speech-setup/references/mlx-audio-apple-silicon.md',
-  'batshit-app/src/lib/server/system-skills/artifacts/references/fabric-and-agent-use.md',
+  'batshit-app/src/lib/server/system-plugins/batshit/skills/cli-tool-creator/references/native.md',
+  'batshit-app/src/lib/server/system-plugins/batshit/skills/voice-engine-installer/references/native.md',
+  'batshit-app/src/lib/server/system-plugins/batshit/skills/voice-engine-installer/references/registration-patterns.md',
+  'batshit-app/src/lib/server/system-plugins/batshit/skills/voice-engine-installer/references/local-self-hosted-engines.md',
+  'batshit-app/src/lib/server/system-plugins/batshit/skills/voice-engine-installer/references/mlx-audio-apple-silicon.md',
+  'batshit-app/src/lib/server/system-plugins/batshit/skills/artifact-creator/references/fabric-and-agent-use.md',
   'batshit-portable-skills/voice-engine-installer/references/registration-patterns.md',
   'batshit-portable-skills/voice-engine-installer/references/local-self-hosted-engines.md',
   'batshit-portable-skills/voice-engine-installer/references/mlx-audio-apple-silicon.md',
@@ -66,15 +66,5 @@ describe('SA-116 DL-116-13: no shipped text still teaches the retired flag', () 
     expect(proxy).not.toContain('confirm/restricted controls require allowRisky=true')
     expect(proxy).toContain("PAUSE for the user's Approve click")
     expect(proxy).toContain('allowRisky is accepted and IGNORED')
-  })
-
-  it('the managed CLI helper marks the flag ignored where the model reads its schema', () => {
-    // The helper still ACCEPTS the flag (P1 kept it deliberately, so a stale caller gets
-    // the pause rather than a type error), but a bare boolean in a schema is itself an
-    // invitation to try it.
-    const helper = read('batshit-app/scripts/mode4-controls-mcp.cjs')
-    const bareFlagDeclarations = helper.match(/allowRisky: \{ type: 'boolean' \}/g) ?? []
-    expect(bareFlagDeclarations).toHaveLength(0)
-    expect(helper).toContain('Ignored (SA-116)')
   })
 })

@@ -460,6 +460,82 @@ describe('messageFormatter – tag scanner review fixes', () => {
   })
 })
 
+describe('messageFormatter – tag scanner leftovers (BL-813)', () => {
+  const ZIP = 'cool_tool_1790500000000_abcde'
+
+  it('does not let lone backticks pair over a two-line tag in the second scan', () => {
+    for (const content of ['`\n<terminal>\n```out</terminal>\nthen `x', '`\n<terminal>ls\n```</terminal>\nthen `x']) {
+      const segments = parseMessageContent(content, 'assistant')
+      expect(segments.map((segment) => segment.type)).toEqual(['text', 'terminal', 'text'])
+      expect(segments[0].content).toBe('`')
+      expect(segments[2].content).toBe('then `x')
+    }
+  })
+
+  it('still reads a code span that a two-line tag does not stand inside', () => {
+    const content = '`<terminal>` is a tag.\n<terminal>\n```out</terminal>\nAfter.'
+    const segments = parseMessageContent(content, 'assistant')
+    expect(segments.map((segment) => segment.type)).toEqual(['text', 'terminal', 'text'])
+    expect(segments[0].content).toBe('`<terminal>` is a tag.')
+  })
+
+  it('keeps reading after a zip reference that an unfinished opening tag ran into', () => {
+    const content = `Use <img src=x then {{batshit-zip:${ZIP}:::read}} done.\n<terminal>ok</terminal>\nEnd.`
+    const segments = parseMessageContent(content, 'assistant', undefined, undefined, new Set([ZIP]))
+    expect(segments.map((segment) => segment.type)).toEqual(['text', 'cool_tool', 'text', 'terminal', 'text'])
+    expect(segments[0].content).toBe('Use <img src=x then')
+    expect(segments[2].content).toBe('done.')
+    expect(segments[3].content).toBe('ok')
+  })
+
+  it('stays linear when many unfinished opening tags each run into a zip reference', () => {
+    const content = `${`<img src=x {{batshit-zip:${ZIP}:::read}} `.repeat(20000)}<terminal>ok</terminal>`
+    const started = performance.now()
+    const segments = parseMessageContent(content, 'assistant', undefined, undefined, new Set([ZIP]))
+    expect(performance.now() - started).toBeLessThan(1500)
+    expect(segments.at(-1)?.type).toBe('terminal')
+  })
+})
+
+describe('messageFormatter – an opening tag still arriving over several lines (BL-780)', () => {
+  const types = (content: string) => parseMessageContent(content, 'assistant').map((segment) => segment.type)
+
+  it('hides an opening tag whose attributes are still arriving on later lines, then draws the card', () => {
+    for (const content of [
+      'Hi\n<terminal\n  title="x"',
+      'Hi\n<terminal\n  title="x"\n  data-a=1',
+      'Hi\n<file\n  path="a.txt"\n  type=text/pl',
+      'Hi\n<file\n  path="a\nb.txt',
+      'Hi\n<image\n  src="https://example.com/a.png"\n  /',
+      'Hi\n<terminal\n  tit'
+    ]) {
+      const segments = parseMessageContent(content, 'assistant', undefined, [], undefined, [], { streaming: true })
+      expect(segments).toEqual([{ type: 'text', content: 'Hi' }])
+    }
+    expect(types('Hi\n<terminal\n  title="x">ls</terminal>')).toEqual(['text', 'terminal'])
+  })
+
+  it('shows a finished reply\'s multi-line opening tag that never closed as the text its record keeps', () => {
+    for (const content of ['Here is the tag:\n<img\n  src="https://example.com/a.png"', 'Open the <terminal\nnow', 'Hi\n<terminal\n  title="x"']) {
+      expect(parseMessageContent(content, 'assistant')).toEqual([{ type: 'text', content }])
+    }
+  })
+
+  it('keeps a tag named in prose, and the words after it, as text', () => {
+    for (const content of [
+      'Use <img tags\nlike this.',
+      'Use <file path=a\nthen more',
+      'A <terminal\n\n  title="x"',
+      'A <terminal\n  title="x" <b'
+    ]) {
+      for (const streaming of [true, false]) {
+        const segments = parseMessageContent(content, 'assistant', undefined, [], undefined, [], { streaming })
+        expect(segments).toEqual([{ type: 'text', content }])
+      }
+    }
+  })
+})
+
 // BL-693: both public parser paths are used by structured transcript export.
 describe('messageFormatter unfinished reference scans', () => {
   it.each(['zip', 'clip'] as const)('preserves unfinished %s text promptly in the fallback path', (kind) => {

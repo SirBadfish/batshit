@@ -93,14 +93,14 @@ describe('dispatch doors resolve the saved CLI tool scope (BL-686)', () => {
     expect(params.selectedToolIds).toBeUndefined()
   })
 
-  it('cli_tool_use on the agent lane is bounded by the credential list, [] when it has none', async () => {
+  it('cli_tool_use respects an in-process ceiling and does not invent one when absent', async () => {
     await nativeToolService.dispatchNativeAutomationPackAction({
       userId: 'user-1',
       action: 'cli_tool_use',
       payloadInput: { toolId: 'b_tool', input: {}, selectedToolIds: ['b_tool'] },
       context: primaryContext,
       projectPath: '/tmp',
-      actorType: 'agent',
+      actorType: 'in-process',
       cliToolScope: ['a_tool']
     })
     expect(cliMocks.resolveCliToolSelectionScope).toHaveBeenLastCalledWith(
@@ -113,11 +113,9 @@ describe('dispatch doors resolve the saved CLI tool scope (BL-686)', () => {
       payloadInput: { toolId: 'a_tool', input: {} },
       context: primaryContext,
       projectPath: '/tmp',
-      actorType: 'agent'
+      actorType: 'in-process'
     })
-    expect(cliMocks.resolveCliToolSelectionScope).toHaveBeenLastCalledWith(
-      expect.objectContaining({ cliToolScope: [] })
-    )
+    expect(cliMocks.resolveCliToolSelectionScope.mock.calls.at(-1)?.[0]).not.toHaveProperty('cliToolScope')
   })
 
   it('cli_tool_find hands findCliTools the resolved list, never the payload list', async () => {

@@ -58,9 +58,9 @@ describe('steerInbox', () => {
 
   it('does not blank text a previous event already supplied', () => {
     applySteerQueued(queued())
-    applySteerDelivered({ sessionId: 's1', messageId: 'm1', steerId: 'steer_a', lane: 'codex' })
+    applySteerDelivered({ sessionId: 's1', messageId: 'm1', steerId: 'steer_a', lane: 'claude' })
     expect(getSteer('steer_a')?.text).toBe('also run the tests')
-    expect(getSteer('steer_a')?.lane).toBe('codex')
+    expect(getSteer('steer_a')?.lane).toBe('claude')
   })
 
   it('starts a local send in the queued state, which is normal for seconds on a CLI lane', () => {
@@ -470,8 +470,10 @@ describe('a queued send (BL-4)', () => {
     expect(steerBubbleStatusLabel(getSteer('msg-b')!)).toBe('Not sent — you stopped the reply')
 
     applySteerQueued(queuedSend({ steerId: 'msg-c' }))
+    // BL-903 (c): Batshit stopping (or a restore) is the plain "Not sent": no reply ended for it.
     applySteerDropped({ steerIds: ['msg-c'], reason: 'shutdown' })
-    expect(getSteer('msg-c')).toMatchObject({ state: 'dropped', dropReason: 'unanswered' })
+    expect(getSteer('msg-c')).toMatchObject({ state: 'dropped', dropReason: 'not_sent' })
+    expect(steerBubbleStatusLabel(getSteer('msg-c')!)).toBe('Not sent')
   })
 
   it('comes back whenever the same message is queued again, whatever the two clocks say (review finding 4)', () => {
@@ -587,7 +589,7 @@ describe('a queued send at an approval card (BL-713)', () => {
     applySteerDropped({ steerIds: ['msg-c'], reason: 'approval_expired' })
     expect(getSteer('msg-b')).toMatchObject({ state: 'dropped', dropReason: 'approval_wait' })
     expect(steerBubbleStatusLabel(getSteer('msg-b')!)).toBe(
-      'Not sent — the approval card is still waiting for your answer. Send it when you are ready.'
+      'Not sent — it stopped waiting for the approval card. Send it when you are ready.'
     )
     expect(getSteer('msg-c')).toMatchObject({ state: 'dropped', dropReason: 'approval_expired' })
     expect(steerBubbleStatusLabel(getSteer('msg-c')!)).toBe(HELD_CARD_EXPIRED_SENTENCE)

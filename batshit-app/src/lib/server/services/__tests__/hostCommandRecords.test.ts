@@ -6,7 +6,7 @@ import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { pathToFileURL } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
-import { HostCommandRecordStore, type HostCommandRecord, type HostDeleteHolder } from '../hostCommandRecords'
+import { HostCommandRecordStore, type HostCommandRecord, type HostDeleteHolder, type HostOriginalRequestRecord } from '../hostCommandRecords'
 
 const roots: string[] = []
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }) })
@@ -29,6 +29,67 @@ const record = (resources = ['owner:user:agent:a', 'profile:batshit_agent_a']): 
   bootId: 'boot-one', namespaceId: 'host', instanceId: 'instance-one', lane: 'mac',
   owner: { userId: 'user', kind: 'agent', id: 'a' }, profileId: 'batshit_agent_a',
   sessionId: 'session-one', messageId: 'message-one', program: 'codex', phase: 'prepared', processes: []
+})
+const originalRequest = (): HostOriginalRequestRecord => ({
+  version: 1, kind: 'p5-original-request', runId: 'original-one', resources: record().resources,
+  bootId: 'boot-one', namespaceId: 'host', instanceId: 'instance-one', lane: 'p5',
+  owner: { userId: 'user', kind: 'agent', id: 'a' }, profileId: 'batshit_agent_a',
+  sessionId: 'session-one', messageId: 'message-one', requestId: 'request-one', phase: 'active', children: [],
+  journal: { outer: 'open', continuation: 'open', replies: [{ id: 'reply-one', save: 'expected' }], nativeRuns: [], management: [] },
+})
+
+// Nothing writes `p5-original-request` receipts any more (the Codex-parent MCP request owner
+// was retired); a profile could still hold one from an older app. Plant it as stored rows.
+const plantOriginalRequest = (root: string, store: HostCommandRecordStore, request: HostOriginalRequestRecord) => {
+  store.pin(request.resources)
+  for (const resource of request.resources) {
+    const db = new DatabaseSync(location(root, resource))
+    try { db.prepare('INSERT INTO runs(run_id,record) VALUES (?,?)').run(request.runId, JSON.stringify(request)) }
+    finally { db.close() }
+  }
+}
+
+describe('leftover original-request receipts', () => {
+  it('still reads a leftover receipt, holds deletion, and retires exactly its copies', () => {
+    const { root, store } = fixture(), request = originalRequest()
+    request.requestId = '01234567-89ab-4cde-8fab-0123456789ab'
+    request.journal.generations = [{ index: 0, relativePath: `runtime/mcp-workflow/${request.requestId}/codex-0/home`,
+      directory: 'unknown', config: 'not_started', assets: 'not_started', auth: 'not_started', native: 'not_started', cleanup: 'not_started' }]
+    plantOriginalRequest(root, store, request)
+    const [stored] = new HostCommandRecordStore({ root }).records(request.resources)
+    expect(stored).toEqual({ ...request, resources: [...request.resources].sort() })
+    expect(() => store.beginDelete(request.resources, { holder })).toThrow('Unresolved host run')
+    store.retireOriginalRequest(stored as HostOriginalRequestRecord)
+    expect(store.records(request.resources)).toEqual([])
+    const deletion = store.beginDelete(request.resources, { holder })
+    store.finishDelete(deletion, { success: true })
+  })
+  it('keeps a leftover receipt while an associated child row remains', () => {
+    const { root, store } = fixture(), child = record(), request = { ...originalRequest(), children: [child.runId] }
+    plantOriginalRequest(root, store, request)
+    store.prepare(child, store.pin(child.resources))
+    expect(() => store.retireOriginalRequest(request)).toThrow('Associated child custody')
+    expect(store.records(request.resources)).toHaveLength(2)
+    store.complete(child)
+    store.retireOriginalRequest(request)
+    expect(store.records(request.resources)).toEqual([])
+  })
+  it('retires only an exact stored copy and retains every copy when persistence fails', () => {
+    const { root, store } = fixture(), request = originalRequest()
+    plantOriginalRequest(root, store, request)
+    const changed = { ...request, journal: { ...request.journal, outer: 'sealed' as const } }
+    expect(() => store.retireOriginalRequest(changed)).toThrow('Stale or inconsistent original-request receipt')
+    const db = new DatabaseSync(location(root, [...request.resources].sort()[1]))
+    try { db.exec("CREATE TRIGGER keep_original BEFORE DELETE ON runs BEGIN SELECT RAISE(ABORT,'hold original'); END;") }
+    finally { db.close() }
+    expect(() => store.retireOriginalRequest(request)).toThrow('hold original')
+    expect(new HostCommandRecordStore({ root }).records(request.resources)).toHaveLength(1)
+  })
+  it('still rejects a malformed leftover receipt instead of guessing its custody', () => {
+    const { root, store } = fixture(), request = Object.assign(originalRequest(), { processes: [], argv: ['synthetic-secret'] })
+    plantOriginalRequest(root, store, request as HostOriginalRequestRecord)
+    expect(() => store.records(request.resources)).toThrow('Malformed original-request receipt')
+  })
 })
 
 describe('host command records', () => {

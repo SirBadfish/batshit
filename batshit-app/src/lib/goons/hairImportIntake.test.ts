@@ -386,7 +386,7 @@ describe("hairImportIntake", () => {
       inspectHairImportSource({
         bytes: genericGlbFixture({}, { bufferUri: "x.bin" }),
       }),
-    ).toThrow(/URI reference/);
+    ).toThrow(/GLB embedded buffer must not declare a URI/);
     expect(() =>
       inspectHairImportSource({
         bytes: genericGlbFixture({

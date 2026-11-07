@@ -25,21 +25,19 @@
 import {
   MAX_PENDING_STEERS,
   STEER_DM_ALREADY_PENDING_REASON,
-  buildSteerSendPayload,
   type DeliveredSteer,
   type SteerEntry,
-  type SteerLane,
-  type SteerSendPayload
+  type SteerLane
 } from '$lib/utils/steerControl'
 
 /**
  * SA-119 P1 (DL-119-05) — is this entry Queue rather than Steer?
  *
- * ONE predicate, read by both take-for-delivery functions, because the API lane's hook and
- * the two CLI lanes' flush are the only two doors to a tool boundary and they must not come
- * to disagree about what "held" means. A held entry injected at a boundary is the user's
- * NEXT message arriving inside the answer it was meant to follow — on whichever lane nobody
- * re-checked.
+ * ONE predicate for every take at a tool boundary, so a door added later cannot come to
+ * disagree about what "held" means. A held entry injected at a boundary is the user's NEXT
+ * message arriving inside the answer it was meant to follow. Today the one door is
+ * `takePendingSteersForDelivery` (the `prepareStep` hook, which the Claude plan connection
+ * runs through too); SA-139 R4 removed the managed CLI's push.
  *
  * Deliberately NOT applied by `takeUndeliveredSteers`: the end of the turn is exactly where
  * a held entry is supposed to be taken, beside every steer that never found a boundary, in
@@ -50,23 +48,8 @@ function isHeldForEndOfTurn(entry: SteerEntry): boolean {
 }
 
 interface SteerInboxState {
-  /** Accepted, not yet handed to any transport. */
+  /** Accepted, not yet handed to the model. */
   pending: SteerEntry[]
-  /**
-   * P2 — written to a managed CLI's wire, not yet echoed back by it.
-   *
-   * The API lane has no such state: `prepareStep` returning the injected message IS the
-   * delivery, so `takePendingSteersForDelivery` moves straight from `pending` to
-   * `delivered`. Both CLI lanes are asynchronous — Codex accepts a `turn/steer` and emits
-   * its own `userMessage` item for it (AMD-114-02), Claude reads a stdin line and replays
-   * it only when it hands it to the model (AMD-114-01) — so between the write and the echo
-   * a steer has left Batshit but has NOT reached the model. It waits here.
-   *
-   * An entry that is still in flight when the turn ends was never read, so it is promoted
-   * exactly like one that never left (`takeUndeliveredSteers`). That is AMD-114-01's rule:
-   * every unechoed steer is promoted.
-   */
-  inFlight: SteerEntry[]
   /** Reached the model, not yet written into the transcript by send-routed. */
   delivered: DeliveredSteer[]
   updatedAt: number
@@ -75,26 +58,18 @@ interface SteerInboxState {
 /**
  * P2 (DL-114-06, DL-114-08, DL-114-09) — the running turn, as steering sees it.
  *
- * Two facts live here, registered together because they are decided together.
- *
  * **Can it be steered, and why not.** `resolveSteerability` answers that once, in
  * send-routed, at the moment the run is registered — it is the only place that knows the
- * agent type, whether this is a group member's run, and which transport lane a `cli`
- * primary is about to take. The steer route reads the answer instead of re-deriving it,
- * because a second derivation is how the route would come to promise a steer the turn
- * cannot carry. It lives in THIS module rather than on the stream-abort entry for the same
- * reason DL-114-02 gave the inbox its own map: the interrupt path and its registry stay
- * byte-identical through this story (DL-114-15), and steering may not grow a field on them.
+ * agent type and whether this is a group member's run. The steer route reads the answer
+ * instead of re-deriving it, because a second derivation is how the route would come to
+ * promise a steer the turn cannot carry. It lives in THIS module rather than on the
+ * stream-abort entry for the same reason DL-114-02 gave the inbox its own map: the interrupt
+ * path and its registry stay byte-identical through this story (DL-114-15), and steering may
+ * not grow a field on them.
  *
- * **How to reach it.** The API lane PULLS: the SDK calls `prepareStep` between steps and
- * the hook takes whatever is waiting, so it registers no `send` at all. Neither CLI lane
- * has such a callback, and waiting for the next tool boundary to push would be worse than
- * useless on Claude — a line written after a boundary is consumed at the NEXT one, and a
- * reply with a single tool call would never deliver. So the route PUSHES: it enqueues, then
- * hands the text straight to the running transport, which holds it until its own next
- * boundary exactly as both vendors document. `send` is attached separately from the verdict
- * because the child process does not exist until `streamNativeMode` resolves, a few
- * seconds after the run is registered.
+ * **How to reach it.** The run PULLS: the SDK calls `prepareStep` between steps and the hook
+ * takes whatever is waiting (`takePendingSteersForDelivery`). SA-139 R4 removed the managed
+ * CLI Primary, the one run the route pushed to.
  */
 export interface SteerRunRegistration {
   /** The assistant message id this run is writing. A later turn registers its own. */
@@ -104,11 +79,11 @@ export interface SteerRunRegistration {
   reason: string | null
   lane: SteerLane | null
   /**
-   * Managed CLI runs only. Resolves `true` when the transport ACCEPTED the write, which is
-   * not the same as the model having read it — that is the echo, and it arrives later as a
-   * synthetic `steer` chunk in the same stream.
+   * SA-139 BL-2358: the longest agent DM, in its model wrapper, this run can hand into the reply.
+   * The Claude plan connection hands a DM steer to Claude Code as a hook note, which Claude Code
+   * passes on whole only up to its limit. Absent or null: no limit.
    */
-  send?: ((payload: SteerSendPayload) => Promise<boolean>) | null
+  dmSteerLimit?: number | null
 }
 
 const inboxes = new Map<string, SteerInboxState>()
@@ -135,7 +110,7 @@ function getState(sessionId: string): SteerInboxState | null {
 }
 
 function emptyState(now: number): SteerInboxState {
-  return { pending: [], inFlight: [], delivered: [], updatedAt: now }
+  return { pending: [], delivered: [], updatedAt: now }
 }
 
 export type SteerEnqueueResult =
@@ -167,15 +142,11 @@ export function enqueueSteer(
   pruneStaleInboxes(now)
   const state = inboxes.get(sessionId) ?? emptyState(now)
 
-  // P2: in-flight entries count too. A steer written to a managed CLI's wire but not yet
-  // echoed has not reached the model, so it is still one of the messages "waiting for this
-  // reply" the refusal sentence talks about.
-  //
   // PR #106 review F-10: counted for THIS reply only, like every sibling in this module. In
   // the overlap window `clearSteerInbox`'s `keepMessageId` exists for, a stopped turn's dead
   // entries must not spend the live turn's budget, and the refusal sentence must not name
   // messages that are not in the reply the user is looking at.
-  const waiting = [...state.pending, ...state.inFlight].filter(
+  const waiting = state.pending.filter(
     (waitingEntry) => waitingEntry.messageId === entry.messageId
   ).length
   if (waiting >= MAX_PENDING_STEERS) {
@@ -187,7 +158,7 @@ export function enqueueSteer(
   }
 
   if (entry.source === 'dm') {
-    const dmWaiting = [...state.pending, ...state.inFlight].some(
+    const dmWaiting = state.pending.some(
       (waitingEntry) =>
         waitingEntry.source === 'dm' && waitingEntry.messageId === entry.messageId
     )
@@ -203,7 +174,7 @@ export function enqueueSteer(
   state.pending = [...state.pending, entry]
   state.updatedAt = now
   inboxes.set(sessionId, state)
-  return { ok: true, pending: state.pending.length + state.inFlight.length }
+  return { ok: true, pending: state.pending.length }
 }
 
 /** Read-only snapshot of what is still waiting, for the route's own reporting and tests. */
@@ -212,19 +183,13 @@ export function listPendingSteers(sessionId: string): SteerEntry[] {
 }
 
 export function countPendingSteers(sessionId: string, messageId?: string): number {
-  const state = getState(sessionId)
-  const waiting = [...(state?.pending ?? []), ...(state?.inFlight ?? [])]
+  const waiting = getState(sessionId)?.pending ?? []
   if (!messageId) return waiting.length
   return waiting.filter((entry) => entry.messageId === messageId).length
 }
 
-/** Read-only snapshot of what has been written to a CLI wire but not echoed back. */
-export function listInFlightSteers(sessionId: string): SteerEntry[] {
-  return [...(getState(sessionId)?.inFlight ?? [])]
-}
-
 /**
- * Hand every waiting steer for this turn to the transport, in acceptance order.
+ * Hand every waiting steer for this turn to the model's next step, in acceptance order.
  *
  * Taking and marking delivered are ONE step on purpose. On the API lane the caller is
  * `prepareStep`, and by the time it returns the injected message the SDK will send it — P0
@@ -313,15 +278,10 @@ export function drainDeliveredSteers(
  * The caller decides whether to promote: an interrupted or Stopped turn must NOT, because
  * Stop means stop and the client still holds what it typed.
  *
- * P2 (AMD-114-01): in-flight entries are taken too, and in acceptance order beside the
- * pending ones. A steer written to a managed CLI's wire that the CLI never echoed was never
- * handed to the model — on Claude it is the exact line that would otherwise start a SECOND
- * turn inside the same process, which is why the bridge kills the child rather than letting
- * it run. "Written" is not "read", so it is promoted like any other undelivered steer.
- *
  * SA-119 (DL-119-05): queued entries are taken HERE and nowhere else. That is the whole of
- * Queue's server half — the transports skip them, this takes them with everything else still
- * waiting, and `promoteSteersToNextTurn` joins the lot into ONE next user message.
+ * Queue's server half — the boundary take skips them, this takes them with everything else
+ * still waiting, in acceptance order, and `promoteSteersToNextTurn` joins the lot into ONE
+ * next user message.
  *
  * P4 (DL-114-13): `source` narrows what is taken, and the promotion loop passes `'user'`.
  * A DM steer is never promoted — an agent's text must not start a user turn — so leaving it
@@ -341,13 +301,12 @@ export function takeUndeliveredSteers(
   const wantedSource = options.source
   const mine = (entry: SteerEntry) =>
     entry.messageId === messageId && (!wantedSource || entry.source === wantedSource)
-  const taken = [...state.pending.filter(mine), ...state.inFlight.filter(mine)].sort((a, b) =>
+  const taken = state.pending.filter(mine).sort((a, b) =>
     a.at === b.at ? 0 : a.at < b.at ? -1 : 1
   )
   if (taken.length === 0) return []
 
   state.pending = state.pending.filter((entry) => !mine(entry))
-  state.inFlight = state.inFlight.filter((entry) => !mine(entry))
   state.updatedAt = now
   inboxes.set(sessionId, state)
   return taken
@@ -358,9 +317,8 @@ export function takeUndeliveredSteers(
  *
  * Every entry is filed under the assistant message it belongs inside, and a continuation is the
  * same reply to the user, written under a fresh id. A steer accepted while the run that ran out
- * of room was going, and never handed to the model there (still waiting, or written to a CLI's
- * wire and never echoed, which its killed process can no longer read), moves to the continuation
- * as a waiting entry: its boundaries hand it over, and its end promotes what is left. Left
+ * of room was going, and never handed to the model there, moves to the continuation as a
+ * waiting entry: its boundaries hand it over, and its end promotes what is left. Left
  * behind, it was never delivered, the promotion took the last run's id, and the request's
  * `finally` cleared it: the user saw only an unanswered receipt. Acceptance order is kept, and a
  * delivered entry stays with the run whose transcript it is written into. Returns how many moved.
@@ -374,11 +332,10 @@ export function refileUndeliveredSteers(
   const state = getState(sessionId)
   if (!state || fromMessageId === toMessageId) return 0
   const fromRun = (entry: SteerEntry) => entry.messageId === fromMessageId
-  const moving = [...state.pending.filter(fromRun), ...state.inFlight.filter(fromRun)].sort((a, b) =>
+  const moving = state.pending.filter(fromRun).sort((a, b) =>
     a.at === b.at ? 0 : a.at < b.at ? -1 : 1
   )
   if (moving.length === 0) return 0
-  state.inFlight = state.inFlight.filter((entry) => !fromRun(entry))
   state.pending = [
     ...state.pending.filter((entry) => !fromRun(entry)),
     ...moving.map((entry) => ({ ...entry, messageId: toMessageId }))
@@ -386,103 +343,6 @@ export function refileUndeliveredSteers(
   state.updatedAt = now
   inboxes.set(sessionId, state)
   return moving.length
-}
-
-/**
- * P2 — move this turn's waiting steers onto a managed CLI's wire.
- *
- * The move happens BEFORE the write, not after it: the route can be called twice in quick
- * succession, and two flushes reading the same `pending` list would send the same words to
- * the model twice. `returnSteersToPending` puts them back when the write is refused, which
- * is what makes a `-32600` refusal or a dead pipe end in promotion rather than in silence.
- *
- * SA-119 (DL-119-05): `deliver: 'end'` entries are skipped, exactly as the API lane's take
- * skips them. A turn whose only waiting entry is queued therefore flushes `nothing_pending`.
- */
-export function takePendingSteersForTransport(
-  sessionId: string,
-  messageId: string,
-  now = Date.now()
-): SteerEntry[] {
-  const state = getState(sessionId)
-  if (!state || state.pending.length === 0) return []
-
-  // DL-119-05: same skip as the API lane's take, from the same predicate. A queued message
-  // written to a managed CLI's wire would be held by the CLI until its own next tool
-  // boundary and handed to the model inside the reply the user asked it to wait for.
-  const mine = (entry: SteerEntry) =>
-    entry.messageId === messageId && !isHeldForEndOfTurn(entry)
-  const taken = state.pending.filter(mine)
-  if (taken.length === 0) return []
-
-  state.pending = state.pending.filter((entry) => !mine(entry))
-  state.inFlight = [...state.inFlight, ...taken]
-  state.updatedAt = now
-  inboxes.set(sessionId, state)
-  return taken
-}
-
-/** Undo a `takePendingSteersForTransport` whose write was refused or threw. */
-export function returnSteersToPending(
-  sessionId: string,
-  entries: SteerEntry[],
-  now = Date.now()
-): void {
-  if (entries.length === 0) return
-  // PR #106 review F-9: this is an UNDO of a take, so it may only put back what is still in
-  // flight, and only into an inbox that still exists. The old shape re-created an inbox
-  // `clearSteerInbox` had deleted (a late transport rejection after the turn ended left a
-  // ghost entry that ate a steer slot for every later turn) and put back entries the
-  // transport had already echoed (a steer the model received, promoted a second time).
-  const state = inboxes.get(sessionId)
-  if (!state) return
-  const returning = new Set(entries.map((entry) => entry.steerId))
-  const stillInFlight = state.inFlight.filter((entry) => returning.has(entry.steerId))
-  if (stillInFlight.length === 0) return
-  state.inFlight = state.inFlight.filter((entry) => !returning.has(entry.steerId))
-  // Acceptance order, not arrival-back order: these were the OLDEST waiting entries, and a
-  // second steer accepted while the write was in flight must still read after them.
-  state.pending = [...stillInFlight, ...state.pending]
-  state.updatedAt = now
-  inboxes.set(sessionId, state)
-}
-
-/**
- * P2 — the CLI transport echoed these back, so the model has them (AMD-114-01, AMD-114-02).
- *
- * Called from send-routed's own `case` for the synthetic `steer` chunk, never from an event
- * adapter. That is F-P1-3's rule turned around for a stream with no steps: the API lane's
- * marker waits for a consumed `finish-step` because the SDK runs ahead of the loop, and a
- * CLI stream has no such count for the gate to consume — so its marker's position IS the
- * chunk's position in the stream, which is exactly where the echo arrived. Marking here and
- * draining unbounded puts it there.
- */
-export function confirmSteerDelivery(
-  sessionId: string,
-  messageId: string,
-  options: { steerIds: string[]; step: number; lane: SteerLane },
-  now = Date.now()
-): DeliveredSteer[] {
-  const state = getState(sessionId)
-  if (!state || state.inFlight.length === 0) return []
-
-  const wanted = new Set(options.steerIds)
-  const confirmed = state.inFlight.filter(
-    (entry) => entry.messageId === messageId && wanted.has(entry.steerId)
-  )
-  if (confirmed.length === 0) return []
-
-  const confirmedIds = new Set(confirmed.map((entry) => entry.steerId))
-  state.inFlight = state.inFlight.filter((entry) => !confirmedIds.has(entry.steerId))
-  const delivered = confirmed.map((entry) => ({
-    ...entry,
-    step: options.step,
-    lane: options.lane
-  }))
-  state.delivered = [...state.delivered, ...delivered]
-  state.updatedAt = now
-  inboxes.set(sessionId, state)
-  return delivered
 }
 
 /**
@@ -506,11 +366,10 @@ export function takeMissedDmSteers(
   const keep = typeof options.keepMessageId === 'string' ? options.keepMessageId : null
   const missed = (entry: SteerEntry) => entry.source === 'dm' && entry.messageId !== keep
 
-  const taken = [...state.pending.filter(missed), ...state.inFlight.filter(missed)]
+  const taken = state.pending.filter(missed)
   if (taken.length === 0) return []
 
   state.pending = state.pending.filter((entry) => !missed(entry))
-  state.inFlight = state.inFlight.filter((entry) => !missed(entry))
   state.updatedAt = Date.now()
   inboxes.set(sessionId, state)
   return taken
@@ -525,9 +384,8 @@ export function takeMissedUserSteers(
   if (!state) return []
   const keep = typeof options.keepMessageId === 'string' ? options.keepMessageId : null
   const missed = (entry: SteerEntry) => entry.source === 'user' && entry.messageId !== keep
-  const taken = [...state.pending.filter(missed), ...state.inFlight.filter(missed)]
+  const taken = state.pending.filter(missed)
   state.pending = state.pending.filter((entry) => !missed(entry))
-  state.inFlight = state.inFlight.filter((entry) => !missed(entry))
   state.updatedAt = Date.now()
   inboxes.set(sessionId, state)
   return taken
@@ -556,13 +414,8 @@ export function clearSteerInbox(
   const state = getState(sessionId)
   if (!state) return
   state.pending = state.pending.filter((entry) => entry.messageId === keep)
-  state.inFlight = state.inFlight.filter((entry) => entry.messageId === keep)
   state.delivered = state.delivered.filter((entry) => entry.messageId === keep)
-  if (
-    state.pending.length === 0 &&
-    state.inFlight.length === 0 &&
-    state.delivered.length === 0
-  ) {
+  if (state.pending.length === 0 && state.delivered.length === 0) {
     inboxes.delete(sessionId)
     return
   }
@@ -578,33 +431,7 @@ export function clearSteerInbox(
  * registration.
  */
 export function registerSteerRun(sessionId: string, run: SteerRunRegistration): void {
-  runs.set(sessionId, { ...run, send: run.send ?? null })
-}
-
-/**
- * Attach a managed CLI's steer channel once its child process exists.
- *
- * Separate from the registration above because `streamNativeMode` can take seconds to
- * resolve on a CLI lane, and the verdict has to be readable for that whole window: a steer
- * arriving before the child is up is accepted and waits in the inbox rather than being
- * refused.
- *
- * Attaching also PUSHES whatever is already waiting (F-P2-1). The route's own flush runs at
- * accept time and finds no transport during that window, and nothing else would run a
- * second one — so the user's earliest correction, typed right after sending, sat in the
- * inbox until the reply ended and arrived as the next turn instead of at the first boundary.
- */
-export function attachSteerTransport(
-  sessionId: string,
-  messageId: string,
-  lane: SteerLane,
-  send: (payload: SteerSendPayload) => Promise<boolean>
-): boolean {
-  const existing = runs.get(sessionId)
-  if (!existing || existing.messageId !== messageId) return false
-  runs.set(sessionId, { ...existing, lane, send })
-  void flushPendingSteersToTransport(sessionId, messageId)
-  return true
+  runs.set(sessionId, { ...run })
 }
 
 export function clearSteerRun(sessionId: string, messageId?: string | null): void {
@@ -616,49 +443,6 @@ export function clearSteerRun(sessionId: string, messageId?: string | null): voi
 
 export function getSteerRun(sessionId: string): SteerRunRegistration | null {
   return runs.get(sessionId) ?? null
-}
-
-export type SteerFlushResult =
-  | { flushed: 0; reason: 'no_transport' | 'nothing_pending' | 'stale_transport' }
-  | { flushed: number; reason: 'sent' }
-  | { flushed: 0; reason: 'refused'; error?: string }
-
-/**
- * P2 — push this turn's waiting steers to its managed CLI, if it has one.
- *
- * The API lane has no transport registered and returns `no_transport`: its hook pulls at
- * the next step instead. A refusal (Codex's three `-32600` cases, a dead pipe) returns the
- * entries to `pending`, where the end of the turn promotes them (DL-114-07) — which is the
- * whole point of failing loudly here rather than swallowing it: the user's words survive a
- * transport that would not take them.
- */
-export async function flushPendingSteersToTransport(
-  sessionId: string,
-  messageId: string
-): Promise<SteerFlushResult> {
-  const run = getSteerRun(sessionId)
-  if (!run || typeof run.send !== 'function') return { flushed: 0, reason: 'no_transport' }
-  if (run.messageId !== messageId) return { flushed: 0, reason: 'stale_transport' }
-  const send = run.send
-
-  const taken = takePendingSteersForTransport(sessionId, messageId)
-  if (taken.length === 0) return { flushed: 0, reason: 'nothing_pending' }
-
-  try {
-    const accepted = await send(buildSteerSendPayload(taken))
-    if (!accepted) {
-      returnSteersToPending(sessionId, taken)
-      return { flushed: 0, reason: 'refused' }
-    }
-    return { flushed: taken.length, reason: 'sent' }
-  } catch (error) {
-    returnSteersToPending(sessionId, taken)
-    return {
-      flushed: 0,
-      reason: 'refused',
-      error: error instanceof Error ? error.message : String(error)
-    }
-  }
 }
 
 /** Test-only reset so one suite's inbox cannot leak into the next. */

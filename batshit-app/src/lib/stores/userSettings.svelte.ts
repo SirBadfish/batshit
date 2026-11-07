@@ -39,6 +39,9 @@ export interface UserSettings {
    */
   global_chat_settings?: GlobalChatSettings
 
+  /** The app's look (cave, minimal, og); read through `resolveAppLook`, never directly. */
+  appearance_settings?: import('$lib/appearance/appLook').AppearanceSettings
+
   // Uploads
   upload_settings?: Record<string, any>
   upload_provider?: string
@@ -59,6 +62,7 @@ export interface UserSettings {
     dcm_schema_hint_required_limit?: number
     dcm_schema_hint_optional_limit?: number
     dcm_schema_hint_max_chars?: number
+    dcm_schema_hint_total_tokens?: number
     dcm_tool_name_threshold?: number
     goon_lip_sync_lab_enabled?: boolean
     /** SA-113 P1 (DL-113-01): instance-wide wake-up master switch. Absent means ON. */
@@ -66,6 +70,7 @@ export interface UserSettings {
     web_search_default_provider?: 'duckduckgo-html' | 'exa' | 'perplexity'
     web_search_exa_type?: 'auto' | 'fast' | 'neural' | 'deep'
     web_search_perplexity_max_tokens_per_page?: number
+    agent_browser?: Partial<import('$lib/utils/toolOperationalSettings').AgentBrowserOperationalSettings>
   }
 
   onboarding_settings?: {

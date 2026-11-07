@@ -107,7 +107,7 @@ const DEFAULT_APP_ORIGIN = `http://127.0.0.1:${DEFAULT_PORTS.app}`;
 const DEFAULT_SERVER_ORIGIN = `http://127.0.0.1:${DEFAULT_PORTS.server}`;
 const DEFAULT_MCP_ORIGIN = `http://127.0.0.1:${DEFAULT_PORTS.mcp}`;
 const DEFAULT_LIVEKIT_AGENT_NAME = 'batshit-livekit-agent';
-const DEFAULT_APP_VERSION = '0.1.0-alpha.3';
+const DEFAULT_APP_VERSION = '0.1.0-alpha.4';
 const DEFAULT_APP_CHANNEL = 'alpha';
 const APPLE_CONTAINER_INSTALL_URL = 'https://github.com/apple/container/releases/latest';
 
@@ -4051,6 +4051,36 @@ export async function auditAnchoredProjectReader(runtimeRoot, entry) {
   return issues;
 }
 
+// These are the shipped manifests, entrypoints, operating guides and core
+// defaults, not user-managed skills.
+// The owning test compares this list with the repository's shipped source inventory.
+export const requiredSystemBundleFiles = Object.freeze([
+  ...['plugin.json', '.claude-plugin/plugin.json']
+    .map(name => `batshit-app/build/server/system-plugins/batshit/${name}`),
+  ...['app-actions', 'artifact-creator', 'batshit-guide', 'cli-tool-creator', 'goon-guide', 'goon-scene-creator', 'skill-creator', 'voice-engine-installer']
+    .map(name => `batshit-app/build/server/system-plugins/batshit/skills/${name}/SKILL.md`),
+  ...['app-actions', 'artifact-creator', 'batshit-guide', 'cli-tool-creator', 'goon-scene-creator', 'skill-creator', 'voice-engine-installer']
+    .flatMap(name => ['native.md', 'outside.md'].map(lane => `batshit-app/build/server/system-plugins/batshit/skills/${name}/references/${lane}`)),
+  ...['batshit-guide/references/guide-index.md', 'batshit-guide/references/reference-paths.md', 'goon-guide/references/goon-guide.md']
+    .map(name => `batshit-app/build/server/system-plugins/batshit/skills/${name}`),
+  ...['File_Ops_Safety.md', 'batshit_dm_guidance.md', 'batshit_dynamic_mcp.md', 'batshit_jev_juice_guidance.md',
+    'batshit_primary_agent_api_system_prompt.md',
+    'batshit_subagent_guidance.md', 'batshit_subagent_system_prompt.md', 'batshit_tool_prompt_memory.md',
+    'batshit_tool_prompt_zips.md', 'batshit_worker_prompt.md']
+    .map(name => `batshit-app/build/server/docs/batshit_System_Prompts/${name}`)
+]);
+
+export async function auditPackagedSystemBundles(runtimeRoot) {
+  const issues = [];
+  for (const file of requiredSystemBundleFiles) {
+    const info = await lstat(join(runtimeRoot, file)).catch(() => null);
+    if (!info?.isFile() || info.size === 0) {
+      issues.push(`Required built-in bundle file is missing, empty, or not a regular file: ${file}`);
+    }
+  }
+  return issues;
+}
+
 async function packageAudit(packagePath) {
   const target = resolve(packagePath || join(macRoot, 'electron-out', 'package'));
   const realTarget = await realpath(target).catch(() => null);
@@ -4151,6 +4181,7 @@ async function packageAudit(packagePath) {
       suspiciousPaths.push(relative);
     }
   }
+  runtimeAssetIssues.push(...await auditPackagedSystemBundles(join(realTarget, 'Contents', 'Resources', 'runtime')));
 
   const runtimeManifestPath = join(
     realTarget,

@@ -25,6 +25,73 @@ function setup(props: Record<string, unknown> = {}) {
   return { ...mounted, doc, execute }
 }
 describe('Settings App Actions use the real navigation and draft owner', () => {
+  it('keeps an active Hair fit through outer close, tab and App Actions navigation, then retains unrelated Goon edits', async () => {
+    const { execute } = setup()
+    await execute('settings.open', { tab: '3d-goons' })
+    await fireEvent.click(screen.getByRole('button', { name: 'Begin Hair fit' }))
+    await waitFor(() => expect(appActionsHaveDrafts()).toBe(true))
+    expect(await execute('settings.open', { tab: '3d-goons' })).toMatchObject({ status: 'no_op' })
+    expect(await execute('settings.close')).toMatchObject({ status: 'blocked', reason: 'unsaved_changes' })
+    expect(await execute('settings.open', { tab: 'theme' })).toMatchObject({ status: 'blocked', reason: 'unsaved_changes' })
+    const models = screen.getAllByRole('tab', { name: 'Models' }).find((item) => item.classList.contains('batshit-settings-rail-item'))!
+    const close = screen.getAllByRole('button', { name: 'Close', exact: true }).find((item) => item.classList.contains('batshit-settings-nav-close'))!
+    await fireEvent.click(models)
+    await fireEvent.click(close)
+    expect((appActionObservation().settings as { tab: string }).tab).toBe('3d-goons')
+    expect(screen.queryByText('Save 3D Goons changes first?')).toBeNull()
+    expect(screen.queryByRole('textbox', { name: 'Goon fixture draft' })).toBeNull()
+    await fireEvent.click(screen.getByRole('button', { name: 'Make Goon draft' }))
+    expect(screen.getByRole('textbox', { name: 'Goon fixture draft' })).toBeVisible()
+    await fireEvent.click(screen.getByRole('button', { name: 'Finish Hair fit' }))
+    expect(await execute('settings.close')).toMatchObject({ status: 'blocked', reason: 'unsaved_changes' })
+    expect(screen.getByRole('textbox', { name: 'Goon fixture draft' })).toBeVisible()
+  })
+
+  it('does not run a queued Settings continuation if Hair ownership starts during an awaited Goon save', async () => {
+    const { execute, rerender } = setup()
+    await execute('settings.open', { tab: '3d-goons' })
+    await fireEvent.click(screen.getByRole('button', { name: 'Make Goon draft' }))
+    await fireEvent.click(screen.getByRole('button', { name: 'Begin Hair during Goon save' }))
+    await rerender({ open: true, initialTab: 'theme' })
+    await screen.findByText('Save 3D Goons changes first?')
+    await fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }))
+    await waitFor(() => expect(screen.queryByText('Save 3D Goons changes first?')).toBeNull())
+    expect((appActionObservation().settings as { tab: string }).tab).toBe('3d-goons')
+    expect(await execute('settings.close')).toMatchObject({ status: 'blocked', reason: 'unsaved_changes' })
+    await fireEvent.click(screen.getByRole('button', { name: 'Finish Hair fit' }))
+    expect(await execute('settings.close')).toMatchObject({ status: 'completed' })
+  })
+
+  it('refuses a human initial-tab redirect during Hair review without replaying it after finish', async () => {
+    const { execute, rerender } = setup()
+    await execute('settings.open', { tab: '3d-goons' })
+    await fireEvent.click(screen.getByRole('button', { name: 'Begin Hair fit' }))
+    await rerender({ open: true, initialTab: 'theme' })
+    await waitFor(() => expect((appActionObservation().settings as { tab: string }).tab).toBe('3d-goons'))
+    expect(screen.queryByText('Save 3D Goons changes first?')).toBeNull()
+    await fireEvent.click(screen.getByRole('button', { name: 'Finish Hair fit' }))
+    expect((appActionObservation().settings as { tab: string }).tab).toBe('3d-goons')
+    expect(await execute('settings.open', { tab: 'theme' })).toMatchObject({ status: 'completed' })
+  })
+
+  it('does not discard another Goon draft if Hair ownership starts after an exit was queued', async () => {
+    const { execute, rerender } = setup()
+    await execute('settings.open', { tab: '3d-goons' })
+    await fireEvent.click(screen.getByRole('button', { name: 'Make Goon draft' }))
+    const beginHair = screen.getByRole('button', { name: 'Begin Hair fit' })
+    await rerender({ open: true, initialTab: 'theme' })
+    await screen.findByText('Save 3D Goons changes first?')
+    // An independently settling import can acquire ownership while the exit dialog is open.
+    await fireEvent.click(beginHair)
+    await fireEvent.click(screen.getByRole('button', { name: 'Discard Changes' }))
+    await waitFor(() => expect(screen.queryByText('Save 3D Goons changes first?')).toBeNull())
+    expect((appActionObservation().settings as { tab: string }).tab).toBe('3d-goons')
+    expect(screen.getByRole('textbox', { name: 'Goon fixture draft' })).toBeVisible()
+    await fireEvent.click(screen.getByRole('button', { name: 'Finish Hair fit' }))
+    expect(await execute('settings.close')).toMatchObject({ status: 'blocked', reason: 'unsaved_changes' })
+    expect(screen.getByRole('textbox', { name: 'Goon fixture draft' })).toBeVisible()
+  })
+
   it('refuses the hidden Dev tab before visibility or reads', async () => {
     const fetcher = vi.fn()
     vi.stubGlobal('fetch', fetcher)
@@ -36,10 +103,10 @@ describe('Settings App Actions use the real navigation and draft owner', () => {
   it('waits for mounted settings, repeats without effects, and closes the actual sheet', async () => {
     const { execute } = setup()
     expect(await execute('settings.open', { tab: 'theme' })).toMatchObject({ status: 'completed', visible: 'applied' })
-    expect(screen.getByText('Theme Controls In Progress')).toBeVisible()
+    expect(await screen.findByRole('heading', { name: 'Themes' })).toBeVisible()
     expect(await execute('settings.open', { tab: 'theme' })).toMatchObject({ status: 'no_op', saved: 'not_requested' })
     expect(await execute('settings.close')).toMatchObject({ status: 'completed' })
-    expect(screen.queryByText('Theme Controls In Progress')).toBeNull()
+    expect(screen.queryByRole('heading', { name: 'Themes' })).toBeNull()
     expect(await execute('settings.close')).toMatchObject({ status: 'no_op' })
   })
   it('validates an existing entity before any visibility effect and never accepts a launcher sentinel', async () => {

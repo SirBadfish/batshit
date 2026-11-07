@@ -11,6 +11,7 @@ import SettingsInfoMenu from '$lib/components/settings/SettingsInfoMenu.svelte'
 import SettingsSaveStatus from '$lib/components/settings/SettingsSaveStatus.svelte'
 import CustomProvidersSettingsPanel from './CustomProvidersSettingsPanel.svelte'
 import ChatgptPlanConnectionCard from './ChatgptPlanConnectionCard.svelte'
+import ClaudePlanConnectionCard from './ClaudePlanConnectionCard.svelte'
 import type { IconRef } from '$lib/icons/iconTypes'
 import { LOCAL_AI_SERVER_DEFINITIONS } from '$lib/data/localAiServers'
 import { LOCAL_AI_KEY_SERVICES } from '$lib/data/localAiKeyServices'
@@ -82,7 +83,7 @@ const SERVICES: ApiKeyServiceDefinition[] = [
   {
     id: 'n8n_instance_mcp_token',
     label: 'n8n Instance MCP Token',
-    description: 'Bearer token for the n8n instance MCP server (Admin → Settings → MCP). Used for instance MCP gateways and Codex.',
+    description: 'Bearer token for the n8n instance MCP server (Admin → Settings → MCP). Used for instance MCP gateways.',
     scope: 'gateway',
     connectionHint: 'n8n instance MCP',
     iconRef: N8N_ICON_REF
@@ -717,7 +718,7 @@ const GROUPS: ApiKeyGroup[] = [
   {
     id: 'custom',
     label: 'Custom OpenAI-Compatible',
-    description: 'Bring your own OpenAI-compatible endpoints for API agents. Models must be entered manually.',
+    description: 'Bring your own OpenAI-compatible endpoints for your agents. Models must be entered manually.',
     kind: 'custom'
   }
 ]
@@ -1294,6 +1295,7 @@ function getServiceIconRef(row: ApiKeyServiceDefinition): IconRef {
     </div>
 
     <ChatgptPlanConnectionCard />
+    <ClaudePlanConnectionCard />
 
     {#if loadError}
       <Card.Root class="batshit-settings-card-danger">

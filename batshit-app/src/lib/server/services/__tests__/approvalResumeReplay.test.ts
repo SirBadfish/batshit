@@ -265,7 +265,7 @@ describe('interleaveDeliveredSteers', () => {
 
   it('leaves out steers another lane delivered, and refuses counts that do not add up', () => {
     const messages = [...step0, ...step1]
-    expect(interleaveDeliveredSteers(messages, [2, 1], [steer(1, 'codex', { lane: 'codex' })])).toEqual(messages)
+    expect(interleaveDeliveredSteers(messages, [2, 1], [steer(1, 'claude', { lane: 'claude' })])).toEqual(messages)
     expect(() => interleaveDeliveredSteers(messages, [2, 5], [steer(1, 'x')])).toThrow()
   })
 })
@@ -304,5 +304,21 @@ describe('buildReplayableTranscript', () => {
       expected,
     })
     expect(replay).toEqual(stored)
+  })
+})
+
+
+describe('SA-133 authoritative whiteboard snapshot', () => {
+  it('preserves exact rendered bytes and refuses absent, foreign or inconsistent snapshots', async () => {
+    const { readWhiteboardContextSnapshot } = await import('../approvalResumeReplay')
+    const { resolveApiReasoningRetention } = await import('$lib/utils/reasoningRetention')
+    const owner = { userId: 'owner', sessionId: 'chat', agentId: 'agent', messageId: 'reply' }
+    const value = { ...owner, schema_version: 1, settings: resolveApiReasoningRetention({ api_reasoning_retention: 'both' }), dcmLines: ['Version: 1; fixed stamp', 'saved conclusion'] }
+    expect(readWhiteboardContextSnapshot(value, owner)).toEqual(value)
+    expect(readWhiteboardContextSnapshot({ ...value, settings: Object.fromEntries(Object.entries(value.settings).reverse()) }, owner)).toEqual(value)
+    expect(readWhiteboardContextSnapshot(value, owner).dcmLines).not.toBe(value.dcmLines)
+    for (const bad of [null, { ...value, agentId: 'other' }, { ...value, dcmLines: [12] }, { ...value, settings: { ...value.settings, preserveReasoning: false } }]) {
+      expect(() => readWhiteboardContextSnapshot(bad, owner)).toThrow(/valid saved Whiteboard context/)
+    }
   })
 })

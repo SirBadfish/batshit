@@ -3,7 +3,7 @@
 /**
  * How the stdio MCP helper (`src/mcp/index.js`) ends (BL-206).
  *
- * 1. The stdio rule every managed CLI bridge follows (`batshit-app/scripts/lib/mcp-stdio-lifecycle.cjs`,
+ * 1. The stdio rule Batshit's stdio bridges follow (`batshit-app/scripts/lib/mcp-stdio-lifecycle.cjs`,
  *    F-P7-10; batshit-server is its own package, so this is its own copy of that rule): exit when
  *    stdin ends or closes, when stdout breaks, or on SIGTERM/SIGHUP/SIGINT, with cleanup bounded by a
  *    deadline. The MCP SDK's `StdioServerTransport` listens only for stdin's `data` and `error`, so

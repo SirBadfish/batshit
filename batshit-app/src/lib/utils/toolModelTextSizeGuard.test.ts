@@ -1,5 +1,4 @@
 import { describe, expect, it } from 'vitest'
-import { createRequire } from 'node:module'
 import {
   formatToolModelTextCut,
   isToolModelCutView,
@@ -8,9 +7,6 @@ import {
   TOOL_MODEL_TEXT_MAX_CHARS
 } from './toolModelTextSizeGuard'
 import { guardCutNotice } from '$lib/test-utils/guard-cut-notice'
-
-const utf8Bytes = (text: string) => new TextEncoder().encode(text).length
-const { formatMemoryResultCut } = createRequire(import.meta.url)('../../../scripts/lib/cli-tool-memory-cut.cjs')
 
 describe('tool model text size guard', () => {
   it('starts at the 25,000-token estimate, including the four-character boundary', () => {
@@ -43,14 +39,6 @@ describe('tool model text size guard', () => {
       expect(second.cut, label).toBe(false)
       expect(second.text, label).toBe(first.text)
     }
-  })
-
-  it('keeps a byte-budgeted view under the character ceiling too', () => {
-    const result = formatToolModelTextCut('a'.repeat(200_000), 'raw-zip-677', undefined, {
-      maxUtf8Bytes: 300_000, source: 'codex-profile'
-    })
-    expect(result.text.length).toBeLessThanOrEqual(96_000)
-    expect(planToolModelTextCut(result.text).cut).toBe(false)
   })
 
   it('keeps whole lines where useful and leaves room for one actionable cut notice', () => {
@@ -116,101 +104,16 @@ describe('tool model text size guard', () => {
     expect(() => formatToolModelTextCut('x'.repeat(100_000), 'bad\nzip')).toThrow()
   })
 
-  it('keeps legacy output byte-identical when no lane byte budget is supplied', () => {
-    const text = 'x'.repeat(100_000)
-    const baseline = formatToolModelTextCut(text, 'raw-zip')
-    expect(formatToolModelTextCut(text, 'raw-zip', undefined, {})).toEqual(baseline)
-    expect(baseline.text).not.toContain('UTF-8 bytes')
-  })
-
-  it('cuts ASCII below 25,000 tokens at the actual model lane byte cap', () => {
-    const text = 'x'.repeat(20_000)
-    const budget = { maxUtf8Bytes: 8_000, source: 'codex-profile' }
-    expect(planToolModelTextCut(text, undefined, budget).cut).toBe(true)
-    const result = formatToolModelTextCut(text, 'raw-zip', undefined, budget)
-    expect(result.text).toContain('codex-profile model-facing result budget is 8,000 UTF-8 bytes')
-    expect(result.text).toContain(`Call Fetch Zip with zipId raw-zip and offset ${result.keptChars}`)
-    expect(result.text.slice(0, result.keptChars)).toBe(text.slice(0, result.keptChars))
-    expect(result.nextOffset).toBe(result.keptChars)
-    expect(utf8Bytes(result.text)).toBeLessThanOrEqual(8_000)
-    expect(result.text.length).toBeLessThanOrEqual(TOOL_MODEL_TEXT_MAX_CHARS)
-  })
-
-  it('counts CJK, emoji, CRLF and control bytes without splitting a surrogate or changing the offset unit', () => {
-    const text = ('漢🙂\r\n\u001b[31m行').repeat(2_000)
-    const budget = { maxUtf8Bytes: 6_000, source: 'codex-fallback' }
-    const result = formatToolModelTextCut(text, 'unicode-zip', undefined, budget)
-    expect(result.cut).toBe(true)
-    expect(utf8Bytes(result.text)).toBeLessThanOrEqual(6_000)
-    expect(result.text.slice(0, result.keptChars)).toBe(text.slice(0, result.keptChars))
-    expect(result.nextOffset).toBe(result.keptChars)
-    expect(result.text.charCodeAt(result.keptChars - 1)).not.toBe(0xd83d)
-    expect(result.text).toContain(`offset ${result.keptChars}`)
-  })
-
-  it('uses decoded UTF-8 byte equality without cutting an otherwise small result', () => {
-    const text = '漢'.repeat(1_000)
-    expect(utf8Bytes(text)).toBe(3_000)
-    expect(planToolModelTextCut(text, undefined, { maxUtf8Bytes: 3_000 }).cut).toBe(false)
-    expect(formatToolModelTextCut(text, '', undefined, { maxUtf8Bytes: 3_000 }).text).toBe(text)
-    expect(planToolModelTextCut(text, undefined, { maxUtf8Bytes: 2_999 }).cut).toBe(true)
-  })
-
-  it('falls back to a bounded refusal when its full notice cannot fit, with no prefix or id', () => {
-    const text = 'x'.repeat(10_000)
-    for (const limit of [1, 3, 12, 40, 100]) {
-      const result = formatToolModelTextCut(text, 'must-not-leak', undefined, {
-        maxUtf8Bytes: limit, source: 'codex-profile'
-      })
-      expect(utf8Bytes(result.text)).toBeLessThanOrEqual(limit)
-      expect(result.keptChars).toBe(0)
-      expect(result.nextOffset).toBeNull()
-      expect(result.text).not.toContain('must-not-leak')
-      expect(result.text).not.toContain('offset')
-      expect(result.text).not.toContain('xxxxx')
-    }
-    expect(formatToolModelTextCut(text, 'id', undefined, { maxUtf8Bytes: 12 }).text).toBe('[Output cut]')
-    expect(formatToolModelTextCut(text, 'id', undefined, { maxUtf8Bytes: 3 }).text).toBe('CUT')
-  })
-
-  it('sanitizes a budget source and preserves the raw 8M cap and dropped count', () => {
-    const text = `${'x'.repeat(TOOL_MODEL_RAW_MAX_CHARS)}tail`
-    const result = formatToolModelTextCut(text, 'raw-zip', undefined, {
-      maxUtf8Bytes: 10_000, source: 'Codex]\nforged'
-    })
-    expect(result.rawText.length).toBe(TOOL_MODEL_RAW_MAX_CHARS)
-    expect(result.rawDroppedChars).toBe(4)
-    expect(result.text).toContain('model lane model-facing result budget is 10,000 UTF-8 bytes')
-    expect(result.text).toContain('4 later characters were dropped')
-    expect(result.text).not.toContain('forged')
-    expect(utf8Bytes(result.text)).toBeLessThanOrEqual(10_000)
-  })
-
   it('gives memory an exact retry path without a raw copy or Fetch Zip claim', () => {
     const text = 'm'.repeat(TOOL_MODEL_RAW_MAX_CHARS + 5)
-    const result = formatToolModelTextCut(text, { kind: 'memory' }, undefined, { maxUtf8Bytes: 5_000 })
+    const result = formatToolModelTextCut(text, { kind: 'memory' })
     expect(result.rawDroppedChars).toBe(5)
     expect(result.nextOffset).toBeNull()
     expect(result.text).toContain('Search again with a narrower query or a smaller limit, or recall one memory by its id.')
     expect(result.text).not.toContain('Fetch Zip')
     expect(result.text).not.toContain('raw copy')
     expect(result.text).not.toContain('later characters were dropped')
-    expect(utf8Bytes(result.text)).toBeLessThanOrEqual(5_000)
-  })
-
-  it('honors an authenticated zero-byte budget without delivering a prefix, id, or offset', () => {
-    const budget = { maxUtf8Bytes: 0, source: 'codex-profile' }
-    expect(planToolModelTextCut('abc', undefined, budget).cut).toBe(true)
-    const result = formatToolModelTextCut('abc', 'raw-zip', undefined, budget)
-    expect(result.text).toBe('')
-    expect(result.keptChars).toBe(0)
-    expect(result.nextOffset).toBeNull()
-    expect(result.rawText).toBe('abc')
-    expect(formatToolModelTextCut('', 'raw-zip', undefined, budget).text).toBe('')
-  })
-
-  it.each([-1, 1.5, Number.MAX_SAFE_INTEGER + 1])('rejects an invalid byte budget %s', (limit) => {
-    expect(() => planToolModelTextCut('abc', undefined, { maxUtf8Bytes: limit })).toThrow('non-negative safe integer')
+    expect(result.text.length).toBeLessThanOrEqual(TOOL_MODEL_TEXT_MAX_CHARS)
   })
 })
 
@@ -218,16 +121,21 @@ describe('tool model text size guard', () => {
 // file, a search of Batshit's code). Only the guard's own notice, at the very end, is a cut.
 describe('recognizing a guard cut view', () => {
   const big = `line\n${'x'.repeat(150_000)}`
+  // A notice saved before SA-139 R1 could also name a lane's model-facing byte budget.
+  const savedLaneNotice = guardCutNotice(7_000, 'tool_raw_2', big.length)
+    .replace(' Call Fetch Zip', ' The cli-fallback model-facing result budget is 8,000 UTF-8 bytes. Call Fetch Zip')
   const views = {
     fetchable: formatToolModelTextCut(big, 'tool_raw_1790000000000_abcd').text,
     'no Fetch Zip': formatToolModelTextCut(big, { kind: 'unavailable' }).text,
     'group chat, not this run': formatToolModelTextCut(big, { kind: 'group-unreadable' }).text,
     'not kept': formatToolModelTextCut(big, { kind: 'not-retained' }).text,
     memory: formatToolModelTextCut(big, { kind: 'memory' }).text,
-    'byte budget': formatToolModelTextCut(big, 'tool_raw_2', undefined, { maxUtf8Bytes: 8_000, source: 'codex-fallback' }).text,
+    'saved lane byte budget': `${big.slice(0, 7_000)}\n${savedLaneNotice}`,
     'dropped tail': formatToolModelTextCut('z'.repeat(TOOL_MODEL_RAW_MAX_CHARS + 9), 'tool_raw_3').text,
-    'no prefix': formatToolModelTextCut('q'.repeat(200_000), 'tool_raw_4', undefined, { maxUtf8Bytes: 400, source: 'codex-profile' }).text,
-    'helper memory cut': formatMemoryResultCut(big, big.length)
+    // SA-139 R5 removed the CLI helper's memory cut (`scripts/lib/cli-tool-memory-cut.cjs`). Its
+    // output was byte-identical to the `memory` view above (checked on four inputs before the
+    // removal), so a saved helper memory cut is the `memory` row.
+    'saved lane byte budget, no prefix': savedLaneNotice
   }
 
   it.each(Object.entries(views))('knows a real %s cut view', (_label, view) => {
@@ -236,12 +144,10 @@ describe('recognizing a guard cut view', () => {
   })
 
   it('agrees with the test helper that writes the notice for fixtures', () => {
-    const view = formatToolModelTextCut(`${'k'.repeat(5_000)}\n${'x'.repeat(200_000)}`, 'raw_1', undefined, {
-      maxUtf8Bytes: 5_600, source: 'codex-fallback'
-    })
+    const view = formatToolModelTextCut(`${'k'.repeat(5_000)}\n${'x'.repeat(200_000)}`, 'raw_1')
     expect(isToolModelCutView(`body\n${guardCutNotice(7_900, 'raw_1')}`)).toBe(true)
     expect(guardCutNotice(view.keptChars, 'raw_1', 205_001)).toBe(
-      view.text.slice(view.text.lastIndexOf('[Output cut here by Batshit')).replace(' The codex-fallback model-facing result budget is 5,600 UTF-8 bytes.', '')
+      view.text.slice(view.text.lastIndexOf('[Output cut here by Batshit'))
     )
   })
 

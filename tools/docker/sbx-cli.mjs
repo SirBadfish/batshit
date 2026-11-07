@@ -81,8 +81,9 @@ export const sbxVersionArgs = () => ['version']
 export const sbxListArgs = () => ['ls', '--json']
 export const sbxPolicyListArgs = () => ['policy', 'ls']
 
-export function sbxCreateArgs({ sandboxName, workspaceRoot, extraWorkspaces = [] }) {
-  const { home, shared, agents, protectedHomes } = sandboxHomes()
+/** Exact expanded workspace mounts used by create and strict pre-admission. */
+export function sbxWorkspaceMounts({ workspaceRoot, extraWorkspaces = [] }) {
+  const { home, shared } = sandboxHomes()
   const isHome = (root) => path.basename(root) === '.batshit' || path.resolve(root) === home
   const mounts = extraWorkspaces.flatMap((workspace) =>
     isHome(workspace)
@@ -91,17 +92,24 @@ export function sbxCreateArgs({ sandboxName, workspaceRoot, extraWorkspaces = []
       ))
       : [workspace]
   )
+  return [workspaceRoot, ...mounts]
+}
+
+export function sbxCreateArgs({ sandboxName, workspaceRoot, extraWorkspaces = [] }) {
+  const { home, agents, protectedHomes, shared } = sandboxHomes()
+  const isHome = (root) => path.basename(root) === '.batshit' || path.resolve(root) === home
+  const mounts = sbxWorkspaceMounts({ workspaceRoot, extraWorkspaces })
   const protectedRoots = [agents, ...[home, shared, ...protectedHomes].flatMap((root) => SANDBOX_BATSHIT_PROTECTED_DIRS.map((name) => path.join(root, name)))]
   for (const workspace of extraWorkspaces) {
     if (isHome(workspace)) protectedRoots.push(...SANDBOX_BATSHIT_PROTECTED_DIRS.map((name) => path.join(workspace, name)))
     if (SANDBOX_BATSHIT_PROTECTED_DIRS.includes(path.basename(workspace)) && path.basename(path.dirname(workspace)) === '.batshit') protectedRoots.push(workspace)
   }
-  for (const workspace of [workspaceRoot, ...mounts]) {
+  for (const workspace of mounts) {
     if (protectedRoots.some((agents) => overlapsProtectedHome(workspace, agents))) {
       throw new Error('Sandbox workspace exposes managed agent homes or protected runtime/Pinokio data.')
     }
   }
-  return ['create', '--name', sandboxName, '--deny-network', SBX_ALL_HOSTS, SBX_SANDBOX_KIT, workspaceRoot, ...mounts]
+  return ['create', '--name', sandboxName, '--deny-network', SBX_ALL_HOSTS, SBX_SANDBOX_KIT, ...mounts]
 }
 
 function overlapsProtectedHome(workspace, agents) {

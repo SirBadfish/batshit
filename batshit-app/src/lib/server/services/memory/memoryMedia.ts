@@ -1,3 +1,8 @@
+import { readMemoryObservation } from './memoryOwnership'
+import { currentMemoryDeliveryAdmission } from './memoryDeliveryAdmission'
+import { acquireSettingsMutation, captureSettingsLifecycle, type SettingsLifecycleSnapshot } from '../appActions/settings/lifecycle'
+import { MemoryMutationError, memoryMutationUnknown } from './memoryMutation'
+import { memoryIsEligible } from './memoryState'
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
@@ -42,6 +47,7 @@ export type MemoryMediaSource =
   | { kind: 'migration'; clipId: string }
 
 export interface SaveMemoryMediaBytesInput {
+  lifecycle?: SettingsLifecycleSnapshot
   agentId: string
   memoryId: string
   bytes: Uint8Array
@@ -107,9 +113,23 @@ function safeDisplayName(value: string | undefined, fallback: string): string {
 }
 
 /** Bytes-first persistence core; Clip copying is only one adapter over this API. */
-export async function saveMemoryMediaBytes(
-  input: SaveMemoryMediaBytesInput
-): Promise<MemoryMediaRecord> {
+export async function saveMemoryMediaBytes(input: SaveMemoryMediaBytesInput): Promise<MemoryMediaRecord> {
+  const lifecycle = input.lifecycle ?? captureSettingsLifecycle([`agent:${input.agentId}`])
+  const lease = acquireSettingsMutation(lifecycle)
+  try {
+    await readMemoryObservation({ agentId: input.agentId, lifecycle })
+    lease.check()
+    const record = await saveMemoryMediaBytesOwned(input, lease.check)
+    lease.settle()
+    return record
+  } catch (error) {
+    if (memoryMutationUnknown(error)) lease.unknown()
+    else lease.settle()
+    throw error
+  }
+}
+
+async function saveMemoryMediaBytesOwned(input: SaveMemoryMediaBytesInput, assertOwner: () => void): Promise<MemoryMediaRecord> {
   const agentId = assertPathPart(input.agentId, 'agent id')
   const memoryId = assertPathPart(input.memoryId, 'memory id')
   const mimeType = input.mimeType.trim().toLowerCase() as SupportedMemoryMediaMime
@@ -157,9 +177,12 @@ export async function saveMemoryMediaBytes(
   const filename = `${agentId}/${memoryId}/${mediaId}.${extension}`
   const relativePath = `${MEMORY_MEDIA_UPLOAD_TYPE}/${filename}`
   const filePath = absolutePathForFilename(filename)
+  assertOwner()
   await mkdir(path.dirname(filePath), { recursive: true })
   const temporaryPath = `${filePath}.${randomUUID()}.tmp`
+  assertOwner()
   await writeFile(temporaryPath, result.data, { mode: 0o600 })
+  assertOwner()
   await rename(temporaryPath, filePath)
 
   const now = new Date().toISOString()
@@ -176,8 +199,11 @@ export async function saveMemoryMediaBytes(
     ...(sourceClipId(input.source) ? { source_clip_id: sourceClipId(input.source) } : {})
   }
 
+  let issued = false
   try {
-    await redis.set(uploadKey(filename), {
+    await redis.execute(async client => {
+      assertOwner(); issued = true
+      const answer = await client.json.set(uploadKey(filename), '$', {
       filename,
       uploadType: MEMORY_MEDIA_UPLOAD_TYPE,
       mimetype: mimeType,
@@ -187,8 +213,11 @@ export async function saveMemoryMediaBytes(
       filePath,
       uploadedAt: now,
       source: input.source
+      } as never)
+      if (answer !== 'OK') throw new Error('Memory image publication was not acknowledged.')
     })
   } catch (error) {
+    if (issued) throw new MemoryMutationError('Memory image publication outcome is unknown; its files and custody are retained.', true)
     await rm(filePath, { force: true }).catch(() => {})
     throw error
   }
@@ -201,7 +230,9 @@ export async function copyClipToMemoryMedia(input: {
   memoryId: string
   clipId: string
   source?: 'clip' | 'migration'
+  lifecycle?: SettingsLifecycleSnapshot
 }): Promise<MemoryMediaRecord> {
+  const lifecycle = input.lifecycle ?? captureSettingsLifecycle([`agent:${input.agentId}`])
   const clip = await loadClipRow(input.userId, input.clipId)
   if (!clip) throw new MemoryMediaError(`Clip "${input.clipId}" was not found.`)
   const dataUrl = await resolveClipDataUrlFromStoredUpload(clip)
@@ -215,6 +246,7 @@ export async function copyClipToMemoryMedia(input: {
   return saveMemoryMediaBytes({
     agentId: input.agentId,
     memoryId: input.memoryId,
+    lifecycle,
     bytes: decoded.bytes,
     mimeType: decoded.mimeType || clip.mimeType || '',
     filename: clip.filename,
@@ -228,24 +260,28 @@ export async function copyClipToMemoryMedia(input: {
 export async function loadMemoryMedia(
   agentId: string,
   memoryId: string,
-  mediaOrId: MemoryMediaRecord | string
+  mediaOrId: MemoryMediaRecord | string,
+  options: { audience?: 'user'; userId?: string; includeExpired?: boolean } = {}
 ): Promise<LoadedMemoryMedia> {
   assertPathPart(agentId, 'agent id')
   assertPathPart(memoryId, 'memory id')
-  const media: MemoryMediaRecord | undefined =
-    typeof mediaOrId === 'string'
-      ? ((
-          ((await redis.get(`memory:${agentId}:${memoryId}`)) as Record<string, any> | null)?.media ??
-          []
-        ) as MemoryMediaRecord[]).find((entry) => entry?.id === mediaOrId)
-      : mediaOrId
+  const admission = currentMemoryDeliveryAdmission()
+  const lifecycle = admission?.lifecycle ?? captureSettingsLifecycle([`agent:${agentId}`])
+  const explicitExpired = options.includeExpired === true || admission?.agentId === agentId && admission.memoryId === memoryId && admission.includeExpired
+  const observation = { agentId, userId: options.userId ?? admission?.userId, memoryIds: [memoryId], lifecycle,
+    ...(admission ? { sessionId: admission.sessionId, expectedAgent: admission.agentOwner, expectedSession: admission.sessionOwner } : {}), requireEnabled: options.audience !== 'user' }
+  const first = await readMemoryObservation(observation)
+  const record = first.records.get(memoryId)
+  if (!record || options.audience !== 'user' && !memoryIsEligible(record, explicitExpired, first.nowTs)) throw new MemoryMediaError('This memory is deleted or expired and is not eligible for agent delivery.')
+  const mediaId = typeof mediaOrId === 'string' ? mediaOrId : mediaOrId.id
+  const media = record.media?.find(entry => entry.id === mediaId)
   if (!media) {
     throw new MemoryMediaError(`Memory media "${String(mediaOrId)}" was not found.`)
   }
   if (!media.filename.startsWith(`${agentId}/${memoryId}/`)) {
     throw new MemoryMediaError('Memory media ownership does not match the requested memory.')
   }
-  const upload = await redis.get(uploadKey(media.filename))
+  const upload = await redis.get(uploadKey(media.filename), { throwOnError: true })
   if (!upload || typeof upload !== 'object' || (upload as any).storage !== 'filesystem') {
     throw new MemoryMediaError(`Memory media "${media.id}" is missing its upload record.`)
   }
@@ -254,15 +290,18 @@ export async function loadMemoryMedia(
   if (bytes.byteLength !== media.bytes) {
     throw new MemoryMediaError(`Memory media "${media.id}" size does not match its record.`)
   }
-  return {
-    media,
-    bytes,
-    dataUrl: `data:${media.mime_type};base64,${Buffer.from(bytes).toString('base64')}`,
-    url: `/uploads/${MEMORY_MEDIA_UPLOAD_TYPE}/${media.filename
-      .split('/')
-      .map((part) => encodeURIComponent(part))
-      .join('/')}`
+  if (createHash('sha256').update(bytes).digest('hex') !== media.sha256) {
+    throw new MemoryMediaError(`Memory media "${media.id}" bytes do not match its saved hash.`)
   }
+  const dataUrl = `data:${media.mime_type};base64,${Buffer.from(bytes).toString('base64')}`
+  const url = `/uploads/${MEMORY_MEDIA_UPLOAD_TYPE}/${media.filename.split('/').map(part => encodeURIComponent(part)).join('/')}`
+  // Last await: original owner/lifecycle plus the exact same currently eligible media.
+  const final = await readMemoryObservation({ ...observation, expectedAgent: first.agentOwner })
+  const current = final.records.get(memoryId)
+  const currentMedia = current?.media?.find(entry => entry.id === mediaId)
+  if (!current || !currentMedia || JSON.stringify(currentMedia) !== JSON.stringify(media) || options.audience !== 'user' && !memoryIsEligible(current, explicitExpired, final.nowTs)) throw new MemoryMediaError('This memory image changed, expired or was deleted while its bytes were loading.')
+  return { media: currentMedia, bytes, dataUrl, url }
+
 }
 
 export async function deleteMemoryMedia(media: MemoryMediaRecord): Promise<void> {

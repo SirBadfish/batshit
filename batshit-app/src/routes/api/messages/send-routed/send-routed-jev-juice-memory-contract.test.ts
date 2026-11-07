@@ -17,7 +17,7 @@ describe('send-routed Judge Juice memory recall contracts', () => {
     const recallTurn = source.indexOf('const jevJuiceMemoryRecall = buildSemanticRecallTurn({', collector)
     const compile = source.indexOf('await databaseService.buildFormattedChatInput(', recallTurn)
     const providerOption = source.indexOf('jevJuiceMemoryRecallProvider: jevJuiceMemoryRecall?.provider,', compile)
-    const compileEnd = source.indexOf("throw new Error('Failed to build formatted chat input for API or CLI agent')", compile)
+    const compileEnd = source.indexOf("throw new Error('Failed to build formatted chat input for the agent')", compile)
     const recordsAttached = source.indexOf('attachJevJuiceRecords(executionMetadata, jevJuiceTurn)', compile)
 
     expect(streamStart).toBeGreaterThan(-1)

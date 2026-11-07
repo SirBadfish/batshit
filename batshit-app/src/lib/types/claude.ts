@@ -1,4 +1,6 @@
 import type { Mode4Style } from '$lib/constants/mode4'
+import type { ReasoningControlSelection } from '$lib/types/reasoningControls'
+import type { CliReasoningEffort } from '$lib/data/cli-reasoning-contracts'
 
 export type ClaudePermissionMode = 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions'
 export type ClaudeConfigScope = 'managed' | 'global'
@@ -19,6 +21,9 @@ export interface ClaudeRuntimeSettings {
   model?: string | null
   alwaysThinkingEnabled?: boolean
   maxThinkingTokens?: number
+  /** Batshit owns persistence; Claude receives this through its per-run --effort flag. */
+  reasoningEffort?: CliReasoningEffort
+  reasoningSelection?: ReasoningControlSelection
   configScope: ClaudeConfigScope
   systemPromptMode?: ClaudeSystemPromptMode
   systemPrompt?: string

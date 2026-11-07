@@ -68,8 +68,18 @@ vi.mock('$lib/server/services/mcpGatewayService', () => ({
     list: vi.fn(async () => [])
   }
 }))
+// Filesystem migration projection only; physical access preservation/revision uses real Redis proof.
+vi.mock('$lib/server/services/slashCommandRevision', async importOriginal => ({
+  ...await importOriginal<typeof import('../slashCommandRevision')>(),
+  captureSlashCommandWriteBasis: vi.fn(async () => Object.freeze({})),
+  saveSlashCommandRecord: vi.fn(async (userId: string, write: { record: { id: string } }) => {
+    mockState.store.set(`slash_command:${userId}:${write.record.id}`, write.record)
+    return write.record
+  })
+}))
 
 let originalHome = process.env.HOME
+const originalBatshitHome = process.env.BATSHIT_HOME_DIR
 let tempHome = ''
 
 async function pathExists(targetPath: string): Promise<boolean> {
@@ -86,11 +96,14 @@ beforeEach(async () => {
   mockState.userSettings = {}
   tempHome = await fs.mkdtemp(path.join(os.tmpdir(), 'batshit-skill-registry-test-'))
   process.env.HOME = tempHome
+  process.env.BATSHIT_HOME_DIR = path.join(tempHome, '.batshit')
   vi.resetModules()
 })
 
 afterEach(async () => {
   process.env.HOME = originalHome
+  if (originalBatshitHome === undefined) delete process.env.BATSHIT_HOME_DIR
+  else process.env.BATSHIT_HOME_DIR = originalBatshitHome
   if (tempHome) {
     await fs.rm(tempHome, { recursive: true, force: true })
   }
@@ -339,8 +352,11 @@ license: MIT
     expect(hydrated?.bundle_files?.map((file) => file.path)).toEqual(['scripts/run.sh'])
   })
 
-  it('reads repo-backed system skills directly from the repo instead of ~/.batshit/skills', async () => {
+  it('binds known built-ins to the current package before an existing stale source_ref', async () => {
     const { getSkill } = await import('../skillRegistry')
+    const obsoleteSource = path.join(tempHome, 'obsolete-system-package')
+    await fs.mkdir(obsoleteSource, { recursive: true })
+    await fs.writeFile(path.join(obsoleteSource, 'SKILL.md'), '# Obsolete shipped instructions\n')
 
     mockState.store.set('skill:user-1:speech_setup', {
       id: 'speech_setup',
@@ -350,7 +366,7 @@ license: MIT
       description: 'Install, verify, and register Batshit TTS/STT speech engines through the server-owned Engine Manager.',
       skill_markdown: '',
       source: 'system',
-      source_ref: undefined,
+      source_ref: obsoleteSource,
       dependencies: [],
       license: 'Proprietary (Batshit system skill)',
       compatibility: 'batshit-prelaunch',
@@ -382,14 +398,14 @@ license: MIT
 
     expect(hydrated).not.toBeNull()
     expect(hydrated?.skill_markdown).toContain('# TTS/STT Engine Installer')
-    expect(hydrated?.cache_path).toContain('/batshit-app/src/lib/server/system-skills/speech-setup/SKILL.md')
-    expect(hydrated?.source_ref).toContain('/batshit-app/src/lib/server/system-skills/speech-setup')
+    expect(hydrated?.cache_path).toContain('/batshit-app/src/lib/server/system-plugins/batshit/skills/voice-engine-installer/SKILL.md')
+    expect(hydrated?.source_ref).toContain('/batshit-app/src/lib/server/system-plugins/batshit/skills/voice-engine-installer')
     expect(hydrated?.bundle_files?.map((file) => file.path)).toContain('references/runtime-preflight.md')
     expect(await pathExists(path.join(tempHome, '.batshit', 'skills', 'speech_setup'))).toBe(false)
 
     const redisRecord = mockState.store.get('skill:user-1:speech_setup')
-    expect(redisRecord.cache_path).toContain('/batshit-app/src/lib/server/system-skills/speech-setup/SKILL.md')
-    expect(redisRecord.source_ref).toContain('/batshit-app/src/lib/server/system-skills/speech-setup')
+    expect(redisRecord.cache_path).toContain('/batshit-app/src/lib/server/system-plugins/batshit/skills/voice-engine-installer/SKILL.md')
+    expect(redisRecord.source_ref).toContain('/batshit-app/src/lib/server/system-plugins/batshit/skills/voice-engine-installer')
   })
 
   it('never deletes the repo bundle when removing a system skill record', async () => {
@@ -417,7 +433,7 @@ license: MIT
       has_assets: false,
       bundle_manifest: undefined,
       bundle_files: [],
-      cache_path: '/Users/example/batshit/batshit-app/src/lib/server/system-skills/speech-setup/SKILL.md',
+      cache_path: '/Users/example/batshit/batshit-app/src/lib/server/system-plugins/batshit/skills/voice-engine-installer/SKILL.md',
       is_system: true,
       is_active: true,
       created_at: '2026-03-09T00:00:00.000Z',
@@ -429,7 +445,7 @@ license: MIT
     expect(mockState.store.has('skill:user-1:speech_setup')).toBe(false)
     await expect(
       fs.readFile(
-        path.resolve(process.cwd(), 'src/lib/server/system-skills/speech-setup/SKILL.md'),
+        path.resolve(process.cwd(), 'src/lib/server/system-plugins/batshit/skills/voice-engine-installer/SKILL.md'),
         'utf8'
       )
     ).resolves.toContain('# TTS/STT Engine Installer')

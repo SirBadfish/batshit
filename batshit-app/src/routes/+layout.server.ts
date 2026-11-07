@@ -1,5 +1,6 @@
 import { RedisService } from '$lib/server/redis'
 import { isInternalDevPanelEnabled } from '$lib/server/internalDevPanel'
+import { resolveAppLook } from '$lib/appearance/appLook'
 import type { LayoutServerLoad } from './$types'
 
 export const load: LayoutServerLoad = async ({ locals }) => {
@@ -18,6 +19,8 @@ export const load: LayoutServerLoad = async ({ locals }) => {
       }
       userSettings = loadedSettings
       userSettingsReadSucceeded = true
+      // hooks.server.ts paints this on <html data-look> (appLookHandler).
+      locals.appLook = resolveAppLook(loadedSettings)
     } catch (error) {
       console.error('Error loading user settings:', error)
       userSettingsReadError = 'User settings could not load'

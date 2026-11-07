@@ -1,6 +1,4 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
-import { toolTextBudgetHeaders } from '$lib/server/services/toolTextBudget'
-import { commandModelCaptureResponse } from '$lib/server/services/commandModelCaptureResponse'
 import { apiFailure } from '$lib/server/services/apiResponses'
 
 import { redis } from '$lib/server/redis'
@@ -37,29 +35,14 @@ function statusForSkillRuntimeResult(result: { success: boolean; error?: string;
 /**
  * BL-75 — whose skill access applies to this call, by the lane it authenticated on.
  *
- * - `agent`: the run credential. A primary run is its own agent. A delegated run is the
- *   Subagent or Worker its credential names; one minted before BL-75 names none, and loads none.
  * - `session`: the signed-in user may act for any of their own agents, so the body names one,
  *   and it must be theirs.
- * - `service`, `portable-skill`, `n8n-callback`: no agent identity here, so no skill loads.
- *   An n8n Workflow Subagent loads skills through `/api/native-tools/dispatch` instead.
+ * - `service`, `portable-skill`: no agent identity here, so no skill loads.
  */
 async function resolveSkillRuntimeActor(
   auth: ResolvedAuth,
   claimedAgentId: unknown
 ): Promise<{ ok: true; actor: SkillRuntimeActor } | { ok: false; status: number; error: string }> {
-  if (auth.auth === 'agent') {
-    if (auth.delegated === true) {
-      return auth.scopeAgentId
-        ? { ok: true, actor: { kind: 'agent', agentId: auth.scopeAgentId, delegated: true } }
-        : { ok: true, actor: { kind: 'none', lane: 'agent-unscoped-delegated' } }
-    }
-    const agentId = auth.agentId?.trim() || ''
-    return agentId
-      ? { ok: true, actor: { kind: 'agent', agentId } }
-      : { ok: true, actor: { kind: 'none', lane: 'agent' } }
-  }
-
   if (auth.auth === 'session') {
     const agentId = typeof claimedAgentId === 'string' ? claimedAgentId.trim() : ''
     if (!agentId) {
@@ -128,19 +111,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       // Passed through as sent, so a malformed offset is refused by the service, not dropped.
       ...(body.offset !== undefined ? { offset: body.offset } : {})
     })
-
-    return commandModelCaptureResponse(
-      {
-        auth: auth.auth,
-        userId: auth.userId,
-        ...result
-      },
-      auth.auth === 'agent', statusForSkillRuntimeResult(result), {
-        ...toolTextBudgetHeaders(auth),
-        ...(auth.auth === 'agent' && result.success && body.action === 'read'
-          ? { 'x-batshit-tool-page-kind': 'skill-read' } : {})
-      }
-    )
+    return json({ auth: auth.auth, userId: auth.userId, ...result }, { status: statusForSkillRuntimeResult(result) })
   } catch (error) {
     console.error('[Skills Runtime] failed:', error)
     return json(

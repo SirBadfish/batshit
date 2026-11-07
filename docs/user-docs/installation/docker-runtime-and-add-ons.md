@@ -141,7 +141,7 @@ Open Settings → API Keys after first launch. Provider keys are normal user-ent
 
 Core Infrastructure rows are different in Docker:
 
-- Batshit Internal Token is managed by `.env.docker` and Compose. Current official n8n templates use scoped per-message native-tool tokens, so most users do not need to copy this value. Rotate it by editing `.env.docker` and recreating/restarting containers.
+- Batshit Internal Token is managed by `.env.docker` and Compose. Rotate it by editing `.env.docker` and recreating/restarting containers.
 - Artifact Complete URL normally uses the Docker default; a blank saved value doesn't mean artifact callbacks are broken.
 - Docker MCP Gateway Token appears only when the optional gateway is configured.
 - n8n URL reflects the effective Docker runtime route.
@@ -166,24 +166,6 @@ The host operator runs only while Docker Batshit does. On a Mac it is a login it
 
 Batshit does not mount the host Docker socket into the core app container by default. That's intentional.
 
-## Codex / Claude Code CLI in Docker
-
-The Docker app image doesn't ship the Codex or Claude Code CLI. Install them with one click from inside Batshit: open your `CLI` agent in Settings and use the install card in the model section. The install lands in a persistent Docker volume (`batshit_agent_runtime`), so it survives container restarts and image upgrades. Docker CLI login state is also kept in persistent Docker state after login.
-
-After installing, each CLI still needs a container-side login before `CLI` agents can use it. Use the exact command Batshit shows in Agent Settings. For a Batshit-managed install, from the folder containing `compose.yaml` and `.env.docker`:
-
-```sh
-docker compose --env-file .env.docker exec app /home/batshit-cli/.batshit/installs/cli/bin/codex login --device-auth
-docker compose --env-file .env.docker exec --user batshit-cli --env HOME=/home/batshit-cli --env USER=batshit-cli --env LOGNAME=batshit-cli --env SHELL=/bin/sh app /home/batshit-cli/.batshit/installs/cli/bin/claude auth login
-```
-
-If you started the n8n profile and your Compose command normally includes `--profile n8n`, include that profile in the login command too.
-
-On Windows, Claude Code may print `Paste code here if prompted >` after the browser login. Paste the browser auth code at that prompt, then press Enter. The pasted code may not appear in the terminal, so do not wait for visible text. Do not save or share auth codes in docs or chat.
-
-Docker Claude runs as the non-root `batshit-cli` user so Claude Code Bypass Permissions can work. If a Docker Claude agent still reports that Bypass Permissions cannot run as root, rebuild the app image from current source and use the exact login command shown in Agent Settings.
-
-An unauthenticated Codex run can reach the real CLI and still fail with an OpenAI `401 Unauthorized`. In that case the missing step is usually container-side Codex login, not provider keys saved in Batshit.
 
 ## Runtime add-on shapes
 

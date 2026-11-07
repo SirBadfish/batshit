@@ -3,24 +3,41 @@ import {
   advanceRecipeJobStage,
   discardRecipeJob,
   failRecipeJob,
+  readReadyRecipeJob,
   recoverInterruptedRecipeJob,
   renewActiveRecipeJobLease,
   retryRecipeJob
 } from '$lib/server/services/goonRecipeLifecycleService.server'
 import { authenticatedRecipeOwner, recipeRouteError } from '$lib/server/services/goonRecipeRoute.server'
 
-export const GET: RequestHandler = async ({ params, locals }) => {
+function noStore(response: Response) {
+  const headers = new Headers(response.headers)
+  headers.set('Cache-Control', 'no-store')
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
+}
+
+export const GET: RequestHandler = async ({ params, locals, url }) => {
+  const readyMode = url.searchParams.has('mode')
   const owner = authenticatedRecipeOwner(locals.user?.id, params.id)
-  if (owner instanceof Response) return owner
-  if (!params.jobId) return json({ error: 'Recipe job id is required' }, { status: 400 })
+  if (owner instanceof Response) return readyMode ? noStore(owner) : owner
+  if (!params.jobId) {
+    const response = json({ error: 'Recipe job id is required' }, { status: 400 })
+    return readyMode ? noStore(response) : response
+  }
+  if (readyMode && (url.searchParams.size !== 1 || url.searchParams.get('mode') !== 'ready-only')) {
+    return noStore(json({ error: 'Invalid Recipe job read mode' }, { status: 400 }))
+  }
   try {
-    return json(await recoverInterruptedRecipeJob({
+    const input = {
       userId: owner.userId,
       goonId: owner.goonId,
       jobId: params.jobId
-    }))
+    }
+    if (readyMode) return noStore(json(await readReadyRecipeJob(input)))
+    return json(await recoverInterruptedRecipeJob(input))
   } catch (error) {
-    return recipeRouteError(error)
+    const response = recipeRouteError(error)
+    return readyMode ? noStore(response) : response
   }
 }
 

@@ -1,3 +1,4 @@
+import { commitMemoryMutation, readMemoryMutationSnapshot, memoryMutationUnknown } from './memoryMutation'
 import { redis } from '$lib/server/redis'
 import type { MemoryMediaRecord, MemoryRecord } from './memoryTypes'
 import { MEMORY_KEY_PREFIX, MEMORY_MEDIA_MIGRATION_KEY } from './memoryKeys'
@@ -18,8 +19,29 @@ export interface MemoryMediaMigrationResult {
  * an honest provenance note, writes media: [], and retires clip_ids permanently.
  */
 export async function ensureMemoryMediaMigration(): Promise<MemoryMediaMigrationResult> {
-  if (await redis.exists(MEMORY_MEDIA_MIGRATION_KEY)) {
-    return { status: 'already-complete', records: 0, media: 0, unresolved: 0 }
+  // A failed read is not an absent marker or an absent memory. These reads must
+  // retain the raw client's errors instead of the generic get facade's null.
+  const { present, receipt } = await redis.execute(async (client) => {
+    const kind = await client.type(MEMORY_MEDIA_MIGRATION_KEY)
+    if (kind === 'none') return { present: false, receipt: null }
+    if (kind !== 'ReJSON-RL') throw new Error('The memory-media migration receipt is unreadable or unsupported.')
+    return { present: true, receipt: await client.json.get(MEMORY_MEDIA_MIGRATION_KEY) }
+  })
+  // JSON null is a present unsupported receipt, not permission to run the migration again.
+  if (present) {
+    const stored = receipt as Partial<MemoryMediaMigrationResult>
+    if (
+      !stored || typeof stored !== 'object' || stored.status !== 'migrated' ||
+      ![stored.records, stored.media, stored.unresolved].every((value) => Number.isSafeInteger(value) && Number(value) >= 0)
+    ) {
+      throw new Error('The memory-media migration receipt is unreadable or unsupported.')
+    }
+    return {
+      status: 'already-complete',
+      records: stored.records!,
+      media: stored.media!,
+      unresolved: stored.unresolved!
+    }
   }
 
   const keys = await redis.keys(`${MEMORY_KEY_PREFIX}*`)
@@ -28,8 +50,11 @@ export async function ensureMemoryMediaMigration(): Promise<MemoryMediaMigration
   let unresolved = 0
 
   for (const key of keys) {
-    const stored = (await redis.get(key)) as LegacyMemoryRecord | null
+    const stored = (await redis.execute((client) => client.json.get(key))) as LegacyMemoryRecord | null
     if (!stored || !Array.isArray(stored.clip_ids)) continue
+    const mutation = await readMemoryMutationSnapshot(stored.agent_id, { targetIds: [stored.id] })
+    const original = mutation.records.find(record => record.id === stored.id) as LegacyMemoryRecord | undefined
+    if (!original || JSON.stringify(original) !== JSON.stringify(stored)) throw new Error('Memory changed before media migration.')
     const clipIds = Array.from(new Set(stored.clip_ids.filter((value) => typeof value === 'string' && value.trim())))
     const copied: MemoryMediaRecord[] = []
     let failure: string | null = null
@@ -41,11 +66,13 @@ export async function ensureMemoryMediaMigration(): Promise<MemoryMediaMigration
             agentId: stored.agent_id,
             memoryId: stored.id,
             clipId,
-            source: 'migration'
+            source: 'migration',
+            lifecycle: mutation.lifecycle
           })
         )
       }
     } catch (error) {
+      if (memoryMutationUnknown(error)) throw error
       for (const media of copied) await deleteMemoryMedia(media).catch(() => {})
       failure = error instanceof MemoryMediaError ? error.message : String(error)
     }
@@ -64,7 +91,11 @@ export async function ensureMemoryMediaMigration(): Promise<MemoryMediaMigration
       }
       unresolved += clipIds.length
     }
-    await redis.set(key, next)
+    try { await commitMemoryMutation(mutation, new Map([[key, next]])) }
+    catch (error) {
+      if (!memoryMutationUnknown(error)) for (const media of copied) await deleteMemoryMedia(media).catch(() => {})
+      throw error
+    }
     records += 1
     mediaCount += failure ? 0 : copied.length
   }

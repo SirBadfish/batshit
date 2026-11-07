@@ -65,21 +65,25 @@ function messages() {
   ]
 }
 
-async function compact() {
+/** The page's id for its Compact (BL-795): one tab's Compact, its plan and its summary. */
+const TAB_A_COMPACT = 'compact_tab_a'
+const TAB_B_COMPACT = 'compact_tab_b'
+
+async function compact(compactId: string = TAB_A_COMPACT) {
   const request = new Request('http://localhost/api/messages/compact', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ sessionId: SESSION, agentId: AGENT, mode: 'manual', messages: messages() })
+    body: JSON.stringify({ sessionId: SESSION, compactId, agentId: AGENT, mode: 'manual', messages: messages() })
   })
   const response = await compactPost({ request, locals: { user: { id: USER } }, fetch: globalThis.fetch } as any)
   return { status: response.status, body: await response.json() }
 }
 
-async function stop(userId = USER, sessionId = SESSION) {
+async function stop(userId = USER, sessionId = SESSION, compactId: string | null = TAB_A_COMPACT) {
   const request = new Request('http://localhost/api/messages/compact/stop', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ sessionId })
+    body: JSON.stringify({ sessionId, ...(compactId === null ? {} : { compactId }) })
   })
   const response = await stopPost({ request, locals: { user: { id: userId } } } as any)
   return { status: response.status, body: await response.json() }
@@ -195,6 +199,26 @@ describe('Stop stops a running Compact (BL-622 C6 and C7, BL-653)', () => {
     // The pending stop is used up: the next Compact runs and writes.
     expect((await compact()).status).toBe(200)
     expect(await storedEvents()).toHaveLength(1)
+  })
+
+  // BL-795: a pending stop was the chat's, so it stopped another tab's Compact of the same chat
+  // that registered within the 5 s, though nobody pressed Stop there.
+  it('a Stop pressed before its own Compact registered does not stop another tab\'s Compact (BL-795)', async () => {
+    expect(await stop(USER, SESSION, TAB_A_COMPACT)).toEqual({ status: 200, body: { success: true, stopped: 0 } })
+    // Tab B's summary, already planned, registers first: nobody stopped it.
+    const tabB = await compact(TAB_B_COMPACT)
+    expect(tabB.status, JSON.stringify(tabB.body)).toBe(200)
+    expect(await storedEvents()).toHaveLength(1)
+    // Tab A's Compact, the one the Stop was for, still starts stopped (on a chat with something
+    // left to compact).
+    await seedChat()
+    expect(await compact(TAB_A_COMPACT)).toEqual({ status: 409, body: STOPPED })
+    expect(await storedEvents()).toEqual([])
+  })
+
+  it('a Stop names its Compact (BL-795)', async () => {
+    expect(await stop(USER, SESSION, null)).toMatchObject({ status: 400, body: { error: 'compactId is required' } })
+    expect(await stop(USER, SESSION, 'not a compact id')).toMatchObject({ status: 400 })
   })
 
   it('the registry entry leaves on every path', async () => {

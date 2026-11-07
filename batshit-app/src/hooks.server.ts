@@ -1,14 +1,22 @@
-import { type Handle } from '@sveltejs/kit'
+import { materializeToolSettingsAtStartup } from '$lib/server/services/toolSettingsMigration'
+import { initializeSystemSlashCommandsAtStartup } from '$lib/server/services/systemSlashCommands'
+import { DEFAULT_APP_LOOK } from '$lib/appearance/appLook'
+import { type Handle } from '@sveltejs/kit/hooks'
+import { building, dev, version } from '$app/env'
 import { env } from '$env/dynamic/private'
 import { authService, resolveSessionCookieName } from '$lib/services/auth.server'
 import { authRateLimiter, apiRateLimiter } from '$lib/middleware/rateLimiter'
 import { ensureSkillFilesystemStartup } from '$lib/server/services/skillRegistry'
 import {
+  foldRetiredZipToolPrompts,
   listCoreSystemPrompts,
   removeRetiredSystemPrompts
 } from '$lib/server/services/systemPromptRegistry'
 import { removeRetiredSystemClips } from '$lib/server/services/retiredSystemClips'
+import { removeRetiredCliCredentialIndexSets } from '$lib/server/services/agentRunCredentials'
+import { removeRetiredSkillReadSettings } from '$lib/server/services/retiredSkillReadSettings'
 import { removeRetiredZipControlFields } from '$lib/server/services/retiredZipControlFields'
+import { describeZipDefaultsSweep, sweepOldZipDefaults } from '$lib/server/services/zipDefaultsSweep'
 import { ensureMemoryIndexes } from '$lib/server/services/memory/memoryIndex'
 import { startMemoryDreamingScheduler } from '$lib/server/services/memory/memoryDreamingScheduler'
 import { startScheduleTicker } from '$lib/server/services/schedules/scheduleTicker'
@@ -31,11 +39,18 @@ import {
   shouldBlockHostedVercelAppRequest
 } from '$lib/server/services/hostedAppGuard'
 import { applyBaselineSecurityHeaders } from '$lib/server/services/securityHeaders'
+import { armClaudePlanRunLifecycle } from '$lib/server/services/claudePlanRunRegistry'
 import {
   ensureBackupRestoreRecovery,
   enterBackupRestoreHttpRequest
 } from '$lib/server/services/backupRestoreService'
 import { sequence } from '@sveltejs/kit/hooks'
+import {
+  automaticBackupBuildId,
+  beginAutomaticBackupStartup,
+  completeAutomaticBackupStartup,
+  failAutomaticBackupStartup
+} from '$lib/server/services/automaticBackupStartup'
 
 let startupIntegrityInitialized = false
 let startupIntegrityPromise: Promise<void> | null = null
@@ -122,10 +137,15 @@ async function closeRuntimeResources(reason: string) {
   }
 }
 
-registerRuntimeShutdownHandler()
-// Docker: the host voice engines this Batshit's operator started stop with the container, from the
-// moment the server starts, not from the first signed-in page load (BL-19).
-registerDockerVoiceEngineShutdown()
+// Kit imports hooks for build analysis and prerendering; those are not server
+// starts and must not sweep live run folders or arm runtime shutdown effects.
+if (!building) {
+  registerRuntimeShutdownHandler()
+  // Docker: register from server start, not the first signed-in page load (BL-19).
+  registerDockerVoiceEngineShutdown()
+  // SA-139 (D10): sweep crashed-run leftovers and own shutdown before any request.
+  armClaudePlanRunLifecycle()
+}
 
 function isUnsafePlaceholderSecret(value: string): boolean {
   return value.trim().toLowerCase().startsWith('replace-with-')
@@ -142,38 +162,74 @@ export function assertInternalServiceTokenConfigured() {
   }
 }
 
-function ensureStartupIntegrityPass() {
+export function ensureStartupIntegrityPass() {
   if (!startupIntegrityInitialized) {
     startupIntegrityInitialized = true
-    assertApiKeyEncryptionConfigured()
-    assertInternalServiceTokenConfigured()
+    // Retain the promise before any admission work, including synchronous owner failures.
+    startupIntegrityPromise = Promise.resolve().then(async () => {
+      assertApiKeyEncryptionConfigured()
+      assertInternalServiceTokenConfigured()
     if (isHostedVercelRegistryDeployment(env)) {
       // Registry-only deployment: no batshit-server, no uploads, read-only filesystem.
       // Backup-restore recovery and instance seeding are single-user-instance work.
       console.info(
         '[Startup] Hosted Vercel registry deployment detected; skipping single-instance startup (backup-restore recovery, skill filesystem, prompt/clip seeding).'
       )
-      startupIntegrityPromise = Promise.resolve()
-      return startupIntegrityPromise
+      return
     }
-    startupIntegrityPromise = (async () => {
-      await ensureBackupRestoreRecovery()
-      void ensureSkillFilesystemStartup()
-      void listCoreSystemPrompts().catch((error) => {
+    const buildId = automaticBackupBuildId(version, dev)
+    const backupStartup = beginAutomaticBackupStartup(buildId)
+    try {
+      const recovery = ensureBackupRestoreRecovery()
+      await recovery
+      // Critical saved-data conversion: no request, compile or scheduler sees inherited grants.
+      await materializeToolSettingsAtStartup()
+      const skills = ensureSkillFilesystemStartup()
+      await skills
+      await initializeSystemSlashCommandsAtStartup()
+      // BL-1777: before any compile and before the seed below, move the two older zip tool
+      // prompts into "Tool Prompt: Zips", so an admin's edit is in place when agents compile and
+      // the seed never writes the default first. A failure keeps every old record as it is
+      // (the compile then reads the built default) and the next start tries again.
+      const zipPrompts = foldRetiredZipToolPrompts()
+      await zipPrompts.catch((error) => {
+        console.error('[Startup] Failed to move the older zip tool prompts into "Tool Prompt: Zips"; the next start tries again:', error)
+      })
+      const promptDefaults = listCoreSystemPrompts()
+      void promptDefaults.catch((error) => {
         console.error('[Startup] Failed to seed core system prompt defaults:', error)
       })
-      void removeRetiredSystemPrompts().catch((error) => {
+      const retiredPrompts = removeRetiredSystemPrompts()
+      void retiredPrompts.catch((error) => {
         console.error('[Startup] Failed to remove retired core system prompts:', error)
       })
-      void removeRetiredSystemClips().catch((error) => {
+      // SA-139 R5: the removed CLI Subagent and Worker runs' credential index sets, which no
+      // delete sweeps. Idempotent; a failure leaves them for the next start.
+      void removeRetiredCliCredentialIndexSets().catch((error) => {
+        console.error('[Startup] Failed to remove retired CLI credential index sets:', error)
+      })
+      const retiredClips = removeRetiredSystemClips()
+      void retiredClips.catch((error) => {
         console.error('[Startup] Failed to remove retired system clips:', error)
       })
       // BL-1484: the parked zip control permission's two older keys are removed for real; the
       // permission reads only its hidden experiment key. Idempotent; logs only when it removed.
-      void removeRetiredZipControlFields().catch((error) => {
+      const retiredZipFields = Promise.all([removeRetiredZipControlFields(), removeRetiredSkillReadSettings()])
+      void retiredZipFields.catch((error) => {
         console.error('[Startup] Failed to remove retired zip control fields; the next start retries:', error)
       })
-      void ensureMemoryIndexes()
+      // SA-126 shipped defaults: stored rows equal to the old factory zip rows go once per instance,
+      // so existing agents and the Global Tool Grid inherit the new defaults (marker-guarded).
+      const zipDefaults = sweepOldZipDefaults()
+      void zipDefaults
+        .then((result) => {
+          if (result.rows > 0) console.info(`[Startup] ${describeZipDefaultsSweep(result)}`)
+        })
+        .catch((error) => {
+          console.error('[Startup] The one-time sweep of old default zip rows failed; the next start retries:', error)
+        })
+      const memoryIndexes = ensureMemoryIndexes()
+      void memoryIndexes
         .then((result) => {
           if (result.status !== 'ready') {
             console.info(
@@ -185,7 +241,8 @@ function ensureStartupIntegrityPass() {
           // Loud by contract (DL-104-10): recall paths also hard-fail until this is fixed.
           console.error('[Startup] Memory index bootstrap failed:', error)
         })
-      void ensureMemoryMediaMigration()
+      const memoryMedia = ensureMemoryMediaMigration()
+      void memoryMedia
         .then((result) => {
           if (result.status === 'migrated' && (result.records > 0 || result.unresolved > 0)) {
             console.info(
@@ -204,19 +261,33 @@ function ensureStartupIntegrityPass() {
       // never fired, so nothing starts an agent turn just because Batshit booted.
       // BL-793: both are skipped, with a boot log line, when BATSHIT_DISABLE_SCHEDULERS=1.
       armBackgroundSchedulers()
-    })()
+      void completeAutomaticBackupStartup({
+        recovery, skills, zipPrompts, promptDefaults, retiredPrompts,
+        retiredClips, retiredZipFields, zipDefaults, memoryIndexes, memoryMedia
+      }, {
+        buildId,
+        schedulersDisabled: env.BATSHIT_DISABLE_SCHEDULERS === '1',
+        guard: backupStartup
+      })
+    } catch (error) {
+      backupStartup.finish()
+      throw error
+    }
+    })
   }
   return startupIntegrityPromise ?? Promise.resolve()
 }
 
-const startupIntegrityHandler: Handle = async ({ event, resolve }) => {
+export const startupIntegrityHandler: Handle = async ({ event, resolve }) => {
   try {
     await ensureStartupIntegrityPass()
   } catch (error) {
-    console.error('[Startup] Backup restore recovery failed:', error)
+    failAutomaticBackupStartup(automaticBackupBuildId(version, dev),
+      'Startup recovery did not complete. Check the app logs before automatic backups can run.')
+    console.error('[Startup] Saved-data startup recovery or tool settings conversion failed:', error)
     return new Response(
       JSON.stringify({
-        error: 'Batshit could not safely recover an interrupted backup restore. Check the app logs before retrying.'
+        error: 'Batshit could not safely finish saved-data startup recovery. Check the app logs before retrying.'
       }),
       { status: 503, headers: { 'Content-Type': 'application/json' } }
     )
@@ -364,6 +435,14 @@ const sessionHandler: Handle = async ({ event, resolve }) => {
   return resolve(event)
 };
 
+// The app's look on <html data-look> before the first frame (Josh, 2026-10-29): the root layout
+// reads the user's settings and leaves the look in locals; a page with no settings read (signed
+// out, or a read that failed) gets the default. app.html carries the %batshit.look% slot.
+const appLookHandler: Handle = async ({ event, resolve }) =>
+  resolve(event, {
+    transformPageChunk: ({ html }) => html.replace('%batshit.look%', event.locals.appLook ?? DEFAULT_APP_LOOK)
+  })
+
 // Baseline security headers on every app response (G-0235); the helper only
 // fills headers the inner handlers did not set.
 const securityHeadersHandler: Handle = async ({ event, resolve }) => {
@@ -382,5 +461,6 @@ export const handle = sequence(
   startupIntegrityHandler,
   backupRestoreMaintenanceHandler,
   sessionHandler,
+  appLookHandler,
   rateLimitHandler
 );

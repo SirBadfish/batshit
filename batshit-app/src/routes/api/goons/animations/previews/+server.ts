@@ -1,4 +1,5 @@
 import { storeGoonReferenceRecordForClient } from '$lib/server/services/goonCustomAssetOwnership.server'
+import { readStoredGoonAnimationLibrary } from '$lib/server/services/goonAnimationLibraryNormalization.server'
 import { json, type RequestHandler } from '@sveltejs/kit'
 import { redis } from '$lib/server/redis'
 import {
@@ -43,17 +44,6 @@ function normalizePreviewVideo(value: unknown): GoonFileRef | null {
   }
 }
 
-function normalizeLibrary(value: unknown): GoonAnimationLibrary {
-  if (!value || typeof value !== 'object') {
-    return { vrma: [] }
-  }
-  const record = value as GoonAnimationLibrary
-  return {
-    ...record,
-    vrma: Array.isArray(record.vrma) ? record.vrma : []
-  }
-}
-
 export const POST: RequestHandler = async ({ request, locals }) => {
   if (!locals.user?.id) {
     return json({ error: 'Unauthorized' }, { status: 401 })
@@ -74,6 +64,12 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
     if (!file) {
       return json({ error: 'No preview file uploaded.' }, { status: 400 })
+    }
+
+    const initialLibrary = await redis.execute((client) =>
+      readStoredGoonAnimationLibrary(client, `user:${locals.user!.id}:goons_animation_library`))
+    if (!initialLibrary.vrma.some((entry) => entry.filename === animationFilename)) {
+      return json({ error: 'Animation not found.' }, { status: 404 })
     }
 
     const uploadForm = new FormData()
@@ -101,8 +97,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 	    let previousPreviewFilename: string | undefined
 	    const updated = await redis.execute(async (client) => {
 	      const key = `user:${locals.user!.id}:goons_animation_library`
-	      const existing = (await client.json.get(key)) as GoonAnimationLibrary | null
-      const library = normalizeLibrary(existing)
+	      const library = await readStoredGoonAnimationLibrary(client, key)
       const current = Array.isArray(library.vrma) ? library.vrma : []
       const existingEntry = current.find((entry) => entry.filename === animationFilename) ?? null
 
@@ -141,7 +136,8 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
 	    return json({
 	      library: resolveUploadUrlsForBrowserInPayload(updated),
-	      previewVideo: resolveUploadUrlsForBrowserInPayload(previewVideo)
+	      previewVideo: resolveUploadUrlsForBrowserInPayload(previewVideo),
+	      ownerId: locals.user.id
 	    })
   } catch (error) {
     console.error('Error uploading animation preview:', error)

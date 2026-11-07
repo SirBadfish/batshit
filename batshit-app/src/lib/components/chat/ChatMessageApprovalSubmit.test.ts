@@ -245,30 +245,44 @@ describe('ChatMessage: what an approval click leaves on the card', () => {
     ])
   })
 
-  it('a failed answer on the Claude lane puts the buttons back', async () => {
+  it('clears a saved Claude permission with a retirement request and no approval response', async () => {
     seed([bashApproval('toolu_1', 'git push', { source: 'claude' })], 'claude')
-    fetchMock.mockResolvedValue(jsonResponse(500, { error: 'Failed to submit approval response' }))
+    fetchMock.mockResolvedValue(jsonResponse(200, { success: true, retiredApprovalIds: ['toolu_1'] }))
     mount()
-
-    await fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
-
-    await screen.findByText('Failed to submit approval response', { selector: '.message-approval-error' })
-    expect(fetchMock.mock.calls[0][0]).toBe('/api/tool-approvals/respond')
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Approve' })).toBeTruthy())
-    expect(storedApprovals()[0]).toMatchObject({ status: 'pending' })
+    await fireEvent.click(screen.getByRole('button', { name: 'Clear expired approval' }))
+    await waitFor(() => expect(storedApprovals()[0]).toMatchObject({ status: 'expired', expiryReason: 'run_ended' }))
+    const body = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))
+    expect(body.metadata.retireSavedApprovalId).toBe('toolu_1')
+    expect(body.metadata).not.toHaveProperty('toolApprovalResponse')
+    expect(screen.queryByText('Approved')).toBeNull()
+    expect(screen.queryByText('Denied')).toBeNull()
   })
 
-  it('an accepted answer on the Claude lane keeps "Approved"', async () => {
-    seed([bashApproval('toolu_1', 'git push', { source: 'claude' })], 'claude')
-    fetchMock.mockResolvedValue(jsonResponse(200, { success: true }))
+  it('clears a mixed old card without sending the Claude permission or the live API decision', async () => {
+    seed([
+      bashApproval('old-claude', 'git push', { source: 'claude' }),
+      { approvalId: 'old-control', status: 'pending', source: 'fabric', toolName: 'native_batshit_tool_use',
+        control: { approvalId: 'apr_old', controlId: 'sys.skill.import', controlTitle: 'Skill Import', riskLevel: 'confirm', lane: 'cli' } },
+      bashApproval('live-api', 'echo live', { source: 'vercel' })
+    ], 'claude')
+    fetchMock.mockResolvedValue(jsonResponse(200, { success: true, retiredApprovalIds: ['old-claude', 'old-control'], stillPending: true }))
     mount()
+    await fireEvent.click(screen.getAllByRole('button', { name: 'Clear expired approval' })[1])
+    await waitFor(() => expect(storedApprovals().map(entry => entry.status)).toEqual(['expired', 'expired', 'pending']))
+    const body = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))
+    expect(body.metadata.retireSavedApprovalId).toBe('old-control')
+    expect(body.metadata).not.toHaveProperty('toolApprovalResponse')
+    expect(screen.getByRole('button', { name: 'Approve' })).toBeTruthy()
+  })
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
-
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
-    await waitFor(() => expect(screen.getByText('Approved')).toBeTruthy())
-    expect(screen.queryByRole('button', { name: 'Approve' })).toBeNull()
-    expect(storedApprovals()[0]).toMatchObject({ status: 'approved' })
+  it('keeps a retired card actionable if the retirement request fails', async () => {
+    seed([bashApproval('old-claude', 'git push', { source: 'claude' })], 'claude')
+    fetchMock.mockResolvedValue(jsonResponse(503, { error: 'Could not clear the old card.' }))
+    mount()
+    await fireEvent.click(screen.getByRole('button', { name: 'Clear expired approval' }))
+    await screen.findByText('Could not clear the old card.', { selector: '.message-approval-error' })
+    expect(storedApprovals()[0]).toMatchObject({ status: 'pending' })
+    expect(screen.getByRole('button', { name: 'Clear expired approval' })).toBeTruthy()
   })
 
   /**
@@ -331,47 +345,37 @@ describe('ChatMessage: what an approval click leaves on the card', () => {
     expect(storedApprovals()[0]).toMatchObject({ status: 'pending', submitted: false })
   })
 
-  /**
-   * BL-496 (A5, A6): a Claude card's clock is its permission helper's wait. When it runs out the
-   * card says nobody answered, and the page sends nothing: the helper ends the card itself, and
-   * send-routed never answers a Claude card (it used to be sent there as a Deny).
-   */
-  it('a Claude card past its own time says nobody answered and sends nothing', async () => {
+  it('keeps an old Claude card actionable even if its former permission clock elapsed', async () => {
     const asked = Date.now() - 11 * 60_000
-    seed(
-      [
-        bashApproval('claude-1', 'git push', {
-          source: 'claude',
-          requestedAt: new Date(asked).toISOString(),
-          expiresAt: new Date(asked + 10 * 60_000).toISOString()
-        })
-      ],
-      'claude'
-    )
+    seed([bashApproval('claude-1', 'git push', { source: 'claude',
+      requestedAt: new Date(asked).toISOString(), expiresAt: new Date(asked + 10 * 60_000).toISOString() })], 'claude')
     mount()
-
-    await screen.findByText('Expired: nobody answered')
-    expect(storedApprovals()[0]).toMatchObject({ status: 'expired', expiryReason: 'unanswered' })
-    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(await screen.findByRole('button', { name: 'Clear expired approval' })).toBeTruthy()
+    expect(storedApprovals()[0]).toMatchObject({ status: 'pending' })
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
-  it('a Claude card still inside its ten minutes keeps its buttons past three', async () => {
-    const asked = Date.now() - 4 * 60_000
-    seed(
-      [
-        bashApproval('claude-2', 'git push', {
-          source: 'claude',
-          requestedAt: new Date(asked).toISOString(),
-          expiresAt: new Date(asked + 10 * 60_000).toISOString()
-        })
-      ],
-      'claude'
-    )
-    mount()
-
-    expect(await screen.findByRole('button', { name: 'Approve' })).toBeTruthy()
-    expect(storedApprovals()[0]).toMatchObject({ status: 'pending' })
-  })
 })
 
+
+// SA-126 item 2: the API lane's Bash tool runs the commands after a patch once it applied, so the
+// card says so on its first line, above the patch in the input (read by the same parser).
+describe('ChatMessage: a Bash card for a patch with commands after it', () => {
+  const patchThen = (after: string) =>
+    `apply_patch <<'PATCH'\n*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n*** End Patch\nPATCH\n${after}`
+
+  it('names the patched files and the first command, with how many more lines', () => {
+    seed([bashApproval('patch-then-test', patchThen('npm test\nnpm run lint'))])
+    mount()
+    expect(screen.getByText(/wants to apply a patch to `a\.txt`, then run `npm test` \(\+1 more line\)\.$/)).toBeTruthy()
+  })
+
+  it('keeps the plain wording for a patch alone and for another tool', () => {
+    seed([
+      bashApproval('patch-alone', patchThen('').trimEnd()),
+      bashApproval('helper', patchThen('npm test'), { toolName: 'batshit_server_bash_execute' })
+    ])
+    mount()
+    expect(screen.queryByText(/then run/)).toBeNull()
+  })
+})

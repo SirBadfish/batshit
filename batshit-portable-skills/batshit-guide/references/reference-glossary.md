@@ -188,7 +188,7 @@ A Batshit conversation where multiple Primary Agents can participate. Launch-fac
 
 ### Hold
 
-Keeping a result open for the model instead of letting the automatic Zip rules compress it. You hold a result from its Zip badge or the Zip Manager (**Hold**, or **Hold for 10 messages**); an agent holds a file it read by naming the file in its Tool Notes. **Release** gives it back to the automatic rules. Your holds always win over an agent's. See [Zips](../tools/zips.md#hold-and-release).
+Keeping a result open for the model instead of letting the automatic Zip rules compress it. You hold a result from its Zip badge or the Zip Manager (**Hold**, or **Hold for 10 messages**); an agent holds a file it read by naming the file in its Tool Notes block (this works with Tool Notes off too). **Release** gives it back to the automatic rules. Your holds always win over an agent's. See [Zips](../tools/zips.md#hold-and-release).
 
 ### Host Operator
 

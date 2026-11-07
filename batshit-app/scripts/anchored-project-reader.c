@@ -10,6 +10,24 @@
  * 255=ERROR(short ASCII code). A failed request publishes no content bytes.
  * Only one request may be in flight. The parent closes stdin on normal release;
  * TERM asks this helper to kill/reap its exact Git child before exiting.
+ *
+ * BL-2006 writer mode, SA-136 protocol v2. argv: --write-v2, absolute configured project root. It admits
+ * the root exactly as the reader does and never runs Git. Requests (relative paths
+ * as above; nothing is followed and no mount is crossed, at any component):
+ * 16=LSTAT(path), 17=READ(u32 byte cap + path), 18=WRITE(u8 kind 1=create-new
+ * 2=replace, u8 flags bit0=fsync, bit1=exact mode (create-new only), two zeroes,
+ * u32 create mode (0 = 0666 unless exact mode), u32 path
+ * length, path, bytes), 19=MKDIR(path), 20=RENAME(u32 source length, source,
+ * destination), 21=UNLINK(path), 22=RMDIR(path), 23=PROBE_WRITABLE(path; no data
+ * or mode change). Responses: 128=READY as above, 144=LSTAT(stat56),
+ * 145=READ(stat56 + bytes), 146=WRITE(stat56 after writing), 147=DONE,
+ * 148=PROBE_WRITABLE(stat56), 255=ERROR("<stage>:<errno name>"). stat56: u8 type (0 absent,
+ * 1 file, 2 link, 3 folder, 4 other, 5 a folder in the path is not a folder),
+ * three zeroes, u32 mode, u64 size, dev, ino, ctimeNs, mtimeNs, nlink. Each operation
+ * holds the target's parent folder as a descriptor opened beneath the root, then
+ * acts on the last component relative to it, so a folder swapped for a link at
+ * any moment can only make the operation fail or land in the held folder. The
+ * reader mode refuses every writer request, and the writer every reader request.
  */
 #define _GNU_SOURCE
 #include <sys/stat.h>
@@ -29,12 +47,54 @@
 #endif
 #ifdef __linux__
 #include <linux/openat2.h>
+#include <linux/stat.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
+#endif
+
+/* BL-2046: Linux shared filesystems can initially cache a newly-created directory's
+ * provisional inode. A later synchronized lookup (including Node's) then reports its backing
+ * inode, falsely resembling replacement. Admit synchronized directory metadata at every native
+ * snapshot instead of accepting an identity change or using an unconfined host-path lookup.
+ * Regular-file snapshots and macOS keep their existing syscalls. No cached fallback. */
+#ifdef __linux__
+static void barrier(const char *stage);
+static int sync_directory_metadata_at(int parent, const char *name, struct stat *st, int flags) {
+  if (!S_ISDIR(st->st_mode)) return 0;
+  struct statx fresh;
+  const unsigned int required = STATX_TYPE | STATX_INO;
+  if (syscall(SYS_statx, parent, name, flags | AT_NO_AUTOMOUNT | AT_STATX_FORCE_SYNC,
+      required, &fresh)) return -1;
+  if ((fresh.stx_mask & required) != required) { errno = EOPNOTSUPP; return -1; }
+  barrier("directory-stat-synchronized");
+  if (fstatat(parent, name, st, flags)) return -1;
+  if (!S_ISDIR(fresh.stx_mode) || !S_ISDIR(st->st_mode) ||
+      (uint64_t)st->st_ino != fresh.stx_ino ||
+      major(st->st_dev) != fresh.stx_dev_major || minor(st->st_dev) != fresh.stx_dev_minor) {
+    errno = EAGAIN;
+    return -1;
+  }
+  return 0;
+}
+static int metadata_stat_at(int parent, const char *name, struct stat *st, int flags) {
+  if (fstatat(parent, name, st, flags)) return -1;
+  return sync_directory_metadata_at(parent, name, st, flags);
+}
+static int metadata_fstat(int fd, struct stat *st) {
+  if (fstat(fd, st)) return -1;
+  return sync_directory_metadata_at(fd, "", st, AT_EMPTY_PATH);
+}
+#else
+#define metadata_stat_at fstatat
+#define metadata_fstat fstat
 #endif
 
 #define FILE_CAP 8000000u
 #define GIT_CAP 5000000u
 #define REQUEST_CAP 4100u /* READ's four-byte cap plus a 4096-byte relative path. */
+#define WRITE_CAP 67108864u /* BL-2006: 64 MiB per patched file. */
+/* WRITE's twelve-byte head, a 4096-byte path and its bytes. */
+#define WRITER_REQUEST_CAP (WRITE_CAP + 12u + 4096u)
 static int rootfd = -1;
 static pid_t git_child = -1;
 static volatile sig_atomic_t stopped = 0;
@@ -235,7 +295,7 @@ static int confined_open(const char *name, int test_barrier) {
   return (int)syscall(SYS_openat2, rootfd, name, &how, sizeof(how));
 #elif defined(__APPLE__)
   struct stat root_stat;
-  if (fstat(rootfd, &root_stat)) return -1;
+  if (metadata_fstat(rootfd, &root_stat)) return -1;
   int parent = dup(rootfd);
   if (parent < 0) return -1;
   char *copy = strdup(name), *part = copy;
@@ -250,7 +310,7 @@ static int confined_open(const char *name, int test_barrier) {
     close(parent);
     if (next < 0) { free(copy); errno = saved; return -1; }
     struct stat st;
-    if (fstat(next, &st) || st.st_dev != root_stat.st_dev || (slash && !S_ISDIR(st.st_mode))) {
+    if (metadata_fstat(next, &st) || st.st_dev != root_stat.st_dev || (slash && !S_ISDIR(st.st_mode))) {
       close(next); free(copy); errno = EXDEV; return -1;
     }
     if (!slash) { free(copy); return next; }
@@ -271,7 +331,7 @@ static void admit(const char *configured) {
   rootfd = open(configured, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   if (rootfd < 0) die("root-open");
   struct stat admitted, checked;
-  if (fstat(rootfd, &admitted) || !S_ISDIR(admitted.st_mode)) die("root-fstat");
+  if (metadata_fstat(rootfd, &admitted) || !S_ISDIR(admitted.st_mode)) die("root-fstat");
   barrier("admit-before-realpath");
   char *canonical = realpath(configured, NULL);
   if (!canonical || canonical[0] != '/' || !canonical[1] || !relative_ok(canonical + 1)) die("root-realpath");
@@ -289,7 +349,7 @@ static void admit(const char *configured) {
     if (!slash) break;
     part = slash + 1;
   }
-  if (fstat(parent, &checked) || checked.st_dev != admitted.st_dev || checked.st_ino != admitted.st_ino)
+  if (metadata_fstat(parent, &checked) || checked.st_dev != admitted.st_dev || checked.st_ino != admitted.st_ino)
     die("root-identity");
   close(parent); free(canonical);
 }
@@ -302,18 +362,20 @@ static void admit_git(const char *configured) {
   if (stat(git_executable, &st) || !S_ISREG(st.st_mode) ||
       access(git_executable, X_OK)) die("git-executable");
 }
-static void file_request(unsigned char kind, uint32_t id, char *name, uint32_t limit) {
+static void put_stat56(unsigned char *out, unsigned char type, const struct stat *st);
+/* `reply` 129 is the reader's READ; the writer's 145 puts the read file's stat56 first. */
+static void file_request(unsigned char kind, uint32_t id, char *name, uint32_t limit, unsigned char reply) {
   if (!relative_ok(name)) { error_frame(id, "relative-path"); return; }
   int file = confined_open(name, 1);
   if (file < 0) { error_frame(id, "confined-open"); return; }
   struct stat before, after;
-  if (fstat(file, &before) || !S_ISREG(before.st_mode) || before.st_size < 0 ||
+  if (metadata_fstat(file, &before) || !S_ISREG(before.st_mode) || before.st_size < 0 ||
       (uint64_t)before.st_size > limit) {
     close(file); error_frame(id, "ordinary-bounded-file"); return;
   }
   if (kind == 2) {
     int verify = confined_open(name, 0);
-    int valid = verify >= 0 && fstat(verify, &after) == 0 && same_file(&before, &after);
+    int valid = verify >= 0 && metadata_fstat(verify, &after) == 0 && same_file(&before, &after);
     if (verify >= 0) close(verify);
     if (!valid) { close(file); error_frame(id, "name-changed"); return; }
     uint64_t ctime_ns, mtime_ns;
@@ -329,26 +391,29 @@ static void file_request(unsigned char kind, uint32_t id, char *name, uint32_t l
     close(file); frame(130, id, stat_body, sizeof(stat_body)); return;
   }
   barrier("file-held");
-  unsigned char *bytes = malloc((size_t)limit + 1u);
-  if (!bytes) die("allocation");
+  const size_t head = reply == 145 ? 56u : 0u;
+  unsigned char *buffer = malloc(head + (size_t)limit + 1u);
+  if (!buffer) die("allocation");
+  unsigned char *bytes = buffer + head;
   size_t used = 0;
   while (used <= limit) {
     ssize_t n = read(file, bytes + used, (size_t)limit + 1u - used);
     if (n < 0 && errno == EINTR) { if (stopped) die("stopped"); continue; }
-    if (n < 0) { close(file); free(bytes); error_frame(id, "read"); return; }
+    if (n < 0) { close(file); free(buffer); error_frame(id, "read"); return; }
     if (!n) break;
     used += (size_t)n;
   }
   barrier("read-finished");
   int verify = confined_open(name, 0);
-  int valid = used <= limit && fstat(file, &after) == 0 && same_file(&before, &after) &&
-    used == (size_t)after.st_size && verify >= 0 && fstat(verify, &after) == 0 &&
+  int valid = used <= limit && metadata_fstat(file, &after) == 0 && same_file(&before, &after) &&
+    used == (size_t)after.st_size && verify >= 0 && metadata_fstat(verify, &after) == 0 &&
     same_file(&before, &after);
   if (verify >= 0) close(verify);
   close(file);
-  if (valid) frame(129, id, bytes, (uint32_t)used);
+  if (valid && head) put_stat56(buffer, 1, &before);
+  if (valid) frame(reply, id, buffer, (uint32_t)(head + used));
   else error_frame(id, "changed-or-oversize");
-  free(bytes);
+  free(buffer);
 }
 static void git_request(uint32_t id, unsigned char *request, uint32_t length) {
   if (!length) { error_frame(id, "git-op"); return; }
@@ -418,12 +483,334 @@ static void git_request(uint32_t id, unsigned char *request, uint32_t length) {
   else error_frame(id, "git-exit");
   free(bytes);
 }
+
+/* ---- BL-2006 writer mode ---------------------------------------------------- */
+
+static const char *errno_name(int error) {
+  switch (error) {
+    case ENOENT: return "ENOENT";
+    case EEXIST: return "EEXIST";
+    case ENOTDIR: return "ENOTDIR";
+    case EISDIR: return "EISDIR";
+    case ENOTEMPTY: return "ENOTEMPTY";
+    case ELOOP: return "ELOOP";
+    case EXDEV: return "EXDEV";
+    case EACCES: return "EACCES";
+    case EPERM: return "EPERM";
+    case ENOSPC: return "ENOSPC";
+    case EDQUOT: return "EDQUOT";
+    case EROFS: return "EROFS";
+    case EIO: return "EIO";
+    case EFBIG: return "EFBIG";
+    case EBUSY: return "EBUSY";
+    case EAGAIN: return "EAGAIN";
+    case EOPNOTSUPP: return "EOPNOTSUPP";
+    case ENXIO: return "ENXIO";
+    case ENAMETOOLONG: return "ENAMETOOLONG";
+    case ESTALE: return "ESTALE";
+    default: return "EOTHER";
+  }
+}
+static void errno_frame(uint32_t id, const char *stage, int error) {
+  char reason[64];
+  int n = snprintf(reason, sizeof(reason), "%s:%s", stage, errno_name(error));
+  if (n < 0 || (size_t)n >= sizeof(reason)) die("error-frame");
+  error_frame(id, reason);
+}
+static void put_stat56(unsigned char *out, unsigned char type, const struct stat *st) {
+  memset(out, 0, 56);
+  out[0] = type;
+  if (!st) return;
+  uint64_t ctime_ns = 0, mtime_ns = 0;
+  if (!stat_times_ns(st, &ctime_ns, &mtime_ns)) ctime_ns = mtime_ns = 0;
+  put32(out + 4, (uint32_t)st->st_mode);
+  put64(out + 8, st->st_size < 0 ? 0 : (uint64_t)st->st_size);
+  put64(out + 16, (uint64_t)st->st_dev);
+  put64(out + 24, (uint64_t)st->st_ino);
+  put64(out + 32, ctime_ns);
+  put64(out + 40, mtime_ns);
+  put64(out + 48, (uint64_t)st->st_nlink);
+}
+#ifndef __linux__
+/* macOS has no RESOLVE_NO_XDEV: each held descriptor is checked against the root's device. */
+static int same_device_as_root(int fd) {
+  struct stat st, root;
+  if (metadata_fstat(fd, &st) || metadata_fstat(rootfd, &root)) return 0;
+  if (st.st_dev != root.st_dev) { errno = EXDEV; return 0; }
+  return 1;
+}
+#endif
+/* The folder `folder` ("" is the root) beneath the held root as a descriptor: no
+ * component may be a link, `..` or another mount. */
+static int confined_folder(const char *folder) {
+  if (!*folder) return fcntl(rootfd, F_DUPFD_CLOEXEC, 0);
+#ifdef __linux__
+  // RESOLVE_NO_SYMLINKS refuses a link at every component, the last included (ELOOP); O_NOFOLLOW
+  // would only turn a last-component link into ENOTDIR.
+  struct open_how how = {
+    .flags = O_RDONLY | O_CLOEXEC | O_DIRECTORY,
+    .resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV
+  };
+  return (int)syscall(SYS_openat2, rootfd, folder, &how, sizeof(how));
+#elif defined(__APPLE__)
+  int parent = fcntl(rootfd, F_DUPFD_CLOEXEC, 0);
+  if (parent < 0) return -1;
+  char *copy = strdup(folder), *part = copy;
+  if (!copy) { close(parent); return -1; }
+  for (;;) {
+    char *slash = strchr(part, '/');
+    if (slash) *slash = 0;
+    int next = openat(parent, part, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY);
+    int saved = errno;
+    // macOS answers a link here with ENOTDIR; name it a link, as Linux's openat2 does (ELOOP).
+    struct stat link;
+    if (next < 0 && saved == ENOTDIR && !metadata_stat_at(parent, part, &link, AT_SYMLINK_NOFOLLOW) &&
+        S_ISLNK(link.st_mode)) saved = ELOOP;
+    close(parent);
+    if (next < 0) { free(copy); errno = saved; return -1; }
+    if (!same_device_as_root(next)) { saved = errno; close(next); free(copy); errno = saved; return -1; }
+    if (!slash) { free(copy); return next; }
+    parent = next;
+    part = slash + 1;
+  }
+#else
+  (void)folder; errno = ENOTSUP; return -1;
+#endif
+}
+/* Splits a checked relative `name` in place and holds its parent folder; `*leaf`
+ * is the last component, which every caller acts on relative to the descriptor. */
+static int confined_parent(char *name, const char **leaf) {
+  char *slash = strrchr(name, '/');
+  if (!slash) { *leaf = name; return confined_folder(""); }
+  *slash = 0;
+  *leaf = slash + 1;
+  int parent = confined_folder(name);
+  int saved = errno;
+  *slash = '/';
+  errno = saved;
+  return parent;
+}
+/* Opens the last component relative to its held folder without following it or
+ * leaving the root's file system. */
+static int confined_leaf_open(int parent, const char *leaf, int flags, mode_t mode) {
+#ifdef __linux__
+  struct open_how how = {
+    .flags = (uint64_t)(flags | O_NOFOLLOW | O_CLOEXEC | O_NOCTTY),
+    .mode = (flags & O_CREAT) ? (uint64_t)mode : 0,
+    .resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV
+  };
+  return (int)syscall(SYS_openat2, parent, leaf, &how, sizeof(how));
+#else
+  int fd = openat(parent, leaf, flags | O_NOFOLLOW | O_CLOEXEC | O_NOCTTY, mode);
+  if (fd < 0) return -1;
+  if (!same_device_as_root(fd)) { int saved = errno; close(fd); errno = saved; return -1; }
+  return fd;
+#endif
+}
+/* A relative path from a request: NUL-free, at most 4096 bytes, and `relative_ok`. */
+static int writer_name(const unsigned char *bytes, uint32_t length, char *out) {
+  if (!length || length > 4096 || memchr(bytes, 0, length)) return 0;
+  memcpy(out, bytes, length);
+  out[length] = 0;
+  return relative_ok(out);
+}
+static void lstat_request(uint32_t id, char *name) {
+  const char *leaf;
+  unsigned char body[56];
+  int parent = confined_parent(name, &leaf);
+  if (parent < 0) {
+    if (errno == ENOENT) { put_stat56(body, 0, NULL); frame(144, id, body, sizeof(body)); }
+    else if (errno == ENOTDIR) { put_stat56(body, 5, NULL); frame(144, id, body, sizeof(body)); }
+    else errno_frame(id, "parent", errno);
+    return;
+  }
+  barrier("writer-parent-held");
+  struct stat st;
+  int failed = metadata_stat_at(parent, leaf, &st, AT_SYMLINK_NOFOLLOW);
+  int saved = errno;
+  close(parent);
+  if (failed) {
+    if (saved == ENOENT) { put_stat56(body, 0, NULL); frame(144, id, body, sizeof(body)); }
+    else errno_frame(id, "leaf", saved);
+    return;
+  }
+  unsigned char type = S_ISREG(st.st_mode) ? 1 : S_ISLNK(st.st_mode) ? 2 : S_ISDIR(st.st_mode) ? 3 : 4;
+  put_stat56(body, type, &st);
+  frame(144, id, body, sizeof(body));
+}
+static void write_request(uint32_t id, const unsigned char *payload, uint32_t length) {
+  char name[4097];
+  if (length < 12) { error_frame(id, "write-input"); return; }
+  const unsigned char kind = payload[0], flags = payload[1];
+  const uint32_t mode = get32(payload + 4), name_length = get32(payload + 8);
+  if ((kind != 1 && kind != 2) || (flags & ~3u) || ((flags & 2u) && kind != 1) ||
+      payload[2] || payload[3] || mode > 0777 ||
+      name_length > length - 12 || !writer_name(payload + 12, name_length, name)) {
+    error_frame(id, "write-input"); return;
+  }
+  const unsigned char *bytes = payload + 12 + name_length;
+  const size_t size = length - 12 - name_length;
+  if (size > WRITE_CAP) { error_frame(id, "write-input"); return; }
+  const char *leaf;
+  int parent = confined_parent(name, &leaf);
+  if (parent < 0) { errno_frame(id, "parent", errno); return; }
+  barrier("writer-parent-held");
+  struct stat st;
+  // A replace refuses a name that is there and not a regular file without opening it. One
+  // swapped in after this check (a device, FIFO or socket) opens without blocking or a
+  // controlling terminal and is refused before any byte; a link or a folder never opens.
+  if (kind == 2) {
+    const int found = metadata_stat_at(parent, leaf, &st, AT_SYMLINK_NOFOLLOW);
+    if (found < 0 && errno != ENOENT) {
+      const int saved = errno;
+      close(parent); errno_frame(id, "leaf", saved); return;
+    }
+    if (found == 0 && !S_ISREG(st.st_mode)) {
+      close(parent); error_frame(id, S_ISLNK(st.st_mode) ? "leaf:ELOOP" : "leaf:ENOTREG"); return;
+    }
+  }
+  int file = confined_leaf_open(parent, leaf, O_WRONLY | O_NONBLOCK | O_CREAT | (kind == 1 ? O_EXCL : 0),
+    (mode || (flags & 2u)) ? (mode_t)mode : 0666);
+  int saved = errno;
+  close(parent);
+  if (file < 0) { errno_frame(id, "leaf", saved); return; }
+  if (metadata_fstat(file, &st)) { saved = errno; close(file); errno_frame(id, "fstat", saved); return; }
+  if (!S_ISREG(st.st_mode)) { close(file); error_frame(id, "leaf:ENOTREG"); return; }
+  if (kind == 2 && ftruncate(file, 0)) { saved = errno; close(file); errno_frame(id, "truncate", saved); return; }
+  size_t sent = 0;
+  while (sent < size) {
+    ssize_t n = write(file, bytes + sent, size - sent);
+    if (n < 0 && errno == EINTR) { if (stopped) die("stopped"); continue; }
+    if (n <= 0) { saved = n < 0 ? errno : EIO; close(file); errno_frame(id, "write", saved); return; }
+    sent += (size_t)n;
+  }
+  if ((flags & 2u) && fchmod(file, (mode_t)mode)) { saved = errno; close(file); errno_frame(id, "chmod", saved); return; }
+  if ((flags & 1u) && fsync(file)) { saved = errno; close(file); errno_frame(id, "fsync", saved); return; }
+  if (metadata_fstat(file, &st)) { saved = errno; close(file); errno_frame(id, "fstat", saved); return; }
+  if (close(file)) { errno_frame(id, "close", errno); return; }
+  unsigned char body[56];
+  put_stat56(body, 1, &st);
+  frame(146, id, body, sizeof(body));
+}
+/* Check write permission through the same confined descriptor boundary, without any write.
+ * A non-regular entry is refused before open; a swapped device opens nonblocking/no-ctty and
+ * is refused before bytes, just as WRITE. No O_CREAT, O_TRUNC, ftruncate, write or fchmod. */
+static void writable_request(uint32_t id, char *name) {
+  const char *leaf;
+  int parent = confined_parent(name, &leaf);
+  if (parent < 0) { errno_frame(id, "parent", errno); return; }
+  barrier("writer-parent-held");
+  struct stat before, opened, named;
+  if (metadata_stat_at(parent, leaf, &before, AT_SYMLINK_NOFOLLOW)) {
+    int saved = errno; close(parent); errno_frame(id, "leaf", saved); return;
+  }
+  if (!S_ISREG(before.st_mode)) {
+    close(parent); error_frame(id, S_ISLNK(before.st_mode) ? "leaf:ELOOP" : "leaf:ENOTREG"); return;
+  }
+  int file = confined_leaf_open(parent, leaf, O_WRONLY | O_NONBLOCK, 0);
+  if (file < 0) { int saved = errno; close(parent); errno_frame(id, "leaf", saved); return; }
+  barrier("writer-probe-opened");
+  if (metadata_fstat(file, &opened) || metadata_stat_at(parent, leaf, &named, AT_SYMLINK_NOFOLLOW)) {
+    int saved = errno; close(file); close(parent); errno_frame(id, "leaf", saved); return;
+  }
+  close(parent);
+  if (!S_ISREG(opened.st_mode) || !S_ISREG(named.st_mode) ||
+      !same_file(&before, &opened) || !same_file(&opened, &named)) {
+    close(file); error_frame(id, "leaf:ESTALE"); return;
+  }
+  if (close(file)) { errno_frame(id, "close", errno); return; }
+  unsigned char body[56];
+  put_stat56(body, 1, &opened);
+  frame(148, id, body, sizeof(body));
+}
+/* MKDIR, UNLINK and RMDIR act on the last component relative to its held folder. */
+static void entry_request(unsigned char kind, uint32_t id, char *name) {
+  const char *leaf;
+  int parent = confined_parent(name, &leaf);
+  if (parent < 0) { errno_frame(id, "parent", errno); return; }
+  barrier("writer-parent-held");
+  int failed = kind == 19 ? mkdirat(parent, leaf, 0777)
+    : unlinkat(parent, leaf, kind == 22 ? AT_REMOVEDIR : 0);
+  int saved = errno;
+  close(parent);
+  if (failed) errno_frame(id, "leaf", saved);
+  else frame(147, id, NULL, 0);
+}
+static void rename_request(uint32_t id, const unsigned char *payload, uint32_t length) {
+  char source[4097], destination[4097];
+  if (length < 4) { error_frame(id, "rename-input"); return; }
+  const uint32_t source_length = get32(payload);
+  if (source_length > length - 4 || !writer_name(payload + 4, source_length, source) ||
+      !writer_name(payload + 4 + source_length, length - 4 - source_length, destination)) {
+    error_frame(id, "rename-input"); return;
+  }
+  const char *source_leaf, *destination_leaf;
+  int from = confined_parent(source, &source_leaf);
+  if (from < 0) { errno_frame(id, "parent", errno); return; }
+  int to = confined_parent(destination, &destination_leaf);
+  if (to < 0) { int saved = errno; close(from); errno_frame(id, "parent", saved); return; }
+  barrier("writer-parent-held");
+  int failed = renameat(from, source_leaf, to, destination_leaf);
+  int saved = errno;
+  close(from); close(to);
+  if (failed) errno_frame(id, "leaf", saved);
+  else frame(147, id, NULL, 0);
+}
+static int writer_main(const char *configured) {
+  admit(configured);
+  if (stopped) die("stopped");
+#ifdef __linux__
+  int probe = confined_open(".", 0);
+  if (probe < 0) die("openat2-unavailable");
+  close(probe);
+#endif
+  struct stat admitted;
+  if (metadata_fstat(rootfd, &admitted) || !S_ISDIR(admitted.st_mode)) die("root-fstat");
+  unsigned char identity[16];
+  put64(identity, (uint64_t)admitted.st_dev); put64(identity + 8, (uint64_t)admitted.st_ino);
+  frame(128, 0, identity, sizeof(identity));
+  barrier("root-held");
+  for (;;) {
+    if (stopped) die("stopped");
+    unsigned char header[16];
+    int read_result = exact_read(0, header, sizeof(header));
+    if (stopped) die("stopped");
+    if (!read_result) break;
+    if (read_result < 0 || memcmp(header, "B320", 4) || header[4] != 1 ||
+        header[6] || header[7] || get32(header + 12) > WRITER_REQUEST_CAP) die("protocol");
+    uint32_t id = get32(header + 8), length = get32(header + 12);
+    unsigned char kind = header[5];
+    if (!id || kind < 16 || kind > 23) die("protocol");
+    unsigned char *payload = malloc((size_t)length + 1u);
+    if (!payload) die("allocation");
+    if (length && exact_read(0, payload, length) != 1) die("protocol-payload");
+    payload[length] = 0;
+    if (stopped) die("stopped");
+    char name[4097];
+    if (kind == 18) write_request(id, payload, length);
+    else if (kind == 20) rename_request(id, payload, length);
+    else if (kind == 17) {
+      if (length < 5 || !get32(payload) || get32(payload) > WRITE_CAP ||
+          !writer_name(payload + 4, length - 4, name)) error_frame(id, "read-input");
+      else file_request(1, id, name, get32(payload), 145);
+    } else if (!writer_name(payload, length, name)) error_frame(id, "relative-path");
+    else if (kind == 16) lstat_request(id, name);
+    else if (kind == 23) writable_request(id, name);
+    else entry_request(kind, id, name);
+    free(payload);
+  }
+  if (rootfd >= 0) close(rootfd);
+  return 0;
+}
 int main(int argc, char **argv) {
   if (argc != 3) die("usage");
   prepare_wakeup();
   struct sigaction action = {.sa_handler = on_stop};
   sigemptyset(&action.sa_mask);
   if (sigaction(SIGTERM, &action, NULL) || sigaction(SIGINT, &action, NULL)) die("signal");
+  // BL-2006: the writer mode never runs Git, so it never admits one.
+  if (!strcmp(argv[1], "--write-v2")) return writer_main(argv[2]);
+  if (!strcmp(argv[1], "--write")) die("writer-version");
   struct sigaction child_action = {.sa_handler = on_child};
   sigemptyset(&child_action.sa_mask);
   if (sigaction(SIGCHLD, &child_action, NULL)) die("signal");
@@ -439,7 +826,7 @@ int main(int argc, char **argv) {
   close(probe);
 #endif
   struct stat admitted;
-  if (fstat(rootfd, &admitted) || !S_ISDIR(admitted.st_mode)) die("root-fstat");
+  if (metadata_fstat(rootfd, &admitted) || !S_ISDIR(admitted.st_mode)) die("root-fstat");
   unsigned char identity[16];
   put64(identity, (uint64_t)admitted.st_dev); put64(identity + 8, (uint64_t)admitted.st_ino);
   frame(128, 0, identity, sizeof(identity));
@@ -462,9 +849,9 @@ int main(int argc, char **argv) {
     else if (header[5] == 1) {
       if (length < 5 || memchr(payload + 4, 0, length - 4) || !get32(payload) ||
           get32(payload) > FILE_CAP) error_frame(id, "read-input");
-      else file_request(1, id, (char *)payload + 4, get32(payload));
+      else file_request(1, id, (char *)payload + 4, get32(payload), 129);
     } else if (!length || memchr(payload, 0, length)) error_frame(id, "relative-path");
-    else file_request(2, id, (char *)payload, FILE_CAP);
+    else file_request(2, id, (char *)payload, FILE_CAP, 130);
   }
   if (rootfd >= 0) close(rootfd);
   reap_git();

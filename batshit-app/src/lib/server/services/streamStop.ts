@@ -9,8 +9,8 @@
  * with no words yet as a provider failure (`The model provider returned an empty response`);
  * only the catch's abort check then turned it back into the interrupted answer. Every Stop also
  * logged `[Send-Routed] Batshit agent streaming error: …` (the reason on the API lane, the
- * lane's `AbortError` on Codex). The stored message and the answer were right; the log said
- * the provider failed. Measured: `_local/sconn-proof/stopapi-before-*.json`.
+ * lane's `AbortError` on Codex, removed in SA-139 R1). The stored message and the answer were
+ * right; the log said the provider failed. Measured: `_local/sconn-proof/stopapi-before-*.json`.
  */
 
 /** Thrown after the stream loop so a stopped run takes the handler's interrupted path. */

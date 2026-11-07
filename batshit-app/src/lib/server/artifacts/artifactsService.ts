@@ -1,4 +1,8 @@
 import { RedisService } from '$lib/server/redis'
+import { admitPresetReferences, preparePresetReferences, presetReferencePaths, presetReferenceIds, presetReferenceLiterals, PresetReferenceWriteError, PRESET_REFERENCE_GUARD_LUA,
+  type PresetReferenceSnapshot, type PresetReferencePreparation } from '$lib/server/services/modelPresetReferenceGuard'
+import { isCanonicalAgentId } from '$lib/utils/agentId'
+import { readArtifactAgentAccess } from '$lib/utils/agentAccessIds'
 import { nanoid } from 'nanoid'
 import type { ArtifactBrainType, ArtifactModelConfig, ArtifactModelRole } from '$lib/types/artifacts'
 import { isCatalogIconRef } from '$lib/icons/iconCatalog'
@@ -10,7 +14,7 @@ import {
   extractManagedApplyPatchPayload,
   parseManagedApplyPatchDocument,
   type ManagedApplyPatchUpdateOperation
-} from '$lib/server/services/managedApplyPatch'
+} from '$lib/utils/managedApplyPatch'
 import {
   buildArtifactZonePublishError,
   evaluateArtifactZonePublish,
@@ -43,9 +47,11 @@ import {
   checkArtifactFieldNames
 } from './artifactFieldNames'
 import { deleteArtifactRunLogs } from '$lib/server/artifacts/artifactRunLogs'
-import { pinokioArtifactProblems } from '$lib/artifacts/pinokioArtifact'
+import { pinokioMachineService } from '$lib/server/services/pinokioMachineService'
+import { pinokioArtifactProblems, readPinokioArtifactBinding } from '$lib/artifacts/pinokioArtifact'
 import { reservedFabricFieldProblems } from '$lib/artifacts/reservedFabricIds'
 import { withArtifactWriteLock } from './artifactWriteLock'
+import { admitArtifactGrants, assertArtifactEnableTarget, ArtifactGrantUnknownError, prepareArtifactGrants, type ArtifactGrantPreparation } from './artifactGrantLifecycle'
 
 export type ArtifactMode = 'edit' | 'published'
 
@@ -108,14 +114,60 @@ export function isRedisJsonMissingPathError(error: unknown): boolean {
  * BL-546 / BL-547: the whole-record write of an artifact is a check-and-set.
  *
  * Every writer reads `artifact:{id}`, builds the next record, and writes it whole. The write
- * lands only while the stored `version` and `updated_at` are still the ones that writer read,
- * in one step inside Redis, so a save that landed in between (another process, or anything the
- * in-process lock cannot see) is refused as `ARTIFACT_WRITE_CONFLICT` instead of overwritten.
+ * lands only while stored `version`, `updated_at` and the five fixed access preimages still
+ * match the writer's atomic snapshot. A changed access list, including an unstamped scrub,
+ * refuses as `ARTIFACT_WRITE_CONFLICT`. Other unstamped slug/widget/control_manifest writes
+ * remain outside this guarantee (BL-821).
  * Every whole-record writer stamps a new `updated_at`; `version` moves with each content change.
  * ARGV: the read `version` and `updated_at` as JSON (`null` when the record had none), then the
- * next record as JSON.
+ * next record as JSON, then the five raw access values and their fixed paths.
  */
+const ARTIFACT_ACCESS_PREIMAGE_PATHS = ['$.agent_allowlist', '$.metadata.agent_allowlist', '$.metadata.agentAllowlist', '$.metadata.assigned_agent_ids', '$.metadata.assignedAgentIds'] as const
+type ArtifactWriteSnapshot = { record: ArtifactRecord; access: string[]; references: PresetReferenceSnapshot; referencePreparation: PresetReferencePreparation }
+/** Node24's native source-aware JSON keeps malformed numeric bystanders exact too.
+ * This is only for fixed permission values, never a new Artifact data serializer. */
+function readArtifactAccessValue(raw: string): unknown {
+  const nativeJson = JSON as typeof JSON & { rawJSON(source: string): unknown }
+  const values = JSON.parse(raw, (_key, value, context?: { source?: string }) => {
+    if (typeof value === 'number' && !Number.isSafeInteger(value)) {
+      if (!context?.source) throw new Error('The exact saved Artifact access value cannot be read.')
+      return nativeJson.rawJSON(context.source)
+    }
+    return value
+  }) as unknown[]
+  return values[0]
+}
+/** Lossless write wrappers stay private; API/service consumers receive ordinary JSON. */
+function artifactAccessRecordForReturn(record: ArtifactRecord): ArtifactRecord {
+  const plain = (value: unknown) => value === undefined ? undefined : JSON.parse(JSON.stringify(value))
+  const result = { ...record }
+  if (Object.hasOwn(record, 'agent_allowlist')) result.agent_allowlist = plain(record.agent_allowlist)
+  if (record.metadata && typeof record.metadata === 'object' && !Array.isArray(record.metadata)) {
+    result.metadata = { ...record.metadata }
+    for (const path of ARTIFACT_ACCESS_PREIMAGE_PATHS.slice(1)) {
+      const field = path.slice('$.metadata.'.length)
+      if (Object.hasOwn(record.metadata, field)) result.metadata[field] = plain(record.metadata[field])
+    }
+  }
+  return result
+}
+/** One physical read: a later unstamped access scrub cannot be adopted as a new baseline. */
+const READ_ARTIFACT_WRITE_SNAPSHOT_SCRIPT = `
+if redis.call('EXISTS', KEYS[1]) == 0 then return {'MISSING'} end
+local raw = redis.pcall('JSON.GET', KEYS[1], '$')
+if type(raw) ~= 'string' then return {'INVALID'} end
+local result = {'OK', raw}
+for _, path in ipairs(cjson.decode(ARGV[1])) do
+  local value = redis.pcall('JSON.GET', KEYS[1], path)
+  if type(value) ~= 'string' then return {'INVALID'} end
+  result[#result + 1] = value
+end
+return result
+`
+
 const WRITE_ARTIFACT_IF_UNCHANGED_SCRIPT = `
+${PRESET_REFERENCE_GUARD_LUA}
+if not presetReferencesAvailable(ARGV[6]) then return 'PRESET_REFERENCE_CHANGED' end
 if redis.call('EXISTS', KEYS[1]) == 0 then
   return 'MISSING'
 end
@@ -129,7 +181,22 @@ end
 if stored('$.version') ~= cjson.decode(ARGV[1]) or stored('$.updated_at') ~= cjson.decode(ARGV[2]) then
   return 'CHANGED'
 end
+local access = cjson.decode(ARGV[4])
+local paths = cjson.decode(ARGV[5])
+if #access ~= #paths then return 'CHANGED' end
+for index, path in ipairs(paths) do
+  if redis.call('JSON.GET', KEYS[1], path) ~= access[index] then return 'CHANGED' end
+end
 redis.call('JSON.SET', KEYS[1], '$', ARGV[3])
+return 'OK'
+`
+
+const CREATE_ARTIFACT_WITH_REFERENCES_SCRIPT = `
+${PRESET_REFERENCE_GUARD_LUA}
+if not presetReferencesAvailable(ARGV[2]) then return 'PRESET_REFERENCE_CHANGED' end
+local indexType = redis.call('TYPE', KEYS[2]).ok
+if indexType ~= 'none' and indexType ~= 'set' then return 'INVALID_INDEX' end
+redis.call('JSON.SET', KEYS[1], '$', ARGV[1])
 return 'OK'
 `
 
@@ -315,30 +382,31 @@ export class ArtifactsService {
     options?: {
       metadata?: Record<string, any> | null
       existing?: unknown
+      savedReferences?: readonly unknown[]
       allowMetadataFallback?: boolean
     }
-  ): string[] | null {
-    // Explicit null means "clear all assigned agents".
+  ): string[] | null | undefined {
     if (value === null) return []
-
-    const direct = this.normalizeStringArray(value)
-    if (direct !== null) return direct
-
-    const existing = this.normalizeStringArray(options?.existing)
-    if (existing !== null) return existing
-
-    if (options?.allowMetadataFallback === true) {
-      const metadata = options.metadata
-      const fromMetadata = this.normalizeStringArray(
-        metadata?.agent_allowlist ??
-          metadata?.agentAllowlist ??
-          metadata?.assigned_agent_ids ??
-          metadata?.assignedAgentIds
-      )
-      if (fromMetadata !== null) return fromMetadata
+    const invalid = () => Object.assign(new Error('New Artifact agent access must name exact valid agent IDs. Existing saved references were not changed.'), {
+      status: 400, code: 'ARTIFACT_AGENT_ALLOWLIST_INVALID'
+    })
+    // An unnamed permission field is stored data, not new input to normalize/migrate.
+    if (value === undefined && options && Object.hasOwn(options, 'existing')) return options.existing as string[] | null | undefined
+    let requested = value
+    if (requested === undefined && options?.allowMetadataFallback) {
+      const view = readArtifactAgentAccess({ metadata: options.metadata })
+      if (!view.configuredNonempty && !view.raw.length) return null
+      if (view.configuredNonempty && !view.raw.length) throw invalid()
+      requested = view.raw
     }
-
-    return null
+    if (requested === undefined) return null
+    const saved = options?.savedReferences ?? (Array.isArray(options?.existing) ? options.existing : [])
+    if (!Array.isArray(requested) || requested.some(entry => !isCanonicalAgentId(entry) && !saved.includes(entry))) {
+      throw invalid()
+    }
+    // Existing raw bystanders stay literal (including duplicates/malformed legacy values).
+    // Only a new canonical list uses the existing string-list normalizer.
+    return options && Object.hasOwn(options, 'existing') ? [...requested] as string[] : this.normalizeStringArray(requested)
   }
 
   /** `all` or `selected` for a value that says one (after trim and lower-case); null for anything else. */
@@ -479,13 +547,18 @@ export class ArtifactsService {
    * kind in `source_type`, stores no address, and carries a recipe its runner can follow once
    * it is published. Every other artifact passes untouched.
    */
-  private enforcePinokioArtifact(options: {
+  private async enforcePinokioArtifact(options: {
+    userId: string
     brainType: unknown
     metadata: Record<string, any> | null | undefined
     mode: ArtifactMode
   }) {
     const problems = pinokioArtifactProblems(options)
-    if (problems.length === 0) return
+    if (problems.length === 0) {
+      const binding = readPinokioArtifactBinding({ metadata: options.metadata })
+      if (binding?.machineId) await pinokioMachineService.resolveCurrent(options.userId, binding.machineId)
+      return
+    }
     throw Object.assign(new Error(`This Pinokio app artifact cannot be saved: ${problems.join(' ')}`), {
       status: 400,
       code: 'ARTIFACT_PINOKIO_INVALID',
@@ -739,25 +812,102 @@ export class ArtifactsService {
     return record
   }
 
+  private async readWriteSnapshot(client: any, id: string): Promise<ArtifactWriteSnapshot | null> {
+    const referencePreparation = preparePresetReferences('artifact', {})
+    const referencePaths = presetReferencePaths('artifact')
+    const allPaths = [...ARTIFACT_ACCESS_PREIMAGE_PATHS, ...referencePaths]
+    const answer = await client.eval(READ_ARTIFACT_WRITE_SNAPSHOT_SCRIPT, {
+      keys: [`artifact:${id}`], arguments: [JSON.stringify(allPaths)]
+    })
+    if (Array.isArray(answer) && answer[0] === 'MISSING') return null
+    if (!Array.isArray(answer) || answer[0] !== 'OK' || answer.length !== allPaths.length + 2 || answer.slice(1).some(value => typeof value !== 'string')) {
+      throw Object.assign(new Error('The saved Artifact access snapshot is unreadable. This update was not issued.'), { status: 409, code: 'ARTIFACT_WRITE_CONFLICT' })
+    }
+    const rows = JSON.parse(answer[1]) as ArtifactRecord[]
+    if (!Array.isArray(rows) || rows.length !== 1 || !rows[0] || typeof rows[0] !== 'object' || rows[0].id !== id) {
+      throw Object.assign(new Error('The saved Artifact identity is unreadable. This update was not issued.'), { status: 409, code: 'ARTIFACT_WRITE_CONFLICT' })
+    }
+    const access = answer.slice(2, 2 + ARTIFACT_ACCESS_PREIMAGE_PATHS.length) as string[]
+    for (let index = 0; index < access.length; index++) {
+      if (access[index] === '[]') continue
+      const value = readArtifactAccessValue(access[index])
+      if (index === 0) rows[0].agent_allowlist = value as ArtifactRecord['agent_allowlist']
+      else if (rows[0].metadata && typeof rows[0].metadata === 'object') {
+        const field = ARTIFACT_ACCESS_PREIMAGE_PATHS[index].slice('$.metadata.'.length)
+        rows[0].metadata[field] = value
+      }
+    }
+    return { record: rows[0], access, referencePreparation,
+      references: { key: `artifact:${id}`, record: rows[0], paths: referencePaths.map((path, index) => [path, answer[2 + ARTIFACT_ACCESS_PREIMAGE_PATHS.length + index]]) } }
+  }
+
   /**
-   * BL-546 / BL-547: write the whole record only while the stored one is still the record
-   * `read` holds (`WRITE_ARTIFACT_IF_UNCHANGED_SCRIPT`). A save that landed in between is
-   * refused loudly, never overwritten.
+   * BL-546 / BL-547 / BL-821 access portion: compare version, timestamp and the five raw access
+   * preimages before this whole write. Other unstamped fields are still BL-821 follow-ons.
    */
   private async writeArtifactIfUnchanged(
     client: any,
     id: string,
     read: ArtifactRecord,
-    next: ArtifactRecord
+    next: ArtifactRecord,
+    access: readonly string[],
+    reference: { userId: string; snapshot: PresetReferenceSnapshot; preparation: PresetReferencePreparation; preserveModelConfig?: boolean },
+    preserveAllowlist = false,
+    grant?: { preparation: ArtifactGrantPreparation; userId: string }
   ): Promise<void> {
-    const answer = await client.eval(WRITE_ARTIFACT_IF_UNCHANGED_SCRIPT, {
+    let serialized = JSON.stringify(next)
+    const modelConfigRaw = reference.preserveModelConfig ? reference.snapshot.paths.find(([path]) => path === '$.model_config')?.[1] : undefined
+    if (reference.preserveModelConfig && (!modelConfigRaw || modelConfigRaw === '[]')) throw new PresetReferenceWriteError('changed')
+    if (preserveAllowlist || reference.preserveModelConfig) {
+      // Keep the exact live raw value/absence, even for malformed legacy JSON bystanders.
+      const withoutList = { ...next }
+      if (preserveAllowlist) Reflect.deleteProperty(withoutList, 'agent_allowlist')
+      if (reference.preserveModelConfig) Reflect.deleteProperty(withoutList, 'model_config')
+      serialized = JSON.stringify(withoutList)
+      if (preserveAllowlist && access[0] !== '[]') serialized = `${serialized.slice(0, -1)},"agent_allowlist":${access[0].slice(1, -1)}}`
+      if (modelConfigRaw) serialized = `${serialized.slice(0, -1)},"model_config":${modelConfigRaw.slice(1, -1)}}`
+    }
+    const referencePayload = JSON.parse(JSON.stringify({ model_config: modelConfigRaw ? JSON.parse(modelConfigRaw)[0] : next.model_config, model: next.model }))
+    const referenceLiterals = modelConfigRaw ? { ...referencePayload, model_config: presetReferenceLiterals([['$.model_config', modelConfigRaw]]).model_config } : undefined
+    const command = {
       keys: [`artifact:${id}`],
       arguments: [
         JSON.stringify(read.version ?? null),
         JSON.stringify(read.updated_at ?? null),
-        JSON.stringify(next)
+        serialized,
+        JSON.stringify(access),
+        JSON.stringify(ARTIFACT_ACCESS_PREIMAGE_PATHS)
       ]
-    })
+    }
+    let references: Awaited<ReturnType<typeof admitPresetReferences>> | undefined
+    let lease: Awaited<ReturnType<typeof admitArtifactGrants>> = undefined
+    let answer: unknown
+    let issued = false
+    try {
+      lease = grant ? await admitArtifactGrants(grant.preparation, grant.userId, read, next, client) : undefined
+      if (presetReferenceIds('artifact', referencePayload).length) references = await admitPresetReferences(reference.userId, 'artifact', reference.snapshot, referencePayload, reference.preparation, undefined, referenceLiterals)
+      lease?.check()
+      references?.check()
+      command.arguments.push(references?.guard ?? '')
+      issued = true
+      answer = await client.eval(WRITE_ARTIFACT_IF_UNCHANGED_SCRIPT, command)
+    } catch (error) {
+      if (issued) {
+        references?.unknown()
+        if (lease) { lease.unknown(); throw new ArtifactGrantUnknownError(id, 'unknown', 'unchanged') }
+        if (references) throw new PresetReferenceWriteError('unknown')
+      }
+      lease?.settle()
+      references?.settle()
+      throw error
+    }
+    if (answer === 'OK' || answer === 'MISSING' || answer === 'CHANGED' || answer === 'PRESET_REFERENCE_CHANGED') { lease?.settle(); references?.settle() }
+    else {
+      references?.unknown()
+      if (lease) { lease.unknown(); throw new ArtifactGrantUnknownError(id, 'unknown', 'unchanged') }
+      if (references) throw new PresetReferenceWriteError('unknown')
+    }
+    if (answer === 'PRESET_REFERENCE_CHANGED') throw new PresetReferenceWriteError('changed')
     if (answer === 'OK') return
     if (answer === 'MISSING') {
       throw Object.assign(new Error('Artifact not found'), { status: 404 })
@@ -870,6 +1020,8 @@ export class ArtifactsService {
   }
 
   async create(userId: string, input: CreateInput): Promise<ArtifactRecord> {
+    const referencePreparation = presetReferenceIds('artifact', input).length ? preparePresetReferences('artifact', input) : undefined
+    const grantPreparation = prepareArtifactGrants(input)
     const now = new Date().toISOString()
     const artifactId = this.buildArtifactId(input.name || 'artifact')
     const initialContent = input.content || ''
@@ -920,7 +1072,7 @@ export class ArtifactsService {
       mode
     })
     this.enforceArtifactHtmlPreflight(initialContent)
-    this.enforcePinokioArtifact({ brainType, metadata, mode })
+    await this.enforcePinokioArtifact({ userId, brainType, metadata, mode })
     this.enforceFabricFieldNames(metadata)
     this.enforcePublishGuard({
       mode,
@@ -986,9 +1138,55 @@ export class ArtifactsService {
       versions: [versionEntry]
     }
 
+    const encodedArtifact = JSON.stringify(artifact)
+    const referencePayload = JSON.parse(JSON.stringify({ model_config: artifact.model_config, model: artifact.model }))
     const client = await this.client()
-    await client.json.set(`artifact:${artifactId}`, '$', artifact)
-    await client.sAdd(`user:${userId}:artifacts`, artifactId)
+    let references: Awaited<ReturnType<typeof admitPresetReferences>> | undefined
+    let lease: Awaited<ReturnType<typeof admitArtifactGrants>> = undefined
+    {
+      let issued = false
+      let record: 'unknown' | 'saved' = 'unknown'
+      let indexPublication: 'not_started' | 'unknown' = 'not_started'
+      try {
+        lease = await admitArtifactGrants(grantPreparation, userId, {}, artifact, client)
+        if (referencePreparation) references = await admitPresetReferences(userId, 'artifact', { key: `artifact:${artifactId}`, record: {},
+          paths: presetReferencePaths('artifact').map(path => [path, '']) }, referencePayload, referencePreparation)
+        // No new preset or subject reference: retain the existing ordinary create owner.
+        if (!lease && !references) {
+          await client.json.set(`artifact:${artifactId}`, '$', artifact)
+          await client.sAdd(`user:${userId}:artifacts`, artifactId)
+          return artifact
+        }
+        lease?.check()
+        references?.check()
+        issued = true
+        const answer = references
+          ? await client.eval(CREATE_ARTIFACT_WITH_REFERENCES_SCRIPT, { keys: [`artifact:${artifactId}`, `user:${userId}:artifacts`], arguments: [encodedArtifact, references.guard] })
+          : await client.json.set(`artifact:${artifactId}`, '$', artifact)
+        if (answer === 'PRESET_REFERENCE_CHANGED' || answer === 'INVALID_INDEX') {
+          issued = false
+          throw new PresetReferenceWriteError(answer === 'PRESET_REFERENCE_CHANGED' ? 'changed' : 'unavailable')
+        }
+        if (answer !== 'OK') throw new Error('Unconfirmed Artifact record save')
+        record = 'saved'
+        // A confirmed record must reach the enumeration index under this SAME
+        // lease, even if deletion/restore has now marked its target for draining.
+        indexPublication = 'unknown'
+        const indexed = await client.sAdd(`user:${userId}:artifacts`, artifactId)
+        if (indexed !== 0 && indexed !== 1) throw new Error('Unconfirmed grant index publication')
+        lease?.settle()
+        references?.settle()
+      } catch (error) {
+        if (issued) {
+          references?.unknown()
+          if (lease) { lease.unknown(); throw new ArtifactGrantUnknownError(artifactId, record, indexPublication) }
+          if (references) throw new PresetReferenceWriteError('unknown', { artifactId, record, indexPublication })
+        }
+        lease?.settle()
+        references?.settle()
+        throw error
+      }
+    }
 
     return artifact
   }
@@ -1007,18 +1205,21 @@ export class ArtifactsService {
     input: UpdateInput,
     options: { expectedVersion?: number } = {}
   ): Promise<ArtifactRecord> {
-    return await withArtifactWriteLock(id, () => this.updateUnderLock(id, userId, input, options))
+    const referencePreparation = preparePresetReferences('artifact', input)
+    const grantPreparation = prepareArtifactGrants(input)
+    return await withArtifactWriteLock(id, () => this.updateUnderLock(id, userId, input, { ...options, grantPreparation, referencePreparation }))
   }
 
   private async updateUnderLock(
     id: string,
     userId: string,
     input: UpdateInput,
-    options: { expectedVersion?: number }
+    options: { expectedVersion?: number; snapshot?: ArtifactWriteSnapshot; grantPreparation: ArtifactGrantPreparation; referencePreparation?: PresetReferencePreparation }
   ): Promise<ArtifactRecord> {
     const updates = this.sanitizeUpdateInput(input)
     const client = await this.client()
-    const existing = await client.json.get(`artifact:${id}`) as ArtifactRecord | null
+    const snapshot = options.snapshot ?? await this.readWriteSnapshot(client, id)
+    const existing = snapshot?.record
     if (!existing) {
       throw Object.assign(new Error('Artifact not found'), { status: 404 })
     }
@@ -1045,6 +1246,7 @@ export class ArtifactsService {
       updates.model_config !== undefined ? updates.model_config : existing.model_config
     const legacyModelInput = updates.model !== undefined ? updates.model : existing.model
     const resolvedModelConfig = normalizeArtifactModelConfig(modelConfigInput ?? null, legacyModelInput ?? null)
+    const preserveModelConfig = updates.model_config === undefined && presetReferenceIds('artifact', existing).length > 0
     if (updates.model_config !== undefined) {
       await this.enforceKnownModelPresets(userId, resolvedModelConfig)
     }
@@ -1090,15 +1292,16 @@ export class ArtifactsService {
     const resolvedNextAgentAllowlist = this.resolveAgentAllowlist(
       (updates as any).agent_allowlist,
       {
-        existing: existing.agent_allowlist
+        existing: existing.agent_allowlist,
+        savedReferences: readArtifactAgentAccess(existing).raw
       }
     )
     // BL-815: Agent Use off keeps the list (it used to be emptied, so switching Agent Use back on
     // left no agent selected). Nothing reads the list while Agent Use is off: the Fabric records,
     // the DCM, and Agents > Access all check Agent Use first. An explicit `null` still clears it.
-    const nextAgentAllowlist = nextAgentUseEnabled
-      ? resolvedNextAgentAllowlist
-      : (resolvedNextAgentAllowlist ?? [])
+    const nextAgentAllowlist = (updates as any).agent_allowlist === undefined
+      ? existing.agent_allowlist
+      : resolvedNextAgentAllowlist ?? []
     // BL-886: a save that names no scope leaves the saved one exactly as it is, also when the record
     // never saved one (Fabric reads such a record by its list and Agent Use, so a scope invented
     // here would change what every agent sees). Turning Agent Use off does not pick `selected`
@@ -1113,7 +1316,7 @@ export class ArtifactsService {
       previousContents: this.savedContents(existing)
     })
     this.enforceArtifactHtmlPreflight(nextContent)
-    this.enforcePinokioArtifact({ brainType: resolvedBrainType, metadata, mode: nextMode })
+    await this.enforcePinokioArtifact({ userId, brainType: resolvedBrainType, metadata, mode: nextMode })
     this.enforceFabricFieldNames(metadata)
     this.enforcePublishGuard({
       mode: nextMode,
@@ -1208,8 +1411,11 @@ export class ArtifactsService {
       widget_position: null
     }
 
-    await this.writeArtifactIfUnchanged(client, id, existing, updated)
-    return updated
+    if (preserveModelConfig) updated.model_config = existing.model_config
+    await this.writeArtifactIfUnchanged(client, id, existing, updated, snapshot!.access,
+      { userId, snapshot: snapshot!.references, preparation: options.referencePreparation ?? snapshot!.referencePreparation, preserveModelConfig }, (updates as any).agent_allowlist === undefined,
+      { preparation: options.grantPreparation, userId })
+    return artifactAccessRecordForReturn(updated)
   }
 
   /**
@@ -1223,28 +1429,37 @@ export class ArtifactsService {
    * nothing and answers the stored record.
    */
   async setAgentAccess(id: string, userId: string, agentId: string, enabled: boolean): Promise<ArtifactRecord> {
+    const grantPreparation = prepareArtifactGrants({ agent_allowlist: enabled ? [agentId] : [] })
     return await withArtifactWriteLock(id, async () => {
       const client = await this.client()
-      const existing = (await client.json.get(`artifact:${id}`)) as ArtifactRecord | null
+      const snapshot = await this.readWriteSnapshot(client, id)
+      const existing = snapshot?.record
       if (!existing) {
         throw Object.assign(new Error('Artifact not found'), { status: 404 })
       }
       if (existing.user_id !== userId) {
         throw Object.assign(new Error('Access denied'), { status: 403 })
       }
-      const current = this.normalizeStringArray(existing.agent_allowlist) ?? []
-      if (current.includes(agentId) === enabled) return existing
+      if (enabled ? !isCanonicalAgentId(agentId) : !agentId || !agentId.isWellFormed()) {
+        throw Object.assign(new Error('The Artifact access target is invalid. No access change was made.'), { status: 400, code: 'ARTIFACT_AGENT_ALLOWLIST_INVALID' })
+      }
+      const access = readArtifactAgentAccess(existing)
+      const current = [...access.raw]
+      if (current.includes(agentId) === enabled) {
+        if (enabled) await assertArtifactEnableTarget(grantPreparation, userId, agentId, client)
+        return artifactAccessRecordForReturn(existing)
+      }
 
       const updates: UpdateInput = {
-        agent_allowlist: enabled ? [...current, agentId] : current.filter((entry) => entry !== agentId)
+        agent_allowlist: (enabled ? [...current, agentId] : current.filter((entry) => entry !== agentId)) as string[]
       }
       const storedScope =
         typeof existing.agent_access_scope === 'string' ? existing.agent_access_scope.trim().toLowerCase() : ''
       if (storedScope !== 'all' && storedScope !== 'selected') {
         updates.agent_access_scope =
-          current.length > 0 || existing.agent_use_enabled === true ? 'selected' : 'all'
+          access.scope
       }
-      return await this.updateUnderLock(id, userId, updates, {})
+      return await this.updateUnderLock(id, userId, updates, { snapshot: snapshot!, grantPreparation })
     })
   }
 
@@ -1540,7 +1755,10 @@ export class ArtifactsService {
 
   private async deleteVersionUnderLock(id: string, userId: string, versionNumber: number): Promise<ArtifactRecord> {
     const client = await this.client()
-    const artifact = await this.getOwned(id, userId)
+    const snapshot = await this.readWriteSnapshot(client, id)
+    if (!snapshot) throw Object.assign(new Error('Artifact not found'), { status: 404 })
+    if (((snapshot.record as any).userId || snapshot.record.user_id) !== userId) throw Object.assign(new Error('Access denied'), { status: 403 })
+    const artifact = await this.ensureRecordSlug(snapshot.record, client)
 
     if (versionNumber === artifact.version) {
       throw Object.assign(new Error('Cannot delete current version'), { status: 400 })
@@ -1557,7 +1775,8 @@ export class ArtifactsService {
       updated_at: new Date().toISOString()
     }
 
-    await this.writeArtifactIfUnchanged(client, id, artifact, updated)
-    return updated
+    await this.writeArtifactIfUnchanged(client, id, artifact, updated, snapshot.access,
+      { userId, snapshot: snapshot.references, preparation: snapshot.referencePreparation, preserveModelConfig: presetReferenceIds('artifact', artifact).length > 0 }, true)
+    return artifactAccessRecordForReturn(updated)
   }
 }

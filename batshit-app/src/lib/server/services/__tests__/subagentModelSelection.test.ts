@@ -102,6 +102,20 @@ describe('resolveApiSubagentModel', () => {
     await expect(resolveApiSubagentModel({ subagent: legacy })).rejects.toThrow(/pick its model again/)
   })
 
+  // SA-139 R5: a record that still keeps a leftover Claude Code CLI preset (an older save or a
+  // restored backup) gets a readable refusal before its run reaches a provider.
+  it('refuses a Subagent that still keeps a leftover Claude Code CLI preset', async () => {
+    store.set('model:preset-claude-cli', { id: 'preset-claude-cli', provider: 'anthropic-claude-cli', modelId: 'claude-cli',
+      connection: { id: 'claude-cli', type: 'direct', service: 'claude-cli' } })
+    const leftover = subagent({ primary_model_preset_id: 'preset-claude-cli', primary_model_provider: 'anthropic-claude-cli',
+      primary_model_name: 'claude-cli', primary_model_connection: { id: 'claude-cli', type: 'direct', service: 'claude-cli' } })
+    await expect(resolveApiSubagentModel({ subagent: leftover })).rejects.toThrow(SubagentModelSelectionError)
+    await expect(resolveApiSubagentModel({ subagent: leftover })).rejects.toMatchObject({
+      code: 'subagent_model_preset_retired',
+      message: "Gemini Helper's model is a Claude Code CLI preset, which Batshit no longer runs. Open Settings → Agents → Gemini Helper and pick another model, for example a Claude plan model.",
+    })
+  })
+
   it('refuses a preset that no longer exists', async () => {
     store.delete('model:preset-gemini-flash')
     await expect(resolveApiSubagentModel({ subagent: subagent() })).rejects.toMatchObject({
@@ -135,7 +149,7 @@ describe('resolveApiSubagentModel', () => {
       resolveApiSubagentModel({
         subagent: subagent({ primary_model_name: undefined, primary_model_preset_id: undefined }),
       }),
-    ).rejects.toThrow('API Subagent needs a model selection or a parent model to inherit.')
+    ).rejects.toThrow('This Subagent needs a model selection or a parent model to inherit.')
   })
 })
 

@@ -1,5 +1,8 @@
 import type {
   AnatomyFitResult,
+  RecipeStateSnapshot,
+  RecipeSource,
+  RecipeRevisionEnvelope,
   RecipeFailureStage,
   RecipeJobStatus,
   RecipeLiveStatus,
@@ -9,6 +12,13 @@ import type {
   RecipeAuthorUpdateClassification,
 } from "$lib/goons/recipe";
 import type { AppearanceDialValueState } from "$lib/goons/appearanceDials";
+
+import type { GoonRecord } from '$lib/types/goons';
+
+export type RecipeEditorPreviewTarget = {
+  goon: GoonRecord; state: RecipeStateSnapshot; preview: RecipeFittedPreviewState; side: RecipePreviewSide;
+  source?: RecipeSource; liveEnvelope?: RecipeRevisionEnvelope;
+};
 
 export type RecipeFittedPreviewState = {
   stateSha256: string;

@@ -19,6 +19,11 @@ import { createOpenAICompatible } from '@ai-sdk/openai-compatible'
 import { createOllama } from 'ollama-ai-provider-v2'
 import { withOllamaOptionsShim } from './ollamaOptionsShim'
 import { withOllamaImageTransportGuard } from './ollamaImageTransportGuard'
+import { localAiConnectionKey } from '../localAiConnectionIdentity'
+import { withOllamaReasoningControl } from './ollamaReasoningControl'
+import { nativeReasoningChatModel } from './nativeReasoningBody'
+import { reasoningContentChatModel } from './reasoningContentCarry'
+import { observeGatewayStreamFormat } from './gatewayStreamFormat'
 import { createGoogle } from '@ai-sdk/google'
 import { createGroq } from '@ai-sdk/groq'
 import { createMistral } from '@ai-sdk/mistral'
@@ -41,6 +46,8 @@ import {
   pausedPlansAllowedOnThisCopy
 } from '$lib/server/services/pausedPlans'
 import { findPausedPlan } from '$lib/data/pausedPlans'
+import { isClaudePlanConnection } from '$lib/utils/claudePlanConnection'
+import { ClaudePlanError } from '$lib/server/services/claudePlanAdmission'
 import { apiKeyService } from '$lib/services/apiKey.server'
 import { listCustomProvidersForRuntime } from '$lib/server/services/customProviders'
 import type { CustomProviderRuntime } from '$lib/types/customProviders'
@@ -115,6 +122,8 @@ export type ModelTransportOption = 'vercel-gateway' | 'direct' | 'openrouter'
 export interface GetModelOptions {
   transport?: ModelTransportOption
   service?: string | null
+  /** The selection's connection id, for the plan guards only (never part of the cache key). */
+  connectionId?: string | null
   allowAutoFallback?: boolean
   fallbackModel?: {
     modelName: string
@@ -163,6 +172,7 @@ export type ProviderId = KnownProviderId | CustomProviderId | LocalAiServerId
 type ProviderApiKeys = Partial<Record<KnownProviderId, string>>
 
 interface ProviderManagerOptions {
+  userId?: string | null
   apiKeys?: ProviderApiKeys
   gateway?: {
     apiKey?: string | null
@@ -230,6 +240,7 @@ export class ProviderManager {
   private apiKeys: ProviderApiKeys
   private gatewayConfig: { apiKey: string | null; baseURL: string | null }
   private customProviders: CustomProviderRuntime[]
+  private readonly localConnectionUserId: string | null
   private localProviders: LocalAiServerSummary[]
   private localProvidersUnreadable: boolean
   private localApiKeys: Record<string, string>
@@ -243,6 +254,7 @@ export class ProviderManager {
       baseURL: options.gateway?.baseURL ?? null
     }
     this.customProviders = options.customProviders ?? []
+    this.localConnectionUserId = options.userId ?? null
     this.localProviders = options.localProviders ?? []
     this.localProvidersUnreadable = options.localProvidersUnreadable === true
     this.localApiKeys = options.localApiKeys ?? {}
@@ -285,6 +297,7 @@ export class ProviderManager {
       }
     }
     return new ProviderManager({
+      userId,
       apiKeys: resolved.apiKeys,
       gateway: {
         apiKey: resolved.gateway.apiKey ?? null,
@@ -320,7 +333,8 @@ export class ProviderManager {
       priority,
       apiMode = 'responses',
       models = [],
-      allowNoKey = false
+      allowNoKey = false,
+      reasoningContent = false
     }: {
       id: ProviderId
       label: string
@@ -330,19 +344,34 @@ export class ProviderManager {
       apiMode?: 'responses' | 'chat'
       models?: string[]
       allowNoKey?: boolean
+      /**
+       * BL-1517: the server streams `reasoning_content` and wants it back on the assistant
+       * messages of the same reply (chat mode only). Turn it on for a connection only after a
+       * wire proof against that server (`reasoningContentCarry.ts`).
+       */
+      reasoningContent?: boolean
     }) => {
+      if (reasoningContent && apiMode !== 'chat') {
+        throw new Error(`[ProviderManager] ${label}: reasoningContent needs apiMode 'chat'`)
+      }
       const resolvedKey = apiKey ?? (allowNoKey ? 'local-ai' : null)
       if (!resolvedKey) return
       if (!allowNoKey && !this.validateApiKey(resolvedKey, label)) return
 
-      const client = createOpenAI({
+      const settings = {
         headers: batshitProviderHeaders(),
         apiKey: resolvedKey,
         baseURL: baseURL ?? undefined
-      })
+      }
+      const client = createOpenAI(settings)
 
-      const clientFactory =
-        apiMode === 'chat'
+      const clientFactory = reasoningContent
+        ? (modelId: string) => {
+            const create = (baseFetch?: typeof globalThis.fetch) => reasoningContentChatModel((fetch) =>
+              (fetch || baseFetch ? createOpenAI({ ...settings, fetch: fetch ?? baseFetch }) : client).chat(modelId), baseFetch)
+            return id === 'mimo' ? nativeReasoningChatModel('mimo', modelId, create) : create()
+          }
+        : apiMode === 'chat'
           ? (modelId: string) => client.chat(modelId)
           : (modelId: string) => client(modelId)
 
@@ -433,13 +462,13 @@ export class ProviderManager {
       // The swap is scoped to this one program so a regression cannot reach the
       // other seven, exactly as SA-102 scoped its own provider swap.
       if (provider.id === 'ollama') {
-        const ollama = createOllama({
+        const ollamaSettings = {
           // The provider appends `/chat`, and its own default is
           // `http://127.0.0.1:11434/api`.
           baseURL: `${baseUrl ?? 'http://127.0.0.1:11434'}/api`,
           // `strict` is the mode for a real Ollama rather than a third party
           // pretending to be one.
-          compatibility: 'strict',
+          compatibility: 'strict' as const,
           // DL-125-06: the provider puts the SDK's standard settings at the TOP
           // LEVEL of the body, and Ollama does not read them there. Measured
           // 2026-09-20 against Ollama directly: `options.temperature` 0 vs 2
@@ -449,16 +478,19 @@ export class ProviderManager {
           // Shipping the provider unshimmed would silently break Temperature and
           // Max Output Tokens on every Ollama preset, which is worse than the
           // `/v1` door it replaces.
-          fetch: withOllamaOptionsShim(),
           headers: {
             ...batshitProviderHeaders(),
             ...(this.localApiKeys[provider.id]
               ? { authorization: `Bearer ${this.localApiKeys[provider.id]}` }
               : {})
           }
-        })
+        }
+        const key = this.localConnectionUserId ? localAiConnectionKey(this.localConnectionUserId, 'ollama', {
+          baseUrl: baseUrl ?? 'http://127.0.0.1:11434', apiKey: this.localApiKeys[provider.id] ?? null
+        }) : null
         this.providers.set(provider.id, {
-          client: (modelId: string) => withOllamaImageTransportGuard(ollama(modelId)),
+          client: (modelId: string) => withOllamaReasoningControl(modelId, key, fetch =>
+            withOllamaImageTransportGuard(createOllama({ ...ollamaSettings, fetch: withOllamaOptionsShim(fetch) })(modelId))),
           models: [],
           features: {
             streaming: true,
@@ -783,7 +815,9 @@ export class ProviderManager {
       baseURL: env.MIMO_API_BASE_URL || 'https://api.xiaomimimo.com/v1',
       priority: 12,
       apiMode: 'chat',
-      models: ['mimo-v2.5-pro', 'mimo-v2.5']
+      models: ['mimo-v2.5-pro', 'mimo-v2.5'],
+      // BL-1517: Xiaomi asks for earlier reasoning back across tool calls.
+      reasoningContent: true
     })
 
     registerOpenAICompatibleProvider({
@@ -811,15 +845,17 @@ export class ProviderManager {
 
     const qwenCloudKey = this.apiKeys.qwencloud ?? env.DASHSCOPE_API_KEY
     if (qwenCloudKey && this.validateApiKey(qwenCloudKey, 'Qwen Cloud')) {
-      const qwenCloud = createAlibaba({
+      const qwenCloudSettings = {
         headers: batshitProviderHeaders(),
         apiKey: qwenCloudKey,
         baseURL:
           env.DASHSCOPE_API_BASE_URL ||
           'https://dashscope-intl.aliyuncs.com/compatible-mode/v1'
-      })
+      }
+      const qwenCloud = createAlibaba(qwenCloudSettings)
       this.providers.set('qwencloud', {
-        client: (modelId: string) => qwenCloud(modelId),
+        client: (modelId: string) => nativeReasoningChatModel('qwencloud', modelId, fetch =>
+          (fetch ? createAlibaba({ ...qwenCloudSettings, fetch }) : qwenCloud)(modelId)),
         models: ['qwen-plus'],
         features: {
           streaming: true,
@@ -881,7 +917,9 @@ export class ProviderManager {
         apiKey: openRouterKey,
         baseURL: env.OPENROUTER_API_BASE_URL || undefined,
         appName: env.OPENROUTER_APP_NAME || 'Batshit',
-        appUrl: env.OPENROUTER_APP_URL || env.PUBLIC_BASE_URL || env.ORIGIN || undefined
+        appUrl: env.OPENROUTER_APP_URL ||
+          (Object.hasOwn(env, 'PUBLIC_BASE_URL') ? env['PUBLIC_BASE_URL' as keyof typeof env] : undefined) ||
+          env.ORIGIN || undefined
       })
       this.providers.set('openrouter', {
         client: (modelId: string) => openrouter.chat(modelId),
@@ -1148,6 +1186,11 @@ export class ProviderManager {
     if (options?.service === 'chatgpt-plan' || options?.service?.startsWith('chatgpt-plan:')) {
       throw new Error('This feature cannot use ChatGPT plan credentials. Use a separate API-compatible connection.')
     }
+    // SA-139: the Claude plan runs only through its own admitted runtime, never a paid Anthropic
+    // key, a cached client or a configured fallback.
+    if (isClaudePlanConnection(options?.service) || isClaudePlanConnection(options?.connectionId)) {
+      throw new ClaudePlanError('consumer_unsupported', 'This feature cannot use the Claude plan connection. Choose a separate API-compatible connection.')
+    }
     const cacheKey = this.buildCacheKey(modelName, options)
 
     if (this.modelCache.has(cacheKey)) {
@@ -1192,7 +1235,10 @@ export class ProviderManager {
       if (!this.gatewayClient) {
         throw new Error('AI Gateway client not configured')
       }
-      return this.gatewayClient(modelName)
+      // BL-1782: every Gateway model (a `vercel-gateway` connection, and a model with no
+      // connection resolved here by name) logs a finish part the installed SDK cannot read;
+      // the run's stream consumers fail the step (`createGatewayStreamFormatCheck`).
+      return observeGatewayStreamFormat(this.gatewayClient(modelName))
     }
 
     const parsed = this.parseModelName(modelName)
@@ -1526,7 +1572,7 @@ export class ProviderManager {
   }
 }
 
-const PROVIDER_KEY_CONFIG = [
+export const PROVIDER_KEY_CONFIG = [
   { id: 'anthropic', envVar: 'ANTHROPIC_API_KEY' },
   { id: 'openai', envVar: 'OPENAI_API_KEY' },
   { id: 'google', envVar: 'GOOGLE_GENERATIVE_AI_API_KEY' },

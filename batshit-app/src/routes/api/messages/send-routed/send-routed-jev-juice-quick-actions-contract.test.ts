@@ -14,7 +14,7 @@ describe('send-routed Judge Juice quick-action contracts', () => {
   const streamStart = source.indexOf('async function handleBatshitAgentStream({')
   const seam = source.indexOf('const jevJuiceHintProvider = jevJuiceGroupSelection', streamStart)
   const compile = source.indexOf('await databaseService.buildFormattedChatInput(', seam)
-  const compileEnd = source.indexOf("throw new Error('Failed to build formatted chat input for API or CLI agent')", compile)
+  const compileEnd = source.indexOf("throw new Error('Failed to build formatted chat input for the agent')", compile)
   const seamBody = source.slice(seam, compile)
 
   it('composes the tell after the after-reply notes and before the woken turn\'s screen', () => {

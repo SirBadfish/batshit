@@ -17,13 +17,17 @@
     "@livekit/agents-plugin-openai": "^1.6.3",
     "@livekit/agents-plugin-xai": "^1.6.3",
     "@livekit/rtc-node": "^0.13.33",
-    "tsx": "^4.23.12"
+    "tsx": "^4.23.12",
+    "zod": "^4.6.6"
   },
   "devDependencies": {
     "@types/node": "^24.10.0",
     "typescript": "^5.9.3"
   },
   "overrides": {
-    "sharp": "0.35.5"
+    "sharp": "0.35.5",
+    "@livekit/throws-transformer": {
+      "glob": "^14.0.3"
+    }
   }
 }

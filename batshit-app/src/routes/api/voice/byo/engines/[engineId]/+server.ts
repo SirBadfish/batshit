@@ -1,6 +1,6 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
 
-import { deleteVoiceEngineRecord } from '$lib/server/services/voiceEngineRegistry'
+import { deleteVoiceEngineRecord, VoiceEngineDeleteError } from '$lib/server/services/voiceEngineRegistry'
 
 export const DELETE: RequestHandler = async ({ locals, params, request }) => {
   if (!locals.user?.id) {
@@ -18,6 +18,9 @@ export const DELETE: RequestHandler = async ({ locals, params, request }) => {
     return json({ success: true, ...result })
   } catch (error) {
     console.error('[voice/byo/engines/:engineId] Failed to delete BYO engine:', error)
+    if (error instanceof VoiceEngineDeleteError) {
+      return json({ error: error.message, code: error.code, deleteOutcome: error.deleteOutcome }, { status: error.status })
+    }
     return json(
       {
         error: error instanceof Error ? error.message : 'Failed to delete BYO engine'

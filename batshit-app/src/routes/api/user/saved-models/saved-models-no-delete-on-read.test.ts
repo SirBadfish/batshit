@@ -1,3 +1,4 @@
+import './presetStorageScriptDouble'
 /**
  * BL-517: loading the preset list never deletes a preset.
  *
@@ -20,6 +21,15 @@ const redisMock = vi.hoisted(() => ({}) as Record<string, any>)
 vi.mock('$lib/server/redis', () => ({ redis: redisMock }))
 
 Object.assign(redisMock, {
+  execute: vi.fn(async (operation: (client: any) => Promise<any>) => operation({
+    type: async (key: string) => store.has(key) ? 'ReJSON-RL' : 'none',
+    sendCommand: async ([, key]: string[]) => store.has(key) ? JSON.stringify([store.get(key)]) : null,
+    eval: async (_script: string, { keys, arguments: args }: { keys: string[]; arguments: string[] }) => {
+      if (args[2] !== 'PERSIST') throw new Error('This fixture admits only cache retention, never refresh writes.')
+      return store.has(keys[0]) && JSON.stringify([store.get(keys[0])]) === args[1] ? 'OK' : 'CHANGED'
+    },
+    json: { get: async (key: string) => store.has(key) ? clone(store.get(key)) : null }
+  })),
   get: vi.fn(async (key: string) => (store.has(key) ? clone(store.get(key)) : null)),
   set: vi.fn(async (key: string, value: unknown) => {
     store.set(key, clone(value))
@@ -238,6 +248,24 @@ describe('BL-517: loading the preset list never deletes a preset', () => {
     expect(body.meta.unlisted).toEqual([])
   })
 
+  it('projects exact-connection control evidence without writing it or changing saved settings/baseline', async () => {
+    const catalog: any = clone(LISTED_SONNET)
+    const evidence = { lastGood: { version: 1, scope: 'public', support: 'supported', connection: 'vercel-gateway',
+      effectiveModelId: catalog.id, endpoint: 'responses', controls: [{ id: 'effort', kind: 'effort', values: ['low', 'high'] }],
+      evidence: [{ url: 'https://vercel.com/docs/ai-gateway', checkedAt: '2026-10-14' }], lastVerified: '2026-10-14' },
+      lastAttempt: { at: '2026-10-14T12:00:00Z', outcome: 'verified' } }
+    catalog.idVariants['vercel-gateway'].reasoningEvidence = evidence
+    store.set('vercel:model_catalog:v1', { models: [catalog], fetchedAt: new Date().toISOString() })
+    const preset = gatewayPreset('evidence-preset', catalog.id, { settings: { temperature: 0.3, 'openai.reasoningEffort': 'high' },
+      enrichment: { source: 'vercel-catalog', fetchedAt: '2026-09-01', capabilities: { reasoning: true } } })
+    seed(preset)
+    const before = clone(store.get('model:evidence-preset'))
+    const body = await listPresets()
+    expect(body.models[0].reasoningEvidence).toEqual({ status: 'supported', evidence })
+    expect(store.get('model:evidence-preset')).toEqual(before)
+    expect(redisMock.json.setIfExists).not.toHaveBeenCalled()
+  })
+
   it('a save never stores the answer-only mark', async () => {
     const response = await routeModule.POST({
       request: new Request('http://localhost/api/user/saved-models', {
@@ -245,7 +273,8 @@ describe('BL-517: loading the preset list never deletes a preset', () => {
         body: JSON.stringify({
           ...gatewayPreset('zm_sonnet_save', 'anthropic/claude-sonnet-5'),
           id: '',
-          unavailableReason: 'Vercel AI Gateway no longer lists this model'
+          unavailableReason: 'Vercel AI Gateway no longer lists this model',
+          reasoningEvidence: { status: 'supported', evidence: { arbitrary: 'client-provided' } }
         })
       }),
       locals: { user: { id: 'josh' } }
@@ -253,5 +282,34 @@ describe('BL-517: loading the preset list never deletes a preset', () => {
     expect(response.status).toBe(200)
     const { model } = await response.json()
     expect(store.get(`model:${model.id}`).unavailableReason).toBeUndefined()
+    expect(store.get(`model:${model.id}`).reasoningEvidence).toBeUndefined()
+  })
+})
+
+
+describe('A12 pure authenticated stored preset projection', () => {
+  it('retains exact unlisted/legacy source bytes and does not call catalog, account, backfill or writer owners', async () => {
+    const original = gatewayPreset('stored_old', 'qwen/retired', { purpose: undefined, settings: { temperature: 0, customFalse: false } })
+    seed(original)
+    const before = JSON.stringify([...store])
+    const response = await routeModule.GET({ locals: { user: { id: 'josh' } }, url: new URL('http://localhost/api/user/saved-models?projection=stored') } as any)
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({ projection: 'stored', models: [clone(original)], total: 1, offset: 0, nextOffset: null })
+    expect(JSON.stringify([...store])).toBe(before)
+    for (const write of [redisMock.set, redisMock.del, redisMock.sAdd, redisMock.sRem, redisMock.json.setIfExists, redisMock.json.setIfAbsent]) expect(write).not.toHaveBeenCalled()
+    expect(fetch).not.toHaveBeenCalled()
+  })
+  it('refuses a missing or oversize indexed row instead of publishing an empty/partial successful list', async () => {
+    sets.set('user:josh:models', new Set(['missing']))
+    const read = () => routeModule.GET({ locals: { user: { id: 'josh' } }, url: new URL('http://localhost/api/user/saved-models?projection=stored') } as any)
+    expect((await read()).status).not.toBe(200)
+    seed(gatewayPreset('missing', 'qwen/retired', { settings: { privateUnknown: 'x'.repeat(131073) } }))
+    expect((await read()).status).not.toBe(200)
+    expect(fetch).not.toHaveBeenCalled()
+  })
+  it('authenticates before any stored read and refuses selectors outside the closed projection', async () => {
+    const response = await routeModule.GET({ locals: {}, url: new URL('http://localhost/api/user/saved-models?projection=stored') } as any)
+    expect(response.status).toBe(401); expect(redisMock.get).not.toHaveBeenCalled()
+    expect((await routeModule.GET({ locals: { user: { id: 'josh' } }, url: new URL('http://localhost/api/user/saved-models?projection=stored&path=$') } as any)).status).toBe(400)
   })
 })

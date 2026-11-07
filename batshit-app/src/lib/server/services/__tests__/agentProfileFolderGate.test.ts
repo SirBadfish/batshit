@@ -1,26 +1,39 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { mkdtemp, realpath, rm } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
 
-const records = vi.hoisted(() => new Map<string, { user_id: string }>())
-const readRecord = vi.hoisted(() => vi.fn(async (key: string) => records.get(key) ?? null))
-vi.mock('$lib/server/redis', () => ({ redis: { json: { get: readRecord } } }))
-
+import { holdAgentProfileFolder, withAgentProfileFolder } from '../agentProfileFolderGate'
 import {
-  holdAgentProfileFolder,
-  isManagedProfileRunRefusal,
-  withManagedProfileRunWrite
-} from '../agentProfileFolderGate'
+  assertProfileFolderPreparation,
+  captureProfileFolderPreparation,
+  ProfileFolderChangedError,
+  releaseProfileFolderPreparation
+} from '../agentProfileFolderQueue'
 
-const owner = { userId: 'josh', kind: 'agent' as const, id: 'one' }
+/**
+ * BL-745 / BL-753 — the folder gate's turns, as the deletes use them. SA-139 R5 removed every
+ * profile writer (its publications and run-start writes went with this file's old cases), so
+ * what stays is the delete's hold: folder work queued during it waits until the delete's steps
+ * are done (the record is gone), the delete's own folder removal inside it runs at once, and the
+ * hold makes any earlier preparation of the folder stale. Generic saves no longer use the folder.
+ */
 
-beforeEach(() => {
-  records.clear()
-  readRecord.mockReset()
-  readRecord.mockImplementation(async (key: string) => records.get(key) ?? null)
+let runtimeRoot: string, previousRuntimeRoot: string | undefined
+
+beforeEach(async () => {
+  previousRuntimeRoot = process.env.BATSHIT_AGENT_RUNTIME_ROOT
+  runtimeRoot = await realpath(await mkdtemp(path.join(os.tmpdir(), 'batshit-folder-gate-')))
+  process.env.BATSHIT_AGENT_RUNTIME_ROOT = runtimeRoot
+})
+afterEach(async () => {
+  if (previousRuntimeRoot === undefined) delete process.env.BATSHIT_AGENT_RUNTIME_ROOT
+  else process.env.BATSHIT_AGENT_RUNTIME_ROOT = previousRuntimeRoot
+  await rm(runtimeRoot, { recursive: true, force: true })
 })
 
-describe('managed profile run admission', () => {
-  it('does not recreate a folder when deletion takes its turn first', async () => {
-    records.set('agent:one', { user_id: 'josh' })
+describe("a delete's hold on a managed profile folder", () => {
+  it('runs folder work queued during the hold only after every step of the delete', async () => {
     let finishDelete!: () => void
     const deleteMayFinish = new Promise<void>((resolve) => { finishDelete = resolve })
     let deleting!: () => void
@@ -30,67 +43,39 @@ describe('managed profile run admission', () => {
       events.push('delete starts')
       deleting()
       await deleteMayFinish
-      records.delete('agent:one')
       events.push('record removed')
     })
     await deleteStarted
-    const start = withManagedProfileRunWrite(owner, 'batshit_agent_one', async () => {
-      events.push('folder written')
-    })
+    const queued = withAgentProfileFolder('batshit_agent_one', async () => { events.push('queued folder work') })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(events).toEqual(['delete starts'])
     finishDelete()
-    await deletion
-    await expect(start).rejects.toMatchObject({ code: 'MANAGED_PROFILE_RUN_REFUSED' })
-    expect(events).toEqual(['delete starts', 'record removed'])
+    await Promise.all([deletion, queued])
+    expect(events).toEqual(['delete starts', 'record removed', 'queued folder work'])
   })
 
-  it('refuses a missing, foreign, or unreadable owner before the folder action', async () => {
-    const write = vi.fn(async () => undefined)
-    await expect(withManagedProfileRunWrite(owner, 'batshit_agent_one', write)).rejects.toMatchObject({ code: 'MANAGED_PROFILE_RUN_REFUSED' })
-    records.set('agent:one', { user_id: 'other' })
-    await expect(withManagedProfileRunWrite(owner, 'batshit_agent_one', write)).rejects.toMatchObject({ code: 'MANAGED_PROFILE_RUN_REFUSED' })
-    readRecord.mockRejectedValueOnce(new Error('Redis unavailable'))
-    await expect(withManagedProfileRunWrite(owner, 'batshit_agent_one', write)).rejects.toMatchObject({ code: 'MANAGED_PROFILE_RUN_REFUSED' })
-    await expect(withManagedProfileRunWrite({ ...owner, kind: 'host' }, 'batshit_agent_one', write)).rejects.toMatchObject({ code: 'MANAGED_PROFILE_RUN_REFUSED' })
-    expect(write).not.toHaveBeenCalled()
-  })
-
-  it('preserves an action error after a verified owner', async () => {
-    records.set('subagent:one', { user_id: 'josh' })
-    const failure = new Error('disk write failed')
-    await expect(withManagedProfileRunWrite(
-      { ...owner, kind: 'subagent' },
-      'batshit_agent_subagent_cli-one',
-      async () => { throw failure }
-    )).rejects.toBe(failure)
-    expect(isManagedProfileRunRefusal(failure)).toBe(false)
-  })
-
-  it.each(['owner read', 'folder action'])('releases the folder turn after a failed %s', async (failureAt) => {
-    records.set('agent:one', { user_id: 'josh' })
-    let releaseFirst!: () => void
-    const firstMayFinish = new Promise<void>((resolve) => { releaseFirst = resolve })
-    let firstEntered!: () => void
-    const firstIsInside = new Promise<void>((resolve) => { firstEntered = resolve })
-    if (failureAt === 'owner read') {
-      readRecord.mockImplementationOnce(async () => {
-        firstEntered()
-        await firstMayFinish
-        throw new Error('Redis unavailable')
-      })
-    }
-    const first = withManagedProfileRunWrite(owner, 'batshit_agent_one', async () => {
-      if (failureAt === 'folder action') {
-        firstEntered()
-        await firstMayFinish
-        throw new Error('disk failed')
-      }
+  it("runs the delete's own folder removal inside the hold at once, and holds no other folder", async () => {
+    const events: string[] = []
+    await holdAgentProfileFolder('batshit_agent_one', async () => {
+      await withAgentProfileFolder('batshit_agent_one', async () => { events.push('folder removed inside the hold') })
+      await withAgentProfileFolder('batshit_agent_two', async () => { events.push('another folder is not held') })
+      events.push('record removed')
     })
-    await firstIsInside
-    const secondAction = vi.fn(async () => 'wrote')
-    const second = withManagedProfileRunWrite(owner, 'batshit_agent_one', secondAction)
-    releaseFirst()
-    await expect(first).rejects.toThrow(failureAt === 'owner read' ? /could not be verified/ : /disk failed/)
-    await expect(second).resolves.toBe('wrote')
-    expect(secondAction).toHaveBeenCalledOnce()
+    expect(events).toEqual(['folder removed inside the hold', 'another folder is not held', 'record removed'])
+  })
+
+  it('makes a preparation of the folder captured before the hold stale, and leaves an ordinary turn alone', async () => {
+    const beforeTurn = captureProfileFolderPreparation('batshit_agent_one')
+    const beforeHold = captureProfileFolderPreparation('batshit_agent_one')
+    const otherFolder = captureProfileFolderPreparation('batshit_agent_two')
+    try {
+      await withAgentProfileFolder('batshit_agent_one', async () => 'an ordinary folder turn')
+      expect(() => assertProfileFolderPreparation(beforeTurn)).not.toThrow()
+      await holdAgentProfileFolder('batshit_agent_one', async () => 'the delete')
+      expect(() => assertProfileFolderPreparation(beforeHold)).toThrow(ProfileFolderChangedError)
+      expect(() => assertProfileFolderPreparation(otherFolder)).not.toThrow()
+    } finally {
+      for (const preparation of [beforeTurn, beforeHold, otherFolder]) releaseProfileFolderPreparation(preparation)
+    }
   })
 })

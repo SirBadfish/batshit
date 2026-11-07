@@ -2,6 +2,8 @@ import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
+  CATCH_UP_RETRY_DELAYS_MS,
+  resolveCatchUpRetryDelay,
   resolveChatsToCatchUpAfterUserChannelReturn,
   resolveRepliesEndedWhileAway,
   shouldCatchUpChatAfterReconnect
@@ -57,13 +59,13 @@ describe('which chats catch up (BL-382 review)', () => {
 
 describe('the chat page ends them after the reconnect reload (source pins)', () => {
   const page = readFileSync(path.resolve('src/routes/+page.svelte'), 'utf8')
-  const start = page.indexOf('\n  async function catchUpAfterReconnect(sessionId: string) {\n')
+  const start = page.indexOf('\n  async function catchUpAfterReconnect(sessionId: string, failedReads = 0) {\n')
   const body = page.slice(start, page.indexOf('\n  }\n', start + 1) + 1)
 
   it('the reconnect handler loads the chat, then ends what ended, in that order', () => {
     expect(page).toContain('\n    void catchUpAfterReconnect(sessionId)\n')
     expect(start).toBeGreaterThan(-1)
-    const load = body.indexOf('\n    await loadMessagesForSession(sessionId)\n')
+    const load = body.indexOf('\n    const outcome = await loadMessagesForSession(sessionId)\n')
     const resolve = body.indexOf('resolveRepliesEndedWhileAway({')
     expect(load).toBeGreaterThan(-1)
     expect(resolve).toBeGreaterThan(load)
@@ -109,5 +111,55 @@ describe('the chat page ends them after the reconnect reload (source pins)', () 
     expect(page).toContain("\n      if (event?.type === 'reconnected') {\n")
     expect(page).toContain('resolveChatsToCatchUpAfterUserChannelReturn({')
     expect(page).toMatch(/chatsWithOwnSubscription: new Set\(sseServices\.keys\(\)\)/)
+  })
+})
+
+/**
+ * BL-814: a failed read of the chat cleared the tab's messages (the chat on screen went blank
+ * until the next read), and a reconnect catch-up that met it found none of its replies, so their
+ * busy state (the Stop button) stayed until a later read that never ended them either.
+ */
+describe('a catch-up whose read failed (BL-814)', () => {
+  it('reads again after 2 s, 5 s, and 15 s, then stops', () => {
+    expect(CATCH_UP_RETRY_DELAYS_MS).toEqual([2_000, 5_000, 15_000])
+    expect(resolveCatchUpRetryDelay(0)).toBe(2_000)
+    expect(resolveCatchUpRetryDelay(1)).toBe(5_000)
+    expect(resolveCatchUpRetryDelay(2)).toBe(15_000)
+    expect(resolveCatchUpRetryDelay(3)).toBeNull()
+  })
+
+  const page = readFileSync(path.resolve('src/routes/+page.svelte'), 'utf8')
+  const bodyOf = (signature: string) => {
+    const start = page.indexOf(signature)
+    expect(start).toBeGreaterThan(-1)
+    return page.slice(start, page.indexOf('\n\t  }\n', start + 1) + 1)
+  }
+
+  it('a failed read keeps the messages the tab has, and says it failed (source pins)', () => {
+    const load = bodyOf('\n  async function loadMessagesFromServer(sessionId: string): Promise<ChatLoadOutcome> {\n')
+    expect(load).toContain("return 'loaded'")
+    expect(load).toContain("return 'missing'")
+    expect(load).toContain("return 'failed'")
+    const failure = load.slice(load.indexOf("console.error('[loadMessagesForSession] Failed to load messages:', error)"))
+    expect(failure).not.toContain('clearMessages')
+    expect(failure).toContain("toast.error('Failed to load conversation. Please try again.')")
+  })
+
+  it('the catch-up reads again after a failed read and ends nothing on the old copy (source pins)', () => {
+    const start = page.indexOf('\n  async function catchUpAfterReconnect(sessionId: string, failedReads = 0) {\n')
+    const body = page.slice(start, page.indexOf('\n  }\n', start + 1) + 1)
+    const failed = body.indexOf("\n    if (outcome === 'failed') {\n      scheduleCatchUpRetry(sessionId, failedReads)\n      return\n    }\n")
+    expect(failed).toBeGreaterThan(-1)
+    expect(failed).toBeLessThan(body.indexOf('resolveRepliesEndedWhileAway({'))
+    const retry = page.slice(page.indexOf('\n  function scheduleCatchUpRetry(sessionId: string, failedReads: number) {\n'))
+    expect(retry).toContain('const delay = resolveCatchUpRetryDelay(failedReads)')
+    expect(retry).toContain('if (missingSessionIds.has(sessionId)) return')
+    expect(retry).toContain('if (stillNeeded) void catchUpAfterReconnect(sessionId, failedReads + 1)')
+  })
+
+  it('a deleted chat and a closed page leave no read behind (source pins)', () => {
+    const forget = page.indexOf('\t    chatLoadQueue.forget(sessionId)\n\t    cancelCatchUpRetry(sessionId)\n')
+    expect(forget).toBeGreaterThan(-1)
+    expect(page).toContain('for (const sessionId of Array.from(catchUpRetryTimers.keys())) cancelCatchUpRetry(sessionId)')
   })
 })

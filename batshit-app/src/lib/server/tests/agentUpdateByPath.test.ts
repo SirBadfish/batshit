@@ -1,7 +1,19 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
-import { useRedisTestServer } from '$lib/test-utils/redis-memory'
+import { useOwnedRedisTestServer } from '$lib/test-utils/ownedRedisTestServer'
+import { MCP_SETTINGS_FIELDS } from '$lib/utils/agentSettingsSectionSaves'
+import { mcpSettingsReadPaths, makeMcpSettingsSnapshot } from '$lib/server/agentRecordUpdate'
+import { instructionLeaves, readInstructionsSnapshot } from '$lib/server/instructionsGuard'
+import { readInstructionsSnapshotTwin } from '$lib/test-utils/agentUpdateScriptTwin'
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { createSettingsRedisAdmission } from '$lib/test-utils/settingsRedisAdmission'
 import { redis } from '$lib/server/redis'
 import { buildAgentMemoryRecordFields, resolveAgentMemorySettingsDraft } from '$lib/utils/memoryControl'
+import { reasoningOverrideKey } from '$lib/utils/modelReasoningControls'
+import { planAgentRecordUpdate } from '$lib/server/agentRecordUpdate'
+import { agentTypeSnapshotOf, runAgentUpdateScriptTwin } from '$lib/test-utils/agentUpdateScriptTwin'
+import { captureSettingsLifecycle, withSettingsRecordReplacement, withSettingsRestoreFence } from '$lib/server/services/appActions/settings/lifecycle'
+import { namesModelSelection, readModelSelectionSnapshot } from '$lib/server/modelSelectionGuard'
+import type { AgentUpdateOptions } from '$lib/server/agentRecordUpdate'
+import { CONFIGURED_TTS_READ_PATHS, configuredTtsSnapshotFromDetail, readConfiguredTtsSnapshot } from '$lib/server/configuredTtsGuard'
 
 /**
  * BL-768: `redis.updateAgent` writes only the fields its caller passed, each by path, in one step
@@ -15,15 +27,39 @@ import { buildAgentMemoryRecordFields, resolveAgentMemorySettingsDraft } from '$
  * plain `npm test`. The gap tests need the real client and run on the real lane only.
  */
 
-useRedisTestServer()
+// A present allocation, even empty/malformed, must use the strict owned-proof admission.
+const strictAdmission = Object.hasOwn(process.env, 'SA122_SETTINGS_REDIS_ALLOCATION')
+  ? createSettingsRedisAdmission(redis) : null
+const admission = useOwnedRedisTestServer(redis, { beforeCleanupAdmission: strictAdmission?.beforeCleanupAdmission ?? (async ({ adminClient, resolvedUrl }) => {
+  const database = Number(new URL(resolvedUrl).pathname.slice(1))
+  expect(Number.isInteger(database) && database > 0).toBe(true)
+  expect((await adminClient.clientInfo()).db).toBe(database)
+}) })
 
 const REAL = process.env.VITEST_USE_REAL_REDIS === 'true'
+afterAll(async () => {
+  try {
+    if (REAL && admission.isAdmitted()) {
+      admission.requireAdmission()
+      await redis.execute(client => client.del(['model:zaupd_preset_a', 'model:zaupd_preset_b', `user:${USER}:models`]))
+    }
+  } finally {
+    if (strictAdmission) await strictAdmission.close()
+    else if (REAL && !admission.ownedLane) await redis.disconnect()
+  }
+})
 const USER = 'zaupd_user'
 const AGENT = 'zaupd_agent'
 const KEY = `agent:${AGENT}`
 const OLD_STAMP = '2026-09-27T09:00:00.000Z'
 
 async function seed(record: Record<string, unknown> = {}) {
+  if (REAL) admission.requireAdmission()
+  for (const id of ['zaupd_preset_a', 'zaupd_preset_b']) {
+    await redis.json.set(`model:${id}`, '$', { id, modelName: id, modelId: id, provider: 'openai', settings: {},
+      connection: { id: 'direct:openai', type: 'direct', service: 'openai' }, createdAt: OLD_STAMP, updatedAt: OLD_STAMP })
+    await redis.sAdd(`user:${USER}:models`, id)
+  }
   await redis.json.set(KEY, '$', {
     id: AGENT,
     user_id: USER,
@@ -41,20 +77,103 @@ async function seed(record: Record<string, unknown> = {}) {
   } as never)
 }
 
+/** A legitimate model save now carries the original atomic detail-read base (A3).
+ * Capture once before entering the writer; the gap hooks below intercept only mutation EVALs. */
+async function saveAgent(id: string, updates: Parameters<typeof redis.updateAgent>[1], options: AgentUpdateOptions = {}) {
+  if (updates.voice_profile !== undefined && options.expectedTtsSelection === undefined) {
+    const record = await redis.json.get(`agent:${id}`)
+    const shown = REAL ? await redis.execute(client => readConfiguredTtsSnapshot(client, id)) :
+      configuredTtsSnapshotFromDetail(id, record, CONFIGURED_TTS_READ_PATHS.map(path => agentTypeSnapshotOf(record, [path])), captureSettingsLifecycle([`agent:${id}`]))
+    options = { ...options, expectedTtsSelection: shown.revision }
+  }
+  const leaves = instructionLeaves(updates as Record<string, unknown>)
+  if (leaves.length && options.expectedInstructions === undefined) {
+    const shown = REAL ? await redis.execute(client => readInstructionsSnapshot(client, id, 'agent', undefined, leaves)) :
+      readInstructionsSnapshotTwin(id, 'agent', await redis.json.get(`agent:${id}`), captureSettingsLifecycle([`agent:${id}`]), leaves)
+    options = { ...options, expectedInstructions: shown.revisions }
+  }
+  // SA-139 R5: a model save carries the API model-selection base only (the CLI native model
+  // tokens went with the Claude Code CLI Subagent).
+  if (REAL && options.expectedModelSelection === undefined && namesModelSelection('agent', updates as Record<string, unknown>)) {
+    const shown = await redis.execute(client => readModelSelectionSnapshot(client, id, 'agent'))
+    return redis.updateAgent(id, updates, { ...options, expectedModelSelection: shown.revision })
+  }
+  return redis.updateAgent(id, updates, options)
+}
+
 async function stored() {
   return (await redis.json.get(KEY)) as any
 }
 
 afterEach(async () => {
   vi.restoreAllMocks()
-  await redis.del(KEY)
+  if (!REAL || admission.isAdmitted()) await redis.del(KEY)
+})
+
+describe('BL-1702 immutable Primary record metadata', () => {
+  it('the planner never emits metadata mutations while retaining the owned stamp and ordinary fields', () => {
+    const now = '2026-10-18T12:00:00.000Z'
+    const plan = planAgentRecordUpdate({ updates: {
+      id: 'replacement-id', user_id: 'replacement-owner', created_at: '2099-01-01T00:00:00.000Z',
+      updated_at: 'caller-stamp', displayName: 'Allowed rename'
+    }, now })
+    expect(plan.ops.filter(op => ['id', 'user_id', 'created_at'].includes(op.field))).toEqual([])
+    expect(plan.ops).toContainEqual({ op: 'set', field: 'displayName', value: 'Allowed rename' })
+    expect(plan.ops.filter(op => op.field === 'updated_at')).toEqual([{ op: 'set', field: 'updated_at', value: now }])
+  })
+
+  it.each([
+    { id: 'replacement-id', user_id: 'replacement-owner', created_at: '2099-01-01T00:00:00.000Z' },
+    { id: null, user_id: null, created_at: null }
+  ])('the direct writer preserves metadata for attempted values %j and still saves an ordinary edit', async metadata => {
+    await seed()
+    const before = await stored()
+    await redis.updateAgent(AGENT, { ...metadata, displayName: 'Allowed rename', updated_at: 'caller-stamp' } as never)
+    const record = await stored()
+    expect(record).toEqual({ ...before, displayName: 'Allowed rename', updated_at: expect.any(String) })
+    expect(record.updated_at).not.toBe('caller-stamp')
+    expect(record.updated_at).not.toBe(OLD_STAMP)
+    expect(await redis.exists('agent:replacement-id')).toBe(false)
+  })
 })
 
 describe('updateAgent writes only the fields it was given (BL-768)', () => {
+  it('BL-1683 treats ordinary nullable cleanup differently from an explicit whole-voice delete', async () => {
+    const voice = { tts: { providerId: 'browser', voiceId: 'system' }, stt: { future: [0] } }
+    await seed({ voice_profile: voice })
+    await saveAgent(AGENT, { displayName: 'Only this name' })
+    expect((await stored()).voice_profile).toEqual(voice)
+    await expect(redis.updateAgent(AGENT, { voice_profile: null } as never)).rejects.toMatchObject({ code: 'tts_selection_base_required' })
+    await saveAgent(AGENT, { voice_profile: null } as never)
+    expect((await stored()).voice_profile).toBeUndefined()
+  })
+  it('SA-132: concurrent reasoning leaves and unrelated agent settings survive; inherit removes only its leaf', async () => {
+    await seed()
+    const identity = { presetId: 'fixture', connection: { type: 'direct' as const, id: 'direct:openai', service: 'openai' }, effectiveModelId: 'gpt-6.1-sol' }
+    const first = reasoningOverrideKey(identity, 'effort')
+    const second = reasoningOverrideKey({ ...identity, presetId: 'another-preset' }, 'effort')
+    await Promise.all([
+      saveAgent(AGENT, { model_reasoning_overrides: { [first]: { mode: 'value', value: 'max' } } } as any),
+      saveAgent(AGENT, { model_reasoning_overrides: { [second]: { mode: 'provider-default' } } } as any),
+      saveAgent(AGENT, { displayName: 'Kept', provider_specific_settings: { 'openai.reasoningEffort': 'high' } } as any)
+    ])
+    expect((await stored()).model_reasoning_overrides).toEqual({ [first]: { mode: 'value', value: 'max' }, [second]: { mode: 'provider-default' } })
+    expect((await stored()).provider_specific_settings).toMatchObject({ 'openai.reasoningEffort': 'high', nativeTools: { bashAccessMode: 'plan' } })
+    await saveAgent(AGENT, { model_reasoning_overrides: { [first]: null } } as any)
+    expect((await stored()).model_reasoning_overrides).toEqual({ [second]: { mode: 'provider-default' } })
+    expect((await stored()).displayName).toBe('Kept')
+  })
+
+  it('SA-132: malformed identities and bulk edits are refused before any sibling write', async () => {
+    await seed()
+    const before = await stored()
+    await expect(saveAgent(AGENT, { displayName: 'Must not land', model_reasoning_overrides: { unsafe: { mode: 'value', value: 'high' } } } as any)).rejects.toThrow(/identity/)
+    expect(await stored()).toEqual(before)
+  })
   it('writes the named fields and the stamp; every other field stays', async () => {
     await seed({ memory_last_interaction_at: '2026-09-27T10:00:00.000Z', voice_profile: { tts: { providerId: 'x' } } })
 
-    await redis.updateAgent(AGENT, { displayName: 'Renamed', system_prompt: 'Be brief.' } as any)
+    await saveAgent(AGENT, { displayName: 'Renamed', system_prompt: 'Be brief.' } as any)
 
     const record = await stored()
     expect(record).toMatchObject({
@@ -74,7 +193,7 @@ describe('updateAgent writes only the fields it was given (BL-768)', () => {
   it('writes provider_specific_settings key by key: a key not passed stays, a null key is removed', async () => {
     await seed()
 
-    await redis.updateAgent(AGENT, {
+    await saveAgent(AGENT, {
       provider_specific_settings: { temperature: null, reasoningEffort: 'low', 'openai.store': false }
     } as any)
 
@@ -87,54 +206,60 @@ describe('updateAgent writes only the fields it was given (BL-768)', () => {
 
   it('makes provider_specific_settings an object first when it is missing or null', async () => {
     await seed({ provider_specific_settings: null })
-    await redis.updateAgent(AGENT, { provider_specific_settings: { codex_permission_mode: 'chat' } } as any)
-    expect((await stored()).provider_specific_settings).toEqual({ codex_permission_mode: 'chat' })
+    await saveAgent(AGENT, { provider_specific_settings: { claude_permission_mode: 'plan' } } as any)
+    expect((await stored()).provider_specific_settings).toEqual({ claude_permission_mode: 'plan' })
 
     await seed({ provider_specific_settings: undefined })
-    await redis.updateAgent(AGENT, { provider_specific_settings: { nativeTools: { bashAccessMode: 'agent' } } } as any)
+    await saveAgent(AGENT, { provider_specific_settings: { nativeTools: { bashAccessMode: 'agent' } } } as any)
     expect((await stored()).provider_specific_settings).toEqual({ nativeTools: { bashAccessMode: 'agent' } })
   })
 
   it('writes nativeTools field by field: a field not named stays, a field named null is removed (BL-841)', async () => {
-    await seed({ provider_specific_settings: { temperature: 1.2, nativeTools: { bashAccessMode: 'plan', bashNeverAllowList: ['rm -rf *'], webSearchProvider: 'exa' } } })
+    await seed({ provider_specific_settings: { temperature: 1.2, nativeTools: { bashAccessMode: 'plan', bashNeverAllowList: ['rm -rf *'], webSearchProvider: 'exa', webSearchEnabled: true } } })
+    const before = await stored()
+    await expect(saveAgent(AGENT, { displayName: 'Must not land', provider_specific_settings: { nativeTools: { webSearchProvider: null } } } as any))
+      .rejects.toMatchObject({ status: 400, message: 'webSearchProvider is now a global tool option in Admin. Nothing was saved.' })
+    expect(await stored()).toEqual(before)
 
-    await redis.updateAgent(AGENT, {
-      provider_specific_settings: { nativeTools: { bashNeverAllowList: ['rm -rf *', 'git push --force'], executionBackend: 'docker', webSearchProvider: null } }
+    await saveAgent(AGENT, {
+      provider_specific_settings: { nativeTools: { bashNeverAllowList: ['rm -rf *', 'git push --force'], executionBackend: 'docker', webSearchEnabled: null } }
     } as any)
 
     expect((await stored()).provider_specific_settings).toEqual({
       temperature: 1.2,
-      nativeTools: { bashAccessMode: 'plan', bashNeverAllowList: ['rm -rf *', 'git push --force'], executionBackend: 'docker' }
+      nativeTools: { bashAccessMode: 'plan', bashNeverAllowList: ['rm -rf *', 'git push --force'], executionBackend: 'docker', webSearchProvider: 'exa' }
     })
   })
 
   it('makes nativeTools an object first when it is missing or not an object; a save of removals only adds nothing', async () => {
     await seed({ provider_specific_settings: { temperature: 1.2 } })
-    await redis.updateAgent(AGENT, { provider_specific_settings: { nativeTools: { bashAccessMode: 'agent' } } } as any)
+    await saveAgent(AGENT, { provider_specific_settings: { nativeTools: { bashAccessMode: 'agent' } } } as any)
     expect((await stored()).provider_specific_settings).toEqual({ temperature: 1.2, nativeTools: { bashAccessMode: 'agent' } })
 
     await seed({ provider_specific_settings: { nativeTools: 'not an object' } })
-    await redis.updateAgent(AGENT, { provider_specific_settings: { nativeTools: { bashAccessMode: 'agent' } } } as any)
+    await saveAgent(AGENT, { provider_specific_settings: { nativeTools: { bashAccessMode: 'agent' } } } as any)
     expect((await stored()).provider_specific_settings).toEqual({ nativeTools: { bashAccessMode: 'agent' } })
 
     await seed({ provider_specific_settings: { temperature: 1.2 } })
-    await redis.updateAgent(AGENT, { provider_specific_settings: { nativeTools: { bashNeverAllowList: null } } } as any)
+    await saveAgent(AGENT, { provider_specific_settings: { nativeTools: { bashNeverAllowList: null } } } as any)
     expect((await stored()).provider_specific_settings).toEqual({ temperature: 1.2 })
   })
 
-  it('nativeTools named null removes the whole block; the last field named null leaves an empty block', async () => {
+  it('the last field named null leaves an empty native block; its ancestor cannot erase explicit choices', async () => {
     await seed()
-    await redis.updateAgent(AGENT, { provider_specific_settings: { nativeTools: { bashAccessMode: null, bashNeverAllowList: null } } } as any)
+    await saveAgent(AGENT, { provider_specific_settings: { nativeTools: { bashAccessMode: null, bashNeverAllowList: null } } } as any)
     expect((await stored()).provider_specific_settings).toEqual({ temperature: 1.2, nativeTools: {} })
 
-    await redis.updateAgent(AGENT, { provider_specific_settings: { nativeTools: null } } as any)
-    expect((await stored()).provider_specific_settings).toEqual({ temperature: 1.2 })
+    const before = await stored()
+    await expect(saveAgent(AGENT, { displayName: 'Must not land', provider_specific_settings: { nativeTools: null } } as any))
+      .rejects.toMatchObject({ status: 400, message: 'Keep the explicit Typed File Tools choice; clear individual tool settings instead. Nothing was saved.' })
+    expect(await stored()).toEqual(before)
   })
 
   it('a null on a nullable field removes it, and a nullable field stored as null goes too; others store null', async () => {
     await seed({ goon_id: null, description: 'kept?' })
 
-    await redis.updateAgent(AGENT, { primary_model_temperature: null, description: null } as any)
+    await saveAgent(AGENT, { primary_model_temperature: null, description: null } as any)
 
     const record = await stored()
     expect('primary_model_temperature' in record).toBe(false)
@@ -143,16 +268,20 @@ describe('updateAgent writes only the fields it was given (BL-768)', () => {
     expect(record.description).toBeNull()
   })
 
-  it('the whole block passed as null removes it (the old nullable rule)', async () => {
+  it('the whole provider block cannot erase explicit choices; named individual leaves still clear', async () => {
     await seed()
-    await redis.updateAgent(AGENT, { provider_specific_settings: null } as any)
-    expect('provider_specific_settings' in (await stored())).toBe(false)
+    const before = await stored()
+    await expect(saveAgent(AGENT, { displayName: 'Must not land', provider_specific_settings: null } as any))
+      .rejects.toMatchObject({ status: 400, message: 'Keep the explicit Typed File Tools choice; clear individual provider settings instead. Nothing was saved.' })
+    expect(await stored()).toEqual(before)
+    await saveAgent(AGENT, { provider_specific_settings: { temperature: null, nativeTools: { bashAccessMode: null, bashNeverAllowList: null } } } as any)
+    expect((await stored()).provider_specific_settings).toEqual({ nativeTools: {} })
   })
 
   it('canonicalizes the type: writes agentType and removes the legacy type fields', async () => {
     await seed({ agentType: undefined, batshitMode: 'cli', mode: 'vercel-native', agent_type: 'batshit' })
 
-    await redis.updateAgent(AGENT, { displayName: 'Typed' } as any)
+    await saveAgent(AGENT, { displayName: 'Typed' } as any)
 
     const record = await stored()
     expect(record.agentType).toBe('cli')
@@ -163,25 +292,28 @@ describe('updateAgent writes only the fields it was given (BL-768)', () => {
 
   it('stamps updated_at itself, over a value the caller passed', async () => {
     await seed()
-    await redis.updateAgent(AGENT, { updated_at: '2000-01-01T00:00:00.000Z' } as any)
+    await saveAgent(AGENT, { updated_at: '2000-01-01T00:00:00.000Z' } as any)
     const stamp = (await stored()).updated_at
     expect(stamp).not.toBe('2000-01-01T00:00:00.000Z')
     expect(stamp).not.toBe(OLD_STAMP)
   })
 
   it('an agent that is gone: throws "Agent not found" and does not recreate it', async () => {
-    await expect(redis.updateAgent(AGENT, { displayName: 'Ghost' } as any)).rejects.toThrow('Agent not found')
+    await expect(saveAgent(AGENT, { displayName: 'Ghost' } as any)).rejects.toThrow('Agent not found')
     expect(await redis.exists(KEY)).toBe(false)
   })
 
   it('refuses a field name that is not an agent field name, writing nothing', async () => {
     await seed()
-    await expect(redis.updateAgent(AGENT, { 'provider_specific_settings.nativeTools': 1 } as any)).rejects.toThrow(
+    await expect(saveAgent(AGENT, { 'provider_specific_settings.nativeTools': 1 } as any)).rejects.toThrow(
       'Not an agent field name'
     )
     expect((await stored()).updated_at).toBe(OLD_STAMP)
   })
 })
+
+// SA-139 R4: the BL-1542 first CLI model promotion of a Primary left with the Claude Code CLI
+// Primary lane (`updateAgent` refuses a promotion guard); a CLI Subagent's promotion stays.
 
 /** What Agent Settings sends as a memory save's base: the stored settings, as its form reads and writes them. */
 function memoryBaseOf(record: unknown) {
@@ -200,7 +332,7 @@ describe('a save of the memory settings writes only while its base is what is sa
     await seed(MEMORY)
     const base = memoryBaseOf(await stored())
 
-    await redis.updateAgent(
+    await saveAgent(
       AGENT,
       { ...base, memory_lane_budgets: { on_my_mind: 100, triggers: 200, recalled: 350 } } as any,
       { expectedMemory: base }
@@ -218,7 +350,7 @@ describe('a save of the memory settings writes only while its base is what is sa
     await redis.json.set(KEY, '$.memory_lane_budgets.on_my_mind', 120 as never)
 
     await expect(
-      redis.updateAgent(
+      saveAgent(
         AGENT,
         { ...base, memory_lane_budgets: { on_my_mind: 100, triggers: 200, recalled: 350 } } as any,
         { expectedMemory: base }
@@ -234,7 +366,7 @@ describe('a save of the memory settings writes only while its base is what is sa
     await seed({ memoryLaneBudgets: { on_my_mind: 40, triggers: 50, recalled: 60 }, memoryLingerTurns: 4 })
     const base = memoryBaseOf(await stored())
 
-    await redis.updateAgent(AGENT, { ...base, memory_recall_linger_turns: 5 } as any, { expectedMemory: base })
+    await saveAgent(AGENT, { ...base, memory_recall_linger_turns: 5 } as any, { expectedMemory: base })
 
     const record = await stored()
     expect(record.memory_recall_linger_turns).toBe(5)
@@ -247,7 +379,7 @@ describe('a save of the memory settings writes only while its base is what is sa
     await redis.json.set(KEY, '$.memory_enabled', false as never)
 
     await expect(
-      redis.updateAgent(AGENT, { ...base, memory_linger_turns: 6 } as any, { expectedMemory: base })
+      saveAgent(AGENT, { ...base, memory_linger_turns: 6 } as any, { expectedMemory: base })
     ).rejects.toMatchObject({ status: 409, code: 'memory_settings_changed' })
     expect((await stored()).memory_linger_turns).toBe(2)
   })
@@ -280,7 +412,7 @@ describe('a save of the memory settings writes only while its base is what is sa
     await seed(MEMORY)
     await redis.json.set(KEY, '$.memory_lane_budgets.on_my_mind', 120 as never)
 
-    await redis.updateAgent(AGENT, { displayName: 'Renamed' } as any)
+    await saveAgent(AGENT, { displayName: 'Renamed' } as any)
 
     const record = await stored()
     expect(record.displayName).toBe('Renamed')
@@ -336,7 +468,7 @@ function interleaveAnotherWriter() {
           if (property === 'json') return json
           if (property === 'eval') {
             return async (script: string, options: { keys?: string[] }) => {
-              if (options?.keys?.[0] === KEY) await writeBetween()
+              if (options?.keys?.[0] === KEY && script.includes('local guard = ARGV[5]')) await writeBetween()
               return client.eval(script, options)
             }
           }
@@ -355,7 +487,7 @@ describe.skipIf(!REAL)('a change written while updateAgent runs survives (BL-768
     const probe = interleaveAnotherWriter()
 
     // What the chat-bar picker sends for a preset with no temperature.
-    await redis.updateAgent(AGENT, {
+    await saveAgent(AGENT, {
       primary_model_preset_id: 'zaupd_preset_b',
       primary_model_temperature: null,
       provider_specific_settings: { temperature: null }
@@ -398,7 +530,7 @@ describe.skipIf(!REAL)('a change written while updateAgent runs survives (BL-768
       })) as any)
 
     // What Agent Settings sends for a never-allow list edit (BL-841): only that field.
-    await redis.updateAgent(AGENT, {
+    await saveAgent(AGENT, {
       provider_specific_settings: { nativeTools: { bashNeverAllowList: ['rm -rf *', 'git push --force'] } }
     } as any)
 
@@ -429,7 +561,7 @@ describe.skipIf(!REAL)('a change written while updateAgent runs survives (BL-768
         return operation(wrapped)
       })) as any)
 
-    await expect(redis.updateAgent(AGENT, { displayName: 'Ghost' } as any)).rejects.toThrow('Agent not found')
+    await expect(saveAgent(AGENT, { displayName: 'Ghost' } as any)).rejects.toThrow('Agent not found')
     expect(await redis.exists(KEY)).toBe(false)
   })
 
@@ -437,7 +569,7 @@ describe.skipIf(!REAL)('a change written while updateAgent runs survives (BL-768
     await seed()
     const probe = interleaveAnotherWriter()
 
-    await redis.updateAgent(AGENT, { displayName: 'Saved from Settings', system_prompt: 'New prompt.' } as any)
+    await saveAgent(AGENT, { displayName: 'Saved from Settings', system_prompt: 'New prompt.' } as any)
 
     const record = await stored()
     expect(probe.wroteBetween()).toBe(true)
@@ -489,7 +621,7 @@ describe('a settings key with any characters is stored under its exact name (rev
   it('writes and removes keys with a dot, a quote, a backslash, brackets, a space, a tab and a line break', async () => {
     await seed()
 
-    await redis.updateAgent(AGENT, {
+    await saveAgent(AGENT, {
       provider_specific_settings: Object.fromEntries(ODD_KEYS.map((key, index) => [key, index]))
     } as any)
 
@@ -504,7 +636,7 @@ describe('a settings key with any characters is stored under its exact name (rev
     expect(record.agentType).toBe('api')
     expect(record.displayName).toBe('Probe')
 
-    await redis.updateAgent(AGENT, {
+    await saveAgent(AGENT, {
       provider_specific_settings: Object.fromEntries(ODD_KEYS.map((key) => [key, null]))
     } as any)
 
@@ -514,11 +646,11 @@ describe('a settings key with any characters is stored under its exact name (rev
 
 describe('an empty name is an ordinary name: RedisJSON 8.10.1 accepts ["" ] for set, type and delete (BL-860)', () => {
   it('writes and removes an empty key or entry id in every shape the plan builds, and the twin agrees', async () => {
-    await seed({ codex_settings: { model: 'gpt-5' }, dcmDisplaySettings: { version: 1, groups: { gw_a: 'hidden' } } })
+    await seed({ claude_settings: { model: 'sonnet' }, dcmDisplaySettings: { version: 1, groups: { gw_a: 'hidden' } } })
 
-    await redis.updateAgent(AGENT, {
+    await saveAgent(AGENT, {
       provider_specific_settings: { '': 'p', nativeTools: { '': 'n' } },
-      codex_settings: { '': 'c' },
+      claude_settings: { '': 'c' },
       dcmDisplaySettings: { groups: { '': 'hidden' } }
     } as any)
 
@@ -528,12 +660,12 @@ describe('an empty name is an ordinary name: RedisJSON 8.10.1 accepts ["" ] for 
       temperature: 1.2,
       nativeTools: { '': 'n', bashAccessMode: 'plan', bashNeverAllowList: ['rm -rf *'] }
     })
-    expect(record.codex_settings).toEqual({ model: 'gpt-5', '': 'c' })
+    expect(record.claude_settings).toEqual({ model: 'sonnet', '': 'c' })
     expect(record.dcmDisplaySettings).toEqual({ version: 1, groups: { gw_a: 'hidden', '': 'hidden' } })
 
-    await redis.updateAgent(AGENT, {
+    await saveAgent(AGENT, {
       provider_specific_settings: { '': null, nativeTools: { '': null } },
-      codex_settings: { '': null },
+      claude_settings: { '': null },
       dcmDisplaySettings: { groups: { '': null } }
     } as any)
 
@@ -542,7 +674,7 @@ describe('an empty name is an ordinary name: RedisJSON 8.10.1 accepts ["" ] for 
       temperature: 1.2,
       nativeTools: { bashAccessMode: 'plan', bashNeverAllowList: ['rm -rf *'] }
     })
-    expect(record.codex_settings).toEqual({ model: 'gpt-5' })
+    expect(record.claude_settings).toEqual({ model: 'sonnet' })
     expect(record.dcmDisplaySettings).toEqual({ version: 1, groups: { gw_a: 'hidden' } })
   })
 })
@@ -551,7 +683,7 @@ describe('a nativeTools field with any characters is stored under its exact name
   it('writes and removes fields with a dot, a quote, a backslash, brackets and a line break', async () => {
     await seed()
 
-    await redis.updateAgent(AGENT, {
+    await saveAgent(AGENT, {
       provider_specific_settings: { nativeTools: Object.fromEntries(ODD_KEYS.map((key, index) => [key, index])) }
     } as any)
 
@@ -565,7 +697,7 @@ describe('a nativeTools field with any characters is stored under its exact name
     expect(record.agentType).toBe('api')
     expect(record.provider_specific_settings.temperature).toBe(1.2)
 
-    await redis.updateAgent(AGENT, {
+    await saveAgent(AGENT, {
       provider_specific_settings: { nativeTools: Object.fromEntries(ODD_KEYS.map((key) => [key, null])) }
     } as any)
 
@@ -574,18 +706,11 @@ describe('a nativeTools field with any characters is stored under its exact name
 })
 
 /**
- * BL-848 and BL-855: `codex_settings`, `claude_settings` and `dcmDisplaySettings` are written field
- * by field, each key (and each entry of a `dcmDisplaySettings` map) at its own path, so two saves
- * that each name one key both survive. Before, each was written whole at `$.<field>`, and the save
- * that landed last took back the other's key.
+ * BL-848 and BL-855: `claude_settings` and `dcmDisplaySettings` are written field by field, each
+ * key (and each entry of a `dcmDisplaySettings` map) at its own path, so two saves that each name
+ * one key both survive. Before, each was written whole at `$.<field>`, and the save that landed
+ * last took back the other's key.
  */
-const CODEX_BLOCK = {
-  model: 'gpt-5',
-  permissionMode: 'chat',
-  sandbox: 'workspace-write',
-  addDirs: ['/a', '/b'],
-  configOverrides: [{ key: 'model_verbosity', value: 'low' }]
-}
 const CLAUDE_BLOCK = { model: 'sonnet', permissionMode: 'default', alwaysThinkingEnabled: false, addDirs: ['/a'] }
 const DCM_BLOCK = {
   version: 1,
@@ -594,7 +719,7 @@ const DCM_BLOCK = {
   groupDisplayPreferences: { gw_a: 'group-only' },
   toolDisplayPreferences: { 'gw_a::read': 'name+hint' }
 }
-const BLOCKS_RECORD = { codex_settings: CODEX_BLOCK, claude_settings: CLAUDE_BLOCK, dcmDisplaySettings: DCM_BLOCK }
+const BLOCKS_RECORD = { claude_settings: CLAUDE_BLOCK, dcmDisplaySettings: DCM_BLOCK }
 
 /** Runs the two saves one after the other, in each order, from a fresh record; answers the block each order left. */
 async function savesInBothOrders(
@@ -605,25 +730,14 @@ async function savesInBothOrders(
   const blocks: unknown[] = []
   for (const [first, second] of [[saveA, saveB], [saveB, saveA]]) {
     await seed(BLOCKS_RECORD)
-    await redis.updateAgent(AGENT, first as any)
-    await redis.updateAgent(AGENT, second as any)
+    await saveAgent(AGENT, first as any)
+    await saveAgent(AGENT, second as any)
     blocks.push((await stored())[field])
   }
   return blocks
 }
 
-describe('codex_settings, claude_settings and dcmDisplaySettings are written field by field (BL-848, BL-855)', () => {
-  it('two saves that each name one codex_settings key both survive, in both orders', async () => {
-    const [aThenB, bThenA] = await savesInBothOrders(
-      'codex_settings',
-      { codex_settings: { model: 'gpt-6', reasoningEffort: 'high' } },
-      { codex_settings: { sandbox: 'read-only' } }
-    )
-    const expected = { ...CODEX_BLOCK, model: 'gpt-6', reasoningEffort: 'high', sandbox: 'read-only' }
-    expect(aThenB).toEqual(expected)
-    expect(bThenA).toEqual(expected)
-  })
-
+describe('claude_settings and dcmDisplaySettings are written field by field (BL-848, BL-855)', () => {
   it('two saves that each name one claude_settings key both survive, in both orders', async () => {
     const [aThenB, bThenA] = await savesInBothOrders(
       'claude_settings',
@@ -650,11 +764,11 @@ describe('codex_settings, claude_settings and dcmDisplaySettings are written fie
     expect(bThenA).toEqual(expected)
   })
 
-  it('a save of one field of the block leaves every other agent field, and the other two blocks, as they were', async () => {
+  it('a save of one field of the block leaves every other agent field, and the other block, as they were', async () => {
     await seed(BLOCKS_RECORD)
-    await redis.updateAgent(AGENT, { codex_settings: { model: 'gpt-6' } } as any)
+    await saveAgent(AGENT, { claude_settings: { model: 'opus' } } as any)
     const record = await stored()
-    expect(record.claude_settings).toEqual(CLAUDE_BLOCK)
+    expect(record.claude_settings).toEqual({ ...CLAUDE_BLOCK, model: 'opus' })
     expect(record.dcmDisplaySettings).toEqual(DCM_BLOCK)
     expect(record.provider_specific_settings).toEqual({
       temperature: 1.2,
@@ -666,50 +780,51 @@ describe('codex_settings, claude_settings and dcmDisplaySettings are written fie
   it('a key named null is removed, a key not named stays, and a list or nested value is written whole', async () => {
     await seed(BLOCKS_RECORD)
 
-    await redis.updateAgent(AGENT, {
-      codex_settings: { permissionMode: null, addDirs: ['/c'], configOverrides: [], search: true },
-      claude_settings: { model: null, addDirs: [] }
+    await saveAgent(AGENT, {
+      claude_settings: { model: null, addDirs: ['/c'], configOverrides: [{ key: 'theme', value: 'dark' }], allowedTools: ['Read'] }
     } as any)
 
     const record = await stored()
-    expect(record.codex_settings).toEqual({ model: 'gpt-5', sandbox: 'workspace-write', addDirs: ['/c'], configOverrides: [], search: true })
-    expect(record.claude_settings).toEqual({ permissionMode: 'default', alwaysThinkingEnabled: false, addDirs: [] })
+    expect(record.claude_settings).toEqual({ permissionMode: 'default', alwaysThinkingEnabled: false, addDirs: ['/c'],
+      configOverrides: [{ key: 'theme', value: 'dark' }], allowedTools: ['Read'] })
   })
 
   it('a partial block makes the block an object first when it is missing, null, or not an object', async () => {
-    for (const record of [{}, { codex_settings: null }, { codex_settings: 'garbage' }, { codex_settings: ['x'] }]) {
+    for (const record of [{}, { claude_settings: null }, { claude_settings: 'garbage' }, { claude_settings: ['x'] }]) {
       await seed(record)
-      await redis.updateAgent(AGENT, { codex_settings: { model: 'gpt-6' } } as any)
-      expect((await stored()).codex_settings).toEqual({ model: 'gpt-6' })
+      await saveAgent(AGENT, { claude_settings: { model: 'opus' } } as any)
+      expect((await stored()).claude_settings).toEqual({ model: 'opus' })
     }
   })
 
   it('the block sent as null is a whole write of null; a save of removals or of {} creates nothing', async () => {
     await seed(BLOCKS_RECORD)
-    await redis.updateAgent(AGENT, { codex_settings: null, claude_settings: null, dcmDisplaySettings: null } as any)
+    await saveAgent(AGENT, { claude_settings: null, dcmDisplaySettings: null } as any)
     let record = await stored()
-    expect(record.codex_settings).toBeNull()
     expect(record.claude_settings).toBeNull()
     expect(record.dcmDisplaySettings).toBeNull()
 
-    await seed()
-    await redis.updateAgent(AGENT, { codex_settings: { model: null }, claude_settings: {}, dcmDisplaySettings: { groups: { gw_a: null } } } as any)
-    record = await stored()
-    expect('codex_settings' in record).toBe(false)
-    expect('claude_settings' in record).toBe(false)
-    expect('dcmDisplaySettings' in record).toBe(false)
+    for (const removals of [{ model: null }, {}]) {
+      await seed()
+      await saveAgent(AGENT, { claude_settings: removals, dcmDisplaySettings: { groups: { gw_a: null } } } as any)
+      record = await stored()
+      expect('claude_settings' in record).toBe(false)
+      expect('dcmDisplaySettings' in record).toBe(false)
+    }
 
-    await seed({ codex_settings: null, claude_settings: CLAUDE_BLOCK })
-    await redis.updateAgent(AGENT, { codex_settings: {}, claude_settings: {} } as any)
-    record = await stored()
-    expect(record.codex_settings).toBeNull()
-    expect(record.claude_settings).toEqual(CLAUDE_BLOCK)
+    await seed({ claude_settings: null })
+    await saveAgent(AGENT, { claude_settings: {} } as any)
+    expect((await stored()).claude_settings).toBeNull()
+
+    await seed({ claude_settings: CLAUDE_BLOCK })
+    await saveAgent(AGENT, { claude_settings: {} } as any)
+    expect((await stored()).claude_settings).toEqual(CLAUDE_BLOCK)
   })
 
   it('dcmDisplaySettings: version at its own key, each map entry by path, an entry named null removed', async () => {
     await seed(BLOCKS_RECORD)
 
-    await redis.updateAgent(AGENT, {
+    await saveAgent(AGENT, {
       dcmDisplaySettings: {
         version: 1,
         groups: { gw_b: null, gw_d: 'group-only' },
@@ -729,10 +844,10 @@ describe('codex_settings, claude_settings and dcmDisplaySettings are written fie
 
   it('dcmDisplaySettings: a map sent whole is written entry by entry, and one sent null is removed', async () => {
     await seed(BLOCKS_RECORD)
-    await redis.updateAgent(AGENT, { dcmDisplaySettings: { groups: { gw_a: 'hidden' } } } as any)
+    await saveAgent(AGENT, { dcmDisplaySettings: { groups: { gw_a: 'hidden' } } } as any)
     expect((await stored()).dcmDisplaySettings.groups).toEqual({ gw_a: 'hidden', gw_b: 'hidden' })
 
-    await redis.updateAgent(AGENT, { dcmDisplaySettings: { groups: null, tools: {} } } as any)
+    await saveAgent(AGENT, { dcmDisplaySettings: { groups: null, tools: {} } } as any)
     const block = (await stored()).dcmDisplaySettings
     expect('groups' in block).toBe(false)
     expect(block.tools).toEqual({ 'gw_a::read': 'name-only' })
@@ -740,43 +855,43 @@ describe('codex_settings, claude_settings and dcmDisplaySettings are written fie
 
   it('dcmDisplaySettings: the block and a map are made objects first, and only when an entry is set', async () => {
     await seed()
-    await redis.updateAgent(AGENT, { dcmDisplaySettings: { groups: { gw_a: 'hidden' } } } as any)
+    await saveAgent(AGENT, { dcmDisplaySettings: { groups: { gw_a: 'hidden' } } } as any)
     expect((await stored()).dcmDisplaySettings).toEqual({ groups: { gw_a: 'hidden' } })
 
     await seed({ dcmDisplaySettings: { version: 1, groups: 'garbage', tools: null } })
-    await redis.updateAgent(AGENT, { dcmDisplaySettings: { groups: { gw_a: 'hidden' }, tools: { t: 'hidden' } } } as any)
+    await saveAgent(AGENT, { dcmDisplaySettings: { groups: { gw_a: 'hidden' }, tools: { t: 'hidden' } } } as any)
     expect((await stored()).dcmDisplaySettings).toEqual({ version: 1, groups: { gw_a: 'hidden' }, tools: { t: 'hidden' } })
 
     await seed({ dcmDisplaySettings: { version: 1, groups: 'garbage' } })
-    await redis.updateAgent(AGENT, { dcmDisplaySettings: { groups: { gw_a: null } } } as any)
+    await saveAgent(AGENT, { dcmDisplaySettings: { groups: { gw_a: null } } } as any)
     expect((await stored()).dcmDisplaySettings).toEqual({ version: 1, groups: 'garbage' })
   })
 
   it('a key or a map entry with any characters is stored under its exact name', async () => {
     await seed(BLOCKS_RECORD)
 
-    await redis.updateAgent(AGENT, {
-      codex_settings: Object.fromEntries(ODD_KEYS.map((key, index) => [key, index])),
+    await saveAgent(AGENT, {
+      claude_settings: Object.fromEntries(ODD_KEYS.map((key, index) => [key, index])),
       dcmDisplaySettings: { groups: Object.fromEntries(ODD_KEYS.map((key, index) => [key, `mode ${index}`])) }
     } as any)
 
     let record = await stored()
-    expect(Object.keys(record.codex_settings).sort()).toEqual([...Object.keys(CODEX_BLOCK), ...ODD_KEYS].sort())
+    expect(Object.keys(record.claude_settings).sort()).toEqual([...Object.keys(CLAUDE_BLOCK), ...ODD_KEYS].sort())
     expect(Object.keys(record.dcmDisplaySettings.groups).sort()).toEqual([...Object.keys(DCM_BLOCK.groups), ...ODD_KEYS].sort())
     ODD_KEYS.forEach((key, index) => {
-      expect(Object.prototype.hasOwnProperty.call(record.codex_settings, key)).toBe(true)
-      expect(record.codex_settings[key]).toBe(index)
+      expect(Object.prototype.hasOwnProperty.call(record.claude_settings, key)).toBe(true)
+      expect(record.claude_settings[key]).toBe(index)
       expect(record.dcmDisplaySettings.groups[key]).toBe(`mode ${index}`)
     })
     expect(record.agentType).toBe('api')
 
-    await redis.updateAgent(AGENT, {
-      codex_settings: Object.fromEntries(ODD_KEYS.map((key) => [key, null])),
+    await saveAgent(AGENT, {
+      claude_settings: Object.fromEntries(ODD_KEYS.map((key) => [key, null])),
       dcmDisplaySettings: { groups: Object.fromEntries(ODD_KEYS.map((key) => [key, null])) }
     } as any)
 
     record = await stored()
-    expect(record.codex_settings).toEqual(CODEX_BLOCK)
+    expect(record.claude_settings).toEqual(CLAUDE_BLOCK)
     expect(record.dcmDisplaySettings.groups).toEqual(DCM_BLOCK.groups)
   })
 })
@@ -792,25 +907,15 @@ describe.skipIf(!REAL)('two saves of one block written at the same moment both s
     for (const [inner, outer] of [[saveB, saveA], [saveA, saveB]]) {
       await seed(BLOCKS_RECORD)
       const probe = changeBeforeEachScript(async () => {
-        await redis.updateAgent(AGENT, inner as any)
+        await saveAgent(AGENT, inner as any)
       })
-      await redis.updateAgent(AGENT, outer as any)
+      await saveAgent(AGENT, outer as any)
       vi.restoreAllMocks()
       expect(probe.changes()).toBe(1)
       blocks.push((await stored())[field])
     }
     return blocks
   }
-
-  it('a Codex model save and a sandbox save', async () => {
-    const [bLandsFirst, aLandsFirst] = await racingSaves(
-      'codex_settings',
-      { codex_settings: { model: 'gpt-6' } },
-      { codex_settings: { sandbox: 'read-only' } }
-    )
-    expect(bLandsFirst).toEqual({ ...CODEX_BLOCK, model: 'gpt-6', sandbox: 'read-only' })
-    expect(aLandsFirst).toEqual({ ...CODEX_BLOCK, model: 'gpt-6', sandbox: 'read-only' })
-  })
 
   it('a Claude mode save and a model save', async () => {
     const [bLandsFirst, aLandsFirst] = await racingSaves(
@@ -837,7 +942,7 @@ describe.skipIf(!REAL)('two saves of one block written at the same moment both s
 describe('a save is checked before anything is written, and a refused one is a 400 (review items 2 and 6)', () => {
   async function expectRefusedUntouched(updates: Record<string, unknown>, message: RegExp) {
     await seed()
-    await expect(redis.updateAgent(AGENT, { displayName: 'Half saved', ...updates } as any)).rejects.toMatchObject({
+    await expect(saveAgent(AGENT, { displayName: 'Half saved', ...updates } as any)).rejects.toMatchObject({
       status: 400,
       message: expect.stringMatching(message)
     })
@@ -870,7 +975,7 @@ describe('a save is checked before anything is written, and a refused one is a 4
 
   it('a value nested exactly 64 levels deep is saved', async () => {
     await seed()
-    await redis.updateAgent(AGENT, { provider_specific_settings: { deep: nested(64) } } as any)
+    await saveAgent(AGENT, { provider_specific_settings: { deep: nested(64) } } as any)
     expect((await stored()).provider_specific_settings.deep).toEqual(nested(64))
   })
 
@@ -896,23 +1001,22 @@ describe('a save is checked before anything is written, and a refused one is a 4
 
   async function expectBlockRefusedUntouched(updates: Record<string, unknown>, message: RegExp) {
     await seed(BLOCKS_RECORD)
-    await expect(redis.updateAgent(AGENT, { displayName: 'Half saved', ...updates } as any)).rejects.toMatchObject({
+    await expect(saveAgent(AGENT, { displayName: 'Half saved', ...updates } as any)).rejects.toMatchObject({
       status: 400,
       message: expect.stringMatching(message)
     })
     const record = await stored()
     expect(record.displayName).toBe('Probe')
     expect(record.updated_at).toBe(OLD_STAMP)
-    expect(record.codex_settings).toEqual(CODEX_BLOCK)
     expect(record.claude_settings).toEqual(CLAUDE_BLOCK)
     expect(record.dcmDisplaySettings).toEqual(DCM_BLOCK)
   }
 
-  it('a codex_settings, claude_settings or dcmDisplaySettings that is not an object or null: refused, and the other blocks of the save are not written (BL-848, BL-855)', async () => {
-    for (const field of ['codex_settings', 'claude_settings', 'dcmDisplaySettings']) {
+  it('a claude_settings or dcmDisplaySettings that is not an object or null: refused, and the other block of the save is not written (BL-848, BL-855)', async () => {
+    for (const field of ['claude_settings', 'dcmDisplaySettings']) {
       for (const bad of ['oops', ['a'], 5, true]) {
         await expectBlockRefusedUntouched(
-          { codex_settings: { model: 'gpt-6' }, [field]: bad },
+          { ...(field === 'claude_settings' ? { dcmDisplaySettings: { groups: { gw_c: 'hidden' } } } : { claude_settings: { model: 'opus' } }), [field]: bad },
           new RegExp(`${field}[\\s\\S]*must be an object or null`)
         )
       }
@@ -926,8 +1030,8 @@ describe('a save is checked before anything is written, and a refused one is a 4
   })
 
   it('a key, entry name or value with a broken character, or a value too deep: refused (BL-848, BL-855)', async () => {
-    await expectBlockRefusedUntouched({ codex_settings: { [`model${LONE_SURROGATE}`]: 'gpt-6' } }, /broken character/)
-    await expectBlockRefusedUntouched({ codex_settings: { addDirs: [`/a${LONE_SURROGATE}`] } }, /broken character/)
+    await expectBlockRefusedUntouched({ claude_settings: { [`model${LONE_SURROGATE}`]: 'opus' } }, /broken character/)
+    await expectBlockRefusedUntouched({ claude_settings: { addDirs: [`/a${LONE_SURROGATE}`] } }, /broken character/)
     await expectBlockRefusedUntouched({ claude_settings: { deep: nested(65) } }, /64 levels/)
     await expectBlockRefusedUntouched({ dcmDisplaySettings: { groups: { [`gw${LONE_SURROGATE}`]: 'hidden' } } }, /broken character/)
     await expectBlockRefusedUntouched({ dcmDisplaySettings: { groups: { gw_a: `hid${LONE_SURROGATE}` } } }, /broken character/)
@@ -938,7 +1042,7 @@ describe('a save is checked before anything is written, and a refused one is a 4
 describe('an agent key that is not a JSON record answers as Redis does (review item 3)', () => {
   it("a string key: RedisJSON's wrong-type error (not \"Agent not found\"), and the key is left as it is", async () => {
     await redis.set(KEY, 'plain text')
-    await expect(redis.updateAgent(AGENT, { displayName: 'X' } as any)).rejects.toThrow(/Existing key has wrong Redis type/)
+    await expect(saveAgent(AGENT, { displayName: 'X' } as any)).rejects.toThrow(/Existing key has wrong Redis type/)
     expect(await redis.readAgentRecordStorage(AGENT)).toEqual({ type: 'string', raw: 'plain text' })
   })
 })
@@ -946,20 +1050,22 @@ describe('an agent key that is not a JSON record answers as Redis does (review i
 /**
  * Another writer changes the agent right before updateAgent's script runs (after its read of the
  * type fields): `change` runs before each of the first `times` scripts on this agent. Records the
- * arguments of every script call, for the twin parity test.
+ * arguments and actual KEYS of every script call, for the twin parity test.
  */
 function changeBeforeEachScript(change: (client: any) => Promise<void>, times = 1) {
   const execute = redis.execute.bind(redis)
   let changes = 0
   const scriptCalls: string[][] = []
+  const scriptKeys: string[][] = []
   vi.spyOn(redis, 'execute').mockImplementation(((operation: (client: any) => Promise<unknown>) =>
     execute(async (client: any) => {
       const wrapped = new Proxy({}, {
         get(_empty, property) {
           if (property === 'eval') {
             return async (script: string, options: { keys?: string[]; arguments?: string[] }) => {
-              if (options?.keys?.[0] === KEY) {
+              if (options?.keys?.[0] === KEY && script.includes('local guard = ARGV[5]')) {
                 scriptCalls.push([...(options.arguments ?? [])])
+                scriptKeys.push([...options.keys])
                 if (changes < times) {
                   changes += 1
                   await change(client)
@@ -974,7 +1080,7 @@ function changeBeforeEachScript(change: (client: any) => Promise<void>, times = 
       })
       return operation(wrapped)
     })) as any)
-  return { changes: () => changes, scriptCalls }
+  return { changes: () => changes, scriptCalls, scriptKeys }
 }
 
 describe.skipIf(!REAL)('a type change written while updateAgent runs survives (review item 1, real Redis)', () => {
@@ -986,7 +1092,7 @@ describe.skipIf(!REAL)('a type change written while updateAgent runs survives (r
     await seed()
     const probe = changeBeforeEachScript(toCli)
 
-    await redis.updateAgent(AGENT, { assigned_subagent_ids: ['zaupd_sub'], assignedSubagents: ['zaupd_sub'] } as any)
+    await saveAgent(AGENT, { assigned_subagent_ids: ['zaupd_sub'], assignedSubagents: ['zaupd_sub'] } as any)
 
     const record = await stored()
     expect(probe.changes()).toBe(1)
@@ -994,21 +1100,23 @@ describe.skipIf(!REAL)('a type change written while updateAgent runs survives (r
     expect(record.assigned_subagent_ids).toEqual(['zaupd_sub'])
   })
 
-  it('a save of model fields (no agentType) keeps the change too', async () => {
+  it('a model save keeps its original A3 base and refuses after a concurrent type change', async () => {
     await seed()
+    const before = await stored()
     const probe = changeBeforeEachScript(toCli)
 
-    await redis.updateAgent(AGENT, { primary_model_provider: 'openai', primary_model_name: 'gpt-5' } as any)
+    await expect(saveAgent(AGENT, { primary_model_provider: 'openai', primary_model_name: 'gpt-5' } as any))
+      .rejects.toMatchObject({ status: 409, code: 'model_selection_settings_changed' })
 
     expect(probe.changes()).toBe(1)
-    expect((await stored()).agentType).toBe('cli')
+    expect(await stored()).toEqual({ ...before, agentType: 'cli' })
   })
 
   it('a legacy record: the canonical type written meanwhile stays, and the legacy fields go', async () => {
     await seed({ agentType: undefined, batshitMode: 'direct', mode: 'vercel-native' })
     const probe = changeBeforeEachScript(toCli)
 
-    await redis.updateAgent(AGENT, { displayName: 'Typed' } as any)
+    await saveAgent(AGENT, { displayName: 'Typed' } as any)
 
     const record = await stored()
     expect(probe.changes()).toBe(1)
@@ -1023,7 +1131,7 @@ describe.skipIf(!REAL)('a type change written while updateAgent runs survives (r
       await client.json.set(KEY, '$.batshitMode', 'cli')
     })
 
-    await redis.updateAgent(AGENT, { displayName: 'Typed again' } as any)
+    await saveAgent(AGENT, { displayName: 'Typed again' } as any)
 
     const record = await stored()
     expect(probe.changes()).toBe(1)
@@ -1041,7 +1149,7 @@ describe.skipIf(!REAL)('a type change written while updateAgent runs survives (r
       await client.json.set(KEY, '$.batshitMode', flip ? 'cli' : 'direct')
     }, 10)
 
-    await expect(redis.updateAgent(AGENT, { displayName: 'Never' } as any)).rejects.toMatchObject({
+    await expect(saveAgent(AGENT, { displayName: 'Never' } as any)).rejects.toMatchObject({
       status: 409,
       message: expect.stringMatching(/kept changing/)
     })
@@ -1055,7 +1163,7 @@ describe.skipIf(!REAL)('a type change written while updateAgent runs survives (r
     await seed()
     const probe = changeBeforeEachScript(toCli)
 
-    await redis.updateAgent(AGENT, { agentType: 'api' } as any)
+    await saveAgent(AGENT, { agentType: 'api' } as any)
 
     expect((await stored()).agentType).toBe('api')
     // Written as passed: no comparison with the type fields, so no second try.
@@ -1063,17 +1171,17 @@ describe.skipIf(!REAL)('a type change written while updateAgent runs survives (r
   })
 
   it('a canonical stored type is left alone: a model change made meanwhile does not make the save try again', async () => {
-    await seed({ agentType: 'cli', primary_model_provider: 'codex', primary_model_name: 'codex-a' })
+    await seed({ agentType: 'cli', primary_model_provider: 'anthropic-claude-cli', primary_model_name: 'claude-a' })
     const probe = changeBeforeEachScript(async (client) => {
-      await client.json.set(KEY, '$.primary_model_name', 'codex-b')
+      await client.json.set(KEY, '$.primary_model_name', 'claude-b')
     })
 
-    await redis.updateAgent(AGENT, { displayName: 'Still CLI' } as any)
+    await saveAgent(AGENT, { displayName: 'Still CLI' } as any)
 
     const record = await stored()
     expect(probe.scriptCalls.length).toBe(1)
     expect(record.agentType).toBe('cli')
-    expect(record.primary_model_name).toBe('codex-b')
+    expect(record.primary_model_name).toBe('claude-b')
   })
 })
 
@@ -1088,7 +1196,7 @@ describe.skipIf(!REAL)('a memory change written after the base compare and befor
     })
 
     await expect(
-      redis.updateAgent(AGENT, { ...base, memory_lane_budgets: newBudgets } as any, { expectedMemory: base })
+      saveAgent(AGENT, { ...base, memory_lane_budgets: newBudgets } as any, { expectedMemory: base })
     ).rejects.toMatchObject({ status: 409, code: 'memory_settings_changed' })
 
     const record = await stored()
@@ -1106,7 +1214,7 @@ describe.skipIf(!REAL)('a memory change written after the base compare and befor
       await client.json.set(KEY, '$.memoryLaneBudgets', { on_my_mind: 1, triggers: 1, recalled: 1 })
     })
 
-    await redis.updateAgent(AGENT, { ...base, memory_lane_budgets: newBudgets } as any, { expectedMemory: base })
+    await saveAgent(AGENT, { ...base, memory_lane_budgets: newBudgets } as any, { expectedMemory: base })
 
     expect(probe.scriptCalls.length).toBe(2)
     expect((await stored()).memory_lane_budgets).toEqual(newBudgets)
@@ -1119,7 +1227,7 @@ describe.skipIf(!REAL)('a memory change written after the base compare and befor
       await client.json.set(KEY, '$.batshitMode', 'cli')
     })
 
-    await redis.updateAgent(AGENT, { ...base, memory_lane_budgets: newBudgets } as any, { expectedMemory: base })
+    await saveAgent(AGENT, { ...base, memory_lane_budgets: newBudgets } as any, { expectedMemory: base })
 
     const record = await stored()
     expect(probe.scriptCalls.length).toBe(2)
@@ -1135,7 +1243,7 @@ describe.skipIf(!REAL)('a memory change written after the base compare and befor
     const base = memoryBaseOf(before)
     const probe = changeBeforeEachScript(async () => {}, 0)
 
-    await redis.updateAgent(AGENT, { ...base, memory_lane_budgets: newBudgets } as any, { expectedMemory: base })
+    await saveAgent(AGENT, { ...base, memory_lane_budgets: newBudgets } as any, { expectedMemory: base })
     vi.restoreAllMocks()
 
     expect(probe.scriptCalls.length).toBe(1)
@@ -1150,9 +1258,9 @@ describe.skipIf(!REAL)('a memory change written after the base compare and befor
 })
 
 describe.skipIf(!REAL)("the default lane's twin applies the real script's arguments the same way (review item 3, real Redis)", () => {
-  it('the same arguments give the same record: odd keys, removals, nullable fields, a legacy record', async () => {
+  it('matches valid sparse-write arguments and retains rejected malformed model sources', async () => {
     const { runAgentUpdateScriptTwin } = await import('$lib/test-utils/agentUpdateScriptTwin')
-    const cases: Array<{ record: Record<string, unknown>; updates: Record<string, unknown> }> = [
+    const cases: Array<{ record: Record<string, unknown>; updates: Record<string, unknown>; refusal?: { status: number; code?: string; message?: string } }> = [
       {
         record: {},
         updates: {
@@ -1164,7 +1272,14 @@ describe.skipIf(!REAL)("the default lane's twin applies the real script's argume
       },
       { record: { provider_specific_settings: 'not an object', goon_id: null }, updates: { provider_specific_settings: { knob: 1 } } },
       { record: { agentType: undefined, batshitMode: 'cli', mode: 'vercel-native' }, updates: { system_prompt: 'x' } },
-      { record: {}, updates: { agentType: 'cli', provider_specific_settings: null } },
+      // The retained preset is API-only; changing the target type cannot make it a CLI source.
+      // SA-139 R4/R5: the lower writer never stores a retired Primary type, before any other rule.
+      { record: {}, updates: { agentType: 'cli', provider_specific_settings: null }, refusal: { status: 400,
+        message: 'A retired Primary Agent type (Claude Code CLI, Codex CLI or n8n) cannot be saved. Nothing was saved.' } },
+      { record: {}, updates: { agentType: 'cli', primary_model_preset_id: 'zaupd_preset_a' }, refusal: { status: 400,
+        message: 'A retired Primary Agent type (Claude Code CLI, Codex CLI or n8n) cannot be saved. Nothing was saved.' } },
+      { record: {}, updates: { agentType: 'n8n' }, refusal: { status: 400,
+        message: 'A retired Primary Agent type (Claude Code CLI, Codex CLI or n8n) cannot be saved. Nothing was saved.' } },
       // BL-841: nativeTools field by field, odd field names, removals, and a block that is not an object.
       {
         record: {},
@@ -1176,15 +1291,18 @@ describe.skipIf(!REAL)("the default lane's twin applies the real script's argume
       },
       { record: { provider_specific_settings: { nativeTools: 'odd' } }, updates: { provider_specific_settings: { nativeTools: { bashAccessMode: 'agent' } } } },
       { record: { provider_specific_settings: { temperature: 1 } }, updates: { provider_specific_settings: { nativeTools: { bashAccessMode: null } } } },
-      { record: {}, updates: { provider_specific_settings: { nativeTools: null } } },
-      // BL-848, BL-855: the three blocks field by field: odd names, removals, lists, and blocks that are not objects.
+      { record: {}, updates: { provider_specific_settings: { nativeTools: null } }, refusal: { status: 400,
+        message: 'Keep the explicit Typed File Tools choice; clear individual tool settings instead. Nothing was saved.' } },
+      // BL-848, BL-855: the two blocks field by field: odd names, removals, lists, and blocks that are not objects.
       {
-        record: { codex_settings: { model: 'a', addDirs: ['/x'], sandbox: 'read-only' } },
-        updates: { codex_settings: { model: null, addDirs: ['/y'], ...Object.fromEntries(ODD_KEYS.map((key, index) => [key, [index]])) } }
+        record: { claude_settings: { model: 'a', addDirs: ['/x'], permissionMode: 'plan' } },
+        updates: { claude_settings: { model: null, addDirs: ['/y'], ...Object.fromEntries(ODD_KEYS.map((key, index) => [key, [index]])) } }
       },
-      { record: { codex_settings: null, claude_settings: 'odd' }, updates: { codex_settings: { model: 'x' }, claude_settings: { permissionMode: 'plan' } } },
-      { record: {}, updates: { codex_settings: { model: null }, claude_settings: {} } },
-      { record: { codex_settings: { a: 1 }, claude_settings: { b: 2 } }, updates: { codex_settings: null, claude_settings: { b: null } } },
+      { record: { claude_settings: 'odd' }, updates: { claude_settings: { permissionMode: 'plan' } } },
+      { record: {}, updates: { claude_settings: { model: null } } },
+      { record: {}, updates: { claude_settings: {} } },
+      { record: { claude_settings: { b: 2 } }, updates: { claude_settings: { b: null } } },
+      { record: { claude_settings: { a: 1 } }, updates: { claude_settings: null } },
       {
         record: { dcmDisplaySettings: { version: 1, groups: { a: 'x' }, tools: { t: 'y' } } },
         updates: {
@@ -1201,14 +1319,47 @@ describe.skipIf(!REAL)("the default lane's twin applies the real script's argume
       { record: { dcmDisplaySettings: { version: 1, groups: 'odd' } }, updates: { dcmDisplaySettings: { groups: { a: null } } } },
       { record: {}, updates: { dcmDisplaySettings: { groups: { a: null } } } }
     ]
-    for (const { record, updates } of cases) {
+    for (const { record, updates, refusal } of cases) {
       await seed(record)
       const before = await stored()
+      // Retain actual original source/index records before the physical write. The twin's
+      // __members adapter holds the real SMEMBERS result, never the guard's expected member.
+      const originalDependencies: Record<string, Record<string, unknown>> = {
+        'model:zaupd_preset_a': await redis.json.get('model:zaupd_preset_a') as Record<string, unknown>,
+        'model:zaupd_preset_b': await redis.json.get('model:zaupd_preset_b') as Record<string, unknown>,
+        [`user:${USER}:models`]: { __members: await redis.sMembers(`user:${USER}:models`) }
+      }
+      expect(originalDependencies['model:zaupd_preset_a']).toMatchObject({ id: 'zaupd_preset_a' })
+      expect(originalDependencies['model:zaupd_preset_b']).toMatchObject({ id: 'zaupd_preset_b' })
       const probe = changeBeforeEachScript(async () => {}, 0)
-      await redis.updateAgent(AGENT, updates as any)
+      if (typeof record.provider_specific_settings === 'string') {
+        // A3 refuses this malformed model source; it is not an automatic repair path.
+        await expect(redis.updateAgent(AGENT, updates as any, { expectedModelSelection: `sha256:${'0'.repeat(64)}` }))
+          .rejects.toMatchObject({ status: 409, code: 'model_selection_settings_changed' })
+        vi.restoreAllMocks()
+        expect(probe.scriptCalls).toHaveLength(0)
+        expect(await stored()).toEqual(before)
+        continue
+      }
+      if (refusal) {
+        await expect(saveAgent(AGENT, updates as any)).rejects.toMatchObject(refusal)
+        vi.restoreAllMocks()
+        expect(probe.scriptCalls).toHaveLength(0)
+        expect(await stored()).toEqual(before)
+        continue
+      }
+      await saveAgent(AGENT, updates as any)
       vi.restoreAllMocks()
       expect(probe.scriptCalls.length).toBe(1)
-      const twin = runAgentUpdateScriptTwin(before, probe.scriptCalls[0])
+      expect(probe.scriptKeys).toHaveLength(1)
+      expect(probe.scriptKeys[0][0]).toBe(KEY)
+      const dependencies: Record<number, Record<string, unknown>> = Object.create(null)
+      for (const [index, key] of probe.scriptKeys[0].entries()) {
+        if (index === 0) continue
+        expect(Object.hasOwn(originalDependencies, key)).toBe(true)
+        dependencies[index + 1] = originalDependencies[key]
+      }
+      const twin = runAgentUpdateScriptTwin(before, probe.scriptCalls[0], undefined, dependencies)
       expect(twin.answer).toBe('OK')
       expect(twin.record).toEqual(await stored())
     }
@@ -1227,3 +1378,177 @@ describe.skipIf(!REAL)("the default lane's twin applies the real script's argume
     expect(parseAgentRecordPath(escapedOnlyQuoteAndBackslash)).toEqual({ field: 'provider_specific_settings', key: expectedKey })
   })
 })
+
+
+describe.runIf(REAL)('C3 actual fixed source/save and preset mapping boundary', () => {
+  beforeEach(async () => { const os = await import('node:os'); const { randomUUID } = await import('node:crypto'); vi.stubEnv('BATSHIT_AGENT_RUNTIME_ROOT', `${os.tmpdir()}/c3-real-source-${randomUUID()}`) })
+  afterEach(async () => { if (admission.isAdmitted()) { await redis.del(`user:${USER}:agents`); await redis.del(`subagent:${AGENT}`) } vi.unstubAllEnvs() })
+  async function interceptNativeIssue(kind: 'agent' | 'subagent', change?: (client: any) => Promise<void>) {
+    const execute = redis.execute.bind(redis), calls: string[][] = []
+    vi.spyOn(redis, 'execute').mockImplementation((async operation => execute(client => operation(new Proxy(client, {
+      get(target, property) {
+        if (property === 'eval') return async (script: string, command: { keys: string[]; arguments: string[] }) => {
+          if (command.keys[0] === `${kind}:${AGENT}` && script.includes(kind === 'agent' ? 'local guard = ARGV[5]' : 'local modelSelection = cjson.decode(ARGV[3])')) {
+            calls.push([...command.arguments]); if (calls.length === 1) await change?.(client)
+          }
+          return client.eval(script, command)
+        }
+        const value = Reflect.get(target, property, target)
+        return typeof value === 'function' ? value.bind(target) : value
+      }
+    })))) as typeof redis.execute)
+    return calls
+  }
+  it.each(['', '__proto__', 'constructor'])('actual nativeTools member %j saves and removes its exact name without a MODEL token', async key => {
+    await seed()
+    const before = await stored(), calls = await interceptNativeIssue('agent')
+    await redis.updateAgent(AGENT, { provider_specific_settings: { nativeTools: Object.fromEntries([[key, 'owned value']]) } } as never)
+    expect(calls).toHaveLength(1)
+    expect(calls[0][4]).toBe('')
+    const saved = await stored()
+    expect(saved).toEqual({ ...before, updated_at: expect.any(String), provider_specific_settings: {
+      ...before.provider_specific_settings, nativeTools: { ...before.provider_specific_settings.nativeTools, ...Object.fromEntries([[key, 'owned value']]) }
+    } })
+    expect(Object.hasOwn(saved.provider_specific_settings.nativeTools, key)).toBe(true)
+    await redis.updateAgent(AGENT, { provider_specific_settings: { nativeTools: Object.fromEntries([[key, null]]) } } as never)
+    expect(calls).toHaveLength(2)
+    expect(calls[1][4]).toBe('')
+    expect(await stored()).toEqual({ ...before, updated_at: expect.any(String) })
+    expect(Object.hasOwn((await stored()).provider_specific_settings.nativeTools, key)).toBe(false)
+  })
+  // SA-139 R4/R5: the native Claude model fence, the CLI selection seed and the CLI profile stage
+  // left with the Claude Code CLI Primary (R4) and Subagent (R5) lanes; their cases went with them.
+  it('updates an unrelated sparse field without requiring the retired profile mapping of a dangling preset', async () => {
+    await seed({ agentType: 'api', primary_model_preset_id: 'missing-preset',
+      claude_settings: { permissionMode: 'default', profileId: 'batshit_agent_legacy', keep: 'value' },
+      provider_specific_settings: { nativeTools: { bashAccessMode: 'plan' }, temperature: 0.2 } })
+    const before = await stored()
+    await redis.updateAgent(AGENT, { claude_settings: { model: 'preserved-data' } } as never)
+    const after = await stored()
+    expect(after).toEqual({ ...before, updated_at: expect.any(String),
+      claude_settings: { ...before.claude_settings, model: 'preserved-data' } })
+  })
+  it('saves a model preset with its owned raw postimage and preserves its index', async () => {
+    await seed()
+    const preset = { id: 'zaupd_preset_a', modelName: 'API fixture', modelId: 'fixture-model', provider: 'openai',
+      settings: { temperature: 0.2, custom: false }, connection: { id: 'direct:openai', type: 'direct', service: 'openai' } }
+    await redis.json.set('model:zaupd_preset_a', '$', preset as never)
+    const owner = await import('$lib/server/services/modelPresetSelectionOwner')
+    const before = await owner.readModelPresetStorage(USER, preset.id), beforeIndex = (await redis.sMembers(`user:${USER}:models`)).sort()
+    const next = { ...preset, settings: { ...preset.settings, temperature: 0.7 } }
+    expect(await withSettingsRecordReplacement(`model:${preset.id}`, () => owner.mutateModelPresetStorage(USER, preset.id, before.raw, 'update', next as never))).toBe('SAVED')
+    const after = await owner.readModelPresetStorage(USER, preset.id)
+    expect(after.preset).toEqual(next)
+    expect(after.raw).not.toBe(before.raw)
+    expect(after.present).toBe(true)
+    expect((await redis.sMembers(`user:${USER}:models`)).sort()).toEqual(beforeIndex)
+  })
+  it('refuses a concurrent model preset change at the actual compare-and-save', async () => {
+    await seed()
+    const preset = { id: 'zaupd_preset_a', modelName: 'API fixture', modelId: 'fixture-model', provider: 'openai',
+      settings: { temperature: 0.2 }, connection: { id: 'direct:openai', type: 'direct', service: 'openai' } }
+    await redis.json.set('model:zaupd_preset_a', '$', preset as never)
+    const owner = await import('$lib/server/services/modelPresetSelectionOwner')
+    const before = await owner.readModelPresetStorage(USER, preset.id)
+    const client = await redis.execute(async value => value), evaluate = client.eval.bind(client)
+    let issues = 0
+    vi.spyOn(client, 'eval').mockImplementation((async (script: string, command: any) => {
+      if (script === owner.MUTATE_MODEL_PRESET_SCRIPT) {
+        issues++
+        await client.json.set('model:zaupd_preset_a', '$.settings.temperature', 0.9)
+      }
+      return evaluate(script, command)
+    }) as never)
+    const answer = await withSettingsRecordReplacement(`model:${preset.id}`, () => owner.mutateModelPresetStorage(USER, preset.id, before.raw,
+      'update', { ...preset, settings: { temperature: 0.7 } } as never))
+    expect(answer).toBe('CONFLICT')
+    expect(issues).toBe(1)
+    expect((await owner.readModelPresetStorage(USER, preset.id)).preset?.settings).toEqual({ temperature: 0.9 })
+    expect(await redis.sismember(`user:${USER}:models`, preset.id)).toBeTruthy()
+  })
+})
+
+// SA-139 R4: the P3b human CLI reasoning pair guard left with the Claude Code CLI Primary lane.
+
+describe('human Primary MCP whole-field original bases', () => {
+  async function shown(leaves = [...MCP_SETTINGS_FIELDS]) {
+    const lifecycle = captureSettingsLifecycle([KEY]), paths = mcpSettingsReadPaths(leaves), row = await stored()
+    const raw = REAL ? (await redis.execute(client => readModelSelectionSnapshot(client, AGENT, 'agent', lifecycle, paths, { typeFenceOnly: true, reportProjection: true }))).extraRaw :
+      paths.map(path => agentTypeSnapshotOf(row, [path]))
+    return makeMcpSettingsSnapshot(AGENT, paths, raw, lifecycle, leaves)
+  }
+  // The default twin uses its actual stored row. Real cases use the real atomic
+  // read and existing strict admitted client, never a synthetic positive token.
+  const readShown = () => shown()
+  it('missing original leaf metadata refuses the whole mixed request before its ordinary sibling write', async () => {
+    await seed({ defaultMCPGateways: ['A'], custom_tool_settings: [] })
+    const before = await stored()
+    await expect(redis.updateAgent(AGENT, { defaultMCPGateways: ['A','C'], displayName: 'Must not land' })).rejects.toMatchObject({ status: 400, code: 'mcp_settings_base_required' })
+    expect(await stored()).toEqual(before)
+  })
+  it.each(['non-mcp-after-mcp', 'mcp-after-non-mcp'] as const)('refuses the stale FULL custom array in both directions: %s', async direction => {
+    // Skill Read's retired row is intentionally removed on writes. Use the live native
+    // Bash row so the FULL-array stale-write oracle retains its opaque future fields.
+    const initial = [{ tool_name: 'bash_execute', buffer_size: 0, auto_zip: false, future: { keep: true } }, { tool_name: 'unrelated', zip_threshold: 0 }]
+    await seed({ custom_tool_settings: initial })
+    const before = await readShown()
+    const winner = direction === 'non-mcp-after-mcp' ? [...initial, { tool_name: 'C_remote_write', buffer_size: 3 }] :
+      [{ ...initial[0], buffer_size: 8 }, initial[1]]
+    await redis.updateAgent(AGENT, { custom_tool_settings: winner } as never, { expectedMcpSettings: { custom_tool_settings: before.revisions.custom_tool_settings! } })
+    const actualWinner = await stored()
+    const stale = direction === 'non-mcp-after-mcp' ? [{ ...initial[0], buffer_size: 9 }, initial[1]] : [...initial, { tool_name: 'C_remote_write', buffer_size: 5 }]
+    await expect(redis.updateAgent(AGENT, { custom_tool_settings: stale, displayName: 'Must not land' } as never,
+      { expectedMcpSettings: { custom_tool_settings: before.revisions.custom_tool_settings! } })).rejects.toMatchObject({ status: 409, code: 'mcp_settings_changed' })
+    expect(await stored()).toEqual(actualWinner)
+    expect((await stored()).custom_tool_settings).toEqual(winner)
+  })
+  it('returns the SAME acknowledged postimage/base before a later read or sibling save and never persists metadata', async () => {
+    await seed({ defaultMCPGateways: ['A'], custom_tool_settings: [{ tool_name: 'unrelated', buffer_size: 0, auto_zip: false }] })
+    const before = await readShown()
+    let ack: Parameters<NonNullable<AgentUpdateOptions['onMcpSettingsSaved']>>[0] | undefined
+    await redis.updateAgent(AGENT, { defaultMCPGateways: ['A','C'] }, { expectedMcpSettings: { defaultMCPGateways: before.revisions.defaultMCPGateways! }, onMcpSettingsSaved(value) { ack = value } })
+    expect(ack?.values).toEqual({ defaultMCPGateways: ['A','C'] })
+    expect(Object.keys(ack!.revisions)).toEqual(['defaultMCPGateways'])
+    expect(ack?.revisions.defaultMCPGateways).not.toBe(before.revisions.defaultMCPGateways)
+    const atAck = structuredClone(ack)
+    await redis.json.set(KEY, '$.defaultMCPGateways', ['A','C','D'])
+    expect(ack).toEqual(atAck)
+    expect(await stored()).not.toHaveProperty('expectedMcpSettings')
+  })
+})
+
+
+describe.runIf(REAL)('human MCP final actual EVAL guard', () => {
+  it('refuses a producer-shaped MCP row arriving after the human read but before its non-MCP array write', async () => {
+    const initial = [{ tool_name: 'skill_read', buffer_size: 0, auto_zip: false }]
+    await seed({ custom_tool_settings: initial })
+    const paths = mcpSettingsReadPaths(['custom_tool_settings']), life = captureSettingsLifecycle([KEY])
+    const shown = await redis.execute(client => readModelSelectionSnapshot(client, AGENT, 'agent', life, paths, { typeFenceOnly: true, reportProjection: true }))
+    const base = makeMcpSettingsSnapshot(AGENT, paths, shown.extraRaw, life, ['custom_tool_settings'])
+    const winner = [...initial, { tool_name: 'C_remote_write', buffer_size: 3 }]
+    const execute = redis.execute.bind(redis)
+    let issued = 0
+    vi.spyOn(redis, 'execute').mockImplementation(operation => execute(client => {
+      const wrap = (target: typeof client): typeof client => new Proxy(target, { get(current, key) {
+        if (key === 'withAbortSignal') return (signal: AbortSignal) => wrap(current.withAbortSignal(signal))
+        if (key === 'eval') return async (script: string, command: { keys: string[]; arguments: string[] }) => {
+          if (command.keys[0] === KEY && script.includes("return 'MCP_SETTINGS_CHANGED'") && JSON.parse(command.arguments[4] || '{}').mcpSettings) {
+            issued++
+            if (issued === 1) await current.json.set(KEY, '$.custom_tool_settings', winner)
+          }
+          return current.eval(script, command)
+        }
+        const value = Reflect.get(current, key, current)
+        return typeof value === 'function' ? value.bind(current) : value
+      } })
+      return operation(wrap(client))
+    }))
+    await expect(redis.updateAgent(AGENT, { displayName: 'Must not land', custom_tool_settings: [{ ...initial[0], buffer_size: 9 }] } as never,
+      { expectedMcpSettings: base.revisions })).rejects.toMatchObject({ code: 'mcp_settings_changed', status: 409 })
+    expect(issued).toBe(1)
+    expect(await stored()).toMatchObject({ displayName: 'Probe', updated_at: OLD_STAMP, custom_tool_settings: winner })
+  })
+})
+
+// SA-139 R5: no save carries a Claude Code CLI promotion any more (the `cliPromotion` option R4
+// refused on a Primary went with the Claude Code CLI Subagent, its last user).

@@ -4,6 +4,7 @@ import {
   SessionDeleteRefusedError,
   deleteSessionStoppingItsTurn
 } from '$lib/server/services/sessionDeleteTurnStop'
+import { SessionSweepReadError } from '$lib/server/sessionSweepReadError'
 import { resolveFixedSessionMetadataUpdate } from '$lib/utils/fixedSession'
 import { resolveSessionOriginMetadataUpdate } from '$lib/utils/sessionOrigin'
 
@@ -155,6 +156,11 @@ export const DELETE: RequestHandler = async ({ params, locals }) => {
       return json({ error: error.message, code: error.code }, { status: error.status })
     }
     console.error('Error deleting session:', error)
+    // A read the sweep needs failed before its first write (BL-1798): nothing was deleted, and
+    // its words say so, so the user knows a retry is safe.
+    if (error instanceof SessionSweepReadError) {
+      return json({ error: error.message, code: error.code }, { status: 500 })
+    }
     return json({ error: 'Failed to delete session' }, { status: 500 })
   }
 }

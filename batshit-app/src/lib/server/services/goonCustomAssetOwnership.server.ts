@@ -6,7 +6,8 @@ export const CUSTOM_GOON_UPLOAD_TYPES = [
   'goon_custom_models',
   'goon_custom_manifests',
   'goon_hair_assets',
-  'goon_hair_imports'
+  'goon_hair_imports',
+  'goon_closet'
 ] as const
 
 export type CustomGoonUploadType = (typeof CUSTOM_GOON_UPLOAD_TYPES)[number]

@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import { stripZipControlBlocks } from '$lib/utils/zipControl'
 import { stripLeadingSubagentZipEcho } from '$lib/utils/subagentEchoSanitizer'
-import { isConcreteZipId, scanZipReferences } from '$lib/utils/zipReferenceSafety'
-import { finishReplyEndContent, replyEndZipIds } from '$lib/utils/replyEndContent'
+import { extractZipIdFromReference, isConcreteZipId, scanZipReferences } from '$lib/utils/zipReferenceSafety'
+import { generateReferenceScanTexts } from '$lib/test-utils/referenceScanTexts'
+import { finishReplyEndContent, replyEndZipIds, zipIdsFromReplyReferences } from '$lib/utils/replyEndContent'
 
 /**
  * BL-775 golden comparison. The chat page edited `end`'s content and wrote the reply's `zipIds`
@@ -295,3 +296,38 @@ describe('replyEndContent: the linear scans match the old patterns', () => {
   }, 60_000)
 })
 
+
+/**
+ * BL-609 (review N1): a `zipReferences` entry's text is read with the trust reader's shape
+ * (`extractZipIdFromReference`, the first reference `scanZipReferences` reads), like every other
+ * reader of these entries. Every entry the server writes reads as before; an odd one now names the
+ * zip trust and the chat view read there.
+ */
+describe('replyEndContent: a reference entry is read with the trust reader\'s shape (BL-609)', () => {
+  const ZIP = 'cool_tool_1790500000000_abcde'
+  const LATER = 'cool_tool_1790500000009_later'
+  const long = `cool_tool_${'1'.repeat(150)}_abcde`
+
+  it('reads an odd entry as the trust reader reads a reference', () => {
+    const cases: Array<[string, string[]]> = [
+      [`{{batshit-zip:${ZIP}:::}}`, [ZIP]], // an empty description: a reference
+      [`{{batshit-zip:a{b:::x}} {{batshit-zip:${LATER}}}`, [LATER]], // a `{`: not one, so the next one is read
+      [`{{batshit-zip:a\nb}} {{batshit-zip:${LATER}}}`, [LATER]], // a line break: not one
+      [`{{batshit-zip:${long}}}`, []], // longer than 160 characters: not one, so no zip
+      [`{{batshit-zip:${ZIP}:::Tool execution: read}}`, [ZIP]]
+    ]
+    for (const [entry, ids] of cases) {
+      expect(zipIdsFromReplyReferences([{ reference: entry }]), JSON.stringify(entry)).toEqual(ids)
+      expect(zipIdsFromReplyReferences([entry]), JSON.stringify(entry)).toEqual(ids)
+    }
+  })
+
+  it('names exactly the concrete first id the shape reads, over generated entries', () => {
+    for (const text of denseTexts(4000, 1609).concat(generateReferenceScanTexts(3000, 1609))) {
+      // The reader's rule for every id field: trimmed, then concrete only.
+      const first = extractZipIdFromReference(text)?.trim()
+      const expected = first && isConcreteZipId(first) ? [first] : []
+      expect(zipIdsFromReplyReferences([{ reference: text }]), JSON.stringify(text)).toEqual(expected)
+    }
+  })
+})

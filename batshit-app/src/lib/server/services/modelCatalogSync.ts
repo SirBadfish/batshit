@@ -1,11 +1,14 @@
 import { retainCatalogSourceEntries } from '$lib/server/services/catalogRetention'
-import { inferModelPurpose } from '$lib/utils/modelPurpose'
+import { fetchArtificialAnalysisCatalog } from '$lib/server/services/artificialAnalysisCatalog'
+import { HOSTED_CATALOG_DIRECT_PROVIDER_IDS as DIRECT_PROVIDER_IDS } from '$lib/data/hostedCatalogConnections'
+import { inferModelPurpose, reviewedModelPurpose } from '$lib/utils/modelPurpose'
 import { logger } from '$lib/utils/logger'
 import { normalizePositiveInteger, sanitizeCatalogMaxOutputTokens } from '$lib/utils/modelOutputTokens'
 import type { ModelPurpose } from '$lib/types/savedModels'
 import { storeCatalogSyncReport } from '$lib/server/services/modelCatalogReportStore'
 import { getRuntimeEnv } from '$lib/server/services/runtimeEnv'
-import { upstashKvGet, upstashKvSet } from '$lib/server/services/upstashKv'
+import { upstashKvGetRaw, upstashKvSetIfUnchanged } from '$lib/server/services/upstashKv'
+import { reviewedPublicReasoningEvidence } from '$lib/data/reviewed-public-reasoning-facts'
 import type { CatalogSyncTrigger, CatalogSyncVariantCollision } from '$lib/types/modelCatalogSyncReport'
 import {
   FAL_DEVELOPER_OVERRIDE_EXACT,
@@ -45,7 +48,8 @@ import {
   type ListedPricing,
   type ZeroPriceContext
 } from '$lib/utils/catalogPricing'
-import type { CatalogConnectionLimits } from '$lib/types/modelCatalog'
+import type { CatalogConnectionLimits, CatalogModelIdVariant, CatalogReasoningEvidence, CatalogModel } from '$lib/types/modelCatalog'
+import { admitReviewedCatalogReasoningEvidence, assertCatalogReasoningConservation, mergeCatalogReasoningEvidence, readCatalogReasoningEvidence } from '$lib/utils/catalogReasoningEvidence'
 import {
   isOpenAICompletionsOnlyModel,
   resolveReviewedCatalogIdentity,
@@ -54,7 +58,6 @@ import {
 
 const GATEWAY_ENDPOINT = 'https://ai-gateway.vercel.sh/v1/models'
 const OPENROUTER_ENDPOINT = 'https://openrouter.ai/api/v1/models'
-const AA_ENDPOINT = 'https://artificialanalysis.ai/api/v2/data/llms/models'
 
 const OPENAI_ENDPOINT = 'https://api.openai.com/v1/models'
 const ANTHROPIC_ENDPOINT = 'https://api.anthropic.com/v1/models'
@@ -120,19 +123,7 @@ interface CatalogEntry {
   availableConnections?: string[]
   purpose: ModelPurpose
   aaSlug?: string
-  idVariants?: Record<
-    string /* connectionId */,
-    {
-      developerId: string
-      modelId: string
-      effectiveId: string
-      source: 'vercel' | 'openrouter' | 'manual' | 'direct'
-      /** BL-68 / BL-132: this connection's own limits; see CatalogModelIdVariant. */
-      limits?: CatalogConnectionLimits
-      /** BL-132: this connection's own price; see CatalogModelIdVariant. */
-      pricing?: ListedPricing
-    }
-  >
+  idVariants?: Record<string, CatalogModelIdVariant>
   pricing?: {
     input?: number
     output?: number
@@ -167,6 +158,7 @@ interface CatalogEntry {
   identityRule?: CatalogIdentityRule
   ownLimits?: CatalogConnectionLimits
   ownPricing?: ListedPricing | null
+  ownReasoningEvidence?: CatalogReasoningEvidence
 }
 
 interface CatalogPayload {
@@ -176,6 +168,12 @@ interface CatalogPayload {
   models: CatalogEntry[]
 }
 
+function mergePresentReasoningEvidence(fresh: CatalogEntry, previous?: CatalogEntry): CatalogEntry {
+  const reasoningEvidence = mergeCatalogReasoningEvidence(previous?.ownReasoningEvidence, fresh.ownReasoningEvidence,
+    { connectionId: fresh.connectionId, effectiveId: fresh.id })
+  return reasoningEvidence ? { ...fresh, ownReasoningEvidence: reasoningEvidence } : fresh
+}
+
 const CATALOG_FETCH_TIMEOUT_MS = 15_000
 const CATALOG_SOURCE_TIMEOUT_MS = 30_000
 
@@ -183,39 +181,9 @@ type SourceFetchOptions = {
   signal?: AbortSignal
   onFallbackError?: (error: unknown) => void
   onCompleteLiveList?: () => void
+  onCatalogEndpoint?: (baseUrl: string) => void
+  onMetadataWarning?: (warning: string) => void
 }
-
-const DIRECT_PROVIDER_IDS = [
-  'openai',
-  'anthropic',
-  'google',
-  'mistral',
-  'groq',
-  'xai',
-  'deepseek',
-  'deepinfra',
-  'moonshot',
-  'kimi_code',
-  'minimax',
-  'minimax_token_plan',
-  'mimo',
-  'mimo_token_plan',
-  'qwencloud',
-  'qwen_token_plan',
-  'zai',
-  'zai_coding',
-  'togetherai',
-  'fireworks',
-  'baseten',
-  'cerebras',
-  'fal',
-  'luma',
-  'replicate',
-  'elevenlabs',
-  'deepgram',
-  'assemblyai',
-  'cohere'
-] as const
 
 type DirectProviderId = (typeof DIRECT_PROVIDER_IDS)[number]
 
@@ -862,12 +830,13 @@ function mapBasetenModels(models: BasetenCatalogModel[]): DirectProviderEntry[] 
   return models
     .map((model) => {
       const id = safeString(model.id).trim()
+      const isDecision = reviewedModelPurpose({ connectionId: 'direct:baseten', id }) === 'utility'
       const description = safeString(model.description).trim()
       const inputModalities = (model.input_modalities ?? []).map(normalizeTag)
       const outputModalities = (model.output_modalities ?? []).map(normalizeTag)
       const tags = Array.from(
         new Set([
-          'chat',
+          isDecision ? 'evaluation' : 'chat',
           ...inferTagsFromIdentifier(id, description),
           ...(model.supported_features ?? []).map(normalizeTag),
           ...inputModalities,
@@ -889,7 +858,7 @@ function mapBasetenModels(models: BasetenCatalogModel[]): DirectProviderEntry[] 
         pricing: mapPricing(model.pricing, {
           pricedOtherwise: ['request', 'image'].some((key) => holdsPositivePrice(model.pricing?.[key]))
         }),
-        modelType: 'chat'
+        modelType: isDecision ? 'evaluation' : 'chat'
       }
     })
     .filter((model) => Boolean(model.id))
@@ -947,6 +916,42 @@ function resolveQwenCloudDeveloperId(id: string, ownedBy: unknown): string {
   return OWNED_BY_NAMES_NO_MAKER.has(owner) ? 'qwencloud' : owner
 }
 
+// Exact fetched IDs only: these facts never create catalog rows. Reviewed 2026-10-18:
+// https://platform.stepfun.ai/docs/en/guides/models/overview
+// https://platform.stepfun.ai/docs/en/guides/models/audio
+// https://platform.stepfun.ai/docs/en/guides/pricing/details
+const STEPFUN_CATALOG_FACTS: Readonly<Record<string, { modelType: 'chat' | 'audio'; tags: string[] }>> = {
+  'step-3.5-flash': { modelType: 'chat', tags: ['chat'] },
+  'step-3.5-flash-2603': { modelType: 'chat', tags: ['chat'] },
+  'step-3.7-flash': { modelType: 'chat', tags: ['chat'] },
+  'step-5-preview': { modelType: 'chat', tags: ['chat'] },
+  'stepaudio-2.5-chat': { modelType: 'chat', tags: ['chat', 'audio-input'] },
+  'stepaudio-2.5-tts': { modelType: 'audio', tags: ['audio', 'tts'] },
+  'stepaudio-2.5-asr': { modelType: 'audio', tags: ['audio', 'stt', 'transcription'] },
+  'stepaudio-2.5-asr-stream': { modelType: 'audio', tags: ['audio', 'stt', 'transcription'] },
+  'stepaudio-2.5-realtime': { modelType: 'audio', tags: ['audio', 'realtime'] },
+  'stepaudio-3-realtime-preview': { modelType: 'audio', tags: ['audio', 'realtime'] },
+  'stepaudio-3-asr-max': { modelType: 'audio', tags: ['audio', 'stt', 'transcription'] },
+  'stepaudio-3-music-preview': { modelType: 'audio', tags: ['audio', 'music'] },
+  // The public speech price table lists this exact ID; ordinary Chat output is unverified.
+  'stepaudio-3-chat-preview': { modelType: 'audio', tags: ['audio'] },
+  'stepaudio-3-gen-preview': { modelType: 'audio', tags: ['audio', 'audio-generation'] },
+  'stepaudio-3-tts': { modelType: 'audio', tags: ['audio', 'tts'] }
+}
+
+function normalizedModelStudioCatalogEndpoint(baseUrl?: string): string | null {
+  if (!baseUrl) return null
+  try {
+    const url = new URL(baseUrl)
+    if (url.protocol !== 'https:' || url.port || url.username || url.password || url.search || url.hash) return null
+    if (url.hostname === new URL(QWEN_TOKEN_PLAN_OPENAI_BASE_URL).hostname) return null
+    const legacyHost = ['dashscope-intl.aliyuncs.com', 'dashscope.aliyuncs.com', 'cn-hongkong.dashscope.aliyuncs.com'].includes(url.hostname)
+    const workspaceHost = /^[a-z0-9-]+\.(ap-southeast-1|cn-beijing|cn-hongkong|eu-central-1|ap-northeast-1|us-east-1)\.maas\.aliyuncs\.com$/.test(url.hostname)
+    const path = url.pathname.replace(/\/+$/, '')
+    return (legacyHost || workspaceHost) && path === '/compatible-mode/v1' ? `${url.origin}${path}` : null
+  } catch { return null }
+}
+
 function mapOpenAICompatibleCatalogModels(
   provider:
     | 'cerebras'
@@ -954,14 +959,21 @@ function mapOpenAICompatibleCatalogModels(
     | 'minimax_token_plan'
     | 'mimo'
     | 'mimo_token_plan'
-    | 'qwencloud',
+    | 'qwencloud'
+    | 'alibaba'
+    | 'stepfun',
   models: OpenAICompatibleCatalogModel[]
 ): DirectProviderEntry[] {
   return models
     .map((model) => {
       const id = safeString(model.id).trim()
+      if (provider === 'stepfun') {
+        const facts = Object.hasOwn(STEPFUN_CATALOG_FACTS, id) ? STEPFUN_CATALOG_FACTS[id] : undefined
+        return { id, developerId: normalizeDeveloperId(model.owned_by, provider), modelId: id, effectiveId: id,
+          displayName: id, tags: facts ? [...facts.tags] : [], modelType: facts?.modelType ?? null }
+      }
       const isAudioProvider =
-        provider === 'mimo' || provider === 'mimo_token_plan' || provider === 'qwencloud'
+        provider === 'mimo' || provider === 'mimo_token_plan' || provider === 'qwencloud' || provider === 'alibaba'
       const isAsr = isAudioProvider && /(?:^|[-_])asr(?:$|[-_])/i.test(id)
       const isTts = isAudioProvider && /(?:^|[-_])tts(?:$|[-_])/i.test(id)
       const isAudio = isAsr || isTts
@@ -977,7 +989,7 @@ function mapOpenAICompatibleCatalogModels(
       return {
         id,
         developerId:
-          provider === 'qwencloud'
+          provider === 'qwencloud' || provider === 'alibaba'
             ? resolveQwenCloudDeveloperId(id, model.owned_by)
             : normalizeDeveloperId(model.owned_by, provider),
         modelId: id,
@@ -1238,6 +1250,7 @@ function mapDirectProviderEntries(provider: DirectProviderId, entries: DirectPro
       const contextWindow = entry.contextWindow ?? undefined
       const pricing = entry.pricing
       const purpose = inferModelPurpose({
+        connectionId,
         modelType: entry.modelType ?? null,
         id: effectiveId,
         name,
@@ -1668,12 +1681,37 @@ async function fetchQwenCloudEntries(options: SourceFetchOptions = {}): Promise<
   const baseUrl =
     (await getRuntimeEnv('DASHSCOPE_API_BASE_URL')) ||
     'https://dashscope-intl.aliyuncs.com/compatible-mode/v1'
+  options.onCatalogEndpoint?.(baseUrl)
   const models = await fetchOpenAICompatibleModels({
     baseUrl,
     apiKey,
     signal: options.signal
   })
   const entries = mapOpenAICompatibleCatalogModels('qwencloud', models)
+  options.onCompleteLiveList?.()
+  return entries
+}
+
+async function fetchAlibabaEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
+  const baseUrl = (await getRuntimeEnv('ALIBABA_CLOUD_API_BASE_URL')) ??
+    (await getRuntimeEnv('DASHSCOPE_API_BASE_URL')) ?? 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1'
+  options.onCatalogEndpoint?.(baseUrl)
+  const apiKey = await getRuntimeEnv('ALIBABA_CLOUD_API_KEY')
+  if (!apiKey) return []
+  const models = await fetchOpenAICompatibleModels({ baseUrl, apiKey, signal: options.signal })
+  const entries = mapOpenAICompatibleCatalogModels('alibaba', models)
+  options.onCompleteLiveList?.()
+  return entries
+}
+
+async function fetchStepfunEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
+  const apiKey = (await getRuntimeEnv('STEPFUN_API_KEY')) || (await getRuntimeEnv('STEP_API_KEY'))
+  if (!apiKey) return []
+  const baseUrl = (await getRuntimeEnv('STEPFUN_API_BASE_URL')) || 'https://api.stepfun.ai/v1'
+  const models = await fetchOpenAICompatibleModels({ baseUrl, apiKey, signal: options.signal })
+  const entries = mapOpenAICompatibleCatalogModels('stepfun', models)
+  const unknownIds = entries.filter(entry => !Object.hasOwn(STEPFUN_CATALOG_FACTS, entry.id)).map(entry => entry.id)
+  if (unknownIds.length) options.onMetadataWarning?.(`Endpoint purpose is unverified for listed StepFun IDs: ${unknownIds.join(', ')}; ordinary catalog inference is not endpoint qualification`)
   options.onCompleteLiveList?.()
   return entries
 }
@@ -2388,15 +2426,14 @@ async function fetchArtificialAnalysis(options: SourceFetchOptions = {}) {
     return new Map<string, any>()
   }
 
-  const payload = await fetchJson<{ data: any[] }>(AA_ENDPOINT, {
-    headers: {
-      'x-api-key': apiKey
-    },
+  const models = await fetchArtificialAnalysisCatalog({
+    apiKey,
+    apiUrl: await getRuntimeEnv('ARTIFICIAL_ANALYSIS_API_URL') || undefined,
     signal: options.signal
   })
 
   const map = new Map<string, any>()
-  for (const entry of payload.data ?? []) {
+  for (const entry of models) {
     const key = normalizeName(entry.slug || entry.name)
     if (key) {
       map.set(key, entry)
@@ -2415,6 +2452,9 @@ function normalizeName(value?: string | null) {
  * reviewed identity rule says the entry is (BL-68).
  */
 function recordOwnNumbers(entry: CatalogEntry): CatalogEntry {
+  // MiMo Token Plan consumes subscription Credits, not USD per token. Neither
+  // generic list pricing nor a retained PAYG-derived price has that meaning.
+  if (entry.connectionId === 'direct:mimo_token_plan') entry = { ...entry, pricing: undefined }
   const reviewed = resolveReviewedCatalogIdentity(entry)
   return {
     ...entry,
@@ -2438,11 +2478,9 @@ function enrichWithAA(entry: CatalogEntry, aaMap: Map<string, any>) {
   // know (BL-130), so only a positive number of theirs is a price.
   const listsOwnPrice = Boolean(entry.pricing && buildListedPricing(entry.pricing))
   const pricing =
-    match.pricing && !listsOwnPrice
+    match.pricing && !listsOwnPrice && entry.connectionId !== 'direct:mimo_token_plan'
       ? buildListedPricing({
-          input:
-            readArtificialAnalysisPrice(match.pricing.price_1m_input_tokens) ??
-            readArtificialAnalysisPrice(match.pricing.price_1m_blended_3_to_1),
+          input: readArtificialAnalysisPrice(match.pricing.price_1m_input_tokens),
           output: readArtificialAnalysisPrice(match.pricing.price_1m_output_tokens)
         })
       : entry.pricing
@@ -2505,7 +2543,7 @@ function ownLimitsForVariant(entry: CatalogEntry, isBase: boolean, row: MergedRo
  * provider's list price with no platform markup on tokens"
  * (https://vercel.com/docs/ai-gateway/pricing), so on a gateway-based row the
  * row's price is what the maker's own API charges. Reviewed by hand, like the
- * developer aliases; a subscription plan counts as its maker's own API.
+ * developer aliases. MiMo Token Plan is excluded: its unit is Credits, not USD.
  */
 const MAKERS_OWN_CONNECTIONS: Readonly<Record<string, readonly string[]>> = Object.freeze({
   'direct:openai': ['openai'],
@@ -2522,7 +2560,6 @@ const MAKERS_OWN_CONNECTIONS: Readonly<Record<string, readonly string[]>> = Obje
   'direct:minimax': ['minimax'],
   'direct:minimax_token_plan': ['minimax'],
   'direct:mimo': ['xiaomi'],
-  'direct:mimo_token_plan': ['xiaomi'],
   'direct:qwencloud': ['qwen', 'alibaba'],
   'direct:qwen_token_plan': ['qwen', 'alibaba'],
   'direct:fireworks': ['fireworks']
@@ -2559,6 +2596,7 @@ function samePricing(left: ListedPricing, right: ListedPricing | undefined, allo
  *   qwen3-max had taken OpenRouter's $0.78 over Alibaba's $1.2.
  */
 function ownPricingForVariant(entry: CatalogEntry, base: CatalogEntry | undefined, row: MergedRowNumbers) {
+  if (entry.connectionId === 'direct:mimo_token_plan') return {}
   if (entry === base) return undefined
   const takesGatewayPrice = base
     ? takesGatewayListPrice(entry.connectionId, base.provider, base.connectionId)
@@ -2584,6 +2622,7 @@ function buildIdVariants(entries: CatalogEntry[], base?: CatalogEntry, row?: Mer
       modelId: entry.name,
       effectiveId: entry.id,
       source: entry.source,
+      ...(entry.ownReasoningEvidence ? { reasoningEvidence: entry.ownReasoningEvidence } : {}),
       ...(limits ? { limits } : {}),
       ...(pricing ? { pricing } : {})
     }
@@ -2599,12 +2638,19 @@ function buildIdVariants(entries: CatalogEntry[], base?: CatalogEntry, row?: Mer
 /** BL-68 (bug-batch find b): what the merge guard did with a same-connection collision. */
 type VariantCollision = CatalogSyncVariantCollision
 
+function catalogBase(group: CatalogEntry[]): CatalogEntry | undefined {
+  return group.find(entry => entry.source === 'vercel') ??
+    group.find(entry => entry.source === 'openrouter') ??
+    group.find(entry => entry.source === 'direct') ?? group[0]
+}
+
 function withoutWorkingFields(entry: CatalogEntry): CatalogEntry {
   const {
     identityName: _identityName,
     identityRule: _identityRule,
     ownLimits: _ownLimits,
     ownPricing: _ownPricing,
+    ownReasoningEvidence: _ownReasoningEvidence,
     ...published
   } = entry
   return published
@@ -2615,15 +2661,18 @@ function withoutWorkingFields(entry: CatalogEntry): CatalogEntry {
  * entry of the same connection in one group used to vanish without a word (the
  * 2026-09-22 registry listed 53 Mistral entries but carried 52 variants).
  *
- * The entry whose variant the row has always published keeps it (the last one,
- * as before), so no saved preset changes model. Each other entry is returned to
- * become a row of its own. A reviewed identity rule must never cause this: it
- * would be a wrong merge, so the sync refuses to publish.
+ * A still-admitted published target stays on its base row. Otherwise a unique
+ * exact-canonical match wins before the historical last-variant choice; an AA
+ * slug alone must not replace a target with another spelling (BL-2077). Each
+ * other exact identity becomes its
+ * own row, or the merge refuses when those rows cannot be represented safely.
+ * A reviewed identity rule must never cause a same-connection collision.
  */
 function findSameConnectionLosers(
   key: CatalogMergeKey,
   group: CatalogEntry[],
-  collisions: VariantCollision[]
+  collisions: VariantCollision[],
+  previousByCanonical: ReadonlyMap<string, any>
 ): Map<CatalogEntry, VariantCollision> {
   const byConnection = new Map<string, CatalogEntry[]>()
   for (const entry of group) {
@@ -2636,6 +2685,9 @@ function findSameConnectionLosers(
   }
 
   const losers = new Map<CatalogEntry, VariantCollision>()
+  const base = catalogBase(group)
+  const baseCanonicalId = base && buildCanonicalId(base.provider, base.name)
+  const priorVariants = baseCanonicalId && previousByCanonical.get(baseCanonicalId)?.idVariants
   for (const [connectionId, list] of byConnection) {
     if (list.length < 2) continue
     if (list.some((entry) => entry.identityRule)) {
@@ -2644,10 +2696,20 @@ function findSameConnectionLosers(
           `in one row (${list.map((entry) => entry.id).join(', ')}).`
       )
     }
-    const kept = list[list.length - 1]
+    const exact = list.filter(entry => {
+      const variant = entry.idVariants?.[connectionId]
+      return buildCanonicalId(variant?.developerId ?? entry.provider, variant?.modelId ?? entry.name) === baseCanonicalId
+    })
+    const prior = priorVariants?.[connectionId]
+    const published = prior ? list.filter(entry => {
+      const variant = entry.idVariants?.[connectionId] ?? { developerId: entry.provider, modelId: entry.name, effectiveId: entry.id }
+      return variant.developerId === prior.developerId && variant.modelId === prior.modelId && variant.effectiveId === prior.effectiveId
+    }) : []
+    // A newly listed exact-canonical alias must not retarget an existing selector.
+    const kept = published.length === 1 ? published[0] : exact.length === 1 ? exact[0] : list[list.length - 1]
     const collision: VariantCollision = { group: key, connectionId, kept: kept.id, split: [], dropped: [] }
     collisions.push(collision)
-    for (const loser of list.slice(0, -1)) {
+    for (const loser of list.filter(entry => entry !== kept)) {
       if (!losers.has(loser)) losers.set(loser, collision)
     }
   }
@@ -2668,11 +2730,7 @@ function listsOwnDisplayName(entry: CatalogEntry): boolean {
 }
 
 function buildMergedRow(group: CatalogEntry[], members: CatalogEntry[]): CatalogEntry | null {
-  const base =
-    group.find((entry) => entry.source === 'vercel') ??
-    group.find((entry) => entry.source === 'openrouter') ??
-    group.find((entry) => entry.source === 'direct') ??
-    group[0]
+  const base = catalogBase(group)
   if (!base) return null
 
   const rowNumbers: MergedRowNumbers = {
@@ -2710,7 +2768,7 @@ function buildMergedRow(group: CatalogEntry[], members: CatalogEntry[]): Catalog
   })
 }
 
-function mergeCatalogEntriesWithReport(entries: CatalogEntry[]): {
+function mergeCatalogEntriesWithReport(entries: CatalogEntry[], previousModels: ExistingCatalogPayload['models'] = []): {
   models: CatalogEntry[]
   variantCollisions: VariantCollision[]
 } {
@@ -2728,29 +2786,68 @@ function mergeCatalogEntriesWithReport(entries: CatalogEntry[]): {
   const merged: CatalogEntry[] = []
   const variantCollisions: VariantCollision[] = []
   const pendingSplits: Array<{ entry: CatalogEntry; collision: VariantCollision }> = []
+  const previousByCanonical = new Map(previousModels.map(model => [safeString(model.canonicalId) || safeString(model.id), model]))
 
   for (const [key, group] of groups) {
-    const losers = findSameConnectionLosers(key, group, variantCollisions)
+    const losers = findSameConnectionLosers(key, group, variantCollisions, previousByCanonical)
     const row = buildMergedRow(group, losers.size ? group.filter((entry) => !losers.has(entry)) : group)
     if (row) merged.push(row)
     for (const [entry, collision] of losers) pendingSplits.push({ entry, collision })
   }
 
-  // A split entry becomes a row of its own only when no row uses its canonical id:
-  // instances merge rows by canonical id (`/api/models`), which would drop it again.
+  // Instances merge by canonical id. Never return a successful lossy merge when
+  // an exact identity cannot have its own unique selector row (BL-2077).
   const usedCanonicalIds = new Set(merged.map((row) => row.canonicalId))
   for (const { entry, collision } of pendingSplits) {
     const row = buildMergedRow([entry], [entry])
     if (!row || usedCanonicalIds.has(row.canonicalId)) {
-      collision.dropped.push(entry.id)
-      continue
+      throw new Error(`Cannot preserve catalog identity ${entry.id} @ ${entry.connectionId}: canonical row ${row?.canonicalId ?? entry.canonicalId} is already occupied`)
     }
     usedCanonicalIds.add(row.canonicalId)
     merged.push(row)
     collision.split.push(entry.id)
   }
 
+  assertMergedIdentityConservation(entries, merged, previousModels)
   return { models: merged, variantCollisions }
+}
+
+/** Every admitted source identity must survive, including first-publication IDs. */
+function assertMergedIdentityConservation(entries: CatalogEntry[], models: CatalogEntry[], previousModels: ExistingCatalogPayload['models'] = []) {
+  const canonicalIds = new Set<string>()
+  const identities = new Set<string>()
+  const admitted = new Set<string>()
+  const key = (connection: string, variant: Pick<CatalogModelIdVariant, 'developerId' | 'modelId' | 'effectiveId'>) =>
+    JSON.stringify([connection, variant.developerId, variant.modelId, variant.effectiveId])
+  for (const model of models) {
+    if (canonicalIds.has(model.canonicalId)) throw new Error(`Catalog canonical identity collision: ${model.canonicalId}`)
+    canonicalIds.add(model.canonicalId)
+    for (const [connection, variant] of Object.entries(model.idVariants ?? {})) identities.add(key(connection, variant))
+  }
+  for (const entry of entries) {
+    const variants = { [entry.connectionId]: { developerId: entry.provider, modelId: entry.name, effectiveId: entry.id }, ...entry.idVariants }
+    for (const [connection, variant] of Object.entries(variants)) {
+      admitted.add(key(connection, variant))
+      if (!identities.has(key(connection, variant))) {
+        throw new Error(`Cannot preserve catalog identity ${variant.effectiveId} @ ${connection}: merge removed an admitted source variant`)
+      }
+    }
+  }
+  const nextByCanonical = new Map(models.map(model => [model.canonicalId, model]))
+  for (const previous of previousModels) {
+    const canonicalId = safeString(previous.canonicalId) || safeString(previous.id)
+    const next = nextByCanonical.get(canonicalId)
+    if (!next) continue // Existing exact-variant lookup still resolves a row that merged away.
+    for (const [connection, variant] of Object.entries(previous.idVariants ?? {}) as Array<[string, CatalogModelIdVariant]>) {
+      // Source retirement/policy filtering precedes this merge. An omitted
+      // variant is not eligible to pin a selector or resurrect that route.
+      if (!admitted.has(key(connection, variant))) continue
+      const replacement = next.idVariants?.[connection]
+      if (!replacement || key(connection, replacement) !== key(connection, variant)) {
+        throw new Error(`Cannot preserve catalog selector ${canonicalId} @ ${connection}: merge would replace a still-admitted exact target`)
+      }
+    }
+  }
 }
 
 function mergeCatalogEntries(entries: CatalogEntry[]): CatalogEntry[] {
@@ -2814,12 +2911,14 @@ function assembleCatalogModels({
   gatewayEntries,
   openRouterEntries,
   directEntriesByProvider,
-  aaMap
+  aaMap,
+  previousModels
 }: {
   gatewayEntries: CatalogEntry[]
   openRouterEntries: CatalogEntry[]
   directEntriesByProvider: Partial<Record<DirectProviderId, CatalogEntry[]>>
   aaMap: Map<string, any>
+  previousModels?: ExistingCatalogPayload['models']
 }): { models: CatalogEntry[]; variantCollisions: VariantCollision[] } {
   const allEntries = [
     ...gatewayEntries,
@@ -2827,7 +2926,7 @@ function assembleCatalogModels({
     ...DIRECT_PROVIDER_IDS.flatMap((provider) => directEntriesByProvider[provider] ?? [])
   ].map((entry) => enrichWithAA(recordOwnNumbers(entry), aaMap))
 
-  const { models, variantCollisions } = mergeCatalogEntriesWithReport(allEntries)
+  const { models, variantCollisions } = mergeCatalogEntriesWithReport(allEntries, previousModels)
   models.sort((a, b) => a.displayName.localeCompare(b.displayName))
   assertCatalogIdentityIntegrity(models)
   return { models, variantCollisions }
@@ -2895,7 +2994,9 @@ export function _mapOpenAICompatibleCatalogModelsForTest(
     | 'minimax_token_plan'
     | 'mimo'
     | 'mimo_token_plan'
-    | 'qwencloud',
+    | 'qwencloud'
+    | 'alibaba'
+    | 'stepfun',
   models: OpenAICompatibleCatalogModel[]
 ): DirectProviderEntry[] {
   return mapOpenAICompatibleCatalogModels(provider, models)
@@ -2929,10 +3030,23 @@ export function _buildCatalogSyncDiffForTest({
   return buildCatalogSyncDiff({ previous, next })
 }
 
-async function uploadCatalog(payload: CatalogPayload) {
-  await upstashKvSet('catalog:v1', payload, {
+async function uploadCatalog(payload: CatalogPayload, expectedRaw: string | null) {
+  const written = await upstashKvSetIfUnchanged('catalog:v1', expectedRaw, payload, {
     timeoutMs: CATALOG_FETCH_TIMEOUT_MS
   })
+  if (!written) throw new Error('Cannot publish catalog: the saved snapshot changed during refresh. Nothing was overwritten; run a fresh sync after reviewing the current catalog.')
+}
+
+/** Only reviewed code facts can admit a changed default/removal; remote fields cannot opt in. */
+function applyReviewedReasoningFacts<T extends CatalogModel>(models: T[]): T[] {
+  return models.map(model => ({ ...model, ...(model.idVariants ? { idVariants: Object.fromEntries(
+    Object.entries(model.idVariants).map(([connectionId, variant]) => {
+      const fact = reviewedPublicReasoningEvidence(connectionId, variant.effectiveId)
+      if (!fact) return [connectionId, variant]
+      const reasoningEvidence = admitReviewedCatalogReasoningEvidence(variant.reasoningEvidence, fact,
+        { connectionId, effectiveId: variant.effectiveId })
+      return [connectionId, { ...variant, ...(reasoningEvidence ? { reasoningEvidence } : {}) }]
+    })) } : {}) }))
 }
 
 type CatalogSyncSourceStatus = {
@@ -2941,6 +3055,7 @@ type CatalogSyncSourceStatus = {
   usedFallback: boolean
   skipped?: boolean
   fetchedCount: number
+  metadataSourceConnectionId?: string
   /** Missing upstream IDs retained until a reviewed source policy confirms retirement. */
   pendingRemovalIds?: string[]
   confirmedRemovalIds?: string[]
@@ -3013,22 +3128,23 @@ type CatalogSyncReport = {
   } | null
 }
 
-async function fetchExistingCatalog(): Promise<ExistingCatalogPayload | null> {
+async function fetchExistingCatalog(): Promise<{ payload: ExistingCatalogPayload | null; raw: string | null }> {
   // A missing key permits the first publish. An unreadable or malformed saved
   // catalog does not: source failures would otherwise lose their fallback rows.
-  const parsed = await upstashKvGet<ExistingCatalogPayload>('catalog:v1', {
+  const raw = await upstashKvGetRaw('catalog:v1', {
     required: true,
     timeoutMs: CATALOG_FETCH_TIMEOUT_MS
   })
-  if (parsed === null) return null
-  if (!parsed || !Array.isArray(parsed.models) || parsed.models.length === 0) {
+  if (raw === null) return { payload: null, raw }
+  const parsed: unknown = JSON.parse(raw)
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray((parsed as ExistingCatalogPayload).models) || (parsed as ExistingCatalogPayload).models!.length === 0) {
     throw new Error('Cannot sync model catalog: existing catalog is malformed')
   }
 
   const supportedConnections = new Set<string>([
     'vercel-gateway', 'openrouter', ...DIRECT_PROVIDER_IDS.map(asDirectConnectionId)
   ])
-  for (const model of parsed.models) {
+  for (const model of (parsed as ExistingCatalogPayload).models!) {
     if (!model || typeof model !== 'object' || typeof model.id !== 'string' || !model.id.trim() ||
       !Array.isArray(model.availableConnections) || !model.availableConnections.length ||
       !model.idVariants || typeof model.idVariants !== 'object') {
@@ -3042,9 +3158,13 @@ async function fetchExistingCatalog(): Promise<ExistingCatalogPayload | null> {
           typeof variant[key] === 'string' && variant[key].trim())) {
         throw new Error('Cannot sync model catalog: existing catalog has an unusable saved identity')
       }
+      if (variant.reasoningEvidence !== undefined && !readCatalogReasoningEvidence(variant.reasoningEvidence,
+        { connectionId: connection, effectiveId: variant.effectiveId })) {
+        throw new Error('Cannot sync model catalog: existing reasoning evidence is malformed, future or non-public; the registry was kept.')
+      }
     }
   }
-  return parsed as ExistingCatalogPayload
+  return { payload: parsed as ExistingCatalogPayload, raw }
 }
 
 function safeString(value: unknown) {
@@ -3090,16 +3210,18 @@ function buildFallbackEntriesFromExisting({
 
     const canonicalId = buildCanonicalId(provider, name)
     const tags = Array.isArray(model?.tags) ? (model.tags as string[]).map((tag) => safeString(tag).toLowerCase()) : []
+    const effectiveId =
+      safeString(variant?.effectiveId) ||
+      (connectionId === 'openrouter' || connectionId === 'vercel-gateway' ? `${provider}/${name}` : name)
     const inferredPurpose = inferModelPurpose({
-      id: safeString(model?.id) || canonicalId,
+      connectionId,
+      id: effectiveId,
       name,
       modelType: (model as any)?.modelType ?? null,
       tags
     })
-    const purpose = normalizePurpose(model?.purpose, inferredPurpose)
-    const effectiveId =
-      safeString(variant?.effectiveId) ||
-      (connectionId === 'openrouter' || connectionId === 'vercel-gateway' ? `${provider}/${name}` : name)
+    const purpose = reviewedModelPurpose({ connectionId, id: effectiveId, modelType: model?.modelType }) ??
+      normalizePurpose(model?.purpose, inferredPurpose)
     // BL-68: a connection that keeps its own limits is rebuilt with them, never
     // with the merged row's numbers, which may belong to another connection.
     const ownLimits = variant?.limits && typeof variant.limits === 'object' ? variant.limits : null
@@ -3140,6 +3262,7 @@ function buildFallbackEntriesFromExisting({
       // row is the exception: it took the row's by rule, so it is rebuilt with
       // none and takes the row's again when the gateway's price moves.
       pricing:
+        connectionId === 'direct:mimo_token_plan' ? undefined :
         variant?.pricing && typeof variant.pricing === 'object'
           ? variant.pricing
           : takesGatewayListPrice(connectionId, safeString(model?.provider), safeString(model?.connectionId))
@@ -3157,6 +3280,7 @@ function buildFallbackEntriesFromExisting({
       source,
       transport,
       connectionId,
+      ...(variant?.reasoningEvidence !== undefined ? { ownReasoningEvidence: variant.reasoningEvidence } : {}),
       // BL-133: the published model type survives a fail-safe rebuild (an
       // OpenRouter row, which never has one, still has none).
       ...(model && 'modelType' in model
@@ -3361,6 +3485,8 @@ const DIRECT_SOURCE_FETCHERS: Record<
   mimo_token_plan: fetchMimoTokenPlanEntries,
   qwencloud: fetchQwenCloudEntries,
   qwen_token_plan: fetchQwenTokenPlanEntries,
+  alibaba: fetchAlibabaEntries,
+  stepfun: fetchStepfunEntries,
   zai: fetchZaiEntries,
   zai_coding: fetchZaiCodingEntries,
   togetherai: fetchTogetherEntries,
@@ -3393,6 +3519,8 @@ const DIRECT_SOURCE_ENV_VARS: Record<DirectProviderId, string[]> = {
   mimo_token_plan: [],
   qwencloud: ['DASHSCOPE_API_KEY'],
   qwen_token_plan: [],
+  alibaba: ['ALIBABA_CLOUD_API_KEY'],
+  stepfun: ['STEPFUN_API_KEY', 'STEP_API_KEY'],
   zai: ['ZAI_API_KEY'],
   zai_coding: [],
   togetherai: ['TOGETHER_API_KEY'],
@@ -3423,13 +3551,18 @@ export async function runModelCatalogSync(
 
   const completedLiveLists = new Set<DirectProviderId>()
   const fallbackErrors = new Map<DirectProviderId, string>()
+  const catalogEndpoints = new Map<DirectProviderId, string>()
+  const metadataWarnings = new Map<DirectProviderId, string>()
+  const metadataSources = new Map<DirectProviderId, CatalogConnectionId>()
   const createSourceOptions = (provider?: DirectProviderId): SourceFetchOptions => ({
     signal: AbortSignal.timeout(CATALOG_SOURCE_TIMEOUT_MS),
     onFallbackError: provider ? error => fallbackErrors.set(provider, normalizeError(error)) : undefined,
-    onCompleteLiveList: provider ? () => { completedLiveLists.add(provider) } : undefined
+    onCompleteLiveList: provider ? () => { completedLiveLists.add(provider) } : undefined,
+    onCatalogEndpoint: provider ? baseUrl => { catalogEndpoints.set(provider, baseUrl) } : undefined,
+    onMetadataWarning: provider ? warning => { metadataWarnings.set(provider, warning) } : undefined
   })
 
-  const existing = await fetchExistingCatalog()
+  const { payload: existing, raw: existingRaw } = await fetchExistingCatalog()
   const hasExisting = Boolean(existing?.models?.length)
 
   const previousGatewayCount = existing
@@ -3481,6 +3614,18 @@ export async function runModelCatalogSync(
     DIRECT_PROVIDER_IDS.map((provider, index) => [provider, directSourceResults[index]])
   ) as Record<DirectProviderId, PromiseSettledResult<DirectProviderEntry[]>>
 
+  // Metadata, not credential inheritance: both adapters target the same documented
+  // Model Studio model-list endpoint. Never reuse a cached/failed/empty peer result,
+  // and never let this reuse count as an independent Alibaba retirement recheck.
+  const alibabaEndpoint = normalizedModelStudioCatalogEndpoint(catalogEndpoints.get('alibaba'))
+  const qwenEndpoint = normalizedModelStudioCatalogEndpoint(catalogEndpoints.get('qwencloud'))
+  const qwenResult = directSourceResultsByProvider.qwencloud
+  if (!directSourceConfigured.alibaba && alibabaEndpoint && alibabaEndpoint === qwenEndpoint &&
+      completedLiveLists.has('qwencloud') && qwenResult.status === 'fulfilled' && qwenResult.value.length) {
+    directSourceResultsByProvider.alibaba = { status: 'fulfilled', value: structuredClone(qwenResult.value) }
+    metadataSources.set('alibaba', 'direct:qwencloud')
+  }
+
   const sources: CatalogSyncSourceStatus[] = []
 
   const gatewayEntriesFresh = gatewayResult.status === 'fulfilled' ? gatewayResult.value : null
@@ -3493,7 +3638,7 @@ export async function runModelCatalogSync(
         transport: 'vercel-gateway'
       })
     : []
-  const gatewayReconciled = retainCatalogSourceEntries('vercel-gateway', gatewayEntriesFresh ?? [], gatewayFallback)
+  const gatewayReconciled = retainCatalogSourceEntries('vercel-gateway', gatewayEntriesFresh ?? [], gatewayFallback, undefined, mergePresentReasoningEvidence)
   const useGatewayFallback = !gatewayEntriesFresh || gatewayReconciled.pendingRemovalIds.length > 0 ||
     (gatewayEntriesFresh.length === 0 && previousGatewayCount === 0)
 
@@ -3528,7 +3673,7 @@ export async function runModelCatalogSync(
         transport: 'openrouter'
       })
     : []
-  const openRouterReconciled = retainCatalogSourceEntries('openrouter', openRouterEntriesFresh ?? [], openRouterFallback)
+  const openRouterReconciled = retainCatalogSourceEntries('openrouter', openRouterEntriesFresh ?? [], openRouterFallback, undefined, mergePresentReasoningEvidence)
   const useOpenRouterFallback = !openRouterEntriesFresh || openRouterReconciled.pendingRemovalIds.length > 0 ||
     (openRouterEntriesFresh.length === 0 && previousOpenRouterCount === 0)
 
@@ -3557,7 +3702,8 @@ export async function runModelCatalogSync(
     result: PromiseSettledResult<DirectProviderEntry[]>
   }) {
     const connectionId = asDirectConnectionId(provider)
-    const sourceConfigured = directSourceConfigured[provider]
+    const metadataSourceConnectionId = metadataSources.get(provider)
+    const sourceConfigured = directSourceConfigured[provider] || Boolean(metadataSourceConnectionId)
 
     const fresh = result.status === 'fulfilled'
       ? applyDirectSourceCatalogPolicy(provider, mapDirectProviderEntries(provider, result.value))
@@ -3588,7 +3734,7 @@ export async function runModelCatalogSync(
     const savedIds = new Set(savedFallback.map(entry => entry.id))
     const fallback = [...savedFallback, ...eligibleRecovery.filter(entry => !savedIds.has(entry.id))]
     const previousCount = previousDirectCounts[provider] ?? 0
-    const reconciled = retainCatalogSourceEntries(connectionId, fresh ?? [], fallback, error || !sourceConfigured || !completedLiveLists.has(provider) ? [] : undefined)
+    const reconciled = retainCatalogSourceEntries(connectionId, fresh ?? [], fallback, error || !sourceConfigured || !completedLiveLists.has(provider) ? [] : undefined, mergePresentReasoningEvidence)
     const useFallback = Boolean(error) || !fresh || reconciled.pendingRemovalIds.length > 0 ||
       (fresh.length === 0 && previousCount === 0)
 
@@ -3602,6 +3748,7 @@ export async function runModelCatalogSync(
       usedFallback: useFallback,
       skipped: !sourceConfigured,
       fetchedCount: fresh?.length ?? 0,
+      ...(metadataSourceConnectionId ? { metadataSourceConnectionId } : {}),
       error,
       warning: [!sourceConfigured
         ? provider === 'fal' && fallback.length
@@ -3612,6 +3759,7 @@ export async function runModelCatalogSync(
             previousCount,
             fetchedCount: fresh?.length ?? 0
           }),
+        metadataWarnings.get(provider),
         policyRemovalIds.length
           ? `Reviewed connection policy excludes saved IDs: ${policyRemovalIds.join(', ')}`
           : undefined
@@ -3640,12 +3788,14 @@ export async function runModelCatalogSync(
     )
   }
 
-  const { models: merged, variantCollisions } = assembleCatalogModels({
+  const { models: assembled, variantCollisions } = assembleCatalogModels({
     gatewayEntries,
     openRouterEntries,
     directEntriesByProvider,
-    aaMap
+    aaMap,
+    previousModels: existing?.models
   })
+  const merged = applyReviewedReasoningFacts(assembled)
 
   const payload: CatalogPayload = {
     version: 2,
@@ -3674,9 +3824,15 @@ export async function runModelCatalogSync(
       }
     }
   }
+  assertCatalogReasoningConservation(applyReviewedReasoningFacts((existing?.models ?? []) as CatalogModel[]), merged)
+
+  for (const source of sources) {
+    const conflicts = merged.filter(model => model.idVariants?.[source.connectionId]?.reasoningEvidence?.lastAttempt.outcome === 'conflict').length
+    if (conflicts) source.warning = [source.warning, `${conflicts} reasoning evidence conflict(s) retain last-good controls pending bounded review.`].filter(Boolean).join('; ')
+  }
 
   if (!options.dryRun) {
-    await uploadCatalog(payload)
+    await uploadCatalog(payload, existingRaw)
   }
   const directTotal = DIRECT_PROVIDER_IDS.reduce(
     (total, provider) => total + directEntriesByProvider[provider].length,
@@ -3779,12 +3935,15 @@ export function buildCatalogFromSnapshot(snapshot: ExistingCatalogPayload): {
     if (slug) aaMap.set(normalizeName(slug), { slug })
   }
 
-  const { models, variantCollisions } = assembleCatalogModels({
+  const { models: assembled, variantCollisions } = assembleCatalogModels({
     gatewayEntries,
     openRouterEntries,
     directEntriesByProvider,
-    aaMap
+    aaMap,
+    previousModels: snapshot.models
   })
+  const models = applyReviewedReasoningFacts(assembled)
+  assertCatalogReasoningConservation(applyReviewedReasoningFacts(snapshot.models as CatalogModel[]), models)
 
   return {
     payload: {

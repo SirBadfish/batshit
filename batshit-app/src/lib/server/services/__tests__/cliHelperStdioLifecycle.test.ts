@@ -9,14 +9,23 @@
  * processes (all PPID 1, ~237 MB resident, 3-4 days old) were measured on one Mac, plus one
  * new orphan per managed Codex turn on the dev lane.
  *
- * WHAT THIS PINS. Every `scripts/*-mcp.cjs` bridge exits promptly on stdin EOF, SIGTERM and
- * SIGHUP, **while holding an open handle**. The `--require` preload swaps `require('redis')`
- * for a client that opens a real listening socket on connect, which is what reproduces the
- * immortality condition without needing a Redis server — so this runs in the default lane.
- * Remove `installStdioLifecycle` from a bridge and its three cases hang and fail.
+ * WHAT THIS PINS. Every stdio bridge on disk (`scripts/*-mcp.cjs` and `scripts/*-bridge.cjs`)
+ * exits promptly on stdin EOF, SIGTERM and SIGHUP, **while holding an open handle**. The
+ * `--require` preload swaps `require('redis')` for a client that opens a real listening socket
+ * on connect, which is what reproduces the immortality condition without needing a Redis server
+ * — so this runs in the default lane. Remove `installStdioLifecycle` from a bridge that holds a
+ * handle and its three cases hang and fail.
  *
- * The last case is the forward-looking half: a NEW `scripts/*-mcp.cjs` is discovered from
- * disk and must be listed here, so the next bridge cannot ship without this contract.
+ * The last case is the forward-looking half: a NEW bridge is discovered from disk and must be
+ * listed here, so the next bridge cannot ship without this contract.
+ *
+ * SA-139 R4 removed the two Redis-holding bridges (`codex-subagent-mcp.cjs`, the CLI Primary's
+ * Subagent bridge, and `claude-permission-mcp.cjs`, its approval callback) and moved these
+ * lessons to the Claude plan connection's bridge, `claude-plan-bridge.cjs`, in its `mcp` role
+ * (the run's MCP server). It holds no handle until a call opens its run socket, so the source
+ * case is what catches a missing lifecycle; the process cases still pin that EOF and the signals
+ * end it. SA-139 R5 removed the managed CLI helper (`mode4-controls-mcp.cjs`), the other bridge
+ * these cases covered, so the Claude plan's bridge is the one left.
  *
  * MUTATION-CHECKED 2026-09-17, three ways:
  *   - drop `installStdioLifecycle` from the bridges -> both Redis-holding bridges fail the
@@ -33,6 +42,7 @@
 import { describe, it, expect } from 'vitest'
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { readdirSync, readFileSync } from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 
 const SCRIPTS_DIR = path.resolve(process.cwd(), 'scripts')
@@ -55,23 +65,16 @@ type HelperCase = {
 
 /**
  * Every stdio bridge Batshit spawns for a managed CLI run. Keep in sync with the
- * `scripts/*-mcp.cjs` discovery case below, which fails when this list goes stale.
+ * `scripts/*-mcp.cjs` / `scripts/*-bridge.cjs` discovery case below, which fails when this list
+ * goes stale.
  */
 const HELPERS: HelperCase[] = [
   {
-    file: 'codex-subagent-mcp.cjs',
-    serverName: 'batshit-subagent-bridge',
-    args: ['--agent=lifecycle_test_agent', '--user=lifecycle-test-user', '--url=http://127.0.0.1:59999']
-  },
-  {
-    file: 'claude-permission-mcp.cjs',
-    serverName: 'batshit-claude-approvals',
-    args: []
-  },
-  {
-    file: 'mode4-controls-mcp.cjs',
-    serverName: 'batshit-cli-internal-tools',
-    args: ['--agent=lifecycle_test_agent', '--user=lifecycle-test-user', '--url=http://127.0.0.1:59999']
+    // The Claude plan run's MCP server. Its run folder must be absolute; nothing in it is read
+    // until a `tools/list` or `tools/call`, which this suite never sends.
+    file: 'claude-plan-bridge.cjs',
+    serverName: '"serverInfo":{"name":"batshit"',
+    args: ['mcp', path.join(os.tmpdir(), 'batshit-lifecycle-test-no-run')]
   }
 ]
 
@@ -185,12 +188,12 @@ describe('managed CLI helper bridges exit with their run (F-P7-10)', () => {
 
   it('covers every stdio bridge on disk, and each one installs the shared lifecycle', () => {
     const onDisk = readdirSync(SCRIPTS_DIR)
-      .filter((name) => name.endsWith('-mcp.cjs'))
+      .filter((name) => name.endsWith('-mcp.cjs') || name.endsWith('-bridge.cjs'))
       .sort()
 
     expect(
       onDisk,
-      'A new scripts/*-mcp.cjs bridge exists that this suite does not cover. Add it to HELPERS.'
+      'A new scripts/*-mcp.cjs or scripts/*-bridge.cjs bridge exists that this suite does not cover. Add it to HELPERS.'
     ).toEqual(HELPERS.map((helper) => helper.file).sort())
 
     for (const name of onDisk) {

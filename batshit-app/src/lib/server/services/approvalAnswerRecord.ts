@@ -24,6 +24,21 @@ export type ApprovalAnswerOutcome =
   | { ok: false; reason: 'already_answered'; approvalIds: string[] }
   | { ok: false; reason: 'record_failed'; error: unknown }
 
+declare const p5AnswerBrand: unique symbol
+export type P5ApprovalAnswerWrite = Readonly<{ readonly [p5AnswerBrand]: true }>
+const p5AnswerResults = new WeakMap<object, P5ApprovalAnswerWrite>()
+const p5AnswerWrites = new WeakMap<object, { userId: string; sessionId: string; messageId: string;
+  approvalIds: readonly string[]; consumed: boolean }>()
+export function observeP5ApprovalAnswerWrite(outcome: ApprovalAnswerOutcome): P5ApprovalAnswerWrite | undefined { return p5AnswerResults.get(outcome) }
+export function readP5ApprovalAnswerWrite(receipt: P5ApprovalAnswerWrite) {
+  const owner = p5AnswerWrites.get(receipt)
+  if (!owner || owner.consumed) throw new Error('The actual approval answer write is unavailable or already claimed.')
+  return Object.freeze({ userId: owner.userId, sessionId: owner.sessionId, messageId: owner.messageId, approvalIds: owner.approvalIds })
+}
+export function consumeP5ApprovalAnswerWrite(receipt: P5ApprovalAnswerWrite): void {
+  readP5ApprovalAnswerWrite(receipt); p5AnswerWrites.get(receipt)!.consumed = true
+}
+
 export async function answerApprovalsOnce(options: {
   userId: string
   sessionId: string
@@ -65,21 +80,38 @@ export async function answerApprovalsOnce(options: {
   }
 
   const decidedAt = (options.now?.() ?? new Date()).toISOString()
+  let knownWrite: P5ApprovalAnswerWrite | undefined
+  const result = (outcome: ApprovalAnswerOutcome): ApprovalAnswerOutcome => {
+    if (knownWrite) p5AnswerResults.set(outcome, knownWrite)
+    return outcome
+  }
   const write = async () => {
     // `updateMessage` REPLACES metadata, so the whole stored metadata goes back with the record
     // added (the same read-then-merge `settleControlApprovalCard` does).
+    const next = recordApprovalAnswers(metadata, options.responses, decidedAt)
+    const acknowledge = () => {
+      if (knownWrite) return
+      knownWrite = Object.freeze({}) as P5ApprovalAnswerWrite
+      const prior = readAnsweredApprovalIds(metadata)
+      p5AnswerWrites.set(knownWrite, { userId: options.userId, sessionId: options.sessionId, messageId,
+        approvalIds: Object.freeze([...readAnsweredApprovalIds(next)].filter(id => !prior.has(id))), consumed: false })
+    }
     await redis.updateMessage(
       messageId,
       options.sessionId,
-      { metadata: recordApprovalAnswers(metadata, options.responses, decidedAt) },
-      options.userId
+      { metadata: next },
+      options.userId,
+      { onJsonWriteAcknowledged: acknowledge }
     )
+    // A fulfilled ordinary writer remains its existing acknowledgement. The
+    // earlier observer additionally preserves the real partial-failure truth.
+    acknowledge()
   }
   try {
     if (options.mutate) await options.mutate(write)
     else await write()
   } catch (error) {
-    return { ok: false, reason: 'record_failed', error }
+    return result({ ok: false, reason: 'record_failed', error })
   }
-  return { ok: true, recorded: true }
+  return result({ ok: true, recorded: true })
 }

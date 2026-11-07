@@ -1,6 +1,6 @@
 /**
  * BL-474 step 2: where each outside picture address of a reply came from, kept beside the reply by
- * the server (the `codexCleanupWarnings.ts` pattern). It is not part of the message: a browser's
+ * the server. It is not part of the message: a browser's
  * save of the reply cannot change it, and the page only reads it.
  *
  * image_origins:{sessionId}                   set of reply ids

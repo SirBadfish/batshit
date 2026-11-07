@@ -117,7 +117,7 @@ describe('decideReplyImageOrigins (BL-474 step 2, the reply end)', () => {
     appendCliModelResult(run, {
       callId: 'cli-call-1', texts: [`curl ok ${READ}`], nonTextInputs: 0, unaccountedInputs: 0
     })
-    const record = decideReplyImageOrigins(input({ lane: 'codex', run }))
+    const record = decideReplyImageOrigins(input({ lane: 'claude', run }))
     expect(record.complete).toBe(false)
     expect(record.addresses).toEqual({
       [READ]: {

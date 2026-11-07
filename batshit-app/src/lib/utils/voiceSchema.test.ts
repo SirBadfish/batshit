@@ -4,12 +4,20 @@ import {
   DEFAULT_VOICE_MODE_END_OF_TURN_THRESHOLD,
   flattenLegacyVoiceStyle,
   normalizeAgentVoiceProfile,
+  mergeVoiceCommon,
   normalizeVoiceModeTurnSettings,
   normalizeVoiceSettings,
   shouldStopVoiceRuntimeOnShutdown
 } from './voiceSchema'
 
 describe('voiceSchema legacy cutover normalization', () => {
+  it('preserves a Qwen workspace endpoint in saved engine and explicit override precedence', () => {
+    const endpoint = 'https://workspace-123.ap-southeast-1.maas.aliyuncs.com/api/v1/services/audio/tts/SpeechSynthesizer'
+    const normalized = normalizeVoiceSettings({ tts: { providerId: 'alibaba', common: { endpoint } }, ttsEngineSettings: { alibaba: { common: { endpoint } } } })
+    expect(normalized.tts?.common?.endpoint).toBe(endpoint)
+    expect(normalized.ttsEngineSettings?.alibaba?.common?.endpoint).toBe(endpoint)
+    expect(mergeVoiceCommon(normalized.ttsEngineSettings?.alibaba?.common, { endpoint: `${endpoint}2` })?.endpoint).toBe(`${endpoint}2`)
+  })
   it('normalizes Fish Audio as a built-in voice provider', () => {
     const normalized = normalizeVoiceSettings({
       tts: {

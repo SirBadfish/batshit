@@ -6,6 +6,8 @@ import {
   createDefaultFabricToolGridSettings,
   describeFabricControlFamilies,
   FABRIC_TOOL_GRID_GROUP_NAME,
+  FABRIC_TOOL_GRID_DISPLAY_NAME,
+  getBrokerFamilyToolGridDefinition,
   fabricControlFamilyKey,
   normalizeArtifactToolGridSettings,
   normalizeFabricToolGridSettings
@@ -26,6 +28,27 @@ describe('broker family Tool Grid settings', () => {
     })
   })
 
+  it('separates the mixed-family display name from existing saved policy keys', () => {
+    const definition = getBrokerFamilyToolGridDefinition('fabric')
+    expect(definition.groupName).toBe('Fabric Controls')
+    expect(definition.displayName).toBe(FABRIC_TOOL_GRID_DISPLAY_NAME)
+    expect(definition.displayName).toBe('Fabric & Utilities')
+    for (const mode of ['hidden', 'group-only', 'group+tools+names', 'group+tools+hints'] as const) {
+      const normalized = normalizeFabricToolGridSettings({
+        dcmDisplayDefaults: {
+          version: 1,
+          groups: { 'Fabric Controls': mode },
+          tools: { 'sys.judge.ask': 'hidden', 'sys.mcp.dynamic.find': 'name-only' }
+        }
+      }).dcmDisplayDefaults
+      expect(normalized.groups).toEqual({ 'Fabric Controls': mode })
+      expect(normalized.tools).toEqual({
+        'sys.judge.ask': 'hidden', 'sys.mcp.dynamic.find': 'name-only'
+      })
+      expect(normalized.groups).not.toHaveProperty(FABRIC_TOOL_GRID_DISPLAY_NAME)
+    }
+  })
+
   it('seeds the default when nothing is stored', () => {
     expect(normalizeFabricToolGridSettings(null).dcmDisplayDefaults.groups).toEqual({
       [FABRIC_TOOL_GRID_GROUP_NAME]: 'group-only'
@@ -43,7 +66,7 @@ describe('broker family Tool Grid settings', () => {
     expect(normalized.dcmDisplayDefaults.tools['sys.zip.fetch']).toBe('name-only')
   })
 
-  it('keeps an explicit user choice, including hidden', () => {
+  it('keeps explicit detail and projects retired Artifact hiding to factory detail', () => {
     const shown = normalizeFabricToolGridSettings({
       dcmDisplayDefaults: { version: 1, groups: { [FABRIC_TOOL_GRID_GROUP_NAME]: 'group+tools+names' }, tools: {} }
     })
@@ -52,7 +75,7 @@ describe('broker family Tool Grid settings', () => {
     const hidden = normalizeArtifactToolGridSettings({
       dcmDisplayDefaults: { version: 1, groups: { [ARTIFACT_TOOL_GRID_GROUP_NAME]: 'hidden' }, tools: {} }
     })
-    expect(hidden.dcmDisplayDefaults.groups[ARTIFACT_TOOL_GRID_GROUP_NAME]).toBe('hidden')
+    expect(hidden.dcmDisplayDefaults.groups[ARTIFACT_TOOL_GRID_GROUP_NAME]).toBe('group+tools+hints')
   })
 
   it('normalizes the legacy group+tools mode into hints', () => {
@@ -87,6 +110,9 @@ describe('Fabric control family words', () => {
         'sys.zz_new_family.do'
       ])
     ).toEqual(['agent DMs', 'artifacts', 'CLI tools', 'Pinokio', 'voice engines', 'zz_new_family'])
+    expect(describeFabricControlFamilies(['sys.ui.settings_open', 'sys.app_settings.native.report'])).toEqual(['App Actions'])
     expect(describeFabricControlFamilies([])).toEqual([])
+    expect(describeFabricControlFamilies(['sys.mcp.dynamic.find', 'sys.mcp.dynamic.use', 'sys.judge.ask']))
+      .toEqual(['Judge Juice', 'MCP search/call'])
   })
 })

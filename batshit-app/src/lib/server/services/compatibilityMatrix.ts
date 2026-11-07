@@ -3,7 +3,6 @@ import type { CompatibilityMatrixSnapshot } from '$lib/types/compatibilityMatrix
 import { COMPATIBILITY_MATRIX_SEED } from '$lib/data/compatibility-matrix.seed'
 import { COMPATIBILITY_MATRIX_DEFAULT_ENTRIES } from '$lib/data/compatibility-matrix.defaults'
 import { buildMatrixScope, resolveMatrixFor } from '$lib/utils/compatibilityMatrix'
-import { loadN8nCompatibilitySnapshot } from '$lib/server/services/n8nParameterCompatibility'
 import { getRuntimeEnv } from '$lib/server/services/runtimeEnv'
 import { upstashKvGet } from '$lib/server/services/upstashKv'
 
@@ -87,19 +86,6 @@ export async function fetchCompatibilityMatrix(forceRefresh = false): Promise<Co
   return await loadMatrixAndCache()
 }
 
-async function mergeLocalN8nMatrix(
-  snapshot: CompatibilityMatrixSnapshot
-): Promise<CompatibilityMatrixSnapshot> {
-  const local = await loadN8nCompatibilitySnapshot()
-  if (!local?.entries?.length) return snapshot
-
-  const filtered = snapshot.entries.filter((entry) => entry.scope.connection !== 'n8n')
-  return {
-    ...snapshot,
-    entries: [...filtered, ...local.entries]
-  }
-}
-
 function mergeDefaultEntries(
   snapshot: CompatibilityMatrixSnapshot
 ): CompatibilityMatrixSnapshot {
@@ -166,8 +152,7 @@ async function loadMatrixAndCache(): Promise<CompatibilityMatrixSnapshot> {
     try {
       const result = await loader()
       if (result && result.entries) {
-        const withDefaults = mergeDefaultEntries(result)
-        const merged = await mergeLocalN8nMatrix(withDefaults)
+        const merged = mergeDefaultEntries(result)
         await cacheCompatibilityMatrixSnapshot(merged)
         return merged
       }

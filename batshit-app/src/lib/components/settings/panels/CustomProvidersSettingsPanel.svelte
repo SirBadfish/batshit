@@ -223,7 +223,7 @@
         <h2 class="batshit-settings-section-title">Custom Providers</h2>
         <SettingsInfoMenu ariaLabel="About Custom Providers" contentClass="w-80">
           <p>
-            Add OpenAI-compatible providers for API agents. Models must be entered manually.
+            Add OpenAI-compatible providers for your agents. Models must be entered manually.
             Leave API key blank to keep the existing key when editing.
           </p>
         </SettingsInfoMenu>

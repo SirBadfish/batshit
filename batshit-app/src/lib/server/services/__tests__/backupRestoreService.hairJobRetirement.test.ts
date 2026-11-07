@@ -3,8 +3,21 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { unzipSync, zipSync } from 'fflate/node'
-import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { redis } from '$lib/server/redis'
+// Install the supported lane root before any production module captures skill/voice paths.
+const ownedHome = vi.hoisted(() => {
+  const root = `${(process.env.TMPDIR ?? '/tmp').replace(/\/$/, '')}/batshit-hair-retirement-home-${process.pid}-${Date.now()}`
+  const previous = process.env.BATSHIT_HOME_DIR
+  process.env.BATSHIT_HOME_DIR = `${root}/.batshit`
+  return { root, previous }
+})
+afterAll(async () => {
+  if (ownedHome.previous === undefined) delete process.env.BATSHIT_HOME_DIR
+  else process.env.BATSHIT_HOME_DIR = ownedHome.previous
+  await fs.rm(ownedHome.root, { recursive: true, force: true })
+})
+
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { createHairAssetFixture, createRigidHairGlbFixture } from '$lib/goons/recipe/fixtures/hairAssetFixture'
 import { collectHairAssetFileRefs, hairAssetRevisionSha256, hairFitReceiptSha256, hairMaterialDefinitionSha256, verifyHairAsset } from '$lib/goons/hairAssets'
@@ -76,9 +89,9 @@ function wrapClient(wrap: (client: any) => any) {
   vi.mocked(redis.execute).mockImplementation((operation: any) => executeUnwrapped((client: any) => operation(wrap(client))))
 }
 async function baseArchive() {
-  await redis.json.set(SETTINGS, '$', { marker: 'archive' })
+  await redis.json.set(SETTINGS, '$', { user_id: USER, marker: 'archive' })
   const bundle = await createBackupBundle(USER)
-  await redis.json.set(SETTINGS, '$', { marker: 'original' })
+  await redis.json.set(SETTINGS, '$', { user_id: USER, marker: 'original' })
   await fs.writeFile(path.join(uploads, 'original.txt'), 'original bytes')
   return bundle
 }
@@ -94,7 +107,7 @@ async function currentAuthority() {
 async function assertOriginal(value: unknown) {
   expect(await redis.json.get(JOB)).toEqual(value)
   expect((await redis.sMembers(INDEX)).sort()).toEqual(['dangling', 'unrelated-index-member'])
-  expect(await redis.json.get(SETTINGS)).toEqual({ marker: 'original' })
+  expect(await redis.json.get(SETTINGS)).toEqual({ user_id: USER, marker: 'original' })
   expect(await fs.readFile(path.join(uploads, 'original.txt'), 'utf8')).toBe('original bytes')
 }
 async function retainedRevision(revision: number) {
@@ -250,7 +263,7 @@ it.each(['before', 'after'])('uses persisted final phase %s rename to replay or 
   expect(journal.phase).toBe(timing === 'before' ? 'redis-replacing' : 'redis-complete')
   await ensureBackupRestoreRecovery()
   if (timing === 'before') await assertOriginal(value)
-  else { expect(await redis.type(JOB)).toBe('none'); expect(await redis.type(INDEX)).toBe('none'); expect(await redis.json.get(SETTINGS)).toEqual({ marker: 'archive' }) }
+  else { expect(await redis.type(JOB)).toBe('none'); expect(await redis.type(INDEX)).toBe('none'); expect(await redis.json.get(SETTINGS)).toEqual({ user_id: USER, marker: 'archive' }) }
   expect((await fs.readdir(staging)).filter((name) => name.endsWith('.restore-journal.json'))).toEqual([])
 })
 

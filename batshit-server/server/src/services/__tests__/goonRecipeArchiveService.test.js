@@ -43,6 +43,27 @@ async function inspect(entries, overrides = {}) {
 }
 
 describe('Recipe archive extraction', () => {
+  it.each([0, 6])('inspects a stored or compressed archive through its already-open file handle (level %i)', async (level) => {
+    const archivePath = path.join(root, 'open-source.bgoon');
+    await fs.writeFile(archivePath, zipSync({
+      'avatar.json': strToU8('{"name":"Source"}'), 'avatar.glb': glbBytes()
+    }, { level }));
+    const handle = await fs.open(archivePath, 'r');
+    try {
+      const result = await inspectAndExtractRecipeArchive({
+        archivePath, archiveHandle: handle, outputDir: root,
+        maxArchiveBytes: 1024 * 1024, maxModelBytes: 512 * 1024,
+        maxManifestBytes: 64 * 1024, maxTotalUncompressedBytes: 576 * 1024,
+        maxExpansionRatio: 100
+      });
+      expect(result.members.map(member => member.role)).toEqual(['manifest', 'model']);
+      expect(result.manifest.name).toBe('Source');
+      expect((await handle.stat()).isFile()).toBe(true);
+    } finally {
+      await handle.close();
+    }
+  });
+
   it('streams and hashes exactly avatar.json plus avatar.glb', async () => {
     const result = await inspect({
       'avatar.json': strToU8(JSON.stringify({ contract: 'batshit-custom-avatar/v2' })),

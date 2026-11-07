@@ -5,7 +5,7 @@ import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { redis } from '$lib/server/redis'
 import * as agentStore from '$lib/stores/agents.svelte'
 import { subagentStore } from '$lib/stores/subagents.svelte'
-import { jsonResponse } from '$lib/test-utils/agentPutRoute'
+import { jsonResponse, loadAgentRoute } from '$lib/test-utils/agentPutRoute'
 
 /**
  * BL-955, BL-915: a Subagent save and a newer read of the same Subagent. A save is built from the
@@ -33,17 +33,14 @@ import { jsonResponse } from '$lib/test-utils/agentPutRoute'
  * is still on the wire), so a read in that window sees the older record.
  */
 
-vi.mock('$lib/server/services/codexProfileManager', () => ({
-  syncAgentCodexProfiles: vi.fn(async () => {}),
-  deleteAgentCodexConfig: vi.fn(async () => {}),
-  buildAgentProfileId: (id: string) => `batshit_agent_${id}`
+vi.mock('$lib/server/services/managedProfileFolderDelete', () => ({
+  deleteManagedProfileFolder: vi.fn(async () => {})
 }))
 vi.mock('$lib/server/services/claudeProfileManager', () => ({
   syncAgentClaudeProfiles: vi.fn(async () => {}),
   deleteAgentClaudeConfig: vi.fn(async () => {}),
   agentClaudeProfileResource: (id: string) => JSON.stringify(['profile', `claude:${id}`])
 }))
-vi.mock('$lib/server/services/n8nParameterCompatibility', () => ({ runTrackedN8nCompatibilitySync: vi.fn() }))
 // A CLI Subagent's save writes its managed profile folder under the real home: not in a test.
 vi.mock('$lib/server/services/cliSubagentProfileSync', () => ({
   syncManagedCliSubagentProfile: vi.fn(async () => ({ written: true })),
@@ -64,40 +61,6 @@ const SUB_NAME = 'Ss955 Panel Sub'
 const SUB2 = 'ss955_sub2'
 const SUB2_NAME = 'Ss955 Second Sub'
 
-const CODEX_BASE = {
-  permissionMode: 'chat',
-  includeProjectInstructions: true,
-  model: 'gpt-6-astra',
-  streamingEffect: true,
-  unifiedExec: true,
-  search: true,
-  sandbox: 'read-only',
-  approval: 'never',
-  configScope: 'managed',
-  addDirs: [] as string[],
-  enableFeatures: [] as string[],
-  disableFeatures: [] as string[],
-  configOverrides: [] as unknown[],
-  workingDirectoryMode: 'project',
-  historyPersistence: 'none'
-}
-
-const CLAUDE_BASE = {
-  permissionMode: 'acceptEdits',
-  includeCoreSystemPrompt: false,
-  includeProjectInstructions: true,
-  model: 'sonnet',
-  alwaysThinkingEnabled: false,
-  configScope: 'managed',
-  systemPromptMode: 'replace',
-  chrome: false,
-  addDirs: [] as string[],
-  allowedTools: [] as string[],
-  disallowedTools: [] as string[],
-  configOverrides: [] as unknown[],
-  workingDirectoryMode: 'project'
-}
-
 const DCM_EMPTY = {
   version: 1,
   groups: {},
@@ -106,26 +69,15 @@ const DCM_EMPTY = {
   toolDisplayPreferences: {}
 }
 
-type Provider = 'codex' | 'claude'
-
-const CLI_SUBAGENT = {
-  codex: {
-    block: 'codex_settings',
-    fields: {
-      primary_model_provider: 'codex',
-      primary_model_name: 'gpt-6-astra',
-      primary_model_connection: { type: 'cli', service: 'codex' }
-    }
-  },
-  claude: {
-    block: 'claude_settings',
-    fields: {
-      primary_model_provider: 'claude-cli',
-      primary_model_name: 'claude-cli',
-      primary_model_connection: { type: 'cli', service: 'claude-cli' }
-    }
-  }
-} as const
+/**
+ * SA-139 R5: the CLI Subagent's Claude section that several cases used as their section save left
+ * with that type. They use the API Subagent's own controls instead: the Tool Grid (a section with
+ * its own effect-driven save) and the Batshit Work mode (a single-choice group of the core form).
+ */
+const TOOL_GRID = { defaultMCPGateways: ['gw_a'], defaultMCPToolSelections: ['tool_one'], dcmDisplaySettings: DCM_EMPTY }
+const WORK_MODE_AGENT = {
+  provider_specific_settings: { nativeTools: { bashAccessMode: 'agent', executionBackend: 'apple_container' } }
+}
 
 function ensureBrowserStubs() {
   if (typeof Element !== 'undefined' && typeof Element.prototype.animate !== 'function') {
@@ -160,7 +112,7 @@ type ReadGate = { id: string; answer: Promise<void>; release: () => void }
 type SubagentReadSnapshot = { id: string; record: Record<string, any> }
 
 let subagentRoute: typeof import('../../../../routes/api/subagents/[id]/+server')
-let agentRoute: typeof import('../../../../routes/api/agents/[id]/+server')
+let agentRoute: Awaited<ReturnType<typeof loadAgentRoute>>
 /** Every PUT body the panel sent for the Subagent under test, in order. */
 let subagentPuts: Array<{ body: Record<string, any> }> = []
 let subagentPutStatuses: Array<{ id: string; status: number }> = []
@@ -180,11 +132,15 @@ const originalFetch = global.fetch
 let rendered: ReturnType<typeof render> | null = null
 
 beforeAll(async () => {
-  agentRoute = await import('../../../../routes/api/agents/[id]/+server')
+  agentRoute = await loadAgentRoute()
   subagentRoute = await import('../../../../routes/api/subagents/[id]/+server')
 }, 60_000)
 
-beforeEach(() => {
+beforeEach(async () => {
+  // 3f6b10c8b moved the agent and Subagent GETs onto Lua reads the default lane's fake cannot run.
+  // loadAgentRoute installs their read twins as spies, and afterEach's restoreAllMocks removes them,
+  // so each case reinstalls them.
+  agentRoute = await loadAgentRoute()
   ensureBrowserStubs()
   subagentPuts = []
   subagentPutStatuses = []
@@ -283,7 +239,7 @@ function installRoutes() {
     if (path === '/api/user/saved-models') return jsonResponse({ models: [] })
     if (path === '/api/models') return jsonResponse({ data: { connections: [] } })
     if (path === '/api/settings/api-keys') return jsonResponse({ keys: {} })
-    if (path === '/api/goons') return jsonResponse({ goons: [] })
+    if (path === '/api/goons') return jsonResponse({ ownerId: 'josh', goons: [] })
     if (path === '/api/icons/library') return jsonResponse({ icons: [], prefs: { favorites: [], recents: [] } })
     if (path === '/api/mcp/gateways') return jsonResponse({ gateways: [] })
     if (path === '/api/cli-tools') return jsonResponse({ tools: [] })
@@ -332,11 +288,6 @@ function subagentRecord(extra: Record<string, unknown> = {}) {
     updated_at: '2026-09-29T00:00:00.000Z',
     ...extra
   }
-}
-
-function cliSubagentRecord(provider: Provider, block: Record<string, unknown>, extra: Record<string, unknown> = {}) {
-  const { block: field, fields } = CLI_SUBAGENT[provider]
-  return subagentRecord({ subagentType: 'cli', ...fields, [field]: block, ...extra })
 }
 
 async function storedSubagent() {
@@ -400,60 +351,37 @@ async function openSubagent(
   expect(writeLog).toEqual([])
 }
 
-/** A CLI Codex Subagent's fields without its id, for the second Subagent. */
-const CLI_CODEX_FIELDS = { subagentType: 'cli', ...CLI_SUBAGENT.codex.fields, codex_settings: CODEX_BASE }
-
-/** The select trigger whose visible value contains `text`, if any. */
-function selectShowing(text: string) {
-  return screen
-    .getAllByRole('button', { hidden: true })
-    .find((element) => element.hasAttribute('data-select-trigger') && (element.textContent ?? '').includes(text))
-}
-
-/**
- * Picks an option of the select whose visible value contains `current`. The popper stays
- * `visibility: hidden` in jsdom (no layout), so its options are found hidden and picked by text.
- */
-async function pickSelectOption(current: string, optionText: RegExp) {
-  const trigger = selectShowing(current)
-  expect(trigger, `the select showing "${current}"`).toBeTruthy()
-  await fireEvent.keyDown(trigger as HTMLElement, { key: 'ArrowDown' })
-  await waitFor(() => expect(screen.queryAllByRole('option', { hidden: true }).length).toBeGreaterThan(0))
-  const option = screen
-    .getAllByRole('option', { hidden: true })
-    .find((element) => optionText.test((element.textContent ?? '').trim()))
-  expect(option, `an option matching ${optionText}`).toBeTruthy()
-  await fireEvent.pointerUp(option as HTMLElement, { pointerType: 'mouse' })
-}
-
 function isReadWaitLocked(element: HTMLElement | null) {
   return Boolean(element && (element.matches(':disabled') || element.closest('fieldset:disabled, [inert]')))
 }
 
-async function tryReadWaitSelect(current: string, optionText: RegExp) {
-  const trigger = selectShowing(current) as HTMLElement | undefined
-  if (!trigger || isReadWaitLocked(trigger)) return false
-  await pickSelectOption(current, optionText)
+/** Clicks `element` unless the read wait locks it; true when the click went through. */
+async function tryReadWaitClick(element: HTMLElement) {
+  if (isReadWaitLocked(element)) return false
+  await fireEvent.click(element)
   return true
 }
 
-function subagentCodexPermissionRadio(label: RegExp) {
-  const group = screen.getByRole('group', { name: 'Subagent Codex permissions mode' })
+/** The shown Subagent's Batshit Work mode choice (an item of its single-choice group, by label). */
+function workModeRadio(label: RegExp) {
+  const group = screen.getByRole('group', { name: 'Subagent Batshit permissions mode' })
   return within(group).getByRole('radio', { name: label })
 }
 
-/** The switch in the row that carries `label` (the nearest ancestor of the text that holds a switch). */
-function switchOf(label: string) {
-  for (let element = screen.getByText(label) as HTMLElement | null; element; element = element.parentElement) {
-    const found = element.querySelector('[role="switch"]')
-    if (found) return found as HTMLElement
-  }
-  throw new Error(`no switch beside "${label}"`)
+/** A Subagent record's saved Work mode. */
+function workModeOf(record: Record<string, any> | null | undefined) {
+  return record?.provider_specific_settings?.nativeTools?.bashAccessMode
 }
 
-function claudeModeRadio(label: RegExp) {
-  const group = screen.getByRole('group', { name: 'Subagent Claude permissions mode' })
-  return within(group).getByRole('radio', { name: label })
+async function storedWorkMode(read: () => Promise<Record<string, any>> = storedSubagent) {
+  return workModeOf(await read())
+}
+
+/** A Work mode save names only the native tools block, with the mode (and its command location, BL-914). */
+function expectWorkModeSave(body: Record<string, any>, mode: string) {
+  expect(Object.keys(body)).toEqual(['provider_specific_settings'])
+  expect(Object.keys(body.provider_specific_settings)).toEqual(['nativeTools'])
+  expect(body.provider_specific_settings.nativeTools.bashAccessMode).toBe(mode)
 }
 
 /** How many PUT bodies repeat an earlier body exactly (S7's harmless second sends of an equal change). */
@@ -494,55 +422,8 @@ async function openPromptEditor(current: string) {
 }
 
 describe('a Subagent save that lands after the user picked another Subagent and back (BL-955)', () => {
-  it('Codex: no PUT takes the change back, the record holds it, and the form shows it after the deferred read', async () => {
-    await openSubagent(cliSubagentRecord('codex', CODEX_BASE))
-    const put = holdNextPut()
-
-    await pickSelectOption('Auto', /^High/)
-    await waitFor(() => expect(subagentPuts.length).toBe(1), { timeout: 8_000 })
-    expect(subagentPuts[0].body).toEqual({ codex_settings: { reasoningEffort: 'high' } })
-    await waitFor(async () => expect((await storedSubagent()).codex_settings.reasoningEffort).toBe('high'), {
-      timeout: 8_000
-    })
-
-    // Another Subagent and back while the answer is on its way: the form is read again from the
-    // panel's list, which does not hold the change yet.
-    await pickSubagent(SUB2_NAME)
-    await pickSubagent(SUB_NAME)
-    expect(selectShowing('Auto')).toBeTruthy()
-
-    put.answer()
-    await pause(2500)
-
-    expect(subagentPuts.length).toBe(1)
-    expect((await storedSubagent()).codex_settings.reasoningEffort).toBe('high')
-    expect(selectShowing('High')).toBeTruthy()
-    expect(secondSubagentPuts).toEqual([])
-  }, 120_000)
-
-  it('Claude: no PUT takes the mode back, the record holds it, and the form shows it after the deferred read', async () => {
-    await openSubagent(cliSubagentRecord('claude', CLAUDE_BASE))
-    const put = holdNextPut()
-
-    await fireEvent.click(claudeModeRadio(/Plan/i))
-    await waitFor(() => expect(subagentPuts.length).toBe(1), { timeout: 8_000 })
-    expect(subagentPuts[0].body).toEqual({ claude_settings: { permissionMode: 'plan' } })
-    await waitFor(async () => expect((await storedSubagent()).claude_settings.permissionMode).toBe('plan'), {
-      timeout: 8_000
-    })
-
-    await pickSubagent(SUB2_NAME)
-    await pickSubagent(SUB_NAME)
-    expect(claudeModeRadio(/Plan/i).getAttribute('aria-checked')).toBe('false')
-
-    put.answer()
-    await pause(2500)
-
-    expect(subagentPuts.length).toBe(1)
-    expect((await storedSubagent()).claude_settings.permissionMode).toBe('plan')
-    expect(claudeModeRadio(/Plan/i).getAttribute('aria-checked')).toBe('true')
-  }, 120_000)
-
+  // SA-139 R5: the CLI Subagent's Claude section case left with that type; the Tool Grid and the
+  // core form below hold the same rule.
   it('the Tool Grid: no PUT takes the gateways back, the record holds them, and the card shows them after the deferred read', async () => {
     await openSubagent(
       subagentRecord({ defaultMCPGateways: ['gw_a'], defaultMCPToolSelections: ['tool_one'], dcmDisplaySettings: DCM_EMPTY }),
@@ -625,52 +506,54 @@ describe('a Subagent save that lands after the user picked another Subagent and 
 })
 
 describe('a store refresh while a Subagent section save is pending (BL-915)', () => {
-  it('Codex, the save queued at the refresh: the refresh leaves the section alone; the record holds the change and the other window\'s, and the form shows both', async () => {
-    await openSubagent(cliSubagentRecord('codex', CODEX_BASE))
+  // SA-139 R5: these held the rule on the CLI Subagent's Claude section, which left with that type;
+  // the Tool Grid is the API Subagent's section with its own effect-driven save.
+  it('the Tool Grid, the save queued at a refresh that carries another window\'s Tool Grid change: the refresh leaves the section alone; the record holds both changes, and the card shows both', async () => {
+    await openSubagent(subagentRecord(TOOL_GRID), { toolsTab: true })
     const put = holdNextPut()
 
-    await pickSelectOption('Auto', /^High/)
-    // Within the debounce: another window renames the Subagent and turns its Codex web search off,
-    // and the store is refreshed. The core form is at rest, so the refresh passes its guard.
-    await anotherWindowSaves({ displayName: 'Ss915 Renamed Elsewhere', codex_settings: { search: false } })
+    await fire(() => card().onGatewaysChange(['gw_a', 'gw_b']))
+    // Within the debounce: another window renames the Subagent and changes its tool selections, and
+    // the store is refreshed. The core form is at rest, so the refresh passes its guard.
+    await anotherWindowSaves({ displayName: 'Ss915 Renamed Elsewhere', defaultMCPToolSelections: ['tool_one', 'tool_two'] })
     await subagentStore.load()
     expect(subagentPuts).toEqual([])
     await screen.findByDisplayValue('Ss915 Renamed Elsewhere', {}, { timeout: 8_000 })
-    const keptDuringRefresh = Boolean(selectShowing('High'))
+    const keptDuringRefresh = JSON.stringify(card().defaultMCPGateways) === JSON.stringify(['gw_a', 'gw_b'])
 
     await waitFor(() => expect(subagentPuts.length).toBe(1), { timeout: 8_000 })
-    await waitFor(async () => expect((await storedSubagent()).codex_settings.reasoningEffort).toBe('high'), {
+    await waitFor(async () => expect((await storedSubagent()).defaultMCPGateways).toEqual(['gw_a', 'gw_b']), {
       timeout: 8_000
     })
     put.answer()
     await pause(2500)
 
-    expect(subagentPuts.map((entry) => entry.body)).toEqual([{ codex_settings: { reasoningEffort: 'high' } }])
+    expect(subagentPuts.map((entry) => entry.body)).toEqual([{ defaultMCPGateways: ['gw_a', 'gw_b'] }])
     const record = await storedSubagent()
-    expect(record.codex_settings.reasoningEffort).toBe('high')
-    expect(record.codex_settings.search).toBe(false)
+    expect(record.defaultMCPGateways).toEqual(['gw_a', 'gw_b'])
+    expect(record.defaultMCPToolSelections).toEqual(['tool_one', 'tool_two'])
     expect(record.displayName).toBe('Ss915 Renamed Elsewhere')
-    expect(selectShowing('High')).toBeTruthy()
-    // The deferred read ran once the section came to rest: the other window's change is on screen.
-    expect(switchOf('Allow Codex Web Search').getAttribute('aria-checked')).toBe('false')
+    expect(card().defaultMCPGateways).toEqual(['gw_a', 'gw_b'])
+    // The deferred read ran once the section came to rest: the other window's change is on the card.
+    expect(card().defaultMCPToolSelections).toEqual(['tool_one', 'tool_two'])
     expect(keptDuringRefresh).toBe(true)
   }, 120_000)
 
   it('a cached-list refresh during an unresolved PUT applies the accepted one-save rule', async () => {
-    await openSubagent(cliSubagentRecord('codex', CODEX_BASE))
+    await openSubagent(subagentRecord(TOOL_GRID), { toolsTab: true })
     const first = holdNextPut({ beforeWrite: true })
 
-    await pickSelectOption('Auto', /^High/)
+    await fire(() => card().onGatewaysChange(['gw_a', 'gw_b']))
     await waitFor(() => expect(subagentPuts.length).toBe(1), { timeout: 8_000 })
     await anotherWindowSaves({ displayName: 'Ss915 Renamed Elsewhere' })
     await subagentStore.load()
     await screen.findByDisplayValue('Ss915 Renamed Elsewhere', {}, { timeout: 8_000 })
-    const keptDuringRefresh = Boolean(selectShowing('High'))
+    const keptDuringRefresh = JSON.stringify(card().defaultMCPGateways) === JSON.stringify(['gw_a', 'gw_b'])
 
     // Past the debounce of anything the refresh queued; then the first PUT writes and answers.
     await pause(1500)
     first.write()
-    await waitFor(async () => expect((await storedSubagent()).codex_settings.reasoningEffort).toBe('high'), {
+    await waitFor(async () => expect((await storedSubagent()).defaultMCPGateways).toEqual(['gw_a', 'gw_b']), {
       timeout: 8_000
     })
     first.answer()
@@ -678,83 +561,87 @@ describe('a store refresh while a Subagent section save is pending (BL-915)', ()
 
     // This is a list refresh while the same change is already unresolved; the final decision
     // accepts one save, while true stale-detail reads still retain their separate S7 echo test.
-    expect(subagentPuts.map((entry) => entry.body)).toEqual([
-      { codex_settings: { reasoningEffort: 'high' } }
-    ])
+    expect(subagentPuts.map((entry) => entry.body)).toEqual([{ defaultMCPGateways: ['gw_a', 'gw_b'] }])
     expect(equalRepeats(subagentPuts)).toBe(0)
-    expect((await storedSubagent()).codex_settings.reasoningEffort).toBe('high')
+    expect((await storedSubagent()).defaultMCPGateways).toEqual(['gw_a', 'gw_b'])
     expect((await storedSubagent()).displayName).toBe('Ss915 Renamed Elsewhere')
-    expect(selectShowing('High')).toBeTruthy()
+    expect(card().defaultMCPGateways).toEqual(['gw_a', 'gw_b'])
     expect(keptDuringRefresh).toBe(true)
   }, 120_000)
 
-  it('Claude, the save queued at the refresh: nothing takes the mode back, and the form shows it', async () => {
-    await openSubagent(cliSubagentRecord('claude', CLAUDE_BASE))
+  it('the Tool Grid, the save queued at the refresh: nothing takes the gateways back, and the card shows them', async () => {
+    await openSubagent(subagentRecord(TOOL_GRID), { toolsTab: true })
     const put = holdNextPut()
 
-    await fireEvent.click(claudeModeRadio(/Plan/i))
+    await fire(() => card().onGatewaysChange(['gw_a', 'gw_b']))
     await anotherWindowSaves({ displayName: 'Ss915 Renamed Elsewhere' })
     await subagentStore.load()
     expect(subagentPuts).toEqual([])
     await screen.findByDisplayValue('Ss915 Renamed Elsewhere', {}, { timeout: 8_000 })
-    const keptDuringRefresh = claudeModeRadio(/Plan/i).getAttribute('aria-checked') === 'true'
+    const keptDuringRefresh = JSON.stringify(card().defaultMCPGateways) === JSON.stringify(['gw_a', 'gw_b'])
 
     await waitFor(() => expect(subagentPuts.length).toBe(1), { timeout: 8_000 })
-    await waitFor(async () => expect((await storedSubagent()).claude_settings.permissionMode).toBe('plan'), {
+    await waitFor(async () => expect((await storedSubagent()).defaultMCPGateways).toEqual(['gw_a', 'gw_b']), {
       timeout: 8_000
     })
     put.answer()
     await pause(2500)
 
-    expect(subagentPuts.map((entry) => entry.body)).toEqual([{ claude_settings: { permissionMode: 'plan' } }])
-    expect((await storedSubagent()).claude_settings.permissionMode).toBe('plan')
-    expect(claudeModeRadio(/Plan/i).getAttribute('aria-checked')).toBe('true')
+    expect(subagentPuts.map((entry) => entry.body)).toEqual([{ defaultMCPGateways: ['gw_a', 'gw_b'] }])
+    expect((await storedSubagent()).defaultMCPGateways).toEqual(['gw_a', 'gw_b'])
+    expect(card().defaultMCPGateways).toEqual(['gw_a', 'gw_b'])
     expect(keptDuringRefresh).toBe(true)
   }, 120_000)
 })
 
 describe('the reviews\' orders on a Subagent, with the simple rules (BL-955)', () => {
+  // SA-139 R5: these two held the rules on the CLI Subagent's Claude permissions mode; the API
+  // Subagent's Batshit Work mode is the same kind of control (a single-choice group).
   it('a Subagent group remains read-only during its save and preserves the pending value', async () => {
-    await openSubagent(cliSubagentRecord('codex', CODEX_BASE))
+    await openSubagent(subagentRecord(WORK_MODE_AGENT))
     const x = holdNextPut({ beforeWrite: true })
 
-    await pickSelectOption('Auto', /^High/)
+    await fireEvent.click(workModeRadio(/^Plan$/))
     await waitFor(() => expect(subagentPuts.length).toBe(1), { timeout: 8_000 })
-    const group = screen.getByRole('group', { name: 'Subagent Codex permissions mode' })
+    const group = screen.getByRole('group', { name: 'Subagent Batshit permissions mode' })
     expect(isReadWaitLocked(group as HTMLElement)).toBe(true)
-    await pickSelectOption('High', /^Low/)
+    // Native activation honors the disabled fieldset, unlike a manually dispatched event.
+    workModeRadio(/^Agent$/).click()
+    await tick()
     expect(subagentPuts).toHaveLength(1)
-    expect(selectShowing('High')).toBeTruthy()
+    expect(workModeRadio(/^Plan$/).getAttribute('aria-checked')).toBe('true')
     x.write()
-    await waitFor(async () => expect((await storedSubagent()).codex_settings.reasoningEffort).toBe('high'), { timeout: 8_000 })
+    await waitFor(async () => expect(await storedWorkMode()).toBe('plan'), { timeout: 8_000 })
     x.answer()
-    await waitFor(() => screen.queryByTestId('subagent-settings-read-wait') === null, { timeout: 8_000 })
-    await waitFor(() => !isReadWaitLocked(group as HTMLElement), { timeout: 8_000 })
+    await waitFor(() => expect(screen.queryByTestId('subagent-settings-read-wait')).toBeNull(), { timeout: 8_000 })
+    await waitFor(() => expect(isReadWaitLocked(workModeRadio(/^Agent$/))).toBe(false), { timeout: 8_000 })
     await pause(2500)
 
-    expect(subagentPuts).toEqual([{ body: { codex_settings: { reasoningEffort: 'high' } } }])
-    expect((await storedSubagent()).codex_settings.reasoningEffort).toBe('high')
-    expect(selectShowing('High')).toBeTruthy()
+    expect(subagentPuts).toHaveLength(1)
+    expectWorkModeSave(subagentPuts[0].body, 'plan')
+    expect(await storedWorkMode()).toBe('plan')
+    expect(workModeRadio(/^Plan$/).getAttribute('aria-checked')).toBe('true')
   }, 120_000)
 
-  it('guard (green on the old code too: no guard against a second send): a save of one Subagent is on its way; the same change on a second Subagent with an equal form is saved for the second', async () => {
-    await openSubagent(cliSubagentRecord('codex', CODEX_BASE), { second: CLI_CODEX_FIELDS })
+  it('guard (no guard against a second send): a save of one Subagent is on its way; the same change on a second Subagent with an equal form is saved for the second', async () => {
+    await openSubagent(subagentRecord(WORK_MODE_AGENT), { second: WORK_MODE_AGENT })
     const put = holdNextPut()
 
-    await pickSelectOption('Auto', /^High/)
+    await fireEvent.click(workModeRadio(/^Plan$/))
     await waitFor(() => expect(subagentPuts.length).toBe(1), { timeout: 8_000 })
     await pickSubagent(SUB2_NAME)
-    await pickSelectOption('Auto', /^High/)
+    // Every Subagent pick reads the Subagent (3f6b10c8b); the form is read-only until that read lands.
+    await waitFor(() => expect(isReadWaitLocked(workModeRadio(/^Plan$/))).toBe(false), { timeout: 8_000 })
+    await fireEvent.click(workModeRadio(/^Plan$/))
 
     await waitFor(() => expect(secondSubagentPuts.length).toBe(1), { timeout: 8_000 })
-    expect(secondSubagentPuts[0].body).toEqual({ codex_settings: { reasoningEffort: 'high' } })
+    expectWorkModeSave(secondSubagentPuts[0].body, 'plan')
     put.answer()
     await pause(2500)
-    const second = (await redis.json.get(`subagent:${SUB2}`)) as Record<string, any>
-    expect(second.codex_settings.reasoningEffort).toBe('high')
-    expect((await storedSubagent()).codex_settings.reasoningEffort).toBe('high')
+    expect(await storedWorkMode(storedSecondSubagent)).toBe('plan')
+    expect(await storedWorkMode()).toBe('plan')
     // The first Subagent's landing touched nothing of the second one it no longer showed.
-    expect(selectShowing('High')).toBeTruthy()
+    expect(workModeRadio(/^Plan$/).getAttribute('aria-checked')).toBe('true')
     expect(secondSubagentPuts.length).toBe(1)
   }, 120_000)
 })
@@ -821,7 +708,11 @@ describe('a Subagent save that no read came between lands as "Saved" (BL-955, th
     await fireEvent.input(editor, { target: { value: 'Answer in limericks.' } })
     await fireEvent.click(save)
     await waitFor(() => expect(subagentPuts.length).toBe(1), { timeout: 8_000 })
-    expect(subagentPuts[0].body).toEqual({ system_prompt: 'Answer in limericks.' })
+    // 3698a4293: an instructions save carries the saved-instructions token it was made against.
+    expect(subagentPuts[0].body).toEqual({
+      system_prompt: 'Answer in limericks.',
+      expectedInstructions: { customPrompt: expect.stringMatching(/^sha256:[a-f0-9]{64}$/) }
+    })
     await waitFor(async () => expect((await storedSubagent()).system_prompt).toBe('Answer in limericks.'), {
       timeout: 8_000
     })
@@ -833,14 +724,18 @@ describe('a Subagent save that no read came between lands as "Saved" (BL-955, th
 
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull(), { timeout: 5_000 })
     expect(subagentPuts.length).toBe(1)
+    // Since 3698a4293 a known instructions save holds the prompt editor until its readback answers.
+    await waitFor(() => expect(subagentGetEvents.at(-1)).toBe(`answered:${SUB}`), { timeout: 8_000 })
+    await waitFor(() => expect(screen.queryByTestId('subagent-instructions-notice')).toBeNull(), { timeout: 8_000 })
     expect((await openPromptEditor('Answer in limericks.')).editor).toBeTruthy()
   }, 120_000)
 
-  it('guard (green on the old code too: the refresh replaces the core form, so the Codex effect builds its payload again after it): a store refresh while the Codex save is queued: the Codex section reads "Saved", and the record holds both changes', async () => {
-    await openSubagent(cliSubagentRecord('codex', CODEX_BASE))
+  // SA-139 R5: this guard held the rule on the CLI Subagent's Claude section; the Tool Grid holds it now.
+  it('guard (the refresh replaces the core form, so the Tool Grid effect builds its payload again after it): a store refresh while the Tool Grid save is queued: the card reads "saved", and the record holds both changes', async () => {
+    await openSubagent(subagentRecord(TOOL_GRID), { toolsTab: true })
     const put = holdNextPut()
 
-    await pickSelectOption('Auto', /^High/)
+    await fire(() => card().onGatewaysChange(['gw_a', 'gw_b']))
     // Within the debounce: another window renames the Subagent, and the store is refreshed. The
     // core form is at rest, so the refresh passes its guard and reads the record.
     await anotherWindowSaves({ displayName: 'Ss915 Renamed Elsewhere' })
@@ -848,17 +743,17 @@ describe('a Subagent save that no read came between lands as "Saved" (BL-955, th
     await screen.findByDisplayValue('Ss915 Renamed Elsewhere', {}, { timeout: 8_000 })
 
     await waitFor(() => expect(subagentPuts.length).toBe(1), { timeout: 8_000 })
-    await waitFor(async () => expect((await storedSubagent()).codex_settings.reasoningEffort).toBe('high'), {
+    await waitFor(async () => expect((await storedSubagent()).defaultMCPGateways).toEqual(['gw_a', 'gw_b']), {
       timeout: 8_000
     })
     put.answer()
-    await waitFor(() => expect(saveStatusTexts()).toContain('Saved'), { timeout: 1_500 })
+    await waitFor(() => expect(card().mcpSaveState).toBe('saved'), { timeout: 1_500 })
 
-    expect(subagentPuts.map((entry) => entry.body)).toEqual([{ codex_settings: { reasoningEffort: 'high' } }])
+    expect(subagentPuts.map((entry) => entry.body)).toEqual([{ defaultMCPGateways: ['gw_a', 'gw_b'] }])
     const record = await storedSubagent()
-    expect(record.codex_settings.reasoningEffort).toBe('high')
+    expect(record.defaultMCPGateways).toEqual(['gw_a', 'gw_b'])
     expect(record.displayName).toBe('Ss915 Renamed Elsewhere')
-    expect(selectShowing('High')).toBeTruthy()
+    expect(card().defaultMCPGateways).toEqual(['gw_a', 'gw_b'])
   }, 120_000)
 })
 
@@ -917,58 +812,41 @@ describe('the Subagent CLI tools list, a pick away and back while its save trave
   }, 120_000)
 })
 
-describe('guards on a Subagent (green on the old code too)', () => {
-  it('a Codex save with no read in between lands as before: one PUT, and the next edit sends only its own key', async () => {
-    await openSubagent(cliSubagentRecord('codex', CODEX_BASE))
-    const put = holdNextPut()
-    await pickSelectOption('Auto', /^High/)
-    await waitFor(() => expect(subagentPuts.length).toBe(1), { timeout: 8_000 })
-    put.answer()
-    await pause(1500)
-    expect(subagentPuts.length).toBe(1)
-
-    await fireEvent.click(switchOf('Allow Codex Web Search'))
-    await waitFor(() => expect(subagentPuts.length).toBe(2), { timeout: 8_000 })
-    expect(subagentPuts[1].body).toEqual({ codex_settings: { search: false } })
-    await pause(1500)
-    const record = await storedSubagent()
-    expect(record.codex_settings.reasoningEffort).toBe('high')
-    expect(record.codex_settings.search).toBe(false)
-    expect(subagentPuts.length).toBe(2)
-  }, 120_000)
-})
+// SA-139 R5: 'guards on a Subagent: a Claude save with no read in between' left with the CLI
+// Subagent's Claude section; the Tool Grid's own key-by-key case is in
+// `AgentSettingsPanel.subagentBlockSaves.test.ts` ("a second Tool Grid change does not send the first again").
 
 describe('BL-979: a Subagent section stays locked while a reselect read is waiting', () => {
-  it('a pending permission-mode group cannot be replaced by a second sandbox edit after pick-away/back', async () => {
-    await openSubagent(cliSubagentRecord('codex', CODEX_BASE))
+  // SA-139 R5: held on the API Subagent's Batshit Work mode (the Claude permissions mode left).
+  it('a pending permission-mode choice cannot be replaced by a second mode edit after pick-away/back', async () => {
+    await openSubagent(subagentRecord(WORK_MODE_AGENT))
     const first = holdNextPut({ beforeWrite: true })
     const second = holdNextPut({ beforeWrite: true })
 
-    await fireEvent.click(subagentCodexPermissionRadio(/^Agent$/))
+    await fireEvent.click(workModeRadio(/^Plan$/))
     await waitFor(() => expect(subagentPuts).toHaveLength(1), { timeout: 8_000 })
-    expect(subagentPuts[0].body).toEqual({ codex_settings: { permissionMode: 'agent', sandbox: 'workspace-write', approval: 'never' } })
+    expectWorkModeSave(subagentPuts[0].body, 'plan')
 
     await pickSubagent(SUB2_NAME)
     await pickSubagent(SUB_NAME)
     const noticeVisible = Boolean(screen.queryByTestId('subagent-settings-read-wait'))
-    const sandbox = selectShowing('Read-only') as HTMLElement | undefined
-    const group = screen.getByRole('group', { name: 'Subagent Codex permissions mode' })
-    const locked = isReadWaitLocked(sandbox ?? (group as HTMLElement))
+    const agentChoice = workModeRadio(/^Agent$/)
+    const locked = isReadWaitLocked(agentChoice)
 
-    // The reselected form is still Chat / Read-only. A manual sandbox edit would send that old
-    // mode beside the changed sandbox, taking back the pending Agent choice.
-    const secondEditBlocked = !(await tryReadWaitSelect('Read-only', /^Workspace write/))
+    // The reselected form is read from the older record. A mode edit on it would be sent before
+    // the pending Plan choice lands and take it back.
+    const secondEditBlocked = !(await tryReadWaitClick(agentChoice))
     if (!secondEditBlocked) {
       await waitFor(() => expect(subagentPuts).toHaveLength(2), { timeout: 8_000 })
-      expect(subagentPuts[1].body).toEqual({ codex_settings: { permissionMode: 'chat', sandbox: 'workspace-write', approval: 'never' } })
+      expectWorkModeSave(subagentPuts[1].body, 'agent')
     }
 
     first.write()
-    await waitFor(async () => expect((await storedSubagent()).codex_settings.permissionMode).toBe('agent'), { timeout: 8_000 })
+    await waitFor(async () => expect(await storedWorkMode()).toBe('plan'), { timeout: 8_000 })
     first.answer()
     if (!secondEditBlocked) {
       second.write()
-      await waitFor(async () => expect((await storedSubagent()).codex_settings.permissionMode).toBe('chat'), { timeout: 8_000 })
+      await waitFor(async () => expect(await storedWorkMode()).toBe('agent'), { timeout: 8_000 })
       second.answer()
     }
     await pause(2500)
@@ -977,50 +855,56 @@ describe('BL-979: a Subagent section stays locked while a reselect read is waiti
     expect(noticeVisible).toBe(true)
     expect(locked).toBe(true)
     expect(secondEditBlocked).toBe(true)
-    expect(await storedSubagent()).toMatchObject({ codex_settings: { permissionMode: 'agent', sandbox: 'workspace-write', approval: 'never' } })
+    expect(await storedWorkMode()).toBe('plan')
   }, 120_000)
 })
 
 describe('BL-979: Subagent GET failures and late answers stay with their requested entity', () => {
+  // SA-139 R5: these carried their pending save on the CLI Subagent's Claude section (a fixture
+  // vehicle); they carry it on the API Subagent's Batshit Work mode now.
   it('an A read failure does not leak to a healthy B before Retry', async () => {
-    const codexB = { subagentType: 'cli', ...CLI_SUBAGENT.codex.fields, codex_settings: CODEX_BASE }
-    await openSubagent(cliSubagentRecord('codex', CODEX_BASE), { second: codexB })
+    await openSubagent(subagentRecord(WORK_MODE_AGENT), { second: WORK_MODE_AGENT })
     const put = holdNextPut()
-    await pickSelectOption('Auto', /^High/)
+    await fireEvent.click(workModeRadio(/^Plan$/))
     await waitFor(() => expect(subagentPuts).toHaveLength(1), { timeout: 8_000 })
-    await waitFor(async () => expect((await storedSubagent()).codex_settings.reasoningEffort).toBe('high'), { timeout: 8_000 })
+    await waitFor(async () => expect(await storedWorkMode()).toBe('plan'), { timeout: 8_000 })
 
     await pickSubagent(SUB2_NAME)
-    await pickSubagent(SUB_NAME)
+    // Every Subagent pick reads the Subagent (3f6b10c8b): the failing read is set before the pick
+    // back to A, so A's own read is the one that fails.
     failedSubagentGets.set(SUB, 1)
+    await pickSubagent(SUB_NAME)
     put.answer()
     await waitFor(() => expect(subagentGetEvents).toContain(`failed:${SUB}`), { timeout: 8_000 })
     await screen.findByTestId('subagent-settings-read-wait')
 
     await pickSubagent(SUB2_NAME)
-    expect(screen.queryByTestId('subagent-settings-read-wait')).toBeNull()
+    // B's own pick-time read (3f6b10c8b) shows the waiting note until it lands; A's error never shows.
     expect(screen.queryByText('Probe subagent read refusal')).toBeNull()
-    await fireEvent.click(switchOf('Allow Codex Web Search'))
+    await waitFor(() => expect(screen.queryByTestId('subagent-settings-read-wait')).toBeNull(), { timeout: 8_000 })
+    expect(screen.queryByText('Probe subagent read refusal')).toBeNull()
+    await fireEvent.click(workModeRadio(/^Plan$/))
     await waitFor(() => expect(secondSubagentPuts).toHaveLength(1), { timeout: 8_000 })
     await waitFor(() => expect(subagentPutStatuses).toContainEqual({ id: SUB2, status: 200 }), { timeout: 8_000 })
-    await waitFor(async () => expect((await storedSecondSubagent()).codex_settings.search).toBe(false), { timeout: 8_000 })
-    expect(secondSubagentPuts[0].body).toEqual({ codex_settings: { search: false } })
+    await waitFor(async () => expect(await storedWorkMode(storedSecondSubagent)).toBe('plan'), { timeout: 8_000 })
+    expectWorkModeSave(secondSubagentPuts[0].body, 'plan')
     expect(subagentPuts).toHaveLength(1)
-    expect((await storedSubagent()).codex_settings.reasoningEffort).toBe('high')
+    expect(await storedWorkMode()).toBe('plan')
   }, 120_000)
 
   it('a failed A read can Retry, and then a healthy B has no A error and saves normally', async () => {
-    const codexB = { subagentType: 'cli', ...CLI_SUBAGENT.codex.fields, codex_settings: CODEX_BASE }
-    await openSubagent(cliSubagentRecord('codex', CODEX_BASE), { second: codexB })
+    await openSubagent(subagentRecord(WORK_MODE_AGENT), { second: WORK_MODE_AGENT })
     const put = holdNextPut()
 
-    await pickSelectOption('Auto', /^High/)
+    await fireEvent.click(workModeRadio(/^Plan$/))
     await waitFor(() => expect(subagentPuts).toHaveLength(1), { timeout: 8_000 })
-    await waitFor(async () => expect((await storedSubagent()).codex_settings.reasoningEffort).toBe('high'), { timeout: 8_000 })
+    await waitFor(async () => expect(await storedWorkMode()).toBe('plan'), { timeout: 8_000 })
 
     await pickSubagent(SUB2_NAME)
-    await pickSubagent(SUB_NAME)
+    // Every Subagent pick reads the Subagent (3f6b10c8b): the failing read is set before the pick
+    // back to A, so A's own read is the one that fails.
     failedSubagentGets.set(SUB, 1)
+    await pickSubagent(SUB_NAME)
     put.answer()
     await waitFor(() => expect(subagentGetEvents).toContain(`failed:${SUB}`), { timeout: 8_000 })
     const failedNotice = await screen.findByTestId('subagent-settings-read-wait')
@@ -1028,31 +912,32 @@ describe('BL-979: Subagent GET failures and late answers stay with their request
     const retry = within(failedNotice).getByRole('button', { name: /Retry/ })
     await fireEvent.click(retry)
     await waitFor(() => expect(subagentGetEvents).toContain(`answered:${SUB}`), { timeout: 8_000 })
-    await waitFor(() => expect(selectShowing('High')).toBeTruthy(), { timeout: 8_000 })
+    await waitFor(() => expect(workModeRadio(/^Plan$/).getAttribute('aria-checked')).toBe('true'), { timeout: 8_000 })
     expect(screen.queryByText('Probe subagent read refusal')).toBeNull()
-    expect(subagentStore.subagents.find((item) => item.id === SUB)?.codex_settings?.reasoningEffort).toBe('high')
+    expect(workModeOf(subagentStore.subagents.find((item) => item.id === SUB))).toBe('plan')
 
     await pickSubagent(SUB2_NAME)
     expect(screen.queryByText('Probe subagent read refusal')).toBeNull()
-    expect(screen.queryByTestId('subagent-settings-read-wait')).toBeNull()
-    await fireEvent.click(switchOf('Allow Codex Web Search'))
+    // B's own pick-time read (3f6b10c8b) shows the waiting note until it lands.
+    await waitFor(() => expect(screen.queryByTestId('subagent-settings-read-wait')).toBeNull(), { timeout: 8_000 })
+    await fireEvent.click(workModeRadio(/^Plan$/))
     await waitFor(() => expect(secondSubagentPuts).toHaveLength(1), { timeout: 8_000 })
     await waitFor(() => expect(subagentPutStatuses).toContainEqual({ id: SUB2, status: 200 }), { timeout: 8_000 })
-    await waitFor(async () => expect((await storedSecondSubagent()).codex_settings.search).toBe(false), { timeout: 8_000 })
+    await waitFor(async () => expect(await storedWorkMode(storedSecondSubagent)).toBe('plan'), { timeout: 8_000 })
 
-    expect(secondSubagentPuts[0].body).toEqual({ codex_settings: { search: false } })
+    expectWorkModeSave(secondSubagentPuts[0].body, 'plan')
     expect(subagentPutStatuses).toContainEqual({ id: SUB2, status: 200 })
-    expect((await storedSecondSubagent()).codex_settings.search).toBe(false)
-    expect((await storedSubagent()).codex_settings.reasoningEffort).toBe('high')
+    expect(await storedWorkMode(storedSecondSubagent)).toBe('plan')
+    expect(await storedWorkMode()).toBe('plan')
     expect(subagentPuts).toHaveLength(1)
   }, 120_000)
 
   it('a late A GET after A→B→A cannot replace the newer shared-cache record', async () => {
-    await openSubagent(cliSubagentRecord('codex', CODEX_BASE))
+    await openSubagent(subagentRecord(WORK_MODE_AGENT))
     const put = holdNextPut()
-    await pickSelectOption('Auto', /^High/)
+    await fireEvent.click(workModeRadio(/^Plan$/))
     await waitFor(() => expect(subagentPuts).toHaveLength(1), { timeout: 8_000 })
-    await waitFor(async () => expect((await storedSubagent()).codex_settings.reasoningEffort).toBe('high'), { timeout: 8_000 })
+    await waitFor(async () => expect(await storedWorkMode()).toBe('plan'), { timeout: 8_000 })
 
     await pickSubagent(SUB2_NAME)
     await pickSubagent(SUB_NAME)
@@ -1077,27 +962,27 @@ describe('BL-979: Subagent GET failures and late answers stay with their request
     expect((document.getElementById('subagent-display') as HTMLInputElement).value).toBe(newerName)
     expect(subagentStore.subagents.find((item) => item.id === SUB)?.displayName).toBe(newerName)
     expect((await storedSubagent()).displayName).toBe(newerName)
-    expect((await storedSubagent()).codex_settings.reasoningEffort).toBe('high')
+    expect(await storedWorkMode()).toBe('plan')
     expect(subagentPuts).toHaveLength(1)
     expect(secondSubagentPuts).toEqual([])
   }, 120_000)
 
   it('a Retry GET that read before a held A write cannot keep its old snapshot after the write lands', async () => {
-    await openSubagent(cliSubagentRecord('codex', CODEX_BASE))
+    await openSubagent(subagentRecord(WORK_MODE_AGENT))
     const put = holdNextPut({ beforeWrite: true })
     const staleGet = holdNextSubagentGet(SUB)
 
-    await fireEvent.click(subagentCodexPermissionRadio(/^Agent$/))
+    await fireEvent.click(workModeRadio(/^Plan$/))
     await waitFor(() => expect(subagentPuts).toHaveLength(1), { timeout: 8_000 })
     const readNotice = await screen.findByTestId('subagent-settings-read-wait')
     await fireEvent.click(within(readNotice).getByRole('button', { name: /Retry/ }))
     await waitFor(() => expect(subagentGetEvents).toContain(`read:${SUB}`), { timeout: 8_000 })
-    expect(subagentGetSnapshots.at(-1)?.record.codex_settings.permissionMode).toBe('chat')
-    expect((await storedSubagent()).codex_settings.permissionMode).toBe('chat')
+    expect(workModeOf(subagentGetSnapshots.at(-1)?.record)).toBe('agent')
+    expect(await storedWorkMode()).toBe('agent')
 
     const readsBeforePostWrite = subagentGetSnapshots.length
     put.write()
-    await waitFor(async () => expect((await storedSubagent()).codex_settings.permissionMode).toBe('agent'), { timeout: 8_000 })
+    await waitFor(async () => expect(await storedWorkMode()).toBe('plan'), { timeout: 8_000 })
     put.answer()
     await waitFor(() => expect(subagentPuts).toHaveLength(1), { timeout: 8_000 })
 
@@ -1106,15 +991,20 @@ describe('BL-979: Subagent GET failures and late answers stay with their request
       () => expect(subagentGetSnapshots.length).toBeGreaterThan(readsBeforePostWrite),
       { timeout: 8_000 }
     )
-    await waitFor(async () => expect((await storedSubagent()).codex_settings.permissionMode).toBe('agent'), { timeout: 8_000 })
-    await waitFor(() => expect(subagentCodexPermissionRadio(/^Agent$/).getAttribute('aria-checked')).toBe('true'), { timeout: 8_000 })
+    await waitFor(async () => expect(await storedWorkMode()).toBe('plan'), { timeout: 8_000 })
+    await waitFor(() => expect(workModeRadio(/^Plan$/).getAttribute('aria-checked')).toBe('true'), { timeout: 8_000 })
 
-    expect(subagentGetSnapshots.map(({ record }) => record.codex_settings.permissionMode)).toEqual(['chat', 'agent'])
-    expect(subagentStore.subagents.find((item) => item.id === SUB)?.codex_settings?.permissionMode).toBe('agent')
+    // Every Subagent pick reads it too (3f6b10c8b), so the list also holds the opening pick's read and
+    // its length is not fixed. The latest read, after the write, shows the written mode, and every
+    // 'agent' read (the stale Retry read among them) came before the first 'plan' read.
+    await waitFor(() => expect(workModeOf(subagentGetSnapshots.at(-1)?.record)).toBe('plan'), { timeout: 8_000 })
+    const modes = subagentGetSnapshots.map(({ record }) => workModeOf(record))
+    expect(modes.lastIndexOf('agent')).toBeLessThan(modes.indexOf('plan'))
+    await waitFor(() => expect(workModeOf(subagentStore.subagents.find((item) => item.id === SUB))).toBe('plan'), { timeout: 8_000 })
     expect(subagentPuts.length).toBeGreaterThanOrEqual(1)
     expect(subagentPuts.length).toBeLessThanOrEqual(2)
     for (const put of subagentPuts) {
-      expect(put.body).toEqual({ codex_settings: { permissionMode: 'agent', sandbox: 'workspace-write', approval: 'never' } })
+      expectWorkModeSave(put.body, 'plan')
     }
     expect(secondSubagentPuts).toEqual([])
   }, 120_000)

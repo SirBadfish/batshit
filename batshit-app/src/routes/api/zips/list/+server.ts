@@ -4,6 +4,7 @@ import { redis } from '$lib/server/redis'
 import { canAccessZipData, requireOwnedSession, requireUser } from '$lib/server/services/routeSecurity'
 import { enrichCoolToolPromptTokens } from '$lib/server/services/coolToolPromptTokens'
 import { logger } from '$lib/utils/logger'
+import { normalizeId } from '$lib/utils/idNormalizer'
 
 interface ZipListItem {
   id: string
@@ -120,6 +121,9 @@ export const GET: RequestHandler = async ({ url, locals }) => {
       try {
         const zipData = zip as any
         if (!zipData) return null
+        // BL-1515: the hold state is keyed on the state id, `normalizeId(<raw id>)` (BL-476); the
+        // record carries the raw id. Only the raw side is normalized, once.
+        const stateZipId = normalizeId(zipData.id)
 
         return {
           id: zipData.id,
@@ -135,8 +139,8 @@ export const GET: RequestHandler = async ({ url, locals }) => {
           source: zipData.source || 'manual',
           sessionId: zipData.metadata?.sessionId,
           messageId: zipData.metadata?.messageId,
-          isUnzipped: sessionId && unzippedIds ? unzippedIds.has(zipData.id) : false,
-          unzippedItem: unzippedItems.get(zipData.id) ?? null,
+          isUnzipped: sessionId && unzippedIds ? unzippedIds.has(stateZipId) : false,
+          unzippedItem: unzippedItems.get(stateZipId) ?? null,
           isCoolTool: zipData.type === 'cool_tool' || zipData.source === 'cool_tool',
           metadata: zipData.metadata && typeof zipData.metadata === 'object'
             ? zipData.metadata

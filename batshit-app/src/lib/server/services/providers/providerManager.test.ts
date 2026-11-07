@@ -425,8 +425,8 @@ describe('ProviderManager - Story 5.3 Tests', () => {
       ])
       expect(providerManager.getProviderInfo('mimo')?.models).toContain('mimo-v2.5-pro')
       expect(providerManager.getProviderInfo('mimo_token_plan')?.models).toEqual([
-        'mimo-v2.5-pro',
-        'mimo-v2.5'
+        'mimo-v2.6-pro',
+        'mimo-v2.6-flash'
       ])
       expect(providerManager.getProviderInfo('alibaba')?.models).toContain('qwen3-max')
       expect(providerManager.getProviderInfo('stepfun')?.models).toContain('step-3.7-flash')

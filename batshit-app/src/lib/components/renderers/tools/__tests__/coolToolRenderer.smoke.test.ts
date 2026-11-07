@@ -953,6 +953,123 @@ describe('CoolToolRenderer (zip-hydrated)', () => {
     expect(container.textContent || '').not.toContain('No changes made')
   })
 
+  // BL-1979: a shell edit or write cut before it finished may have changed the file first (the
+  // stored shapes are the ones `managedPatchAfterCommandZips.test.ts` stores from the real runs).
+  it.each([
+    {
+      label: 'a stopped in-place edit',
+      cut: { stopped: true },
+      error: 'The command was stopped.',
+      title: /edit stopped/i,
+      sentence: 'Stopped before it finished, so the file may or may not have changed: The command was stopped.'
+    },
+    {
+      label: 'an in-place edit that never returned after the Stop (a sandbox end)',
+      cut: { stopped: true, neverReturned: true },
+      error: 'The reply was stopped while this ran, and it returned no result.',
+      title: /edit stopped/i,
+      sentence: 'Stopped before it finished, so the file may or may not have changed: The reply was stopped while this ran, and it returned no result.'
+    },
+    {
+      label: 'an in-place edit cut by its time limit',
+      cut: { timedOut: true },
+      error: 'The command timed out after 1 s.',
+      title: /edit timed out/i,
+      sentence: 'Timed out before it finished, so the file may or may not have changed: The command timed out after 1 s.'
+    }
+  ])('shows $label as unknown, never as not applied (BL-1979)', async ({ cut, error, title, sentence }) => {
+    const step = buildHydratedCoolToolStep(
+      storedShellActionPayload({
+        lane: 'edit_file',
+        toolName: 'batshit_server_edit_file',
+        toolArgs: { filePath: 'x.js', path: 'x.js', innerCommand: "sed -i '' 's/a/b/' x.js\nsleep 30" },
+        toolResult: { filePath: 'x.js', path: 'x.js', diff: '', diffTruncated: false, diffOmitted: false, language: 'javascript', shell: '/bin/zsh', ...cut },
+        error
+      })
+    )
+    const { container } = render(CoolToolRenderer as any, {
+      props: { intermediateStep: step, toolId: 'zip_cut_shell_edit_1' }
+    })
+
+    const headerButton = await screen.findByRole('button', { name: title })
+    expect(container.querySelector('.full-tool')?.classList.contains('error')).toBe(true)
+    await fireEvent.click(headerButton)
+    await waitFor(() => {
+      const text = container.textContent || ''
+      expect(text).toContain(sentence)
+      expect(text).toContain('Unknown, cut before it finished')
+    })
+    const text = container.textContent || ''
+    expect(text).not.toContain('Edit Not Applied')
+    expect(text).not.toContain('Not applied')
+    expect(text).not.toContain('Edit not applied')
+  })
+
+  // BL-1986: the stored shape `managedPatchAfterCommandZips.test.ts` stores from a real partly
+  // written patch (a write failed, and putting the files back failed too).
+  it('shows a partly written managed patch as partly applied, never as not applied (BL-1986)', async () => {
+    const step = buildHydratedCoolToolStep(
+      storedShellActionPayload({
+        lane: 'edit_file',
+        toolName: 'batshit_server_edit_file',
+        toolArgs: { filePath: 'a.txt', path: 'a.txt', innerCommand: "apply_patch <<'PATCH'\n*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n*** Update File: b.txt\n@@\n-old\n+new\n*** End Patch\nPATCH" },
+        toolResult: {
+          filePath: 'a.txt', path: 'a.txt', diffTruncated: false, diffOmitted: false, language: 'plaintext',
+          diff: '*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n*** Update File: b.txt\n@@\n-old\n+new\n*** End Patch',
+          managedApplyPatch: { managed: true, partial: true, changedPaths: ['/w/a.txt', '/w/b.txt'] }
+        },
+        error: 'Writing "b.txt" failed (EIO: i/o error, write), and Batshit could not put back a.txt, b.txt: those paths are left changed. Read them before you patch again.'
+      })
+    )
+    const { container } = render(CoolToolRenderer as any, {
+      props: { intermediateStep: step, toolId: 'zip_partial_patch_1' }
+    })
+
+    const headerButton = await screen.findByRole('button', { name: /edit partly applied/i })
+    expect(container.querySelector('.full-tool')?.classList.contains('error')).toBe(true)
+    await fireEvent.click(headerButton)
+    await waitFor(() => {
+      const text = container.textContent || ''
+      expect(text).toContain('Edit partly applied: Writing "b.txt" failed')
+      expect(text).toContain('Partly applied, some paths left changed')
+      expect(text).toContain('2 paths')
+    })
+    const text = container.textContent || ''
+    expect(text).not.toContain('Edit Not Applied')
+    expect(text).not.toContain('Edit not applied')
+    expect(text).not.toMatch(/Result\s*Not applied/)
+  })
+
+  it('shows a stopped shell write as unknown, never as not written (BL-1979)', async () => {
+    const step = buildHydratedCoolToolStep(
+      storedShellActionPayload({
+        lane: 'write_file',
+        toolName: 'batshit_server_overwrite_file',
+        toolArgs: { filePath: 'y.txt', path: 'y.txt', innerCommand: 'echo hi > y.txt\nsleep 30' },
+        toolResult: {
+          filePath: 'y.txt', path: 'y.txt', content: '', lineCount: 0, size: 0, language: 'plaintext',
+          contentTruncated: false, contentOmitted: false, contentChars: 0, shell: '/bin/zsh', stopped: true
+        },
+        error: 'The command was stopped.'
+      })
+    )
+    const { container } = render(CoolToolRenderer as any, {
+      props: { intermediateStep: step, toolId: 'zip_cut_shell_write_1' }
+    })
+
+    const headerButton = await screen.findByRole('button', { name: /write file/i })
+    expect(headerButton.textContent || '').toContain('stopped before it finished')
+    expect(headerButton.textContent || '').not.toContain('not written')
+    await fireEvent.click(headerButton)
+    await waitFor(() => {
+      const text = container.textContent || ''
+      expect(text).toContain('Stopped before it finished, so the file may or may not have been written: The command was stopped.')
+      expect(text).toContain('Unknown, cut before it finished')
+    })
+    expect(container.textContent || '').not.toContain('Not written')
+    expect(container.textContent || '').not.toContain('Failed to write file')
+  })
+
   it.each([
     {
       label: 'a Codex listing that exited 1',

@@ -11,6 +11,8 @@
  * the browser.
  */
 
+import { resolveAgentFabricUtilitiesEnabled } from '$lib/utils/brokerAvailability'
+
 /* ------------------------------------------------------------------ *
  * Caps (DL-113-12) — fixed numbers in v1, printed in the docs.
  * The ONE exception is the woken-turn time limit, which Josh made a
@@ -136,6 +138,15 @@ export const STEER_NO_ACTIVE_TURN_REASON =
   'That agent is not mid-reply right now, so there was nothing to steer.'
 
 /**
+ * SA-139 BL-2358: why a `steer` too long for the recipient's reply in progress was not handed in.
+ * The Claude plan connection hands an agent DM to Claude Code as a hook note, which Claude Code
+ * passes on whole only up to `limit` characters, so a longer one stays an ordinary DM.
+ */
+export function steerDmTooLongReason(length: number, limit: number): string {
+  return `This DM is ${length.toLocaleString('en-US')} characters in its mid-reply wrapper, and that agent's model connection (the Claude plan) takes at most ${limit.toLocaleString('en-US')} in the middle of a reply, so it was not steered in.`
+}
+
+/**
  * Why a `steer` that WAS accepted still ended up in the inbox (DL-114-13).
  *
  * The reply ended before a tool boundary carried it. The user's own steers are promoted
@@ -191,19 +202,39 @@ export function resolveAgentWakeEnabled(agent: unknown): boolean {
 }
 
 /**
+ * The saved "Agent DMs" switch exactly as Settings shows it. Not the rule: only the Settings
+ * form (which must not erase a saved choice) and housekeeping that outlives the feature read
+ * this. Everything else asks `resolveAgentDmsEnabled`.
+ */
+export function readAgentDmsSwitch(agent: unknown): boolean {
+  if (!agent || typeof agent !== 'object') return false
+  const record = agent as Record<string, any>
+  if (typeof record.dms_enabled === 'boolean') return record.dms_enabled
+  if (typeof record.dmsEnabled === 'boolean') return record.dmsEnabled
+  return false
+}
+
+/**
  * THE per-agent "Agent DMs" gate (DL-113-01). Defaults **OFF**, unlike the wake switch:
  * DMs create sessions and spend tokens outside the user's view, so an agent gets them
  * only when the user turns them on. Off means zero prompt bytes, no roster, no tools.
  *
  * This is the single rule behind the `sys.dm.*` family, the guidance block, the DCM
  * roster, and the header inbox icon — they ship together or not at all (DL-113-13).
+ *
+ * The DM and schedule tools are Fabric controls, so DMs are also off while the agent's
+ * Fabric & Utilities switch is off (Josh, 2026-10-24). The saved Agent DMs choice is kept and
+ * works again once Fabric & Utilities is back on.
  */
 export function resolveAgentDmsEnabled(agent: unknown): boolean {
-  if (!agent || typeof agent !== 'object') return false
-  const record = agent as Record<string, any>
-  if (typeof record.dms_enabled === 'boolean') return record.dms_enabled
-  if (typeof record.dmsEnabled === 'boolean') return record.dmsEnabled
-  return false
+  return readAgentDmsSwitch(agent) && resolveAgentFabricUtilitiesEnabled(agent)
+}
+
+/** The "turn it on" hint a refusal gives when `resolveAgentDmsEnabled` is false, naming the switch that is off. */
+export function agentDmsOffHint(agent: unknown): string {
+  return readAgentDmsSwitch(agent)
+    ? 'Agent DMs need Fabric & Utilities: turn it on for that agent in Agent Settings.'
+    : 'Turn on Agent DMs for that agent in Agent Settings.'
 }
 
 /* ------------------------------------------------------------------ *

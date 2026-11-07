@@ -38,10 +38,11 @@ beforeEach(() => {
   const http = vi.fn(async (url, init) => { calls.push([url, init]); return Response.json({ models: listed }) }) as typeof fetch
   runtime = new ChatgptPlanRuntime(vault, new ChatgptPlanOAuth(vault, async () => true, http), http)
   host.__batshitChatgptPlanRuntime = runtime
+  host.__batshitChatgptPlanDeployment = JSON.stringify(chatgptPlanEligibility(env, 'darwin'))
 })
 afterEach(() => {
   Object.defineProperty(process, 'platform', platformDescriptor)
-  runtime.oauth.close(); vault.close(); delete host.__batshitChatgptPlanRuntime
+  runtime.oauth.close(); vault.close(); delete host.__batshitChatgptPlanRuntime; delete host.__batshitChatgptPlanDeployment
   for (const key of Object.keys(env)) if (!(key in previous)) delete (env as any)[key]
   Object.assign(env, previous); vi.restoreAllMocks(); rmSync(root, { recursive: true, force: true })
 })
@@ -49,6 +50,13 @@ function event(body: unknown, overrides: { origin?: string; user?: string; sessi
   return { request: new Request(`${overrides.url ?? origin}/api/settings/chatgpt-plan`, { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: overrides.origin ?? origin }, body: JSON.stringify(body) }), locals: { user: { id: overrides.user ?? userId }, session: overrides.noSession ? undefined : { token: 'FIXTURE_SESSION', user_id: overrides.sessionUser ?? userId, expires_at: new Date(Date.now() + (overrides.expired ? -1000 : 3600000)).toISOString() } } } as any
 }
 describe('native Mac connection admission and account-scoped models', () => {
+  it('refuses descriptor drift rather than reusing the previous vault', () => withMacPlatform(async () => {
+    Object.assign(env, { BATSHIT_MAC_DATA_DIR: path.join(root, 'different-root') })
+    const response = await POST(event({ action: 'status' }))
+    expect(response.status).toBe(409)
+    expect(await response.json()).toMatchObject({ code: 'runtime_configuration_changed' })
+    expect(calls).toHaveLength(0)
+  }))
   it('refreshes owned account order/eligibility every call and supplements only exact published slugs (BL-1066)', () => withMacPlatform(async () => {
     listed = [
       { slug: 'future-unknown', display_name: 'Account name', visibility: 'list' },

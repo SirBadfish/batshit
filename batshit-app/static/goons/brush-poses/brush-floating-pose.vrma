@@ -3008,14 +3008,14 @@
           "leftHand": {
             "node": 13
           },
+          "leftThumbMetacarpal": {
+            "node": 14
+          },
           "leftThumbProximal": {
             "node": 15
           },
-          "leftThumbIntermediate": {
-            "node": 16
-          },
           "leftThumbDistal": {
-            "node": 17
+            "node": 16
           },
           "leftIndexProximal": {
             "node": 18
@@ -3065,14 +3065,14 @@
           "rightHand": {
             "node": 37
           },
+          "rightThumbMetacarpal": {
+            "node": 38
+          },
           "rightThumbProximal": {
             "node": 39
           },
-          "rightThumbIntermediate": {
-            "node": 40
-          },
           "rightThumbDistal": {
-            "node": 41
+            "node": 40
           },
           "rightIndexProximal": {
             "node": 42

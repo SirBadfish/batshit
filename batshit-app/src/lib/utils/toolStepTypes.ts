@@ -1,3 +1,4 @@
+/** `codex` (provider and source): only tool steps saved before Codex CLI retired (SA-139 R1). */
 export type ToolProvider =
   | 'batshit-server'
   | 'n8n-workflow'

@@ -1,13 +1,21 @@
 import { vi } from 'vitest'
 import { redis } from '$lib/server/redis'
 
+async function fixtureSelectionSnapshot(id: string, kind: 'agent' | 'subagent', lifecycle?: import('$lib/server/services/appActions/settings/lifecycle').SettingsLifecycleSnapshot,
+  extraPaths: readonly string[] = []) {
+  const { captureSettingsLifecycle } = await import('$lib/server/services/appActions/settings/lifecycle')
+  const { readModelSelectionSnapshotTwin } = await import('./agentUpdateScriptTwin')
+  const targetLifecycle = lifecycle ?? captureSettingsLifecycle([`${kind}:${id}`])
+  const row = await redis.json.get(`${kind}:${id}`) as Record<string, any> | null
+  return readModelSelectionSnapshotTwin(id, kind, row, targetLifecycle, extraPaths)
+}
+
 /**
  * A browser's view of the agent route, for component tests (BL-848, BL-855). `fetch` sends
  * `/api/agents/<id>` to the REAL route handlers, which write through the REAL `redis.updateAgent`
  * (the default lane's Redis fake runs its twin), so a test sees both what the browser sent and
  * what the record holds after. The agents store is the real one.
  *
- * The test file mocks `codexProfileManager` and `claudeProfileManager` (the route syncs profiles).
  */
 
 export type AgentPut = { body: Record<string, any> }
@@ -22,10 +30,15 @@ export function jsonResponse(payload: unknown, status = 200) {
 type RouteModule = typeof import('../../routes/api/agents/[id]/+server')
 
 export async function loadAgentRoute(): Promise<RouteModule> {
+  if (process.env.VITEST_USE_REAL_REDIS !== 'true') {
+    const modelOwner = await import('$lib/server/modelSelectionGuard')
+    vi.spyOn(modelOwner, 'readModelSelectionSnapshot').mockImplementation(async (_client, id, kind, lifecycle, extraPaths) =>
+      fixtureSelectionSnapshot(id, kind, lifecycle, extraPaths))
+  }
   return import('../../routes/api/agents/[id]/+server')
 }
 
-type Extra = (path: string, method: string, init: RequestInit) => Response | Promise<Response> | undefined
+type Extra = (path: string, method: string, init: RequestInit, url: string) => Response | Promise<Response> | undefined
 
 /**
  * Installs the `fetch` stub. `puts` collects every PUT body sent to the agent, in order. `extra`
@@ -43,12 +56,16 @@ export function installAgentRoutes(input: {
   holdPuts?: () => Promise<void> | null
 }) {
   const puts: AgentPut[] = []
+  // Suites restore spies after each case; install the scoped raw-reader twin for
+  // each new HTTP fixture, rather than depending on a beforeAll spy surviving.
+  const routeReady = loadAgentRoute()
   const fetchMock = vi.fn(async (request: RequestInfo | URL, init: RequestInit = {}) => {
     const url = typeof request === 'string' ? request : request instanceof URL ? request.toString() : request.url
     const method = (init.method ?? 'GET').toUpperCase()
     const path = url.split('?')[0]
 
     if (path === `/api/agents/${input.agentId}`) {
+      await routeReady
       if (method === 'PUT') {
         puts.push({ body: JSON.parse(String(init.body)) })
         const failStatus = input.failPutsWith?.() ?? null
@@ -67,7 +84,7 @@ export function installAgentRoutes(input: {
         locals: { user: { id: input.userId } }
       } as any)) as Response
     }
-    const answer = await input.extra?.(path, method, init)
+    const answer = await input.extra?.(path, method, init, url)
     if (answer) return answer
     return jsonResponse({ error: `not routed in this test: ${method} ${path}` }, 404)
   })

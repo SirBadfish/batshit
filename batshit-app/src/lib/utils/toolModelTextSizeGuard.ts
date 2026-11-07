@@ -19,12 +19,6 @@ export type ToolModelTextRemainder =
   | { kind: 'not-retained' }
   | { kind: 'memory' }
 
-/** A server-derived effective model-facing byte ceiling, independent of token policy. */
-export type ToolModelTextBudget = {
-  maxUtf8Bytes?: number
-  source?: string
-}
-
 export type ToolModelTextCutPlan = {
   cut: boolean
   totalChars: number
@@ -48,25 +42,10 @@ function safeSliceEnd(text: string, end: number): number {
     : end
 }
 
-const encoder = new TextEncoder()
-
-function byteLimit(budget?: ToolModelTextBudget): number | undefined {
-  const limit = budget?.maxUtf8Bytes
-  if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 0)) {
-    throw new Error('The model-facing byte budget must be a non-negative safe integer.')
-  }
-  return limit
-}
-
-function utf8Bytes(text: string): number {
-  return encoder.encode(text).length
-}
-
 /** Plan from the exact text the model would receive, never a renderer/storage JSON size. */
 export function planToolModelTextCut(
   text: string,
-  originalTextChars?: number,
-  budget?: ToolModelTextBudget
+  originalTextChars?: number
 ): ToolModelTextCutPlan {
   if (originalTextChars !== undefined &&
       (!Number.isSafeInteger(originalTextChars) || originalTextChars < text.length)) {
@@ -74,9 +53,7 @@ export function planToolModelTextCut(
   }
   const totalChars = originalTextChars ?? text.length
   const estimatedTokens = Math.ceil(totalChars / 4)
-  const maxUtf8Bytes = byteLimit(budget)
-  const cut = estimatedTokens >= TOOL_RESULT_TOO_LARGE_TOKENS ||
-    (maxUtf8Bytes !== undefined && utf8Bytes(text) > maxUtf8Bytes)
+  const cut = estimatedTokens >= TOOL_RESULT_TOO_LARGE_TOKENS
   if (!cut) {
     return { cut, totalChars, estimatedTokens, rawText: text, rawDroppedChars: 0 }
   }
@@ -98,11 +75,6 @@ function firstPartEnd(text: string, maxChars: number): number {
   return lastLineEnd > 0 && safeEnd - lastLineEnd <= maxChars / 4 ? lastLineEnd : safeEnd
 }
 
-function safeBudgetSource(source: string | undefined): string {
-  const clean = source?.trim()
-  return clean && /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$/.test(clean) ? clean : 'model lane'
-}
-
 const CUT_NOTICE_START = '[Output cut here by Batshit: this result is about '
 // The fixed "how to read the rest" sentences. The notice and its reader share them (BL-678).
 const REST_UNAVAILABLE = 'The rest cannot be read in this run, because this agent has no Fetch Zip. Run the tool again for a smaller part.'
@@ -113,15 +85,10 @@ const REST_GROUP_UNREADABLE = 'The rest cannot be read in this run, because in a
 function cutNotice(
   plan: ToolModelTextCutPlan,
   remainder: ToolModelTextRemainder,
-  keptChars: number,
-  laneBudget?: ToolModelTextBudget
+  keptChars: number
 ): string {
   const dropped = remainder.kind !== 'not-retained' && remainder.kind !== 'memory' && plan.rawDroppedChars > 0
     ? ` The raw copy keeps its first ${plan.rawText.length.toLocaleString('en-US')} characters; ${plan.rawDroppedChars.toLocaleString('en-US')} later characters were dropped.`
-    : ''
-  const maxUtf8Bytes = laneBudget?.maxUtf8Bytes
-  const laneLimit = maxUtf8Bytes !== undefined
-    ? ` The ${safeBudgetSource(laneBudget?.source)} model-facing result budget is ${maxUtf8Bytes.toLocaleString('en-US')} UTF-8 bytes.`
     : ''
   const next = remainder.kind === 'fetchable'
     ? `Call Fetch Zip with zipId ${remainder.zipId} and offset ${keptChars} to read the rest.`
@@ -132,12 +99,15 @@ function cutNotice(
       : remainder.kind === 'memory'
         ? REST_MEMORY
       : REST_NOT_RETAINED
-  return `${CUT_NOTICE_START}${plan.estimatedTokens.toLocaleString('en-US')} tokens (${plan.totalChars.toLocaleString('en-US')} characters). One result can be ${TOOL_RESULT_TOO_LARGE_TOKENS.toLocaleString('en-US')} tokens at most. You have the first ${keptChars.toLocaleString('en-US')} characters.${laneLimit} ${next}${dropped}]`
+  return `${CUT_NOTICE_START}${plan.estimatedTokens.toLocaleString('en-US')} tokens (${plan.totalChars.toLocaleString('en-US')} characters). One result can be ${TOOL_RESULT_TOO_LARGE_TOKENS.toLocaleString('en-US')} tokens at most. You have the first ${keptChars.toLocaleString('en-US')} characters. ${next}${dropped}]`
 }
 
 const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 const COUNT = '\\d{1,3}(?:,\\d{3})*'
-/** Exactly the notice `cutNotice` writes, from its first character to the text's end. */
+/**
+ * Exactly the notice `cutNotice` writes, from its first character to the text's end. A notice
+ * saved before SA-139 R1 may also name a lane's model-facing byte budget; it is still a cut.
+ */
 const CUT_NOTICE_EXACT = new RegExp(
   `^${escapeRegExp(CUT_NOTICE_START)}${COUNT} tokens \\(${COUNT} characters\\)\\. ` +
   `One result can be ${escapeRegExp(TOOL_RESULT_TOO_LARGE_TOKENS.toLocaleString('en-US'))} tokens at most\\. ` +
@@ -172,78 +142,17 @@ export function isToolModelCutView(text: string, maxChars: number = TOOL_MODEL_T
   return text.length <= maxChars && endsWithToolModelCutNotice(text)
 }
 
-function shortCutRefusal(maxUtf8Bytes: number): string {
-  const notices = [
-    '[Output cut: the model-facing byte limit cannot hold the full notice.]',
-    '[Output cut]',
-    'CUT',
-    '!'
-  ]
-  return notices.find((notice) => notice.length <= maxUtf8Bytes) ?? ''
-}
-
-function formatWithByteBudget(
-  plan: ToolModelTextCutPlan,
-  remainder: ToolModelTextRemainder,
-  budget: ToolModelTextBudget,
-  maxUtf8Bytes: number,
-  byteLimited: boolean
-): FormattedToolModelTextCut {
-  const noticeFor = (keptChars: number) => cutNotice(plan, remainder, keptChars, byteLimited ? budget : undefined)
-  const render = (keptChars: number) => {
-    const prefix = plan.rawText.slice(0, keptChars)
-    return `${prefix}${prefix && !prefix.endsWith('\n') ? '\n' : ''}${noticeFor(keptChars)}`
-  }
-  const fits = (keptChars: number) => {
-    const finalText = render(keptChars)
-    return finalText.length <= TOOL_MODEL_TEXT_MAX_CHARS && utf8Bytes(finalText) <= maxUtf8Bytes
-  }
-
-  if (!fits(0)) {
-    return { ...plan, text: shortCutRefusal(maxUtf8Bytes), keptChars: 0, nextOffset: null }
-  }
-
-  // Search UTF-16 offsets, but measure the final encoded text and its changing notice.
-  let low = 0
-  let high = Math.min(plan.rawText.length, TOOL_MODEL_TEXT_MAX_CHARS)
-  while (low < high) {
-    const middle = Math.ceil((low + high) / 2)
-    if (fits(safeSliceEnd(plan.rawText, middle))) low = middle
-    else high = middle - 1
-  }
-  let keptChars = safeSliceEnd(plan.rawText, low)
-  const wholeLineEnd = firstPartEnd(plan.rawText, keptChars)
-  if (wholeLineEnd < keptChars && fits(wholeLineEnd)) keptChars = wholeLineEnd
-  const result = render(keptChars)
-  if (result.length > TOOL_MODEL_TEXT_MAX_CHARS || utf8Bytes(result) > maxUtf8Bytes) {
-    throw new Error('The tool-result cut exceeded its model budget.')
-  }
-  return {
-    ...plan,
-    text: result,
-    keptChars,
-    nextOffset: remainder.kind === 'fetchable' ? keptChars : null
-  }
-}
-
 /** Format one bounded, visible cut after the named raw zip has been saved by the server. */
 export function formatToolModelTextCut(
   text: string,
   target: string | ToolModelTextRemainder,
-  originalTextChars?: number,
-  budget?: ToolModelTextBudget
+  originalTextChars?: number
 ): FormattedToolModelTextCut {
-  const plan = planToolModelTextCut(text, originalTextChars, budget)
+  const plan = planToolModelTextCut(text, originalTextChars)
   if (!plan.cut) return { ...plan, text, keptChars: text.length, nextOffset: null }
-  if (byteLimit(budget) === 0) return { ...plan, text: '', keptChars: 0, nextOffset: null }
   const remainder = typeof target === 'string' ? { kind: 'fetchable' as const, zipId: target } : target
   if (remainder.kind === 'fetchable' && (!remainder.zipId || remainder.zipId.length > 256 || /[\r\n\]]/.test(remainder.zipId))) {
     throw new Error('A cut tool result needs a valid server-owned zip id.')
-  }
-
-  const maxUtf8Bytes = byteLimit(budget)
-  if (maxUtf8Bytes !== undefined) {
-    return formatWithByteBudget(plan, remainder, budget!, maxUtf8Bytes, utf8Bytes(text) > maxUtf8Bytes)
   }
 
   // The notice contains the kept-character count, so reserve its actual length and converge.

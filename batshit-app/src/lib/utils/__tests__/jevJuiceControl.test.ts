@@ -6,11 +6,14 @@ import {
   AGENT_JEV_REPLY_CHECK_FIELD,
   AGENT_JEV_SKILL_TOOL_HINTS_FIELD,
   AGENT_JEV_STYLE_COACH_FIELD,
+  readAgentJevJudgeToolSwitch,
   resolveAgentJevJudgeToolEnabled,
   resolveAgentJevMemoryRecallEnabled,
   resolveAgentJevMemoryRerankEnabled,
   resolveAgentJevReplyCheckEnabled,
   resolveAgentJevSkillToolHintsEnabled,
+  resolveAgentJevSkillSessionMode,
+  resolveAgentJevSkillSessionsEnabled,
   resolveAgentJevStyleCoachEnabled,
   GLOBAL_JEV_SMART_ZIP_FIELD,
   GLOBAL_JEV_SMART_ZIP_LABEL,
@@ -37,6 +40,19 @@ describe('resolveAgentJevSkillToolHintsEnabled', () => {
   it('reads literal true as ON', () => {
     expect(resolveAgentJevSkillToolHintsEnabled({ [AGENT_JEV_SKILL_TOOL_HINTS_FIELD]: true })).toBe(true)
   })
+
+  it('preserves legacy Suggest consent and requires explicit Manage for lifecycle changes', () => {
+    expect(resolveAgentJevSkillSessionMode({ jev_juice_skill_tool_hints: true })).toBe('suggest')
+    expect(resolveAgentJevSkillSessionsEnabled({ jev_juice_skill_tool_hints: true })).toBe(false)
+    for (const mode of ['off', 'suggest', 'manage'] as const) {
+      const agent = { jev_juice_skill_tool_hints: mode }
+      expect(resolveAgentJevSkillSessionMode(agent)).toBe(mode)
+      expect(resolveAgentJevSkillToolHintsEnabled(agent)).toBe(mode !== 'off')
+      expect(resolveAgentJevSkillSessionsEnabled(agent)).toBe(mode === 'manage')
+      expect(validateJevJuiceAgentFields(agent)).toBeNull()
+    }
+    expect(resolveAgentJevSkillSessionsEnabled({ jev_juice_skill_tool_hints: 'true' })).toBe(false)
+  })
 })
 
 describe('validateJevJuiceAgentFields', () => {
@@ -48,7 +64,7 @@ describe('validateJevJuiceAgentFields', () => {
   })
 
   it('refuses anything else loudly, naming the switch', () => {
-    expect(validateJevJuiceAgentFields({ [AGENT_JEV_SKILL_TOOL_HINTS_FIELD]: 'yes' })).toMatch(/Suggest Skills and Tools.*true or false/)
+    expect(validateJevJuiceAgentFields({ [AGENT_JEV_SKILL_TOOL_HINTS_FIELD]: 'yes' })).toMatch(/Skills and Tools.*off, suggest, or manage/)
     expect(validateJevJuiceAgentFields({ [AGENT_JEV_SKILL_TOOL_HINTS_FIELD]: 1 })).toMatch(/true or false/)
     expect(validateJevJuiceAgentFields({ [AGENT_JEV_JUDGE_TOOL_FIELD]: 'on' })).toMatch(/Judgment Tool.*true or false/)
     expect(validateJevJuiceAgentFields({ [AGENT_JEV_MEMORY_RERANK_FIELD]: 'on' })).toMatch(/Rerank Memory Search.*true or false/)
@@ -63,6 +79,22 @@ describe('resolveAgentJevJudgeToolEnabled (SA-120 P2)', () => {
     expect(resolveAgentJevJudgeToolEnabled({ [AGENT_JEV_JUDGE_TOOL_FIELD]: true })).toBe(true)
     // The two switches are independent.
     expect(resolveAgentJevSkillToolHintsEnabled({ [AGENT_JEV_JUDGE_TOOL_FIELD]: true })).toBe(false)
+  })
+
+  // Josh, 2026-10-24: `sys.judge.ask` is a Fabric control, so the tool needs it too.
+  it('is OFF while Fabric & Utilities is off, and keeps the saved switch', () => {
+    const agent = {
+      [AGENT_JEV_JUDGE_TOOL_FIELD]: true,
+      provider_specific_settings: { nativeTools: { batshitToolsEnabled: false } }
+    }
+    expect(resolveAgentJevJudgeToolEnabled(agent)).toBe(false)
+    expect(readAgentJevJudgeToolSwitch(agent)).toBe(true)
+    expect(
+      resolveAgentJevJudgeToolEnabled({
+        [AGENT_JEV_JUDGE_TOOL_FIELD]: true,
+        provider_specific_settings: { nativeTools: { batshitToolsEnabled: true } }
+      })
+    ).toBe(true)
   })
 })
 

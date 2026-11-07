@@ -9,6 +9,7 @@ import {
   MAX_GOON_PACKAGE_SELECTION_BYTES,
   SUPERVISOR_COMMANDS,
   collectAllowedOrigins,
+  createNavigationDiagnostic,
   isAllowedAppUrl,
   isAllowedElectronMediaPermission,
   isAllowedMainWindowUrl,
@@ -20,6 +21,7 @@ import {
   resolveCustomCssPath,
   resolveDesktopControlsUrl,
   resolveDevToolsEnabled,
+  resolveNavigationDiagnosticsEnabled,
   resolveDevToolsOptInPath,
   resolveDesktopGoonUrl,
   resolveBackupExportUrl,
@@ -32,6 +34,46 @@ import {
   validateGoonPackageReadRequest,
   validateSaveFileOptions
 } from './electron-shell-policy.mjs';
+
+test('navigation diagnostics require an exact explicit opt-in', () => {
+  for (const value of [undefined, '', '0', 'true', true, 1]) {
+    assert.equal(resolveNavigationDiagnosticsEnabled({ BATSHIT_MAC_NAVIGATION_DIAGNOSTICS: value }), false);
+  }
+  assert.equal(resolveNavigationDiagnosticsEnabled({ BATSHIT_MAC_NAVIGATION_DIAGNOSTICS: '1' }), true);
+});
+
+test('navigation diagnostics distinguish event shapes without retaining private URL data', () => {
+  const allowedOrigins = collectAllowedOrigins({});
+  const value = createNavigationDiagnostic({
+    phase: 'will-redirect', role: 'main', allowedOrigins,
+    legacyUrl: { url: 'do-not-coerce' },
+    eventUrl: 'http://127.0.0.1:5640/login?code=PRIVATE_SENTINEL#PRIVATE_FRAGMENT',
+    allowed: false, isMainFrame: true, isSameDocument: false, defaultPrevented: true,
+    errorCode: -3, errorDescription: 'PRIVATE_ERROR', cookie: 'PRIVATE_COOKIE'
+  });
+  assert.deepEqual(value.legacyArgument, { present: true, type: 'object', category: 'non-string' });
+  assert.deepEqual(value.eventUrl, { present: true, type: 'string', category: 'approved-loopback', origin: 'http://127.0.0.1:5640', route: 'login' });
+  assert.equal(value.allowed, false);
+  assert.equal(value.errorCode, -3);
+  assert.ok(!JSON.stringify(value).includes('PRIVATE'));
+  assert.ok(!JSON.stringify(value).includes('do-not-coerce'));
+});
+
+test('navigation diagnostics redact credentials, external hosts and unknown paths', () => {
+  const allowedOrigins = collectAllowedOrigins({});
+  for (const url of [
+    'http://PRIVATE_USER:PRIVATE_PASS@127.0.0.1:5640/PRIVATE_PATH?PRIVATE_QUERY',
+    'https://PRIVATE_HOST.test/PRIVATE_PATH?PRIVATE_QUERY',
+    'http://127.0.0.1:5640/PRIVATE_PATH?PRIVATE_QUERY',
+    '/PRIVATE_PATH?PRIVATE_QUERY',
+    { toString() { throw new Error('No coercion allowed'); } }
+  ]) {
+    const value = createNavigationDiagnostic({ phase: 'did-fail-load', role: 'main', legacyUrl: url, allowedOrigins });
+    assert.ok(!JSON.stringify(value).includes('PRIVATE'));
+  }
+  const shell = createNavigationDiagnostic({ phase: 'did-finish-load', role: 'main', legacyUrl: 'batshit-shell://app/index.html?PRIVATE_QUERY', allowedOrigins });
+  assert.deepEqual(shell.legacyArgument, { present: true, type: 'string', category: 'shell', route: 'shell' });
+});
 
 test('only explicit loopback HTTP origins enter the native bridge allowlist', () => {
   assert.equal(normalizeLoopbackOrigin('http://127.0.0.1:5650/path'), 'http://127.0.0.1:5650');

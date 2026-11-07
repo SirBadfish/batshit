@@ -21,14 +21,7 @@ vi.mock('$lib/server/services/nativeTools', () => ({
   resolveNativeToolSettings: (providerSettings: Record<string, any> | null) => {
     const nativeTools = providerSettings?.nativeTools ?? {}
     return {
-      agentBrowserEnabled: nativeTools.agentBrowserEnabled !== false,
-      agentBrowserLiveViewEnabled: nativeTools.agentBrowserLiveViewEnabled ?? true,
-      agentBrowserRuntimeMode: nativeTools.agentBrowserRuntimeMode ?? 'chromium',
-      agentBrowserCdpPort: nativeTools.agentBrowserCdpPort ?? 9222,
-      agentBrowserProvider: nativeTools.agentBrowserProvider ?? 'local',
-      agentBrowserExecutablePath: nativeTools.agentBrowserExecutablePath ?? null,
-      agentBrowserExtraFlags: nativeTools.agentBrowserExtraFlags ?? [],
-      agentBrowserTimeoutMs: nativeTools.agentBrowserTimeoutMs ?? 120000
+      agentBrowserEnabled: nativeTools.agentBrowserEnabled !== false
     }
   },
   nativeToolService: {
@@ -41,8 +34,7 @@ import { POST } from './+server'
 import {
   __resetStreamAbortRegistryForTests,
   abortStream,
-  registerStreamAbort,
-  RETIRED_REPLY_STOP_REASON
+  registerStreamAbort
 } from '$lib/server/services/streamAbortRegistry'
 
 function useRequest(body: Record<string, unknown>) {
@@ -183,35 +175,4 @@ describe('/api/native-tools/agent-browser', () => {
     }
   })
 
-  /** BL-1321: on the agent lane the run credential, not a chat, decides which Stop the call hears. */
-  const agentRun = (messageId: string) => ({
-    userId: 'user-1', auth: 'agent', agentId: 'agent-1', sessionId: 'session-1', messageId, credentialId: 'arc_test'
-  })
-
-  it('BL-1321: a live primary run hands the call exactly its own reply’s Stop', async () => {
-    mocks.resolveNativeToolUser.mockResolvedValue(agentRun('message-1'))
-    const own = new AbortController()
-    registerStreamAbort('session-1', 'message-1', own)
-    mocks.nativeAgentBrowserUse.mockResolvedValue({ success: true })
-
-    await useRequest({ params: { url: 'https://example.com' } })
-
-    expect(mocks.nativeAgentBrowserUse.mock.calls[0]?.[0]?.abortSignal).toBe(own.signal)
-  })
-
-  it('BL-1321: a credential of an earlier reply gets an already-aborted Stop, never the newer reply’s', async () => {
-    mocks.resolveNativeToolUser.mockResolvedValue(agentRun('message-earlier'))
-    const newer = new AbortController()
-    registerStreamAbort('session-1', 'message-newer', newer)
-    mocks.nativeAgentBrowserUse.mockResolvedValue({ success: false, stopped: true })
-
-    // A body chat changes nothing on the agent lane: the credential's chat and reply count.
-    await useRequest({ sessionId: 'session-2', params: { url: 'https://example.com' } })
-
-    const signal = mocks.nativeAgentBrowserUse.mock.calls[0]?.[0]?.abortSignal
-    expect(signal).not.toBe(newer.signal)
-    expect(signal?.aborted).toBe(true)
-    expect(signal?.reason).toBe(RETIRED_REPLY_STOP_REASON)
-    expect(newer.signal.aborted).toBe(false)
-  })
 })

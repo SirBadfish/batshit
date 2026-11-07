@@ -22,11 +22,40 @@ import {
   unloadLocalAiModel
 } from '$lib/server/services/localAiModelManagement'
 
-export const GET: RequestHandler = async ({ url, locals }) => {
+import { redis } from '$lib/server/redis'
+import { loadRuntimeModelPreset } from '$lib/server/services/runtimeModelPreset'
+import { readLocalModelReasoning, isOllamaReasoningIdentity } from '$lib/server/services/localModelReasoning'
+import { resolveRuntimeModelSelection } from '$lib/utils/modelPresetRuntime'
+import { reasoningOverrideKey } from '$lib/utils/modelReasoningControls'
+import { normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
+
+export const GET: RequestHandler = async ({ url, locals, request }) => {
   const userId = locals.user?.id
   if (!userId) return apiFailure('Unauthorized', 401)
 
   const program = url.searchParams.get('program')
+  if (url.searchParams.get('mode') === 'reasoning') {
+    const id = url.searchParams.get('agentId') ?? ''
+    if (program !== 'ollama' || !id || id.length > 256 || /[\u0000-\u001f\u007f]/.test(id)) return json({ success: false, error: 'Choose an owned Ollama agent.' }, { status: 400 })
+    try {
+      const agent = await redis.get(`agent:${id}`)
+      if (!agent || agent.id !== id || agent.user_id !== userId) return json({ success: false, error: 'Agent not found.' }, { status: 404 })
+      if (normalizePrimaryAgentType(agent) !== 'api') return json({ success: false, error: 'Choose an agent using Ollama.' }, { status: 409 })
+      const preset = await loadRuntimeModelPreset(agent.primary_model_preset_id, 'primary')
+      const selection = resolveRuntimeModelSelection({ preset, presetId: agent.primary_model_preset_id,
+        provider: agent.primary_model_provider, modelId: agent.primary_model_name, connection: agent.primary_model_connection,
+        settings: agent.provider_specific_settings })
+      const effectiveModelId = selection.effectiveModelId ?? selection.modelId
+      if (!selection.connection || !effectiveModelId) return json({ success: false, error: 'Choose an exact Ollama model.' }, { status: 409 })
+      const identity = { presetId: selection.presetId, connection: selection.connection, effectiveModelId }
+      if (!isOllamaReasoningIdentity(identity)) return json({ success: false, error: 'The selected agent is not using this Ollama connection.' }, { status: 409 })
+      const snapshot = await readLocalModelReasoning(userId, identity, request.signal)
+      // Only filtered evidence leaves the server; no HMAC, saved key or raw show fields.
+      return json({ success: true, reasoning: { key: reasoningOverrideKey(identity, 'thinking'), contract: snapshot.contract } })
+    } catch {
+      return json({ success: false, error: 'Thinking options could not be verified. Your saved choice was kept.' }, { status: 500 })
+    }
+  }
   if (!isManageableProgram(program)) {
     return json(
       { success: false, error: 'Batshit cannot manage models on that program.' },

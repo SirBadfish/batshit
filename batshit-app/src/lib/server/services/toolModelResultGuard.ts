@@ -3,7 +3,7 @@ import { createZipFromContent } from '$lib/server/zipService'
 import { isSessionDeleting } from './streamAbortRegistry'
 import { reserveToolModelRetainedCopy } from './toolModelRetentionTurnBudget'
 import { canRunFetchItsKeptCopy } from './fetchZipForModel'
-import { formatToolModelTextCut, planToolModelTextCut, type ToolModelTextBudget } from '$lib/utils/toolModelTextSizeGuard'
+import { formatToolModelTextCut, planToolModelTextCut } from '$lib/utils/toolModelTextSizeGuard'
 
 /** All identity fields come from an in-process turn or a verified run credential. */
 export interface ToolModelResultContext {
@@ -16,7 +16,6 @@ export interface ToolModelResultContext {
   originalTextChars?: number
   /** Resolved by the server from this run's tool scope, never from helper request JSON. */
   fetchZipAllowed?: boolean
-  modelTextBudget?: ToolModelTextBudget
   /** Internal server-classified identity only; never an endpoint body flag. */
   memoryResult?: boolean
 }
@@ -85,17 +84,17 @@ export async function retainToolModelText(
 
 /** Save before announcing an id. The raw copy and the model's cut view have distinct owners. */
 export async function guardToolModelText(text: string, context: ToolModelResultContext): Promise<string> {
-  if (!planToolModelTextCut(text, context.originalTextChars, context.modelTextBudget).cut) return text
-  if (context.memoryResult === true) return formatToolModelTextCut(text, { kind: 'memory' }, context.originalTextChars, context.modelTextBudget).text
+  if (!planToolModelTextCut(text, context.originalTextChars).cut) return text
+  if (context.memoryResult === true) return formatToolModelTextCut(text, { kind: 'memory' }, context.originalTextChars).text
   const retained = await retainToolModelText(text, context)
-  if (!retained) return formatToolModelTextCut(text, { kind: 'not-retained' }, context.originalTextChars, context.modelTextBudget).text
+  if (!retained) return formatToolModelTextCut(text, { kind: 'not-retained' }, context.originalTextChars).text
   try {
     // BL-680: name the id only when this run's own Fetch Zip will accept it.
     return formatToolModelTextCut(text, context.fetchZipAllowed !== true
       ? { kind: 'unavailable' }
       : retained.readableByRun
         ? { kind: 'fetchable', zipId: retained.zipId }
-        : { kind: 'group-unreadable' }, context.originalTextChars, context.modelTextBudget).text
+        : { kind: 'group-unreadable' }, context.originalTextChars).text
   } catch (error) {
     if (await removeUndeliveredCopy(retained.zipId, context.sessionId)) retained.releaseBudget()
     throw error

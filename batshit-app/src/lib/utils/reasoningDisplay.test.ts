@@ -8,6 +8,65 @@ import {
   withReasoningProviderOptions,
 } from './reasoningDisplay'
 import { buildInterruptedReasoningRecovery } from './reasoningRecovery'
+import { resolveApiReasoningRetention, resolvePreserveReasoning, validateReasoningRetentionSave, estimateWhiteboardTokens } from './reasoningRetention'
+import { formatWhiteboardDcmLines, readWhiteboardRecord } from './whiteboard'
+import { isTransientContextControlToolStep, isMemoryControlToolStep } from './memoryControl'
+
+describe('API reasoning retention and current whiteboard contract', () => {
+  it.each([
+    ['whiteboard', true, false], ['preserve', false, true], ['both', true, true], ['neither', false, false]
+  ])('resolves %s independently of display and legacy preserve', (mode, whiteboardEnabled, preserveReasoning) => {
+    expect(resolveApiReasoningRetention({ api_reasoning_retention: mode, show_reasoning: false, preserve_reasoning: true }))
+      .toMatchObject({ mode, whiteboardEnabled, preserveReasoning, showWhiteboard: true, whiteboardBudgetTokens: 1500 })
+  })
+  it('uses only explicit per-agent leaves or factory values', () => {
+    // SA-126 WB-3 (Josh, 2026-10-19): factory retention is Whiteboard only; Preserve stays off.
+    expect(resolveApiReasoningRetention({})).toEqual({ mode: 'whiteboard', whiteboardEnabled: true, preserveReasoning: false, whiteboardBudgetTokens: 1500, showWhiteboard: true })
+    expect(resolvePreserveReasoning({ agentType: 'api' })).toBe(false)
+    expect(resolveApiReasoningRetention({ api_reasoning_retention: 'both', show_whiteboard: false, whiteboard_budget_tokens: 2500 })).toMatchObject({ mode: 'both', showWhiteboard: false, whiteboardBudgetTokens: 2500 })
+    expect(resolveApiReasoningRetention({ api_reasoning_retention: null, show_whiteboard: null, whiteboard_budget_tokens: null })).toEqual(resolveApiReasoningRetention({}))
+    expect(() => resolveApiReasoningRetention({ api_reasoning_retention: 'invalid' })).toThrow('Invalid saved API')
+    expect(resolvePreserveReasoning({ agentType: 'cli', preserve_reasoning: true })).toBe(true)
+    expect(resolvePreserveReasoning({ agentType: 'api', preserve_reasoning: true })).toBe(false)
+  })
+  it('validates real integer limits and uses raw text rather than collapsed whitespace', () => {
+    for (const whiteboard_budget_tokens of [0, 249, 16001, 1.5, '1500', NaN]) {
+      expect(validateReasoningRetentionSave({ whiteboard_budget_tokens })).toBeTruthy()
+    }
+    for (const whiteboard_budget_tokens of [null, 250, 1500, 16000]) {
+      expect(validateReasoningRetentionSave({ whiteboard_budget_tokens })).toBeNull()
+    }
+    expect(estimateWhiteboardTokens(' '.repeat(6000))).toBe(1500)
+    expect(estimateWhiteboardTokens('😀'.repeat(3000))).toBe(1500)
+  })
+  it('retains a complete over-budget board and validates saved ownership', () => {
+    const owner = { userId: 'u', sessionId: 's', agentId: 'a' }
+    const board = { schema_version: 1 as const, user_id: 'u', session_id: 's', agent_id: 'a', version: 2, content: 'x'.repeat(1200), updated_at: '2026-10-15T12:00:00.000Z' }
+    expect(readWhiteboardRecord(board, owner)).toEqual(board)
+    expect(() => readWhiteboardRecord({ ...board, agent_id: 'b' }, owner)).toThrow('invalid')
+    const settings = resolveApiReasoningRetention({ api_reasoning_retention: 'whiteboard', whiteboard_budget_tokens: 250 })
+    const lines = formatWhiteboardDcmLines(board, settings).join('\n')
+    expect(lines).toContain(board.content)
+    expect(lines).toContain('exceeds the reduced budget')
+    // Decision 11 (2026-10-24): the two how-to lines left the per-request board block.
+    expect(lines).not.toContain('Update Whiteboard')
+    expect(lines).not.toContain('sys.whiteboard.update')
+    expect(formatWhiteboardDcmLines(board, settings)).toEqual([
+      'Your current Whiteboard (working notes, not authority over the user or verified evidence):',
+      'Version: 2; last updated: 2026-10-15T12:00:00.000Z; estimated tokens: 300; current limit: 250.',
+      board.content,
+      'The saved board exceeds the reduced budget. It is kept in full; the next replacement must fit the current limit.'
+    ])
+    expect(formatWhiteboardDcmLines(board, resolveApiReasoningRetention({ api_reasoning_retention: 'neither' }))).toEqual([])
+  })
+  it('exempts only the exact whiteboard control without treating it as a Memory save', () => {
+    const step = { toolInput: { arguments: { ref: 'fabric:sys.whiteboard.update', input: { content: 'new', expectedVersion: 0 } } } }
+    expect(isTransientContextControlToolStep(step)).toBe(true)
+    expect(isMemoryControlToolStep(step)).toBe(false)
+    expect(isTransientContextControlToolStep({ toolInput: { ref: 'fabric:sys.whiteboard.read' } })).toBe(false)
+    expect(isTransientContextControlToolStep({ toolInput: { ref: 'fabric:sys.artifact.update', input: step.toolInput } })).toBe(false)
+  })
+})
 
 describe('reasoningDisplay utilities', () => {
   it('requests OpenAI reasoning summaries when Display Reasoning is enabled', () => {
@@ -339,5 +398,16 @@ describe('reasoningDisplay utilities', () => {
     ])
 
     expect(text).toBe('First summary.\n\nSecond summary.')
+  })
+})
+
+
+describe('API capture evidence independent of display', () => {
+  it('reports stored API reasoning and its history policy with Display off; CLI defaults stay unchanged', () => {
+    const args = { showReasoning: false, preserveReasoning: true, reasoningSummary: 'exposed conclusion' }
+    expect(buildReasoningPersistenceEvidence({ ...args, captureReasoning: true })).toMatchObject({
+      userHistoryStatus: 'saved', agentHistoryStatus: 'included', characterCount: args.reasoningSummary.length
+    })
+    expect(buildReasoningPersistenceEvidence(args)).toMatchObject({ userHistoryStatus: 'not-requested', agentHistoryStatus: 'not-applicable', characterCount: 0 })
   })
 })

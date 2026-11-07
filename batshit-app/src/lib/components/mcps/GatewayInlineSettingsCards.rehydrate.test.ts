@@ -1,4 +1,5 @@
-import { cleanup, fireEvent, render, waitFor } from '@testing-library/svelte'
+import { createHash } from 'node:crypto'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { MCPGateway } from '$lib/types/database'
 
@@ -16,9 +17,10 @@ const ARGS_A = '-y\n@modelcontextprotocol/server-filesystem\n/tmp'
 const ARGS_B = '-y\n@modelcontextprotocol/server-filesystem\n/Users/example/b'
 const ARGS_C = '-y\n@modelcontextprotocol/server-filesystem\n/Users/example/c'
 
-function copy(args: string, updatedAt: string, stdioExtra: Record<string, unknown> = {}): MCPGateway {
+function copy(args: string, updatedAt: string, stdioExtra: Record<string, unknown> = {}): MCPGateway & { sourceRevision: string } {
   return {
     id: ID,
+    sourceRevision: `source1:${createHash('sha256').update(args).digest('hex')}`,
     name: 'Filesystem',
     type: 'stdio',
     enabled: true,
@@ -38,13 +40,17 @@ function copy(args: string, updatedAt: string, stdioExtra: Record<string, unknow
 
 let putBodies: any[] = []
 let answerPut: (body: any) => Promise<Response>
+let answerSourceRead: () => Promise<Response>
 
 function okJson(body: unknown) {
-  return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
+  const value = body as { gateway?: MCPGateway & { sourceRevision?: string }; sourceAcknowledgement?: unknown }
+  const response = value?.gateway && !value.sourceAcknowledgement ? { ...value, sourceAcknowledgement: { id: value.gateway.id, sourceRevision: value.gateway.sourceRevision } } : body
+  return new Response(JSON.stringify(response), { status: 200, headers: { 'Content-Type': 'application/json' } })
 }
 
 beforeEach(() => {
   putBodies = []
+  answerSourceRead = async () => okJson({ gateway: copy(ARGS_A, '2026-10-11T15:00:00.000Z') })
   answerPut = async (body) => okJson({ gateway: { ...copy(body.stdioConfig.args.join('\n'), '2026-10-11T15:00:05.000Z') } })
   vi.stubGlobal(
     'fetch',
@@ -57,6 +63,7 @@ beforeEach(() => {
         putBodies.push(body)
         return answerPut(body)
       }
+      if (url.startsWith(`/api/mcp/gateways/${ID}`)) return answerSourceRead()
       throw new Error(`unexpected fetch ${url}`)
     })
   )
@@ -215,5 +222,45 @@ describe('BL-550: a new copy of the gateway does not take back typed arguments',
     // A list read from before the save (the record had never been stamped then) answers late.
     await view.rerender({ gateway: { ...unstamped }, userId: USER, onGatewayUpdated })
     expect(argsField(view.container).value).toBe(ARGS_B)
+  })
+})
+
+
+describe('human gateway source draft/base ownership', () => {
+  it('a refreshed source cannot replace a queued original base, and only an explicit saved-source read discards the refused draft', async () => {
+    const original = copy(ARGS_A, '2026-10-11T15:00:00.000Z')
+    const current = copy(ARGS_C, '2026-10-11T15:00:02.000Z')
+    answerPut = async () => new Response(JSON.stringify({ code: 'gateway_source_changed', error: 'The saved gateway source changed. Your draft is kept.' }), { status: 409 })
+    answerSourceRead = async () => okJson({ gateway: current })
+    const view = render(GatewayInlineSettingsCards, { props: { gateway: original, userId: USER } })
+    await waitFor(() => expect(argsField(view.container).value).toBe(ARGS_A))
+    await type(view.container, ARGS_B)
+    await view.rerender({ gateway: current, userId: USER })
+    await waitFor(() => expect(putBodies).toHaveLength(1), { timeout: 2000 })
+    expect(putBodies[0].expectedGatewaySource).toBe(original.sourceRevision)
+    expect(putBodies[0].stdioConfig.args).toEqual(ARGS_B.split('\n'))
+    expect(argsField(view.container).value).toBe(ARGS_B)
+    await waitFor(() => expect(screen.getByText(/saved gateway source changed/i)).toBeTruthy())
+    await new Promise(resolve => setTimeout(resolve, 600))
+    expect(putBodies).toHaveLength(1)
+    await fireEvent.click(screen.getByRole('button', { name: 'Use Saved Gateway Source' }))
+    await waitFor(() => expect(argsField(view.container).value).toBe(ARGS_C))
+    expect(putBodies).toHaveLength(1)
+  })
+
+  it('a failed explicit source read preserves the held draft and cannot borrow the refresh copy token', async () => {
+    const original = copy(ARGS_A, '2026-10-11T15:00:00.000Z')
+    answerPut = async () => new Response(JSON.stringify({ code: 'gateway_source_changed', error: 'The saved gateway source changed.' }), { status: 409 })
+    answerSourceRead = async () => new Response(JSON.stringify({ error: 'The source detail read failed.' }), { status: 500 })
+    const view = render(GatewayInlineSettingsCards, { props: { gateway: original, userId: USER } })
+    await waitFor(() => expect(argsField(view.container).value).toBe(ARGS_A))
+    await type(view.container, ARGS_B)
+    await waitFor(() => expect(putBodies).toHaveLength(1), { timeout: 2000 })
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Use Saved Gateway Source' })).toBeTruthy())
+    await fireEvent.click(screen.getByRole('button', { name: 'Use Saved Gateway Source' }))
+    await waitFor(() => expect(screen.getByText(/source detail read failed/)).toBeTruthy())
+    expect(argsField(view.container).value).toBe(ARGS_B)
+    expect(putBodies[0].expectedGatewaySource).toBe(original.sourceRevision)
+    expect(putBodies).toHaveLength(1)
   })
 })

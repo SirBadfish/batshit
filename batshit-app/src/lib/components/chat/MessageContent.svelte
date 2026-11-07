@@ -42,7 +42,8 @@
   } from '$lib/utils/coolToolAiContent'
   import { buildToolActivityGroups } from './toolActivityGrouping'
   import * as agentStore from '$lib/stores/agents.svelte'
-  import { getDeadCopyReason } from '$lib/stores/zipDeadCopies.svelte'
+  import { getDeadCopyReason, getLiveReadCopyFact } from '$lib/stores/zipDeadCopies.svelte'
+  import { liveSnapshotFromFact, liveSnapshotTokens, snapshotCompressesCopy, withLiveSnapshotSize, type ZipLiveSnapshot } from '$lib/utils/zipLiveSnapshot'
   import { describeHoldForUser, isUserHold } from '$lib/utils/zipHoldWords'
   import type { DeadCopyReason } from '$lib/utils/zipDeadCopies'
   import * as sessionStore from '$lib/stores/session.svelte'
@@ -73,6 +74,7 @@
     isConcreteZipId,
     isTrustedClipReferenceId
   } from '$lib/utils/zipReferenceSafety'
+  import { namesOnlyToolZips, zipIdOfReference, zipIdsInMessageText } from '$lib/utils/messageZipIds'
 
   type IntermediateStep = {
     type: 'tool' | 'tool_error' | 'error'
@@ -140,6 +142,8 @@
   
   let strippedContent = $state('')
   let compiledContent = $state('')
+  /** The live view of a streaming reply as `hideStreamingHiddenControlBlocks` made it (BL-696). */
+  let liveViewContent = $state<string | null>(null)
   let hydratedContent = $state<{ content: string; ranges: TextRange[] } | null>(null)
   let isCompiling = $state(false)
   let lastCompiledSource = $state<string | null>(null)
@@ -221,25 +225,6 @@
       projectStore.markFileTreeStale()
     }
   })
-
-  const hasOnlyCoolToolZips = (value: string) => {
-    if (!value || !value.includes('{{batshit-zip:')) return false
-    const regex = /\{\{batshit-zip:([^:}]+)(?::::[^}]*)?\}\}/g
-    let match: RegExpExecArray | null = null
-    let foundTrusted = false
-    while ((match = regex.exec(value)) !== null) {
-      const zipId = match[1] || ''
-      const normalized = normalizeId(zipId)
-      if (validZipIds && !validZipIds.has(normalized)) {
-        continue
-      }
-      if (!zipId.includes('cool_tool')) {
-        return false
-      }
-      foundTrusted = true
-    }
-    return foundTrusted
-  }
 
   function isCoolToolHydrated(zipId: string): boolean {
     const normalized = normalizeId(zipId)
@@ -348,12 +333,6 @@
     }
   }
 
-  function extractZipIdFromReference(ref: string): string | null {
-    if (!ref) return null
-    const match = ref.match(/\{\{batshit-zip:([^:}]+)(?::::[^}]*)?\}\}/)
-    return match ? match[1] : null
-  }
-
   function collectImageZipIds(payload: any, ids: Set<string>) {
     if (!payload) return
     const parsed = typeof payload === 'string'
@@ -372,7 +351,7 @@
       if (Array.isArray(refs)) {
         refs.forEach((ref) => {
           if (typeof ref !== 'string') return
-          const zipId = extractZipIdFromReference(ref)
+          const zipId = zipIdOfReference(ref)
           if (zipId) ids.add(normalizeId(zipId))
         })
       }
@@ -652,14 +631,17 @@
         // `{{batshit-steer:…}}` braces would sit in the chat for the rest of the reply.
         compileToken++
         hydratedContent = null
-        compiledContent = hasSteerPlaceholder(streamingContent)
+        const steered = hasSteerPlaceholder(streamingContent)
+        compiledContent = steered
           ? expandSteerPlaceholders(streamingContent, liveSteers, formatSteerForUser)
           : streamingContent
+        // A steer's own words are not the live view's: they still get the scans below.
+        liveViewContent = steered ? null : streamingContent
         isCompiling = false
         pendingCompileSource = null
         lastCompiledSource = null
       } else if (
-        extractZipIds(content, validZipIds).length === 0 &&
+        zipIdsInMessageText(content, validZipIds).length === 0 &&
         // SA-114 (DL-114-04): a reply can carry a steer marker and no zips at all, and the
         // short-circuit would then show the raw `{{batshit-steer:…}}` braces in the chat.
         !hasSteerPlaceholder(content)
@@ -670,7 +652,7 @@
         isCompiling = false
         pendingCompileSource = null
         lastCompiledSource = compilationKey
-      } else if (hasOnlyCoolToolZips(content) && !hasSteerPlaceholder(content)) {
+      } else if (namesOnlyToolZips(content, validZipIds) && !hasSteerPlaceholder(content)) {
         // Tool-only messages already hydrate from Redis; no compile needed.
         compileToken++
         hydratedContent = null
@@ -720,7 +702,7 @@
         isCompiling = false
         pendingCompileSource = null
         lastCompiledSource = null
-      } else if (extractZipIds(strippedContent, validZipIds).length === 0) {
+      } else if (zipIdsInMessageText(strippedContent, validZipIds).length === 0) {
         compileToken++
         hydratedContent = null
         compiledContent = strippedContent
@@ -942,7 +924,7 @@
     const agent = currentAgent
     const messagesFromEnd = messagesAgo
     
-    const extractedZipIds = extractZipIds(compiledContent || content, validZipIds)
+    const extractedZipIds = zipIdsInMessageText(compiledContent || content, validZipIds)
 
     if (hasMetadata) {
       for (const [zipId, zipData] of zipMetadataFromRedis) {
@@ -994,7 +976,20 @@
   
   // SA-911: Don't show empty segments while compiling - use raw content as fallback
   const segmentContent = $derived(isCompiling ? content : compiledContent)
-  const visibleControlState = $derived.by(() => extractVisibleBatshitCueState(segmentContent))
+  /**
+   * BL-696: while a reply streams, the text shown is the live view's own output, which already hid
+   * every control block (cues included), emote tag, and stage direction. Reading it again for cues
+   * and for the bulky blocks, and the raw reply once more for its clips, scanned each chunk up to
+   * eight times; the live view's one scan is enough.
+   */
+  const controlsAlreadyHidden = $derived(
+    role === 'assistant' && isStreaming && !isCompiling && liveViewContent !== null && segmentContent === liveViewContent
+  )
+  const visibleControlState = $derived.by(() =>
+    controlsAlreadyHidden
+      ? { cleanedContent: segmentContent, notes: [] }
+      : extractVisibleBatshitCueState(segmentContent)
+  )
   const visibleSegmentContent = $derived(visibleControlState.cleanedContent)
   const visibleControlNotes = $derived(visibleControlState.notes)
 
@@ -1011,12 +1006,14 @@
     let parsed = parseMessageContent(
       visibleSegmentContent,
       role,
-      content,
+      // The live view keeps the reply's clip references; only its control blocks are gone.
+      controlsAlreadyHidden ? undefined : content,
       clipsLoaded ? messageClips : [],
       validZipIds ?? undefined,
       !isCompiling && hydratedContent && hydratedContent.content === segmentContent
         ? projectRemovedTextRanges(segmentContent, visibleSegmentContent, hydratedContent.ranges)
-        : []
+        : [],
+      { controlBlocksHidden: controlsAlreadyHidden, streaming: role === 'assistant' && isStreaming }
     )
 
     if (hiddenImageZipIds.size > 0) {
@@ -1062,25 +1059,6 @@
     })
   })
   
-  function extractZipIds(text: string, allowedIds?: Set<string> | null): string[] {
-    const ids = new Set<string>()
-    const newZipRegex = /\{\{batshit-zip:([^:}]+)(?::::[^}]*)?\}\}/g
-    let match
-    while ((match = newZipRegex.exec(text)) !== null) {
-      const zipId = match[1]
-      const normalized = normalizeId(zipId)
-      if (allowedIds && !allowedIds.has(normalized)) continue
-      ids.add(zipId)
-    }
-    const oldZipRegex = /\{\{batshit\|id:([^|]+)\|[^}]+\}\}/g
-    while ((match = oldZipRegex.exec(text)) !== null) {
-      const zipId = match[1]
-      const normalized = normalizeId(zipId)
-      if (allowedIds && !allowedIds.has(normalized)) continue
-      ids.add(zipId)
-    }
-    return Array.from(ids)
-  }
 
 
   // If a stream finishes and we skipped events, catch up with a debounced refresh
@@ -1297,22 +1275,26 @@
         metadata?.metadata?.tokens ??
         segment.tokens ??
         estimateTokens(segment.content || '')
+      // SA-137 P4: the size guard judges the size the newest reply's compile saw (a file snapshot).
+      const liveSnapshot = liveSnapshotFor(normalizedSegmentId)
 
       const activation = calculateZipActivation({
         zipType: segment.zipType || segment.type || metadata?.type || 'all_other',
         messagesFromEnd: messagesAgo,
-        zipData: metadata ?? { tokens: fallbackTokens },
+        zipData: withLiveSnapshotSize(metadata ?? { tokens: fallbackTokens }, liveSnapshot),
         agentSettings: currentAgent,
         globalSettings: mergedGlobalZipSettings,
         toolName: segment.toolName || metadata?.metadata?.toolName,
-        fallbackTokens,
+        fallbackTokens: liveSnapshotTokens(liveSnapshot) ?? fallbackTokens,
         isUnzipped: zippingService.isUnzipped(normalizedSegmentId),
         isInferredUnzipped: zippingService.getUnzippedInfo(normalizedSegmentId)?.source === 'inferred',
         isRezipped: zippingService.isRezipped(normalizedSegmentId),
         ...deadCopyActivationInput(normalizedSegmentId)
       })
 
-      if (activation.shouldCompress) {
+      // Round 2: a copy the newest reply did not refresh was zipped that turn, whatever its buffer,
+      // Hold or Off says (the badge says so; `resolveZipVisualState` reads the same rule).
+      if (activation.shouldCompress || snapshotCompressesCopy(liveSnapshot)) {
         return true
       }
 
@@ -1446,10 +1428,15 @@
     autoZip?: boolean
     agentControlled?: boolean
     inferredControlled?: boolean
+    skillSessionContext?: import('$lib/utils/skillSessions').SkillSessionZipContext
     holdLabel?: string | null
     deadCopyReason?: DeadCopyReason | null
     heldDeadCopy?: boolean
+    /** The stored hold is the user's: the badge never offers a new Hold over it (Release stays). */
+    userHeld?: boolean
     sizeGuard?: ToolResultSizeGuard
+    /** SA-137 P4: the newest reply showed this read as a file snapshot (size, and whether sent). */
+    liveSnapshot?: ZipLiveSnapshot | null
   } {
     const normalized = normalizeId(options.zipId)
     if (!normalized) {
@@ -1473,14 +1460,18 @@
       options.zipData?.metadata?.tokens ??
       0
 
+    // SA-137 P4: the size guard judges the size the newest reply's compile saw (a file snapshot);
+    // the badge's own token label keeps the stored size.
+    const liveSnapshot = liveSnapshotFor(normalized)
+
     const activation = calculateZipActivation({
       zipType: options.zipType,
       messagesFromEnd: options.messagesFromEnd,
-      zipData: options.zipData ?? { tokens: fallbackTokens },
+      zipData: withLiveSnapshotSize(options.zipData ?? { tokens: fallbackTokens }, liveSnapshot),
       agentSettings: currentAgent,
       globalSettings: mergedGlobalZipSettings,
       toolName: options.toolName,
-      fallbackTokens,
+      fallbackTokens: liveSnapshotTokens(liveSnapshot) ?? fallbackTokens,
       isUnzipped,
       isInferredUnzipped: unzippedItem?.source === 'inferred',
       isRezipped,
@@ -1491,7 +1482,10 @@
     // SA-129 P2 (BL-333): a dead copy is compressed in the prompt even while an agent holds it
     // (the hold waits for the next whole read); only a user hold keeps one open.
     const deadCopyCompressed = Boolean(activation.deadCopy) && activation.shouldCompress
-    const effectiveUnzipped = isUnzipped && !activation.shouldCompress
+    // Round 2: a copy the newest reply did not refresh was zipped that turn, held or not; its hold
+    // stays and is said, and Batshit tries the refresh again at the next reply.
+    const compressed = activation.shouldCompress || snapshotCompressesCopy(liveSnapshot)
+    const effectiveUnzipped = isUnzipped && !compressed
 
     // SA-120 P5: one reading of stored sources for the chat and the Zip Manager, so an
     // `inferred` unzip is never drawn as a user lock.
@@ -1499,13 +1493,13 @@
     let expandedReason: ExpandedReason | undefined
     if (effectiveUnzipped) {
       expandedReason = actors.expandedReason
-    } else if (!activation.shouldCompress) {
+    } else if (!compressed) {
       expandedReason = 'buffer'
     }
 
     const aboutToZip =
       !autoZip &&
-      !activation.shouldCompress &&
+      !compressed &&
       !effectiveUnzipped &&
       !isRezipped &&
       !activation.exceedsBuffer &&
@@ -1521,7 +1515,7 @@
     const autoRemainingMessages =
       !effectiveUnzipped &&
       !isRezipped &&
-      !activation.shouldCompress &&
+      !compressed &&
       activation.meetsThreshold &&
       activation.bufferSize > 0
         ? Math.max(1, activation.bufferSize - activation.messagesFromEnd)
@@ -1537,16 +1531,27 @@
       autoZip,
       agentControlled: actors.agentControlled,
       inferredControlled: actors.inferredControlled,
+      skillSessionContext: unzippedItem?.skillSessionContext,
       holdLabel: describeHoldForUser(
         unzippedItem,
         unzippedItem?.agentId ? agentStore.getAgentById(unzippedItem.agentId)?.displayName ?? null : null
       ),
       deadCopyReason: deadCopyCompressed ? activation.deadCopy : null,
       // BL-358: an agent's (or Judge Juice's) hold on a dead copy the prompt compresses anyway;
-      // the badge still offers Release, as the Zip Manager does.
-      heldDeadCopy: isUnzipped && activation.shouldCompress,
-      sizeGuard: activation.sizeGuard
+      // the badge still offers Release, as the Zip Manager does. Round 2: so does a hold on a copy
+      // the newest reply did not refresh.
+      heldDeadCopy: isUnzipped && compressed,
+      // Round 2: a copy drawn compressed because it was not refreshed, under the user's own Hold,
+      // must not offer "Hold" again: that would silently replace a permanent Hold.
+      userHeld: isUserHold(unzippedItem),
+      sizeGuard: activation.sizeGuard,
+      liveSnapshot
     }
+  }
+
+  /** SA-137 P4: this read's file snapshot for the chat's newest reply, or null (static, none). */
+  function liveSnapshotFor(zipId: string): ZipLiveSnapshot | null {
+    return liveSnapshotFromFact(getLiveReadCopyFact(sessionId || sessionStore.getCurrentSessionId(), zipId))
   }
 
   /**
@@ -1877,9 +1882,12 @@
         agentControlled={Boolean(zipState.agentControlled)}
         inferredControlled={Boolean(zipState.inferredControlled)}
         holdLabel={zipState.holdLabel ?? null}
+        skillSessionOpen={Boolean(zipState.skillSessionContext)}
         deadCopyReason={zipState.deadCopyReason ?? null}
         heldDeadCopy={Boolean(zipState.heldDeadCopy)}
+        userHeld={Boolean(zipState.userHeld)}
         sizeGuard={zipState.sizeGuard}
+        liveSnapshot={zipState.liveSnapshot ?? null}
         {manualZip}
         onToggleUnzip={(permanent: boolean) =>
           normalizedZipId &&
@@ -1949,9 +1957,12 @@
         agentControlled={Boolean(zipState.agentControlled)}
         inferredControlled={Boolean(zipState.inferredControlled)}
         holdLabel={zipState.holdLabel ?? null}
+        skillSessionOpen={Boolean(zipState.skillSessionContext)}
         deadCopyReason={zipState.deadCopyReason ?? null}
         heldDeadCopy={Boolean(zipState.heldDeadCopy)}
+        userHeld={Boolean(zipState.userHeld)}
         sizeGuard={zipState.sizeGuard}
+        liveSnapshot={zipState.liveSnapshot ?? null}
         {manualZip}
         onToggleUnzip={(permanent: boolean) =>
           normalizedZipId &&
@@ -2031,9 +2042,12 @@
           agentControlled={Boolean(zipState.agentControlled)}
           inferredControlled={Boolean(zipState.inferredControlled)}
           holdLabel={zipState.holdLabel ?? null}
+        skillSessionOpen={Boolean(zipState.skillSessionContext)}
           deadCopyReason={zipState.deadCopyReason ?? null}
           heldDeadCopy={Boolean(zipState.heldDeadCopy)}
+          userHeld={Boolean(zipState.userHeld)}
           sizeGuard={zipState.sizeGuard}
+          liveSnapshot={zipState.liveSnapshot ?? null}
           {manualZip}
           onToggleUnzip={(permanent: boolean) =>
             normalizedZipId &&
@@ -2102,9 +2116,12 @@
           agentControlled={Boolean(zipState.agentControlled)}
           inferredControlled={Boolean(zipState.inferredControlled)}
           holdLabel={zipState.holdLabel ?? null}
+        skillSessionOpen={Boolean(zipState.skillSessionContext)}
           deadCopyReason={zipState.deadCopyReason ?? null}
           heldDeadCopy={Boolean(zipState.heldDeadCopy)}
+          userHeld={Boolean(zipState.userHeld)}
           sizeGuard={zipState.sizeGuard}
+          liveSnapshot={zipState.liveSnapshot ?? null}
           {manualZip}
           onToggleUnzip={(permanent: boolean) =>
             zipId &&
@@ -2176,9 +2193,12 @@
           agentControlled={Boolean(zipState.agentControlled)}
           inferredControlled={Boolean(zipState.inferredControlled)}
           holdLabel={zipState.holdLabel ?? null}
+        skillSessionOpen={Boolean(zipState.skillSessionContext)}
           deadCopyReason={zipState.deadCopyReason ?? null}
           heldDeadCopy={Boolean(zipState.heldDeadCopy)}
+          userHeld={Boolean(zipState.userHeld)}
           sizeGuard={zipState.sizeGuard}
+          liveSnapshot={zipState.liveSnapshot ?? null}
           {manualZip}
           onToggleUnzip={(permanent: boolean) =>
             zipId &&
@@ -2250,9 +2270,12 @@
           agentControlled={Boolean(zipState.agentControlled)}
           inferredControlled={Boolean(zipState.inferredControlled)}
           holdLabel={zipState.holdLabel ?? null}
+        skillSessionOpen={Boolean(zipState.skillSessionContext)}
           deadCopyReason={zipState.deadCopyReason ?? null}
           heldDeadCopy={Boolean(zipState.heldDeadCopy)}
+          userHeld={Boolean(zipState.userHeld)}
           sizeGuard={zipState.sizeGuard}
+          liveSnapshot={zipState.liveSnapshot ?? null}
           {manualZip}
           onToggleUnzip={(permanent: boolean) =>
             zipId &&
@@ -2348,9 +2371,12 @@
             agentControlled={Boolean(zipState.agentControlled)}
             inferredControlled={Boolean(zipState.inferredControlled)}
             holdLabel={zipState.holdLabel ?? null}
+        skillSessionOpen={Boolean(zipState.skillSessionContext)}
             deadCopyReason={zipState.deadCopyReason ?? null}
             heldDeadCopy={Boolean(zipState.heldDeadCopy)}
+            userHeld={Boolean(zipState.userHeld)}
             sizeGuard={zipState.sizeGuard}
+            liveSnapshot={zipState.liveSnapshot ?? null}
             {manualZip}
             onToggleUnzip={(permanent: boolean) =>
               handleUnzip(
@@ -2459,9 +2485,12 @@
         agentControlled={Boolean(zipState.agentControlled)}
         inferredControlled={Boolean(zipState.inferredControlled)}
         holdLabel={zipState.holdLabel ?? null}
+        skillSessionOpen={Boolean(zipState.skillSessionContext)}
         deadCopyReason={zipState.deadCopyReason ?? null}
         heldDeadCopy={Boolean(zipState.heldDeadCopy)}
+        userHeld={Boolean(zipState.userHeld)}
         sizeGuard={zipState.sizeGuard}
+        liveSnapshot={zipState.liveSnapshot ?? null}
         {manualZip}
         onToggleUnzip={(permanent: boolean) =>
           handleUnzip(
@@ -2551,9 +2580,12 @@
         agentControlled={Boolean(zipState.agentControlled)}
         inferredControlled={Boolean(zipState.inferredControlled)}
         holdLabel={zipState.holdLabel ?? null}
+        skillSessionOpen={Boolean(zipState.skillSessionContext)}
         deadCopyReason={zipState.deadCopyReason ?? null}
         heldDeadCopy={Boolean(zipState.heldDeadCopy)}
+        userHeld={Boolean(zipState.userHeld)}
         sizeGuard={zipState.sizeGuard}
+        liveSnapshot={zipState.liveSnapshot ?? null}
         {manualZip}
         onToggleUnzip={(permanent: boolean) =>
           handleUnzip(

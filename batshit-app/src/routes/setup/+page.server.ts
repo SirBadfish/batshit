@@ -54,6 +54,7 @@ export const actions = {
 			})
 		}
 
+		let accountCreated = false
 		try {
 			// Create first user as admin
 			const result = await authService.createAdminUser(email, password, displayName)
@@ -68,6 +69,7 @@ export const actions = {
 			}
 
 			// Auto-login the new admin
+			accountCreated = true
 			const session = await authService.createSession(result.user)
 
 			// Set session cookie. createSession() above is non-remember-me (24h
@@ -84,7 +86,9 @@ export const actions = {
 			// Success - redirect happens outside try-catch
 		} catch (error) {
 			return fail(500, {
-				error: error instanceof Error ? error.message : 'Setup failed',
+				error: accountCreated
+					? 'Your account was created and kept, but Batshit could not safely finish signing you in. Check the app logs and repair the problem, then sign in with this account. Do not run setup again or reset your data.'
+					: error instanceof Error ? error.message : 'Setup failed',
 				email,
 				displayName
 			})

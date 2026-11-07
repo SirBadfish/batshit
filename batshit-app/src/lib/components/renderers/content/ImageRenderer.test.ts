@@ -1,5 +1,7 @@
 import { fireEvent, render, screen } from '@testing-library/svelte'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { page } from '$app/state'
+import { toast } from 'svelte-sonner'
 
 import ImageRenderer from './ImageRenderer.svelte'
 import { IMAGE_MESSAGE_ID_CONTEXT, resetImageLoadConsentForTests } from '$lib/stores/imageLoadConsent.svelte'
@@ -149,5 +151,85 @@ describe('ImageRenderer outside pictures (BL-474 step 1)', () => {
 
     const noMessage = render(ImageRenderer, { props: { src: OUTSIDE } })
     expect(images(noMessage.container)).toHaveLength(0)
+  })
+})
+
+// BL-797: Save to Clip Vault must use the Clip compression settings saved NOW. The page's
+// load-time snapshot (`page.data.userSettings`) never changes until a reload.
+describe('ImageRenderer Save to Clip Vault compression settings (BL-797)', () => {
+  const DATA_IMAGE = 'data:image/png;base64,iVBORw0KGgo='
+  const staleSnapshot = { ui_settings: { compress_images: true, compression_quality: 40, max_image_size: '1024', force_jpeg: true } }
+  const savedNow = { compress_images: false, compression_quality: 75, max_image_size: '2048', force_jpeg: false }
+  const pageData = page.data as Record<string, unknown>
+  let savedPageData: unknown
+
+  beforeEach(() => {
+    savedPageData = pageData.userSettings
+    pageData.userSettings = staleSnapshot
+  })
+
+  afterEach(() => {
+    if (savedPageData === undefined) delete pageData.userSettings
+    else pageData.userSettings = savedPageData
+    vi.restoreAllMocks()
+  })
+
+  const route = (settings: () => Response) => {
+    fetchSpy.mockImplementation(async (url: string, init?: RequestInit) => {
+      const target = String(url)
+      if (target === DATA_IMAGE) return new Response(new Blob(['x'], { type: 'image/png' }))
+      if (target.startsWith('/api/user/settings')) return settings()
+      if (target === '/api/uploads/clips') {
+        return new Response(JSON.stringify({ files: [{ originalName: 'x.png', clipData: { id: 'clip-1' } }] }), { status: 200 })
+      }
+      return new Response('{}', { status: 404 })
+    })
+  }
+  const uploads = () => fetchSpy.mock.calls.filter(([url]) => String(url) === '/api/uploads/clips')
+  const clickSave = async (container: HTMLElement) => {
+    await fireEvent.load(images(container)[0])
+    await fireEvent.click(screen.getByRole('button', { name: 'Upload to Clip Vault' }))
+  }
+
+  it('sends the compression settings read at click time, not the page-load snapshot', async () => {
+    route(() => new Response(JSON.stringify({ settings: { ui_settings: savedNow } }), { status: 200 }))
+    const { container } = render(ImageRenderer, { props: { src: DATA_IMAGE, messageId: 'm1' } })
+    await clickSave(container)
+    await vi.waitFor(() => expect(uploads()).toHaveLength(1))
+    const body = uploads()[0][1].body as FormData
+    expect(JSON.parse(String(body.get('compressionSettings')))).toEqual(savedNow)
+  })
+
+  it('applies a change saved after the picture was drawn to the very next save', async () => {
+    let current: Record<string, unknown> = { compress_images: true, compression_quality: 40, max_image_size: '1024', force_jpeg: true }
+    route(() => new Response(JSON.stringify({ settings: { ui_settings: current } }), { status: 200 }))
+    const { container } = render(ImageRenderer, { props: { src: DATA_IMAGE, messageId: 'm1' } })
+    current = savedNow
+    await clickSave(container)
+    await vi.waitFor(() => expect(uploads()).toHaveLength(1))
+    expect(JSON.parse(String((uploads()[0][1].body as FormData).get('compressionSettings')))).toEqual(savedNow)
+  })
+
+  it('uses the defaults when the saved settings have no Clip section yet', async () => {
+    route(() => new Response(JSON.stringify({ settings: { user_id: 'josh' } }), { status: 200 }))
+    const { container } = render(ImageRenderer, { props: { src: DATA_IMAGE, messageId: 'm1' } })
+    await clickSave(container)
+    await vi.waitFor(() => expect(uploads()).toHaveLength(1))
+    expect(JSON.parse(String((uploads()[0][1].body as FormData).get('compressionSettings')))).toEqual({
+      compress_images: true,
+      compression_quality: 40,
+      max_image_size: '1024',
+      force_jpeg: true
+    })
+  })
+
+  it('fails visibly and uploads nothing when the saved settings cannot be read', async () => {
+    const error = vi.spyOn(toast, 'error').mockImplementation(() => 'error-toast')
+    route(() => new Response('{}', { status: 503 }))
+    const { container } = render(ImageRenderer, { props: { src: DATA_IMAGE, messageId: 'm1' } })
+    await clickSave(container)
+    await vi.waitFor(() => expect(error).toHaveBeenCalled())
+    expect(String(error.mock.calls[0][0])).toContain('Clip upload settings are unavailable (503)')
+    expect(uploads()).toHaveLength(0)
   })
 })

@@ -2,6 +2,7 @@ import type { DesktopGoonPreferences } from '$lib/types/goons'
 
 export const LIVE_SETTINGS_EVENTS = {
   artifactUpdated: 'batshit:artifact-updated',
+  pinokioMachinesUpdated: 'batshit:pinokio-machines-updated',
   artifactDeleted: 'batshit:artifact-deleted',
   artifactDraftPreview: 'batshit:artifact-draft-preview',
   localAiSettingsUpdated: 'batshit:local-ai-settings-updated',
@@ -11,6 +12,12 @@ export const LIVE_SETTINGS_EVENTS = {
   sessionClipStateChanged: 'batshit:session-clip-state-changed',
   slashCommandsUpdated: 'batshit:slash-commands-updated'
 } as const
+
+export type PinokioMachinesUpdatedDetail = {
+  /** Absent when a create outcome is unknown; consumers re-read the whole registry. */
+  machineId?: string
+  revision?: number
+}
 
 export type ArtifactUpdatedDetail = {
   artifactId: string
@@ -131,4 +138,8 @@ export function dispatchSlashCommandsUpdated(
     LIVE_SETTINGS_EVENTS.slashCommandsUpdated,
     detail
   )
+}
+
+export function dispatchPinokioMachinesUpdated(detail: PinokioMachinesUpdatedDetail) {
+  dispatchLiveSettingsEvent<PinokioMachinesUpdatedDetail>(LIVE_SETTINGS_EVENTS.pinokioMachinesUpdated, detail)
 }

@@ -31,6 +31,8 @@ This page explains the user-facing pieces without requiring you to understand ev
 
 ## MCP gateways
 
+With [App Actions](../fabric/app-actions.md#connect-an-mcp-source-during-a-task), a permitted Primary Agent can configure supported custom HTTP or already-installed local STDIO sources during your task, then discover and use the actual returned tools. Setup permission does not approve later tool effects.
+
 An MCP gateway is a source of MCP tools. Batshit works with several gateway types:
 
 - Docker MCP Gateway.
@@ -48,7 +50,7 @@ The agent uses its saved gateway selection unless you choose a different set in 
 Dynamic Tool Search is an on-demand pattern:
 
 1. **Call listed tools directly** — if the needed tool is already in the agent's tool list, the agent calls it without searching.
-2. **Use an exact capability hint directly** — if Batshit's current-message context already provides an exact ref and enough input hints, the agent can call that ref without repeating the search.
+2. **Use an exact capability hint directly** — if Agent Setup and its current change notes provide an exact ref and enough input hints, the agent can call that ref without repeating the search.
 3. **Search when needed** — otherwise, the agent searches discoverable capabilities by query, family, group, or exact name, then calls the selected result.
 
 Search results are labeled by family so the agent knows what it found:
@@ -57,18 +59,23 @@ Search results are labeled by family so the agent knows what it found:
 - `cli:` for saved CLI Tools.
 - `artifact:` for published Artifact runtime tools.
 - `fabric:` for Batshit-native controls.
+- `batshit:` for Batshit utilities.
 - `agent_browser:` for Agent Browser capabilities, where that runtime supports them.
 
-The key habit is exactness: the agent uses the exact ref that Batshit provided, whether it came from a search result or a current-message capability hint. If Batshit provides `mcp:github.search_issues` or `artifact:use.artifact.storyboard`, the use step calls that exact ref with the required input. The backend validates every call, so compact schema hints help the agent but don't replace permissions or safety checks.
+The key habit is exactness: the agent uses the exact ref that Batshit provided, whether it came from a search result or Agent Setup and its current change notes. If Batshit provides `mcp:github.search_issues` or `artifact:use.artifact.storyboard`, the use step calls that exact ref with the required input. The backend validates every call, so compact schema hints help the agent but don't replace permissions or safety checks.
 
 Why it works this way:
 
 - Prompts stay smaller.
 - You can install many MCP tools, CLI Tools, and published runtime tools without overwhelming every agent.
 - Each agent can have a different discoverability scope.
-- The agent gets schema hints only when it needs them.
+- Compact schema hints let the agent use known tools directly; Tool Search supplies more detail when needed.
 
 If an agent can't find a tool, check the Tool Grid and gateway health before assuming the tool doesn't exist.
+
+Agents use Tool Use for Batshit Web Search, Workers, enabled Skill documentation and assigned Subagent calls. Existing switches, access and limits still apply. Skill scripts keep their Work Mode approval path.
+
+Use **Preview Agent Setup Tools** in an agent’s Tool Grid to inspect the tool portion and estimated tokens. The enabled Skills catalog is outside this preview. [Dynamic Schema Hints](../admin/overview.md#dynamic-schema-hints) controls detail and the scalable-tool budget; changing hint size never grants tool access.
 
 ## The Tool Grid
 
@@ -83,13 +90,13 @@ The Tool Grid is the main control surface for agent tool access and Zip behavior
 
 Common controls:
 
-- **Discoverable** — whether the agent may find or use that tool family.
+- **Enable** — the applicable native-tool or discovery choice for that row. Native grants and MCP/CLI discoverability retain their own meaning.
 - **Display detail** — how much tool information appears in the dynamic context shown to the agent.
 - **Zip buffer** — how many previous agent/assistant responses stay expanded for model context. It doesn't count user messages or each tool call separately.
 - **Zip threshold** — minimum token size before `Normal` behavior may zip content. Most defaults use `0`.
 - **Zip behavior** — `Inherited` follows the parent/default when there's a real one to inherit from, `Normal` uses buffer and threshold, `Auto` zips immediately by default, and `Off` keeps output open unless a Cool Tool result reaches the 25,000-token size guard.
 - Default and inherited values appear as quiet placeholder text; a typed-looking value means that row is overriding its parent/default.
-- **Batshit Tools** holds the built-in first-party lanes: file tools, Bash, Web Search, Fetch Zip, Subagent Call, Dynamic Tool Search, Artifact Tools, Fabric Controls, and Agent Browser Actions.
+- **Batshit Tools** holds the built-in first-party lanes: file tools, Bash, Web Search, Fetch Zip, Subagent Call, Dynamic Tool Search, Artifact Tools, Fabric & Utilities, and Agent Browser Actions.
 - CLI Tools and each MCP Source appear as their own top-level rows below Batshit Tools.
 - Other tool handling sits at the bottom, usually as the single All Other Tools row.
 - Group header rows (Batshit Tools, CLI Tools, MCP) can apply Zip Buffer and Zip Threshold to every child row underneath; individual rows can override their own details where the UI shows a per-tool control.
@@ -99,46 +106,56 @@ The Global Tool Grid has `Reset to defaults`. The Agent Tool Grid has `Reset to 
 
 Keep tool access as narrow as the job allows. Broad access is powerful, but it also makes agent behavior harder to predict.
 
+- **Typed File Tools** adds `read_file`, `write_file` and `edit_file` when Bash and the host allow them. It starts off and has its own Enable switch per agent. See [Typed file tools](#typed-file-tools).
+
+- **Refreshed File Reads** starts on. Eligible open file reads show the file as it was when the reply started; reads that cannot refresh stay zipped for that reply. Saved per-agent and global choices remain in effect. See [Refreshed File Reads](zips.md#refreshed-file-reads).
+
 ### Bash access modes
 
 - **Plan** allows inspection and search commands plus deliberate Markdown (`.md`) writes or edits. Batshit blocks command chaining, hidden mutation or command-execution flags, shell/process substitution, and pipelines that contain an executor or writer instead of another approved read-only stage. Git commands are blocked here because repository configuration can make even an inspection run helper programs. Use direct commands or managed `apply_patch` for Markdown edits; shell/interpreter wrappers are blocked, and every redirected output file must be Markdown.
-- **Agent** allows workspace work. Simple inspections normally skip a popup. In an API agent chat, shell file writes, Git commands, interpreters, and ambiguous compound commands follow your approval policy unless explicitly allowlisted. Every operation must qualify independently. Batshit's managed patch and native file tools keep their normal workspace checks.
-- **Dangerous** skips approval popups, while Batshit's hard safety blocks and your Never Allow rules still apply.
+- **Agent** allows workspace work. Simple inspections normally skip a popup. In an agent chat, shell file writes, Git commands, interpreters, and ambiguous compound commands follow the agent's **Approval Policy** unless explicitly allowlisted: **On Failure** asks you first, and **Never** refuses them. Managed patches, and the typed file tools when they are on, create and edit files without a card. Every operation must qualify independently. Batshit's managed patch and native file tools keep their normal workspace checks. When an agent sends a patch together with a command to run after it, such as a test, Batshit asks once for both. The card names the patched files and the first command. The command runs only after the whole patch applied, and if you deny the card, neither runs. Where no card can appear (a group chat, or approval cards turned off), Batshit writes nothing for such a call, and the agent sends the patch and the command separately.
+- **Dangerous** skips approval popups, while Batshit's hard safety blocks and your Always Block rules still apply.
 
-**Codex and Claude agents use their own Bash.** A CLI agent already has a shell, file editing, and search of its own, so Batshit does not give it a second Bash tool, and it refuses one that a CLI agent tries anyway ("Use your own shell tool."). That is why the Bash Tool switch is off and greyed out for a CLI agent and for a CLI Subagent. Its commands run where the Codex or Claude program runs them (on your Mac as you; in Docker, inside the app container), under the mode you picked for that agent in the chat bar (Codex: Chat (read-only), Agent (workspace write), or Agent (full access); Claude: Plan, Ask before edits, Edit automatically, or Bypass permissions), and never with more than its Agent Settings allow (a Codex Sandbox Level you set tighter by hand holds; see [What a chat message lets the agent do](../primary-agents/overview.md#what-a-chat-message-lets-the-agent-do)). The Bash modes above, the Sandbox choice, the allow list, the Never Allow list, and Batshit's guard on its own source code do not reach those commands, and **Stop** for one is the program's own. A Codex agent in Chat (read-only) mode cannot change files; pick Agent (workspace write) for that. If you want Batshit's Sandbox and lists around an agent's commands, use an API agent.
+**On the Claude plan, commands go through Batshit's Bash.** Claude Code's own tools are off there, so an agent or Subagent on the Claude plan connection runs its commands through Batshit's Bash tool, under the modes, the Sandbox choice, the allow list, the Always Block list and Batshit's guard on its own source code. The removed Claude Code CLI lanes had a shell of their own outside all of these.
 
 **An approved command runs once.** If the reply fails or you press **Stop** after you approved, the card still says **Approved** and does not offer the buttons again. To run the command again, ask the agent again; it asks you again with a new card.
 
 **What you typed while it waited, waits too.** A steer or a queued message the agent did not get to before the card waits for your click, and the agent answers it when the reply you approved (or denied) finishes; a card that expired does not release it. See [When the reply stops at an approval card](../chat/overview.md#when-the-reply-stops-at-an-approval-card).
 
-Local Bash commands use an installed system zsh, or bash when zsh is unavailable. The tool card records the shell that ran the command. If neither shell is installed, Batshit explains what is missing. A failed command is never repeated in another shell. Managed `apply_patch` edits run inside Batshit and do not need either shell.
+Local Bash commands use an installed system zsh, or bash when zsh is unavailable. The tool card records the shell that ran the command. If neither shell is installed, Batshit explains what is missing. A failed command is never repeated in another shell. Managed `apply_patch` edits run inside Batshit and do not need either shell. Batshit reads and writes a patch only inside the workspace folder, even when the agent's commands run in a sandbox: if a folder in a patched path turns into a link while the patch runs, or the path leads onto another disk, the patch stops. Batshit then puts back what the patch had already changed, and names any file it could not put back. A patch can read or write files up to 64 MB each. A command written after a patch, such as a test, runs in the shell like any other command, and only when the whole patch applied.
 
-### The Fabric Controls and Artifact Tools rows
+### Typed file tools
 
-Most people never need to touch these two. They're already set the way they should be, and this section is here for the times you're curious what they are or you want to turn one off.
+An agent can also get three file tools beside Bash: `read_file`, `write_file` and `edit_file`. They do the file work an agent does most (read a file, write a whole file, change part of a file) without a shell command, so each call shows a clean file card and its result is easy for the agent to follow.
 
-You'll find both inside the **Batshit Tools** group, on the rows already named `Fabric Controls` and `Artifact Tools`.
+- **`read_file`** reads a text file in the project, whole or as a line range. The result says which lines it shows and how many lines the file has. A very large file is cut at about 90,000 characters, and the result says so.
+- **`write_file`** creates or replaces a whole text file. The file is replaced in one step: it is either fully written or not changed.
+- **`edit_file`** changes part of a file by exact replacement. Each piece of old text must match the file exactly once, and all the changes in one call apply together or not at all. If a piece matches twice or not at all, nothing is written and the agent is told why. Its immediate success reply is concise; the full diff stays in the saved card and Zip. An agent can make several independent file calls in one batch; each file is a separate operation.
 
-**Fabric Controls** are Batshit's own app actions, the things that let an agent manage Artifacts, install a CLI Tool, look at your model catalog, start a Pinokio app, and so on. There are more than sixty of them, and they all live in one row.
+They follow the same rules as a file patch in Bash: they work only inside the project folder, Plan mode lets them write only Markdown (`.md`) files, and Batshit's guard on its own source code still applies. They never show an approval card, the same as a file patch. They refuse a symbolic link at the file itself and preserve ordinary permission bits when replacing a file. If a call loses confirmation during a write, its result says the outcome is uncertain; any temporary files that could not be safely removed are named.
 
-**Artifact Tools** are the Artifacts you've published and marked as agent-usable. Each one shows up as something the agent can run directly.
+**Turning them on.** They start off. Open **Settings → Agents → the agent → Tools**, expand **Batshit Tools**, and turn on **Typed File Tools** in the Enable column. The same agent Tool Grid is available from the chat bar. An agent gets them only when:
 
-Each row carries the same controls as everything else in the grid:
+- its **Bash Tool** is on, and
+- its **Sandbox Level** and host support them: **Local machine** on a supported native Mac or Linux installation, or **Apple Container** / **Docker Sandbox** on Mac. In the Docker app, **Local machine** works inside the app container's workspace; **Docker Sandbox** also needs the normal host operator on Mac and a real shared host folder. A private Docker workspace volume works with Local, but cannot be shared with host Sandbox. Windows and native Linux sandbox locations are not qualified yet. The setting shows the reason when the tools are unavailable; saved setup does not mean a runtime is ready.
 
-- **Discoverable** decides whether the agent may find and use that family at all. Turn it off and the whole family disappears for that agent.
-- **Display detail** decides how much shows up in the compact capability list Batshit gives the agent on every message.
-- The **Zip** columns work like every other Batshit Tools row: they control how the results of a search get compressed in the conversation, not what the agent can reach.
+**Known Mac shared-folder limitation.** With Batshit running inside Docker Desktop on Mac, a hard-linked file in a shared host folder can be read but an edit may be refused. A hard link means two filenames refer to the same underlying file. When Batshit cannot verify that file, it reports the refusal and leaves the contents of both files intact. This limitation is still open for a future fix.
 
-The two rows ship with different display detail on purpose, because they're different sizes:
+A Subagent has its own choice in its Tools tab, and it also needs its parent agent to allow them.
 
-- **Fabric Controls** shows **the group name, the count, and the kinds of control it holds**, for example `Fabric Controls (45 tools: artifacts, CLI tools, ComfyUI, Pinokio, …)`. More than sixty entries is too many to list on every single message, and listing them would cost you real tokens for something the agent can find in one search anyway. The kinds are there so the agent knows to search: when you ask about Pinokio in plain words, it sees that it has Pinokio controls. It only sees the kinds it can actually use.
-- **Artifact Tools** shows **names and hints**. This family is small and it's yours, so spelling out each Artifact's input fields is worth it: the agent can call your Artifact directly instead of spending an extra round trip searching for it first.
+**The Always Block List covers them.** The Always Block List also covers the typed file tools: a rule whose first word names apply_patch, write_file or edit_file blocks every write_file and edit_file call, and one naming read_file blocks read_file. Wildcards count, so apply_patch* names the two writers and * names all three. The rest of the rule is not read as a file path.
 
-Discoverable and Display detail only appear when the family is actually reachable for that agent. If Fabric is switched off for an agent entirely, the row keeps its Zip settings and drops the other two controls.
+**Zips.** Their results use the **Read File**, **Write File** and **Edit File** rows of the Tool Grid. Those rows set zip behavior only; they do not turn the tools on or off. When the agent reads a whole file again or edits it, the older copy of that file compresses on the agent's next reply, the same as for a read in Bash.
 
-The Chat Bar tool grid works the same way, since it's the same grid. Subagent Settings doesn't have a Batshit Tools group, so the two families appear there as their own rows instead, with the same controls. Group Settings is a different grid that only decides whether a tool's results are shared into the thread, so it has nothing to set here.
+### Fabric & Utilities and Artifact Tools
 
-If you do change one, the most useful move is usually turning **Artifact Tools** display detail down when you have a lot of published Artifacts and only a few matter to that agent, or turning **Discoverable** off entirely for an agent that has no business managing your app.
+Both rows sit under **Batshit Tools**. An agent's **Enable** switches control whether it may use those capabilities; a hint or Display Detail choice does not grant access.
+
+**Fabric & Utilities** covers Batshit's app controls and enabled utilities. It includes a compact family/count hint plus fixed guidance for features the agent can use. There is no separate display/hide setting for this row. Agent DMs, schedules, Whiteboard and the judgment tool keep their own settings and dependencies. Broad Fabric app management stays Primary-only; a Subagent's switch is unavailable with an explanation.
+
+**Artifact Tools** is separate. Its Enable switch controls execution access, while **Display Detail** controls how much information the agent sees about accessible published runtime tools. Artifact allowlists and runtime validation still apply. A visible panel is not automatically an agent tool.
+
+The **Global Tool Grid** sets shared display and compression defaults. The **Agent Tool Grid** and chat-bar Tools menu add applicable Enable switches. **Reset to global settings** clears display and Zip overrides; it does not silently turn on a native tool or change an explicitly saved Typed File Tools choice. Read, Write, Edit, Search and List rows own compression rather than having their own enable switches.
 
 ## Skills and Prompts
 
@@ -152,7 +169,7 @@ Keep enabled Skills trusted and relevant to that agent. Batshit uses its normal 
 
 Portable Skills are the outside-agent version of Batshit system skills. Instead of running inside a Batshit chat, they are installed into an agent you already use, such as Claude Code, Codex, or another coding assistant.
 
-They call your local Batshit instance through the app API with a Portable Skill Token from Settings -> Skills & Prompts -> Portable Skills. That token is scoped by family, such as Voice Engines, Artifacts, CLI Tools, Skills, or Goon Scenes.
+They call your local Batshit instance through the app API with a Portable Skill Token from Settings → Plugins & shit → Portable Skills. That token is scoped by family, such as Voice Engines, Artifacts, CLI Tools, Skills, or Goon Scenes.
 
 Use Portable Skills when you want an outside agent to do setup work for Batshit without giving it `BATSHIT_TOKEN`, your password, browser cookies, or direct Redis access. Start with [Portable Skills](../skills/portable-skills.md).
 
@@ -181,7 +198,7 @@ Good examples:
 - Query a local helper with fixed arguments.
 - Call a trusted internal command with a narrow input schema.
 
-Avoid CLI Tools for vague, open-ended shell access. If the agent needs general command work, use the right Bash or CLI Primary Agent path with the appropriate sandbox/back-end setting.
+Avoid CLI Tools for vague, open-ended shell access. If the agent needs general command work, use Batshit's Bash tool with the appropriate sandbox/back-end setting.
 
 ## Fabric controls
 
@@ -209,7 +226,7 @@ See [Artifacts](../artifacts/overview.md) for details.
 
 Runtime add-ons are optional services Batshit can connect to, start through an approved operator, or guide you to start manually.
 
-For Codex and Claude agents, starting or stopping an add-on must go through a Primary Agent’s matching Batshit Tools control and its user approval. A direct automation request is refused and names the control. A Subagent or Worker must ask its Primary Agent; the refusal does not grant it access to that control. Existing n8n workflow actions and signed-in or service automation keep their separate settings-governed behavior.
+Manage an add-on through the Primary Agent's matching Batshit control and the required approval. Subagents and Workers do not receive broad runtime-management access. Keep n8n and external runtime administration under their documented controls.
 
 Current Docker add-on shapes:
 
@@ -219,14 +236,12 @@ Current Docker add-on shapes:
 
 The Docker core app container does not get arbitrary host Docker control. Start/stop actions go through Batshit-approved add-on IDs and an authenticated host operator when that path is configured.
 
-## How tools reach each Primary Agent type
+## How tools reach an agent
 
-| Primary Agent type | Tool path |
-| --- | --- |
-| `API` | Uses Batshit native tools through the direct provider path. |
-| `CLI` | Uses CLI-native command/search/edit behavior (its own shell, so Batshit's Bash modes, Sandbox, and lists do not apply) plus Batshit-managed helper tools through a managed bridge. |
+Every Primary Agent uses Batshit native tools, on any model connection. On the Claude plan connection, Claude Code's own tools are turned off and the model sees only the Batshit tools you allow.
 
-The user-facing result should feel similar, but the transport differs. If a tool works for one type and not another, check that it's enabled for that agent type and that the runtime path is configured.
+
+If a tool works for one agent and not another, check that it's enabled for that agent and that the runtime path is configured.
 
 ## Agent Browser
 
@@ -242,8 +257,7 @@ In Docker, raw app-container Bash commands like `agent-browser ...` are blocked.
 
 n8n can participate in several ways:
 
-- An n8n Workflow Subagent can call its n8n-native nodes and its assigned Batshit Subagent Tools.
-- `API` and `CLI` Primary Agents can call n8n workflows as tools.
+- Primary Agents can call n8n workflows as tools.
 - n8n Instance MCP can expose workflows and workflow inspection through n8n's MCP server.
 - n8n MCP Trigger workflows can expose curated MCP tool sets.
 
@@ -273,12 +287,11 @@ Tools are powerful — treat them like giving a capable assistant access to real
 | A tool you just added on the server doesn't show up yet | Batshit keeps each gateway's tool list for up to five minutes, so messages don't wait on every tool server. | Click **Refresh** on that gateway in Settings → MCPs, or wait five minutes. |
 | Docker MCP calls fail with unauthorized errors | Gateway token mismatch, or the gateway wasn't started with the same token. | Docker MCP Gateway settings and active environment. |
 | CLI Tool is visible but fails | Manifest input, working directory, missing executable, or missing saved key. | Run the CLI Tool test path. |
-| n8n tool callback fails | The Batshit Tools node isn't forwarding the per-message native-tool token, or the callback URL isn't reachable from n8n. | The `x-batshit-native-tool-token` header, n8n execution history, and runtime URLs. |
 | Agent starts inventing setup commands | The add-on is connect-existing or deferred, not startable. | Runtime add-on status/prepare result. |
 
-## App Actions in Fabric Controls
+## App Actions in Fabric & Utilities
 
-App Actions use the existing Fabric Controls row. They let a Primary Agent operate a small set of views in a live tab showing its chat, inspect masked Settings and change only its own display name, Awareness/Triggers/Recalled Lane Budgets and the linger defaults for trigger and recalled memories. The agent discovers the exact action it needs; enabling discovery does not remove approvals or grant new native/file permissions. [Fabric](../fabric/overview.md#asking-an-agent-to-use-the-current-view) explains multiple tabs, unsaved edits and unconfirmed results.
+App Actions use the enabled Fabric & Utilities family with their own explicitly saved access. They support current-view operations and scoped Settings changes at the limits in [App Actions](../fabric/app-actions.md). Tool enablement does not replace protected-category policy, exact review or native/file permissions. [Fabric](../fabric/overview.md#asking-an-agent-to-use-the-current-view) explains current tabs and unsaved edits.
 
 ## Related docs
 

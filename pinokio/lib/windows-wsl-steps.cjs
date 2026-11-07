@@ -3,7 +3,12 @@ const command = (action, service) => ({
   params: { conda: { skip: true }, bluefairy: 'off', message: `node lib/windows-wsl.mjs ${action}${service ? ` ${service}` : ''}` }
 });
 
-const explanation = 'Batshit uses its own Linux environment in WSL 2. Install/Update/Reset keep your data disk outside this launcher. Windows-managed local voice processes end when that environment ends. Connected external runtimes are separate. Windows-host tools and model servers are not automatically moved, reconfigured or exposed to Linux.';
+const explanation = [
+  '<p><strong>Just so you know</strong><br>Batshit uses WSL 2 to run on Windows. Pinokio takes care of starting Batshit for you.</p>',
+  '<p><strong>Your data</strong><br>Pinokio’s Install, Update and Reset buttons keep your chats, settings and other Batshit data. Your data is stored separately from the app download.</p>',
+  '<p><strong>Voice apps</strong><br>If you later use Batshit to run voice software, it stops when you stop Batshit in Pinokio. Voice software you run in other apps stays under those apps’ control.</p>',
+  '<p><strong>Other AI tools</strong><br>Apps and tools you already have on Windows are not connected automatically. You can connect compatible ones later in Batshit.</p>'
+].join('');
 
 module.exports.windowsMenuState = async () => (await import('./windows-wsl.mjs')).windowsMenuState();
 

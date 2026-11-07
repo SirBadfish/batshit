@@ -477,16 +477,24 @@
     </p>
   {:else if loadError}
     <p class="batshit-settings-form-meta is-error">{loadError}</p>
-  {:else if agents.length === 0}
+  {:else if agents.length === 0 && schedules.length === 0}
     <p class="batshit-settings-form-help">
       No agent has Agent DMs turned on yet. A schedule writes a DM to one agent, so turn on Agent
-      DMs for that agent in Agent Settings first.
+      DMs, and the Fabric &amp; Utilities switch they need, for that agent in Agent Settings first.
     </p>
   {:else if schedules.length === 0}
     <p class="batshit-settings-form-help">
       No schedules yet. Create one to have an agent wake up at a set time, like every day at 9am.
     </p>
   {:else}
+    {#if agents.length === 0}
+      <!-- Saved schedules stay listed when no agent can receive one (Agent DMs or Fabric &
+           Utilities turned off): they still fire, and each run records why it failed. -->
+      <p class="batshit-settings-form-help" data-testid="schedules-no-eligible-agent">
+        No agent can receive a schedule's DM right now (Agent DMs, or the Fabric &amp; Utilities
+        switch they need, is off), so each run below records a failure until that is turned back on.
+      </p>
+    {/if}
     <div class="batshit-settings-group">
       {#each schedules as schedule (schedule.id)}
         {@const agent = agentById.get(schedule.agentId)}

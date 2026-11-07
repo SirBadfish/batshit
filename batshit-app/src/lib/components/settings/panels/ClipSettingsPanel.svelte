@@ -101,6 +101,9 @@
   let cloudflaredStatus = $state<CloudflaredTunnelStatus | null>(null)
   let cloudflaredBusy = $state(false)
   let cloudflaredError = $state<string | null>(null)
+  const observedCloudflaredTarget = $derived(
+    cloudflaredStatus?.tunnel?.targetUrl || cloudflaredStatus?.dockerSidecar?.targetUrl || cloudflaredStatus?.targetUrl || ''
+  )
 
   $effect(() => {
     if (!isLoading) return
@@ -160,24 +163,6 @@
     }
   }, SAVE_DEBOUNCE_MS)
 
-  // Auto-detect HTTPS from tunnel URL for manual tunnel mode
-  $effect(() => {
-    if (
-      clipSettings.tunnelProvider === 'manual' &&
-      clipSettings.tunnelUrl &&
-      clipSettings.tunnelUrl.includes('https://')
-    ) {
-      clipSettings.useHttps = true
-    }
-  })
-
-  // Managed Cloudflare tunnel always uses HTTPS
-  $effect(() => {
-    if (clipSettings.tunnelProvider === 'cloudflared_managed') {
-      clipSettings.useHttps = true
-    }
-  })
-
   $effect(() => {
     // BL-962: never a write built while no read of the saved settings succeeded. The controls
     // are not offered then either; this line keeps the whole blocks from being sent if one ever is.
@@ -228,6 +213,11 @@
       }
 
       const result = await response.json()
+      if (!result || typeof result !== 'object' || Array.isArray(result) ||
+        !Object.hasOwn(result, 'settings') ||
+        (result.settings !== null && (typeof result.settings !== 'object' || Array.isArray(result.settings)))) {
+        throw new Error('Invalid clip settings response')
+      }
       const remoteSettings: UserSettingsRow | null = result?.settings ?? null
       // A read that succeeded is the answer: `null` means "no record yet" (the route rethrows
       // every Redis failure), and a new install opens on the defaults. The page's copy is never
@@ -266,18 +256,23 @@
     }
   }
 
-  // Retry does what opening does: the saved settings first, then the managed tunnel's status,
-  // which overlays the live tunnel URL and auto-start on the saved copy.
+  // Retry reads saved preferences, then a separate runtime observation. Neither is an edit.
   async function retryLoadSettings() {
     if (settingsLoadBusy) return
     await loadSettings()
     if (settingsLoaded) await loadCloudflaredStatus()
   }
 
+  function uploadRecord(value: unknown): Record<string, unknown> {
+    return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
+  }
+
   function normaliseClipSettings(settings?: UserSettingsRow | null): ClipSettingsState {
     const uiSettings = (settings?.ui_settings as Record<string, any>) ?? {}
-    const legacyUpload = settings ? ((settings as unknown as Record<string, any>).upload_settings as Record<string, any>) ?? {} : {}
-    const nestedUpload = (uiSettings.upload_settings as Record<string, any>) ?? legacyUpload
+    const legacyUpload = uploadRecord(settings?.upload_settings)
+    const canonicalUpload = uploadRecord(uiSettings.upload_settings)
+    // Match tunnel/Clip runtime precedence: an empty nested alias owns no values.
+    const nestedUpload = Object.keys(canonicalUpload).length > 0 ? canonicalUpload : legacyUpload
 
     const maxSize = (() => {
       const value = uiSettings.max_image_size
@@ -362,7 +357,7 @@
       strategy: 'local',
       storage_mode: 'local',
       tunnel_url: isManualTunnel || isManagedCloudflare ? state.tunnelUrl : '',
-      use_https: isManagedCloudflare ? true : isManualTunnel ? state.useHttps : false,
+      use_https: isManualTunnel || isManagedCloudflare ? state.useHttps : false,
       tunnel_provider: state.tunnelProvider,
       cloudflared_auto_start: isManagedCloudflare ? state.cloudflaredAutoStart : false,
       cloudflared_target_url: isManagedCloudflare ? state.cloudflaredTargetUrl : ''
@@ -391,15 +386,6 @@
 
       const payload = (await response.json()) as CloudflaredTunnelStatus
       cloudflaredStatus = payload
-      if (typeof payload.autoStart === 'boolean') {
-        clipSettings.cloudflaredAutoStart = payload.autoStart
-      }
-      if (typeof payload.targetUrl === 'string' && payload.targetUrl.trim().length > 0) {
-        clipSettings.cloudflaredTargetUrl = payload.targetUrl.trim()
-      }
-      if (clipSettings.tunnelProvider === 'cloudflared_managed') {
-        clipSettings.tunnelUrl = payload?.tunnel?.publicUrl ?? ''
-      }
     } catch (error) {
       console.error('[ClipSettings] Failed to load Cloudflare tunnel status:', error)
       cloudflaredError =
@@ -411,6 +397,7 @@
 
   async function startManagedTunnel() {
     if (cloudflaredBusy) return
+    const intent = makeTunnelSignature(clipSettings)
     cloudflaredBusy = true
     cloudflaredError = null
 
@@ -429,8 +416,10 @@
         throw new Error(payload?.reason || payload?.error || 'Failed to start Cloudflare tunnel')
       }
       cloudflaredStatus = payload
-      clipSettings.tunnelUrl = payload?.tunnel?.publicUrl ?? ''
-      clipSettings.useHttps = true
+      if (clipSettings.tunnelProvider === 'cloudflared_managed' && makeTunnelSignature(clipSettings) === intent) {
+        clipSettings.tunnelUrl = payload?.tunnel?.publicUrl ?? ''
+        clipSettings.useHttps = true
+      }
       toast.success('Managed Cloudflare tunnel started')
     } catch (error) {
       const message =
@@ -444,6 +433,7 @@
 
   async function stopManagedTunnel() {
     if (cloudflaredBusy) return
+    const intent = makeTunnelSignature(clipSettings)
     cloudflaredBusy = true
     cloudflaredError = null
 
@@ -458,7 +448,9 @@
         throw new Error(payload?.reason || payload?.error || 'Failed to stop Cloudflare tunnel')
       }
       cloudflaredStatus = payload
-      clipSettings.tunnelUrl = ''
+      if (clipSettings.tunnelProvider === 'cloudflared_managed' && makeTunnelSignature(clipSettings) === intent) {
+        clipSettings.tunnelUrl = ''
+      }
       toast.success('Managed Cloudflare tunnel stopped')
     } catch (error) {
       const message =
@@ -472,6 +464,7 @@
 
   async function updateManagedAutoStart(enabled: boolean) {
     clipSettings.cloudflaredAutoStart = enabled
+    const intent = makeTunnelSignature(clipSettings)
     cloudflaredError = null
     try {
       const response = await fetch('/api/native-tools/cloudflared/tunnel', {
@@ -488,7 +481,8 @@
         throw new Error(payload?.reason || payload?.error || 'Failed to update auto-start')
       }
       cloudflaredStatus = payload
-      if (enabled && payload?.tunnel?.publicUrl) {
+      if (enabled && payload?.tunnel?.publicUrl && clipSettings.tunnelProvider === 'cloudflared_managed' &&
+        makeTunnelSignature(clipSettings) === intent) {
         clipSettings.tunnelUrl = payload.tunnel.publicUrl
       }
     } catch (error) {
@@ -523,6 +517,15 @@
     if (clipSettings.tunnelUrl.startsWith('https://')) {
       clipSettings.useHttps = true
     }
+  }
+
+  function handleManualTunnelUrlInput(value: string) {
+    clipSettings.tunnelUrl = value
+    if (value.includes('https://')) clipSettings.useHttps = true
+  }
+
+  function handleCloudflaredTargetInput(value: string) {
+    if (cloudflaredStatus?.supportLevel !== 'docker-sidecar') clipSettings.cloudflaredTargetUrl = value
   }
 
   async function extractError(response: Response, fallback: string) {
@@ -766,6 +769,7 @@
                     <Input
                       id="tunnel-url"
                       bind:value={clipSettings.tunnelUrl}
+                      oninput={(event) => handleManualTunnelUrlInput((event.currentTarget as HTMLInputElement).value)}
                       placeholder="abc123.ngrok.io or my-tunnel.example.com"
                       class="font-mono text-xs"
                     />
@@ -868,7 +872,10 @@
                     <div class="batshit-settings-form-control is-wide">
                       <Input
                         id="cloudflared-target-url"
-                        bind:value={clipSettings.cloudflaredTargetUrl}
+                        value={cloudflaredStatus?.supportLevel === 'docker-sidecar'
+                          ? observedCloudflaredTarget || clipSettings.cloudflaredTargetUrl
+                          : clipSettings.cloudflaredTargetUrl}
+                        oninput={(event) => handleCloudflaredTargetInput((event.currentTarget as HTMLInputElement).value)}
                         placeholder={DEFAULT_CLOUDFLARED_TARGET_URL}
                         class="font-mono text-xs"
                         disabled={cloudflaredBusy || cloudflaredStatus?.supportLevel === 'docker-sidecar'}
@@ -901,9 +908,14 @@
                     Public URL: <code>{cloudflaredStatus.tunnel.publicUrl}</code>
                   </p>
                 {/if}
+                {#if cloudflaredStatus?.tunnel?.running && observedCloudflaredTarget}
+                  <p class="batshit-settings-form-meta">
+                    Active Target: <code>{observedCloudflaredTarget}</code>
+                  </p>
+                {/if}
                 {#if cloudflaredStatus?.supportLevel === 'docker-sidecar'}
                   <p class="batshit-settings-form-help">
-                    Docker sidecar target: <code>{clipSettings.cloudflaredTargetUrl}</code>.
+                    Docker sidecar target: <code>{observedCloudflaredTarget || clipSettings.cloudflaredTargetUrl}</code>.
                     This is internal to Docker Compose, so it does not collide with host ports.
                     Batshit uses the current public URL when clips need it.
                   </p>

@@ -169,7 +169,7 @@ describe('chatBarWorkModeSave (BL-833)', () => {
 })
 
 describe('presetModelSettings', () => {
-  it('drops the agent keys a preset may carry (a Codex preset carries codex_* keys) and keeps a real 0', () => {
+  it('drops the agent keys a preset may carry (an older Codex preset carries codex_* keys) and keeps a real 0', () => {
     expect(presetModelSettings({ temperature: 0, reasoningEffort: 'low', codex_permission_mode: 'agent', nativeTools: {} })).toEqual({
       temperature: 0,
       reasoningEffort: 'low'
@@ -179,28 +179,28 @@ describe('presetModelSettings', () => {
 })
 
 describe('the chat-bar controls send only their own key (BL-514, BL-833; pinned from the line start)', () => {
-  const selector = readFileSync('src/lib/components/models/CodexReasoningEffortSelector.svelte', 'utf8')
+  const selector = readFileSync('src/lib/components/models/ModelReasoningControl.svelte', 'utf8')
   const chatInput = readFileSync('src/lib/components/chat/ChatInput.svelte', 'utf8')
 
-  it('the Codex reasoning selector sends codex_reasoning_effort alone, null for Default', () => {
-    expect(selector).toContain(
-      "\n      const nextProviderSettings = { codex_reasoning_effort: clamped === 'default' ? null : clamped }\n"
-    )
-    expect(selector).toContain('\n        provider_specific_settings: nextProviderSettings\n')
-    expect(selector).not.toContain('...(currentAgent.provider_specific_settings')
-    expect(selector).not.toContain('delete nextProviderSettings.codex_reasoning_effort')
+  it('the reasoning selector uses the shared acknowledged owner without rewriting legacy defaults', () => {
+    // SA-139 R4: the CLI runtime selector left with the Claude Code CLI Primary; the API
+    // selector saves each control by its own key through the same owner.
+    expect(selector).toContain('await saveAgentReasoningControl(owner.agentId, control.key, next)')
+    expect(selector).not.toContain('provider_specific_settings:')
+    expect(selector).not.toContain('codex_settings:')
   })
 
-  it('the Codex and Claude mode controls send their permission-mode key alone', () => {
-    // BL-941 part C: each save sits inside `trackModeSave(...)`, the send's wait for it.
-    expect(chatInput).toContain('\n          provider_specific_settings: { codex_permission_mode: mode }\n')
-    expect(chatInput).toContain('\n          provider_specific_settings: { claude_permission_mode: mode }\n')
+  it('the chat bar has no Claude Code or Codex permission-mode control (SA-139 R4)', () => {
+    // The Claude mode control left with the Claude Code CLI Primary; Codex's left in R1.
+    expect(chatInput).not.toContain('claude_permission_mode')
+    expect(chatInput).not.toContain('codex_permission_mode')
   })
 
   it('the Work mode control sends chatBarWorkModeSave, never the copy of the whole block', () => {
-    expect(chatInput).toContain(
-      '\n        provider_specific_settings: chatBarWorkModeSave(currentAgent.provider_specific_settings, mode)\n'
-    )
+    // BL-2048 took the change into a local first (its own result decides the badge re-ask); the save
+    // still sends exactly that change.
+    expect(chatInput).toContain('\n    const change = chatBarWorkModeSave(currentAgent.provider_specific_settings, mode)\n')
+    expect(chatInput).toContain('\n      await agentStore.updateAgentSettings(currentAgent.id, { provider_specific_settings: change })\n')
     expect(chatInput).not.toContain('...(currentAgent.provider_specific_settings ?? {})')
     expect(chatInput).not.toContain('...currentProviderSettings,\n        nativeTools: nextNativeTools')
   })

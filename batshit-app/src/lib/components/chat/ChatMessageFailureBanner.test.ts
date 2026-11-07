@@ -86,10 +86,10 @@ describe('ChatMessage: the failure banner', () => {
   // BL-759: a managed lane lost its connection mid-answer and started the answer again; the
   // unfinished first try was taken out. The reply says so, naming the program, and only then.
   it('says the answer started again after a lost connection when the record says so, and never otherwise', () => {
-    seed('The retried answer.', { restartedAfterLostConnection: { program: 'Codex' } })
+    seed('The retried answer.', { restartedAfterLostConnection: { program: 'Claude Code' } })
     const first = render(Harness, { props: { messageId: REPLY, sessionId: SESSION } })
     expect(screen.getByTestId('reply-restarted-after-lost-connection').textContent).toContain(
-      'Codex lost its connection during this answer and started it again. The unfinished first try was removed.'
+      'Claude Code lost its connection during this answer and started it again. The unfinished first try was removed.'
     )
     first.unmount()
 
@@ -102,15 +102,6 @@ describe('ChatMessage: the failure banner', () => {
   // whose record holds Chat, an older window); the server saves the note at every way the reply
   // ends, and the reply says what ran, in one line, and only then.
   it('says what ran when Agent Settings made the run tighter than the mode the chat bar sent, and never otherwise', () => {
-    seed('The read-only answer.', {
-      modeLimitedByAgentSettings: { program: 'Codex', sentMode: 'agent_full', ranMode: 'chat', sandbox: 'read-only' }
-    })
-    const codex = render(Harness, { props: { messageId: REPLY, sessionId: SESSION } })
-    expect(screen.getByTestId('reply-mode-limited-by-agent-settings').textContent?.trim()).toBe(
-      'Codex ran as Chat, Read-only, because Agent Settings holds that for this agent; the chat bar sent Agent (full access).'
-    )
-    codex.unmount()
-
     seed('The planned answer.', {
       modeLimitedByAgentSettings: { program: 'Claude Code', sentMode: 'acceptEdits', ranMode: 'plan' }
     })
@@ -125,15 +116,43 @@ describe('ChatMessage: the failure banner', () => {
     expect(screen.queryByTestId('reply-mode-limited-by-agent-settings')).toBeNull()
     none.unmount()
 
+    // SA-139 R1: a note an older Codex CLI reply saved names a program Batshit no longer runs; it
+    // shows nothing rather than words for modes that no longer exist.
+    seed('The read-only answer.', {
+      modeLimitedByAgentSettings: { program: 'Codex', sentMode: 'agent_full', ranMode: 'chat', sandbox: 'read-only' }
+    })
+    const retired = render(Harness, { props: { messageId: REPLY, sessionId: SESSION } })
+    expect(screen.queryByTestId('reply-mode-limited-by-agent-settings')).toBeNull()
+    retired.unmount()
+
     // A note Batshit cannot read shows nothing rather than words it made up.
-    seed('The whole reply.', { modeLimitedByAgentSettings: { program: 'Codex', sentMode: 'agent', ranMode: 'bogus' } })
+    seed('The whole reply.', { modeLimitedByAgentSettings: { program: 'Claude Code', sentMode: 'acceptEdits', ranMode: 'bogus' } })
     const bogus = render(Harness, { props: { messageId: REPLY, sessionId: SESSION } })
     expect(screen.queryByTestId('reply-mode-limited-by-agent-settings')).toBeNull()
     bogus.unmount()
 
     // A mode named like a built-in of every object is no mode.
-    seed('The whole reply.', { modeLimitedByAgentSettings: { program: 'Codex', sentMode: 'constructor', ranMode: 'chat' } })
+    seed('The whole reply.', { modeLimitedByAgentSettings: { program: 'Claude Code', sentMode: 'constructor', ranMode: 'plan' } })
     render(Harness, { props: { messageId: REPLY, sessionId: SESSION } })
     expect(screen.queryByTestId('reply-mode-limited-by-agent-settings')).toBeNull()
+  })
+
+  // BL-969 (a): the note is information, not a failure. It is the reply's quiet status line (the
+  // empty stopped reply's style, BL-934) with an information icon, never the pink failure banner
+  // with its warning triangle.
+  it('shows the note as a quiet information line, not as the failure banner', () => {
+    seed('The planned answer.', {
+      modeLimitedByAgentSettings: { program: 'Claude Code', sentMode: 'acceptEdits', ranMode: 'plan' }
+    })
+    render(Harness, { props: { messageId: REPLY, sessionId: SESSION } })
+
+    const note = screen.getByTestId('reply-mode-limited-by-agent-settings')
+    expect(note.classList.contains('message-stopped-note')).toBe(true)
+    expect(note.classList.contains('message-mode-limited-note')).toBe(true)
+    expect(note.getAttribute('role')).toBe('note')
+    expect(note.closest('.message-failure-banner')).toBeNull()
+    expect(note.querySelector('.message-failure-icon')).toBeNull()
+    expect(note.querySelector('.message-stopped-note-icon')).not.toBeNull()
+    expect(document.querySelector('.message-failure-banner')).toBeNull()
   })
 })

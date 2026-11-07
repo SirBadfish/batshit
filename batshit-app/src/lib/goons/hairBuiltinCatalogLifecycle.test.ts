@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 
 import {
   createHairState,
@@ -9,6 +11,7 @@ import {
 } from './hairAssets'
 import {
   HAIR_BUILTIN_CATALOG_CONTRACT,
+  HAIR_BUILTIN_FIT_CATALOG_CONTRACT,
   hairBuiltinRevisionRef,
   listCurrentHairBuiltinAssets,
   migrateHairBuiltinStateToCurrent,
@@ -17,6 +20,7 @@ import {
   type HairBuiltinCatalogV2
 } from './hairBuiltinCatalog'
 import { HAIR_ROOT_WEIGHTED_MOTION_TAG } from './secondaryMotion'
+import { projectBuiltinHairStyleCards } from './hairCatalog'
 import {
   createHairAssetFixture,
   createRigidHairGlbFixture
@@ -81,6 +85,38 @@ async function successorRevision(
   return verifyHairAsset(next)
 }
 
+async function separateFit(source: HairAssetV1, target: RecipeSourceIdentity, revision: number) {
+  const next = structuredClone(source)
+  next.revision = revision
+  next.revisionId = `${source.assetId}-r${revision}`
+  next.compatibility = { baseId: target.baseId, fitFamily: target.fitFamily }
+  Object.assign(next.attachment.fitReceipt, {
+    receiptId: `${source.assetId}-fit-r${revision}`, assetRevisionId: next.revisionId,
+    baseId: target.baseId, fitFamily: target.fitFamily,
+    appearanceDefinitionSha256: target.definitionSha256, physicalBasisSha256: target.physicalBasisSha256,
+    topologySha256: target.topologySha256, skeletonHierarchySha256: target.skeletonHierarchySha256,
+    assetRevisionSha256: ZERO, fitSha256: ZERO
+  })
+  next.revisionSha256 = ZERO
+  next.revisionSha256 = await hairAssetRevisionSha256(next)
+  next.attachment.fitReceipt.assetRevisionSha256 = next.revisionSha256
+  next.attachment.fitReceipt.fitSha256 = await hairFitReceiptSha256(next.attachment.fitReceipt)
+  return verifyHairAsset(next)
+}
+
+function sourceForFit(asset: HairAssetV1): RecipeSourceIdentity {
+  const fit = asset.attachment.fitReceipt
+  return sourceIdentity({ baseId: asset.compatibility.baseId, fitFamily: asset.compatibility.fitFamily,
+    definitionSha256: fit.appearanceDefinitionSha256, physicalBasisSha256: fit.physicalBasisSha256,
+    topologySha256: fit.topologySha256, skeletonHierarchySha256: fit.skeletonHierarchySha256 })
+}
+
+function fitManifest(assets: HairAssetV1[], current: HairAssetV1[], edges: Array<[HairAssetV1, HairAssetV1]>) {
+  return { schemaVersion: HAIR_BUILTIN_FIT_CATALOG_CONTRACT, assets,
+    currentRevisions: current.map(hairBuiltinRevisionRef),
+    successorEdges: edges.map(([from, to]) => ({ from: hairBuiltinRevisionRef(from), to: hairBuiltinRevisionRef(to) })) }
+}
+
 function manifest(assets: HairAssetV1[], current: HairAssetV1, edges: Array<[HairAssetV1, HairAssetV1]>) {
   return {
     schemaVersion: HAIR_BUILTIN_CATALOG_CONTRACT,
@@ -94,6 +130,155 @@ function manifest(assets: HairAssetV1[], current: HairAssetV1, edges: Array<[Hai
 }
 
 describe('versioned built-in Hair catalog lifecycle', () => {
+  it('keeps the real Female r1 to r2 successor despite its changed exact fit hashes', async () => {
+    const catalog = await parseHairBuiltinCatalog(JSON.parse(readFileSync(resolve(process.cwd(), 'static/goon-assets/hair/v2/catalog.json'), 'utf8')))
+    const r1 = catalog.assets.find(asset => asset.assetId === 'batshit-style-01' && asset.revision === 1)!
+    const r2 = catalog.assets.find(asset => asset.assetId === 'batshit-style-01' && asset.revision === 2)!
+    expect(r1.attachment.fitReceipt.topologySha256).not.toBe(r2.attachment.fitReceipt.topologySha256)
+    const state = createHairState(r1, { baseColor: '#123456', highlightColor: '#abcdef', motionSettings: { enabled: false, intensity: 0.42 } })
+    const result = migrateHairBuiltinStateToCurrent(state, catalog, sourceForFit(r2))
+    expect(result.status).toBe('migrated')
+    expect(result.path).toEqual([hairBuiltinRevisionRef(r1), hairBuiltinRevisionRef(r2)])
+    expect(result.state).toEqual(createHairState(r2, { baseColor: '#123456', highlightColor: '#abcdef', motionSettings: { enabled: false, intensity: 0.42 } }))
+  })
+  it('keeps two target fits under one style while preserving the established successor lineage', async () => {
+    const femaleR1 = await firstRevision()
+    const femaleR2 = await successorRevision(femaleR1, { definitionSha256: 'a'.repeat(64) })
+    const maleSource = sourceIdentity({ baseId: 'base-male', fitFamily: 'fit-male', definitionSha256: 'b'.repeat(64), physicalBasisSha256: 'c'.repeat(64), topologySha256: 'd'.repeat(64), skeletonHierarchySha256: 'e'.repeat(64) })
+    const maleR3 = await separateFit(femaleR1, maleSource, 3)
+    const catalog = await parseHairBuiltinCatalog(fitManifest([femaleR1, femaleR2, maleR3], [femaleR2, maleR3], [[femaleR1, femaleR2]]))
+    expect(listCurrentHairBuiltinAssets(catalog)).toEqual([femaleR2, maleR3])
+    const old = createHairState(femaleR1, { baseColor: '#123456', highlightColor: '#abcdef', motionSettings: { enabled: false, intensity: 0.42 } })
+    const unchanged = migrateHairBuiltinStateToCurrent(old, catalog, sourceForFit(femaleR1))
+    expect(unchanged).toMatchObject({ status: 'current', state: old, targetAsset: femaleR1 })
+    const migrated = migrateHairBuiltinStateToCurrent(old, catalog, sourceForFit(femaleR2))
+    expect(migrated.status).toBe('migrated')
+    expect(migrated.path).toEqual([hairBuiltinRevisionRef(femaleR1), hairBuiltinRevisionRef(femaleR2)])
+    expect(migrated.state).toEqual(createHairState(femaleR2, { baseColor: '#123456', highlightColor: '#abcdef', motionSettings: { enabled: false, intensity: 0.42 } }))
+    expect(() => migrateHairBuiltinStateToCurrent(old, catalog, maleSource)).toThrowError(expect.objectContaining({ code: 'INCOMPATIBLE_SUCCESSOR' }))
+    expect(() => migrateHairBuiltinStateToCurrent(old, catalog)).toThrowError(expect.objectContaining({ code: 'INCOMPATIBLE_SUCCESSOR' }))
+    expect(migrateHairBuiltinStateToCurrent(createHairState(maleR3), catalog, maleSource)).toMatchObject({ status: 'current', targetAsset: maleR3 })
+  })
+
+  it('keeps an older fit selectable while following its declared successor only for a matching Source update', async () => {
+    const r1 = await firstRevision()
+    const r2 = await successorRevision(r1, { definitionSha256: 'a'.repeat(64) })
+    const maleSource = sourceIdentity({ baseId: 'base-male', fitFamily: 'fit-male', definitionSha256: 'c'.repeat(64) })
+    const r3 = await separateFit(r1, maleSource, 3)
+    const r4 = await successorRevision(r2, { revision: 4, definitionSha256: 'b'.repeat(64) })
+    const catalog = await parseHairBuiltinCatalog(fitManifest(
+      [r1, r2, r3, r4], [r2, r3, r4], [[r1, r2], [r2, r4]]
+    ))
+    const saved = createHairState(r2, {
+      baseColor: '#123456', highlightColor: '#abcdef',
+      motionSettings: { enabled: false, intensity: 0.42 }
+    })
+    const before = structuredClone(saved)
+    const selectable = listCurrentHairBuiltinAssets(catalog)
+    expect(selectable).toEqual([r2, r3, r4])
+    for (const order of [selectable, [...selectable].reverse()]) {
+      for (const asset of [r2, r3, r4]) {
+        expect(projectBuiltinHairStyleCards(order, sourceForFit(asset))).toMatchObject([
+          { asset, availability: { selectable: true } }
+        ])
+      }
+    }
+    expect(migrateHairBuiltinStateToCurrent(saved, catalog, sourceForFit(r2))).toMatchObject({
+      status: 'current', state: before, targetAsset: r2, path: [hairBuiltinRevisionRef(r2)]
+    })
+    expect(migrateHairBuiltinStateToCurrent(createHairState(r1), catalog, sourceForFit(r2))).toMatchObject({
+      status: 'migrated', targetAsset: r2, path: [hairBuiltinRevisionRef(r1), hairBuiltinRevisionRef(r2)]
+    })
+    expect(migrateHairBuiltinStateToCurrent(saved, catalog, sourceForFit(r4))).toMatchObject({
+      status: 'migrated', targetAsset: r4,
+      state: createHairState(r4, { baseColor: '#123456', highlightColor: '#abcdef', motionSettings: { enabled: false, intensity: 0.42 } }),
+      path: [hairBuiltinRevisionRef(r2), hairBuiltinRevisionRef(r4)]
+    })
+    expect(migrateHairBuiltinStateToCurrent(createHairState(r1), catalog, sourceForFit(r4)).path).toEqual([
+      hairBuiltinRevisionRef(r1), hairBuiltinRevisionRef(r2), hairBuiltinRevisionRef(r4)
+    ])
+    expect(() => migrateHairBuiltinStateToCurrent(saved, catalog)).toThrowError(expect.objectContaining({ code: 'INCOMPATIBLE_SUCCESSOR' }))
+    expect(() => migrateHairBuiltinStateToCurrent(saved, catalog, maleSource)).toThrowError(expect.objectContaining({ code: 'INCOMPATIBLE_SUCCESSOR' }))
+    expect(() => migrateHairBuiltinStateToCurrent(createHairState(r4), catalog, sourceForFit(r2))).toThrowError(expect.objectContaining({ code: 'INCOMPATIBLE_SUCCESSOR' }))
+    expect(saved).toEqual(before)
+  })
+
+  it('validates the entire v3 chain even after an intermediate selectable fit', async () => {
+    const r1 = await firstRevision()
+    const r2 = await successorRevision(r1, { definitionSha256: 'a'.repeat(64) })
+    const r4 = await successorRevision(r2, { revision: 4, definitionSha256: 'b'.repeat(64) })
+    await expect(parseHairBuiltinCatalog(fitManifest([r1, r2, r4], [r2], [[r1, r2], [r2, r4]])))
+      .rejects.toMatchObject({ code: 'INVALID_CATALOG' })
+    await expect(parseHairBuiltinCatalog(fitManifest([r1, r2], [r2], [[r1, r2], [r2, r4]])))
+      .rejects.toMatchObject({ code: 'INVALID_CATALOG' })
+    await expect(parseHairBuiltinCatalog(fitManifest([r1, r2, r4], [r2, r4], [[r1, r2], [r2, r4], [r4, r2]])))
+      .rejects.toMatchObject({ code: 'INVALID_CATALOG' })
+    await expect(parseHairBuiltinCatalog(manifest([r1, r2, r4], r2, [[r1, r2], [r2, r4]])))
+      .rejects.toMatchObject({ code: 'INVALID_CATALOG' })
+  })
+
+  it('refuses a matching but unready intermediate fit without changing the saved state', async () => {
+    const r1 = await firstRevision()
+    const candidate = await successorRevision(r1, { definitionSha256: 'a'.repeat(64) })
+    const pending = structuredClone(candidate)
+    Object.assign(pending.material, { status: 'pending', definitionSha256: null, layout: null,
+      neutralValueTexture: null, highlightMask: null, normalTexture: null, roughnessTexture: null })
+    pending.revisionSha256 = ZERO
+    pending.attachment.fitReceipt.assetRevisionSha256 = ZERO
+    pending.attachment.fitReceipt.fitSha256 = ZERO
+    pending.revisionSha256 = await hairAssetRevisionSha256(pending)
+    pending.attachment.fitReceipt.assetRevisionSha256 = pending.revisionSha256
+    pending.attachment.fitReceipt.fitSha256 = await hairFitReceiptSha256(pending.attachment.fitReceipt)
+    const r2 = await verifyHairAsset(pending)
+    const r4 = await successorRevision(r2, { revision: 4, definitionSha256: 'b'.repeat(64) })
+    const catalog = await parseHairBuiltinCatalog(fitManifest([r1, r2, r4], [r2, r4], [[r1, r2], [r2, r4]]))
+    const saved = createHairState(r1, { baseColor: '#123456', highlightColor: '#abcdef' })
+    const before = structuredClone(saved)
+    expect(() => migrateHairBuiltinStateToCurrent(saved, catalog, sourceForFit(r2)))
+      .toThrowError(expect.objectContaining({ code: 'INCOMPATIBLE_SUCCESSOR' }))
+    expect(saved).toEqual(before)
+  })
+
+  it('rejects duplicate same-style target fits and cross-family successor edges', async () => {
+    const femaleR1 = await firstRevision()
+    const femaleR2 = await successorRevision(femaleR1)
+    const sameFitR3 = await separateFit(femaleR1, sourceForFit(femaleR2), 3)
+    await expect(parseHairBuiltinCatalog(fitManifest([femaleR1, femaleR2, sameFitR3], [femaleR2, sameFitR3], [[femaleR1, femaleR2]]))).rejects.toMatchObject({ code: 'INVALID_CATALOG' })
+    const maleR3 = await separateFit(femaleR1, sourceIdentity({ baseId: 'base-male', fitFamily: 'fit-male' }), 3)
+    await expect(parseHairBuiltinCatalog(fitManifest([femaleR1, femaleR2, maleR3], [maleR3], [[femaleR1, femaleR2], [femaleR2, maleR3]]))).rejects.toMatchObject({ code: 'INVALID_CATALOG' })
+  })
+
+  it('allows different styles to share a fit and revision number', async () => {
+    const r1 = await firstRevision()
+    const r2 = await successorRevision(r1)
+    const other = structuredClone(r2)
+    other.assetId = 'z-other-style'
+    other.revisionId = 'z-other-style-r2'
+    other.attachment.fitReceipt.assetId = other.assetId
+    other.attachment.fitReceipt.assetRevisionId = other.revisionId
+    other.attachment.fitReceipt.receiptId = 'z-other-style-fit-r2'
+    other.revisionSha256 = ZERO
+    other.attachment.fitReceipt.assetRevisionSha256 = ZERO
+    other.attachment.fitReceipt.fitSha256 = ZERO
+    other.revisionSha256 = await hairAssetRevisionSha256(other)
+    other.attachment.fitReceipt.assetRevisionSha256 = other.revisionSha256
+    other.attachment.fitReceipt.fitSha256 = await hairFitReceiptSha256(other.attachment.fitReceipt)
+    const verified = await verifyHairAsset(other)
+    const catalog = await parseHairBuiltinCatalog(fitManifest([r1, r2, verified], [r2, verified], [[r1, r2]]))
+    expect(listCurrentHairBuiltinAssets(catalog)).toEqual([r2, verified])
+  })
+
+  it('refuses a compatible terminal on another lineage without changing the saved state', async () => {
+    const r1 = await firstRevision()
+    const r2 = await successorRevision(r1)
+    const separateTarget = sourceIdentity({ definitionSha256: 'b'.repeat(64) })
+    const otherTerminal = await separateFit(r1, separateTarget, 3)
+    const catalog = await parseHairBuiltinCatalog(fitManifest([r1, r2, otherTerminal], [r2, otherTerminal], [[r1, r2]]))
+    const saved = createHairState(r1, { baseColor: '#123456', highlightColor: '#abcdef', motionSettings: { enabled: false, intensity: 0.42 } })
+    const before = structuredClone(saved)
+    expect(() => migrateHairBuiltinStateToCurrent(saved, catalog, separateTarget)).toThrowError(expect.objectContaining({ code: 'INCOMPATIBLE_SUCCESSOR' }))
+    expect(saved).toEqual(before)
+  })
   it('retains historical revisions while exposing exactly the declared current revision', async () => {
     const r1 = await firstRevision()
     const r2 = await successorRevision(r1)

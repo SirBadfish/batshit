@@ -33,6 +33,8 @@ import {
 import { loadPinokioArtifactForUser } from '$lib/server/artifacts/pinokioArtifactAccess'
 import { pinokioProxyPathProblem } from '$lib/server/artifacts/pinokioProxyRules'
 import { resolvePinokioAppEndpoint } from '$lib/server/services/pinokioAppEndpoint'
+import { ownPinokioOperation, pinokioBindingFingerprint } from '$lib/server/services/pinokioAdmission'
+import { enterBackupRestoreHttpRequest } from '$lib/server/services/backupRestoreService'
 
 const DEFAULT_PROXY_TIMEOUT_MS = 20_000
 const MIN_PROXY_TIMEOUT_MS = 1_000
@@ -46,9 +48,10 @@ const FORWARDED_RESPONSE_HEADERS = [
   'content-disposition'
 ]
 /** Batshit's own query parameters, never forwarded to the app. */
-const BATSHIT_QUERY_KEYS = ['artifactId', 'userId', 'timeoutMs', 'app']
+const BATSHIT_QUERY_KEYS = ['artifactId', 'userId', 'timeoutMs', 'app', 'machineId', 'revision', 'machineRevision']
 
 function parseTimeoutMs(rawValue: string | null): number {
+  if (rawValue === null || !rawValue.trim()) return DEFAULT_PROXY_TIMEOUT_MS
   const parsed = Number(rawValue)
   if (!Number.isFinite(parsed)) return DEFAULT_PROXY_TIMEOUT_MS
   return Math.min(MAX_PROXY_TIMEOUT_MS, Math.max(MIN_PROXY_TIMEOUT_MS, Math.floor(parsed)))
@@ -106,51 +109,78 @@ async function handlePinokioProxy(request: Request, localsUserId: string | null,
     }
   }
 
-  const endpoint = await resolvePinokioAppEndpoint(binding.appId)
-  if (!endpoint.ok) {
-    return json(
-      {
-        success: false,
-        code: endpoint.code,
-        error: endpoint.message,
-        artifactId: access.artifact.id,
-        app: { id: endpoint.appId, title: endpoint.title, state: endpoint.state ?? null },
-        ...(endpoint.reason ? { reason: endpoint.reason } : {})
-      },
-      { status: endpoint.status }
-    )
+  const requestedMachine = url.searchParams.get('machineId')
+  if (requestedMachine !== null && requestedMachine !== (binding.machineId ?? 'local')) {
+    return json({ success: false, code: 'machine_mismatch', error: 'This artifact reaches only its saved Pinokio computer.' }, { status: 403 })
   }
-
-  const upstreamQuery = new URLSearchParams(url.search)
-  for (const key of BATSHIT_QUERY_KEYS) upstreamQuery.delete(key)
-  const targetUrl = buildTargetUrl(endpoint.baseUrl, requestPath, upstreamQuery)
+  const endWork = enterBackupRestoreHttpRequest()
+  if (!endWork) return json({ success: false, code: 'pinokio_restore_in_progress', error: 'Pinokio operations are paused while Batshit restores data.' }, { status: 503 })
+  const fingerprint = pinokioBindingFingerprint(access.artifact)
+  let operation: ReturnType<typeof ownPinokioOperation> | undefined
+  let timer: ReturnType<typeof setTimeout> | undefined
   const timeoutMs = parseTimeoutMs(url.searchParams.get('timeoutMs'))
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), timeoutMs)
-  try {
-    const upstream = await fetch(targetUrl, {
-      method,
-      headers: buildForwardRequestHeaders(request),
-      body: rawBody,
-      signal: controller.signal
-    })
-    return new Response(upstream.body, { status: upstream.status, headers: forwardResponseHeaders(upstream, binding.appId) })
-  } catch (error) {
-    const timedOut = error instanceof DOMException && error.name === 'AbortError'
-    return json(
-      {
-        success: false,
-        code: 'app_unreachable',
-        error: timedOut
-          ? `${endpoint.title} did not answer within ${timeoutMs} ms.`
-          : `${endpoint.title} did not answer: ${error instanceof Error ? error.message : 'unknown error'}.`,
-        app: { id: binding.appId, title: endpoint.title }
-      },
-      { status: timedOut ? 504 : 502 }
-    )
-  } finally {
-    clearTimeout(timer)
+  let finished = false
+  let retainedBody = false
+  let removeAbort = () => {}
+  const finish = () => {
+    if (finished) return
+    finished = true
+    if (timer) clearTimeout(timer)
+    removeAbort()
+    operation?.close()
+    endWork()
   }
+  try {
+    operation = ownPinokioOperation({ signal: AbortSignal.any([request.signal, controller.signal]), admit: async () => {
+      const current = await loadPinokioArtifactForUser(access.artifact.id, auth.userId)
+      if (!current.ok || pinokioBindingFingerprint(current.artifact) !== fingerprint ||
+        current.binding.appId !== binding.appId || current.binding.machineId !== binding.machineId || current.binding.kind !== binding.kind) {
+        throw Object.assign(new Error('This saved Pinokio artifact changed during the request.'), { status: 409 })
+      }
+    } })
+    await operation.assert()
+    const endpoint = await resolvePinokioAppEndpoint(binding.appId, { userId: auth.userId, machineId: binding.machineId, signal: operation.signal, admitFetch: () => operation!.assert() })
+    if (!endpoint.ok) return json({ success: false, code: endpoint.code, error: endpoint.message, artifactId: access.artifact.id,
+      app: { id: endpoint.appId, title: endpoint.title, state: endpoint.state ?? null },
+      ...(endpoint.machineId ? { machineId: endpoint.machineId, machineRevision: endpoint.machineRevision } : {}), ...(endpoint.reason ? { reason: endpoint.reason } : {}) }, { status: endpoint.status })
+    const requestedRevision = url.searchParams.get('revision') ?? url.searchParams.get('machineRevision')
+    if (requestedRevision !== null && requestedRevision !== String(endpoint.machineRevision ?? 0)) return json({ success: false, code: 'machine_mismatch', error: 'The saved Pinokio computer changed; run the artifact again.' }, { status: 409 })
+    if (binding.machineId && !endpoint.fetch) throw new Error('The remote app has no bound request policy.')
+    const upstreamQuery = new URLSearchParams(url.search)
+    for (const key of BATSHIT_QUERY_KEYS) upstreamQuery.delete(key)
+    const targetUrl = buildTargetUrl(endpoint.baseUrl, requestPath, upstreamQuery)
+    timer = setTimeout(() => controller.abort('pinokio_proxy_timeout'), timeoutMs)
+    await operation.assert()
+    const upstream = await (endpoint.fetch ?? fetch)(targetUrl, { method, headers: buildForwardRequestHeaders(request), body: rawBody, signal: operation.signal })
+    const headers = forwardResponseHeaders(upstream, binding.appId)
+    if (!upstream.body) return new Response(null, { status: upstream.status, headers })
+    const reader = upstream.body.getReader()
+    const abortBody = () => { void reader.cancel(operation!.signal.reason).catch(() => {}).finally(finish) }
+    operation.signal.addEventListener('abort', abortBody, { once: true })
+    removeAbort = () => operation!.signal.removeEventListener('abort', abortBody)
+    const body = new ReadableStream<Uint8Array>({
+      async pull(output) {
+        try {
+          operation!.signal.throwIfAborted()
+          const part = await reader.read()
+          operation!.signal.throwIfAborted()
+          if (part.done) { output.close(); finish() }
+          else output.enqueue(part.value)
+        } catch (error) { output.error(error); await reader.cancel(error).catch(() => {}); finish() }
+      },
+      async cancel(reason) {
+        controller.abort(reason)
+        try { await reader.cancel(reason) } finally { finish() }
+      }
+    })
+    retainedBody = true
+    return new Response(body, { status: upstream.status, headers })
+  } catch (error) {
+    const timedOut = controller.signal.aborted && !request.signal.aborted
+    return json({ success: false, code: 'app_unreachable', error: timedOut ? `The Pinokio app did not answer within ${timeoutMs} ms.` : error instanceof Error ? error.message : 'The Pinokio app did not answer.', app: { id: binding.appId } }, { status: timedOut ? 504 : 502 })
+  } finally { if (!retainedBody) finish() }
+
 }
 
 export const GET: RequestHandler = async ({ request, locals, url, params }) =>

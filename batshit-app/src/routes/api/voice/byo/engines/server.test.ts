@@ -1,7 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { RequestEvent } from '@sveltejs/kit'
 
-vi.mock('$lib/server/services/voiceEngineRegistry', () => ({
+vi.mock('$lib/server/services/voiceEngineRegistry', async importOriginal => ({
+  ...(await importOriginal<typeof import('$lib/server/services/voiceEngineRegistry')>()),
+  deleteVoiceEngineRecord: vi.fn(),
   applyVoiceEnginePublicUpdates: vi.fn(),
   listVoiceEngineManagerView: vi.fn(),
   listUnreadableVoiceEngines: vi.fn(),
@@ -9,7 +11,10 @@ vi.mock('$lib/server/services/voiceEngineRegistry', () => ({
 }))
 
 import { GET, POST, PUT } from './+server'
+import { DELETE } from './[engineId]/+server'
 import {
+  deleteVoiceEngineRecord,
+  VoiceEngineDeleteError,
   applyVoiceEnginePublicUpdates,
   listUnreadableVoiceEngines,
   listVoiceEngineManagerView,
@@ -234,5 +239,68 @@ describe('GET /api/voice/byo/engines', () => {
     const response = await GET(getEvent())
 
     expect(response.status).toBe(500)
+  })
+})
+
+
+describe('DELETE /api/voice/byo/engines/[engineId] terminal outcomes', () => {
+  function event(engineId = 'koKoro', userId: string | null = 'user-1') {
+    return { ...buildEvent({ deleteLocalFiles: false }, userId), params: { engineId } } as unknown as RequestEvent
+  }
+  beforeEach(() => { vi.clearAllMocks() })
+
+  it.each(['known_no_change', 'known_settled_partial', 'unknown'] as const)(
+    'projects only the server-produced %s receipt for its normalized engine', async configurationOutcome => {
+      const { PresetReferenceWriteError } = await import('$lib/server/services/modelPresetReferenceGuard')
+      const cause = new PresetReferenceWriteError(configurationOutcome === 'unknown' ? 'unknown' : 'changed')
+      vi.mocked(deleteVoiceEngineRecord).mockRejectedValue(new VoiceEngineDeleteError('kokoro', configurationOutcome, cause))
+      const response = await DELETE(event())
+      expect(response.status).toBe(configurationOutcome === 'unknown' ? 503 : 409)
+      expect(await response.json()).toMatchObject({
+        code: configurationOutcome === 'unknown' ? 'MODEL_PRESET_REFERENCE_UNKNOWN' : 'MODEL_PRESET_REFERENCE_CHANGED',
+        deleteOutcome: { contract: 'voice-engine-delete-outcome/v1', engineId: 'kokoro', configurationOutcome }
+      })
+      expect(deleteVoiceEngineRecord).toHaveBeenCalledWith('user-1', 'koKoro', { deleteLocalFiles: false })
+    }
+  )
+
+  it('does not certify generic errors or objects carrying forged receipt/status fields', async () => {
+    vi.mocked(deleteVoiceEngineRecord).mockRejectedValue(Object.assign(new Error('unfamiliar failure'), {
+      status: 409, code: 'MODEL_PRESET_REFERENCE_CHANGED',
+      deleteOutcome: { contract: 'voice-engine-delete-outcome/v1', engineId: 'kokoro', configurationOutcome: 'known_no_change' }
+    }))
+    const response = await DELETE(event())
+    expect(response.status).toBe(400)
+    expect(await response.json()).toEqual({ error: 'unfamiliar failure' })
+  })
+
+  it('does not answer while its actual service promise is pending', async () => {
+    let enter!: () => void, fail!: (error: Error) => void
+    const entered = new Promise<void>(resolve => { enter = resolve })
+    const pending = new Promise<never>((_resolve, reject) => { fail = reject })
+    vi.mocked(deleteVoiceEngineRecord).mockImplementation(() => { enter(); return pending })
+    let answered = false
+    const flight = Promise.resolve(DELETE(event())).then(response => { answered = true; return response })
+    await entered
+    expect(answered).toBe(false)
+    fail(new VoiceEngineDeleteError('kokoro', 'unknown', new Error('issued outcome missing')))
+    const response = await flight
+    expect((await response.json()).deleteOutcome.configurationOutcome).toBe('unknown')
+  })
+
+  it('retains existing canonical success and physical cleanup notices', async () => {
+    const result = { deletedEngineId: 'kokoro', deletedProviderId: 'byo:kokoro', deletedProviderIds: ['byo:kokoro'],
+      clearedUserDefaults: true, clearedAgentIds: [], deletedVoiceProfileIds: [],
+      localFiles: { requested: true, deleted: false, deletedInstallRoots: [], deletedStateRoots: [], skipped: [],
+        errors: [{ engineId: 'kokoro', message: 'Kept for another runtime.' }] } }
+    vi.mocked(deleteVoiceEngineRecord).mockResolvedValue(result as never)
+    const response = await DELETE(event())
+    expect(await response.json()).toEqual({ success: true, ...result })
+  })
+
+  it('keeps authentication and missing-ID refusals before the service', async () => {
+    expect((await DELETE(event('kokoro', null))).status).toBe(401)
+    expect((await DELETE(event(''))).status).toBe(400)
+    expect(deleteVoiceEngineRecord).not.toHaveBeenCalled()
   })
 })

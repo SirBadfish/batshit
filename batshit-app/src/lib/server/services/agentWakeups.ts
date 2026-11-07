@@ -22,6 +22,7 @@
  * sender's tool result.
  */
 
+import { withoutServerReplayFields } from '$lib/utils/serverReplayFields'
 import { redis } from '$lib/server/redis'
 import { randomBytes } from 'node:crypto'
 import { resolveCliHelperBatshitBaseUrl } from '$lib/server/services/cliHelperBaseUrl'
@@ -53,7 +54,7 @@ import {
   resolveWakeTimeoutMs
 } from '$lib/utils/dmControl'
 import { isFixedSession, resolveFixedSessionAgentId } from '$lib/utils/fixedSession'
-import { normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
+import { PRIMARY_AGENT_TYPE_RETIRED_CODE, retiredPrimaryAgentRefusal } from '$lib/utils/primaryAgentType'
 import {
   buildSessionOrigin,
   buildWokenSessionName,
@@ -147,7 +148,7 @@ export type WakeRefusalCode =
   | 'wake_disabled_instance'
   | 'wake_disabled_agent'
   | 'agent_not_found'
-  | 'agent_not_primary'
+  | 'primary_agent_type_retired'
   | 'chain_depth_exceeded'
   | 'wake_rate_limit_agent'
   | 'wake_rate_limit_instance'
@@ -321,12 +322,12 @@ async function runAgentWakeup(
   }
 
   // 3) The recipient is a live primary agent. Groups are not agents and never woken.
-  const agentType = normalizePrimaryAgentType(agent as any)
-  if (agentType !== 'api' && agentType !== 'cli') {
-    return refuse(
-      'agent_not_primary',
-      'Only API and CLI primary agents can be woken.'
-    )
+  // SA-139 R4 (D14): a stored retired type (the Claude Code CLI lane, Codex CLI, n8n) cannot
+  // run, so it is not woken: nothing is reserved or saved for it. send-routed refuses one that
+  // gets past with the same code (read below, never taken for "busy").
+  const retired = retiredPrimaryAgentRefusal(agent as any)
+  if (retired) {
+    return refuse(retired.code, `${agent.displayName ?? 'That agent'} cannot be woken. ${retired.error} ${retired.details}`)
   }
 
   // 4) Chain depth: A wakes B, B wakes C… stops at three.
@@ -621,7 +622,8 @@ async function runAgentWakeup(
   // F-P2-1: the RECENT 300. `getMessages` is head-first, so waking INTO an existing chat
   // (a `result`, or "One at a time") longer than 300 messages would have posted ancient
   // history and left out the DM message this turn is about.
-  const history = await redis.getRecentMessages(sessionId, 300)
+  // SA-137: a paused reply's server-only replay fields never ride a history post.
+  const history = (await redis.getRecentMessages(sessionId, 300)).map(withoutServerReplayFields)
   // Assigned to an explicitly-typed variable first (not an inline object literal at the
   // `fetch` call site) so `dispatcher` — real at runtime, on every lane that resolves
   // `fetch` to undici — does not trip the object-literal excess-property check against
@@ -656,8 +658,14 @@ async function runAgentWakeup(
       // chat between the busy check and this POST, so the wake becomes a `wait`. The
       // message is already in the chat and the DM shows on that chat's next turn.
       let reason: WakeRunEndReason = 'completed'
-      if (response.status === 409) {
+      // SA-139 R4: a 409 that names a removed Primary type is a refusal, not a busy chat.
+      const refusalCode = response.status === 409
+        ? await response.clone().json().then((body: any) => typeof body?.code === 'string' ? body.code : null, () => null)
+        : null
+      const retiredRefusal = refusalCode === PRIMARY_AGENT_TYPE_RETIRED_CODE
+      if (response.status === 409 && !retiredRefusal) {
         reason = 'agent_busy'
+        response.body?.cancel().catch(() => {})
       } else if (!response.ok && response.status !== 499) {
         reason = 'failed'
         const detail = await response.text().catch(() => '<unreadable>')

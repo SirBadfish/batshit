@@ -3,7 +3,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { nativeToolService } from '../nativeTools'
-import { findCommandModelCapture, commandModelCaptureResponse } from '../commandModelCaptureResponse'
+import { findCommandModelCapture } from '../commandModelCaptureLookup'
 import { redis } from '$lib/server/redis'
 import { VercelAIBrain } from '../vercelBrain'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
@@ -22,7 +22,7 @@ afterEach(async () => {
 })
 
 describe('native command output crosses actual result boundaries privately', () => {
-  it('keeps a tail beyond the visible Bash cap through direct and managed dispatch', async () => {
+  it('keeps a tail privately beyond the visible Bash cap through direct and current session dispatch', async () => {
     workspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-command-capture-'))
     const stdout = '界'.repeat(140_000) + '\nORIGINAL-TAIL'
     await writeFile(path.join(workspace, 'output.txt'), stdout)
@@ -43,23 +43,16 @@ describe('native command output crosses actual result boundaries privately', () 
         nativeTools: { executionBackend: 'local', bashEnabled: true, bashAccessMode: 'dangerous' }
       }
     })
-    // BL-878 (Josh, 2026-09-28): the agent lane (a managed Codex or Claude run's credential) is
-    // refused `bash_execute`, so the dispatch's private capture is proven on a caller that keeps
-    // Bash through it, an n8n Workflow Subagent's callback. `commandModelCaptureResponse` below
-    // takes the route's lane flag (`auth.auth === 'agent'`) as a plain boolean either way.
+    // The current session dispatcher preserves private API capture without the retired
+    // CLI-only HTTP response bridge. Ordinary result serialization remains bounded.
     const result = await nativeToolService.dispatchNativeAutomationPackAction({
       userId: 'capture-user', action: 'bash_execute', payloadInput: { command: 'cat output.txt' },
       context: { session_id: 'capture-session', agent_id: agentId, mode: 'mode4', actor_type: 'primary' },
-      projectPath: workspace, actorType: 'n8n-callback'
+      projectPath: workspace, actorType: 'session'
     } as any)
     expect(result.success).toBe(true)
     expect(findCommandModelCapture(result)?.text).toContain(stdout)
-    const internal = commandModelCaptureResponse(result, true)
-    expect(internal.headers.get('x-batshit-command-model-capture')).toBe('1')
-    const body = await internal.json()
-    expect(body.modelCapture.text).toContain('ORIGINAL-TAIL')
-    expect(JSON.stringify(body.result)).not.toContain('ORIGINAL-TAIL')
-    expect(await commandModelCaptureResponse(result, false).text()).not.toContain('ORIGINAL-TAIL')
+    expect(JSON.stringify(result)).not.toContain('ORIGINAL-TAIL')
   })
 
   // BL-679: a build prints 150,000 characters and then fails with one line on stderr. With

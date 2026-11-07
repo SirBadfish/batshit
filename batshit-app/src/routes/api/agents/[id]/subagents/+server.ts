@@ -2,12 +2,12 @@ import { json } from '@sveltejs/kit'
 import type { RequestHandler } from './$types'
 import { redis } from '$lib/server/redis'
 import type { SubagentRow } from '$lib/types/database'
-import { syncAgentCodexProfiles } from '$lib/server/services/codexProfileManager'
-import { syncAgentClaudeProfiles } from '$lib/server/services/claudeProfileManager'
-import { normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
+import { normalizePrimaryAgentType, retiredPrimaryAgentRefusal } from '$lib/utils/primaryAgentType'
 import {
 	canonicalizeSubagentRecord,
+	isRetiredSubagentType,
 	isSubagentCompatibleWithPrimaryAgent,
+	retiredSubagentRefusal,
 } from '$lib/utils/subagentType'
 
 // GET /api/agents/[id]/subagents - Get all subagents assigned to an agent
@@ -45,7 +45,9 @@ export const GET: RequestHandler = async ({ params, locals }) => {
 				const subagent = canonicalizeSubagentRecord(
 					subagentData as Record<string, any>
 				) as SubagentRow
-				subagents.push(subagent)
+				// SA-139 R2/R5 (D14): a record of a removed Subagent type (n8n, or the CLI Subagent) is
+				// never listed as an assignment; it never runs, and the next save of the list drops it.
+				if (!isRetiredSubagentType(subagent.subagentType)) subagents.push(subagent)
 			}
 		}
 
@@ -75,6 +77,11 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
 		if (agent.user_id !== locals.user.id) {
 			return json({ error: 'Unauthorized' }, { status: 403 })
 		}
+		// SA-139 R4 (D14): a leftover agent of a removed type can only be deleted.
+		const retired = retiredPrimaryAgentRefusal(agent)
+		if (retired) {
+			return json({ error: retired.error, code: retired.code, details: retired.details }, { status: 409 })
+		}
 
 		const { subagentIds } = await request.json()
 		
@@ -98,6 +105,10 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
 			if (subagent.user_id !== locals.user.id) {
 				return json({ error: 'Unauthorized' }, { status: 403 })
 			}
+			// SA-139 R2/R5 (D14): a removed Subagent type is never assigned; refused by type, readably,
+			// before the list is replaced.
+			const retired = retiredSubagentRefusal(subagent)
+			if (retired) return json(retired, { status: 409 })
 			if (!isSubagentCompatibleWithPrimaryAgent(primaryAgentType, subagent)) {
 				return json(
 					{
@@ -124,15 +135,6 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
 			assigned_subagent_ids: subagentIds,
 			assignedSubagents: subagentIds
 		} as any)
-
-		// Keep Mode 4 managed profiles in sync when subagent assignments change.
-		// This ensures Codex/Claude stdio subagent bridge entries are added/removed immediately.
-		try {
-			await syncAgentCodexProfiles(locals.user.id)
-			await syncAgentClaudeProfiles(locals.user.id)
-		} catch (syncError) {
-			console.warn('Subagent assignment saved but profile sync failed:', syncError)
-		}
 
 		return json({ success: true, subagentIds })
 	} catch (error) {

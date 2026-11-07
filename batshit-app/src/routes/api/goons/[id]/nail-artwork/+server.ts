@@ -6,6 +6,7 @@ import {
   rewriteInternalBatshitServerUrlsInPayload
 } from '$lib/server/services/batshitServerUrls'
 import { loadGoonNailSurfaceDefinition } from '$lib/server/services/nailSurface.server'
+import { projectGoonRecipeSource } from '$lib/goons/recipe/recipeRuntimeProjection'
 import {
   collectGoonUploadReferencesForClient,
   deleteGoonUploadAsset,
@@ -50,7 +51,7 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
     const goon = await redis.execute(async (client) => {
       const current = (await client.json.get(`goon:${params.id}`)) as GoonRecord | null
       if (!current || current.user_id !== locals.user!.id) return null
-      const definition = await loadGoonNailSurfaceDefinition(client as any, current)
+      const definition = await loadGoonNailSurfaceDefinition(client as any, projectGoonRecipeSource(current))
       return { definition }
     })
     if (!goon) return json({ error: 'Goon not found' }, { status: 404 })

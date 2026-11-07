@@ -255,7 +255,7 @@ const EXIT_ONE_IS_AN_ANSWER = new Set(['grep', 'egrep', 'fgrep', 'rg', 'ag', 'ac
 
 /**
  * The one kind whose target is a COMMAND: a shell command on every lane (API
- * `native_bash_execute`, the CLI helper's `batshit_server_bash_execute`, Codex and Claude shell
+ * `native_bash_execute`, the CLI helper's `batshit_server_bash_execute`, Claude shell
  * calls; `resolveToolOperationKind`). A read, write, edit, or listing mapped from a shell command
  * stores its PATH as the target, so a failed read of a file called `find`, or `ls test` with no
  * `test` folder (exit 1 on macOS), is a failure like any other (2026-09-18).

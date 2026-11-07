@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { redis } from '$lib/server/redis'
@@ -17,7 +17,17 @@ import {
   deleteSessionStoppingItsTurn
 } from '$lib/server/services/sessionDeleteTurnStop'
 
-useRedisTestServer()
+useRedisTestServer({ beforeCleanupAdmission: async ({ adminClient, resolvedUrl }) => {
+  const expectedRunId = process.env.SA133_REDIS_RUN_ID
+  if (expectedRunId === undefined) return
+  expect(expectedRunId.trim()).not.toBe('')
+  expect(Number(new URL(resolvedUrl).pathname.slice(1))).toBe(14)
+  for (const client of [adminClient, await redis.execute(async connection => connection)]) {
+    expect((await client.clientInfo()).db).toBe(14)
+    const actualRunId = /^run_id:([^\r\n]+)\r?$/m.exec(await client.info('server'))?.[1]
+    expect(actualRunId).toBe(expectedRunId)
+  }
+} })
 
 const REAL_REDIS_LANE = process.env.VITEST_USE_REAL_REDIS === 'true'
 
@@ -189,6 +199,315 @@ describe('message deletion persistence', () => {
     expect(await redis.exists(`session:${sessionId}:zips`)).toBe(false)
     expect(await redis.exists(`unzipped:${sessionId}`)).toBe(false)
     await redis.deleteSession(sessionId)
+  })
+
+  // BL-1513: the chat delete sweeps every zip the chat's set lists AND every zip a message's text
+  // names, read as the trust reader reads a reference. A Batshit-written reference with an empty
+  // description (`zipService.ts` writes `:::}}`) once escaped the text sweep, so a zip the set did
+  // not list (an older chat's record, or a set that lost the member) outlived its chat.
+  it.runIf(REAL_REDIS_LANE)('a chat delete takes every zip its messages name, an empty description included (BL-1513)', async () => {
+    const sessionId = 'session-bl1513-sweep'
+    const userId = 'josh'
+    await redis.createSession({ id: sessionId, user_id: userId, name: 'Every named zip goes' })
+    const unlisted = {
+      empty: 'cool_tool_1790500000000_empty',
+      described: 'cool_tool_1790500000001_descr',
+      older: 'cool_tool_1790500000002_older',
+      unnamed: 'cool_tool_1790500000003_unnam'
+    }
+    // Zip records the chat's set does not list.
+    for (const zipId of Object.values(unlisted)) {
+      await redis.execute((client: any) =>
+        client.json.set(`zip:${zipId}`, '$', { id: zipId, type: 'cool_tool', content: 'x', metadata: { sessionId } })
+      )
+    }
+    const listed = await createZipFromContent('listed in the set', 'cool_tool', sessionId, 'msg-a')
+    await redis.saveMessage({
+      id: 'msg-a', session_id: sessionId, user_id: userId, role: 'assistant',
+      content: `Read: {{batshit-zip:${unlisted.empty}:::}} and {{batshit-zip:${unlisted.described}:::Tool execution: read}}`,
+      metadata: {}
+    })
+    await redis.saveMessage({
+      id: 'msg-b', session_id: sessionId, user_id: userId, role: 'assistant',
+      content: `Older form: {{batshit|id:${unlisted.older}|tool}}`, metadata: {}
+    })
+    expect((await redis.json.get(`message:${sessionId}:msg-a`) as any)?.content).toContain(`{{batshit-zip:${unlisted.empty}:::}}`)
+
+    await redis.deleteSession(sessionId)
+
+    expect(await redis.exists(`zip:${listed.zipId}`)).toBe(false)
+    expect(await redis.exists(`zip:${unlisted.empty}`)).toBe(false)
+    expect(await redis.exists(`zip:${unlisted.described}`)).toBe(false)
+    expect(await redis.exists(`zip:${unlisted.older}`)).toBe(false)
+    // A zip nothing names and the set does not list is not the chat's to sweep.
+    expect(await redis.exists(`zip:${unlisted.unnamed}`)).toBe(true)
+    await redis.del(`zip:${unlisted.unnamed}`)
+  })
+
+  /**
+   * BL-1798: the chat delete took `zip:<id>` for every id a message of the chat named, with no
+   * look at the zip's own chat. Two saves keep another chat's reference as written: the older
+   * `{{batshit|id:…|` form (never neutralized, user text included) and a reply saved through
+   * `saveMessage` (the LiveKit voice route's transcript), and a tab posts `zipMetadata` and
+   * `metadata.zipIds`. So deleting chat A deleted chat B's zip that A's words named. A zip goes
+   * now only when its record names the deleted chat; one that names no chat goes only when the
+   * chat's own set lists it.
+   */
+  describe.runIf(REAL_REDIS_LANE)('a chat delete takes only its own zips (BL-1798)', () => {
+    const userId = 'josh'
+
+    async function chatWithZip(sessionId: string, label: string) {
+      await redis.createSession({ id: sessionId, user_id: userId, name: label })
+      const zip = await createZipFromContent(`${label} output`, 'cool_tool', sessionId, `${sessionId}-reply`)
+      await redis.saveMessage({
+        id: `${sessionId}-reply`, session_id: sessionId, user_id: userId, role: 'assistant',
+        content: `Read it. {{batshit-zip:${zip.zipId}:::Tool execution: read}}`,
+        metadata: { zipIds: [zip.zipId] }
+      })
+      return zip.zipId
+    }
+
+    async function expectChatStillReads(sessionId: string, zipId: string, label: string) {
+      expect(await redis.exists(`zip:${zipId}`)).toBe(true)
+      expect((await redis.getZip(zipId))?.content).toBe(`${label} output`)
+      expect((await redis.getZip(zipId))?.metadata?.sessionId).toBe(sessionId)
+      expect(await redis.sMembers(`session:${sessionId}:zips`)).toContain(zipId)
+      const [reply] = await redis.getMessages(sessionId, 10)
+      expect(reply?.content).toContain(`{{batshit-zip:${zipId}:::`)
+    }
+
+    it('keeps another chat\'s zip that its words name in the older form or that a tab posted, and that chat still reads it', async () => {
+      const otherOlder = await chatWithZip('session-bl1798-b1', 'B older form')
+      const otherPosted = await chatWithZip('session-bl1798-b2', 'B posted zipMetadata')
+      const otherIds = await chatWithZip('session-bl1798-b3', 'B posted zipIds')
+      const own = await chatWithZip('session-bl1798-a', 'A')
+      const sessionId = 'session-bl1798-a'
+      await redis.saveMessage({
+        id: 'msg-user', session_id: sessionId, user_id: userId, role: 'user',
+        content: `Pasted from the other chat: {{batshit|id:${otherOlder}|tool}}`,
+        zipMetadata: [{ zipId: otherPosted }],
+        metadata: { zipIds: [otherIds] }
+      } as any)
+      // The older form is saved as written (the precondition of the bug).
+      expect(((await redis.json.get(`message:${sessionId}:msg-user`)) as any)?.content).toContain(
+        `{{batshit|id:${otherOlder}|`
+      )
+
+      await redis.deleteSession(sessionId)
+
+      expect(await redis.exists(`zip:${own}`)).toBe(false)
+      await expectChatStillReads('session-bl1798-b1', otherOlder, 'B older form')
+      await expectChatStillReads('session-bl1798-b2', otherPosted, 'B posted zipMetadata')
+      await expectChatStillReads('session-bl1798-b3', otherIds, 'B posted zipIds')
+    })
+
+    it('keeps another chat\'s zip that a voice reply saved by the LiveKit turn route names', async () => {
+      const other = await chatWithZip('session-bl1798-voice-b', 'B voice')
+      const sessionId = 'session-bl1798-voice-a'
+      await redis.createSession({ id: sessionId, user_id: userId, name: 'A voice' })
+      await redis.createAgent({ id: 'agent-bl1798-voice', user_id: userId, displayName: 'Voice', agentType: 'API' } as any)
+      const { env } = await import('$env/dynamic/private')
+      const mutableEnv = env as Record<string, string | undefined>
+      const previousToken = mutableEnv.BATSHIT_TOKEN
+      const token = 'bl1798-voice-route-test-token-0123456789'
+      mutableEnv.BATSHIT_TOKEN = token
+      try {
+        const { POST } = await import('../../../routes/api/voice/livekit/turn/+server')
+        const response = await POST({
+          request: new Request('http://localhost/api/voice/livekit/turn', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-batshit-service-token': token },
+            body: JSON.stringify({
+              kind: 'speech_to_speech_assistant_message',
+              userId,
+              sessionId,
+              agentId: 'agent-bl1798-voice',
+              messageId: 'voice-reply-1',
+              transcript: `As the other chat said, {{batshit-zip:${other}:::Tool execution: read}}`
+            })
+          }),
+          fetch: async () => new Response('{}', { status: 200 })
+        } as any)
+        expect(response.status).toBe(200)
+      } finally {
+        if (previousToken === undefined) delete mutableEnv.BATSHIT_TOKEN
+        else mutableEnv.BATSHIT_TOKEN = previousToken
+      }
+      // The route saved the transcript as spoken (the precondition of the bug).
+      expect(((await redis.json.get(`message:${sessionId}:voice-reply-1`)) as any)?.content).toContain(
+        `{{batshit-zip:${other}:::`
+      )
+
+      await redis.deleteSession(sessionId)
+
+      await expectChatStillReads('session-bl1798-voice-b', other, 'B voice')
+    })
+
+    it('takes its own zips wherever a message names them, the set missing them included', async () => {
+      const sessionId = 'session-bl1798-own'
+      await redis.createSession({ id: sessionId, user_id: userId, name: 'Own zips' })
+      const zipIds = {
+        inSet: (await createZipFromContent('listed', 'cool_tool', sessionId, 'msg-a')).zipId,
+        zipIds: (await createZipFromContent('metadata.zipIds only', 'cool_tool', sessionId, 'msg-a')).zipId,
+        zipIdsSnake: (await createZipFromContent('metadata.zip_ids only', 'cool_tool', sessionId, 'msg-a')).zipId,
+        zipReferences: (await createZipFromContent('metadata.zipReferences only', 'cool_tool', sessionId, 'msg-a')).zipId,
+        emptyDescription: (await createZipFromContent('empty description', 'cool_tool', sessionId, 'msg-a')).zipId,
+        zipMetadata: (await createZipFromContent('zipMetadata only', 'cool_tool', sessionId, 'msg-a')).zipId
+      }
+      await redis.saveMessage({
+        id: 'msg-a', session_id: sessionId, user_id: userId, role: 'assistant',
+        content: `Read {{batshit-zip:${zipIds.emptyDescription}:::}}`,
+        zipMetadata: [{ zipId: zipIds.zipMetadata }],
+        metadata: {
+          zipIds: [zipIds.zipIds],
+          zip_ids: [zipIds.zipIdsSnake],
+          zipReferences: [{ zipId: zipIds.zipReferences }]
+        }
+      } as any)
+      // Every zip but the listed one has lost its set member (an older chat's set, say).
+      for (const [name, zipId] of Object.entries(zipIds)) {
+        if (name !== 'inSet') await redis.sRem(`session:${sessionId}:zips`, zipId)
+      }
+      expect(await redis.sMembers(`session:${sessionId}:zips`)).toEqual([zipIds.inSet])
+
+      await redis.deleteSession(sessionId)
+
+      for (const [name, zipId] of Object.entries(zipIds)) {
+        expect(await redis.exists(`zip:${zipId}`), name).toBe(false)
+      }
+    })
+
+    it('reads a zip\'s chat as the compile does, and takes a record that names no chat only from its own set', async () => {
+      const sessionId = 'session-bl1798-recorded'
+      await redis.createSession({ id: sessionId, user_id: userId, name: 'Recorded chat' })
+      const records: Record<string, Record<string, unknown>> = {
+        // No field names a chat: the chat's own set is the only proof it is this chat's.
+        noChatInSet: { id: 'cool_tool_1790600000000_nocha', type: 'cool_tool', content: 'x', metadata: {} },
+        noChatNamedOnly: { id: 'cool_tool_1790600000001_nonam', type: 'cool_tool', content: 'x', metadata: {} },
+        // Older shapes the compile and the zip routes read after `metadata.sessionId`.
+        topLevelThisChat: { id: 'cool_tool_1790600000002_topth', type: 'cool_tool', content: 'x', sessionId },
+        snakeOtherChatInSet: {
+          id: 'cool_tool_1790600000003_snako', type: 'cool_tool', content: 'x', metadata: { session_id: 'session-elsewhere' }
+        }
+      }
+      for (const record of Object.values(records)) {
+        await redis.execute((client: any) => client.json.set(`zip:${record.id}`, '$', record))
+      }
+      await redis.sAdd(`session:${sessionId}:zips`, records.noChatInSet.id as string)
+      await redis.sAdd(`session:${sessionId}:zips`, records.snakeOtherChatInSet.id as string)
+      await redis.saveMessage({
+        id: 'msg-a', session_id: sessionId, user_id: userId, role: 'assistant',
+        content: `{{batshit|id:${records.noChatNamedOnly.id}|tool}} {{batshit-zip:${records.topLevelThisChat.id}:::read}}`,
+        metadata: {}
+      })
+
+      await redis.deleteSession(sessionId)
+
+      expect(await redis.exists(`zip:${records.noChatInSet.id}`)).toBe(false)
+      expect(await redis.exists(`zip:${records.topLevelThisChat.id}`)).toBe(false)
+      expect(await redis.exists(`zip:${records.noChatNamedOnly.id}`)).toBe(true)
+      expect(await redis.exists(`zip:${records.snakeOtherChatInSet.id}`)).toBe(true)
+    })
+
+    /** Make the real `client.json.mGet` reject when it reads a key `matches` accepts, and nothing else. */
+    function failJsonMGets(matches: (key: string) => boolean) {
+      const execute = redis.execute.bind(redis) as (operation: (client: any) => Promise<unknown>) => Promise<unknown>
+      return vi.spyOn(redis, 'execute').mockImplementation(((operation: (client: any) => Promise<unknown>) =>
+        execute(async (client: any) => {
+          const target = client.json
+          // Empty proxy targets: the client's own properties are read-only.
+          const json = new Proxy({}, {
+            get(_empty, property) {
+              const value = Reflect.get(target, property)
+              if (property === 'mGet') {
+                return async (keys: string[], path: string) => {
+                  if (keys.some(matches)) throw new Error('Redis read failed (injected by the test)')
+                  return value.call(target, keys, path)
+                }
+              }
+              return typeof value === 'function' ? value.bind(target) : value
+            }
+          })
+          const wrapped = new Proxy({}, {
+            get(_empty, property) {
+              if (property === 'json') return json
+              const value = Reflect.get(client, property)
+              return typeof value === 'function' ? value.bind(client) : value
+            }
+          })
+          return operation(wrapped)
+        })) as typeof redis.execute)
+    }
+
+    // Review of BL-1798 (S1): the sweep read the zips' chats only after it had deleted the
+    // messages and the chat's set, and a failed read was only logged, so the chat's zips were left
+    // with nothing that could find them again. Every read the sweep needs now comes before its
+    // first write, and a failed one throws: nothing is deleted, the door reports the failure, and
+    // a retry deletes the whole chat (the rule of BL-390's message delete and BL-608's agent delete).
+    it.each([
+      ['the zips\' chats', 'zips'],
+      ['the messages\' claims', 'messages']
+    ] as const)('a failed read of %s deletes nothing, the delete fails, and a retry deletes the chat', async (_name, failing) => {
+      const sessionId = `session-bl1798-failed-${failing}`
+      const zipId = await chatWithZip(sessionId, 'Failed read')
+      await redis.saveMessage({
+        id: 'msg-user', session_id: sessionId, user_id: userId, role: 'user', content: 'and another'
+      })
+      await redis.set(`whiteboard:${sessionId}:board`, { text: 'kept' })
+      const keysBefore = (await redis.keys(`*${sessionId}*`)).sort()
+      expect(keysBefore).toEqual(expect.arrayContaining([
+        `session:${sessionId}`, `messages:${sessionId}`, `session:${sessionId}:zips`,
+        `message:${sessionId}:${sessionId}-reply`, `message:${sessionId}:msg-user`, `whiteboard:${sessionId}:board`
+      ]))
+
+      const injected = failJsonMGets((key) =>
+        failing === 'zips' ? key.startsWith('zip:') : key === `message:${sessionId}:msg-user`
+      )
+      try {
+        await expect(deleteSessionStoppingItsTurn(sessionId)).rejects.toThrow('nothing was deleted')
+      } finally {
+        injected.mockRestore()
+      }
+
+      expect((await redis.keys(`*${sessionId}*`)).sort()).toEqual(keysBefore)
+      expect(await redis.exists(`zip:${zipId}`)).toBe(true)
+      expect(await redis.sMembers(`user:${userId}:sessions`)).toContain(sessionId)
+      expect(isSessionDeleting(sessionId)).toBe(false)
+
+      await deleteSessionStoppingItsTurn(sessionId)
+      expect(await redis.keys(`*${sessionId}*`)).toEqual([])
+      expect(await redis.exists(`zip:${zipId}`)).toBe(false)
+    })
+
+    // Re-review of BL-1798: a message key that exists but is not JSON is no failed read. It
+    // claims no zip, is named in the log, and goes with the chat; refused, it left the chat
+    // undeletable. Only a failed read (the transport) stops the delete.
+    it('deletes a chat with a message key that is not JSON, that key included, and still keeps another chat\'s zip', async () => {
+      const other = await chatWithZip('session-bl1798-broken-b', 'B broken')
+      const sessionId = 'session-bl1798-broken-a'
+      const own = await chatWithZip(sessionId, 'A broken')
+      await redis.saveMessage({
+        id: 'msg-user', session_id: sessionId, user_id: userId, role: 'user',
+        content: `Pasted: {{batshit|id:${other}|tool}}`
+      })
+      // A message record that is a plain string, listed like the others.
+      await redis.execute(async (client: any) => {
+        await client.set(`message:${sessionId}:msg-broken`, '{"content": "not a JSON record"}')
+        await client.rPush(`messages:${sessionId}`, 'msg-broken')
+      })
+      expect(await redis.execute((client: any) => client.type(`message:${sessionId}:msg-broken`))).toBe('string')
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+      try {
+        await deleteSessionStoppingItsTurn(sessionId)
+        expect(warn.mock.calls.some((call) => JSON.stringify(call).includes(`message:${sessionId}:msg-broken`))).toBe(true)
+      } finally {
+        warn.mockRestore()
+      }
+
+      expect(await redis.keys(`*${sessionId}*`)).toEqual([])
+      expect(await redis.exists(`zip:${own}`)).toBe(false)
+      await expectChatStillReads('session-bl1798-broken-b', other, 'B broken')
+    })
   })
 
   it.runIf(REAL_REDIS_LANE)('keeps a zip another message claims only in its text, or only through zipReferences (BL-390)', async () => {

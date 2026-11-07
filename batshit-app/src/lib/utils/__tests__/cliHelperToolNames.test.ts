@@ -9,14 +9,13 @@ import { MODE4_INTERNAL_HELPER_TOOL_NAMES } from '$lib/server/services/mode4Inte
 /**
  * BL-5 — every helper tool keeps its own name on every CLI.
  *
- * codex-cli 0.139.0 through 0.148.0 show the model `mcp__<server>__<tool>` with every
- * character outside [A-Za-z0-9_] turned into `_`, and rename anything over 64 bytes to a
- * hashed code name (`codex-rs/codex-mcp/src/tools.rs`, `MAX_TOOL_NAME_LENGTH`). So the name
- * Batshit builds must survive that rewrite unchanged, or the prompt names a tool the model
- * cannot find.
+ * The strictest model-visible name rule a managed CLI applied (codex-cli 0.139.0 through
+ * 0.148.0, now removed) was `mcp__<server>__<tool>` with every character outside [A-Za-z0-9_]
+ * turned into `_` and anything over 64 bytes renamed to a hashed code name. Helper names stay
+ * inside that rule, so no CLI can rename a tool the prompt names.
  */
-const CODEX_0_139_TOOL_NAME_LIMIT_BYTES = 64
-const codexModelVisibleName = (name: string) => name.replace(/[^A-Za-z0-9_]/g, '_')
+const MODEL_VISIBLE_TOOL_NAME_LIMIT_BYTES = 64
+const modelVisibleName = (name: string) => name.replace(/[^A-Za-z0-9_]/g, '_')
 
 describe('the managed CLI helper server name', () => {
   it('is one fixed name', () => {
@@ -26,15 +25,15 @@ describe('the managed CLI helper server name', () => {
     )
   })
 
-  it('keeps every helper tool inside Codex 0.139 naming, byte for byte', () => {
+  it('keeps every helper tool inside the 64-byte model-visible name rule, byte for byte', () => {
     expect(MODE4_INTERNAL_HELPER_TOOL_NAMES.length).toBeGreaterThan(0)
     for (const tool of MODE4_INTERNAL_HELPER_TOOL_NAMES) {
       const full = buildCliHelperMcpToolName(tool)
       expect(full, full).toMatch(/^[a-z0-9_]+$/)
       expect(Buffer.byteLength(full, 'utf8'), full).toBeLessThanOrEqual(
-        CODEX_0_139_TOOL_NAME_LIMIT_BYTES
+        MODEL_VISIBLE_TOOL_NAME_LIMIT_BYTES
       )
-      expect(codexModelVisibleName(full)).toBe(full)
+      expect(modelVisibleName(full)).toBe(full)
     }
   })
 
@@ -57,7 +56,7 @@ describe('isCliHelperMcpServerName', () => {
     expect(isCliHelperMcpServerName('batshit_gateway_cody-mode4-controls')).toBe(true)
     expect(isCliHelperMcpServerName('batshit_gateway_jev_p4_codex-mode4-controls')).toBe(true)
     expect(isCliHelperMcpServerName('agent-123-mode4-controls')).toBe(true)
-    // Codex's own spelling of an old name, hyphens already turned into underscores.
+    // An old name as a CLI rewrote it, hyphens already turned into underscores.
     expect(isCliHelperMcpServerName('batshit_gateway_cody_mode4_controls')).toBe(true)
   })
 

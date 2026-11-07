@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 
 const source = readFileSync('src/routes/api/messages/send-routed/+server.ts', 'utf8')
+const replyRecordSource = readFileSync('src/lib/server/services/replyStreamRecord.ts', 'utf8')
 
 /**
  * An API-lane approval resume streams into the message the card was ON — the same id every
@@ -15,6 +16,21 @@ const source = readFileSync('src/routes/api/messages/send-routed/+server.ts', 'u
  * and streams to the tab normally.
  */
 describe('send-routed approval resume contract', () => {
+  it('the one canonical save awaits the record write before it returns (1f6b28f31)', () => {
+    // Every pin below names `persistCanonicalReply`, so its body must still be the awaited save
+    // first; send-routed-reply-record-handler.test.ts proves the record exists when `end` goes out.
+    const start = replyRecordSource.indexOf('export async function persistCanonicalReply(')
+    const end = replyRecordSource.indexOf('\n}\n', start)
+    expect(start).toBeGreaterThan(-1)
+    const body = replyRecordSource.slice(start, end)
+    const save = body.indexOf('try { await redis.saveMessage(message) }')
+    expect(save).toBeGreaterThan(-1)
+    expect(body.slice(0, save)).not.toContain('await ')
+    expect(body.split('redis.saveMessage(').length - 1).toBe(1)
+    // A failed save is thrown on, never swallowed: `end` must not go out with no record (BL-775).
+    expect(body.slice(save)).toContain('throw error')
+  })
+
   it('opens an in-place resume after run registration and before provider or tool work', () => {
     const registerAbort = source.indexOf('registerStreamAbort(sessionId, messageId, streamAbortController)')
     const registerSteer = source.indexOf('registerSteerRun(sessionId, {', registerAbort)
@@ -59,6 +75,7 @@ describe('send-routed approval resume contract', () => {
       .toBeLessThan(helperBody.indexOf('await streamAdapter.emitError({'))
     expect(helperBody).toContain('await streamAdapter.emitError({')
     expect(helperBody).not.toContain('redis.saveMessage')
+    expect(helperBody).not.toContain('persistCanonicalReply(')
     // BL-775: a real failure is saved before the tabs are told, and the POST's catch skips it.
     expect(helperBody.indexOf('await persistFailedAssistantTurn({'))
       .toBeLessThan(helperBody.indexOf('await streamAdapter.emitError({'))
@@ -84,7 +101,7 @@ describe('send-routed approval resume contract', () => {
   })
 
   it('tells the tab AFTER the resumed message is saved, and only for an in-place resume', () => {
-    const save = source.indexOf('await redis.saveMessage(finalMessage)')
+    const save = source.indexOf('await persistCanonicalReply(finalMessage, mcpOriginalPreparation, mcpApiPart)')
     expect(save).toBeGreaterThan(-1)
     const announce = source.indexOf('if (isApprovalResumeWithoutUserTurn) {', save)
     expect(announce).toBeGreaterThan(save)
@@ -100,9 +117,6 @@ describe('send-routed approval resume contract', () => {
   })
 
   it('reuses the message the card was on only for an in-place resume', () => {
-    // The CLI control resume mints its own ids, so its turn streams to the tab as usual and
-    // needs no announcement.
-    expect(source).toContain('managedAssistantMessageId = resumeAssistantMessageId')
     expect(source).toContain('const isApprovalResumeWithoutUserTurn =\n    hasToolApprovalResponse && !hasUserTurnContent')
     // Two writers can end an in-place resume: the finalize and the no-output failure writer. The
     // failure writer also announces a turn that failed before its stream opened (bug sweep item 2,
@@ -120,7 +134,7 @@ describe('send-routed approval resume contract', () => {
  */
 describe('send-routed keeps what the message held before the card', () => {
   it('continues the stored message BEFORE the finalize saves it, for an in-place resume only', () => {
-    const save = source.indexOf('await redis.saveMessage(finalMessage)')
+    const save = source.indexOf('await persistCanonicalReply(finalMessage, mcpOriginalPreparation, mcpApiPart)')
     const gate = source.lastIndexOf(
       "if (isApprovalResumeWithoutUserTurn && typeof finalMessage.content === 'string') {",
       save
@@ -153,7 +167,7 @@ describe('send-routed keeps what the message held before the card', () => {
       '...carriedReplyEndMetadata(\n          options.replyEndMetadata,\n          inPlaceResume ? (options.replyEndPrior ?? null) : null,\n        ),'
     )
     expect(body).toContain('      content,\n')
-    const saved = body.indexOf('await redis.saveMessage({')
+    const saved = body.indexOf('await persistCanonicalReply({')
     const told = body.indexOf("type: 'session_messages_changed',")
     expect(saved).toBeGreaterThan(-1)
     expect(told).toBeGreaterThan(saved)
@@ -172,7 +186,7 @@ describe('send-routed keeps what the message held before the card', () => {
     // The partial finalize joins its own half later. The empty writer receives the
     // frozen-prefix accounting join now, including the same resume version.
     const accountingMetadata = source.indexOf(
-      '\n    const joinedFailureAccounting = isApprovalResumeWithoutUserTurn && approvalResumePrior\n' +
+      '\n    const joinedFailureAccounting: Record<string, any> = isApprovalResumeWithoutUserTurn && approvalResumePrior\n' +
       '      ? mergeResumedMetadata(approvalResumePrior.metadata, failureRuntimeMetadata)\n' +
       '      : failureRuntimeMetadata\n',
       metadata
@@ -215,7 +229,7 @@ describe('send-routed keeps what the message held before the card', () => {
       'runInProgress = { messageId: managedAssistantMessageId,\n          inPlaceResume: managedRunIsInPlaceApprovalResume, steerIds: trustedFirstRunSteerIds }'
     )
     // BL-965: the record is read again after the run is named, so a failed read lands on it.
-    expect(source).toContain('\n            runInProgress = { messageId: continuationMessageId, inPlaceResume: false }\n            // BL-965: this turn starts after the last one ended: the record as it is now.\n            agent = await readAgentRecordForFollowUpTurn(resolvedUserId, agentId)\n            streamResult = await handleBatshitAgentStream({')
+    expect(source).toContain('\n            runInProgress = { messageId: continuationMessageId, inPlaceResume: false }\n            const continuationRunOwner = runInProgress\n            // BL-965: this turn starts after the last one ended: the record as it is now.\n            agent = await readAgentRecordForFollowUpTurn(resolvedUserId, agentId)\n            streamResult = await handleBatshitAgentStream({')
     // A promoted turn, or (BL-455) the message held for the card the click answered.
     const promotedOwner = source.indexOf('runInProgress = { messageId: nextTurn.assistantMessageId, inPlaceResume: false, steerIds: nextTurn.steerIds }')
     const promotedRead = source.indexOf('agent = await readAgentRecordForFollowUpTurn(resolvedUserId, agentId)', promotedOwner)
@@ -225,9 +239,9 @@ describe('send-routed keeps what the message held before the card', () => {
     expect(source.indexOf('streamResult = await handleBatshitAgentStream({', promotedRead)).toBeGreaterThan(promotedRead)
     // Every run is let go of as soon as it returns: three calls, three `runFinished(streamResult)`.
     expect(source.split('\n          runFinished(streamResult)\n').length - 1 + source.split('\n            runFinished(streamResult)\n').length - 1).toBe(3)
-    // BL-455: a CLI Deny that answers the message held for its card runs a NEW turn.
+    // The API click remains an in-place resume of the card's reply.
     expect(source).toContain(
-      'const managedRunIsInPlaceApprovalResume =\n          heldAnswerAfterDeny === null &&\n          isInPlaceApprovalResume({\n            approvalResponseCount: approvalResponseForStream.length,\n            content,\n            controlResumeContent: controlApprovalResumeContent,\n          })'
+      'const managedRunIsInPlaceApprovalResume = isInPlaceApprovalResume({\n          approvalResponseCount: approvalResponseForStream.length,\n          content,\n        })'
     )
   })
 })
@@ -242,7 +256,7 @@ describe('send-routed keeps what the message held before the card', () => {
  */
 describe('send-routed resumes the paused call, not a different one (BL-322)', () => {
   const handlerStart = source.indexOf('async function handleBatshitAgentStream({')
-  const compileCall = source.indexOf('const formattedInput = await databaseService.buildFormattedChatInput(', handlerStart)
+  const compileCall = source.indexOf('let formattedInput = await databaseService.buildFormattedChatInput(', handlerStart)
 
   it('finds the paused turn in the history and refuses a resume without one, before compiling', () => {
     const find = source.indexOf(
@@ -263,7 +277,8 @@ describe('send-routed resumes the paused call, not a different one (BL-322)', ()
 
   it("compiles the paused turn's history and message, with its sender, time, project, and files", () => {
     expect(source).toContain(
-      'const historyForCompilation = pausedApprovalTurn\n    ? pausedApprovalTurn.history\n    : previousMessages',
+      // SA-137 P2: the compile's own history drops the server-only replay fields, whoever posted it.
+      'const historyForCompilation = (pausedApprovalTurn\n    ? pausedApprovalTurn.history\n    : previousMessages\n  ).map(withoutServerReplayFields)',
     )
     expect(source).toContain(
       'const compileCurrentMessage = pausedApprovalTurn\n    ? pausedApprovalTurn.currentText\n    : messageForCompilation',
@@ -339,7 +354,9 @@ describe('send-routed keeps the paused run’s steps in the Execution Viewer (BL
   it('adds this run’s steps after them on every write', () => {
     const writes = handler.split(/await executionViewerService\.updateSnapshot\(sessionId, messageId, (?:withPriorRunAccounting\()?\{/).slice(1)
     const stepWrites = writes.filter((write) => write.slice(0, 900).includes('intermediateSteps:'))
-    expect(stepWrites.length).toBe(4)
+    // The API finish, the raw-chunk backfill and the failure capture (SA-139 R4 removed the CLI
+    // finish write).
+    expect(stepWrites.length).toBe(3)
     for (const write of stepWrites) {
       const body = write.slice(0, 900)
       expect(body).toMatch(/intermediateSteps:\s*withPriorRunSteps\(/)
@@ -375,9 +392,9 @@ describe('send-routed counts both halves of a resumed reply (BL-525)', () => {
       calls.push(handler.slice(open + 1, end))
     }
     const numberWrites = calls.filter((args) => /\b(responseSummary|llmSummary|delegated)\b/.test(args))
-    // The CLI finish, the API finish, the raw-chunk backfill, the failure capture, and the
-    // Stop/failure `delegated`.
-    expect(numberWrites.length).toBe(5)
+    // The API finish, the raw-chunk backfill, the failure capture, and the Stop/failure
+    // `delegated` (SA-139 R4 removed the CLI finish write).
+    expect(numberWrites.length).toBe(4)
     for (const args of numberWrites) {
       expect(args.replace(/\s+/g, ' ').trim().startsWith('sessionId, messageId, withPriorRunAccounting(')).toBe(true)
     }
@@ -392,8 +409,8 @@ describe('send-routed counts both halves of a resumed reply (BL-525)', () => {
 
   it('records `delegated` for a run the finish callback never reached (a Stop, a failure)', () => {
     expect(handler).toContain(
-      // BL-1362: plus the Batshit runs Claude Code's own helper model started (accounting only).
-      '\n    const failedRunDelegated = onFinishResolved\n      ? null\n      : buildDelegatedExecutionSummary([...streamedToolSteps, ...helperDelegatedSteps])\n',
+      // SA-139 R4: the managed CLI helper's accounting-only runs (BL-1362) went with the lane.
+      '\n    const failedRunDelegated = onFinishResolved\n      ? null\n      : buildDelegatedExecutionSummary([...streamedToolSteps])\n',
     )
     expect(handler.split('\n          ...(failedRunDelegated ? { delegated: failedRunDelegated } : {}),\n').length - 1).toBe(2)
   })

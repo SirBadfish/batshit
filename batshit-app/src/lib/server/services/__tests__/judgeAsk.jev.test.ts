@@ -392,8 +392,11 @@ describe('the guidance block restates JUDGE_ASK_LIMITS', () => {
     expect(guidance).toContain(`Up to ${JUDGE_ASK_LIMITS.maxQuestions} questions per call`)
     expect(guidance).toContain(`${JUDGE_ASK_LIMITS.minChoiceOptions} to ${JUDGE_ASK_LIMITS.maxChoiceOptions} options`)
     expect(guidance).toContain(`${JUDGE_ASK_LIMITS.minScoreLevels} to ${JUDGE_ASK_LIMITS.maxScoreLevels} levels`)
-    // 120,000 chars is "about 30k tokens" at the four-chars-a-token rule the guard uses.
+    // Decision 11 (Josh, 2026-10-24): the guidance names no request size, because a fixed number
+    // is not true of every judge; it says the refusal names the limit. The refusal for Batshit's
+    // own guard does: 120,000 chars, "about 30k tokens" at the four-chars-a-token rule.
+    expect(guidance).not.toContain('30k')
+    expect(guidance).toContain('a request over one is refused, and the refusal names the limit')
     expect(Math.round(JUDGE_ASK_LIMITS.maxRequestChars / 4 / 1000)).toBe(30)
-    expect(guidance).toContain('under about 30k tokens')
   })
 })

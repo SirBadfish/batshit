@@ -1155,31 +1155,6 @@ export async function stampDmNeedsUser(
 }
 
 /**
- * BL-496 (A4) — take back the "needs you" mark ONE holdup set, and only that one.
- *
- * A Claude approval card in a woken turn marks the DM while it waits and takes the mark back
- * when it is answered or ends. The mark may belong to someone else by then: a Fabric pause
- * or another card stamped first (only the first holdup is recorded), or the user replied and
- * a later holdup stamped again. So the mark goes only while it is still the one stamped at
- * `stampedAt`.
- */
-export async function clearDmNeedsUserStamp(dmId: string, stampedAt: string): Promise<boolean> {
-  if (!dmId?.trim() || !stampedAt) return false
-  const record = await getDm(dmId)
-  if (record?.delivery?.needsUser?.at !== stampedAt) return false
-  let cleared = false
-  await withInboxLock(record.to, async () => {
-    const current = await getDm(dmId)
-    if (current?.delivery?.needsUser?.at !== stampedAt) return
-    const { needsUser: _cleared, ...delivery } = current.delivery
-    await writeDm({ ...current, delivery })
-    cleared = true
-    await announceInboxChanged(current.to, current.userId)
-  })
-  return cleared
-}
-
-/**
  * F-SEC-1b — the holdup is over: the user replied in that chat, or the DM closed.
  *
  * Deletes the key rather than writing `undefined`, so a re-read never sees a half-present

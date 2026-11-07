@@ -143,18 +143,19 @@ export function pairCodeSpans(runs: readonly CodeSpanRun[]): CodeRegion[] {
 /**
  * Whether a position is in a code span, with `runs` (a `CodeLayout`'s) paired left to right as
  * `findCodeRegions` pairs them, lazily: the positions asked about never go back. A run that `skip`
- * names (by its `start`) never opens a span. The control-block scanner skips the runs inside the
- * blocks it has read, so a backtick in a payload never shifts a pairing after the block (BL-701),
- * however many such blocks come before. Each run is read once: linear.
+ * names (by its `start`, with the end of the span it would open) never opens a span. The
+ * control-block scanner skips the runs inside the blocks it has read, so a backtick in a payload
+ * never shifts a pairing after the block (BL-701), however many such blocks come before. Each run
+ * is read once: linear.
  */
 export class CodeSpanReader {
   private readonly runs: readonly CodeSpanRun[]
-  private readonly skip: (start: number) => boolean
+  private readonly skip: (start: number, spanEnd: number) => boolean
   private next = 0
   private spanStart = 0
   private spanEnd = 0
 
-  constructor(runs: readonly CodeSpanRun[], skip: (start: number) => boolean) {
+  constructor(runs: readonly CodeSpanRun[], skip: (start: number, spanEnd: number) => boolean) {
     this.runs = runs
     this.skip = skip
   }
@@ -174,7 +175,7 @@ export class CodeSpanReader {
       const run = this.runs[this.next]
       if (!run || run.start > index) return false
       this.next += 1
-      if (run.close < 0 || this.skip(run.start)) continue
+      if (run.close < 0 || this.skip(run.start, this.runs[run.close].end)) continue
       this.spanStart = run.start
       this.spanEnd = this.runs[run.close].end
       this.next = run.close + 1

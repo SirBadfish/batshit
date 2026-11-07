@@ -1,5 +1,10 @@
+import type { ReasoningControlDefinition } from '$lib/types/reasoningControls'
 import type { ModelCapabilities, ModelPurpose } from '$lib/types/savedModels'
 import type { LocalAiServerId } from '$lib/types/localAi'
+import { reviewedReasoningBinding } from '$lib/data/reasoning-controls'
+import { CLI_REASONING_EFFORTS } from '$lib/data/cli-reasoning-contracts'
+import { CLAUDE_PLAN_EFFORT_LIMITS, CLAUDE_PLAN_THINKING_MODELS } from '$lib/utils/claudePlanConnection'
+import { REVIEWED_OPENAI_REASONING_MODELS, REVIEWED_ANTHROPIC_REASONING_MODELS, REVIEWED_GOOGLE_REASONING_MODELS, REVIEWED_GOOGLE_BUDGET_MODELS, REVIEWED_MIMO_REASONING_MODELS, REVIEWED_QWEN_REASONING_MODELS } from '$lib/data/reviewed-public-reasoning-facts'
 import {
   LOCAL_AI_SERVER_DEFINITIONS,
   resolveLocalProviderOptionsSegment
@@ -32,7 +37,6 @@ export interface ParameterDefinition {
   label: string
   description?: string
   inputType: ParameterInputType
-  n8nSupported?: boolean
   placeholder?: string
   helperText?: string
   min?: number
@@ -87,6 +91,10 @@ export interface ParameterDefinition {
    * Only a definition that sets this is checked; every other select sends what was saved.
    */
   onlyListedValues?: true
+  /** New exact reasoning controls require their reviewed direct transport/SDK binding. */
+  reviewedReasoningControl?: true
+  /** Strict entry applies only to reviewed budget fields, preserving legacy numeric parsing. */
+  reviewedBudget?: Extract<ReasoningControlDefinition, { kind: 'budget' }>
   /**
    * SA-124 P1: turn typed escapes (\\n, \\t, \\") into the real characters, per
    * entry. A newline-delimited editor cannot hold a real newline as an ENTRY,
@@ -635,7 +643,7 @@ const OPENAI_BASE: ParameterDefinition[] = markChatOnly([
     providerOptionKey: 'openai.reasoningEffort',
     section: 'reasoning',
     order: 10,
-    onlyModels: ['gpt-5*', 'o1*', 'o3*', 'o4*']
+    onlyModels: ['gpt-5*', ...REVIEWED_OPENAI_REASONING_MODELS, 'o1*', 'o3*', 'o4*']
   },
   {
     name: 'reasoningSummary',
@@ -649,7 +657,7 @@ const OPENAI_BASE: ParameterDefinition[] = markChatOnly([
     providerOptionKey: 'openai.reasoningSummary',
     section: 'reasoning',
     order: 15,
-    onlyModels: ['gpt-5*', 'o1*', 'o3*', 'o4*']
+    onlyModels: ['gpt-5*', ...REVIEWED_OPENAI_REASONING_MODELS, 'o1*', 'o3*', 'o4*']
   },
   {
     name: 'maxCompletionTokens',
@@ -858,8 +866,8 @@ const ANTHROPIC_BETWEEN_TOOLS_MODELS = [
 const ANTHROPIC_PARAMETERS: ParameterDefinition[] = markChatOnly([
   {
     name: 'sendReasoning',
-    label: 'Send reasoning stream',
-    description: 'Forward Claude thinking tokens to the client.',
+    label: 'Send prior reasoning to Claude',
+    description: 'Include available prior reasoning blocks in requests to Claude. This does not control thinking depth or display.',
     inputType: 'boolean',
     providerOptionKey: 'anthropic.sendReasoning',
     section: 'reasoning',
@@ -1952,21 +1960,72 @@ function buildLocalRuntimeParameters(runtimeId: LocalAiServerId): ParameterDefin
   })
 }
 
+function reviewedReasoningParameters(provider: 'openai' | 'anthropic' | 'google' | 'mimo' | 'qwencloud', ids: readonly string[]) {
+  return Object.fromEntries(ids.map(modelId => {
+    const binding = reviewedReasoningBinding({ modelId, connection: { type: 'direct', id: `direct:${provider}`, service: provider } })
+    return [modelId, [...(provider === 'anthropic' && modelId === 'claude-sonnet-5-5' ? ANTHROPIC_BETWEEN_TOOLS_PARAMETERS : []), ...(binding?.controls ?? []).map(control => {
+      const definition = binding!.descriptor.controls.find(item => item.id === control.id)!
+      if (definition.kind === 'budget') return { name: control.setting, label: control.label,
+        description: 'Requested reasoning token budget. The model may use fewer or more tokens. Blank uses the provider default.',
+        inputType: 'integer', min: definition.min, max: definition.max, reviewedBudget: definition,
+        providerOptionKey: control.providerPath.join('.'), section: 'reasoning', roles: CHAT_ONLY, order: 30, reviewedReasoningControl: true } satisfies ParameterDefinition
+      if (definition.kind !== 'effort' && definition.kind !== 'mode' && definition.kind !== 'toggle') return null
+      const values = definition.kind === 'toggle' ? ['true', 'false'] : definition.values
+      return { name: control.setting, label: control.label, description: `Supported ${control.label.toLowerCase()} for ${modelId}. Blank uses the provider default.`,
+        inputType: 'select', options: values.map(value => ({ value,
+          label: definition.kind === 'toggle' ? value === 'true' ? 'On' : 'Off' : value === 'xhigh' ? 'Extra High' : value === 'between_tools' ? 'Between tools (lowest)' : value[0].toUpperCase() + value.slice(1) })),
+        ...(definition.kind === 'toggle' ? { booleanTriState: true as const } : {}),
+        providerOptionKey: control.providerPath.join('.'), section: 'reasoning', roles: CHAT_ONLY,
+        order: control.id === 'effort' ? 10 : 20, onlyListedValues: true, reviewedReasoningControl: true,
+        ...(modelId === 'claude-sonnet-5-5' && control.id === 'mode' ? { savedValueAliases: { disabled: 'between_tools' } } : {})
+      } satisfies ParameterDefinition
+    }).filter((item): item is NonNullable<typeof item> => item !== null)]]
+  }))
+}
+
+/**
+ * SA-139 (D12): the Claude plan connection takes only what Claude Code honors. Effort goes to the run
+ * as `--effort` through the connection's admission owner, never as provider options on the wire.
+ */
+function claudePlanEffortParameter(values: readonly string[]): ParameterDefinition {
+  return { name: 'anthropicEffort', label: 'Reasoning effort',
+    description: 'Sent to Claude Code as --effort. Blank lets Claude Code choose. With an alias or CLI default, the level is checked when the run starts: the model it starts may take fewer levels.',
+    inputType: 'select', options: values.map(value => ({ value, label: value === 'xhigh' ? 'Extra High' : value[0].toUpperCase() + value.slice(1) })),
+    section: 'reasoning', roles: CHAT_ONLY, order: 10, onlyListedValues: true }
+}
+const CLAUDE_PLAN_PARAMETERS: ParameterDefinition[] = [claudePlanEffortParameter(CLI_REASONING_EFFORTS)]
+/** Only where Claude Code can turn thinking off (P0 §6); elsewhere the model decides per step. */
+const CLAUDE_PLAN_THINKING_PARAMETER: ParameterDefinition = {
+  name: 'claudePlanThinking', label: 'Thinking',
+  description: 'Disabled turns Claude Code\'s thinking off for this model. Default lets Claude Code decide.',
+  inputType: 'select', booleanTriState: true, options: BOOLEAN_TRI_STATE_OPTIONS,
+  section: 'reasoning', roles: CHAT_ONLY, order: 20
+}
+
 export const PARAMETER_SCHEMAS: ParameterSchema[] = [
+  { provider: 'claude-plan', base: CLAUDE_PLAN_PARAMETERS,
+    // Per model: a narrower effort list where Claude Code takes fewer levels, and Thinking where it can be turned off.
+    modelOverrides: Object.fromEntries([...new Set([...Object.keys(CLAUDE_PLAN_EFFORT_LIMITS), ...CLAUDE_PLAN_THINKING_MODELS])].map(model => [model, [
+      ...(CLAUDE_PLAN_EFFORT_LIMITS[model] ? [claudePlanEffortParameter(CLAUDE_PLAN_EFFORT_LIMITS[model])] : []),
+      ...(CLAUDE_PLAN_THINKING_MODELS.has(model) ? [CLAUDE_PLAN_THINKING_PARAMETER] : [])]])) },
+  { provider: 'mimo', base: [...COMMON_PARAMETERS, ...ROLE_PARAMETERS], modelOverrides: reviewedReasoningParameters('mimo', REVIEWED_MIMO_REASONING_MODELS) },
+  { provider: 'qwencloud', base: [...COMMON_PARAMETERS, ...ROLE_PARAMETERS], modelOverrides: reviewedReasoningParameters('qwencloud', REVIEWED_QWEN_REASONING_MODELS) },
   {
     provider: 'openai',
-    base: [...COMMON_PARAMETERS, ...OPENAI_BASE, ...ROLE_PARAMETERS]
+    base: [...COMMON_PARAMETERS, ...OPENAI_BASE, ...ROLE_PARAMETERS],
+    modelOverrides: reviewedReasoningParameters('openai', REVIEWED_OPENAI_REASONING_MODELS)
   },
   {
     provider: 'anthropic',
     base: [...COMMON_PARAMETERS, ...ANTHROPIC_PARAMETERS, ...ROLE_PARAMETERS],
-    modelOverrides: Object.fromEntries(
+    modelOverrides: { ...Object.fromEntries(
       ANTHROPIC_BETWEEN_TOOLS_MODELS.map((pattern) => [pattern, ANTHROPIC_BETWEEN_TOOLS_PARAMETERS])
-    )
+    ), ...reviewedReasoningParameters('anthropic', REVIEWED_ANTHROPIC_REASONING_MODELS) }
   },
   {
     provider: 'google',
-    base: [...COMMON_PARAMETERS, ...GOOGLE_PARAMETERS, ...ROLE_PARAMETERS]
+    base: [...COMMON_PARAMETERS, ...GOOGLE_PARAMETERS, ...ROLE_PARAMETERS],
+    modelOverrides: reviewedReasoningParameters('google', [...REVIEWED_GOOGLE_REASONING_MODELS, ...REVIEWED_GOOGLE_BUDGET_MODELS])
   },
   {
     provider: 'mistral',

@@ -1,5 +1,7 @@
 import {
   createHairState,
+  hairAssetMatchesRecipeFit,
+  hairAssetStyleFitKey,
   parseHairState,
   verifyHairAsset,
   type HairAssetSelectionV1,
@@ -8,8 +10,11 @@ import {
 } from './hairAssets'
 import { requireLowercaseSha256 } from './recipe/recipeCanonical'
 import { HAIR_ROOT_WEIGHTED_MOTION_TAG } from './secondaryMotion'
+import { classifyHairAssetAvailability } from './hairCatalog'
+import type { RecipeSourceIdentity } from './recipe/packageMetadata'
 
 export const HAIR_BUILTIN_CATALOG_CONTRACT = 'hair-catalog/v2' as const
+export const HAIR_BUILTIN_FIT_CATALOG_CONTRACT = 'hair-catalog/v3' as const
 
 export type HairBuiltinRevisionRefV2 = {
   assetId: string
@@ -30,6 +35,11 @@ export type HairBuiltinCatalogV2 = {
   successorEdges: HairBuiltinSuccessorEdgeV2[]
 }
 
+export type HairBuiltinCatalogV3 = Omit<HairBuiltinCatalogV2, 'schemaVersion'> & {
+  schemaVersion: typeof HAIR_BUILTIN_FIT_CATALOG_CONTRACT
+}
+export type HairBuiltinCatalog = HairBuiltinCatalogV2 | HairBuiltinCatalogV3
+
 export type HairBuiltinCatalogErrorCode =
   | 'INVALID_CATALOG'
   | 'UNKNOWN_BUILTIN_SELECTION'
@@ -42,7 +52,7 @@ export class HairBuiltinCatalogError extends Error {
     readonly code: HairBuiltinCatalogErrorCode,
     message: string
   ) {
-    super(`[${HAIR_BUILTIN_CATALOG_CONTRACT}] ${message}`)
+    super(`[hair-catalog] ${message}`)
     this.name = 'HairBuiltinCatalogError'
   }
 }
@@ -168,12 +178,15 @@ function requireSorted<T>(
   }
 }
 
-export async function parseHairBuiltinCatalog(value: unknown): Promise<HairBuiltinCatalogV2> {
+export function parseHairBuiltinCatalog(value: HairBuiltinCatalogV2): Promise<HairBuiltinCatalogV2>
+export function parseHairBuiltinCatalog(value: unknown): Promise<HairBuiltinCatalog>
+export async function parseHairBuiltinCatalog(value: unknown): Promise<HairBuiltinCatalog> {
   const raw = record(value, 'catalog')
   exactKeys(raw, ['schemaVersion', 'assets', 'currentRevisions', 'successorEdges'], 'catalog')
-  if (raw.schemaVersion !== HAIR_BUILTIN_CATALOG_CONTRACT) {
-    invalid(`catalog.schemaVersion must equal ${HAIR_BUILTIN_CATALOG_CONTRACT}.`)
+  if (raw.schemaVersion !== HAIR_BUILTIN_CATALOG_CONTRACT && raw.schemaVersion !== HAIR_BUILTIN_FIT_CATALOG_CONTRACT) {
+    invalid('catalog.schemaVersion must be a supported Hair catalog version.')
   }
+  const isFitCatalog = raw.schemaVersion === HAIR_BUILTIN_FIT_CATALOG_CONTRACT
   if (!Array.isArray(raw.assets) || raw.assets.length === 0) {
     invalid('catalog.assets must be a non-empty array.')
   }
@@ -222,21 +235,31 @@ export async function parseHairBuiltinCatalog(value: unknown): Promise<HairBuilt
   const currentRevisions = raw.currentRevisions.map((entry, index) =>
     revisionRef(entry, `catalog.currentRevisions[${index}]`)
   )
-  requireSorted(currentRevisions, (entry) => entry.assetId, 'catalog.currentRevisions')
+  requireSorted(currentRevisions, (entry) => isFitCatalog
+    ? `${entry.assetId}\u0000${String(entry.revision).padStart(12, '0')}\u0000${entry.revisionId}`
+    : entry.assetId, 'catalog.currentRevisions')
   const assetIds = new Set(assets.map((asset) => asset.assetId))
-  if (currentRevisions.length !== assetIds.size) {
+  if (!isFitCatalog && currentRevisions.length !== assetIds.size) {
     invalid('catalog must declare exactly one current revision for every built-in style.')
   }
-  const currentByAssetId = new Map<string, HairAssetV1>()
+  const currentByAssetId = new Map<string, HairAssetV1[]>()
+  const currentByRevision = new Map<string, HairAssetV1>()
+  const currentFits = new Set<string>()
   for (const ref of currentRevisions) {
     const asset = identityMap.get(`${ref.assetId}@${ref.revisionId}`)
     if (!asset || !refMatchesAsset(ref, asset)) {
       invalid(`current revision ${revisionKey(ref)} does not match an immutable catalog asset.`)
     }
-    if (currentByAssetId.has(ref.assetId)) {
+    if (!isFitCatalog && currentByAssetId.has(ref.assetId)) {
       invalid(`catalog declares more than one current revision for ${ref.assetId}.`)
     }
-    currentByAssetId.set(ref.assetId, asset)
+    const fitKey = hairAssetStyleFitKey(asset)
+    if (currentFits.has(fitKey)) invalid(`catalog declares ambiguous current fits for ${ref.assetId}.`)
+    currentFits.add(fitKey)
+    currentByRevision.set(revisionKey(ref), asset)
+    const group = currentByAssetId.get(ref.assetId) ?? []
+    group.push(asset)
+    currentByAssetId.set(ref.assetId, group)
   }
   for (const assetId of assetIds) {
     if (!currentByAssetId.has(assetId)) {
@@ -267,6 +290,10 @@ export async function parseHairBuiltinCatalog(value: unknown): Promise<HairBuilt
     if (edge.from.assetId !== edge.to.assetId) {
       invalid('successor edges cannot change the built-in style id.')
     }
+    if (isFitCatalog && (fromAsset.compatibility.baseId !== toAsset.compatibility.baseId ||
+        fromAsset.compatibility.fitFamily !== toAsset.compatibility.fitFamily)) {
+      invalid('fit-catalog successors must stay within the same base and fit family.')
+    }
     if (edge.to.revision <= edge.from.revision) {
       invalid(`successor edge for ${edge.from.assetId} must advance the revision number.`)
     }
@@ -280,39 +307,37 @@ export async function parseHairBuiltinCatalog(value: unknown): Promise<HairBuilt
   for (const asset of assets) {
     const ref = hairBuiltinRevisionRef(asset)
     const key = revisionKey(ref)
-    const current = currentByAssetId.get(asset.assetId)!
-    if (asset === current) {
-      if (successorBySource.has(key)) {
-        invalid(`current revision ${key} cannot declare a successor.`)
-      }
-      continue
-    }
-    if (!successorBySource.has(key)) {
-      invalid(`historical built-in revision ${key} has no declared successor.`)
-    }
     const visited = new Set<string>()
     let cursor = ref
-    while (!refMatchesAsset(cursor, current)) {
+    // A v3 selectable fit may itself have a successor for a different Source.
+    // Validate the complete chain, including edges after selectable entries.
+    while (true) {
       const cursorKey = revisionKey(cursor)
       if (visited.has(cursorKey)) invalid(`successor path for ${asset.assetId} contains a cycle.`)
       visited.add(cursorKey)
       const edge = successorBySource.get(cursorKey)
+      if (!isFitCatalog && currentByRevision.has(cursorKey) && edge) {
+        invalid(`current revision ${cursorKey} cannot declare a successor.`)
+      }
       if (!edge) {
-        invalid(`successor path for ${key} does not reach the declared current revision.`)
+        if (!currentByRevision.has(cursorKey)) {
+          invalid(`successor path for ${key} does not reach a declared current revision.`)
+        }
+        break
       }
       cursor = edge.to
     }
   }
 
   return {
-    schemaVersion: HAIR_BUILTIN_CATALOG_CONTRACT,
+    schemaVersion: isFitCatalog ? HAIR_BUILTIN_FIT_CATALOG_CONTRACT : HAIR_BUILTIN_CATALOG_CONTRACT,
     assets,
     currentRevisions,
     successorEdges
   }
 }
 
-export function listCurrentHairBuiltinAssets(catalog: HairBuiltinCatalogV2): HairAssetV1[] {
+export function listCurrentHairBuiltinAssets(catalog: HairBuiltinCatalog): HairAssetV1[] {
   return catalog.currentRevisions.map((ref) => {
     const asset = catalog.assets.find((candidate) => refMatchesAsset(ref, candidate))
     if (!asset) {
@@ -323,7 +348,7 @@ export function listCurrentHairBuiltinAssets(catalog: HairBuiltinCatalogV2): Hai
 }
 
 export function resolveHairBuiltinSelection(
-  catalog: HairBuiltinCatalogV2,
+  catalog: HairBuiltinCatalog,
   selection: HairAssetSelectionV1
 ): HairAssetV1 | null {
   const matchingStyle = catalog.assets.filter((asset) => asset.assetId === selection.assetId)
@@ -348,7 +373,8 @@ export function resolveHairBuiltinSelection(
 
 export function migrateHairBuiltinStateToCurrent(
   stateValue: HairStateV2,
-  catalog: HairBuiltinCatalogV2
+  catalog: HairBuiltinCatalog,
+  target?: RecipeSourceIdentity
 ): HairBuiltinStateMigration {
   const state = parseHairState(stateValue)
   if (!state.selected) {
@@ -370,29 +396,19 @@ export function migrateHairBuiltinStateToCurrent(
       path: []
     }
   }
-  const currentRef = catalog.currentRevisions.find(
-    (ref) => ref.assetId === sourceAsset.assetId
-  )
-  if (!currentRef) {
-    throw new HairBuiltinCatalogError(
-      'MISSING_SUCCESSOR',
-      `catalog has no declared current revision for ${sourceAsset.assetId}.`
-    )
-  }
-  const currentAsset = catalog.assets.find((asset) => refMatchesAsset(currentRef, asset))
-  if (!currentAsset) {
-    throw new HairBuiltinCatalogError(
-      'MISSING_SUCCESSOR',
-      `declared current revision ${revisionKey(currentRef)} is missing.`
-    )
-  }
   const path = [hairBuiltinRevisionRef(sourceAsset)]
-  if (sourceAsset === currentAsset) {
+  if (catalog.schemaVersion === HAIR_BUILTIN_FIT_CATALOG_CONTRACT && !target) {
+    throw new HairBuiltinCatalogError('INCOMPATIBLE_SUCCESSOR', 'A target Recipe Source is required to resolve fitted built-in Hair.')
+  }
+  // A still-compatible saved historical revision remains valid; do not rewrite
+  // its state merely because a newer selectable fit exists for the style.
+  if (catalog.schemaVersion === HAIR_BUILTIN_FIT_CATALOG_CONTRACT && target &&
+      hairAssetMatchesRecipeFit(sourceAsset, target)) {
     return {
       status: 'current',
       state,
       sourceAsset,
-      targetAsset: currentAsset,
+      targetAsset: sourceAsset,
       path
     }
   }
@@ -402,7 +418,8 @@ export function migrateHairBuiltinStateToCurrent(
   )
   let cursor = path[0]!
   const visited = new Set<string>()
-  while (!refMatchesAsset(cursor, currentAsset)) {
+  let currentAsset: HairAssetV1 | null = null
+  while (true) {
     const key = revisionKey(cursor)
     if (visited.has(key)) {
       throw new HairBuiltinCatalogError(
@@ -411,8 +428,23 @@ export function migrateHairBuiltinStateToCurrent(
       )
     }
     visited.add(key)
+    const selectable = catalog.currentRevisions.some((ref) => revisionKey(ref) === key)
+    if (selectable) {
+      const candidate = catalog.assets.find((asset) => refMatchesAsset(cursor, asset))
+      if (!candidate) {
+        throw new HairBuiltinCatalogError('MISSING_SUCCESSOR', `declared current revision ${key} is missing.`)
+      }
+      if (catalog.schemaVersion !== HAIR_BUILTIN_FIT_CATALOG_CONTRACT ||
+          (target && hairAssetMatchesRecipeFit(candidate, target))) {
+        currentAsset = candidate
+        break
+      }
+    }
     const next = successors.get(key)
     if (!next) {
+      if (selectable && catalog.schemaVersion === HAIR_BUILTIN_FIT_CATALOG_CONTRACT) {
+        throw new HairBuiltinCatalogError('INCOMPATIBLE_SUCCESSOR', `no compatible declared successor exists for ${sourceAsset.assetId} on this Goon.`)
+      }
       throw new HairBuiltinCatalogError(
         'MISSING_SUCCESSOR',
         `saved built-in selection ${key} has no declared successor.`
@@ -420,6 +452,13 @@ export function migrateHairBuiltinStateToCurrent(
     }
     path.push(next)
     cursor = next
+  }
+  const currentRef = cursor
+  if (target && !classifyHairAssetAvailability(currentAsset, target).selectable) {
+    throw new HairBuiltinCatalogError('INCOMPATIBLE_SUCCESSOR', `no compatible declared successor exists for ${sourceAsset.assetId} on this Goon.`)
+  }
+  if (sourceAsset === currentAsset) {
+    return { status: 'current', state, sourceAsset, targetAsset: currentAsset, path }
   }
 
   if (

@@ -1,3 +1,4 @@
+import { invalidateP5SessionWorkflow } from '$lib/server/services/appActions/mcp/originalTask'
 import { json } from '@sveltejs/kit'
 import { apiFailure } from '$lib/server/services/apiResponses'
 import type { RequestHandler } from './$types'
@@ -14,11 +15,15 @@ import {
   stopSessionTurn
 } from '$lib/server/services/streamAbortRegistry'
 import { abortWokenTurnForInterrupt } from '$lib/server/services/agentWakeups'
+import { endHeldClaudePlanRuns } from '$lib/server/services/claudePlanRunRegistry'
+
 import { QUEUED_SEND_FORWARD_LIMIT_MS } from '$lib/server/services/queuedSendRules'
 import {
   internalServiceHeaders,
   isTrustedInternalRequest
 } from '$lib/server/services/internalRequestAuth'
+
+const HELD_RUN_STOPPED = 'The reply was stopped while its approval card waited, so its Claude Code run ended.'
 
 /**
  * BL-4 — tell every tab on the chat that its waiting sends will not be sent.
@@ -98,6 +103,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
   // request makes SvelteKit fire `request.signal` inside send-routed, which is the one
   // signal that reaches a turn still in setup. No-op for ordinary browser turns.
   const abortedWokenTurn = abortWokenTurnForInterrupt(sessionId)
+  const endedOriginalWorkflow = invalidateP5SessionWorkflow(sessionId)
 
   // BL-4: the chat's own Stop stops everything, a waiting message included (AMD-119-04). Every
   // send waiting in the chat's line is kept, BEFORE the running turn is touched, so the lock it
@@ -119,8 +125,12 @@ export const POST: RequestHandler = async ({ request, locals }) => {
   const activeGroup = getActiveGroupAbort(sessionId)
   const activeSessionTurn = getActiveSessionTurn(sessionId)
   if (!active && !activeGroup && !activeSessionTurn) {
+    // SA-139 D6: Stop in the gap after a reply that ended at an approval card ends the Claude plan run
+    // held for that card (BL-455), and waits for its exit.
+    const heldRuns = await endHeldClaudePlanRuns({ sessionId }, HELD_RUN_STOPPED)
     return answer({
-      success: abortedWokenTurn || keptQueuedSends > 0,
+      success: abortedWokenTurn || endedOriginalWorkflow || keptQueuedSends > 0 || heldRuns.ended > 0,
+      ...(heldRuns.ended > 0 ? { endedHeldClaudePlanRuns: heldRuns.ended, unsettledHeldClaudePlanRuns: heldRuns.unsettled } : {}),
       reason: abortedWokenTurn ? 'wake_run_aborted' : 'no_active_stream',
       abortedWokenTurn
     })
@@ -147,8 +157,11 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     }
     // The reply is over (its request is doing its after-reply work) or its request is stuck.
     clearSessionTurn(sessionId, requestedMessageId)
+    // SA-139 D6 (review B S3): a reply that ended at a card already holds its run here.
+    const heldAfterReply = await endHeldClaudePlanRuns({ sessionId }, HELD_RUN_STOPPED)
     return answer({
       success: true,
+      ...(heldAfterReply.ended > 0 ? { endedHeldClaudePlanRuns: heldAfterReply.ended, unsettledHeldClaudePlanRuns: heldAfterReply.unsettled } : {}),
       reason: abortedWokenTurn ? 'wake_run_aborted' : 'stale_turn_cleared',
       abortedWokenTurn,
       messageId: requestedMessageId,

@@ -1,3 +1,6 @@
+import { VoiceCatalogCompatibilityError } from './builtinVoiceCatalogErrors'
+import { MimoVoiceInputError } from './mimoVoiceInput'
+
 type VoiceApiMode = 'tts' | 'stt'
 
 export type VoiceApiErrorDetails = {
@@ -103,6 +106,8 @@ function isNetworkMessage(lowerMessage: string): boolean {
 }
 
 export function classifyVoiceApiError(error: unknown, mode: VoiceApiMode): VoiceApiErrorDetails {
+  if (error instanceof VoiceCatalogCompatibilityError) return { status: 412, error: error.message, setupHint: error.setupHint, logLevel: 'warn' }
+  if (error instanceof MimoVoiceInputError) return { status: 400, error: error.message, setupHint: error.setupHint, logLevel: 'warn' }
   const fallback = mode === 'tts' ? 'Failed to synthesize speech' : 'Failed to transcribe audio'
   const message = normalizeMessage(error) || fallback
   const lower = message.toLowerCase()

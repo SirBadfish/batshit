@@ -30,7 +30,6 @@ const REASON =
 describe('/api/models connection options for custom providers', () => {
   it('locks a custom provider whose saved key is not usable, with the reason', () => {
     const options = _buildConnectionOptions(access, {
-      codex: null,
       customProviders: [summary('custom_restored', false)]
     })
     expect(options.find((entry) => entry.id === 'direct:custom_restored')).toMatchObject({
@@ -41,11 +40,18 @@ describe('/api/models connection options for custom providers', () => {
 
   it('keeps a custom provider with a usable key Ready (the control)', () => {
     const options = _buildConnectionOptions(access, {
-      codex: null,
       customProviders: [summary('custom_ok', true)]
     })
     const option = options.find((entry) => entry.id === 'direct:custom_ok')
     expect(option?.status).toBe('ready')
     expect(option?.lockedReason).toBeUndefined()
+  })
+
+  // SA-139 R1 removed Codex CLI, and R5 the Claude Code CLI Subagent, its last user: no managed
+  // CLI connection is offered (the Claude plan is its own connection).
+  it('offers no Codex CLI and no Claude Code CLI connection', () => {
+    const options = _buildConnectionOptions(access, { customProviders: [] })
+    expect(options.filter((entry) => entry.id === 'codex-cli' || entry.service === 'openai-codex')).toEqual([])
+    expect(options.filter((entry) => entry.id === 'claude-cli' || String(entry.service ?? '').includes('claude-cli'))).toEqual([])
   })
 })

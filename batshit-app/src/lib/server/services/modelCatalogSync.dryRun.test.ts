@@ -4,16 +4,21 @@
  * at all. Each "never" has a positive control in the same setup.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import mistralCollision from './__fixtures__/mistral-catalog-collision.json'
 
 const retirements: import('$lib/data/catalog-confirmed-retirements').ConfirmedCatalogRetirement[] = []
 vi.mock('$lib/data/catalog-confirmed-retirements', () => ({ CONFIRMED_CATALOG_RETIREMENTS: retirements }))
 
-const upstashKvGet = vi.fn()
-const upstashKvSet = vi.fn(async () => undefined)
+const readPriorValue = vi.fn()
+const upstashKvGetRaw = vi.fn(async (...args: unknown[]) => {
+  const value = await readPriorValue(...args)
+  return value === null || typeof value === 'string' ? value : JSON.stringify(value)
+})
+const upstashKvSetIfUnchanged = vi.fn<(key: string, raw: string | null, value: unknown, options: unknown) => Promise<boolean>>(async () => true)
 const storeCatalogSyncReport = vi.fn(async () => ({ warningStreak: 0, warningAlert: null }))
 const getRuntimeEnv = vi.fn(async (_name: string): Promise<string | undefined> => undefined)
 
-vi.mock('$lib/server/services/upstashKv', () => ({ upstashKvGet, upstashKvSet }))
+vi.mock('$lib/server/services/upstashKv', () => ({ upstashKvGetRaw, upstashKvSetIfUnchanged }))
 vi.mock('$lib/server/services/modelCatalogReportStore', () => ({ storeCatalogSyncReport }))
 vi.mock('$lib/server/services/runtimeEnv', () => ({ getRuntimeEnv }))
 
@@ -72,9 +77,10 @@ describe('BL-68 sync dry run and snapshot replay', () => {
 
   beforeEach(() => {
     retirements.length = 0
-    upstashKvGet.mockReset()
-    upstashKvGet.mockResolvedValue(SNAPSHOT)
-    upstashKvSet.mockClear()
+    readPriorValue.mockReset()
+    readPriorValue.mockResolvedValue(SNAPSHOT)
+    upstashKvSetIfUnchanged.mockReset().mockResolvedValue(true)
+    upstashKvGetRaw.mockClear()
     storeCatalogSyncReport.mockClear()
     getRuntimeEnv.mockReset().mockResolvedValue(undefined)
     fetchSpy = vi.fn(async () => new Response(JSON.stringify({ data: [] }), { status: 200 }))
@@ -85,41 +91,77 @@ describe('BL-68 sync dry run and snapshot replay', () => {
   it('publishes and stores its report on a real run (the control)', async () => {
     await runModelCatalogSync({ trigger: 'cli' })
 
-    expect(upstashKvSet).toHaveBeenCalledWith('catalog:v1', expect.anything(), expect.anything())
+    expect(upstashKvSetIfUnchanged).toHaveBeenCalledWith('catalog:v1', expect.anything(), expect.anything(), expect.anything())
     expect(storeCatalogSyncReport).toHaveBeenCalledTimes(1)
   })
 
+  it('uses the actual stored raw snapshot and refuses a conflicting publication without retry', async () => {
+    const raw = JSON.stringify(SNAPSHOT, null, 2) + '\n'
+    readPriorValue.mockResolvedValueOnce(raw)
+    upstashKvSetIfUnchanged.mockResolvedValueOnce(false)
+    await expect(runModelCatalogSync()).rejects.toThrow('saved snapshot changed during refresh')
+    expect(upstashKvSetIfUnchanged).toHaveBeenCalledExactlyOnceWith('catalog:v1', raw, expect.anything(), expect.anything())
+    expect(storeCatalogSyncReport).not.toHaveBeenCalled()
+  })
+
   it('refuses publication when the prior catalog read fails', async () => {
-    upstashKvGet.mockRejectedValueOnce(new Error('Upstash read timed out'))
+    readPriorValue.mockRejectedValueOnce(new Error('Upstash read timed out'))
 
     await expect(runModelCatalogSync({ trigger: 'cli' })).rejects.toThrow('Upstash read timed out')
-    expect(upstashKvGet).toHaveBeenCalledWith('catalog:v1', expect.objectContaining({ required: true }))
+    expect(readPriorValue).toHaveBeenCalledWith('catalog:v1', expect.objectContaining({ required: true }))
     expect(fetchSpy).not.toHaveBeenCalled()
-    expect(upstashKvSet).not.toHaveBeenCalled()
+    expect(upstashKvSetIfUnchanged).not.toHaveBeenCalled()
+    expect(storeCatalogSyncReport).not.toHaveBeenCalled()
+  })
+
+  it('retains last-good evidence on a same-ID fresh list that supplies no control metadata', async () => {
+    const prior: any = structuredClone(SNAPSHOT)
+    const evidence = { lastGood: { version: 1, scope: 'public', support: 'supported', connection: 'vercel-gateway',
+      effectiveModelId: prior.models[0].idVariants['vercel-gateway'].effectiveId, endpoint: 'responses',
+      controls: [{ id: 'effort', kind: 'effort', values: ['low', 'high'] }],
+      evidence: [{ url: 'https://vercel.com/docs/ai-gateway', checkedAt: '2026-10-14' }], lastVerified: '2026-10-14' },
+      lastAttempt: { at: '2026-10-14T12:00:00Z', outcome: 'verified' } }
+    prior.models[0].idVariants['vercel-gateway'].reasoningEvidence = evidence
+    readPriorValue.mockResolvedValueOnce(prior)
+    fetchSpy.mockImplementation(async () => new Response(JSON.stringify({ data: [{ id: prior.models[0].id, name: 'Fresh name' }] }), { status: 200 }))
+    const result = await runModelCatalogSync({ dryRun: true })
+    const variant = result.payload.models.flatMap(model => Object.values(model.idVariants ?? {})).find(variant => variant.effectiveId === prior.models[0].id)
+    expect(variant?.reasoningEvidence).toEqual(evidence)
+    expect(upstashKvSetIfUnchanged).not.toHaveBeenCalled()
+    expect(storeCatalogSyncReport).not.toHaveBeenCalled()
+  })
+
+  it('refuses unknown saved evidence before any provider read or publication', async () => {
+    const prior: any = structuredClone(SNAPSHOT)
+    prior.models[0].idVariants['vercel-gateway'].reasoningEvidence = { schemaVersion: 99, futureFacts: true }
+    readPriorValue.mockResolvedValueOnce(prior)
+    await expect(runModelCatalogSync()).rejects.toThrow(/reasoning evidence is malformed, future or non-public/)
+    expect(fetchSpy).not.toHaveBeenCalled()
+    expect(upstashKvSetIfUnchanged).not.toHaveBeenCalled()
     expect(storeCatalogSyncReport).not.toHaveBeenCalled()
   })
 
   it('refuses publication when catalog read credentials are missing', async () => {
-    upstashKvGet.mockRejectedValueOnce(new Error('KV_REST_API_READ_ONLY_TOKEN not configured'))
+    readPriorValue.mockRejectedValueOnce(new Error('KV_REST_API_READ_ONLY_TOKEN not configured'))
 
     await expect(runModelCatalogSync({ trigger: 'cli' })).rejects.toThrow('KV_REST_API_READ_ONLY_TOKEN not configured')
-    expect(upstashKvGet).toHaveBeenCalledWith('catalog:v1', expect.objectContaining({ required: true }))
+    expect(readPriorValue).toHaveBeenCalledWith('catalog:v1', expect.objectContaining({ required: true }))
     expect(fetchSpy).not.toHaveBeenCalled()
-    expect(upstashKvSet).not.toHaveBeenCalled()
+    expect(upstashKvSetIfUnchanged).not.toHaveBeenCalled()
     expect(storeCatalogSyncReport).not.toHaveBeenCalled()
   })
 
   it('refuses publication when the prior catalog is malformed', async () => {
-    upstashKvGet.mockResolvedValueOnce({ version: 2, models: 'not an array' })
+    readPriorValue.mockResolvedValueOnce({ version: 2, models: 'not an array' })
 
     await expect(runModelCatalogSync({ trigger: 'cli' })).rejects.toThrow('existing catalog')
     expect(fetchSpy).not.toHaveBeenCalled()
-    expect(upstashKvSet).not.toHaveBeenCalled()
+    expect(upstashKvSetIfUnchanged).not.toHaveBeenCalled()
     expect(storeCatalogSyncReport).not.toHaveBeenCalled()
   })
 
   it.each([null, {}, { ...SNAPSHOT.models[0], idVariants: {} }])('refuses an unusable saved identity before fetching sources: %s', badRow => {
-    upstashKvGet.mockResolvedValueOnce({ ...SNAPSHOT, models: [badRow] })
+    readPriorValue.mockResolvedValueOnce({ ...SNAPSHOT, models: [badRow] })
     return expect(runModelCatalogSync()).rejects.toThrow('existing catalog')
   })
 
@@ -171,7 +213,7 @@ describe('BL-68 sync dry run and snapshot replay', () => {
           }
         } : {}) })
       const openRouterId = 'openai/gpt-3.5-turbo-instruct'
-      upstashKvGet.mockResolvedValueOnce({ ...SNAPSHOT, models: [...SNAPSHOT.models,
+      readPriorValue.mockResolvedValueOnce({ ...SNAPSHOT, models: [...SNAPSHOT.models,
         ...[...excluded, 'gpt-4o', 'future-missing'].map(savedOpenAI),
         row({ id: openRouterId, provider: 'openai', name: 'gpt-3.5-turbo-instruct', displayName: 'Instruct',
           source: 'openrouter', transport: 'openrouter', connectionId: 'openrouter', availableConnections: ['openrouter'],
@@ -207,7 +249,7 @@ describe('BL-68 sync dry run and snapshot replay', () => {
       const liveSuccess = mode === 'fresh list' || mode === 'absent from fresh list'
       expect(ids.includes('direct:openai:fresh-model')).toBe(liveSuccess)
       if (liveSuccess) expect(source.fetchedCount).toBe(2)
-      expect(upstashKvSet).toHaveBeenCalledWith('catalog:v1', result.payload, expect.anything())
+      expect(upstashKvSetIfUnchanged).toHaveBeenCalledWith('catalog:v1', expect.any(String), result.payload, expect.anything())
       expect(storeCatalogSyncReport).toHaveBeenCalledWith(expect.objectContaining({ report: expect.objectContaining({
         sources: expect.arrayContaining([expect.objectContaining({ connectionId: 'direct:openai', policyRemovalIds: excluded })])
       }) }))
@@ -216,14 +258,14 @@ describe('BL-68 sync dry run and snapshot replay', () => {
 
   it('names saved Z.ai compatibility aliases as policy removals during an outage', async () => {
     const id = 'glm-4.5'
-    upstashKvGet.mockResolvedValueOnce({ ...SNAPSHOT, models: [...SNAPSHOT.models, row({
+    readPriorValue.mockResolvedValueOnce({ ...SNAPSHOT, models: [...SNAPSHOT.models, row({
       id, provider: 'zai', name: id, displayName: id, connectionId: 'direct:zai_coding', availableConnections: ['direct:zai_coding'],
       idVariants: { 'direct:zai_coding': { developerId: 'zai', modelId: id, effectiveId: id } }
     })] })
     const result = await runModelCatalogSync({ dryRun: true })
     expect(result.payload.models.some(model => model.idVariants?.['direct:zai_coding']?.effectiveId === id)).toBe(false)
     expect(result.report.sources.find(source => source.connectionId === 'direct:zai_coding')).toMatchObject({ policyRemovalIds: [id] })
-    expect(upstashKvSet).not.toHaveBeenCalled()
+    expect(upstashKvSetIfUnchanged).not.toHaveBeenCalled()
   })
 
   it('still refuses unapproved downstream loss after a same-connection merge collision', async () => {
@@ -232,14 +274,36 @@ describe('BL-68 sync dry run and snapshot replay', () => {
       connectionId: 'vercel-gateway', availableConnections: ['vercel-gateway'],
       idVariants: { 'vercel-gateway': { developerId: 'maker', modelId: 'shared', effectiveId: `maker/${id}` } }
     }))
-    upstashKvGet.mockResolvedValueOnce({ ...SNAPSHOT, models: saved })
-    await expect(runModelCatalogSync()).rejects.toThrow('unapproved saved connection')
-    expect(upstashKvSet).not.toHaveBeenCalled()
+    readPriorValue.mockResolvedValueOnce({ ...SNAPSHOT, models: saved })
+    await expect(runModelCatalogSync()).rejects.toThrow(/cannot preserve catalog identity/i)
+    expect(upstashKvSetIfUnchanged).not.toHaveBeenCalled()
     expect(storeCatalogSyncReport).not.toHaveBeenCalled()
   })
 
+  it('preserves both exact Mistral variants through the real sync producer with provider-list fixtures and AA enrichment', async () => {
+    readPriorValue.mockResolvedValueOnce(mistralCollision)
+    getRuntimeEnv.mockImplementation(async name => ['MISTRAL_API_KEY', 'ARTIFICIAL_ANALYSIS_API_KEY'].includes(name) ? 'test-key' : undefined)
+    fetchSpy.mockImplementation(async (input: string) => {
+      const data = input.includes('ai-gateway.vercel.sh') ? [{ id: 'mistral/mistral-medium-3.5', name: 'Mistral Medium Latest',
+        type: 'language', context_window: 262144, pricing: { input: '0.0000015', output: '0.0000075', input_cache_read: '0.00000015' } }] :
+        input.includes('api.mistral.ai') ? ['mistral-medium-3.5', 'mistral-medium-3-5'].map(id => ({ id, name: id, max_context_length: 262144 })) :
+        input.includes('artificialanalysis.ai') ? [{ slug: 'mistral-medium-3-5', name: 'Mistral Medium 3.5' }] : []
+      return new Response(JSON.stringify({ data, ...(input.includes('artificialanalysis.ai') ? { pagination: { page: 1, page_size: 200, total_pages: 1, has_more: false } } : {}) }), { status: 200 })
+    })
+    const result = await runModelCatalogSync({ trigger: 'cli' })
+    expect(result.payload.models.filter(model => model.provider === 'mistral').map(model => model.canonicalId).sort())
+      .toEqual(mistralCollision.models.map(model => model.canonicalId).sort())
+    expect(result.report.sources.find(source => source.connectionId === 'direct:mistral')).toMatchObject({ fetchedCount: 2, confirmedRemovalIds: [] })
+    for (const row of mistralCollision.models) {
+      expect(result.payload.models.find(model => model.canonicalId === row.canonicalId)?.idVariants?.['direct:mistral'].effectiveId)
+        .toBe(row.idVariants['direct:mistral'].effectiveId)
+    }
+    expect(upstashKvSetIfUnchanged).toHaveBeenCalledOnce()
+    expect(storeCatalogSyncReport).toHaveBeenCalledOnce()
+  })
+
   it('permits the first publication when the catalog key is genuinely absent', async () => {
-    upstashKvGet.mockResolvedValueOnce(null)
+    readPriorValue.mockResolvedValueOnce(null)
     fetchSpy.mockImplementation(async (input: string) =>
       new Response(
         JSON.stringify(
@@ -253,14 +317,15 @@ describe('BL-68 sync dry run and snapshot replay', () => {
 
     await runModelCatalogSync({ trigger: 'cli' })
 
-    expect(upstashKvSet).toHaveBeenCalledWith('catalog:v1', expect.anything(), expect.anything())
+    expect(upstashKvSetIfUnchanged).toHaveBeenCalledWith('catalog:v1', null, expect.anything(), expect.anything())
+    expect(upstashKvSetIfUnchanged.mock.calls[0][1]).toBeNull()
     expect(storeCatalogSyncReport).toHaveBeenCalledTimes(1)
   })
 
   it('writes nothing to Upstash on a dry run and still returns the catalog', async () => {
     const result = await runModelCatalogSync({ trigger: 'cli', dryRun: true })
 
-    expect(upstashKvSet).not.toHaveBeenCalled()
+    expect(upstashKvSetIfUnchanged).not.toHaveBeenCalled()
     expect(storeCatalogSyncReport).not.toHaveBeenCalled()
     const ids = result.payload.models.map((model) => model.id)
     expect(ids).toContain('anthropic/claude-sonnet-4.5')
@@ -288,7 +353,7 @@ describe('BL-68 sync dry run and snapshot replay', () => {
   it('uses fresh metadata for present identities while retaining missing ones', async () => {
     const second = { ...SNAPSHOT.models[0], id: 'maker/old', provider: 'maker', name: 'old',
       canonicalId: 'maker/old', idVariants: { 'vercel-gateway': { developerId: 'maker', modelId: 'old', effectiveId: 'maker/old' } } }
-    upstashKvGet.mockResolvedValueOnce({ ...SNAPSHOT, models: [SNAPSHOT.models[0], second] })
+    readPriorValue.mockResolvedValueOnce({ ...SNAPSHOT, models: [SNAPSHOT.models[0], second] })
     fetchSpy.mockImplementation(async (input: string) => new Response(JSON.stringify(
       input.includes('ai-gateway.vercel.sh')
         ? { data: [{ id: 'anthropic/claude-sonnet-4.5', name: 'Fresh name', context_window: 999999 }] }
@@ -314,7 +379,7 @@ describe('BL-68 sync dry run and snapshot replay', () => {
     const saved = row({ id: 'maker/old', provider: 'maker', name: 'old', canonicalId: 'maker/old',
       connectionId, availableConnections: [connectionId],
       idVariants: { [connectionId]: { developerId: 'maker', modelId: 'old', effectiveId: 'maker/old' } } })
-    upstashKvGet.mockResolvedValueOnce({ ...SNAPSHOT, models: [SNAPSHOT.models[0], saved] })
+    readPriorValue.mockResolvedValueOnce({ ...SNAPSHOT, models: [SNAPSHOT.models[0], saved] })
     getRuntimeEnv.mockImplementation(async name => name === 'REPLICATE_API_KEY' ? 'test-key' : undefined)
     fetchSpy.mockImplementation(async (input: string) => new Response(JSON.stringify(
       input.includes('replicate.com')
@@ -353,7 +418,7 @@ describe('BL-68 sync dry run and snapshot replay', () => {
     const { payload } = buildCatalogFromSnapshot(SNAPSHOT)
 
     expect(fetchSpy).not.toHaveBeenCalled()
-    expect(upstashKvGet).not.toHaveBeenCalled()
+    expect(readPriorValue).not.toHaveBeenCalled()
     expect(payload.fetchedAt).toBe(SNAPSHOT.fetchedAt)
     expect(payload.models).toHaveLength(1)
     expect(payload.models[0].idVariants?.['direct:anthropic']).toMatchObject({

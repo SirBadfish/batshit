@@ -4,6 +4,7 @@ import path from 'node:path'
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import type { TypesafeCallRecord, UntrustedTextScreen } from '$lib/types/typesafe'
+import { initializedBuiltinPluginEntries } from '$lib/test-utils/initialized-builtin-plugin'
 
 /**
  * SA-120 P7 — the incoming-text screen at the two skill-import doors.
@@ -19,16 +20,20 @@ import type { TypesafeCallRecord, UntrustedTextScreen } from '$lib/types/typesaf
 
 /**
  * `sys.skill.import` SAVES a skill, and `skillRegistry.ts` writes it under `~/.batshit/skills`,
- * a path it resolves ONCE, from `os.homedir()`, when the module loads. So `node:os` is mocked to
- * answer a throwaway home BEFORE any import runs. Setting `process.env.HOME` is not enough: it
+ * a path it resolves ONCE through `batshitHome.ts` when the module loads. Its supported
+ * `BATSHIT_HOME_DIR` override and `node:os` both name the throwaway home BEFORE imports run.
+ * Setting `process.env.HOME` is not enough: it
  * works in the default forks pool, but `npm run test:redis` runs in worker THREADS, where
  * `process.env` is a copy and `os.homedir()` still answers the real home (found the hard way:
  * the first real-Redis run of this suite wrote its synthetic skill into the real folder).
  * A builtin's mock must override `default` too (testing-architecture.md §5).
  */
-const home = vi.hoisted(() => ({
-  temp: `${(process.env.TMPDIR ?? '/tmp').replace(/\/$/, '')}/batshit-p7-home-${process.pid}-${Date.now()}`
-}))
+const home = vi.hoisted(() => {
+  const temp = `${(process.env.TMPDIR ?? '/tmp').replace(/\/$/, '')}/batshit-p7-home-${process.pid}-${Date.now()}`
+  const previousBatshitHome = process.env.BATSHIT_HOME_DIR
+  process.env.BATSHIT_HOME_DIR = `${temp}/.batshit`
+  return { temp, previousBatshitHome }
+})
 vi.mock('node:os', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:os')>()
   const homedir = () => home.temp
@@ -114,21 +119,55 @@ description: Diagnose environment problems.
 `
 
 let skillDir = ''
+let catalog = new Map<string, unknown>()
+let originalExecute: ((operation: any) => Promise<any>) | undefined
+let addedRawReader = false
 
-beforeEach(() => {
+beforeEach(async () => {
   screenMock.answer = null
   screenMock.calls.length = 0
   attachMock.calls.length = 0
   skillDir = mkdtempSync(path.join(os.tmpdir(), 'batshit-p7-skill-'))
   writeFileSync(path.join(skillDir, 'SKILL.md'), SKILL_MD)
+  // This consumer starts after built-in migration. Keep its complete all-off catalog
+  // and real plugin membership checks, without pretending to execute migration Lua.
+  catalog = new Map(initializedBuiltinPluginEntries(USER))
+  for (const [key, row] of catalog) await redis.set(key, structuredClone(row))
+  if (vi.isMockFunction(redis.execute)) {
+    if (typeof redis.json.getRaw !== 'function') {
+      addedRawReader = true
+      ;(redis.json as any).getRaw = async (key: string, jsonPath: string) => {
+        if (jsonPath !== '$') throw new Error(`Unsupported skill-import raw fixture path: ${jsonPath}`)
+        const row = await redis.json.get(key)
+        return row === null ? null : JSON.stringify([row])
+      }
+    }
+    originalExecute = vi.mocked(redis.execute).getMockImplementation()
+    if (!originalExecute) throw new Error('The existing Redis execute fixture is unavailable.')
+    const execute = originalExecute
+    vi.mocked(redis.execute).mockImplementation(operation => execute((client: any) => operation({
+      ...client, lPush: client.lPush ?? ((key: string, value: string) => redis.lpush(key, value)),
+      lTrim: client.lTrim ?? ((key: string, start: number, end: number) => redis.ltrim(key, start, end))
+    })))
+  }
 })
 
-afterEach(() => {
-  rmSync(skillDir, { recursive: true, force: true })
-  vi.restoreAllMocks()
+afterEach(async () => {
+  try {
+    for (const [key, row] of catalog) expect(await redis.get(key), key).toEqual(row)
+  } finally {
+    rmSync(skillDir, { recursive: true, force: true })
+    vi.restoreAllMocks()
+    if (originalExecute) vi.mocked(redis.execute).mockImplementation(originalExecute)
+    originalExecute = undefined
+    if (addedRawReader) delete (redis.json as any).getRaw
+    addedRawReader = false
+  }
 })
 
 afterAll(() => {
+  if (home.previousBatshitHome === undefined) delete process.env.BATSHIT_HOME_DIR
+  else process.env.BATSHIT_HOME_DIR = home.previousBatshitHome
   rmSync(home.temp, { recursive: true, force: true })
 })
 
@@ -146,6 +185,7 @@ function importEvent(body: Record<string, unknown>, userId: string | null = USER
 describe('this suite\'s own safety net', () => {
   it('has the skill registry writing under the throwaway home, never the real one', () => {
     expect(os.homedir()).toBe(home.temp)
+    expect(process.env.BATSHIT_HOME_DIR).toBe(path.join(home.temp, '.batshit'))
     expect(home.temp).not.toBe(process.env.HOME)
   })
 })
@@ -238,7 +278,7 @@ describe('sys.skill.import (an agent imports a skill)', () => {
 
   it('saves the skill whatever the screen says, and says so only when it is flagged', async () => {
     const calm = await runImport()
-    expect(calm.success).toBe(true)
+    expect(calm.success, JSON.stringify(calm)).toBe(true)
     const calmResult = (calm as any).result
     expect(calmResult.imported).toBe(true)
     expect(Object.prototype.hasOwnProperty.call(calmResult, 'jev_juice_screen')).toBe(false)
@@ -250,7 +290,7 @@ describe('sys.skill.import (an agent imports a skill)', () => {
 
     screenMock.answer = screenOf('flagged')
     const hot = await runImport()
-    expect(hot.success).toBe(true)
+    expect(hot.success, JSON.stringify(hot)).toBe(true)
     const hotResult = (hot as any).result
     // Advisory only: a flag never turns an approved import into a refusal.
     expect(hotResult.imported).toBe(true)
@@ -278,8 +318,10 @@ describe('sys.skill.import (an agent imports a skill)', () => {
 
   it.each(['no_flag', 'skipped'] as const)('adds NOTHING to the result for "%s"', async (status) => {
     const calm = (await runImport()) as any
+    expect(calm.success, JSON.stringify(calm)).toBe(true)
     screenMock.answer = screenOf(status)
     const screened = (await runImport()) as any
+    expect(screened.success, JSON.stringify(screened)).toBe(true)
     expect(Object.keys(screened.result).sort()).toEqual(Object.keys(calm.result).sort())
     expect(screened.result.warnings).toEqual(calm.result.warnings)
   })

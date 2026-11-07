@@ -1,4 +1,5 @@
 import { redis } from '$lib/server/redis'
+import { captureRecipeVerificationEpoch, publishInRecipeVerificationEpoch } from './recipeVerificationEpoch.server'
 import type { GoonRecord } from '$lib/types/goons'
 import { RECIPE_MANAGED_GOON_FIELDS } from '$lib/goons/recipe/recipeManagedGoonFields'
 import {
@@ -23,6 +24,7 @@ import {
 } from '$lib/goons/recipe'
 
 export type RecipeRepositoryErrorCode =
+  | 'UNSUPPORTED_FIELDS'
   | 'NOT_FOUND'
   | 'FORBIDDEN'
   | 'RECIPE_NOT_INITIALIZED'
@@ -42,6 +44,25 @@ export class RecipeRepositoryError extends Error {
     this.status = status
   }
 }
+
+function assertSupportedPublicRecipeGoon(goon: GoonRecord) {
+  const value = goon as unknown as Record<string, unknown>
+  if (['anatomyPresence', 'clothingState', 'clothingCloset', 'sphericalEyelid'].some(field => Object.hasOwn(value, field)) ||
+      value.closet && typeof value.closet === 'object' && Object.hasOwn(value.closet, 'clothingPresets') ||
+      value.recipe && typeof value.recipe === 'object' && Object.hasOwn(value.recipe, 'requiredMotionPreparation')) {
+    throw new RecipeRepositoryError('UNSUPPORTED_FIELDS', 'This Goon has fields this release does not support. Nothing was saved.', 400)
+  }
+}
+
+const PUBLIC_RECIPE_GOON_REFUSAL_LUA = `
+local function unsupportedPublicRecipeGoon(value)
+  for _, field in ipairs({'anatomyPresence', 'clothingState', 'clothingCloset', 'sphericalEyelid'}) do
+    if value[field] ~= nil then return true end
+  end
+  return (type(value['closet']) == 'table' and value['closet']['clothingPresets'] ~= nil) or
+    (type(value['recipe']) == 'table' and value['recipe']['requiredMotionPreparation'] ~= nil)
+end
+`
 
 const RECIPE_MANAGED_GOON_FIELDS_LUA = RECIPE_MANAGED_GOON_FIELDS
   .map((field) => `  '${field}'`)
@@ -64,7 +85,7 @@ const RECIPE_LEASE_RENEWABLE_STATUSES_LUA = RECIPE_LEASE_RENEWABLE_STATUSES
   .join(',\n')
 
 export type RecipeBootstrapManagedSnapshot = Partial<
-  Pick<GoonRecord, (typeof RECIPE_MANAGED_GOON_FIELDS)[number]>
+  Pick<GoonRecord, (typeof RECIPE_MANAGED_GOON_FIELDS)[number] | 'kind' | 'sourceProfile' | 'closet'>
 >
 
 export function createRecipeBootstrapManagedSnapshot(
@@ -72,13 +93,14 @@ export function createRecipeBootstrapManagedSnapshot(
 ): RecipeBootstrapManagedSnapshot {
   const source = goon as unknown as Record<string, unknown>
   return Object.fromEntries(
-    RECIPE_MANAGED_GOON_FIELDS
+    [...RECIPE_MANAGED_GOON_FIELDS, 'kind', 'sourceProfile', 'closet']
       .filter((field) => Object.prototype.hasOwnProperty.call(source, field))
       .map((field) => [field, source[field]])
   ) as RecipeBootstrapManagedSnapshot
 }
 
 const RECIPE_COMPARE_AND_SWAP_SCRIPT = `
+${PUBLIC_RECIPE_GOON_REFUSAL_LUA}
 ${CUSTOM_GOON_UPLOAD_GUARD_LUA}
 local raw = redis.call('JSON.GET', KEYS[1])
 if not raw then
@@ -88,6 +110,7 @@ local current = cjson.decode(raw)
 if current['user_id'] ~= ARGV[1] then
   return 'FORBIDDEN'
 end
+if unsupportedPublicRecipeGoon(current) then return 'UNSUPPORTED_FIELDS' end
 local recipe = current['recipe']
 if not recipe or recipe['contract'] ~= '${GOON_RECIPE_OWNER_V2_CONTRACT}' then
   return 'RECIPE_NOT_INITIALIZED'
@@ -123,6 +146,7 @@ return redis.call('JSON.GET', KEYS[1])
 `
 
 const RECIPE_BOOTSTRAP_SCRIPT = `
+${PUBLIC_RECIPE_GOON_REFUSAL_LUA}
 ${CUSTOM_GOON_UPLOAD_GUARD_LUA}
 local function deepEqual(left, right)
   if left == cjson.null or right == cjson.null then
@@ -155,11 +179,13 @@ local current = cjson.decode(raw)
 if current['user_id'] ~= ARGV[1] then
   return 'FORBIDDEN'
 end
+if unsupportedPublicRecipeGoon(current) then return 'UNSUPPORTED_FIELDS' end
 if current['recipe'] and current['recipe'] ~= cjson.null then
   return 'RECIPE_ALREADY_INITIALIZED'
 end
 local managedFields = {
 ${RECIPE_MANAGED_GOON_FIELDS_LUA}
+  , 'kind', 'sourceProfile', 'closet'
 }
 local currentManaged = {}
 for _, field in ipairs(managedFields) do
@@ -210,6 +236,7 @@ return 'STORED'
 `
 
 const RECIPE_JOB_COMPARE_AND_SWAP_SCRIPT = `
+${PUBLIC_RECIPE_GOON_REFUSAL_LUA}
 ${CUSTOM_GOON_UPLOAD_GUARD_LUA}
 local raw = redis.call('JSON.GET', KEYS[1])
 if not raw then
@@ -219,6 +246,7 @@ local current = cjson.decode(raw)
 if current['user_id'] ~= ARGV[1] then
   return 'FORBIDDEN'
 end
+if unsupportedPublicRecipeGoon(current) then return 'UNSUPPORTED_FIELDS' end
 local recipe = current['recipe']
 if not recipe or recipe['contract'] ~= '${GOON_RECIPE_OWNER_V2_CONTRACT}' then
   return 'RECIPE_NOT_INITIALIZED'
@@ -291,6 +319,7 @@ return redis.call('JSON.GET', KEYS[1])
 `
 
 const RECIPE_JOB_RENEW_LEASE_SCRIPT = `
+${PUBLIC_RECIPE_GOON_REFUSAL_LUA}
 local ownerRaw = redis.call('JSON.GET', KEYS[1])
 if not ownerRaw then
   return 'NOT_FOUND'
@@ -299,6 +328,7 @@ local owner = cjson.decode(ownerRaw)
 if owner['user_id'] ~= ARGV[1] then
   return 'FORBIDDEN'
 end
+if unsupportedPublicRecipeGoon(owner) then return 'UNSUPPORTED_FIELDS' end
 if owner['id'] ~= ARGV[2] then
   return 'JOB_CORRUPT'
 end
@@ -357,6 +387,7 @@ return {redis.call('JSON.GET', KEYS[1]), redis.call('JSON.GET', KEYS[2])}
 `
 
 const RECIPE_ANALYSIS_DISCARD_SCRIPT = `
+${PUBLIC_RECIPE_GOON_REFUSAL_LUA}
 local raw = redis.call('JSON.GET', KEYS[1])
 if not raw then
   return 'NOT_FOUND'
@@ -365,6 +396,7 @@ local current = cjson.decode(raw)
 if current['user_id'] ~= ARGV[1] then
   return 'FORBIDDEN'
 end
+if unsupportedPublicRecipeGoon(current) then return 'UNSUPPORTED_FIELDS' end
 local recipe = current['recipe']
 if not recipe or recipe['contract'] ~= '${GOON_RECIPE_OWNER_V2_CONTRACT}' then
   return 'RECIPE_NOT_INITIALIZED'
@@ -395,6 +427,7 @@ function goonKey(goonId: string) {
 }
 
 function statusForCode(code: RecipeRepositoryErrorCode) {
+  if (code === 'UNSUPPORTED_FIELDS') return 400
   if (code === 'NOT_FOUND') return 404
   if (code === 'FORBIDDEN') return 403
   if (code === 'WRITE_CONFLICT') return 409
@@ -441,6 +474,7 @@ function throwCasFailure(code: string): never {
     )
   }
   const known = [
+    'UNSUPPORTED_FIELDS',
     'NOT_FOUND',
     'FORBIDDEN',
     'RECIPE_NOT_INITIALIZED',
@@ -456,6 +490,7 @@ function throwCasFailure(code: string): never {
   }
   const typed = code as (typeof known)[number]
   const messages: Record<(typeof known)[number], string> = {
+    UNSUPPORTED_FIELDS: 'This Goon has fields this release does not support. Nothing was saved.',
     NOT_FOUND: 'Goon not found.',
     FORBIDDEN: 'The Goon belongs to another user.',
     RECIPE_NOT_INITIALIZED: 'This Goon does not have a durable Recipe owner yet.',
@@ -466,6 +501,7 @@ function throwCasFailure(code: string): never {
 }
 
 function assertGoonIdentity(goon: GoonRecord, userId: string, goonId: string) {
+  assertSupportedPublicRecipeGoon(goon)
   if (goon.id !== goonId || goon.user_id !== userId) {
     throw new RecipeRepositoryError(
       'CORRUPT_RECORD',
@@ -488,6 +524,8 @@ export async function getOwnedRecipeGoon(
   if (goon.user_id !== userId) {
     throw new RecipeRepositoryError('FORBIDDEN', 'The Goon belongs to another user.', 403)
   }
+  if (goon.id !== goonId) throw new RecipeRepositoryError('CORRUPT_RECORD', 'Recipe Goon identity does not match its storage key.', 500)
+  assertSupportedPublicRecipeGoon(goon)
   if (!goon.recipe || goon.recipe.contract !== GOON_RECIPE_OWNER_V2_CONTRACT) {
     throw new RecipeRepositoryError(
       'RECIPE_NOT_INITIALIZED',
@@ -510,6 +548,8 @@ export async function getOwnedGoonForRecipeBootstrap(
   if (goon.user_id !== userId) {
     throw new RecipeRepositoryError('FORBIDDEN', 'The Goon belongs to another user.', 403)
   }
+  if (goon.id !== goonId) throw new RecipeRepositoryError('CORRUPT_RECORD', 'Recipe Goon identity does not match its storage key.', 500)
+  assertSupportedPublicRecipeGoon(goon)
   if (goon.recipe) {
     throw new RecipeRepositoryError(
       'RECIPE_ALREADY_INITIALIZED',
@@ -584,6 +624,7 @@ export async function getGoonRecipeDocument(
   if (document.userId !== userId || document.goonId !== goonId) {
     throw new RecipeRepositoryError('CORRUPT_RECORD', 'Recipe document ownership is corrupt.', 500)
   }
+  if (document.sha256 !== sha256) throw new RecipeRepositoryError('CORRUPT_RECORD', 'Recipe document identity does not match its storage key.', 500)
   return document
 }
 
@@ -612,7 +653,9 @@ export async function getRecipeRevisionEnvelope(
       404
     )
   }
-  return verifyRecipeRevisionEnvelope(value)
+  const envelope = await verifyRecipeRevisionEnvelope(value)
+  if (envelope.revision.revisionId !== revisionId) throw new RecipeRepositoryError('CORRUPT_RECORD', 'Recipe revision identity does not match its storage key.', 500)
+  return envelope
 }
 
 export async function putGoonRecipeJob(jobValue: unknown) {
@@ -649,6 +692,7 @@ export async function getGoonRecipeJob(
   if (job.userId !== userId || job.goonId !== goonId) {
     throw new RecipeRepositoryError('CORRUPT_RECORD', 'Recipe job ownership is corrupt.', 500)
   }
+  if (job.jobId !== jobId) throw new RecipeRepositoryError('CORRUPT_RECORD', 'Recipe job identity does not match its storage key.', 500)
   return job
 }
 
@@ -719,9 +763,11 @@ export async function initializeRecipeState(input: {
   goonId: string
   expectedManagedState: RecipeBootstrapManagedSnapshot
   nextGoon: GoonRecord
+  verificationEpoch?: symbol | null
   records: Array<{ key: string; value: unknown }>
 }): Promise<GoonRecord> {
   assertGoonIdentity(input.nextGoon, input.userId, input.goonId)
+  const verificationEpoch = input.verificationEpoch === undefined ? captureRecipeVerificationEpoch() : input.verificationEpoch
   const owner = parseGoonRecipeV2(input.nextGoon.recipe)
   if (owner.writeVersion !== 1) {
     throw new RecipeRepositoryError(
@@ -745,7 +791,7 @@ export async function initializeRecipeState(input: {
         500
       )
     }
-    return client.eval(RECIPE_BOOTSTRAP_SCRIPT, {
+    return publishInRecipeVerificationEpoch(verificationEpoch, () => client.eval(RECIPE_BOOTSTRAP_SCRIPT, {
       keys,
       arguments: [
         input.userId,
@@ -755,7 +801,7 @@ export async function initializeRecipeState(input: {
         ...input.records.map((record) => JSON.stringify(record.value)),
         JSON.stringify(uploadKeys)
       ]
-    })
+    }))
   })
   const serialized = String(result)
   if (!serialized.startsWith('{')) throwCasFailure(serialized)

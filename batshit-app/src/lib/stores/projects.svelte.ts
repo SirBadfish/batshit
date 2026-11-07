@@ -1,4 +1,8 @@
 import type { IconRef } from '$lib/icons/iconTypes'
+import {
+  buildDefaultProject,
+  normalizeDefaultProjectPath
+} from '$lib/projects/defaultProject'
 
 // Projects store using Svelte 5 runes
 export interface Project {
@@ -10,6 +14,8 @@ export interface Project {
   max_depth?: number
   custom_exclusions?: string[]
   icon_ref?: IconRef | null
+  /** BL-2373: true only on the Default Project built from the Default Project Path (never stored). */
+  is_default_project?: boolean
   created_at: string
   updated_at: string
 }
@@ -43,6 +49,12 @@ export type MentionIndexStatus = 'idle' | 'loading' | 'ready' | 'error'
 
 let projects = $state<Project[]>([])
 let currentProjectId = $state<string | null>(null)
+// BL-2373: the saved Default Project Path, the one source of the Default Project. Null until a
+// successful preferences read (or when the path is blank).
+let defaultProjectPath = $state<string | null>(null)
+let defaultProjectCache: { path: string | null; project: Project | null } = { path: null, project: null }
+// Counts every write of the path, so a read that started before a newer write can tell it is old.
+let defaultProjectPathRevision = 0
 let fileTree = $state<FileTreeNode[]>([])
 let flatFileList = $state<FlatFileEntry[]>([])
 let activeFilePath = $state<string | null>(null)
@@ -56,12 +68,73 @@ let mentionIndexStatus = $state<MentionIndexStatus>('idle')
 let mentionIndexError = $state<string | null>(null)
 let mentionIndexTruncated = $state(false)
 
+/** The saved project records only (what `/api/projects` returns). */
 export function getProjects() {
   return projects
 }
 
+export function getDefaultProjectPath() {
+  return defaultProjectPath
+}
+
+/**
+ * Read the saved Default Project Path and install it, unless the path was written while the read
+ * was on its way (a save in Settings is newer than the read that started before it). Answers
+ * whether the read was installed; a failed read throws and changes nothing.
+ */
+export async function loadDefaultProjectPath(
+  read: () => Promise<{ default_workspace_path?: string | null } | null>
+): Promise<boolean> {
+  const revision = defaultProjectPathRevision
+  const preferences = await read()
+  if (defaultProjectPathRevision !== revision) return false
+  setDefaultProjectPath(preferences?.default_workspace_path ?? null)
+  return true
+}
+
+/** Takes the saved Default Project Path as read or saved; a blank or relative value means none. */
+export function setDefaultProjectPath(path: string | null | undefined) {
+  keepingTreeWithItsFolder(() => {
+    defaultProjectPathRevision += 1
+    defaultProjectPath = normalizeDefaultProjectPath(path)
+  })
+}
+
+/**
+ * BL-2373 / BL-2391: a project keeps its id when its folder changes (the Default Project when the
+ * Default Project Path changes, a saved project when its Root Path is edited, saved, or a list
+ * read brings the new root). The shown tree and @ mention index of the old folder are cleared
+ * here, whichever writer changed it, as if the project had been switched; chat already sends
+ * the new root, and an open sidebar loads the new folder (`ProjectsSidebar`).
+ */
+function keepingTreeWithItsFolder(write: () => void) {
+  const shownId = currentProjectId
+  const previousRoot = getCurrentProject()?.root_path ?? null
+  write()
+  const nextRoot = getCurrentProject()?.root_path ?? null
+  if (shownId && shownId === currentProjectId && previousRoot && nextRoot && previousRoot !== nextRoot) {
+    clearFileTreeState()
+    loadedProjectIds.delete(shownId)
+  }
+}
+
+/** BL-2373: the Default Project for the saved Default Project Path, or null when it is blank. */
+export function getDefaultProject(): Project | null {
+  const path = defaultProjectPath
+  if (defaultProjectCache.path !== path) {
+    defaultProjectCache = { path, project: buildDefaultProject(path) }
+  }
+  return defaultProjectCache.project
+}
+
+/** What the Projects sidebar offers: the Default Project first, then the saved projects. */
+export function getSelectableProjects(): Project[] {
+  const defaultProject = getDefaultProject()
+  return defaultProject ? [defaultProject, ...projects] : projects
+}
+
 export function getCurrentProject() {
-  return projects.find(p => p.id === currentProjectId) || null
+  return getSelectableProjects().find(p => p.id === currentProjectId) || null
 }
 
 export function getCurrentProjectId() {
@@ -112,8 +185,16 @@ export function isMentionIndexTruncated() {
   return mentionIndexTruncated
 }
 
+/**
+ * Install a project list: it replaces the store's copies, whatever their stamps. A backup restore
+ * rewrites records without a newer `updated_at`, and a server clock can step back, so an older
+ * stamp is no proof that the store's copy is newer. A list the server read before a save landed
+ * is corrected where it is read (`ProjectService.loadProjects`, `applySavedAnswersSince`).
+ */
 export function setProjects(newProjects: Project[]) {
-  projects = newProjects
+  keepingTreeWithItsFolder(() => {
+    projects = newProjects
+  })
 }
 
 export function addProject(project: Project) {
@@ -121,15 +202,18 @@ export function addProject(project: Project) {
 }
 
 export function updateProject(id: string, updates: Partial<Project>) {
-  projects = projects.map(p =>
-    p.id === id ? { ...p, ...updates } : p
-  )
+  keepingTreeWithItsFolder(() => {
+    projects = projects.map(p =>
+      p.id === id ? { ...p, ...updates } : p
+    )
+  })
 }
 
 export function deleteProject(id: string) {
   projects = projects.filter(p => p.id !== id)
+  // BL-2373: never fall onto another saved project; the agent's selection rule picks again.
   if (currentProjectId === id) {
-    currentProjectId = projects[0]?.id || null
+    setCurrentProject(null)
   }
   if (loadedProjectIds.has(id)) {
     loadedProjectIds.delete(id)
@@ -142,17 +226,20 @@ export function setCurrentProject(id: string | null) {
 
   // Only clear file tree if switching to a different project
   if (id !== previousProjectId) {
-    fileTree = []
-    flatFileList = []
-    activeFilePath = null
-    error = null
-    fileTreeLoadedAt = null
-    fileTreeStale = false
-    mentionIndexStatus = 'idle'
-    mentionIndexError = null
-    mentionIndexTruncated = false
+    clearFileTreeState()
   }
+}
 
+function clearFileTreeState() {
+  fileTree = []
+  flatFileList = []
+  activeFilePath = null
+  error = null
+  fileTreeLoadedAt = null
+  fileTreeStale = false
+  mentionIndexStatus = 'idle'
+  mentionIndexError = null
+  mentionIndexTruncated = false
 }
 
 /**

@@ -1,4 +1,3 @@
-import { normalizeId } from './idNormalizer'
 import {
   CONTROL_TAGS,
   GOON_STAGE_DIRECTION_REGEX_SOURCE,
@@ -57,10 +56,6 @@ export type ToolNotesPayload = {
   /** `hold` / `release` entries that were not file paths (a number, an object, an empty string). */
   invalidEntries?: Array<{ key: 'hold' | 'release'; value: string }>
   parseError?: string
-}
-
-export type ZipControlResolveOptions = {
-  currentToolZipIds?: string[]
 }
 
 const ZIP_CONTROL_TAG = controlTag('zip-control').tag
@@ -140,64 +135,6 @@ function normalizeStringList(value: unknown): string[] {
       .filter((entry) => entry.length > 0)
   }
   return []
-}
-
-const TOOL_RESULT_ALIAS_REGEX = /^tool_result_([1-9]\d*)$/i
-
-function normalizeCurrentToolZipIds(ids: string[] | undefined): string[] {
-  const resolved: string[] = []
-  const seen = new Set<string>()
-  for (const id of ids ?? []) {
-    const raw = typeof id === 'string' ? id.trim() : ''
-    if (!raw) continue
-    const normalized = normalizeId(raw)
-    if (seen.has(normalized)) continue
-    seen.add(normalized)
-    resolved.push(raw)
-  }
-  return resolved
-}
-
-function resolveToolResultAlias(raw: string, currentToolZipIds: string[]): string | null {
-  const match = raw.match(TOOL_RESULT_ALIAS_REGEX)
-  if (!match) return null
-  const index = Number.parseInt(match[1] ?? '', 10)
-  if (!Number.isInteger(index) || index < 1) return null
-  return currentToolZipIds[index - 1] ?? null
-}
-
-export function resolveZipControlZipIds(
-  requestedIds: string[],
-  availableZipIds: string[],
-  options: ZipControlResolveOptions = {}
-): string[] {
-  const currentToolZipIds = normalizeCurrentToolZipIds(options.currentToolZipIds)
-  const lookup = new Map<string, string>()
-  for (const id of [...availableZipIds, ...currentToolZipIds]) {
-    const raw = typeof id === 'string' ? id.trim() : ''
-    if (!raw) continue
-    const normalized = normalizeId(raw)
-    if (normalized && !lookup.has(normalized)) {
-      lookup.set(normalized, raw)
-    }
-  }
-
-  const resolved: string[] = []
-  const seen = new Set<string>()
-  for (const id of requestedIds) {
-    const raw = typeof id === 'string' ? id.trim() : ''
-    if (!raw) continue
-    const resolvedAlias = resolveToolResultAlias(raw, currentToolZipIds)
-    const normalized = normalizeId(resolvedAlias ?? raw)
-    const zipId = lookup.get(normalized)
-    if (!zipId) continue
-    const normalizedZip = normalizeId(zipId)
-    if (seen.has(normalizedZip)) continue
-    seen.add(normalizedZip)
-    resolved.push(zipId)
-  }
-
-  return resolved
 }
 
 function normalizeToolResultsSummary(value: unknown): ZipControlToolSummary[] {
@@ -643,6 +580,13 @@ export function hideStreamingHiddenControlBlocks(content: string): string {
   return stripBareHiddenControlPayloads(cleaned)
 }
 
+/** A notes block that parses but asks for nothing (`{}`, an empty `hold`). */
+export const TOOL_NOTES_EMPTY_BLOCK_ERROR =
+  'Tool Notes block must be a JSON object like {"notes":[{"toolName":"...","summary":"..."}]}.'
+/** BL-1785: the same error for an agent with Tool Notes off, which never names notes. */
+export const TOOL_NOTES_OFF_EMPTY_BLOCK_ERROR =
+  'The <batshit-tool-notes> block must be a JSON object with "hold" or "release".'
+
 /**
  * Extract the last `<batshit-tool-notes>` block (or a trailing bare
  * `{"notes":[...]}` payload) from a message. `cleaned` removes only tool-notes
@@ -663,7 +607,7 @@ function parseToolNotesBlock(raw: string): { payload?: ToolNotesPayload; parseEr
         (normalized.invalidEntries?.length ?? 0) > 0)
     if (!normalized || !saysSomething) {
       return {
-        parseError: 'Tool Notes block must be a JSON object like {"notes":[{"toolName":"...","summary":"..."}]}.'
+        parseError: TOOL_NOTES_EMPTY_BLOCK_ERROR
       }
     }
     return { payload: normalized }
